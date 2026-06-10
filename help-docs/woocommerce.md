@@ -11,12 +11,28 @@ One Two Inventory connects to your WooCommerce store to automatically import ord
    - **Consumer Key** — generated in WooCommerce under Settings > Advanced > REST API
    - **Consumer Secret** — shown once when you create the key in WooCommerce
 4. Click **Save Settings**
+5. **Click "Test Connection"** — sync remains disabled until you successfully run the connection test. The system stores a fingerprint of the saved credentials at test time; if you later change any of them, you must re-test before sync re-activates. See [Connection Test Gate](#connection-test-gate) below.
 
-Once connected, a green "Connected" badge appears and the remaining tabs become available.
+Once connected AND tested, a green "Connected" badge appears and the remaining tabs become available.
 
 > **Note:** The consumer secret is masked after saving. To change it, enter the full new value — the system detects and ignores the masked placeholder.
 >
 > **Base currency check:** the WooCommerce store currency must match the IMS base currency before credentials or sync settings can be enabled. Order currencies may still vary per transaction; the IMS converts them into its own base currency for reporting and valuation.
+
+### Connection Test Gate
+
+The connection test gate prevents sync from running with stale or wrong credentials. The flow is:
+
+1. You save credentials → status `not tested`. Sync is disabled.
+2. You click Test Connection → IMS calls the WooCommerce API with the saved credentials.
+3. If the test succeeds, the system stores:
+   - Test status: `success`
+   - Tested-at timestamp
+   - A fingerprint (hash of URL + key) of the credentials at test time.
+4. Sync can now be enabled.
+5. If you later change the URL, key, or secret, the fingerprint comparison detects the change and reverts the status to `stale`. You must re-test.
+
+This means a credential rotation can't silently leave sync running with old (or broken) credentials.
 
 ## Order Sync
 
@@ -143,7 +159,26 @@ The **Tax Rates** tab maps WooCommerce tax rates to One Two Inventory tax rates.
 4. Use the dropdown to change the target IMS tax rate if needed
 5. Delete mappings that are no longer relevant
 
-Without tax rate mappings, imported orders fall back to the default IMS tax rate.
+### Tax fallback policy
+
+When a WC order line arrives with a tax rate ID that has no IMS mapping, the system falls through to the IMS tax-rate resolver. If the resolver finds a matching rate based on country and product category, that rate is used.
+
+If the resolver also can't find a match, the system would fall back to the order-default tax rate. This is the point where things get dangerous: a misconfigured default could silently apply the wrong VAT to imports.
+
+The system handles this two ways:
+
+- **Non-zero fallback → import BLOCKED.** If the order-default rate is non-zero (most common case) and a line would use it, the import is rejected with a clear error message. A `tax_rate_fallback_blocked` activity log entry is written with the order details and the lines that hit fallback.
+- **Zero-rated fallback → import allowed, but logged.** If the fallback is to a zero-rate, the import proceeds but a `tax_rate_fallback` warning activity entry is written so operators can review.
+
+**To unblock a blocked order:** import the missing tax rates from WC, ensure the relevant country + category combination resolves, then retry the import from Sync > WooCommerce > Sync Log.
+
+The Sales Settings page surfaces recent fallback events as a widget so you can spot misconfigurations early.
+
+### Pending FX retry queue
+
+WooCommerce orders in a currency for which IMS has no stored FX rate are queued rather than failed. The system writes a `PENDING` shoppingSyncLog row with the full order payload and a `wc_order_fx_pending` activity log entry.
+
+When the next FX rate fetch succeeds, the queue is drained automatically and the queued orders are imported. If the queue grows beyond 5 entries (configurable via `WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD`), an admin notification is sent.
 
 ## Refund Sync
 
@@ -154,14 +189,34 @@ Refunds created in WooCommerce are automatically synced to One Two Inventory:
 
 Refunds are deduplicated by WooCommerce refund ID, so they are safe to re-process.
 
-## Invoice Notes
+## Invoice Notes and Customer PDF Downloads
 
-When an invoice is generated for a WooCommerce order, the system pushes:
+When an invoice is generated for a WooCommerce order, the system pushes invoice metadata to the WC order. The customer-facing invoice PDF download is then handled by the **OneTwoInventory Helper** WordPress plugin via a server-to-server handoff.
 
-- A **customer-visible** order note with a link to download the invoice PDF
-- An **admin-only** order note with a link to the accounting invoice (e.g. in Xero)
+### How customer PDF downloads work
 
-These are stored as WooCommerce order meta (`_invoice_pdf_url` and `_accounting_invoice_url`).
+1. WC customer logs into their account and visits the My Account → Orders page (or the order detail page).
+2. The helper plugin renders an **Invoice** button. The button URL is a WordPress nonce-protected REST endpoint on the WC site, NOT a direct IMS URL.
+3. The customer clicks the button. The helper plugin:
+   - Verifies the WC customer is logged in and owns the order (WordPress nonce + capability check).
+   - Calls the IMS endpoint `POST /api/shopping/woocommerce/invoice-pdf` with an HMAC-signed payload containing the order ID, customer ID, timestamp, and nonce.
+4. IMS verifies the HMAC signature, checks the order ownership, and streams the invoice PDF back to the helper plugin.
+5. The helper plugin proxies the PDF to the customer's browser.
+
+This means the customer never sees a direct IMS URL, no reusable token leaves the IMS, and order ownership is verified at both the WC and IMS layers.
+
+### Shared secret
+
+The HMAC signing key is the same value as the **WC webhook secret** (`wc_webhook_secret`). When you generate or rotate this secret in **Sync > WooCommerce > Orders**, paste the same value into the helper plugin's settings page (WP admin → Settings → OneTwoInventory Helper). The secret has two purposes:
+
+1. Verifying incoming WC webhooks at IMS
+2. Signing outgoing PDF requests from the helper plugin to IMS
+
+Rotating this secret requires updating it in BOTH places — IMS and the WP helper plugin — or webhooks AND invoice PDF downloads will both break.
+
+### Admin-only links
+
+When the invoice is also synced to Xero, the system pushes an admin-only WC order note with a "View in Xero" link. This link is stored as WC order meta (`_accounting_invoice_url`) and is only visible to WC admin users.
 
 ## onetwoInventory Helper WordPress plugin
 

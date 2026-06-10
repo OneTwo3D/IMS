@@ -138,6 +138,26 @@ Returned stock is added back into the selected warehouse's inventory automatical
 
 For Kit / Bundle sales, refunds reverse the component-level stock movements. Returned stock, FIFO cost restoration, and shipment reversal all happen against the underlying component products.
 
+### Refund-time cost revaluation
+
+When a refund processes returned stock, the system uses the **current** cost-layer unit cost — not the snapshot recorded at shipment time. This means if a landed-cost revaluation has changed the unit cost since the original shipment, the refund's COGS reversal uses the up-to-date value. The returned stock is also valued at the current cost.
+
+This keeps the returned-stock balance sheet entry aligned with the live cost layers. Note that the COGS reversal amount may differ from the originally-posted COGS amount by the revaluation delta — this is the expected behaviour for single-snapshot accounting.
+
+### Refunds without a shipment source
+
+If a sales order line was allocated but never shipped, the refund rejects with a clear message: *"Cannot return refunded stock for product X: no shipped stock source exists"*. The system refuses to silently restock from an allocation-only source — there's no actual stock movement to reverse.
+
+You can still process the refund as cash-only by leaving the return warehouse unset.
+
+### Warehouse-scoped idempotency
+
+The refund return-stock movement is bound by `(refundId, refundLineId, warehouseId)`. This means split returns to different warehouses don't collide — you can return part of an order to Warehouse A and part to Warehouse B in the same refund without idempotency conflicts.
+
+### WooCommerce refund deduplication
+
+Refunds synced from WooCommerce are deduplicated by `externalRefundId`. If a duplicate webhook fires (network retry, race condition), the second delivery is silently absorbed without creating a duplicate refund.
+
 ## Payments
 
 You can record payments against a sales order:
@@ -154,6 +174,47 @@ Invoices can be generated either manually or automatically. The trigger for auto
 - **Manual** — you generate the invoice yourself when ready
 - **On ship** — invoice is created automatically when the order is shipped
 - **On paid** — invoice is created automatically when payment is received in full
+
+
+## Multi-Currency and FX
+
+Sales orders can be in any configured currency. The system handles the conversion to your base currency for reporting and accounting.
+
+### How the FX rate is locked
+
+When you create an order:
+
+- The current stored exchange rate for the order date is fetched from the FX rate table.
+- The rate is stamped on the order as `fxRateToBase`.
+- All base-currency totals on the order use this stamped rate.
+
+Even if the daily rate changes tomorrow, the order's base-currency totals don't drift. This stamping is forwarded to Xero as `CurrencyRate` so Xero uses the same rate the IMS recorded.
+
+### Realised FX gain/loss on settlement
+
+When a multi-currency invoice is paid weeks or months later, the actual settlement exchange rate may differ from the rate booked at invoice creation. The system computes the **realised FX gain/loss** at payment time and books it to a configured FX P&L account in Xero.
+
+Example: a €100 invoice booked at €1 = £0.85 (so £85 in base) but paid two months later at €1 = £0.88 (so £88 received) realises an £3 FX gain.
+
+The realised FX entry is queued as a `REALISED_FX_JOURNAL` accounting sync row and posted to Xero via the standard daily batch.
+
+### Tax inclusive vs exclusive
+
+The system supports both pricing modes per tax rate:
+
+- **Exclusive** — the price entered is the net amount; tax is added on top. Common for B2B orders.
+- **Inclusive** — the price entered includes tax. The system back-calculates the net amount. Common for B2C orders.
+
+When creating a sales order via API or CSV import, you can optionally include a `taxForeign` value as an assertion. If the asserted value doesn't match what the system would compute from the unit price, quantity, and rate (within a small rounding tolerance), the order is rejected. This prevents the silent class of bug where the upstream sends the wrong tax amount.
+
+### VAT reporting
+
+The VAT report (Analytics > VAT) correctly handles both modes:
+
+- **Tax-exclusive orders** — `taxableBase = totalBase`.
+- **Tax-inclusive orders** — `taxableBase = totalBase - taxBase`.
+
+This means the taxable base column in the report shows the net amount in both cases, comparable across tenants regardless of pricing mode.
 
 ## Documents
 

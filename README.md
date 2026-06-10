@@ -72,12 +72,22 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 
 ```bash
 npm install
-cp .env.example .env    # edit with your database URL
+cp .env.example .env    # edit with your database URL and CRON_SECRET
 npx prisma migrate deploy && npx prisma generate
 npm run cli -- create-user
 npm run dev              # development
 npm run build && npm start  # production
 ```
+
+After the dev server starts, log in as the user you just created. The first visit redirects to `/onboarding` — the setup wizard walks you through company details, currency, integrations, and product import. See the [Setup Wizard Walkthrough](help-docs/onboarding-walkthrough.md) for what each step does.
+
+For production deployments, also configure:
+
+- **CRON_SECRET** — required for the scheduled-job endpoints to authenticate (the system fails fast on startup if unset in production).
+- **Backup cron** — schedule `/api/cron/backup` daily; see [Backup & Restore](docs/backup-restore.md).
+- **Multi-instance rate limits** — set `RATE_LIMIT_BACKEND=redis` and `REDIS_URL` if running multiple replicas.
+
+The [Installation & Deployment](docs/installation.md) guide covers the full deployment surface.
 
 ## Project Structure
 
@@ -106,12 +116,23 @@ scripts/
 
 ## Documentation
 
+### For users
+- [Getting Started](help-docs/getting-started.md) — first-time users
+- [Setup Wizard Walkthrough](help-docs/onboarding-walkthrough.md) — step-by-step first-run guide
+- [Glossary](help-docs/glossary.md) — plain-English definitions (FIFO, COGS, RFQ, EOL, etc.)
+- [Troubleshooting](help-docs/troubleshooting.md) — common errors and fixes
+- [Full in-app help docs index](help-docs/README.md)
+
+### For developers and administrators
 - [Architecture](docs/architecture.md)
 - [Workflow State Machines](docs/workflows.md)
 - [Installation & Deployment](docs/installation.md)
-- [WooCommerce Integration](docs/woocommerce.md)
-- [Xero Accounting Sync](docs/xero-sync.md)
-- [In-App Help Docs](help-docs/README.md)
+- [Development Workflow](docs/development.md)
+- [Backup & Restore](docs/backup-restore.md)
+- [Migration Conventions](docs/migration-conventions.md)
+- [WooCommerce Integration](docs/woocommerce.md) (symlink → user-facing doc)
+- [Xero Accounting Sync](docs/xero-sync.md) (symlink → user-facing doc)
+- [Production Readiness Plan](docs/plan.md) — current roadmap
 
 ## License
 

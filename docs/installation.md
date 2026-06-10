@@ -243,6 +243,75 @@ Authentication note:
   fails if trusted proxy entries are missing on a proxied production deploy
 
 
+## Production Readiness Checklist
+
+Before declaring a deployment production-ready, work through this checklist. Each item maps to a real failure mode the system has hit before.
+
+### Environment
+
+- [ ] `NEXT_PUBLIC_APP_URL` set to the production URL (no trailing slash).
+- [ ] `AUTH_SECRET`, `AUTH_URL` set; `AUTH_URL` matches the public URL.
+- [ ] `CRON_SECRET` is set and is a strong random value (32+ chars). The system fails fast on startup if this is unset in production.
+- [ ] `DATABASE_URL` points at the production database; verified by `npx prisma migrate status`.
+- [ ] `SETTINGS_ENCRYPTION_KEY` set and backed up off-server (rotation procedure documented).
+- [ ] If multi-replica: `RATE_LIMIT_BACKEND=redis` and `REDIS_URL` set.
+
+### Cron jobs
+
+Verify each scheduled job is registered with your cron daemon and has run successfully at least once:
+
+- [ ] `/api/cron/fx-rates` — daily
+- [ ] `/api/cron/wc-reconcile` — daily (if WooCommerce connected)
+- [ ] `/api/cron/accounting-daily-batch` — daily at midnight (if Xero connected)
+- [ ] `/api/cron/accounting-sync` — every 5 min (if accounting connected)
+- [ ] `/api/cron/accounting-payment-poll` — every 15 min (if accounting connected)
+- [ ] `/api/cron/accounting-fx-revaluation` — daily (if accounting connected)
+- [ ] `/api/cron/account-balance-snapshot` — daily (if accounting connected)
+- [ ] `/api/cron/delivery-status` — every 15 min (if delivery tracking enabled)
+- [ ] `/api/cron/backup` — daily, off-peak window
+- [ ] `/api/cron/invariant-check` — daily
+- [ ] `/api/cron/product-lifecycle-archive` — daily
+
+Each cron endpoint requires `Authorization: Bearer ${CRON_SECRET}` in the request. The system's per-route rate-limit quotas have headroom for jitter but not double-frequency abuse — verify your cron daemon doesn't retry aggressively.
+
+### Backup & restore
+
+- [ ] Backup cron schedule confirmed (`/api/cron/backup` daily).
+- [ ] Remote upload (S3 or SFTP) configured under Settings > Backup. Local-only backups are vulnerable to the same incident that takes down the application server.
+- [ ] Restore round-trip tested on a staging environment — confirm the manifest validation passes and the database is functional after restore.
+- [ ] `DATABASE_RESTORE_MAX_FILE_BYTES` raised if your typical backup exceeds 50MB.
+
+### Integrations
+
+For each connected integration (WooCommerce, Xero, Shopify, QuickBooks, Mintsoft):
+
+- [ ] Credentials configured.
+- [ ] **Connection test passes** — the connection test gate blocks sync until you click "Test Connection" successfully. Verify by visiting Sync > {Integration} and looking for the green "Connected" badge.
+- [ ] Sync enabled.
+- [ ] Sync Log shows recent successful runs.
+
+For WooCommerce specifically:
+
+- [ ] OneTwoInventory Helper plugin installed in WordPress with matching shared secret.
+- [ ] Webhook endpoints registered (use Setup Webhooks button).
+- [ ] Initial order import completed (one-time, gates ongoing sync).
+- [ ] Tax rate mappings imported and reviewed (Sync > WooCommerce > Tax Rates).
+
+### Security
+
+- [ ] Admin user has 2FA enabled (TOTP or passkey).
+- [ ] Default passwords changed; password policy is enforced (12 chars + uppercase + number + symbol + not in common-password list).
+- [ ] HTTPS only — no HTTP fallback.
+- [ ] `INVOICE_PDF_TOKEN_TTL_SECONDS` set to a sensible value for your operator workflow (default 3 days is reasonable; lower for high-security tenants).
+- [ ] Activity log redaction confirmed (Settings > System > Activity Log shows `[REDACTED]` placeholders, not raw secrets).
+
+### Monitoring
+
+- [ ] System Health page (Settings > System > Health) shows green for FX sync, accounting sync, integration outbox, and recent cron runs.
+- [ ] Email notifications working — admin recipients receive critical-finding notifications from the invariant check cron.
+- [ ] Application logs are being collected (stdout/journald → your log aggregator).
+
+
 ## Updating
 
 To update to a newer version:
@@ -288,6 +357,11 @@ Key variables in the `.env` file:
 | `NODE_ENV` | Set to `production` for deployment |
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
 | `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for IMS-session signed invoice PDF download links. Default `600` (10 minutes), maximum `600`. Links are bound to the current IMS session and client IP, so customer-facing shopping downloads use `/api/shopping/{connector}/invoice-pdf` via the shopping platform instead. |
+| `RATE_LIMIT_BACKEND` | Backend for rate-limit counters (cron quotas, login throttle, etc.). `memory` (default) keeps counters per-process. For multi-replica deployments, set `redis` and configure `REDIS_URL` so the limits are shared across replicas. |
+| `DATABASE_RESTORE_MAX_FILE_BYTES` | Maximum size of database restore upload in bytes. Default `52428800` (50MB). Raise for tenants with larger backups; the server also performs a disk-space preflight before accepting the upload. |
+| `XERO_DAILY_BATCH_LIMIT` | Maximum entities per group per daily batch run. Default `1000`, hard cap `5000`. Larger tenants whose daily volume exceeds the cap get multiple deterministic-reference journals per date. |
+| `WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD` | When the WooCommerce pending-FX retry queue reaches this depth, notify active admins. Default `5`. The queue accumulates when WC orders arrive in a currency without a stored FX rate; it drains automatically after the next FX-rate refresh. |
+| `BD_GIT_HOOK` / `BEADS_HOOK_TIMEOUT` | Beads (bd) integration hook settings, used only when bd issue tracking is enabled in the working tree. Not required for runtime. |
 | `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. Defaults locally to `./data/invoices`; required by production preflight. Relative paths resolve against the process working directory, so production values should be absolute |
 | `SETTINGS_ENCRYPTION_KEY` | 32-byte raw key, or base64 value that decodes to 32 bytes, used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; if needed during migration, it must also be a 32-byte raw key or base64 value that decodes to 32 bytes |

@@ -17,9 +17,11 @@ Whether you manage a single warehouse or multiple locations, One Two Inventory g
 
 ## First Steps
 
+> **New here?** For a step-by-step walkthrough of the setup wizard, see the [Setup Wizard Walkthrough](onboarding-walkthrough.md). For unfamiliar terms (FIFO, COGS, EOL, etc.), see the [Glossary](glossary.md). For common errors, see [Troubleshooting](troubleshooting.md).
+
 ### 1. Log In
 
-Use the credentials provided by your administrator. If you are the first user, follow the setup prompts to create your account.
+Use the credentials provided by your administrator. If you are the first user, follow the setup wizard at `/onboarding` to configure the system.
 
 ### 2. Set Up Company Details
 
@@ -31,9 +33,15 @@ Set the base currency carefully. It becomes the system's reporting and valuation
 
 Go to **Settings > Inventory** and create at least one warehouse. Each warehouse tracks its own stock levels independently.
 
-### 4. Add Products
+### 4. Connect Integrations (optional)
 
-Head to **Inventory** and click **New Product**. Fill in the SKU, name, product type, and pricing. You can add products one at a time or import them in bulk via CSV.
+If you use WooCommerce, Shopify, Xero, QuickBooks, or Mintsoft, connect them now from **Integrations**. After entering credentials, you must **click "Test Connection"** before sync activates — this is the system's safety net against silently running with bad credentials. See the [Setup Wizard Walkthrough](onboarding-walkthrough.md) for connector-specific instructions.
+
+### 5. Add Products
+
+Head to **Inventory** and click **New Product**. Fill in the SKU, name, product type, lifecycle status, and pricing. You can add products one at a time or import them in bulk via CSV.
+
+For new products that aren't ready for sale yet, set **lifecycle status to Draft** — they can still be purchased but won't be sellable until you flip them to Active. See the [Glossary](glossary.md#lifecycle-status) for the full lifecycle.
 
 
 ## Notifications
@@ -89,4 +97,35 @@ Every product has four stock-level figures per warehouse:
 - **On Hand** -- The total physical quantity in the warehouse.
 - **Allocated** -- Quantity reserved for confirmed sales orders. Click the figure to see which orders hold the allocation.
 - **Available** -- On Hand minus Allocated. This is what you can sell or transfer right now.
-- **Incoming** -- Quantity expected from open purchase orders or inbound transfers. Click the figure to see the source documents.
+- **Incoming** -- Quantity expected from open purchase orders, in-transit transfers, in-progress manufacturing, or WMS ASN evidence. Click the figure to see the source documents.
+
+### Product Lifecycle
+
+Every product has a lifecycle status that controls what you can do with it:
+
+| Status | Sellable? | Purchasable? | In reorder forecasts? |
+|---|---|---|---|
+| **Draft** | No | Yes | Yes |
+| **Active** | Yes | Yes | Yes |
+| **EOL** (End of Life) | Yes (from existing stock) | No | No |
+| **Archived** | No | No | No |
+
+The system auto-archives EOL products once stock and incoming supply hit zero. See the [Glossary](glossary.md#lifecycle-status) and [Inventory documentation](inventory.md#lifecycle-status) for more detail.
+
+
+## Where to find help
+
+| Topic | See |
+|---|---|
+| Step-by-step setup | [Setup Wizard Walkthrough](onboarding-walkthrough.md) |
+| Unfamiliar terms | [Glossary](glossary.md) |
+| Errors and unexpected behaviour | [Troubleshooting](troubleshooting.md) |
+| Detailed inventory features | [Inventory](inventory.md) |
+| Sales workflows | [Sales Orders](sales.md) |
+| Purchasing workflows | [Purchasing](purchasing.md) |
+| Settings | [Settings](settings.md) |
+| WooCommerce integration | [WooCommerce Integration](woocommerce.md) |
+| Xero accounting sync | [Xero Accounting Sync](xero-sync.md) |
+| User roles & security | [User Management & Security](user-management.md) |
+| Manufacturing | [Manufacturing](manufacturing.md) |
+| Analytics & reports | [Analytics](analytics.md) |

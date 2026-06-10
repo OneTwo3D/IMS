@@ -9,9 +9,14 @@ One Two Inventory integrates with Xero to keep your accounting records in sync. 
 3. Click **Connect to Xero** — you'll be redirected to Xero to authorise the connection
 4. Once connected, click **Sync Chart of Accounts** to pull your Xero account list
 5. Map each IMS transaction type to the correct Xero account (see Account Mapping below)
-6. Enable **Xero Sync** and save settings
+6. **Click "Test Connection"** — sync remains disabled until you successfully run the test. The system stores a fingerprint of the saved credentials at test time; if you later change them, you must re-test.
+7. Enable **Xero Sync** and save settings
 
 Before connection or sync can be enabled, the Xero organisation base currency must match the IMS base currency configured in **Settings > Company**.
+
+### Connection Test Gate
+
+Like other integrations, Xero sync is gated behind a successful connection test. The fingerprint includes the Client ID, expected tenant ID, and authenticated tenant ID/name. If you rotate the Client Secret or re-authorise to a different Xero tenant, re-test before activating sync.
 
 ## Account Mapping
 
@@ -325,8 +330,54 @@ Group B of the daily batch consumes FIFO (First In, First Out) cost layers when 
 | `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals) |
 | `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
+| `/api/cron/accounting-fx-revaluation` | Daily | Periodic unrealised FX revaluation of open AR/AP balances |
+| `/api/cron/account-balance-snapshot` | Daily | Snapshot Xero account balances for period reporting |
 
 All cron endpoints require the `CRON_SECRET` bearer header in production.
+
+
+## Realised and Unrealised FX
+
+The system tracks both kinds of foreign-currency P&L impact separately.
+
+### Realised FX (at settlement)
+
+When a multi-currency invoice or bill is paid, the actual settlement exchange rate may differ from the rate booked at invoice creation. The system computes the realised FX gain or loss at payment time:
+
+- **AR (sales invoice paid)** — gain when the settlement base value exceeds the booked base value (the customer's currency strengthened in your favour).
+- **AP (supplier bill paid)** — gain when the settlement base value is less than the booked base value (your home currency strengthened against the supplier's).
+
+The realised FX entry is queued as a `REALISED_FX_JOURNAL` accounting sync row. Configure the Realised FX Gain/Loss account in **Integrations → Xero → Account Mapping**.
+
+### Unrealised FX (period revaluation)
+
+For open multi-currency AR and AP balances, the daily `accounting-fx-revaluation` cron job:
+
+- Computes the current base-currency value of every open invoice/bill at today's rate
+- Compares against the originally-booked base value
+- Posts an unrealised FX gain/loss journal to balance the difference
+- Reverses yesterday's revaluation journal on the next run so the entries don't accumulate
+
+This ensures month-end financial reports correctly reflect what your foreign-currency exposure is worth today, without double-counting movements.
+
+Configure the Unrealised FX Gain/Loss account separately from Realised in Xero account mapping.
+
+### FX rate staleness
+
+If the FX rate for a transaction's currency is older than 1 day, the system surfaces this in the activity log as a `fx_rate_fallback_used` WARNING entry. Period-movement queries for accounts strictly require a previous-day snapshot — if no snapshot exists, the report shows a notice rather than silently using a stale value.
+
+
+## Daily Batch Caps
+
+The Xero daily batch processes orders and shipments in batches to avoid creating multi-thousand-line journals that are slow to post and hard for finance to read. The default cap is 1,000 entities per group per run (configurable via `XERO_DAILY_BATCH_LIMIT`, max 5,000).
+
+If a single day exceeds the cap, the batch creates multiple journals for that date:
+
+- **A1 — Revenue Deferral**: e.g. `A1-2026-06-09-abc12345` and `A1-2026-06-09-def67890`
+- **A2 — Inventory Reclassification**: same pattern
+- **Group B — Shipment Recognition**: same pattern
+
+The hash suffix is deterministic (computed from the entity IDs in the batch), so re-runs produce the same reference IDs and don't double-post. Finance reading the Xero ledger should sum all entries for a given date to reconcile against the IMS daily total.
 
 ## Sync Log
 

@@ -11,26 +11,28 @@ The main inventory page displays all products in a searchable, filterable table.
 
 - **Search** -- Type a SKU, product name, or barcode to find products instantly.
 - **Filter by Type** -- Narrow the list to a specific product type (Simple, Variable, Variant, Kit, BOM, Non-Inventory).
-- **Filter by Status** -- Show only active or inactive products.
+- **Filter by Lifecycle Status** -- Show products in a specific lifecycle state: **Draft**, **Active**, **EOL** (end of life), or **Archived**. See [Lifecycle Status](#lifecycle-status) below for what each state means.
+- **Filter by Preferred Supplier** -- Show only products linked to a specific supplier. Useful for supplier-scoped reorder planning.
 
 ### Bulk Actions
 
 Select multiple products using the checkboxes, then choose a bulk action:
 
-- **Delete** -- Permanently remove the selected products.
-- **Deactivate** -- Mark the selected products as inactive so they no longer appear in order forms.
+- **Delete** -- Permanently remove the selected products. Only available for products with no transactional history.
+- **Set lifecycle** -- Change the lifecycle status of selected products in bulk (e.g. mark a discontinued line as EOL). See [Lifecycle Status](#lifecycle-status).
 
 ### Column Visibility
 
 Click the **Columns** button to show or hide table columns. Your selection is saved in the browser so it persists between sessions. Available columns include:
 
-- **SKU**, **Name**, **Type**, **Status** — visible by default
-- **Parent SKU**, **Barcode**, **Dimensions**, **Weight** — hidden by default
+- **SKU**, **Name**, **Type**, **Lifecycle Status** — visible by default
+- **Parent SKU**, **Barcode**, **MPN**, **Category**, **Dimensions**, **Weight** — hidden by default
+- **Preferred Supplier** — the supplier auto-recorded from the most recent purchase order (hidden by default; see [Preferred Supplier](#preferred-supplier))
 - **Regular Price**, **Sale Price**, **Tax Incl.** — pricing columns
 - **Stock** — total on-hand quantity (visible by default)
 - **Allocated** — quantity reserved by active sales or manufacturing orders (amber when > 0)
 - **Available** — on hand minus allocated (red when negative)
-- **Incoming** — quantity expected from open purchase orders or in-transit transfers (blue)
+- **Incoming** — quantity expected from open purchase orders, in-transit transfers, manufacturing outputs, or WMS ASN evidence (blue)
 - **COGS Value** — total inventory value from FIFO cost layers
 - **Variants**, **Created**, **Updated** — additional metadata columns
 
@@ -143,14 +145,67 @@ Each product displays four stock figures per warehouse:
 Every time stock is received (from a purchase order or build order), a new FIFO cost layer is created recording the quantity and unit cost. When stock is sold or consumed, the oldest layers are used first. This ensures your cost of goods sold accurately reflects purchase prices over time.
 
 
-## Suppliers per Product
+## Lifecycle Status
 
-Each product can be linked to one or more suppliers. For each supplier, the system records:
+Every product has a lifecycle status that controls whether it can be sold, purchased, and what's expected of it in reorder planning. The four states form a typical lifecycle:
 
-- The last purchase order price.
-- The currency and FX rate at the time of the last PO.
+| Status | Sellable? | Purchasable? | Appears in reorder forecasts? | Typical use |
+|---|---|---|---|---|
+| **Draft** | No | Yes | Yes | Catalogue addition that isn't ready for sale yet — you can place POs to stock it, but it won't appear on the storefront. |
+| **Active** | Yes | Yes | Yes | The normal operating state. The product is live and re-orderable. |
+| **EOL** (End of Life) | Yes (from existing stock) | **No** | **No** | The product is being sold off. Existing stock can be sold; no more can be purchased; reorder forecasts skip it. |
+| **Archived** | No | No | No | The product is fully withdrawn. Set when EOL stock is exhausted (auto), or set manually to remove from active workflows. |
 
-This information is used to pre-fill prices when creating new purchase orders.
+### Automatic transitions
+
+- **EOL → Archived (auto)** — when an EOL product has zero stock across every warehouse AND no incoming supply (no open PO lines, no in-transit transfers, no in-progress manufacturing for it, no WMS ASN evidence), a daily cron job auto-archives it. The activity log records the transition with the incoming-stock breakdown at archive time.
+
+### When to use each state
+
+- **Setting up a new SKU?** Start as Draft. Switch to Active when the listing is ready.
+- **Phasing out a product?** Set to EOL. The system will keep selling existing stock and won't surface it in reorder suggestions. It auto-archives when stock and incoming supply hit zero.
+- **Product is fully discontinued?** Set to Archived directly. (If stock is non-zero, you may want to write it off first.)
+
+### Lifecycle status on bulk import
+
+The CSV import template includes a `lifecycleStatus` column. For first-time bulk imports, set to **Draft** if you want to review the catalogue before going live, or **Active** if everything is publish-ready. Do not use EOL/Archived for fresh imports.
+
+
+## Preferred Supplier
+
+Each product can be linked to one **preferred supplier** — the supplier the system uses for reorder forecasting. The preferred supplier is updated automatically when you send a purchase order to a supplier for that product.
+
+### How it's set
+
+1. **Automatically on PO_SENT** — the first time you send a PO to Supplier A for Product X, Supplier A becomes Product X's preferred supplier.
+2. **Latest wins** — if you later send a PO to Supplier B for Product X, the preferred supplier flips to Supplier B.
+3. **Explicit override** — set the preferred supplier directly on the product page if you want to pin it without placing a PO.
+
+### Locking the preferred supplier
+
+If your product is consistently sourced from Supplier A but you occasionally place emergency POs with backup suppliers, set **Preferred Supplier Locked** on the product page. The system will skip the auto-update for that product, preserving Supplier A as the preferred regardless of recent POs.
+
+### Skipping the update per PO
+
+When creating a one-off PO with a non-primary supplier, tick **"Skip preferred-supplier update"** on the PO header. This particular PO won't change the product's preferred supplier, even if it's the most recent.
+
+### Why this matters for reorder planning
+
+Supplier-scoped reorder draft generation (in Analytics > Reorder Forecast) scopes products to their preferred supplier. Without a preferred supplier, the product doesn't appear in the draft PO for any specific supplier. The auto-update ensures the system tracks your actual buying history without manual maintenance.
+
+
+## Supplier Catalogue (Multi-Supplier Products)
+
+In addition to the preferred supplier, each product can be linked to multiple suppliers via the supplier catalogue. Each catalogue entry records:
+
+- The supplier's own SKU for the product (their reference)
+- The last purchase order price
+- The currency at the time of the last PO
+- Lead time days (used in reorder calculations)
+
+The supplier catalogue is for products genuinely sourced from multiple vendors (different lead times, different costs). The preferred supplier is the one the system suggests for reorder forecasting; the catalogue holds the per-supplier metadata for all suppliers.
+
+When pricing a new PO, the system pre-fills the unit cost from the catalogue entry for the chosen supplier.
 
 
 ## Variable Products -- Options and Variants
@@ -172,3 +227,35 @@ When a kit contains another kit as a component, the system expands that structur
 ## BOM Products -- Manufactured Stock
 
 A BOM product's detail page shows both its own on-hand stock and the component list. Stock is added to a BOM product through build orders in the Manufacturing section, which consume the listed components.
+
+
+## Reorder Forecasting
+
+When the product appears in a reorder forecast (Analytics > Reorder), the forecast considers:
+
+- Available stock today
+- Open PO incoming stock (the forecast subtracts inbound PO quantity from the suggested reorder)
+- Average daily demand from sales history (the "velocity")
+- Lead-time days from the preferred supplier's catalogue entry (or a system default if not set)
+- Safety stock and configured reorder thresholds
+
+### Reorder Evidence
+
+When a draft PO is generated from a reorder forecast, each line carries **reorder evidence** — a snapshot of why the system suggested that quantity at that time. The evidence is stored on the PO line and visible from the PO detail page. It includes:
+
+- Stock at forecast time
+- Daily demand rate
+- Lead time used
+- Suggested days of cover
+- Forecast generation timestamp
+
+This lets you replay "why did we order 100 of these?" months later when reconciling inventory.
+
+### Exclusions
+
+The reorder forecast excludes:
+
+- **EOL products** — they're being sold off, not re-ordered
+- **Archived products** — withdrawn
+- **Non-Inventory products** — services, not stocked
+- **Kit/bundle parents** — reorder works on components, not on virtual kits
