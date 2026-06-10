@@ -347,6 +347,11 @@ function WebhookSecretField({
         waiting for a polling interval. The secret is a shared key used to verify that incoming
         webhook requests genuinely come from your WooCommerce store and haven&apos;t been tampered with.
       </p>
+      <p className="text-xs text-muted-foreground">
+        The same <code className="rounded bg-muted px-1 py-0.5">wc_webhook_secret</code> is also used by the
+        OneTwoInventory Helper plugin to sign customer-visible invoice PDF download requests. Paste this exact value in
+        WooCommerce Admin - Settings - OneTwoInventory Helper; rotating the secret requires updating both IMS and WordPress.
+      </p>
       <div className="text-xs text-muted-foreground space-y-1">
         <p className="font-medium text-foreground/70">Create these webhooks in WooCommerce → Settings → Advanced → Webhooks:</p>
         <table className="text-xs w-full max-w-lg">

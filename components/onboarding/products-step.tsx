@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState, useTransition } from 'react'
-import { Check, Download, Loader2, Package, RefreshCw, ShoppingCart } from 'lucide-react'
+import { Archive, Check, Download, Loader2, Package, RefreshCw, ShoppingCart, Truck } from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { CsvImportFlow } from '@/components/ui/csv-import-flow'
@@ -240,6 +240,52 @@ export function ProductsStep({
         </div>
       )}
 
+      <div className="grid gap-3 md:grid-cols-2">
+        <div className="rounded-lg border p-4 text-sm">
+          <div className="flex items-center gap-2 font-medium">
+            <Archive className="h-4 w-4 text-muted-foreground" />
+            Lifecycle status
+          </div>
+          <dl className="mt-3 grid gap-2 text-xs text-muted-foreground">
+            <div>
+              <dt className="font-medium text-foreground">DRAFT</dt>
+              <dd>Can be purchased, but is not published for sale yet. Use this as the default for first imports that still need review.</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">ACTIVE</dt>
+              <dd>Can be sold and included in reorder forecasts.</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">EOL</dt>
+              <dd>Can sell down existing stock, but is excluded from reorder forecasts and supplier draft POs.</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">ARCHIVED</dt>
+              <dd>Withdrawn from sales and reordering. Archived products are forced out of storefront stock sync.</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div className="rounded-lg border p-4 text-sm">
+          <div className="flex items-center gap-2 font-medium">
+            <Truck className="h-4 w-4 text-muted-foreground" />
+            Preferred supplier
+          </div>
+          <div className="mt-3 space-y-2 text-xs text-muted-foreground">
+            <p>
+              Set <code className="rounded bg-muted px-1 py-0.5">preferredSupplierId</code> or{' '}
+              <code className="rounded bg-muted px-1 py-0.5">preferredSupplierName</code> in the CSV when the supplier is known.
+            </p>
+            <p>
+              Supplier-scoped reorder forecasts and draft POs use this field. If it is blank, IMS can populate it later from the latest placed goods PO unless the product is supplier-locked.
+            </p>
+            <p>
+              WooCommerce imports should start as <code className="rounded bg-muted px-1 py-0.5">DRAFT</code> when the catalog needs review before publication.
+            </p>
+          </div>
+        </div>
+      </div>
+
       {(wcEnabled || wcConnected || shopifyEnabled || shopifyConnected) && (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-3">
@@ -315,7 +361,11 @@ export function ProductsStep({
         </div>
 
         <p className="text-xs text-muted-foreground">
-          The CSV template includes example rows for simple products, variants, kits, and BOMs.
+          The CSV template includes example rows for simple products, variants, kits, and BOMs, including
+          <code className="mx-1 rounded bg-muted px-1 py-0.5">lifecycleStatus</code>,
+          <code className="mx-1 rounded bg-muted px-1 py-0.5">preferredSupplierId</code>, and
+          <code className="mx-1 rounded bg-muted px-1 py-0.5">preferredSupplierName</code>. Use
+          <code className="mx-1 rounded bg-muted px-1 py-0.5">DRAFT</code> for first-time catalog imports that need review before sale.
           Max file size: 10 MB, max 10,000 rows.
         </p>
       </div>
