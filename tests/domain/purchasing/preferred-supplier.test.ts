@@ -6,32 +6,61 @@ import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/pur
 
 function txForPurchaseOrder(po: {
   supplierId: string
+  supplierName?: string
+  reference?: string
   type?: string
   skipPreferredSupplierUpdate?: boolean
   productIds: string[]
+  products?: Array<{
+    id: string
+    sku: string
+    preferredSupplierId: string | null
+    preferredSupplier: { name: string } | null
+  }>
 }) {
-  const calls: { lockedSql: unknown[]; updateManyArgs: unknown[] } = {
+  const products = po.products ?? Array.from(new Set(po.productIds)).map((productId) => ({
+    id: productId,
+    sku: productId.toUpperCase(),
+    preferredSupplierId: null,
+    preferredSupplier: null,
+  }))
+  const calls: { lockedSql: unknown[]; findManyArgs: unknown[]; updateManyArgs: unknown[]; activityLogs: unknown[] } = {
     lockedSql: [],
+    findManyArgs: [],
     updateManyArgs: [],
+    activityLogs: [],
   }
   const tx = {
-    $executeRaw: async (query: unknown) => {
+    $queryRaw: async (query: unknown) => {
       calls.lockedSql.push(query)
       return 1
     },
     purchaseOrder: {
       findUnique: async () => ({
         id: 'po-1',
+        reference: po.reference ?? 'PO-1',
         supplierId: po.supplierId,
+        supplier: { name: po.supplierName ?? 'Supplier 1' },
         type: po.type ?? 'GOODS',
         skipPreferredSupplierUpdate: po.skipPreferredSupplierUpdate ?? false,
         lines: po.productIds.map((productId) => ({ productId })),
       }),
     },
     product: {
+      findMany: async (args: unknown) => {
+        calls.findManyArgs.push(args)
+        return products.filter((product) => product.preferredSupplierId !== po.supplierId)
+      },
       updateMany: async (args: unknown) => {
         calls.updateManyArgs.push(args)
-        return { count: new Set(po.productIds).size }
+        const ids = ((args as { where: { id: { in: string[] } } }).where.id.in)
+        return { count: ids.length }
+      },
+    },
+    activityLog: {
+      create: async (args: unknown) => {
+        calls.activityLogs.push(args)
+        return args
       },
     },
   }
@@ -51,6 +80,7 @@ test('preferred supplier update locks sorted product ids and respects lock flag'
   assert.deepEqual(result.productIds, ['product-a', 'product-b'])
   assert.equal(result.updatedCount, 2)
   assert.equal(calls.lockedSql.length, 1)
+  assert.equal(calls.findManyArgs.length, 1)
   assert.deepEqual(calls.updateManyArgs, [{
     where: {
       id: { in: ['product-a', 'product-b'] },
@@ -61,6 +91,37 @@ test('preferred supplier update locks sorted product ids and respects lock flag'
       preferredSupplierUpdatedAt: placedAt,
     },
   }])
+  assert.equal(calls.activityLogs.length, 2)
+  assert.deepEqual(calls.activityLogs.map((entry) => (entry as { data: { entityId: string } }).data.entityId), ['product-a', 'product-b'])
+  assert.deepEqual((calls.activityLogs[0] as { data: { metadata: Record<string, unknown> } }).data.metadata, {
+    sku: 'PRODUCT-A',
+    previousSupplierId: null,
+    previousSupplierName: null,
+    newSupplierId: 'supplier-1',
+    newSupplierName: 'Supplier 1',
+    triggeredByPoId: 'po-1',
+    triggeredByPoReference: 'PO-1',
+    placedAt: placedAt.toISOString(),
+  })
+})
+
+test('preferred supplier update skips activity log when supplier is unchanged', async () => {
+  const { tx, calls } = txForPurchaseOrder({
+    supplierId: 'supplier-1',
+    productIds: ['product-a'],
+    products: [{
+      id: 'product-a',
+      sku: 'SKU-A',
+      preferredSupplierId: 'supplier-1',
+      preferredSupplier: { name: 'Supplier 1' },
+    }],
+  })
+
+  const result = await updatePreferredSuppliersForPlacedPurchaseOrder(tx, 'po-1', new Date('2026-06-10T10:00:00.000Z'))
+
+  assert.deepEqual(result, { productIds: ['product-a'], updatedCount: 0 })
+  assert.equal(calls.updateManyArgs.length, 0)
+  assert.equal(calls.activityLogs.length, 0)
 })
 
 test('preferred supplier update skips one-off and non-goods purchase orders', async () => {

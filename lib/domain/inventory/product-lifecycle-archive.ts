@@ -6,7 +6,9 @@ import { toDecimal } from '@/lib/domain/math/decimal'
 
 const OPEN_PO_STATUSES = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'] as const
 const OPEN_PRODUCTION_STATUSES = ['DRAFT', 'IN_PROGRESS'] as const
-const OPEN_WMS_ASN_STATUSES = ['CREATE_PENDING', 'CREATE_IN_FLIGHT', 'OPEN', 'PARTIALLY_BOOKED_IN'] as const
+// Only WMS-confirmed ASNs count as incoming stock. Pre-confirmation create states
+// can dead-letter indefinitely and should not block EOL auto-archive forever.
+const OPEN_WMS_ASN_STATUSES = ['OPEN', 'PARTIALLY_BOOKED_IN'] as const
 
 export type ProductIncomingStockBreakdown = {
   purchaseOrders: string
@@ -113,7 +115,7 @@ export async function archiveExhaustedEolProducts(
 
   for (const candidate of candidates) {
     const archived = await db.$transaction(async (tx) => {
-      await tx.$executeRaw(Prisma.sql`SELECT id FROM "products" WHERE id = ${candidate.id} FOR UPDATE`)
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM "products" WHERE id = ${candidate.id} FOR UPDATE`)
       const product = await tx.product.findUnique({
         where: { id: candidate.id },
         select: {

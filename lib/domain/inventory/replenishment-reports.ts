@@ -78,6 +78,7 @@ type ProductPlanningRow = {
   safetyStockQty: DecimalInput | null
   abcClass: string | null
   category: { id: string; name: string } | null
+  preferredSupplierId: string | null
   preferredSupplier: { id: string; name: string } | null
   supplierProducts: SupplierProductRow[]
 }
@@ -373,7 +374,14 @@ function productWhere(filters: StockPositionFilters) {
     lifecycleStatus: { in: REORDER_ELIGIBLE_PRODUCT_STATUSES },
     type: filteredType ?? { in: REPLENISHMENT_PRODUCT_TYPES },
     ...(filters.categoryId ? { categoryId: filters.categoryId } : {}),
-    ...(filters.supplierId ? { preferredSupplierId: filters.supplierId } : {}),
+    ...(filters.supplierId
+      ? {
+        OR: [
+          { preferredSupplierId: filters.supplierId },
+          { supplierProducts: { some: { supplierId: filters.supplierId } } },
+        ],
+      }
+      : {}),
   }
 }
 
@@ -576,6 +584,7 @@ export async function getReorderReport(
         safetyStockQty: true,
         abcClass: true,
         category: { select: { id: true, name: true } },
+        preferredSupplierId: true,
         preferredSupplier: { select: { id: true, name: true } },
         supplierProducts: {
           ...(filters.supplierId ? { where: { supplierId: filters.supplierId } } : {}),
@@ -615,7 +624,10 @@ export async function getReorderReport(
   const rows = products.flatMap<ReorderReportRow>((product) => {
     const configuredReorderQty = product.reorderQty == null ? null : toDecimal(product.reorderQty)
     if (configuredReorderQty?.lte(0)) return []
-    const supplier = product.supplierProducts[0] ?? null
+    const preferredCatalog = product.preferredSupplierId
+      ? product.supplierProducts.find((supplierProduct) => supplierProduct.supplierId === product.preferredSupplierId)
+      : null
+    const supplier = preferredCatalog ?? product.supplierProducts[0] ?? null
     const displaySupplier = supplier
       ? { id: supplier.supplierId, name: supplier.supplier.name, sku: supplier.supplierSku }
       : product.preferredSupplier

@@ -14,7 +14,9 @@ export async function updatePreferredSuppliersForPlacedPurchaseOrder(
     where: { id: purchaseOrderId },
     select: {
       id: true,
+      reference: true,
       supplierId: true,
+      supplier: { select: { name: true } },
       type: true,
       skipPreferredSupplierUpdate: true,
       lines: { select: { productId: true } },
@@ -30,7 +32,7 @@ export async function updatePreferredSuppliersForPlacedPurchaseOrder(
     return { productIds: [], updatedCount: 0 }
   }
 
-  await tx.$executeRaw(Prisma.sql`
+  await tx.$queryRaw(Prisma.sql`
     SELECT id
     FROM "products"
     WHERE id IN (${Prisma.join(productIds)})
@@ -38,9 +40,33 @@ export async function updatePreferredSuppliersForPlacedPurchaseOrder(
     FOR UPDATE
   `)
 
-  const result = await tx.product.updateMany({
+  const changingProducts = await tx.product.findMany({
     where: {
       id: { in: productIds },
+      preferredSupplierLocked: false,
+      OR: [
+        { preferredSupplierId: null },
+        { preferredSupplierId: { not: po.supplierId } },
+      ],
+    },
+    select: {
+      id: true,
+      sku: true,
+      preferredSupplierId: true,
+      preferredSupplier: { select: { name: true } },
+    },
+    orderBy: { id: 'asc' },
+  })
+
+  const sortedChangingProducts = [...changingProducts].sort((a, b) => a.id.localeCompare(b.id))
+
+  if (sortedChangingProducts.length === 0) {
+    return { productIds, updatedCount: 0 }
+  }
+
+  const result = await tx.product.updateMany({
+    where: {
+      id: { in: sortedChangingProducts.map((product) => product.id) },
       preferredSupplierLocked: false,
     },
     data: {
@@ -48,6 +74,27 @@ export async function updatePreferredSuppliersForPlacedPurchaseOrder(
       preferredSupplierUpdatedAt: placedAt,
     },
   })
+
+  await Promise.all(sortedChangingProducts.map((product) => tx.activityLog.create({
+    data: {
+      entityType: 'PRODUCT',
+      entityId: product.id,
+      action: 'preferred_supplier_changed',
+      tag: 'inventory',
+      level: 'INFO',
+      description: `Preferred supplier for ${product.sku} changed by ${po.reference}: ${product.preferredSupplier?.name ?? 'none'} to ${po.supplier.name}`,
+      metadata: {
+        sku: product.sku,
+        previousSupplierId: product.preferredSupplierId,
+        previousSupplierName: product.preferredSupplier?.name ?? null,
+        newSupplierId: po.supplierId,
+        newSupplierName: po.supplier.name,
+        triggeredByPoId: po.id,
+        triggeredByPoReference: po.reference,
+        placedAt: placedAt.toISOString(),
+      },
+    },
+  })))
 
   return { productIds, updatedCount: result.count }
 }

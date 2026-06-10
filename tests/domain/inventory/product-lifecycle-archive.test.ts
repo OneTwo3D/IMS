@@ -9,6 +9,7 @@ function decimal(value: string | number): Prisma.Decimal {
 }
 
 test('product incoming stock breakdown sums only remaining inbound quantities', async () => {
+  let wmsAsnStatusFilter: unknown
   const client = {
     purchaseOrderLine: {
       findMany: async () => [
@@ -27,13 +28,16 @@ test('product incoming stock breakdown sums only remaining inbound quantities', 
       ],
     },
     wmsAsnLineMap: {
-      findMany: async () => [
-        {
-          expectedQty: decimal('7'),
-          qtyAccountedViaSnapshot: decimal('2'),
-          qtyAccountedViaReceipt: decimal('1.25'),
-        },
-      ],
+      findMany: async (args?: unknown) => {
+        wmsAsnStatusFilter = (args as { where: { asn: { status: { in: string[] } } } }).where.asn.status.in
+        return [
+          {
+            expectedQty: decimal('7'),
+            qtyAccountedViaSnapshot: decimal('2'),
+            qtyAccountedViaReceipt: decimal('1.25'),
+          },
+        ]
+      },
     },
   }
 
@@ -44,4 +48,26 @@ test('product incoming stock breakdown sums only remaining inbound quantities', 
   assert.equal(incoming.productionOrders, '6')
   assert.equal(incoming.wmsAsn, '3.75')
   assert.equal(incoming.total, '19.25')
+  assert.deepEqual(wmsAsnStatusFilter, ['OPEN', 'PARTIALLY_BOOKED_IN'])
+})
+
+test('product incoming stock excludes unconfirmed WMS ASN create states', async () => {
+  const client = {
+    purchaseOrderLine: { findMany: async () => [] },
+    stockTransferLine: { findMany: async () => [] },
+    productionOrder: { findMany: async () => [] },
+    wmsAsnLineMap: {
+      findMany: async (args?: unknown) => {
+        const statuses = (args as { where: { asn: { status: { in: string[] } } } }).where.asn.status.in
+        assert.equal(statuses.includes('CREATE_PENDING'), false)
+        assert.equal(statuses.includes('CREATE_IN_FLIGHT'), false)
+        return []
+      },
+    },
+  }
+
+  const incoming = await getProductIncomingStock('product-1', { client: client as never })
+
+  assert.equal(incoming.wmsAsn, '0')
+  assert.equal(incoming.total, '0')
 })
