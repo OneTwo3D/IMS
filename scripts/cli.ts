@@ -11,6 +11,7 @@ import { createInterface } from 'readline'
 import bcrypt from 'bcryptjs'
 import { db } from '../lib/db/index'
 import { bulkMigrateEncryptedSettings } from '../lib/settings-store'
+import { validateUserPassword } from '../lib/security/password-policy'
 
 const rl = createInterface({ input: process.stdin, output: process.stdout })
 const ask = (q: string): Promise<string> =>
@@ -50,8 +51,9 @@ async function createUser() {
     })
   })
 
-  if (password.length < 8) {
-    console.error('Error: password must be at least 8 characters.')
+  const policyError = validateUserPassword(password)
+  if (policyError) {
+    console.error(`Error: ${policyError}.`)
     process.exit(1)
   }
 
