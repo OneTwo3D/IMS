@@ -196,7 +196,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
       )
   ```
 - **Acceptance:** Sidebar renders correctly for each role; no duplicate links; one place to update for new report sets.
-- **Tests:** `tests/components/sidebar.test.ts` covers analytics link visibility and duplicate prevention for `ADMIN`, `MANAGER`, `WAREHOUSE`, `FINANCE`, `READONLY`, and `SUPPLIER`.
+- **Tests:** `tests/lib/sidebar/analytics-access.test.ts` covers analytics link visibility, access-policy alignment, Analytics group visibility, and duplicate prevention for `ADMIN`, `MANAGER`, `WAREHOUSE`, `FINANCE`, `READONLY`, and `SUPPLIER`.
 
 ### P2.4 — Migration-doc / convention page
 - **Status:** Complete.
