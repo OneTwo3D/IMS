@@ -467,14 +467,49 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 
 ---
 
+## Phase 8 — Product lifecycle controls
+
+### P8.1 — Product lifecycle statuses and end-of-life sell-off
+- **Status:** Planned.
+- **Files:** `prisma/schema.prisma`, product create/edit actions and pages, reorder forecast/report modules, product list filters, inventory/purchasing incoming-stock helpers, lifecycle cron/job.
+- **Problem:** Product lifecycle state is not expressive enough for sell-off workflows. Operators need to mark products as end-of-life (EOL): still sellable while stock remains, but blocked from re-ordering and excluded from replenishment forecasts. Once stock reaches zero across all warehouses and no incoming stock remains, EOL products should automatically become archived.
+- **Product statuses:**
+  - `active`: published/sellable and can be re-ordered.
+  - `draft`: generated or being prepared, not published for sale yet, but can already be purchased.
+  - `eol`: can still be sold from existing stock, cannot be re-ordered, and must not appear in reorder forecasts.
+  - `archived`: withdrawn from sales and cannot be re-ordered.
+- **Fix:**
+  1. Model product lifecycle state explicitly, either by extending the existing product status enum or by replacing the old status/archived marker with a single status field that represents `active`, `draft`, `eol`, and `archived`.
+  2. Add an EOL/status control on the product page and product edit form, with list/report filters for EOL and archived products.
+  3. Treat `eol` products as sellable wherever available stock exists, but block purchase/reorder creation and replenishment suggestions for them.
+  4. Exclude `eol` and `archived` products from reorder forecasts and reorder recommendation reports.
+  5. Add an automatic archival job: when an EOL product has zero stock in every warehouse and no incoming stock remains, transition it to `archived` and write an activity-log entry. Incoming stock should include open purchase-order receipts and any modeled inbound supply such as inbound transfers, manufacturing outputs, or WMS ASN/booked-in evidence.
+- **Acceptance:**
+  - Operators can filter product lists/reports by `active`, `draft`, `eol`, and `archived`.
+  - `active` products can be sold and re-ordered.
+  - `draft` products can be purchased but are not published/sellable.
+  - `eol` products remain sellable from existing stock, cannot be re-ordered, and do not appear in reorder forecasts.
+  - `archived` products cannot be sold or re-ordered.
+  - The archive job only archives EOL products after all warehouse stock is zero and incoming supply is zero.
+  - Lifecycle transitions are activity-logged with actor/job context and previous/new status.
+- **Tests:**
+  - Product action/unit tests for each allowed and blocked transition.
+  - Reorder forecast tests asserting EOL and archived products are excluded while active products remain included.
+  - Purchase/reorder creation tests asserting EOL and archived products are blocked, while draft products can be purchased.
+  - Sales/allocation tests asserting EOL products can be sold from available stock but archived and draft products cannot be sold.
+  - Auto-archive job tests for zero-stock/no-incoming, positive-stock, and incoming-stock cases.
+
+---
+
 ## Quality gates — tests + invariants
 
 These are not a separate implementation phase except for the invariant CI gate. They are rules that apply to every PR in the plan.
 
 ### QG1 — Inventory invariant check blocks deploy
+- **Status:** Complete.
 - **File:** `app/api/cron/invariant-check/route.ts`, CI pipeline
-- **Fix:** Add `npm run invariant-check:preflight` step to CI. Fail build on critical findings. Document remediation path.
-- **Tests:** Synthetic data with a known invariant violation; assert CI fails.
+- **Fix:** `npm run invariant-check:preflight` runs the scheduled inventory, accounting, and sales invariant reporters with cron side effects disabled. Production-readiness CI applies migrations to a clean PostgreSQL service and fails when the report fails or returns critical findings. The remediation path is documented in `docs/development.md`.
+- **Tests:** `tests/cron/invariant-check-preflight.test.ts` covers clean reports, critical findings, divergent critical summary/list evidence, and partial report failures.
 
 ### QG2 — Per-phase regression test requirement
 - For each fix in Phases 1–6, the regression test must exist and pass before the PR can merge. No exceptions.
@@ -577,6 +612,9 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
 19. **Sidebar cleanup:** P2.3, CR5.
    - [x] P2.3 / CR5 — Sidebar analytics links are built from a single report-access grouping helper with per-role coverage.
 20. **CI invariant gate:** QG1 plus QG2's regression-test convention.
+   - [x] QG1 — Production-readiness CI runs `npm run invariant-check:preflight` against a migrated database and blocks on critical findings/report failures.
+21. **Product lifecycle status and EOL sell-off:** P8.1.
+   - [ ] P8.1 — Add `active`, `draft`, `eol`, and `archived` product statuses; block EOL reordering and forecasts; auto-archive EOL products once stock and incoming supply are exhausted.
 
 After each PR:
 - Run `npm run validate` and `npm run validate:db`.
