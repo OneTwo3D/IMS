@@ -43,8 +43,7 @@ export function SalesPageClient({ initialOrders, products, warehouses, currencie
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Sales Orders</h1>
+      <div className="flex items-center justify-end">
         <div className="flex items-center gap-2">
           <CsvBar exportUrl="/api/export/sales" templateUrl="/api/export/sales?template=1" importAction={importSalesOrdersCsv} />
           <Button size="sm" onClick={() => setShowCreate(true)}>

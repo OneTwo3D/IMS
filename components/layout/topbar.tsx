@@ -1,8 +1,8 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
-import { Moon, Sun, LogOut, User, Settings, Bell, CheckCircle2, AlertTriangle, Info, XCircle, Menu } from 'lucide-react'
+import { useRouter, usePathname } from 'next/navigation'
+import { Moon, Sun, LogOut, User, Settings, Bell, CheckCircle2, AlertTriangle, Info, XCircle, Menu, Boxes } from 'lucide-react'
 import { signOut, useSession } from 'next-auth/react'
 import { Button } from '@/components/ui/button'
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar'
@@ -46,6 +46,52 @@ const TYPE_COLOR: Record<string, string> = {
   error: 'text-destructive',
 }
 
+const SECTION_TITLES: Array<{ prefix: string; title: string }> = [
+  { prefix: '/dashboard', title: 'One Two Inventory' },
+  { prefix: '/inventory/new', title: 'New Product' },
+  { prefix: '/inventory', title: 'Inventory' },
+  { prefix: '/stock-control/transfers', title: 'Warehouse Transfers' },
+  { prefix: '/stock-control/stock-adjustments', title: 'Stock Adjustments' },
+  { prefix: '/stock-control', title: 'Stock Control' },
+  { prefix: '/purchase-orders/suppliers', title: 'Suppliers' },
+  { prefix: '/purchase-orders', title: 'Purchase Orders' },
+  { prefix: '/sales/contacts', title: 'Customers' },
+  { prefix: '/sales', title: 'Sales Orders' },
+  { prefix: '/manufacturing', title: 'Manufacturing' },
+  { prefix: '/analytics/purchase-stats', title: 'Purchase Statistics' },
+  { prefix: '/analytics/sales-stats', title: 'Sales Statistics' },
+  { prefix: '/analytics/inventory-stats', title: 'Inventory Report' },
+  { prefix: '/analytics/forecast', title: 'Reorder Forecast' },
+  { prefix: '/analytics/product-profitability', title: 'Product Profitability' },
+  { prefix: '/analytics', title: 'Analytics' },
+  { prefix: '/sync', title: 'Integrations' },
+  { prefix: '/settings/company', title: 'Company Settings' },
+  { prefix: '/settings/inventory', title: 'Inventory Settings' },
+  { prefix: '/settings/sales', title: 'Sales Settings' },
+  { prefix: '/settings/purchasing', title: 'Purchasing Settings' },
+  { prefix: '/settings/accounting', title: 'Accounting Settings' },
+  { prefix: '/settings/system', title: 'System Settings' },
+  { prefix: '/settings/users', title: 'User Management' },
+  { prefix: '/settings/backup', title: 'Backup & Restore' },
+  { prefix: '/settings', title: 'Settings' },
+  { prefix: '/profile', title: 'Profile' },
+  { prefix: '/activity', title: 'Activity Log' },
+  { prefix: '/help', title: 'Help' },
+  { prefix: '/supplier/products', title: 'My Products' },
+  { prefix: '/supplier/rfqs', title: 'Requests for Quotation' },
+  { prefix: '/supplier/orders', title: 'Purchase Orders' },
+]
+
+function sectionTitleFor(pathname: string): string {
+  let best: { prefix: string; title: string } | null = null
+  for (const entry of SECTION_TITLES) {
+    if (pathname === entry.prefix || pathname.startsWith(entry.prefix + '/')) {
+      if (!best || entry.prefix.length > best.prefix.length) best = entry
+    }
+  }
+  return best?.title ?? ''
+}
+
 function timeAgo(dateStr: string) {
   const diff = Date.now() - new Date(dateStr).getTime()
   const mins = Math.floor(diff / 60000)
@@ -60,6 +106,8 @@ function timeAgo(dateStr: string) {
 export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: TopbarProps) {
   const { setTheme, resolvedTheme } = useTheme()
   const router = useRouter()
+  const pathname = usePathname()
+  const sectionTitle = sectionTitleFor(pathname)
   const { data: session } = useSession()
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [unreadCount, setUnreadCount] = useState(0)
@@ -158,9 +206,14 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
         </Button>
       )}
       <div className="flex-1" />
-      <span className="hidden truncate text-sm font-semibold tracking-wide text-muted-foreground min-[420px]:block">
-        One Two Inventory
-      </span>
+      {sectionTitle && (
+        <div className="flex min-w-0 items-center gap-2">
+          <Boxes className="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
+          <span className="truncate text-sm font-semibold tracking-wide">
+            {sectionTitle}
+          </span>
+        </div>
+      )}
       <div className="flex flex-1 items-center justify-end gap-2" />
 
       <DropdownMenu>

@@ -121,12 +121,9 @@ export function StockAdjustmentsClient({ warehouses, products, reasons, history 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Stock Adjustments</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
-            Bulk inventory adjustments — enter quantities to add or remove per product
-          </p>
-        </div>
+        <p className="text-sm text-muted-foreground">
+          Bulk inventory adjustments — enter quantities to add or remove per product
+        </p>
         <div className="flex items-center gap-2">
           <CsvBar
             exportUrl="/api/export/adjustments"

@@ -30,25 +30,24 @@ export function InventoryHeader({ total, variableProducts, stockUnitOptions, pro
   return (
     <>
       <div className="flex flex-col gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold">Inventory</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-sm text-muted-foreground">
             {total} product{total !== 1 ? 's' : ''}
           </p>
-        </div>
 
-        <div className="hidden items-center gap-2 sm:flex">
-          <a href="/api/export/products?template=1" className={buttonVariants({ variant: 'outline', size: 'sm' })}>
-            <Download className="h-4 w-4 mr-1" />Template
-          </a>
-          <a href="/api/export/products" className={buttonVariants({ variant: 'outline', size: 'sm' })}>
-            <Download className="h-4 w-4 mr-1" />Export CSV
-          </a>
-          <CsvImportButton label="Import CSV" action={importProductsCsv} onDone={() => router.refresh()} />
-          <Button size="sm" onClick={() => setShowCreate(true)}>
-            <Plus className="h-4 w-4 mr-1" />
-            Add Product
-          </Button>
+          <div className="hidden items-center gap-2 sm:flex">
+            <a href="/api/export/products?template=1" className={buttonVariants({ variant: 'outline', size: 'sm' })}>
+              <Download className="h-4 w-4 mr-1" />Template
+            </a>
+            <a href="/api/export/products" className={buttonVariants({ variant: 'outline', size: 'sm' })}>
+              <Download className="h-4 w-4 mr-1" />Export CSV
+            </a>
+            <CsvImportButton label="Import CSV" action={importProductsCsv} onDone={() => router.refresh()} />
+            <Button size="sm" onClick={() => setShowCreate(true)}>
+              <Plus className="h-4 w-4 mr-1" />
+              Add Product
+            </Button>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-2 sm:hidden">

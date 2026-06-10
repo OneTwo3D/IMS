@@ -354,12 +354,10 @@ export function SuppliersClient({ initialSuppliers, taxRates, currencies }: Prop
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2">
-          <Link href="/purchase-orders" className="text-muted-foreground hover:text-foreground">
-            <ChevronLeft className="h-4 w-4" />
-          </Link>
-          <h1 className="text-2xl font-semibold">Suppliers</h1>
-        </div>
+        <Link href="/purchase-orders" className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+          <ChevronLeft className="h-4 w-4" />
+          Purchase Orders
+        </Link>
         <div className="flex flex-wrap items-center gap-2">
           <CsvBar exportUrl="/api/export/suppliers" templateUrl="/api/export/suppliers?template=1" importAction={importSuppliersCsv} />
           <Button size="sm" onClick={() => setEditing(null)}>

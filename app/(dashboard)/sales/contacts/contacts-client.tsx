@@ -363,8 +363,7 @@ export function ContactsClient({ initialCustomers }: Props) {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Customers</h1>
+      <div className="flex items-center justify-end">
         <div className="flex items-center gap-2">
           <CsvBar exportUrl="/api/export/contacts" templateUrl="/api/export/contacts?template=1" importAction={importContactsCsv} />
           <Button size="sm" onClick={() => setEditing(null)}>

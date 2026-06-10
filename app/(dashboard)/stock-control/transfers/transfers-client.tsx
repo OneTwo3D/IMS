@@ -44,8 +44,7 @@ export function TransfersClient({ warehouses, products, initialTransfers, mintso
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Warehouse Transfers</h1>
+      <div className="flex items-center justify-end">
         <div className="flex items-center gap-2">
           <CsvBar exportUrl="/api/export/transfers" templateUrl="/api/export/transfers?template=1" importAction={importTransfersCsv} />
           <Button

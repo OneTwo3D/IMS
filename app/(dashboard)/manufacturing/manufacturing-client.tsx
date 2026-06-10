@@ -117,8 +117,7 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
   return (
     <div className="space-y-4">
       <div className="space-y-2">
-        <div className="flex items-center justify-between gap-4">
-          <h1 className="text-2xl font-semibold">Manufacturing</h1>
+        <div className="flex items-center justify-end gap-4">
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="outline" size="sm" onClick={handleExport}>
               <Download className="h-4 w-4 mr-1" />Export
