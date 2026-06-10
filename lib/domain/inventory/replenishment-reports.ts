@@ -4,7 +4,7 @@ import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/d
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
 import { calculateDailyVelocity, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
-import { OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
+import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { getObservedLeadTimeP95BySupplierProduct } from '@/lib/domain/purchasing/purchasing-analytics'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
@@ -78,6 +78,7 @@ type ProductPlanningRow = {
   safetyStockQty: DecimalInput | null
   abcClass: string | null
   category: { id: string; name: string } | null
+  preferredSupplier: { id: string; name: string } | null
   supplierProducts: SupplierProductRow[]
 }
 
@@ -369,10 +370,10 @@ function productWhere(filters: StockPositionFilters) {
     ? filters.productType
     : undefined
   return {
-    lifecycleStatus: { in: OPERATIONAL_PRODUCT_STATUSES },
+    lifecycleStatus: { in: REORDER_ELIGIBLE_PRODUCT_STATUSES },
     type: filteredType ?? { in: REPLENISHMENT_PRODUCT_TYPES },
     ...(filters.categoryId ? { categoryId: filters.categoryId } : {}),
-    ...(filters.supplierId ? { supplierProducts: { some: { supplierId: filters.supplierId } } } : {}),
+    ...(filters.supplierId ? { preferredSupplierId: filters.supplierId } : {}),
   }
 }
 
@@ -574,7 +575,8 @@ export async function getReorderReport(
         reorderQty: true,
         safetyStockQty: true,
         abcClass: true,
-          category: { select: { id: true, name: true } },
+        category: { select: { id: true, name: true } },
+        preferredSupplier: { select: { id: true, name: true } },
         supplierProducts: {
           ...(filters.supplierId ? { where: { supplierId: filters.supplierId } } : {}),
           select: {
@@ -614,11 +616,16 @@ export async function getReorderReport(
     const configuredReorderQty = product.reorderQty == null ? null : toDecimal(product.reorderQty)
     if (configuredReorderQty?.lte(0)) return []
     const supplier = product.supplierProducts[0] ?? null
+    const displaySupplier = supplier
+      ? { id: supplier.supplierId, name: supplier.supplier.name, sku: supplier.supplierSku }
+      : product.preferredSupplier
+      ? { id: product.preferredSupplier.id, name: product.preferredSupplier.name, sku: null }
+      : null
     const availableQty = availableByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const inboundOpenPoQty = inboundByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const projectedAvailableQty = availableQty.add(inboundOpenPoQty)
     const averageDailyDemand = toDecimal(velocityByProduct.get(product.id)?.dailyQtyVelocity ?? 0)
-    const observedLeadTimeDays = supplier ? observedLeadTimeP95BySupplierProduct.get(`${supplier.supplierId}:${product.id}`) : undefined
+    const observedLeadTimeDays = displaySupplier ? observedLeadTimeP95BySupplierProduct.get(`${displaySupplier.id}:${product.id}`) : undefined
     const leadTimeDays = supplier?.leadTimeDays ?? observedLeadTimeDays ?? DEFAULT_LEAD_TIME_DAYS
     if (supplier?.leadTimeDays == null && observedLeadTimeDays == null) defaultLeadTimeSkus.push(product.sku)
     const safetyStockQty = toDecimal(product.safetyStockQty ?? 0)
@@ -643,9 +650,9 @@ export async function getReorderReport(
       productName: product.name,
       productType: product.type,
       categoryName: product.category?.name ?? null,
-      supplierId: supplier?.supplierId ?? null,
-      supplierName: supplier?.supplier.name ?? null,
-      supplierSku: supplier?.supplierSku ?? null,
+      supplierId: displaySupplier?.id ?? null,
+      supplierName: displaySupplier?.name ?? null,
+      supplierSku: displaySupplier?.sku ?? null,
       stockUnit: product.stockUnit,
       availableQty: quantityString(availableQty),
       warehouseAvailabilityBreakdown: warehouseBreakdown.get(product.id) ?? '',

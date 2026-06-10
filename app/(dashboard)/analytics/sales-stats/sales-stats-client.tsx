@@ -51,7 +51,7 @@ const PRODUCT_FIELDS: FieldDef[] = [
   { key: 'stockUnit', label: 'Stock Unit', type: 'text' },
   { key: 'barcode', label: 'Barcode', type: 'text' },
   { key: 'mpn', label: 'MPN', type: 'text' },
-  { key: 'lifecycleStatus', label: 'Status', type: 'select', options: ['ACTIVE', 'NOT_FOR_SALE', 'ARCHIVED'] },
+  { key: 'lifecycleStatus', label: 'Status', type: 'select', options: ['DRAFT', 'ACTIVE', 'EOL', 'ARCHIVED'] },
   { key: 'qtySold', label: 'Qty Sold', type: 'number' },
   { key: 'qtyRefunded', label: 'Qty Refunded', type: 'number' },
   { key: 'netQty', label: 'Net Qty', type: 'number' },

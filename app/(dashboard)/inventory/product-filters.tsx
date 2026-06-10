@@ -20,10 +20,12 @@ type Props = {
   type?: string
   lifecycleStatus?: string
   categoryId?: string
+  supplierId?: string
   productCategories: { id: string; name: string; parentId: string | null }[]
+  supplierOptions: { id: string; name: string }[]
 }
 
-export function ProductFilters({ search, type, lifecycleStatus, categoryId, productCategories }: Props) {
+export function ProductFilters({ search, type, lifecycleStatus, categoryId, supplierId, productCategories, supplierOptions }: Props) {
   const router = useRouter()
   const pathname = usePathname()
   const [isPending, startTransition] = useTransition()
@@ -55,13 +57,14 @@ export function ProductFilters({ search, type, lifecycleStatus, categoryId, prod
       if (key !== 'type' && type) params.set('type', type)
       if (key !== 'lifecycleStatus' && lifecycleStatus && lifecycleStatus !== 'ALL') params.set('lifecycleStatus', lifecycleStatus)
       if (key !== 'categoryId' && categoryId) params.set('categoryId', categoryId)
+      if (key !== 'supplierId' && supplierId) params.set('supplierId', supplierId)
       if (value) params.set(key, value)
       // reset page on filter change
       startTransition(() => {
         router.push(`${pathname}?${params.toString()}`)
       })
     },
-    [router, pathname, search, type, lifecycleStatus, categoryId]
+    [router, pathname, search, type, lifecycleStatus, categoryId, supplierId]
   )
 
   useEffect(() => {
@@ -119,8 +122,9 @@ export function ProductFilters({ search, type, lifecycleStatus, categoryId, prod
           onChange={(e) => update('lifecycleStatus', e.target.value === 'ALL' ? '' : e.target.value)}
         >
           <option value="ALL">All Status</option>
+          <option value="DRAFT">Draft</option>
           <option value="ACTIVE">Active</option>
-          <option value="NOT_FOR_SALE">Not for sale</option>
+          <option value="EOL">End of life</option>
           <option value="ARCHIVED">Archived</option>
         </Select>
       </div>
@@ -137,6 +141,21 @@ export function ProductFilters({ search, type, lifecycleStatus, categoryId, prod
           <option value="">All Categories</option>
           {productCategories.map((category) => (
             <option key={category.id} value={category.id}>{category.name}</option>
+          ))}
+        </Select>
+      </div>
+
+      <div className="w-full sm:w-48">
+        <label htmlFor="inventory-supplier" className="sr-only">Filter by preferred supplier</label>
+        <Select
+          id="inventory-supplier"
+          className="w-full"
+          value={supplierId ?? ''}
+          onChange={(e) => update('supplierId', e.target.value)}
+        >
+          <option value="">All Suppliers</option>
+          {supplierOptions.map((supplier) => (
+            <option key={supplier.id} value={supplier.id}>{supplier.name}</option>
           ))}
         </Select>
       </div>

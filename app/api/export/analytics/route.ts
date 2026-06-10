@@ -98,11 +98,11 @@ export async function GET(req: NextRequest) {
         sku: r.sku, name: r.name, stockUnit: r.stockUnit, abcClass: r.abcClass,
         urgency: r.urgency, currentStock: r.currentStock, availableStock: r.availableStock,
         avgDailyDemand: r.avgDailyDemand, demandTrend: r.demandTrend,
-        supplierName: r.supplierName, avgLeadTimeDays: r.avgLeadTimeDays,
+        supplierId: r.supplierId, supplierName: r.supplierName, avgLeadTimeDays: r.avgLeadTimeDays,
         reorderPoint: r.reorderPoint, safetyStock: r.safetyStock,
         recommendedOrderQty: r.recommendedOrderQty, daysUntilStockout: r.daysUntilStockout,
       }))
-      return csvResponse(toCsv(data, ['sku', 'name', 'stockUnit', 'abcClass', 'urgency', 'currentStock', 'availableStock', 'avgDailyDemand', 'demandTrend', 'supplierName', 'avgLeadTimeDays', 'reorderPoint', 'safetyStock', 'recommendedOrderQty', 'daysUntilStockout']), `reorder-forecast-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'name', 'stockUnit', 'abcClass', 'urgency', 'currentStock', 'availableStock', 'avgDailyDemand', 'demandTrend', 'supplierId', 'supplierName', 'avgLeadTimeDays', 'reorderPoint', 'safetyStock', 'recommendedOrderQty', 'daysUntilStockout']), `reorder-forecast-${date}.csv`)
     }
 
     case 'po_products': {

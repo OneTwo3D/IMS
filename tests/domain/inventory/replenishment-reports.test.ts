@@ -60,6 +60,7 @@ test('reorder report nets available and inbound open PO against lead-time demand
         safetyStockQty: decimal('5'),
         abcClass: 'A',
         category,
+        preferredSupplier: null,
         supplierProducts: [{
           supplierId: 'supplier-1',
           supplierSku: 'SUP-SKU-1',
@@ -148,6 +149,7 @@ test('reorder report treats configured reorderQty zero as opt-out', async () => 
         safetyStockQty: decimal('0'),
         abcClass: null,
         category,
+        preferredSupplier: null,
         supplierProducts: [],
       }],
     },
@@ -176,6 +178,7 @@ test('reorder report suppresses critical urgency when inbound covers a zero-stoc
         safetyStockQty: decimal('0'),
         abcClass: 'B',
         category,
+        preferredSupplier: null,
         supplierProducts: [],
       }],
     },
@@ -214,6 +217,7 @@ test('reorder report falls back to observed supplier-product P95 lead time when 
         safetyStockQty: decimal('0'),
         abcClass: null,
         category,
+        preferredSupplier: null,
         supplierProducts: [{
           supplierId: 'supplier-1',
           supplierSku: 'SUP-SKU-1',
@@ -280,6 +284,7 @@ test('reorder report surfaces default lead-time fallback and invalid ABC class n
           safetyStockQty: decimal('0'),
           abcClass: 'z',
           category,
+          preferredSupplier: null,
           supplierProducts: [],
         }]
       },

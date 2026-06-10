@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
-import { ProductType, type Prisma } from '@/app/generated/prisma/client'
+import { ProductType, type Prisma, type ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
@@ -164,7 +164,7 @@ async function runWithConcurrency<T>(
 }
 
 function scheduleProductImportShoppingSync(
-  targets: Array<{ id: string; lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED' }>,
+  targets: Array<{ id: string; lifecycleStatus: ProductLifecycleStatus }>,
 ): void {
   const uniqueTargets = [...new Map(targets.map((entry) => [entry.id, entry])).values()]
   if (uniqueTargets.length === 0) return
@@ -231,10 +231,13 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
   const productIdToBarcode = new Map(
     allProducts.map((product) => [product.id, product.barcode ?? null]),
   )
+  const suppliers = await db.supplier.findMany({ select: { id: true, name: true } })
+  const supplierIds = new Set(suppliers.map((supplier) => supplier.id))
+  const supplierIdByName = new Map(suppliers.map((supplier) => [supplier.name.trim().toLocaleLowerCase('en-US'), supplier.id]))
 
   // Track rows with components to process in second pass
   const componentRows: { lineNum: number; sku: string; components: string }[] = []
-  const touchedProducts: Array<{ id: string; lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED' }> = []
+  const touchedProducts: Array<{ id: string; lifecycleStatus: ProductLifecycleStatus }> = []
   const categoryIdCache = new Map<string, string>()
   type ProductCategoryResolverClient = Pick<Prisma.TransactionClient, 'productCategory'> | Pick<typeof db, 'productCategory'>
 
@@ -308,11 +311,34 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
     }
 
     const lifecycleStatusRaw = row['lifecycleStatus']?.trim() || row['lifecyclestatus']?.trim() || null
-    const lifecycleStatus = lifecycleStatusRaw === 'ACTIVE' || lifecycleStatusRaw === 'NOT_FOR_SALE' || lifecycleStatusRaw === 'ARCHIVED'
-      ? lifecycleStatusRaw
+    const lifecycleStatus = lifecycleStatusRaw === 'DRAFT' || lifecycleStatusRaw === 'ACTIVE' || lifecycleStatusRaw === 'EOL' || lifecycleStatusRaw === 'ARCHIVED'
+      ? lifecycleStatusRaw as ProductLifecycleStatus
       : hasCsvValue(row, 'active')
         ? deriveLifecycleStatusFromLegacyActive((row['active'] ?? 'TRUE').trim().toUpperCase() !== 'FALSE')
         : existingProduct?.lifecycleStatus ?? deriveLifecycleStatusFromLegacyActive(true)
+    const preferredSupplierIdRaw = readCsvValue(row, 'preferredSupplierId', 'preferredsupplierid').trim()
+    const preferredSupplierNameRaw = readCsvValue(row, 'preferredSupplierName', 'preferredsuppliername', 'supplier').trim()
+    let preferredSupplierId: string | null | undefined
+    if (preferredSupplierIdRaw) {
+      if (!supplierIds.has(preferredSupplierIdRaw)) {
+        result.errors.push(`Row ${lineNum} (${sku}): preferredSupplierId "${preferredSupplierIdRaw}" not found`)
+        result.skipped++
+        continue
+      }
+      preferredSupplierId = preferredSupplierIdRaw
+    } else if (preferredSupplierNameRaw) {
+      preferredSupplierId = supplierIdByName.get(preferredSupplierNameRaw.toLocaleLowerCase('en-US'))
+      if (!preferredSupplierId) {
+        result.errors.push(`Row ${lineNum} (${sku}): preferred supplier "${preferredSupplierNameRaw}" not found`)
+        result.skipped++
+        continue
+      }
+    } else if (hasCsvValue(row, 'preferredSupplierId', 'preferredsupplierid', 'preferredSupplierName', 'preferredsuppliername', 'supplier')) {
+      preferredSupplierId = null
+    }
+    const preferredSupplierLocked = hasCsvValue(row, 'preferredSupplierLocked', 'preferredsupplierlocked')
+      ? parseCsvBoolean(readCsvValue(row, 'preferredSupplierLocked', 'preferredsupplierlocked'))
+      : undefined
     const categoryName = cleanProductCategoryName(readCsvValue(row, 'category', 'productCategory', 'productcategory'))
     if (categoryName && categoryName.length > PRODUCT_CATEGORY_NAME_MAX_LENGTH) {
       result.errors.push(`Row ${lineNum} (${sku}): category must be ${PRODUCT_CATEGORY_NAME_MAX_LENGTH} characters or fewer`)
@@ -350,6 +376,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
         if (hasCsvValue(row, 'stockUnit', 'stockunit')) updateData.stockUnit = readCsvValue(row, 'stockUnit', 'stockunit').trim()
         if (hasCsvValue(row, 'oversellAllowed', 'oversellallowed')) updateData.oversellAllowed = parseCsvBoolean(readCsvValue(row, 'oversellAllowed', 'oversellallowed'))
         if (hasCsvValue(row, 'imageUrl', 'imageurl')) updateData.imageUrl = readCsvValue(row, 'imageUrl', 'imageurl').trim()
+        if (preferredSupplierId !== undefined) {
+          updateData.preferredSupplierId = preferredSupplierId
+          updateData.preferredSupplierUpdatedAt = preferredSupplierId ? new Date() : null
+        }
+        if (preferredSupplierLocked !== undefined) updateData.preferredSupplierLocked = preferredSupplierLocked
         if (lifecycleStatusRaw || hasCsvValue(row, 'active')) {
           updateData.active = deriveLegacyActiveFromLifecycleStatus(lifecycleStatus)
           updateData.lifecycleStatus = lifecycleStatus
@@ -451,6 +482,9 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           stockUnit: hasCsvValue(row, 'stockUnit', 'stockunit') ? readCsvValue(row, 'stockUnit', 'stockunit').trim() : 'pcs',
           oversellAllowed: hasCsvValue(row, 'oversellAllowed', 'oversellallowed') ? parseCsvBoolean(readCsvValue(row, 'oversellAllowed', 'oversellallowed')) : true,
           imageUrl: hasCsvValue(row, 'imageUrl', 'imageurl') ? readCsvValue(row, 'imageUrl', 'imageurl').trim() : null,
+          preferredSupplierId: preferredSupplierId ?? null,
+          preferredSupplierLocked: preferredSupplierLocked ?? false,
+          preferredSupplierUpdatedAt: preferredSupplierId ? new Date() : null,
           active: deriveLegacyActiveFromLifecycleStatus(lifecycleStatus),
           lifecycleStatus,
         }

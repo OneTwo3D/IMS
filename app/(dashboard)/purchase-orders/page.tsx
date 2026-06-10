@@ -25,7 +25,7 @@ export default async function PurchaseOrdersPage() {
   ])
 
   const products = productsResult.products.filter(
-    (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type),
+    (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type) && (p.lifecycleStatus === 'ACTIVE' || p.lifecycleStatus === 'DRAFT'),
   )
 
   return (

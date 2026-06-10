@@ -266,7 +266,7 @@ type CandidateProduct = {
   id: string
   sku: string
   type: 'SIMPLE' | 'VARIANT' | 'KIT' | 'BOM'
-  lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED'
+  lifecycleStatus: 'DRAFT' | 'ACTIVE' | 'EOL' | 'ARCHIVED'
   externalProductId: bigint | null
   parent: { sku: string } | null
   productComponents: {
@@ -274,7 +274,7 @@ type CandidateProduct = {
     qty: Prisma.Decimal
     component: {
       type: 'SIMPLE' | 'VARIABLE' | 'VARIANT' | 'KIT' | 'BOM' | 'NON_INVENTORY'
-      lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED'
+      lifecycleStatus: 'DRAFT' | 'ACTIVE' | 'EOL' | 'ARCHIVED'
     }
   }[]
 }

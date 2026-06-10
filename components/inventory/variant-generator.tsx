@@ -30,13 +30,15 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const router = useRouter()
   const statusLabels: Record<ProductLifecycleStatus, string> = {
+    DRAFT: 'Draft',
     ACTIVE: 'Active',
-    NOT_FOR_SALE: 'Not for sale',
+    EOL: 'End of life',
     ARCHIVED: 'Archived',
   }
   const statusVariants: Record<ProductLifecycleStatus, 'default' | 'secondary' | 'outline'> = {
+    DRAFT: 'secondary',
     ACTIVE: 'default',
-    NOT_FOR_SALE: 'secondary',
+    EOL: 'secondary',
     ARCHIVED: 'outline',
   }
   const [options, setOptions] = useState<Option[]>(

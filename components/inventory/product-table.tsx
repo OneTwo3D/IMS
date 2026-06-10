@@ -54,14 +54,16 @@ type Props = {
 }
 
 const STATUS_LABELS: Record<ProductLifecycleStatus, string> = {
+  DRAFT: 'Draft',
   ACTIVE: 'Active',
-  NOT_FOR_SALE: 'Not for sale',
+  EOL: 'End of life',
   ARCHIVED: 'Archived',
 }
 
 const STATUS_VARIANTS: Record<ProductLifecycleStatus, 'default' | 'secondary' | 'outline'> = {
+  DRAFT: 'secondary',
   ACTIVE: 'default',
-  NOT_FOR_SALE: 'secondary',
+  EOL: 'secondary',
   ARCHIVED: 'outline',
 }
 
@@ -154,6 +156,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     if (searchParams.type) params.set('type', searchParams.type)
     if (searchParams.lifecycleStatus) params.set('lifecycleStatus', searchParams.lifecycleStatus)
     if (searchParams.categoryId) params.set('categoryId', searchParams.categoryId)
+    if (searchParams.supplierId) params.set('supplierId', searchParams.supplierId)
     if (searchParams.sort) params.set('sort', searchParams.sort)
     if (searchParams.dir) params.set('dir', searchParams.dir)
     return params
@@ -171,6 +174,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     if (searchParams.type) params.set('type', searchParams.type)
     if (searchParams.lifecycleStatus) params.set('lifecycleStatus', searchParams.lifecycleStatus)
     if (searchParams.categoryId) params.set('categoryId', searchParams.categoryId)
+    if (searchParams.supplierId) params.set('supplierId', searchParams.supplierId)
     params.set('sort', field)
     params.set('dir', currentSort === field && currentDir === 'asc' ? 'desc' : 'asc')
     params.set('page', '1')
@@ -206,6 +210,15 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
         return <Badge variant={TYPE_COLOURS[p.type]}>{TYPE_LABELS[p.type]}</Badge>
       case 'category':
         return p.categoryName ?? '—'
+      case 'preferredSupplier':
+        return p.preferredSupplierName
+          ? (
+              <span>
+                {p.preferredSupplierName}
+                {p.preferredSupplierLocked && <span className="ml-1 text-xs text-muted-foreground">(locked)</span>}
+              </span>
+            )
+          : '—'
       case 'parentSku':
         return p.parentSku ?? '—'
       case 'barcode':

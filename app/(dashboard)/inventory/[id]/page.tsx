@@ -2,7 +2,7 @@ import Link from 'next/link'
 import { notFound } from 'next/navigation'
 import { ChevronRight, Package, Layers, SlidersHorizontal } from 'lucide-react'
 import { db } from '@/lib/db'
-import { getProduct, getVariableProducts, listProductCategories, updateProduct, getProductOptions, getProductSuppliers, getProductComponents, getKitStock } from '@/app/actions/products'
+import { getProduct, getVariableProducts, listProductCategories, listProductSupplierOptions, updateProduct, getProductOptions, getProductSuppliers, getProductComponents, getKitStock } from '@/app/actions/products'
 import { getWarehouses, getActiveAdjustmentReasons } from '@/app/actions/stock'
 import { getStockUnitOptions } from '@/app/actions/settings'
 import { ProductForm } from '@/components/inventory/product-form'
@@ -30,14 +30,16 @@ const TYPE_LABELS: Record<ProductType, string> = {
 }
 
 const STATUS_LABELS: Record<ProductLifecycleStatus, string> = {
+  DRAFT: 'Draft',
   ACTIVE: 'Active',
-  NOT_FOR_SALE: 'Not for sale',
+  EOL: 'End of life',
   ARCHIVED: 'Archived',
 }
 
 const STATUS_VARIANTS: Record<ProductLifecycleStatus, 'default' | 'secondary' | 'outline'> = {
+  DRAFT: 'secondary',
   ACTIVE: 'default',
-  NOT_FOR_SALE: 'secondary',
+  EOL: 'secondary',
   ARCHIVED: 'outline',
 }
 
@@ -54,13 +56,14 @@ export default async function ProductDetailPage({
   params: Promise<{ id: string }>
 }) {
   const { id } = await params
-  const [product, variableProducts, warehouses, reasons, stockUnitOptions, productCategories] = await Promise.all([
+  const [product, variableProducts, warehouses, reasons, stockUnitOptions, productCategories, supplierOptions] = await Promise.all([
     getProduct(id),
     getVariableProducts(),
     getWarehouses(),
     getActiveAdjustmentReasons(),
     getStockUnitOptions(),
     listProductCategories(),
+    listProductSupplierOptions(),
   ])
   const baseCurrency = await getBaseCurrencyDisplay()
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
@@ -81,7 +84,7 @@ export default async function ProductDetailPage({
   // For the kit configurator: all stockable products (not self, not VARIABLE, not NON_INVENTORY)
   const allSimpleProducts = isKitOrBom
     ? await db.product.findMany({
-        where: { lifecycleStatus: { in: ['ACTIVE', 'NOT_FOR_SALE'] }, type: { notIn: ['VARIABLE', 'NON_INVENTORY'] }, NOT: { id } },
+        where: { lifecycleStatus: { in: ['DRAFT', 'ACTIVE', 'EOL'] }, type: { notIn: ['VARIABLE', 'NON_INVENTORY'] }, NOT: { id } },
         select: { id: true, sku: true, name: true },
         orderBy: { sku: 'asc' },
       })
@@ -142,6 +145,8 @@ export default async function ProductDetailPage({
                 description: product.description ?? undefined,
                 type: product.type,
                 parentId: product.parentId ?? undefined,
+                preferredSupplierId: product.preferredSupplierId,
+                preferredSupplierLocked: product.preferredSupplierLocked,
                 barcode: product.barcode ?? undefined,
                 mpn: product.mpn ?? undefined,
                 hsCode: product.hsCode ?? undefined,
@@ -162,6 +167,7 @@ export default async function ProductDetailPage({
               }}
               stockUnitOptions={stockUnitOptions}
               productCategories={productCategories}
+              supplierOptions={supplierOptions}
               inline
             />
           </Card>
@@ -469,9 +475,18 @@ export default async function ProductDetailPage({
           )}
 
           {/* Suppliers */}
-          {suppliers.length > 0 && (
+          {(suppliers.length > 0 || product.preferredSupplierName) && (
             <Card className="p-4">
               <h2 className="text-sm font-semibold mb-3">Suppliers</h2>
+              {product.preferredSupplierName && (
+                <div className="mb-3 rounded-md border border-border bg-muted/40 p-2 text-sm">
+                  <div className="text-xs text-muted-foreground">Preferred Supplier</div>
+                  <div className="font-medium">
+                    {product.preferredSupplierName}
+                    {product.preferredSupplierLocked && <span className="ml-1 text-xs text-muted-foreground">(locked)</span>}
+                  </div>
+                </div>
+              )}
               <div className="space-y-3">
                 {suppliers.map((s) => (
                   <div key={s.supplierId} className="text-sm space-y-0.5">

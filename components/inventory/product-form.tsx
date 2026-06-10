@@ -19,11 +19,13 @@ import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
 type VariableProduct = { id: string; sku: string; name: string }
 type ProductCategoryOption = { id: string; name: string; parentId: string | null }
+type SupplierOption = { id: string; name: string }
 
 type Props = {
   action: (prev: ProductFormState, formData: FormData) => Promise<ProductFormState>
   variableProducts: VariableProduct[]
   productCategories?: ProductCategoryOption[]
+  supplierOptions?: SupplierOption[]
   defaultValues?: {
     sku?: string
     name?: string
@@ -31,6 +33,8 @@ type Props = {
     description?: string
     type?: string
     parentId?: string
+    preferredSupplierId?: string | null
+    preferredSupplierLocked?: boolean
     barcode?: string
     mpn?: string
     hsCode?: string
@@ -47,7 +51,7 @@ type Props = {
     stockUnit?: string
     oversellAllowed?: boolean
     active?: boolean
-    lifecycleStatus?: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED'
+    lifecycleStatus?: 'DRAFT' | 'ACTIVE' | 'EOL' | 'ARCHIVED'
   }
   stockUnitOptions?: string[]
   onClose?: () => void
@@ -78,7 +82,7 @@ function normalizeCategoryOption(value: string) {
     .toLocaleLowerCase('en-US')
 }
 
-export function ProductForm({ action, variableProducts, productCategories, defaultValues, stockUnitOptions, onClose, title, inline }: Props) {
+export function ProductForm({ action, variableProducts, productCategories, supplierOptions, defaultValues, stockUnitOptions, onClose, title, inline }: Props) {
   const baseCurrency = useBaseCurrency()
   const [state, formAction, isPending] = useActionState(action, {})
 
@@ -90,6 +94,8 @@ export function ProductForm({ action, variableProducts, productCategories, defau
     description:          defaultValues?.description          ?? '',
     type:                 defaultValues?.type                 ?? 'SIMPLE',
     parentId:             defaultValues?.parentId             ?? '',
+    preferredSupplierId:  defaultValues?.preferredSupplierId  ?? '',
+    preferredSupplierLocked: defaultValues?.preferredSupplierLocked ?? false,
     barcode:              defaultValues?.barcode              ?? '',
     mpn:                  defaultValues?.mpn                  ?? '',
     hsCode:               defaultValues?.hsCode               ?? '',
@@ -140,11 +146,12 @@ export function ProductForm({ action, variableProducts, productCategories, defau
           onChange={(ev) => set('lifecycleStatus', ev.target.value as typeof fields.lifecycleStatus)}
         >
           <option value="ACTIVE">Active</option>
-          <option value="NOT_FOR_SALE">Not for sale</option>
+          <option value="DRAFT">Draft</option>
+          <option value="EOL">End of life</option>
           <option value="ARCHIVED">Archived</option>
         </Select>
         <p className="text-xs text-muted-foreground">
-          Active products can be sold. Not for sale products stay operational for purchasing, transfers, manufacturing, and kit components. Archived products are retired and removed from new operational flows.
+          Active products can be sold and reordered. Draft products can be purchased before publication. EOL products can sell down existing stock but are excluded from reorder forecasts. Archived products are retired.
         </p>
       </div>
 
@@ -226,6 +233,34 @@ export function ProductForm({ action, variableProducts, productCategories, defau
           <p className="text-xs text-muted-foreground">Will create new category &ldquo;{cleanedCategoryName}&rdquo;.</p>
         )}
         {e.categoryName && <p className="text-xs text-destructive">{e.categoryName[0]}</p>}
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-4 items-end">
+        <div className="space-y-1.5">
+          <Label htmlFor="preferredSupplierId">Preferred Supplier</Label>
+          <Select
+            id="preferredSupplierId"
+            name="preferredSupplierId"
+            value={fields.preferredSupplierId}
+            onChange={(ev) => set('preferredSupplierId', ev.target.value)}
+          >
+            <option value="">No supplier</option>
+            {(supplierOptions ?? []).map((supplier) => (
+              <option key={supplier.id} value={supplier.id}>{supplier.name}</option>
+            ))}
+          </Select>
+          {e.preferredSupplierId && <p className="text-xs text-destructive">{e.preferredSupplierId[0]}</p>}
+        </div>
+        <label className="flex items-center gap-2 h-9 text-sm">
+          <input
+            type="checkbox"
+            name="preferredSupplierLocked"
+            checked={fields.preferredSupplierLocked}
+            onChange={(ev) => set('preferredSupplierLocked', ev.target.checked)}
+            className="h-4 w-4 rounded border-border"
+          />
+          Lock supplier
+        </label>
       </div>
 
       <div className="space-y-1.5">

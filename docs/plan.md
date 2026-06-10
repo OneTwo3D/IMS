@@ -470,7 +470,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ## Phase 8 — Product lifecycle controls
 
 ### P8.1 — Product lifecycle statuses and end-of-life sell-off
-- **Status:** Planned.
+- **Status:** Complete.
 - **Files:** `prisma/schema.prisma`, product create/edit actions and pages, reorder forecast/report modules, product list filters, inventory/purchasing incoming-stock helpers, lifecycle cron/job.
 - **Problem:** Product lifecycle state is not expressive enough for sell-off workflows. Operators need to mark products as end-of-life (EOL): still sellable while stock remains, but blocked from re-ordering and excluded from replenishment forecasts. Once stock reaches zero across all warehouses and no incoming stock remains, EOL products should automatically become archived.
 - **Product statuses:**
@@ -520,22 +520,26 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
   - Auto-archive job tests for zero-stock/no-incoming, positive-stock, open PO incoming, inbound transfer incoming, production-order incoming, WMS ASN/receipt incoming, and a race case where a new PO line for the product is created between the initial read and the transaction re-check.
 
 ### P8.2 — Product supplier field and supplier-scoped reorder drafts
-- **Status:** Planned.
+- **Status:** Complete.
 - **Files:** `prisma/schema.prisma`, product create/edit actions and pages, product list filters, purchase-order create/update actions, reorder forecast/report modules, draft purchase-order generation workflow.
 - **Problem:** Reorder planning has no product-level supplier signal. Operators need to filter products by supplier and turn reorder forecasts into supplier-specific draft purchase orders. The product supplier should reflect the supplier used for the most recent purchase order placed for that product, so the replenishment workflow follows real buying history instead of stale manual metadata.
 - **Fix:**
-  1. Add a supplier field to products, backed by a relation to the supplier/vendor model used by purchase orders.
-  2. Update the product supplier automatically when a purchase order is placed for that product. If a PO contains multiple products, update each included product to that PO's supplier. If a product appears on multiple POs, the latest placed PO wins.
-  3. Surface supplier on product create/edit/detail screens and product exports/reports where SKU/EAN/MPN/product identity fields are shown.
-  4. Add supplier filters to product lists and relevant inventory/replenishment reports.
-  5. Add a supplier-scoped draft-PO generator from reorder forecasts. It should let operators choose a supplier, include only reorder-eligible products assigned to that supplier, group lines into a draft purchase order for that supplier, and preserve forecast evidence on each line.
-  6. Respect lifecycle constraints from P8.1: `eol` and `archived` products must not be included in generated reorder drafts; `draft` and `active` products may be included when otherwise reorder-eligible.
+  1. Add `Product.preferredSupplierId` as a singular preferred-supplier pointer backed by the supplier/vendor model used by purchase orders. This supplements, not replaces, `SupplierProduct`; `SupplierProduct` remains the many-to-many source for supplier SKU, last cost, currency, lead-time, supplier portal, and multi-supplier history.
+  2. Backfill `preferredSupplierId` from the latest placed goods PO line for each product, with fallback to the most recently updated `SupplierProduct` row when no placed PO history exists.
+  3. Update the product preferred supplier automatically when a goods purchase order transitions to `PO_SENT`. If a PO contains multiple products, update each included product to that PO's supplier. If a product appears on multiple sent POs, the latest `PO_SENT` transaction wins. The update runs in the same transaction as the status transition, locks product rows in product-id order, skips products with `preferredSupplierLocked = true`, and does not roll back on later cancellation/return.
+  4. Add a PO header opt-out flag (`skipPreferredSupplierUpdate`) for one-off/emergency POs that should not change products' preferred supplier.
+  5. Surface supplier on product create/edit/detail screens and product exports/reports where SKU/EAN/MPN/product identity fields are shown.
+  6. Add supplier filters to product lists and relevant inventory/replenishment reports.
+  7. Add a supplier-scoped draft-PO generator from reorder forecasts. It should let operators choose a supplier, include only reorder-eligible products assigned to that supplier, group lines into a draft purchase order for that supplier, and preserve forecast evidence on each line.
+  8. Store forecast evidence on `PurchaseOrderLine.reorderEvidence` JSON for forecast-generated draft lines. Required evidence includes generator source/version, generated timestamp, forecast settings, supplier/product ids, demand inputs, stock inputs, lead time, reorder point, safety stock, suggested quantity, days until stockout, urgency, and ABC class.
+  9. Respect lifecycle constraints from P8.1: `eol` and `archived` products must not be included in generated reorder drafts; `draft` and `active` products may be included when otherwise reorder-eligible.
 - **Acceptance:**
   - Products expose a supplier field in the UI, API/action payloads, and relevant reports.
-  - Placing a purchase order updates every included product's supplier to the PO supplier.
+  - Placing a non-one-off goods purchase order updates every unlocked included product's preferred supplier to the PO supplier on `PO_SENT`.
+  - `SupplierProduct` remains intact for per-supplier metadata and multi-supplier history.
   - Product list/report filters can narrow results by supplier.
   - Reorder forecasts can generate a draft PO for one supplier, containing only products assigned to that supplier and only products that are reorder-eligible.
-  - Generated draft PO lines carry enough forecast metadata to explain the suggested quantity.
+  - Generated draft PO lines carry `reorderEvidence` metadata sufficient to explain the suggested quantity.
   - EOL and archived products are excluded from supplier draft-PO generation even if the forecast would otherwise suggest a reorder.
 - **Tests:**
   - Product action/unit tests for setting and filtering by supplier.
@@ -658,8 +662,8 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
 20. **CI invariant gate:** QG1 plus QG2's regression-test convention.
    - [x] QG1 — Production-readiness CI runs `npm run invariant-check:preflight` against a migrated database and blocks on critical findings/report failures.
 21. **Product lifecycle, supplier, and reorder planning:** P8.1 and P8.2.
-   - [ ] P8.1 — Add `active`, `draft`, `eol`, and `archived` product statuses; block EOL reordering and forecasts; auto-archive EOL products once stock and incoming supply are exhausted.
-   - [ ] P8.2 — Add product supplier tracking from latest placed PO, supplier filters, and supplier-scoped draft PO generation from reorder forecasts.
+   - [x] P8.1 — Add `active`, `draft`, `eol`, and `archived` product statuses; block EOL reordering and forecasts; auto-archive EOL products once stock and incoming supply are exhausted.
+   - [x] P8.2 — Add product supplier tracking from latest placed PO, supplier filters, and supplier-scoped draft PO generation from reorder forecasts.
 
 After each PR:
 - Run `npm run validate` and `npm run validate:db`.
