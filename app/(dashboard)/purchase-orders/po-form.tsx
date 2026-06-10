@@ -175,6 +175,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const [fxRate, setFxRate] = useState(existingPo?.fxRateToBase ?? 1)
   const [destinationWarehouseId, setDestinationWarehouseId] = useState(existingPo?.destinationWarehouseId ?? '')
   const [supplierRef, setSupplierRef] = useState(existingPo?.supplierRef ?? '')
+  const [skipPreferredSupplierUpdate, setSkipPreferredSupplierUpdate] = useState(existingPo?.skipPreferredSupplierUpdate ?? false)
   const [expectedDelivery, setExpectedDelivery] = useState(
     existingPo?.expectedDelivery ? existingPo.expectedDelivery.slice(0, 10) : '',
   )
@@ -596,6 +597,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       fxRateToBase: fxRate,
       destinationWarehouseId: destinationWarehouseId || undefined,
       supplierRef: supplierRef || undefined,
+      skipPreferredSupplierUpdate,
       expectedDelivery: expectedDelivery || undefined,
       notes: notes || undefined,
       internalNotes: internalNotes || undefined,
@@ -773,6 +775,22 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                 </label>
               )}
             </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>Supplier Tracking</Label>
+            <label className="flex min-h-9 items-center gap-2 rounded-md border border-input px-3 text-sm">
+              <input
+                type="checkbox"
+                checked={skipPreferredSupplierUpdate}
+                onChange={(e) => setSkipPreferredSupplierUpdate(e.target.checked)}
+                className="rounded border-input"
+              />
+              One-off PO
+            </label>
+            <p className="text-xs text-muted-foreground">
+              One-off POs do not change products&apos; preferred supplier when sent.
+            </p>
           </div>
 
           <div className="space-y-1.5">

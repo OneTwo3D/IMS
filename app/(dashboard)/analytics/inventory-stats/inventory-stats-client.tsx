@@ -47,7 +47,7 @@ const ONHAND_FIELDS: FieldDef[] = [
   { key: 'barcode', label: 'Barcode', type: 'text' },
   { key: 'mpn', label: 'MPN', type: 'text' },
   { key: 'warehouseCode', label: 'Warehouse', type: 'text' },
-  { key: 'lifecycleStatus', label: 'Status', type: 'select', options: ['ACTIVE', 'NOT_FOR_SALE', 'ARCHIVED'] },
+  { key: 'lifecycleStatus', label: 'Status', type: 'select', options: ['DRAFT', 'ACTIVE', 'EOL', 'ARCHIVED'] },
   { key: 'quantity', label: 'Quantity', type: 'number' },
   { key: 'reservedQty', label: 'Reserved', type: 'number' },
   { key: 'available', label: 'Available', type: 'number' },

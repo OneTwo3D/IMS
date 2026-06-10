@@ -43,7 +43,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
   const products = productsResult.products.filter(
-    (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type),
+    (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type) && (p.lifecycleStatus === 'ACTIVE' || p.lifecycleStatus === 'DRAFT'),
   )
 
   return (

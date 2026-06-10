@@ -13,15 +13,17 @@ import { importProductsCsv } from '@/app/actions/import'
 
 type VariableProduct = { id: string; sku: string; name: string }
 type ProductCategoryOption = { id: string; name: string; parentId: string | null }
+type SupplierOption = { id: string; name: string }
 
 type Props = {
   total: number
   variableProducts: VariableProduct[]
   stockUnitOptions: string[]
   productCategories: ProductCategoryOption[]
+  supplierOptions: SupplierOption[]
 }
 
-export function InventoryHeader({ total, variableProducts, stockUnitOptions, productCategories }: Props) {
+export function InventoryHeader({ total, variableProducts, stockUnitOptions, productCategories, supplierOptions }: Props) {
   const router = useRouter()
   const [showCreate, setShowCreate] = useState(false)
 
@@ -89,6 +91,7 @@ export function InventoryHeader({ total, variableProducts, stockUnitOptions, pro
           variableProducts={variableProducts}
           stockUnitOptions={stockUnitOptions}
           productCategories={productCategories}
+          supplierOptions={supplierOptions}
           onClose={() => setShowCreate(false)}
           title="New Product"
         />

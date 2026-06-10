@@ -314,6 +314,7 @@ export function ForecastClient({ forecasts, settings }: Props) {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [filter, setFilter] = useState<'all' | 'critical' | 'low' | 'ok' | 'overstock'>('all')
   const [abcFilter, setAbcFilter] = useState<'all' | 'A' | 'B' | 'C'>('all')
+  const [supplierFilter, setSupplierFilter] = useState('all')
   const [search, setSearch] = useState('')
   const [error, setError] = useState('')
   const [sortField, setSortField] = useState<SortField>('daysUntilStockout')
@@ -333,6 +334,7 @@ export function ForecastClient({ forecasts, settings }: Props) {
   const filtered = forecasts.filter((f) => {
     if (filter !== 'all' && f.urgency !== filter) return false
     if (abcFilter !== 'all' && f.abcClass !== abcFilter) return false
+    if (supplierFilter !== 'all' && f.supplierId !== supplierFilter) return false
     if (search) {
       const q = search.toLowerCase()
       return f.sku.toLowerCase().includes(q) || f.name.toLowerCase().includes(q) || (f.supplierName ?? '').toLowerCase().includes(q)
@@ -346,19 +348,31 @@ export function ForecastClient({ forecasts, settings }: Props) {
   const paged = sorted.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
 
   const needsReorder = forecasts.filter((f) => f.urgency === 'critical' || f.urgency === 'low')
+  const supplierOptions = Array.from(
+    new Map(
+      forecasts
+        .filter((f) => f.supplierId && f.supplierName)
+        .map((f) => [f.supplierId!, f.supplierName!]),
+    ),
+  ).sort((a, b) => a[1].localeCompare(b[1]))
 
   function toggleSelect(id: string) {
     setSelected((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n })
   }
   function selectAllNeedingReorder() {
-    setSelected(new Set(needsReorder.filter((f) => f.supplierId).map((f) => f.productId)))
+    setSelected(new Set(
+      needsReorder
+        .filter((f) => f.supplierId && (supplierFilter === 'all' || f.supplierId === supplierFilter))
+        .map((f) => f.productId),
+    ))
   }
 
   function handleCreatePOs() {
     if (selected.size === 0) { setError('Select at least one product'); return }
+    if (supplierFilter === 'all') { setError('Choose one supplier before creating a draft PO'); return }
     setError('')
     startTransition(async () => {
-      const result = await createReorderPOs(Array.from(selected))
+      const result = await createReorderPOs(Array.from(selected), { supplierId: supplierFilter })
       if (result.success) {
         setSelected(new Set())
         router.refresh()
@@ -428,6 +442,17 @@ export function ForecastClient({ forecasts, settings }: Props) {
           ))}
         </div>
         <span className="w-px h-5 bg-border" />
+        <select
+          className="h-7 rounded-md border border-input bg-background px-2 text-xs"
+          value={supplierFilter}
+          onChange={(e) => { setSupplierFilter(e.target.value); setSelected(new Set()); setPage(1) }}
+        >
+          <option value="all">All suppliers</option>
+          {supplierOptions.map(([id, name]) => (
+            <option key={id} value={id}>{name}</option>
+          ))}
+        </select>
+        <span className="w-px h-5 bg-border" />
         <div className="flex gap-1">
           {(['all', 'A', 'B', 'C'] as const).map((c) => (
             <Button key={c} variant={abcFilter === c ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => { setAbcFilter(c); setPage(1) }}>
@@ -439,7 +464,7 @@ export function ForecastClient({ forecasts, settings }: Props) {
           <>
             <span className="w-px h-5 bg-border" />
             <Button variant="outline" size="sm" className="h-7 text-xs" onClick={selectAllNeedingReorder}>
-              Select all needing reorder ({needsReorder.filter((f) => f.supplierId).length})
+              Select all needing reorder ({needsReorder.filter((f) => f.supplierId && (supplierFilter === 'all' || f.supplierId === supplierFilter)).length})
             </Button>
           </>
         )}

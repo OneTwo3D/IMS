@@ -11,7 +11,8 @@ import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-alloc
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict } from '@/lib/cost-layers'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
-import { isOperationalProductStatus } from '@/lib/products/lifecycle'
+import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
+import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
@@ -136,6 +137,7 @@ export type PoRow = {
   isFullyReturned: boolean
   trackingNumber: string | null
   shippingProvider: string | null
+  skipPreferredSupplierUpdate: boolean
 }
 
 export type PoReturn = {
@@ -229,6 +231,7 @@ export type CreatePoInput = {
   expectedDelivery?: string
   notes?: string
   internalNotes?: string
+  skipPreferredSupplierUpdate?: boolean
   pricesIncludeVat: boolean
   taxRateId?: string
   taxRateName?: string
@@ -304,6 +307,7 @@ const PO_SELECT = {
   expectedDelivery: true,
   notes: true,
   internalNotes: true,
+  skipPreferredSupplierUpdate: true,
   createdAt: true,
   updatedAt: true,
   supplier: { select: { id: true, name: true } },
@@ -362,6 +366,7 @@ function mapPoRow(po: {
   expectedDelivery: Date | null
   notes: string | null
   internalNotes: string | null
+  skipPreferredSupplierUpdate: boolean
   createdAt: Date
   updatedAt: Date
   trackingNumber: string | null
@@ -412,6 +417,7 @@ function mapPoRow(po: {
     isFullyReturned: allReturned,
     trackingNumber: po.trackingNumber ?? null,
     shippingProvider: po.shippingProvider ?? null,
+    skipPreferredSupplierUpdate: po.skipPreferredSupplierUpdate,
   }
 }
 
@@ -860,9 +866,9 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
           select: { id: true, taxCategory: true, lifecycleStatus: true },
         })
       : []
-    const archivedProduct = productRows.find((p) => !isOperationalProductStatus(p.lifecycleStatus))
-    if (archivedProduct) {
-      return { success: false, error: 'Archived products cannot be added to new purchase orders' }
+    const nonPurchasableProduct = productRows.find((p) => !isPurchasableProductStatus(p.lifecycleStatus))
+    if (nonPurchasableProduct) {
+      return { success: false, error: 'Only active and draft products can be added to new purchase orders' }
     }
     const productCategoryById = new Map<string, TaxCategory>(
       productRows.map((p) => [p.id, p.taxCategory]),
@@ -1063,6 +1069,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null,
         notes: input.notes || null,
         internalNotes: input.internalNotes || null,
+        skipPreferredSupplierUpdate: input.skipPreferredSupplierUpdate ?? false,
         lines: { create: lineData },
         ...(freightCostLineData.length > 0 && {
           freightCostLines: { create: freightCostLineData },
@@ -1168,6 +1175,7 @@ export async function updatePurchaseOrder(
       ...(input.expectedDelivery !== undefined && { expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null }),
       ...(input.notes !== undefined && { notes: input.notes || null }),
       ...(input.internalNotes !== undefined && { internalNotes: input.internalNotes || null }),
+      ...(input.skipPreferredSupplierUpdate !== undefined && { skipPreferredSupplierUpdate: input.skipPreferredSupplierUpdate }),
     }
 
     // Order-level tax rate update (always apply when lines are being saved,
@@ -1244,9 +1252,9 @@ export async function updatePurchaseOrder(
             select: { id: true, taxCategory: true, lifecycleStatus: true },
           })
         : []
-      const archivedProduct = productRows.find((p) => !isOperationalProductStatus(p.lifecycleStatus))
-      if (archivedProduct) {
-        return { success: false, error: 'Archived products cannot be added to purchase orders' }
+      const nonPurchasableProduct = productRows.find((p) => !isPurchasableProductStatus(p.lifecycleStatus))
+      if (nonPurchasableProduct) {
+        return { success: false, error: 'Only active and draft products can be added to purchase orders' }
       }
       const productCategoryById = new Map<string, TaxCategory>(
         productRows.map((p) => [p.id, p.taxCategory]),
@@ -1559,7 +1567,7 @@ export async function advancePoStatus(
       const existing = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
       if (!existing) throw new Error('PO not found')
       if (existing.status === targetStatus) {
-        return { existing, changed: false }
+        return { existing, changed: false, preferredSupplierUpdate: { productIds: [], updatedCount: 0 } }
       }
       const transition = validatePurchaseOrderStatusTransition(existing.status, targetStatus)
       if (!transition.success) throw new Error(transition.error)
@@ -1574,7 +1582,10 @@ export async function advancePoStatus(
       }
 
       await tx.purchaseOrder.update({ where: { id }, data })
-      return { existing, changed: true }
+      const preferredSupplierUpdate = targetStatus === 'PO_SENT'
+        ? await updatePreferredSuppliersForPlacedPurchaseOrder(tx, id, now)
+        : { productIds: [], updatedCount: 0 }
+      return { existing, changed: true, preferredSupplierUpdate }
     }, STOCK_TX_OPTIONS)
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
@@ -1586,7 +1597,13 @@ export async function advancePoStatus(
         tag: 'purchase',
         level: 'INFO',
         description: `Advanced PO ${result.existing.reference} to ${targetStatus}`,
-        metadata: { reference: result.existing.reference, previousStatus: result.existing.status, newStatus: targetStatus },
+        metadata: {
+          reference: result.existing.reference,
+          previousStatus: result.existing.status,
+          newStatus: targetStatus,
+          preferredSupplierUpdatedCount: result.preferredSupplierUpdate.updatedCount,
+          preferredSupplierCandidateCount: result.preferredSupplierUpdate.productIds.length,
+        },
       })
     }
 

@@ -176,7 +176,7 @@ async function buildShoppingStockUpdates(
     },
   })
 
-  const allowedLifecycle = new Set<ProductLifecycleStatus>(['ACTIVE', 'NOT_FOR_SALE', 'ARCHIVED'])
+  const allowedLifecycle = new Set<ProductLifecycleStatus>(['DRAFT', 'ACTIVE', 'EOL', 'ARCHIVED'])
   const products = rawProducts.filter((product) => {
     if (!product.sku) {
       recordSkip('blank_sku')

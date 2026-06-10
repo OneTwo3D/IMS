@@ -6,14 +6,16 @@ import { getSupplierProducts } from '@/app/actions/supplier-portal'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 
 const STATUS_LABELS: Record<ProductLifecycleStatus, string> = {
+  DRAFT: 'Draft',
   ACTIVE: 'Active',
-  NOT_FOR_SALE: 'Not for sale',
+  EOL: 'End of life',
   ARCHIVED: 'Archived',
 }
 
 const STATUS_CLASSES: Record<ProductLifecycleStatus, string> = {
+  DRAFT: 'text-muted-foreground',
   ACTIVE: 'text-green-600',
-  NOT_FOR_SALE: 'text-amber-600',
+  EOL: 'text-amber-600',
   ARCHIVED: 'text-muted-foreground',
 }
 

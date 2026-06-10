@@ -2,7 +2,10 @@
 
 import { useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { Check, ExternalLink, Loader2, ShoppingCart, Store, BookOpen, Calculator, Boxes } from 'lucide-react'
+import {
+  Boxes, BookOpen, Calculator, CalendarClock, Check, ExternalLink,
+  Loader2, ShoppingCart, Store,
+} from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -310,7 +313,7 @@ export function IntegrationsStep({
           return
         }
         setAcSaved(true)
-        setAccountingMessage(result.message ?? 'Connection settings saved.')
+        setAccountingMessage(result.message ?? `${selectedAccountingLabel} app credentials saved. Use Connect & Verify to complete OAuth before leaving this step.`)
         router.refresh()
         setTimeout(() => setAcSaved(false), 2000)
       } catch (e) {
@@ -335,7 +338,7 @@ export function IntegrationsStep({
           return
         }
         setAcSaved(true)
-        setAccountingMessage(saveResult.message ?? 'Connection settings saved.')
+        setAccountingMessage(saveResult.message ?? `${selectedAccountingLabel} app credentials saved. Redirecting to complete OAuth verification.`)
 
         const origin = window.location.origin
         const result = await connectAccountingConnector(acClientId, acClientSecret, origin, '/onboarding', selectedAccountingConnector)
@@ -440,11 +443,19 @@ export function IntegrationsStep({
                   className="h-9"
                 />
               </div>
+              <div className="rounded-md border bg-muted/20 p-3 sm:col-span-2">
+                <div className="text-xs font-medium">Webhook Secret</div>
+                <p className="text-xs text-muted-foreground">
+                  The WooCommerce webhook secret verifies incoming order/product webhooks and signs customer invoice PDF requests
+                  from the OneTwoInventory Helper plugin. Generate it in Integrations after the connection is verified, then paste
+                  the same value into WordPress Admin - Settings - OneTwoInventory Helper. Rotating it requires updating both sides.
+                </p>
+              </div>
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <Button type="button" onClick={handleSaveWcCredentials} disabled={busy} size="sm">
                 {savingWc ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                {wcSaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save Connection'}
+                {wcSaved ? <><Check className="h-4 w-4 mr-1" />Verified</> : 'Save & Test Connection'}
               </Button>
               {wcMessage ? <span className="text-xs text-muted-foreground">{wcMessage}</span> : null}
             </div>
@@ -498,7 +509,7 @@ export function IntegrationsStep({
             <div className="flex flex-wrap items-center gap-3">
               <Button type="button" onClick={handleSaveShopifyCredentials} disabled={busy} size="sm">
                 {savingShopify ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                {shopifySaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save Connection'}
+                {shopifySaved ? <><Check className="h-4 w-4 mr-1" />Verified</> : 'Save & Test Connection'}
               </Button>
               {shopifyMessage ? <span className="text-xs text-muted-foreground">{shopifyMessage}</span> : null}
             </div>
@@ -548,14 +559,17 @@ export function IntegrationsStep({
                 <div className="flex flex-wrap items-center gap-3">
                   <Button type="button" onClick={handleSaveAccountingConnection} disabled={busy || !acClientId || !hasAccountingSecret || !hasPublicAppUrl} size="sm">
                     {savingAccountingConnection ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                    {acSaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save Connection'}
+                    {acSaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save OAuth Settings'}
                   </Button>
                   <Button type="button" onClick={handleConnectAccounting} disabled={busy || !acClientId || !hasAccountingSecret || !hasPublicAppUrl} size="sm" variant="outline">
                     {connectingAccounting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                    Connect to Xero
+                    Connect & Verify Xero
                   </Button>
                   {accountingMessage ? <span className="text-xs text-muted-foreground">{accountingMessage}</span> : null}
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  Saving stores the OAuth app credentials only. Connect & Verify completes OAuth and records the connection-test gate; onboarding cannot continue until Xero is connected.
+                </p>
               </>
             )}
             <p className="text-xs text-muted-foreground">
@@ -610,14 +624,17 @@ export function IntegrationsStep({
                 <div className="flex flex-wrap items-center gap-3">
                   <Button type="button" onClick={handleSaveAccountingConnection} disabled={busy || !acClientId || !hasAccountingSecret || !hasPublicAppUrl} size="sm">
                     {savingAccountingConnection ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                    {acSaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save Connection'}
+                    {acSaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save OAuth Settings'}
                   </Button>
                   <Button type="button" onClick={handleConnectAccounting} disabled={busy || !acClientId || !hasAccountingSecret || !hasPublicAppUrl} size="sm" variant="outline">
                     {connectingAccounting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                    Connect to QuickBooks
+                    Connect & Verify QuickBooks
                   </Button>
                   {accountingMessage ? <span className="text-xs text-muted-foreground">{accountingMessage}</span> : null}
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  Saving stores the OAuth app credentials only. Connect & Verify completes OAuth and records the connection-test gate; onboarding cannot continue until QuickBooks is connected.
+                </p>
               </>
             )}
             <p className="text-xs text-muted-foreground">
@@ -714,7 +731,7 @@ export function IntegrationsStep({
                 size="sm"
               >
                 {savingMintsoft ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                {mintsoftSaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save Connection'}
+                {mintsoftSaved ? <><Check className="h-4 w-4 mr-1" />Verified</> : 'Save & Test Connection'}
               </Button>
               {mintsoftMessage ? <span className="text-xs text-muted-foreground">{mintsoftMessage}</span> : null}
               {initialMintsoftConnection.status.configured ? (
@@ -731,6 +748,29 @@ export function IntegrationsStep({
           </Card>
         )}
 
+      </div>
+
+      <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+        <div className="flex items-center gap-2 font-medium">
+          <CalendarClock className="h-4 w-4" />
+          Production readiness
+        </div>
+        <div className="mt-2 grid gap-2 text-xs">
+          <p>
+            Before production, set a 32+ character <code className="rounded bg-amber-100 px-1 py-0.5">CRON_SECRET</code> and apply scheduler settings from{' '}
+            <Link href="/settings/system?tab=scheduler" className="font-medium underline underline-offset-2">
+              System scheduler
+            </Link>
+            .
+          </p>
+          <p>
+            Enable scheduled backups and configure a remote backup target in{' '}
+            <Link href="/settings/backup" className="font-medium underline underline-offset-2">
+              Backup & Restore
+            </Link>
+            , then confirm the latest backup and cron freshness in operational health after deployment.
+          </p>
+        </div>
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}

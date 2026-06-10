@@ -43,6 +43,9 @@ export type ProductRow = {
   categoryName: string | null
   type: ProductType
   parentSku: string | null
+  preferredSupplierId: string | null
+  preferredSupplierName: string | null
+  preferredSupplierLocked: boolean
   barcode: string | null
   mpn: string | null
   weight: string | null
@@ -116,6 +119,7 @@ export async function listProducts(params: {
   active?: 'true' | 'false' | 'all'
   lifecycleStatus?: ProductLifecycleStatus | 'ALL'
   categoryId?: string
+  supplierId?: string
   page?: number
   pageSize?: number
   sort?: SortField
@@ -155,6 +159,7 @@ export async function listProducts(params: {
       ? { lifecycleStatus: 'ARCHIVED' as const }
       : {}),
     ...(params.categoryId ? { categoryId: params.categoryId } : {}),
+    ...(params.supplierId ? { preferredSupplierId: params.supplierId } : {}),
   }
 
   const [rawProducts, total] = await Promise.all([
@@ -163,12 +168,15 @@ export async function listProducts(params: {
       include: {
         category: { select: { id: true, name: true } },
         parent: { select: { sku: true, imageUrl: true } },
+        preferredSupplier: { select: { id: true, name: true } },
         variants: {
           select: {
             id: true,
             imageUrl: true,
             salesPriceBase: true,
             salePriceBase: true,
+            preferredSupplier: { select: { id: true, name: true } },
+            preferredSupplierLocked: true,
             stockLevels: { select: { quantity: true, reservedQty: true } },
           },
         },
@@ -253,6 +261,9 @@ export async function listProducts(params: {
     categoryName: p.category?.name ?? null,
     type: p.type,
     parentSku: p.parent?.sku ?? null,
+    preferredSupplierId: p.preferredSupplier?.id ?? null,
+    preferredSupplierName: p.preferredSupplier?.name ?? null,
+    preferredSupplierLocked: p.preferredSupplierLocked,
     barcode: p.barcode,
     mpn: p.mpn,
     weight: p.weight?.toString() ?? null,
@@ -305,9 +316,11 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       include: {
         category: { select: { id: true, name: true } },
         parent: { select: { sku: true, imageUrl: true } },
+        preferredSupplier: { select: { id: true, name: true } },
         variants: {
           include: {
             category: { select: { id: true, name: true } },
+            preferredSupplier: { select: { id: true, name: true } },
             stockLevels: { select: { quantity: true, reservedQty: true } },
           },
           orderBy: { sku: 'asc' },
@@ -439,6 +452,9 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     type: p.type,
     parentId: p.parentId,
     parentSku: p.parent?.sku ?? null,
+    preferredSupplierId: p.preferredSupplier?.id ?? null,
+    preferredSupplierName: p.preferredSupplier?.name ?? null,
+    preferredSupplierLocked: p.preferredSupplierLocked,
     barcode: p.barcode,
     mpn: p.mpn,
     hsCode: p.hsCode ?? null,
@@ -477,6 +493,9 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       categoryName: v.category?.name ?? null,
       type: v.type,
       parentSku: p.sku,
+      preferredSupplierId: v.preferredSupplier?.id ?? null,
+      preferredSupplierName: v.preferredSupplier?.name ?? null,
+      preferredSupplierLocked: v.preferredSupplierLocked,
       barcode: v.barcode,
       mpn: v.mpn,
       weight: v.weight?.toString() ?? null,
@@ -576,6 +595,17 @@ export async function listProductCategories(): Promise<ProductCategoryOption[]> 
   return listProductCategoryOptions()
 }
 
+export type ProductSupplierOption = { id: string; name: string }
+
+export async function listProductSupplierOptions(): Promise<ProductSupplierOption[]> {
+  await requireAuth()
+  return db.supplier.findMany({
+    where: { active: true },
+    select: { id: true, name: true },
+    orderBy: { name: 'asc' },
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Mutations
 // ---------------------------------------------------------------------------
@@ -587,6 +617,8 @@ const productSchema = z.object({
   description: z.string().optional(),
   type: z.nativeEnum(ProductType),
   parentId: z.string().optional().nullable(),
+  preferredSupplierId: z.string().optional().nullable(),
+  preferredSupplierLocked: z.boolean().default(false),
   barcode: z.string().optional().nullable(),
   mpn: z.string().max(100).optional().nullable(),
   hsCode: z.string().optional().nullable(),
@@ -603,7 +635,7 @@ const productSchema = z.object({
   heightCm: z.string().optional().nullable(),
   depthCm: z.string().optional().nullable(),
   active: z.boolean().default(true),
-  lifecycleStatus: z.enum(['ACTIVE', 'NOT_FOR_SALE', 'ARCHIVED']).default('ACTIVE'),
+  lifecycleStatus: z.enum(['DRAFT', 'ACTIVE', 'EOL', 'ARCHIVED']).default('ACTIVE'),
 })
 
 export type ProductFormState = {
@@ -673,6 +705,8 @@ export async function createProduct(
     description: formData.get('description') as string || undefined,
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
+    preferredSupplierId: formData.get('preferredSupplierId') as string || null,
+    preferredSupplierLocked: formData.get('preferredSupplierLocked') === 'on',
     barcode: ((formData.get('barcode') as string) || '').trim() || null,
     mpn: ((formData.get('mpn') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
@@ -730,6 +764,9 @@ export async function createProduct(
         description: data.description || null,
         type: data.type,
         parentId: structureValidation.normalizedParentId,
+        preferredSupplierId: data.preferredSupplierId || null,
+        preferredSupplierLocked: data.preferredSupplierLocked,
+        preferredSupplierUpdatedAt: data.preferredSupplierId ? new Date() : null,
         barcode: data.barcode || null,
         mpn: data.mpn || null,
         hsCode: data.hsCode || null,
@@ -758,7 +795,15 @@ export async function createProduct(
     tag: 'inventory',
     level: 'INFO',
     description: `Created product ${data.sku} — ${data.name}`,
-    metadata: { sku: data.sku, name: data.name, type: data.type, mpn: data.mpn ?? null, categoryName: data.categoryName ?? null },
+    metadata: {
+      sku: data.sku,
+      name: data.name,
+      type: data.type,
+      mpn: data.mpn ?? null,
+      categoryName: data.categoryName ?? null,
+      preferredSupplierId: data.preferredSupplierId ?? null,
+      preferredSupplierLocked: data.preferredSupplierLocked,
+    },
   })
 
   try {
@@ -794,6 +839,8 @@ export async function updateProduct(
     description: formData.get('description') as string || undefined,
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
+    preferredSupplierId: formData.get('preferredSupplierId') as string || null,
+    preferredSupplierLocked: formData.get('preferredSupplierLocked') === 'on',
     barcode: ((formData.get('barcode') as string) || '').trim() || null,
     mpn: ((formData.get('mpn') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
@@ -845,7 +892,10 @@ export async function updateProduct(
   const updatedCategoryChange = await db.$transaction(async (tx) => {
     const previous = await tx.product.findUnique({
       where: { id },
-      select: { category: { select: { name: true } } },
+      select: {
+        category: { select: { name: true } },
+        preferredSupplierId: true,
+      },
     })
     const previousCategoryName = previous?.category?.name ?? null
     const categoryId = await resolveProductCategoryIdByName(data.categoryName, { client: tx })
@@ -859,6 +909,12 @@ export async function updateProduct(
         description: data.description || null,
         type: data.type,
         parentId: structureValidation.normalizedParentId,
+        preferredSupplierId: data.preferredSupplierId || null,
+        preferredSupplierLocked: data.preferredSupplierLocked,
+        preferredSupplierUpdatedAt:
+          data.preferredSupplierId !== (previous?.preferredSupplierId ?? null)
+            ? new Date()
+            : undefined,
         barcode: data.barcode || null,
         mpn: data.mpn || null,
         hsCode: data.hsCode || null,
@@ -904,6 +960,8 @@ export async function updateProduct(
       mpn: data.mpn ?? null,
       categoryName: data.categoryName ?? null,
       categoryNameChange: updatedCategoryChange,
+      preferredSupplierId: data.preferredSupplierId ?? null,
+      preferredSupplierLocked: data.preferredSupplierLocked,
     },
   })
 
@@ -1523,7 +1581,7 @@ export async function deleteOrDeactivateVariant(
   } else {
     await db.product.update({
       where: { id },
-      data: { active: true, lifecycleStatus: 'NOT_FOR_SALE' },
+      data: { active: true, lifecycleStatus: 'EOL' },
     })
 
     await logActivity({
@@ -1624,7 +1682,7 @@ export async function bulkDeactivateProducts(
   await requirePermission('inventory.edit')
   await db.product.updateMany({
     where: { id: { in: ids } },
-    data: { active: true, lifecycleStatus: 'NOT_FOR_SALE' },
+    data: { active: true, lifecycleStatus: 'EOL' },
   })
   await logActivity({
     entityType: 'PRODUCT',

@@ -60,6 +60,7 @@ test('reorder report nets available and inbound open PO against lead-time demand
         safetyStockQty: decimal('5'),
         abcClass: 'A',
         category,
+        preferredSupplier: null,
         supplierProducts: [{
           supplierId: 'supplier-1',
           supplierSku: 'SUP-SKU-1',
@@ -108,6 +109,112 @@ test('reorder report nets available and inbound open PO against lead-time demand
   assert.equal(report.rows[0]?.urgency, 'reorder')
 })
 
+test('reorder report prefers the preferred supplier catalog row before stale supplier catalog rows', async () => {
+  const supplierA = { name: 'Supplier A' }
+  const supplierB = { name: 'Supplier B' }
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        {
+          id: 'product-1',
+          sku: 'SKU-1',
+          name: 'Preferred catalog',
+          type: ProductType.SIMPLE,
+          stockUnit: 'pcs',
+          reorderPoint: decimal('10'),
+          reorderQty: decimal('2'),
+          safetyStockQty: decimal('0'),
+          abcClass: null,
+          category,
+          preferredSupplierId: 'supplier-b',
+          preferredSupplier: { id: 'supplier-b', name: 'Supplier B' },
+          supplierProducts: [
+            { supplierId: 'supplier-a', supplierSku: 'A-SKU', lastUnitCost: decimal('1'), leadTimeDays: 30, supplier: supplierA },
+            { supplierId: 'supplier-b', supplierSku: 'B-SKU', lastUnitCost: decimal('2'), leadTimeDays: 5, supplier: supplierB },
+          ],
+        },
+        {
+          id: 'product-2',
+          sku: 'SKU-2',
+          name: 'Catalog fallback',
+          type: ProductType.SIMPLE,
+          stockUnit: 'pcs',
+          reorderPoint: decimal('10'),
+          reorderQty: decimal('2'),
+          safetyStockQty: decimal('0'),
+          abcClass: null,
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [
+            { supplierId: 'supplier-a', supplierSku: 'A2-SKU', lastUnitCost: decimal('1'), leadTimeDays: 8, supplier: supplierA },
+          ],
+        },
+        {
+          id: 'product-3',
+          sku: 'SKU-3',
+          name: 'Preferred fallback',
+          type: ProductType.SIMPLE,
+          stockUnit: 'pcs',
+          reorderPoint: decimal('10'),
+          reorderQty: decimal('2'),
+          safetyStockQty: decimal('0'),
+          abcClass: null,
+          category,
+          preferredSupplierId: 'supplier-b',
+          preferredSupplier: { id: 'supplier-b', name: 'Supplier B' },
+          supplierProducts: [],
+        },
+      ],
+    },
+    stockLevel: {
+      findMany: async () => [
+        { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') },
+        { productId: 'product-2', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') },
+        { productId: 'product-3', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') },
+      ],
+    },
+  }
+
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+
+  assert.deepEqual(report.rows.map((row) => ({
+    sku: row.sku,
+    supplierId: row.supplierId,
+    supplierName: row.supplierName,
+    supplierSku: row.supplierSku,
+    leadTimeDays: row.leadTimeDays,
+  })), [
+    { sku: 'SKU-1', supplierId: 'supplier-b', supplierName: 'Supplier B', supplierSku: 'B-SKU', leadTimeDays: 5 },
+    { sku: 'SKU-2', supplierId: 'supplier-a', supplierName: 'Supplier A', supplierSku: 'A2-SKU', leadTimeDays: 8 },
+    { sku: 'SKU-3', supplierId: 'supplier-b', supplierName: 'Supplier B', supplierSku: null, leadTimeDays: 14 },
+  ])
+})
+
+test('reorder report supplier filter includes preferred suppliers and catalog-only suppliers', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async (args?: unknown) => {
+        const where = (args as { where: { OR: unknown[] } }).where
+        assert.deepEqual(where.OR, [
+          { preferredSupplierId: 'supplier-1' },
+          { supplierProducts: { some: { supplierId: 'supplier-1' } } },
+        ])
+        return []
+      },
+    },
+  }
+
+  const report = await getReorderReport(
+    { supplierId: 'supplier-1' },
+    { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } },
+  )
+
+  assert.equal(report.rows.length, 0)
+})
+
 test('reorder report ignores non-stock product type filters', async () => {
   const client: ReplenishmentReportClient = {
     ...unusedClient(),
@@ -148,6 +255,7 @@ test('reorder report treats configured reorderQty zero as opt-out', async () => 
         safetyStockQty: decimal('0'),
         abcClass: null,
         category,
+        preferredSupplier: null,
         supplierProducts: [],
       }],
     },
@@ -176,6 +284,7 @@ test('reorder report suppresses critical urgency when inbound covers a zero-stoc
         safetyStockQty: decimal('0'),
         abcClass: 'B',
         category,
+        preferredSupplier: null,
         supplierProducts: [],
       }],
     },
@@ -214,6 +323,7 @@ test('reorder report falls back to observed supplier-product P95 lead time when 
         safetyStockQty: decimal('0'),
         abcClass: null,
         category,
+        preferredSupplier: null,
         supplierProducts: [{
           supplierId: 'supplier-1',
           supplierSku: 'SUP-SKU-1',
@@ -280,6 +390,7 @@ test('reorder report surfaces default lead-time fallback and invalid ABC class n
           safetyStockQty: decimal('0'),
           abcClass: 'z',
           category,
+          preferredSupplier: null,
           supplierProducts: [],
         }]
       },

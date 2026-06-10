@@ -3,7 +3,7 @@
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
-import { OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
+import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,6 +38,10 @@ export type ProductForecast = {
   recommendedOrderQty: number
   daysUntilStockout: number
   urgency: 'critical' | 'low' | 'ok' | 'overstock'
+}
+
+export type GenerateForecastOptions = {
+  supplierId?: string | null
 }
 
 export type ForecastSettings = {
@@ -131,7 +135,7 @@ function exponentialSmoothing(data: number[], alpha = 0.3): number {
 // Core forecast calculation
 // ---------------------------------------------------------------------------
 
-export async function generateForecasts(): Promise<ProductForecast[]> {
+export async function generateForecasts(options: GenerateForecastOptions = {}): Promise<ProductForecast[]> {
   await requirePermission('analytics')
   const settings = await getForecastSettings()
   const now = new Date()
@@ -141,9 +145,15 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
 
   // 1. Get all stockable products with current stock levels
   const products = await db.product.findMany({
-    where: { lifecycleStatus: { in: OPERATIONAL_PRODUCT_STATUSES }, type: { notIn: ['VARIABLE', 'NON_INVENTORY'] } },
+    where: {
+      lifecycleStatus: { in: REORDER_ELIGIBLE_PRODUCT_STATUSES },
+      type: { notIn: ['VARIABLE', 'NON_INVENTORY'] },
+      ...(options.supplierId ? { preferredSupplierId: options.supplierId } : {}),
+    },
     select: {
       id: true, sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } }, stockUnit: true,
+      preferredSupplierId: true,
+      preferredSupplier: { select: { id: true, name: true } },
       stockLevels: { select: { quantity: true, reservedQty: true } },
     },
   })
@@ -166,19 +176,7 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
     movementsByProduct.set(m.productId, list)
   }
 
-  // 3. Get preferred supplier per product (from SupplierProduct — most recent)
-  const supplierProducts = await db.supplierProduct.findMany({
-    select: { productId: true, supplierId: true, supplier: { select: { name: true } } },
-    orderBy: { updatedAt: 'desc' },
-  })
-  const preferredSupplier = new Map<string, { supplierId: string; supplierName: string }>()
-  for (const sp of supplierProducts) {
-    if (!preferredSupplier.has(sp.productId)) {
-      preferredSupplier.set(sp.productId, { supplierId: sp.supplierId, supplierName: sp.supplier.name })
-    }
-  }
-
-  // 4. Calculate avg lead time per supplier from PO history
+  // 3. Calculate avg lead time per supplier from PO history
   const poLeadTimes = await db.purchaseOrder.findMany({
     where: { status: 'RECEIVED', poSentAt: { not: null }, receivedAt: { not: null } },
     select: { supplierId: true, poSentAt: true, receivedAt: true },
@@ -194,7 +192,7 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
     }
   }
 
-  // 5. Total revenue by product for ABC classification
+  // 4. Total revenue by product for ABC classification
   const salesLines = await db.salesOrderLine.findMany({
     where: { order: { status: { in: ['SHIPPED', 'COMPLETED'] } } },
     select: { productId: true, totalBase: true },
@@ -216,7 +214,7 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
     abcMap.set(pid, pct <= 0.8 ? 'A' : pct <= 0.95 ? 'B' : 'C')
   }
 
-  // 6. Generate forecast per product
+  // 5. Generate forecast per product
   const forecasts: ProductForecast[] = []
 
   for (const p of products) {
@@ -281,7 +279,9 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
     }
 
     // Supplier + lead time
-    const supplier = preferredSupplier.get(p.id)
+    const supplier = p.preferredSupplier
+      ? { supplierId: p.preferredSupplier.id, supplierName: p.preferredSupplier.name }
+      : null
     const supplierLeadTimes = supplier ? leadTimeBySupplier.get(supplier.supplierId) : undefined
     const avgLeadTimeDays = supplierLeadTimes?.length
       ? Math.round(supplierLeadTimes.reduce((s, v) => s + v, 0) / supplierLeadTimes.length)
@@ -357,11 +357,20 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
 
 export async function createReorderPOs(
   productIds: string[],
+  options: { supplierId?: string | null } = {},
 ): Promise<{ success: boolean; poCount: number; error?: string }> {
   await requirePermission('purchasing.create')
   try {
-    const forecasts = await generateForecasts()
-    const selected = forecasts.filter((f) => productIds.includes(f.productId) && f.supplierId)
+    const settings = await getForecastSettings()
+    const generatedAt = new Date().toISOString()
+    const forecasts = await generateForecasts({ supplierId: options.supplierId ?? null })
+    const selected = forecasts.filter((f) =>
+      productIds.includes(f.productId)
+      && f.supplierId
+      && f.recommendedOrderQty > 0
+      && (f.urgency === 'critical' || f.urgency === 'low')
+      && (!options.supplierId || f.supplierId === options.supplierId)
+    )
 
     // Group by supplier
     const bySupplier = new Map<string, ProductForecast[]>()
@@ -391,6 +400,27 @@ export async function createReorderPOs(
         const unitCost = priceMap.get(item.productId) ?? 0
         const total = item.recommendedOrderQty * unitCost
         subtotal += total
+        const reorderEvidence = {
+          source: 'reorder_forecast',
+          generatedAt,
+          forecastSettings: settings,
+          supplierId,
+          productId: item.productId,
+          sku: item.sku,
+          avgDailyDemand: item.avgDailyDemand,
+          demandTrend: item.demandTrend,
+          coefficientOfVariation: item.coefficientOfVariation,
+          abcClass: item.abcClass,
+          currentStock: item.currentStock,
+          reservedStock: item.reservedStock,
+          availableStock: item.availableStock,
+          avgLeadTimeDays: item.avgLeadTimeDays,
+          reorderPoint: item.reorderPoint,
+          safetyStock: item.safetyStock,
+          recommendedOrderQty: item.recommendedOrderQty,
+          daysUntilStockout: item.daysUntilStockout,
+          urgency: item.urgency,
+        }
         return {
           productId: item.productId,
           qty: item.recommendedOrderQty,
@@ -399,6 +429,7 @@ export async function createReorderPOs(
           taxForeign: 0, taxBase: 0,
           totalForeign: total,
           totalBase: total,
+          reorderEvidence,
           sortOrder: i,
         }
       })

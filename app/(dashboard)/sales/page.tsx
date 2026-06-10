@@ -14,7 +14,7 @@ export const metadata: Metadata = { title: 'Sales Orders' }
 export default async function SalesPage() {
   const [orders, { products }, warehouses, currencies, taxRates, customers, avgCogs, users, session, organisation] = await Promise.all([
     getSalesOrders(),
-    listProducts({ pageSize: 1000, type: 'ALL', lifecycleStatus: 'ACTIVE' }),
+    listProducts({ pageSize: 1000, type: 'ALL', active: 'true' }),
     getWarehouses(),
     getCurrencies(true),
     getTaxRates(),
@@ -26,7 +26,7 @@ export default async function SalesPage() {
   ])
 
   const stockable = products.filter(
-    (p) => !['VARIABLE', 'NON_INVENTORY'].includes(p.type),
+    (p) => !['VARIABLE', 'NON_INVENTORY'].includes(p.type) && (p.lifecycleStatus === 'ACTIVE' || p.lifecycleStatus === 'EOL'),
   )
   const stockLevels = await getScopedStockLevelMap({
     productIds: stockable.map((product) => product.id),

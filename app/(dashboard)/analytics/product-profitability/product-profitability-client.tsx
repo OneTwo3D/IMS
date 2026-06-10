@@ -21,7 +21,8 @@ type SortDir = 'asc' | 'desc'
 
 const LIFECYCLE_OPTIONS = [
   { value: 'ACTIVE', label: 'Active' },
-  { value: 'NOT_FOR_SALE', label: 'Not for Sale' },
+  { value: 'DRAFT', label: 'Draft' },
+  { value: 'EOL', label: 'End of Life' },
   { value: 'ARCHIVED', label: 'Archived' },
 ] as const
 
