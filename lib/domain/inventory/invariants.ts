@@ -960,6 +960,10 @@ function sqlOptionalStockMovementLookbackFilter(days: number | null | undefined)
   return Prisma.sql`AND sm."createdAt" >= NOW() - (${normalizedDays}::int * INTERVAL '1 day')`
 }
 
+function sqlNumeric(value: number): Prisma.Sql {
+  return Prisma.sql`${value}::numeric`
+}
+
 function sqlOptionalAllocationProductFilter(productId: string | undefined): Prisma.Sql {
   return productId ? Prisma.sql`AND oa."productId" = ${productId}` : Prisma.empty
 }
@@ -1000,6 +1004,11 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
   const limit = normalizeSqlQueryLimit(options.limit)
   const tolerance = options.quantityTolerance
   const negativeTolerance = -tolerance
+  const toleranceSql = sqlNumeric(tolerance)
+  const negativeToleranceSql = sqlNumeric(negativeTolerance)
+  const stockMovementValueSmallToleranceSql = sqlNumeric(STOCK_MOVEMENT_VALUE_SMALL_TOLERANCE)
+  const stockMovementValueToleranceSql = sqlNumeric(STOCK_MOVEMENT_VALUE_TOLERANCE)
+  const stockMovementValueRelativeToleranceSql = sqlNumeric(STOCK_MOVEMENT_VALUE_RELATIVE_TOLERANCE)
   const offset = sqlPageOffset(options.page, options.cursor, limit)
   const stockProductFilter = sqlOptionalProductFilter('sl', options.productId)
   const stockWarehouseFilter = sqlOptionalWarehouseFilter('sl', options.warehouseId)
@@ -1083,7 +1092,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ${allocationProductFilter}
         ${allocationWarehouseFilter}
       GROUP BY oa."productId", oa."warehouseId"
-      HAVING SUM(GREATEST(oa.qty - COALESCE(asl.qty, 0), 0)) > ${tolerance}
+      HAVING SUM(GREATEST(oa.qty - COALESCE(asl.qty, 0), 0)) > ${toleranceSql}
 
       UNION ALL
 
@@ -1099,7 +1108,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ${productionWarehouseFilter}
         ${productionAssemblyProductFilter}
       GROUP BY pc."componentId", po."warehouseId"
-      HAVING SUM(po."qtyPlanned" * pc.qty) > ${tolerance}
+      HAVING SUM(po."qtyPlanned" * pc.qty) > ${toleranceSql}
 
       UNION ALL
 
@@ -1113,7 +1122,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ${productionWarehouseFilter}
         ${productionDisassemblyProductFilter}
       GROUP BY po."outputProductId", po."warehouseId"
-      HAVING SUM(po."qtyPlanned") > ${tolerance}
+      HAVING SUM(po."qtyPlanned") > ${toleranceSql}
     ),
     reservation_totals AS (
       SELECT
@@ -1139,7 +1148,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ) AS details
       FROM "stock_levels" sl
       INNER JOIN "products" p ON p.id = sl."productId"
-      WHERE sl.quantity < ${negativeTolerance}
+      WHERE sl.quantity < ${negativeToleranceSql}
         ${stockProductFilter}
         ${stockWarehouseFilter}
 
@@ -1159,7 +1168,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ) AS details
       FROM "stock_levels" sl
       INNER JOIN "products" p ON p.id = sl."productId"
-      WHERE sl."reservedQty" < ${negativeTolerance}
+      WHERE sl."reservedQty" < ${negativeToleranceSql}
         ${stockProductFilter}
         ${stockWarehouseFilter}
 
@@ -1183,7 +1192,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       INNER JOIN "products" p ON p.id = sl."productId"
       WHERE p.type::text IN (${sqlFifoProductTypes()})
         AND p."oversellAllowed" = false
-        AND sl."reservedQty" - sl.quantity > ${tolerance}
+        AND sl."reservedQty" - sl.quantity > ${toleranceSql}
         ${stockProductFilter}
         ${stockWarehouseFilter}
 
@@ -1212,7 +1221,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ON rt."productId" = sl."productId"
        AND rt."warehouseId" = sl."warehouseId"
       INNER JOIN "products" p ON p.id = COALESCE(sl."productId", rt."productId")
-      WHERE ABS(COALESCE(sl."reservedQty", 0) - COALESCE(rt."knownReservedQty", 0)) > ${tolerance}
+      WHERE ABS(COALESCE(sl."reservedQty", 0) - COALESCE(rt."knownReservedQty", 0)) > ${toleranceSql}
         ${reservationProductFilter}
         ${reservationWarehouseFilter}
 
@@ -1254,7 +1263,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ) AS details
       FROM "cost_layers" cl
       INNER JOIN "products" p ON p.id = cl."productId"
-      WHERE cl."remainingQty" < ${negativeTolerance}
+      WHERE cl."remainingQty" < ${negativeToleranceSql}
         ${costLayerProductFilter}
         ${costLayerWarehouseFilter}
 
@@ -1275,7 +1284,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ) AS details
       FROM "cost_layers" cl
       INNER JOIN "products" p ON p.id = cl."productId"
-      WHERE cl."remainingQty" - cl."receivedQty" > ${tolerance}
+      WHERE cl."remainingQty" - cl."receivedQty" > ${toleranceSql}
         ${costLayerProductFilter}
         ${costLayerWarehouseFilter}
 
@@ -1301,7 +1310,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       LEFT JOIN cost_layer_totals clt
         ON clt."productId" = fsl."productId"
        AND clt."warehouseId" = fsl."warehouseId"
-      WHERE ABS(fsl.quantity - COALESCE(clt."remainingCostLayerQty", 0)) > ${tolerance}
+      WHERE ABS(fsl.quantity - COALESCE(clt."remainingCostLayerQty", 0)) > ${toleranceSql}
 
       UNION ALL
 
@@ -1325,7 +1334,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ON sl."productId" = clt."productId"
        AND sl."warehouseId" = clt."warehouseId"
       WHERE sl.id IS NULL
-        AND ABS(clt."remainingCostLayerQty") > ${tolerance}
+        AND ABS(clt."remainingCostLayerQty") > ${toleranceSql}
 
       UNION ALL
 
@@ -1401,8 +1410,8 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
           'expectedTotalValueBase', ABS(sm.qty) * sm."unitCostBase",
           'delta', ROUND(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase"), 6),
           'absoluteTolerance', CASE
-            WHEN ABS(ABS(sm.qty) * sm."unitCostBase") < 1 THEN ${STOCK_MOVEMENT_VALUE_SMALL_TOLERANCE}
-            ELSE ${STOCK_MOVEMENT_VALUE_TOLERANCE}
+            WHEN ABS(ABS(sm.qty) * sm."unitCostBase") < 1 THEN ${stockMovementValueSmallToleranceSql}
+            ELSE ${stockMovementValueToleranceSql}
           END,
           'relativeDelta', CASE
             WHEN ABS(ABS(sm.qty) * sm."unitCostBase") > 0
@@ -1410,19 +1419,19 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
             WHEN ABS(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase")) = 0 THEN 0
             ELSE NULL
           END,
-          'relativeTolerance', ${STOCK_MOVEMENT_VALUE_RELATIVE_TOLERANCE}
+          'relativeTolerance', ${stockMovementValueRelativeToleranceSql}
         ) AS details
       FROM "stock_movements" sm
       INNER JOIN "products" p ON p.id = sm."productId"
       WHERE sm."unitCostBase" IS NOT NULL
         AND sm."totalValueBase" IS NOT NULL
         AND ABS(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase")) > CASE
-          WHEN ABS(ABS(sm.qty) * sm."unitCostBase") < 1 THEN ${STOCK_MOVEMENT_VALUE_SMALL_TOLERANCE}
-          ELSE ${STOCK_MOVEMENT_VALUE_TOLERANCE}
+          WHEN ABS(ABS(sm.qty) * sm."unitCostBase") < 1 THEN ${stockMovementValueSmallToleranceSql}
+          ELSE ${stockMovementValueToleranceSql}
         END
         AND CASE
           WHEN ABS(ABS(sm.qty) * sm."unitCostBase") = 0 THEN TRUE
-          ELSE ABS(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase")) / ABS(ABS(sm.qty) * sm."unitCostBase") > ${STOCK_MOVEMENT_VALUE_RELATIVE_TOLERANCE}
+          ELSE ABS(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase")) / ABS(ABS(sm.qty) * sm."unitCostBase") > ${stockMovementValueRelativeToleranceSql}
         END
         ${movementProductFilter}
         ${movementPrimaryWarehouseFilter}
@@ -1477,14 +1486,14 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
           sm.type IN ('PURCHASE_RECEIPT', 'PRODUCTION_IN')
           OR (sm.type = 'ADJUSTMENT' AND sm."toWarehouseId" IS NOT NULL)
         )
-        AND sm.qty > ${tolerance}
+        AND sm.qty > ${toleranceSql}
         AND sm."toWarehouseId" IS NOT NULL
         AND NOT EXISTS (
           SELECT 1
           FROM "cost_layers" cl
           WHERE cl."productId" = sm."productId"
             AND cl."warehouseId" = sm."toWarehouseId"
-            AND ABS(cl."receivedQty" - sm.qty) <= ${tolerance}
+            AND ABS(cl."receivedQty" - sm.qty) <= ${toleranceSql}
             AND (
               (sm.type = 'PRODUCTION_IN'
                 AND sm."referenceType" = 'ProductionOrder'
@@ -1535,7 +1544,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
           sm.type IN ('SALE_DISPATCH', 'PURCHASE_REVERSAL', 'PRODUCTION_OUT')
           OR (sm.type = 'ADJUSTMENT' AND sm."fromWarehouseId" IS NOT NULL)
         )
-        AND sm.qty > ${tolerance}
+        AND sm.qty > ${toleranceSql}
         AND NOT EXISTS (
           SELECT 1
           FROM "cogs_entries" ce
@@ -1569,7 +1578,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       WHERE s.status = 'SHIPPED'
         AND so.status <> 'REFUNDED'
         AND p.type::text IN (${sqlFifoProductTypes()})
-        AND sl.qty > ${tolerance}
+        AND sl.qty > ${toleranceSql}
         AND CASE
           WHEN sl."costLayerSnapshot" IS NULL THEN true
           WHEN jsonb_typeof(sl."costLayerSnapshot") <> 'array' THEN true
