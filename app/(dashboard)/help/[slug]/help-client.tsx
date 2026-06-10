@@ -18,7 +18,9 @@ function rewriteHelpHref(href: string | undefined): string | undefined {
   return `/help/${slug}${anchor}`
 }
 
-function HelpMarkdownLink({ href, children, ...props }: ComponentPropsWithoutRef<'a'>) {
+type HelpMarkdownLinkProps = ComponentPropsWithoutRef<'a'> & { node?: unknown }
+
+function HelpMarkdownLink({ href, children, node: _node, ...props }: HelpMarkdownLinkProps) {
   const rewritten = rewriteHelpHref(href)
   if (rewritten && rewritten.startsWith('/help/')) {
     return <Link href={rewritten} {...props}>{children}</Link>
