@@ -499,6 +499,30 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
   - Sales/allocation tests asserting EOL products can be sold from available stock but archived and draft products cannot be sold.
   - Auto-archive job tests for zero-stock/no-incoming, positive-stock, and incoming-stock cases.
 
+### P8.2 — Product supplier field and supplier-scoped reorder drafts
+- **Status:** Planned.
+- **Files:** `prisma/schema.prisma`, product create/edit actions and pages, product list filters, purchase-order create/update actions, reorder forecast/report modules, draft purchase-order generation workflow.
+- **Problem:** Reorder planning has no product-level supplier signal. Operators need to filter products by supplier and turn reorder forecasts into supplier-specific draft purchase orders. The product supplier should reflect the supplier used for the most recent purchase order placed for that product, so the replenishment workflow follows real buying history instead of stale manual metadata.
+- **Fix:**
+  1. Add a supplier field to products, backed by a relation to the supplier/vendor model used by purchase orders.
+  2. Update the product supplier automatically when a purchase order is placed for that product. If a PO contains multiple products, update each included product to that PO's supplier. If a product appears on multiple POs, the latest placed PO wins.
+  3. Surface supplier on product create/edit/detail screens and product exports/reports where SKU/EAN/MPN/product identity fields are shown.
+  4. Add supplier filters to product lists and relevant inventory/replenishment reports.
+  5. Add a supplier-scoped draft-PO generator from reorder forecasts. It should let operators choose a supplier, include only reorder-eligible products assigned to that supplier, group lines into a draft purchase order for that supplier, and preserve forecast evidence on each line.
+  6. Respect lifecycle constraints from P8.1: `eol` and `archived` products must not be included in generated reorder drafts; `draft` and `active` products may be included when otherwise reorder-eligible.
+- **Acceptance:**
+  - Products expose a supplier field in the UI, API/action payloads, and relevant reports.
+  - Placing a purchase order updates every included product's supplier to the PO supplier.
+  - Product list/report filters can narrow results by supplier.
+  - Reorder forecasts can generate a draft PO for one supplier, containing only products assigned to that supplier and only products that are reorder-eligible.
+  - Generated draft PO lines carry enough forecast metadata to explain the suggested quantity.
+  - EOL and archived products are excluded from supplier draft-PO generation even if the forecast would otherwise suggest a reorder.
+- **Tests:**
+  - Product action/unit tests for setting and filtering by supplier.
+  - Purchase-order tests asserting the latest placed PO supplier updates product supplier for all included products.
+  - Reorder forecast tests asserting supplier filters and lifecycle exclusions.
+  - Draft-PO generation tests for one supplier, mixed-supplier forecast candidates, EOL/archive exclusions, and forecast-evidence metadata.
+
 ---
 
 ## Quality gates — tests + invariants
@@ -613,8 +637,9 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P2.3 / CR5 — Sidebar analytics links are built from a single report-access grouping helper with per-role coverage.
 20. **CI invariant gate:** QG1 plus QG2's regression-test convention.
    - [x] QG1 — Production-readiness CI runs `npm run invariant-check:preflight` against a migrated database and blocks on critical findings/report failures.
-21. **Product lifecycle status and EOL sell-off:** P8.1.
+21. **Product lifecycle, supplier, and reorder planning:** P8.1 and P8.2.
    - [ ] P8.1 — Add `active`, `draft`, `eol`, and `archived` product statuses; block EOL reordering and forecasts; auto-archive EOL products once stock and incoming supply are exhausted.
+   - [ ] P8.2 — Add product supplier tracking from latest placed PO, supplier filters, and supplier-scoped draft PO generation from reorder forecasts.
 
 After each PR:
 - Run `npm run validate` and `npm run validate:db`.
