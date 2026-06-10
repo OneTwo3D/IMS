@@ -7,6 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { assertSupplierOwnsResource, SupplierPortalAccessError } from '@/lib/security/supplier-portal-boundary'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
@@ -190,48 +191,55 @@ export async function getSupplierRfqDetail(poId: string): Promise<{
   const ctx = await requireSupplier()
   if (!ctx) return null
 
-  const po = await db.purchaseOrder.findFirst({
-    where: { id: poId, supplierId: ctx.supplierId },
-    select: {
-      id: true, reference: true, status: true, currency: true,
-      expectedDelivery: true, supplierRef: true, createdAt: true, notes: true,
-      _count: { select: { lines: true } },
-      lines: {
-        select: {
-          id: true, qty: true, productId: true,
-          product: { select: { sku: true, name: true } },
+  try {
+    const po = await db.purchaseOrder.findUnique({
+      where: { id: poId },
+      select: {
+        id: true, supplierId: true, reference: true, status: true, currency: true,
+        expectedDelivery: true, supplierRef: true, createdAt: true, notes: true,
+        _count: { select: { lines: true } },
+        lines: {
+          select: {
+            id: true, qty: true, productId: true,
+            product: { select: { sku: true, name: true } },
+          },
+          orderBy: { sortOrder: 'asc' },
         },
-        orderBy: { sortOrder: 'asc' },
       },
-    },
-  })
-  if (!po) return null
+    })
+    if (!po) return null
+    assertSupplierOwnsResource(ctx, po)
+    if (!['DRAFT', 'RFQ_SENT'].includes(po.status)) return null
 
-  // Get supplier SKUs
-  const supplierProducts = await db.supplierProduct.findMany({
-    where: { supplierId: ctx.supplierId },
-    select: { productId: true, supplierSku: true },
-  })
-  const spMap = new Map(supplierProducts.map((sp) => [sp.productId, sp.supplierSku]))
+    // Get supplier SKUs
+    const supplierProducts = await db.supplierProduct.findMany({
+      where: { supplierId: ctx.supplierId },
+      select: { productId: true, supplierSku: true },
+    })
+    const spMap = new Map(supplierProducts.map((sp) => [sp.productId, sp.supplierSku]))
 
-  return {
-    po: {
-      id: po.id,
-      reference: po.reference,
-      status: po.status,
-      currency: po.currency,
-      expectedDelivery: po.expectedDelivery?.toISOString() ?? null,
-      supplierRef: po.supplierRef,
-      createdAt: po.createdAt.toISOString(),
-      lineCount: po._count.lines,
-    },
-    lines: po.lines.map((l) => ({
-      id: l.id,
-      productSku: l.product.sku,
-      productName: l.product.name,
-      qty: Number(l.qty),
-      supplierSku: spMap.get(l.productId) ?? null,
-    })),
+    return {
+      po: {
+        id: po.id,
+        reference: po.reference,
+        status: po.status,
+        currency: po.currency,
+        expectedDelivery: po.expectedDelivery?.toISOString() ?? null,
+        supplierRef: po.supplierRef,
+        createdAt: po.createdAt.toISOString(),
+        lineCount: po._count.lines,
+      },
+      lines: po.lines.map((l) => ({
+        id: l.id,
+        productSku: l.product.sku,
+        productName: l.product.name,
+        qty: Number(l.qty),
+        supplierSku: spMap.get(l.productId) ?? null,
+      })),
+    }
+  } catch (e) {
+    if (e instanceof SupplierPortalAccessError) return null
+    throw e
   }
 }
 
@@ -277,9 +285,10 @@ export async function submitSupplierQuote(
       `
       const lockedPo = await tx.purchaseOrder.findFirst({
         where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
-        select: { id: true, reference: true, currency: true, fxRateToBase: true },
+        select: { id: true, supplierId: true, reference: true, currency: true, fxRateToBase: true },
       })
       if (!lockedPo) throw new Error('RFQ not found or not accessible')
+      assertSupplierOwnsResource(ctx, lockedPo)
 
       const fxRate = toDecimal(lockedPo.fxRateToBase)
       if (!fxRate.gt(0)) {
@@ -352,6 +361,7 @@ export async function submitSupplierQuote(
     })
     return { success: true }
   } catch (e) {
+    if (e instanceof SupplierPortalAccessError) return { success: false, error: 'RFQ not found or not accessible' }
     return { success: false, error: String(e) }
   }
 }
@@ -378,6 +388,7 @@ export async function submitProductEdit(
       include: { product: { select: { sku: true } } },
     })
     if (!link) return { success: false, error: 'Product not accessible' }
+    assertSupplierOwnsResource(ctx, link)
 
     await logActivity({
       entityType: 'PRODUCT', entityId: productId, action: 'supplier_edit_proposed', tag: 'inventory', level: 'INFO',
@@ -387,6 +398,7 @@ export async function submitProductEdit(
     revalidatePath('/supplier/products')
     return { success: true }
   } catch (e) {
+    if (e instanceof SupplierPortalAccessError) return { success: false, error: 'Product not accessible' }
     return { success: false, error: String(e) }
   }
 }

@@ -112,6 +112,16 @@ invoice links must remain available during connector outages. Plan disk capacity
 for roughly 50-500 KB per invoice PDF; 100,000 invoices can consume about
 5-50 GB. Pre-release files under the old local `data/invoices` path are not
 migrated by IMS because production installs are not live yet.
+Customer-facing invoice buttons in shopping platforms do not receive reusable
+IMS public PDF URLs. The shopping platform must first verify the logged-in
+customer owns the order, then call IMS server-to-server with a short-lived
+HMAC-signed request to `/api/shopping/{connector}/invoice-pdf`. For WooCommerce,
+the bundled helper plugin adds the My Account button and signs that request with
+a dedicated `WC_INVOICE_PDF_SECRET` value. Do not reuse `WC_WEBHOOK_SECRET`
+for invoice PDF requests. The helper plugin also requires an admin-configured
+HTTPS IMS base URL and constructs the fixed IMS invoice endpoint itself; IMS
+only writes `_ims_invoice_pdf_available=yes` to the order, never a per-order URL
+for the plugin to follow.
 Branding upload URLs include a unique filename per upload so browser and CDN
 caches do not depend on query-string cache keys. Avatar URLs preserve the
 historical `/uploads/avatars/*` path and rotate a `?t=` cache-busting query
@@ -276,7 +286,7 @@ Key variables in the `.env` file:
 | `NEXT_PUBLIC_APP_URL` | Public URL of the application (e.g. `https://ims.yourdomain.com`) |
 | `NODE_ENV` | Set to `production` for deployment |
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
-| `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for public signed invoice PDF download links. Default `259200` (3 days), maximum `2592000` (30 days). Lower values reduce leaked-link exposure; higher values reduce customer "link expired" friction. |
+| `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for IMS-session signed invoice PDF download links. Default `600` (10 minutes), maximum `600`. Links are bound to the current IMS session and client IP, so customer-facing shopping downloads use `/api/shopping/{connector}/invoice-pdf` via the shopping platform instead. |
 | `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. Defaults locally to `./data/invoices`; required by production preflight. Relative paths resolve against the process working directory, so production values should be absolute |
 | `SETTINGS_ENCRYPTION_KEY` | 32-byte raw key, or base64 value that decodes to 32 bytes, used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; if needed during migration, it must also be a 32-byte raw key or base64 value that decodes to 32 bytes |
@@ -289,7 +299,9 @@ Key variables in the `.env` file:
 | `WC_STORE_URL` | WooCommerce store URL |
 | `WC_CONSUMER_KEY` | WooCommerce API consumer key |
 | `WC_CONSUMER_SECRET` | WooCommerce API consumer secret |
-| `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks |
+| `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks and WooCommerce helper-plugin FX pushes |
+| `WC_INVOICE_PDF_SECRET` | Separate secret used only by the WooCommerce helper plugin to sign customer-visible invoice PDF proxy requests to IMS |
+| `SHOPIFY_INVOICE_PDF_SECRET` | Separate secret used only for Shopify customer-visible invoice PDF proxy requests to IMS |
 | `MINTSOFT_USE_BULK_ASN_LOOKUP` | Temporary rollback flag for Mintsoft ASN booked-in processing. Default `false` uses direct ASN lookup; set `true` only if the Mintsoft direct ASN endpoint fails in staging/production. |
 | `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` | Maximum pending Mintsoft ASN booked-in webhook events processed by one sweeper run. Default `250`. |
 | `CONNECTOR_FETCH_TIMEOUT_MS` | Default whole-request timeout for validated connector HTTP requests, including redirects and composed with any caller-supplied `AbortSignal`. Invalid values fall back to `30000`. |

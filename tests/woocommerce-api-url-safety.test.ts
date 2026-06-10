@@ -36,3 +36,30 @@ test('WooCommerce API wrappers reject unsafe explicit credentials before network
     globalThis.fetch = originalFetch
   }
 })
+
+test('WooCommerce API wrappers return generic missing-configuration errors', async () => {
+  const originalWarn = console.warn
+  const warnings: unknown[][] = []
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args)
+  }
+  try {
+    assert.deepEqual(await wcFetch('/products', {}, null), {
+      data: null,
+      totalPages: 0,
+      totalItems: 0,
+      error: 'WooCommerce integration is not configured.',
+    })
+    assert.deepEqual(await wcPost('/products', {}, null), {
+      data: null,
+      error: 'WooCommerce integration is not configured.',
+    })
+    assert.deepEqual(await wcPut('/products/1', {}, null), {
+      data: null,
+      error: 'WooCommerce integration is not configured.',
+    })
+    assert.match(JSON.stringify(warnings), /wc_consumer_secret/)
+  } finally {
+    console.warn = originalWarn
+  }
+})

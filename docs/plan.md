@@ -371,9 +371,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/security/cron-rate-limit.test.ts` covers the 429 helper response, source-IP keying, and 5-minute quota headroom; `tests/security/api-route-auth-inventory.test.ts` asserts every cron-secret route calls `enforceCronRateLimit` after `verifyCron`.
 
 ### P6.2 — Supplier portal cross-tenant boundary
+- **Status:** Complete.
 - **File:** `app/actions/supplier-portal.ts:77–89`
-- **Fix:** Add an explicit assertion `ctx.supplierId === purchaseOrder.supplierId` (and similar for RFQs/products) inside each portal action.
-- **Tests:** Forge a session with a different `supplierId` than the requested resource; assert 403.
+- **Fix:** Added an explicit supplier ownership assertion helper and applied it to supplier RFQ/detail, quote, and product-edit paths so cross-supplier resource access is rejected even if a query shape is later loosened.
+- **Tests:** `tests/security/supplier-portal-boundary.test.ts` covers owned, cross-supplier, and missing supplier ownership boundaries.
 
 ### P6.3 — Restore token TTL + binding
 - **Status:** Complete.
@@ -382,19 +383,22 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/api/backup-restore.test.ts` covers two-minute token issuance, session/IP payload binding, and copied-token rejection before restore.
 
 ### P6.4 — Invoice PDF token leakage mitigation
+- **Status:** Complete.
 - **File:** `app/api/invoices/[id]/route.ts:105`
-- **Fix:** Bind token to session ID + IP (currently IP only). Reduce TTL to 5–10 minutes. Use UUID/hash in the filename rather than the sequential order ID.
-- **Tests:** Forwarded token from a different IP; assert rejection.
+- **Fix:** Invoice PDF tokens now default to a 10-minute maximum TTL, carry hashed session/IP binding claims, are verified against the current IMS session and client IP, and use the token nonce in `Content-Disposition` rather than the order id. Customer-visible shopping invoice PDFs use `/api/shopping/{connector}/invoice-pdf`: the shopping platform verifies customer login/order ownership, then calls IMS server-to-server with a short-lived connector HMAC request. WooCommerce helper-plugin buttons use that flow instead of storing reusable IMS PDF URLs.
+- **Tests:** `tests/security/invoice-pdf-token.test.ts` covers copied-token rejection for another session/IP, bound-token requirement, short TTL limits, and non-order-id response filenames. `tests/security/shopping-invoice-pdf.test.ts` covers signed shopping customer invoice requests and storage access guards.
 
 ### P6.5 — Error messages reveal connector field names
+- **Status:** Complete.
 - **File:** `lib/connectors/woocommerce/api.ts:55`
-- **Fix:** Generic "Integration not configured" message at the API surface; detailed message in server logs only.
-- **Tests:** API call without settings; assert generic message in response body, detailed message in server logs.
+- **Fix:** WooCommerce API wrappers now return a generic integration-not-configured message while logging missing setting keys server-side only.
+- **Tests:** `tests/woocommerce-api-url-safety.test.ts` covers the generic API-surface error and server-side detail.
 
 ### P6.6 — Password minimum length
+- **Status:** Complete.
 - **File:** `app/actions/users.ts:94`
-- **Fix:** Raise minimum to 12. Add complexity requirements (uppercase + number + symbol) or rely on a deny-list of common passwords.
-- **Tests:** Password under new minimum is rejected; existing users grandfathered until next login (or forced rotation per security policy).
+- **Fix:** User create/update flows now share a 12-character password policy with lowercase, uppercase, number, symbol, and common-password checks. Existing users are affected only when a password is set or changed.
+- **Tests:** `tests/security/password-policy.test.ts` covers minimum length, common-password, and complexity rejection plus a valid password.
 
 ### P6.7 — Restore upload size + disk space
 - **Status:** Complete.
@@ -403,9 +407,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/api/backup-restore.test.ts` covers configurable form/file upload caps and mocked low-disk rejection using the manifest-backed 10x SQL / 1.25x database-size estimate before consuming the restore code.
 
 ### P6.8 — Activity logging redaction
+- **Status:** Complete.
 - **File:** `app/actions/users.ts:113–115`, `lib/activity-log.ts`
-- **Fix:** Add an explicit `password` (and `secret`, `token`) redactor in `logActivity()` that strips sensitive fields from the metadata before writing.
-- **Tests:** Log an activity with `metadata: { password: 'x' }`; assert the stored row has no password.
+- **Fix:** Activity logging already redacts secret-like metadata keys recursively; coverage now explicitly includes `password`, `secret`, and `token` keys.
+- **Tests:** `tests/security/activity-log-redaction.test.ts` covers recursive password/secret/token metadata redaction.
 
 ---
 

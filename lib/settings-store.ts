@@ -12,9 +12,11 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
   mintsoft_username: 'MINTSOFT_USERNAME',
   mintsoft_webhook_secret: 'MINTSOFT_WEBHOOK_SECRET',
   shopify_admin_api_access_token: 'SHOPIFY_ADMIN_API_ACCESS_TOKEN',
+  shopify_invoice_pdf_secret: 'SHOPIFY_INVOICE_PDF_SECRET',
   shopify_webhook_secret: 'SHOPIFY_WEBHOOK_SECRET',
   wc_consumer_key: 'WC_CONSUMER_KEY',
   wc_consumer_secret: 'WC_CONSUMER_SECRET',
+  wc_invoice_pdf_secret: 'WC_INVOICE_PDF_SECRET',
   wc_webhook_secret: 'WC_WEBHOOK_SECRET',
 }
 
@@ -29,9 +31,11 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   'mintsoft_webhook_secret',
   'quickbooks_client_secret',
   'shopify_admin_api_access_token',
+  'shopify_invoice_pdf_secret',
   'shopify_webhook_secret',
   'trackship_api_key',
   'wc_consumer_secret',
+  'wc_invoice_pdf_secret',
   'wc_webhook_secret',
   'xero_client_secret',
 ])

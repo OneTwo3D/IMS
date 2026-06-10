@@ -1,28 +1,27 @@
 /**
- * Push invoice download link as a WooCommerce order note.
+ * Push accounting invoice metadata to a WooCommerce order.
  * This is a shopping channel concern — Shopify would have its own equivalent.
  */
 
 import { db } from '@/lib/db'
 import { wcPost, wcPut } from '../api'
-import { getInvoiceDownloadUrl } from '@/lib/invoice-pdf'
 import { getAccountingSettings } from '@/lib/accounting'
 import { logActivity } from '@/lib/activity-log'
-import { getPublicAppUrl } from '@/lib/public-app-url'
 
 /**
- * Push an invoice download note to the WC order (customer-visible).
- * Also pushes an accounting invoice link as an admin-only note.
+ * Push invoice metadata for WooCommerce order screens.
+ * Customer PDF downloads use the WooCommerce helper plugin as the customer
+ * authorization boundary, then the plugin calls IMS server-to-server.
  */
 export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: boolean; error?: string }> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
     select: {
       invoiceNumber: true,
+      invoicePdfPath: true,
       orderNumber: true,
       externalOrderNumber: true,
       accountingInvoiceId: true,
-      invoicePdfPath: true,
       shoppingLinks: {
         where: { connector: 'woocommerce' },
         select: { externalOrderId: true, externalOrderNumber: true },
@@ -34,13 +33,8 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
   const wcLink = so.shoppingLinks[0]
   if (!wcLink?.externalOrderId) return { success: true }
 
-  const ref = so.invoiceNumber ?? so.orderNumber ?? so.externalOrderNumber ?? orderId.slice(0, 8)
   const wcOrderLabel = wcLink.externalOrderNumber ?? so.externalOrderNumber ?? wcLink.externalOrderId
-  const appUrl = (await getPublicAppUrl())?.replace(/\/$/, '') ?? ''
   let failure: string | null = null
-
-  // Build absolute download URL
-  const downloadUrl = so.invoicePdfPath ? `${appUrl}${getInvoiceDownloadUrl(orderId)}` : null
 
   // Build accounting invoice URL
   let accountingInvoiceUrl: string | null = null
@@ -50,22 +44,6 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
       accountingInvoiceUrl = settings.invoiceUrlTemplate.replace('{id}', so.accountingInvoiceId)
     } catch {
       // Non-critical
-    }
-  }
-
-  // Customer-visible note with download link
-  if (downloadUrl) {
-    try {
-      await wcPost(`orders/${wcLink.externalOrderId}/notes`, {
-        note: `Your invoice ${ref} is ready. <a href="${downloadUrl}">Download Invoice PDF</a>`,
-        customer_note: true,
-      })
-    } catch (e) {
-      await logActivity({
-        entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_invoice_note_failed', tag: 'sync', level: 'WARNING',
-        description: `Failed to push invoice note to WC order #${wcOrderLabel}: ${String(e)}`,
-      })
-      failure = `Failed to push customer invoice note to WooCommerce: ${String(e)}`
     }
   }
 
@@ -83,8 +61,10 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
 
   // Store meta on WC order for button rendering by mu-plugin
   const metaData: { key: string; value: string }[] = []
-  if (downloadUrl) metaData.push({ key: '_invoice_pdf_url', value: downloadUrl })
   if (accountingInvoiceUrl) metaData.push({ key: '_accounting_invoice_url', value: accountingInvoiceUrl })
+  if (so.invoicePdfPath) {
+    metaData.push({ key: '_ims_invoice_pdf_available', value: 'yes' })
+  }
 
   if (metaData.length > 0) {
     try {
