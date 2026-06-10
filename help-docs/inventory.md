@@ -41,6 +41,18 @@ Click the **Columns** button to show or hide table columns. Your selection is sa
 Click **Export** to download the current filtered product list as a CSV file.
 
 
+## CSV Templates & Import Rules
+
+Every screen with a **Templates** menu (Inventory, Customers, Suppliers, Sales Orders, Purchase Orders, Stock Adjustments, Transfers, Stock Levels) follows the same conventions:
+
+- **Download a template** before importing. The template ships with the exact columns the importer expects.
+- The template includes a guidance row beginning with **`# REQUIRED`** in the first cell. Cells under each column show `REQUIRED` or `OPTIONAL` so you can see which fields must be filled. **Keep this row in the file** — the importer detects and skips it automatically.
+- **Empty cells do not overwrite existing values.** If you re-import a row to update one field, leave every other column blank and only fill the field you want changed. This makes partial updates safe.
+- To clear a value, use a sentinel like `NULL` or `-` per column where the importer documents it; a blank cell is read as "leave alone".
+
+These rules apply consistently across every CSV import in the app — if a screen has a Templates menu next to its Import button, the template, the guidance row, and the empty-cell behaviour all work the same way.
+
+
 ## Creating a Product
 
 Click **New Product** to open the product form. The following fields are available:

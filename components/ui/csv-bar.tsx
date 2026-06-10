@@ -84,8 +84,6 @@ export function CsvBar({ exportUrl, templateUrl, importAction, extraButtons, mob
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
-
-          <span className="text-xs text-muted-foreground">Templates include a `# REQUIRED` guidance row. Empty import cells do not overwrite existing values.</span>
         </div>
       )}
     </CsvImportFlow>
