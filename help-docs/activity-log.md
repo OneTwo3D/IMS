@@ -98,6 +98,23 @@ The activity log displays 50 entries per page. Use the pagination controls to na
 - Database reset
 - Backup creation, restoration, upload, and deletion
 - Scheduled task execution
+- Cost-layer snapshot revaluation events (when retrospective landed costs rewrite historical FIFO layers)
+- Connection-test fingerprint events (a SHA256 fingerprint of credentials, recorded each time a "Test Connection" is run for WC/Xero/Mintsoft — useful for spotting silent credential rotation)
+- Cron rate-limit hits (when a per-route cron quota is exceeded, the rejection is logged so you can spot misconfigured schedules)
+
+
+## Redaction of Sensitive Fields
+
+The activity log redacts sensitive values **at write time** — they never reach the database in cleartext, so there is no way to retrieve the original value from the log after the fact. Redacted fields include:
+
+- Passwords and password hashes
+- TOTP secrets and recovery codes
+- Webhook signing secrets
+- OAuth client secrets, refresh tokens, and bearer tokens
+- API keys for WooCommerce, Xero, Mintsoft, and SMTP
+- Connection-test credential payloads (the SHA256 fingerprint is logged, never the credential itself)
+
+In metadata, these values are replaced with `[REDACTED]` plus a length hint where useful (e.g. `[REDACTED:32]`). If you see a redacted value where you expected real data, check the underlying setting page directly — the activity log is intentionally a one-way audit trail for secrets.
 
 
 ## Retention

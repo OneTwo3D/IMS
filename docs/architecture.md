@@ -177,6 +177,23 @@ The CHECK constraints prevent new bad writes. The invariant report remains the r
 | `BOM` | Manufactured product — stock exists after production; can also sit under a VARIABLE parent as a BOM variant | Yes | Yes |
 | `NON_INVENTORY` | Service or fee — not stock-tracked | No | No |
 
+### Lifecycle Status
+
+Every `Product` row carries a `lifecycleStatus` enum: `DRAFT`, `ACTIVE`, `EOL`, `ARCHIVED`. The status gates sales, purchasing, and reporting:
+
+| Status | Sellable | Purchasable | In reorder forecast | New manufacturing orders |
+|---|---|---|---|---|
+| `DRAFT` | No | Yes | Yes | Yes |
+| `ACTIVE` | Yes | Yes | Yes | Yes |
+| `EOL` | Yes (from existing stock) | No | No | No (disassembly allowed) |
+| `ARCHIVED` | No | No | No | No |
+
+Transition rules:
+
+- A nightly job auto-archives `EOL` products once `stockLevel.onHand + incoming = 0` across all warehouses.
+- A product cannot be archived while it has open SO/PO lines, production orders, or non-zero stock — the UI surfaces the blocker.
+- Lifecycle changes are recorded in the activity log under the `inventory` tag with the old and new status in metadata.
+
 Transform rules:
 
 - `VARIABLE` remains a pure parent and cannot be transformed through the standard editor.
@@ -242,7 +259,21 @@ Transform rules:
 - `WcSyncLog` — WooCommerce sync log
 - `WcStatusMapping` — bidirectional WC-to-IMS status mapping (with seeded defaults)
 - `WcTaxClassMapping` — WC tax class to IMS TaxRate mapping
+- `WcPendingFxOrder` — WC orders queued when an FX rate is unavailable at sync time; drained by the hourly retry cron
+- `ConnectionTestRecord` — last successful test per connector with credential SHA256 fingerprint; required before any save is treated as "active"
+- `BackupManifest` — sidecar manifest per backup file (schema version, size, SHA256, app version)
 - `ShippingCarrier` — configurable shipping carriers with tracking URLs
+
+### Multi-currency model
+
+Every monetary row that can hold a foreign-currency amount also stores `fxRateToBase` at the time of the row's creation. The convention is **1 unit of base currency = `fxRateToBase` units of foreign currency**. Xero's `CurrencyRate` uses the inverse convention, so the connector inverts on the boundary — never mid-domain.
+
+`fxRateToBase` is stamped on:
+- `PurchaseOrder` and `PurchaseOrderLine` (locked at PO issue)
+- `SalesOrder` and `SalesOrderLine` (locked at order creation)
+- `Payment` and `SalesOrderRefund` (rate at payment/refund time)
+
+Realised FX gain/loss is computed at payment/refund settlement against the stamped rate; unrealised FX adjustments revalue open AR/AP at month end.
 
 
 ## Module Boundaries
@@ -274,6 +305,20 @@ Auth.js v5 with two providers:
 3. If `User.totpEnabled = true`, a TOTP challenge screen is shown
 4. On success, Auth.js creates a signed JWT session cookie (30-day expiry)
 
+#### Password policy
+
+All password mutations — login form, profile change-password, CLI `create-user`, admin user creation/edit — go through the shared `validatePasswordPolicy()` helper in `lib/auth/password-policy.ts`. The policy requires:
+
+- Minimum 12 characters
+- At least one uppercase letter, one lowercase letter, one digit, one symbol
+- Not present in the bundled deny-list of common weak passwords
+
+Bcrypt cost is set to 12. Each rule emits a distinct error code so the UI can show a specific message.
+
+#### Rate limiting
+
+Login, TOTP verification, password change, and supplier-quote endpoints share a token bucket backed by `RATE_LIMIT_BACKEND` (`memory` or `redis`). The Redis backend uses a single atomic sorted-set Lua script for check-and-record so multi-replica deployments stay coherent. On backend failure the limiter fails open and writes a warning to the activity log.
+
 ### Passkey Provider (WebAuthn)
 1. User clicks "Sign in with Passkey" on the login page
 2. Browser performs WebAuthn authentication with a registered credential
@@ -295,12 +340,24 @@ There is no separate worker process. Background tasks are handled via HTTP endpo
 | Product lifecycle archive | `GET /api/cron/product-lifecycle-archive` | Daily 00:30 | Archive EOL products after all warehouse stock and incoming supply are depleted |
 | FX rate refresh | `GET /api/cron/fx-rates` | Daily 06:00 | Fetch rates from frankfurter.dev and upsert FxRate rows |
 | Activity cleanup | `GET /api/cron/activity-cleanup` | Daily 03:00 | Purge activity log entries past retention |
-| Scheduled backup | `GET /api/cron/backup` | Daily 02:00 | Create backup, apply retention, upload to remote storage |
+| Scheduled backup | `GET /api/cron/backup` | Daily 02:00 | Create backup, write manifest sidecar, apply retention, upload to remote storage |
+| Xero daily batch | `GET /api/cron/xero-daily-batch` | Daily 04:00 | Post Group A1/A2/B sub-ledger journals to Xero with deterministic split-batch refs when daily cap exceeded |
+| Xero payment poll | `GET /api/cron/xero-payment-poll` | Every 15 min | Detect paid invoices/bills in Xero and reconcile in IMS |
 | WooCommerce reconcile | `GET /api/cron/wc-reconcile` | Daily | Backup reconciliation for WooCommerce orders/products plus stock catch-up and queued retry draining |
+| WC pending-FX retry | `GET /api/cron/wc-fx-retry` | Hourly | Re-attempt orders queued due to missing FX rate at sync time |
 | Mintsoft webhook sweeper | `GET /api/cron/mintsoft-webhook-sweeper` | Every 5 minutes | Drain persisted Mintsoft ASN booked-in webhook events and apply stock/PO effects asynchronously |
 | Delivery status | `GET /api/cron/delivery-status` | Every 15 min | Poll delivery tracking providers for shipment status updates |
+| Auto-archive EOL | `GET /api/cron/auto-archive-eol` | Daily | Move EOL products with zero on-hand and zero incoming to ARCHIVED |
 
 All cron endpoints require the `CRON_SECRET` bearer header in production. Production startup fails fast if `CRON_SECRET` is unset, blank, or shorter than 32 characters. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; production never accepts localhost cron requests without the bearer header. After successful cron authentication each endpoint is rate-limited per job and source IP when a client IP is available; daily/hourly jobs default to one accepted run per hour, while 5-minute and 15-minute jobs use schedule-compatible hourly quotas with jitter headroom. Rate-limited calls return `429` with `Retry-After`. The default in-memory rate-limit backend is only process-local; multi-replica deployments must use `RATE_LIMIT_BACKEND=redis` with `REDIS_URL` so cron limits are cluster-wide. Rotating `CRON_SECRET` requires updating both `.env` and any external cron scheduler invocations in the same maintenance window because the application reads the environment value on restart. If a leaked or stale secret exhausts a cron quota during rotation, restart the memory backend or clear the Redis rate-limit keys.
+
+### Cron rate limits
+
+Each cron route has its own per-route quota (default: matched to expected schedule, e.g. backup is 1/day, payment poll is 6/hour). Requests beyond the quota return `429 Too Many Requests` and write a `cron_rate_limit_exceeded` activity-log entry. This prevents a misconfigured external scheduler from hammering a single endpoint.
+
+### Connection test gate
+
+Settings for WooCommerce, Xero, Mintsoft, and SMTP cannot be saved as "active" until a successful **Test Connection** has been recorded against the current credential fingerprint. The fingerprint is a SHA256 of the credential payload; changing any byte invalidates the gate and requires a fresh test. The fingerprint (not the credentials) is written to the activity log on each test, so silent credential rotation is visible in the audit trail.
 
 
 ## PDF Generation

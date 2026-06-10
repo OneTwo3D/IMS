@@ -2,6 +2,8 @@
 
 The analytics section provides operational and finance reporting across stock, purchasing, sales, replenishment, accounting, and manufacturing. Report access depends on role and report family; users only see reports they are allowed to open.
 
+> **New to the terms used here?** See the [Glossary](glossary.md) for plain-English definitions of FIFO, COGS, VAT inclusive/exclusive, preferred supplier, AR/AP aging, and more.
+
 ## Common Report Features
 
 Most current reports provide:
@@ -13,7 +15,11 @@ Most current reports provide:
 - **CSV export** for the filtered result set
 - **Drill-through links** to source products, orders, shipments, purchase orders, or production orders where the source document is available
 
-Large exports are capped. If an export or report says the source set is too large, narrow the filters and try again.
+### Source-row cap (50,000 rows)
+
+To keep large reports responsive, the underlying data fetch is capped at **50,000 source rows** per report. If your date range or filters select more than that, the report returns a `413 Payload Too Large` error and asks you to narrow the range or apply more filters.
+
+The cap applies before any aggregation, so a report that displays "120 supplier rows" might still hit it if those 120 rows roll up from millions of PO lines — narrow by date in that case.
 
 ## Stock Position Reports
 
@@ -54,6 +60,16 @@ Inventory valuation and COGS only show accounting variance when matching account
 
 Reorder suggestions are never negative. They are planning guidance and should be reviewed before creating supplier documents.
 
+### Lifecycle filtering
+
+Only **Draft** and **Active** products appear in reorder planning by default. **EOL** and **Archived** products are excluded — you should be running them down, not reordering them. To see EOL products too, toggle the "Include EOL" filter.
+
+### Preferred supplier scoping
+
+When you generate draft POs from reorder planning, the system groups suggestions by each product's **preferred supplier**. One draft PO is created per supplier with all of that supplier's products on it, rather than one giant mixed PO.
+
+Products without a preferred supplier are listed under "Unassigned" and require you to pick a supplier before the draft can be generated. The preferred supplier is auto-updated whenever a PO is sent to a different supplier for that product, so once you start ordering from a new vendor, planning follows you.
+
 ## Sales and Fulfillment Analytics
 
 | Report | What it shows |
@@ -64,6 +80,8 @@ Reorder suggestions are never negative. They are planning guidance and should be
 | **Returns** | Refund and return activity by SKU, customer, and reason, with same-period shipment context. |
 | **Fulfillment KPIs** | Shipment-based fulfillment timing, fill rate, partial shipment rate, and late shipment evidence. |
 | **Throughput** | Shipment status activity by user and queue depth for picking, packing, and shipping work. |
+
+Revenue figures honour each order's `taxInclusive` flag: tax-exclusive orders use the line subtotal before VAT; tax-inclusive orders back-calculate revenue by removing VAT from the gross. Mixed-mode batches (some WC orders inclusive, some exclusive) sum correctly without double-counting.
 
 ## Purchasing and Supplier Analytics
 
@@ -80,9 +98,9 @@ Reorder suggestions are never negative. They are planning guidance and should be
 | Report | What it shows |
 |---|---|
 | **VAT** | Output VAT by tax rate and jurisdiction for invoiced, non-cancelled sales orders. |
-| **AR Aging** | Outstanding sales-order balances by customer and aging bucket. |
+| **AR Aging** | Outstanding sales-order balances by customer and aging bucket (Current / 1–30 / 31–60 / 61–90 / 90+). |
 | **AP Aging** | Outstanding purchase-invoice balances by supplier and aging bucket. |
-| **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics. |
+| **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics (realised + unrealised). |
 
 Finance period-end reports are limited to finance and admin roles.
 
@@ -113,3 +131,15 @@ Historical demand can still be imported for forecasting:
 
 - **WooCommerce import** — bulk import past WooCommerce orders by date range. A progress indicator shows real-time import status including pages processed and orders imported.
 - **CSV import** — upload historical sales data for products not covered by WooCommerce.
+
+
+## Troubleshooting
+
+| Problem | Where to look |
+|---|---|
+| Report returns 413 Payload Too Large | Narrow date range or apply more filters — see [Source-row cap](#source-row-cap-50000-rows) |
+| Revenue doesn't match invoice total | Check the order's `Tax Inclusive` flag |
+| Reorder planning missing a product | Check lifecycle status — EOL/Archived are excluded by default |
+| Draft PO has wrong supplier | A preferred supplier was auto-updated by a recent PO; edit on the product page |
+| Inventory valuation shows no GL variance | Account-balance snapshots haven't been ingested from the accounting connector yet |
+| FX rate looks stale | FX rates auto-fetch via cron — see [Troubleshooting](troubleshooting.md) for cron status |

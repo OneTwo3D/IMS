@@ -81,3 +81,16 @@ Quick-reference metrics covering:
 ## Recent Orders
 
 A feed of the latest sales orders, showing order number, customer, total, and status. Click any order to open its detail page.
+
+
+## System Health Card
+
+A live health indicator visible to administrators only. It surfaces:
+
+- **Integration status** — green/amber/red for WooCommerce, Xero, Mintsoft, and SMTP. Amber means the connection-test gate has not been satisfied (credentials saved but never verified); red means the last sync failed.
+- **Cron status** — last run timestamp and result for each scheduled job (FX rates, WC sync, Xero daily batch, backup, activity cleanup). A job that hasn't run within its expected interval is flagged red.
+- **Backup status** — date and size of the most recent successful backup, plus a warning if the manifest sidecar is missing or stale.
+- **Invariant check** — count of any open inventory invariant findings (negative stock, cost-layer integrity, allocation drift). Click through to the full report under **Settings > System**.
+- **Pending FX queue** — number of WooCommerce orders waiting for a missing FX rate before they can be synced to Xero.
+
+When the card is fully green, day-to-day operations are healthy. Any non-green status is a prompt to investigate before it cascades — see [Troubleshooting](troubleshooting.md) for first-stop fixes.

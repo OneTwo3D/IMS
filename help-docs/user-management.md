@@ -40,8 +40,16 @@ The date your account was created is shown on your profile for reference.
 Click **Change Password** on your profile page to open the password dialog. You will need to provide:
 
 - Your current password
-- A new password (minimum 8 characters)
+- A new password that meets the password policy:
+  - **Minimum 12 characters**
+  - At least one **uppercase letter**
+  - At least one **lowercase letter**
+  - At least one **number**
+  - At least one **symbol** (anything non-alphanumeric)
+  - Not in the system's deny-list of common weak passwords (e.g. `password123`, `Welcome2024!`)
 - Confirmation of the new password
+
+If your new password fails any rule, the form returns a specific message indicating which rule was violated. The policy is enforced consistently across the UI, the CLI user-creation tool (`npm run cli -- create-user`), and any API endpoints that create or update passwords.
 
 
 ## Two-Factor Authentication (TOTP)

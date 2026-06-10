@@ -9,6 +9,21 @@ Click **Create Backup** to generate a full PostgreSQL dump of your database. The
 - **Downloaded automatically** to your browser
 - **Saved on the server** for future use
 
+Each backup is written as a pair of files:
+
+- **`<name>.sql`** — the PostgreSQL dump itself.
+- **`<name>.sql.manifest.json`** — a sidecar manifest recording the schema version (Prisma migration id), source database name, app version, byte length, and SHA256 checksum of the `.sql` file.
+
+The restore flow verifies the manifest matches the `.sql` before applying it. A backup whose manifest is missing or whose checksum doesn't match the file is rejected with `backup_manifest_invalid` and cannot be restored from the UI — re-upload a clean pair or delete and recreate. This protects against partial uploads, truncated files, and accidental edits.
+
+### Backup file-size cap
+
+Server-side restore and upload endpoints enforce a per-file cap controlled by the `DATABASE_RESTORE_MAX_FILE_BYTES` environment variable (default 50 MB). Files above the cap are rejected with HTTP 413. Increase the limit only when your dump genuinely exceeds it; the cap protects the server from accidental OOM during restore.
+
+### Disk-space preflight
+
+Before creating a backup, the system checks free disk space on the backup directory's filesystem. If estimated free space drops below 2× the expected dump size, the backup is aborted with a `backup_disk_space_low` activity-log entry rather than risking a partial dump. Free space is also checked before restore — a restore needs roughly 1.5× the dump's size in temp space.
+
 ## Backup List
 
 The backup list shows all backups stored on the server, with:
@@ -28,6 +43,8 @@ You can restore from:
 Restoring overwrites all current data. To confirm, you must type **RESTORE** into the confirmation field. This safeguard prevents accidental restores.
 
 The restore API also enforces this confirmation server-side, requires a short-lived one-time confirmation code emailed to the authenticated admin address, requires a fresh admin login, and only accepts plain `.sql` files from the configured backup directory or an uploaded `.sql` file for that request. The confirmation code expires after two minutes and is bound to the issuing session and verifiable client IP; by default the fresh-login window is 15 minutes (`FRESH_AUTH_MAX_AGE_SECONDS`), so admins may need to sign in again and request a new code if either window expires.
+
+The confirmation token is **bound to the requesting admin's session ID and IP address**: a token issued to admin A from network X cannot be replayed by admin B, by admin A from network Y, or by any unauthenticated caller. Replay attempts are logged with `restore_token_binding_mismatch`.
 
 When `NODE_ENV=production`, restore is disabled unless `ALLOW_DATABASE_RESTORE=true` is set for a supervised restore window. Restoring from a server-side backup only requires that base flag; restoring from an uploaded SQL file also requires `ALLOW_DATABASE_RESTORE_UPLOAD=true`. Leave both flags unset or `false` during normal operation. Non-production environments bypass these kill switches, so staging restore drills should run with `NODE_ENV=production` if they need to exercise production restore gating.
 

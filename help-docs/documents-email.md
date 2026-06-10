@@ -31,6 +31,28 @@ All PDF routes now correctly load and render the full set of template fields:
 - Totals are right-aligned with the last column of the line items table for a clean, professional appearance.
 
 
+## Secure PDF Links
+
+Invoice and credit-note PDFs are served behind **single-use, time-limited tokens** rather than direct file paths. When you click "View PDF" or "Email PDF":
+
+1. The system generates a token bound to your current session **and your IP address**.
+2. The token is valid for a short TTL (default 15 minutes).
+3. The PDF route checks the token, the bound session, and the requesting IP before streaming the file.
+
+A token issued on one network cannot be replayed from another, and tokens cannot be shared between users. If a customer needs the PDF, use the **Email PDF** action — the recipient receives the file as an attachment, not a link.
+
+### WooCommerce customer-facing PDF download
+
+WooCommerce customers can download their invoice PDF from their Order page in the WC storefront. The flow is:
+
+1. The customer clicks "Download Invoice" on the WC order page.
+2. The WordPress helper plugin (`wc-invoice-handoff`) calls IMS with a customer-scoped token.
+3. IMS verifies the WC order maps to a real IMS invoice and that the requesting customer owns it.
+4. The PDF is streamed back to the customer through the WC storefront.
+
+No IMS login is required for the customer — authorisation comes from the WC session plus the order-ownership check on the IMS side. The handoff token is single-use and short-lived.
+
+
 ## Document Types
 
 | Document | Notes |

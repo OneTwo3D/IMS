@@ -4,6 +4,19 @@ Manufacturing orders let you assemble finished products from their components or
 
 BOM products can be either standalone SKUs or BOM child variants under a Variable parent. Manufacturing always runs against the BOM SKU itself, not the Variable parent.
 
+## Lifecycle status and manufacturing
+
+The BOM product's [lifecycle status](glossary.md#lifecycle-status) controls which manufacturing operations are allowed:
+
+| Status | New assembly orders? | New disassembly orders? | Complete in-flight orders? |
+|---|---|---|---|
+| **Draft** | Yes | Yes | Yes |
+| **Active** | Yes | Yes | Yes |
+| **EOL** | No | Yes | Yes |
+| **Archived** | No | No | Yes (existing orders can be completed) |
+
+Component products follow the same rule: an Archived component blocks new assemblies that need it, but existing in-flight orders can still complete. EOL components are flagged with a warning on the create form so you know stock is finite.
+
 ## Manufacturing Order List
 
 The list view shows all manufacturing orders with search and filtering options:
