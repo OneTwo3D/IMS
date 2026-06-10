@@ -292,6 +292,7 @@ There is no separate worker process. Background tasks are handled via HTTP endpo
 | Task | Endpoint | Schedule | Description |
 |---|---|---|---|
 | Account balance snapshot | `GET /api/cron/account-balance-snapshot` | Daily 01:00 | Fetch previous-day Xero Trial Balance account balances for inventory and COGS GL variance reporting |
+| Product lifecycle archive | `GET /api/cron/product-lifecycle-archive` | Daily 00:30 | Archive EOL products after all warehouse stock and incoming supply are depleted |
 | FX rate refresh | `GET /api/cron/fx-rates` | Daily 06:00 | Fetch rates from frankfurter.dev and upsert FxRate rows |
 | Activity cleanup | `GET /api/cron/activity-cleanup` | Daily 03:00 | Purge activity log entries past retention |
 | Scheduled backup | `GET /api/cron/backup` | Daily 02:00 | Create backup, apply retention, upload to remote storage |

@@ -53,6 +53,16 @@ registerCronJobs([
     defaultEnabled: false,
   },
   {
+    slug: 'product-lifecycle-archive',
+    settingKey: 'product_lifecycle_archive',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Product Lifecycle Archive',
+    description: 'Archives EOL products after stock and incoming supply are depleted.',
+    defaultSchedule: '30 0 * * *',
+    defaultEnabled: true,
+  },
+  {
     slug: 'delivery-status',
     settingKey: 'delivery_status',
     module: 'system',
