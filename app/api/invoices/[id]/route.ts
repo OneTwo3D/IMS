@@ -114,8 +114,8 @@ export async function handleInvoicePdfRoute(
   const { id } = params
   const token = request.nextUrl.searchParams.get('token')
   const tokenLength = token?.length ?? 0
-  const clientIp = getClientIp(request.headers) ?? 'unknown'
-  const rateLimit = await dependencies.checkRateLimit?.(`invoice-pdf:${clientIp}`, 30, 60_000)
+  const clientIp = getClientIp(request.headers)
+  const rateLimit = await dependencies.checkRateLimit?.(`invoice-pdf:${clientIp ?? 'unknown'}`, 30, 60_000)
   if (rateLimit && !rateLimit.allowed) {
     return NextResponse.json(
       { error: 'Too many invoice PDF requests' },
@@ -129,7 +129,7 @@ export async function handleInvoicePdfRoute(
     )
   }
 
-  const tokenBinding = await dependencies.getTokenBinding?.(request, clientIp) ?? null
+  const tokenBinding = clientIp ? await dependencies.getTokenBinding?.(request, clientIp) ?? null : null
   const verification = dependencies.verifyPdfToken(id, token, {
     binding: tokenBinding,
     requireBinding: true,
@@ -160,7 +160,7 @@ export async function handleInvoicePdfRoute(
     status: 200,
     headers: {
       'Content-Type': 'application/pdf',
-      'Content-Disposition': `inline; filename="invoice-${safeInvoiceFilenameId(verification.payload.nonce)}.pdf"`,
+      'Content-Disposition': `inline; filename="invoice-${safeInvoiceFilenameId(id)}.pdf"`,
       ...NO_STORE_HEADERS,
     },
   })

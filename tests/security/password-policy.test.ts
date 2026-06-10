@@ -5,7 +5,11 @@ import { validateUserPassword } from '../../lib/security/password-policy.ts'
 
 test('user password policy enforces length and complexity', () => {
   assert.equal(validateUserPassword('Short1!'), 'Password must be at least 12 characters')
+  assert.equal(validateUserPassword(`A${'x'.repeat(256)}1!`), 'Password must be at most 256 characters')
   assert.equal(validateUserPassword('password123!'), 'Password is too common')
+  assert.equal(validateUserPassword('Welcome2024!'), 'Password is too common')
+  assert.equal(validateUserPassword('Qwerty123456!'), 'Password is too common')
+  assert.equal(validateUserPassword('P@ssword123!'), 'Password is too common')
   assert.equal(validateUserPassword('lowercase123!'), 'Password must include an uppercase letter')
   assert.equal(validateUserPassword('UPPERCASE123!'), 'Password must include a lowercase letter')
   assert.equal(validateUserPassword('NoNumberHere!'), 'Password must include a number')

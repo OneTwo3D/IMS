@@ -7,14 +7,15 @@ export const SHOPPING_INVOICE_PDF_TTL_SECONDS = 5 * 60
 const SHOPPING_INVOICE_PDF_CLOCK_SKEW_SECONDS = 5 * 60
 
 const SHOPPING_INVOICE_SECRET_SETTING: Record<ShoppingConnectorId, string> = {
-  woocommerce: 'wc_webhook_secret',
-  shopify: 'shopify_webhook_secret',
+  woocommerce: 'wc_invoice_pdf_secret',
+  shopify: 'shopify_invoice_pdf_secret',
 }
 
 export type ShoppingInvoicePdfRequest = {
   connector: ShoppingConnectorId
   externalOrderId: string
   externalCustomerId?: string
+  externalOrderKey?: string
   issuedAt: number
   expiresAt: number
   nonce: string
@@ -84,6 +85,7 @@ export function parseShoppingInvoicePdfRequest(
   const payloadConnector = parseString(payload.connector)
   const externalOrderId = parseString(payload.externalOrderId)
   const externalCustomerId = payload.externalCustomerId === undefined ? undefined : parseString(payload.externalCustomerId)
+  const externalOrderKey = payload.externalOrderKey === undefined ? undefined : parseString(payload.externalOrderKey)
   const issuedAt = parseSafeInteger(payload.issuedAt)
   const expiresAt = parseSafeInteger(payload.expiresAt)
   const nonce = parseString(payload.nonce)
@@ -93,6 +95,7 @@ export function parseShoppingInvoicePdfRequest(
   }
   if (payloadConnector !== connector) return { valid: false, reason: 'connector_mismatch' }
   if (payload.externalCustomerId !== undefined && !externalCustomerId) return { valid: false, reason: 'malformed' }
+  if (payload.externalOrderKey !== undefined && !externalOrderKey) return { valid: false, reason: 'malformed' }
   if (issuedAt > expiresAt) return { valid: false, reason: 'malformed' }
   if (expiresAt - issuedAt > SHOPPING_INVOICE_PDF_TTL_SECONDS) {
     return { valid: false, reason: 'ttl_exceeded' }
@@ -110,6 +113,7 @@ export function parseShoppingInvoicePdfRequest(
       connector,
       externalOrderId,
       externalCustomerId: externalCustomerId ?? undefined,
+      externalOrderKey: externalOrderKey ?? undefined,
       issuedAt,
       expiresAt,
       nonce,
@@ -121,6 +125,7 @@ export function createShoppingInvoicePdfRequestBody(input: {
   connector: ShoppingConnectorId
   externalOrderId: string
   externalCustomerId?: string | number | null
+  externalOrderKey?: string | null
   now?: Date | number
   ttlSeconds?: number
   nonce: string
@@ -136,6 +141,7 @@ export function createShoppingInvoicePdfRequestBody(input: {
     ...(input.externalCustomerId !== undefined && input.externalCustomerId !== null
       ? { externalCustomerId: String(input.externalCustomerId) }
       : {}),
+    ...(input.externalOrderKey ? { externalOrderKey: input.externalOrderKey } : {}),
     issuedAt,
     expiresAt: issuedAt + ttlSeconds,
     nonce: input.nonce,

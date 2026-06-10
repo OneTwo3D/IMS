@@ -7,7 +7,6 @@ import { db } from '@/lib/db'
 import { wcPost, wcPut } from '../api'
 import { getAccountingSettings } from '@/lib/accounting'
 import { logActivity } from '@/lib/activity-log'
-import { getPublicAppUrl } from '@/lib/public-app-url'
 
 /**
  * Push invoice metadata for WooCommerce order screens.
@@ -36,7 +35,6 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
 
   const wcOrderLabel = wcLink.externalOrderNumber ?? so.externalOrderNumber ?? wcLink.externalOrderId
   let failure: string | null = null
-  const publicAppUrl = await getPublicAppUrl()
 
   // Build accounting invoice URL
   let accountingInvoiceUrl: string | null = null
@@ -65,23 +63,7 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
   const metaData: { key: string; value: string }[] = []
   if (accountingInvoiceUrl) metaData.push({ key: '_accounting_invoice_url', value: accountingInvoiceUrl })
   if (so.invoicePdfPath) {
-    if (publicAppUrl) {
-      metaData.push(
-        { key: '_ims_invoice_pdf_available', value: 'yes' },
-        { key: '_ims_invoice_pdf_endpoint', value: `${publicAppUrl}/api/shopping/woocommerce/invoice-pdf` },
-      )
-    } else {
-      const message = `Cannot expose customer invoice PDF for WC order #${wcOrderLabel}: public_app_url is not configured`
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: orderId,
-        action: 'wc_invoice_pdf_customer_link_skipped',
-        tag: 'sync',
-        level: 'WARNING',
-        description: message,
-      })
-      if (!failure) failure = message
-    }
+    metaData.push({ key: '_ims_invoice_pdf_available', value: 'yes' })
   }
 
   if (metaData.length > 0) {

@@ -40,6 +40,7 @@ type ShoppingInvoicePdfRouteDependencies = {
   getPluginEnabled: (connector: ShoppingConnectorId) => Promise<boolean>
   getSecret: (connector: ShoppingConnectorId) => Promise<string | null>
   findOrder: (request: ShoppingInvoicePdfRequest) => Promise<ShoppingInvoicePdfOrder | null>
+  consumeNonce: (request: ShoppingInvoicePdfRequest) => Promise<boolean>
   loadInvoicePdf: typeof loadInvoicePdf
   auditAttempt: (input: ShoppingInvoicePdfAuditInput) => Promise<void>
   checkRateLimit?: (key: string, max: number, windowMs: number) => Promise<RateLimitResult>
@@ -59,6 +60,7 @@ const defaultDependencies: ShoppingInvoicePdfRouteDependencies = {
   getPluginEnabled: isShoppingConnectorPluginEnabled,
   getSecret: getShoppingInvoicePdfSecret,
   findOrder: findShoppingInvoicePdfOrder,
+  consumeNonce: consumeShoppingInvoicePdfNonce,
   loadInvoicePdf,
   auditAttempt: auditShoppingInvoicePdfAttempt,
   checkRateLimit,
@@ -82,6 +84,34 @@ async function isShoppingConnectorPluginEnabled(connector: ShoppingConnectorId):
   return pluginState[connector]
 }
 
+function isUniqueConstraintError(error: unknown): error is { code: string } {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'P2002'
+}
+
+/** @internal Test seam for guest-checkout ownership proof. */
+export function shoppingOrderLinkHasExternalOrderKey(metadata: unknown, externalOrderKey: string | undefined): boolean {
+  if (!externalOrderKey || !metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false
+  const value = (metadata as Record<string, unknown>).externalOrderKey
+  return typeof value === 'string' && value.length > 0 && value === externalOrderKey
+}
+
+async function consumeShoppingInvoicePdfNonce(request: ShoppingInvoicePdfRequest): Promise<boolean> {
+  const expiresAt = new Date(request.expiresAt * 1000)
+  try {
+    await db.oneTimeToken.create({
+      data: {
+        key: `shopping-invoice-pdf:${request.connector}:${request.nonce}`,
+        value: request.externalOrderId,
+        expiresAt,
+      },
+    })
+    return true
+  } catch (error) {
+    if (isUniqueConstraintError(error)) return false
+    throw error
+  }
+}
+
 async function findShoppingInvoicePdfOrder(request: ShoppingInvoicePdfRequest): Promise<ShoppingInvoicePdfOrder | null> {
   const link = await db.shoppingOrderLink.findFirst({
     where: {
@@ -89,6 +119,7 @@ async function findShoppingInvoicePdfOrder(request: ShoppingInvoicePdfRequest): 
       externalOrderId: request.externalOrderId,
     },
     select: {
+      metadata: true,
       order: {
         select: {
           id: true,
@@ -102,7 +133,8 @@ async function findShoppingInvoicePdfOrder(request: ShoppingInvoicePdfRequest): 
   const order = link?.order
   if (!order) return null
 
-  if (request.externalCustomerId && request.externalCustomerId !== '0' && order.customerId) {
+  if (request.externalCustomerId && request.externalCustomerId !== '0') {
+    if (!order.customerId) return null
     const customerLink = await db.shoppingCustomerLink.findFirst({
       where: {
         connector: request.connector,
@@ -112,6 +144,8 @@ async function findShoppingInvoicePdfOrder(request: ShoppingInvoicePdfRequest): 
       select: { id: true },
     })
     if (!customerLink) return null
+  } else if (!shoppingOrderLinkHasExternalOrderKey(link.metadata, request.externalOrderKey)) {
+    return null
   }
 
   return {
@@ -240,6 +274,9 @@ export async function handleShoppingInvoicePdfRoute(
   }
   if (!order) return reject(dependencies, auditWithOrder, 'order_not_found')
   if (!order.invoicePdfPath) return reject(dependencies, auditWithOrder, 'invoice_pdf_missing', 404)
+  if (!await dependencies.consumeNonce(parsed.request)) {
+    return reject(dependencies, auditWithOrder, 'nonce_replayed')
+  }
 
   const pdf = await dependencies.loadInvoicePdf(order.orderId)
   if (!pdf) return reject(dependencies, auditWithOrder, 'invoice_pdf_storage_missing', 404)

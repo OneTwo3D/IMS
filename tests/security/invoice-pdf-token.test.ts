@@ -357,7 +357,7 @@ test('invoice PDF route sanitizes the Content-Disposition filename', async () =>
   assert.equal(response.status, 200)
   assert.equal(
     response.headers.get('content-disposition'),
-    'inline; filename="invoice-download-nonce-1.pdf"',
+    'inline; filename="invoice-order___Set-Cookie_x.pdf"',
   )
 })
 
@@ -452,4 +452,36 @@ test('invoice PDF route applies request rate limiting before token verification'
   assert.equal(response.headers.get('retry-after'), '42')
   assert.equal(response.headers.get('cache-control'), 'private, no-store')
   assert.equal(verifyCalled, false)
+})
+
+test('invoice PDF route does not bind tokens to a shared unknown IP fallback', async () => {
+  let tokenBindingCalled = false
+  const response = await handleInvoicePdfRoute(
+    new NextRequest('http://ims.test/api/invoices/order-1?token=valid-token'),
+    { id: 'order-1' },
+    {
+      async loadInvoicePdf() {
+        throw new Error('PDF storage should not be reached without a verifiable binding')
+      },
+      verifyPdfToken(_orderId, _token, options) {
+        assert.equal(options?.requireBinding, true)
+        assert.equal(options?.binding, null)
+        return { valid: false, reason: 'missing_binding' }
+      },
+      async auditTokenAttempt(input) {
+        assert.equal(input.verification.valid, false)
+        if (!input.verification.valid) assert.equal(input.verification.reason, 'missing_binding')
+      },
+      async getTokenBinding() {
+        tokenBindingCalled = true
+        return {
+          sessionId: 'session',
+          clientIp: 'unknown',
+        }
+      },
+    },
+  )
+
+  assert.equal(response.status, 403)
+  assert.equal(tokenBindingCalled, false)
 })

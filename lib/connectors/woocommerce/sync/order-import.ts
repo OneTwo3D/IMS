@@ -232,6 +232,9 @@ async function updateExistingWcOrderFromPayload(
       },
       data: {
         externalOrderNumber: wcOrder.number,
+        metadata: {
+          externalOrderKey: wcOrder.order_key,
+        },
       },
     })
     await tx.salesOrder.update({
@@ -545,6 +548,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
               connector: 'woocommerce',
               externalOrderId: String(wcOrder.id),
               externalOrderNumber: wcOrder.number,
+              metadata: {
+                externalOrderKey: wcOrder.order_key,
+              },
             },
           },
           lines: { create: lineData },

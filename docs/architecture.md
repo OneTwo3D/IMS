@@ -372,6 +372,7 @@ WooCommerce integration is implemented as a modular connector in `lib/connectors
 - **Tax class mapping** — maps WC tax classes to IMS TaxRate records
 - **Completion flow** — WC completed status triggers auto-allocation, shipment creation with tracking
 - **Webhook security** — HMAC verification using timing-safe comparison (`timingSafeEqual`)
+- **Customer invoice PDFs** — WooCommerce My Account buttons are rendered by the helper plugin after Woo verifies order ownership. The plugin signs a short-lived server-to-server request to IMS with `WC_INVOICE_PDF_SECRET`, which is intentionally separate from `WC_WEBHOOK_SECRET`. The plugin uses an admin-pinned IMS base URL and never follows per-order meta as a fetch URL; IMS order meta only signals `_ims_invoice_pdf_available=yes`.
 
 ### Integrations Dashboard
 

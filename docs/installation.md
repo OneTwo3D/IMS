@@ -117,7 +117,11 @@ IMS public PDF URLs. The shopping platform must first verify the logged-in
 customer owns the order, then call IMS server-to-server with a short-lived
 HMAC-signed request to `/api/shopping/{connector}/invoice-pdf`. For WooCommerce,
 the bundled helper plugin adds the My Account button and signs that request with
-the same shared secret configured as `WC_WEBHOOK_SECRET`.
+a dedicated `WC_INVOICE_PDF_SECRET` value. Do not reuse `WC_WEBHOOK_SECRET`
+for invoice PDF requests. The helper plugin also requires an admin-configured
+HTTPS IMS base URL and constructs the fixed IMS invoice endpoint itself; IMS
+only writes `_ims_invoice_pdf_available=yes` to the order, never a per-order URL
+for the plugin to follow.
 Branding upload URLs include a unique filename per upload so browser and CDN
 caches do not depend on query-string cache keys. Avatar URLs preserve the
 historical `/uploads/avatars/*` path and rotate a `?t=` cache-busting query
@@ -295,7 +299,9 @@ Key variables in the `.env` file:
 | `WC_STORE_URL` | WooCommerce store URL |
 | `WC_CONSUMER_KEY` | WooCommerce API consumer key |
 | `WC_CONSUMER_SECRET` | WooCommerce API consumer secret |
-| `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks and signing WooCommerce helper-plugin customer invoice PDF requests to IMS |
+| `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks and WooCommerce helper-plugin FX pushes |
+| `WC_INVOICE_PDF_SECRET` | Separate secret used only by the WooCommerce helper plugin to sign customer-visible invoice PDF proxy requests to IMS |
+| `SHOPIFY_INVOICE_PDF_SECRET` | Separate secret used only for Shopify customer-visible invoice PDF proxy requests to IMS |
 | `MINTSOFT_USE_BULK_ASN_LOOKUP` | Temporary rollback flag for Mintsoft ASN booked-in processing. Default `false` uses direct ASN lookup; set `true` only if the Mintsoft direct ASN endpoint fails in staging/production. |
 | `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` | Maximum pending Mintsoft ASN booked-in webhook events processed by one sweeper run. Default `250`. |
 | `CONNECTOR_FETCH_TIMEOUT_MS` | Default whole-request timeout for validated connector HTTP requests, including redirects and composed with any caller-supplied `AbortSignal`. Invalid values fall back to `30000`. |

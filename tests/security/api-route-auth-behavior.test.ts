@@ -390,6 +390,9 @@ test('public shopping invoice PDF route rejects unsigned requests before order l
         async findOrder() {
           throw new Error('Order lookup should not be reached without a valid signature')
         },
+        async consumeNonce() {
+          throw new Error('Nonce consumption should not be reached without a valid signature')
+        },
         async loadInvoicePdf() {
           throw new Error('PDF storage should not be reached without a valid signature')
         },

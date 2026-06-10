@@ -44,7 +44,7 @@ if (!function_exists('oti_order_has_invoice_pdf')) {
     function oti_order_has_invoice_pdf(int $order_id): bool
     {
         return oti_get_order_meta($order_id, '_ims_invoice_pdf_available') === 'yes'
-            && oti_get_order_meta($order_id, '_ims_invoice_pdf_endpoint') !== '';
+            && oti_invoice_pdf_endpoint() !== '';
     }
 }
 
@@ -139,7 +139,7 @@ if (!function_exists('oti_render_invoice_meta_box')) {
  *
  * Authentication: HMAC-SHA256 of the raw request body, computed with the
  * shared secret stored in the wp_option `oti_fx_shared_secret`. The secret is
- * the same value as `WC_WEBHOOK_SECRET` in IMS — the admin paste it in once
+ * the same value as `WC_WEBHOOK_SECRET` in IMS — the admin pastes it in once
  * via Settings → onetwoInventory below.
  *
  * Request body shape (JSON):
@@ -158,6 +158,8 @@ const OTI_FX_OPTION       = 'oti_fx_rates';
 const OTI_FX_SECRET_OPT   = 'oti_fx_shared_secret';
 const OTI_FX_BASE_OPT     = 'oti_fx_base_currency';
 const OTI_FX_LASTPUSH_OPT = 'oti_fx_last_push';
+const OTI_INVOICE_PDF_SECRET_OPT = 'oti_invoice_pdf_shared_secret';
+const OTI_IMS_INVOICE_PDF_BASE_URL_OPT = 'oti_ims_invoice_pdf_base_url';
 const OTI_FX_NAMESPACE    = 'oti/v1';
 
 add_action('rest_api_init', function () {
@@ -274,6 +276,30 @@ if (!function_exists('oti_can_download_invoice_pdf')) {
     }
 }
 
+if (!function_exists('oti_normalized_ims_base_url')) {
+    function oti_normalized_ims_base_url(): string
+    {
+        $raw = trim((string) get_option(OTI_IMS_INVOICE_PDF_BASE_URL_OPT, ''));
+        if ($raw === '') return '';
+        $url = untrailingslashit(esc_url_raw($raw));
+        $parts = wp_parse_url($url);
+        if (!is_array($parts)) return '';
+        $scheme = isset($parts['scheme']) ? strtolower((string) $parts['scheme']) : '';
+        $host = isset($parts['host']) ? (string) $parts['host'] : '';
+        if ($scheme !== 'https' || $host === '') return '';
+        return $url;
+    }
+}
+
+if (!function_exists('oti_invoice_pdf_endpoint')) {
+    function oti_invoice_pdf_endpoint(): string
+    {
+        $base = oti_normalized_ims_base_url();
+        if ($base === '') return '';
+        return $base . '/api/shopping/woocommerce/invoice-pdf';
+    }
+}
+
 if (!function_exists('oti_proxy_invoice_pdf')) {
     function oti_proxy_invoice_pdf(WP_REST_Request $request)
     {
@@ -283,8 +309,8 @@ if (!function_exists('oti_proxy_invoice_pdf')) {
             return new WP_Error('oti_invoice_not_found', 'Invoice not found', ['status' => 404]);
         }
 
-        $endpoint = oti_get_order_meta($order_id, '_ims_invoice_pdf_endpoint');
-        $secret = (string) get_option(OTI_FX_SECRET_OPT, '');
+        $endpoint = oti_invoice_pdf_endpoint();
+        $secret = (string) get_option(OTI_INVOICE_PDF_SECRET_OPT, '');
         if ($endpoint === '' || $secret === '') {
             return new WP_Error('oti_invoice_not_configured', 'Invoice download is not configured', ['status' => 503]);
         }
@@ -294,6 +320,7 @@ if (!function_exists('oti_proxy_invoice_pdf')) {
             'connector'          => 'woocommerce',
             'externalOrderId'    => (string) $order_id,
             'externalCustomerId' => (string) $order->get_customer_id(),
+            'externalOrderKey'   => (string) $order->get_order_key(),
             'issuedAt'           => $now,
             'expiresAt'          => $now + 300,
             'nonce'              => wp_generate_uuid4(),
@@ -429,6 +456,16 @@ add_action('admin_init', function () {
         'sanitize_callback' => 'sanitize_text_field',
         'show_in_rest'      => false,
     ]);
+    register_setting('oti_helper', OTI_INVOICE_PDF_SECRET_OPT, [
+        'type'              => 'string',
+        'sanitize_callback' => 'sanitize_text_field',
+        'show_in_rest'      => false,
+    ]);
+    register_setting('oti_helper', OTI_IMS_INVOICE_PDF_BASE_URL_OPT, [
+        'type'              => 'string',
+        'sanitize_callback' => 'esc_url_raw',
+        'show_in_rest'      => false,
+    ]);
 });
 
 if (!function_exists('oti_render_settings_page')) {
@@ -437,6 +474,8 @@ if (!function_exists('oti_render_settings_page')) {
         if (!current_user_can('manage_options')) return;
 
         $secret    = (string) get_option(OTI_FX_SECRET_OPT, '');
+        $invoice_secret = (string) get_option(OTI_INVOICE_PDF_SECRET_OPT, '');
+        $ims_base_url = (string) get_option(OTI_IMS_INVOICE_PDF_BASE_URL_OPT, '');
         $rates     = get_option(OTI_FX_OPTION, []);
         $base      = (string) get_option(OTI_FX_BASE_OPT, '');
         $last_push = (string) get_option(OTI_FX_LASTPUSH_OPT, '');
@@ -451,7 +490,13 @@ if (!function_exists('oti_render_settings_page')) {
         echo '<table class="form-table" role="presentation">';
         echo '<tr><th scope="row"><label for="oti-secret">Shared secret</label></th>';
         echo '<td><input type="password" id="oti-secret" name="' . esc_attr(OTI_FX_SECRET_OPT) . '" value="' . esc_attr($secret) . '" class="regular-text" autocomplete="off">';
-        echo '<p class="description">Paste the same value you set as <code>WC_WEBHOOK_SECRET</code> in One Two Inventory. Used to verify FX rate pushes and sign customer invoice PDF requests back to IMS.</p></td></tr>';
+        echo '<p class="description">Paste the same value you set as <code>WC_WEBHOOK_SECRET</code> in One Two Inventory. Used only to verify FX rate pushes from IMS.</p></td></tr>';
+        echo '<tr><th scope="row"><label for="oti-invoice-secret">Invoice PDF secret</label></th>';
+        echo '<td><input type="password" id="oti-invoice-secret" name="' . esc_attr(OTI_INVOICE_PDF_SECRET_OPT) . '" value="' . esc_attr($invoice_secret) . '" class="regular-text" autocomplete="off">';
+        echo '<p class="description">Paste the same value you set as <code>WC_INVOICE_PDF_SECRET</code> in One Two Inventory. This is separate from the WooCommerce webhook / FX secret.</p></td></tr>';
+        echo '<tr><th scope="row"><label for="oti-ims-base-url">IMS base URL</label></th>';
+        echo '<td><input type="url" id="oti-ims-base-url" name="' . esc_attr(OTI_IMS_INVOICE_PDF_BASE_URL_OPT) . '" value="' . esc_attr($ims_base_url) . '" class="regular-text" placeholder="https://ims.example.com">';
+        echo '<p class="description">HTTPS base URL for One Two Inventory. The helper constructs the fixed invoice endpoint from this site option and never follows per-order meta URLs.</p></td></tr>';
         echo '</table>';
         submit_button();
         echo '</form>';
