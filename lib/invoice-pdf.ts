@@ -21,7 +21,8 @@ const MAX_INVOICE_PDF_ID_LENGTH = 256
 const INVOICE_PDF_TOKEN_PURPOSE = 'invoice-pdf'
 const INVOICE_PDF_TOKEN_VERSION = 1
 const DEFAULT_INVOICE_PDF_TOKEN_TTL_SECONDS = 10 * 60
-const MAX_INVOICE_PDF_TOKEN_TTL_SECONDS = 10 * 60
+const DEFAULT_INVOICE_PDF_TOKEN_MAX_TTL_SECONDS = 30 * 24 * 60 * 60
+const ABSOLUTE_INVOICE_PDF_TOKEN_MAX_TTL_SECONDS = 30 * 24 * 60 * 60
 const INVOICE_PDF_TOKEN_CLOCK_SKEW_SECONDS = 5 * 60
 
 export type InvoicePdfTokenPayload = {
@@ -77,6 +78,7 @@ export type InvoicePdfTokenBinding = {
 type VerifyTokenOptions = Pick<TokenOptions, 'now'> & {
   binding?: InvoicePdfTokenBinding | null
   requireBinding?: boolean
+  env?: Record<string, string | undefined>
 }
 
 function configuredInvoicePdfStorageDir(env: Record<string, string | undefined> = process.env): string {
@@ -180,6 +182,16 @@ function getTokenTtlSeconds(env: Record<string, string | undefined> = process.en
   )
 }
 
+function getTokenMaxTtlSeconds(env: Record<string, string | undefined> = process.env): number {
+  return Math.min(
+    parsePositiveIntegerEnv(
+      env.INVOICE_PDF_TOKEN_MAX_TTL_SECONDS,
+      DEFAULT_INVOICE_PDF_TOKEN_MAX_TTL_SECONDS,
+    ),
+    ABSOLUTE_INVOICE_PDF_TOKEN_MAX_TTL_SECONDS,
+  )
+}
+
 function hmacHex(value: string): string {
   return createHmac('sha256', getSigningSecret()).update(value, 'utf8').digest('hex')
 }
@@ -269,11 +281,12 @@ export async function saveInvoicePdfFile(orderId: string, buffer: Buffer): Promi
 export function signPdfToken(orderId: string, options: TokenOptions = {}): string {
   const issuedAt = nowSeconds(options.now)
   const ttlSeconds = options.ttlSeconds ?? getTokenTtlSeconds(options.env)
+  const maxTtlSeconds = getTokenMaxTtlSeconds(options.env)
   if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0) {
     throw new Error('Invoice PDF token TTL must be a positive integer')
   }
-  if (ttlSeconds > MAX_INVOICE_PDF_TOKEN_TTL_SECONDS) {
-    throw new Error(`Invoice PDF token TTL must not exceed ${MAX_INVOICE_PDF_TOKEN_TTL_SECONDS} seconds`)
+  if (ttlSeconds > maxTtlSeconds) {
+    throw new Error(`Invoice PDF token TTL must not exceed ${maxTtlSeconds} seconds`)
   }
 
   const payload: InvoicePdfTokenPayload = {
@@ -336,7 +349,7 @@ export function verifyPdfTokenDetailed(
   if (payload.iat > now + INVOICE_PDF_TOKEN_CLOCK_SKEW_SECONDS) {
     return { valid: false, reason: 'not_yet_valid' }
   }
-  if (payload.exp - payload.iat > MAX_INVOICE_PDF_TOKEN_TTL_SECONDS) {
+  if (payload.exp - payload.iat > getTokenMaxTtlSeconds(options.env)) {
     return { valid: false, reason: 'ttl_exceeded' }
   }
   if (now >= payload.exp) return { valid: false, reason: 'expired' }

@@ -30,6 +30,7 @@ async function withInvoiceTokenEnv<T>(
     AUTH_SECRET: SECRET,
     NEXTAUTH_SECRET: undefined,
     INVOICE_PDF_TOKEN_TTL_SECONDS: undefined,
+    INVOICE_PDF_TOKEN_MAX_TTL_SECONDS: undefined,
     ...env,
   }, run)
 }
@@ -111,9 +112,39 @@ test('invoice PDF token signing rejects invalid TTL options', async () => {
       /positive integer/,
     )
     assert.throws(
-      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 10 * 60 + 1, nonce: 'nonce-1' }),
+      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 30 * 24 * 60 * 60 + 1, nonce: 'nonce-1' }),
       /must not exceed/,
     )
+  })
+})
+
+test('invoice PDF token max TTL can be configured below the absolute cap', async () => {
+  await withInvoiceTokenEnv({ INVOICE_PDF_TOKEN_MAX_TTL_SECONDS: '3600' }, () => {
+    const token = signPdfToken('order-1', { now: NOW, ttlSeconds: 3600, nonce: 'nonce-1', binding: BINDING })
+    assert.equal(verifyPdfTokenDetailed('order-1', token, {
+      now: new Date(NOW.getTime() + 3599_000),
+      binding: BINDING,
+      requireBinding: true,
+    }).valid, true)
+
+    assert.throws(
+      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 3601, nonce: 'nonce-2' }),
+      /must not exceed 3600 seconds/,
+    )
+
+    const overLimitToken = signPdfToken('order-1', {
+      now: NOW,
+      ttlSeconds: 7200,
+      nonce: 'nonce-3',
+      binding: BINDING,
+      env: { INVOICE_PDF_TOKEN_MAX_TTL_SECONDS: '7200' },
+    })
+    assert.deepEqual(verifyPdfTokenDetailed('order-1', overLimitToken, {
+      now: NOW,
+      binding: BINDING,
+      requireBinding: true,
+      env: { INVOICE_PDF_TOKEN_MAX_TTL_SECONDS: '3600' },
+    }), { valid: false, reason: 'ttl_exceeded' })
   })
 })
 
@@ -267,9 +298,12 @@ test('invoice PDF route audits rejected token attempts without logging token val
     verification: PdfTokenVerificationResult
     tokenPresent: boolean
     tokenLength: number
+    userAgent: string | null
   }> = []
   const response = await handleInvoicePdfRoute(
-    new NextRequest(`http://ims.test/api/invoices/order-1?token=${token}`),
+    new NextRequest(`http://ims.test/api/invoices/order-1?token=${token}`, {
+      headers: { 'user-agent': 'IMS-Test-Agent/1.0' },
+    }),
     { id: 'order-1' },
     {
       async loadInvoicePdf() {
@@ -285,11 +319,15 @@ test('invoice PDF route audits rejected token attempts without logging token val
   )
 
   assert.equal(response.status, 403)
+  assert.deepEqual(await response.json(), {
+    error: 'Invalid or expired invoice PDF link. Return to the invoice page and request a fresh link.',
+  })
   assert.equal(response.headers.get('cache-control'), 'private, no-store')
   assert.equal(audits.length, 1)
   assert.equal(audits[0].orderId, 'order-1')
   assert.equal(audits[0].tokenPresent, true)
   assert.equal(audits[0].tokenLength, token.length)
+  assert.equal(audits[0].userAgent, 'IMS-Test-Agent/1.0')
   assert.deepEqual(audits[0].verification, { valid: false, reason: 'bad_signature' })
   assert.doesNotMatch(JSON.stringify(audits), /secret-token-value/)
 })

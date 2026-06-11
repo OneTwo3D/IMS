@@ -385,8 +385,8 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ### P6.4 — Invoice PDF token leakage mitigation
 - **Status:** Complete.
 - **File:** `app/api/invoices/[id]/route.ts:105`
-- **Fix:** Invoice PDF tokens now default to a 10-minute maximum TTL, carry hashed session/IP binding claims, are verified against the current IMS session and client IP, and use the token nonce in `Content-Disposition` rather than the order id. Customer-visible shopping invoice PDFs use `/api/shopping/{connector}/invoice-pdf`: the shopping platform verifies customer login/order ownership, then calls IMS server-to-server with a short-lived connector HMAC request. WooCommerce helper-plugin buttons use that flow instead of storing reusable IMS PDF URLs.
-- **Tests:** `tests/security/invoice-pdf-token.test.ts` covers copied-token rejection for another session/IP, bound-token requirement, short TTL limits, and non-order-id response filenames. `tests/security/shopping-invoice-pdf.test.ts` covers signed shopping customer invoice requests and storage access guards.
+- **Fix:** Invoice PDF tokens default to a 10-minute lifetime with a configurable maximum lifetime capped at 30 days, carry hashed session/IP binding claims, are verified against the current IMS session and client IP, and keep the invoice/order id in the sanitized `Content-Disposition` filename. Customer-visible shopping invoice PDFs use `/api/shopping/{connector}/invoice-pdf`: the shopping platform verifies customer login/order ownership, then calls IMS server-to-server with a short-lived connector HMAC request. WooCommerce helper-plugin buttons use that flow instead of storing reusable IMS PDF URLs.
+- **Tests:** `tests/security/invoice-pdf-token.test.ts` covers copied-token rejection for another session/IP, bound-token requirement, configurable TTL limits, and invoice-id response filenames. `tests/security/shopping-invoice-pdf.test.ts` covers signed shopping customer invoice requests and storage access guards.
 
 ### P6.5 — Error messages reveal connector field names
 - **Status:** Complete.
