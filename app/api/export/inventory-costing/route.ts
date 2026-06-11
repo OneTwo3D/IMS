@@ -17,6 +17,16 @@ import { inventoryCostingApiAccessDenied } from '@/lib/security/inventory-costin
 
 export const INVENTORY_VALUATION_CSV_HEADERS = ['sku', 'mpn', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase']
 
+type InventoryCostingExportDeps = {
+  requireApiAuth: typeof requireApiAuth
+  accessDenied: typeof inventoryCostingApiAccessDenied
+  getInventoryValuationReport: typeof getInventoryValuationReport
+  getCogsReport: typeof getCogsReport
+  getLandedCostReport: typeof getLandedCostReport
+  getInventoryTurnoverReport: typeof getInventoryTurnoverReport
+  loadMpnByProductId: typeof loadMpnByProductId
+}
+
 async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
   const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
   if (ids.length === 0) return new Map()
@@ -27,10 +37,24 @@ async function loadMpnByProductId(productIds: Array<string | null | undefined>):
   return new Map(products.map((product) => [product.id, product.mpn ?? '']))
 }
 
-export async function GET(req: NextRequest) {
-  const session = await requireApiAuth()
+const defaultInventoryCostingExportDeps: InventoryCostingExportDeps = {
+  requireApiAuth,
+  accessDenied: inventoryCostingApiAccessDenied,
+  getInventoryValuationReport,
+  getCogsReport,
+  getLandedCostReport,
+  getInventoryTurnoverReport,
+  loadMpnByProductId,
+}
+
+export async function getInventoryCostingExportResponse(
+  req: NextRequest,
+  deps: Partial<InventoryCostingExportDeps> = {},
+) {
+  const resolvedDeps = { ...defaultInventoryCostingExportDeps, ...deps }
+  const session = await resolvedDeps.requireApiAuth()
   if (session instanceof NextResponse) return session
-  const denied = inventoryCostingApiAccessDenied(session)
+  const denied = resolvedDeps.accessDenied(session)
   if (denied) return denied
 
   const type = req.nextUrl.searchParams.get('report') ?? 'inventory-valuation'
@@ -42,10 +66,10 @@ export async function GET(req: NextRequest) {
 
   switch (type) {
     case 'inventory-valuation': {
-      const report = await getInventoryValuationReport(filters, { paginate: false })
+      const report = await resolvedDeps.getInventoryValuationReport(filters, { paginate: false })
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         sku: row.sku,
         mpn: mpnByProductId.get(row.productId) ?? '',
@@ -70,10 +94,10 @@ export async function GET(req: NextRequest) {
     }
 
     case 'cogs': {
-      const report = await getCogsReport(filters, { paginate: false })
+      const report = await resolvedDeps.getCogsReport(filters, { paginate: false })
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         groupLabel: row.groupLabel,
         sku: row.sku ?? '',
@@ -99,10 +123,10 @@ export async function GET(req: NextRequest) {
     }
 
     case 'landed-cost': {
-      const report = await getLandedCostReport(filters, { paginate: false })
+      const report = await resolvedDeps.getLandedCostReport(filters, { paginate: false })
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         poReference: row.poReference,
         supplierName: row.supplierName,
@@ -130,7 +154,7 @@ export async function GET(req: NextRequest) {
     }
 
     case 'inventory-turnover': {
-      const report = await getInventoryTurnoverReport(filters, { paginate: false }).catch((error: unknown) => {
+      const report = await resolvedDeps.getInventoryTurnoverReport(filters, { paginate: false }).catch((error: unknown) => {
         if (error instanceof InventoryTurnoverSourceLimitError) return error
         throw error
       })
@@ -139,7 +163,7 @@ export async function GET(req: NextRequest) {
       }
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         groupLabel: row.groupLabel,
         sku: row.sku ?? '',
@@ -157,6 +181,10 @@ export async function GET(req: NextRequest) {
       return csvBufferedStreamResponse(rows, ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount'], `inventory-turnover-${date}.csv`)
     }
   }
+}
+
+export async function GET(req: NextRequest) {
+  return getInventoryCostingExportResponse(req)
 }
 
 function isInventoryCostingReportType(value: string): value is InventoryCostingReportType {

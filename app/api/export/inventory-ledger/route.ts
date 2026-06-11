@@ -16,6 +16,17 @@ import { inventoryLedgerApiAccessDenied } from '@/lib/security/inventory-ledger-
 const INVENTORY_LEDGER_CSV_ROW_LIMIT = 100000
 export const STOCK_MOVEMENT_LEDGER_CSV_HEADERS = ['createdAt', 'type', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note']
 
+type InventoryLedgerExportDeps = {
+  requireApiAuth: typeof requireApiAuth
+  accessDenied: typeof inventoryLedgerApiAccessDenied
+  getInventoryLedgerExportRowCount: typeof getInventoryLedgerExportRowCount
+  getStockMovementLedgerReport: typeof getStockMovementLedgerReport
+  getStockAdjustmentReport: typeof getStockAdjustmentReport
+  getStockTransferReport: typeof getStockTransferReport
+  getStockCountReport: typeof getStockCountReport
+  loadMpnByProductId: typeof loadMpnByProductId
+}
+
 async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
   const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
   if (ids.length === 0) return new Map()
@@ -43,10 +54,25 @@ function filtersFromRequest(req: NextRequest): InventoryLedgerFilters {
   }
 }
 
-export async function GET(req: NextRequest) {
-  const session = await requireApiAuth()
+const defaultInventoryLedgerExportDeps: InventoryLedgerExportDeps = {
+  requireApiAuth,
+  accessDenied: inventoryLedgerApiAccessDenied,
+  getInventoryLedgerExportRowCount,
+  getStockMovementLedgerReport,
+  getStockAdjustmentReport,
+  getStockTransferReport,
+  getStockCountReport,
+  loadMpnByProductId,
+}
+
+export async function getInventoryLedgerExportResponse(
+  req: NextRequest,
+  deps: Partial<InventoryLedgerExportDeps> = {},
+) {
+  const resolvedDeps = { ...defaultInventoryLedgerExportDeps, ...deps }
+  const session = await resolvedDeps.requireApiAuth()
   if (session instanceof NextResponse) return session
-  const denied = inventoryLedgerApiAccessDenied(session)
+  const denied = resolvedDeps.accessDenied(session)
   if (denied) return denied
 
   const type = req.nextUrl.searchParams.get('report') ?? 'stock-movements'
@@ -56,7 +82,7 @@ export async function GET(req: NextRequest) {
   if (!isInventoryLedgerExportReportType(type)) {
     return NextResponse.json({ error: 'Unknown inventory-ledger export type' }, { status: 400 })
   }
-  const rowCount = await getInventoryLedgerExportRowCount(type, filters)
+  const rowCount = await resolvedDeps.getInventoryLedgerExportRowCount(type, filters)
   if (rowCount > INVENTORY_LEDGER_CSV_ROW_LIMIT) {
     return NextResponse.json(
       { error: `Inventory ledger CSV exports are capped at ${INVENTORY_LEDGER_CSV_ROW_LIMIT.toLocaleString()} rows. Narrow the filters and retry.` },
@@ -66,8 +92,8 @@ export async function GET(req: NextRequest) {
 
   switch (type) {
     case 'stock-movements': {
-      const report = await getStockMovementLedgerReport(filters, { paginate: false })
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
+      const report = await resolvedDeps.getStockMovementLedgerReport(filters, { paginate: false })
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         createdAt: row.createdAt,
         type: row.type,
@@ -95,8 +121,8 @@ export async function GET(req: NextRequest) {
     }
 
     case 'stock-adjustments': {
-      const report = await getStockAdjustmentReport(filters, { paginate: false })
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
+      const report = await resolvedDeps.getStockAdjustmentReport(filters, { paginate: false })
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         createdAt: row.createdAt,
         sku: row.sku,
@@ -122,7 +148,7 @@ export async function GET(req: NextRequest) {
     }
 
     case 'transfers': {
-      const report = await getStockTransferReport(filters, { paginate: false })
+      const report = await resolvedDeps.getStockTransferReport(filters, { paginate: false })
       const rows = report.rows.map((row) => ({
         reference: row.reference,
         status: row.status,
@@ -150,8 +176,8 @@ export async function GET(req: NextRequest) {
     }
 
     case 'stock-counts': {
-      const report = await getStockCountReport(filters, { paginate: false })
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
+      const report = await resolvedDeps.getStockCountReport(filters, { paginate: false })
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         reference: row.reference,
         status: row.status,
@@ -178,6 +204,10 @@ export async function GET(req: NextRequest) {
     default:
       return NextResponse.json({ error: 'Unknown inventory-ledger export type' }, { status: 400 })
   }
+}
+
+export async function GET(req: NextRequest) {
+  return getInventoryLedgerExportResponse(req)
 }
 
 function isInventoryLedgerExportReportType(value: string): value is InventoryLedgerExportReportType {
