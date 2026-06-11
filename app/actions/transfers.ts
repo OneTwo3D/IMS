@@ -305,7 +305,7 @@ export async function updateTransferDraft(
     if (existing.status !== 'DRAFT') return { message: 'Only draft transfers can be edited.' }
 
     await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
       const lockedTransfer = await tx.stockTransfer.findUnique({ where: { id }, select: { status: true } })
       if (!lockedTransfer) throw new Error('Transfer not found.')
       if (lockedTransfer.status !== 'DRAFT') throw new Error('Only draft transfers can be edited.')
@@ -366,7 +366,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
     await requirePermission('stock_control.transfer')
     await db.$transaction(async (tx) => {
       // Lock the transfer row to prevent concurrent dispatch
-      await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
       const transfer = await tx.stockTransfer.findUnique({
         where: { id },
         select: { ...TRANSFER_SELECT, status: true },
@@ -378,7 +378,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
       // Lock stock levels for all affected products in the source warehouse
       const productIds = transfer.lines.map((l) => l.productId)
       if (productIds.length > 0) {
-        await tx.$executeRaw`SELECT "productId", "warehouseId" FROM stock_levels WHERE "productId" = ANY(${productIds}::text[]) AND "warehouseId" = ${transfer.fromWarehouseId} FOR UPDATE`
+        await tx.$queryRaw`SELECT "productId", "warehouseId" FROM stock_levels WHERE "productId" = ANY(${productIds}::text[]) AND "warehouseId" = ${transfer.fromWarehouseId} FOR UPDATE`
       }
 
       // Validate available stock for each line before making any changes
@@ -544,7 +544,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
     await requirePermission('stock_control.transfer')
     await db.$transaction(async (tx) => {
       // Lock the transfer row to prevent concurrent receive
-      await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
       const transfer = await tx.stockTransfer.findUnique({
         where: { id },
         select: { ...TRANSFER_SELECT, status: true },

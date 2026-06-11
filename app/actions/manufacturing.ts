@@ -532,7 +532,7 @@ export async function updateManufacturingOrderStatus(
       await db.$transaction(async (tx) => {
         // Lock the production order row and re-read inside the tx to
         // prevent concurrent completion from duplicating stock mutations.
-        await tx.$executeRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
+        await tx.$queryRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
         const order = await tx.productionOrder.findUnique({
           where: { id },
           select: {
@@ -933,7 +933,7 @@ export async function updateManufacturingOrderStatus(
       const qtyPlanned = Number(orderPreview.qtyPlanned)
       // Reserve inside the same locked transaction as the status transition.
       await db.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
+        await tx.$queryRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
         const lockedOrder = await tx.productionOrder.findUnique({
           where: { id },
           select: { status: true },

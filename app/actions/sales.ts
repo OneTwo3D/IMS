@@ -299,7 +299,7 @@ async function refreshDraftOrderFxAtFinalization(
 ): Promise<void> {
   const baseCurrency = await getBaseCurrencyCode()
   await db.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
     const order = await tx.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -2046,7 +2046,7 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
     const { getNumberingFormats } = await import('./company')
     const numbering = await getNumberingFormats()
     const result = await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${id} FOR UPDATE`
       const so = await tx.salesOrder.findUnique({ where: { id }, select: { externalOrderNumber: true, orderNumber: true, invoiceNumber: true } })
       if (!so) throw new Error('Order not found')
       if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
@@ -2118,7 +2118,7 @@ export async function addPayment(input: {
     if (!input.amount || input.amount <= 0) return { success: false, error: 'Amount must be greater than 0' }
     const baseCurrency = await getBaseCurrencyCode()
     const txResult = await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
       const so = await tx.salesOrder.findUnique({
         where: { id: input.orderId },
         select: {
@@ -2276,7 +2276,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
   try {
     await requirePermission('sales.refund')
     const txResult = await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
       const so = await tx.salesOrder.findUnique({
         where: { id: orderId },
         select: {

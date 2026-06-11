@@ -118,7 +118,7 @@ async function buildLayerSnapshot(
       select: { id: true, remainingQty: true, unitCostBase: true },
     })
     if (candidateLayers.length > 0) {
-      await tx.$executeRaw`SELECT id FROM cost_layers WHERE id = ANY(${candidateLayers.map((layer) => layer.id)}::text[]) FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM cost_layers WHERE id = ANY(${candidateLayers.map((layer) => layer.id)}::text[]) FOR UPDATE`
     }
     const layers = candidateLayers.length === 0
       ? []
