@@ -83,5 +83,7 @@ test('WooCommerce pending FX payload is currency-agnostic and replayable', () =>
   assert.equal(isQueuedWcOrderPayload(payload), true)
   assert.equal(isQueuedWcOrderPayload({ ...payload, reason: 'Missing GBP FX rate for EUR' }), false)
   assert.equal(isQueuedWcOrderPayload({ ...payload, connector: 'shopify' }), false)
+  assert.equal(isQueuedWcOrderPayload({ ...payload, externalOrderNumber: 123 }), false)
+  assert.equal(isQueuedWcOrderPayload({ ...payload, asOf: 0 }), false)
   assert.equal(isQueuedWcOrderPayload({ ...payload, order: { id: '987' } }), false)
 })

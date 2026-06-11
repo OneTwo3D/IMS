@@ -178,7 +178,7 @@ export async function applyStockAdjustment({
     create: { productId, warehouseId, quantity: 0 },
     update: {},
   })
-  await tx.$executeRaw`
+  await tx.$queryRaw`
     SELECT "productId", "warehouseId"
     FROM stock_levels
     WHERE "productId" = ${productId}
@@ -297,7 +297,7 @@ export async function applyOpeningStock({
     create: { productId, warehouseId, quantity: 0 },
     update: {},
   })
-  await tx.$executeRaw`
+  await tx.$queryRaw`
     SELECT "productId", "warehouseId"
     FROM stock_levels
     WHERE "productId" = ${productId}

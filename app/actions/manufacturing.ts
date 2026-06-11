@@ -437,7 +437,7 @@ async function assertStockAvailable(
   qty: number,
   options: { includeReserved?: boolean; requireReserved?: boolean } = {},
 ) {
-  await tx.$executeRaw`
+  await tx.$queryRaw`
     SELECT "productId", "warehouseId"
     FROM stock_levels
     WHERE "productId" = ${productId}
@@ -467,7 +467,7 @@ async function reserveAvailableStock(
     create: { productId, warehouseId, quantity: 0, reservedQty: 0 },
     update: {},
   })
-  await tx.$executeRaw`
+  await tx.$queryRaw`
     SELECT "productId", "warehouseId"
     FROM stock_levels
     WHERE "productId" = ${productId}

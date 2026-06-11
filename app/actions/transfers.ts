@@ -93,7 +93,7 @@ async function validateTransferAvailability(
   }
 
   for (const [productId, requested] of requestedByProduct) {
-    await tx.$executeRaw`
+    await tx.$queryRaw`
       SELECT "productId", "warehouseId"
       FROM stock_levels
       WHERE "productId" = ${productId}
@@ -569,7 +569,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
           })),
           skipDuplicates: true,
         })
-        await tx.$executeRaw`
+        await tx.$queryRaw`
           SELECT "productId", "warehouseId"
           FROM stock_levels
           WHERE "productId" = ANY(${productIds}::text[])

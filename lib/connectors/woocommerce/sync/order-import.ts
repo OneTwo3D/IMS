@@ -779,7 +779,12 @@ export function isQueuedWcOrderPayload(payload: unknown): payload is PendingFxOr
     && (payload as { reason?: unknown }).reason === MISSING_FX_RATE_QUEUE_REASON
     && (payload as { connector?: unknown }).connector === 'woocommerce'
     && typeof (payload as { externalOrderId?: unknown }).externalOrderId === 'string'
+    && typeof (payload as { externalOrderNumber?: unknown }).externalOrderNumber === 'string'
     && typeof (payload as { currency?: unknown }).currency === 'string'
+    && (
+      (payload as { asOf?: unknown }).asOf === null
+      || typeof (payload as { asOf?: unknown }).asOf === 'string'
+    )
     && typeof (payload as { order?: { id?: unknown } }).order?.id === 'number'
 }
 
