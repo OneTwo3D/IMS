@@ -1275,6 +1275,57 @@ export async function createSalesOrderRefund(
     if (!so) return { error: 'Order not found' } as const
 
     const fxRate = refundBoundaryNumber(so.fxRateToBase) || 1
+
+    if (input.externalRefundId != null) {
+      const existingExternalRefund = await tx.salesOrderRefund.findFirst({
+        where: {
+          orderId: input.orderId,
+          externalRefundId: input.externalRefundId,
+        },
+        select: {
+          id: true,
+          creditNoteNumber: true,
+          totalBase: true,
+          lines: {
+            select: {
+              id: true,
+              salesOrderLineId: true,
+              productId: true,
+              description: true,
+              qty: true,
+              unitPriceForeign: true,
+              unitPriceBase: true,
+              totalForeign: true,
+              totalBase: true,
+            },
+          },
+        },
+      })
+      if (existingExternalRefund) {
+        return {
+          replay: true as const,
+          so,
+          fxRate,
+          replayTotalBase: refundBoundaryNumber(existingExternalRefund.totalBase),
+          createdRefund: { id: existingExternalRefund.id },
+          createdRefundLines: existingExternalRefund.lines.map((line) => ({
+            id: line.id,
+            lineId: line.salesOrderLineId ?? null,
+            productId: line.productId,
+            description: line.description,
+            qty: refundBoundaryNumber(line.qty),
+            unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
+            unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
+            totalForeign: refundBoundaryNumber(line.totalForeign),
+            totalBase: refundBoundaryNumber(line.totalBase),
+            lineKind: line.salesOrderLineId == null ? 'shipping' as const : 'sale' as const,
+          })),
+          creditNoteNumber: existingExternalRefund.creditNoteNumber ?? '',
+          newStatus: so.status === 'REFUNDED' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
+        }
+      }
+    }
+
     if (
       input.returnWarehouseId &&
       refundLines.some((refundLine) => refundLine.productId && refundLine.qty > 0) &&
@@ -1430,6 +1481,24 @@ export async function createSalesOrderRefund(
   if ('error' in txResult) return { success: false, error: txResult.error ?? 'Refund failed' }
 
   const refundOrderRef = getSalesOrderReference(txResult.so)
+  if ('replay' in txResult) {
+    if (txResult.replayTotalBase == null) throw new Error('Refund replay result missing persisted total')
+    return {
+      success: true,
+      orderId: input.orderId,
+      totalBase: txResult.replayTotalBase,
+      refundFxRate: txResult.fxRate,
+      createdRefund: txResult.createdRefund,
+      createdRefundLines: txResult.createdRefundLines,
+      creditNoteNumber: txResult.creditNoteNumber,
+      newStatus: txResult.newStatus,
+      refundOrderRef,
+      so: txResult.so,
+      accountingSyncs: [],
+      returnedRows: [],
+    }
+  }
+
   let accountingSyncs: RefundAccountingSyncRequest[] = []
   let accountingWarning: string | undefined
   let snapshotReturnRows: RefundReturnRow[] | null = null

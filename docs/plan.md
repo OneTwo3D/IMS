@@ -110,7 +110,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Acceptance:**
   - Replaying a refund with the same idempotency key produces zero new cost layers.
   - A test simulating retry asserts the state is identical to first-run state.
-- **Tests:** `tests/refund-service.idempotency.test.ts` — call `processRefund` twice with same key, assert one set of movements and one set of layers.
+- **Tests:** `tests/domain/sales/refund-service.test.ts` — `createSalesOrderRefund replays external refunds without duplicate stock side effects` calls the refund service twice with the same external refund id and asserts movements, cost layers, refund rows, refund lines, and stock quantity are unchanged on replay.
 
 ### P1.4 — WooCommerce refund webhook not idempotent
 - **Status:** Complete.
@@ -288,7 +288,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Status:** Complete.
 - **File:** `app/actions/purchase-orders.ts:1985–2018`
 - **Fix:** Wrap the state transition validation: if already CANCELLED, return success without changes.
-- **Tests:** `tests/domain/purchasing/po-cancellation.test.ts` covers the cancellation no-op helper used by `cancelPurchaseOrder()`.
+- **Tests:** `tests/domain/purchasing/po-cancellation.test.ts` — `cancelPurchaseOrder action is idempotent when called twice` covers the action returning success on replay without duplicate cancellation logs, accounting syncs, or stock-sync enqueueing.
 
 ### P4.5 — Stock movement `unitCostBase` not finite-checked
 - **Status:** Complete.

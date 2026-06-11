@@ -39,7 +39,7 @@ import {
   getRealisedFxAccounts,
   resolveSettlementFxRateToBase,
 } from '@/lib/accounting-fx'
-import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
+import { Prisma, type PurchaseOrderStatus, type TaxCategory } from '@/app/generated/prisma/client'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
   buildStockMovementValueFields,
@@ -48,8 +48,40 @@ import {
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
-async function logPurchaseOrderCancellationNoop(id: string, reference: string): Promise<void> {
-  await logActivity({
+/** @internal Test seam for cancellation replay behavior; production calls use the default deps. */
+export type CancelPurchaseOrderDeps = {
+  requirePermission: typeof requirePermission
+  findPurchaseOrderFast(id: string): Promise<{ status: PurchaseOrderStatus; reference: string } | null>
+  transaction<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>, options: typeof STOCK_TX_OPTIONS): Promise<T>
+  revalidatePath: typeof revalidatePath
+  logActivity: typeof logActivity
+  enqueueStockSync: typeof enqueueStockSync
+  getAccountingSettings: typeof getAccountingSettings
+  queueAccountingSyncTx: typeof queueAccountingSyncTx
+  reversePurchaseOrderCostLayersForCancellation: typeof reversePurchaseOrderCostLayersForCancellation
+}
+
+const defaultCancelPurchaseOrderDeps: CancelPurchaseOrderDeps = {
+  requirePermission,
+  findPurchaseOrderFast: (id) => db.purchaseOrder.findUnique({
+    where: { id },
+    select: { status: true, reference: true },
+  }),
+  transaction: (fn, options) => db.$transaction(fn, options),
+  revalidatePath,
+  logActivity,
+  enqueueStockSync,
+  getAccountingSettings,
+  queueAccountingSyncTx,
+  reversePurchaseOrderCostLayersForCancellation,
+}
+
+async function logPurchaseOrderCancellationNoop(
+  deps: Pick<CancelPurchaseOrderDeps, 'logActivity'>,
+  id: string,
+  reference: string,
+): Promise<void> {
+  await deps.logActivity({
     entityType: 'PURCHASE_ORDER',
     entityId: id,
     action: 'cancelled_noop',
@@ -2028,24 +2060,39 @@ export async function cancelPurchaseOrder(id: string): Promise<{
   error?: string
   notice?: string
   reversedCostLayers?: PurchaseOrderCostLayerReversal[]
+}>
+export async function cancelPurchaseOrder(
+  id: string,
+  deps: CancelPurchaseOrderDeps,
+): Promise<{
+  success: boolean
+  error?: string
+  notice?: string
+  reversedCostLayers?: PurchaseOrderCostLayerReversal[]
+}>
+export async function cancelPurchaseOrder(
+  id: string,
+  deps: CancelPurchaseOrderDeps = defaultCancelPurchaseOrderDeps,
+): Promise<{
+  success: boolean
+  error?: string
+  notice?: string
+  reversedCostLayers?: PurchaseOrderCostLayerReversal[]
 }> {
   try {
-    await requirePermission('purchasing.create')
+    await deps.requirePermission('purchasing.create')
     const cancellationDate = new Date().toISOString().slice(0, 10)
 
-    const fastExisting = await db.purchaseOrder.findUnique({
-      where: { id },
-      select: { status: true, reference: true },
-    })
+    const fastExisting = await deps.findPurchaseOrderFast(id)
     if (!fastExisting) throw new Error('PO not found')
     if (isPurchaseOrderCancellationNoop(fastExisting.status)) {
-      await logPurchaseOrderCancellationNoop(id, fastExisting.reference)
-      revalidatePath('/purchase-orders')
-      revalidatePath(`/purchase-orders/${id}`)
+      await logPurchaseOrderCancellationNoop(deps, id, fastExisting.reference)
+      deps.revalidatePath('/purchase-orders')
+      deps.revalidatePath(`/purchase-orders/${id}`)
       return { success: true }
     }
 
-    const cancellation = await db.$transaction(async (tx) => {
+    const cancellation = await deps.transaction(async (tx) => {
       const existing = await tx.purchaseOrder.findUnique({
         where: { id },
         select: {
@@ -2066,7 +2113,7 @@ export async function cancelPurchaseOrder(id: string): Promise<{
       if (!transition.success) throw new Error(transition.error)
       assertPurchaseOrderCancellationHasNoInvoices(existing._count.invoices)
 
-      const reversal = await reversePurchaseOrderCostLayersForCancellation(tx, {
+      const reversal = await deps.reversePurchaseOrderCostLayersForCancellation(tx, {
         poId: id,
         poReference: existing.reference,
         poLineIds: existing.lines.map((line) => line.id),
@@ -2075,7 +2122,7 @@ export async function cancelPurchaseOrder(id: string): Promise<{
       await tx.purchaseOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
 
       if (reversal.totalReversalValueBase.gt(0.000001)) {
-        const accountingSettings = await getAccountingSettings()
+        const accountingSettings = await deps.getAccountingSettings()
         const amount = roundQuantity(reversal.totalReversalValueBase, 2).toNumber()
         if (accountingSettings.syncEnabled) {
           const payload = {
@@ -2095,7 +2142,7 @@ export async function cancelPurchaseOrder(id: string): Promise<{
               },
             ],
           }
-          await queueAccountingSyncTx(tx, {
+          await deps.queueAccountingSyncTx(tx, {
             type: 'INVENTORY_ADJUSTMENT',
             referenceType: 'PurchaseOrder',
             referenceId: id,
@@ -2109,15 +2156,15 @@ export async function cancelPurchaseOrder(id: string): Promise<{
     }, STOCK_TX_OPTIONS)
 
     if (cancellation.alreadyCancelled) {
-      await logPurchaseOrderCancellationNoop(id, cancellation.reference)
-      revalidatePath('/purchase-orders')
-      revalidatePath(`/purchase-orders/${id}`)
+      await logPurchaseOrderCancellationNoop(deps, id, cancellation.reference)
+      deps.revalidatePath('/purchase-orders')
+      deps.revalidatePath(`/purchase-orders/${id}`)
       return { success: true }
     }
 
-    revalidatePath('/purchase-orders')
-    revalidatePath(`/purchase-orders/${id}`)
-    await logActivity({
+    deps.revalidatePath('/purchase-orders')
+    deps.revalidatePath(`/purchase-orders/${id}`)
+    await deps.logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'cancelled',
@@ -2135,11 +2182,11 @@ export async function cancelPurchaseOrder(id: string): Promise<{
 
     if (cancellation.reversal.productIds.length > 0) {
       try {
-        await enqueueStockSync(cancellation.reversal.productIds, 'IMS_CHANGE')
+        await deps.enqueueStockSync(cancellation.reversal.productIds, 'IMS_CHANGE')
       } catch (syncError) {
         const syncMessage = syncError instanceof Error ? syncError.message : String(syncError)
         console.error(syncError)
-        await logActivity({
+        await deps.logActivity({
           entityType: 'PURCHASE_ORDER',
           entityId: id,
           action: 'stock_sync_enqueue_failed',
@@ -2164,7 +2211,7 @@ export async function cancelPurchaseOrder(id: string): Promise<{
     }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
-    await logActivity({
+    await deps.logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'cancelled',
