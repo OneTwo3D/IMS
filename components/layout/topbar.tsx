@@ -245,9 +245,9 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
       {sectionTitle && (
         <div className="flex min-w-0 items-center gap-2">
           <Boxes className="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
-          <span className="truncate text-sm font-semibold tracking-wide">
+          <h1 className="truncate text-sm font-semibold tracking-wide">
             {sectionTitle}
-          </span>
+          </h1>
         </div>
       )}
       <div className="flex flex-1 items-center justify-end gap-2" />
