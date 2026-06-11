@@ -14,6 +14,17 @@ import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-acce
 const STOCK_POSITION_CSV_ROW_LIMIT = 50000
 export const STOCK_ON_HAND_CSV_HEADERS = ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount']
 
+type StockPositionExportDeps = {
+  requireApiAuth: typeof requireApiAuth
+  accessDenied: typeof stockPositionApiAccessDenied
+  getStockOnHandReport: typeof getStockOnHandReport
+  getStockAllocationReport: typeof getStockAllocationReport
+  getNegativeStockReport: typeof getNegativeStockReport
+  getInventoryAgingReport: typeof getInventoryAgingReport
+  getDeadStockReport: typeof getDeadStockReport
+  loadMpnByProductId: typeof loadMpnByProductId
+}
+
 async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
   const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
   if (ids.length === 0) return new Map()
@@ -56,10 +67,25 @@ function rejectOversizedExport(totalRows: number): NextResponse | null {
     : null
 }
 
-export async function GET(req: NextRequest) {
-  const session = await requireApiAuth()
+const defaultStockPositionExportDeps: StockPositionExportDeps = {
+  requireApiAuth,
+  accessDenied: stockPositionApiAccessDenied,
+  getStockOnHandReport,
+  getStockAllocationReport,
+  getNegativeStockReport,
+  getInventoryAgingReport,
+  getDeadStockReport,
+  loadMpnByProductId,
+}
+
+export async function getStockPositionExportResponse(
+  req: NextRequest,
+  deps: Partial<StockPositionExportDeps> = {},
+) {
+  const resolvedDeps = { ...defaultStockPositionExportDeps, ...deps }
+  const session = await resolvedDeps.requireApiAuth()
   if (session instanceof NextResponse) return session
-  const denied = stockPositionApiAccessDenied(session)
+  const denied = resolvedDeps.accessDenied(session)
   if (denied) return denied
 
   const type = req.nextUrl.searchParams.get('type') ?? 'stock-on-hand'
@@ -67,10 +93,10 @@ export async function GET(req: NextRequest) {
 
   switch (type) {
     case 'stock-on-hand': {
-      const report = await getStockOnHandReport(stockPositionFilters(req), { paginate: false })
+      const report = await resolvedDeps.getStockOnHandReport(stockPositionFilters(req), { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
         mpn: mpnByProductId.get(r.productId) ?? '',
@@ -98,10 +124,10 @@ export async function GET(req: NextRequest) {
     }
 
     case 'stock-allocations': {
-      const report = await getStockAllocationReport(stockPositionFilters(req), { paginate: false })
+      const report = await resolvedDeps.getStockAllocationReport(stockPositionFilters(req), { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
         mpn: mpnByProductId.get(r.productId) ?? '',
@@ -128,10 +154,10 @@ export async function GET(req: NextRequest) {
     }
 
     case 'negative-stock': {
-      const report = await getNegativeStockReport(stockPositionFilters(req), { paginate: false })
+      const report = await resolvedDeps.getNegativeStockReport(stockPositionFilters(req), { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
         mpn: mpnByProductId.get(r.productId) ?? '',
@@ -156,7 +182,7 @@ export async function GET(req: NextRequest) {
     }
 
     case 'inventory-aging': {
-      const report = await getInventoryAgingReport(stockPositionFilters(req), { paginate: false }).catch((error: unknown) => {
+      const report = await resolvedDeps.getInventoryAgingReport(stockPositionFilters(req), { paginate: false }).catch((error: unknown) => {
         if (error instanceof InventoryHealthSourceLimitError) return error
         throw error
       })
@@ -165,7 +191,7 @@ export async function GET(req: NextRequest) {
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
         mpn: mpnByProductId.get(r.productId) ?? '',
@@ -187,7 +213,7 @@ export async function GET(req: NextRequest) {
     }
 
     case 'dead-stock': {
-      const report = await getDeadStockReport(stockPositionFilters(req), { paginate: false }).catch((error: unknown) => {
+      const report = await resolvedDeps.getDeadStockReport(stockPositionFilters(req), { paginate: false }).catch((error: unknown) => {
         if (error instanceof InventoryHealthSourceLimitError) return error
         throw error
       })
@@ -196,7 +222,7 @@ export async function GET(req: NextRequest) {
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
         mpn: mpnByProductId.get(r.productId) ?? '',
@@ -219,4 +245,8 @@ export async function GET(req: NextRequest) {
     default:
       return NextResponse.json({ error: 'Unknown stock-position export type' }, { status: 400 })
   }
+}
+
+export async function GET(req: NextRequest) {
+  return getStockPositionExportResponse(req)
 }
