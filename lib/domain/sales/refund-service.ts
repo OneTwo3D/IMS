@@ -1248,7 +1248,7 @@ export async function createSalesOrderRefund(
   const totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
   const txResult = await runInTransaction(client, async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REFUND_ACCOUNTING_LOCK_KEY})`
-    await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
+    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
 
     const so = await tx.salesOrder.findUnique({
       where: { id: input.orderId },

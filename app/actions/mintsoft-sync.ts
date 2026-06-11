@@ -2068,7 +2068,7 @@ export async function createMintsoftPurchaseOrderAsn(
 
   async function reserveAsn(): Promise<AsnReservation> {
     return db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${parsedId.data} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${parsedId.data} FOR UPDATE`
 
       const po = await tx.purchaseOrder.findUnique({
         where: { id: parsedId.data },
@@ -2420,7 +2420,7 @@ export async function createMintsoftPurchaseOrderAsn(
     reservation: Extract<AsnReservation, { kind: 'pending' }>,
   ): Promise<string | null> {
     return db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${reservation.poId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${reservation.poId} FOR UPDATE`
 
       const po = await tx.purchaseOrder.findUnique({
         where: { id: reservation.poId },
@@ -2546,7 +2546,7 @@ export async function createMintsoftPurchaseOrderAsn(
     const mappedLines = mapCreatedMintsoftAsnLines(reservation.lines, createdAsn.externalAsnId, createdAsn)
 
     return db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM wms_asn_maps WHERE id = ${reservation.asnMapId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM wms_asn_maps WHERE id = ${reservation.asnMapId} FOR UPDATE`
 
       const conflictingAsn = await tx.wmsAsnMap.findUnique({
         where: {
@@ -2963,7 +2963,7 @@ export async function createMintsoftTransferAsn(
 
   async function reserveAsn(): Promise<AsnReservation> {
     return db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${parsedId.data} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${parsedId.data} FOR UPDATE`
 
       const transfer = await tx.stockTransfer.findUnique({
         where: { id: parsedId.data },
@@ -3321,7 +3321,7 @@ export async function createMintsoftTransferAsn(
     reservation: Extract<AsnReservation, { kind: 'pending' }>,
   ): Promise<string | null> {
     return db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${reservation.transferId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${reservation.transferId} FOR UPDATE`
 
       const transfer = await tx.stockTransfer.findUnique({
         where: { id: reservation.transferId },
@@ -3447,7 +3447,7 @@ export async function createMintsoftTransferAsn(
     const mappedLines = mapCreatedMintsoftAsnLines(reservation.lines, createdAsn.externalAsnId, createdAsn)
 
     return db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM wms_asn_maps WHERE id = ${reservation.asnMapId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM wms_asn_maps WHERE id = ${reservation.asnMapId} FOR UPDATE`
 
       const conflictingAsn = await tx.wmsAsnMap.findUnique({
         where: {
@@ -3781,7 +3781,7 @@ export async function restockMintsoftReturnInboxItem(
 
   try {
     await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM wms_returns_inbox WHERE id = ${data.id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM wms_returns_inbox WHERE id = ${data.id} FOR UPDATE`
 
       const [item, warehouse] = await Promise.all([
         tx.wmsReturnsInbox.findFirst({

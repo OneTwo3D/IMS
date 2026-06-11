@@ -461,7 +461,7 @@ export async function transitionShipmentStatus(
   }
 
   const transitioned = await runInTransaction(client, async (tx) => {
-    await tx.$executeRaw`SELECT id FROM shipments WHERE id = ${shipmentId} FOR UPDATE`
+    await tx.$queryRaw`SELECT id FROM shipments WHERE id = ${shipmentId} FOR UPDATE`
     const locked = await tx.shipment.findUnique({
       where: { id: shipmentId },
       select: { status: true },
@@ -509,7 +509,7 @@ export async function reconcileOrderAfterShipment(
     .join(', ')
 
   await runInTransaction(client, async (tx) => {
-    await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${shipment.orderId} FOR UPDATE`
+    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${shipment.orderId} FOR UPDATE`
     const currentOrder = await tx.salesOrder.findUnique({
       where: { id: shipment.orderId },
       select: { status: true },

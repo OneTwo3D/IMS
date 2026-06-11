@@ -190,7 +190,7 @@ async function reserveStockSyncJob(
   triggeredBy: string,
 ): Promise<StockSyncReservation> {
   return db.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT id FROM external_wms_bindings WHERE id = ${bindingId} FOR UPDATE`
+    await tx.$queryRaw`SELECT id FROM external_wms_bindings WHERE id = ${bindingId} FOR UPDATE`
 
     const binding = await tx.externalWmsBinding.findFirst({
       where: {
@@ -559,7 +559,7 @@ async function lockAlignmentCandidateLines(
   candidateIds: string[],
 ): Promise<void> {
   if (candidateIds.length === 0) return
-  await tx.$executeRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${candidateIds}::text[]) ORDER BY id FOR UPDATE`
+  await tx.$queryRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${candidateIds}::text[]) ORDER BY id FOR UPDATE`
 }
 
 async function lockStockLevelForAlignment(

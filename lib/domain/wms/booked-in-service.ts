@@ -301,7 +301,7 @@ export async function processBookedInEvent(
       : null
 
     const processed = await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
 
       const lockedEvent = await tx.wmsInboundReceiptEvent.findUnique({
         where: { id: event.id },
@@ -366,7 +366,7 @@ export async function processBookedInEvent(
         },
       })
       if (lineIds.length > 0) {
-        await tx.$executeRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${lineIds.map((line) => line.id)}::text[]) ORDER BY id FOR UPDATE`
+        await tx.$queryRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${lineIds.map((line) => line.id)}::text[]) ORDER BY id FOR UPDATE`
       }
 
       const asnLines = await tx.wmsAsnLineMap.findMany({
@@ -604,7 +604,7 @@ export async function processBookedInEvent(
       const touchedProductIds = new Set<string>()
 
       for (const [poId, receiptLines] of receiptLinesByPoId) {
-        await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
+        await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
 
         const po = await tx.purchaseOrder.findUnique({
           where: { id: poId },
@@ -791,7 +791,7 @@ export async function processBookedInEvent(
       }
 
       for (const [transferId, receiptLines] of receiptLinesByTransferId) {
-        await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${transferId} FOR UPDATE`
+        await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${transferId} FOR UPDATE`
 
         const transfer = await tx.stockTransfer.findUnique({
           where: { id: transferId },

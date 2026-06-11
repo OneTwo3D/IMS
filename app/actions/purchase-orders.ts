@@ -1561,7 +1561,7 @@ export async function advancePoStatus(
   try {
     await requirePermission('purchasing.create')
     const result = await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
       const existing = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
       if (!existing) throw new Error('PO not found')
       if (existing.status === targetStatus) {
@@ -1726,7 +1726,7 @@ export async function receivePurchaseOrder(
     const receiptRef = `RCP-${po.reference}-${Date.now().toString(36).toUpperCase()}`
     const receiptResult = await db.$transaction(async (tx) => {
       // Lock the PO row to prevent concurrent receipts from over-receiving
-      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
 
       const currentPo = await tx.purchaseOrder.findUnique({
         where: { id },
@@ -2513,9 +2513,9 @@ export async function createInvoice(
     }
 
     await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
-      await tx.$executeRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ${poId} FOR UPDATE`
-      await tx.$executeRaw`SELECT id FROM freight_cost_lines WHERE "poId" = ${poId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ${poId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM freight_cost_lines WHERE "poId" = ${poId} FOR UPDATE`
 
       const existing = await tx.purchaseInvoiceLine.findMany({
         where: { invoice: { poId } },
