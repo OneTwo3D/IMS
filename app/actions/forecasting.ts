@@ -4,6 +4,8 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -380,11 +382,17 @@ export async function createReorderPOs(
       bySupplier.set(f.supplierId!, list)
     }
 
+    const baseCurrency = await getBaseCurrencyCode()
     let poCount = 0
     for (const [supplierId, items] of bySupplier) {
       // Get supplier info for currency
       const supplier = await db.supplier.findUnique({ where: { id: supplierId }, select: { currency: true } })
       const currency = supplier?.currency ?? 'GBP'
+      const fxRate = await resolvePurchaseOrderFxRateToBase(db, {
+        currency,
+        baseCurrency,
+        asOf: new Date(),
+      })
 
       // Get last prices
       const lastPrices = await db.supplierProduct.findMany({
@@ -399,6 +407,8 @@ export async function createReorderPOs(
       const lineData = items.map((item, i) => {
         const unitCost = priceMap.get(item.productId) ?? 0
         const total = item.recommendedOrderQty * unitCost
+        const unitCostBase = Math.round((unitCost / fxRate) * 1000000) / 1000000
+        const totalBase = Math.round((total / fxRate) * 10000) / 10000
         subtotal += total
         const reorderEvidence = {
           source: 'reorder_forecast',
@@ -425,14 +435,15 @@ export async function createReorderPOs(
           productId: item.productId,
           qty: item.recommendedOrderQty,
           unitCostForeign: unitCost,
-          unitCostBase: unitCost, // approximate — will be recalculated with FX
+          unitCostBase,
           taxForeign: 0, taxBase: 0,
           totalForeign: total,
-          totalBase: total,
+          totalBase,
           reorderEvidence,
           sortOrder: i,
         }
       })
+      const subtotalBase = Math.round((subtotal / fxRate) * 10000) / 10000
 
       await db.purchaseOrder.create({
         data: {
@@ -440,12 +451,12 @@ export async function createReorderPOs(
           type: 'GOODS',
           supplierId,
           currency,
-          fxRateToBase: 1, // user can update FX rate on the PO
+          fxRateToBase: fxRate,
           subtotalForeign: subtotal,
-          subtotalBase: subtotal,
+          subtotalBase,
           taxForeign: 0, taxBase: 0,
           totalForeign: subtotal,
-          totalBase: subtotal,
+          totalBase: subtotalBase,
           notes: 'Auto-generated from reorder forecast',
           lines: { create: lineData },
         },

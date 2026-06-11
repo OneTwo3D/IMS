@@ -15,6 +15,7 @@ import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import {
   computeGrossUnitCostBaseByLine,
   queueLandedCostAdjustmentJournals,
@@ -62,6 +63,8 @@ export type CancelPurchaseOrderDeps = {
 }
 
 const defaultCancelPurchaseOrderDeps: CancelPurchaseOrderDeps = {
+  // Production implementations are captured at module load. Tests that need
+  // alternate behavior should pass explicit deps to cancelPurchaseOrder().
   requirePermission,
   findPurchaseOrderFast: (id) => db.purchaseOrder.findUnique({
     where: { id },
@@ -257,7 +260,7 @@ export type CreatePoInput = {
   reference?: string
   supplierId: string
   currency: string
-  fxRateToBase: number
+  fxRateToBase?: number
   destinationWarehouseId?: string
   supplierRef?: string
   expectedDelivery?: string
@@ -833,7 +836,13 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       if (l.unitCostForeign < 0) return { success: false, error: `Negative cost for ${l.sku}` }
     }
 
-    const fxRate = safeFxRate(input.fxRateToBase || 1)
+    const baseCurrency = await getBaseCurrencyCode()
+    const fxRate = await resolvePurchaseOrderFxRateToBase(db, {
+      currency: input.currency,
+      baseCurrency,
+      asOf: new Date(),
+      inputRateToBase: input.fxRateToBase,
+    })
     const vatRate = input.taxRateValue ?? 0
     const inclVat = !!input.pricesIncludeVat
     let subtotalForeign = 0
@@ -1189,19 +1198,27 @@ export async function updatePurchaseOrder(
     const session = await requirePermission('purchasing.create')
     const existing = await db.purchaseOrder.findUnique({
       where: { id },
-      select: { status: true, fxRateToBase: true, directFreightForeign: true, directFreightBase: true },
+      select: { status: true, currency: true, fxRateToBase: true, directFreightForeign: true, directFreightBase: true },
     })
     if (!existing) return { success: false, error: 'PO not found' }
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be edited' }
 
-    const fxRate = input.fxRateToBase ?? Number(existing.fxRateToBase)
+    const shouldRefreshFxRate = input.currency !== undefined || input.fxRateToBase !== undefined
+    const fxRate = shouldRefreshFxRate
+      ? await resolvePurchaseOrderFxRateToBase(db, {
+          currency: input.currency ?? existing.currency,
+          baseCurrency: await getBaseCurrencyCode(),
+          asOf: new Date(),
+          inputRateToBase: input.fxRateToBase,
+        })
+      : Number(existing.fxRateToBase)
     const inclVat = !!input.pricesIncludeVat
     const vatRate = input.taxRateValue ?? 0
 
     const updates: Record<string, unknown> = {
       ...(input.supplierId !== undefined && { supplierId: input.supplierId }),
       ...(input.currency !== undefined && { currency: input.currency }),
-      ...(input.fxRateToBase !== undefined && { fxRateToBase: input.fxRateToBase }),
+      ...(shouldRefreshFxRate && { fxRateToBase: fxRate }),
       ...(input.destinationWarehouseId !== undefined && { destinationWarehouseId: input.destinationWarehouseId || null }),
       ...(input.supplierRef !== undefined && { supplierRef: input.supplierRef || null }),
       ...(input.expectedDelivery !== undefined && { expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null }),
