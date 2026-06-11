@@ -5,6 +5,10 @@ import {
   PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE,
   resolvePurchaseOrderFxRateToBase,
 } from '@/lib/domain/purchasing/purchase-order-fx'
+import {
+  buildPurchaseOrderFxRebaseUpdates,
+  rebasePurchaseOrderStoredBaseAmounts,
+} from '@/lib/domain/purchasing/purchase-order-fx-rebase'
 
 function createClient(rate: number | null) {
   return {
@@ -70,4 +74,107 @@ test('purchase-order FX resolver forces base-currency purchase orders to rate 1'
   })
 
   assert.equal(resolved, 1)
+})
+
+test('purchase-order FX rebase rebuilds stored base totals from persisted foreign values', () => {
+  const rebased = buildPurchaseOrderFxRebaseUpdates({
+    subtotalForeign: '120',
+    taxForeign: '24',
+    totalForeign: '156',
+    directFreightForeign: '12',
+    lines: [
+      { id: 'line-1', unitCostForeign: '10', totalForeign: '100', taxForeign: '20' },
+      { id: 'line-2', unitCostForeign: '5.555555', totalForeign: '20', taxForeign: '4' },
+    ],
+    freightCostLines: [
+      { id: 'freight-1', amountForeign: '12' },
+    ],
+  }, 1.2)
+
+  assert.deepEqual(rebased.purchaseOrder, {
+    subtotalBase: 100,
+    taxBase: 20,
+    totalBase: 130,
+    directFreightBase: 10,
+  })
+  assert.deepEqual(rebased.lines, [
+    { id: 'line-1', unitCostBase: 8.333333, totalBase: 83.3333, taxBase: 16.6667 },
+    { id: 'line-2', unitCostBase: 4.629629, totalBase: 16.6667, taxBase: 3.3333 },
+  ])
+  assert.deepEqual(rebased.freightCostLines, [
+    { id: 'freight-1', amountBase: 10 },
+  ])
+})
+
+test('purchase-order FX rebase updates persisted line and freight base amounts', async () => {
+  const lineUpdates: unknown[] = []
+  const freightUpdates: unknown[] = []
+  const findManyCalls: unknown[] = []
+  const db = {
+    purchaseOrderLine: {
+      findMany: async (args: unknown) => {
+        findManyCalls.push(args)
+        return [
+          { id: 'line-1', unitCostForeign: '10', totalForeign: '100', taxForeign: '20' },
+          { id: 'line-2', unitCostForeign: '5.555555', totalForeign: '20', taxForeign: '4' },
+        ]
+      },
+      update: async (args: unknown) => {
+        lineUpdates.push(args)
+        return {}
+      },
+    },
+    freightCostLine: {
+      findMany: async (args: unknown) => {
+        findManyCalls.push(args)
+        return [
+          { id: 'freight-1', amountForeign: '12' },
+        ]
+      },
+      update: async (args: unknown) => {
+        freightUpdates.push(args)
+        return {}
+      },
+    },
+  }
+
+  const purchaseOrderUpdates = await rebasePurchaseOrderStoredBaseAmounts(db, 'po-1', {
+    subtotalForeign: '120',
+    taxForeign: '24',
+    totalForeign: '156',
+    directFreightForeign: '12',
+  }, 1.2)
+
+  assert.deepEqual(findManyCalls, [
+    {
+      where: { poId: 'po-1' },
+      select: { id: true, unitCostForeign: true, totalForeign: true, taxForeign: true },
+    },
+    {
+      where: { poId: 'po-1' },
+      select: { id: true, amountForeign: true },
+    },
+  ])
+  assert.deepEqual(purchaseOrderUpdates, {
+    subtotalBase: 100,
+    taxBase: 20,
+    totalBase: 130,
+    directFreightBase: 10,
+  })
+  assert.deepEqual(lineUpdates, [
+    {
+      where: { id: 'line-1' },
+      data: { unitCostBase: 8.333333, totalBase: 83.3333, taxBase: 16.6667 },
+    },
+    {
+      where: { id: 'line-2' },
+      data: { unitCostBase: 4.629629, totalBase: 16.6667, taxBase: 3.3333 },
+    },
+  ])
+  assert.deepEqual(freightUpdates, [
+    {
+      where: { id: 'freight-1' },
+      data: { amountBase: 10 },
+    },
+  ])
 })

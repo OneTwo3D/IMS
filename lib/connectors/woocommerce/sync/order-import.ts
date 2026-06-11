@@ -43,6 +43,11 @@ export type WcTaxRateFallbackLine = {
   warning: string | null
 }
 
+// Pending FX retries intentionally persist the full WooCommerce order snapshot.
+// Replaying the same payload avoids a second connector fetch that could import a
+// later order shape under the original idempotency key. These rows should remain
+// short-lived operational retry state: successful replay deletes the queue row,
+// and failed rows are bounded by the normal shoppingSyncLog retention policy.
 export type PendingFxOrderPayload = {
   reason: typeof MISSING_FX_RATE_QUEUE_REASON
   connector: 'woocommerce'

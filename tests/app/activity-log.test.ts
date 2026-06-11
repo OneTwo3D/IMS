@@ -74,10 +74,10 @@ test('invoice PDF token security query filters to source reasons the summarizer 
   assert.deepEqual(invoicePdfTokenSecurityEventWhere(), {
     tag: 'auth',
     level: 'WARNING',
-    action: { in: ['invoice_pdf_token_security_signal', 'invoice_pdf_token_rejected'] },
     OR: [
-      { metadata: { path: ['reason'], equals: 'wrong_session' } },
-      { metadata: { path: ['reason'], equals: 'wrong_ip' } },
+      { action: 'invoice_pdf_token_security_signal' },
+      { action: 'invoice_pdf_token_rejected', metadata: { path: ['reason'], equals: 'wrong_session' } },
+      { action: 'invoice_pdf_token_rejected', metadata: { path: ['reason'], equals: 'wrong_ip' } },
     ],
   })
 })
