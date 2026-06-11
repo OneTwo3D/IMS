@@ -1,6 +1,7 @@
 import { Prisma, StockCountStatus, StockMovementType, StockTransferStatus } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { startOfNextUtcDay } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -270,10 +271,6 @@ function parseDateOnly(value: string | undefined): Date | null {
   return new Date(Date.UTC(year!, month! - 1, day!, 0, 0, 0, 0))
 }
 
-function endOfUtcDay(value: Date): Date {
-  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate(), 23, 59, 59, 999))
-}
-
 function normalizeTextFilter(value: string | undefined): string | undefined {
   const normalized = value?.replace(/\s+/g, ' ').trim()
   return normalized ? normalized.slice(0, 100) : undefined
@@ -354,7 +351,7 @@ function dateRangeWhere(filters: Pick<InventoryLedgerFilters, 'dateFrom' | 'date
   if (!from && !to) return undefined
   return {
     ...(from ? { gte: from } : {}),
-    ...(to ? { lte: endOfUtcDay(to) } : {}),
+    ...(to ? { lt: startOfNextUtcDay(to) } : {}),
   }
 }
 

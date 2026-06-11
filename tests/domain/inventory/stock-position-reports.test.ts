@@ -459,6 +459,7 @@ test('stock allocation report adds unattributed rows so source totals reconcile 
 
 test('negative stock report replays movements from an as-of opening balance and includes current negatives', async (t) => {
   void t
+  let observedMovementWhere: unknown
   const getOnHandAsOf = async () => ({
     asOf: '2026-05-31T23:59:59.999Z',
     generatedAt: '2026-06-02T10:00:00.000Z',
@@ -474,26 +475,29 @@ test('negative stock report replays movements from an as-of opening balance and 
   })
   const client = makeClient({
     stockMovement: {
-      findMany: async () => [
-        {
-          id: 'movement-1',
-          createdAt: new Date('2026-06-01T12:00:00.000Z'),
-          type: 'SALE_DISPATCH',
-          productId: 'product-1',
-          fromWarehouseId: 'warehouse-1',
-          toWarehouseId: null,
-          qty: decimal('10'),
-        },
-        {
-          id: 'movement-2',
-          createdAt: new Date('2026-06-01T15:00:00.000Z'),
-          type: 'PURCHASE_RECEIPT',
-          productId: 'product-1',
-          fromWarehouseId: null,
-          toWarehouseId: 'warehouse-1',
-          qty: decimal('7'),
-        },
-      ],
+      findMany: async (args?: unknown) => {
+        observedMovementWhere = (args as { where?: unknown } | undefined)?.where
+        return [
+          {
+            id: 'movement-1',
+            createdAt: new Date('2026-06-01T12:00:00.000Z'),
+            type: 'SALE_DISPATCH',
+            productId: 'product-1',
+            fromWarehouseId: 'warehouse-1',
+            toWarehouseId: null,
+            qty: decimal('10'),
+          },
+          {
+            id: 'movement-2',
+            createdAt: new Date('2026-06-01T15:00:00.000Z'),
+            type: 'PURCHASE_RECEIPT',
+            productId: 'product-1',
+            fromWarehouseId: null,
+            toWarehouseId: 'warehouse-1',
+            qty: decimal('7'),
+          },
+        ]
+      },
     },
     stockLevel: {
       findMany: async () => [
@@ -521,6 +525,10 @@ test('negative stock report replays movements from an as-of opening balance and 
   assert.equal(report.rows.find((row) => row.productId === 'product-1')?.minimumQty, '-9')
   assert.equal(report.rows.find((row) => row.productId === 'product-2')?.status, 'currently_negative')
   assert.equal(report.rows.find((row) => row.productId === 'product-2')?.minimumQty, '-1')
+  const createdAt = (observedMovementWhere as { createdAt?: { gte?: Date; lt?: Date; lte?: Date } }).createdAt
+  assert.equal(createdAt?.gte?.toISOString(), '2026-06-01T00:00:00.000Z')
+  assert.equal(createdAt?.lt?.toISOString(), '2026-06-03T00:00:00.000Z')
+  assert.equal(createdAt?.lte, undefined)
 })
 
 test('stock-position filter options are bounded and hydrate selected values', async () => {

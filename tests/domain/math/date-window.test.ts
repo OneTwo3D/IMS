@@ -9,6 +9,7 @@ import {
   inclusiveUtcDayCount,
   parseDateOnly,
   parseOptionalDateOnly,
+  startOfNextUtcDay,
   startOfUtcDay,
   subtractUtcDays,
   utcCalendarDayDelta,
@@ -34,6 +35,13 @@ test('date-only parsing normalizes to UTC day boundaries', () => {
   assert.equal(parseOptionalDateOnly('2026-04-05')?.toISOString(), '2026-04-05T00:00:00.000Z')
   assert.equal(parseOptionalDateOnly('bad'), undefined)
   assert.equal(parseOptionalDateOnly('2026-02-30'), undefined)
+})
+
+test('startOfNextUtcDay supports half-open timestamp range filters', () => {
+  const day = new Date('2026-06-09T12:34:56.789Z')
+
+  assert.equal(startOfNextUtcDay(day).toISOString(), '2026-06-10T00:00:00.000Z')
+  assert.equal(exclusiveEndOfUtcDay(day).toISOString(), startOfNextUtcDay(day).toISOString())
 })
 
 test('default window and subtract helpers keep UTC dates stable', () => {

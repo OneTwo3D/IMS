@@ -8,6 +8,7 @@ import {
   type ReservationBreakdownRow,
 } from '@/lib/domain/inventory/reservation-breakdown'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { startOfNextUtcDay } from '@/lib/domain/math/date-window'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -356,10 +357,6 @@ function parseDateOnly(value: string | undefined, fallback: Date): Date {
 
 function formatDateOnly(value: Date): string {
   return value.toISOString().slice(0, 10)
-}
-
-function endOfUtcDay(value: Date): Date {
-  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate(), 23, 59, 59, 999))
 }
 
 function subtractDays(value: Date, days: number): Date {
@@ -1134,12 +1131,13 @@ export async function getNegativeStockReport(
   const now = options.now?.() ?? new Date()
   const defaultFrom = subtractDays(now, DEFAULT_NEGATIVE_STOCK_LOOKBACK_DAYS)
   const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
-  const dateTo = endOfUtcDay(parseDateOnly(filters.dateTo, now))
+  const dateTo = parseDateOnly(filters.dateTo, now)
+  const dateToExclusive = startOfNextUtcDay(dateTo)
   // The opening balance is the end of the previous UTC day; movements inside
   // dateFrom..dateTo are then replayed inclusively to find the trough.
   const openingAsOf = subtractDays(dateFrom, 1)
   const movementWhere: Prisma.StockMovementWhereInput = {
-    createdAt: { gte: dateFrom, lte: dateTo },
+    createdAt: { gte: dateFrom, lt: dateToExclusive },
     ...(filters.warehouseId
       ? { OR: [{ fromWarehouseId: filters.warehouseId }, { toWarehouseId: filters.warehouseId }] }
       : {}),
