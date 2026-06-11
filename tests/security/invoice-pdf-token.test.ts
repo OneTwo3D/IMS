@@ -4,7 +4,12 @@ import test from 'node:test'
 
 import { NextRequest } from 'next/server'
 
-import { handleInvoicePdfRoute } from '../../app/api/invoices/[id]/route.ts'
+import {
+  handleInvoicePdfRoute,
+  invoicePdfTokenAuditAction,
+  invoicePdfTokenAuditDescription,
+  isInvoicePdfTokenSecuritySignal,
+} from '../../app/api/invoices/[id]/route.ts'
 import {
   signPdfToken,
   verifyPdfTokenDetailed,
@@ -195,6 +200,16 @@ test('invoice PDF token verification rejects copied tokens from another session 
       { valid: false, reason: 'missing_binding' },
     )
   })
+})
+
+test('invoice PDF token audit classifies session and IP mismatches as security signals', () => {
+  assert.equal(isInvoicePdfTokenSecuritySignal({ valid: false, reason: 'wrong_session' }), true)
+  assert.equal(isInvoicePdfTokenSecuritySignal({ valid: false, reason: 'wrong_ip' }), true)
+  assert.equal(isInvoicePdfTokenSecuritySignal({ valid: false, reason: 'bad_signature' }), false)
+  assert.equal(isInvoicePdfTokenSecuritySignal({ valid: true, payload: validPayload() }), false)
+  assert.equal(invoicePdfTokenAuditAction({ valid: false, reason: 'wrong_ip' }), 'invoice_pdf_token_security_signal')
+  assert.equal(invoicePdfTokenAuditAction({ valid: false, reason: 'expired' }), 'invoice_pdf_token_rejected')
+  assert.equal(invoicePdfTokenAuditDescription({ valid: false, reason: 'wrong_session' }), 'Invoice PDF token security signal: wrong_session')
 })
 
 test('invoice PDF route rejects validly signed but unbound tokens before storage access', async () => {
