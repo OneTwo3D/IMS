@@ -48,6 +48,27 @@ const defaultDependencies: InvoicePdfRouteDependencies = {
   checkRateLimit,
 }
 
+export function isInvoicePdfTokenSecuritySignal(verification: PdfTokenVerificationResult): boolean {
+  return !verification.valid && (
+    verification.reason === 'wrong_session' ||
+    verification.reason === 'wrong_ip'
+  )
+}
+
+export function invoicePdfTokenAuditAction(verification: PdfTokenVerificationResult): string {
+  if (verification.valid) return 'invoice_pdf_token_verified'
+  return isInvoicePdfTokenSecuritySignal(verification)
+    ? 'invoice_pdf_token_security_signal'
+    : 'invoice_pdf_token_rejected'
+}
+
+export function invoicePdfTokenAuditDescription(verification: PdfTokenVerificationResult): string {
+  if (verification.valid) return 'Invoice PDF token accepted'
+  return isInvoicePdfTokenSecuritySignal(verification)
+    ? `Invoice PDF token security signal: ${verification.reason}`
+    : `Invoice PDF token rejected: ${verification.reason}`
+}
+
 function jsonNoStore(body: object, status: number): NextResponse {
   return NextResponse.json(body, { status, headers: NO_STORE_HEADERS })
 }
@@ -88,21 +109,21 @@ async function auditTokenAttemptSafely(
 /** @internal Test seam for the invoice PDF route handler. */
 export async function auditInvoicePdfTokenAttempt(input: InvoicePdfTokenAuditInput): Promise<void> {
   const accepted = input.verification.valid
+  const securitySignal = isInvoicePdfTokenSecuritySignal(input.verification)
   await logActivity({
     entityType: 'SALES_ORDER',
     entityId: input.orderId,
     tag: 'auth',
-    action: accepted ? 'invoice_pdf_token_verified' : 'invoice_pdf_token_rejected',
+    action: invoicePdfTokenAuditAction(input.verification),
     level: accepted ? 'INFO' : 'WARNING',
-    description: accepted
-      ? 'Invoice PDF token accepted'
-      : `Invoice PDF token rejected: ${input.verification.reason}`,
+    description: invoicePdfTokenAuditDescription(input.verification),
     metadata: {
       tokenPresent: input.tokenPresent,
       tokenLength: input.tokenLength,
       tokenFormat: 'expiring',
       reason: accepted ? null : input.verification.reason,
       userAgent: input.userAgent,
+      securitySignal,
     },
     resolveUser: false,
   })
