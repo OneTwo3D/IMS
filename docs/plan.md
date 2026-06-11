@@ -131,7 +131,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Fix:** On refund creation, re-read current `unitCostBase` from `cost_layers` and recompute the reversal cost. Document inline that the snapshot is informational only.
 - **Acceptance:**
   - Refund of a shipped item against a layer that was revalued after shipment uses the current `unitCostBase`, not the snapshot.
-- **Tests:** `tests/refund-service.revaluation.test.ts` — ship, revalue, refund, assert COGS reversal matches the new cost.
+- **Tests:** `tests/domain/sales/refund-service.test.ts` — `createSalesOrderRefund uses current cost layer cost after landed cost revaluation`, `createSalesOrderRefund uses decreased current cost layer cost after landed cost revaluation`, and `createSalesOrderRefund falls back to shipment snapshot cost when cost layer no longer exists`.
 
 ### P1.6 — VAT taxable base wrong for tax-inclusive pricing
 - **Status:** Complete.
@@ -276,7 +276,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Status:** Complete.
 - **File:** `app/actions/manufacturing.ts:628–635`
 - **Fix:** Pass `productionOrder.completedAt ?? new Date()` to `createCostLayer({ receivedAt })`.
-- **Tests:** Complete two production orders same day; assert FIFO order matches `completedAt`.
+- **Tests:** `tests/domain/manufacturing/manufacturing-action-inputs.test.ts` covers manufacturing cost-layer `receivedAt` selection from `completedAt`, fallback completion time, and disassembly recovery transition time. `tests/cost-layers.test.ts` — `manufacturing cost layers created out of order consume FIFO by completedAt receivedAt` covers same-day production outputs being consumed by `completedAt` FIFO order, not processing order.
 
 ### P4.3 — Stock removal with no cost layers
 - **Status:** Complete.

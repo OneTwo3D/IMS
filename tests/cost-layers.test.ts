@@ -7,8 +7,10 @@ import {
   cogsEntryDataFromConsumed,
   consumeFifoLayers,
   consumeFifoLayersStrict,
+  createCostLayer,
   refreshShipmentCogsForCostLayerChange,
 } from '../lib/cost-layers.ts'
+import { manufacturingCostLayerReceivedAt } from '@/lib/domain/manufacturing/manufacturing-action-inputs'
 
 test('cogsEntryDataFromConsumed preserves six-decimal consumed quantities', () => {
   assert.deepEqual(cogsEntryDataFromConsumed('movement-1', {
@@ -269,6 +271,107 @@ test('consumeFifoLayers returns the full remaining quantity when no FIFO rows ar
   assert.equal(result.remainingQty.toString(), '3')
   assert.equal(result.totalCost.toString(), '0')
   assert.deepEqual(result.consumed, [])
+})
+
+test('manufacturing cost layers created out of order consume FIFO by completedAt receivedAt', async () => {
+  const layers: Array<{
+    id: string
+    productId: string
+    warehouseId: string
+    remainingQty: Prisma.Decimal
+    unitCostBase: Prisma.Decimal
+    receivedAt: Date
+  }> = []
+  let nextLayer = 1
+  const tx = {
+    $executeRaw: async () => 0,
+    $queryRaw: async (_strings: TemplateStringsArray, productId: string, warehouseId: string) => {
+      return layers
+        .filter((layer) => (
+          layer.productId === productId &&
+          layer.warehouseId === warehouseId &&
+          layer.remainingQty.gt(0)
+        ))
+        .sort((left, right) => (
+          left.receivedAt.getTime() - right.receivedAt.getTime() ||
+          left.id.localeCompare(right.id)
+        ))
+        .map((layer) => ({
+          id: layer.id,
+          remainingQty: layer.remainingQty,
+          unitCostBase: layer.unitCostBase,
+        }))
+    },
+    costLayer: {
+      create: async ({ data }: {
+        data: {
+          productId: string
+          warehouseId: string
+          remainingQty: string
+          unitCostBase: number
+          receivedAt?: Date
+        }
+      }) => {
+        const id = `layer-${nextLayer++}`
+        layers.push({
+          id,
+          productId: data.productId,
+          warehouseId: data.warehouseId,
+          remainingQty: new Prisma.Decimal(data.remainingQty),
+          unitCostBase: new Prisma.Decimal(data.unitCostBase),
+          receivedAt: data.receivedAt ?? new Date(),
+        })
+        return { id }
+      },
+      update: async ({ where, data }: {
+        where: { id: string }
+        data: { remainingQty: { decrement: number } }
+      }) => {
+        const layer = layers.find((candidate) => candidate.id === where.id)
+        if (!layer) throw new Error(`Missing layer ${where.id}`)
+        layer.remainingQty = layer.remainingQty.minus(data.remainingQty.decrement)
+      },
+    },
+  }
+  const productId = 'manufactured-product-1'
+  const warehouseId = 'warehouse-1'
+  const completedA = new Date('2026-06-01T09:00:00.000Z')
+  const completedB = new Date('2026-06-01T10:00:00.000Z')
+
+  const layerB = await createCostLayer(tx as never, {
+    productId,
+    warehouseId,
+    qty: 1,
+    unitCostBase: 20,
+    productionOrderId: 'production-b',
+    receivedAt: manufacturingCostLayerReceivedAt({
+      orderType: 'ASSEMBLY',
+      completedAt: completedB,
+      transitionAt: new Date('2026-06-01T12:00:00.000Z'),
+    }),
+  })
+  const layerA = await createCostLayer(tx as never, {
+    productId,
+    warehouseId,
+    qty: 1,
+    unitCostBase: 10,
+    productionOrderId: 'production-a',
+    receivedAt: manufacturingCostLayerReceivedAt({
+      orderType: 'ASSEMBLY',
+      completedAt: completedA,
+      transitionAt: new Date('2026-06-01T13:00:00.000Z'),
+    }),
+  })
+
+  assert.deepEqual(layers.map((layer) => layer.id), [layerB, layerA])
+  assert.equal(layers.find((layer) => layer.id === layerA)?.receivedAt.toISOString(), completedA.toISOString())
+  assert.equal(layers.find((layer) => layer.id === layerB)?.receivedAt.toISOString(), completedB.toISOString())
+
+  const result = await consumeFifoLayersStrict(tx as never, productId, warehouseId, 1.5)
+
+  assert.deepEqual(result.consumed.map((layer) => layer.costLayerId), [layerA, layerB])
+  assert.deepEqual(result.consumed.map((layer) => layer.qty.toString()), ['1', '0.5'])
+  assert.equal(result.totalCost.toString(), '20')
 })
 
 test('consumeFifoLayersStrict throws when no FIFO rows are available', async () => {
