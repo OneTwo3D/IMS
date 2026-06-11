@@ -32,6 +32,7 @@ export type ImportWcOrderOptions = {
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
 const DEFAULT_PENDING_FX_NOTIFY_THRESHOLD = 5
 const TAX_RATE_EPSILON = 0.000001
+const MISSING_FX_RATE_QUEUE_REASON = 'missing_fx_rate'
 
 export type WcTaxRateFallbackLine = {
   sku: string
@@ -40,6 +41,16 @@ export type WcTaxRateFallbackLine = {
   taxRateValue: number
   expectedTaxRateValue: number | null
   warning: string | null
+}
+
+export type PendingFxOrderPayload = {
+  reason: typeof MISSING_FX_RATE_QUEUE_REASON
+  connector: 'woocommerce'
+  externalOrderId: string
+  externalOrderNumber: string
+  currency: string
+  asOf: string | null
+  order: WcFullOrder
 }
 
 export function shouldBlockWcTaxRateFallback(lines: WcTaxRateFallbackLine[]): boolean {
@@ -76,8 +87,23 @@ export function pendingFxQueueWhere(externalOrderId?: string): Prisma.ShoppingSy
     ...(externalOrderId ? { externalId: externalOrderId } : {}),
     payload: {
       path: ['reason'],
-      equals: 'missing_fx_rate',
+      equals: MISSING_FX_RATE_QUEUE_REASON,
     },
+  }
+}
+
+export function buildPendingFxOrderPayload(
+  wcOrder: WcFullOrder,
+  error: { currency: string; asOf?: Date },
+): PendingFxOrderPayload {
+  return {
+    reason: MISSING_FX_RATE_QUEUE_REASON,
+    connector: 'woocommerce',
+    externalOrderId: String(wcOrder.id),
+    externalOrderNumber: wcOrder.number,
+    currency: error.currency,
+    asOf: error.asOf?.toISOString() ?? null,
+    order: wcOrder,
   }
 }
 
@@ -116,15 +142,7 @@ async function recordPendingFxOrder(
   error: { message: string; currency: string; asOf?: Date },
   retryLogId?: string,
 ): Promise<void> {
-  const payload = {
-    reason: 'missing_fx_rate',
-    connector: 'woocommerce',
-    externalOrderId: String(wcOrder.id),
-    externalOrderNumber: wcOrder.number,
-    currency: error.currency,
-    asOf: error.asOf?.toISOString() ?? null,
-    order: wcOrder,
-  }
+  const payload = buildPendingFxOrderPayload(wcOrder, error)
   const jsonPayload = JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue
   const data = {
     connector: 'woocommerce',
@@ -755,10 +773,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
   }
 }
 
-function isQueuedWcOrderPayload(payload: unknown): payload is { reason: 'missing_fx_rate'; order: WcFullOrder } {
+export function isQueuedWcOrderPayload(payload: unknown): payload is PendingFxOrderPayload {
   return typeof payload === 'object'
     && payload !== null
-    && (payload as { reason?: unknown }).reason === 'missing_fx_rate'
+    && (payload as { reason?: unknown }).reason === MISSING_FX_RATE_QUEUE_REASON
+    && (payload as { connector?: unknown }).connector === 'woocommerce'
+    && typeof (payload as { externalOrderId?: unknown }).externalOrderId === 'string'
+    && typeof (payload as { currency?: unknown }).currency === 'string'
     && typeof (payload as { order?: { id?: unknown } }).order?.id === 'number'
 }
 

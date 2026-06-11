@@ -2,11 +2,14 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  buildPendingFxOrderPayload,
+  isQueuedWcOrderPayload,
   pendingFxQueueWhere,
   shouldBlockWcTaxRateFallback,
   type WcTaxRateFallbackLine,
 } from '@/lib/connectors/woocommerce/sync/order-import'
 import { MissingFxRateError, isMissingFxRateError } from '@/lib/connectors/woocommerce/sync/field-mapping'
+import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
 
 const baseLine = {
   sku: 'SKU-1',
@@ -42,7 +45,9 @@ test('WooCommerce missing FX errors are distinguishable for retry queues', () =>
 })
 
 test('WooCommerce pending FX queue lookup uses structured payload reason, not GBP error text', () => {
-  assert.deepEqual(pendingFxQueueWhere('wc-123'), {
+  const where = pendingFxQueueWhere('wc-123')
+
+  assert.deepEqual(where, {
     connector: 'woocommerce',
     direction: 'FROM_CONNECTOR',
     status: 'PENDING',
@@ -53,4 +58,30 @@ test('WooCommerce pending FX queue lookup uses structured payload reason, not GB
       equals: 'missing_fx_rate',
     },
   })
+  assert.equal('errorMessage' in where, false)
+})
+
+test('WooCommerce pending FX payload is currency-agnostic and replayable', () => {
+  const asOf = new Date('2026-05-01T00:00:00.000Z')
+  const order = {
+    id: 987,
+    number: 'EU-987',
+    currency: 'EUR',
+  } as WcFullOrder
+
+  const payload = buildPendingFxOrderPayload(order, { currency: 'EUR', asOf })
+
+  assert.deepEqual(payload, {
+    reason: 'missing_fx_rate',
+    connector: 'woocommerce',
+    externalOrderId: '987',
+    externalOrderNumber: 'EU-987',
+    currency: 'EUR',
+    asOf: '2026-05-01T00:00:00.000Z',
+    order,
+  })
+  assert.equal(isQueuedWcOrderPayload(payload), true)
+  assert.equal(isQueuedWcOrderPayload({ ...payload, reason: 'Missing GBP FX rate for EUR' }), false)
+  assert.equal(isQueuedWcOrderPayload({ ...payload, connector: 'shopify' }), false)
+  assert.equal(isQueuedWcOrderPayload({ ...payload, order: { id: '987' } }), false)
 })
