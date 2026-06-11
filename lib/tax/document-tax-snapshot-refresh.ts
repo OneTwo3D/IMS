@@ -1,10 +1,10 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
-const MUTABLE_SALES_TAX_STATUSES = ['DRAFT', 'PENDING_PAYMENT'] as const
+const MUTABLE_SALES_TAX_STATUSES = ['DRAFT'] as const
 const MUTABLE_PURCHASE_TAX_STATUSES = ['DRAFT'] as const
 
-type TaxSnapshotClient = Pick<Prisma.TransactionClient, 'salesOrderLine' | 'salesOrder' | 'purchaseOrderLine' | 'purchaseOrder' | 'activityLog' | '$queryRaw' | '$executeRaw'>
+type TaxSnapshotClient = Pick<Prisma.TransactionClient, 'salesOrderLine' | 'purchaseOrderLine' | 'activityLog' | '$queryRaw' | '$executeRaw'>
 
 type TaxRateSnapshot = {
   id: string
@@ -163,26 +163,7 @@ async function refreshMutableSalesOrderTaxSnapshots(
 
   await updateSalesTaxLines(client, updates)
 
-  for (const [orderId, delta] of deltas) {
-    await client.salesOrder.updateMany({
-      where: {
-        id: orderId,
-        status: { in: [...MUTABLE_SALES_TAX_STATUSES] },
-      },
-      data: {
-        subtotalForeign: { increment: delta.subtotalForeign },
-        subtotalBase: { increment: delta.subtotalBase },
-        taxForeign: { increment: delta.taxForeign },
-        taxBase: { increment: delta.taxBase },
-        totalForeign: { increment: delta.subtotalForeign.add(delta.taxForeign) },
-        totalBase: { increment: delta.subtotalBase.add(delta.taxBase) },
-        ...(delta.updateHeader ? {
-          taxRateName: newRateSnapshot.name,
-          taxRatePercent: newRate.gt(0) ? newRate : null,
-        } : {}),
-      },
-    })
-  }
+  await updateSalesOrderTaxTotals(client, deltas, newRateSnapshot, newRate)
 
   return { orders: deltas.size, lines: updates.length }
 }
@@ -238,24 +219,7 @@ async function refreshMutablePurchaseOrderTaxSnapshots(
 
   await updatePurchaseTaxLines(client, updates)
 
-  for (const [poId, delta] of deltas) {
-    await client.purchaseOrder.updateMany({
-      where: {
-        id: poId,
-        status: { in: [...MUTABLE_PURCHASE_TAX_STATUSES] },
-      },
-      data: {
-        taxForeign: { increment: delta.taxForeign },
-        taxBase: { increment: delta.taxBase },
-        totalForeign: { increment: delta.taxForeign },
-        totalBase: { increment: delta.taxBase },
-        ...(delta.updateHeader ? {
-          taxRateName: newRateSnapshot.name,
-          taxRatePercent: newRate.gt(0) ? newRate : null,
-        } : {}),
-      },
-    })
-  }
+  await updatePurchaseOrderTaxTotals(client, deltas, newRateSnapshot, newRate)
 
   return { orders: deltas.size, lines: updates.length }
 }
@@ -264,6 +228,8 @@ async function lockMutableSalesOrders(client: TaxSnapshotClient, orderIds: strin
   if (orderIds.length === 0) return new Set()
   // Lock parent documents and re-check mutable status inside the same
   // transaction so a concurrent status transition cannot be silently re-rated.
+  // DRAFT is the only sales tax-mutable state; PENDING_PAYMENT has crossed the
+  // customer quote/invoice boundary and keeps its original tax snapshot.
   const rows = await client.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT id
     FROM "sales_orders"
@@ -315,6 +281,54 @@ async function updateSalesTaxLines(
   `)
 }
 
+async function updateSalesOrderTaxTotals(
+  client: TaxSnapshotClient,
+  deltas: Map<string, Delta & { updateHeader: boolean }>,
+  newRateSnapshot: TaxRateSnapshot,
+  newRate: Decimal,
+): Promise<void> {
+  if (deltas.size === 0) return
+  const taxRatePercent = newRate.gt(0) ? newRate.toString() : null
+  const values = Prisma.join([...deltas.entries()].map(([id, delta]) => Prisma.sql`(
+    ${id}::text,
+    ${delta.subtotalForeign.toString()}::numeric,
+    ${delta.subtotalBase.toString()}::numeric,
+    ${delta.taxForeign.toString()}::numeric,
+    ${delta.taxBase.toString()}::numeric,
+    ${delta.subtotalForeign.add(delta.taxForeign).toString()}::numeric,
+    ${delta.subtotalBase.add(delta.taxBase).toString()}::numeric,
+    ${delta.updateHeader}::boolean,
+    ${newRateSnapshot.name}::text,
+    ${taxRatePercent}::numeric
+  )`))
+  await client.$executeRaw(Prisma.sql`
+    UPDATE "sales_orders" AS orders
+    SET
+      "subtotalForeign" = orders."subtotalForeign" + updates."subtotalForeignDelta",
+      "subtotalBase" = orders."subtotalBase" + updates."subtotalBaseDelta",
+      "taxForeign" = orders."taxForeign" + updates."taxForeignDelta",
+      "taxBase" = orders."taxBase" + updates."taxBaseDelta",
+      "totalForeign" = orders."totalForeign" + updates."totalForeignDelta",
+      "totalBase" = orders."totalBase" + updates."totalBaseDelta",
+      "taxRateName" = CASE WHEN updates."updateHeader" THEN updates."taxRateName" ELSE orders."taxRateName" END,
+      "taxRatePercent" = CASE WHEN updates."updateHeader" THEN updates."taxRatePercent" ELSE orders."taxRatePercent" END
+    FROM (VALUES ${values}) AS updates(
+      "id",
+      "subtotalForeignDelta",
+      "subtotalBaseDelta",
+      "taxForeignDelta",
+      "taxBaseDelta",
+      "totalForeignDelta",
+      "totalBaseDelta",
+      "updateHeader",
+      "taxRateName",
+      "taxRatePercent"
+    )
+    WHERE orders.id = updates.id
+      AND orders.status IN (${Prisma.join([...MUTABLE_SALES_TAX_STATUSES])})
+  `)
+}
+
 async function updatePurchaseTaxLines(
   client: TaxSnapshotClient,
   updates: Array<{
@@ -335,6 +349,44 @@ async function updatePurchaseTaxLines(
       "taxBase" = updates."taxBase"
     FROM (VALUES ${values}) AS updates("id", "taxForeign", "taxBase")
     WHERE line.id = updates.id
+  `)
+}
+
+async function updatePurchaseOrderTaxTotals(
+  client: TaxSnapshotClient,
+  deltas: Map<string, Delta & { updateHeader: boolean }>,
+  newRateSnapshot: TaxRateSnapshot,
+  newRate: Decimal,
+): Promise<void> {
+  if (deltas.size === 0) return
+  const taxRatePercent = newRate.gt(0) ? newRate.toString() : null
+  const values = Prisma.join([...deltas.entries()].map(([id, delta]) => Prisma.sql`(
+    ${id}::text,
+    ${delta.taxForeign.toString()}::numeric,
+    ${delta.taxBase.toString()}::numeric,
+    ${delta.updateHeader}::boolean,
+    ${newRateSnapshot.name}::text,
+    ${taxRatePercent}::numeric
+  )`))
+  await client.$executeRaw(Prisma.sql`
+    UPDATE "purchase_orders" AS orders
+    SET
+      "taxForeign" = orders."taxForeign" + updates."taxForeignDelta",
+      "taxBase" = orders."taxBase" + updates."taxBaseDelta",
+      "totalForeign" = orders."totalForeign" + updates."taxForeignDelta",
+      "totalBase" = orders."totalBase" + updates."taxBaseDelta",
+      "taxRateName" = CASE WHEN updates."updateHeader" THEN updates."taxRateName" ELSE orders."taxRateName" END,
+      "taxRatePercent" = CASE WHEN updates."updateHeader" THEN updates."taxRatePercent" ELSE orders."taxRatePercent" END
+    FROM (VALUES ${values}) AS updates(
+      "id",
+      "taxForeignDelta",
+      "taxBaseDelta",
+      "updateHeader",
+      "taxRateName",
+      "taxRatePercent"
+    )
+    WHERE orders.id = updates.id
+      AND orders.status IN (${Prisma.join([...MUTABLE_PURCHASE_TAX_STATUSES])})
   `)
 }
 
