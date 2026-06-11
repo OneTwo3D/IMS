@@ -43,15 +43,59 @@ export type FinanceAnalyticsFilters = {
   bucket3Days?: number
 }
 
-export type FinanceAnalyticsReport<Row> = {
+export type FinanceAnalyticsReport<Row, Totals extends Record<string, string> = Record<string, string>> = {
   generatedAt: string
   dateFrom: string
   dateTo: string
   rows: Row[]
   pageInfo: PageInfo
-  totals: Record<string, string>
+  totals: Totals
   notices: string[]
 }
+
+export type VatReportTotals = {
+  taxableBase: string
+  salesTaxBase: string
+  purchaseTaxBase: string
+  taxBase: string
+}
+
+export type ArAgingReportTotals = {
+  outstandingBase: string
+  creditBalanceBase: string
+  bucket1Days: string
+  bucket2Days: string
+  bucket3Days: string
+}
+
+export type ApAgingReportTotals = {
+  outstandingBase: string
+  bucket1Days: string
+  bucket2Days: string
+  bucket3Days: string
+}
+
+export type CurrencySummaryReportTotals = {
+  salesBase: string
+  arOutstandingBase: string
+  purchasesBase: string
+  apOutstandingBase: string
+}
+
+export type FxGainLossReportTotals = {
+  gainLossBase: string
+  gainsBase: string
+  lossesBase: string
+  rowCount: string
+}
+
+export const FINANCE_ANALYTICS_EMPTY_TOTALS = {
+  vat: { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' } satisfies VatReportTotals,
+  arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ArAgingReportTotals,
+  apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ApAgingReportTotals,
+  currencySummary: { salesBase: '0', arOutstandingBase: '0', purchasesBase: '0', apOutstandingBase: '0' } satisfies CurrencySummaryReportTotals,
+  fxGainLoss: { gainLossBase: '0', gainsBase: '0', lossesBase: '0', rowCount: '0' } satisfies FxGainLossReportTotals,
+} as const
 
 export type VatReportRow = {
   side: 'sales' | 'purchases'
@@ -274,12 +318,12 @@ function pageInfo(totalRows: number, page: number | undefined, pageSize: number)
   }
 }
 
-export function emptyFinanceAnalyticsReportForSourceLimit<Row>(
+export function emptyFinanceAnalyticsReportForSourceLimit<Row, Totals extends Record<string, string>>(
   filters: FinanceAnalyticsFilters,
   error: SourceScanTooLargeError,
-  totals: Record<string, string>,
+  totals: Totals,
   now = new Date(),
-): FinanceAnalyticsReport<Row> {
+): FinanceAnalyticsReport<Row, Totals> {
   const window = period(filters, now)
   const pageSize = clampPageSize(filters.pageSize)
   return {
@@ -301,15 +345,15 @@ function paginate<T>(rows: T[], filters: FinanceAnalyticsFilters, enabled: boole
   return { rows: rows.slice(start, start + pageSize), pageInfo: info }
 }
 
-function report<Row>(
+function report<Row, Totals extends Record<string, string>>(
   rows: Row[],
   filters: FinanceAnalyticsFilters,
   window: { dateFrom: Date; dateTo: Date },
   generatedAt: Date,
-  totals: Record<string, string>,
+  totals: Totals,
   notices: string[],
   paginateRows: boolean,
-): FinanceAnalyticsReport<Row> {
+): FinanceAnalyticsReport<Row, Totals> {
   const paged = paginate(rows, filters, paginateRows)
   return {
     generatedAt: generatedAt.toISOString(),
@@ -386,7 +430,7 @@ function latestRateToBase(rates: FxRateRow[], baseCurrency: string, currency: st
 export async function getVatReport(
   filters: FinanceAnalyticsFilters = {},
   options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
-): Promise<FinanceAnalyticsReport<VatReportRow>> {
+): Promise<FinanceAnalyticsReport<VatReportRow, VatReportTotals>> {
   const client = clientFromDeps(options.deps)
   const generatedAt = nowFromDeps(options.deps)
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
@@ -576,7 +620,7 @@ function agingRowsFromAccumulators(
 export async function getArAgingReport(
   filters: FinanceAnalyticsFilters = {},
   options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
-): Promise<FinanceAnalyticsReport<AgingReportRow>> {
+): Promise<FinanceAnalyticsReport<AgingReportRow, ArAgingReportTotals>> {
   const client = clientFromDeps(options.deps)
   const generatedAt = nowFromDeps(options.deps)
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
@@ -693,7 +737,7 @@ export async function getArAgingReport(
 export async function getApAgingReport(
   filters: FinanceAnalyticsFilters = {},
   options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
-): Promise<FinanceAnalyticsReport<AgingReportRow>> {
+): Promise<FinanceAnalyticsReport<AgingReportRow, ApAgingReportTotals>> {
   const client = clientFromDeps(options.deps)
   const generatedAt = nowFromDeps(options.deps)
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
@@ -780,7 +824,7 @@ export async function getApAgingReport(
 export async function getCurrencySummaryReport(
   filters: FinanceAnalyticsFilters = {},
   options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
-): Promise<FinanceAnalyticsReport<CurrencySummaryReportRow>> {
+): Promise<FinanceAnalyticsReport<CurrencySummaryReportRow, CurrencySummaryReportTotals>> {
   const client = clientFromDeps(options.deps)
   const generatedAt = nowFromDeps(options.deps)
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
@@ -935,7 +979,7 @@ async function loadFxRates(client: FinanceAnalyticsClient, baseCurrency: string,
 export async function getFxGainLossReport(
   filters: FinanceAnalyticsFilters = {},
   options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
-): Promise<FinanceAnalyticsReport<FxGainLossReportRow>> {
+): Promise<FinanceAnalyticsReport<FxGainLossReportRow, FxGainLossReportTotals>> {
   const client = clientFromDeps(options.deps)
   const generatedAt = nowFromDeps(options.deps)
   const window = period(filters, generatedAt)

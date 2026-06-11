@@ -1,5 +1,6 @@
 import {
   emptyFinanceAnalyticsReportForSourceLimit,
+  FINANCE_ANALYTICS_EMPTY_TOTALS,
   getApAgingReport,
   getArAgingReport,
   getCurrencySummaryReport,
@@ -45,23 +46,17 @@ export function financeAnalyticsFiltersForUi(filters: FinanceAnalyticsFilters): 
   }
 }
 
-export const financeAnalyticsEmptyTotals = {
-  vat: { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' },
-  arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' },
-  apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' },
-  currencySummary: { salesBase: '0', arOutstandingBase: '0', purchasesBase: '0', apOutstandingBase: '0' },
-  fxGainLoss: { gainLossBase: '0', gainsBase: '0', lossesBase: '0', rowCount: '0' },
-} as const satisfies Record<string, Record<string, string>>
+export const financeAnalyticsEmptyTotals = FINANCE_ANALYTICS_EMPTY_TOTALS
 
-async function loadFinanceAnalyticsReportForPage<Row>(
+async function loadFinanceAnalyticsReportForPage<Row, Totals extends Record<string, string>>(
   filters: FinanceAnalyticsFilters,
-  load: (filters: FinanceAnalyticsFilters) => Promise<FinanceAnalyticsReport<Row>>,
-  emptyTotals: Record<string, string>,
-): Promise<FinanceAnalyticsReport<Row>> {
+  load: (filters: FinanceAnalyticsFilters) => Promise<FinanceAnalyticsReport<Row, Totals>>,
+  emptyTotals: Totals,
+): Promise<FinanceAnalyticsReport<Row, Totals>> {
   try {
     return await load(filters)
   } catch (error) {
-    if (isSourceScanTooLargeError(error)) return emptyFinanceAnalyticsReportForSourceLimit<Row>(filters, error, emptyTotals)
+    if (isSourceScanTooLargeError(error)) return emptyFinanceAnalyticsReportForSourceLimit(filters, error, emptyTotals)
     throw error
   }
 }

@@ -6,6 +6,10 @@ import {
   loadVatReportForPage,
 } from '@/app/(dashboard)/analytics/_components/finance-analytics-page-utils'
 import {
+  getArAgingReport,
+  getCurrencySummaryReport,
+} from '@/lib/domain/finance/finance-period-analytics'
+import {
   loadSalesReportForPage,
   salesAnalyticsEmptyTotals,
 } from '@/app/(dashboard)/analytics/_components/sales-analytics-page-utils'
@@ -13,6 +17,23 @@ import {
   loadOpenPurchaseOrdersReportForPage,
   purchasingAnalyticsEmptyTotals,
 } from '@/app/(dashboard)/analytics/_components/purchasing-analytics-page-utils'
+
+type ExactKeys<Actual, Expected> =
+  Exclude<keyof Actual, keyof Expected> extends never
+    ? Exclude<keyof Expected, keyof Actual> extends never
+      ? true
+      : never
+    : never
+
+const arAgingEmptyTotalsKeysMatchReportTotals: ExactKeys<
+  typeof financeAnalyticsEmptyTotals.arAging,
+  Awaited<ReturnType<typeof getArAgingReport>>['totals']
+> = true
+
+const currencySummaryEmptyTotalsKeysMatchReportTotals: ExactKeys<
+  typeof financeAnalyticsEmptyTotals.currencySummary,
+  Awaited<ReturnType<typeof getCurrencySummaryReport>>['totals']
+> = true
 
 test('finance analytics page loaders return typed empty reports for source scan limits', async () => {
   const report = await loadVatReportForPage(
@@ -26,6 +47,11 @@ test('finance analytics page loaders return typed empty reports for source scan 
   assert.deepEqual(report.totals, financeAnalyticsEmptyTotals.vat)
   assert.equal(report.pageInfo.totalRows, 0)
   assert.equal(report.notices[0], 'VAT report source rows exceed 50,000; Narrow the filters and retry.')
+})
+
+test('finance empty totals keys match report totals types', () => {
+  assert.equal(arAgingEmptyTotalsKeysMatchReportTotals, true)
+  assert.equal(currencySummaryEmptyTotalsKeysMatchReportTotals, true)
 })
 
 test('sales analytics page loaders return typed empty reports for source scan limits', async () => {
