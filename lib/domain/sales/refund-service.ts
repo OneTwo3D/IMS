@@ -1276,6 +1276,9 @@ export async function createSalesOrderRefund(
 
     const fxRate = refundBoundaryNumber(so.fxRateToBase) || 1
 
+    // External refund deliveries provide a stable replay key. Manual refunds
+    // intentionally rely on the operator UI's double-submit guard instead of
+    // inventing a synthetic service-level idempotency key.
     if (input.externalRefundId != null) {
       const existingExternalRefund = await tx.salesOrderRefund.findFirst({
         where: {
