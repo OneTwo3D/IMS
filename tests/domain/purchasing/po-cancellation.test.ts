@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import test from 'node:test'
 
-import { Prisma } from '@/app/generated/prisma/client'
+import { Prisma, type PurchaseOrderStatus } from '@/app/generated/prisma/client'
+import { cancelPurchaseOrder, type CancelPurchaseOrderDeps } from '@/app/actions/purchase-orders'
 import {
   assertPurchaseOrderCancellationHasNoInvoices,
   isPurchaseOrderCancellationNoop,
@@ -249,14 +248,99 @@ test('isPurchaseOrderCancellationNoop treats already cancelled purchase orders a
   assert.equal(isPurchaseOrderCancellationNoop('RECEIVED'), false)
 })
 
-test('cancelPurchaseOrder action wires already-cancelled no-op before the stock transaction', () => {
-  const source = readFileSync(join(process.cwd(), 'app/actions/purchase-orders.ts'), 'utf8')
-  const fastPathIndex = source.indexOf('isPurchaseOrderCancellationNoop(fastExisting.status)')
-  const transactionIndex = source.indexOf('const cancellation = await db.$transaction')
+test('cancelPurchaseOrder action is idempotent when called twice', async () => {
+  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'PARTIALLY_RECEIVED', reference: 'PO-1' }
+  const logs: Array<{ action: string; description: string }> = []
+  const revalidated: string[] = []
+  const accountingSyncs: unknown[] = []
+  const stockSyncs: Array<{ productIds: string[]; reason: string }> = []
+  let transactionCalls = 0
+  let reversalCalls = 0
 
-  assert.notEqual(fastPathIndex, -1)
-  assert.notEqual(transactionIndex, -1)
-  assert.ok(fastPathIndex < transactionIndex, 'expected no-op status check before stock transaction')
-  assert.match(source, /select:\s*\{\s*status:\s*true,\s*reference:\s*true\s*\}/)
-  assert.match(source, /action:\s*'cancelled_noop'/)
+  const tx = {
+    purchaseOrder: {
+      findUnique: async () => ({
+        status: po.status,
+        reference: po.reference,
+        lines: [{ id: 'po-line-1' }],
+        _count: { invoices: 0 },
+      }),
+      update: async ({ data }: { data: { status: typeof po.status } }) => {
+        po.status = data.status
+        return { id: 'po-1' }
+      },
+    },
+  }
+  const deps: CancelPurchaseOrderDeps = {
+    requirePermission: async () => ({ user: { id: 'user-1', role: 'ADMIN' } }) as never,
+    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
+    transaction: async (fn) => {
+      transactionCalls += 1
+      return fn(tx as never)
+    },
+    revalidatePath: (path) => {
+      revalidated.push(path)
+    },
+    logActivity: async (input) => {
+      logs.push({ action: input.action, description: input.description })
+    },
+    enqueueStockSync: async (productIds, reason) => {
+      stockSyncs.push({ productIds, reason })
+    },
+    getAccountingSettings: async () => ({
+      syncEnabled: true,
+      transitAccount: '140',
+      inventoryAccount: '120',
+    }) as never,
+    queueAccountingSyncTx: async (_tx, input) => {
+      accountingSyncs.push(input)
+      return { id: `sync-${accountingSyncs.length}` } as never
+    },
+    reversePurchaseOrderCostLayersForCancellation: async () => {
+      reversalCalls += 1
+      return {
+        reversedLayers: [{
+          costLayerId: 'layer-1',
+          poLineId: 'po-line-1',
+          productId: 'product-1',
+          warehouseId: 'warehouse-1',
+          qty: '2.000000',
+          unitCostBase: '5.000000',
+          totalValueBase: '10.000000',
+        }],
+        productIds: ['product-1'],
+        totalReversalValueBase: new Prisma.Decimal('10'),
+      }
+    },
+  }
+
+  assert.deepEqual(await cancelPurchaseOrder('po-1', deps), {
+    success: true,
+    reversedCostLayers: [{
+      costLayerId: 'layer-1',
+      poLineId: 'po-line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: '2.000000',
+      unitCostBase: '5.000000',
+      totalValueBase: '10.000000',
+    }],
+    notice: 'Cancelled PO and reversed 1 remaining receipt cost layer(s).',
+  })
+  assert.equal(po.status, 'CANCELLED')
+
+  assert.deepEqual(await cancelPurchaseOrder('po-1', deps), { success: true })
+
+  assert.equal(transactionCalls, 1)
+  assert.equal(reversalCalls, 1)
+  assert.equal(accountingSyncs.length, 1)
+  assert.deepEqual(stockSyncs, [{ productIds: ['product-1'], reason: 'IMS_CHANGE' }])
+  assert.deepEqual(logs.map((log) => log.action), ['cancelled', 'cancelled_noop'])
+  assert.equal(logs.filter((log) => log.action === 'cancelled').length, 1)
+  assert.deepEqual(revalidated, [
+    '/purchase-orders',
+    '/purchase-orders/po-1',
+    '/purchase-orders',
+    '/purchase-orders/po-1',
+  ])
 })

@@ -21,8 +21,7 @@ const MAX_INVOICE_PDF_ID_LENGTH = 256
 const INVOICE_PDF_TOKEN_PURPOSE = 'invoice-pdf'
 const INVOICE_PDF_TOKEN_VERSION = 1
 const DEFAULT_INVOICE_PDF_TOKEN_TTL_SECONDS = 10 * 60
-const DEFAULT_INVOICE_PDF_TOKEN_MAX_TTL_SECONDS = 30 * 24 * 60 * 60
-const ABSOLUTE_INVOICE_PDF_TOKEN_MAX_TTL_SECONDS = 30 * 24 * 60 * 60
+const INVOICE_PDF_TOKEN_MAX_TTL_SECONDS = 30 * 24 * 60 * 60
 const INVOICE_PDF_TOKEN_CLOCK_SKEW_SECONDS = 5 * 60
 
 export type InvoicePdfTokenPayload = {
@@ -186,9 +185,9 @@ function getTokenMaxTtlSeconds(env: Record<string, string | undefined> = process
   return Math.min(
     parsePositiveIntegerEnv(
       env.INVOICE_PDF_TOKEN_MAX_TTL_SECONDS,
-      DEFAULT_INVOICE_PDF_TOKEN_MAX_TTL_SECONDS,
+      INVOICE_PDF_TOKEN_MAX_TTL_SECONDS,
     ),
-    ABSOLUTE_INVOICE_PDF_TOKEN_MAX_TTL_SECONDS,
+    INVOICE_PDF_TOKEN_MAX_TTL_SECONDS,
   )
 }
 

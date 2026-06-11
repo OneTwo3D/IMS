@@ -118,6 +118,28 @@ test('invoice PDF token signing rejects invalid TTL options', async () => {
   })
 })
 
+test('invoice PDF token default max TTL accepts the hard cap and rejects over-cap tokens', async () => {
+  await withInvoiceTokenEnv({}, () => {
+    const maxTtlSeconds = 30 * 24 * 60 * 60
+    const token = signPdfToken('order-1', {
+      now: NOW,
+      ttlSeconds: maxTtlSeconds,
+      nonce: 'nonce-1',
+      binding: BINDING,
+    })
+
+    assert.equal(verifyPdfTokenDetailed('order-1', token, {
+      now: new Date(NOW.getTime() + (maxTtlSeconds - 1) * 1000),
+      binding: BINDING,
+      requireBinding: true,
+    }).valid, true)
+    assert.throws(
+      () => signPdfToken('order-1', { now: NOW, ttlSeconds: maxTtlSeconds + 1, nonce: 'nonce-2' }),
+      /must not exceed 2592000 seconds/,
+    )
+  })
+})
+
 test('invoice PDF token max TTL can be configured below the absolute cap', async () => {
   await withInvoiceTokenEnv({ INVOICE_PDF_TOKEN_MAX_TTL_SECONDS: '3600' }, () => {
     const token = signPdfToken('order-1', { now: NOW, ttlSeconds: 3600, nonce: 'nonce-1', binding: BINDING })

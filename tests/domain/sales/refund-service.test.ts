@@ -286,6 +286,17 @@ function createClient(state: State): RefundServiceClient {
       },
     },
     salesOrderRefund: {
+      findFirst: async ({ where }: { where: { orderId: string; externalRefundId: number } }) => {
+        const refund = state.refunds.find((row) => (
+          row.orderId === where.orderId &&
+          row.externalRefundId === where.externalRefundId
+        ))
+        if (!refund) return null
+        return {
+          ...refund,
+          lines: state.refundLines.filter((line) => line.refundId === refund.id),
+        }
+      },
       findUnique: async ({ where }: { where: { id: string } }) => {
         const refund = state.refunds.find((row) => row.id === where.id)
         if (!refund) return null
@@ -716,6 +727,67 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+})
+
+test('createSalesOrderRefund replays external refunds without duplicate stock side effects', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+  const input = {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'WooCommerce refund replay',
+    returnWarehouseId: 'warehouse-returns',
+    externalRefundId: 12345,
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  }
+
+  const first = await createSalesOrderRefund(createClient(state), input)
+  assert.equal(first.success, true)
+  const movementCount = state.movements.length
+  const costLayerCount = state.costLayers.length
+  const refundCount = state.refunds.length
+  const refundLineCount = state.refundLines.length
+  const stockQty = state.stockLevels[0]?.quantity
+
+  const second = await createSalesOrderRefund(createClient(state), input)
+
+  assert.equal(second.success, true)
+  assert.equal(second.success && first.success && second.createdRefund.id, first.success && first.createdRefund.id)
+  assert.deepEqual(second.success && second.accountingSyncs, [])
+  assert.deepEqual(second.success && second.returnedRows, [])
+  assert.equal(state.movements.length, movementCount)
+  assert.equal(state.costLayers.length, costLayerCount)
+  assert.equal(state.refunds.length, refundCount)
+  assert.equal(state.refundLines.length, refundLineCount)
+  assert.equal(state.stockLevels[0]?.quantity, stockQty)
 })
 
 test('createSalesOrderRefund reconstructs legacy shipment snapshots from COGS entries', async () => {
