@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { Prisma, type PurchaseOrderStatus } from '@/app/generated/prisma/client'
-import { cancelPurchaseOrder, type CancelPurchaseOrderDeps } from '@/app/actions/purchase-orders'
+import {
+  cancelPurchaseOrderService,
+  type CancelPurchaseOrderServiceDeps,
+} from '@/lib/domain/purchasing/cancellation-service'
 import {
   assertPurchaseOrderCancellationHasNoInvoices,
   isPurchaseOrderCancellationNoop,
@@ -248,10 +251,9 @@ test('isPurchaseOrderCancellationNoop treats already cancelled purchase orders a
   assert.equal(isPurchaseOrderCancellationNoop('RECEIVED'), false)
 })
 
-test('cancelPurchaseOrder action is idempotent when called twice', async () => {
+test('cancelPurchaseOrderService is idempotent when called twice', async () => {
   const po: { status: PurchaseOrderStatus; reference: string } = { status: 'PARTIALLY_RECEIVED', reference: 'PO-1' }
   const logs: Array<{ action: string; description: string }> = []
-  const revalidated: string[] = []
   const accountingSyncs: unknown[] = []
   const stockSyncs: Array<{ productIds: string[]; reason: string }> = []
   let transactionCalls = 0
@@ -271,15 +273,11 @@ test('cancelPurchaseOrder action is idempotent when called twice', async () => {
       },
     },
   }
-  const deps: CancelPurchaseOrderDeps = {
-    requirePermission: async () => ({ user: { id: 'user-1', role: 'ADMIN' } }) as never,
+  const deps: CancelPurchaseOrderServiceDeps = {
     findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
     transaction: async (fn) => {
       transactionCalls += 1
       return fn(tx as never)
-    },
-    revalidatePath: (path) => {
-      revalidated.push(path)
     },
     logActivity: async (input) => {
       logs.push({ action: input.action, description: input.description })
@@ -314,7 +312,7 @@ test('cancelPurchaseOrder action is idempotent when called twice', async () => {
     },
   }
 
-  assert.deepEqual(await cancelPurchaseOrder('po-1', deps), {
+  assert.deepEqual(await cancelPurchaseOrderService('po-1', deps), {
     success: true,
     reversedCostLayers: [{
       costLayerId: 'layer-1',
@@ -329,7 +327,7 @@ test('cancelPurchaseOrder action is idempotent when called twice', async () => {
   })
   assert.equal(po.status, 'CANCELLED')
 
-  assert.deepEqual(await cancelPurchaseOrder('po-1', deps), { success: true })
+  assert.deepEqual(await cancelPurchaseOrderService('po-1', deps), { success: true })
 
   assert.equal(transactionCalls, 1)
   assert.equal(reversalCalls, 1)
@@ -337,10 +335,4 @@ test('cancelPurchaseOrder action is idempotent when called twice', async () => {
   assert.deepEqual(stockSyncs, [{ productIds: ['product-1'], reason: 'IMS_CHANGE' }])
   assert.deepEqual(logs.map((log) => log.action), ['cancelled', 'cancelled_noop'])
   assert.equal(logs.filter((log) => log.action === 'cancelled').length, 1)
-  assert.deepEqual(revalidated, [
-    '/purchase-orders',
-    '/purchase-orders/po-1',
-    '/purchase-orders',
-    '/purchase-orders/po-1',
-  ])
 })
