@@ -157,6 +157,19 @@ test('getStockMovementLedgerReport reconciles opening plus movement to closing',
   assert.equal(report.totals.closingQty, '7')
 })
 
+test('getStockMovementLedgerReport uses a half-open UTC date upper bound', async () => {
+  const product = { id: 'p1', sku: 'SKU-1', name: 'Widget', stockUnit: 'ea' }
+  const warehouse = { code: 'MAIN', name: 'Main' }
+  const client = movementClient([
+    { id: 'included', type: 'PURCHASE_RECEIPT', productId: 'p1', product, fromWarehouseId: null, toWarehouseId: 'w1', fromWarehouse: null, toWarehouse: warehouse, qty: new Prisma.Decimal(1), unitCostBase: new Prisma.Decimal(1), totalValueBase: new Prisma.Decimal(1), referenceType: null, referenceId: null, note: null, createdAt: new Date('2026-01-02T23:59:59.999Z') },
+    { id: 'excluded', type: 'PURCHASE_RECEIPT', productId: 'p1', product, fromWarehouseId: null, toWarehouseId: 'w1', fromWarehouse: null, toWarehouse: warehouse, qty: new Prisma.Decimal(1), unitCostBase: new Prisma.Decimal(1), totalValueBase: new Prisma.Decimal(1), referenceType: null, referenceId: null, note: null, createdAt: new Date('2026-01-03T00:00:00.000Z') },
+  ]) as never
+
+  const report = await getStockMovementLedgerReport({ dateTo: '2026-01-02' }, { client })
+
+  assert.deepEqual(report.rows.map((row) => row.id), ['included'])
+})
+
 test('getStockAdjustmentReport reason summary covers all filtered adjustments when display is paginated', async () => {
   const product = { id: 'p1', sku: 'SKU-1', name: 'Widget', stockUnit: 'ea' }
   const warehouse = { code: 'MAIN', name: 'Main' }

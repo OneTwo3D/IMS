@@ -37,6 +37,10 @@ export class InventoryHealthSourceLimitError extends SourceScanTooLargeError {
     })
     this.name = 'InventoryHealthSourceLimitError'
   }
+
+  get scanLabel(): string {
+    return this.source.replace(/^Inventory health /, '')
+  }
 }
 
 type FindManyDelegate = {

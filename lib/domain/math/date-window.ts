@@ -12,12 +12,24 @@ export function startOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
 }
 
+/**
+ * Inclusive day-end instant at JavaScript millisecond precision.
+ *
+ * Do not use this as an upper bound for PostgreSQL timestamp/timestamptz range
+ * filters. PostgreSQL stores microseconds, so `lte: endOfUtcDay(day)` can miss
+ * rows between `23:59:59.999000` and `23:59:59.999999`. Query filters should
+ * use the half-open pattern `lt: startOfNextUtcDay(day)` instead.
+ */
 export function endOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999))
 }
 
 export function exclusiveEndOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1))
+}
+
+export function startOfNextUtcDay(date: Date): Date {
+  return exclusiveEndOfUtcDay(date)
 }
 
 export function subtractUtcDays(date: Date, days: number): Date {
