@@ -276,7 +276,7 @@ export async function submitSupplierQuote(
     if (!supplierRef) return { success: false, error: 'Supplier reference is required' }
 
     const po = await db.$transaction(async (tx) => {
-      await tx.$executeRaw`
+      await tx.$queryRaw`
         SELECT id
         FROM purchase_orders
         WHERE id = ${poId}

@@ -585,7 +585,7 @@ async function lockStockLevelForAlignment(
     },
   })
 
-  await tx.$executeRaw`
+  await tx.$queryRaw`
     SELECT id
     FROM stock_levels
     WHERE "productId" = ${productId} AND "warehouseId" = ${warehouseId}

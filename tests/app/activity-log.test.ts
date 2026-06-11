@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { summarizeInvoicePdfTokenSecurityEvents } from '@/app/actions/activity-log'
+import {
+  invoicePdfTokenSecurityEventWhere,
+  summarizeInvoicePdfTokenSecurityEvents,
+} from '@/app/actions/activity-log'
 
 test('invoice PDF token security summary groups wrong-session and wrong-IP events by order', () => {
   const rows = summarizeInvoicePdfTokenSecurityEvents([
@@ -65,4 +68,16 @@ test('invoice PDF token security summary groups wrong-session and wrong-IP event
       latestEventId: 'event-order-2',
     },
   ])
+})
+
+test('invoice PDF token security query filters to source reasons the summarizer uses', () => {
+  assert.deepEqual(invoicePdfTokenSecurityEventWhere(), {
+    tag: 'auth',
+    level: 'WARNING',
+    action: { in: ['invoice_pdf_token_security_signal', 'invoice_pdf_token_rejected'] },
+    OR: [
+      { metadata: { path: ['reason'], equals: 'wrong_session' } },
+      { metadata: { path: ['reason'], equals: 'wrong_ip' } },
+    ],
+  })
 })

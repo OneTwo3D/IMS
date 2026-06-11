@@ -168,3 +168,70 @@ test('tax snapshot refresh locks mutable parents and batches only still-mutable 
   assert.match(JSON.stringify((calls.executeRaw[3] as { values?: unknown[] }).values), /po-draft/)
   assert.doesNotMatch(JSON.stringify((calls.executeRaw[3] as { values?: unknown[] }).values), /po-sent/)
 })
+
+test('tax snapshot parent total updates are chunked for large affected sets', async () => {
+  const rowCount = 1001
+  const salesLines = Array.from({ length: rowCount }, (_, index) => ({
+    id: `sales-line-${index}`,
+    orderId: `sales-order-${index}`,
+    qty: '1',
+    unitPriceForeign: '10',
+    discountAmount: '0',
+    taxForeign: '1',
+    taxBase: '1',
+    totalForeign: '10',
+    totalBase: '10',
+    order: {
+      id: `sales-order-${index}`,
+      fxRateToBase: '1',
+      pricesIncludeVat: false,
+      taxRateName: 'Old VAT',
+    },
+  }))
+  const purchaseLines = Array.from({ length: rowCount }, (_, index) => ({
+    id: `purchase-line-${index}`,
+    poId: `po-${index}`,
+    taxForeign: '1',
+    taxBase: '1',
+    totalForeign: '10',
+    po: {
+      id: `po-${index}`,
+      fxRateToBase: '1',
+      taxRateName: 'Old VAT',
+    },
+  }))
+  const executeRawCalls: unknown[] = []
+  let lockCall = 0
+  const client = {
+    salesOrderLine: { findMany: async () => salesLines },
+    purchaseOrderLine: { findMany: async () => purchaseLines },
+    activityLog: { create: async () => ({ id: 'activity-1' }) },
+    $queryRaw: async () => {
+      lockCall += 1
+      return lockCall === 1
+        ? salesLines.map((line) => ({ id: line.orderId }))
+        : purchaseLines.map((line) => ({ id: line.poId }))
+    },
+    $executeRaw: async (query: unknown) => {
+      executeRawCalls.push(query)
+      return 1
+    },
+  }
+
+  const result = await refreshMutableDocumentTaxSnapshotsForRate(client as never, {
+    oldRate: { id: 'old-rate', name: 'Old VAT', rate: '0.1' },
+    newRate: { id: 'new-rate', name: 'New VAT', rate: '0.2' },
+  })
+
+  assert.deepEqual(result, {
+    salesOrders: rowCount,
+    salesLines: rowCount,
+    purchaseOrders: rowCount,
+    purchaseLines: rowCount,
+  })
+  assert.equal(executeRawCalls.length, 6)
+  assert.equal((executeRawCalls[1] as { values?: unknown[] }).values?.length, 10001)
+  assert.equal((executeRawCalls[2] as { values?: unknown[] }).values?.length, 11)
+  assert.equal((executeRawCalls[4] as { values?: unknown[] }).values?.length, 6001)
+  assert.equal((executeRawCalls[5] as { values?: unknown[] }).values?.length, 7)
+})

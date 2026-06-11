@@ -2137,7 +2137,7 @@ export async function returnPurchaseOrder(
           create: { productId: poLine.productId, warehouseId: rl.warehouseId, quantity: 0 },
           update: {},
         })
-        await tx.$executeRaw`
+        await tx.$queryRaw`
           SELECT "productId", "warehouseId"
           FROM stock_levels
           WHERE "productId" = ${poLine.productId}

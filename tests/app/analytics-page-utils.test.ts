@@ -6,8 +6,11 @@ import {
   loadVatReportForPage,
 } from '@/app/(dashboard)/analytics/_components/finance-analytics-page-utils'
 import {
+  getApAgingReport,
   getArAgingReport,
   getCurrencySummaryReport,
+  getFxGainLossReport,
+  getVatReport,
 } from '@/lib/domain/finance/finance-period-analytics'
 import {
   loadSalesReportForPage,
@@ -30,9 +33,24 @@ const arAgingEmptyTotalsKeysMatchReportTotals: ExactKeys<
   Awaited<ReturnType<typeof getArAgingReport>>['totals']
 > = true
 
+const apAgingEmptyTotalsKeysMatchReportTotals: ExactKeys<
+  typeof financeAnalyticsEmptyTotals.apAging,
+  Awaited<ReturnType<typeof getApAgingReport>>['totals']
+> = true
+
 const currencySummaryEmptyTotalsKeysMatchReportTotals: ExactKeys<
   typeof financeAnalyticsEmptyTotals.currencySummary,
   Awaited<ReturnType<typeof getCurrencySummaryReport>>['totals']
+> = true
+
+const fxGainLossEmptyTotalsKeysMatchReportTotals: ExactKeys<
+  typeof financeAnalyticsEmptyTotals.fxGainLoss,
+  Awaited<ReturnType<typeof getFxGainLossReport>>['totals']
+> = true
+
+const vatEmptyTotalsKeysMatchReportTotals: ExactKeys<
+  typeof financeAnalyticsEmptyTotals.vat,
+  Awaited<ReturnType<typeof getVatReport>>['totals']
 > = true
 
 test('finance analytics page loaders return typed empty reports for source scan limits', async () => {
@@ -51,7 +69,10 @@ test('finance analytics page loaders return typed empty reports for source scan 
 
 test('finance empty totals keys match report totals types', () => {
   assert.equal(arAgingEmptyTotalsKeysMatchReportTotals, true)
+  assert.equal(apAgingEmptyTotalsKeysMatchReportTotals, true)
   assert.equal(currencySummaryEmptyTotalsKeysMatchReportTotals, true)
+  assert.equal(fxGainLossEmptyTotalsKeysMatchReportTotals, true)
+  assert.equal(vatEmptyTotalsKeysMatchReportTotals, true)
 })
 
 test('sales analytics page loaders return typed empty reports for source scan limits', async () => {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { Buffer } from 'node:buffer'
 import test from 'node:test'
-import { NextRequest } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 
 import { getInventoryCostingExportResponse, INVENTORY_VALUATION_CSV_HEADERS } from '../../app/api/export/inventory-costing/route.ts'
 import { getInventoryLedgerExportResponse, STOCK_MOVEMENT_LEDGER_CSV_HEADERS } from '../../app/api/export/inventory-ledger/route.ts'
@@ -199,4 +199,98 @@ test('representative affected export routes keep report metadata out of CSV data
     valueReplayReliable: true,
     generatedAt: '2026-06-09T10:10:00.000Z',
   })
+})
+
+test('affected export routes reject oversized CSV exports', async () => {
+  const stockResponse = await getStockPositionExportResponse(
+    new NextRequest('http://localhost/api/export/stock-position?type=stock-on-hand'),
+    {
+      ...authorizedRouteDeps,
+      getStockOnHandReport: async () => ({
+        rows: [],
+        pageInfo: { totalRows: 50001 },
+        asOf: '2026-06-09',
+        source: 'snapshot',
+        generatedAt: '2026-06-09T10:00:00.000Z',
+      }) as never,
+    },
+  )
+  assert.equal(stockResponse.status, 413)
+
+  const ledgerResponse = await getInventoryLedgerExportResponse(
+    new NextRequest('http://localhost/api/export/inventory-ledger?report=stock-movements'),
+    {
+      ...authorizedRouteDeps,
+      getInventoryLedgerExportRowCount: async () => 100001,
+      getStockMovementLedgerReport: async () => {
+        throw new Error('report loader should not run for oversized export')
+      },
+    },
+  )
+  assert.equal(ledgerResponse.status, 413)
+
+  const costingResponse = await getInventoryCostingExportResponse(
+    new NextRequest('http://localhost/api/export/inventory-costing?report=inventory-valuation'),
+    {
+      ...authorizedRouteDeps,
+      getInventoryValuationReport: async () => ({
+        rows: [],
+        pageInfo: { totalRows: 100001 },
+        asOf: '2026-06-09',
+        source: 'snapshot',
+        valueReplayReliable: true,
+        generatedAt: '2026-06-09T10:10:00.000Z',
+      }) as never,
+    },
+  )
+  assert.equal(costingResponse.status, 413)
+})
+
+test('affected export routes return access denial before loading reports', async () => {
+  const denied = NextResponse.json({ error: 'denied' }, { status: 403 })
+
+  let stockLoaded = false
+  const stockResponse = await getStockPositionExportResponse(
+    new NextRequest('http://localhost/api/export/stock-position?type=stock-on-hand'),
+    {
+      ...authorizedRouteDeps,
+      accessDenied: () => denied,
+      getStockOnHandReport: async () => {
+        stockLoaded = true
+        throw new Error('stock report loader should not run')
+      },
+    },
+  )
+  assert.equal(stockResponse, denied)
+  assert.equal(stockLoaded, false)
+
+  let ledgerLoaded = false
+  const ledgerResponse = await getInventoryLedgerExportResponse(
+    new NextRequest('http://localhost/api/export/inventory-ledger?report=stock-movements'),
+    {
+      ...authorizedRouteDeps,
+      accessDenied: () => denied,
+      getInventoryLedgerExportRowCount: async () => {
+        ledgerLoaded = true
+        throw new Error('ledger row-count loader should not run')
+      },
+    },
+  )
+  assert.equal(ledgerResponse, denied)
+  assert.equal(ledgerLoaded, false)
+
+  let costingLoaded = false
+  const costingResponse = await getInventoryCostingExportResponse(
+    new NextRequest('http://localhost/api/export/inventory-costing?report=inventory-valuation'),
+    {
+      ...authorizedRouteDeps,
+      accessDenied: () => denied,
+      getInventoryValuationReport: async () => {
+        costingLoaded = true
+        throw new Error('costing report loader should not run')
+      },
+    },
+  )
+  assert.equal(costingResponse, denied)
+  assert.equal(costingLoaded, false)
 })

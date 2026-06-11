@@ -50,6 +50,19 @@ export type InvoicePdfTokenSecuritySummaryRow = {
   latestEventId: string
 }
 
+const INVOICE_PDF_TOKEN_SECURITY_REASONS = ['wrong_session', 'wrong_ip'] as const
+
+export function invoicePdfTokenSecurityEventWhere() {
+  return {
+    tag: 'auth',
+    level: 'WARNING' as const,
+    action: { in: ['invoice_pdf_token_security_signal', 'invoice_pdf_token_rejected'] },
+    OR: INVOICE_PDF_TOKEN_SECURITY_REASONS.map((reason) => ({
+      metadata: { path: ['reason'], equals: reason },
+    })),
+  }
+}
+
 type Filters = {
   search?: string
   tag?: string
@@ -142,7 +155,7 @@ function isInvoicePdfTokenSecurityEvent(row: InvoicePdfTokenSecurityEventSourceR
   const reason = metadataString(row.metadata, 'reason')
   return (
     row.action === 'invoice_pdf_token_security_signal' ||
-    (row.action === 'invoice_pdf_token_rejected' && (reason === 'wrong_session' || reason === 'wrong_ip'))
+    (row.action === 'invoice_pdf_token_rejected' && INVOICE_PDF_TOKEN_SECURITY_REASONS.includes(reason as typeof INVOICE_PDF_TOKEN_SECURITY_REASONS[number]))
   )
 }
 
@@ -191,11 +204,7 @@ export function summarizeInvoicePdfTokenSecurityEvents(
 export async function getRecentInvoicePdfTokenSecurityEvents(limit = 5): Promise<InvoicePdfTokenSecuritySummaryRow[]> {
   await requirePermission('settings')
   const rows = await db.activityLog.findMany({
-    where: {
-      tag: 'auth',
-      level: 'WARNING',
-      action: { in: ['invoice_pdf_token_security_signal', 'invoice_pdf_token_rejected'] },
-    },
+    where: invoicePdfTokenSecurityEventWhere(),
     select: {
       id: true,
       entityId: true,
