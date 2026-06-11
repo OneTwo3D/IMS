@@ -150,11 +150,21 @@ test('tax snapshot refresh locks mutable parents and batches only still-mutable 
 
   assert.deepEqual(result, { salesOrders: 1, salesLines: 1, purchaseOrders: 1, purchaseLines: 1 })
   assert.equal(calls.queryRaw.length, 2)
-  assert.equal(calls.executeRaw.length, 2)
+  assert.equal(calls.executeRaw.length, 4)
+  assert.equal(calls.salesOrderUpdateMany.length, 0)
+  assert.equal(calls.purchaseOrderUpdateMany.length, 0)
   assert.equal(JSON.stringify((calls.executeRaw[0] as { values?: unknown[] }).values), '["sales-line-draft","20","20","4","4"]')
-  assert.equal(JSON.stringify((calls.executeRaw[1] as { values?: unknown[] }).values), '["purchase-line-draft","20","20"]')
+  assert.deepEqual(
+    (calls.salesFindMany[0] as { where: { order: { status: { in: string[] } } } }).where.order.status.in,
+    ['DRAFT'],
+  )
   assert.deepEqual(
     (calls.purchaseFindMany[0] as { where: { po: { status: { in: string[] } } } }).where.po.status.in,
     ['DRAFT'],
   )
+  assert.match(JSON.stringify((calls.executeRaw[1] as { values?: unknown[] }).values), /sales-order-draft/)
+  assert.doesNotMatch(JSON.stringify((calls.executeRaw[1] as { values?: unknown[] }).values), /sales-order-raced/)
+  assert.equal(JSON.stringify((calls.executeRaw[2] as { values?: unknown[] }).values), '["purchase-line-draft","20","20"]')
+  assert.match(JSON.stringify((calls.executeRaw[3] as { values?: unknown[] }).values), /po-draft/)
+  assert.doesNotMatch(JSON.stringify((calls.executeRaw[3] as { values?: unknown[] }).values), /po-sent/)
 })
