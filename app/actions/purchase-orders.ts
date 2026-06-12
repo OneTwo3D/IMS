@@ -15,14 +15,16 @@ import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
+import { rebasePurchaseOrderStoredBaseAmounts } from '@/lib/domain/purchasing/purchase-order-fx-rebase'
 import {
   computeGrossUnitCostBaseByLine,
   queueLandedCostAdjustmentJournals,
   recalculateDirectLandedCosts,
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
-import { cancelPurchaseOrderService, type CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
+import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
 import {
   validateLinkedFreightReceiptStatus,
@@ -1147,7 +1149,16 @@ export async function updatePurchaseOrder(
     const session = await requirePermission('purchasing.create')
     const existing = await db.purchaseOrder.findUnique({
       where: { id },
-      select: { status: true, currency: true, fxRateToBase: true, directFreightForeign: true, directFreightBase: true },
+      select: {
+        status: true,
+        currency: true,
+        fxRateToBase: true,
+        subtotalForeign: true,
+        taxForeign: true,
+        totalForeign: true,
+        directFreightForeign: true,
+        directFreightBase: true,
+      },
     })
     if (!existing) return { success: false, error: 'PO not found' }
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be edited' }
@@ -1181,6 +1192,16 @@ export async function updatePurchaseOrder(
     if (input.lines || input.taxRateId !== undefined || input.taxRateName !== undefined) {
       updates.taxRateName = input.taxRateName || null
       updates.taxRatePercent = vatRate > 0 ? vatRate : null
+    }
+
+    if (shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined) {
+      const rebasedPurchaseOrder = await rebasePurchaseOrderStoredBaseAmounts(db, id, {
+        subtotalForeign: existing.subtotalForeign,
+        taxForeign: existing.taxForeign,
+        totalForeign: existing.totalForeign,
+        directFreightForeign: existing.directFreightForeign,
+      }, fxRate)
+      Object.assign(updates, rebasedPurchaseOrder)
     }
 
     let updateFallbackInfo: {
@@ -2022,13 +2043,7 @@ export async function receivePurchaseOrder(
 }
 
 export async function cancelPurchaseOrder(id: string): Promise<CancelPurchaseOrderResult> {
-  await requirePermission('purchasing.create')
-  const result = await cancelPurchaseOrderService(id)
-  if (result.success) {
-    revalidatePath('/purchase-orders')
-    revalidatePath(`/purchase-orders/${id}`)
-  }
-  return result
+  return cancelPurchaseOrderAction(id)
 }
 
 export async function getSupplierLastPrices(

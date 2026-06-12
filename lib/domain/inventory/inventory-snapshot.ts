@@ -285,12 +285,12 @@ function parseSnapshotDate(input: SnapshotDateInput): Date {
   return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()))
 }
 
-function endOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999))
-}
-
 function addUtcDays(date: Date, days: number): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + days))
+}
+
+function startOfNextUtcDay(date: Date): Date {
+  return addUtcDays(date, 1)
 }
 
 function formatSnapshotDate(date: Date): string {
@@ -615,18 +615,18 @@ async function loadReservationBackfillSupportSnapshot(
 
 function reservationBackfillUnsupportedWarnings(
   snapshotDate: Date,
-  cutoff: Date,
+  exclusiveCutoff: Date,
   support: ReservationBackfillSupportSnapshot,
 ): InventoryReservationSnapshotBackfillWarning[] {
   const warnings: InventoryReservationSnapshotBackfillWarning[] = []
   const formattedDate = formatSnapshotDate(snapshotDate)
 
-  if (support.latestMutableSourceUpdatedAt && support.latestMutableSourceUpdatedAt > cutoff) {
+  if (support.latestMutableSourceUpdatedAt && support.latestMutableSourceUpdatedAt >= exclusiveCutoff) {
     warnings.push({
       snapshotDate: formattedDate,
       code: 'reservation_source_changed_after_cutoff',
       message: [
-        `Reservation sources changed after ${cutoff.toISOString()};`,
+        `Reservation sources changed on or after ${exclusiveCutoff.toISOString()};`,
         'historical reserved quantities cannot be reconstructed from current allocation/shipment/production state for this day.',
       ].join(' '),
     })
@@ -901,7 +901,7 @@ export async function writeDailyInventorySnapshot(options: {
     reservationSnapshotCount: reservationSnapshotsWritten,
     source: 'cron',
     checkMethod: 'daily_current_state_v1',
-    cutoffAt: endOfUtcDay(snapshotDate),
+    cutoffAt: startOfNextUtcDay(snapshotDate),
     reservationSourceCount: reservationSnapshot.reservationSourceCount,
   })
 
@@ -1024,7 +1024,7 @@ export async function backfillInventorySnapshots(options: {
 
     if (movementPageIndex >= movementPage.length) {
       movementPage = await client.stockMovement.findMany({
-        where: { createdAt: { gt: endOfUtcDay(addUtcDays(fromDate, -1)) } },
+        where: { createdAt: { gte: fromDate } },
         select: {
           id: true,
           type: true,
@@ -1047,11 +1047,11 @@ export async function backfillInventorySnapshots(options: {
     return movementPage[movementPageIndex++] ?? null
   }
 
-  async function reverseMovementsAfter(cutoff: Date): Promise<void> {
+  async function reverseMovementsOnOrAfter(boundary: Date): Promise<void> {
     while (true) {
       const movement = await nextMovement()
       if (!movement) return
-      if (movement.createdAt <= cutoff) {
+      if (movement.createdAt < boundary) {
         pendingMovement = movement
         return
       }
@@ -1061,7 +1061,7 @@ export async function backfillInventorySnapshots(options: {
     }
   }
 
-  await reverseMovementsAfter(endOfUtcDay(toDate))
+  await reverseMovementsOnOrAfter(startOfNextUtcDay(toDate))
 
   for (let day = toDate; day >= fromDate; day = addUtcDays(day, -1)) {
     const rows = rowsFromState(day, state)
@@ -1069,7 +1069,7 @@ export async function backfillInventorySnapshots(options: {
     daysWritten += 1
 
     if (options.includeReservationSnapshots) {
-      const cutoff = endOfUtcDay(day)
+      const cutoff = startOfNextUtcDay(day)
       const unsupportedWarnings = reservationSupport
         ? reservationBackfillUnsupportedWarnings(day, cutoff, reservationSupport)
         : []
@@ -1114,7 +1114,7 @@ export async function backfillInventorySnapshots(options: {
       }
     }
 
-    await reverseMovementsAfter(endOfUtcDay(addUtcDays(day, -1)))
+    await reverseMovementsOnOrAfter(day)
   }
 
   return {

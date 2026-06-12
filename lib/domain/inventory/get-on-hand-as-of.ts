@@ -164,16 +164,20 @@ function assertNotAborted(signal?: AbortSignal): void {
   throw new Error('Inventory as-of movement replay was aborted')
 }
 
-function validateReplayRange(range: { gt?: Date; lt?: Date; lte?: Date }): void {
+type ReplayDateRange = { gt?: Date; gte?: Date; lt?: Date; lte?: Date }
+
+function validateReplayRange(range: ReplayDateRange): void {
+  const lower = range.gt ?? range.gte
   const upper = range.lte ?? range.lt
-  if (range.gt && upper && range.gt > upper) {
+  if (lower && upper && lower > upper) {
     throw new Error('Inventory as-of movement replay range is inverted')
   }
 }
 
-function isEmptyReplayRange(range: { gt?: Date; lt?: Date; lte?: Date }): boolean {
+function isEmptyReplayRange(range: ReplayDateRange): boolean {
+  const lower = range.gt ?? range.gte
   const upper = range.lte ?? range.lt
-  return Boolean(range.gt && upper && range.gt.getTime() === upper.getTime())
+  return Boolean(lower && upper && lower.getTime() >= upper.getTime())
 }
 
 function buildResult(input: {
@@ -234,6 +238,10 @@ function parseAsOf(input: AsOfInput): Date {
 
 function startOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
+}
+
+function startOfNextUtcDay(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1))
 }
 
 function endOfUtcDay(date: Date): Date {
@@ -582,12 +590,12 @@ async function replayMovements(
   client: OnHandAsOfClient,
   state: OnHandState,
   filters: OnHandAsOfFilters,
-  range: { gt?: Date; lt?: Date; lte?: Date },
+  range: ReplayDateRange,
   direction: 'forward' | 'reverse',
   signal?: AbortSignal,
 ): Promise<ReplayMovementsResult> {
-  validateReplayRange(range)
   if (isEmptyReplayRange(range)) return emptyReplayResult()
+  validateReplayRange(range)
   const result = emptyReplayResult()
   let cursor: { id: string } | undefined
 
@@ -711,7 +719,7 @@ export async function getOnHandAsOf(options: {
       client,
       state,
       filters,
-      { gt: endOfUtcDay(priorSnapshotDate), lte: asOf },
+      { gte: startOfNextUtcDay(priorSnapshotDate), lte: asOf },
       'forward',
       options.signal,
     )
@@ -733,7 +741,7 @@ export async function getOnHandAsOf(options: {
       client,
       state,
       filters,
-      { gt: asOf, lte: endOfUtcDay(futureSnapshotDate) },
+      { gt: asOf, lt: startOfNextUtcDay(futureSnapshotDate) },
       'reverse',
       options.signal,
     )

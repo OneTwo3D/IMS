@@ -56,10 +56,13 @@ export function invoicePdfTokenSecurityEventWhere() {
   return {
     tag: 'auth',
     level: 'WARNING' as const,
-    action: { in: ['invoice_pdf_token_security_signal', 'invoice_pdf_token_rejected'] },
-    OR: INVOICE_PDF_TOKEN_SECURITY_REASONS.map((reason) => ({
-      metadata: { path: ['reason'], equals: reason },
-    })),
+    OR: [
+      { action: 'invoice_pdf_token_security_signal' },
+      ...INVOICE_PDF_TOKEN_SECURITY_REASONS.map((reason) => ({
+        action: 'invoice_pdf_token_rejected',
+        metadata: { path: ['reason'], equals: reason },
+      })),
+    ],
   }
 }
 

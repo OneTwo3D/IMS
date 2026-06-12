@@ -73,9 +73,20 @@ function createSnapshotClient(input: {
     },
     stockMovement: {
       findMany: async (args) => {
-        const query = args as { cursor?: { id: string }; skip?: number; take?: number } | undefined
+        const query = args as {
+          where?: { createdAt?: { gt?: Date; gte?: Date; lt?: Date; lte?: Date } }
+          cursor?: { id: string }
+          skip?: number
+          take?: number
+        } | undefined
+        const range = query?.where?.createdAt ?? {}
         const movements = [...(input.movements ?? [])].sort((a, b) => (
           b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id)
+        )).filter((movement) => (
+          (!range.gt || movement.createdAt > range.gt) &&
+          (!range.gte || movement.createdAt >= range.gte) &&
+          (!range.lt || movement.createdAt < range.lt) &&
+          (!range.lte || movement.createdAt <= range.lte)
         ))
         const cursorIndex = query?.cursor?.id == null
           ? -1
@@ -266,7 +277,7 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
     reservationSnapshotCount: 1,
     source: 'cron',
     checkMethod: 'daily_current_state_v1',
-    cutoffAt: new Date('2026-05-28T23:59:59.999Z'),
+    cutoffAt: new Date('2026-05-29T00:00:00.000Z'),
     reservationSourceCount: 1,
   })
 })
@@ -464,7 +475,7 @@ test('reservation backfill writes sparse rows and run markers for reliable days'
     snapshotDate: '2026-05-28T00:00:00.000Z',
     source: 'backfill',
     checkMethod: 'current_sources_updated_at_gate_v2',
-    cutoffAt: '2026-05-28T23:59:59.999Z',
+    cutoffAt: '2026-05-29T00:00:00.000Z',
     reservationSourceCount: 1,
   })
 })
@@ -504,7 +515,7 @@ test('reservation backfill warns and skips run marker when source state changed 
     warnings: [{
       snapshotDate: '2026-05-28',
       code: 'reservation_source_changed_after_cutoff',
-      message: 'Reservation sources changed after 2026-05-28T23:59:59.999Z; historical reserved quantities cannot be reconstructed from current allocation/shipment/production state for this day.',
+      message: 'Reservation sources changed on or after 2026-05-29T00:00:00.000Z; historical reserved quantities cannot be reconstructed from current allocation/shipment/production state for this day.',
     }],
     knownLimitations: EXPECTED_RESERVATION_BACKFILL_LIMITATIONS,
   })
@@ -789,7 +800,7 @@ test('reservation backfill reruns are idempotent by snapshot date and stock pair
       {
         source: 'backfill',
         checkMethod: 'current_sources_updated_at_gate_v2',
-        cutoffAt: '2026-05-28T23:59:59.999Z',
+        cutoffAt: '2026-05-29T00:00:00.000Z',
         stockLevelCount: 1,
         reservationSnapshotCount: 1,
         reservationSourceCount: 1,
@@ -797,7 +808,7 @@ test('reservation backfill reruns are idempotent by snapshot date and stock pair
       {
         source: 'backfill',
         checkMethod: 'current_sources_updated_at_gate_v2',
-        cutoffAt: '2026-05-28T23:59:59.999Z',
+        cutoffAt: '2026-05-29T00:00:00.000Z',
         stockLevelCount: 1,
         reservationSnapshotCount: 1,
         reservationSourceCount: 1,
