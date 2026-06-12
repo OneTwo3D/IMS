@@ -25,6 +25,7 @@ function unusedClient(): ReplenishmentReportClient {
     orderAllocation: unused,
     shipmentLine: unused,
     productionOrder: unused,
+    bomItem: unused,
   }
 }
 
@@ -557,4 +558,209 @@ test('component shortage report includes draft and in-progress production demand
   assert.deepEqual(report.rows[0]?.outputProducts, ['BOM-1 Assembly', 'BOM-2 Second assembly'])
   assert.equal(report.rows[0]?.earliestScheduledAt?.slice(0, 10), '2026-06-10')
   assert.match(report.notices.join(' '), /without a destination warehouse/)
+})
+
+test('reorder report labels BOM products with the latest production order manufacturer', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        {
+          id: 'bom-product',
+          sku: 'BOM-TABLE',
+          name: 'Oak table',
+          type: ProductType.BOM,
+          stockUnit: 'each',
+          reorderPoint: decimal(5),
+          reorderQty: decimal(8),
+          safetyStockQty: decimal(0),
+          abcClass: null,
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [],
+        },
+      ],
+    },
+    productionOrder: {
+      findMany: async () => [
+        {
+          outputProductId: 'bom-product',
+          warehouseId: 'wh-main',
+          manufacturerId: 'sup-co-pack',
+          manufacturer: { name: 'Co-Pack Co' },
+          outputProduct: { type: ProductType.BOM },
+          createdAt: new Date('2026-03-01T00:00:00.000Z'),
+        },
+      ],
+    },
+  }
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } })
+  assert.equal(report.rows.length, 1)
+  assert.equal(report.rows[0]?.supplierName, 'Manufactured by Co-Pack Co')
+  assert.equal(report.rows[0]?.supplierId, null)
+})
+
+test('reorder report falls back to "Manufactured in-house" when no manufacturer is set', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        {
+          id: 'bom-product',
+          sku: 'BOM-CHAIR',
+          name: 'Oak chair',
+          type: ProductType.BOM,
+          stockUnit: 'each',
+          reorderPoint: decimal(5),
+          reorderQty: decimal(8),
+          safetyStockQty: decimal(0),
+          abcClass: null,
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [],
+        },
+      ],
+    },
+    productionOrder: {
+      findMany: async () => [
+        {
+          outputProductId: 'bom-product',
+          warehouseId: 'wh-main',
+          manufacturerId: null,
+          manufacturer: null,
+          outputProduct: { type: ProductType.BOM },
+          createdAt: new Date('2026-03-01T00:00:00.000Z'),
+        },
+      ],
+    },
+  }
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } })
+  assert.equal(report.rows[0]?.supplierName, 'Manufactured in-house')
+})
+
+test('reorder report folds BOM component demand into the component reorder math', async () => {
+  // Oak board (RAW) is a component of Oak table (BOM). The BOM needs 8 units
+  // produced (gap = 5 reorder point - 0 available - 0 inbound, max with
+  // configured reorderQty 8). Each BOM unit consumes 2 oak boards. So the
+  // raw material picks up 16 units of extra demand on top of its own gap.
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        {
+          id: 'raw-oak',
+          sku: 'RAW-OAK',
+          name: 'Oak board',
+          type: ProductType.SIMPLE,
+          stockUnit: 'each',
+          reorderPoint: decimal(0),
+          reorderQty: decimal(0),
+          safetyStockQty: decimal(0),
+          abcClass: null,
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [
+            { supplierId: 'sup-timber', supplierSku: 'OAK-1', lastUnitCost: decimal(5), leadTimeDays: 7, supplier: { name: 'Timber Co' } },
+          ],
+        },
+        {
+          id: 'bom-table',
+          sku: 'BOM-TABLE',
+          name: 'Oak table',
+          type: ProductType.BOM,
+          stockUnit: 'each',
+          reorderPoint: decimal(5),
+          reorderQty: decimal(8),
+          safetyStockQty: decimal(0),
+          abcClass: null,
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [],
+        },
+      ],
+    },
+    bomItem: {
+      findMany: async () => [
+        { parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2) },
+      ],
+    },
+  }
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } })
+  const rawRow = report.rows.find((r) => r.sku === 'RAW-OAK')
+  assert.ok(rawRow, 'raw material row present')
+  assert.equal(rawRow?.reorderPoint, '16')
+  assert.equal(rawRow?.suggestedReorderQty, '16')
+  assert.deepEqual(rawRow?.neededFor, ['BOM BOM-TABLE'])
+})
+
+test('reorder report aggregates raw-material demand across multiple parent BOMs', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        {
+          id: 'raw-oak',
+          sku: 'RAW-OAK',
+          name: 'Oak board',
+          type: ProductType.SIMPLE,
+          stockUnit: 'each',
+          reorderPoint: decimal(0),
+          reorderQty: decimal(0),
+          safetyStockQty: decimal(0),
+          abcClass: null,
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [
+            { supplierId: 'sup-timber', supplierSku: 'OAK-1', lastUnitCost: decimal(5), leadTimeDays: 7, supplier: { name: 'Timber Co' } },
+          ],
+        },
+        {
+          id: 'bom-table',
+          sku: 'BOM-TABLE',
+          name: 'Oak table',
+          type: ProductType.BOM,
+          stockUnit: 'each',
+          reorderPoint: decimal(5),
+          reorderQty: decimal(5),
+          safetyStockQty: decimal(0),
+          abcClass: null,
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [],
+        },
+        {
+          id: 'bom-shelf',
+          sku: 'BOM-SHELF',
+          name: 'Oak shelf',
+          type: ProductType.BOM,
+          stockUnit: 'each',
+          reorderPoint: decimal(4),
+          reorderQty: decimal(4),
+          safetyStockQty: decimal(0),
+          abcClass: null,
+          category,
+          preferredSupplierId: null,
+          preferredSupplier: null,
+          supplierProducts: [],
+        },
+      ],
+    },
+    bomItem: {
+      findMany: async () => [
+        { parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2) },
+        { parentProductId: 'bom-shelf', componentProductId: 'raw-oak', qty: decimal(1) },
+      ],
+    },
+  }
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } })
+  const rawRow = report.rows.find((r) => r.sku === 'RAW-OAK')
+  // 5 tables × 2 oak + 4 shelves × 1 oak = 14 extra units of demand.
+  assert.equal(rawRow?.suggestedReorderQty, '14')
+  assert.deepEqual(rawRow?.neededFor, ['BOM BOM-SHELF', 'BOM BOM-TABLE'])
 })

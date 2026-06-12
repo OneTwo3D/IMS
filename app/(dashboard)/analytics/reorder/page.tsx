@@ -5,6 +5,7 @@ import {
   getReorderReport,
   type ReorderReportRow,
 } from '@/lib/domain/inventory/replenishment-reports'
+import { ReorderActionsToolbar } from './reorder-actions-client'
 import {
   getStockPositionFilterOptions,
   stockPositionSelectedFilterOptionInputs,
@@ -73,7 +74,8 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       render: (row) => <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />,
       footer: 'Totals',
     },
-    { key: 'supplier', label: 'Supplier', render: (row) => row.supplierName ?? 'Unassigned' },
+    { key: 'supplier', label: 'Supplier / source', render: (row) => row.supplierName ?? 'Unassigned' },
+    { key: 'neededFor', label: 'Needed for', render: (row) => row.neededFor.join(', ') },
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },
     { key: 'available', label: 'Available', align: 'right', render: (row) => `${row.availableQty} ${row.stockUnit}`, footer: report.totals.availableQty },
     { key: 'warehouseAvailability', label: 'Warehouse availability', render: (row) => row.warehouseAvailabilityBreakdown || 'None' },
@@ -85,7 +87,10 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     { key: 'urgency', label: 'Status', render: (row) => urgencyLabel(row.urgency) },
   ]
 
+  const toolbarRows = report.rows.map((row) => ({ productId: row.productId, productType: row.productType }))
   return (
+    <div className="space-y-3">
+      <ReorderActionsToolbar rows={toolbarRows} />
     <StockPositionReportPage
       title="Reorder Planning"
       description="Demand-driven replenishment suggestions using sales velocity, supplier lead time, safety stock, available stock, and inbound open POs."
@@ -108,5 +113,6 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       showIncludeZero={false}
       showDemandWindowDays
     />
+    </div>
   )
 }
