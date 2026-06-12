@@ -35,6 +35,25 @@ export type PurchaseOrderFxRebaseDb = {
   }
 }
 
+export type PurchaseOrderFxRebaseTransactionDb<TResult = unknown> = PurchaseOrderFxRebaseDb & {
+  purchaseOrder: {
+    update(args: {
+      where: { id: string }
+      data: Record<string, unknown>
+      select?: unknown
+    }): Promise<TResult>
+  }
+}
+
+export type PurchaseOrderFxRebaseTransactionalDb<TResult = unknown> = {
+  $transaction<T>(fn: (tx: PurchaseOrderFxRebaseTransactionDb<TResult>) => Promise<T>): Promise<T>
+}
+
+export type PurchaseOrderFxRebaseParentUpdate = {
+  data: Record<string, unknown>
+  select?: unknown
+}
+
 function safeFxRate(rate: number): number {
   return rate > 0 ? rate : 1
 }
@@ -102,4 +121,25 @@ export async function rebasePurchaseOrderStoredBaseAmounts(
   ])
 
   return rebased.purchaseOrder
+}
+
+export async function rebasePurchaseOrderStoredBaseAmountsWithParentUpdate<TResult>(
+  db: PurchaseOrderFxRebaseTransactionalDb<TResult>,
+  poId: string,
+  order: PurchaseOrderFxRebaseStoredOrder,
+  fxRateToBase: number,
+  parentUpdate: PurchaseOrderFxRebaseParentUpdate,
+): Promise<TResult> {
+  return db.$transaction(async (tx) => {
+    const rebasedPurchaseOrder = await rebasePurchaseOrderStoredBaseAmounts(tx, poId, order, fxRateToBase)
+
+    return tx.purchaseOrder.update({
+      where: { id: poId },
+      data: {
+        ...parentUpdate.data,
+        ...rebasedPurchaseOrder,
+      },
+      ...(parentUpdate.select === undefined ? {} : { select: parentUpdate.select }),
+    })
+  })
 }

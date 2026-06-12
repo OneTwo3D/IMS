@@ -17,7 +17,10 @@ import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { rebasePurchaseOrderStoredBaseAmounts } from '@/lib/domain/purchasing/purchase-order-fx-rebase'
+import {
+  rebasePurchaseOrderStoredBaseAmountsWithParentUpdate,
+  type PurchaseOrderFxRebaseTransactionalDb,
+} from '@/lib/domain/purchasing/purchase-order-fx-rebase'
 import {
   computeGrossUnitCostBaseByLine,
   queueLandedCostAdjustmentJournals,
@@ -1194,16 +1197,6 @@ export async function updatePurchaseOrder(
       updates.taxRatePercent = vatRate > 0 ? vatRate : null
     }
 
-    if (shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined) {
-      const rebasedPurchaseOrder = await rebasePurchaseOrderStoredBaseAmounts(db, id, {
-        subtotalForeign: existing.subtotalForeign,
-        taxForeign: existing.taxForeign,
-        totalForeign: existing.totalForeign,
-        directFreightForeign: existing.directFreightForeign,
-      }, fxRate)
-      Object.assign(updates, rebasedPurchaseOrder)
-    }
-
     let updateFallbackInfo: {
       destCountry: string | null
       lines: { sku: string; category: TaxCategory }[]
@@ -1487,11 +1480,24 @@ export async function updatePurchaseOrder(
       updates.totalBase = subtotalBase + totalTaxBase + currentDirectFreightBase
     }
 
-    const po = await db.purchaseOrder.update({
-      where: { id },
-      data: updates,
-      select: PO_SELECT,
-    })
+    const po = shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined
+      ? await rebasePurchaseOrderStoredBaseAmountsWithParentUpdate(
+          db as unknown as PurchaseOrderFxRebaseTransactionalDb<Parameters<typeof mapPoRow>[0]>,
+          id,
+          {
+            subtotalForeign: existing.subtotalForeign,
+            taxForeign: existing.taxForeign,
+            totalForeign: existing.totalForeign,
+            directFreightForeign: existing.directFreightForeign,
+          },
+          fxRate,
+          { data: updates, select: PO_SELECT },
+        )
+      : await db.purchaseOrder.update({
+          where: { id },
+          data: updates,
+          select: PO_SELECT,
+        })
 
     // If additional costs were changed on a GOODS PO that has already been
     // received (cost layers exist), recalculate the landed unit cost on
