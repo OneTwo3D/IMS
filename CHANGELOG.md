@@ -6,7 +6,16 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
-## Unreleased - target 2.0.0
+## 2.0.0 - 2026-06-12
+
+### Reorder Planning & manufacturing (cycle PRs #188–#190)
+
+- **Reorder report covers manufactured products end-to-end.** BOM-typed products no longer show "Unassigned" in the supplier column; they display **Manufactured by [name]** using the manufacturer set on the product's most recent `ProductionOrder`, or **Manufactured in-house** when none has been set.
+- **Raw materials inherit demand from BOM parents that need replenishment.** For each BOM row whose own `suggestedReorderQty > 0`, every `BomItem.componentProductId` adds `(bomSuggestedQty × bomItem.qty)` to its component's reorder point. Raw materials used by multiple BOMs aggregate demand across all parents; raw materials that are also sellable add BOM demand on top of their sales-driven demand. Products with `reorderQty = 0` (explicit opt-out) stay out of the report unless a BOM is driving demand into them.
+- **New "Needed for" column** lists the demand sources per row: `Direct sales` when daily demand > 0, `BOM <parent SKU>` for each contributing parent BOM (sorted + deduped), `Stock policy` fallback when neither applies.
+- **One-click "Generate POs + draft MOs for visible rows" toolbar** on the Reorder Planning page. Splits the visible rows by `productType` and routes purchased rows to `createReorderPOs` (one draft PO per supplier) and manufactured rows to `createReorderMOs` (one draft `ProductionOrder` per BOM product, copying `manufacturerId` + `warehouseId` from the product's latest MO, picking the most recently-updated active `Bom` as parent). Operator scopes via the existing filter form.
+- **Replenishment CSV export gains the `neededFor` column** (semicolon-joined). Consumers with pinned column maps need updating.
+- **Analytics report description + methodology notices fold into a single (i) tooltip** next to each report title. The paragraph below the title and the amber notices box lower on the page are gone; the same content shows on hover or keyboard focus, and the data table sits ~24px higher on every report page.
 
 ### Tax & accounting (cycle PRs #169–#186)
 
