@@ -21,7 +21,7 @@ export type PurchaseInvoicePoLine = {
   id: string
   qty: unknown
   product: { sku: string }
-  taxRate?: { accountingTaxType: string | null } | null
+  taxRate?: { accountingTaxType: string | null; reverseCharge?: boolean } | null
 }
 
 export type PurchaseInvoiceCostLine = {
@@ -129,6 +129,13 @@ export function calculatePurchaseInvoice(params: {
   poTaxForeign: number
   transitAccount: string
   fallbackTaxType?: string
+  /**
+   * Accounting tax type to use when a line's resolved TaxRate has
+   * reverseCharge=true. Falls back to the line's normal taxType (or
+   * fallbackTaxType) when empty — defensive default so the bill still
+   * posts even if the admin hasn't configured the swap yet.
+   */
+  reverseChargeTaxType?: string
   poLineById: Map<string, PurchaseInvoicePoLine>
   costLineById: Map<string, PurchaseInvoiceCostLine>
 }): PurchaseInvoiceCalculation {
@@ -167,12 +174,16 @@ export function calculatePurchaseInvoice(params: {
         totalForeign,
         totalBase,
       })
+      const baseTaxType = poLine.taxRate?.accountingTaxType ?? params.fallbackTaxType
+      const productTaxType = poLine.taxRate?.reverseCharge && params.reverseChargeTaxType
+        ? params.reverseChargeTaxType
+        : baseTaxType
       accountingLines.push({
         description: `PO ${params.poReference} line`,
         quantity: line.qtyBilled,
         unitAmount: rounded4(line.unitCostForeign),
         accountCode: params.transitAccount,
-        taxType: poLine.taxRate?.accountingTaxType ?? params.fallbackTaxType,
+        taxType: productTaxType,
       })
       continue
     }

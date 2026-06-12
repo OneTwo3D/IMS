@@ -2440,7 +2440,7 @@ export async function createInvoice(
             id: true,
             qty: true,
             product: { select: { sku: true } },
-            taxRate: { select: { accountingTaxType: true } },
+            taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
           },
         },
         freightCostLines: {
@@ -2519,6 +2519,7 @@ export async function createInvoice(
       poTaxForeign: Number(po.taxForeign),
       transitAccount: accountingSettings.transitAccount,
       fallbackTaxType,
+      reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
       poLineById,
       costLineById,
     })
@@ -2773,6 +2774,7 @@ export async function updateInvoice(
         poTaxForeign: Number(invoice.po.taxForeign),
         transitAccount: accountingSettings.transitAccount,
         fallbackTaxType,
+        reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
         poLineById,
         costLineById,
       })

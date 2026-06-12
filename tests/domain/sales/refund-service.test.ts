@@ -156,6 +156,8 @@ const accountingSettings: AccountingSettings = {
   paymentAccountMap: '{}',
   invoiceUrlTemplate: '',
   billUrlTemplate: '',
+  reverseChargeSalesTaxType: '',
+  reverseChargePurchaseTaxType: '',
 }
 
 function baseState(overrides: Partial<State> = {}): State {
