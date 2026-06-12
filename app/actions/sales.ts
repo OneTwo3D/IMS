@@ -10,6 +10,7 @@ import {
   type AccountingSettings,
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
+import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
@@ -1095,28 +1096,16 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   if (!so) return
   const settings = await getAccountingSettings()
   if (!settings.syncEnabled) return
-  // Multi-component TaxRates can't be expressed as multiple per-line TaxTypes
-  // without distorting the goods total or the per-component tax base (single
-  // economic sale split into N accounting lines double-counts goods value).
-  // Xero/QBO express the breakdown via their TaxComponents API at the TaxRate
-  // level instead — the operator must configure the equivalent TaxRate on the
-  // accounting side, or wait for the IMS→Xero TaxRate sync helper. Log a
-  // warning so the operator knows the breakdown won't appear in Xero.
-  const multiComponentRates = new Set<string>()
-  for (const line of so.lines) {
-    if (line.taxRate && (line.taxRate.isCompound || line.taxRate.components.length > 0)) {
-      multiComponentRates.add(line.taxRate.name)
-    }
-  }
-  if (multiComponentRates.size > 0) {
+  const multiComponentRateNames = multiComponentTaxRateNames(so.lines)
+  if (multiComponentRateNames.length > 0) {
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: so.id,
       action: 'sales_invoice_tax_components_not_pushed',
       tag: 'accounting',
       level: 'WARNING',
-      description: `Multi-component tax rates on this order will post to the accounting system as a single TaxType: ${[...multiComponentRates].join(', ')}. Configure the equivalent TaxComponents on the accounting side or the per-component breakdown will not appear on the VAT return.`,
-      metadata: { taxRateNames: [...multiComponentRates] },
+      description: `Multi-component tax rates on this order will post to the accounting system as a single TaxType: ${multiComponentRateNames.join(', ')}. Configure the equivalent TaxComponents on the accounting side or the per-component breakdown will not appear on the VAT return.`,
+      metadata: { taxRateNames: multiComponentRateNames },
     })
   }
 
