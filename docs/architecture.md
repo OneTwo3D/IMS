@@ -162,7 +162,7 @@ The CHECK constraints prevent new bad writes. The invariant report remains the r
 
 **Discount storage** — Discounts are stored separately as `discountStr` (the original input) and `discountAmount` (the computed value). Prices are never baked with discounts applied.
 
-**Tax rate snapshotting** — Sales orders store `taxRateName` and `taxRatePercent` at creation time, ensuring historical accuracy if tax rates change later.
+**Tax rate snapshotting** — Sales and purchase order lines store `taxRateId` and rate snapshots at creation/edit time, ensuring historical accuracy if tax rates change later. `TaxRate` now represents a connector/reporting tax profile: it can carry ordered `TaxRateComponent` rows for compound rates, a reverse-charge flag, and a reporting category such as `DOMESTIC`, `REVERSE_CHARGE`, `EC_SALES`, or `OSS`. The effective rate is still written to the line snapshot so historical documents stay stable; component metadata remains available for connector mapping and VAT/reporting views.
 
 **Key-value settings store** — The `Setting` model provides a generic key-value store with JSON-encoded values for all application configuration that does not warrant its own table.
 

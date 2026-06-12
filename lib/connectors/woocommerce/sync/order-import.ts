@@ -417,6 +417,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         taxRateName,
         taxRateValue,
         accountingTaxType,
+        isCompound: false,
+        reverseCharge: false,
+        reportingCategory: null,
+        components: [],
         matched: 'fallback' as const,
         warning: `No configured sales rate for ${destCountry ? destCountry.toUpperCase() : 'unknown country'} / ${l.taxCategoryFallback ?? 'STANDARD'}. Using order default.`,
       }

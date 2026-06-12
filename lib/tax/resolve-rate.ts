@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
-import type { TaxCategory } from '@/app/generated/prisma/client'
+import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
+import { effectiveTaxRateFromComponents } from '@/lib/tax/tax-rate-components'
 
 export type TaxUsedFor = 'SALES' | 'PURCHASE'
 
@@ -8,8 +9,20 @@ export type ResolvedTaxRate = {
   taxRateName: string | null
   taxRateValue: number
   accountingTaxType: string | null
+  isCompound: boolean
+  reverseCharge: boolean
+  reportingCategory: string | null
+  components: TaxRateComponentCandidate[]
   matched: 'exact' | 'country_standard' | 'global' | 'fallback'
   warning: string | null
+}
+
+export type TaxRateComponentCandidate = {
+  name: string
+  rate: number
+  compoundOnPrevious: boolean
+  accountingTaxType: string | null
+  sortOrder: number
 }
 
 export type TaxRateCandidate = {
@@ -20,7 +33,34 @@ export type TaxRateCandidate = {
   countryCode: string | null
   taxCategory: TaxCategory
   usedFor: string
+  isCompound: boolean
+  reverseCharge: boolean
+  reportingCategory: string | null
+  components: TaxRateComponentCandidate[]
 }
+
+export const taxRateProfileSelect = {
+  id: true,
+  name: true,
+  rate: true,
+  accountingTaxType: true,
+  isCompound: true,
+  reverseCharge: true,
+  reportingCategory: true,
+  components: {
+    where: { active: true },
+    orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+    select: {
+      name: true,
+      rate: true,
+      compoundOnPrevious: true,
+      accountingTaxType: true,
+      sortOrder: true,
+    },
+  },
+} satisfies Prisma.TaxRateSelect
+
+type TaxRateProfileRow = Prisma.TaxRateGetPayload<{ select: typeof taxRateProfileSelect }>
 
 type ResolveContext = {
   usedFor: TaxUsedFor
@@ -29,6 +69,10 @@ type ResolveContext = {
     name: string | null
     rate: number
     accountingTaxType: string | null
+    isCompound?: boolean
+    reverseCharge?: boolean
+    reportingCategory?: string | null
+    components?: TaxRateComponentCandidate[]
   }
 }
 
@@ -41,6 +85,50 @@ export function taxRateMatchesUsedFor(rowUsedFor: string, usedFor: TaxUsedFor): 
   if (uf === 'BOTH') return true
   if (usedFor === 'SALES') return uf === 'SALES'
   return uf === 'PURCHASE'
+}
+
+export function resolvedTaxRateFromProfile(
+  row: TaxRateProfileRow,
+  matched: ResolvedTaxRate['matched'],
+): ResolvedTaxRate {
+  const components = row.components.map((component) => ({
+    name: component.name,
+    rate: Number(component.rate),
+    compoundOnPrevious: component.compoundOnPrevious,
+    accountingTaxType: component.accountingTaxType,
+    sortOrder: component.sortOrder,
+  }))
+  return {
+    taxRateId: row.id,
+    taxRateName: row.name,
+    taxRateValue: effectiveTaxRateFromComponents(components) ?? Number(row.rate),
+    accountingTaxType: row.accountingTaxType,
+    isCompound: row.isCompound,
+    reverseCharge: row.reverseCharge,
+    reportingCategory: row.reportingCategory,
+    components,
+    matched,
+    warning: null,
+  }
+}
+
+function resolvedTaxRateFromCandidate(
+  row: TaxRateCandidate,
+  matched: ResolvedTaxRate['matched'],
+): ResolvedTaxRate {
+  const activeRate = effectiveTaxRateFromComponents(row.components) ?? Number(row.rate)
+  return {
+    taxRateId: row.id,
+    taxRateName: row.name,
+    taxRateValue: activeRate,
+    accountingTaxType: row.accountingTaxType,
+    isCompound: row.isCompound,
+    reverseCharge: row.reverseCharge,
+    reportingCategory: row.reportingCategory,
+    components: row.components,
+    matched,
+    warning: null,
+  }
 }
 
 /**
@@ -71,14 +159,7 @@ export function pickTaxRate(args: {
         r.taxCategory === productCategory,
     )
     if (exact) {
-      return {
-        taxRateId: exact.id,
-        taxRateName: exact.name,
-        taxRateValue: Number(exact.rate),
-        accountingTaxType: exact.accountingTaxType,
-        matched: 'exact',
-        warning: null,
-      }
+      return resolvedTaxRateFromCandidate(exact, 'exact')
     }
   }
 
@@ -91,28 +172,14 @@ export function pickTaxRate(args: {
         r.taxCategory === 'STANDARD',
     )
     if (countryStandard) {
-      return {
-        taxRateId: countryStandard.id,
-        taxRateName: countryStandard.name,
-        taxRateValue: Number(countryStandard.rate),
-        accountingTaxType: countryStandard.accountingTaxType,
-        matched: 'country_standard',
-        warning: null,
-      }
+      return resolvedTaxRateFromCandidate(countryStandard, 'country_standard')
     }
   }
 
   // Step 3: global rate for the category
   const global = applicable.find((r) => r.countryCode == null && r.taxCategory === productCategory)
   if (global) {
-    return {
-      taxRateId: global.id,
-      taxRateName: global.name,
-      taxRateValue: Number(global.rate),
-      accountingTaxType: global.accountingTaxType,
-      matched: 'global',
-      warning: null,
-    }
+    return resolvedTaxRateFromCandidate(global, 'global')
   }
 
   // Step 4: order default — flagged
@@ -122,6 +189,10 @@ export function pickTaxRate(args: {
     taxRateName: orderDefault.name,
     taxRateValue: orderDefault.rate,
     accountingTaxType: orderDefault.accountingTaxType,
+    isCompound: orderDefault.isCompound ?? false,
+    reverseCharge: orderDefault.reverseCharge ?? false,
+    reportingCategory: orderDefault.reportingCategory ?? null,
+    components: orderDefault.components ?? [],
     matched: 'fallback',
     warning,
   }
@@ -189,6 +260,20 @@ async function loadCandidateRates(args: {
       countryCode: true,
       taxCategory: true,
       usedFor: true,
+      isCompound: true,
+      reverseCharge: true,
+      reportingCategory: true,
+      components: {
+        where: { active: true },
+        orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+        select: {
+          name: true,
+          rate: true,
+          compoundOnPrevious: true,
+          accountingTaxType: true,
+          sortOrder: true,
+        },
+      },
     },
   })
 
@@ -200,6 +285,16 @@ async function loadCandidateRates(args: {
     countryCode: r.countryCode,
     taxCategory: r.taxCategory,
     usedFor: r.usedFor,
+    isCompound: r.isCompound,
+    reverseCharge: r.reverseCharge,
+    reportingCategory: r.reportingCategory,
+    components: r.components.map((component) => ({
+      name: component.name,
+      rate: Number(component.rate),
+      compoundOnPrevious: component.compoundOnPrevious,
+      accountingTaxType: component.accountingTaxType,
+      sortOrder: component.sortOrder,
+    })),
   }))
 }
 
@@ -251,6 +346,20 @@ export async function resolveLineTaxRateBatch<L extends { id: string; productCat
       countryCode: true,
       taxCategory: true,
       usedFor: true,
+      isCompound: true,
+      reverseCharge: true,
+      reportingCategory: true,
+      components: {
+        where: { active: true },
+        orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+        select: {
+          name: true,
+          rate: true,
+          compoundOnPrevious: true,
+          accountingTaxType: true,
+          sortOrder: true,
+        },
+      },
     },
   })
 
@@ -262,6 +371,16 @@ export async function resolveLineTaxRateBatch<L extends { id: string; productCat
     countryCode: r.countryCode,
     taxCategory: r.taxCategory,
     usedFor: r.usedFor,
+    isCompound: r.isCompound,
+    reverseCharge: r.reverseCharge,
+    reportingCategory: r.reportingCategory,
+    components: r.components.map((component) => ({
+      name: component.name,
+      rate: Number(component.rate),
+      compoundOnPrevious: component.compoundOnPrevious,
+      accountingTaxType: component.accountingTaxType,
+      sortOrder: component.sortOrder,
+    })),
   }))
 
   const cache = new Map<TaxCategory, ResolvedTaxRate>()
