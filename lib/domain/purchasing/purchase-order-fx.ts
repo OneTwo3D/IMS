@@ -1,8 +1,18 @@
-import { Prisma } from '@/app/generated/prisma/client'
-
 export const PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE = 0.02
 
-type PurchaseOrderFxClient = Pick<Prisma.TransactionClient, 'fxRate'>
+export type PurchaseOrderFxClient = {
+  fxRate: {
+    findFirst(args: {
+      where: {
+        fromCurrency: string
+        toCurrency: string
+        fetchedAt: { lte: Date }
+      }
+      orderBy: { fetchedAt: 'desc' }
+      select: { rate: true; fetchedAt: true }
+    }): Promise<{ rate: unknown; fetchedAt: Date } | null>
+  }
+}
 
 export type ResolvePurchaseOrderFxRateInput = {
   currency: string

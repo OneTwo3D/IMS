@@ -11,6 +11,7 @@ import {
   rebasePurchaseOrderStoredBaseAmountsWithParentUpdate,
   type PurchaseOrderFxRebaseTransactionDb,
 } from '@/lib/domain/purchasing/purchase-order-fx-rebase'
+import { updatePurchaseOrderFxRateOnly } from '@/lib/domain/purchasing/purchase-order-fx-update'
 
 function createClient(rate: number | null) {
   return {
@@ -387,4 +388,84 @@ test('purchase-order FX rebase rolls back child base updates when parent update 
       { id: 'freight-1', amountForeign: '12', amountBase: 12 },
     ],
   })
+})
+
+test('purchase-order rate-only update re-resolves stored FX rate and persists rebased values', async () => {
+  const asOf = new Date('2026-06-11T12:00:00.000Z')
+  const fxRateQueries: unknown[] = []
+  const state: RebaseTestState = {
+    purchaseOrder: {
+      currency: 'GBP',
+      fxRateToBase: 1,
+      subtotalBase: 120,
+      taxBase: 24,
+      totalBase: 156,
+      directFreightBase: 12,
+    },
+    lines: [
+      {
+        id: 'line-1',
+        unitCostForeign: '10',
+        totalForeign: '100',
+        taxForeign: '20',
+        unitCostBase: 10,
+        totalBase: 100,
+        taxBase: 20,
+      },
+    ],
+    freightCostLines: [
+      { id: 'freight-1', amountForeign: '12', amountBase: 12 },
+    ],
+  }
+  const db = {
+    ...createTransactionalRebaseDb(state),
+    fxRate: {
+      findFirst: async (args: unknown) => {
+        fxRateQueries.push(args)
+        return { rate: 1.18, fetchedAt: new Date('2026-06-11T00:00:00.000Z') }
+      },
+    },
+  }
+
+  const po = await updatePurchaseOrderFxRateOnly(
+    db,
+    'po-1',
+    {
+      currency: 'GBP',
+      subtotalForeign: '120',
+      taxForeign: '24',
+      totalForeign: '156',
+      directFreightForeign: '12',
+    },
+    { currency: 'EUR' },
+    {
+      baseCurrency: 'GBP',
+      asOf,
+      parentUpdate: { data: {} },
+    },
+  )
+
+  assert.deepEqual(fxRateQueries, [
+    {
+      where: {
+        fromCurrency: 'GBP',
+        toCurrency: 'EUR',
+        fetchedAt: { lte: asOf },
+      },
+      orderBy: { fetchedAt: 'desc' },
+      select: { rate: true, fetchedAt: true },
+    },
+  ])
+  assert.deepEqual(po, {
+    currency: 'EUR',
+    fxRateToBase: 1.18,
+    subtotalBase: 101.6949,
+    taxBase: 20.339,
+    totalBase: 132.2034,
+    directFreightBase: 10.1695,
+  })
+  assert.equal(state.lines[0]?.unitCostBase, 8.474576)
+  assert.equal(state.lines[0]?.totalBase, 84.7458)
+  assert.equal(state.lines[0]?.taxBase, 16.9492)
+  assert.equal(state.freightCostLines[0]?.amountBase, 10.1695)
 })
