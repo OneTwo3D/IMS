@@ -19,7 +19,8 @@ for pairs that were previously non-zero and are now zero. Reservation rows are
 also idempotent on `(snapshotDate, productId, warehouseId)`, but they are sparse:
 only rows with a positive reserved quantity or known source-row evidence are
 written. The companion `inventory_reservation_snapshot_runs` row marks the UTC
-day as captured.
+day as captured and stores `cutoffAt` as the exclusive start of the next UTC
+day.
 
 ## Sparsity Contract
 
@@ -85,8 +86,8 @@ The reservation pass is conservative. It writes sparse reservation rows and a
 daily run marker only when allocation, shipment, and production reservation
 sources pass the support check for the target UTC day. The support check uses
 current source-row timestamps: it compares the latest `updatedAt` on surviving
-sales orders, order allocations, and production orders against the target
-end-of-day cutoff. It also rejects current reservation graphs with committed
+sales orders, order allocations, and production orders against the exclusive
+start of the next UTC day. It also rejects current reservation graphs with committed
 shipment lines, because `shipment_lines` has no `updatedAt`, and in-progress
 assembly production orders, because current BOM component membership may not
 match the historical day.

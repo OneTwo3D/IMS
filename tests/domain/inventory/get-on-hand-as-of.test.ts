@@ -87,7 +87,7 @@ function createClient(input: {
       findMany: async (args: unknown) => {
         const query = args as {
           where?: {
-            createdAt?: { gt?: Date; lte?: Date }
+            createdAt?: { gt?: Date; gte?: Date; lt?: Date; lte?: Date }
             productId?: string
             product?: { categoryId?: string }
             OR?: Array<{ fromWarehouseId?: string; toWarehouseId?: string }>
@@ -105,6 +105,8 @@ function createClient(input: {
         const rows = [...(input.movements ?? [])]
           .filter((movement) => (
             (!range.gt || movement.createdAt > range.gt) &&
+            (!range.gte || movement.createdAt >= range.gte) &&
+            (!range.lt || movement.createdAt < range.lt) &&
             (!range.lte || movement.createdAt <= range.lte) &&
             (!where.productId || movement.productId === where.productId) &&
             (!where.product?.categoryId || movement.categoryId === where.product.categoryId) &&
@@ -218,6 +220,24 @@ test('getOnHandAsOf replays movements forward from the nearest prior snapshot', 
     }],
     movements: [
       {
+        id: 'prior-day-tail',
+        productId: 'product-1',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-1',
+        qty: decimal('99'),
+        totalValueBase: decimal('99'),
+        createdAt: new Date('2026-05-27T23:59:59.999Z'),
+      },
+      {
+        id: 'next-day-midnight',
+        productId: 'product-1',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-1',
+        qty: decimal('1'),
+        totalValueBase: decimal('2'),
+        createdAt: new Date('2026-05-28T00:00:00.000Z'),
+      },
+      {
         id: 'inbound',
         productId: 'product-1',
         fromWarehouseId: null,
@@ -248,9 +268,9 @@ test('getOnHandAsOf replays movements forward from the nearest prior snapshot', 
   assert.deepEqual(result.rows, [{
     productId: 'product-1',
     warehouseId: 'warehouse-1',
-    qty: '12.0000',
-    valueBase: '29.000000',
-    unitCostBase: '2.416667',
+    qty: '13.0000',
+    valueBase: '31.000000',
+    unitCostBase: '2.384615',
   }])
 })
 
@@ -263,15 +283,26 @@ test('getOnHandAsOf reverses from the first later snapshot before the first snap
       qty: decimal('10'),
       valueBase: decimal('50'),
     }],
-    movements: [{
-      id: 'future-inbound',
-      productId: 'product-1',
-      fromWarehouseId: null,
-      toWarehouseId: 'warehouse-1',
-      qty: decimal('2'),
-      totalValueBase: decimal('10'),
-      createdAt: new Date('2026-05-30T10:00:00.000Z'),
-    }],
+    movements: [
+      {
+        id: 'future-inbound',
+        productId: 'product-1',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-1',
+        qty: decimal('2'),
+        totalValueBase: decimal('10'),
+        createdAt: new Date('2026-05-30T10:00:00.000Z'),
+      },
+      {
+        id: 'next-day-inbound',
+        productId: 'product-1',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-1',
+        qty: decimal('50'),
+        totalValueBase: decimal('250'),
+        createdAt: new Date('2026-05-31T00:00:00.000Z'),
+      },
+    ],
   })
 
   const result = await getOnHandAsOf({
