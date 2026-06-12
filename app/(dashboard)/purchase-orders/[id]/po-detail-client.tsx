@@ -3,7 +3,7 @@
 import { useState, useTransition, useEffect } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink, CreditCard, CheckCircle2 } from 'lucide-react'
+import { X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink, CreditCard, CheckCircle2, AlertTriangle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -39,6 +39,7 @@ import type {
 import { createMintsoftPurchaseOrderAsn } from '@/app/actions/mintsoft-sync'
 import { getTrackingUrl } from '@/lib/tracking'
 import type { AccountingBankAccount } from '@/lib/accounting'
+import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accounting/rejected-sync-warnings'
 import type { SupplierRow } from '@/app/actions/suppliers'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
@@ -64,6 +65,7 @@ type Props = {
   accountingAvailable: boolean
   accountingBillUrlTemplate: string
   mintsoftAsnState: MintsoftPurchaseOrderAsnState
+  rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -94,6 +96,11 @@ const STATUS_CLASS: Record<PoStatus, string> = {
   PARTIALLY_RETURNED: 'bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200 border-orange-200',
   RETURNED: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300 border-gray-200',
   CANCELLED: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200 border-red-200',
+}
+
+const ACCOUNTING_SYNC_TYPE_LABEL: Record<RejectedAccountingDocumentUpdateWarning['type'], string> = {
+  SALES_INVOICE_UPDATE: 'sales invoice update',
+  PURCHASE_INVOICE_UPDATE: 'purchase bill update',
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,7 +1481,7 @@ function ShipDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState, rejectedAccountingSyncs }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -1700,6 +1707,26 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {error && <p className="text-sm text-destructive">{error}</p>}
       {notice && <p className="text-sm text-emerald-700 dark:text-emerald-300">{notice}</p>}
+      {rejectedAccountingSyncs.length > 0 && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          <div className="flex gap-2">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            <div className="space-y-2">
+              <p className="font-medium">Accounting rejected the latest bill update. Review the message, correct the bill in IMS or accounting, then retry the failed sync from the sync dashboard.</p>
+              <ul className="space-y-1 text-xs">
+                {rejectedAccountingSyncs.map((sync) => (
+                  <li key={sync.id}>
+                    <span className="font-medium uppercase">{sync.connector}</span>
+                    {' '}
+                    {ACCOUNTING_SYNC_TYPE_LABEL[sync.type]} failed on {new Date(sync.createdAt).toLocaleString('en-GB')}
+                    {sync.retryCount > 0 ? ` after ${sync.retryCount} retries` : ''}: {sync.errorMessage}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Header info */}
       <div className="rounded-md border p-4 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">

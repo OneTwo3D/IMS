@@ -7,6 +7,7 @@ import { getWarehouses, getScopedStockLevelMap } from '@/app/actions/stock'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getSetting } from '@/app/actions/settings'
 import { getOrderAllocations, getOrderFulfillmentRequirements, getOrderShipments } from '@/app/actions/allocation'
+import { getRejectedAccountingDocumentUpdateWarnings } from '@/app/actions/accounting-sync'
 import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { getSalesOrderAdminLinks } from '@/lib/shopping'
@@ -20,7 +21,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable] = await Promise.all([
+  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs] = await Promise.all([
     requireAuth(),
     getSalesOrder(id),
     getWarehouses(),
@@ -34,6 +35,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     getSetting('accounting_invoice_url_template'),
     getAccountingSettings(),
     isIntegrationPluginEnabled('xero'),
+    getRejectedAccountingDocumentUpdateWarnings([{ referenceType: 'SalesOrder', referenceId: id }]),
   ])
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
@@ -71,6 +73,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         accountingInvoiceUrlTemplate={invoiceUrlTemplate ?? accountingSettings.invoiceUrlTemplate}
         accountingSyncEnabled={accountingAvailable && accountingSettings.syncEnabled}
         currentUserRole={session.user.role}
+        rejectedAccountingSyncs={rejectedAccountingSyncs}
       />
     </div>
   )
