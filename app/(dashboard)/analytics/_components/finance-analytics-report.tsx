@@ -19,6 +19,15 @@ export type FinanceAnalyticsFilterValues = {
   bucket1Days?: string
   bucket2Days?: string
   bucket3Days?: string
+  vatReportingCategory?: string
+}
+
+export const VAT_REPORTING_CATEGORIES = ['DOMESTIC', 'REVERSE_CHARGE', 'EC_SALES', 'OSS'] as const
+const VAT_REPORTING_CATEGORY_LABELS: Record<typeof VAT_REPORTING_CATEGORIES[number], string> = {
+  DOMESTIC: 'Domestic',
+  REVERSE_CHARGE: 'Reverse charge',
+  EC_SALES: 'EC sales',
+  OSS: 'OSS',
 }
 
 export type FinanceAnalyticsColumn<Row> = {
@@ -41,6 +50,7 @@ type FinanceAnalyticsReportPageProps<Row> = {
   summary: Array<{ label: string; value: string; tone?: SummaryTone }>
   notices?: string[]
   showAgingBuckets?: boolean
+  showReportingCategory?: boolean
 }
 
 export function FinanceAnalyticsReportPage<Row>({
@@ -55,6 +65,7 @@ export function FinanceAnalyticsReportPage<Row>({
   summary,
   notices = [],
   showAgingBuckets = false,
+  showReportingCategory = false,
 }: FinanceAnalyticsReportPageProps<Row>) {
   const params = currentParams(filters)
   const csvHref = `/api/export/finance-analytics?${appendParams(params, { report: reportKey })}`
@@ -109,6 +120,22 @@ export function FinanceAnalyticsReportPage<Row>({
                 <Input id="bucket3Days" name="bucket3Days" type="number" min="1" defaultValue={filters.bucket3Days ?? '90'} className="h-9" />
               </div>
             </>
+          )}
+          {showReportingCategory && (
+            <div className="space-y-1.5">
+              <Label htmlFor="vatReportingCategory">Reporting category</Label>
+              <select
+                id="vatReportingCategory"
+                name="vatReportingCategory"
+                defaultValue={filters.vatReportingCategory ?? ''}
+                className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+              >
+                <option value="">All categories</option>
+                {VAT_REPORTING_CATEGORIES.map((category) => (
+                  <option key={category} value={category}>{VAT_REPORTING_CATEGORY_LABELS[category]}</option>
+                ))}
+              </select>
+            </div>
           )}
           <div className="space-y-1.5">
             <Label htmlFor="pageSize">Rows</Label>

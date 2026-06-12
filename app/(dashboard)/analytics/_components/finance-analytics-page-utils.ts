@@ -44,6 +44,7 @@ export function financeAnalyticsFiltersForUi(filters: FinanceAnalyticsFilters): 
     bucket1Days: String(filters.bucket1Days ?? 30),
     bucket2Days: String(filters.bucket2Days ?? 60),
     bucket3Days: String(filters.bucket3Days ?? 90),
+    vatReportingCategory: filters.vatReportingCategory,
   }
 }
 
