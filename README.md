@@ -2,6 +2,8 @@
 
 Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, PostgreSQL, and Shadcn/UI.
 
+**Current release: v2.0.0** (2026-06-12) — major release covering VAT/tax profiles, bidirectional Xero invoice & TaxRate sync, manufacturing-aware reorder planning, end-to-end Decimal precision across landed cost / allocation / refund / COGS, and hardened cron + webhook authentication. See [CHANGELOG.md](CHANGELOG.md) and [GitHub Releases](https://github.com/OneTwo3D/IMS/releases) for the full delta; the in-app **Settings > System** page shows the same notes.
+
 ## Features
 
 ### Inventory
@@ -18,12 +20,14 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 
 ### Purchases
 - Multi-currency purchase orders with live FX rates (ECB via frankfurter.dev)
-- VAT handling (inclusive/exclusive) with named tax rates
+- VAT handling (inclusive/exclusive) with named tax rates and per-component breakdowns
 - Landed cost distribution (by value/weight/quantity/equal split) per cost line
 - Purchase units with stock unit conversion (e.g. 1 roll = 1000m)
 - Freight/landed cost POs linked to multiple primary POs
 - Retrospective landed cost recalculation (updates FIFO cost layers and COGS)
-- RFQ PDF generation, goods receipt, supplier returns, billing with PDF upload
+- RFQ PDF generation, goods receipt, supplier returns
+- Unpaid bill edit from the PO detail page, with overbilling guards and the latest FX rate; if the bill has already pushed to Xero the edit syncs back as a `PURCHASE_INVOICE_UPDATE`
+- DRAFT PO currency/rate edits rebase header + lines + freight cost lines inside a single transaction
 - Supplier management with default currency, tax rate, and payment terms
 
 ### Sales
@@ -31,21 +35,50 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 - Multi-currency with VAT, line/order discounts (% or absolute), shipping fees
 - Customer contacts with billing/shipping addresses and tax numbers
 - Component-aware stock allocation for kits / bundles, including bundle refunds and COGS reversal support
+- Allocation now distinguishes physical reservations from backorder demand; activity logs include the backorder breakdown
 - Stock reservation on allocation, release on ship/cancel/refund
 - Invoice generation (manual, auto on ship, or auto on paid — configurable)
+- Edits to invoices that have already pushed to Xero sync back as `SALES_INVOICE_UPDATE` (QuickBooks logs an explicit "not supported" warning)
 - Payment tracking against invoices and credit notes
 - Automatic credit note numbers on refund
 - Order and invoice PDF generation, SMTP email, and packing slips
 - Clone, delete (pending only), column picker (COGS, margin, qty on hand, etc.)
 - Sales representative assignment, delivery dates
 
+### Manufacturing
+- BOM (multi-component) and KIT (bundled) product types with optional manufacturer (Supplier acting as co-packer)
+- Production orders: DRAFT → IN_PROGRESS → COMPLETED, with planned vs produced quantities
+- WIP and cost-layer timing align with finance expectations (FIFO consumption of components, output cost layer on completion)
+- ManufacturingCostLine for labour / machine time / overhead spread across produced units, with foreign-currency cost lines (own FX rate per production order)
+- Component shortage report drives raw-material demand into Reorder Planning
+
+### Analytics
+- VAT report groups by side / reporting category / jurisdiction / tax rate, with a category filter (DOMESTIC / REVERSE_CHARGE / EC_SALES / OSS) that round-trips via the URL
+- AR / AP aging with configurable buckets, FX gain/loss (realised + unrealised), currency summary
+- Reorder Planning: demand-driven replenishment that now covers manufactured goods. BOM rows show the most recent manufacturer (or "Manufactured in-house") and raw materials inherit demand from their parent BOMs with a "Needed for" column. One-click "Generate POs + draft MOs for visible rows" creates draft orders by product type
+- Sales analytics, customer mix, margin, returns, fulfillment, throughput
+- Procurement analytics: open POs, supplier on-time, PPV, spend, lead times
+- Inventory valuation, COGS, landed cost, inventory turnover with GL variance against Xero Trial Balance snapshots
+- Production variance and WIP for manufacturing
+- All report descriptions and methodology notices live behind a single (i) tooltip next to the title
+
 ### Settings
-- VAT rates (sales/purchase/both) with Xero tax type codes
+- VAT rate profiles in **Accounting**: ordered components, compound math, reverse-charge flag, reporting category. Connector-specific reverse-charge tax-type codes for the Xero swap
+- Multi-component VAT rates auto-sync to Xero TaxRates via the `TaxComponents` API on save (idempotent by `Name`); QBO logs a clear "not supported" warning
 - Currencies and FX rates with daily auto-fetch cron
 - Landed cost distribution method default
 - Invoice generation trigger (manual/on shipped/on paid)
 - Purchase units with stock unit conversion
 - Stock adjustment reasons with Xero account mapping
+- Integration connection-test gate: Xero / WooCommerce / Mintsoft / SMTP must pass a connection test before sync can be enabled; the test result, timestamp, and configuration fingerprint are persisted and re-checked on save
+
+### Integrations
+- **Xero** — bidirectional accounting sync: AUTHORISED or DRAFT invoices at order time, `SALES_INVOICE_UPDATE` and `PURCHASE_INVOICE_UPDATE` on edits, daily batch sub-ledger journals (Group A1 / A2 / B), credit notes on refund with sub-ledger-aware reversal journals, payment polling, deep links from SO/PO detail pages, optional invoice PDF attachment. Failed updates surface as an amber alert on the related order/PO
+- **Xero TaxRate sync** — multi-component IMS `TaxRate` rows auto-push to Xero with the matching `TaxComponents` so the VAT return picks up the breakdown
+- **WooCommerce** — webhook or polling order import with multi-currency support, tax-class mapping, refund reversal, product sync, and stock push-back. Pending-FX queue retries store the full WC order snapshot for deterministic replay
+- **Mintsoft 3PL** — outbound stock-sync + ASN booked-in webhooks with HMAC-bound freshness timestamp, durable-persistence ack before responding, configurable sweeper, and queryable retry state; bundle/product verification crons keep IMS in sync with 3PL inventory
+- **QuickBooks** — invoice push, credit notes, daily batch sync; invoice update + TaxRate sync log "not supported" instead of silently failing
+- **SMTP** — outbound document delivery (orders, invoices, packing slips, notifications) with configurable from-name / from-email and per-department reply-to addresses
 
 ### CSV Import/Export
 - Products (with BOMs, variants, bundles, components)
