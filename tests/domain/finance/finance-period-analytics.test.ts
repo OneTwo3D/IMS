@@ -427,3 +427,123 @@ test('FX gain/loss keeps partial receivable payments as separate settlement rows
   assert.deepEqual(report.rows.map((row) => row.settlementRateToBase), ['1.1', '1.5'])
   assert.match(report.notices.join(' '), /one row per Payment\.id/)
 })
+
+test('VAT report groups same rate across reporting categories into separate rows', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    salesOrderLine: {
+      findMany: async () => [
+        {
+          taxRateId: 'tax-uk-domestic',
+          taxForeign: decimal('20'),
+          taxBase: decimal('20'),
+          totalBase: decimal('100'),
+          order: { shippingAddress: { country: 'GB' }, pricesIncludeVat: false },
+          taxRate: { name: 'UK Standard', rate: decimal('0.2'), accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: 'DOMESTIC' },
+        },
+        {
+          taxRateId: 'tax-eu-oss',
+          taxForeign: decimal('20'),
+          taxBase: decimal('20'),
+          totalBase: decimal('100'),
+          order: { shippingAddress: { country: 'DE' }, pricesIncludeVat: false },
+          taxRate: { name: 'DE Standard via OSS', rate: decimal('0.2'), accountingTaxType: 'OUTPUT2', countryCode: 'DE', reportingCategory: 'OSS' },
+        },
+      ],
+    },
+  }
+
+  const report = await getVatReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-30' },
+    { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } },
+  )
+
+  assert.equal(report.rows.length, 2)
+  const categories = report.rows.map((row) => row.reportingCategory).sort()
+  assert.deepEqual(categories, ['DOMESTIC', 'OSS'])
+  assert.equal(report.totals.salesTaxBase, '40')
+})
+
+test('VAT report filters rows by vatReportingCategory', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    salesOrderLine: {
+      findMany: async (args: { where: { taxRate?: { reportingCategory?: { equals: string } } } }) => {
+        const filter = args.where?.taxRate?.reportingCategory?.equals
+        const all = [
+          {
+            taxRateId: 'tax-uk-domestic',
+            taxForeign: decimal('20'),
+            taxBase: decimal('20'),
+            totalBase: decimal('100'),
+            order: { shippingAddress: { country: 'GB' }, pricesIncludeVat: false },
+            taxRate: { name: 'UK Standard', rate: decimal('0.2'), accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: 'DOMESTIC' },
+          },
+          {
+            taxRateId: 'tax-eu-oss',
+            taxForeign: decimal('20'),
+            taxBase: decimal('20'),
+            totalBase: decimal('100'),
+            order: { shippingAddress: { country: 'DE' }, pricesIncludeVat: false },
+            taxRate: { name: 'DE Standard via OSS', rate: decimal('0.2'), accountingTaxType: 'OUTPUT2', countryCode: 'DE', reportingCategory: 'OSS' },
+          },
+        ]
+        return filter ? all.filter((line) => line.taxRate.reportingCategory === filter) : all
+      },
+    },
+  }
+
+  const report = await getVatReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-30', vatReportingCategory: 'OSS' },
+    { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } },
+  )
+
+  assert.equal(report.rows.length, 1)
+  assert.equal(report.rows[0]?.reportingCategory, 'OSS')
+  assert.equal(report.totals.salesTaxBase, '20')
+})
+
+test('VAT report skips purchase invoice lines whose taxRate category does not match the filter', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    purchaseInvoice: {
+      findMany: async () => [
+        {
+          invoiceDate: new Date('2026-06-15T00:00:00.000Z'),
+          po: { supplier: { country: 'GB' } },
+          lines: [
+            {
+              qtyBilled: decimal('1'),
+              totalBase: decimal('50'),
+              poLine: {
+                qty: decimal('1'),
+                taxRateId: 'tax-uk-domestic',
+                taxBase: decimal('10'),
+                taxRate: { name: 'UK Standard', rate: decimal('0.2'), accountingTaxType: 'INPUT2', countryCode: 'GB', reportingCategory: 'DOMESTIC' },
+              },
+            },
+            {
+              qtyBilled: decimal('1'),
+              totalBase: decimal('50'),
+              poLine: {
+                qty: decimal('1'),
+                taxRateId: 'tax-rc',
+                taxBase: decimal('0'),
+                taxRate: { name: 'Reverse charge', rate: decimal('0'), accountingTaxType: 'REVERSECHARGES', countryCode: 'GB', reportingCategory: 'REVERSE_CHARGE' },
+              },
+            },
+          ],
+        },
+      ],
+    },
+  }
+
+  const report = await getVatReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-30', vatReportingCategory: 'REVERSE_CHARGE' },
+    { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } },
+  )
+
+  assert.equal(report.rows.length, 1)
+  assert.equal(report.rows[0]?.reportingCategory, 'REVERSE_CHARGE')
+  assert.equal(report.rows[0]?.taxBase, '0')
+})

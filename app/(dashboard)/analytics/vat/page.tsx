@@ -7,6 +7,7 @@ type Props = { searchParams: Promise<FinanceAnalyticsSearchParams> }
 
 const columns: Array<FinanceAnalyticsColumn<VatReportRow>> = [
   { key: 'side', label: 'Side', render: (row) => row.side === 'sales' ? 'Sales' : 'Purchases' },
+  { key: 'category', label: 'Reporting category', render: (row) => row.reportingCategory ?? 'Uncategorised' },
   { key: 'jurisdiction', label: 'Jurisdiction', render: (row) => row.jurisdiction },
   { key: 'rate', label: 'Rate', render: (row) => row.taxRateName },
   { key: 'accounting', label: 'Accounting tax type', render: (row) => row.accountingTaxType ?? 'Unmapped' },
@@ -28,7 +29,7 @@ export default async function VatAnalyticsPage({ searchParams }: Props) {
       filters={financeAnalyticsFiltersForUi(filters)}
       pageInfo={report.pageInfo}
       rows={report.rows}
-      rowKey={(row, index) => `${row.side}:${row.taxRateId ?? 'none'}:${row.jurisdiction}:${index}`}
+      rowKey={(row, index) => `${row.side}:${row.taxRateId ?? 'none'}:${row.jurisdiction}:${row.reportingCategory ?? 'none'}:${index}`}
       columns={columns}
       summary={[
         { label: 'Taxable base', value: report.totals.taxableBase ?? '0' },

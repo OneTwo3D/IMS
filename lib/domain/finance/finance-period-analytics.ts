@@ -41,6 +41,7 @@ export type FinanceAnalyticsFilters = {
   bucket1Days?: number
   bucket2Days?: number
   bucket3Days?: number
+  vatReportingCategory?: string
 }
 
 export type FinanceAnalyticsReport<Row, Totals extends Record<string, string> = Record<string, string>> = {
@@ -102,6 +103,7 @@ export type VatReportRow = {
   taxRateId: string | null
   taxRateName: string
   accountingTaxType: string | null
+  reportingCategory: string | null
   jurisdiction: string
   ratePct: string
   lineCount: number
@@ -170,6 +172,7 @@ type SalesOrderLineTaxRow = {
     rate: DecimalInput
     accountingTaxType: string | null
     countryCode: string | null
+    reportingCategory: string | null
   } | null
 }
 
@@ -187,6 +190,7 @@ type PurchaseInvoiceTaxRow = {
         rate: DecimalInput
         accountingTaxType: string | null
         countryCode: string | null
+        reportingCategory: string | null
       } | null
     } | null
   }>
@@ -435,6 +439,7 @@ export async function getVatReport(
   const generatedAt = nowFromDeps(options.deps)
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
   const window = period(filters, generatedAt)
+  const reportingCategoryFilter = filters.vatReportingCategory?.trim() || undefined
   const [salesLines, purchaseInvoices] = await Promise.all([
     client.salesOrderLine.findMany({
       where: {
@@ -443,6 +448,9 @@ export async function getVatReport(
           status: { not: SalesOrderStatus.CANCELLED },
           archived: false,
         },
+        ...(reportingCategoryFilter && {
+          taxRate: { reportingCategory: { equals: reportingCategoryFilter } },
+        }),
       },
       select: {
         taxRateId: true,
@@ -450,13 +458,16 @@ export async function getVatReport(
         taxBase: true,
         totalBase: true,
         order: { select: { shippingAddress: true, pricesIncludeVat: true } },
-        taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true } },
+        taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true, reportingCategory: true } },
       },
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<SalesOrderLineTaxRow[]>,
     client.purchaseInvoice.findMany({
       where: {
         invoiceDate: { gte: window.dateFrom, lt: window.dateToExclusive },
+        ...(reportingCategoryFilter && {
+          lines: { some: { poLine: { taxRate: { reportingCategory: { equals: reportingCategoryFilter } } } } },
+        }),
       },
       select: {
         invoiceDate: true,
@@ -469,7 +480,7 @@ export async function getVatReport(
                 qty: true,
                 taxRateId: true,
                 taxBase: true,
-                taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true } },
+                taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true, reportingCategory: true } },
               },
             },
           },
@@ -487,6 +498,7 @@ export async function getVatReport(
     taxRateId: string | null
     taxRateName: string
     accountingTaxType: string | null
+    reportingCategory: string | null
     jurisdiction: string
     ratePct: string
     lineCount: number
@@ -500,10 +512,11 @@ export async function getVatReport(
     taxRateId: string | null
     taxRateName: string
     accountingTaxType: string | null
+    reportingCategory: string | null
     jurisdiction: string
     ratePct: string
   }) => {
-    const key = `${params.side}:${params.taxRateId ?? 'none'}:${params.jurisdiction}`
+    const key = `${params.side}:${params.taxRateId ?? 'none'}:${params.jurisdiction}:${params.reportingCategory ?? 'none'}`
     let row = byKey.get(key)
     if (!row) {
       row = {
@@ -525,6 +538,7 @@ export async function getVatReport(
       taxRateId: line.taxRateId,
       taxRateName: line.taxRate?.name ?? 'No tax rate',
       accountingTaxType: line.taxRate?.accountingTaxType ?? null,
+      reportingCategory: line.taxRate?.reportingCategory ?? null,
       jurisdiction,
       ratePct,
     })
@@ -539,6 +553,7 @@ export async function getVatReport(
   for (const invoice of purchaseInvoices) {
     for (const line of invoice.lines) {
       const taxRate = line.poLine?.taxRate ?? null
+      if (reportingCategoryFilter && taxRate?.reportingCategory !== reportingCategoryFilter) continue
       const poLineQty = toDecimal(line.poLine?.qty)
       const ratio = poLineQty.gt(0) ? toDecimal(line.qtyBilled).div(poLineQty) : new Prisma.Decimal(0)
       const taxBase = line.poLine ? toDecimal(line.poLine.taxBase).mul(ratio) : new Prisma.Decimal(0)
@@ -548,6 +563,7 @@ export async function getVatReport(
         taxRateId: line.poLine?.taxRateId ?? null,
         taxRateName: taxRate?.name ?? 'No tax rate',
         accountingTaxType: taxRate?.accountingTaxType ?? null,
+        reportingCategory: taxRate?.reportingCategory ?? null,
         jurisdiction,
         ratePct: pctString(taxRate?.rate ?? 0),
       })
@@ -562,13 +578,19 @@ export async function getVatReport(
     taxRateId: row.taxRateId,
     taxRateName: row.taxRateName,
     accountingTaxType: row.accountingTaxType,
+    reportingCategory: row.reportingCategory,
     jurisdiction: row.jurisdiction,
     ratePct: row.ratePct,
     lineCount: row.lineCount,
     taxableBase: moneyString(row.taxableBase, baseCurrency),
     taxBase: moneyString(row.taxBase, baseCurrency),
   }))
-  rows.sort((a, b) => a.side.localeCompare(b.side) || a.jurisdiction.localeCompare(b.jurisdiction) || a.taxRateName.localeCompare(b.taxRateName))
+  rows.sort((a, b) =>
+    a.side.localeCompare(b.side)
+    || (a.reportingCategory ?? '').localeCompare(b.reportingCategory ?? '')
+    || a.jurisdiction.localeCompare(b.jurisdiction)
+    || a.taxRateName.localeCompare(b.taxRateName)
+  )
   const totals = rows.reduce((total, row) => ({
     taxableBase: total.taxableBase.add(row.taxableBase),
     salesTaxBase: row.side === 'sales' ? total.salesTaxBase.add(row.taxBase) : total.salesTaxBase,
