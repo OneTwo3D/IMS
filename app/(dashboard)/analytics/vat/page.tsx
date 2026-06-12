@@ -31,6 +31,7 @@ export default async function VatAnalyticsPage({ searchParams }: Props) {
       rows={report.rows}
       rowKey={(row, index) => `${row.side}:${row.taxRateId ?? 'none'}:${row.jurisdiction}:${row.reportingCategory ?? 'none'}:${index}`}
       columns={columns}
+      showReportingCategory
       summary={[
         { label: 'Taxable base', value: report.totals.taxableBase ?? '0' },
         { label: 'Sales VAT', value: report.totals.salesTaxBase ?? '0' },
