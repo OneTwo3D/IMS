@@ -6,6 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
+import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
@@ -2440,7 +2441,15 @@ export async function createInvoice(
             id: true,
             qty: true,
             product: { select: { sku: true } },
-            taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
+            taxRate: {
+              select: {
+                accountingTaxType: true,
+                reverseCharge: true,
+                name: true,
+                isCompound: true,
+                components: { where: { active: true }, select: { id: true }, take: 1 },
+              },
+            },
           },
         },
         freightCostLines: {
@@ -2612,6 +2621,20 @@ export async function createInvoice(
         lineCount: productInputs.length + costInputs.length,
       },
     })
+    if (accountingSettings.syncEnabled) {
+      const multiComponentRateNames = multiComponentTaxRateNames(po.lines)
+      if (multiComponentRateNames.length > 0) {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: poId,
+          action: 'purchase_invoice_tax_components_not_pushed',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Multi-component tax rates on this bill will post to the accounting system as a single TaxType: ${multiComponentRateNames.join(', ')}. Configure the equivalent TaxComponents on the accounting side or the per-component breakdown will not appear on the VAT return.`,
+          metadata: { taxRateNames: multiComponentRateNames },
+        })
+      }
+    }
 
     return { success: true }
   } catch (e) {
@@ -2676,7 +2699,15 @@ export async function updateInvoice(
                 id: true,
                 qty: true,
                 product: { select: { sku: true } },
-                taxRate: { select: { accountingTaxType: true } },
+                taxRate: {
+                  select: {
+                    accountingTaxType: true,
+                    reverseCharge: true,
+                    name: true,
+                    isCompound: true,
+                    components: { where: { active: true }, select: { id: true }, take: 1 },
+                  },
+                },
               },
             },
             freightCostLines: {
@@ -2925,6 +2956,20 @@ export async function updateInvoice(
         queuedAccountingUpdate: Boolean(invoice.accountingInvoiceId && idempotencyKey),
       },
     })
+    if (accountingSettings.syncEnabled) {
+      const multiComponentRateNames = multiComponentTaxRateNames(invoice.po.lines)
+      if (multiComponentRateNames.length > 0) {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: invoice.poId,
+          action: 'purchase_invoice_tax_components_not_pushed',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Multi-component tax rates on this bill will post to the accounting system as a single TaxType: ${multiComponentRateNames.join(', ')}. Configure the equivalent TaxComponents on the accounting side or the per-component breakdown will not appear on the VAT return.`,
+          metadata: { taxRateNames: multiComponentRateNames },
+        })
+      }
+    }
 
     return { success: true }
   } catch (e) {
