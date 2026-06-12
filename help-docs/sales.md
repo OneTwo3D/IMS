@@ -175,6 +175,24 @@ Invoices can be generated either manually or automatically. The trigger for auto
 - **On ship** — invoice is created automatically when the order is shipped
 - **On paid** — invoice is created automatically when payment is received in full
 
+### Editing an order after it has been pushed to the accounting system
+
+Editing a sales order that already has an external accounting invoice (Xero) queues a
+`SALES_INVOICE_UPDATE` to push the changes through, instead of silently dropping them. The update
+payload is constructed by the same builder used for the original push, so what Xero sees matches a
+fresh post would have sent. A payload-derived idempotency key prevents duplicates if you re-save
+without any content change.
+
+If the active accounting connector is QuickBooks (not Xero), IMS records a
+`sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
+behaviour is symmetric with the purchase bill edit path.
+
+If the accounting connector rejects the update (e.g. the external invoice is locked, paid, or
+voided), an amber **rejected sync** alert appears at the top of the sales order detail page with
+the connector, timestamp, retry count, and a safely truncated error message. Operators correct the
+underlying issue and retry the failed sync from the Sync Dashboard; once the row transitions out of
+`FAILED`, the alert disappears.
+
 
 ## Multi-Currency and FX
 

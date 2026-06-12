@@ -123,11 +123,54 @@ Toggle the delivery tracking module on or off. When enabled:
 This section only appears when an accounting plugin is enabled.
 
 - **Financial year start** — set your financial year start date (UK format)
-- **VAT rates** — manage VAT rates with Xero tax type mapping
+- **VAT rates** — manage VAT rate profiles (see below)
 - **Currencies & FX rates** — add currencies and manage exchange rates
 - **FX rate schedule** — enable automatic exchange rate updates, set the update interval, or trigger an immediate update with the **Update Now** button
+- **Reverse-charge accounting tax types** — connector-specific tax codes that IMS swaps in for any line whose `TaxRate.reverseCharge` is true. Configure `accounting_reverse_charge_sales_tax_type` (typical Xero: `ECOUTPUTSERVICES`) and `accounting_reverse_charge_purchase_tax_type` (typical Xero: `REVERSECHARGES`). Empty values disable the swap — the line posts with the parent `TaxRate.accountingTaxType` and is not flagged as reverse-charge on the VAT return.
 
 The organisation base currency is not changed here. It is defined in **Settings > Company** and is treated as a one-time setup choice for a live system.
+
+### VAT rate profiles
+
+A VAT rate row in Settings > Accounting > VAT rates is a **tax profile**, not just a single percent. Each row carries:
+
+| Field | Purpose |
+|---|---|
+| **Name** | The label shown on order/bill line dropdowns. |
+| **Rate** | The effective rate stamped on document lines. Auto-computed from components if any are configured; otherwise hand-entered. |
+| **Accounting tax type** | The tax code IMS sends to the accounting connector (e.g. Xero `OUTPUT2`, QBO `TAX_RATE_ID`) on every line that uses this rate. |
+| **Country code** | ISO 3166-1 alpha-2; null = applies globally as a fallback. |
+| **Used for** | `SALES`, `PURCHASE`, or `BOTH`. Filters which dropdowns the rate appears in. |
+| **Compound** | When true, line totals apply this rate on top of the previous tax — see Components below. |
+| **Reverse charge** | When true, IMS swaps the connector-side tax type on every line using this rate to the configured `accounting_reverse_charge_{sales,purchase}_tax_type` setting, so the VAT return classifies it on box 1 / box 8. The customer is not charged VAT (rate is 0 or the document posts at zero). |
+| **Reporting category** | One of `DOMESTIC`, `REVERSE_CHARGE`, `EC_SALES`, `OSS`. Used to group/filter the VAT analytics report. Does not change accounting posting. |
+| **Components** | Ordered breakdown for compound or multi-element taxes (e.g. Canada `GST 5% + PST 7%`). See below. |
+
+#### Tax components (compound + multi-element)
+
+When a jurisdiction layers multiple taxes onto the same goods value (e.g. Canada GST + PST, India IGST split), add the components in **Settings > Accounting > VAT rates > Edit > Components**. Each component carries:
+
+- **Name** (e.g. `GST`, `PST`)
+- **Rate** as a decimal (e.g. `0.05` for 5%)
+- **Compound on previous** — when true, this component's rate applies to the running total (gross + previous components), not the goods value. So `GST 5%` non-compound followed by `PST 7%` compound yields `5% + 7%×(1+5%) = 12.35%` effective.
+- **Accounting tax type** — connector-specific code for THIS component on the accounting side.
+- **Sort order** — components apply in this order; the math is order-sensitive when any component is compound.
+
+IMS computes the **effective rate** from the active components automatically and stamps it on every document line that uses the parent rate. The per-component breakdown is NOT pushed as separate invoice lines (that would either double-count goods or distort per-component tax bases). Instead:
+
+- If the active accounting connector is **Xero**, IMS auto-syncs the components to a matching Xero `TaxRate` via the `TaxRate.TaxComponents` API on every save (gated by `xero_sync_tax_rate` setting). Xero then handles the component-level VAT-return reporting. The push is idempotent: matching by `Name`, unchanged re-saves are no-ops.
+- If the active connector is **QuickBooks**, the IMS Activity log records a `tax_rate_sync_skipped_unsupported_connector` WARNING — there is no equivalent QBO API, so the operator must configure the equivalent tax codes manually.
+- Until the sync completes, IMS emits a `sales_invoice_tax_components_not_pushed` (sales) or `purchase_invoice_tax_components_not_pushed` (purchases) WARNING on the relevant order or bill, naming the affected rate.
+
+#### Reverse charge
+
+Setting `TaxRate.reverseCharge` to true changes how IMS posts the line to the accounting system:
+
+- The line's `taxType` is swapped to `settings.reverseChargeSalesTaxType` (sales) or `settings.reverseChargePurchaseTaxType` (purchases) so the accounting system tags the line for reverse-charge VAT return treatment.
+- The IMS-side tax computation is unaffected (rate stays as configured — usually `0` for reverse-charge B2B services).
+- The reporting category should be set to `REVERSE_CHARGE` so the VAT analytics report groups it separately from domestic sales.
+
+If the reverse-charge tax type settings are empty, IMS falls back to the parent `TaxRate.accountingTaxType` — the line still posts but is not flagged as reverse-charge on the accounting side.
 
 ## Backup & Restore
 
