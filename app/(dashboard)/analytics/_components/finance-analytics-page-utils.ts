@@ -32,6 +32,7 @@ export function financeAnalyticsFiltersFromSearch(searchParams: FinanceAnalytics
     bucket1Days: positiveInteger(one(searchParams.bucket1Days)),
     bucket2Days: positiveInteger(one(searchParams.bucket2Days)),
     bucket3Days: positiveInteger(one(searchParams.bucket3Days)),
+    vatReportingCategory: one(searchParams.vatReportingCategory)?.trim() || undefined,
   }
 }
 
