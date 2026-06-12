@@ -4,7 +4,14 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, getAccountingSettings, type AccountingSettings } from '@/lib/accounting'
+import {
+  queueAccountingSync,
+  getAccountingSettings,
+  getActiveAccountingConnectorInfo,
+  isAccountingSyncTypeEnabled,
+  type AccountingSettings,
+} from '@/lib/accounting'
+import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
@@ -1072,23 +1079,6 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     },
   })
   if (!so) return
-  if (so.accountingInvoiceId) {
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: so.id,
-      action: 'sales_invoice_sync_skipped_existing_external_id',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: `Skipped sales invoice queue for ${getSalesOrderReference(so)} because it already has accounting invoice ${so.accountingInvoiceId}`,
-      metadata: {
-        accountingInvoiceId: so.accountingInvoiceId,
-        orderNumber: getSalesOrderReference(so),
-        reason: 'accounting_invoice_already_posted',
-      },
-    })
-    return
-  }
-
   const settings = await getAccountingSettings()
   if (!settings.syncEnabled) return
 
@@ -1118,44 +1108,98 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   // the order (matching WC import), so it can be passed through directly.
   const discountForeign = roundDecimalNumber(so.discountAmount ?? 0, 2)
 
+  const payload = {
+    invoiceNumber: `${manualPrefix}${orderNumber}`,
+    contactName: so.customerName ?? 'Unknown',
+    contactEmail: so.customerEmail ?? undefined,
+    date: new Date().toISOString().slice(0, 10),
+    currency: so.currency,
+    // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
+    // their own daily rate (which causes 1-3 % drift on multi-currency
+    // invoices). Connector adapter inverts to the platform's convention.
+    currencyRateToBase: Number(so.fxRateToBase) || undefined,
+    reference: orderNumber,
+    lines: so.lines.map((l) => {
+      const qty = Number(l.qty)
+      const discForeign = Number(l.discountAmount ?? 0)
+      return {
+        itemCode: l.sku ?? undefined,
+        description: l.description ?? l.sku ?? 'Item',
+        quantity: qty,
+        unitAmount: Number(l.unitPriceForeign),
+        accountCode: settings.salesAccount,
+        taxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType ?? undefined,
+        discountAmount: discForeign > 0 ? discForeign : undefined,
+      }
+    }),
+    shippingAmount: shippingSendForeign > 0 ? shippingSendForeign : undefined,
+    shippingDescription: 'Shipping',
+    shippingAccountCode: settings.shippingAccount || undefined,
+    shippingTaxType: orderDefaultTaxType ?? undefined,
+    discountAmount: discountForeign > 0 ? discountForeign : undefined,
+    discountAccountCode: settings.discountAccount || undefined,
+    discountTaxType: orderDefaultTaxType ?? undefined,
+    lineAmountsIncludeTax,
+  }
+
+  if (so.accountingInvoiceId) {
+    const updatePayload = {
+      ...payload,
+      accountingInvoiceId: so.accountingInvoiceId,
+    }
+    const idempotencyKey = accountingPayloadKey(`sales-invoice-update:${so.id}:${so.accountingInvoiceId}`, updatePayload)
+    const connector = await getActiveAccountingConnectorInfo()
+    if (connector?.id !== 'xero') {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'sales_invoice_update_skipped_unsupported_connector',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: connector
+          ? `Sales invoice update for ${orderNumber} was not queued because ${connector.name} invoice updates are not supported yet`
+          : `Sales invoice update for ${orderNumber} was not queued because no accounting connector is active`,
+        metadata: {
+          accountingInvoiceId: so.accountingInvoiceId,
+          orderNumber,
+          connector: connector?.id ?? null,
+          idempotencyKey,
+        },
+      })
+      return
+    }
+    if (!(await isAccountingSyncTypeEnabled('SALES_INVOICE_UPDATE'))) return
+
+    const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
+    await queueXeroSync({
+      type: 'SALES_INVOICE_UPDATE',
+      referenceType: 'SalesOrder',
+      referenceId: so.id,
+      payload: updatePayload,
+      idempotencyKey,
+    })
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: so.id,
+      action: 'sales_invoice_update_queued',
+      tag: 'accounting',
+      level: 'INFO',
+      description: `Queued sales invoice update for ${orderNumber} against accounting invoice ${so.accountingInvoiceId}`,
+      metadata: {
+        accountingInvoiceId: so.accountingInvoiceId,
+        orderNumber,
+        idempotencyKey,
+      },
+    })
+    return
+  }
+
   await queueAccountingSync({
     type: 'SALES_INVOICE',
     referenceType: 'SalesOrder',
     referenceId: so.id,
-    payload: {
-      invoiceNumber: `${manualPrefix}${orderNumber}`,
-      contactName: so.customerName ?? 'Unknown',
-      contactEmail: so.customerEmail ?? undefined,
-      date: new Date().toISOString().slice(0, 10),
-      currency: so.currency,
-      // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
-      // their own daily rate (which causes 1-3 % drift on multi-currency
-      // invoices). Connector adapter inverts to the platform's convention.
-      currencyRateToBase: Number(so.fxRateToBase) || undefined,
-      reference: orderNumber,
-      lines: so.lines.map((l) => {
-        const qty = Number(l.qty)
-        const discForeign = Number(l.discountAmount ?? 0)
-        return {
-          itemCode: l.sku ?? undefined,
-          description: l.description ?? l.sku ?? 'Item',
-          quantity: qty,
-          unitAmount: Number(l.unitPriceForeign),
-          accountCode: settings.salesAccount,
-          taxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType ?? undefined,
-          discountAmount: discForeign > 0 ? discForeign : undefined,
-        }
-      }),
-      shippingAmount: shippingSendForeign > 0 ? shippingSendForeign : undefined,
-      shippingDescription: 'Shipping',
-      shippingAccountCode: settings.shippingAccount || undefined,
-      shippingTaxType: orderDefaultTaxType ?? undefined,
-      discountAmount: discountForeign > 0 ? discountForeign : undefined,
-      discountAccountCode: settings.discountAccount || undefined,
-      discountTaxType: orderDefaultTaxType ?? undefined,
-      lineAmountsIncludeTax,
-      _postingMode: 'draft',
-    },
+    payload,
+    idempotencyKey: accountingPayloadKey(`sales-invoice:${so.id}`, payload),
   })
 }
 

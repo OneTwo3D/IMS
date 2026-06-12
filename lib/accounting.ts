@@ -32,8 +32,10 @@ type AccountingConnectorInfo = {
 
 const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
   SALES_INVOICE: 'xero_sync_sales_invoice',
+  SALES_INVOICE_UPDATE: 'xero_sync_sales_invoice',
   CREDIT_NOTE: 'xero_sync_credit_note',
   PURCHASE_INVOICE: 'xero_sync_purchase_invoice',
+  PURCHASE_INVOICE_UPDATE: 'xero_sync_purchase_invoice',
   COGS_JOURNAL: 'xero_sync_cogs_journal',
   COGS_REVERSAL: 'xero_sync_cogs_reversal',
   STOCK_RECEIPT: 'xero_sync_stock_receipt',
@@ -47,8 +49,10 @@ const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
 
 const QUICKBOOKS_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
   SALES_INVOICE: 'quickbooks_sync_sales_invoice',
+  SALES_INVOICE_UPDATE: 'quickbooks_sync_sales_invoice',
   CREDIT_NOTE: 'quickbooks_sync_credit_note',
   PURCHASE_INVOICE: 'quickbooks_sync_purchase_invoice',
+  PURCHASE_INVOICE_UPDATE: 'quickbooks_sync_purchase_invoice',
   COGS_JOURNAL: 'quickbooks_sync_cogs_journal',
   COGS_REVERSAL: 'quickbooks_sync_cogs_reversal',
   STOCK_RECEIPT: 'quickbooks_sync_stock_receipt',

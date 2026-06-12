@@ -406,6 +406,10 @@ async function processEntry(
       return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
     }
 
+    case 'SALES_INVOICE_UPDATE':
+    case 'PURCHASE_INVOICE_UPDATE':
+      return { success: false, error: `${type} is not supported by the QuickBooks sync processor yet` }
+
     case 'CREDIT_NOTE': {
       const creditCustomerId = referenceType === 'SalesOrderRefund'
         ? (await db.salesOrderRefund.findUnique({
