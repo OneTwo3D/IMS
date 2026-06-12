@@ -2507,14 +2507,10 @@ export async function createInvoice(
       getAccountingSettings(),
       db.purchaseOrder.findUnique({
         where: { id: poId },
-        select: { supplier: { select: { name: true, prepaid: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
+        select: { supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
       }),
     ])
     const fallbackTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
-    // Prepaid / deposit suppliers may be billed up to the ordered quantity
-    // before goods arrive; everyone else is capped at the received quantity
-    // (three-way match). See onetwo3d-ims-32tm.
-    const allowBillBeforeReceipt = supplierData?.supplier?.prepaid ?? false
     const invoiceCalculation = calculatePurchaseInvoice({
       lines: [
         ...productInputs.map((l): PurchaseInvoiceInputLine => ({
@@ -2561,12 +2557,35 @@ export async function createInvoice(
         where: { invoice: { poId } },
         select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
       })
+      // Re-read quantities + supplier policy UNDER the locks just acquired.
+      // The pre-transaction reads above feed pricing/tax; the three-way match
+      // must validate against locked rows or a return / receipt / prepaid
+      // toggle committed between the pre-read and the lock could let a bill
+      // through against stale quantities.
+      const lockedPo = await tx.purchaseOrder.findUniqueOrThrow({
+        where: { id: poId },
+        select: {
+          supplier: { select: { prepaid: true } },
+          lines: {
+            select: {
+              id: true,
+              qty: true,
+              qtyReceived: true,
+              qtyReturned: true,
+              product: { select: { sku: true } },
+            },
+          },
+          freightCostLines: {
+            select: { id: true, description: true, amountForeign: true, vatable: true },
+          },
+        },
+      })
       validatePurchaseInvoiceLineLimits({
         lineData: invoiceCalculation.lineData,
         alreadyBilledLines: existing,
-        poLineById,
-        costLineById,
-        allowBillBeforeReceipt,
+        poLineById: new Map(lockedPo.lines.map((l) => [l.id, l])),
+        costLineById: new Map(lockedPo.freightCostLines.map((c) => [c.id, c])),
+        allowBillBeforeReceipt: lockedPo.supplier.prepaid,
       })
 
       await tx.purchaseInvoice.create({
@@ -2887,7 +2906,10 @@ export async function updateInvoice(
 
       const lockedInvoice = await tx.purchaseInvoice.findUnique({
         where: { id: invoice.id },
-        select: { paidAt: true },
+        select: {
+          paidAt: true,
+          lines: { select: { poLineId: true, qtyBilled: true } },
+        },
       })
       if (!lockedInvoice) throw new Error('Bill not found')
       assertPurchaseInvoiceEditable(lockedInvoice)
@@ -2896,13 +2918,47 @@ export async function updateInvoice(
         where: { invoice: { poId: invoice.poId, id: { not: invoice.id } } },
         select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
       })
+      // Re-read quantities + supplier policy UNDER the locks (the pre-tx reads
+      // feed pricing/tax only) so a return / receipt / prepaid toggle committed
+      // between the pre-read and the lock cannot let stale quantities through.
+      const lockedPo = await tx.purchaseOrder.findUniqueOrThrow({
+        where: { id: invoice.poId },
+        select: {
+          supplier: { select: { prepaid: true } },
+          lines: {
+            select: {
+              id: true,
+              qty: true,
+              qtyReceived: true,
+              qtyReturned: true,
+              product: { select: { sku: true } },
+            },
+          },
+          freightCostLines: {
+            select: { id: true, description: true, amountForeign: true, vatable: true },
+          },
+        },
+      })
+      // Grandfather this invoice's current quantities: lines billed under the
+      // policy in force at creation (prepaid then, or returns landed after
+      // billing) stay editable at their existing level; only increases must
+      // satisfy today's cap.
+      const grandfatheredQtyByPoLineId = new Map<string, number>()
+      for (const line of lockedInvoice.lines) {
+        if (!line.poLineId) continue
+        grandfatheredQtyByPoLineId.set(
+          line.poLineId,
+          (grandfatheredQtyByPoLineId.get(line.poLineId) ?? 0) + Number(line.qtyBilled),
+        )
+      }
       validatePurchaseInvoiceLineLimits({
         lineData: lineUpdates,
         alreadyBilledLines: otherLines,
-        poLineById,
-        costLineById,
+        poLineById: new Map(lockedPo.lines.map((l) => [l.id, l])),
+        costLineById: new Map(lockedPo.freightCostLines.map((c) => [c.id, c])),
         // Prepaid suppliers bill up to ordered qty; others up to received qty.
-        allowBillBeforeReceipt: invoice.po.supplier.prepaid ?? false,
+        allowBillBeforeReceipt: lockedPo.supplier.prepaid,
+        grandfatheredQtyByPoLineId,
       })
 
       await tx.purchaseInvoice.update({

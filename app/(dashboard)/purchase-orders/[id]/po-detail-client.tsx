@@ -805,7 +805,9 @@ function BillDialog({
           ...selectedLines.map((l) => ({
             kind: 'product' as const,
             poLineId: l.poLineId,
-            qtyBilled: l.qtyBilled,
+            // Clamp at the billable cap so a hand-typed value above the input
+            // max becomes the cap instead of a server rejection.
+            qtyBilled: Math.min(l.qtyBilled, l.remaining),
             unitCostForeign: l.unitCostForeign,
           })),
           ...selectedCostLines.map((l) => ({
@@ -1133,8 +1135,11 @@ function EditBillDialog({
 
   // Per-line billing cap for the edit: three-way match (net received) for
   // pay-on-receipt suppliers, ordered qty for prepaid — minus what OTHER
-  // invoices on this PO have already billed against the line. Mirrors the
-  // server-side validatePurchaseInvoiceLineLimits rule.
+  // invoices on this PO have already billed against the line. The line's
+  // existing quantity is grandfathered (kept editable at its current level
+  // even if today's cap is lower, e.g. supplier toggled off prepaid or goods
+  // were returned after billing); only increases must satisfy today's cap.
+  // Mirrors the server-side validatePurchaseInvoiceLineLimits rule.
   const maxQtyByPoLineId = new Map<string, number>(
     invoice.lines
       .filter((line) => line.poLineId)
@@ -1143,7 +1148,8 @@ function EditBillDialog({
         if (!poLine) return [line.poLineId as string, line.qtyBilled]
         const capTotal = po.supplierPrepaid ? poLine.qty : poLine.qtyRemaining
         const billedOnOtherInvoices = poLine.qtyBilled - line.qtyBilled
-        return [line.poLineId as string, Math.max(0, capTotal - billedOnOtherInvoices)]
+        const policyAllowed = Math.max(0, capTotal - billedOnOtherInvoices)
+        return [line.poLineId as string, Math.min(poLine.qty - billedOnOtherInvoices, Math.max(policyAllowed, line.qtyBilled))]
       }),
   )
 
@@ -1198,7 +1204,10 @@ function EditBillDialog({
         supplierInvoiceUrl: supplierInvoiceUrl || undefined,
         lines: lines.map((line) => line.poLineId ? {
           id: line.id,
-          qtyBilled: line.qtyBilled,
+          // Clamp at the per-line edit cap (net received minus other invoices'
+          // billing, or the grandfathered quantity) so hand-typed overshoots
+          // become the cap instead of a server rejection.
+          qtyBilled: Math.min(line.qtyBilled, maxQtyByPoLineId.get(line.poLineId) ?? line.qtyBilled),
           unitCostForeign: line.unitCostForeign,
         } : {
           id: line.id,
