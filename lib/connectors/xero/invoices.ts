@@ -18,59 +18,16 @@ type XeroInvoiceResponse = {
   }>
 }
 
-/**
- * Create a sales invoice (ACCREC) in Xero.
- *
- * Before posting, any line with an `itemCode` is pre-checked against Xero's
- * Items endpoint — missing items are auto-created so that invoices for new
- * products don't fail with "item not found". If item creation fails (e.g.
- * Xero name collision on a different code) the line still posts, just
- * without ItemCode, so the invoice itself is not blocked.
- */
-export async function pushSalesInvoice(
+function buildSalesInvoicePayload(
   data: InvoiceData,
-  status: string = 'AUTHORISED',
-  opts?: { idempotencyKey?: string; customerId?: string },
-): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; error?: string }> {
-  // Find or create the contact
-  const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, false, { customerId: opts?.customerId })
-  if (!contactResult.success || !contactResult.contactId) {
-    return { success: false, error: `Contact error: ${contactResult.error}` }
-  }
-
-  // Pre-create any items that don't exist in Xero yet. Deduplicate by code to
-  // avoid redundant API calls when the same SKU appears on multiple lines.
-  const itemCodes = new Set<string>()
-  const droppedItemCodes = new Set<string>()
-  for (const line of data.lines) {
-    if (!line.itemCode || itemCodes.has(line.itemCode)) continue
-    itemCodes.add(line.itemCode)
-    const itemName = line.itemName ?? line.description ?? line.itemCode
-    const result = await findOrCreateItem(line.itemCode, itemName, line.accountCode)
-    if (!result.success) {
-      // Non-fatal: drop the ItemCode from this line and fall back to a plain
-      // description-only line so the invoice still goes through.
-      droppedItemCodes.add(line.itemCode)
-    }
-  }
-
+  status: string,
+  contactId: string,
+  droppedItemCodes: Set<string>,
+): Record<string, unknown> {
   // Xero requires a TaxType on every line item. "NONE" is the no-tax fallback
   // for customers/products that carry no VAT, so we default to it whenever the
   // caller hasn't supplied a specific tax type.
   const DEFAULT_TAX_TYPE = 'NONE'
-
-  // Validate that every product line has an account code — Xero rejects the
-  // whole invoice with "Account code or ID must be specified" if any line is
-  // missing one. Bail out early with a clear error instead of making a bad
-  // API call.
-  for (const line of data.lines) {
-    if (!line.accountCode) {
-      return {
-        success: false,
-        error: `Line "${line.description}" is missing a sales account code. Configure Account Mapping → Sales Revenue in the Xero integration settings.`,
-      }
-    }
-  }
 
   // Build line items. Xero supports `DiscountRate` (a percentage, 0-100) on
   // sales invoices (ACCREC) — translate the generic per-line `discountAmount`
@@ -128,7 +85,7 @@ export async function pushSalesInvoice(
 
   const invoice: Record<string, unknown> = {
     Type: 'ACCREC',
-    Contact: { ContactID: contactResult.contactId },
+    Contact: { ContactID: contactId },
     InvoiceNumber: data.invoiceNumber,
     Date: data.date,
     DueDate: dueDate,
@@ -146,9 +103,93 @@ export async function pushSalesInvoice(
   if (xeroCurrencyRate != null) invoice.CurrencyRate = xeroCurrencyRate
   if (data.reference) invoice.Reference = data.reference
 
-  const res = await xeroPost<XeroInvoiceResponse>('Invoices', invoice, opts)
+  return invoice
+}
+
+async function prepareSalesInvoicePayload(
+  data: InvoiceData,
+  status: string,
+  opts?: { customerId?: string },
+): Promise<{ success: true; invoice: Record<string, unknown> } | { success: false; error: string }> {
+  // Find or create the contact
+  const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, false, { customerId: opts?.customerId })
+  if (!contactResult.success || !contactResult.contactId) {
+    return { success: false, error: `Contact error: ${contactResult.error}` }
+  }
+
+  // Pre-create any items that don't exist in Xero yet. Deduplicate by code to
+  // avoid redundant API calls when the same SKU appears on multiple lines.
+  const itemCodes = new Set<string>()
+  const droppedItemCodes = new Set<string>()
+  for (const line of data.lines) {
+    if (!line.itemCode || itemCodes.has(line.itemCode)) continue
+    itemCodes.add(line.itemCode)
+    const itemName = line.itemName ?? line.description ?? line.itemCode
+    const result = await findOrCreateItem(line.itemCode, itemName, line.accountCode)
+    if (!result.success) {
+      // Non-fatal: drop the ItemCode from this line and fall back to a plain
+      // description-only line so the invoice still goes through.
+      droppedItemCodes.add(line.itemCode)
+    }
+  }
+
+  // Validate that every product line has an account code — Xero rejects the
+  // whole invoice with "Account code or ID must be specified" if any line is
+  // missing one. Bail out early with a clear error instead of making a bad
+  // API call.
+  for (const line of data.lines) {
+    if (!line.accountCode) {
+      return {
+        success: false,
+        error: `Line "${line.description}" is missing a sales account code. Configure Account Mapping → Sales Revenue in the Xero integration settings.`,
+      }
+    }
+  }
+
+  return {
+    success: true,
+    invoice: buildSalesInvoicePayload(data, status, contactResult.contactId, droppedItemCodes),
+  }
+}
+
+/**
+ * Create a sales invoice (ACCREC) in Xero.
+ *
+ * Before posting, any line with an `itemCode` is pre-checked against Xero's
+ * Items endpoint — missing items are auto-created so that invoices for new
+ * products don't fail with "item not found". If item creation fails (e.g.
+ * Xero name collision on a different code) the line still posts, just
+ * without ItemCode, so the invoice itself is not blocked.
+ */
+export async function pushSalesInvoice(
+  data: InvoiceData,
+  status: string = 'AUTHORISED',
+  opts?: { idempotencyKey?: string; customerId?: string },
+): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; error?: string }> {
+  const prepared = await prepareSalesInvoicePayload(data, status, opts)
+  if (!prepared.success) return prepared
+
+  const res = await xeroPost<XeroInvoiceResponse>('Invoices', prepared.invoice, opts)
   if (!res.ok || !res.data?.Invoices?.length) {
     return { success: false, error: res.error ?? 'Failed to create invoice' }
+  }
+
+  const inv = res.data.Invoices[0]
+  return { success: true, invoiceId: inv.InvoiceID, invoiceNumber: inv.InvoiceNumber, total: inv.Total }
+}
+
+export async function updateSalesInvoice(
+  accountingInvoiceId: string,
+  data: InvoiceData,
+  status: string = 'AUTHORISED',
+  opts?: { idempotencyKey?: string; customerId?: string },
+): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; error?: string }> {
+  const prepared = await prepareSalesInvoicePayload(data, status, opts)
+  if (!prepared.success) return prepared
+
+  const res = await xeroPost<XeroInvoiceResponse>(`Invoices/${accountingInvoiceId}`, prepared.invoice, opts)
+  if (!res.ok || !res.data?.Invoices?.length) {
+    return { success: false, error: res.error ?? 'Failed to update invoice' }
   }
 
   const inv = res.data.Invoices[0]

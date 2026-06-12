@@ -164,6 +164,53 @@ test('sales and purchase document sync logs mirror with stable document keys', (
   assert.equal((purchase.linesJson as Record<string, unknown>).supplierInvoicePath, 'uploads/supplier/SUP-123.pdf')
 })
 
+test('sales and purchase document update sync logs mirror as document events', () => {
+  assert.equal(isMirrorableAccountingSyncType('SALES_INVOICE_UPDATE'), true)
+  assert.equal(isMirrorableAccountingSyncType('PURCHASE_INVOICE_UPDATE'), true)
+
+  const sales = buildMirroredAccountingEventDraft({
+    connector: 'xero',
+    type: 'SALES_INVOICE_UPDATE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    currency: 'GBP',
+    payload: {
+      _idempotencyKey: 'sales-invoice-update:order-1:invoice-1:abc123',
+      accountingInvoiceId: 'invoice-1',
+      invoiceNumber: 'INV-1001',
+      contactName: 'Customer One',
+      date: '2026-06-12',
+      currency: 'EUR',
+      lines: [{ description: 'Item', quantity: 1, unitAmount: 10, accountCode: '400' }],
+    },
+  })
+  const purchase = buildMirroredAccountingEventDraft({
+    connector: 'xero',
+    type: 'PURCHASE_INVOICE_UPDATE',
+    referenceType: 'PurchaseInvoice',
+    referenceId: 'purchase-invoice-1',
+    currency: 'GBP',
+    payload: {
+      _idempotencyKey: 'purchase-invoice-update:purchase-invoice-1:bill-1:abc123',
+      accountingInvoiceId: 'bill-1',
+      invoiceNumber: 'SUP-123',
+      contactName: 'Supplier Ltd',
+      date: '2026-06-12',
+      currency: 'USD',
+      lines: [{ description: 'PO line', quantity: 2, unitAmount: 5, accountCode: '150' }],
+    },
+  })
+
+  assert.ok(sales)
+  assert.equal(sales.type, 'SALES_INVOICE_UPDATE')
+  assert.equal(sales.idempotencyKey, 'accounting-sync:xero:sales_invoice_update:sales-invoice-update:order-1:invoice-1:abc123')
+  assert.equal((sales.linesJson as Record<string, unknown>).documentType, 'SALES_INVOICE_UPDATE')
+  assert.ok(purchase)
+  assert.equal(purchase.type, 'PURCHASE_INVOICE_UPDATE')
+  assert.equal(purchase.idempotencyKey, 'accounting-sync:xero:purchase_invoice_update:purchase-invoice-update:purchase-invoice-1:bill-1:abc123')
+  assert.equal((purchase.linesJson as Record<string, unknown>).documentType, 'PURCHASE_INVOICE_UPDATE')
+})
+
 test('malformed document sync log payloads surface validation errors', () => {
   assert.throws(() => buildMirroredAccountingEventDraft({
     connector: 'xero',

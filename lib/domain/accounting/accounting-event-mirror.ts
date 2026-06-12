@@ -22,8 +22,10 @@ export type MirroredJournalAccountingSyncType =
 
 export type MirroredDocumentAccountingSyncType =
   | 'SALES_INVOICE'
+  | 'SALES_INVOICE_UPDATE'
   | 'CREDIT_NOTE'
   | 'PURCHASE_INVOICE'
+  | 'PURCHASE_INVOICE_UPDATE'
 
 export type MirroredAccountingSyncType = MirroredJournalAccountingSyncType | MirroredDocumentAccountingSyncType
 
@@ -40,8 +42,10 @@ export const MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES = [
 export const MIRRORED_ACCOUNTING_SYNC_TYPES = [
   ...MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES,
   'SALES_INVOICE',
+  'SALES_INVOICE_UPDATE',
   'CREDIT_NOTE',
   'PURCHASE_INVOICE',
+  'PURCHASE_INVOICE_UPDATE',
 ] as const
 
 const MIRRORED_JOURNAL_TYPES = new Set<string>(MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES)

@@ -3,6 +3,7 @@ import test from 'node:test'
 import { accountingPayloadKey } from '../lib/accounting/payload-key.ts'
 import { XERO_SALES_CREDIT_NOTE_TYPE } from '../lib/connectors/xero/credit-notes.ts'
 import { imsRateToXeroCurrencyRate } from '../lib/connectors/xero/fx.ts'
+import { buildXeroIdempotencyKey } from '../lib/connectors/xero/sync-processor.ts'
 
 test('inverts IMS fxRateToBase into Xero CurrencyRate', () => {
   // Base GBP, document EUR. IMS stores 1 GBP = 1.18 EUR.
@@ -64,4 +65,20 @@ test('accounting payload keys include the document-stamped FX rate', () => {
 
   assert.equal(first, retry)
   assert.notEqual(first, restamped)
+})
+
+test('Xero idempotency keys prefer stable accounting payload keys when present', () => {
+  const first = buildXeroIdempotencyKey('sync-log-1', 'invoice-update', {
+    _idempotencyKey: 'sales-invoice-update:order-1:invoice-1:payload-a',
+  })
+  const retryFromDifferentLog = buildXeroIdempotencyKey('sync-log-2', 'invoice-update', {
+    _idempotencyKey: 'sales-invoice-update:order-1:invoice-1:payload-a',
+  })
+  const changedPayload = buildXeroIdempotencyKey('sync-log-1', 'invoice-update', {
+    _idempotencyKey: 'sales-invoice-update:order-1:invoice-1:payload-b',
+  })
+
+  assert.equal(first, retryFromDifferentLog)
+  assert.notEqual(first, changedPayload)
+  assert.equal(buildXeroIdempotencyKey('sync-log-1', 'invoice-update'), 'ims-invoice-update-sync-log-1')
 })

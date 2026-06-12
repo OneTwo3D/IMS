@@ -15,32 +15,13 @@ type XeroInvoiceResponse = {
   }>
 }
 
-/**
- * Create a purchase bill (ACCPAY) in Xero.
- */
-export async function pushPurchaseBill(
+function buildPurchaseBillPayload(
   data: BillData,
-  status: string = 'AUTHORISED',
-  opts?: { idempotencyKey?: string; supplierId?: string; supplierEmail?: string },
-): Promise<{ success: boolean; invoiceId?: string; error?: string }> {
-  // Find or create the supplier contact
-  const contactResult = await findOrCreateContact(data.contactName, opts?.supplierEmail, true, { supplierId: opts?.supplierId })
-  if (!contactResult.success || !contactResult.contactId) {
-    return { success: false, error: `Contact error: ${contactResult.error}` }
-  }
-
+  status: string,
+  contactId: string,
+): Record<string, unknown> {
   // Xero mandates TaxType on every line; "NONE" is the no-tax fallback.
   const DEFAULT_TAX_TYPE = 'NONE'
-
-  // Validate account codes up front — Xero rejects the whole bill otherwise.
-  for (const line of data.lines) {
-    if (!line.accountCode) {
-      return {
-        success: false,
-        error: `Line "${line.description}" is missing an account code. Configure Account Mapping → Stock in Transit in the Xero integration settings.`,
-      }
-    }
-  }
 
   // Build line items. Xero ACCPAY (bills) does NOT support DiscountRate at
   // the line level — so we apply any generic per-line `discountAmount` by
@@ -70,7 +51,7 @@ export async function pushPurchaseBill(
 
   const invoice: Record<string, unknown> = {
     Type: 'ACCPAY',
-    Contact: { ContactID: contactResult.contactId },
+    Contact: { ContactID: contactId },
     LineItems: lineItems,
     Status: status,
     CurrencyCode: data.currency,
@@ -83,9 +64,67 @@ export async function pushPurchaseBill(
   if (data.invoiceNumber) invoice.InvoiceNumber = data.invoiceNumber
   if (data.reference) invoice.Reference = data.reference
 
-  const res = await xeroPost<XeroInvoiceResponse>('Invoices', invoice, opts)
+  return invoice
+}
+
+async function preparePurchaseBillPayload(
+  data: BillData,
+  status: string,
+  opts?: { supplierId?: string; supplierEmail?: string },
+): Promise<{ success: true; invoice: Record<string, unknown> } | { success: false; error: string }> {
+  // Find or create the supplier contact
+  const contactResult = await findOrCreateContact(data.contactName, opts?.supplierEmail, true, { supplierId: opts?.supplierId })
+  if (!contactResult.success || !contactResult.contactId) {
+    return { success: false, error: `Contact error: ${contactResult.error}` }
+  }
+
+  // Validate account codes up front — Xero rejects the whole bill otherwise.
+  for (const line of data.lines) {
+    if (!line.accountCode) {
+      return {
+        success: false,
+        error: `Line "${line.description}" is missing an account code. Configure Account Mapping → Stock in Transit in the Xero integration settings.`,
+      }
+    }
+  }
+
+  return {
+    success: true,
+    invoice: buildPurchaseBillPayload(data, status, contactResult.contactId),
+  }
+}
+
+/**
+ * Create a purchase bill (ACCPAY) in Xero.
+ */
+export async function pushPurchaseBill(
+  data: BillData,
+  status: string = 'AUTHORISED',
+  opts?: { idempotencyKey?: string; supplierId?: string; supplierEmail?: string },
+): Promise<{ success: boolean; invoiceId?: string; error?: string }> {
+  const prepared = await preparePurchaseBillPayload(data, status, opts)
+  if (!prepared.success) return prepared
+
+  const res = await xeroPost<XeroInvoiceResponse>('Invoices', prepared.invoice, opts)
   if (!res.ok || !res.data?.Invoices?.length) {
     return { success: false, error: res.error ?? 'Failed to create bill' }
+  }
+
+  return { success: true, invoiceId: res.data.Invoices[0].InvoiceID }
+}
+
+export async function updatePurchaseBill(
+  accountingInvoiceId: string,
+  data: BillData,
+  status: string = 'AUTHORISED',
+  opts?: { idempotencyKey?: string; supplierId?: string; supplierEmail?: string },
+): Promise<{ success: boolean; invoiceId?: string; error?: string }> {
+  const prepared = await preparePurchaseBillPayload(data, status, opts)
+  if (!prepared.success) return prepared
+
+  const res = await xeroPost<XeroInvoiceResponse>(`Invoices/${accountingInvoiceId}`, prepared.invoice, opts)
+  if (!res.ok || !res.data?.Invoices?.length) {
+    return { success: false, error: res.error ?? 'Failed to update bill' }
   }
 
   return { success: true, invoiceId: res.data.Invoices[0].InvoiceID }

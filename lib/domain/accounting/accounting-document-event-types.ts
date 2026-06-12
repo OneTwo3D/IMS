@@ -2,8 +2,10 @@ import type { AccountingEventStatus } from './accounting-event-types'
 
 export type AccountingDocumentEventType =
   | 'SALES_INVOICE'
+  | 'SALES_INVOICE_UPDATE'
   | 'CREDIT_NOTE'
   | 'PURCHASE_INVOICE'
+  | 'PURCHASE_INVOICE_UPDATE'
 
 export type AccountingDocumentLineAmountMode = 'EXCLUSIVE' | 'INCLUSIVE'
 

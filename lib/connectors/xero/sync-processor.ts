@@ -4,10 +4,11 @@
  */
 
 import { readFile } from 'fs/promises'
+import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { pushSalesInvoice } from './invoices'
-import { pushPurchaseBill } from './bills'
+import { pushSalesInvoice, updateSalesInvoice } from './invoices'
+import { pushPurchaseBill, updatePurchaseBill } from './bills'
 import { pushCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
 import { xeroUploadAttachment, xeroPost } from './api'
@@ -61,7 +62,11 @@ export function isXeroAccountingOutboxEnabled(value = process.env.XERO_ACCOUNTIN
   return !['false', '0', 'off'].includes(String(value ?? 'true').trim().toLowerCase())
 }
 
-function buildXeroIdempotencyKey(entryId: string, operation: string): string {
+export function buildXeroIdempotencyKey(entryId: string, operation: string, payload?: SyncPayload): string {
+  if (typeof payload?._idempotencyKey === 'string' && payload._idempotencyKey.trim()) {
+    const digest = createHash('sha256').update(payload._idempotencyKey).digest('hex')
+    return `ims-${operation}-${digest}`
+  }
   return `ims-${operation}-${entryId}`
 }
 
@@ -906,7 +911,7 @@ async function processEntry(
             select: { customerId: true },
           }).catch(() => null))?.customerId ?? undefined
         : undefined
-      const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice')
+      const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
         contactName: payload.contactName as string,
@@ -915,7 +920,41 @@ async function processEntry(
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
         currencyRateToBase: payload.currencyRateToBase as number | undefined,
-        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; discountRate?: number }>,
+        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; discountAmount?: number }>,
+        shippingAmount: payload.shippingAmount as number | undefined,
+        shippingDescription: payload.shippingDescription as string | undefined,
+        shippingAccountCode: payload.shippingAccountCode as string | undefined,
+        shippingTaxType: payload.shippingTaxType as string | undefined,
+        discountAmount: payload.discountAmount as number | undefined,
+        discountAccountCode: payload.discountAccountCode as string | undefined,
+        discountTaxType: payload.discountTaxType as string | undefined,
+        lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
+        reference: payload.reference as string | undefined,
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId })
+      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, error: invoiceResult.error }
+    }
+
+    case 'SALES_INVOICE_UPDATE': {
+      const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
+      if (!accountingInvoiceId) {
+        return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
+      }
+      const customerId = referenceType === 'SalesOrder'
+        ? (await db.salesOrder.findUnique({
+            where: { id: referenceId },
+            select: { customerId: true },
+          }).catch(() => null))?.customerId ?? undefined
+        : undefined
+      const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice-update', payload)
+      const invoiceResult = await updateSalesInvoice(accountingInvoiceId, {
+        invoiceNumber: payload.invoiceNumber as string,
+        contactName: payload.contactName as string,
+        contactEmail: payload.contactEmail as string | undefined,
+        date: payload.date as string,
+        dueDate: payload.dueDate as string | undefined,
+        currency: payload.currency as string,
+        currencyRateToBase: payload.currencyRateToBase as number | undefined,
+        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; discountAmount?: number }>,
         shippingAmount: payload.shippingAmount as number | undefined,
         shippingDescription: payload.shippingDescription as string | undefined,
         shippingAccountCode: payload.shippingAccountCode as string | undefined,
@@ -936,8 +975,33 @@ async function processEntry(
             select: { supplierId: true, supplier: { select: { email: true } } },
           }).catch(() => null)
         : null
-      const billIdempotencyKey = buildXeroIdempotencyKey(entryId, 'bill')
+      const billIdempotencyKey = buildXeroIdempotencyKey(entryId, 'bill', payload)
       const billResult = await pushPurchaseBill({
+        invoiceNumber: payload.invoiceNumber as string | undefined,
+        contactName: payload.contactName as string,
+        date: payload.date as string,
+        dueDate: payload.dueDate as string | undefined,
+        currency: payload.currency as string,
+        currencyRateToBase: payload.currencyRateToBase as number | undefined,
+        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
+        reference: payload.reference as string | undefined,
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
+      return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
+    }
+
+    case 'PURCHASE_INVOICE_UPDATE': {
+      const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
+      if (!accountingInvoiceId) {
+        return { success: false, error: 'Missing accountingInvoiceId for PURCHASE_INVOICE_UPDATE' }
+      }
+      const supplier = referenceType === 'PurchaseOrder'
+        ? await db.purchaseOrder.findUnique({
+            where: { id: referenceId },
+            select: { supplierId: true, supplier: { select: { email: true } } },
+          }).catch(() => null)
+        : null
+      const billIdempotencyKey = buildXeroIdempotencyKey(entryId, 'bill-update', payload)
+      const billResult = await updatePurchaseBill(accountingInvoiceId, {
         invoiceNumber: payload.invoiceNumber as string | undefined,
         contactName: payload.contactName as string,
         date: payload.date as string,

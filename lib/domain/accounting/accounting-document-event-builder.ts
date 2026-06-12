@@ -11,8 +11,10 @@ const DEFAULT_STATUS: AccountingEventStatus = 'PENDING'
 
 const DOCUMENT_EVENT_TYPES = new Set<string>([
   'SALES_INVOICE',
+  'SALES_INVOICE_UPDATE',
   'CREDIT_NOTE',
   'PURCHASE_INVOICE',
+  'PURCHASE_INVOICE_UPDATE',
 ])
 
 function requireNonBlank(value: string, field: string): string {
