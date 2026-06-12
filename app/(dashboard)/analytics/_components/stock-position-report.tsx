@@ -8,7 +8,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import type { ProductType } from '@/app/generated/prisma/client'
 import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventory/stock-position-reports'
 import { cn } from '@/lib/utils'
-import { PageTitle } from '@/lib/page-title'
+import { ReportPageTitle } from './report-page-title'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
 import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
 
@@ -84,8 +84,7 @@ export function StockPositionReportPage<Row>({
     <div className="space-y-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <PageTitle title={title} />
-          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+          <ReportPageTitle title={title} description={description} />
         </div>
         <a href={csvHref} className={cn(buttonVariants({ variant: 'outline', size: 'sm' }), 'w-fit')}>
           <Download className="mr-2 h-4 w-4" />
