@@ -114,6 +114,7 @@ export type PoRow = {
   status: PoStatus
   supplierId: string
   supplierName: string
+  supplierPrepaid: boolean
   currency: string
   fxRateToBase: number
   subtotalForeign: number
@@ -318,7 +319,7 @@ const PO_SELECT = {
   skipPreferredSupplierUpdate: true,
   createdAt: true,
   updatedAt: true,
-  supplier: { select: { id: true, name: true } },
+  supplier: { select: { id: true, name: true, prepaid: true } },
   destinationWarehouse: { select: { id: true, name: true } },
   lines: {
     select: {
@@ -379,7 +380,7 @@ function mapPoRow(po: {
   updatedAt: Date
   trackingNumber: string | null
   shippingProvider: string | null
-  supplier: { name: string }
+  supplier: { name: string; prepaid: boolean }
   destinationWarehouse: { name: string } | null
   lines: { id: string; qtyReceived: unknown; qtyReturned: unknown }[]
   _count: { invoices: number; returns: number }
@@ -395,6 +396,7 @@ function mapPoRow(po: {
     status: po.status as PoStatus,
     supplierId: po.supplierId,
     supplierName: po.supplier.name,
+    supplierPrepaid: po.supplier.prepaid,
     currency: po.currency,
     fxRateToBase: Number(po.fxRateToBase),
     subtotalForeign: Number(po.subtotalForeign),
@@ -2440,6 +2442,8 @@ export async function createInvoice(
           select: {
             id: true,
             qty: true,
+            qtyReceived: true,
+            qtyReturned: true,
             product: { select: { sku: true } },
             taxRate: {
               select: {
@@ -2503,10 +2507,14 @@ export async function createInvoice(
       getAccountingSettings(),
       db.purchaseOrder.findUnique({
         where: { id: poId },
-        select: { supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
+        select: { supplier: { select: { name: true, prepaid: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
       }),
     ])
     const fallbackTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
+    // Prepaid / deposit suppliers may be billed up to the ordered quantity
+    // before goods arrive; everyone else is capped at the received quantity
+    // (three-way match). See onetwo3d-ims-32tm.
+    const allowBillBeforeReceipt = supplierData?.supplier?.prepaid ?? false
     const invoiceCalculation = calculatePurchaseInvoice({
       lines: [
         ...productInputs.map((l): PurchaseInvoiceInputLine => ({
@@ -2558,6 +2566,7 @@ export async function createInvoice(
         alreadyBilledLines: existing,
         poLineById,
         costLineById,
+        allowBillBeforeReceipt,
       })
 
       await tx.purchaseInvoice.create({
@@ -2691,6 +2700,7 @@ export async function updateInvoice(
               select: {
                 name: true,
                 email: true,
+                prepaid: true,
                 taxRate: { select: { accountingTaxType: true } },
               },
             },
@@ -2698,6 +2708,8 @@ export async function updateInvoice(
               select: {
                 id: true,
                 qty: true,
+                qtyReceived: true,
+                qtyReturned: true,
                 product: { select: { sku: true } },
                 taxRate: {
                   select: {
@@ -2889,6 +2901,8 @@ export async function updateInvoice(
         alreadyBilledLines: otherLines,
         poLineById,
         costLineById,
+        // Prepaid suppliers bill up to ordered qty; others up to received qty.
+        allowBillBeforeReceipt: invoice.po.supplier.prepaid ?? false,
       })
 
       await tx.purchaseInvoice.update({

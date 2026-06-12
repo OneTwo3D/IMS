@@ -20,6 +20,20 @@ export type PurchaseInvoiceEditLine = {
 export type PurchaseInvoicePoLine = {
   id: string
   qty: unknown
+  /**
+   * Quantity received against this PO line. With qtyReturned, drives the
+   * three-way match guard: a line can only be billed up to the NET received
+   * quantity (received − returned), not the ordered quantity, so goods sent
+   * back as defective before invoicing are not billable. Optional so legacy
+   * callers still typecheck; when absent the guard falls back to the ordered
+   * quantity cap.
+   */
+  qtyReceived?: unknown
+  /**
+   * Quantity returned to the supplier. Subtracted from qtyReceived to get the
+   * billable net. Optional; treated as 0 when absent.
+   */
+  qtyReturned?: unknown
   product: { sku: string }
   taxRate?: { accountingTaxType: string | null; reverseCharge?: boolean } | null
 }
@@ -267,6 +281,20 @@ export function validatePurchaseInvoiceLineLimits(params: {
   alreadyBilledLines: ExistingPurchaseInvoiceLine[]
   poLineById: Map<string, PurchaseInvoicePoLine>
   costLineById: Map<string, PurchaseInvoiceCostLine>
+  /**
+   * When false (the default), product lines may only be billed up to the
+   * received quantity — the three-way match control (PO ↔ receipt ↔ bill).
+   * When true, billing is capped at the ordered quantity instead, which is
+   * the legacy behaviour and is intended only for operators who deliberately
+   * raise deposit / pro-forma bills before goods arrive. Driven by the
+   * `purchasing_allow_bill_before_receipt` setting at the action layer.
+   *
+   * The cap only relaxes to the ordered quantity when a PO line has a known
+   * qtyReceived; lines whose qtyReceived is undefined (legacy callers that
+   * don't select it) always fall back to the ordered-quantity cap regardless
+   * of this flag, preserving prior behaviour.
+   */
+  allowBillBeforeReceipt?: boolean
 }): void {
   const alreadyProductByLine = new Map<string, number>()
   const alreadyCostByLine = new Map<string, number>()
@@ -291,8 +319,22 @@ export function validatePurchaseInvoiceLineLimits(params: {
       const poLine = params.poLineById.get(line.poLineId)
       if (!poLine) throw new Error(`Unknown PO line ${line.poLineId}`)
       const already = alreadyProductByLine.get(line.poLineId) ?? 0
-      if (already + line.qtyBilled > Number(poLine.qty) + 1e-6) {
-        throw new Error(`Line ${poLine.product.sku} exceeds remaining qty`)
+      const orderedQty = Number(poLine.qty)
+      // Three-way match: cap at the NET received quantity (received − returned)
+      // unless the supplier is prepaid (allowBillBeforeReceipt). Goods returned
+      // to the supplier before invoicing are not billable. Fall back to the
+      // ordered quantity when qtyReceived is unknown (un-migrated caller).
+      const receivedKnown = poLine.qtyReceived !== undefined && poLine.qtyReceived !== null
+      const netReceived = Number(poLine.qtyReceived ?? 0) - Number(poLine.qtyReturned ?? 0)
+      const cap = (!params.allowBillBeforeReceipt && receivedKnown)
+        ? netReceived
+        : orderedQty
+      if (already + line.qtyBilled > cap + 1e-6) {
+        const billedSoFar = already > 0 ? ` (${already} already billed)` : ''
+        const reason = (!params.allowBillBeforeReceipt && receivedKnown && cap < orderedQty)
+          ? `exceeds net received qty ${cap}${billedSoFar} — only received, un-returned goods can be billed`
+          : `exceeds remaining qty${billedSoFar}`
+        throw new Error(`Line ${poLine.product.sku} ${reason}`)
       }
     }
     if (line.costLineId) {

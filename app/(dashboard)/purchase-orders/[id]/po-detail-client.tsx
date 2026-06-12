@@ -670,15 +670,19 @@ function BillDialog({
   const billSymPos = positionMap[po.currency] ?? 'PREFIX'
   const billMoney = (n: number) => formatMoney(n, billSym, billSymPos)
 
-  // All PO lines with remaining qty are billable — even if goods haven't been
-  // received yet. Default quantity to the already-received amount when there
-  // is one, otherwise default to the full ordered qty so the supplier can be
-  // billed ahead of (or independently from) receiving — capped at remaining.
+  // Three-way match: pay-on-receipt suppliers (the default) can only be
+  // billed up to the NET received quantity (received − returned). Prepaid
+  // suppliers (Supplier.prepaid) may bill the full ordered quantity ahead of
+  // receiving — the deposit / pro-forma flow. The server enforces the same
+  // rule in validatePurchaseInvoiceLineLimits; the cap here keeps the UI
+  // from offering quantities the server will reject.
+  const billableCap = (l: { qty: number; qtyRemaining: number; qtyBilled: number }) =>
+    po.supplierPrepaid ? l.qty - l.qtyBilled : Math.max(0, l.qtyRemaining - l.qtyBilled)
   const [billLines, setBillLines] = useState<BillLineState[]>(
     po.lines
-      .filter((l) => l.qty - l.qtyBilled > 0)
+      .filter((l) => billableCap(l) > 0)
       .map((l) => {
-        const remaining = l.qty - l.qtyBilled
+        const remaining = billableCap(l)
         const preferred = l.qtyReceived > 0 ? l.qtyReceived : l.qty
         const qtyBilled = Math.min(preferred, remaining)
         return {
@@ -1127,6 +1131,22 @@ function EditBillDialog({
     })),
   )
 
+  // Per-line billing cap for the edit: three-way match (net received) for
+  // pay-on-receipt suppliers, ordered qty for prepaid — minus what OTHER
+  // invoices on this PO have already billed against the line. Mirrors the
+  // server-side validatePurchaseInvoiceLineLimits rule.
+  const maxQtyByPoLineId = new Map<string, number>(
+    invoice.lines
+      .filter((line) => line.poLineId)
+      .map((line) => {
+        const poLine = po.lines.find((pl) => pl.id === line.poLineId)
+        if (!poLine) return [line.poLineId as string, line.qtyBilled]
+        const capTotal = po.supplierPrepaid ? poLine.qty : poLine.qtyRemaining
+        const billedOnOtherInvoices = poLine.qtyBilled - line.qtyBilled
+        return [line.poLineId as string, Math.max(0, capTotal - billedOnOtherInvoices)]
+      }),
+  )
+
   const productSubtotal = lines.filter((line) => line.poLineId).reduce((sum, line) => sum + line.qtyBilled * line.unitCostForeign, 0)
   const costSubtotal = lines.filter((line) => line.costLineId).reduce((sum, line) => sum + line.amountForeign, 0)
   const subtotal = productSubtotal + costSubtotal
@@ -1243,6 +1263,7 @@ function EditBillDialog({
                       <Input
                         type="number"
                         min={0}
+                        max={maxQtyByPoLineId.get(line.poLineId)}
                         step={1}
                         value={line.qtyBilled}
                         onChange={(e) => updateLine(line.id, { qtyBilled: Number(e.target.value) || 0 })}

@@ -38,6 +38,7 @@ export type SupplierRow = {
   vatNumber: string | null
   accountNumber: string | null
   paymentTermsDays: number | null
+  prepaid: boolean
   /** User-entered manual override for expected delivery time, in days. */
   manualDeliveryDays: number | null
   /** Computed average delivery time in days across completed POs (null if no history). */
@@ -64,6 +65,7 @@ export type SupplierInput = {
   vatNumber?: string
   accountNumber?: string
   paymentTermsDays?: number | null
+  prepaid?: boolean
   manualDeliveryDays?: number | null
   notes?: string
 }
@@ -90,6 +92,7 @@ const SUPPLIER_SELECT = {
   vatNumber: true,
   accountNumber: true,
   paymentTermsDays: true,
+  prepaid: true,
   manualDeliveryDays: true,
   notes: true,
   active: true,
@@ -114,6 +117,7 @@ function mapSupplier(
     vatNumber: string | null
     accountNumber: string | null
     paymentTermsDays: number | null
+    prepaid: boolean
     manualDeliveryDays: number | null
     notes: string | null
     active: boolean
@@ -139,6 +143,7 @@ function mapSupplier(
     vatNumber: s.vatNumber,
     accountNumber: s.accountNumber,
     paymentTermsDays: s.paymentTermsDays,
+    prepaid: s.prepaid,
     manualDeliveryDays: s.manualDeliveryDays,
     avgDeliveryDays: avg.days,
     avgDeliveryDaysCount: avg.count,
@@ -221,6 +226,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
         vatNumber: input.vatNumber || null,
         accountNumber: input.accountNumber || null,
         paymentTermsDays: input.paymentTermsDays ?? null,
+        prepaid: input.prepaid ?? false,
         manualDeliveryDays: input.manualDeliveryDays ?? null,
         notes: input.notes || null,
       },
@@ -259,6 +265,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
         ...(input.vatNumber !== undefined && { vatNumber: input.vatNumber || null }),
         ...(input.accountNumber !== undefined && { accountNumber: input.accountNumber || null }),
         ...(input.paymentTermsDays !== undefined && { paymentTermsDays: input.paymentTermsDays ?? null }),
+        ...(input.prepaid !== undefined && { prepaid: input.prepaid }),
         ...(input.manualDeliveryDays !== undefined && { manualDeliveryDays: input.manualDeliveryDays ?? null }),
         ...(input.notes !== undefined && { notes: input.notes || null }),
         ...(input.active !== undefined && { active: input.active }),
