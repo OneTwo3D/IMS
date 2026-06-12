@@ -2,6 +2,13 @@
 
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
+import { db } from '@/lib/db'
+import { requireAuth } from '@/lib/auth/server'
+import {
+  collectRejectedAccountingDocumentUpdateWarnings,
+  type AccountingDocumentUpdateReference,
+  type RejectedAccountingDocumentUpdateWarning,
+} from '@/lib/domain/accounting/rejected-sync-warnings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 
 export type AccountingAccountRow = {
@@ -181,6 +188,14 @@ export async function autoLinkAccountingTaxRates(): Promise<{
 export async function getAccountingSyncLogs(limit = 50): Promise<AccountingSyncLogRow[]> {
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).getSyncLogs(limit)
+}
+
+export async function getRejectedAccountingDocumentUpdateWarnings(
+  references: AccountingDocumentUpdateReference[],
+  limit = 10,
+): Promise<RejectedAccountingDocumentUpdateWarning[]> {
+  await requireAuth()
+  return collectRejectedAccountingDocumentUpdateWarnings(db, references, limit)
 }
 
 export async function triggerAccountingSync(): Promise<{ success: boolean; result?: unknown; error?: string }> {

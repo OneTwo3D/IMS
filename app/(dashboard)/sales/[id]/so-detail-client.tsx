@@ -25,6 +25,7 @@ import {
   type AllocationRow, type FulfillmentRequirementRow, type ShipmentRow,
 } from '@/app/actions/allocation'
 import type { CurrencyRow } from '@/app/actions/currencies'
+import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accounting/rejected-sync-warnings'
 import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
@@ -95,6 +96,7 @@ type Props = {
   accountingInvoiceUrlTemplate: string
   accountingSyncEnabled: boolean
   currentUserRole: string
+  rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -138,6 +140,11 @@ const OPT_COLUMNS: { key: OptCol; label: string }[] = [
   { key: 'qtyCancelled', label: 'Qty Cancelled' },
   { key: 'qtyShipped', label: 'Qty Shipped' },
 ]
+
+const ACCOUNTING_SYNC_TYPE_LABEL: Record<RejectedAccountingDocumentUpdateWarning['type'], string> = {
+  SALES_INVOICE_UPDATE: 'sales invoice update',
+  PURCHASE_INVOICE_UPDATE: 'purchase invoice update',
+}
 
 // ---------------------------------------------------------------------------
 // Refund dialog
@@ -778,7 +785,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -1054,6 +1061,27 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           </DropdownMenu>
         </div>
       </div>
+
+      {rejectedAccountingSyncs.length > 0 && (
+        <Alert className="border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <div className="space-y-2">
+              <p className="font-medium">Accounting rejected the latest invoice update. Review the message, correct the document in IMS or accounting, then retry the failed sync from the sync dashboard.</p>
+              <ul className="space-y-1 text-xs">
+                {rejectedAccountingSyncs.map((sync) => (
+                  <li key={sync.id}>
+                    <span className="font-medium uppercase">{sync.connector}</span>
+                    {' '}
+                    {ACCOUNTING_SYNC_TYPE_LABEL[sync.type]} failed on {new Date(sync.createdAt).toLocaleString('en-GB')}
+                    {sync.retryCount > 0 ? ` after ${sync.retryCount} retries` : ''}: {sync.errorMessage}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </AlertDescription>
+        </Alert>
+      )}
 
       {error && <p className="text-sm text-destructive">{error}</p>}
 

@@ -7,8 +7,6 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
   queueAccountingSync,
   getAccountingSettings,
-  getActiveAccountingConnectorInfo,
-  isAccountingSyncTypeEnabled,
   type AccountingSettings,
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
@@ -45,6 +43,7 @@ import {
   cancelSalesOrderFulfillmentState,
   updateSalesOrderStatusUnderLock,
 } from '@/lib/domain/sales/allocation-service'
+import { queueSalesInvoiceUpdateForExistingAccountingInvoice } from '@/lib/domain/sales/sales-invoice-update-sync'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -1148,48 +1147,19 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       accountingInvoiceId: so.accountingInvoiceId,
     }
     const idempotencyKey = accountingPayloadKey(`sales-invoice-update:${so.id}:${so.accountingInvoiceId}`, updatePayload)
-    const connector = await getActiveAccountingConnectorInfo()
-    if (connector?.id !== 'xero') {
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: so.id,
-        action: 'sales_invoice_update_skipped_unsupported_connector',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: connector
-          ? `Sales invoice update for ${orderNumber} was not queued because ${connector.name} invoice updates are not supported yet`
-          : `Sales invoice update for ${orderNumber} was not queued because no accounting connector is active`,
-        metadata: {
-          accountingInvoiceId: so.accountingInvoiceId,
-          orderNumber,
-          connector: connector?.id ?? null,
-          idempotencyKey,
-        },
-      })
-      return
-    }
-    if (!(await isAccountingSyncTypeEnabled('SALES_INVOICE_UPDATE'))) return
-
     const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
-    await queueXeroSync({
-      type: 'SALES_INVOICE_UPDATE',
-      referenceType: 'SalesOrder',
-      referenceId: so.id,
+    const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled } = await import('@/lib/accounting')
+    await queueSalesInvoiceUpdateForExistingAccountingInvoice({
+      salesOrderId: so.id,
+      orderNumber,
+      accountingInvoiceId: so.accountingInvoiceId,
       payload: updatePayload,
       idempotencyKey,
-    })
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: so.id,
-      action: 'sales_invoice_update_queued',
-      tag: 'accounting',
-      level: 'INFO',
-      description: `Queued sales invoice update for ${orderNumber} against accounting invoice ${so.accountingInvoiceId}`,
-      metadata: {
-        accountingInvoiceId: so.accountingInvoiceId,
-        orderNumber,
-        idempotencyKey,
-      },
+    }, {
+      getActiveAccountingConnectorInfo,
+      isAccountingSyncTypeEnabled,
+      queueXeroSync,
+      logActivity,
     })
     return
   }
