@@ -303,6 +303,64 @@ Xero can reject bill updates once an external bill is paid, locked, voided, or o
 editable. Rejected bill-update sync rows are surfaced on the purchase order detail page with the
 connector, timestamp, retry count, and safe error text; the raw sync payload is not displayed.
 
+### Sales Invoice Edits
+
+Editing a sales order that has already been pushed to Xero (i.e. `accountingInvoiceId` is set)
+queues a `SALES_INVOICE_UPDATE` entry instead of silently skipping the change. The payload reuses
+the same document builder as the create path, so the update reflects exactly what a fresh push
+would have sent. An idempotency key derived from the payload prevents duplicate updates if the
+order is re-saved without changes.
+
+If the active accounting connector is QuickBooks (not Xero), IMS records a
+`sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
+behaviour is symmetric with the purchase bill path.
+
+### Rejected Update Sync Alerts
+
+When Xero rejects a `SALES_INVOICE_UPDATE` or `PURCHASE_INVOICE_UPDATE` (e.g. the external invoice
+is locked, paid, voided, or a downstream validation failed), the sync row stays in the failed state
+and IMS surfaces an amber alert at the top of the related sales order or purchase order detail
+page. The alert lists the connector, when the failure happened, the retry count, and a safely
+truncated error message. The full sync payload is never displayed on the UI because it may contain
+sensitive document data.
+
+Operators correct the underlying issue (in IMS or in the accounting system) and retry the failed
+sync from the Sync Dashboard. Once the row transitions out of `FAILED`, the alert disappears
+automatically.
+
+### Tax Rate Sync (Multi-Component Profiles)
+
+When an IMS VAT rate has one or more active components (e.g. Canada `GST 5% + PST 7%`), saving the
+rate queues an `AccountingSyncType.TAX_RATE_SYNC` entry. The sync processor calls Xero's
+`POST /TaxRates` endpoint with the matching `TaxComponents` payload so the VAT return picks up the
+component-level breakdown on the Xero side. The push is idempotent: Xero matches the rate by
+`Name`, and unchanged re-saves dedupe at the IMS queue layer via a payload-derived idempotency key.
+
+A per-connector toggle (`xero_sync_tax_rate`, defaulting to `submitted`) gates the queueing. The
+QuickBooks side has no equivalent API for component breakdowns — for QBO operators the trigger
+logs a `tax_rate_sync_skipped_unsupported_connector` WARNING and the equivalent QBO tax codes must
+be configured manually.
+
+Until the sync settles (or for connectors that don't support it), every IMS invoice or bill that
+uses a multi-component rate also emits a one-shot WARNING activity log
+(`sales_invoice_tax_components_not_pushed` or `purchase_invoice_tax_components_not_pushed`) naming
+the affected rate, so the operator knows the per-component breakdown depends on the accounting-side
+configuration.
+
+### Reverse Charge
+
+Lines whose `TaxRate.reverseCharge` is true post to Xero / QuickBooks with the connector-side tax
+type swapped to a configurable reverse-charge code:
+
+- `accounting_reverse_charge_sales_tax_type` (typical Xero: `ECOUTPUTSERVICES`)
+- `accounting_reverse_charge_purchase_tax_type` (typical Xero: `REVERSECHARGES`)
+
+This ensures the VAT return classifies the line under reverse-charge (box 1 / box 8 in the UK)
+instead of as a normal output / input VAT entry. The IMS-side tax math is unaffected — the rate
+stays as configured (usually `0` for B2B services), and only the connector-side tag changes. When
+the reverse-charge settings are empty, IMS falls back to the parent `TaxRate.accountingTaxType` so
+the bill or invoice still posts, just without the reverse-charge classification.
+
 ## Invoice PDF & Email
 
 When a sales invoice is synced to Xero and payment is registered:

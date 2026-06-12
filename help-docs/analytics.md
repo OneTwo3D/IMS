@@ -97,12 +97,20 @@ Revenue figures honour each order's `taxInclusive` flag: tax-exclusive orders us
 
 | Report | What it shows |
 |---|---|
-| **VAT** | Output VAT by tax rate and jurisdiction for invoiced, non-cancelled sales orders. |
+| **VAT** | Output and input VAT by side / reporting category / jurisdiction / tax rate, for invoiced non-cancelled sales orders and purchase-invoice lines in the selected period. |
 | **AR Aging** | Outstanding sales-order balances by customer and aging bucket (Current / 1–30 / 31–60 / 61–90 / 90+). |
 | **AP Aging** | Outstanding purchase-invoice balances by supplier and aging bucket. |
 | **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics (realised + unrealised). |
 
 Finance period-end reports are limited to finance and admin roles.
+
+### VAT report — reporting category dimension
+
+The VAT report groups by **side**, **reporting category**, **jurisdiction**, and **tax rate**, so a 20% UK domestic sale and a 20% EU OSS sale appear as separate rows even though they share the rate. Categories come from the `TaxRate.reportingCategory` field configured in Settings > Accounting > VAT rates: `DOMESTIC`, `REVERSE_CHARGE`, `EC_SALES`, `OSS`, or `Uncategorised` for tax rates with no category set.
+
+A **Reporting category** dropdown filter at the top of the report scopes the page to a single category — useful when preparing OSS filings or matching the reverse-charge box on the VAT return. The filter round-trips through the URL (`?vatReportingCategory=OSS`) so the value is preserved in CSV exports and pagination links.
+
+Multi-component tax rates (e.g. Canada `GST + PST`) post to the accounting system with a single effective rate per line. The component breakdown is captured at the rate-profile level and synced to Xero's TaxComponents API (see Settings > Accounting > VAT rates); the report does not list components separately.
 
 ## Manufacturing Analytics
 

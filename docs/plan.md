@@ -1,5 +1,7 @@
 # IMS production-readiness plan
 
+> **Status (2026-06-12):** the original 16-item release-blocker tree (epic `onetwo3d-ims-dhk`) and its review follow-ups have all merged onto `development` across PRs #157–#186. Outstanding tracked work is fully drained — the bd backlog is at zero open issues. The historical implementation plan that this document was synthesised from has moved to `docs/completed/IMS_Codex_Production_Readiness_Blockers.md` for reference. The sections below remain as a record of the rollout sequence and what was in scope.
+
 Synthesised from a full codebase audit covering security, rollout, accounting, sales, purchase, and inventory workflows. Shopify and QuickBooks paths excluded.
 
 The IMS instance is assumed not to be in live production use yet. That means legacy compatibility and dual-write rollout phases are less important than landing clean forward-only fixes with strong tests. Before implementing any item, verify the finding still exists on `origin/development`; several entries may already be partially addressed by later work.

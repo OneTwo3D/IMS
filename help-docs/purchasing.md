@@ -35,6 +35,18 @@ For non-base-currency POs, the system protects against typos and stale rates:
 
 This catches the "decimal in the wrong place" class of errors that previously could silently misprice every cost layer.
 
+### Editing currency or FX rate on a DRAFT PO
+
+Changing **only** the currency or the FX rate (without touching lines or additional costs) triggers
+a **stored base-amount rebase**: the persisted base values on the PO header, every line, and every
+freight cost line are recomputed against the new FX rate and written in a single database
+transaction. If anything in that transaction fails (e.g. a tax-resolution error), the entire
+rebase rolls back so the PO stays internally consistent — line bases never drift away from the
+parent header bases. Foreign-currency values are preserved exactly.
+
+When the same edit also includes line or additional-cost changes, the standard recalculation path
+runs instead (the rebase helper is skipped). This is the only path where the FX rate change
+recalculates everything end-to-end including VAT.
 
 ## Purchase Order Statuses
 
@@ -115,7 +127,30 @@ If goods need to be sent back to the supplier, create a purchase return against 
 
 ## Purchase Invoicing
 
-Record supplier invoices against purchase orders to track what has been billed. This helps reconcile POs with accounts payable.
+Record supplier invoices (bills) against purchase orders to track what has been billed. This helps reconcile POs with accounts payable.
+
+### Editing an unpaid bill
+
+Unpaid bills can be edited from the PO detail page. Headers (number, dates, notes, supplier
+invoice URL) and per-line quantities or amounts can be updated. The edit recomputes totals on the
+original PO FX rate and is wrapped in a single transaction that:
+
+- Locks the bill, its lines, the parent PO, PO lines, and freight cost lines via row-level locks.
+- Re-validates editability **inside** the transaction (a concurrent "mark paid" between page load
+  and save will abort the edit).
+- Checks overbilling against the **other** bills on the same PO so the combined billed quantity
+  never exceeds the PO quantity, and the combined freight amount never exceeds the cost line.
+- Persists the new header and line values.
+- Queues a `PURCHASE_INVOICE_UPDATE` accounting sync (if the bill has already been synced) using a
+  payload-derived idempotency key. Saving without any content change short-circuits with a
+  "No bill changes to save" notice — no queue row is created.
+
+If the bill was previously synced and the accounting connector rejects the update (e.g. the
+external bill is paid, locked, or voided), an amber **rejected sync** alert appears at the top of
+the PO detail page with the connector, timestamp, retry count, and a safely truncated error
+message. See the Xero sync docs for retry semantics.
+
+Paid bills cannot be edited. Reverse the payment first if a correction is required.
 
 
 ## Freight Purchase Orders
