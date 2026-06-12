@@ -5,13 +5,22 @@ import { PageTitle } from "@/lib/page-title"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 
 /**
- * Report header: title with an info icon that reveals the explanatory
- * description on hover or keyboard focus. The description used to render
- * as a paragraph below the title on every report page; moving it behind
- * the (i) lets the data sit higher on the viewport without losing the
- * context that finance/ops users occasionally need.
+ * Report header: title with an info icon that reveals the report's
+ * description and methodology notices in a single tooltip on hover or
+ * keyboard focus. Previously the description rendered as a paragraph
+ * below the title and the notices rendered in a separate amber box
+ * lower on the page — the same context appears in one place now so the
+ * data table sits higher on the viewport without losing information.
  */
-export function ReportPageTitle({ title, description }: { title: string; description: string }) {
+export function ReportPageTitle({
+  title,
+  description,
+  notices = [],
+}: {
+  title: string
+  description: string
+  notices?: string[]
+}) {
   return (
     <div className="flex items-center gap-2">
       <PageTitle title={title} />
@@ -24,7 +33,14 @@ export function ReportPageTitle({ title, description }: { title: string; descrip
           <Info className="h-4 w-4" />
         </TooltipTrigger>
         <TooltipContent className="max-w-md text-left whitespace-normal">
-          {description}
+          <p>{description}</p>
+          {notices.length > 0 && (
+            <ul className="mt-2 space-y-1 border-t border-background/20 pt-2 text-[11px] leading-snug">
+              {notices.map((notice) => (
+                <li key={notice}>{notice}</li>
+              ))}
+            </ul>
+          )}
         </TooltipContent>
       </Tooltip>
     </div>
