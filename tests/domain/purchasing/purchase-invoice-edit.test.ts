@@ -326,3 +326,60 @@ test('validatePurchaseInvoiceLineLimits rejects product and cost overbilling', (
     costLineById,
   }), /Cost line "Freight" exceeds remaining amount/)
 })
+
+test('calculatePurchaseInvoice swaps taxType to reverseChargeTaxType when poLine.taxRate.reverseCharge is true', () => {
+  const poLineById = new Map([
+    ['po-line-uk', {
+      id: 'po-line-uk',
+      qty: 5 as unknown,
+      product: { sku: 'SKU-UK' },
+      taxRate: { accountingTaxType: 'INPUT2', reverseCharge: false },
+    }],
+    ['po-line-rc', {
+      id: 'po-line-rc',
+      qty: 5 as unknown,
+      product: { sku: 'SKU-RC' },
+      taxRate: { accountingTaxType: 'INPUT2', reverseCharge: true },
+    }],
+  ])
+  const result = calculatePurchaseInvoice({
+    lines: [
+      { kind: 'product', poLineId: 'po-line-uk', qtyBilled: 1, unitCostForeign: 100 },
+      { kind: 'product', poLineId: 'po-line-rc', qtyBilled: 1, unitCostForeign: 100 },
+    ],
+    fxRateToBase: 1,
+    poReference: 'PO-1',
+    poSubtotalForeign: 200,
+    poTaxForeign: 40,
+    transitAccount: 'TRANSIT',
+    fallbackTaxType: 'NONE',
+    reverseChargeTaxType: 'REVERSECHARGES',
+    poLineById,
+    costLineById: new Map(),
+  })
+  assert.equal(result.accountingLines[0]?.taxType, 'INPUT2')
+  assert.equal(result.accountingLines[1]?.taxType, 'REVERSECHARGES')
+})
+
+test('calculatePurchaseInvoice falls back to baseTaxType when reverseChargeTaxType is empty', () => {
+  const poLineById = new Map([
+    ['po-line-rc', {
+      id: 'po-line-rc',
+      qty: 5 as unknown,
+      product: { sku: 'SKU-RC' },
+      taxRate: { accountingTaxType: 'INPUT2', reverseCharge: true },
+    }],
+  ])
+  const result = calculatePurchaseInvoice({
+    lines: [{ kind: 'product', poLineId: 'po-line-rc', qtyBilled: 1, unitCostForeign: 100 }],
+    fxRateToBase: 1,
+    poReference: 'PO-1',
+    poSubtotalForeign: 100,
+    poTaxForeign: 0,
+    transitAccount: 'TRANSIT',
+    fallbackTaxType: 'NONE',
+    poLineById,
+    costLineById: new Map(),
+  })
+  assert.equal(result.accountingLines[0]?.taxType, 'INPUT2')
+})

@@ -23,6 +23,16 @@ export type AccountingSettings = {
   paymentAccountMap: string
   invoiceUrlTemplate: string
   billUrlTemplate: string
+  /**
+   * Connector-specific accounting tax type code applied to invoice lines whose
+   * resolved TaxRate has reverseCharge=true. Empty string disables the swap
+   * (the original accountingTaxType is sent through). Typical Xero value:
+   * ECOUTPUTSERVICES for B2B services to EU customers post-Brexit.
+   */
+  reverseChargeSalesTaxType: string
+  /** Same as reverseChargeSalesTaxType but applied to bills (ACCPAY). Typical
+   *  Xero value: REVERSECHARGES for EU services purchased into the UK. */
+  reverseChargePurchaseTaxType: string
 }
 
 type AccountingConnectorInfo = {
@@ -82,6 +92,8 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
   paymentAccountMap: '{}',
   invoiceUrlTemplate: '',
   billUrlTemplate: '',
+  reverseChargeSalesTaxType: '',
+  reverseChargePurchaseTaxType: '',
 }
 
 async function getActiveAccountingConnectorId(): Promise<AccountingConnectorInfo['id'] | null> {
@@ -234,11 +246,15 @@ export async function queueAccountingSyncTx(
 export async function getAccountingSettings(): Promise<AccountingSettings> {
   // Read connector-agnostic settings directly from the core settings table.
   const { db } = await import('@/lib/db')
-  const [invoiceUrlSetting, billUrlSetting, paymentMapSetting] = await Promise.all([
+  const [invoiceUrlSetting, billUrlSetting, paymentMapSetting, reverseChargeSalesSetting, reverseChargePurchaseSetting] = await Promise.all([
     db.setting.findUnique({ where: { key: 'accounting_invoice_url_template' } }),
     db.setting.findUnique({ where: { key: 'accounting_bill_url_template' } }),
     db.setting.findUnique({ where: { key: 'accounting_payment_account_map' } }),
+    db.setting.findUnique({ where: { key: 'accounting_reverse_charge_sales_tax_type' } }),
+    db.setting.findUnique({ where: { key: 'accounting_reverse_charge_purchase_tax_type' } }),
   ])
+  const reverseChargeSalesTaxType = reverseChargeSalesSetting?.value?.trim() ?? ''
+  const reverseChargePurchaseTaxType = reverseChargePurchaseSetting?.value?.trim() ?? ''
 
   const connector = await getActiveAccountingConnectorId()
   if (!connector) {
@@ -247,6 +263,8 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
       paymentAccountMap: paymentMapSetting?.value ?? '{}',
       invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',
       billUrlTemplate: billUrlSetting?.value ?? '',
+      reverseChargeSalesTaxType,
+      reverseChargePurchaseTaxType,
     }
   }
 
@@ -272,6 +290,8 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
         paymentAccountMap: paymentMapSetting?.value ?? '{}',
         invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',
         billUrlTemplate: billUrlSetting?.value ?? '',
+        reverseChargeSalesTaxType,
+        reverseChargePurchaseTaxType,
       }
     }
     case 'quickbooks': {
@@ -295,6 +315,8 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
         paymentAccountMap: paymentMapSetting?.value ?? '{}',
         invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',
         billUrlTemplate: billUrlSetting?.value ?? '',
+        reverseChargeSalesTaxType,
+        reverseChargePurchaseTaxType,
       }
     }
   }

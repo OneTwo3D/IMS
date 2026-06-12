@@ -1079,7 +1079,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
           discountAmount: true,
           totalForeign: true,
           taxRateId: true,
-          taxRate: { select: { accountingTaxType: true } },
+          taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
         },
       },
     },
@@ -1128,13 +1128,22 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     lines: so.lines.map((l) => {
       const qty = Number(l.qty)
       const discForeign = Number(l.discountAmount ?? 0)
+      const baseTaxType = l.taxRate?.accountingTaxType ?? orderDefaultTaxType ?? undefined
+      // Reverse-charge B2B: customer self-accounts, so we swap to the
+      // configured reverse-charge accounting tax type. Falls back to the
+      // resolved baseTaxType when the setting is empty (defensive default —
+      // the admin gets the same posting they'd get without the swap, the
+      // line just isn't reverse-charge-tagged in the accounting system).
+      const taxType = l.taxRate?.reverseCharge && settings.reverseChargeSalesTaxType
+        ? settings.reverseChargeSalesTaxType
+        : baseTaxType
       return {
         itemCode: l.sku ?? undefined,
         description: l.description ?? l.sku ?? 'Item',
         quantity: qty,
         unitAmount: Number(l.unitPriceForeign),
         accountCode: settings.salesAccount,
-        taxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType ?? undefined,
+        taxType,
         discountAmount: discForeign > 0 ? discForeign : undefined,
       }
     }),
