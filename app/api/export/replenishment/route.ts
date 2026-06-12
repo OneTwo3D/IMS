@@ -77,6 +77,7 @@ export async function GET(req: NextRequest) {
         category: row.categoryName ?? '',
         supplierName: row.supplierName ?? '',
         supplierSku: row.supplierSku ?? '',
+        neededFor: row.neededFor.join('; '),
         stockUnit: row.stockUnit,
         availableQty: row.availableQty,
         warehouseAvailabilityBreakdown: row.warehouseAvailabilityBreakdown,
@@ -90,7 +91,7 @@ export async function GET(req: NextRequest) {
         abcClass: row.abcClass ?? '',
         urgency: row.urgency,
       }))
-      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency']), `reorder-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'neededFor', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency']), `reorder-${date}.csv`)
     }
 
     case 'backorder': {

@@ -52,6 +52,7 @@ export type ReplenishmentReportClient = {
   orderAllocation: FindManyDelegate
   shipmentLine: FindManyDelegate
   productionOrder: FindManyDelegate
+  bomItem: FindManyDelegate
 }
 
 export type ReplenishmentReportDeps = {
@@ -184,7 +185,18 @@ export type ReorderReportRow = {
   productName: string
   productType: ProductType
   categoryName: string | null
+  /**
+   * For purchased products: the chosen supplier's id. For BOM (manufactured)
+   * products: null — manufacturers come from the latest ProductionOrder, not
+   * from the SupplierProduct catalog.
+   */
   supplierId: string | null
+  /**
+   * Display label for the Supplier column. Purchased products: supplier name.
+   * BOM products: "Manufactured by <name>" if the latest ProductionOrder for
+   * the product has a manufacturer set, otherwise "Manufactured in-house".
+   * Products with neither end up "Unassigned".
+   */
   supplierName: string | null
   supplierSku: string | null
   stockUnit: string
@@ -199,6 +211,15 @@ export type ReorderReportRow = {
   suggestedReorderQty: string
   abcClass: string | null
   urgency: 'critical' | 'reorder' | 'watch'
+  /**
+   * Why this product needs replenishment. Sources are:
+   *   - "Direct sales" — average daily demand > 0 from the velocity window
+   *   - "BOM <parent SKU>" — listed once per parent BOM whose suggested
+   *     reorder quantity drives component demand into this product
+   * For finished goods (SIMPLE/VARIANT/KIT) the list is typically just
+   * ["Direct sales"]. For raw materials it can include multiple BOM parents.
+   */
+  neededFor: string[]
 }
 
 export type ReorderReport = {
@@ -570,7 +591,7 @@ export async function getReorderReport(
   const generatedAt = nowFromDeps(options.deps)
   const demandDays = parsePositiveInteger(filters.thresholdDays, DEFAULT_DEMAND_WINDOW_DAYS)
   const window = demandWindow(generatedAt, demandDays)
-  const [products, stockLevels, velocityInputs, openPoLines, observedLeadTimeP95BySupplierProduct] = await Promise.all([
+  const [products, stockLevels, velocityInputs, openPoLines, observedLeadTimeP95BySupplierProduct, latestMoRows, bomItemRows] = await Promise.all([
     client.product.findMany({
       where: productWhere(filters),
       select: {
@@ -608,6 +629,45 @@ export async function getReorderReport(
       client: { purchaseReceipt: client.purchaseReceipt },
       now: () => generatedAt,
     }),
+    // Latest production order per BOM product, used both for the "Manufactured
+    // by <name>" supplier-column label and as the warehouse fallback when
+    // createReorderMOs creates a draft MO. Ordering is per-(outputProductId,
+    // createdAt desc) and we keep only the first row seen per product.
+    client.productionOrder.findMany({
+      select: {
+        outputProductId: true,
+        warehouseId: true,
+        manufacturerId: true,
+        manufacturer: { select: { name: true } },
+        outputProduct: { select: { type: true } },
+        createdAt: true,
+      },
+      orderBy: [{ createdAt: 'desc' }],
+      take: SOURCE_ROW_LIMIT + 1,
+    }) as Promise<Array<{
+      outputProductId: string
+      warehouseId: string
+      manufacturerId: string | null
+      manufacturer: { name: string } | null
+      outputProduct: { type: ProductType }
+      createdAt: Date
+    }>>,
+    // BOM-item rows for every active BOM whose parent is BOM-typed. The map
+    // built from these drives component-demand expansion: when a BOM parent
+    // needs N units, each of its components needs N × bomItem.qty more on
+    // top of its own direct (sales-driven) demand.
+    client.bomItem.findMany({
+      where: { bom: { active: true }, parentProduct: { type: ProductType.BOM } },
+      select: {
+        parentProductId: true,
+        componentProductId: true,
+        qty: true,
+      },
+    }) as Promise<Array<{
+      parentProductId: string
+      componentProductId: string
+      qty: DecimalInput
+    }>>,
   ])
   assertSourceLimit(products.length, SOURCE_ROW_LIMIT, 'Replenishment product source rows')
 
@@ -621,9 +681,49 @@ export async function getReorderReport(
   const defaultLeadTimeSkus: string[] = []
   const invalidAbcClassSkus: string[] = []
 
-  const rows = products.flatMap<ReorderReportRow>((product) => {
+  // Latest production order per product (most recent createdAt). Used to
+  // derive the manufacturer label for BOM rows and as the warehouse fallback
+  // when createReorderMOs creates a draft MO. Picked off the pre-sorted
+  // findMany result so the first row seen per outputProductId wins.
+  const latestMoByProduct = new Map<string, { manufacturerName: string | null; warehouseId: string }>()
+  for (const row of latestMoRows) {
+    if (!latestMoByProduct.has(row.outputProductId)) {
+      latestMoByProduct.set(row.outputProductId, {
+        manufacturerName: row.manufacturer?.name ?? null,
+        warehouseId: row.warehouseId,
+      })
+    }
+  }
+  // BOM-item rows keyed by parent (the BOM-typed finished good). When that
+  // parent needs replenishment we walk its items to add component demand.
+  const bomItemsByParent = new Map<string, Array<{ componentProductId: string; qty: Prisma.Decimal }>>()
+  for (const item of bomItemRows) {
+    const list = bomItemsByParent.get(item.parentProductId) ?? []
+    list.push({ componentProductId: item.componentProductId, qty: toDecimal(item.qty) })
+    bomItemsByParent.set(item.parentProductId, list)
+  }
+
+  type Candidate = {
+    product: ProductPlanningRow
+    displaySupplier: { id: string; name: string; sku: string | null } | null
+    availableQty: Prisma.Decimal
+    inboundOpenPoQty: Prisma.Decimal
+    projectedAvailableQty: Prisma.Decimal
+    averageDailyDemand: Prisma.Decimal
+    leadTimeDays: number
+    safetyStockQty: Prisma.Decimal
+    /** Reorder point before BOM-driven demand is folded in. */
+    baseReorderPoint: Prisma.Decimal
+    configuredReorderQty: Prisma.Decimal | null
+    abcClass: ReorderReportRow['abcClass']
+  }
+  const candidatesByProductId = new Map<string, Candidate>()
+  for (const product of products) {
     const configuredReorderQty = product.reorderQty == null ? null : toDecimal(product.reorderQty)
-    if (configuredReorderQty?.lte(0)) return []
+    // reorderQty <= 0 used to be an immediate opt-out, but raw materials that
+    // are pure components often never have one set. We still want them to
+    // appear when a BOM parent drives demand into them, so the actual drop
+    // happens in phase 2 once we know whether componentDemand fired.
     const preferredCatalog = product.preferredSupplierId
       ? product.supplierProducts.find((supplierProduct) => supplierProduct.supplierId === product.preferredSupplierId)
       : null
@@ -643,42 +743,120 @@ export async function getReorderReport(
     const safetyStockQty = toDecimal(product.safetyStockQty ?? 0)
     const demandDuringLeadTime = averageDailyDemand.mul(leadTimeDays)
     const computedReorderPoint = demandDuringLeadTime.add(safetyStockQty)
-    const reorderPoint = product.reorderPoint == null ? computedReorderPoint : toDecimal(product.reorderPoint)
-    const gapQty = reorderPoint.sub(projectedAvailableQty)
-    const suggestedReorderQty = gapQty.gt(0)
-      ? Prisma.Decimal.max(configuredReorderQty ?? new Prisma.Decimal(0), gapQty)
-      : new Prisma.Decimal(0)
-    if (suggestedReorderQty.lte(0) && projectedAvailableQty.gt(reorderPoint)) return []
+    const baseReorderPoint = product.reorderPoint == null ? computedReorderPoint : toDecimal(product.reorderPoint)
     const abcClass = normalizeAbcClass(product.abcClass)
     if (product.abcClass && !abcClass) invalidAbcClassSkus.push(product.sku)
-    const urgency: ReorderReportRow['urgency'] = projectedAvailableQty.lte(0)
+    candidatesByProductId.set(product.id, {
+      product,
+      displaySupplier,
+      availableQty,
+      inboundOpenPoQty,
+      projectedAvailableQty,
+      averageDailyDemand,
+      leadTimeDays,
+      safetyStockQty,
+      baseReorderPoint,
+      configuredReorderQty,
+      abcClass,
+    })
+  }
+
+  // Phase 1: for every BOM candidate that itself needs replenishment, derive
+  // the additional demand its components inherit (suggestedReorderQty × bomItem.qty).
+  // Walk in stable SKU order so accumulator ordering is deterministic.
+  const componentDemand = new Map<string, Prisma.Decimal>()
+  const componentNeededFor = new Map<string, string[]>()
+  const orderedCandidates = [...candidatesByProductId.values()].sort((a, b) => a.product.sku.localeCompare(b.product.sku))
+  for (const candidate of orderedCandidates) {
+    if (candidate.product.type !== ProductType.BOM) continue
+    const gap = candidate.baseReorderPoint.sub(candidate.projectedAvailableQty)
+    const ownSuggested = gap.gt(0)
+      ? Prisma.Decimal.max(candidate.configuredReorderQty ?? new Prisma.Decimal(0), gap)
+      : new Prisma.Decimal(0)
+    if (ownSuggested.lte(0)) continue
+    const bomItems = bomItemsByParent.get(candidate.product.id) ?? []
+    for (const item of bomItems) {
+      const extra = ownSuggested.mul(item.qty)
+      const existing = componentDemand.get(item.componentProductId) ?? new Prisma.Decimal(0)
+      componentDemand.set(item.componentProductId, existing.add(extra))
+      const tags = componentNeededFor.get(item.componentProductId) ?? []
+      tags.push(`BOM ${candidate.product.sku}`)
+      componentNeededFor.set(item.componentProductId, tags)
+    }
+  }
+
+  // Phase 2: build the final rows, folding any BOM-driven demand into the
+  // candidate's reorder point and (re)computing the suggested quantity and
+  // urgency band. Filter products that still don't need replenishment.
+  const rows: ReorderReportRow[] = []
+  for (const candidate of candidatesByProductId.values()) {
+    const extraDemand = componentDemand.get(candidate.product.id) ?? new Prisma.Decimal(0)
+    // Opt-out: reorderQty <= 0 means the operator explicitly told us not to
+    // replenish this product, UNLESS a BOM parent is now driving demand into
+    // it. In that case we still surface the shortfall so the operator can
+    // act, even though no direct reorder cadence was configured.
+    if (candidate.configuredReorderQty?.lte(0) && extraDemand.lte(0)) continue
+    const reorderPoint = candidate.baseReorderPoint.add(extraDemand)
+    const gapQty = reorderPoint.sub(candidate.projectedAvailableQty)
+    const suggestedReorderQty = gapQty.gt(0)
+      ? Prisma.Decimal.max(candidate.configuredReorderQty ?? new Prisma.Decimal(0), gapQty)
+      : new Prisma.Decimal(0)
+    if (suggestedReorderQty.lte(0) && candidate.projectedAvailableQty.gt(reorderPoint)) continue
+    const urgency: ReorderReportRow['urgency'] = candidate.projectedAvailableQty.lte(0)
       ? 'critical'
-      : projectedAvailableQty.lte(reorderPoint)
+      : candidate.projectedAvailableQty.lte(reorderPoint)
         ? 'reorder'
         : 'watch'
-    return [{
-      productId: product.id,
-      sku: product.sku,
-      productName: product.name,
-      productType: product.type,
-      categoryName: product.category?.name ?? null,
-      supplierId: displaySupplier?.id ?? null,
-      supplierName: displaySupplier?.name ?? null,
-      supplierSku: displaySupplier?.sku ?? null,
-      stockUnit: product.stockUnit,
-      availableQty: quantityString(availableQty),
-      warehouseAvailabilityBreakdown: warehouseBreakdown.get(product.id) ?? '',
-      inboundOpenPoQty: quantityString(inboundOpenPoQty),
-      averageDailyDemand: quantityString(averageDailyDemand),
-      leadTimeDays,
-      safetyStockQty: quantityString(safetyStockQty),
+
+    // Supplier-column label policy: BOM rows surface manufacturer info from
+    // the latest ProductionOrder; everything else shows the resolved supplier.
+    const isBom = candidate.product.type === ProductType.BOM
+    const mfg = isBom ? latestMoByProduct.get(candidate.product.id) : undefined
+    const supplierName = isBom
+      ? (mfg?.manufacturerName ? `Manufactured by ${mfg.manufacturerName}` : 'Manufactured in-house')
+      : candidate.displaySupplier?.name ?? null
+    const supplierId = isBom ? null : candidate.displaySupplier?.id ?? null
+    const supplierSku = isBom ? null : candidate.displaySupplier?.sku ?? null
+
+    // neededFor explains why this product is in the report. Direct sales
+    // appears when there is any sales-driven daily demand; BOM tags come
+    // from componentNeededFor (built above, may be empty for finished goods).
+    const neededFor: string[] = []
+    if (candidate.averageDailyDemand.gt(0)) neededFor.push('Direct sales')
+    const bomTags = componentNeededFor.get(candidate.product.id)
+    if (bomTags) {
+      // Stable-sort + dedupe so the column is deterministic across runs.
+      const uniqueBoms = [...new Set(bomTags)].sort()
+      neededFor.push(...uniqueBoms)
+    }
+    // If neither direct sales nor BOM demand drives this row we still tag it
+    // ("Stock policy") so the column never renders empty when a row is shown.
+    if (neededFor.length === 0) neededFor.push('Stock policy')
+
+    rows.push({
+      productId: candidate.product.id,
+      sku: candidate.product.sku,
+      productName: candidate.product.name,
+      productType: candidate.product.type,
+      categoryName: candidate.product.category?.name ?? null,
+      supplierId,
+      supplierName,
+      supplierSku,
+      stockUnit: candidate.product.stockUnit,
+      availableQty: quantityString(candidate.availableQty),
+      warehouseAvailabilityBreakdown: warehouseBreakdown.get(candidate.product.id) ?? '',
+      inboundOpenPoQty: quantityString(candidate.inboundOpenPoQty),
+      averageDailyDemand: quantityString(candidate.averageDailyDemand),
+      leadTimeDays: candidate.leadTimeDays,
+      safetyStockQty: quantityString(candidate.safetyStockQty),
       reorderPoint: quantityString(reorderPoint),
-      configuredReorderQty: quantityString(configuredReorderQty ?? 0),
+      configuredReorderQty: quantityString(candidate.configuredReorderQty ?? 0),
       suggestedReorderQty: quantityString(suggestedReorderQty),
-      abcClass,
+      abcClass: candidate.abcClass,
       urgency,
-    }]
-  })
+      neededFor,
+    })
+  }
 
   rows.sort((a, b) => {
     const urgencyOrder = { critical: 0, reorder: 1, watch: 2 }

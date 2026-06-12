@@ -477,3 +477,116 @@ export async function createReorderPOs(
     return { success: false, poCount: 0, error: String(e) }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Auto-generate draft Manufacturing Orders from reorder suggestions for
+// manufactured (BOM) products.
+//
+// Mirrors createReorderPOs but emits ProductionOrder rows instead of
+// PurchaseOrder rows. For each selected BOM product the helper:
+//   - looks up the latest ProductionOrder to copy the manufacturer and
+//     warehouse (falling back to the first warehouse if none exists),
+//   - picks the most recently-updated active Bom for that product,
+//   - re-runs getReorderReport to read the suggestedReorderQty consistent
+//     with the report the operator selected from, and
+//   - creates a DRAFT ProductionOrder for that quantity.
+// ---------------------------------------------------------------------------
+
+export async function createReorderMOs(
+  productIds: string[],
+): Promise<{ success: boolean; moCount: number; error?: string }> {
+  await requirePermission('manufacturing')
+  try {
+    const { getReorderReport } = await import('@/lib/domain/inventory/replenishment-reports')
+    const report = await getReorderReport({}, { paginate: false })
+    const suggestedByProduct = new Map(report.rows.map((row) => [row.productId, row]))
+
+    const eligible = productIds.filter((productId) => {
+      const row = suggestedByProduct.get(productId)
+      return row && row.productType === 'BOM' && Number(row.suggestedReorderQty) > 0
+    })
+    if (eligible.length === 0) return { success: true, moCount: 0 }
+
+    // Latest production order per product gives us manufacturer + warehouse
+    // to copy. orderBy then keep-first wins so a single query covers it.
+    const latestMoRows = await db.productionOrder.findMany({
+      where: { outputProductId: { in: eligible } },
+      select: { outputProductId: true, warehouseId: true, manufacturerId: true },
+      orderBy: { createdAt: 'desc' },
+    })
+    const latestByProduct = new Map<string, { warehouseId: string; manufacturerId: string | null }>()
+    for (const row of latestMoRows) {
+      if (!latestByProduct.has(row.outputProductId)) {
+        latestByProduct.set(row.outputProductId, {
+          warehouseId: row.warehouseId,
+          manufacturerId: row.manufacturerId,
+        })
+      }
+    }
+
+    // Active BOMs per product. We pick the most recently-updated active BOM
+    // that lists the product as a parent on any of its items — that's the
+    // BOM the operator most recently shaped, mirroring the "latest MO" pick.
+    const bomCandidates = await db.bom.findMany({
+      where: {
+        active: true,
+        items: { some: { parentProductId: { in: eligible } } },
+      },
+      select: {
+        id: true,
+        updatedAt: true,
+        items: { where: { parentProductId: { in: eligible } }, select: { parentProductId: true } },
+      },
+      orderBy: { updatedAt: 'desc' },
+    })
+    const bomIdByProduct = new Map<string, string>()
+    for (const bom of bomCandidates) {
+      for (const item of bom.items) {
+        if (!bomIdByProduct.has(item.parentProductId)) {
+          bomIdByProduct.set(item.parentProductId, bom.id)
+        }
+      }
+    }
+
+    const fallbackWarehouse = await db.warehouse.findFirst({
+      orderBy: { code: 'asc' },
+      select: { id: true },
+    })
+
+    let moCount = 0
+    for (const productId of eligible) {
+      const row = suggestedByProduct.get(productId)
+      if (!row) continue
+      const bomId = bomIdByProduct.get(productId)
+      if (!bomId) continue
+      const latest = latestByProduct.get(productId)
+      const warehouseId = latest?.warehouseId ?? fallbackWarehouse?.id
+      if (!warehouseId) continue
+      const reference = `MO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
+      await db.productionOrder.create({
+        data: {
+          reference,
+          orderType: 'ASSEMBLY',
+          bomId,
+          outputProductId: productId,
+          warehouseId,
+          manufacturerId: latest?.manufacturerId ?? null,
+          qtyPlanned: Number(row.suggestedReorderQty),
+          status: 'DRAFT',
+        },
+      })
+      await logActivity({
+        entityType: 'PRODUCTION_ORDER',
+        entityId: reference,
+        tag: 'manufacturing',
+        action: 'created',
+        description: `Created draft MO ${reference} for ${row.sku} from reorder report (qty ${row.suggestedReorderQty})`,
+        metadata: { productId, bomId, qtyPlanned: row.suggestedReorderQty, source: 'reorder_report' },
+      })
+      moCount += 1
+    }
+    return { success: true, moCount }
+  } catch (e) {
+    return { success: false, moCount: 0, error: String(e) }
+  }
+}
