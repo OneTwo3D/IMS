@@ -8,6 +8,12 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
+import {
+  effectiveTaxRateFromComponents,
+  normalizeTaxRateComponents,
+  taxRateIsCompoundProfile,
+  type TaxRateComponentInput,
+} from '@/lib/tax/tax-rate-components'
 
 // ---------------------------------------------------------------------------
 // Adjustment Reasons
@@ -127,8 +133,20 @@ export type TaxRateRow = {
   accountingTaxType: string | null
   countryCode: string | null
   taxCategory: TaxCategoryValue
+  isCompound: boolean
+  reverseCharge: boolean
+  reportingCategory: string | null
   isDefault: boolean
   active: boolean
+  components: {
+    id: string
+    name: string
+    rate: number
+    compoundOnPrevious: boolean
+    accountingTaxType: string | null
+    sortOrder: number
+    active: boolean
+  }[]
 }
 
 const TAX_CATEGORIES: TaxCategoryValue[] = ['STANDARD', 'REDUCED', 'SECOND_REDUCED', 'ZERO', 'EXEMPT']
@@ -154,8 +172,23 @@ export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
       accountingTaxType: true,
       countryCode: true,
       taxCategory: true,
+      isCompound: true,
+      reverseCharge: true,
+      reportingCategory: true,
       isDefault: true,
       active: true,
+      components: {
+        orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+        select: {
+          id: true,
+          name: true,
+          rate: true,
+          compoundOnPrevious: true,
+          accountingTaxType: true,
+          sortOrder: true,
+          active: true,
+        },
+      },
     },
   })
   return rows.map((r) => ({
@@ -167,8 +200,20 @@ export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
     accountingTaxType: r.accountingTaxType,
     countryCode: r.countryCode,
     taxCategory: r.taxCategory as TaxCategoryValue,
+    isCompound: r.isCompound,
+    reverseCharge: r.reverseCharge,
+    reportingCategory: r.reportingCategory,
     isDefault: r.isDefault,
     active: r.active,
+    components: r.components.map((component) => ({
+      id: component.id,
+      name: component.name,
+      rate: Number(component.rate),
+      compoundOnPrevious: component.compoundOnPrevious,
+      accountingTaxType: component.accountingTaxType,
+      sortOrder: component.sortOrder,
+      active: component.active,
+    })),
   }))
 }
 
@@ -179,17 +224,36 @@ export async function createTaxRate(input: {
   accountingTaxType?: string
   countryCode?: string | null
   taxCategory?: TaxCategoryValue
+  isCompound?: boolean
+  reverseCharge?: boolean
+  reportingCategory?: string | null
+  components?: TaxRateComponentInput[]
 }): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   try {
+    const components = normalizeTaxRateComponents(input.components)
+    const effectiveRate = effectiveTaxRateFromComponents(components) ?? input.rate
     await db.taxRate.create({
       data: {
         name: input.name,
-        rate: input.rate,
+        rate: effectiveRate,
         usedFor: input.usedFor || 'BOTH',
         accountingTaxType: input.accountingTaxType || null,
         countryCode: input.countryCode ? input.countryCode.toLowerCase() : null,
         taxCategory: normaliseTaxCategory(input.taxCategory),
+        isCompound: input.isCompound ?? taxRateIsCompoundProfile(components),
+        reverseCharge: input.reverseCharge ?? false,
+        reportingCategory: input.reportingCategory?.trim() || null,
+        components: components.length > 0 ? {
+          create: components.map((component) => ({
+            name: component.name,
+            rate: component.rate,
+            compoundOnPrevious: component.compoundOnPrevious,
+            accountingTaxType: component.accountingTaxType,
+            sortOrder: component.sortOrder,
+            active: component.active,
+          })),
+        } : undefined,
       },
     })
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
@@ -208,11 +272,17 @@ export async function updateTaxRate(id: string, input: {
   accountingTaxType?: string
   countryCode?: string | null
   taxCategory?: TaxCategoryValue
+  isCompound?: boolean
+  reverseCharge?: boolean
+  reportingCategory?: string | null
+  components?: TaxRateComponentInput[]
   active?: boolean
 }): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   try {
     const summary = await db.$transaction(async (tx) => {
+      const components = input.components === undefined ? undefined : normalizeTaxRateComponents(input.components)
+      const effectiveRate = components === undefined ? input.rate : (effectiveTaxRateFromComponents(components) ?? input.rate)
       const oldRate = await tx.taxRate.findUnique({
         where: { id },
         select: { id: true, name: true, rate: true },
@@ -222,15 +292,40 @@ export async function updateTaxRate(id: string, input: {
         where: { id },
         data: {
           ...(input.name !== undefined && { name: input.name }),
-          ...(input.rate !== undefined && { rate: input.rate }),
+          ...(effectiveRate !== undefined && { rate: effectiveRate }),
           ...(input.usedFor !== undefined && { usedFor: input.usedFor }),
           ...(input.accountingTaxType !== undefined && { accountingTaxType: input.accountingTaxType || null }),
           ...(input.countryCode !== undefined && { countryCode: input.countryCode ? input.countryCode.toLowerCase() : null }),
           ...(input.taxCategory !== undefined && { taxCategory: normaliseTaxCategory(input.taxCategory) }),
+          ...(input.isCompound !== undefined && { isCompound: input.isCompound }),
+          ...(input.reverseCharge !== undefined && { reverseCharge: input.reverseCharge }),
+          ...(input.reportingCategory !== undefined && { reportingCategory: input.reportingCategory?.trim() || null }),
           ...(input.active !== undefined && { active: input.active }),
         },
         select: { id: true, name: true, rate: true },
       })
+      if (components !== undefined) {
+        await tx.taxRateComponent.deleteMany({ where: { taxRateId: id } })
+        if (components.length > 0) {
+          await tx.taxRateComponent.createMany({
+            data: components.map((component) => ({
+              taxRateId: id,
+              name: component.name,
+              rate: component.rate,
+              compoundOnPrevious: component.compoundOnPrevious,
+              accountingTaxType: component.accountingTaxType,
+              sortOrder: component.sortOrder,
+              active: component.active,
+            })),
+          })
+        }
+        await tx.taxRate.update({
+          where: { id },
+          data: {
+            isCompound: input.isCompound ?? taxRateIsCompoundProfile(components),
+          },
+        })
+      }
       return refreshMutableDocumentTaxSnapshotsForRate(tx, { oldRate, newRate: updated })
     })
     await logActivity({

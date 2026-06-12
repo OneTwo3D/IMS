@@ -459,11 +459,15 @@ model TaxRate {
   usedFor     String      @default("BOTH") // SALES, PURCHASE, BOTH
   accountingTaxType String?  @map("accounting_tax_type") // Accounting tax type code e.g. "OUTPUT2", "INPUT2"
   countryCode String?     // ISO 3166-1 alpha-2, null = applies globally
+  isCompound  Boolean     @default(false) @map("is_compound")
+  reverseCharge Boolean   @default(false) @map("reverse_charge")
+  reportingCategory String? @map("reporting_category") // e.g. DOMESTIC, REVERSE_CHARGE, EC_SALES, OSS
   active      Boolean     @default(true)
   isDefault   Boolean     @default(false)
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
 
+  components         TaxRateComponent[]
   supplierTaxRate    Supplier[]
   orderLines         SalesOrderLine[]
   poLines            PurchaseOrderLine[]
@@ -471,6 +475,24 @@ model TaxRate {
 
   @@index([countryCode, taxCategory, usedFor])
   @@map("tax_rates")
+}
+
+model TaxRateComponent {
+  id                 String   @id @default(cuid())
+  taxRateId          String   @map("tax_rate_id")
+  name               String
+  rate               Decimal  @db.Decimal(5, 4)
+  compoundOnPrevious Boolean  @default(false) @map("compound_on_previous")
+  accountingTaxType  String?  @map("accounting_tax_type")
+  sortOrder          Int      @default(0) @map("sort_order")
+  active             Boolean  @default(true)
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  taxRate TaxRate @relation(fields: [taxRateId], references: [id], onDelete: Cascade)
+
+  @@index([taxRateId, sortOrder])
+  @@map("tax_rate_components")
 }
 
 // ---------------------------------------------------------------------------

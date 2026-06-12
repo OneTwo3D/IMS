@@ -36,6 +36,23 @@ const TAX_CATEGORY_LABELS: Record<string, string> = Object.fromEntries(
   TAX_CATEGORY_OPTIONS.map((o) => [o.value, o.label]),
 )
 
+const REPORTING_CATEGORY_OPTIONS = [
+  { value: '', label: 'None' },
+  { value: 'DOMESTIC', label: 'Domestic' },
+  { value: 'REVERSE_CHARGE', label: 'Reverse charge' },
+  { value: 'EC_SALES', label: 'EC sales' },
+  { value: 'OSS', label: 'OSS' },
+]
+
+type TaxComponentFormRow = {
+  id?: string
+  name: string
+  ratePct: string
+  compoundOnPrevious: boolean
+  accountingTaxType: string
+  active: boolean
+}
+
 function TaxRateFormDialog({
   rate,
   onClose,
@@ -52,7 +69,40 @@ function TaxRateFormDialog({
   const [usedFor, setUsedFor] = useState(rate?.usedFor ?? 'BOTH')
   const [taxCategory, setTaxCategory] = useState<TaxCategoryValue>(rate?.taxCategory ?? 'STANDARD')
   const [countryCode, setCountryCode] = useState(rate?.countryCode ?? '')
+  const [reverseCharge, setReverseCharge] = useState(rate?.reverseCharge ?? false)
+  const [reportingCategory, setReportingCategory] = useState(rate?.reportingCategory ?? '')
+  const [components, setComponents] = useState<TaxComponentFormRow[]>(
+    rate?.components.map((component) => ({
+      id: component.id,
+      name: component.name,
+      ratePct: (component.rate * 100).toFixed(2),
+      compoundOnPrevious: component.compoundOnPrevious,
+      accountingTaxType: component.accountingTaxType ?? '',
+      active: component.active,
+    })) ?? [],
+  )
   const [error, setError] = useState('')
+
+  function updateComponent(index: number, patch: Partial<TaxComponentFormRow>) {
+    setComponents((current) => current.map((component, idx) => (idx === index ? { ...component, ...patch } : component)))
+  }
+
+  function addComponent() {
+    setComponents((current) => [
+      ...current,
+      {
+        name: '',
+        ratePct: '',
+        compoundOnPrevious: current.length > 0,
+        accountingTaxType: '',
+        active: true,
+      },
+    ])
+  }
+
+  function removeComponent(index: number) {
+    setComponents((current) => current.filter((_, idx) => idx !== index))
+  }
 
   function handleSave() {
     setError('')
@@ -64,6 +114,25 @@ function TaxRateFormDialog({
       setError('Country code must be ISO 3166-1 alpha-2 (2 letters), or blank for global')
       return
     }
+    const normalizedComponents = components
+      .map((component, index) => ({
+        id: component.id,
+        name: component.name.trim(),
+        rate: parseFloat(component.ratePct) / 100,
+        compoundOnPrevious: component.compoundOnPrevious,
+        accountingTaxType: component.accountingTaxType.trim() || null,
+        sortOrder: index,
+        active: component.active,
+      }))
+      .filter((component) => component.name.length > 0)
+    const invalidComponent = normalizedComponents.find((component) => !Number.isFinite(component.rate) || component.rate < 0 || component.rate > 1)
+    if (invalidComponent) {
+      setError('Component rates must be between 0 and 100')
+      return
+    }
+    const componentPayload = rate
+      ? normalizedComponents
+      : (normalizedComponents.length > 0 ? normalizedComponents : undefined)
 
     startTransition(async () => {
       const payload = {
@@ -72,6 +141,12 @@ function TaxRateFormDialog({
         usedFor,
         taxCategory,
         countryCode: trimmedCountry ? trimmedCountry.toLowerCase() : null,
+        isCompound: componentPayload !== undefined
+          ? componentPayload.length > 1 || componentPayload.some((component) => component.compoundOnPrevious)
+          : undefined,
+        reverseCharge,
+        reportingCategory: reportingCategory || null,
+        components: componentPayload,
       }
       const result = rate
         ? await updateTaxRate(rate.id, payload)
@@ -89,7 +164,7 @@ function TaxRateFormDialog({
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
+      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>{rate ? 'Edit VAT Rate' : 'New VAT Rate'}</DialogTitle>
         </DialogHeader>
@@ -156,6 +231,92 @@ function TaxRateFormDialog({
             </div>
           </div>
 
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label>Reporting Category</Label>
+              <select
+                value={reportingCategory}
+                onChange={(e) => setReportingCategory(e.target.value)}
+                className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
+              >
+                {REPORTING_CATEGORY_OPTIONS.map((option) => (
+                  <option key={option.value || 'none'} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </div>
+            <label className="flex items-center gap-2 self-end h-9 text-sm">
+              <input
+                type="checkbox"
+                checked={reverseCharge}
+                onChange={(e) => setReverseCharge(e.target.checked)}
+                className="h-4 w-4 rounded border-input"
+              />
+              Reverse charge
+            </label>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <Label>Tax Components</Label>
+              <Button type="button" size="sm" variant="outline" onClick={addComponent}>
+                <Plus className="h-3 w-3 mr-1" />Add
+              </Button>
+            </div>
+            {components.length > 0 && (
+              <div className="space-y-2">
+                {components.map((component, index) => (
+                  <div key={component.id ?? index} className="grid grid-cols-1 sm:grid-cols-[1fr_7rem_auto] gap-2 rounded-md border p-2">
+                    <Input
+                      value={component.name}
+                      onChange={(e) => updateComponent(index, { name: e.target.value })}
+                      placeholder="Component name"
+                      className="h-9"
+                    />
+                    <Input
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="0.01"
+                      value={component.ratePct}
+                      onChange={(e) => updateComponent(index, { ratePct: e.target.value })}
+                      placeholder="0.00"
+                      className="h-9 font-mono"
+                    />
+                    <Button type="button" variant="ghost" size="sm" className="h-9 w-9 p-0" onClick={() => removeComponent(index)}>
+                      <X className="h-4 w-4" />
+                    </Button>
+                    <div className="sm:col-span-3 grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-2">
+                      <Input
+                        value={component.accountingTaxType}
+                        onChange={(e) => updateComponent(index, { accountingTaxType: e.target.value })}
+                        placeholder="Accounting tax type"
+                        className="h-9"
+                      />
+                      <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          checked={component.compoundOnPrevious}
+                          onChange={(e) => updateComponent(index, { compoundOnPrevious: e.target.checked })}
+                          className="h-4 w-4 rounded border-input"
+                        />
+                        Compound
+                      </label>
+                      <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          checked={component.active}
+                          onChange={(e) => updateComponent(index, { active: e.target.checked })}
+                          className="h-4 w-4 rounded border-input"
+                        />
+                        Active
+                      </label>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {error && <p className="text-destructive text-sm">{error}</p>}
         </div>
 
@@ -203,6 +364,7 @@ export function TaxRatesTable({ taxRates, onChanged }: Props) {
             <TableHead className="text-xs">Name</TableHead>
             <TableHead className="text-xs">Category</TableHead>
             <TableHead className="text-xs">Country</TableHead>
+            <TableHead className="text-xs">Reporting</TableHead>
             <TableHead className="text-xs text-right">Rate</TableHead>
             {!allBoth && <TableHead className="text-xs">Applies To</TableHead>}
             <TableHead className="text-xs">Status</TableHead>
@@ -220,6 +382,10 @@ export function TaxRatesTable({ taxRates, onChanged }: Props) {
               </TableCell>
               <TableCell className="font-mono text-xs text-muted-foreground uppercase">
                 {r.countryCode ?? '—'}
+              </TableCell>
+              <TableCell className="text-xs text-muted-foreground">
+                {r.reverseCharge ? 'Reverse charge' : r.reportingCategory ?? '—'}
+                {r.components.length > 0 && <span className="block">{r.components.length} component{r.components.length === 1 ? '' : 's'}</span>}
               </TableCell>
               <TableCell className="text-right font-mono text-xs">{(r.rate * 100).toFixed(2)}%</TableCell>
               {!allBoth && <TableCell className="text-xs text-muted-foreground">{USED_FOR_LABELS[r.usedFor] ?? r.usedFor}</TableCell>}

@@ -13,7 +13,12 @@ import { cogsEntryDataFromConsumed, consumeFifoLayersStrict } from '@/lib/cost-l
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
-import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
+import {
+  resolveLineTaxRateBatch,
+  resolvedTaxRateFromProfile,
+  taxRateProfileSelect,
+  type ResolvedTaxRate,
+} from '@/lib/tax/resolve-rate'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
@@ -833,19 +838,24 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
     const orderDefaultRate = input.taxRateId
       ? await db.taxRate.findUnique({
           where: { id: input.taxRateId },
-          select: { id: true, name: true, rate: true, accountingTaxType: true },
+          select: taxRateProfileSelect,
         })
       : input.taxRateName
       ? await db.taxRate.findFirst({
           where: { name: input.taxRateName, active: true },
-          select: { id: true, name: true, rate: true, accountingTaxType: true },
+          select: taxRateProfileSelect,
         })
       : null
+    const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
     const orderDefaultCtx = {
-      id: orderDefaultRate?.id ?? null,
-      name: orderDefaultRate?.name ?? input.taxRateName ?? null,
-      rate: orderDefaultRate ? Number(orderDefaultRate.rate) : vatRate,
-      accountingTaxType: orderDefaultRate?.accountingTaxType ?? null,
+      id: orderDefaultProfile?.taxRateId ?? null,
+      name: orderDefaultProfile?.taxRateName ?? input.taxRateName ?? null,
+      rate: orderDefaultProfile?.taxRateValue ?? vatRate,
+      accountingTaxType: orderDefaultProfile?.accountingTaxType ?? null,
+      isCompound: orderDefaultProfile?.isCompound ?? false,
+      reverseCharge: orderDefaultProfile?.reverseCharge ?? false,
+      reportingCategory: orderDefaultProfile?.reportingCategory ?? null,
+      components: orderDefaultProfile?.components ?? [],
     }
 
     // Destination country: receiving warehouse → company home country.
@@ -911,7 +921,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
     const overrideRows = overrideIds.length
       ? await db.taxRate.findMany({
           where: { id: { in: overrideIds } },
-          select: { id: true, name: true, rate: true, accountingTaxType: true },
+          select: taxRateProfileSelect,
         })
       : []
     const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
@@ -920,14 +930,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       if (l.taxRateId) {
         const row = overrideById.get(l.taxRateId)
         if (row) {
-          return {
-            taxRateId: row.id,
-            taxRateName: row.name,
-            taxRateValue: Number(row.rate),
-            accountingTaxType: row.accountingTaxType,
-            matched: 'exact',
-            warning: null,
-          }
+          return resolvedTaxRateFromProfile(row, 'exact')
         }
       }
       return (
@@ -936,6 +939,10 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
           taxRateName: orderDefaultCtx.name,
           taxRateValue: orderDefaultCtx.rate,
           accountingTaxType: orderDefaultCtx.accountingTaxType,
+          isCompound: orderDefaultCtx.isCompound,
+          reverseCharge: orderDefaultCtx.reverseCharge,
+          reportingCategory: orderDefaultCtx.reportingCategory,
+          components: orderDefaultCtx.components,
           matched: 'fallback',
           warning: null,
         }
@@ -1226,19 +1233,24 @@ export async function updatePurchaseOrder(
       const orderDefaultRate = input.taxRateId
         ? await db.taxRate.findUnique({
             where: { id: input.taxRateId },
-            select: { id: true, name: true, rate: true, accountingTaxType: true },
+            select: taxRateProfileSelect,
           })
         : input.taxRateName
         ? await db.taxRate.findFirst({
             where: { name: input.taxRateName, active: true },
-            select: { id: true, name: true, rate: true, accountingTaxType: true },
+            select: taxRateProfileSelect,
           })
         : null
+      const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
       const orderDefaultCtx = {
-        id: orderDefaultRate?.id ?? null,
-        name: orderDefaultRate?.name ?? input.taxRateName ?? null,
-        rate: orderDefaultRate ? Number(orderDefaultRate.rate) : vatRate,
-        accountingTaxType: orderDefaultRate?.accountingTaxType ?? null,
+        id: orderDefaultProfile?.taxRateId ?? null,
+        name: orderDefaultProfile?.taxRateName ?? input.taxRateName ?? null,
+        rate: orderDefaultProfile?.taxRateValue ?? vatRate,
+        accountingTaxType: orderDefaultProfile?.accountingTaxType ?? null,
+        isCompound: orderDefaultProfile?.isCompound ?? false,
+        reverseCharge: orderDefaultProfile?.reverseCharge ?? false,
+        reportingCategory: orderDefaultProfile?.reportingCategory ?? null,
+        components: orderDefaultProfile?.components ?? [],
       }
 
       // Destination country: receiving warehouse (use new value when set,
@@ -1317,7 +1329,7 @@ export async function updatePurchaseOrder(
       const overrideRows = overrideIds.length
         ? await db.taxRate.findMany({
             where: { id: { in: overrideIds } },
-            select: { id: true, name: true, rate: true, accountingTaxType: true },
+            select: taxRateProfileSelect,
           })
         : []
       const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
@@ -1326,14 +1338,7 @@ export async function updatePurchaseOrder(
         if (l.taxRateId) {
           const row = overrideById.get(l.taxRateId)
           if (row) {
-            return {
-              taxRateId: row.id,
-              taxRateName: row.name,
-              taxRateValue: Number(row.rate),
-              accountingTaxType: row.accountingTaxType,
-              matched: 'exact',
-              warning: null,
-            }
+            return resolvedTaxRateFromProfile(row, 'exact')
           }
         }
         return (
@@ -1342,6 +1347,10 @@ export async function updatePurchaseOrder(
             taxRateName: orderDefaultCtx.name,
             taxRateValue: orderDefaultCtx.rate,
             accountingTaxType: orderDefaultCtx.accountingTaxType,
+            isCompound: orderDefaultCtx.isCompound,
+            reverseCharge: orderDefaultCtx.reverseCharge,
+            reportingCategory: orderDefaultCtx.reportingCategory,
+            components: orderDefaultCtx.components,
             matched: 'fallback',
             warning: null,
           }
