@@ -7,7 +7,7 @@ import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { cn } from '@/lib/utils'
-import { PageTitle } from '@/lib/page-title'
+import { ReportPageTitle } from './report-page-title'
 import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
 
 export type PurchasingAnalyticsReportKey = 'open-pos' | 'supplier-performance' | 'ppv' | 'spend' | 'lead-times'
@@ -60,8 +60,7 @@ export function PurchasingAnalyticsReportPage<Row>({
     <div className="space-y-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <PageTitle title={title} />
-          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+          <ReportPageTitle title={title} description={description} />
         </div>
         <a href={csvHref} className={cn(buttonVariants({ variant: 'outline', size: 'sm' }), 'w-fit')}>
           <Download className="mr-2 h-4 w-4" />
