@@ -6,6 +6,10 @@ For plans that have shipped end-to-end, see `docs/completed/`.
 
 ## Plans
 
+### Workflow audit remediation (epic `onetwo3d-ims-r3xh`)
+
+- [`workflow-audit-remediation-plan.md`](workflow-audit-remediation-plan.md) — sequenced fix plan for the 2026-06-12 six-domain business-workflow audit (5 critical, 9 high, ~12 medium findings). 18 child bd issues under epic `r3xh`. Wave 1 is financial controls (three-way match, credit-note reverse charge, TrackShip guard bypass, purchasing-reversal alerts).
+
 ### Released v2.0.0 follow-ups
 
 - [`xero-tax-rate-drift-detection-plan.md`](xero-tax-rate-drift-detection-plan.md) — daily cron that compares IMS `TaxRate` profiles to live Xero `TaxComponents` and alerts on drift without writeback. Completes the residual scope from PR #186.
