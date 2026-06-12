@@ -25,6 +25,7 @@ import {
   receivePurchaseOrder,
   returnPurchaseOrder,
   createInvoice,
+  updateInvoice,
   updateFreightPoCosts,
   markBillPaid,
   getBillPaymentAccounts,
@@ -1076,6 +1077,256 @@ function BillDialog({
   )
 }
 
+function EditBillDialog({
+  po,
+  invoice,
+  currencies,
+  onClose,
+}: {
+  po: PoDetail
+  invoice: InvoiceRow
+  currencies: CurrencyRow[]
+  onClose: () => void
+}) {
+  const baseCurrency = useBaseCurrency()
+  const router = useRouter()
+  const [isPending, startTransition] = useTransition()
+  const [error, setError] = useState('')
+
+  const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
+  for (const c of currencies) {
+    symbolMap[c.code] = c.symbol
+    positionMap[c.code] = c.symbolPosition
+  }
+  const billSym = symbolMap[po.currency] ?? po.currency
+  const billSymPos = positionMap[po.currency] ?? 'PREFIX'
+  const billMoney = (n: number) => formatMoney(n, billSym, billSymPos)
+
+  const [invoiceNumber, setInvoiceNumber] = useState(invoice.invoiceNumber ?? '')
+  const [invoiceDate, setInvoiceDate] = useState(invoice.invoiceDate.slice(0, 10))
+  const [dueDate, setDueDate] = useState(invoice.dueDate?.slice(0, 10) ?? '')
+  const [notes, setNotes] = useState(invoice.notes ?? '')
+  const [uploading, setUploading] = useState(false)
+  const [supplierInvoiceUrl, setSupplierInvoiceUrl] = useState(invoice.supplierInvoiceUrl ?? '')
+  const [uploadName, setUploadName] = useState(invoice.supplierInvoiceUrl ? 'Current PDF' : '')
+  const [lines, setLines] = useState(
+    invoice.lines.map((line) => ({
+      id: line.id,
+      poLineId: line.poLineId,
+      costLineId: line.costLineId,
+      productId: line.productId,
+      sku: line.sku,
+      productName: line.productName,
+      description: line.description,
+      qtyBilled: line.qtyBilled,
+      unitCostForeign: line.unitCostForeign,
+      amountForeign: line.totalForeign,
+      taxRatePercent: line.taxRatePercent ?? po.taxRatePercent ?? 0,
+      vatable: line.vatable ?? false,
+    })),
+  )
+
+  const productSubtotal = lines.filter((line) => line.poLineId).reduce((sum, line) => sum + line.qtyBilled * line.unitCostForeign, 0)
+  const costSubtotal = lines.filter((line) => line.costLineId).reduce((sum, line) => sum + line.amountForeign, 0)
+  const subtotal = productSubtotal + costSubtotal
+  const poRate = po.taxRatePercent ?? 0
+  const vatTotal =
+    lines.filter((line) => line.poLineId).reduce((sum, line) => sum + line.qtyBilled * line.unitCostForeign * line.taxRatePercent, 0)
+    + lines.filter((line) => line.costLineId && line.vatable).reduce((sum, line) => sum + line.amountForeign * poRate, 0)
+  const total = subtotal + vatTotal
+
+  function updateLine(lineId: string, patch: Partial<typeof lines[number]>) {
+    setLines((prev) => prev.map((line) => line.id === lineId ? { ...line, ...patch } : line))
+  }
+
+  async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setUploading(true)
+    const form = new FormData()
+    form.append('file', file)
+    const res = await fetch('/api/upload/invoice', { method: 'POST', body: form })
+    const data = await res.json()
+    setUploading(false)
+    if (data.url) {
+      setSupplierInvoiceUrl(data.url)
+      setUploadName(file.name)
+    } else {
+      setError(data.error ?? 'Upload failed')
+    }
+  }
+
+  function handleSubmit() {
+    setError('')
+    if (!invoiceDate) { setError('Invoice date is required'); return }
+    if (lines.some((line) => line.poLineId && (!Number.isFinite(line.qtyBilled) || line.qtyBilled <= 0))) {
+      setError('Product bill lines need a quantity greater than zero')
+      return
+    }
+    if (lines.some((line) => line.costLineId && (!Number.isFinite(line.amountForeign) || line.amountForeign <= 0))) {
+      setError('Cost bill lines need an amount greater than zero')
+      return
+    }
+
+    startTransition(async () => {
+      const result = await updateInvoice(invoice.id, {
+        invoiceNumber: invoiceNumber || undefined,
+        invoiceDate,
+        dueDate: dueDate || undefined,
+        notes: notes || undefined,
+        supplierInvoiceUrl: supplierInvoiceUrl || undefined,
+        lines: lines.map((line) => line.poLineId ? {
+          id: line.id,
+          qtyBilled: line.qtyBilled,
+          unitCostForeign: line.unitCostForeign,
+        } : {
+          id: line.id,
+          description: line.description,
+          amountForeign: line.amountForeign,
+        }),
+      })
+      if (result.success) {
+        router.refresh()
+        onClose()
+      } else {
+        setError(result.error ?? 'Failed to update bill')
+      }
+    })
+  }
+
+  return (
+    <Dialog open onOpenChange={onClose}>
+      <DialogContent className="max-w-3xl sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>Edit Bill</DialogTitle>
+          <DialogDescription>Update the IMS bill and queue an accounting bill update when this bill has already synced.</DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div className="space-y-1.5">
+              <Label>Invoice Number</Label>
+              <Input value={invoiceNumber} onChange={(e) => setInvoiceNumber(e.target.value)} className="h-9 text-sm" />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Invoice Date *</Label>
+              <Input type="date" value={invoiceDate} onChange={(e) => setInvoiceDate(e.target.value)} className="h-9 text-sm" />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Due Date</Label>
+              <Input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} className="h-9 text-sm" />
+            </div>
+          </div>
+
+          <Table className="rounded-md border min-w-[620px]">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                <TableHead className="text-xs">Line</TableHead>
+                <TableHead className="text-xs text-right w-24">Qty</TableHead>
+                <TableHead className="text-xs text-right w-32">Unit / Amount ({billSym})</TableHead>
+                <TableHead className="text-xs text-right w-28">Total ({billSym})</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {lines.map((line) => (
+                <TableRow key={line.id}>
+                  <TableCell>
+                    {line.poLineId ? (
+                      <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
+                    ) : (
+                      <Input value={line.description} onChange={(e) => updateLine(line.id, { description: e.target.value })} className="h-8 text-sm" />
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {line.poLineId ? (
+                      <Input
+                        type="number"
+                        min={0}
+                        step={1}
+                        value={line.qtyBilled}
+                        onChange={(e) => updateLine(line.id, { qtyBilled: Number(e.target.value) || 0 })}
+                        className="h-8 text-sm text-right font-mono"
+                      />
+                    ) : (
+                      <span className="block text-right text-muted-foreground">1</span>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <Input
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      value={line.poLineId ? line.unitCostForeign : line.amountForeign}
+                      onChange={(e) => {
+                        const value = Number(e.target.value) || 0
+                        updateLine(line.id, line.poLineId ? { unitCostForeign: value } : { amountForeign: value })
+                      }}
+                      className="h-8 text-sm text-right font-mono"
+                    />
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-xs">
+                    {billMoney(line.poLineId ? line.qtyBilled * line.unitCostForeign : line.amountForeign)}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+
+          <div className="flex justify-end text-sm">
+            <div className="min-w-56 space-y-1">
+              <div className="flex justify-between text-muted-foreground">
+                <span>Subtotal</span>
+                <span className="font-mono">{billMoney(subtotal)}</span>
+              </div>
+              <div className="flex justify-between text-muted-foreground">
+                <span>VAT</span>
+                <span className="font-mono">{billMoney(vatTotal)}</span>
+              </div>
+              <div className="flex justify-between font-medium border-t pt-1">
+                <span>Total</span>
+                <span className="font-mono">{billMoney(total)}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>Supplier Invoice PDF</Label>
+            <div className="flex items-center gap-2">
+              <label className="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 h-9 text-sm cursor-pointer hover:bg-muted">
+                <Upload className="h-4 w-4 text-muted-foreground" />
+                {uploading ? 'Uploading...' : uploadName || 'Choose file'}
+                <input type="file" accept=".pdf" className="hidden" onChange={handleUpload} disabled={uploading} />
+              </label>
+              {supplierInvoiceUrl && <span className="text-xs text-green-600">Attached</span>}
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>Notes</Label>
+            <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="text-sm resize-none" />
+          </div>
+
+          {invoice.accountingInvoiceId && (
+            <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/30 p-2 text-xs text-amber-800 dark:text-amber-200">
+              Saving changes queues an accounting bill update. If accounting rejects it because the external bill is paid or locked, the warning appears on this PO.
+            </div>
+          )}
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+          <Button onClick={handleSubmit} disabled={isPending}>
+            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+            Save Bill
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Pay Bill dialog — mark a supplier bill as paid and push payment to the accounting connector
 // ---------------------------------------------------------------------------
@@ -1511,6 +1762,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const [showReturns, setShowReturns] = useState(false)
   const [showInvoices, setShowInvoices] = useState(false)
   const [payBillFor, setPayBillFor] = useState<InvoiceRow | null>(null)
+  const [editBillFor, setEditBillFor] = useState<InvoiceRow | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
@@ -2199,6 +2451,10 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
         <PayBillDialog po={po} invoice={payBillFor} onClose={() => setPayBillFor(null)} />
       )}
 
+      {accountingAvailable && editBillFor && (
+        <EditBillDialog po={po} invoice={editBillFor} currencies={currencies} onClose={() => setEditBillFor(null)} />
+      )}
+
       {/* Edit Freight Costs dialog */}
       {showEditFreight && (
         <EditFreightCostsDialog po={po} currencies={currencies} onClose={() => setShowEditFreight(false)} />
@@ -2256,16 +2512,28 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                         </a>
                       )}
                       {!inv.paidAt && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-6 px-2 text-xs"
-                          onClick={() => setPayBillFor(inv)}
-                          disabled={isPending}
-                        >
-                          <CreditCard className="h-3 w-3 mr-1" />
-                          Mark Paid
-                        </Button>
+                        <>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-6 px-2 text-xs"
+                            onClick={() => setEditBillFor(inv)}
+                            disabled={isPending}
+                          >
+                            <Pencil className="h-3 w-3 mr-1" />
+                            Edit
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-6 px-2 text-xs"
+                            onClick={() => setPayBillFor(inv)}
+                            disabled={isPending}
+                          >
+                            <CreditCard className="h-3 w-3 mr-1" />
+                            Mark Paid
+                          </Button>
+                        </>
                       )}
                     </div>
                   </div>

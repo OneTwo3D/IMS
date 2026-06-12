@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
+import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
@@ -21,6 +21,11 @@ import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
 } from '@/lib/domain/purchasing/purchase-order-fx-update'
+import {
+  assertPurchaseInvoiceEditable,
+  buildPurchaseInvoiceUpdateIdempotencyKey,
+  hasPurchaseInvoiceEditChanges,
+} from '@/lib/domain/purchasing/purchase-invoice-edit'
 import {
   computeGrossUnitCostBaseByLine,
   queueLandedCostAdjustmentJournals,
@@ -567,11 +572,13 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
                 select: {
                   productId: true,
                   product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
+                  taxRate: { select: { rate: true } },
                 },
               },
               costLine: {
                 select: {
                   description: true,
+                  vatable: true,
                 },
               },
             },
@@ -722,6 +729,8 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           unitCostForeign: Number(il.unitCostForeign),
           totalForeign: Number(il.totalForeign),
           totalBase: Number(il.totalBase),
+          taxRatePercent: isProduct ? Number(il.poLine?.taxRate?.rate ?? po.taxRatePercent ?? 0) : null,
+          vatable: !isProduct ? !!il.costLine?.vatable : null,
         }
       }),
     })),
@@ -2340,6 +2349,23 @@ export type CreateInvoiceInput = {
   lines: InvoiceLineInput[]
 }
 
+export type UpdateInvoiceLineInput = {
+  id: string
+  qtyBilled?: number
+  unitCostForeign?: number
+  description?: string
+  amountForeign?: number
+}
+
+export type UpdateInvoiceInput = {
+  invoiceNumber?: string
+  invoiceDate: string
+  dueDate?: string
+  notes?: string
+  supplierInvoiceUrl?: string
+  lines: UpdateInvoiceLineInput[]
+}
+
 export type InvoiceRow = {
   id: string
   invoiceNumber: string | null
@@ -2371,7 +2397,23 @@ export type InvoiceRow = {
     unitCostForeign: number
     totalForeign: number
     totalBase: number
+    taxRatePercent: number | null
+    vatable: boolean | null
   }[]
+}
+
+function dateKey(value: Date | string | null | undefined): string | null {
+  if (!value) return null
+  return (value instanceof Date ? value : new Date(value)).toISOString().slice(0, 10)
+}
+
+function optionalText(value: string | null | undefined): string | null {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : null
+}
+
+function rounded4(value: number): number {
+  return roundQuantity(value, 4).toNumber()
 }
 
 export async function createInvoice(
@@ -2642,6 +2684,405 @@ export async function createInvoice(
       level: 'ERROR',
       description: `Failed to create invoice for PO ${poId}: ${String(e)}`,
       metadata: null,
+    })
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function updateInvoice(
+  invoiceId: string,
+  input: UpdateInvoiceInput,
+): Promise<{ success: boolean; error?: string; notice?: string }> {
+  try {
+    await requirePermission('purchasing.invoice')
+    if (!input.invoiceDate) return { success: false, error: 'Invoice date is required' }
+    if (!input.lines.length) return { success: false, error: 'Bill must have at least one line' }
+
+    const invoice = await db.purchaseInvoice.findUnique({
+      where: { id: invoiceId },
+      select: {
+        id: true,
+        poId: true,
+        invoiceNumber: true,
+        invoiceDate: true,
+        dueDate: true,
+        subtotalForeign: true,
+        subtotalBase: true,
+        taxForeign: true,
+        taxBase: true,
+        totalForeign: true,
+        totalBase: true,
+        fxRateToBase: true,
+        notes: true,
+        supplierInvoiceUrl: true,
+        accountingInvoiceId: true,
+        paidAt: true,
+        po: {
+          select: {
+            id: true,
+            reference: true,
+            currency: true,
+            fxRateToBase: true,
+            taxForeign: true,
+            subtotalForeign: true,
+            supplier: {
+              select: {
+                name: true,
+                email: true,
+                taxRate: { select: { accountingTaxType: true } },
+              },
+            },
+            lines: {
+              select: {
+                id: true,
+                qty: true,
+                product: { select: { sku: true } },
+                taxRate: { select: { accountingTaxType: true } },
+              },
+            },
+            freightCostLines: {
+              select: {
+                id: true,
+                description: true,
+                amountForeign: true,
+                vatable: true,
+              },
+            },
+          },
+        },
+        lines: {
+          select: {
+            id: true,
+            poLineId: true,
+            costLineId: true,
+            description: true,
+            qtyBilled: true,
+            unitCostForeign: true,
+            totalForeign: true,
+            totalBase: true,
+          },
+        },
+      },
+    })
+    if (!invoice) return { success: false, error: 'Bill not found' }
+    try {
+      assertPurchaseInvoiceEditable(invoice)
+    } catch (error) {
+      return { success: false, error: String(error instanceof Error ? error.message : error) }
+    }
+
+    const lineInputById = new Map(input.lines.map((line) => [line.id, line]))
+    if (lineInputById.size !== input.lines.length) {
+      return { success: false, error: 'Duplicate bill line in edit request' }
+    }
+    for (const line of invoice.lines) {
+      if (!lineInputById.has(line.id)) {
+        return { success: false, error: 'All existing bill lines must be included when editing a bill' }
+      }
+    }
+    for (const line of input.lines) {
+      if (!invoice.lines.some((existing) => existing.id === line.id)) {
+        return { success: false, error: `Unknown bill line ${line.id}` }
+      }
+    }
+
+    const invoiceDate = new Date(input.invoiceDate)
+    const dueDate = input.dueDate ? new Date(input.dueDate) : null
+    const fxRate = Number(invoice.fxRateToBase)
+    if (!Number.isFinite(fxRate) || fxRate <= 0) {
+      return { success: false, error: `Invalid FX rate on bill ${invoice.invoiceNumber ?? invoice.id}` }
+    }
+    const baseCurrency = await getBaseCurrencyCode()
+    const poLineById = new Map(invoice.po.lines.map((line) => [line.id, line]))
+    const costLineById = new Map(invoice.po.freightCostLines.map((line) => [line.id, line]))
+    const fallbackTaxType = invoice.po.supplier.taxRate?.accountingTaxType ?? undefined
+    const taxTypeByLine = new Map(invoice.po.lines.map((line) => [line.id, line.taxRate?.accountingTaxType ?? undefined]))
+
+    let subtotalForeign = 0
+    let subtotalBase = 0
+    let taxBaseForeign = 0
+    const lineUpdates: Array<{
+      id: string
+      poLineId: string | null
+      costLineId: string | null
+      description: string | null
+      qtyBilled: number
+      unitCostForeign: number
+      totalForeign: number
+      totalBase: number
+    }> = []
+    const productPayloadLines: Array<{ description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }> = []
+    const costPayloadLines: Array<{ description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }> = []
+    const accountingSettings = await getAccountingSettings()
+
+    for (const existingLine of invoice.lines) {
+      const lineInput = lineInputById.get(existingLine.id)!
+      if (existingLine.poLineId) {
+        const poLine = poLineById.get(existingLine.poLineId)
+        if (!poLine) return { success: false, error: `Unknown PO line ${existingLine.poLineId}` }
+        const qtyBilled = Number(lineInput.qtyBilled ?? existingLine.qtyBilled)
+        const unitCostForeign = Number(lineInput.unitCostForeign ?? existingLine.unitCostForeign)
+        if (!Number.isFinite(qtyBilled) || qtyBilled <= 0) return { success: false, error: `Invalid quantity for ${poLine.product.sku}` }
+        if (!Number.isFinite(unitCostForeign) || unitCostForeign < 0) return { success: false, error: `Invalid unit cost for ${poLine.product.sku}` }
+        const totalForeign = rounded4(qtyBilled * unitCostForeign)
+        const totalBase = rounded4(totalForeign / fxRate)
+        subtotalForeign += totalForeign
+        subtotalBase += totalBase
+        taxBaseForeign += totalForeign
+        lineUpdates.push({
+          id: existingLine.id,
+          poLineId: existingLine.poLineId,
+          costLineId: null,
+          description: null,
+          qtyBilled,
+          unitCostForeign,
+          totalForeign,
+          totalBase,
+        })
+        productPayloadLines.push({
+          description: `PO ${invoice.po.reference} line`,
+          quantity: qtyBilled,
+          unitAmount: rounded4(unitCostForeign),
+          accountCode: accountingSettings.transitAccount,
+          taxType: taxTypeByLine.get(existingLine.poLineId) ?? fallbackTaxType,
+        })
+      } else if (existingLine.costLineId) {
+        const costLine = costLineById.get(existingLine.costLineId)
+        if (!costLine) return { success: false, error: `Unknown cost line ${existingLine.costLineId}` }
+        const amountForeign = Number(lineInput.amountForeign ?? lineInput.unitCostForeign ?? existingLine.totalForeign)
+        const description = optionalText(lineInput.description ?? existingLine.description ?? costLine.description) ?? costLine.description
+        if (!Number.isFinite(amountForeign) || amountForeign <= 0) return { success: false, error: `Invalid amount for ${costLine.description}` }
+        const totalForeign = rounded4(amountForeign)
+        const totalBase = rounded4(totalForeign / fxRate)
+        subtotalForeign += totalForeign
+        subtotalBase += totalBase
+        if (costLine.vatable) taxBaseForeign += totalForeign
+        lineUpdates.push({
+          id: existingLine.id,
+          poLineId: null,
+          costLineId: existingLine.costLineId,
+          description,
+          qtyBilled: 1,
+          unitCostForeign: totalForeign,
+          totalForeign,
+          totalBase,
+        })
+        costPayloadLines.push({
+          description,
+          quantity: 1,
+          unitAmount: totalForeign,
+          accountCode: accountingSettings.transitAccount,
+          taxType: costLine.vatable ? fallbackTaxType : undefined,
+        })
+      } else {
+        return { success: false, error: `Bill line ${existingLine.id} is not linked to a PO or cost line` }
+      }
+    }
+
+    const poSubtotal = Number(invoice.po.subtotalForeign)
+    const poTax = Number(invoice.po.taxForeign)
+    const taxRate = poSubtotal > 0 ? poTax / poSubtotal : 0
+    const taxForeign = rounded4(taxBaseForeign * taxRate)
+    const taxBase = rounded4(taxForeign / fxRate)
+    const totalForeign = rounded4(subtotalForeign + taxForeign)
+    const totalBase = rounded4(subtotalBase + taxBase)
+
+    const normalizedHeader = {
+      invoiceNumber: optionalText(input.invoiceNumber),
+      invoiceDate: dateKey(invoiceDate),
+      dueDate: dateKey(dueDate),
+      notes: optionalText(input.notes),
+      supplierInvoiceUrl: optionalText(input.supplierInvoiceUrl),
+    }
+    const existingHeader = {
+      invoiceNumber: optionalText(invoice.invoiceNumber),
+      invoiceDate: dateKey(invoice.invoiceDate),
+      dueDate: dateKey(invoice.dueDate),
+      notes: optionalText(invoice.notes),
+      supplierInvoiceUrl: optionalText(invoice.supplierInvoiceUrl),
+    }
+    const existingLines = invoice.lines.map((line) => ({
+      id: line.id,
+      description: optionalText(line.description),
+      qtyBilled: Number(line.qtyBilled),
+      unitCostForeign: Number(line.unitCostForeign),
+      totalForeign: Number(line.totalForeign),
+    })).sort((a, b) => a.id.localeCompare(b.id))
+    const nextLines = lineUpdates.map((line) => ({
+      id: line.id,
+      description: optionalText(line.description),
+      qtyBilled: line.qtyBilled,
+      unitCostForeign: line.unitCostForeign,
+      totalForeign: line.totalForeign,
+    })).sort((a, b) => a.id.localeCompare(b.id))
+    const hasChanges = hasPurchaseInvoiceEditChanges({
+      existingHeader,
+      nextHeader: normalizedHeader,
+      existingLines,
+      nextLines,
+    })
+    if (!hasChanges) {
+      return { success: true, notice: 'No bill changes to save' }
+    }
+
+    const accountingPayload = {
+      accountingInvoiceId: invoice.accountingInvoiceId ?? undefined,
+      invoiceNumber: invoice.po.reference,
+      contactName: invoice.po.supplier.name ?? 'Unknown Supplier',
+      date: input.invoiceDate,
+      dueDate: input.dueDate ?? undefined,
+      currency: invoice.po.currency ?? baseCurrency,
+      currencyRateToBase: Number(fxRate) || undefined,
+      reference: normalizedHeader.invoiceNumber ?? undefined,
+      lines: [...productPayloadLines, ...costPayloadLines],
+      supplierInvoicePath: normalizedHeader.supplierInvoiceUrl ?? undefined,
+    }
+    const idempotencyKey = invoice.accountingInvoiceId
+      ? buildPurchaseInvoiceUpdateIdempotencyKey({
+          invoiceId: invoice.id,
+          accountingInvoiceId: invoice.accountingInvoiceId,
+          payload: accountingPayload,
+        })
+      : null
+
+    await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM purchase_invoices WHERE id = ${invoice.id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${invoice.poId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_invoice_lines WHERE "invoiceId" = ${invoice.id} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ${invoice.poId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM freight_cost_lines WHERE "poId" = ${invoice.poId} FOR UPDATE`
+
+      const lockedInvoice = await tx.purchaseInvoice.findUnique({
+        where: { id: invoice.id },
+        select: { paidAt: true },
+      })
+      if (!lockedInvoice) throw new Error('Bill not found')
+      assertPurchaseInvoiceEditable(lockedInvoice)
+
+      const otherLines = await tx.purchaseInvoiceLine.findMany({
+        where: { invoice: { poId: invoice.poId, id: { not: invoice.id } } },
+        select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
+      })
+      const alreadyProductByLine = new Map<string, number>()
+      const alreadyCostByLine = new Map<string, number>()
+      for (const otherLine of otherLines) {
+        if (otherLine.poLineId) {
+          alreadyProductByLine.set(otherLine.poLineId, (alreadyProductByLine.get(otherLine.poLineId) ?? 0) + Number(otherLine.qtyBilled))
+        }
+        if (otherLine.costLineId) {
+          alreadyCostByLine.set(otherLine.costLineId, (alreadyCostByLine.get(otherLine.costLineId) ?? 0) + Number(otherLine.totalForeign))
+        }
+      }
+      for (const line of lineUpdates) {
+        if (line.poLineId) {
+          const poLine = poLineById.get(line.poLineId)
+          if (!poLine) throw new Error(`Unknown PO line ${line.poLineId}`)
+          const already = alreadyProductByLine.get(line.poLineId) ?? 0
+          if (already + line.qtyBilled > Number(poLine.qty) + 1e-6) {
+            throw new Error(`Line ${poLine.product.sku} exceeds remaining qty`)
+          }
+        }
+        if (line.costLineId) {
+          const costLine = costLineById.get(line.costLineId)
+          if (!costLine) throw new Error(`Unknown cost line ${line.costLineId}`)
+          const already = alreadyCostByLine.get(line.costLineId) ?? 0
+          if (already + line.totalForeign > Number(costLine.amountForeign) + 1e-4) {
+            throw new Error(`Cost line "${costLine.description}" exceeds remaining amount`)
+          }
+        }
+      }
+
+      await tx.purchaseInvoice.update({
+        where: { id: invoice.id },
+        data: {
+          invoiceNumber: normalizedHeader.invoiceNumber,
+          invoiceDate,
+          dueDate,
+          subtotalForeign,
+          subtotalBase,
+          taxForeign,
+          taxBase,
+          totalForeign,
+          totalBase,
+          notes: normalizedHeader.notes,
+          supplierInvoiceUrl: normalizedHeader.supplierInvoiceUrl,
+        },
+      })
+      for (const line of lineUpdates) {
+        await tx.purchaseInvoiceLine.update({
+          where: { id: line.id },
+          data: {
+            description: line.description,
+            qtyBilled: line.qtyBilled,
+            unitCostForeign: line.unitCostForeign,
+            totalForeign: line.totalForeign,
+            totalBase: line.totalBase,
+          },
+        })
+      }
+
+      if (invoice.accountingInvoiceId && accountingSettings.syncEnabled && idempotencyKey) {
+        const connector = await getActiveAccountingConnectorInfo()
+        if (connector?.id === 'xero') {
+          if (await isAccountingSyncTypeEnabled('PURCHASE_INVOICE_UPDATE')) {
+            await queueAccountingSyncTx(tx, {
+              type: 'PURCHASE_INVOICE_UPDATE',
+              referenceType: 'PurchaseOrder',
+              referenceId: invoice.poId,
+              payload: accountingPayload,
+              idempotencyKey,
+            })
+          }
+        } else {
+          await tx.activityLog.create({
+            data: {
+              entityType: 'PURCHASE_ORDER',
+              entityId: invoice.poId,
+              action: 'purchase_invoice_update_skipped_unsupported_connector',
+              tag: 'accounting',
+              level: 'WARNING',
+              description: connector
+                ? `Purchase bill update for ${invoice.po.reference} was not queued because ${connector.name} bill updates are not supported yet`
+                : `Purchase bill update for ${invoice.po.reference} was not queued because no accounting connector is active`,
+              metadata: {
+                invoiceId: invoice.id,
+                accountingInvoiceId: invoice.accountingInvoiceId,
+                connector: connector?.id ?? null,
+                idempotencyKey,
+              },
+            },
+          })
+        }
+      }
+    }, STOCK_TX_OPTIONS)
+
+    revalidatePath('/purchase-orders')
+    revalidatePath(`/purchase-orders/${invoice.poId}`)
+    await logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: invoice.poId,
+      action: 'bill_updated',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Updated bill ${normalizedHeader.invoiceNumber ?? invoice.invoiceNumber ?? invoice.id} for PO ${invoice.po.reference}`,
+      metadata: {
+        reference: invoice.po.reference,
+        invoiceId: invoice.id,
+        accountingInvoiceId: invoice.accountingInvoiceId,
+        queuedAccountingUpdate: Boolean(invoice.accountingInvoiceId && idempotencyKey),
+      },
+    })
+
+    return { success: true }
+  } catch (e) {
+    await logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: null,
+      action: 'bill_updated',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to update bill ${invoiceId}: ${String(e)}`,
+      metadata: { invoiceId },
     })
     return { success: false, error: String(e) }
   }
