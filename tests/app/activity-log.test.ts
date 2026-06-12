@@ -4,7 +4,7 @@ import test from 'node:test'
 import {
   invoicePdfTokenSecurityEventWhere,
   summarizeInvoicePdfTokenSecurityEvents,
-} from '@/app/actions/activity-log'
+} from '@/lib/activity-log-invoice-pdf-security'
 
 test('invoice PDF token security summary groups wrong-session and wrong-IP events by order', () => {
   const rows = summarizeInvoicePdfTokenSecurityEvents([
