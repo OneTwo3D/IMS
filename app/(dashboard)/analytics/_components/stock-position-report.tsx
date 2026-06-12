@@ -84,7 +84,7 @@ export function StockPositionReportPage<Row>({
     <div className="space-y-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <ReportPageTitle title={title} description={description} />
+          <ReportPageTitle title={title} description={description} notices={notices} />
         </div>
         <a href={csvHref} className={cn(buttonVariants({ variant: 'outline', size: 'sm' }), 'w-fit')}>
           <Download className="mr-2 h-4 w-4" />
@@ -218,11 +218,6 @@ export function StockPositionReportPage<Row>({
         </div>
       </form>
 
-      {notices.length > 0 && (
-        <div className="rounded-md border border-orange-200 bg-orange-50 p-3 text-sm text-orange-900 dark:border-orange-900/50 dark:bg-orange-950/30 dark:text-orange-100">
-          {notices.map((notice) => <p key={notice}>{notice}</p>)}
-        </div>
-      )}
 
       <div className="rounded-md border">
         <div className="flex items-center justify-between border-b bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
