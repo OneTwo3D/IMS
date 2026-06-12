@@ -18,9 +18,9 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import {
-  rebasePurchaseOrderStoredBaseAmountsWithParentUpdate,
-  type PurchaseOrderFxRebaseTransactionalDb,
-} from '@/lib/domain/purchasing/purchase-order-fx-rebase'
+  updatePurchaseOrderFxRateOnly,
+  type PurchaseOrderFxRateOnlyUpdateDb,
+} from '@/lib/domain/purchasing/purchase-order-fx-update'
 import {
   computeGrossUnitCostBaseByLine,
   queueLandedCostAdjustmentJournals,
@@ -1167,10 +1167,12 @@ export async function updatePurchaseOrder(
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be edited' }
 
     const shouldRefreshFxRate = input.currency !== undefined || input.fxRateToBase !== undefined
-    const fxRate = shouldRefreshFxRate
+    const rateOnlyFxRefresh = shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined
+    const baseCurrency = shouldRefreshFxRate ? await getBaseCurrencyCode() : null
+    const fxRate = shouldRefreshFxRate && !rateOnlyFxRefresh
       ? await resolvePurchaseOrderFxRateToBase(db, {
           currency: input.currency ?? existing.currency,
-          baseCurrency: await getBaseCurrencyCode(),
+          baseCurrency: baseCurrency!,
           asOf: new Date(),
           inputRateToBase: input.fxRateToBase,
         })
@@ -1181,7 +1183,7 @@ export async function updatePurchaseOrder(
     const updates: Record<string, unknown> = {
       ...(input.supplierId !== undefined && { supplierId: input.supplierId }),
       ...(input.currency !== undefined && { currency: input.currency }),
-      ...(shouldRefreshFxRate && { fxRateToBase: fxRate }),
+      ...(shouldRefreshFxRate && !rateOnlyFxRefresh && { fxRateToBase: fxRate }),
       ...(input.destinationWarehouseId !== undefined && { destinationWarehouseId: input.destinationWarehouseId || null }),
       ...(input.supplierRef !== undefined && { supplierRef: input.supplierRef || null }),
       ...(input.expectedDelivery !== undefined && { expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null }),
@@ -1480,18 +1482,26 @@ export async function updatePurchaseOrder(
       updates.totalBase = subtotalBase + totalTaxBase + currentDirectFreightBase
     }
 
-    const po = shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined
-      ? await rebasePurchaseOrderStoredBaseAmountsWithParentUpdate(
-          db as unknown as PurchaseOrderFxRebaseTransactionalDb<Parameters<typeof mapPoRow>[0]>,
+    const po = rateOnlyFxRefresh
+      ? await updatePurchaseOrderFxRateOnly(
+          db as unknown as PurchaseOrderFxRateOnlyUpdateDb<Parameters<typeof mapPoRow>[0]>,
           id,
           {
+            currency: existing.currency,
             subtotalForeign: existing.subtotalForeign,
             taxForeign: existing.taxForeign,
             totalForeign: existing.totalForeign,
             directFreightForeign: existing.directFreightForeign,
           },
-          fxRate,
-          { data: updates, select: PO_SELECT },
+          {
+            currency: input.currency,
+            fxRateToBase: input.fxRateToBase,
+          },
+          {
+            baseCurrency: baseCurrency!,
+            asOf: new Date(),
+            parentUpdate: { data: updates, select: PO_SELECT },
+          },
         )
       : await db.purchaseOrder.update({
           where: { id },
