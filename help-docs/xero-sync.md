@@ -290,6 +290,19 @@ When enabled, the IMS polls Xero every 15 minutes for:
 - **Paid sales invoices** (manual orders only — WC orders arrive pre-paid)
 - **Paid purchase bills** (all POs — detects when a bill is paid via bank feed)
 
+### Purchase Bill Edits
+
+Unpaid purchase bills can be edited from the purchase order detail page. IMS updates the local
+`PurchaseInvoice` and `PurchaseInvoiceLine` rows transactionally, revalidates billed quantities
+and cost-line amounts against the underlying PO, and recalculates bill totals on the original PO FX
+rate. If the bill has already synced to Xero, saving a content change queues a
+`PURCHASE_INVOICE_UPDATE` entry with a payload-derived idempotency key. Saving without changing the
+bill is treated as a no-op and does not queue a duplicate update.
+
+Xero can reject bill updates once an external bill is paid, locked, voided, or otherwise no longer
+editable. Rejected bill-update sync rows are surfaced on the purchase order detail page with the
+connector, timestamp, retry count, and safe error text; the raw sync payload is not displayed.
+
 ## Invoice PDF & Email
 
 When a sales invoice is synced to Xero and payment is registered:

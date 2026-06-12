@@ -409,7 +409,7 @@ Xero integration is implemented as a modular connector in `lib/connectors/xero/`
 
 - **Sub-ledger model** — IMS acts as accounting guard; Xero handles invoicing, payments, and bank reconciliation; IMS creates daily correction journals
 - **Sales invoices** — AUTHORISED (WC pre-paid) or DRAFT (manual) invoice created at order time, with automatic Xero payment registration
-- **Purchase bills** — pushed when a PO is invoiced, with optional supplier invoice PDF attachment
+- **Purchase bills** — pushed when a PO is invoiced, with optional supplier invoice PDF attachment; unpaid IMS bills can be edited and, once externally synced, enqueue a Xero `PURCHASE_INVOICE_UPDATE` with a payload-derived idempotency key
 - **Credit notes** — pushed on refund with sub-ledger state-aware reversal journals
 - **Daily batch sync** — nightly cron runs Group A1 (revenue deferral), A2 (inventory reclassification), B (shipment COGS + revenue recognition via FIFO cost layer consumption). Each Xero group processes at most `XERO_DAILY_BATCH_LIMIT` candidate rows per run, default `1000`, and leaves unprocessed rows eligible for the next run while reporting `hasMore` in the cron summary. Split batches use deterministic batch reference suffixes so Xero-facing journal references stay unique for the same business date. Finance reconciliation should treat split journals as one logical daily batch by grouping on the payload metadata (`batchDate`, `batchGroup`, `batchReferenceId`) or the shared date/group reference prefix, then summing all entries for that group and date.
 - **Payment polling** — 15-min cron detects paid invoices (manual orders) and paid bills (POs) via Xero API
