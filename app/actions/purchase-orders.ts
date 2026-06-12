@@ -23,9 +23,17 @@ import {
 } from '@/lib/domain/purchasing/purchase-order-fx-update'
 import {
   assertPurchaseInvoiceEditable,
+  buildPurchaseInvoiceAccountingPayload,
   buildPurchaseInvoiceUpdateIdempotencyKey,
+  calculatePurchaseInvoice,
+  dateKey,
   hasPurchaseInvoiceEditChanges,
+  optionalText,
+  purchaseInvoiceLineChangeSnapshot,
+  validatePurchaseInvoiceLineLimits,
+  type PurchaseInvoiceInputLine,
 } from '@/lib/domain/purchasing/purchase-invoice-edit'
+import { maybeQueuePurchaseInvoiceUpdate } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
   computeGrossUnitCostBaseByLine,
   queueLandedCostAdjustmentJournals,
@@ -2402,20 +2410,6 @@ export type InvoiceRow = {
   }[]
 }
 
-function dateKey(value: Date | string | null | undefined): string | null {
-  if (!value) return null
-  return (value instanceof Date ? value : new Date(value)).toISOString().slice(0, 10)
-}
-
-function optionalText(value: string | null | undefined): string | null {
-  const trimmed = value?.trim()
-  return trimmed ? trimmed : null
-}
-
-function rounded4(value: number): number {
-  return roundQuantity(value, 4).toNumber()
-}
-
 export async function createInvoice(
   poId: string,
   input: CreateInvoiceInput,
@@ -2487,60 +2481,6 @@ export async function createInvoice(
     if (!Number.isFinite(fxRate) || fxRate <= 0) {
       return { success: false, error: `Invalid FX rate on PO ${po.reference}` }
     }
-    let subtotalForeign = 0
-    let subtotalBase = 0
-    let taxBaseForeign = 0
-
-    const productLineData = productInputs.map((l) => {
-      const totalForeign = Math.round(l.qtyBilled * l.unitCostForeign * 10000) / 10000
-      const totalBase = Math.round((totalForeign / fxRate) * 10000) / 10000
-      subtotalForeign += totalForeign
-      subtotalBase += totalBase
-      // Product lines always contribute to the tax base (the existing
-      // PO-level ratio heuristic is applied across the whole product subtotal).
-      taxBaseForeign += totalForeign
-      return {
-        poLineId: l.poLineId,
-        costLineId: null,
-        description: null,
-        qtyBilled: l.qtyBilled,
-        unitCostForeign: l.unitCostForeign,
-        totalForeign,
-        totalBase,
-      }
-    })
-
-    const costLineData = costInputs.map((l) => {
-      const totalForeign = Math.round(l.amountForeign * 10000) / 10000
-      const totalBase = Math.round((totalForeign / fxRate) * 10000) / 10000
-      subtotalForeign += totalForeign
-      subtotalBase += totalBase
-      const costLine = costLineById.get(l.costLineId)!
-      // Only vatable cost lines contribute to the tax base.
-      if (costLine.vatable) taxBaseForeign += totalForeign
-      return {
-        poLineId: null,
-        costLineId: l.costLineId,
-        description: l.description,
-        qtyBilled: 1,
-        unitCostForeign: l.amountForeign,
-        totalForeign,
-        totalBase,
-      }
-    })
-
-    const lineData = [...productLineData, ...costLineData]
-
-    // Calculate tax proportion (same ratio as PO) — applied only to the portion
-    // of the bill that is actually vatable (product subtotal + vatable cost lines).
-    const poSubtotal = Number(po.subtotalForeign)
-    const poTax = Number(po.taxForeign)
-    const taxRate = poSubtotal > 0 ? poTax / poSubtotal : 0
-    const taxForeign = Math.round(taxBaseForeign * taxRate * 10000) / 10000
-    const taxBase = Math.round((taxForeign / fxRate) * 10000) / 10000
-
-    const totalForeign = subtotalForeign + taxForeign
-    const totalBase = subtotalBase + taxBase
     const [accountingSettings, supplierData] = await Promise.all([
       getAccountingSettings(),
       db.purchaseOrder.findUnique({
@@ -2549,41 +2489,41 @@ export async function createInvoice(
       }),
     ])
     const fallbackTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
-    const taxTypeByLine = new Map(
-      po.lines.map((r) => [r.id, r.taxRate?.accountingTaxType ?? undefined]),
-    )
-    const productPayloadLines = productInputs.map((l) => ({
-      description: `PO ${po.reference} line`,
-      quantity: l.qtyBilled,
-      unitAmount: Math.round(l.unitCostForeign * 10000) / 10000,
-      accountCode: accountingSettings.transitAccount,
-      taxType: taxTypeByLine.get(l.poLineId) ?? fallbackTaxType,
-    }))
-    const costPayloadLines = costInputs.map((l) => {
-      const costLine = costLineById.get(l.costLineId)!
-      return {
-        description: l.description || costLine.description,
-        quantity: 1,
-        unitAmount: Math.round(l.amountForeign * 10000) / 10000,
-        accountCode: accountingSettings.transitAccount,
-        taxType: costLine.vatable ? fallbackTaxType : undefined,
-      }
+    const invoiceCalculation = calculatePurchaseInvoice({
+      lines: [
+        ...productInputs.map((l): PurchaseInvoiceInputLine => ({
+          kind: 'product',
+          poLineId: l.poLineId,
+          qtyBilled: l.qtyBilled,
+          unitCostForeign: l.unitCostForeign,
+        })),
+        ...costInputs.map((l): PurchaseInvoiceInputLine => ({
+          kind: 'cost',
+          costLineId: l.costLineId,
+          description: l.description,
+          amountForeign: l.amountForeign,
+        })),
+      ],
+      fxRateToBase: fxRate,
+      poReference: po.reference,
+      poSubtotalForeign: Number(po.subtotalForeign),
+      poTaxForeign: Number(po.taxForeign),
+      transitAccount: accountingSettings.transitAccount,
+      fallbackTaxType,
+      poLineById,
+      costLineById,
     })
-    const accountingPayload = {
-      invoiceNumber: po.reference,
-      contactName: supplierData?.supplier?.name ?? 'Unknown Supplier',
+    const accountingPayload = buildPurchaseInvoiceAccountingPayload({
+      poReference: po.reference,
+      contactName: supplierData?.supplier?.name,
       date: input.invoiceDate,
-      dueDate: input.dueDate ?? undefined,
+      dueDate: input.dueDate,
       currency: supplierData?.currency ?? baseCurrency,
-      // Stamp IMS's FX rate so Xero/QB don't apply their own daily rate.
-      currencyRateToBase: Number(fxRate) || undefined,
-      reference: input.invoiceNumber ?? undefined,
-      // Bills always debit transit first. For landed-cost changes that arrive
-      // after receipt, the recalculation path posts a separate reclass from
-      // transit into inventory/COGS for the delta on already-received stock.
-      lines: [...productPayloadLines, ...costPayloadLines],
-      supplierInvoicePath: input.supplierInvoiceUrl ?? undefined,
-    }
+      fxRateToBase: fxRate,
+      reference: input.invoiceNumber,
+      lines: invoiceCalculation.accountingLines,
+      supplierInvoicePath: input.supplierInvoiceUrl,
+    })
 
     await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
@@ -2594,33 +2534,12 @@ export async function createInvoice(
         where: { invoice: { poId } },
         select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
       })
-      const alreadyProductByLine = new Map<string, number>()
-      const alreadyCostByLine = new Map<string, number>()
-      for (const el of existing) {
-        if (el.poLineId) {
-          alreadyProductByLine.set(el.poLineId, (alreadyProductByLine.get(el.poLineId) ?? 0) + Number(el.qtyBilled))
-        }
-        if (el.costLineId) {
-          alreadyCostByLine.set(el.costLineId, (alreadyCostByLine.get(el.costLineId) ?? 0) + Number(el.totalForeign))
-        }
-      }
-
-      for (const l of productInputs) {
-        const poLine = poLineById.get(l.poLineId)
-        if (!poLine) throw new Error(`Unknown PO line ${l.poLineId}`)
-        const already = alreadyProductByLine.get(l.poLineId) ?? 0
-        if (already + l.qtyBilled > Number(poLine.qty) + 1e-6) {
-          throw new Error(`Line ${poLine.product.sku} exceeds remaining qty`)
-        }
-      }
-      for (const l of costInputs) {
-        const costLine = costLineById.get(l.costLineId)
-        if (!costLine) throw new Error(`Unknown cost line ${l.costLineId}`)
-        const already = alreadyCostByLine.get(l.costLineId) ?? 0
-        if (already + l.amountForeign > Number(costLine.amountForeign) + 1e-4) {
-          throw new Error(`Cost line "${costLine.description}" exceeds remaining amount`)
-        }
-      }
+      validatePurchaseInvoiceLineLimits({
+        lineData: invoiceCalculation.lineData,
+        alreadyBilledLines: existing,
+        poLineById,
+        costLineById,
+      })
 
       await tx.purchaseInvoice.create({
         data: {
@@ -2628,16 +2547,26 @@ export async function createInvoice(
           invoiceNumber: input.invoiceNumber || null,
           invoiceDate,
           dueDate: input.dueDate ? new Date(input.dueDate) : null,
-          subtotalForeign,
-          subtotalBase,
-          taxForeign,
-          taxBase,
-          totalForeign,
-          totalBase,
+          subtotalForeign: invoiceCalculation.subtotalForeign,
+          subtotalBase: invoiceCalculation.subtotalBase,
+          taxForeign: invoiceCalculation.taxForeign,
+          taxBase: invoiceCalculation.taxBase,
+          totalForeign: invoiceCalculation.totalForeign,
+          totalBase: invoiceCalculation.totalBase,
           fxRateToBase: fxRate,
           notes: input.notes || null,
           supplierInvoiceUrl: input.supplierInvoiceUrl || null,
-          lines: { create: lineData },
+          lines: {
+            create: invoiceCalculation.lineData.map((line) => ({
+              poLineId: line.poLineId,
+              costLineId: line.costLineId,
+              description: line.description,
+              qtyBilled: line.qtyBilled,
+              unitCostForeign: line.unitCostForeign,
+              totalForeign: line.totalForeign,
+              totalBase: line.totalBase,
+            })),
+          },
         },
       })
 
@@ -2796,96 +2725,52 @@ export async function updateInvoice(
     const poLineById = new Map(invoice.po.lines.map((line) => [line.id, line]))
     const costLineById = new Map(invoice.po.freightCostLines.map((line) => [line.id, line]))
     const fallbackTaxType = invoice.po.supplier.taxRate?.accountingTaxType ?? undefined
-    const taxTypeByLine = new Map(invoice.po.lines.map((line) => [line.id, line.taxRate?.accountingTaxType ?? undefined]))
-
-    let subtotalForeign = 0
-    let subtotalBase = 0
-    let taxBaseForeign = 0
-    const lineUpdates: Array<{
-      id: string
-      poLineId: string | null
-      costLineId: string | null
-      description: string | null
-      qtyBilled: number
-      unitCostForeign: number
-      totalForeign: number
-      totalBase: number
-    }> = []
-    const productPayloadLines: Array<{ description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }> = []
-    const costPayloadLines: Array<{ description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }> = []
     const accountingSettings = await getAccountingSettings()
-
+    const invoiceInputLines: PurchaseInvoiceInputLine[] = []
     for (const existingLine of invoice.lines) {
       const lineInput = lineInputById.get(existingLine.id)!
       if (existingLine.poLineId) {
         const poLine = poLineById.get(existingLine.poLineId)
         if (!poLine) return { success: false, error: `Unknown PO line ${existingLine.poLineId}` }
-        const qtyBilled = Number(lineInput.qtyBilled ?? existingLine.qtyBilled)
-        const unitCostForeign = Number(lineInput.unitCostForeign ?? existingLine.unitCostForeign)
-        if (!Number.isFinite(qtyBilled) || qtyBilled <= 0) return { success: false, error: `Invalid quantity for ${poLine.product.sku}` }
-        if (!Number.isFinite(unitCostForeign) || unitCostForeign < 0) return { success: false, error: `Invalid unit cost for ${poLine.product.sku}` }
-        const totalForeign = rounded4(qtyBilled * unitCostForeign)
-        const totalBase = rounded4(totalForeign / fxRate)
-        subtotalForeign += totalForeign
-        subtotalBase += totalBase
-        taxBaseForeign += totalForeign
-        lineUpdates.push({
+        invoiceInputLines.push({
+          kind: 'product',
           id: existingLine.id,
           poLineId: existingLine.poLineId,
-          costLineId: null,
-          description: null,
-          qtyBilled,
-          unitCostForeign,
-          totalForeign,
-          totalBase,
-        })
-        productPayloadLines.push({
-          description: `PO ${invoice.po.reference} line`,
-          quantity: qtyBilled,
-          unitAmount: rounded4(unitCostForeign),
-          accountCode: accountingSettings.transitAccount,
-          taxType: taxTypeByLine.get(existingLine.poLineId) ?? fallbackTaxType,
+          qtyBilled: Number(lineInput.qtyBilled ?? existingLine.qtyBilled),
+          unitCostForeign: Number(lineInput.unitCostForeign ?? existingLine.unitCostForeign),
         })
       } else if (existingLine.costLineId) {
         const costLine = costLineById.get(existingLine.costLineId)
         if (!costLine) return { success: false, error: `Unknown cost line ${existingLine.costLineId}` }
-        const amountForeign = Number(lineInput.amountForeign ?? lineInput.unitCostForeign ?? existingLine.totalForeign)
-        const description = optionalText(lineInput.description ?? existingLine.description ?? costLine.description) ?? costLine.description
-        if (!Number.isFinite(amountForeign) || amountForeign <= 0) return { success: false, error: `Invalid amount for ${costLine.description}` }
-        const totalForeign = rounded4(amountForeign)
-        const totalBase = rounded4(totalForeign / fxRate)
-        subtotalForeign += totalForeign
-        subtotalBase += totalBase
-        if (costLine.vatable) taxBaseForeign += totalForeign
-        lineUpdates.push({
+        invoiceInputLines.push({
+          kind: 'cost',
           id: existingLine.id,
-          poLineId: null,
           costLineId: existingLine.costLineId,
-          description,
-          qtyBilled: 1,
-          unitCostForeign: totalForeign,
-          totalForeign,
-          totalBase,
-        })
-        costPayloadLines.push({
-          description,
-          quantity: 1,
-          unitAmount: totalForeign,
-          accountCode: accountingSettings.transitAccount,
-          taxType: costLine.vatable ? fallbackTaxType : undefined,
+          description: optionalText(lineInput.description ?? existingLine.description ?? costLine.description) ?? costLine.description,
+          amountForeign: Number(lineInput.amountForeign ?? lineInput.unitCostForeign ?? existingLine.totalForeign),
         })
       } else {
         return { success: false, error: `Bill line ${existingLine.id} is not linked to a PO or cost line` }
       }
     }
 
-    const poSubtotal = Number(invoice.po.subtotalForeign)
-    const poTax = Number(invoice.po.taxForeign)
-    const taxRate = poSubtotal > 0 ? poTax / poSubtotal : 0
-    const taxForeign = rounded4(taxBaseForeign * taxRate)
-    const taxBase = rounded4(taxForeign / fxRate)
-    const totalForeign = rounded4(subtotalForeign + taxForeign)
-    const totalBase = rounded4(subtotalBase + taxBase)
+    let invoiceCalculation
+    try {
+      invoiceCalculation = calculatePurchaseInvoice({
+        lines: invoiceInputLines,
+        fxRateToBase: fxRate,
+        poReference: invoice.po.reference,
+        poSubtotalForeign: Number(invoice.po.subtotalForeign),
+        poTaxForeign: Number(invoice.po.taxForeign),
+        transitAccount: accountingSettings.transitAccount,
+        fallbackTaxType,
+        poLineById,
+        costLineById,
+      })
+    } catch (error) {
+      return { success: false, error: String(error instanceof Error ? error.message : error) }
+    }
+    const lineUpdates = invoiceCalculation.lineData
 
     const normalizedHeader = {
       invoiceNumber: optionalText(input.invoiceNumber),
@@ -2908,13 +2793,7 @@ export async function updateInvoice(
       unitCostForeign: Number(line.unitCostForeign),
       totalForeign: Number(line.totalForeign),
     })).sort((a, b) => a.id.localeCompare(b.id))
-    const nextLines = lineUpdates.map((line) => ({
-      id: line.id,
-      description: optionalText(line.description),
-      qtyBilled: line.qtyBilled,
-      unitCostForeign: line.unitCostForeign,
-      totalForeign: line.totalForeign,
-    })).sort((a, b) => a.id.localeCompare(b.id))
+    const nextLines = lineUpdates.map((line) => purchaseInvoiceLineChangeSnapshot(line)).sort((a, b) => a.id.localeCompare(b.id))
     const hasChanges = hasPurchaseInvoiceEditChanges({
       existingHeader,
       nextHeader: normalizedHeader,
@@ -2925,18 +2804,18 @@ export async function updateInvoice(
       return { success: true, notice: 'No bill changes to save' }
     }
 
-    const accountingPayload = {
-      accountingInvoiceId: invoice.accountingInvoiceId ?? undefined,
-      invoiceNumber: invoice.po.reference,
-      contactName: invoice.po.supplier.name ?? 'Unknown Supplier',
+    const accountingPayload = buildPurchaseInvoiceAccountingPayload({
+      accountingInvoiceId: invoice.accountingInvoiceId,
+      poReference: invoice.po.reference,
+      contactName: invoice.po.supplier.name,
       date: input.invoiceDate,
-      dueDate: input.dueDate ?? undefined,
+      dueDate: input.dueDate,
       currency: invoice.po.currency ?? baseCurrency,
-      currencyRateToBase: Number(fxRate) || undefined,
-      reference: normalizedHeader.invoiceNumber ?? undefined,
-      lines: [...productPayloadLines, ...costPayloadLines],
-      supplierInvoicePath: normalizedHeader.supplierInvoiceUrl ?? undefined,
-    }
+      fxRateToBase: fxRate,
+      reference: normalizedHeader.invoiceNumber,
+      lines: invoiceCalculation.accountingLines,
+      supplierInvoicePath: normalizedHeader.supplierInvoiceUrl,
+    })
     const idempotencyKey = invoice.accountingInvoiceId
       ? buildPurchaseInvoiceUpdateIdempotencyKey({
           invoiceId: invoice.id,
@@ -2963,34 +2842,12 @@ export async function updateInvoice(
         where: { invoice: { poId: invoice.poId, id: { not: invoice.id } } },
         select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
       })
-      const alreadyProductByLine = new Map<string, number>()
-      const alreadyCostByLine = new Map<string, number>()
-      for (const otherLine of otherLines) {
-        if (otherLine.poLineId) {
-          alreadyProductByLine.set(otherLine.poLineId, (alreadyProductByLine.get(otherLine.poLineId) ?? 0) + Number(otherLine.qtyBilled))
-        }
-        if (otherLine.costLineId) {
-          alreadyCostByLine.set(otherLine.costLineId, (alreadyCostByLine.get(otherLine.costLineId) ?? 0) + Number(otherLine.totalForeign))
-        }
-      }
-      for (const line of lineUpdates) {
-        if (line.poLineId) {
-          const poLine = poLineById.get(line.poLineId)
-          if (!poLine) throw new Error(`Unknown PO line ${line.poLineId}`)
-          const already = alreadyProductByLine.get(line.poLineId) ?? 0
-          if (already + line.qtyBilled > Number(poLine.qty) + 1e-6) {
-            throw new Error(`Line ${poLine.product.sku} exceeds remaining qty`)
-          }
-        }
-        if (line.costLineId) {
-          const costLine = costLineById.get(line.costLineId)
-          if (!costLine) throw new Error(`Unknown cost line ${line.costLineId}`)
-          const already = alreadyCostByLine.get(line.costLineId) ?? 0
-          if (already + line.totalForeign > Number(costLine.amountForeign) + 1e-4) {
-            throw new Error(`Cost line "${costLine.description}" exceeds remaining amount`)
-          }
-        }
-      }
+      validatePurchaseInvoiceLineLimits({
+        lineData: lineUpdates,
+        alreadyBilledLines: otherLines,
+        poLineById,
+        costLineById,
+      })
 
       await tx.purchaseInvoice.update({
         where: { id: invoice.id },
@@ -2998,17 +2855,20 @@ export async function updateInvoice(
           invoiceNumber: normalizedHeader.invoiceNumber,
           invoiceDate,
           dueDate,
-          subtotalForeign,
-          subtotalBase,
-          taxForeign,
-          taxBase,
-          totalForeign,
-          totalBase,
+          subtotalForeign: invoiceCalculation.subtotalForeign,
+          subtotalBase: invoiceCalculation.subtotalBase,
+          taxForeign: invoiceCalculation.taxForeign,
+          taxBase: invoiceCalculation.taxBase,
+          totalForeign: invoiceCalculation.totalForeign,
+          totalBase: invoiceCalculation.totalBase,
           notes: normalizedHeader.notes,
           supplierInvoiceUrl: normalizedHeader.supplierInvoiceUrl,
         },
       })
+      // Interactive Prisma transactions run on one connection; keep these
+      // small line updates sequential so errors surface at the exact row.
       for (const line of lineUpdates) {
+        if (!line.id) throw new Error('Bill line update is missing an id')
         await tx.purchaseInvoiceLine.update({
           where: { id: line.id },
           data: {
@@ -3021,39 +2881,21 @@ export async function updateInvoice(
         })
       }
 
-      if (invoice.accountingInvoiceId && accountingSettings.syncEnabled && idempotencyKey) {
-        const connector = await getActiveAccountingConnectorInfo()
-        if (connector?.id === 'xero') {
-          if (await isAccountingSyncTypeEnabled('PURCHASE_INVOICE_UPDATE')) {
-            await queueAccountingSyncTx(tx, {
-              type: 'PURCHASE_INVOICE_UPDATE',
-              referenceType: 'PurchaseOrder',
-              referenceId: invoice.poId,
-              payload: accountingPayload,
-              idempotencyKey,
-            })
-          }
-        } else {
-          await tx.activityLog.create({
-            data: {
-              entityType: 'PURCHASE_ORDER',
-              entityId: invoice.poId,
-              action: 'purchase_invoice_update_skipped_unsupported_connector',
-              tag: 'accounting',
-              level: 'WARNING',
-              description: connector
-                ? `Purchase bill update for ${invoice.po.reference} was not queued because ${connector.name} bill updates are not supported yet`
-                : `Purchase bill update for ${invoice.po.reference} was not queued because no accounting connector is active`,
-              metadata: {
-                invoiceId: invoice.id,
-                accountingInvoiceId: invoice.accountingInvoiceId,
-                connector: connector?.id ?? null,
-                idempotencyKey,
-              },
-            },
-          })
-        }
-      }
+      await maybeQueuePurchaseInvoiceUpdate({
+        tx,
+        syncEnabled: accountingSettings.syncEnabled,
+        invoiceId: invoice.id,
+        poId: invoice.poId,
+        poReference: invoice.po.reference,
+        accountingInvoiceId: invoice.accountingInvoiceId,
+        accountingPayload,
+        idempotencyKey,
+        deps: {
+          getActiveAccountingConnectorInfo,
+          isAccountingSyncTypeEnabled,
+          queueAccountingSyncTx,
+        },
+      })
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
