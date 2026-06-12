@@ -55,6 +55,7 @@ const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
   UNREALISED_FX_JOURNAL: 'xero_sync_unrealised_fx_journal',
   MANUFACTURING_JOURNAL: 'xero_sync_manufacturing_journal',
   MANUFACTURING_RECLASS: 'xero_sync_manufacturing_journal',
+  TAX_RATE_SYNC: 'xero_sync_tax_rate',
 }
 
 const QUICKBOOKS_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {

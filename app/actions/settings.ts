@@ -8,6 +8,7 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
+import { maybeQueueTaxRateSync } from '@/lib/accounting/tax-rate-sync-trigger'
 import {
   effectiveTaxRateFromComponents,
   normalizeTaxRateComponents,
@@ -233,7 +234,7 @@ export async function createTaxRate(input: {
   try {
     const components = normalizeTaxRateComponents(input.components)
     const effectiveRate = effectiveTaxRateFromComponents(components) ?? input.rate
-    await db.taxRate.create({
+    const created = await db.taxRate.create({
       data: {
         name: input.name,
         rate: effectiveRate,
@@ -255,8 +256,34 @@ export async function createTaxRate(input: {
           })),
         } : undefined,
       },
+      select: {
+        id: true,
+        name: true,
+        accountingTaxType: true,
+        components: {
+          select: {
+            name: true,
+            rate: true,
+            compoundOnPrevious: true,
+            accountingTaxType: true,
+            active: true,
+          },
+        },
+      },
     })
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
+    await maybeQueueTaxRateSync({
+      id: created.id,
+      name: created.name,
+      accountingTaxType: created.accountingTaxType,
+      components: created.components.map((component) => ({
+        name: component.name,
+        rate: Number(component.rate),
+        compoundOnPrevious: component.compoundOnPrevious,
+        accountingTaxType: component.accountingTaxType,
+        active: component.active,
+      })),
+    })
     revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
@@ -336,6 +363,37 @@ export async function updateTaxRate(id: string, input: {
       description: `Updated tax rate: ${input.name ?? id}`,
       metadata: summary,
     })
+    const refreshed = await db.taxRate.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        name: true,
+        accountingTaxType: true,
+        components: {
+          select: {
+            name: true,
+            rate: true,
+            compoundOnPrevious: true,
+            accountingTaxType: true,
+            active: true,
+          },
+        },
+      },
+    })
+    if (refreshed) {
+      await maybeQueueTaxRateSync({
+        id: refreshed.id,
+        name: refreshed.name,
+        accountingTaxType: refreshed.accountingTaxType,
+        components: refreshed.components.map((component) => ({
+          name: component.name,
+          rate: Number(component.rate),
+          compoundOnPrevious: component.compoundOnPrevious,
+          accountingTaxType: component.accountingTaxType,
+          active: component.active,
+        })),
+      })
+    }
     revalidatePath('/settings', 'layout')
     revalidatePath('/sales')
     revalidatePath('/purchase-orders')

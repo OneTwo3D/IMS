@@ -20,6 +20,7 @@ export type XeroSettings = {
   xero_sync_realised_fx_journal: string
   xero_sync_unrealised_fx_journal: string
   xero_sync_manufacturing_journal: string
+  xero_sync_tax_rate: string
   xero_sync_attach_pdf: string
   xero_sales_account: string
   xero_shipping_account: string
@@ -45,6 +46,7 @@ export const XERO_SETTING_KEYS = [
   'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_stock_allocation',
   'xero_sync_realised_fx_journal', 'xero_sync_unrealised_fx_journal',
   'xero_sync_manufacturing_journal',
+  'xero_sync_tax_rate',
   'xero_sync_attach_pdf',
   'xero_sales_account', 'xero_shipping_account', 'xero_discount_account',
   'xero_cogs_account', 'xero_inventory_account', 'xero_allocated_inventory_account',
@@ -71,6 +73,7 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_sync_realised_fx_journal: 'submitted',
   xero_sync_unrealised_fx_journal: 'submitted',
   xero_sync_manufacturing_journal: 'submitted',
+  xero_sync_tax_rate: 'submitted',
   xero_sync_attach_pdf: 'true',
   xero_sales_account: '',
   xero_shipping_account: '',

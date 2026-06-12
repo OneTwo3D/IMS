@@ -1194,6 +1194,23 @@ async function processEntry(
       }, resolveJournalStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(idempotencySource, 'manual-journal') }).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
     }
 
+    case 'TAX_RATE_SYNC': {
+      const { putXeroTaxRate } = await import('./tax-rates')
+      const name = payload.name as string | undefined
+      const components = payload.components as Array<{ name: string; rate: number; compoundOnPrevious: boolean; accountingTaxType?: string | null }> | undefined
+      if (!name || !components || components.length === 0) {
+        return { success: false, error: 'TAX_RATE_SYNC payload missing name or components' }
+      }
+      const idempotencyKey = buildXeroIdempotencyKey(entryId, 'tax-rate', payload)
+      const result = await putXeroTaxRate({
+        name,
+        reportTaxType: payload.reportTaxType as string | null | undefined,
+        components,
+        status: (payload.status as 'ACTIVE' | 'ARCHIVED' | undefined) ?? 'ACTIVE',
+      }, { idempotencyKey })
+      return { success: result.success, externalId: result.taxType, error: result.error }
+    }
+
     default:
       return { success: false, error: `Unknown sync type: ${type}` }
   }

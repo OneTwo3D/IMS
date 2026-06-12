@@ -164,6 +164,7 @@ enum AccountingSyncType {
   UNREALISED_FX_JOURNAL
   MANUFACTURING_JOURNAL
   MANUFACTURING_RECLASS
+  TAX_RATE_SYNC
 
   @@map("AccountingSyncType")
 }
