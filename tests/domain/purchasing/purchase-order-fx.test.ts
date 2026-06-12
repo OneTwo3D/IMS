@@ -8,6 +8,8 @@ import {
 import {
   buildPurchaseOrderFxRebaseUpdates,
   rebasePurchaseOrderStoredBaseAmounts,
+  rebasePurchaseOrderStoredBaseAmountsWithParentUpdate,
+  type PurchaseOrderFxRebaseTransactionDb,
 } from '@/lib/domain/purchasing/purchase-order-fx-rebase'
 
 function createClient(rate: number | null) {
@@ -177,4 +179,212 @@ test('purchase-order FX rebase updates persisted line and freight base amounts',
       data: { amountBase: 10 },
     },
   ])
+})
+
+type RebaseTestState = {
+  purchaseOrder: {
+    currency: string
+    fxRateToBase: number
+    subtotalBase: number
+    taxBase: number
+    totalBase: number
+    directFreightBase: number
+  }
+  lines: Array<{
+    id: string
+    unitCostForeign: string
+    totalForeign: string
+    taxForeign: string
+    unitCostBase: number
+    totalBase: number
+    taxBase: number
+  }>
+  freightCostLines: Array<{
+    id: string
+    amountForeign: string
+    amountBase: number
+  }>
+}
+
+function cloneRebaseState(state: RebaseTestState): RebaseTestState {
+  return {
+    purchaseOrder: { ...state.purchaseOrder },
+    lines: state.lines.map((line) => ({ ...line })),
+    freightCostLines: state.freightCostLines.map((line) => ({ ...line })),
+  }
+}
+
+function createTransactionalRebaseDb(
+  state: RebaseTestState,
+  options: { throwOnParentUpdate?: boolean } = {},
+) {
+  return {
+    $transaction: async <T>(fn: (tx: PurchaseOrderFxRebaseTransactionDb<RebaseTestState['purchaseOrder']>) => Promise<T>) => {
+      const txState = cloneRebaseState(state)
+      const tx: PurchaseOrderFxRebaseTransactionDb<RebaseTestState['purchaseOrder']> = {
+        purchaseOrderLine: {
+          findMany: async () => txState.lines.map((line) => ({
+            id: line.id,
+            unitCostForeign: line.unitCostForeign,
+            totalForeign: line.totalForeign,
+            taxForeign: line.taxForeign,
+          })),
+          update: async ({ where, data }) => {
+            const line = txState.lines.find((candidate) => candidate.id === where.id)
+            assert.ok(line)
+            Object.assign(line, data)
+            return {}
+          },
+        },
+        freightCostLine: {
+          findMany: async () => txState.freightCostLines.map((line) => ({
+            id: line.id,
+            amountForeign: line.amountForeign,
+          })),
+          update: async ({ where, data }) => {
+            const line = txState.freightCostLines.find((candidate) => candidate.id === where.id)
+            assert.ok(line)
+            Object.assign(line, data)
+            return {}
+          },
+        },
+        purchaseOrder: {
+          update: async ({ data }) => {
+            if (options.throwOnParentUpdate) {
+              throw new Error('parent update failed')
+            }
+            Object.assign(txState.purchaseOrder, data)
+            return txState.purchaseOrder
+          },
+        },
+      }
+
+      const result = await fn(tx)
+      Object.assign(state.purchaseOrder, txState.purchaseOrder)
+      state.lines = txState.lines
+      state.freightCostLines = txState.freightCostLines
+      return result
+    },
+  }
+}
+
+test('purchase-order FX rebase commits child and parent base updates in one transaction', async () => {
+  const state: RebaseTestState = {
+    purchaseOrder: {
+      currency: 'GBP',
+      fxRateToBase: 1,
+      subtotalBase: 120,
+      taxBase: 24,
+      totalBase: 156,
+      directFreightBase: 12,
+    },
+    lines: [
+      {
+        id: 'line-1',
+        unitCostForeign: '10',
+        totalForeign: '100',
+        taxForeign: '20',
+        unitCostBase: 10,
+        totalBase: 100,
+        taxBase: 20,
+      },
+    ],
+    freightCostLines: [
+      { id: 'freight-1', amountForeign: '12', amountBase: 12 },
+    ],
+  }
+
+  const po = await rebasePurchaseOrderStoredBaseAmountsWithParentUpdate(
+    createTransactionalRebaseDb(state),
+    'po-1',
+    {
+      subtotalForeign: '120',
+      taxForeign: '24',
+      totalForeign: '156',
+      directFreightForeign: '12',
+    },
+    1.2,
+    { data: { currency: 'EUR', fxRateToBase: 1.2 } },
+  )
+
+  assert.deepEqual(po, {
+    currency: 'EUR',
+    fxRateToBase: 1.2,
+    subtotalBase: 100,
+    taxBase: 20,
+    totalBase: 130,
+    directFreightBase: 10,
+  })
+  assert.equal(state.lines[0]?.unitCostBase, 8.333333)
+  assert.equal(state.lines[0]?.totalBase, 83.3333)
+  assert.equal(state.lines[0]?.taxBase, 16.6667)
+  assert.equal(state.freightCostLines[0]?.amountBase, 10)
+})
+
+test('purchase-order FX rebase rolls back child base updates when parent update fails', async () => {
+  const state: RebaseTestState = {
+    purchaseOrder: {
+      currency: 'GBP',
+      fxRateToBase: 1,
+      subtotalBase: 120,
+      taxBase: 24,
+      totalBase: 156,
+      directFreightBase: 12,
+    },
+    lines: [
+      {
+        id: 'line-1',
+        unitCostForeign: '10',
+        totalForeign: '100',
+        taxForeign: '20',
+        unitCostBase: 10,
+        totalBase: 100,
+        taxBase: 20,
+      },
+    ],
+    freightCostLines: [
+      { id: 'freight-1', amountForeign: '12', amountBase: 12 },
+    ],
+  }
+
+  await assert.rejects(
+    () => rebasePurchaseOrderStoredBaseAmountsWithParentUpdate(
+      createTransactionalRebaseDb(state, { throwOnParentUpdate: true }),
+      'po-1',
+      {
+        subtotalForeign: '120',
+        taxForeign: '24',
+        totalForeign: '156',
+        directFreightForeign: '12',
+      },
+      1.2,
+      { data: { currency: 'EUR', fxRateToBase: 1.2 } },
+    ),
+    /parent update failed/,
+  )
+
+  assert.deepEqual(state, {
+    purchaseOrder: {
+      currency: 'GBP',
+      fxRateToBase: 1,
+      subtotalBase: 120,
+      taxBase: 24,
+      totalBase: 156,
+      directFreightBase: 12,
+    },
+    lines: [
+      {
+        id: 'line-1',
+        unitCostForeign: '10',
+        totalForeign: '100',
+        taxForeign: '20',
+        unitCostBase: 10,
+        totalBase: 100,
+        taxBase: 20,
+      },
+    ],
+    freightCostLines: [
+      { id: 'freight-1', amountForeign: '12', amountBase: 12 },
+    ],
+  })
 })
