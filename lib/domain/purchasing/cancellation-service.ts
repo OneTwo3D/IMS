@@ -289,14 +289,18 @@ export async function cancelPurchaseOrderService(
       : landedCostRecalc
         ? 'Reverted landed-cost uplift on linked PO(s).'
         : undefined
+    const reversalNotice = cancellation.reversal.reversedLayers.length > 0
+      ? `Cancelled PO and reversed ${cancellation.reversal.reversedLayers.length} remaining receipt cost layer(s).`
+      : undefined
+    // Combine both notices: a freight PO normally has no goods layers, but if it
+    // somehow does, neither notice should be silently dropped.
+    const notice = [reversalNotice, landedNotice].filter(Boolean).join(' ') || undefined
     return {
       success: true,
       reversedCostLayers: cancellation.reversal.reversedLayers,
       consumedCost,
       ...(landedCostRecalc ? { landedCostRecalc } : {}),
-      notice: cancellation.reversal.reversedLayers.length > 0
-        ? `Cancelled PO and reversed ${cancellation.reversal.reversedLayers.length} remaining receipt cost layer(s).`
-        : landedNotice,
+      notice,
     }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)

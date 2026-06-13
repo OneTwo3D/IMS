@@ -522,7 +522,7 @@ export async function recalculateLandedCosts(
     })
     if (!primaryPo) continue
     if (primaryPo.status === 'CLOSED') {
-      throw new Error(`Cannot recalculate landed costs for ${primaryPoId}: purchase order is in a locked status`)
+      throw new Error(`Cannot recalculate landed costs for ${primaryPo.reference}: linked purchase order is in a locked status`)
     }
     const beforeJson = revaluationBeforeJson(primaryPo)
 
@@ -753,9 +753,12 @@ export async function recalculateLandedCosts(
       })
     }
 
+    // audit-C3: when this recalc reverts a cancelled freight PO's uplift, its
+    // cost is no longer applied to the primary — mark the link unallocated.
+    const linkAllocated = options.reason !== 'freight_purchase_order_cancelled'
     await tx.landedCostLink.updateMany({
       where: { primaryPoId, freightPoId },
-      data: { allocated: true },
+      data: { allocated: linkAllocated },
     })
 
     // Audit row writes inside the transaction so an audit failure aborts the
