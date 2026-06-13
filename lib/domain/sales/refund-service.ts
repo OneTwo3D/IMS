@@ -14,6 +14,7 @@ import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/d
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
+import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import {
   isStockMovementIdempotencyConflict,
   refundInboundMovementKey,
@@ -1342,7 +1343,10 @@ export async function createSalesOrderRefund(
       select: { totalBase: true },
     })
     const previouslyRefunded = existingRefunds.reduce((sum, refund) => sum + refundBoundaryNumber(refund.totalBase), 0)
-    if (totalBase + previouslyRefunded > refundBoundaryNumber(so.totalBase) * 1.001) {
+    // audit-M-o2c: cumulative refunded must not exceed the order total, with a
+    // fixed rounding epsilon (not a 0.1% relative slack, which on a large order
+    // is pounds of headroom) so N partial refunds can't creep over.
+    if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, refundBoundaryNumber(so.totalBase))) {
       return { error: 'Refund total would exceed order total' } as const
     }
 

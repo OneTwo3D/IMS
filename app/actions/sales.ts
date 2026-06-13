@@ -47,6 +47,7 @@ import {
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
+import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
   cancelSalesOrderFulfillmentState,
   updateSalesOrderStatusUnderLock,
@@ -1245,12 +1246,19 @@ export async function applySalesOrderStatusTransition(
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
+        archived: true,
         shipFromWarehouseId: true,
         shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
         lines: { select: { id: true, productId: true, sku: true, qty: true } },
       },
     })
     if (!so) return { success: false, error: 'Order not found' }
+    // audit-M-o2c: an archived order is filed away — block status edits. The
+    // internalBypassToken (WooCommerce force-sync) keeps its escape-hatch
+    // semantics; manual and sessionless-cron callers are rejected.
+    if (so.archived && !bypassPermission) {
+      return { success: false, error: 'This order is archived; unarchive it before changing its status.' }
+    }
 
     const transition = validateManualSalesOrderStatusTransition(so.status, targetStatus, {
       bypass: bypassPermission,
@@ -2390,6 +2398,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
           externalOrderNumber: true,
           currency: true,
           totalForeign: true,
+          status: true,
         },
       })
       if (!so) return { error: 'Order not found' }
@@ -2401,6 +2410,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
         return { error: 'Payment not found for this order' }
       }
       await tx.payment.delete({ where: { id: paymentId } })
+      let becameUnpaid = false
       if (!payment.refundId) {
         const remainingPayments = await tx.payment.findMany({
           where: { orderId, refundId: null },
@@ -2410,12 +2420,14 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
           if (p.currency !== so.currency) return sum
           return sum + Number(p.amount)
         }, 0)
+        const stillFullyPaid = totalPaid >= Number(so.totalForeign) - 0.0001
+        becameUnpaid = !stillFullyPaid
         await tx.salesOrder.update({
           where: { id: orderId },
-          data: { paidAt: totalPaid >= Number(so.totalForeign) - 0.0001 ? undefined : null },
+          data: { paidAt: stillFullyPaid ? undefined : null },
         })
       }
-      return { so, payment: { refundId: payment.refundId, amount: Number(payment.amount), currency: payment.currency } }
+      return { so, becameUnpaid, payment: { refundId: payment.refundId, amount: Number(payment.amount), currency: payment.currency } }
     }, STOCK_TX_OPTIONS)
     if ('error' in txResult) return { success: false, error: txResult.error }
     if (!txResult.payment.refundId) {
@@ -2461,6 +2473,20 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       description: `Deleted payment from order ${getSalesOrderReference(txResult.so)}`,
       metadata: { orderNumber: getSalesOrderReference(txResult.so), paymentId },
     })
+    // audit-M-o2c: deleting the last payment clears paidAt but does not revert
+    // status — flag the mismatch when the order has already advanced past
+    // payment (shipped/completed) so it doesn't sit silently unpaid-but-shipped.
+    if (isPaymentStatusMismatch(txResult.so.status, txResult.becameUnpaid)) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'payment_status_mismatch',
+        tag: 'sales',
+        level: 'WARNING',
+        description: `Order ${getSalesOrderReference(txResult.so)} is ${txResult.so.status} but is no longer fully paid after deleting a payment. Review whether the status should be reverted.`,
+        metadata: { orderNumber: getSalesOrderReference(txResult.so), status: txResult.so.status, paymentId },
+      })
+    }
     return { success: true }
   } catch (e) {
     await logActivity({

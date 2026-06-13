@@ -1007,6 +1007,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               </button>
             </span>
           )}
+          {/* audit-M-o2c: an order advanced past payment but no longer fully paid
+              (e.g. its last payment was deleted) — a status/payment mismatch. */}
+          {!so.paidAt && ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'].includes(so.status) && (
+            <span className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+              <AlertTriangle className="h-3 w-3" /> {STATUS_LABELS[so.status]} but not paid
+            </span>
+          )}
 
           {canRefund && (
             <Button type="button" variant="outline" size="sm" onClick={() => setShowRefund(true)} disabled={isPending}>
