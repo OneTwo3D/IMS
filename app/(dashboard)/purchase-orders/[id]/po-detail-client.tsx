@@ -2003,7 +2003,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
             <div className="space-y-2">
               <p className="font-medium">
-                Returned goods exceed what was billed back. {overBilling.totalOverBilledQty} unit(s) are billed but no longer kept —{' '}
+                Supplier bill exceeds goods kept after return. {overBilling.totalOverBilledQty} unit(s) are billed but were returned —{' '}
                 {formatMoney(Number(overBilling.totalOverBilledValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)} over-billed.
                 Raise a supplier credit to reduce the AP liability; IMS does not adjust the bill automatically.
               </p>
@@ -2016,7 +2016,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 ))}
               </ul>
               <p className="text-xs">
-                Bills: {overBilling.bills.map((b) => b.invoiceNumber ?? b.invoiceId).join(', ')}
+                Affected bills (gross total incl. tax): {overBilling.bills.map((b) => `${b.invoiceNumber ?? b.invoiceId} (${formatMoney(Number(b.totalBase), baseCurrency.symbol, baseCurrency.symbolPosition)})`).join(', ')}
               </p>
             </div>
           </div>

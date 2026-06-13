@@ -60,6 +60,36 @@ test('aggregates billed quantity across multiple bills for one line', () => {
   assert.equal(summary.bills.length, 2)
 })
 
+test('names only the bills that billed an over-billed line', () => {
+  const summary = computePurchaseOrderOverBilling({
+    lines: [
+      // line A: over-billed (billed 10 via inv-1, kept 0)
+      { id: 'pol-A', productId: 'pA', sku: 'A', qtyReceived: 10, qtyReturned: 10 },
+      // line B: correctly billed (billed 5 via inv-2, kept 5)
+      { id: 'pol-B', productId: 'pB', sku: 'B', qtyReceived: 5, qtyReturned: 0 },
+    ],
+    invoices: [
+      { id: 'inv-1', invoiceNumber: 'BILL-1', totalBase: 100, lines: [{ poLineId: 'pol-A', qtyBilled: 10, totalBase: 100 }] },
+      { id: 'inv-2', invoiceNumber: 'BILL-2', totalBase: 50, lines: [{ poLineId: 'pol-B', qtyBilled: 5, totalBase: 50 }] },
+    ],
+  })
+  assert.equal(summary.hasOverBilling, true)
+  // Only inv-1 contributed to an over-billed line; inv-2 must not be named.
+  assert.deepEqual(summary.bills.map((b) => b.invoiceNumber), ['BILL-1'])
+})
+
+test('clamps a corrupt qtyReturned > qtyReceived so it does not inflate over-billing', () => {
+  const summary = computePurchaseOrderOverBilling({
+    // billed 10, received 5 but qtyReturned 8 (corrupt) → netReceived clamps to 0, not -3
+    lines: [{ id: 'pol-1', productId: 'p1', sku: 'SKU-1', qtyReceived: 5, qtyReturned: 8 }],
+    invoices: [
+      { id: 'inv-1', invoiceNumber: 'BILL-1', totalBase: 100, lines: [{ poLineId: 'pol-1', qtyBilled: 10, totalBase: 100 }] },
+    ],
+  })
+  // over-billed = billed 10 − netReceived 0 = 10 (NOT 13)
+  assert.equal(summary.totalOverBilledQty, '10')
+})
+
 test('ignores freight/cost invoice lines with no poLineId', () => {
   const summary = computePurchaseOrderOverBilling({
     lines: [{ id: 'pol-1', productId: 'p1', sku: 'SKU-1', qtyReceived: 10, qtyReturned: 10 }],

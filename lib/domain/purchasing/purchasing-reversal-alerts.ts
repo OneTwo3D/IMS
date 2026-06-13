@@ -1,3 +1,4 @@
+import { Prisma } from '@/app/generated/prisma/client'
 import {
   addMoney,
   multiplyMoney,
@@ -72,14 +73,17 @@ export function computePurchaseOrderOverBilling(input: {
 }): PurchaseOrderOverBillingSummary {
   const hasInvoices = input.invoices.length > 0
 
-  // Sum billed quantity and value per PO line across every invoice line.
-  const billedByLine = new Map<string, { qty: ReturnType<typeof toDecimal>; valueBase: ReturnType<typeof toDecimal> }>()
+  // Sum billed quantity and value per PO line across every invoice line, and
+  // remember which invoices billed each line (so we can name only the bills that
+  // actually contributed to an over-billed line, not every bill on the PO).
+  const billedByLine = new Map<string, { qty: Prisma.Decimal; valueBase: Prisma.Decimal; invoiceIds: Set<string> }>()
   for (const invoice of input.invoices) {
     for (const line of invoice.lines) {
       if (!line.poLineId) continue
-      const existing = billedByLine.get(line.poLineId) ?? { qty: toDecimal(0), valueBase: toDecimal(0) }
+      const existing = billedByLine.get(line.poLineId) ?? { qty: toDecimal(0), valueBase: toDecimal(0), invoiceIds: new Set<string>() }
       existing.qty = addMoney(existing.qty, line.qtyBilled)
       existing.valueBase = addMoney(existing.valueBase, line.totalBase)
+      existing.invoiceIds.add(invoice.id)
       billedByLine.set(line.poLineId, existing)
     }
   }
@@ -87,13 +91,15 @@ export function computePurchaseOrderOverBilling(input: {
   let totalOverBilledQty = toDecimal(0)
   let totalOverBilledValueBase = toDecimal(0)
   const lines: PurchaseOrderOverBillingLine[] = []
+  const contributingInvoiceIds = new Set<string>()
 
   for (const poLine of input.lines) {
     const billed = billedByLine.get(poLine.id)
     if (!billed || billed.qty.lte(0)) continue
-    const netReceived = subtractMoney(poLine.qtyReceived, poLine.qtyReturned)
+    // Clamp to 0: a corrupt qtyReturned > qtyReceived must not inflate over-billing.
+    const netReceived = Prisma.Decimal.max(subtractMoney(poLine.qtyReceived, poLine.qtyReturned), toDecimal(0))
     const overBilledQty = subtractMoney(billed.qty, netReceived)
-    if (overBilledQty.lte(1e-6)) continue
+    if (overBilledQty.lte(0)) continue
 
     // Average billed unit cost for the line; guards against a zero qty divide.
     const avgUnitCostBase = billed.qty.gt(0) ? billed.valueBase.div(billed.qty) : toDecimal(0)
@@ -101,6 +107,7 @@ export function computePurchaseOrderOverBilling(input: {
 
     totalOverBilledQty = addMoney(totalOverBilledQty, overBilledQty)
     totalOverBilledValueBase = addMoney(totalOverBilledValueBase, overBilledValueBase)
+    for (const invoiceId of billed.invoiceIds) contributingInvoiceIds.add(invoiceId)
     lines.push({
       poLineId: poLine.id,
       productId: poLine.productId,
@@ -118,10 +125,14 @@ export function computePurchaseOrderOverBilling(input: {
     totalOverBilledQty: roundQuantity(totalOverBilledQty, 4).toString(),
     totalOverBilledValueBase: roundQuantity(totalOverBilledValueBase, 2).toString(),
     lines,
-    bills: input.invoices.map((invoice) => ({
-      invoiceId: invoice.id,
-      invoiceNumber: invoice.invoiceNumber,
-      totalBase: roundQuantity(toDecimal(invoice.totalBase), 2).toString(),
-    })),
+    // Only the bills that billed an over-billed line — totalBase is the gross
+    // bill total (incl. tax/freight), shown for reference, not the over-billed value.
+    bills: input.invoices
+      .filter((invoice) => contributingInvoiceIds.has(invoice.id))
+      .map((invoice) => ({
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        totalBase: roundQuantity(toDecimal(invoice.totalBase), 2).toString(),
+      })),
   }
 }

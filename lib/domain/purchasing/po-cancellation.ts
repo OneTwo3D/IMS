@@ -82,7 +82,7 @@ export function summarizeConsumedCostLayers(rows: ConsumedCostLayerRow[]): Purch
 
   for (const row of rows) {
     const consumed = subtractMoney(row.receivedQty, row.remainingQty)
-    if (consumed.lte(1e-6)) continue
+    if (consumed.lte(0)) continue
     const unitCostBase = toDecimal(row.unitCostBase)
     const valueBase = roundQuantity(multiplyMoney(consumed, unitCostBase), 6)
     consumedQty = addMoney(consumedQty, consumed)
@@ -111,6 +111,10 @@ export async function readPurchaseOrderConsumedCostForCancellation(
   if (poLineIds.length === 0) {
     return { consumedQty: '0', consumedValueBase: '0', layers: [] }
   }
+  // No FOR UPDATE: the consumed (remainingQty < receivedQty) portion of a layer
+  // is immutable, and this runs in the same tx immediately before the reversal
+  // locks the remaining>0 layers. ORDER BY only gives the metadata layer list a
+  // stable order; it does not affect the summed totals.
   const rows = await tx.$queryRaw<ConsumedCostLayerRow[]>`
     SELECT id, "poLineId", "productId", "receivedQty", "remainingQty", "unitCostBase"
     FROM "cost_layers"

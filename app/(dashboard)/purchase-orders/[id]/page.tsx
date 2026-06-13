@@ -51,7 +51,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   // audit-C4: surface bills that are over-billed relative to the quantity kept
   // after returns, so finance can raise a supplier credit.
   const overBilling = computePurchaseOrderOverBilling({
-    lines: po.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.product?.sku ?? null, qtyReceived: l.qtyReceived, qtyReturned: l.qtyReturned })),
+    lines: po.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.sku, qtyReceived: l.qtyReceived, qtyReturned: l.qtyReturned })),
     invoices: po.invoices.map((inv) => ({ id: inv.id, invoiceNumber: inv.invoiceNumber, totalBase: inv.totalBase, lines: inv.lines.map((il) => ({ poLineId: il.poLineId, qtyBilled: il.qtyBilled, totalBase: il.totalBase })) })),
   })
 

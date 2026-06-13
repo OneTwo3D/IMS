@@ -182,20 +182,26 @@ export async function cancelPurchaseOrderService(
 
     const consumedCost = cancellation.consumedCost
     if (Number(consumedCost.consumedQty) > 0) {
-      await deps.logActivity({
-        entityType: 'PURCHASE_ORDER',
-        entityId: id,
-        action: 'cancelled_consumed_cogs_standing',
-        tag: 'purchase',
-        level: 'WARNING',
-        description: `Cancelled PO ${cancellation.existing.reference} with ${consumedCost.consumedQty} unit(s) already sold/used — £${consumedCost.consumedValueBase} of COGS remains booked against the cancelled receipt. Review with finance.`,
-        metadata: {
-          reference: cancellation.existing.reference,
-          consumedQty: consumedCost.consumedQty,
-          consumedValueBase: consumedCost.consumedValueBase,
-          consumedLayers: consumedCost.layers,
-        },
-      })
+      // Isolate from the success path: the PO is already cancelled and committed,
+      // so a log failure must not turn a successful cancellation into an error.
+      try {
+        await deps.logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: id,
+          action: 'cancelled_consumed_cogs_standing',
+          tag: 'purchase',
+          level: 'WARNING',
+          description: `Cancelled PO ${cancellation.existing.reference} with ${consumedCost.consumedQty} unit(s) already sold/used — ${consumedCost.consumedValueBase} of COGS (base currency) remains booked against the cancelled receipt. Review with finance.`,
+          metadata: {
+            reference: cancellation.existing.reference,
+            consumedQty: consumedCost.consumedQty,
+            consumedValueBase: consumedCost.consumedValueBase,
+            consumedLayers: consumedCost.layers,
+          },
+        })
+      } catch (consumedLogError) {
+        console.error('Failed to log consumed-COGS warning:', consumedLogError)
+      }
     }
 
     if (cancellation.reversal.productIds.length > 0) {
