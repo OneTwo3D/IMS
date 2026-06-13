@@ -31,6 +31,14 @@ rules.
 | `REFUNDED` | None | Terminal. |
 | `SHIPPED` | `COMPLETED`, `DELIVERED`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
 
+The `DELIVERED` transition can be driven automatically by delivery-tracking
+polling (TrackShip or the active shopping connector, via `/api/cron/delivery-status`).
+That cron path runs the **same** transition guard and side effects as a manual
+delivery — it does not write the status directly. If an order has moved out of a
+deliverable state (e.g. cancelled or refunded after dispatch) between the poll's
+SHIPPED query and the write, the guard rejects the change and the cron logs a
+`delivery_status_skipped` warning instead of forcing it.
+
 ### Shipments
 
 | Status | Allowed next statuses | Notes |
