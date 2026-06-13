@@ -27,3 +27,7 @@ test('does NOT warn when an invoice already exists', () => {
 test('does NOT warn when the order did not just become paid', () => {
   assert.equal(shouldWarnPaidWithoutInvoice({ becamePaid: false, hasInvoiceNumber: false, invoiceTrigger: 'manual' }), false)
 })
+
+test('warns for an unknown/future trigger value (safe default)', () => {
+  assert.equal(shouldWarnPaidWithoutInvoice({ becamePaid: true, hasInvoiceNumber: false, invoiceTrigger: 'some_future_trigger' }), true)
+})

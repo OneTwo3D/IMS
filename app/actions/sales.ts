@@ -2286,18 +2286,23 @@ export async function addPayment(input: {
       const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
       if (trigger?.value === 'on_paid') {
         await generateInvoiceNumber(input.orderId, { skipLog: true })
-      } else if (shouldWarnPaidWithoutInvoice({ becamePaid: true, hasInvoiceNumber: Boolean(txResult.so.invoiceNumber), invoiceTrigger: trigger?.value })) {
-        // audit-H2: manual/unset trigger won't generate an invoice — make the
-        // receivable/invoice gap loud rather than auto-generating.
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: input.orderId,
-          action: 'paid_without_invoice',
-          tag: 'sales',
-          level: 'WARNING',
-          description: `Order ${getSalesOrderReference(txResult.so)} is fully paid but has no invoice (trigger: ${trigger?.value ?? 'manual'}). Generate an invoice to keep the GL receivable and invoice in sync.`,
-          metadata: { orderNumber: getSalesOrderReference(txResult.so), invoiceTrigger: trigger?.value ?? null },
-        })
+      } else if (!txResult.so.invoiceNumber) {
+        // Re-read invoiceNumber: a concurrent generateInvoiceNumber could have
+        // set it between the tx commit and here — avoid a spurious warning.
+        const current = await db.salesOrder.findUnique({ where: { id: input.orderId }, select: { invoiceNumber: true } })
+        if (shouldWarnPaidWithoutInvoice({ becamePaid: txResult.becamePaid, hasInvoiceNumber: Boolean(current?.invoiceNumber), invoiceTrigger: trigger?.value })) {
+          // audit-H2: manual/unset trigger won't generate an invoice — make the
+          // receivable/invoice gap loud rather than auto-generating.
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: input.orderId,
+            action: 'paid_without_invoice',
+            tag: 'sales',
+            level: 'WARNING',
+            description: `Order ${getSalesOrderReference(txResult.so)} is fully paid but has no invoice (trigger: ${trigger?.value ?? 'manual'}). Generate an invoice to keep the GL receivable and invoice in sync.`,
+            metadata: { orderNumber: getSalesOrderReference(txResult.so), invoiceTrigger: trigger?.value ?? null },
+          })
+        }
       }
     }
 
