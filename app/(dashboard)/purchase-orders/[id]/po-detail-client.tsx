@@ -136,8 +136,13 @@ function ReceiveDialog({
   const [isPending, startTransition] = useTransition()
   const [receiptNotes, setReceiptNotes] = useState('')
   const [error, setError] = useState('')
+  // audit-H7: require explicit confirmation when receiving into a non-destination warehouse.
+  const [confirmDivergence, setConfirmDivergence] = useState(false)
 
   const defaultWarehouseId = po.destinationWarehouseId ?? warehouses[0]?.id ?? ''
+  const destinationWarehouseName = po.destinationWarehouseId
+    ? warehouses.find((w) => w.id === po.destinationWarehouseId)?.name ?? '(unknown warehouse)'
+    : null
 
   const [receiptLines, setReceiptLines] = useState<ReceiveLineState[]>(
     po.lines
@@ -156,9 +161,16 @@ function ReceiveDialog({
   )
 
   function updateLine(poLineId: string, field: 'qtyToReceive' | 'warehouseId', value: string | number) {
+    // audit-H7: any warehouse/qty edit invalidates a prior divergence confirmation,
+    // so the operator must re-confirm the current state.
+    setConfirmDivergence(false)
     setReceiptLines((prev) =>
       prev.map((l) => (l.poLineId === poLineId ? { ...l, [field]: value } : l)),
     )
+  }
+
+  function lineDiverges(l: ReceiveLineState): boolean {
+    return Boolean(po.destinationWarehouseId && l.warehouseId && l.warehouseId !== po.destinationWarehouseId)
   }
 
   function handleConfirm() {
@@ -168,6 +180,11 @@ function ReceiveDialog({
     if (toReceive.some((l) => !l.warehouseId)) { setError('Select a warehouse for each line'); return }
     if (toReceive.some((l) => l.qtyToReceive > l.qtyRemaining)) {
       setError('Cannot receive more than remaining quantity')
+      return
+    }
+    const divergentCount = toReceive.filter(lineDiverges).length
+    if (divergentCount > 0 && !confirmDivergence) {
+      setError('Confirm receiving into a non-destination warehouse to proceed.')
       return
     }
 
@@ -180,6 +197,7 @@ function ReceiveDialog({
           warehouseId: l.warehouseId,
         })),
         receiptNotes || undefined,
+        { confirmWarehouseDivergence: confirmDivergence },
       )
       if (result.success) {
         router.refresh()
@@ -233,13 +251,16 @@ function ReceiveDialog({
                     <select
                       value={l.warehouseId}
                       onChange={(e) => updateLine(l.poLineId, 'warehouseId', e.target.value)}
-                      className="h-7 rounded-md border border-input bg-background px-2 text-xs w-36"
+                      className={`h-7 rounded-md border bg-background px-2 text-xs w-36 ${lineDiverges(l) ? 'border-amber-400 ring-1 ring-amber-300 dark:border-amber-600' : 'border-input'}`}
                     >
                       <option value="">Select…</option>
                       {warehouses.map((w) => (
                         <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
                       ))}
                     </select>
+                    {lineDiverges(l) && (
+                      <p className="mt-0.5 text-[10px] text-amber-700 dark:text-amber-400">≠ destination ({destinationWarehouseName})</p>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -256,6 +277,21 @@ function ReceiveDialog({
               className="text-sm resize-none"
             />
           </div>
+
+          {receiptLines.some((l) => l.qtyToReceive > 0 && lineDiverges(l)) && (
+            <label className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200">
+              <input
+                type="checkbox"
+                checked={confirmDivergence}
+                onChange={(e) => setConfirmDivergence(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                One or more lines are being received into a warehouse other than the PO destination
+                {destinationWarehouseName ? ` (${destinationWarehouseName})` : ''}. I confirm this is intended.
+              </span>
+            </label>
+          )}
 
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>

@@ -49,6 +49,7 @@ import {
 import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
 import { computePurchaseOrderOverBilling, type PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
+import { findDivergentReceiptLines } from '@/lib/domain/purchasing/receipt-warehouse-divergence'
 import {
   validateLinkedFreightReceiptStatus,
   validatePurchaseOrderStatusTransition,
@@ -1724,6 +1725,7 @@ export async function receivePurchaseOrder(
   id: string,
   receiptLines: ReceiptLineInput[],
   notes?: string,
+  options?: { confirmWarehouseDivergence?: boolean },
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('purchasing.receive')
@@ -1734,6 +1736,7 @@ export async function receivePurchaseOrder(
         reference: true,
         status: true,
         fxRateToBase: true,
+        destinationWarehouseId: true,
         lines: {
           select: {
             id: true,
@@ -1787,6 +1790,21 @@ export async function receivePurchaseOrder(
       const outstanding = Number(poLine.qty) - Number(poLine.qtyReceived)
       if (rl.qtyReceived > outstanding) {
         return { success: false, error: `Cannot receive more than outstanding qty (${outstanding})` }
+      }
+    }
+
+    // audit-H7: lines received into a warehouse other than the PO destination
+    // send stock + cost layers to the wrong site (and landed-cost distribution
+    // assumed the planned location). Require explicit confirmation, and record
+    // the divergence on the receipt log.
+    const divergentLines = findDivergentReceiptLines({
+      destinationWarehouseId: po.destinationWarehouseId,
+      lines: linesWithQty.map((rl) => ({ poLineId: rl.poLineId, warehouseId: rl.warehouseId })),
+    })
+    if (divergentLines.length > 0 && !options?.confirmWarehouseDivergence) {
+      return {
+        success: false,
+        error: `${divergentLines.length} line(s) are being received into a warehouse other than the PO destination. Confirm the divergence to proceed.`,
       }
     }
 
@@ -2034,8 +2052,15 @@ export async function receivePurchaseOrder(
       action: 'received',
       tag: 'purchase',
       level: 'INFO',
-      description: `Received PO ${po.reference} (${linesWithQty.length} lines)`,
-      metadata: { reference: po.reference, lineCount: linesWithQty.length, newStatus: receiptResult.newStatus },
+      description: divergentLines.length > 0
+        ? `Received PO ${po.reference} (${linesWithQty.length} lines; ${divergentLines.length} into a non-destination warehouse)`
+        : `Received PO ${po.reference} (${linesWithQty.length} lines)`,
+      metadata: {
+        reference: po.reference,
+        lineCount: linesWithQty.length,
+        newStatus: receiptResult.newStatus,
+        ...(divergentLines.length > 0 ? { warehouseDivergence: divergentLines } : {}),
+      },
     })
 
     // Log stock movement for the receipt
