@@ -5,6 +5,7 @@ import {
   landedCostResultHasJournals,
   landedCostOutboxPayloadToRecalcResult,
   processLandedCostJournalOutbox,
+  scheduleLandedCostJournalOutbox,
   type LandedCostOutboxDrainDeps,
 } from '@/lib/domain/purchasing/landed-cost-journal-outbox'
 import { LandedCostJournalOutboxPayloadSchema } from '@/lib/domain/integrations/outbox-registry'
@@ -72,11 +73,13 @@ test('drain: a malformed payload is marked retryable, not silently dropped', asy
   assert.equal(calls.queued, 0) // parse threw before queueing
 })
 
-test('drain: a payload missing the arrays defaults to empty (valid no-op success)', async () => {
+test('drain: a payload missing the adjustment arrays is malformed → retry, not silent success', async () => {
+  // The scheduler only enqueues fully-formed results, so {} is malformed (Codex review).
   const { deps, calls } = makeDeps({ jobs: [makeJob({})] })
   const res = await processLandedCostJournalOutbox(deps)
-  assert.equal(res.succeeded, 1)
-  assert.equal(calls.queued, 1) // queued with empty adjustments → idempotent no-op downstream
+  assert.equal(res.failed, 1)
+  assert.equal(calls.retry, 1)
+  assert.equal(calls.queued, 0)
 })
 
 test('drain: no jobs → nothing happens', async () => {
@@ -84,4 +87,40 @@ test('drain: no jobs → nothing happens', async () => {
   const res = await processLandedCostJournalOutbox(deps)
   assert.deepEqual(res, { claimed: 0, succeeded: 0, failed: 0 })
   assert.equal(calls.queued, 0)
+})
+
+test('scheduleLandedCostJournalOutbox enqueues ON THE PASSED tx client (atomicity) with a delayed drain + per-recalc key', async () => {
+  // Prove the enqueue uses the transaction client (not the global db), so the
+  // outbox row commits/rolls back atomically with the recalc (Codex review).
+  const created: Array<{ data: Record<string, unknown> }> = []
+  const tx = {
+    integrationOutbox: {
+      create: async (args: { data: Record<string, unknown> }) => { created.push(args); return { id: 'o1', ...args.data } },
+      findUnique: async () => null,
+    },
+  } as never
+
+  const now = new Date('2026-06-13T00:00:00.000Z')
+  await scheduleLandedCostJournalOutbox(
+    tx,
+    { inventoryTransitAdjustments: [adj(5)], cogsAdjustments: [], auditRunIds: ['run-1'] },
+    { now, graceMs: 90_000 },
+  )
+  assert.equal(created.length, 1) // create invoked on the tx client, not db
+  assert.equal(created[0].data.connector, 'accounting')
+  assert.equal(created[0].data.operation, 'landed-cost.adjustment-journal')
+  // Drain is delayed past the immediate direct call (no race).
+  assert.equal((created[0].data.nextAttemptAt as Date).getTime(), now.getTime() + 90_000)
+  // Per-recalc identity in the key so a later identical recalc still gets its own row.
+  const key1 = created[0].data.idempotencyKey as string
+  created.length = 0
+  await scheduleLandedCostJournalOutbox(tx, { inventoryTransitAdjustments: [adj(5)], cogsAdjustments: [], auditRunIds: ['run-2'] }, { now })
+  assert.notEqual(created[0].data.idempotencyKey, key1)
+})
+
+test('scheduleLandedCostJournalOutbox is a no-op for a zero-delta recalc', async () => {
+  let createCalls = 0
+  const tx = { integrationOutbox: { create: async () => { createCalls++; return {} }, findUnique: async () => null } } as never
+  await scheduleLandedCostJournalOutbox(tx, { inventoryTransitAdjustments: [adj(0)], cogsAdjustments: [], auditRunIds: ['r'] })
+  assert.equal(createCalls, 0)
 })

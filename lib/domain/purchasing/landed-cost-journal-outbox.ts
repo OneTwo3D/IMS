@@ -35,8 +35,14 @@ export const LANDED_COST_OUTBOX_CONNECTOR = 'accounting'
 export const LANDED_COST_OUTBOX_OPERATION = 'landed-cost.adjustment-journal'
 const LANDED_COST_OUTBOX_WORKER = 'landed-cost-journal-drain'
 const ADJUSTMENT_EPSILON = 0.01
+// Delay the backstop drain past the immediate post-commit direct call so the drain
+// never races it (Codex review): by the next cron tick the direct journals are
+// already queued/SYNCED, so the drain's re-queue is an idempotent no-op. A crash
+// that lost the direct call is still recovered on the following tick.
+const DEFAULT_DRAIN_GRACE_MS = 90_000
 
 type LandedCostAdjustmentArrays = Pick<LandedCostRecalcResult, 'inventoryTransitAdjustments' | 'cogsAdjustments'>
+type LandedCostScheduleInput = LandedCostAdjustmentArrays & Pick<LandedCostRecalcResult, 'auditRunIds'>
 
 /**
  * True when a recalc produced at least one material (|delta| > epsilon) journal.
@@ -63,13 +69,19 @@ export function buildLandedCostOutboxPayload(result: LandedCostAdjustmentArrays)
  */
 export async function scheduleLandedCostJournalOutbox(
   tx: Prisma.TransactionClient,
-  result: LandedCostAdjustmentArrays,
+  result: LandedCostScheduleInput,
+  options: { graceMs?: number; now?: Date } = {},
 ): Promise<void> {
   if (!landedCostResultHasJournals(result)) return
   const payload = buildLandedCostOutboxPayload(result)
+  const now = options.now ?? new Date()
   const idempotencyKey = buildOutboxIdempotencyKey(
     LANDED_COST_OUTBOX_CONNECTOR,
     LANDED_COST_OUTBOX_OPERATION,
+    // Per-recalc identity (auditRunIds) so two DISTINCT recalcs with identical
+    // adjustment content (e.g. A→B today, A→B again later) still each get their
+    // own durable backstop row instead of deduping to the first (Codex review).
+    result.auditRunIds.join(','),
     accountingPayloadKey('landed-cost-outbox', payload),
   )
   await enqueueIntegrationOutbox(
@@ -78,6 +90,7 @@ export async function scheduleLandedCostJournalOutbox(
       operation: LANDED_COST_OUTBOX_OPERATION,
       idempotencyKey,
       payloadJson: payload,
+      nextAttemptAt: new Date(now.getTime() + (options.graceMs ?? DEFAULT_DRAIN_GRACE_MS)),
     },
     { client: tx as unknown as IntegrationOutboxClient },
   )

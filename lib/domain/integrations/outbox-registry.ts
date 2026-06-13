@@ -38,8 +38,11 @@ const LandedCostAdjustmentEntrySchema = z.object({
   totalDelta: z.number().finite(),
 })
 export const LandedCostJournalOutboxPayloadSchema = z.object({
-  inventoryTransitAdjustments: z.array(LandedCostAdjustmentEntrySchema).default([]),
-  cogsAdjustments: z.array(LandedCostAdjustmentEntrySchema).default([]),
+  // Required (not defaulted): the scheduler only ever enqueues a fully-formed
+  // result with both arrays, so a missing array is a malformed payload that must
+  // retry, not a silent no-op success (Codex review).
+  inventoryTransitAdjustments: z.array(LandedCostAdjustmentEntrySchema),
+  cogsAdjustments: z.array(LandedCostAdjustmentEntrySchema),
 })
 
 type OutboxRegistryEntry<Name extends string = string> = {
