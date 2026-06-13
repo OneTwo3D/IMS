@@ -22,7 +22,7 @@ import {
   type StockLevelMapScope,
 } from '@/lib/domain/inventory/stock-level-map'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
-import { calculateAdjustmentStockDelta } from '@/lib/domain/inventory/stock-adjustment-edit'
+import { calculateAdjustmentStockDelta, assertAdjustmentEditFifoFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
 import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromConsumed,
@@ -719,18 +719,14 @@ export async function updateAdjustmentMovement(
         currentReservedQty: currentLevel?.reservedQty,
       })
 
-      if (stockDelta !== 0) {
-        await tx.stockLevel.upsert({
-          where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
-          create: {
-            productId: movement.productId,
-            warehouseId: newWarehouseId,
-            quantity: resultingQuantity.toString(),
-          },
-          update: { quantity: { increment: stockDelta } },
-        })
-      }
-
+      // audit-H9: validate the edit is feasible BEFORE mutating anything. The
+      // old cleanup deleted the existing COGS/restored layers and only then
+      // re-ran the strict FIFO consumption, so an impossible edit threw a
+      // low-level "insufficient layers" error that just the surrounding
+      // transaction rollback saved. Front-loading these checks rejects the edit
+      // atomically with a clear, actionable message and zero mutation.
+      let restorableConsumedQty = 0
+      let removableLayerQty = 0
       if (oldIsAddition) {
         const layer = movement.adjustmentLayers[0]
         if (!layer) {
@@ -746,7 +742,7 @@ export async function updateAdjustmentMovement(
             'Create a reversing adjustment instead of editing it in place.',
           )
         }
-        await tx.costLayer.deleteMany({ where: { adjustmentMovementId: id } })
+        removableLayerQty = Number(layer.remainingQty)
       } else {
         if (movement.cogsEntries.length === 0) {
           throw new Error(
@@ -754,6 +750,40 @@ export async function updateAdjustmentMovement(
             'Create a reversing adjustment instead of editing it in place.',
           )
         }
+        restorableConsumedQty = movement.cogsEntries.reduce((sum, entry) => sum + Number(entry.qty), 0)
+      }
+
+      if (!newIsAddition) {
+        const layerAgg = await tx.costLayer.aggregate({
+          where: { productId: movement.productId, warehouseId: newWarehouseId },
+          _sum: { remainingQty: true },
+        })
+        assertAdjustmentEditFifoFeasible({
+          newIsAddition,
+          newAbsQty: Math.abs(newSignedQty),
+          currentRemainingLayerQty: layerAgg._sum.remainingQty,
+          restorableConsumedQty,
+          removableLayerQty,
+        })
+      }
+
+      if (stockDelta !== 0) {
+        await tx.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
+          create: {
+            productId: movement.productId,
+            warehouseId: newWarehouseId,
+            quantity: resultingQuantity.toString(),
+          },
+          update: { quantity: { increment: stockDelta } },
+        })
+      }
+
+      // Cleanup — feasibility and the layer/cogs preconditions were already
+      // validated above, so these are pure mutations now.
+      if (oldIsAddition) {
+        await tx.costLayer.deleteMany({ where: { adjustmentMovementId: id } })
+      } else {
         for (const entry of movement.cogsEntries) {
           await tx.costLayer.update({
             where: { id: entry.costLayerId },
