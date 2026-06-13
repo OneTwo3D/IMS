@@ -124,3 +124,34 @@ test('audit-H5: non-update entries are ignored (no lookup)', async () => {
   assert.equal(blocked.size, 0)
   assert.equal(called, false)
 })
+
+test('audit-H5: UPDATE is deferred when its CREATE shares the same createdAt (same-ms queue)', async () => {
+  const t = new Date('2026-02-04T10:00:00.000Z')
+  const client = {
+    accountingSyncLog: {
+      findMany: async () => [
+        { id: 'create-s', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-s', createdAt: t },
+      ],
+    },
+  }
+  const blocked = await findInvoiceUpdatesBlockedByPendingCreate(client as never, [
+    { id: 'update-s', type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'order-s', createdAt: t },
+  ])
+  assert.deepEqual([...blocked], ['update-s'])
+})
+
+test('audit-H5: UPDATE is NOT deferred by a CREATE queued AFTER it (re-issued CREATE) — no indefinite defer', async () => {
+  const tUpdate = new Date('2026-02-05T10:00:00.000Z')
+  const tLaterCreate = new Date('2026-02-05T11:00:00.000Z')
+  const client = {
+    accountingSyncLog: {
+      findMany: async () => [
+        { id: 'create-late', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-l', createdAt: tLaterCreate },
+      ],
+    },
+  }
+  const blocked = await findInvoiceUpdatesBlockedByPendingCreate(client as never, [
+    { id: 'update-l', type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'order-l', createdAt: tUpdate },
+  ])
+  assert.equal(blocked.size, 0)
+})

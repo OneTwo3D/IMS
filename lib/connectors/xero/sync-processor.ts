@@ -297,8 +297,10 @@ export async function findInvoiceUpdatesBlockedByPendingCreate(
     const createType = INVOICE_UPDATE_TO_CREATE_TYPE[entry.type]!
     const liveCreate = earliestLiveCreateByKey.get(invoiceCreateKey(createType, entry.referenceType, entry.referenceId))
     // Defer only when the live CREATE was queued no later than the UPDATE — the
-    // normal case (CREATE first). Avoids a deadlock on a pathological later CREATE.
-    if (liveCreate && liveCreate.id !== entry.id && liveCreate.createdAt <= entry.createdAt) {
+    // normal case (CREATE first, possibly same millisecond). A CREATE queued
+    // AFTER this UPDATE (a re-issued invoice) does not block it, so the UPDATE is
+    // never deferred indefinitely waiting on a newer CREATE.
+    if (liveCreate && liveCreate.createdAt <= entry.createdAt) {
       blocked.add(entry.id)
     }
   }
