@@ -8,6 +8,9 @@ import {
   Loader2, AlertTriangle, ExternalLink, Package,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
@@ -59,6 +62,9 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState<string | null>(null)
+  // audit-wght: assembly completion prompts for the ACTUAL produced quantity.
+  const [completionOpen, setCompletionOpen] = useState(false)
+  const [completionQty, setCompletionQty] = useState(String(order.qtyPlanned))
 
   const isDisassembly = order.orderType === 'DISASSEMBLY'
   const hasManufacturer = !!order.manufacturerId
@@ -68,16 +74,42 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
     ? order.components.filter((component) => (component.shortageQty ?? 0) > 0)
     : []
 
-  function handleStatusChange(status: 'IN_PROGRESS' | 'COMPLETED' | 'CANCELLED') {
+  function runStatusChange(status: 'IN_PROGRESS' | 'COMPLETED' | 'CANCELLED', actualQtyProduced?: number) {
     setError(null)
     startTransition(async () => {
-      const result = await updateManufacturingOrderStatus(order.id, status)
+      const result = await updateManufacturingOrderStatus(order.id, status, actualQtyProduced)
       if (result.success) {
+        setCompletionOpen(false)
         router.refresh()
       } else {
         setError(result.error ?? 'Failed to update status.')
       }
     })
+  }
+
+  function handleStatusChange(status: 'IN_PROGRESS' | 'COMPLETED' | 'CANCELLED') {
+    // audit-wght: completing an ASSEMBLY records the actual produced quantity
+    // (yield loss); other transitions and disassembly go straight through.
+    if (status === 'COMPLETED' && !isDisassembly) {
+      setError(null)
+      setCompletionQty(String(order.qtyPlanned))
+      setCompletionOpen(true)
+      return
+    }
+    runStatusChange(status)
+  }
+
+  function confirmCompletion() {
+    const qty = Number(completionQty)
+    if (!Number.isFinite(qty) || qty <= 0) {
+      setError('Enter a produced quantity greater than 0.')
+      return
+    }
+    if (qty > order.qtyPlanned) {
+      setError(`Produced quantity cannot exceed the planned ${order.qtyPlanned}.`)
+      return
+    }
+    runStatusChange('COMPLETED', qty)
   }
 
   return (
@@ -346,6 +378,35 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
           </TableBody>
         </Table>
       </Card>
+
+      {/* audit-wght: assembly completion — record the actual produced quantity */}
+      <Dialog open={completionOpen} onOpenChange={(o) => { setCompletionOpen(o); if (!o) setError(null) }}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Complete production — {order.reference}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="produced-qty">Quantity produced (good units)</Label>
+            <Input
+              id="produced-qty"
+              type="number"
+              min="0"
+              step="any"
+              max={order.qtyPlanned}
+              value={completionQty}
+              onChange={(e) => setCompletionQty(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Planned {order.qtyPlanned}. Components are consumed at the planned BOM regardless, so a lower yield raises the per-unit cost of the good units.
+            </p>
+            {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCompletionOpen(false)} disabled={isPending}>Cancel</Button>
+            <Button onClick={confirmCompletion} disabled={isPending}>{isPending ? 'Completing…' : 'Complete'}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

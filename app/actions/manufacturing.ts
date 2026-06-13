@@ -31,6 +31,7 @@ import {
   parseProductionOrderComponentSnapshot,
   type ProductionOrderComponentSnapshot,
 } from '@/lib/domain/manufacturing/component-consumption'
+import { resolveAssemblyOutputQty } from '@/lib/domain/manufacturing/production-completion'
 import {
   evaluateProductionOrderCompletion,
   evaluateProductionOrderCancellation,
@@ -493,6 +494,9 @@ async function reserveAvailableStock(
 export async function updateManufacturingOrderStatus(
   id: string,
   status: ProductionOrderStatus,
+  // audit-wght: actual produced quantity for an ASSEMBLY completion (yield loss).
+  // Defaults to the planned quantity; ignored for non-COMPLETED / disassembly.
+  actualQtyProduced?: number,
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('manufacturing')
@@ -529,6 +533,9 @@ export async function updateManufacturingOrderStatus(
     // readable warning without holding the tx open.
     let manufacturingJournalSkipReason: string | null = null
     let disassemblyFallback = null as { recoveredLayerCount: number } | null
+    // audit-wght: the quantity actually booked into stock at completion — the
+    // ASSEMBLY actual (yield loss) when supplied, else the planned quantity.
+    let producedQty = Number(orderPreview.qtyPlanned)
     // audit-77d1: hoisted out of the disassembly block so the order-update below
     // (outside the assembly/disassembly branches) can persist the fallback flag.
     let equalSplitOverheadUsed = false
@@ -593,7 +600,14 @@ export async function updateManufacturingOrderStatus(
         )
 
         if (isAssembly) {
-          // ASSEMBLY: deduct components (and release reservation), add output product
+          // ASSEMBLY: deduct components (and release reservation), add output product.
+          // audit-wght: book the ACTUAL produced quantity (yield loss) into stock +
+          // the output cost layer; component consumption below stays at the planned
+          // BOM, so the full run cost capitalises into the fewer good units.
+          const outputResolution = resolveAssemblyOutputQty({ qtyPlanned, actualQtyProduced })
+          if ('error' in outputResolution) throw new Error(outputResolution.error)
+          const outputQty = outputResolution.qty
+          producedQty = outputQty
           let totalAssemblyCostBase = new Prisma.Decimal(0)
           const assemblySourceLines: Array<{
             sourceProductId: string
@@ -642,39 +656,40 @@ export async function updateManufacturingOrderStatus(
             })
           }
 
-          // Add output product stock
+          // Add output product stock (ACTUAL produced quantity).
           await tx.stockLevel.upsert({
             where: { productId_warehouseId: { productId: order.outputProductId, warehouseId: order.warehouseId } },
-            create: { productId: order.outputProductId, warehouseId: order.warehouseId, quantity: qtyPlanned },
-            update: { quantity: { increment: qtyPlanned } },
+            create: { productId: order.outputProductId, warehouseId: order.warehouseId, quantity: outputQty },
+            update: { quantity: { increment: outputQty } },
           })
           // Fold per-run manufacturing overhead (labour, machine, utilities,
           // etc.) into the output cost layer alongside the consumed component
-          // costs. Spread equally across qtyPlanned.
+          // costs. Spread the FULL run cost across the ACTUAL produced units, so
+          // yield loss raises the per-unit cost rather than vanishing.
           const outputTotalCostBase = totalAssemblyCostBase.add(totalManufacturingCostBase)
           const outputLayerId = await createCostLayer(tx, {
             productId: order.outputProductId,
             warehouseId: order.warehouseId,
-            qty: qtyPlanned,
-            unitCostBase: outputTotalCostBase.div(new Prisma.Decimal(qtyPlanned)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toNumber(),
+            qty: outputQty,
+            unitCostBase: outputTotalCostBase.div(new Prisma.Decimal(outputQty)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toNumber(),
             productionOrderId: id,
             isOpeningStock: false,
             receivedAt: costLayerReceivedAt,
           })
           await addCostLayerSourceLines(tx, outputLayerId, assemblySourceLines)
 
-          // Record PRODUCTION_IN movement
+          // Record PRODUCTION_IN movement (ACTUAL produced quantity).
           await tx.stockMovement.create({
             data: {
               type: 'PRODUCTION_IN',
               productId: order.outputProductId,
               toWarehouseId: order.warehouseId,
-              qty: qtyPlanned,
+              qty: outputQty,
               ...buildStockMovementValueFieldsFromTotal({
-                qty: qtyPlanned,
+                qty: outputQty,
                 totalValueBase: outputTotalCostBase,
               }),
-              note: `${order.reference}: assembled ${qtyPlanned} units`,
+              note: `${order.reference}: assembled ${outputQty} units`,
               referenceType: 'ProductionOrder',
               referenceId: id,
             },
@@ -881,7 +896,7 @@ export async function updateManufacturingOrderStatus(
         //     overhead was split equally across components.
         await tx.productionOrder.update({
           where: { id },
-          data: { status, completedAt: now, qtyProduced: qtyPlanned, usedDisassemblyFallback: disassemblyFallback !== null || equalSplitOverheadUsed },
+          data: { status, completedAt: now, qtyProduced: producedQty, usedDisassemblyFallback: disassemblyFallback !== null || equalSplitOverheadUsed },
         })
       })
 
@@ -930,8 +945,8 @@ export async function updateManufacturingOrderStatus(
           entityId: orderPreview.outputProductId,
           tag: 'stock',
           action: 'production_in',
-          description: `${orderPreview.reference}: produced ${qtyPlanned} units of ${orderPreview.outputProduct.sku}`,
-          metadata: { movementType: 'PRODUCTION_IN', qty: qtyPlanned, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
+          description: `${orderPreview.reference}: produced ${producedQty} units of ${orderPreview.outputProduct.sku}`,
+          metadata: { movementType: 'PRODUCTION_IN', qty: producedQty, plannedQty: qtyPlanned, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
         })
       } else {
         await logActivity({
@@ -1084,8 +1099,12 @@ export async function updateManufacturingOrderStatus(
     }
 
     const qtyPlannedLog = Number(orderPreview.qtyPlanned)
+    // audit-wght: report the actual produced quantity (assembly yield) in the log.
+    const yieldNote = status === 'COMPLETED' && isAssembly && producedQty !== qtyPlannedLog
+      ? ` (planned ${qtyPlannedLog})`
+      : ''
     const actionDesc = status === 'COMPLETED'
-      ? `Completed ${orderPreview.reference} — ${isAssembly ? 'assembled' : 'disassembled'} ${qtyPlannedLog} units of ${orderPreview.outputProduct.sku}, stock updated`
+      ? `Completed ${orderPreview.reference} — ${isAssembly ? 'assembled' : 'disassembled'} ${producedQty} units${yieldNote} of ${orderPreview.outputProduct.sku}, stock updated`
       : `Updated ${orderPreview.reference} status to ${status}`
 
     await logActivity({
@@ -1094,7 +1113,7 @@ export async function updateManufacturingOrderStatus(
       tag: 'manufacturing',
       action: 'status_changed',
       description: actionDesc,
-      metadata: status === 'COMPLETED' ? { orderType: orderPreview.orderType, qty: qtyPlannedLog, sku: orderPreview.outputProduct.sku } : undefined,
+      metadata: status === 'COMPLETED' ? { orderType: orderPreview.orderType, qty: producedQty, plannedQty: qtyPlannedLog, sku: orderPreview.outputProduct.sku } : undefined,
     })
 
     revalidatePath('/manufacturing')
