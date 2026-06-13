@@ -26,3 +26,23 @@ export function shouldWarnPaidWithoutInvoice(params: {
   if (!params.becamePaid || params.hasInvoiceNumber) return false
   return !AUTO_INVOICE_TRIGGERS.has(params.invoiceTrigger ?? '')
 }
+
+/**
+ * True when a FULLY-PAID order with no invoice is being cancelled (audit-s3en).
+ *
+ * shouldWarnPaidWithoutInvoice deliberately stays quiet for the on_shipped (and
+ * on_paid) auto-triggers because the invoice is expected to generate later in the
+ * normal flow (at dispatch / at payment). But cancellation forecloses that: an
+ * on_shipped order paid then cancelled-before-ship will NEVER get its invoice, so
+ * the at-payment suppression leaves a silent paid-receivable-without-invoice gap.
+ * At cancel time the trigger is irrelevant — no auto-generation can fire anymore —
+ * so any fully-paid, uninvoiced order being cancelled must be surfaced for a
+ * receivable reversal / refund. (on_paid orders already hold an invoice number;
+ * manual/unset already warned at payment via shouldWarnPaidWithoutInvoice.)
+ */
+export function shouldWarnPaidOrderCancelledWithoutInvoice(params: {
+  isPaid: boolean
+  hasInvoiceNumber: boolean
+}): boolean {
+  return params.isPaid && !params.hasInvoiceNumber
+}

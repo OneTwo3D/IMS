@@ -46,7 +46,7 @@ import {
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
-import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
+import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
   cancelSalesOrderFulfillmentState,
@@ -1248,6 +1248,9 @@ export async function applySalesOrderStatusTransition(
         status: true,
         archived: true,
         shipFromWarehouseId: true,
+        // audit-s3en: needed to detect a fully-paid, uninvoiced order being cancelled.
+        paidAt: true,
+        invoiceNumber: true,
         shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
         lines: { select: { id: true, productId: true, sku: true, qty: true } },
       },
@@ -1303,6 +1306,22 @@ export async function applySalesOrderStatusTransition(
             releasedAllocations: cancellation.releasedAllocationCount,
             releasedReservationScopes: cancellation.releasedReservationScopes,
           },
+        })
+      }
+      // audit-s3en: a fully-paid order with no invoice that is cancelled will
+      // never auto-generate one (on_shipped generates at dispatch, which no longer
+      // happens) — leaving a paid receivable with no invoice and, for on_shipped,
+      // no prior warning (H2 suppressed it at payment). Surface the gap so finance
+      // reverses/refunds the receivable.
+      if (shouldWarnPaidOrderCancelledWithoutInvoice({ isPaid: so.paidAt !== null, hasInvoiceNumber: Boolean(so.invoiceNumber) })) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: id,
+          action: 'paid_order_cancelled_without_invoice',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Cancelled order ${getSalesOrderReference(so)} was fully paid but has no invoice — no invoice will auto-generate now. Reverse/refund the receivable to keep the GL in sync.`,
+          metadata: { orderNumber: getSalesOrderReference(so), previousStatus: cancellation.previousStatus },
         })
       }
       orderUpdated = true
@@ -2045,14 +2064,24 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.refund')
-    const so = await db.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
-    if (!so) return { success: false, error: 'Order not found' }
-
-    const markingAsPaid = !so.paidAt // transitioning from unpaid to paid
-    await db.salesOrder.update({
-      where: { id },
-      data: { paidAt: markingAsPaid ? new Date() : null },
-    })
+    // audit-mmvp: lock the order row (same FOR UPDATE pattern as addPayment) so a
+    // concurrent addPayment/markSalesOrderPaid can't both observe paidAt=null,
+    // both flip it, and both run the warn/generate block — double-warning the
+    // same paid_without_invoice transition. Reading + flipping paidAt under one
+    // lock makes exactly one caller see the unpaid→paid transition.
+    const locked = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${id} FOR UPDATE`
+      const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
+      if (!row) return null
+      const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
+      await tx.salesOrder.update({
+        where: { id },
+        data: { paidAt: markingAsPaid ? new Date() : null },
+      })
+      return { so: row, markingAsPaid }
+    }, STOCK_TX_OPTIONS)
+    if (!locked) return { success: false, error: 'Order not found' }
+    const { so, markingAsPaid } = locked
 
     // Only auto-generate invoice when transitioning TO paid (not when toggling off).
     // Skip its own log — the 'paid' entry below covers both actions.
@@ -2060,17 +2089,23 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
       if (trigger?.value === 'on_paid') {
         await generateInvoiceNumber(id, { skipLog: true })
-      } else if (shouldWarnPaidWithoutInvoice({ becamePaid: true, hasInvoiceNumber: false, invoiceTrigger: trigger?.value })) {
-        // audit-H2: surface the paid-without-invoice gap for manual/unset triggers.
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: id,
-          action: 'paid_without_invoice',
-          tag: 'sales',
-          level: 'WARNING',
-          description: `Order ${getSalesOrderReference({ id, ...so })} is fully paid but has no invoice (trigger: ${trigger?.value ?? 'manual'}). Generate an invoice to keep the GL receivable and invoice in sync.`,
-          metadata: { orderNumber: getSalesOrderReference({ id, ...so }), invoiceTrigger: trigger?.value ?? null },
-        })
+      } else {
+        // Re-read invoiceNumber: a concurrent generateInvoiceNumber could have set
+        // it between the tx commit and here — avoid a spurious warning (matches
+        // addPayment's H2 path).
+        const current = await db.salesOrder.findUnique({ where: { id }, select: { invoiceNumber: true } })
+        if (shouldWarnPaidWithoutInvoice({ becamePaid: true, hasInvoiceNumber: Boolean(current?.invoiceNumber), invoiceTrigger: trigger?.value })) {
+          // audit-H2: surface the paid-without-invoice gap for manual/unset triggers.
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: id,
+            action: 'paid_without_invoice',
+            tag: 'sales',
+            level: 'WARNING',
+            description: `Order ${getSalesOrderReference({ id, ...so })} is fully paid but has no invoice (trigger: ${trigger?.value ?? 'manual'}). Generate an invoice to keep the GL receivable and invoice in sync.`,
+            metadata: { orderNumber: getSalesOrderReference({ id, ...so }), invoiceTrigger: trigger?.value ?? null },
+          })
+        }
       }
     }
 
