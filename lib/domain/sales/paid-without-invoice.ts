@@ -28,21 +28,27 @@ export function shouldWarnPaidWithoutInvoice(params: {
 }
 
 /**
- * True when a FULLY-PAID order with no invoice is being cancelled (audit-s3en).
+ * True when an order carrying SETTLED CUSTOMER MONEY and no invoice is being
+ * cancelled (audit-s3en for the fully-paid case, audit-45kd for the partial case).
  *
  * shouldWarnPaidWithoutInvoice deliberately stays quiet for the on_shipped (and
  * on_paid) auto-triggers because the invoice is expected to generate later in the
  * normal flow (at dispatch / at payment). But cancellation forecloses that: an
- * on_shipped order paid then cancelled-before-ship will NEVER get its invoice, so
- * the at-payment suppression leaves a silent paid-receivable-without-invoice gap.
- * At cancel time the trigger is irrelevant — no auto-generation can fire anymore —
- * so any fully-paid, uninvoiced order being cancelled must be surfaced for a
- * receivable reversal / refund. (on_paid orders already hold an invoice number;
- * manual/unset already warned at payment via shouldWarnPaidWithoutInvoice.)
+ * order paid (fully OR partially) then cancelled-before-ship will NEVER get its
+ * invoice, so the at-payment suppression leaves a silent
+ * receivable-without-invoice gap. At cancel time the trigger is irrelevant — no
+ * auto-generation can fire anymore — so any order with settled money and no
+ * invoice being cancelled must be surfaced for a receivable reversal / refund.
+ * (on_paid orders already hold an invoice number; manual/unset already warned at
+ * payment via shouldWarnPaidWithoutInvoice for the fully-paid case.)
+ *
+ * `hasSettledPayment` is true when the order is fully paid (paidAt set) OR has any
+ * settled customer payment on it — so partial prepayments aren't silently dropped
+ * on cancel.
  */
 export function shouldWarnPaidOrderCancelledWithoutInvoice(params: {
-  isPaid: boolean
+  hasSettledPayment: boolean
   hasInvoiceNumber: boolean
 }): boolean {
-  return params.isPaid && !params.hasInvoiceNumber
+  return params.hasSettledPayment && !params.hasInvoiceNumber
 }

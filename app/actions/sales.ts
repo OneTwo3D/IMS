@@ -1248,9 +1248,10 @@ export async function applySalesOrderStatusTransition(
         status: true,
         archived: true,
         shipFromWarehouseId: true,
-        // audit-s3en: needed to detect a fully-paid, uninvoiced order being cancelled.
+        // audit-s3en/45kd: detect a paid (full or partial), uninvoiced order being cancelled.
         paidAt: true,
         invoiceNumber: true,
+        currency: true,
         shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
         lines: { select: { id: true, productId: true, sku: true, qty: true } },
       },
@@ -1308,20 +1309,31 @@ export async function applySalesOrderStatusTransition(
           },
         })
       }
-      // audit-s3en: a fully-paid order with no invoice that is cancelled will
-      // never auto-generate one (on_shipped generates at dispatch, which no longer
-      // happens) — leaving a paid receivable with no invoice and, for on_shipped,
-      // no prior warning (H2 suppressed it at payment). Surface the gap so finance
-      // reverses/refunds the receivable.
-      if (shouldWarnPaidOrderCancelledWithoutInvoice({ isPaid: so.paidAt !== null, hasInvoiceNumber: Boolean(so.invoiceNumber) })) {
+      // audit-s3en/45kd: a paid order (fully OR partially) with no invoice that is
+      // cancelled will never auto-generate one (on_shipped generates at dispatch,
+      // which no longer happens) — leaving settled customer money with no invoice
+      // and, for on_shipped, no prior warning (H2 suppressed it at payment).
+      // Surface the gap so finance reverses/refunds the receivable. Sum settled
+      // customer payments (refundId null) so partial prepayments aren't dropped.
+      const settledPaymentAgg = await db.payment.aggregate({
+        where: { orderId: id, refundId: null },
+        _sum: { amount: true },
+      })
+      const settledPaymentTotal = Number(settledPaymentAgg._sum.amount ?? 0)
+      const isFullyPaid = so.paidAt !== null
+      const hasSettledPayment = isFullyPaid || settledPaymentTotal > 0
+      if (shouldWarnPaidOrderCancelledWithoutInvoice({ hasSettledPayment, hasInvoiceNumber: Boolean(so.invoiceNumber) })) {
+        const paidDescriptor = isFullyPaid
+          ? 'was fully paid'
+          : `was partially paid (${so.currency} ${settledPaymentTotal.toFixed(2)} received)`
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: id,
           action: 'paid_order_cancelled_without_invoice',
           tag: 'sales',
           level: 'WARNING',
-          description: `Cancelled order ${getSalesOrderReference(so)} was fully paid but has no invoice — no invoice will auto-generate now. Reverse/refund the receivable to keep the GL in sync.`,
-          metadata: { orderNumber: getSalesOrderReference(so), previousStatus: cancellation.previousStatus },
+          description: `Cancelled order ${getSalesOrderReference(so)} ${paidDescriptor} but has no invoice — no invoice will auto-generate now. Reverse/refund the receivable to keep the GL in sync.`,
+          metadata: { orderNumber: getSalesOrderReference(so), previousStatus: cancellation.previousStatus, fullyPaid: isFullyPaid, settledPaymentTotal },
         })
       }
       orderUpdated = true
