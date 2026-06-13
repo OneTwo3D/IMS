@@ -1,5 +1,6 @@
 'use server'
 
+import { revalidatePath } from 'next/cache'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
@@ -87,13 +88,17 @@ export async function getCrossConnectorOrphanSummary(): Promise<ConnectorOrphanS
   const groups = await db.accountingSyncLog.groupBy({
     by: ['connector'],
     where: { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] } },
-    _count: { _all: true },
+    _count: { id: true },
   })
   return summarizeCrossConnectorOrphans(
-    groups.map((group) => ({ connector: group.connector, count: group._count._all })),
+    groups.map((group) => ({ connector: group.connector, count: group._count.id })),
     activeConnector,
   )
 }
+
+// Match the processor's stale-claim window so an actively-processing row is not
+// clobbered mid-flight by a cancel (audit-H4 review).
+const ORPHAN_CANCEL_STALE_PROCESSING_MS = 15 * 60 * 1000
 
 /**
  * audit-H4: bulk-cancel orphaned live sync rows. Marks them FAILED (so neither
@@ -110,14 +115,28 @@ export async function cancelOrphanedAccountingSyncRows(
   if (connector && connector === activeConnector) {
     return { success: false, cancelled: 0, error: 'Cannot cancel sync rows for the active connector.' }
   }
+  // With no active connector, an un-scoped cancel would wipe EVERY connector's
+  // queue — require an explicit connector so a transient both-plugins-off state
+  // can't silently destroy all pending work (audit-H4 review).
+  if (!connector && !activeConnector) {
+    return { success: false, cancelled: 0, error: 'No active accounting connector — specify which connector’s orphaned rows to cancel.' }
+  }
 
+  // Don't clobber a row a processor is actively working: only PENDING rows and
+  // PROCESSING rows whose claim has gone stale (audit-H4 review). A mid-flight
+  // row is left to finish; it then leaves the live set on its own.
+  const staleProcessingCutoff = new Date(Date.now() - ORPHAN_CANCEL_STALE_PROCESSING_MS)
   const where = {
-    status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] },
-    ...(connector
-      ? { connector }
-      : activeConnector
-        ? { connector: { not: activeConnector } }
-        : {}),
+    AND: [
+      connector ? { connector } : { connector: { not: activeConnector ?? undefined } },
+      {
+        OR: [
+          { status: 'PENDING' as const },
+          { status: 'PROCESSING' as const, processingStartedAt: null },
+          { status: 'PROCESSING' as const, processingStartedAt: { lt: staleProcessingCutoff } },
+        ],
+      },
+    ],
   }
 
   const reason = `Cancelled: orphaned accounting sync row for ${connector ?? 'a non-active connector'} (no longer the active connector${activeConnector ? ` — now ${activeConnector}` : ''}).`
@@ -137,6 +156,7 @@ export async function cancelOrphanedAccountingSyncRows(
     })
   }
 
+  revalidatePath('/sync')
   return { success: true, cancelled: result.count }
 }
 

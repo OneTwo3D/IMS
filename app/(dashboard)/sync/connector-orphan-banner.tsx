@@ -22,17 +22,16 @@ export function ConnectorOrphanBanner({ summary }: { summary: ConnectorOrphanSum
   const router = useRouter()
   const [pending, startTransition] = useTransition()
   const [error, setError] = useState<string | null>(null)
-  const [dismissedTotal, setDismissedTotal] = useState<number | null>(null)
 
-  // Hide once cancelled (the refreshed summary will report 0).
-  if (summary.totalOrphans === 0 || dismissedTotal === summary.totalOrphans) return null
+  // The server summary is the source of truth: router.refresh() re-fetches it
+  // after a cancel, so the banner hides (or shows the remainder) on its own.
+  if (summary.totalOrphans === 0) return null
 
   function handleCancel(connector?: string) {
     setError(null)
     startTransition(async () => {
       const result = await cancelOrphanedAccountingSyncRows(connector)
       if (result.success) {
-        setDismissedTotal(summary.totalOrphans)
         router.refresh()
       } else {
         setError(result.error ?? 'Failed to cancel orphaned rows.')
@@ -48,7 +47,9 @@ export function ConnectorOrphanBanner({ summary }: { summary: ConnectorOrphanSum
           <p className="font-medium">
             {summary.totalOrphans} accounting sync row(s) are queued for a connector that is no longer active
             {summary.activeConnector ? ` (active: ${connectorLabel(summary.activeConnector)})` : ' (no accounting connector is enabled)'}.
-            They will never be processed. Process them by re-enabling that connector, or cancel them below.
+            They will not be processed while that connector is inactive. Re-enable the connector to let them resume,
+            or cancel them below to permanently discard them. (Cancelling does not stop the document itself from
+            syncing to the active connector later.)
           </p>
           <ul className="space-y-1 text-xs">
             {summary.orphanGroups.map((group) => (
