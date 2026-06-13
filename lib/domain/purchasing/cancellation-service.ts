@@ -6,7 +6,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { enqueueStockSync } from '@/lib/shopping'
 import { roundQuantity } from '@/lib/domain/math/decimal'
 import {
-  assertPurchaseOrderCancellationHasNoInvoices,
+  evaluatePurchaseOrderCancellationInvoiceGate,
   isPurchaseOrderCancellationNoop,
   readPurchaseOrderConsumedCostForCancellation,
   reversePurchaseOrderCostLayersForCancellation,
@@ -115,6 +115,9 @@ export async function cancelPurchaseOrderService(
           type: true,
           lines: { select: { id: true } },
           _count: { select: { invoices: true } },
+          invoices: { select: { totalForeign: true } },
+          // audit-g5u2.4: POSTED supplier credit notes that may offset the bills.
+          supplierCreditNotes: { where: { status: 'POSTED' }, select: { amountForeign: true } },
         },
       })
       if (!existing) throw new Error('PO not found')
@@ -126,7 +129,15 @@ export async function cancelPurchaseOrderService(
       }
       const transition = validatePurchaseOrderStatusTransition(existing.status, 'CANCELLED')
       if (!transition.success) throw new Error(transition.error)
-      assertPurchaseOrderCancellationHasNoInvoices(existing._count.invoices)
+      // audit-g5u2.4: allow cancelling a FREIGHT PO whose bills are fully offset by
+      // POSTED supplier credit notes; otherwise the invoice gate blocks it.
+      const invoiceGate = evaluatePurchaseOrderCancellationInvoiceGate({
+        invoiceCount: existing._count.invoices,
+        isFreight: existing.type === 'FREIGHT',
+        invoiceTotalForeign: existing.invoices.reduce((sum, inv) => sum + Number(inv.totalForeign), 0),
+        postedCreditTotalForeign: existing.supplierCreditNotes.reduce((sum, cn) => sum + Number(cn.amountForeign), 0),
+      })
+      if (!invoiceGate.allowed) throw new Error(invoiceGate.reason ?? 'Cannot cancel this purchase order.')
 
       const poLineIds = existing.lines.map((line) => line.id)
 

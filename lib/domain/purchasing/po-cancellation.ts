@@ -131,6 +131,39 @@ export function assertPurchaseOrderCancellationHasNoInvoices(invoiceCount: numbe
   }
 }
 
+/**
+ * audit-g5u2.4: decide whether an invoiced PO may still be cancelled.
+ *
+ * An uninvoiced PO is always cancellable. Once a supplier invoice is recorded,
+ * cancellation is normally blocked (the GL would be left unbalanced). The one
+ * exception is a FREIGHT PO whose bills are FULLY offset by POSTED supplier
+ * credit notes (e.g. a duplicate freight bill that's been credited back): the
+ * credit note keeps the GL balanced, so the cancel — which reverts the freight's
+ * landed-cost uplift on linked primaries — is safe. A non-freight PO, or a freight
+ * PO not fully credited, stays blocked.
+ */
+export function evaluatePurchaseOrderCancellationInvoiceGate(params: {
+  invoiceCount: number
+  isFreight: boolean
+  invoiceTotalForeign: number
+  postedCreditTotalForeign: number
+}): { allowed: boolean; reason: string | null } {
+  if (params.invoiceCount === 0) return { allowed: true, reason: null }
+  if (params.isFreight && params.postedCreditTotalForeign >= params.invoiceTotalForeign - 0.01) {
+    return { allowed: true, reason: null }
+  }
+  if (params.isFreight) {
+    return {
+      allowed: false,
+      reason: `Cannot cancel this freight PO: its supplier invoice total (${params.invoiceTotalForeign.toFixed(2)}) is not fully offset by posted credit notes (${params.postedCreditTotalForeign.toFixed(2)}). Record and post a supplier credit note covering the bill first.`,
+    }
+  }
+  return {
+    allowed: false,
+    reason: 'Cannot cancel a purchase order after supplier invoices have been recorded. Create a supplier credit or bill reversal instead.',
+  }
+}
+
 export function isPurchaseOrderCancellationNoop(status: PurchaseOrderStatus): boolean {
   return status === 'CANCELLED'
 }
