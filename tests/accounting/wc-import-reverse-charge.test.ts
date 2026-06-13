@@ -36,3 +36,33 @@ test('WC-import line stays base when the RC code is unconfigured (defensive)', (
     'OUTPUT2',
   )
 })
+
+// Regression guard for the mapped-rate gap found in review: a WC line that maps
+// to a configured IMS TaxRate (source: 'mapped') must propagate that rate's
+// reverseCharge flag so it swaps — previously resolveWcTaxRateById dropped the
+// flag from its `select`, posting a mapped reverse-charge sale under the
+// standard code. Each resolution path now carries a real boolean, exercised here
+// in the exact shapes lineTaxResolved[idx] yields (resolver / mapped / forceNoTax).
+test('WC-import mapped reverse-charge rate swaps (flag now propagated from the select)', () => {
+  const mappedRcRate = { accountingTaxType: 'OUTPUT2', reverseCharge: true, source: 'mapped' as const }
+  assert.equal(
+    resolveSalesLineTaxType({
+      baseTaxType: mappedRcRate.accountingTaxType,
+      reverseCharge: mappedRcRate.reverseCharge,
+      reverseChargeSalesTaxType: RC,
+    }),
+    RC,
+  )
+})
+
+test('WC-import forceNoTax line never swaps (carries reverseCharge:false, base stays null)', () => {
+  const forceNoTax = { accountingTaxType: null, reverseCharge: false }
+  assert.equal(
+    resolveSalesLineTaxType({
+      baseTaxType: forceNoTax.accountingTaxType ?? undefined,
+      reverseCharge: forceNoTax.reverseCharge,
+      reverseChargeSalesTaxType: RC,
+    }),
+    undefined,
+  )
+})

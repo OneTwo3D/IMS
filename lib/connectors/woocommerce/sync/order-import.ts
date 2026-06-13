@@ -336,7 +336,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     ]))
     const wcResolvedById = new Map<
       number,
-      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; source?: 'mapped' | 'default' }
+      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; reverseCharge: boolean; source?: 'mapped' | 'default' }
     >()
     for (const id of distinctWcRateIds) {
       wcResolvedById.set(id, await resolveWcTaxRateById(id))
@@ -407,6 +407,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           taxRateName: null,
           taxRateValue: 0,
           accountingTaxType: null,
+          // Tax-exempt lines are never reverse-charged — keeps the union uniform
+          // so the accounting-payload swap reads a real flag, not an absent one.
+          reverseCharge: false,
         }
       }
       if (l.externalTaxRateId != null) {
@@ -697,13 +700,11 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             // audit-H1b: swap reverse-charge LINE items to the RC tax code, same
             // as the native invoice push (resolveSalesLineTaxType), so a WC
             // reverse-charge order's goods lines post on the RC VAT boxes — not
-            // the standard code. (Mapped WC rates without a reverseCharge flag
-            // fall through unswapped, matching prior behaviour.)
+            // the standard code. Every resolution path (resolver-derived, mapped
+            // WC rate, forceNoTax) now carries a real reverseCharge flag.
             taxType: resolveSalesLineTaxType({
               baseTaxType: lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType,
-              // reverseCharge is only present on resolver-derived rates; mapped WC
-              // rates omit it (treated as not-reverse-charge — unswapped).
-              reverseCharge: (lineTaxResolved[idx] as { reverseCharge?: boolean } | undefined)?.reverseCharge,
+              reverseCharge: lineTaxResolved[idx]?.reverseCharge,
               reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
             }),
             discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,

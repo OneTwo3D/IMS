@@ -249,13 +249,18 @@ type ResolvedTaxRate = {
   taxRateName: string | null
   taxRateValue: number
   accountingTaxType: string | null
+  // Carry the IMS rate's reverse-charge flag so the accounting payload can swap
+  // mapped reverse-charge lines to the RC tax code (audit-H1b) — a mapped WC
+  // rate pointing at an RC IMS TaxRate must post on the reverse-charge boxes,
+  // not the standard code, exactly as the resolver-derived path does.
+  reverseCharge: boolean
   source: 'mapped' | 'default'
 }
 
 async function fallbackDefaultTaxRate(): Promise<ResolvedTaxRate> {
   const defaultRate = await db.taxRate.findFirst({
     where: { isDefault: true, active: true },
-    select: { id: true, name: true, rate: true, accountingTaxType: true },
+    select: { id: true, name: true, rate: true, accountingTaxType: true, reverseCharge: true },
   })
   if (defaultRate) {
     return {
@@ -263,10 +268,11 @@ async function fallbackDefaultTaxRate(): Promise<ResolvedTaxRate> {
       taxRateName: defaultRate.name,
       taxRateValue: Number(defaultRate.rate),
       accountingTaxType: defaultRate.accountingTaxType,
+      reverseCharge: defaultRate.reverseCharge,
       source: 'default',
     }
   }
-  return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null, source: 'default' }
+  return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null, reverseCharge: false, source: 'default' }
 }
 
 export async function resolveWcTaxRateById(wcRateId: number | null | undefined): Promise<ResolvedTaxRate> {
@@ -280,7 +286,7 @@ export async function resolveWcTaxRateById(wcRateId: number | null | undefined):
         externalTaxRateId: String(wcRateId),
       },
     },
-    include: { taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true } } },
+    include: { taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true, reverseCharge: true } } },
   })
   if (!mapping) return fallbackDefaultTaxRate()
   return {
@@ -288,6 +294,7 @@ export async function resolveWcTaxRateById(wcRateId: number | null | undefined):
     taxRateName: mapping.taxRate.name,
     taxRateValue: Number(mapping.taxRate.rate),
     accountingTaxType: mapping.taxRate.accountingTaxType,
+    reverseCharge: mapping.taxRate.reverseCharge,
     source: 'mapped',
   }
 }
