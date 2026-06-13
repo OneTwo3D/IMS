@@ -4,6 +4,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import {
   buildDisassemblyRecoveryPlan,
   calculateRequiredComponentQty,
+  parseProductionOrderComponentSnapshot,
 } from '../lib/domain/manufacturing/component-consumption.ts'
 
 function fakeTx(layerDetails: unknown[]) {
@@ -156,4 +157,44 @@ test('buildDisassemblyRecoveryPlan returns no entries when planned quantity is z
 
   assert.equal(plan.usedLegacyFallback, true)
   assert.deepEqual(plan.entries, [])
+})
+
+test('parseProductionOrderComponentSnapshot accepts a well-formed snapshot', () => {
+  const snap = parseProductionOrderComponentSnapshot([
+    { componentId: 'leg', qty: 4 },
+    { componentId: 'top', qty: 1 },
+  ])
+  assert.deepEqual(snap, [
+    { componentId: 'leg', qty: 4 },
+    { componentId: 'top', qty: 1 },
+  ])
+})
+
+test('parseProductionOrderComponentSnapshot returns null for absent/empty/malformed JSON (falls back to live BOM)', () => {
+  assert.equal(parseProductionOrderComponentSnapshot(null), null)
+  assert.equal(parseProductionOrderComponentSnapshot(undefined), null)
+  assert.equal(parseProductionOrderComponentSnapshot([]), null)
+  assert.equal(parseProductionOrderComponentSnapshot('nope'), null)
+  assert.equal(parseProductionOrderComponentSnapshot([{ componentId: 'x' }]), null) // missing qty
+  assert.equal(parseProductionOrderComponentSnapshot([{ qty: 4 }]), null) // missing componentId
+  assert.equal(parseProductionOrderComponentSnapshot([{ componentId: '', qty: 4 }]), null) // empty id
+  assert.equal(parseProductionOrderComponentSnapshot([{ componentId: 'x', qty: 'four' }]), null) // non-numeric
+  assert.equal(parseProductionOrderComponentSnapshot([{ componentId: 'x', qty: Number.NaN }]), null) // NaN
+})
+
+test('edit-in-between: consumption follows the frozen snapshot, not the edited live BOM', () => {
+  // Order started with 4 legs/unit; snapshot frozen at IN_PROGRESS.
+  const snapshot = parseProductionOrderComponentSnapshot([{ componentId: 'leg', qty: 4 }])!
+  // BOM later edited to 3 legs/unit — the live components the COMPLETED path would
+  // otherwise read.
+  const liveBom = [{ componentId: 'leg', qty: new Prisma.Decimal(3) }]
+  const qtyPlanned = 10
+
+  // Consuming from the snapshot removes exactly what was reserved (4 × 10 = 40),
+  // leaving zero ghost reservation. Reading the edited live BOM would consume 30
+  // and strand 10 reserved forever.
+  const fromSnapshot = calculateRequiredComponentQty(snapshot[0], qtyPlanned)
+  const fromLiveBom = calculateRequiredComponentQty(liveBom[0], qtyPlanned)
+  assert.equal(fromSnapshot.toString(), '40')
+  assert.equal(fromLiveBom.toString(), '30')
 })

@@ -1670,6 +1670,14 @@ model ProductionOrder {
   currency        String               @default("GBP")
   fxRateToBase    Decimal              @db.Decimal(18, 8) @default(1)
 
+  // audit-H6: frozen component requirements captured at the IN_PROGRESS
+  // transition — [{ componentId, qty }] (qty per output unit at snapshot time).
+  // Consumption (COMPLETED) and release (CANCELLED) read this, never the live
+  // BOM, so editing the product's components mid-production cannot strand a
+  // reservation or change what is consumed/recovered. Null for orders that were
+  // never started (direct completion falls back to the live BOM).
+  componentSnapshot Json?
+
   bom             Bom                  @relation(fields: [bomId], references: [id])
   outputProduct   Product              @relation(fields: [outputProductId], references: [id])
   warehouse       Warehouse            @relation(fields: [warehouseId], references: [id])

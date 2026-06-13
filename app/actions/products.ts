@@ -1242,7 +1242,7 @@ export async function checkProductComponentDuplicates(
 export async function saveProductComponents(
   productId: string,
   components: { componentId: string; qty: string }[]
-): Promise<{ success: boolean; error?: string; warnings?: ProductComponentDuplicateMatch[] }> {
+): Promise<{ success: boolean; error?: string; warnings?: ProductComponentDuplicateMatch[]; inProgressProductionOrders?: { id: string; reference: string }[] }> {
   try {
     await requirePermission('inventory.edit')
 
@@ -1256,6 +1256,15 @@ export async function saveProductComponents(
 
     const _p = await db.product.findUnique({ where: { id: productId }, select: { sku: true } })
     const _sku = _p?.sku ?? productId
+
+    // audit-H6: in-progress production orders for this product froze their
+    // component requirements at start, so this edit will NOT change what they
+    // consume or release — but the operator should know the edit won't apply to
+    // them. Surface them so the UI can warn.
+    const inProgressProductionOrders = await db.productionOrder.findMany({
+      where: { outputProductId: productId, status: 'IN_PROGRESS' },
+      select: { id: true, reference: true },
+    })
 
     await db.productComponent.deleteMany({ where: { productId } })
     if (components.length > 0) {
@@ -1274,13 +1283,15 @@ export async function saveProductComponents(
       entityId: productId,
       action: 'updated',
       tag: 'manufacturing',
-      level: 'INFO',
-      description: `Updated BOM/kit components for SKU ${_sku}`,
-      metadata: { componentCount: components.length, duplicateComponentMatches: warnings.length },
+      level: inProgressProductionOrders.length > 0 ? 'WARNING' : 'INFO',
+      description: inProgressProductionOrders.length > 0
+        ? `Updated BOM/kit components for SKU ${_sku} while ${inProgressProductionOrders.length} production order(s) are in progress (${inProgressProductionOrders.map((o) => o.reference).join(', ')}); those orders keep their frozen component snapshot and are unaffected.`
+        : `Updated BOM/kit components for SKU ${_sku}`,
+      metadata: { componentCount: components.length, duplicateComponentMatches: warnings.length, inProgressProductionOrders },
     })
 
     revalidatePath(`/inventory/${productId}`)
-    return { success: true, warnings }
+    return { success: true, warnings, inProgressProductionOrders }
   } catch (e: unknown) {
     const errorMsg = e instanceof Error ? e.message : 'Failed to save components'
     await logActivity({

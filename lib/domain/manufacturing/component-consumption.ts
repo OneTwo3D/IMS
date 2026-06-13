@@ -6,6 +6,32 @@ export type ManufacturingComponentRequirement = {
   qty: Prisma.Decimal | number
 }
 
+/**
+ * Frozen BOM component requirements snapshotted onto a production order at its
+ * IN_PROGRESS transition (audit-H6). Stored as JSON; qty is per output unit.
+ */
+export type ProductionOrderComponentSnapshot = Array<{ componentId: string; qty: number }>
+
+/**
+ * Validate and normalise a production order's persisted componentSnapshot JSON.
+ * Returns null when absent, empty, or malformed — callers then fall back to the
+ * live BOM (an order completed without ever being started has no snapshot).
+ */
+export function parseProductionOrderComponentSnapshot(
+  raw: unknown,
+): ProductionOrderComponentSnapshot | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null
+  const parsed: ProductionOrderComponentSnapshot = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') return null
+    const { componentId, qty } = entry as { componentId?: unknown; qty?: unknown }
+    if (typeof componentId !== 'string' || componentId.length === 0) return null
+    if (typeof qty !== 'number' || !Number.isFinite(qty)) return null
+    parsed.push({ componentId, qty })
+  }
+  return parsed
+}
+
 export type RecoveredCostLayer = {
   costLayerId: string
   qty: Prisma.Decimal

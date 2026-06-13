@@ -28,6 +28,8 @@ import {
 import {
   buildDisassemblyRecoveryPlan,
   calculateRequiredComponentQty,
+  parseProductionOrderComponentSnapshot,
+  type ProductionOrderComponentSnapshot,
 } from '@/lib/domain/manufacturing/component-consumption'
 import {
   evaluateProductionOrderCompletion,
@@ -504,6 +506,7 @@ export async function updateManufacturingOrderStatus(
         outputProductId: true,
         warehouseId: true,
         qtyPlanned: true,
+        componentSnapshot: true,
         outputProduct: {
           select: {
             sku: true,
@@ -543,6 +546,7 @@ export async function updateManufacturingOrderStatus(
             outputProductId: true,
             warehouseId: true,
             qtyPlanned: true,
+            componentSnapshot: true,
             outputProduct: {
               select: {
                 sku: true,
@@ -563,7 +567,12 @@ export async function updateManufacturingOrderStatus(
         if (completionDecision.action === 'already-completed') return
 
         const qtyPlanned = Number(order.qtyPlanned)
-        const components = order.outputProduct.productComponents
+        // audit-H6: use the snapshot frozen at IN_PROGRESS, not the live BOM, so
+        // a mid-production component edit can't change what is consumed/recovered
+        // or strand the reservation. Fall back to the live BOM only for orders
+        // that were never started (no snapshot).
+        const components: ProductionOrderComponentSnapshot | typeof order.outputProduct.productComponents =
+          parseProductionOrderComponentSnapshot(order.componentSnapshot) ?? order.outputProduct.productComponents
         const wasInProgress = order.status === 'IN_PROGRESS'
         const costLayerReceivedAt = manufacturingCostLayerReceivedAt({
           orderType: order.orderType,
@@ -950,7 +959,16 @@ export async function updateManufacturingOrderStatus(
         } else {
           await reserveAvailableStock(tx, orderPreview.outputProductId, orderPreview.warehouseId, qtyPlanned)
         }
-        await tx.productionOrder.update({ where: { id }, data: { status, startedAt: now } })
+        // audit-H6: freeze the component requirements onto the order. Completion
+        // and cancellation read this snapshot, not the live BOM, so a BOM edit
+        // mid-production can't strand a reservation or change what is consumed.
+        const componentSnapshot: ProductionOrderComponentSnapshot = orderPreview.outputProduct.productComponents.map(
+          (comp) => ({ componentId: comp.componentId, qty: Number(comp.qty) }),
+        )
+        await tx.productionOrder.update({
+          where: { id },
+          data: { status, startedAt: now, componentSnapshot },
+        })
       })
 
       // Log stock reservations
@@ -986,10 +1004,14 @@ export async function updateManufacturingOrderStatus(
         })
       } else {
         const qtyPlanned = Number(orderPreview.qtyPlanned)
+        // audit-H6: release exactly what was reserved by reading the frozen
+        // snapshot, not the live BOM (which may have been edited since start).
+        const releaseComponents = parseProductionOrderComponentSnapshot(orderPreview.componentSnapshot)
+          ?? orderPreview.outputProduct.productComponents
         // Release reservations when cancelling an in-progress order
         await db.$transaction(async (tx) => {
           if (isAssembly) {
-            for (const comp of orderPreview.outputProduct.productComponents) {
+            for (const comp of releaseComponents) {
               const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
               await tx.stockLevel.update({
                 where: { productId_warehouseId: { productId: comp.componentId, warehouseId: orderPreview.warehouseId } },
