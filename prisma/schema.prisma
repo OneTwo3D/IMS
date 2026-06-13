@@ -950,6 +950,14 @@ model Supplier {
   accountNumber   String?   // our account ref with supplier
   paymentTermsDays Int?
   /**
+   * Prepaid / deposit supplier. When true, purchase invoices (bills) for this
+   * supplier's POs may be raised before goods are received — the three-way
+   * match control (bill ≤ received qty) is relaxed to the ordered quantity.
+   * Pay-on-receipt suppliers (the default) keep the control enforced so a
+   * bill can never exceed what has actually been received.
+   */
+  prepaid         Boolean   @default(false)
+  /**
    * User-entered override for expected delivery time in days. Does NOT
    * overwrite the computed average — the average is always shown alongside
    * as read-only info in the supplier form.

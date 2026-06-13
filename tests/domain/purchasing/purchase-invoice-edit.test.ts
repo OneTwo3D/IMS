@@ -383,3 +383,244 @@ test('calculatePurchaseInvoice falls back to baseTaxType when reverseChargeTaxTy
   })
   assert.equal(result.accountingLines[0]?.taxType, 'INPUT2')
 })
+
+test('three-way match caps billing at net received qty when qtyReceived is known', () => {
+  const receivedPoLines = new Map<string, PurchaseInvoicePoLine>([
+    ['po-line-r', {
+      id: 'po-line-r',
+      qty: 100,
+      qtyReceived: 50,
+      qtyReturned: 0,
+      product: { sku: 'SKU-R' },
+      taxRate: { accountingTaxType: 'INPUT2' },
+    }],
+  ])
+  const draft = (qtyBilled: number) => [{
+    poLineId: 'po-line-r',
+    costLineId: null,
+    description: null,
+    qtyBilled,
+    unitCostForeign: 10,
+    totalForeign: qtyBilled * 10,
+    totalBase: qtyBilled * 5,
+  }]
+
+  // Billing exactly the received quantity is allowed.
+  assert.doesNotThrow(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(50),
+    alreadyBilledLines: [],
+    poLineById: receivedPoLines,
+    costLineById: new Map(),
+  }))
+
+  // Billing one more than received is rejected even though the PO ordered 100.
+  assert.throws(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(51),
+    alreadyBilledLines: [],
+    poLineById: receivedPoLines,
+    costLineById: new Map(),
+  }), /SKU-R exceeds net received qty 50/)
+
+  // Cumulative across bills: 30 already billed + 21 now = 51 > 50 received.
+  assert.throws(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(21),
+    alreadyBilledLines: [
+      { poLineId: 'po-line-r', costLineId: null, qtyBilled: 30, totalForeign: 300 },
+    ],
+    poLineById: receivedPoLines,
+    costLineById: new Map(),
+  }), /SKU-R exceeds net received qty 50 \(30 already billed\)/)
+})
+
+test('three-way match subtracts supplier returns from the billable quantity', () => {
+  // Received 100, returned 30 defective before invoicing: only 70 billable.
+  const returnedPoLines = new Map<string, PurchaseInvoicePoLine>([
+    ['po-line-d', {
+      id: 'po-line-d',
+      qty: 100,
+      qtyReceived: 100,
+      qtyReturned: 30,
+      product: { sku: 'SKU-D' },
+      taxRate: { accountingTaxType: 'INPUT2' },
+    }],
+  ])
+  const draft = (qtyBilled: number) => [{
+    poLineId: 'po-line-d',
+    costLineId: null,
+    description: null,
+    qtyBilled,
+    unitCostForeign: 10,
+    totalForeign: qtyBilled * 10,
+    totalBase: qtyBilled * 5,
+  }]
+
+  assert.doesNotThrow(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(70),
+    alreadyBilledLines: [],
+    poLineById: returnedPoLines,
+    costLineById: new Map(),
+  }))
+
+  assert.throws(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(71),
+    alreadyBilledLines: [],
+    poLineById: returnedPoLines,
+    costLineById: new Map(),
+  }), /SKU-D exceeds net received qty 70/)
+})
+
+test('prepaid suppliers (allowBillBeforeReceipt) bill up to ordered qty with nothing received', () => {
+  const prepaidPoLines = new Map<string, PurchaseInvoicePoLine>([
+    ['po-line-p', {
+      id: 'po-line-p',
+      qty: 100,
+      qtyReceived: 0,
+      qtyReturned: 0,
+      product: { sku: 'SKU-P' },
+      taxRate: { accountingTaxType: 'INPUT2' },
+    }],
+  ])
+  const draft = (qtyBilled: number) => [{
+    poLineId: 'po-line-p',
+    costLineId: null,
+    description: null,
+    qtyBilled,
+    unitCostForeign: 10,
+    totalForeign: qtyBilled * 10,
+    totalBase: qtyBilled * 5,
+  }]
+
+  // Pay-on-receipt default: nothing received, nothing billable.
+  assert.throws(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(1),
+    alreadyBilledLines: [],
+    poLineById: prepaidPoLines,
+    costLineById: new Map(),
+  }), /SKU-P exceeds net received qty 0/)
+
+  // Prepaid supplier: the full ordered quantity is billable as a deposit.
+  assert.doesNotThrow(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(100),
+    alreadyBilledLines: [],
+    poLineById: prepaidPoLines,
+    costLineById: new Map(),
+    allowBillBeforeReceipt: true,
+  }))
+
+  // But never beyond the ordered quantity, even prepaid.
+  assert.throws(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(101),
+    alreadyBilledLines: [],
+    poLineById: prepaidPoLines,
+    costLineById: new Map(),
+    allowBillBeforeReceipt: true,
+  }), /SKU-P exceeds remaining qty/)
+})
+
+test('three-way match falls back to ordered qty when qtyReceived is unknown (legacy caller)', () => {
+  // The shared poLineById fixture at the top of this file has no qtyReceived;
+  // this test pins that the fallback keeps the old ordered-quantity behaviour
+  // so un-migrated callers are not suddenly stricter.
+  assert.doesNotThrow(() => validatePurchaseInvoiceLineLimits({
+    lineData: [{
+      poLineId: 'po-line-1',
+      costLineId: null,
+      description: null,
+      qtyBilled: 5,
+      unitCostForeign: 10,
+      totalForeign: 50,
+      totalBase: 25,
+    }],
+    alreadyBilledLines: [],
+    poLineById,
+    costLineById,
+  }))
+})
+
+test('grandfathered quantities keep existing bills editable when policy tightens', () => {
+  // Billed 100 while the supplier was prepaid; supplier later toggled to
+  // pay-on-receipt with nothing received. Editing the bill (header tweak,
+  // same quantities) must not fail; increases beyond the grandfathered
+  // quantity must.
+  const poLines = new Map<string, PurchaseInvoicePoLine>([
+    ['po-line-g', {
+      id: 'po-line-g',
+      qty: 100,
+      qtyReceived: 0,
+      qtyReturned: 0,
+      product: { sku: 'SKU-G' },
+      taxRate: { accountingTaxType: 'INPUT2' },
+    }],
+  ])
+  const draft = (qtyBilled: number) => [{
+    poLineId: 'po-line-g',
+    costLineId: null,
+    description: null,
+    qtyBilled,
+    unitCostForeign: 10,
+    totalForeign: qtyBilled * 10,
+    totalBase: qtyBilled * 5,
+  }]
+  const grandfathered = new Map([['po-line-g', 100]])
+
+  // Unchanged (or reduced) quantity passes despite policyCap = 0.
+  assert.doesNotThrow(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(100),
+    alreadyBilledLines: [],
+    poLineById: poLines,
+    costLineById: new Map(),
+    grandfatheredQtyByPoLineId: grandfathered,
+  }))
+  assert.doesNotThrow(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(90),
+    alreadyBilledLines: [],
+    poLineById: poLines,
+    costLineById: new Map(),
+    grandfatheredQtyByPoLineId: grandfathered,
+  }))
+
+  // Without the grandfather (a NEW bill), the same quantities are rejected.
+  assert.throws(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(1),
+    alreadyBilledLines: [],
+    poLineById: poLines,
+    costLineById: new Map(),
+  }), /SKU-G exceeds net received qty 0/)
+})
+
+test('negative qtyReturned anomalies never expand the billable cap', () => {
+  // Bad data: qtyReturned = -50 would make netReceived 150 on a 100-unit PO.
+  // The clamp pins the cap at the ordered quantity.
+  const poLines = new Map<string, PurchaseInvoicePoLine>([
+    ['po-line-n', {
+      id: 'po-line-n',
+      qty: 100,
+      qtyReceived: 100,
+      qtyReturned: -50,
+      product: { sku: 'SKU-N' },
+      taxRate: { accountingTaxType: 'INPUT2' },
+    }],
+  ])
+  const draft = (qtyBilled: number) => [{
+    poLineId: 'po-line-n',
+    costLineId: null,
+    description: null,
+    qtyBilled,
+    unitCostForeign: 10,
+    totalForeign: qtyBilled * 10,
+    totalBase: qtyBilled * 5,
+  }]
+
+  assert.doesNotThrow(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(100),
+    alreadyBilledLines: [],
+    poLineById: poLines,
+    costLineById: new Map(),
+  }))
+  assert.throws(() => validatePurchaseInvoiceLineLimits({
+    lineData: draft(101),
+    alreadyBilledLines: [],
+    poLineById: poLines,
+    costLineById: new Map(),
+  }))
+})

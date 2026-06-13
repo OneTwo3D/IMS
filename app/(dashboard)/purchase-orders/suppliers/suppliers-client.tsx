@@ -45,6 +45,7 @@ type FormState = {
   vatNumber: string
   accountNumber: string
   paymentTermsDays: string
+  prepaid: boolean
   manualDeliveryDays: string
   notes: string
 }
@@ -65,6 +66,7 @@ const EMPTY_FORM: FormState = {
   vatNumber: '',
   accountNumber: '',
   paymentTermsDays: '',
+  prepaid: false,
   manualDeliveryDays: '',
   notes: '',
 }
@@ -90,6 +92,7 @@ function supplierToForm(s: SupplierRow): FormState {
     vatNumber: s.vatNumber ?? '',
     accountNumber: s.accountNumber ?? '',
     paymentTermsDays: s.paymentTermsDays?.toString() ?? '',
+    prepaid: s.prepaid ?? false,
     manualDeliveryDays: s.manualDeliveryDays?.toString() ?? '',
     notes: s.notes ?? '',
   }
@@ -112,6 +115,7 @@ function formToInput(f: FormState): SupplierInput {
     vatNumber: f.vatNumber || undefined,
     accountNumber: f.accountNumber || undefined,
     paymentTermsDays: f.paymentTermsDays ? parseInt(f.paymentTermsDays) : null,
+    prepaid: f.prepaid,
     manualDeliveryDays: f.manualDeliveryDays ? parseInt(f.manualDeliveryDays) : null,
     notes: f.notes || undefined,
   }
@@ -137,7 +141,7 @@ function SupplierFormDialog({
   const [form, setForm] = useState<FormState>(supplier ? supplierToForm(supplier) : buildEmptyForm(baseCurrencyCode))
   const [error, setError] = useState('')
 
-  function set(field: keyof FormState, value: string) {
+  function set<K extends keyof FormState>(field: K, value: FormState[K]) {
     setForm((prev) => ({ ...prev, [field]: value }))
   }
 
@@ -266,6 +270,24 @@ function SupplierFormDialog({
                 placeholder="30"
               />
             </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={form.prepaid}
+                onChange={(e) => set('prepaid', e.target.checked)}
+                className="mt-0.5 h-4 w-4"
+              />
+              <span>
+                <span className="font-medium">Prepaid / deposit supplier</span>
+                <span className="block text-xs text-muted-foreground">
+                  Allow bills for this supplier to be raised before goods are received. Pay-on-receipt
+                  suppliers (default) can only be billed up to the net received quantity.
+                </span>
+              </span>
+            </label>
           </div>
 
           <div className="space-y-1.5">

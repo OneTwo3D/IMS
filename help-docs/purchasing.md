@@ -129,6 +129,21 @@ If goods need to be sent back to the supplier, create a purchase return against 
 
 Record supplier invoices (bills) against purchase orders to track what has been billed. This helps reconcile POs with accounts payable.
 
+### Three-way match (bill ≤ net received)
+
+By default a PO line can only be billed up to its **net received quantity** (received − returned to
+supplier). This is the classic three-way match control: the bill must reconcile with the PO *and*
+the goods receipt, so a supplier can never be paid for goods that haven't arrived — or for
+defective goods already sent back.
+
+For **prepaid / deposit suppliers**, tick **Prepaid / deposit supplier** on the supplier record
+(Purchase Orders > Suppliers > Edit). Bills for that supplier's POs may then be raised up to the
+full **ordered** quantity before anything is received — the deposit / pro-forma flow. The ordered
+quantity remains a hard cap either way.
+
+Note: if a prepaid PO is later received short (paid 100, received 90), the over-paid delta is not
+yet flagged automatically — reconcile manually until the prepaid reconciliation alert ships.
+
 ### Editing an unpaid bill
 
 Unpaid bills can be edited from the PO detail page. Headers (number, dates, notes, supplier

@@ -114,6 +114,7 @@ export type PoRow = {
   status: PoStatus
   supplierId: string
   supplierName: string
+  supplierPrepaid: boolean
   currency: string
   fxRateToBase: number
   subtotalForeign: number
@@ -318,7 +319,7 @@ const PO_SELECT = {
   skipPreferredSupplierUpdate: true,
   createdAt: true,
   updatedAt: true,
-  supplier: { select: { id: true, name: true } },
+  supplier: { select: { id: true, name: true, prepaid: true } },
   destinationWarehouse: { select: { id: true, name: true } },
   lines: {
     select: {
@@ -379,7 +380,7 @@ function mapPoRow(po: {
   updatedAt: Date
   trackingNumber: string | null
   shippingProvider: string | null
-  supplier: { name: string }
+  supplier: { name: string; prepaid: boolean }
   destinationWarehouse: { name: string } | null
   lines: { id: string; qtyReceived: unknown; qtyReturned: unknown }[]
   _count: { invoices: number; returns: number }
@@ -395,6 +396,7 @@ function mapPoRow(po: {
     status: po.status as PoStatus,
     supplierId: po.supplierId,
     supplierName: po.supplier.name,
+    supplierPrepaid: po.supplier.prepaid,
     currency: po.currency,
     fxRateToBase: Number(po.fxRateToBase),
     subtotalForeign: Number(po.subtotalForeign),
@@ -2440,6 +2442,8 @@ export async function createInvoice(
           select: {
             id: true,
             qty: true,
+            qtyReceived: true,
+            qtyReturned: true,
             product: { select: { sku: true } },
             taxRate: {
               select: {
@@ -2553,11 +2557,35 @@ export async function createInvoice(
         where: { invoice: { poId } },
         select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
       })
+      // Re-read quantities + supplier policy UNDER the locks just acquired.
+      // The pre-transaction reads above feed pricing/tax; the three-way match
+      // must validate against locked rows or a return / receipt / prepaid
+      // toggle committed between the pre-read and the lock could let a bill
+      // through against stale quantities.
+      const lockedPo = await tx.purchaseOrder.findUniqueOrThrow({
+        where: { id: poId },
+        select: {
+          supplier: { select: { prepaid: true } },
+          lines: {
+            select: {
+              id: true,
+              qty: true,
+              qtyReceived: true,
+              qtyReturned: true,
+              product: { select: { sku: true } },
+            },
+          },
+          freightCostLines: {
+            select: { id: true, description: true, amountForeign: true, vatable: true },
+          },
+        },
+      })
       validatePurchaseInvoiceLineLimits({
         lineData: invoiceCalculation.lineData,
         alreadyBilledLines: existing,
-        poLineById,
-        costLineById,
+        poLineById: new Map(lockedPo.lines.map((l) => [l.id, l])),
+        costLineById: new Map(lockedPo.freightCostLines.map((c) => [c.id, c])),
+        allowBillBeforeReceipt: lockedPo.supplier.prepaid,
       })
 
       await tx.purchaseInvoice.create({
@@ -2691,6 +2719,7 @@ export async function updateInvoice(
               select: {
                 name: true,
                 email: true,
+                prepaid: true,
                 taxRate: { select: { accountingTaxType: true } },
               },
             },
@@ -2698,6 +2727,8 @@ export async function updateInvoice(
               select: {
                 id: true,
                 qty: true,
+                qtyReceived: true,
+                qtyReturned: true,
                 product: { select: { sku: true } },
                 taxRate: {
                   select: {
@@ -2875,7 +2906,10 @@ export async function updateInvoice(
 
       const lockedInvoice = await tx.purchaseInvoice.findUnique({
         where: { id: invoice.id },
-        select: { paidAt: true },
+        select: {
+          paidAt: true,
+          lines: { select: { poLineId: true, qtyBilled: true } },
+        },
       })
       if (!lockedInvoice) throw new Error('Bill not found')
       assertPurchaseInvoiceEditable(lockedInvoice)
@@ -2884,11 +2918,47 @@ export async function updateInvoice(
         where: { invoice: { poId: invoice.poId, id: { not: invoice.id } } },
         select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
       })
+      // Re-read quantities + supplier policy UNDER the locks (the pre-tx reads
+      // feed pricing/tax only) so a return / receipt / prepaid toggle committed
+      // between the pre-read and the lock cannot let stale quantities through.
+      const lockedPo = await tx.purchaseOrder.findUniqueOrThrow({
+        where: { id: invoice.poId },
+        select: {
+          supplier: { select: { prepaid: true } },
+          lines: {
+            select: {
+              id: true,
+              qty: true,
+              qtyReceived: true,
+              qtyReturned: true,
+              product: { select: { sku: true } },
+            },
+          },
+          freightCostLines: {
+            select: { id: true, description: true, amountForeign: true, vatable: true },
+          },
+        },
+      })
+      // Grandfather this invoice's current quantities: lines billed under the
+      // policy in force at creation (prepaid then, or returns landed after
+      // billing) stay editable at their existing level; only increases must
+      // satisfy today's cap.
+      const grandfatheredQtyByPoLineId = new Map<string, number>()
+      for (const line of lockedInvoice.lines) {
+        if (!line.poLineId) continue
+        grandfatheredQtyByPoLineId.set(
+          line.poLineId,
+          (grandfatheredQtyByPoLineId.get(line.poLineId) ?? 0) + Number(line.qtyBilled),
+        )
+      }
       validatePurchaseInvoiceLineLimits({
         lineData: lineUpdates,
         alreadyBilledLines: otherLines,
-        poLineById,
-        costLineById,
+        poLineById: new Map(lockedPo.lines.map((l) => [l.id, l])),
+        costLineById: new Map(lockedPo.freightCostLines.map((c) => [c.id, c])),
+        // Prepaid suppliers bill up to ordered qty; others up to received qty.
+        allowBillBeforeReceipt: lockedPo.supplier.prepaid,
+        grandfatheredQtyByPoLineId,
       })
 
       await tx.purchaseInvoice.update({

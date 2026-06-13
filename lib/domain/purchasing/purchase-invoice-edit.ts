@@ -20,6 +20,20 @@ export type PurchaseInvoiceEditLine = {
 export type PurchaseInvoicePoLine = {
   id: string
   qty: unknown
+  /**
+   * Quantity received against this PO line. With qtyReturned, drives the
+   * three-way match guard: a line can only be billed up to the NET received
+   * quantity (received − returned), not the ordered quantity, so goods sent
+   * back as defective before invoicing are not billable. Optional so legacy
+   * callers still typecheck; when absent the guard falls back to the ordered
+   * quantity cap.
+   */
+  qtyReceived?: unknown
+  /**
+   * Quantity returned to the supplier. Subtracted from qtyReceived to get the
+   * billable net. Optional; treated as 0 when absent.
+   */
+  qtyReturned?: unknown
   product: { sku: string }
   taxRate?: { accountingTaxType: string | null; reverseCharge?: boolean } | null
 }
@@ -267,6 +281,29 @@ export function validatePurchaseInvoiceLineLimits(params: {
   alreadyBilledLines: ExistingPurchaseInvoiceLine[]
   poLineById: Map<string, PurchaseInvoicePoLine>
   costLineById: Map<string, PurchaseInvoiceCostLine>
+  /**
+   * When false (the default), product lines may only be billed up to the
+   * received quantity — the three-way match control (PO ↔ receipt ↔ bill).
+   * When true, billing is capped at the ordered quantity instead, intended
+   * for prepaid / deposit suppliers (Supplier.prepaid) that legitimately
+   * bill before goods arrive.
+   *
+   * The cap only relaxes to the ordered quantity when a PO line has a known
+   * qtyReceived; lines whose qtyReceived is undefined (legacy callers that
+   * don't select it) always fall back to the ordered-quantity cap regardless
+   * of this flag, preserving prior behaviour.
+   */
+  allowBillBeforeReceipt?: boolean
+  /**
+   * Quantities already on the invoice being EDITED, keyed by poLineId.
+   * Grandfathers existing billing: a line that was legitimately billed under
+   * the policy in force at creation (e.g. the supplier was prepaid then, or
+   * goods were later returned) stays editable at up to its current quantity
+   * even if today's cap is lower. Only INCREASES beyond the grandfathered
+   * quantity must satisfy the current cap. The ordered quantity remains a
+   * hard ceiling in all cases.
+   */
+  grandfatheredQtyByPoLineId?: Map<string, number>
 }): void {
   const alreadyProductByLine = new Map<string, number>()
   const alreadyCostByLine = new Map<string, number>()
@@ -291,8 +328,33 @@ export function validatePurchaseInvoiceLineLimits(params: {
       const poLine = params.poLineById.get(line.poLineId)
       if (!poLine) throw new Error(`Unknown PO line ${line.poLineId}`)
       const already = alreadyProductByLine.get(line.poLineId) ?? 0
-      if (already + line.qtyBilled > Number(poLine.qty) + 1e-6) {
-        throw new Error(`Line ${poLine.product.sku} exceeds remaining qty`)
+      const orderedQty = Number(poLine.qty)
+      // Three-way match: cap at the NET received quantity (received − returned)
+      // unless the supplier is prepaid (allowBillBeforeReceipt). Goods returned
+      // to the supplier before invoicing are not billable. Fall back to the
+      // ordered quantity when qtyReceived is unknown (un-migrated caller).
+      // Clamp the net into [0, ordered] so anomalous data (negative returns)
+      // can never EXPAND the billable quantity beyond what was ordered.
+      const receivedKnown = poLine.qtyReceived !== undefined && poLine.qtyReceived !== null
+      const netReceived = Math.min(
+        orderedQty,
+        Math.max(0, Number(poLine.qtyReceived ?? 0) - Number(poLine.qtyReturned ?? 0)),
+      )
+      const policyCap = (!params.allowBillBeforeReceipt && receivedKnown)
+        ? netReceived
+        : orderedQty
+      // Grandfather: when editing an existing bill, quantities billed under
+      // the policy in force at creation stay valid; only increases beyond the
+      // grandfathered quantity have to satisfy today's policy cap. Never
+      // above the ordered quantity.
+      const grandfathered = params.grandfatheredQtyByPoLineId?.get(line.poLineId) ?? 0
+      const effectiveCap = Math.min(orderedQty, Math.max(policyCap, already + grandfathered))
+      if (already + line.qtyBilled > effectiveCap + 1e-6) {
+        const billedSoFar = already > 0 ? ` (${already} already billed)` : ''
+        const reason = (!params.allowBillBeforeReceipt && receivedKnown && effectiveCap < orderedQty)
+          ? `exceeds net received qty ${netReceived}${billedSoFar} — only received, un-returned goods can be billed`
+          : `exceeds remaining qty${billedSoFar}`
+        throw new Error(`Line ${poLine.product.sku} ${reason}`)
       }
     }
     if (line.costLineId) {
