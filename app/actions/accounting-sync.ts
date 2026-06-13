@@ -96,6 +96,30 @@ export async function getCrossConnectorOrphanSummary(): Promise<ConnectorOrphanS
   )
 }
 
+export type FailedAccountingSyncSummary = {
+  /** The active accounting connector (null when none is enabled). */
+  connector: string | null
+  /** Terminally-FAILED rows (retries exhausted) on the active connector. */
+  failedCount: number
+}
+
+/**
+ * audit-6vq0: count terminally-FAILED accounting sync rows for the active
+ * connector so the sync dashboard can raise a prominent admin alert (the
+ * per-row + Retry-All UI already exists, but only inside the sync log table).
+ * CANCELLED rows (audit-46ry: cross-connector orphans deliberately abandoned)
+ * are NOT FAILED, so they are correctly excluded — these are real failures.
+ */
+export async function getFailedAccountingSyncSummary(): Promise<FailedAccountingSyncSummary> {
+  await requireAuth()
+  const connector = await getActiveConnector()
+  if (!connector) return { connector: null, failedCount: 0 }
+  const failedCount = await db.accountingSyncLog.count({
+    where: { connector, status: 'FAILED' },
+  })
+  return { connector, failedCount }
+}
+
 // Match the processor's stale-claim window so an actively-processing row is not
 // clobbered mid-flight by a cancel (audit-H4 review).
 const ORPHAN_CANCEL_STALE_PROCESSING_MS = 15 * 60 * 1000

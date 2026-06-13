@@ -27,9 +27,10 @@ import { getPaymentAccountMap } from '@/lib/accounting'
 import { getTaxRates } from '@/app/actions/settings'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { getCrossConnectorOrphanSummary } from '@/app/actions/accounting-sync'
+import { getCrossConnectorOrphanSummary, getFailedAccountingSyncSummary } from '@/app/actions/accounting-sync'
 import { SyncDashboard } from './sync-dashboard'
 import { ConnectorOrphanBanner } from './connector-orphan-banner'
+import { FailedSyncBanner } from './failed-sync-banner'
 
 export const metadata: Metadata = { title: 'Integrations' }
 
@@ -84,6 +85,8 @@ export default async function SyncPage() {
 
   // audit-H4: surface accounting sync rows stranded by a connector switch.
   const orphanSummary = await getCrossConnectorOrphanSummary().catch(() => null)
+  // audit-6vq0: surface accounting sync rows that exhausted retries (FAILED).
+  const failedSyncSummary = await getFailedAccountingSyncSummary().catch(() => null)
 
   return (
     <div className="space-y-6 max-w-5xl">
@@ -94,6 +97,7 @@ export default async function SyncPage() {
         </p>
       </div>
       {orphanSummary && <ConnectorOrphanBanner summary={orphanSummary} />}
+      {failedSyncSummary && <FailedSyncBanner summary={failedSyncSummary} />}
       <SyncDashboard
         pluginState={pluginState}
         shoppingSettings={shoppingSettings}
