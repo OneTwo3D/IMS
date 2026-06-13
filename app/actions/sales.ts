@@ -1492,12 +1492,13 @@ async function queueRefundAccountingActions(input: {
   const cnTaxRate = orderForCN?.taxRateName
     ? await db.taxRate.findFirst({
         where: { name: orderForCN.taxRateName, active: true },
-        select: { accountingTaxType: true, reverseCharge: true },
+        select: { accountingTaxType: true },
       })
     : null
-  // Credit-note line tax type must apply the SAME reverse-charge swap the
-  // original invoice did (audit H1), or a refund of a reverse-charged sale
-  // posts under the standard code and the VAT return no longer balances.
+  // Credit-note PRODUCT lines must apply the SAME per-line reverse-charge swap
+  // the original invoice did (audit H1), keyed on each sales line's own
+  // TaxRate.reverseCharge — or a refund of a reverse-charged sale posts under
+  // the standard code and the VAT return no longer balances.
   const taxTypeBySalesLineId = new Map(
     (orderForCN?.lines ?? []).map((line) => [
       line.id,
@@ -1508,11 +1509,13 @@ async function queueRefundAccountingActions(input: {
       }),
     ]),
   )
-  const fallbackCnTaxType = resolveSalesLineTaxType({
-    baseTaxType: cnTaxRate?.accountingTaxType,
-    reverseCharge: cnTaxRate?.reverseCharge,
-    reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-  })
+  // Fallback for refund lines with no mapped sales line (shipping, ad-hoc):
+  // the order-level tax type WITHOUT the swap, mirroring exactly how the
+  // invoice posts its shipping/discount lines (shippingTaxType =
+  // orderDefaultTaxType, no swap). Swapping here would post credit-note
+  // shipping under the reverse-charge code while the invoice posted it under
+  // the standard code — an asymmetry the VAT return would flag.
+  const fallbackCnTaxType = cnTaxRate?.accountingTaxType ?? undefined
 
   await queueAccountingSync({
     type: 'CREDIT_NOTE',

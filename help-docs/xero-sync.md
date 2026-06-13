@@ -361,10 +361,12 @@ stays as configured (usually `0` for B2B services), and only the connector-side 
 the reverse-charge settings are empty, IMS falls back to the parent `TaxRate.accountingTaxType` so
 the bill or invoice still posts, just without the reverse-charge classification.
 
-The swap applies symmetrically to **credit notes**: refunding a reverse-charged sale posts the
-credit note under the same reverse-charge code the original invoice used, so the VAT return's
-debit and credit lines reconcile. (Sales invoices, purchase bills, and credit notes all share one
-resolver, so the three can never drift.)
+The swap applies symmetrically to **credit notes**: refunding a reverse-charged sale posts each
+product line's credit under the same reverse-charge code the original invoice used, so the VAT
+return's debit and credit lines reconcile. Sales invoices and credit notes resolve product-line
+tax types through one shared resolver, so the two can never drift. The swap is decided **per line**
+from that line's own tax rate; shipping and discount lines follow the order-level tax rate without
+the swap on both the invoice and the credit note (kept identical so the two sides match).
 
 ## Invoice PDF & Email
 
