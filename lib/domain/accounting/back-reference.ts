@@ -40,6 +40,10 @@ export type BackReferenceDeps = {
     findUnique(args: { where: { id: string }; select: { accountingInvoiceId: true } }): Promise<{ accountingInvoiceId: string | null } | null>
     findFirst(args: { where: Record<string, unknown>; orderBy?: Record<string, unknown>; select: { id: true } }): Promise<{ id: string } | null>
   }
+  supplierCreditNote: {
+    update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>
+    findUnique(args: { where: { id: string }; select: { accountingCreditNoteId: true } }): Promise<{ accountingCreditNoteId: string | null } | null>
+  }
 }
 
 /** Whether a sync type/reference pair writes a back-reference at all. */
@@ -47,7 +51,8 @@ export function syncTypeWritesBackReference(type: AccountingSyncType, referenceT
   return (
     (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') ||
     (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') ||
-    (type === 'PURCHASE_INVOICE' && (referenceType === 'PurchaseInvoice' || referenceType === 'PurchaseOrder'))
+    (type === 'PURCHASE_INVOICE' && (referenceType === 'PurchaseInvoice' || referenceType === 'PurchaseOrder')) ||
+    (type === 'PURCHASE_CREDIT_NOTE' && referenceType === 'SupplierCreditNote')
   )
 }
 
@@ -91,6 +96,11 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
         data: { accountingInvoiceId: externalId },
       })
     }
+  } else if (type === 'PURCHASE_CREDIT_NOTE' && referenceType === 'SupplierCreditNote') {
+    await deps.supplierCreditNote.update({
+      where: { id: referenceId },
+      data: { accountingCreditNoteId: externalId },
+    })
   }
 }
 
@@ -120,6 +130,10 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
       select: { id: true },
     })
     return invoice != null
+  }
+  if (type === 'PURCHASE_CREDIT_NOTE' && referenceType === 'SupplierCreditNote') {
+    const cn = await deps.supplierCreditNote.findUnique({ where: { id: referenceId }, select: { accountingCreditNoteId: true } })
+    return cn != null && !cn.accountingCreditNoteId
   }
   return false
 }

@@ -23,6 +23,7 @@ import {
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload } from '@/lib/domain/purchasing/supplier-credit-note'
 import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
@@ -3329,6 +3330,149 @@ export type CreateFreightPoInput = {
   notes?: string
   taxRateValue?: number
   costLines: FreightCostLineInput[]
+}
+
+// audit-g5u2.3: record a supplier credit note (DRAFT) against a billed (freight)
+// PO — e.g. crediting a duplicate freight bill. POSTED later via
+// postSupplierCreditNote, which pushes it to the accounting connector.
+export async function recordSupplierFreightCreditNote(input: {
+  poId: string
+  amountForeign: number
+  reason?: string
+  creditNoteNumber?: string
+  notes?: string
+  purchaseInvoiceId?: string
+}): Promise<{ success: boolean; id?: string; error?: string }> {
+  try {
+    const session = await requirePermission('purchasing.invoice')
+    const po = await db.purchaseOrder.findUnique({
+      where: { id: input.poId },
+      select: {
+        id: true,
+        reference: true,
+        currency: true,
+        fxRateToBase: true,
+        supplierId: true,
+        invoices: { select: { id: true, fxRateToBase: true }, orderBy: { createdAt: 'desc' } },
+      },
+    })
+    if (!po) return { success: false, error: 'Purchase order not found' }
+
+    const selectedInvoice = input.purchaseInvoiceId
+      ? po.invoices.find((inv) => inv.id === input.purchaseInvoiceId) ?? null
+      : po.invoices[0] ?? null
+    const validationError = validateRecordSupplierCreditNote({
+      amountForeign: input.amountForeign,
+      hasInvoice: po.invoices.length > 0,
+      selectedInvoiceBelongsToPo: input.purchaseInvoiceId ? Boolean(selectedInvoice) : null,
+    })
+    if (validationError) return { success: false, error: validationError }
+
+    const fxRateToBase = Number(selectedInvoice?.fxRateToBase ?? po.fxRateToBase ?? 1)
+    const amountBase = roundQuantity(toDecimal(input.amountForeign).mul(fxRateToBase), 4).toNumber()
+
+    const creditNote = await db.supplierCreditNote.create({
+      data: {
+        poId: po.id,
+        purchaseInvoiceId: selectedInvoice?.id ?? null,
+        supplierId: po.supplierId,
+        reference: input.creditNoteNumber || po.reference,
+        creditNoteNumber: input.creditNoteNumber || null,
+        amountForeign: roundQuantity(input.amountForeign, 4).toNumber(),
+        amountBase,
+        currency: po.currency,
+        fxRateToBase,
+        reason: input.reason || null,
+        notes: input.notes || null,
+        status: 'DRAFT',
+        createdBy: session.user.id,
+      },
+      select: { id: true },
+    })
+
+    revalidatePath(`/purchase-orders/${po.id}`)
+    await logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: po.id,
+      action: 'supplier_credit_note_recorded',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Recorded supplier credit note of ${po.currency} ${input.amountForeign.toFixed(2)} against ${po.reference}`,
+      metadata: { creditNoteId: creditNote.id, amountForeign: input.amountForeign, currency: po.currency, reason: input.reason ?? null },
+    })
+    return { success: true, id: creditNote.id }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+// audit-g5u2.3: post a DRAFT supplier credit note — mark POSTED and (Xero only)
+// queue the ACCPAYCREDIT push so the GL is credited.
+export async function postSupplierCreditNote(id: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    await requirePermission('purchasing.invoice')
+    const cn = await db.supplierCreditNote.findUnique({
+      where: { id },
+      select: {
+        id: true, poId: true, supplierId: true, currency: true, fxRateToBase: true,
+        amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true,
+        po: { select: { reference: true, supplier: { select: { name: true } } } },
+      },
+    })
+    if (!cn) return { success: false, error: 'Credit note not found' }
+    if (cn.status !== 'DRAFT') return { success: false, error: 'Credit note is already posted' }
+
+    // Atomic DRAFT->POSTED guard so concurrent posts can't double-queue.
+    const claimed = await db.supplierCreditNote.updateMany({
+      where: { id, status: 'DRAFT' },
+      data: { status: 'POSTED', postedAt: new Date() },
+    })
+    if (claimed.count === 0) return { success: false, error: 'Credit note is already posted' }
+
+    const connector = await getActiveAccountingConnectorInfo()
+    const settings = await getAccountingSettings()
+    // Xero-only: the ACCPAYCREDIT poster exists for Xero. Skip the accounting
+    // queue for other connectors (the credit note still records as POSTED in IMS).
+    if (connector?.id === 'xero' && settings.syncEnabled && await isAccountingSyncTypeEnabled('PURCHASE_CREDIT_NOTE')) {
+      try {
+        await queueAccountingSync({
+          type: 'PURCHASE_CREDIT_NOTE',
+          referenceType: 'SupplierCreditNote',
+          referenceId: cn.id,
+          payload: buildSupplierCreditNoteSyncPayload({
+            creditNoteId: cn.id,
+            creditNoteNumber: cn.creditNoteNumber,
+            reference: cn.reference,
+            reason: cn.reason,
+            supplierName: cn.po.supplier.name,
+            supplierId: cn.supplierId,
+            currency: cn.currency,
+            fxRateToBase: Number(cn.fxRateToBase),
+            amountForeign: Number(cn.amountForeign),
+            transitAccount: settings.transitAccount,
+            date: new Date().toISOString().slice(0, 10),
+          }),
+          idempotencyKey: `supplier-credit-note:${cn.id}`,
+        })
+      } catch {
+        // Accounting queue errors must not strand the POSTED transition.
+      }
+    }
+
+    revalidatePath(`/purchase-orders/${cn.poId}`)
+    await logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: cn.poId,
+      action: 'supplier_credit_note_posted',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Posted supplier credit note of ${cn.currency} ${Number(cn.amountForeign).toFixed(2)} for ${cn.po.reference}`,
+      metadata: { creditNoteId: cn.id, amountForeign: Number(cn.amountForeign), currency: cn.currency },
+    })
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
 }
 
 export async function createFreightPo(input: CreateFreightPoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
