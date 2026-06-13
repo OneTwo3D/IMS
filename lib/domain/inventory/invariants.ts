@@ -125,12 +125,25 @@ export type InventoryInvariantShipmentLineRow = {
   }
 }
 
+export type InventoryInvariantStrandedTransferRow = {
+  id: string
+  reference: string
+  fromWarehouseId: string
+  dispatchedAt: Date | string | null
+  lines: Array<{ productId: string; qty: DecimalLike }>
+}
+
 export type InventoryInvariantRows = {
   stockLevels: InventoryInvariantStockLevelRow[]
   costLayers: InventoryInvariantCostLayerRow[]
   stockMovements: InventoryInvariantStockMovementRow[]
   shippedShipmentLines: InventoryInvariantShipmentLineRow[]
   reservationSources?: ReservationBreakdownRow[]
+  /**
+   * Transfers stranded IN_TRANSIT (audit-C5). The caller (collector) applies the
+   * status + age filter; the evaluator emits a per-line finding for each row here.
+   */
+  strandedTransfers?: InventoryInvariantStrandedTransferRow[]
 }
 
 export type InventoryInvariantOptions = {
@@ -157,6 +170,9 @@ type InventoryInvariantClient = {
   productionOrder?: {
     findMany(args: unknown): Promise<unknown[]>
   }
+  stockTransfer?: {
+    findMany(args: unknown): Promise<InventoryInvariantStrandedTransferRow[]>
+  }
 }
 
 export type InventoryInvariantSqlClient = {
@@ -174,6 +190,10 @@ type InventoryInvariantSqlFindingRow = {
 }
 
 const DEFAULT_QUANTITY_TOLERANCE = 0.0001
+// audit-C5: a transfer IN_TRANSIT longer than this is treated as stranded — its
+// stock left the source but never arrived at the destination (a receive that
+// failed or was never run). Surfaced as a reconciliation exception.
+const STRANDED_TRANSFER_DAYS = 7
 const STOCK_MOVEMENT_VALUE_TOLERANCE = 0.01
 const STOCK_MOVEMENT_VALUE_SMALL_TOLERANCE = 0.000001
 const STOCK_MOVEMENT_VALUE_RELATIVE_TOLERANCE = 0.0001
@@ -768,6 +788,33 @@ export function evaluateInventoryInvariantRows(
     })
   }
 
+  // audit-C5: transfers the caller has already filtered to "stranded IN_TRANSIT"
+  // (stock left the source but was never received). One finding per line so the
+  // product/warehouse drill-down matches the source warehouse.
+  for (const transfer of rows.strandedTransfers ?? []) {
+    const dispatchedAtIso = transfer.dispatchedAt == null
+      ? null
+      : (transfer.dispatchedAt instanceof Date ? transfer.dispatchedAt.toISOString() : String(transfer.dispatchedAt))
+    for (const line of transfer.lines) {
+      findings.push({
+        severity: 'warning',
+        code: 'transfer_stranded_in_transit',
+        productId: line.productId,
+        warehouseId: transfer.fromWarehouseId,
+        message: `Transfer ${transfer.reference} has been in transit since ${dispatchedAtIso ?? 'an unknown date'} — stock left the source but was never received`,
+        details: {
+          transferId: transfer.id,
+          reference: transfer.reference,
+          productId: line.productId,
+          fromWarehouseId: transfer.fromWarehouseId,
+          dispatchedAt: dispatchedAtIso,
+          qty: decimalToNumber(line.qty),
+          thresholdDays: STRANDED_TRANSFER_DAYS,
+        },
+      })
+    }
+  }
+
   return findings
 }
 
@@ -781,7 +828,10 @@ export async function collectInventoryInvariantRows(
   const stockMovementLookbackDate = stockMovementLookbackDays == null
     ? null
     : new Date(Date.now() - Math.max(1, Math.floor(stockMovementLookbackDays)) * 24 * 60 * 60 * 1000)
-  const [stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources] = await Promise.all([
+  // audit-C5: transfers stranded IN_TRANSIT past the threshold (status + age
+  // filter applied here so the evaluator stays pure).
+  const strandedTransferCutoff = new Date(Date.now() - STRANDED_TRANSFER_DAYS * 24 * 60 * 60 * 1000)
+  const [stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources, strandedTransfers] = await Promise.all([
     client.stockLevel.findMany({
       select: {
         id: true,
@@ -897,9 +947,21 @@ export async function collectInventoryInvariantRows(
     client.orderAllocation && client.productionOrder && client.stockLevel.findUnique
       ? loadReservationSourceRows(client as unknown as Parameters<typeof loadReservationSourceRows>[0])
       : Promise.resolve(undefined),
+    client.stockTransfer
+      ? client.stockTransfer.findMany({
+          where: { status: 'IN_TRANSIT', dispatchedAt: { lt: strandedTransferCutoff } },
+          select: {
+            id: true,
+            reference: true,
+            fromWarehouseId: true,
+            dispatchedAt: true,
+            lines: { select: { productId: true, qty: true } },
+          },
+        })
+      : Promise.resolve(undefined),
   ])
 
-  return { stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources }
+  return { stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources, strandedTransfers }
 }
 
 function sqlFifoProductTypes(): Prisma.Sql {
@@ -1597,6 +1659,37 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         END
         ${shipmentProductFilter}
         ${shipmentWarehouseFilter}
+
+      UNION ALL
+
+      -- audit-C5: transfers stranded IN_TRANSIT — stock left the source but the
+      -- receive failed or was never run. One finding per line so product/warehouse
+      -- filters apply (warehouse = source). The compensating action is either a
+      -- retry of the receive or a cancel-dispatch that books the stock back.
+      SELECT
+        'transfer_stranded_in_transit:' || stl.id AS "sortKey",
+        'warning'::text AS severity,
+        'transfer_stranded_in_transit'::text AS code,
+        stl."productId",
+        st."fromWarehouseId" AS "warehouseId",
+        'Transfer ' || st.reference || ' has been in transit since ' || to_char(st."dispatchedAt", 'YYYY-MM-DD') || ' — stock left the source but was never received' AS message,
+        jsonb_build_object(
+          'transferId', st.id,
+          'transferLineId', stl.id,
+          'reference', st.reference,
+          'productId', stl."productId",
+          'fromWarehouseId', st."fromWarehouseId",
+          'dispatchedAt', st."dispatchedAt",
+          'qty', stl.qty,
+          'thresholdDays', ${STRANDED_TRANSFER_DAYS}
+        ) AS details
+      FROM "stock_transfers" st
+      INNER JOIN "stock_transfer_lines" stl ON stl."transferId" = st.id
+      WHERE st.status = 'IN_TRANSIT'
+        AND st."dispatchedAt" IS NOT NULL
+        AND st."dispatchedAt" < NOW() - (${STRANDED_TRANSFER_DAYS}::int * INTERVAL '1 day')
+        ${options.productId ? Prisma.sql`AND stl."productId" = ${options.productId}` : Prisma.empty}
+        ${options.warehouseId ? Prisma.sql`AND st."fromWarehouseId" = ${options.warehouseId}` : Prisma.empty}
     )
     SELECT
       "sortKey",

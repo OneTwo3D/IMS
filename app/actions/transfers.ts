@@ -770,3 +770,173 @@ export async function cancelTransfer(id: string): Promise<TransferResult> {
     return { message: 'Failed to cancel transfer.' }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Cancel dispatch (IN_TRANSIT → CANCELLED): compensating action that books the
+// stranded stock back into the SOURCE warehouse when a dispatched transfer will
+// never be received (audit-C5). The state machine intentionally does NOT allow
+// IN_TRANSIT → CANCELLED for the plain cancel path (which performs no stock
+// movement); this dedicated action restores stock + cost layers from the
+// dispatch-time snapshot, so it owns its own guard and conditional update.
+// ---------------------------------------------------------------------------
+
+export async function cancelDispatchedTransfer(id: string): Promise<TransferResult> {
+  try {
+    await requirePermission('stock_control.transfer')
+    let restoredLineCount = 0
+    await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
+      const transfer = await tx.stockTransfer.findUnique({
+        where: { id },
+        select: { ...TRANSFER_SELECT, status: true },
+      })
+      if (!transfer) throw new Error('Transfer not found')
+      if (transfer.status !== 'IN_TRANSIT') {
+        throw new Error('Only an in-transit transfer can have its dispatch cancelled')
+      }
+
+      const lines = await tx.stockTransferLine.findMany({
+        where: { transferId: id },
+        select: { id: true, productId: true, qty: true, qtyReceived: true, costLayerSnapshot: true },
+      })
+      const productIds = [...new Set(lines.map((line) => line.productId))]
+      if (productIds.length > 0) {
+        await tx.stockLevel.createMany({
+          data: productIds.map((productId) => ({ productId, warehouseId: transfer.fromWarehouseId, quantity: 0 })),
+          skipDuplicates: true,
+        })
+        await tx.$queryRaw`
+          SELECT "productId", "warehouseId"
+          FROM stock_levels
+          WHERE "productId" = ANY(${productIds}::text[])
+            AND "warehouseId" = ${transfer.fromWarehouseId}
+          FOR UPDATE
+        `
+      }
+
+      for (const line of lines) {
+        const qty = Number(line.qty)
+        // A WMS partial-receive may already have landed some units at the
+        // DESTINATION — those are not stranded. Restore only the portion that
+        // never arrived, using the same snapshot slice the receive path uses.
+        const alreadyReceived = Number(line.qtyReceived ?? 0)
+        const restoreQty = Math.max(0, qty - alreadyReceived)
+        if (restoreQty <= 0) continue
+
+        const snapshotSlice = sliceTransferSnapshotForReceipt({
+          snapshot: line.costLayerSnapshot,
+          alreadyReceivedQty: alreadyReceived,
+          qtyReceived: restoreQty,
+        })
+        const totalValueBase = snapshotSlice.reduce(
+          (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
+          toDecimal(0),
+        )
+
+        await tx.stockMovement.create({
+          data: {
+            type: 'TRANSFER_IN',
+            productId: line.productId,
+            fromWarehouseId: null,
+            toWarehouseId: transfer.fromWarehouseId,
+            qty: restoreQty.toString(),
+            note: `Transfer ${transfer.reference} dispatch cancelled — restored ${restoreQty} to source`,
+            referenceType: 'StockTransfer',
+            referenceId: id,
+            ...buildStockMovementValueFieldsFromTotal({ qty: restoreQty, totalValueBase }),
+          },
+        })
+        await tx.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: line.productId, warehouseId: transfer.fromWarehouseId } },
+          create: { productId: line.productId, warehouseId: transfer.fromWarehouseId, quantity: restoreQty.toString() },
+          update: { quantity: { increment: restoreQty } },
+        })
+
+        // Recreate FIFO layers at the SOURCE from the snapshot slice (mirrors the
+        // destination recreation in receiveTransfer, targeting fromWarehouseId).
+        for (const entry of snapshotSlice) {
+          const entryQty = toDecimal(entry.qty)
+          const unitCostBase = toDecimal(entry.unitCostBase)
+          if (entryQty.gt(0) && unitCostBase.gte(0)) {
+            const newLayerId = await createCostLayer(tx, {
+              productId: line.productId,
+              warehouseId: transfer.fromWarehouseId,
+              qty: entryQty,
+              unitCostBase,
+            })
+            const copied = await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
+            if (copied === 0) {
+              await tx.costLayerSourceLine.create({
+                data: {
+                  costLayerId: newLayerId,
+                  sourceProductId: line.productId,
+                  sourceCostLayerId: entry.costLayerId,
+                  qty: entryQty.toFixed(6),
+                  unitCostBase,
+                  totalCostBase: roundQuantity(multiplyMoney(entryQty, unitCostBase), 6).toFixed(6),
+                },
+              })
+            }
+          }
+        }
+        restoredLineCount += 1
+      }
+
+      // Conditional status update — only from IN_TRANSIT (guards a concurrent receive).
+      const updated = await tx.stockTransfer.updateMany({
+        where: { id, status: 'IN_TRANSIT' },
+        data: { status: 'CANCELLED', completedAt: new Date() },
+      })
+      if (updated.count === 0) throw new Error('Transfer is no longer in transit')
+    }, STOCK_TX_OPTIONS)
+
+    revalidatePath('/stock-control/transfers')
+    revalidatePath('/inventory')
+
+    const cancelled = await db.stockTransfer.findUnique({
+      where: { id },
+      select: { reference: true, fromWarehouseId: true, fromWarehouse: { select: { name: true } }, lines: { select: { productId: true } } },
+    })
+    await logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'dispatch_cancelled',
+      tag: 'stock',
+      level: 'WARNING',
+      description: `Cancelled dispatch of transfer ${cancelled?.reference ?? id} — restored ${restoredLineCount} line(s) to ${cancelled?.fromWarehouse.name ?? 'source'}`,
+      metadata: { reference: cancelled?.reference ?? id, restoredLineCount, fromWarehouseId: cancelled?.fromWarehouseId ?? null },
+    })
+
+    const restoredProductIds = [...new Set((cancelled?.lines ?? []).map((line) => line.productId))]
+    if (restoredProductIds.length > 0) {
+      try {
+        await allocateBackordersForProducts(restoredProductIds, {
+          source: 'transfer_cancel',
+          referenceId: id,
+          referenceLabel: `transfer dispatch cancel ${cancelled?.reference ?? id}`,
+        })
+      } catch (allocError) {
+        console.error(allocError)
+      }
+      try {
+        await enqueueStockSync(restoredProductIds, 'IMS_CHANGE')
+      } catch (syncError) {
+        console.error(syncError)
+      }
+    }
+
+    return { success: true }
+  } catch (e: unknown) {
+    console.error(e)
+    const msg = toInventoryConstraintMessage(e, 'Failed to cancel transfer dispatch.')
+    await logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'dispatch_cancelled',
+      tag: 'stock',
+      level: 'ERROR',
+      description: msg,
+    })
+    return { message: msg }
+  }
+}

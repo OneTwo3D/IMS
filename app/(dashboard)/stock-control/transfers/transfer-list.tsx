@@ -20,6 +20,7 @@ import {
   dispatchTransfer,
   receiveTransfer,
   cancelTransfer,
+  cancelDispatchedTransfer,
   updateTransferDraft,
   type TransferRow,
   type TransferLine,
@@ -502,6 +503,20 @@ function TransferCard({
     else setActionError(res.message ?? 'Failed.')
   }
 
+  async function handleCancelDispatch() {
+    if (!confirm('Cancel this dispatch and return the stranded stock to the source warehouse? Use this only if the transfer will never be received.')) return
+    setActioning(true); setActionError(null)
+    const res = await cancelDispatchedTransfer(transfer.id)
+    setActioning(false)
+    if (res.success) {
+      const next = { ...transfer, status: 'CANCELLED' as const }
+      setTransfer(next)
+      onUpdated(next)
+      router.refresh()
+    }
+    else setActionError(res.message ?? 'Failed.')
+  }
+
   const COL_COUNT = 6
 
   return (
@@ -546,6 +561,10 @@ function TransferCard({
                 <Button size="sm" variant="outline" className="h-7 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950"
                   onClick={handleReceive} disabled={actioning}>
                   <PackageCheck className="h-3 w-3" /> Mark Received
+                </Button>
+                <Button size="icon" variant="ghost" className="h-7 w-7 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive"
+                  title="Cancel dispatch (return stranded stock to source)" onClick={handleCancelDispatch} disabled={actioning}>
+                  <Ban className="h-3 w-3" />
                 </Button>
               </>
             )}
