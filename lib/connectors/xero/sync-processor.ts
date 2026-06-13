@@ -105,7 +105,7 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
   })
 }
 
-async function markSyncLogForFollowUpRetry(
+export async function markSyncLogForFollowUpRetry(
   entry: { id: string; retryCount: number },
   error: unknown,
   client?: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
@@ -113,8 +113,14 @@ async function markSyncLogForFollowUpRetry(
   const errorMessage = `Xero follow-up work failed after connector post: ${String(error)}`
   const retryCount = entry.retryCount + 1
   const finalFailure = retryCount >= MAX_RETRIES
-  await (client ?? db).accountingSyncLog.update({
-    where: { id: entry.id },
+  const conn = client ?? db
+  // Optimistic-concurrency guard: only advance from the retryCount we observed.
+  // Two workers handling the same sync log (e.g. duplicate outbox jobs pointing
+  // at one AccountingSyncLog) must not both increment from a stale value and
+  // double-write the failure transition. The compound where makes the update a
+  // no-op for the loser of the race.
+  const updated = await conn.accountingSyncLog.updateMany({
+    where: { id: entry.id, retryCount: entry.retryCount },
     data: {
       status: finalFailure ? 'FAILED' : 'PENDING',
       retryCount,
@@ -122,7 +128,23 @@ async function markSyncLogForFollowUpRetry(
       processingStartedAt: null,
     },
   })
-  return { errorMessage, finalFailure }
+  if (updated.count > 0) {
+    return { errorMessage, finalFailure }
+  }
+  // Lost the race: another worker already advanced this row. Reflect the
+  // PERSISTED state so the caller's outbox decision (permanent vs retry) acts on
+  // reality, not our stale view — otherwise we could mark the outbox job for
+  // retry while the row is already terminally FAILED (or vice-versa).
+  const current = await conn.accountingSyncLog.findUnique({
+    where: { id: entry.id },
+    select: { retryCount: true, status: true },
+  })
+  return {
+    errorMessage,
+    finalFailure: current
+      ? current.status === 'FAILED' || current.retryCount >= MAX_RETRIES
+      : finalFailure,
+  }
 }
 
 async function logFollowUpRetry(entryId: string, error: unknown): Promise<void> {
