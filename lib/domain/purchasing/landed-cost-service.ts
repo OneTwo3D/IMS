@@ -10,6 +10,7 @@ import {
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
 import { toJsonInputValue } from '@/lib/db/json-input'
+import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
 
 export const LANDED_COST_DISTRIBUTION_METHODS = [
   'BY_VALUE',
@@ -76,6 +77,12 @@ export type LandedCostRevaluationReason = typeof LANDED_COST_REVALUATION_REASONS
 export type LandedCostRevaluationOptions = {
   triggeredById: string | null
   reason?: LandedCostRevaluationReason | null
+  /**
+   * audit-grob: also enqueue the adjustment journals into the durable outbox IN
+   * this recalc's transaction (a crash-recovery backstop for the post-commit
+   * queueLandedCostAdjustmentJournals call). Only the journaling callers pass it.
+   */
+  scheduleAdjustmentJournals?: boolean
 }
 
 type DistributionLine = {
@@ -805,6 +812,10 @@ export async function recalculateLandedCosts(
     })
     result.auditRunIds.push(auditRun.id)
   }
+  // audit-grob: durably enqueue the adjustment journals IN this tx (backstop).
+  if (options.scheduleAdjustmentJournals) {
+    await scheduleLandedCostJournalOutbox(tx, result)
+  }
   return result
 }
 
@@ -1083,5 +1094,9 @@ export async function recalculateDirectLandedCosts(
     select: { id: true },
   })
   result.auditRunIds.push(auditRun.id)
+  // audit-grob: durably enqueue the adjustment journals IN this tx (backstop).
+  if (options.scheduleAdjustmentJournals) {
+    await scheduleLandedCostJournalOutbox(tx, result)
+  }
   return result
 }

@@ -23,6 +23,17 @@ export async function GET(request: Request) {
     if (!token) {
       return NextResponse.json({ skipped: true, reason: 'Xero not connected' })
     }
+    // audit-grob: drain the landed-cost adjustment-journal backstop FIRST so any
+    // journals lost to a crash before their post-commit enqueue are re-queued
+    // (into AccountingSyncLog) in time for this run's processPendingXeroSync.
+    // Idempotent — a no-op when the direct post-commit call already queued them.
+    let landedCostJournalOutbox: Awaited<ReturnType<typeof import('@/lib/domain/purchasing/landed-cost-journal-outbox')['processLandedCostJournalOutbox']>> | undefined
+    try {
+      const { processLandedCostJournalOutbox } = await import('@/lib/domain/purchasing/landed-cost-journal-outbox')
+      landedCostJournalOutbox = await processLandedCostJournalOutbox()
+    } catch (outboxError) {
+      console.error('accounting-sync cron: landed-cost journal outbox drain failed', outboxError)
+    }
     const { processPendingXeroSync, repairXeroBackReferences } = await import('@/lib/connectors/xero/sync-processor')
     const result = await processPendingXeroSync()
     // audit-H3: repair any documents whose back-reference was never written
@@ -33,7 +44,7 @@ export async function GET(request: Request) {
     } catch (repairError) {
       console.error('accounting-sync cron: back-reference repair sweep failed', repairError)
     }
-    return NextResponse.json({ ...result, backReferenceRepair })
+    return NextResponse.json({ ...result, backReferenceRepair, landedCostJournalOutbox })
   }
 
   if (await isIntegrationPluginEnabled('quickbooks')) {

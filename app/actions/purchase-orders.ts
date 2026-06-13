@@ -1594,6 +1594,7 @@ export async function updatePurchaseOrder(
           return recalculateDirectLandedCosts(tx, id, undefined, {
             triggeredById: session.user.id,
             reason: 'purchase_order_additional_costs_updated',
+            scheduleAdjustmentJournals: true, // audit-grob durable backstop
           })
         }, STOCK_TX_OPTIONS)
         landedCostAuditRunIds = landedResult.auditRunIds
@@ -3598,6 +3599,7 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
       async (tx) => recalculateLandedCosts(tx, po.id, undefined, {
         triggeredById: session.user.id,
         reason: 'freight_purchase_order_created',
+        scheduleAdjustmentJournals: true, // audit-grob durable backstop
       }),
       STOCK_TX_OPTIONS,
     )
@@ -3787,6 +3789,7 @@ export async function updateFreightPoCosts(
       const landedResult = await recalculateLandedCosts(tx, freightPoId, undefined, {
         triggeredById: session.user.id,
         reason: 'freight_purchase_order_costs_updated',
+        scheduleAdjustmentJournals: true, // audit-grob durable backstop
       })
       return { reference: po.reference, landedResult }
     }, STOCK_TX_OPTIONS)

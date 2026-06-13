@@ -175,6 +175,7 @@ export async function cancelPurchaseOrderService(
         landedCostRecalc = await deps.recalculateLandedCosts(tx, id, undefined, {
           triggeredById: null,
           reason: 'freight_purchase_order_cancelled',
+          scheduleAdjustmentJournals: true, // audit-grob durable backstop
         })
       }
 
