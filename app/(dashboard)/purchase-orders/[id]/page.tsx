@@ -59,9 +59,12 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   // audit-C1b: prepaid suppliers can be billed beyond what arrives (the deposit
   // was deliberate, so three-way-match is off) — surface a read-time soft
   // reconciliation banner when billed > received.
+  // Only reconcile once receipt is effectively done — otherwise a still-arriving
+  // PO would alarm mid-delivery. (Receipt-complete / post-receipt statuses.)
+  const PREPAID_RECONCILE_STATUSES = ['RECEIVED', 'INVOICED', 'PARTIALLY_RETURNED', 'RETURNED', 'CLOSED']
   const prepaidReconciliation = computePrepaidReconciliation({
-    isPrepaidSupplier: po.supplierPrepaid,
-    lines: po.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.sku, qtyReceived: l.qtyReceived })),
+    isPrepaidSupplier: po.supplierPrepaid && PREPAID_RECONCILE_STATUSES.includes(po.status),
+    lines: po.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.sku, qtyReceived: l.qtyReceived, qtyReturned: l.qtyReturned })),
     invoices: po.invoices.map((inv) => ({ lines: inv.lines.map((il) => ({ poLineId: il.poLineId, qtyBilled: il.qtyBilled, totalBase: il.totalBase })) })),
   })
 

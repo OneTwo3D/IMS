@@ -1,3 +1,4 @@
+import { Prisma } from '@/app/generated/prisma/client'
 import {
   addMoney,
   multiplyMoney,
@@ -48,6 +49,7 @@ type PoLineInput = {
   productId: string
   sku?: string | null
   qtyReceived: DecimalInput
+  qtyReturned: DecimalInput
 }
 
 type InvoiceInput = {
@@ -91,12 +93,17 @@ export function computePrepaidReconciliation(input: {
   for (const poLine of input.lines) {
     const billed = billedByLine.get(poLine.id)
     if (!billed || billed.qty.lte(0)) continue
-    const received = toDecimal(poLine.qtyReceived)
-    const shortfall = subtractMoney(billed.qty, received)
+    // Net out returns: goods received then returned are no longer in our
+    // possession, so "prepaid but not arrived" is billed − (received − returned).
+    // This keeps the figure consistent with the C4 over-billing banner and
+    // avoids a prepaid PO with returns showing two contradictory numbers.
+    const netReceived = Prisma.Decimal.max(subtractMoney(poLine.qtyReceived, poLine.qtyReturned), toDecimal(0))
+    const shortfall = subtractMoney(billed.qty, netReceived)
     if (shortfall.lt(-QTY_EPSILON)) hasUnderBilled = true
     if (shortfall.lte(QTY_EPSILON)) continue
 
-    const avgUnitCostBase = billed.qty.gt(0) ? billed.valueBase.div(billed.qty) : toDecimal(0)
+    // billed.qty > 0 is guaranteed by the early-continue above.
+    const avgUnitCostBase = billed.valueBase.div(billed.qty)
     const shortfallValueBase = roundQuantity(multiplyMoney(shortfall, avgUnitCostBase), 2)
     totalShortfallQty = addMoney(totalShortfallQty, shortfall)
     totalShortfallValueBase = addMoney(totalShortfallValueBase, shortfallValueBase)
@@ -105,7 +112,7 @@ export function computePrepaidReconciliation(input: {
       productId: poLine.productId,
       sku: poLine.sku ?? null,
       billedQty: roundQuantity(billed.qty, 4).toString(),
-      receivedQty: roundQuantity(received, 4).toString(),
+      receivedQty: roundQuantity(netReceived, 4).toString(),
       shortfallQty: roundQuantity(shortfall, 4).toString(),
       shortfallValueBase: shortfallValueBase.toString(),
     })
