@@ -180,6 +180,8 @@ test('parseProductionOrderComponentSnapshot returns null for absent/empty/malfor
   assert.equal(parseProductionOrderComponentSnapshot([{ componentId: '', qty: 4 }]), null) // empty id
   assert.equal(parseProductionOrderComponentSnapshot([{ componentId: 'x', qty: 'four' }]), null) // non-numeric
   assert.equal(parseProductionOrderComponentSnapshot([{ componentId: 'x', qty: Number.NaN }]), null) // NaN
+  assert.equal(parseProductionOrderComponentSnapshot([{ componentId: 'x', qty: 0 }]), null) // zero
+  assert.equal(parseProductionOrderComponentSnapshot([{ componentId: 'x', qty: -1 }]), null) // negative — would flip a decrement
 })
 
 test('edit-in-between: consumption follows the frozen snapshot, not the edited live BOM', () => {

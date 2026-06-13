@@ -26,7 +26,9 @@ export function parseProductionOrderComponentSnapshot(
     if (!entry || typeof entry !== 'object') return null
     const { componentId, qty } = entry as { componentId?: unknown; qty?: unknown }
     if (typeof componentId !== 'string' || componentId.length === 0) return null
-    if (typeof qty !== 'number' || !Number.isFinite(qty)) return null
+    // Reject non-positive quantities: a negative qty would flip a reservedQty
+    // decrement into an increment and corrupt reserved stock.
+    if (typeof qty !== 'number' || !Number.isFinite(qty) || qty <= 0) return null
     parsed.push({ componentId, qty })
   }
   return parsed

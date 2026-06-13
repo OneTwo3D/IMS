@@ -529,6 +529,10 @@ export async function updateManufacturingOrderStatus(
     // readable warning without holding the tx open.
     let manufacturingJournalSkipReason: string | null = null
     let disassemblyFallback = null as { recoveredLayerCount: number } | null
+    // audit-H6: the components actually consumed/recovered at COMPLETED (snapshot
+    // when present, else live BOM), captured out of the tx so post-tx activity
+    // logs and stock-sync report exactly what changed — not a since-edited BOM.
+    let completedComponents: ProductionOrderComponentSnapshot | { componentId: string; qty: Prisma.Decimal }[] = []
 
     // When completing: execute stock movements in a transaction
     if (status === 'COMPLETED') {
@@ -573,6 +577,7 @@ export async function updateManufacturingOrderStatus(
         // that were never started (no snapshot).
         const components: ProductionOrderComponentSnapshot | typeof order.outputProduct.productComponents =
           parseProductionOrderComponentSnapshot(order.componentSnapshot) ?? order.outputProduct.productComponents
+        completedComponents = components
         const wasInProgress = order.status === 'IN_PROGRESS'
         const costLayerReceivedAt = manufacturingCostLayerReceivedAt({
           orderType: order.orderType,
@@ -894,11 +899,12 @@ export async function updateManufacturingOrderStatus(
         })
       }
 
-      // Log individual stock movements (fire-and-forget, after transaction)
-      // Use orderPreview for logging — the inner `order` is scoped to the tx
+      // Log individual stock movements (fire-and-forget, after transaction).
+      // audit-H6: log the components actually consumed/recovered (completedComponents
+      // = snapshot when present), so the audit log matches the tx, not a since-edited BOM.
       const qtyPlanned = Number(orderPreview.qtyPlanned)
       if (isAssembly) {
-        for (const comp of orderPreview.outputProduct.productComponents) {
+        for (const comp of completedComponents) {
           const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
           await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
@@ -926,7 +932,7 @@ export async function updateManufacturingOrderStatus(
           description: `${orderPreview.reference}: disassembled ${qtyPlanned} units of ${orderPreview.outputProduct.sku}`,
           metadata: { movementType: 'PRODUCTION_OUT', qty: qtyPlanned, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
         })
-        for (const comp of orderPreview.outputProduct.productComponents) {
+        for (const comp of completedComponents) {
           const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
           await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
@@ -940,6 +946,10 @@ export async function updateManufacturingOrderStatus(
       }
     } else if (status === 'IN_PROGRESS') {
       const qtyPlanned = Number(orderPreview.qtyPlanned)
+      // The components actually reserved + snapshotted — read fresh under the
+      // lock below, then reused for the post-tx reservation logging so logs
+      // match what was reserved/frozen.
+      let startedComponents: ProductionOrderComponentSnapshot = []
       // Reserve inside the same locked transaction as the status transition.
       await db.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
@@ -951,20 +961,28 @@ export async function updateManufacturingOrderStatus(
         const startDecision = evaluateProductionOrderStart(lockedOrder.status)
         if (!startDecision.allowed) throw new Error(startDecision.error)
 
+        // audit-H6: read the BOM FRESH under the lock — not the pre-lock
+        // orderPreview — so the reserved set and the persisted snapshot are
+        // both the BOM as of the transaction, with no edit race between them.
+        const liveComponents = await tx.productComponent.findMany({
+          where: { productId: orderPreview.outputProductId },
+          select: { componentId: true, qty: true },
+        })
+        const componentSnapshot: ProductionOrderComponentSnapshot = liveComponents.map(
+          (comp) => ({ componentId: comp.componentId, qty: Number(comp.qty) }),
+        )
+        startedComponents = componentSnapshot
+
         if (isAssembly) {
-          for (const comp of orderPreview.outputProduct.productComponents) {
+          for (const comp of componentSnapshot) {
             const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
             await reserveAvailableStock(tx, comp.componentId, orderPreview.warehouseId, totalQty)
           }
         } else {
           await reserveAvailableStock(tx, orderPreview.outputProductId, orderPreview.warehouseId, qtyPlanned)
         }
-        // audit-H6: freeze the component requirements onto the order. Completion
-        // and cancellation read this snapshot, not the live BOM, so a BOM edit
-        // mid-production can't strand a reservation or change what is consumed.
-        const componentSnapshot: ProductionOrderComponentSnapshot = orderPreview.outputProduct.productComponents.map(
-          (comp) => ({ componentId: comp.componentId, qty: Number(comp.qty) }),
-        )
+        // Freeze the requirements onto the order. Completion and cancellation
+        // read this snapshot, not the live BOM.
         await tx.productionOrder.update({
           where: { id },
           data: { status, startedAt: now, componentSnapshot },
@@ -973,7 +991,7 @@ export async function updateManufacturingOrderStatus(
 
       // Log stock reservations
       if (isAssembly) {
-        for (const comp of orderPreview.outputProduct.productComponents) {
+        for (const comp of startedComponents) {
           const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
           await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
@@ -1004,12 +1022,25 @@ export async function updateManufacturingOrderStatus(
         })
       } else {
         const qtyPlanned = Number(orderPreview.qtyPlanned)
-        // audit-H6: release exactly what was reserved by reading the frozen
-        // snapshot, not the live BOM (which may have been edited since start).
-        const releaseComponents = parseProductionOrderComponentSnapshot(orderPreview.componentSnapshot)
-          ?? orderPreview.outputProduct.productComponents
-        // Release reservations when cancelling an in-progress order
+        // Release reservations when cancelling an in-progress order.
         await db.$transaction(async (tx) => {
+          // Lock + re-check under the lock so two concurrent cancels can't both
+          // release and drive reservedQty negative.
+          await tx.$queryRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
+          const lockedOrder = await tx.productionOrder.findUnique({
+            where: { id },
+            select: { status: true, componentSnapshot: true },
+          })
+          if (!lockedOrder) throw new Error('Order not found')
+          const lockedDecision = evaluateProductionOrderCancellation(lockedOrder.status)
+          if (!lockedDecision.allowed || lockedDecision.action !== 'release-reservations') {
+            // Already cancelled/completed by a concurrent request — nothing to release.
+            return
+          }
+          // audit-H6: release exactly what was reserved by reading the frozen
+          // snapshot (under the lock), not the live BOM which may have changed.
+          const releaseComponents = parseProductionOrderComponentSnapshot(lockedOrder.componentSnapshot)
+            ?? orderPreview.outputProduct.productComponents
           if (isAssembly) {
             for (const comp of releaseComponents) {
               const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
@@ -1061,11 +1092,14 @@ export async function updateManufacturingOrderStatus(
     revalidatePath('/inventory')
     revalidatePath('/stock-control')
     try {
+      // audit-H6: on completion, sync the components actually consumed/recovered
+      // (snapshot set); for other transitions no component stock changed, so fall
+      // back to the live BOM list (unchanged behaviour).
+      const syncComponentIds = completedComponents.length > 0
+        ? completedComponents.map((comp) => comp.componentId)
+        : orderPreview.outputProduct.productComponents.map((comp) => comp.componentId)
       await enqueueStockSync(
-        [
-          orderPreview.outputProductId,
-          ...orderPreview.outputProduct.productComponents.map((comp) => comp.componentId),
-        ],
+        [orderPreview.outputProductId, ...syncComponentIds],
         'IMS_CHANGE',
       )
     } catch (syncError) {
@@ -1151,6 +1185,7 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
       notes: true,
       currency: true,
       fxRateToBase: true,
+      componentSnapshot: true,
       outputProduct: {
         select: {
           id: true,
@@ -1180,7 +1215,43 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
   })
   if (!o) return null
 
-  const componentIds = o.outputProduct.productComponents.map((c) => c.componentId)
+  // audit-H6: a started order's reservation/consumption is governed by the frozen
+  // snapshot, not the live BOM. Display the snapshot's components/quantities so the
+  // detail view's required/shortage figures match what was actually reserved. Fall
+  // back to the live BOM when there is no snapshot (order never started).
+  const snapshot = parseProductionOrderComponentSnapshot(o.componentSnapshot)
+  const liveComponentById = new Map(o.outputProduct.productComponents.map((c) => [c.componentId, c]))
+  type ComponentMeta = { sku: string; name: string; barcode: string | null; mpn: string | null; imageUrl: string | null }
+  let effectiveComponents: Array<{ componentId: string; qtyPerUnit: number; meta: ComponentMeta | null }>
+  if (snapshot) {
+    // Snapshot components removed from the live BOM still need metadata for display.
+    const missingIds = snapshot.filter((s) => !liveComponentById.has(s.componentId)).map((s) => s.componentId)
+    const extraMeta = missingIds.length > 0
+      ? await db.product.findMany({
+          where: { id: { in: missingIds } },
+          select: { id: true, sku: true, name: true, barcode: true, mpn: true, imageUrl: true, parent: { select: { imageUrl: true } } },
+        })
+      : []
+    const extraById = new Map(extraMeta.map((p) => [p.id, p]))
+    effectiveComponents = snapshot.map((s) => {
+      const live = liveComponentById.get(s.componentId)
+      const extra = extraById.get(s.componentId)
+      const meta: ComponentMeta | null = live
+        ? { sku: live.component.sku, name: live.component.name, barcode: live.component.barcode, mpn: live.component.mpn, imageUrl: live.component.imageUrl ?? live.component.parent?.imageUrl ?? null }
+        : extra
+          ? { sku: extra.sku, name: extra.name, barcode: extra.barcode, mpn: extra.mpn, imageUrl: extra.imageUrl ?? extra.parent?.imageUrl ?? null }
+          : null
+      return { componentId: s.componentId, qtyPerUnit: s.qty, meta }
+    })
+  } else {
+    effectiveComponents = o.outputProduct.productComponents.map((c) => ({
+      componentId: c.componentId,
+      qtyPerUnit: Number(c.qty),
+      meta: { sku: c.component.sku, name: c.component.name, barcode: c.component.barcode, mpn: c.component.mpn, imageUrl: c.component.imageUrl ?? c.component.parent?.imageUrl ?? null },
+    }))
+  }
+
+  const componentIds = effectiveComponents.map((c) => c.componentId)
   const componentStock = componentIds.length > 0
     ? await db.stockLevel.findMany({
         where: {
@@ -1220,8 +1291,8 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
     notes: o.notes,
     currency: o.currency,
     fxRateToBase: Number(o.fxRateToBase),
-    components: o.outputProduct.productComponents.map((c) => {
-      const qtyPerUnit = Number(c.qty)
+    components: effectiveComponents.map((c) => {
+      const qtyPerUnit = c.qtyPerUnit
       const requiredQty = qtyPerUnit * plannedQty
       const stock = stockByProductId.get(c.componentId)
       const stockOnHand = Number(stock?.quantity ?? 0)
@@ -1229,11 +1300,11 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
       const availableForOrder = includeReservedForThisOrder ? stockOnHand : stockOnHand - reservedQty
       return {
         componentId: c.componentId,
-        componentSku: c.component.sku,
-        componentName: c.component.name,
-        componentBarcode: c.component.barcode,
-        componentMpn: c.component.mpn,
-        componentImageUrl: c.component.imageUrl ?? c.component.parent?.imageUrl ?? null,
+        componentSku: c.meta?.sku ?? c.componentId,
+        componentName: c.meta?.name ?? '(component removed from BOM)',
+        componentBarcode: c.meta?.barcode ?? null,
+        componentMpn: c.meta?.mpn ?? null,
+        componentImageUrl: c.meta?.imageUrl ?? null,
         qtyPerUnit,
         requiredQty,
         stockOnHand,
