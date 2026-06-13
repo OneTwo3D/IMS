@@ -17,6 +17,7 @@ import {
 } from '@/lib/cost-layers'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
+import { availableForTransfer, canDispatchTransferQty } from '@/lib/domain/inventory/transfer-availability'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import {
@@ -388,8 +389,10 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
           where: { productId_warehouseId: { productId: line.productId, warehouseId: transfer.fromWarehouseId } },
           select: { quantity: true, reservedQty: true },
         })
-        const available = level ? Number(level.quantity) - Number(level.reservedQty) : 0
-        if (available < qty) {
+        // audit-M-stock #1: net the source warehouse's reserved (allocated)
+        // quantity so a transfer can't drain stock an order is holding there.
+        const available = availableForTransfer(level?.quantity, level?.reservedQty)
+        if (!canDispatchTransferQty(level?.quantity, level?.reservedQty, qty)) {
           throw new Error(`Insufficient stock for ${line.sku}: ${available} available, ${qty} requested`)
         }
       }

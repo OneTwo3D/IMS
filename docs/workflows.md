@@ -151,3 +151,26 @@ refund payments.
 
 Stock transfer status tracks inter-warehouse movement. `IN_TRANSIT` means stock
 has left the source warehouse and is not yet available at the destination.
+
+**Stock / concurrency invariants (audit-M-stock).** A few cross-cutting guards
+worth knowing:
+
+- **Transfers don't strand allocations.** Dispatch availability is the source
+  warehouse's on-hand minus its `reservedQty` (`availableForTransfer`), and
+  `StockLevel.reservedQty` is per-(product, warehouse) and kept in sync with
+  order allocations — so a transfer can never drain stock an order is holding in
+  that warehouse.
+- **Manual receipt + WMS booked-in don't double-count.** `reconcileBookedInQuantities`
+  nets the locally-received quantity (read under the PO's `FOR UPDATE` lock) so a
+  manual receipt already covering a line is not re-added when the Mintsoft
+  booked-in webhook approves the same ASN.
+- **Opening stock can't duplicate.** `applyOpeningStock` takes a `FOR UPDATE`
+  lock on the stock level before checking for an existing opening cost layer, so
+  concurrent calls serialise and the second is rejected.
+- **Non-negative stock is enforced in the DB** via CHECK constraints
+  (`stock_levels_quantity_nonnegative`, `reservedQty >= 0`, `reservedQty <= quantity`).
+- **FIFO ordering at the destination** of a received transfer follows the
+  dispatch-time cost-layer snapshot order. If transfers are received out of
+  dispatch order the recreated layers can be marginally out of strict FIFO order
+  at the destination — this is cosmetic for reporting and accepted (the cost
+  basis per layer is preserved).
