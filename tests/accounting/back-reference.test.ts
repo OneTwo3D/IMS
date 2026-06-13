@@ -13,12 +13,14 @@ function makeDeps(overrides: {
   salesOrderRefundCreditNoteId?: string | null
   purchaseInvoiceAccountingInvoiceId?: string | null
   poNullInvoiceId?: string | null
+  supplierCreditNoteAccountingCreditNoteId?: string | null
   throwOnUpdate?: boolean
 }) {
   const calls = {
     salesOrderUpdate: 0,
     salesOrderRefundUpdate: 0,
     purchaseInvoiceUpdate: 0,
+    supplierCreditNoteUpdate: 0,
     lastUpdateData: undefined as Record<string, unknown> | undefined,
   }
   const maybeThrow = () => {
@@ -37,6 +39,10 @@ function makeDeps(overrides: {
       async update(args) { maybeThrow(); calls.purchaseInvoiceUpdate++; calls.lastUpdateData = args.data; return {} },
       async findUnique() { return { accountingInvoiceId: overrides.purchaseInvoiceAccountingInvoiceId ?? null } },
       async findFirst() { return overrides.poNullInvoiceId ? { id: overrides.poNullInvoiceId } : null },
+    },
+    supplierCreditNote: {
+      async update(args) { maybeThrow(); calls.supplierCreditNoteUpdate++; calls.lastUpdateData = args.data; return {} },
+      async findUnique() { return { accountingCreditNoteId: overrides.supplierCreditNoteAccountingCreditNoteId ?? null } },
     },
   }
   return { deps, calls }
@@ -94,4 +100,19 @@ test('backReferenceIsMissing for PURCHASE_INVOICE/PurchaseOrder reflects an unli
 
   const allLinked = makeDeps({ poNullInvoiceId: null })
   assert.equal(await backReferenceIsMissing(allLinked.deps, { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' }), false)
+})
+
+test('PURCHASE_CREDIT_NOTE/SupplierCreditNote writes accountingCreditNoteId back (g5u2)', async () => {
+  assert.equal(syncTypeWritesBackReference('PURCHASE_CREDIT_NOTE', 'SupplierCreditNote'), true)
+
+  const d = makeDeps({})
+  await applyBackReference(d.deps, { type: 'PURCHASE_CREDIT_NOTE', referenceType: 'SupplierCreditNote', referenceId: 'scn-1', externalId: 'XCN-9' })
+  assert.equal(d.calls.supplierCreditNoteUpdate, 1)
+  assert.equal(d.calls.lastUpdateData?.accountingCreditNoteId, 'XCN-9')
+
+  // repair probe: missing when the credit note still has no external id
+  const missing = makeDeps({ supplierCreditNoteAccountingCreditNoteId: null })
+  assert.equal(await backReferenceIsMissing(missing.deps, { type: 'PURCHASE_CREDIT_NOTE', referenceType: 'SupplierCreditNote', referenceId: 'scn-1', externalId: 'XCN-9' }), true)
+  const linked = makeDeps({ supplierCreditNoteAccountingCreditNoteId: 'XCN-9' })
+  assert.equal(await backReferenceIsMissing(linked.deps, { type: 'PURCHASE_CREDIT_NOTE', referenceType: 'SupplierCreditNote', referenceId: 'scn-1', externalId: 'XCN-9' }), false)
 })
