@@ -64,6 +64,7 @@ const ACCOUNT_FIELDS: { key: keyof AccountingConnectorSettings; label: string; d
   { key: 'xero_inventory_account', label: 'Inventory Asset', description: 'Stock on hand value' },
   { key: 'xero_allocated_inventory_account', label: 'Allocated Inventory', description: 'Stock allocated to paid orders awaiting dispatch' },
   { key: 'xero_cogs_account', label: 'Cost of Goods Sold', description: 'COGS booked on dispatch' },
+  { key: 'xero_inventory_revaluation_account', label: 'Inventory Revaluation', description: 'P&L offset for retrospective COGS corrections on goods already sold (e.g. freight cancelled after dispatch). Leave blank to use Stock in Transit.' },
   { key: 'xero_unearned_revenue_account', label: 'Unearned Revenue', description: 'Liability account for revenue deferred until shipment' },
   { key: 'xero_accounts_receivable_account', label: 'Accounts Receivable', description: 'Control account adjusted for realised FX on customer payments' },
   { key: 'xero_accounts_payable_account', label: 'Accounts Payable', description: 'Control account adjusted for realised FX on supplier payments' },

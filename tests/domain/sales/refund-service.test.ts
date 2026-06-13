@@ -144,6 +144,7 @@ const accountingSettings: AccountingSettings = {
   shippingAccount: '4010',
   discountAccount: '',
   cogsAccount: '5000',
+  inventoryRevaluationAccount: '',
   inventoryAccount: '1200',
   allocatedInventoryAccount: '1210',
   unearnedRevenueAccount: '2100',
