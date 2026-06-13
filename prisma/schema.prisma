@@ -183,6 +183,16 @@ enum AccountingSyncStatus {
   @@map("AccountingSyncStatus")
 }
 
+// audit-g5u2: supplier credit-note lifecycle. DRAFT = recorded in IMS awaiting
+// review; POSTED = pushed to the accounting connector (ACCPAYCREDIT) and eligible
+// to offset a freight bill for cancellation.
+enum SupplierCreditNoteStatus {
+  DRAFT
+  POSTED
+
+  @@map("SupplierCreditNoteStatus")
+}
+
 enum ShoppingSyncDirection {
   TO_CONNECTOR
   FROM_CONNECTOR
@@ -1060,6 +1070,7 @@ model PurchaseOrder {
   receipts        PurchaseReceipt[]
   invoices        PurchaseInvoice[]
   returns         PurchaseReturn[]
+  supplierCreditNotes SupplierCreditNote[]
 
   // Landed cost links — this PO as primary
   landedCostLinks LandedCostLink[]   @relation("PrimaryPO")
@@ -1233,6 +1244,7 @@ model PurchaseInvoice {
 
   po              PurchaseOrder @relation(fields: [poId], references: [id])
   lines           PurchaseInvoiceLine[]
+  supplierCreditNotes SupplierCreditNote[]
 
   @@index([poId])
   @@map("purchase_invoices")
@@ -1287,6 +1299,45 @@ model PurchaseReturnLine {
   @@index([returnId])
   @@index([poLineId])
   @@map("purchase_return_lines")
+}
+
+// audit-g5u2: a supplier credit note recorded against a (freight) PO — e.g. a
+// duplicate freight bill the supplier is crediting back. Once POSTED to the
+// accounting connector it can offset the freight invoice so the PO becomes
+// cancellable (g5u2.4) while the credit note keeps the GL balanced.
+model SupplierCreditNote {
+  id                    String                   @id @default(cuid())
+  poId                  String
+  // The freight PurchaseInvoice this credit note offsets (nullable: a credit may
+  // be recorded before being tied to a specific bill).
+  purchaseInvoiceId     String?
+  // Denormalised supplier snapshot (resolved via the PO at record time), matching
+  // how other purchasing rows avoid a hard Supplier relation.
+  supplierId            String
+  reference             String?
+  creditNoteNumber      String?
+  amountForeign         Decimal                  @db.Decimal(18, 4)
+  amountBase            Decimal                  @db.Decimal(18, 4)
+  currency              String
+  fxRateToBase          Decimal                  @db.Decimal(18, 8)
+  reason                String?
+  notes                 String?
+  status                SupplierCreditNoteStatus @default(DRAFT)
+  // Accounting-connector credit-note id (Xero ACCPAYCREDIT), set once POSTED.
+  accountingCreditNoteId String?                 @map("accounting_credit_note_id")
+  recordedAt            DateTime                 @default(now())
+  postedAt              DateTime?
+  createdBy             String?
+  createdAt             DateTime                 @default(now())
+  updatedAt             DateTime                 @updatedAt
+
+  po                    PurchaseOrder            @relation(fields: [poId], references: [id])
+  purchaseInvoice       PurchaseInvoice?         @relation(fields: [purchaseInvoiceId], references: [id])
+
+  @@index([poId])
+  @@index([supplierId])
+  @@index([purchaseInvoiceId])
+  @@map("supplier_credit_notes")
 }
 
 // ---------------------------------------------------------------------------
