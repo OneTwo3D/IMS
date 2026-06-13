@@ -97,6 +97,8 @@ type Props = {
   accountingSyncEnabled: boolean
   currentUserRole: string
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
+  /** audit-H2: order is fully paid but its trigger won't auto-generate an invoice. */
+  paidWithoutInvoice: boolean
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -785,7 +787,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -985,14 +987,25 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             </Button>
           ))}
 
-          {/* Invoice */}
-          {accountingAvailable && !so.invoiceNumber && !accountingSyncEnabled && (
+          {/* Invoice. audit-H2: when the order is paid without an invoice on a
+              manual/unset trigger (paidWithoutInvoice), show ONLY the amber chip
+              — suppress the plain generate button and the pending-sync chip so
+              there is a single, unambiguous affordance. */}
+          {accountingAvailable && !so.invoiceNumber && !accountingSyncEnabled && !paidWithoutInvoice && (
             <Button variant="outline" size="sm" onClick={handleGenerateInvoice} disabled={isPending}>
               <FileText className="h-4 w-4 mr-1" />Generate Invoice
             </Button>
           )}
-          {accountingAvailable && accountingSyncEnabled && !so.invoiceNumber && !so.accountingInvoiceId && so.status !== 'DRAFT' && (
+          {accountingAvailable && accountingSyncEnabled && !so.invoiceNumber && !so.accountingInvoiceId && so.status !== 'DRAFT' && !paidWithoutInvoice && (
             <span className="inline-flex items-center gap-1 text-xs text-muted-foreground"><Clock className="h-3 w-3" />Invoice pending sync</span>
+          )}
+          {paidWithoutInvoice && (
+            <span className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+              <AlertTriangle className="h-3 w-3" /> Paid without invoice —{' '}
+              <button type="button" onClick={handleGenerateInvoice} disabled={isPending} className="underline hover:no-underline disabled:opacity-50">
+                generate now
+              </button>
+            </span>
           )}
 
           {canRefund && (

@@ -46,6 +46,7 @@ import {
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
+import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import {
   cancelSalesOrderFulfillmentState,
   updateSalesOrderStatusUnderLock,
@@ -2049,6 +2050,17 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
       if (trigger?.value === 'on_paid') {
         await generateInvoiceNumber(id, { skipLog: true })
+      } else if (shouldWarnPaidWithoutInvoice({ becamePaid: true, hasInvoiceNumber: false, invoiceTrigger: trigger?.value })) {
+        // audit-H2: surface the paid-without-invoice gap for manual/unset triggers.
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: id,
+          action: 'paid_without_invoice',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Order ${getSalesOrderReference({ id, ...so })} is fully paid but has no invoice (trigger: ${trigger?.value ?? 'manual'}). Generate an invoice to keep the GL receivable and invoice in sync.`,
+          metadata: { orderNumber: getSalesOrderReference({ id, ...so }), invoiceTrigger: trigger?.value ?? null },
+        })
       }
     }
 
@@ -2205,6 +2217,7 @@ export async function addPayment(input: {
           totalForeign: true,
           fxRateToBase: true,
           paidAt: true,
+          invoiceNumber: true,
         },
       })
       if (!so) return { error: 'Order not found' }
@@ -2273,6 +2286,23 @@ export async function addPayment(input: {
       const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
       if (trigger?.value === 'on_paid') {
         await generateInvoiceNumber(input.orderId, { skipLog: true })
+      } else if (!txResult.so.invoiceNumber) {
+        // Re-read invoiceNumber: a concurrent generateInvoiceNumber could have
+        // set it between the tx commit and here — avoid a spurious warning.
+        const current = await db.salesOrder.findUnique({ where: { id: input.orderId }, select: { invoiceNumber: true } })
+        if (shouldWarnPaidWithoutInvoice({ becamePaid: txResult.becamePaid, hasInvoiceNumber: Boolean(current?.invoiceNumber), invoiceTrigger: trigger?.value })) {
+          // audit-H2: manual/unset trigger won't generate an invoice — make the
+          // receivable/invoice gap loud rather than auto-generating.
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: input.orderId,
+            action: 'paid_without_invoice',
+            tag: 'sales',
+            level: 'WARNING',
+            description: `Order ${getSalesOrderReference(txResult.so)} is fully paid but has no invoice (trigger: ${trigger?.value ?? 'manual'}). Generate an invoice to keep the GL receivable and invoice in sync.`,
+            metadata: { orderNumber: getSalesOrderReference(txResult.so), invoiceTrigger: trigger?.value ?? null },
+          })
+        }
       }
     }
 

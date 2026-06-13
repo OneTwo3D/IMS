@@ -13,6 +13,7 @@ import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { getSalesOrderAdminLinks } from '@/lib/shopping'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requireAuth } from '@/lib/auth/server'
+import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -21,7 +22,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs] = await Promise.all([
+  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs, invoiceTrigger] = await Promise.all([
     requireAuth(),
     getSalesOrder(id),
     getWarehouses(),
@@ -36,11 +37,18 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     getAccountingSettings(),
     isIntegrationPluginEnabled('xero'),
     getRejectedAccountingDocumentUpdateWarnings([{ referenceType: 'SalesOrder', referenceId: id }]),
+    getSetting('invoice_trigger'),
   ])
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
   if (!so) notFound()
+  // audit-H2: a fully-paid order whose trigger won't auto-generate an invoice.
+  const paidWithoutInvoice = shouldWarnPaidWithoutInvoice({
+    becamePaid: Boolean(so.paidAt),
+    hasInvoiceNumber: Boolean(so.invoiceNumber),
+    invoiceTrigger,
+  })
   const stockWarehouseIds = Array.from(new Set([
     ...warehouses.map((warehouse) => warehouse.id),
     so.shipFromWarehouseId,
@@ -74,6 +82,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         accountingSyncEnabled={accountingAvailable && accountingSettings.syncEnabled}
         currentUserRole={session.user.role}
         rejectedAccountingSyncs={rejectedAccountingSyncs}
+        paidWithoutInvoice={paidWithoutInvoice}
       />
     </div>
   )
