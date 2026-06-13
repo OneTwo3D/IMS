@@ -3222,6 +3222,14 @@ export async function markBillPaid(
     // pushed to the accounting connector already (has an external id).
     // Otherwise the payment would have nothing to attach to; users should
     // wait for the bill to sync before marking paid.
+    //
+    // Ordering invariant (audit-68cv): accountingInvoiceId is written back ONLY
+    // after the PURCHASE_INVOICE CREATE posts to Xero, so this guard means a
+    // BILL_PAYMENT can never be queued ahead of its bill's CREATE. Unlike
+    // SALES_INVOICE_UPDATE / PURCHASE_INVOICE_UPDATE (which CAN be queued before
+    // their CREATE and so need findInvoiceUpdatesBlockedByPendingCreate
+    // deferral, audit-H5), BILL_PAYMENT needs no CREATE-ordering deferral — it is
+    // safe by construction, exactly like INVOICE_PAYMENT.
     if (invoice.accountingInvoiceId) {
       try {
         await queueAccountingSync({
