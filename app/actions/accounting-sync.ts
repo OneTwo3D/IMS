@@ -101,10 +101,13 @@ export async function getCrossConnectorOrphanSummary(): Promise<ConnectorOrphanS
 const ORPHAN_CANCEL_STALE_PROCESSING_MS = 15 * 60 * 1000
 
 /**
- * audit-H4: bulk-cancel orphaned live sync rows. Marks them FAILED (so neither
- * processor will claim them) with a clear reason and an activity log. When
- * `connector` is given, only that connector's orphans are cancelled; otherwise
- * every non-active connector's live rows are cancelled.
+ * audit-H4: bulk-cancel orphaned live sync rows. Marks them CANCELLED (audit-46ry)
+ * so neither processor will claim them AND reconciliation / event-backfill sweeps
+ * and FAILED dashboards (which scan explicit PENDING/PROCESSING/SYNCED/FAILED lists)
+ * don't treat them as unresolved failures or re-queue the underlying document.
+ * Records a clear reason and an activity log. When `connector` is given, only that
+ * connector's orphans are cancelled; otherwise every non-active connector's live
+ * rows are cancelled.
  */
 export async function cancelOrphanedAccountingSyncRows(
   connector?: string,
@@ -142,7 +145,9 @@ export async function cancelOrphanedAccountingSyncRows(
   const reason = `Cancelled: orphaned accounting sync row for ${connector ?? 'a non-active connector'} (no longer the active connector${activeConnector ? ` — now ${activeConnector}` : ''}).`
   const result = await db.accountingSyncLog.updateMany({
     where,
-    data: { status: 'FAILED', errorMessage: reason, processingStartedAt: null },
+    // audit-46ry: CANCELLED (not FAILED) so these abandoned rows are excluded from
+    // FAILED-scanning reconciliation/backfill sweeps and error dashboards.
+    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
   })
 
   if (result.count > 0) {
