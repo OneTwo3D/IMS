@@ -26,6 +26,7 @@ export type XeroSettings = {
   xero_shipping_account: string
   xero_discount_account: string
   xero_cogs_account: string
+  xero_inventory_revaluation_account: string
   xero_inventory_account: string
   xero_allocated_inventory_account: string
   xero_unearned_revenue_account: string
@@ -49,7 +50,8 @@ export const XERO_SETTING_KEYS = [
   'xero_sync_tax_rate',
   'xero_sync_attach_pdf',
   'xero_sales_account', 'xero_shipping_account', 'xero_discount_account',
-  'xero_cogs_account', 'xero_inventory_account', 'xero_allocated_inventory_account',
+  'xero_cogs_account', 'xero_inventory_revaluation_account',
+  'xero_inventory_account', 'xero_allocated_inventory_account',
   'xero_unearned_revenue_account',
   'xero_transit_account',
   'xero_accounts_receivable_account', 'xero_accounts_payable_account',
@@ -79,6 +81,7 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_shipping_account: '',
   xero_discount_account: '',
   xero_cogs_account: '',
+  xero_inventory_revaluation_account: '',
   xero_inventory_account: '',
   xero_allocated_inventory_account: '',
   xero_unearned_revenue_account: '',

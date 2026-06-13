@@ -11,6 +11,15 @@ export type AccountingSettings = {
   shippingAccount: string
   discountAccount: string
   cogsAccount: string
+  /**
+   * Inventory-revaluation P&L account (audit-o3yb). Offsets retrospective COGS
+   * corrections on goods ALREADY SOLD (consumed qty) — e.g. a freight-PO
+   * cancellation or freight-cost change after dispatch. On-hand stock revaluation
+   * stays on inventory/transit; the consumed portion lands here so the clearing
+   * (transit) account doesn't accumulate balances that never reconcile to stock.
+   * Empty falls back to transitAccount (prior behaviour) until configured.
+   */
+  inventoryRevaluationAccount: string
   inventoryAccount: string
   allocatedInventoryAccount: string
   unearnedRevenueAccount: string
@@ -81,6 +90,7 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
   shippingAccount: '',
   discountAccount: '',
   cogsAccount: '',
+  inventoryRevaluationAccount: '',
   inventoryAccount: '',
   allocatedInventoryAccount: '',
   unearnedRevenueAccount: '',
@@ -279,6 +289,7 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
         shippingAccount: xs.xero_shipping_account,
         discountAccount: xs.xero_discount_account,
         cogsAccount: xs.xero_cogs_account,
+        inventoryRevaluationAccount: xs.xero_inventory_revaluation_account,
         inventoryAccount: xs.xero_inventory_account,
         allocatedInventoryAccount: xs.xero_allocated_inventory_account,
         unearnedRevenueAccount: xs.xero_unearned_revenue_account,
@@ -304,6 +315,8 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
         shippingAccount: qs.quickbooks_shipping_account,
         discountAccount: qs.quickbooks_discount_account,
         cogsAccount: qs.quickbooks_cogs_account,
+        // QuickBooks out of scope for audit-o3yb — empty falls back to transit.
+        inventoryRevaluationAccount: '',
         inventoryAccount: qs.quickbooks_inventory_account,
         allocatedInventoryAccount: qs.quickbooks_allocated_inventory_account,
         unearnedRevenueAccount: qs.quickbooks_unearned_revenue_account,

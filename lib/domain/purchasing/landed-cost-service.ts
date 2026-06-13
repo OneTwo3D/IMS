@@ -1,5 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
-import { getAccountingSettings, queueAccountingSync } from '@/lib/accounting'
+import { getAccountingSettings, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -403,6 +403,18 @@ export function computeGrossUnitCostBaseByLine(params: {
   return grossByLine
 }
 
+/**
+ * audit-o3yb: the account that offsets a CONSUMED-qty retrospective COGS
+ * correction (goods already sold). Uses the inventory-revaluation P&L account
+ * when configured; otherwise falls back to the transit/clearing account (the
+ * prior behaviour) so deployments that haven't set the new account keep working.
+ */
+export function resolveConsumedCogsOffsetAccount(
+  settings: Pick<AccountingSettings, 'inventoryRevaluationAccount' | 'transitAccount'>,
+): string {
+  return settings.inventoryRevaluationAccount || settings.transitAccount
+}
+
 export async function queueLandedCostAdjustmentJournals(
   adjustments: LandedCostRecalcResult,
 ): Promise<void> {
@@ -438,6 +450,12 @@ export async function queueLandedCostAdjustmentJournals(
     })
   }
 
+  // audit-o3yb: the CONSUMED-qty correction (goods already sold) offsets COGS to
+  // the inventory-revaluation P&L account, not the transit/clearing account — the
+  // goods have left stock, so a clearing entry there would never reconcile. The
+  // ON-HAND portion is handled by the inventoryTransitAdjustments loop above and
+  // stays on inventory/transit. Falls back to transit until the account is set.
+  const consumedCogsOffsetAccount = resolveConsumedCogsOffsetAccount(settings)
   for (const adj of adjustments.cogsAdjustments) {
     const absDelta = Math.abs(adj.totalDelta)
     if (absDelta <= 0.01) continue
@@ -448,12 +466,12 @@ export async function queueLandedCostAdjustmentJournals(
       narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
       lines: [
         {
-          accountCode: isIncrease ? settings.cogsAccount : settings.transitAccount,
+          accountCode: isIncrease ? settings.cogsAccount : consumedCogsOffsetAccount,
           description: `COGS adjustment — ${adj.primaryPoRef}`,
           debit: absDelta,
         },
         {
-          accountCode: isIncrease ? settings.transitAccount : settings.cogsAccount,
+          accountCode: isIncrease ? consumedCogsOffsetAccount : settings.cogsAccount,
           description: `COGS adjustment — ${adj.primaryPoRef}`,
           credit: absDelta,
         },
