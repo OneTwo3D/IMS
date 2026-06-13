@@ -9,7 +9,6 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getOrderDeliveryStatus } from '@/lib/shopping'
-import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 
 // ---------------------------------------------------------------------------
 // TrackShip API (direct)
@@ -81,8 +80,8 @@ type MarkDeliveredDeps = {
   transition: (
     id: string,
     targetStatus: 'DELIVERED',
-    extra: undefined,
-    options: { internalBypassToken: symbol },
+    extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
+    options?: { skipPermissionCheck?: boolean },
   ) => Promise<{ success: boolean; error?: string }>
   log: typeof logActivity
 }
@@ -91,21 +90,22 @@ type MarkDeliveredDeps = {
  * Mark an order DELIVERED from a delivery-tracking poll.
  *
  * Routes through the real status-transition path rather than a raw status
- * write (audit C2): the transition re-validates under a lock — so an order
- * that moved to CANCELLED / REFUNDED / etc. between the SHIPPED query and now
- * is not silently overwritten — and runs the same side effects a manual
- * DELIVERED transition does (status_changed log, WooCommerce status push,
- * cache revalidation). The cron has no session, so it passes the internal
- * bypass token to skip the sales.process permission check while keeping the
- * guard and side effects. Dependency-injected so the routing + skip-on-reject
- * behaviour is unit-testable without the DB or external API.
+ * write (audit C2): the transition re-validates the state machine under a lock
+ * — so an order that moved to CANCELLED / REFUNDED / etc. between the SHIPPED
+ * query and now is rejected, not silently overwritten — and runs the same side
+ * effects a manual DELIVERED transition does (status_changed log, WooCommerce
+ * status push, cache revalidation). The cron has no session, so it passes
+ * skipPermissionCheck to skip ONLY the sales.process permission check; the
+ * state-machine guard still runs (unlike the WooCommerce bypass token, which
+ * skips both). Dependency-injected so the routing + skip-on-reject behaviour
+ * is unit-testable without the DB or external API.
  */
 export async function markOrderDelivered(
   target: DeliveredTarget,
   deps: MarkDeliveredDeps,
 ): Promise<{ delivered: boolean }> {
   const result = await deps.transition(target.id, 'DELIVERED', undefined, {
-    internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
+    skipPermissionCheck: true,
   })
   if (result.success) {
     await deps.log({
@@ -170,6 +170,9 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
   let checked = 0
   let delivered = 0
 
+  // Hoisted: the transition module is loaded once, not per delivered order.
+  const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
+
   for (const order of shippedOrders) {
     let isDelivered = false
 
@@ -200,12 +203,17 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
 
     if (isDelivered) {
       const resolvedSource = useShoppingConnector ? 'shopping_connector' : 'trackship'
-      const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
-      const result = await markOrderDelivered(
-        { id: order.id, externalOrderNumber: order.externalOrderNumber, source: resolvedSource },
-        { transition: applySalesOrderStatusTransition, log: logActivity },
-      )
-      if (result.delivered) delivered++
+      try {
+        const result = await markOrderDelivered(
+          { id: order.id, externalOrderNumber: order.externalOrderNumber, source: resolvedSource },
+          { transition: applySalesOrderStatusTransition, log: logActivity },
+        )
+        if (result.delivered) delivered++
+      } catch (error) {
+        // Isolate per-order failures (e.g. a transient DB error while logging)
+        // so one bad order does not abort delivery processing for the rest.
+        console.error(`[delivery-status] failed to mark order ${order.id} delivered:`, error)
+      }
     }
   }
 

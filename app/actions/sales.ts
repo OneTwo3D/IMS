@@ -1224,11 +1224,17 @@ export async function applySalesOrderStatusTransition(
   id: string,
   targetStatus: SoStatus,
   extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
-  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol },
+  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol; skipPermissionCheck?: boolean },
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    // internalBypassToken skips BOTH the permission check and the state-machine
+    // guard — used by external systems (WooCommerce) that may legitimately force
+    // a mapped status. skipPermissionCheck is narrower: it skips ONLY the
+    // permission check (for sessionless internal callers such as the delivery
+    // cron) while the state-machine guard still runs, so a stale transition
+    // (e.g. an order cancelled after the poll's SHIPPED query) is still rejected.
     const bypassPermission = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_BYPASS
-    if (!bypassPermission) {
+    if (!bypassPermission && !options?.skipPermissionCheck) {
       await requirePermission('sales.process')
     }
     const so = await db.salesOrder.findUnique({
