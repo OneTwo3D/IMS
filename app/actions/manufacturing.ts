@@ -529,6 +529,9 @@ export async function updateManufacturingOrderStatus(
     // readable warning without holding the tx open.
     let manufacturingJournalSkipReason: string | null = null
     let disassemblyFallback = null as { recoveredLayerCount: number } | null
+    // audit-77d1: hoisted out of the disassembly block so the order-update below
+    // (outside the assembly/disassembly branches) can persist the fallback flag.
+    let equalSplitOverheadUsed = false
     // audit-H6: the components actually consumed/recovered at COMPLETED (snapshot
     // when present, else live BOM), captured out of the tx so post-tx activity
     // logs and stock-sync report exactly what changed — not a since-edited BOM.
@@ -698,6 +701,7 @@ export async function updateManufacturingOrderStatus(
           //     fallback the journal would over-state Inventory relative
           //     to the layer-derived stock value.
           const useEqualSplitOverhead = totalRecoveredCostBase.eq(0) && components.length > 0
+          equalSplitOverheadUsed = useEqualSplitOverhead
           const equalSplitOverheadPerComponent = useEqualSplitOverhead
             ? totalManufacturingCostBase.div(new Prisma.Decimal(components.length))
             : new Prisma.Decimal(0)
@@ -877,7 +881,7 @@ export async function updateManufacturingOrderStatus(
         //     overhead was split equally across components.
         await tx.productionOrder.update({
           where: { id },
-          data: { status, completedAt: now, qtyProduced: qtyPlanned, usedDisassemblyFallback: disassemblyFallback !== null || useEqualSplitOverhead },
+          data: { status, completedAt: now, qtyProduced: qtyPlanned, usedDisassemblyFallback: disassemblyFallback !== null || equalSplitOverheadUsed },
         })
       })
 
