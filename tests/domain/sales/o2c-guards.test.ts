@@ -15,6 +15,11 @@ test('refund exactly at the order total is allowed (epsilon slack)', () => {
   assert.equal(refundWouldExceedOrderTotal(50, 50, 100), false)
 })
 
+test('single-shot full refund (no prior refunds) is always allowed', () => {
+  assert.equal(refundWouldExceedOrderTotal(100, 0, 100), false)
+  assert.equal(refundWouldExceedOrderTotal(9999.99, 0, 9999.99), false)
+})
+
 test('cumulative partial refunds cannot creep over the total (fixed epsilon, not relative)', () => {
   // Old 0.1% relative slack on a £10,000 order allowed ~£10 over; the fixed
   // epsilon rejects anything beyond a rounding penny.

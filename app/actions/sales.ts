@@ -1253,10 +1253,12 @@ export async function applySalesOrderStatusTransition(
       },
     })
     if (!so) return { success: false, error: 'Order not found' }
-    // audit-M-o2c: an archived order is filed away — block status edits. The
-    // internalBypassToken (WooCommerce force-sync) keeps its escape-hatch
-    // semantics; manual and sessionless-cron callers are rejected.
-    if (so.archived && !bypassPermission) {
+    // audit-M-o2c: an archived order is filed away — block MANUAL status edits.
+    // Automated data-pushes still apply: the WooCommerce force-sync
+    // (internalBypassToken) and the sessionless delivery cron (skipPermissionCheck)
+    // are carrier/source-of-truth signals, so they bypass this guard — otherwise an
+    // archived-but-shipped order could never auto-reach DELIVERED.
+    if (so.archived && !bypassPermission && !options?.skipPermissionCheck) {
       return { success: false, error: 'This order is archived; unarchive it before changing its status.' }
     }
 
@@ -2399,6 +2401,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
           currency: true,
           totalForeign: true,
           status: true,
+          paidAt: true,
         },
       })
       if (!so) return { error: 'Order not found' }
@@ -2421,7 +2424,10 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
           return sum + Number(p.amount)
         }, 0)
         const stillFullyPaid = totalPaid >= Number(so.totalForeign) - 0.0001
-        becameUnpaid = !stillFullyPaid
+        // Only a genuine paid → not-paid transition is a mismatch. An order that
+        // was never fully paid (e.g. shipped on credit terms) isn't flagged just
+        // because a partial payment was removed.
+        becameUnpaid = so.paidAt !== null && !stillFullyPaid
         await tx.salesOrder.update({
           where: { id: orderId },
           data: { paidAt: stillFullyPaid ? undefined : null },
