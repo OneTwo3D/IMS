@@ -1733,3 +1733,47 @@ test('inventory report fails fast when SQL mode receives only a row mock client'
     /\$queryRaw-capable client/,
   )
 })
+
+test('audit-C5: stranded in-transit transfers surface a per-line warning finding', () => {
+  const dispatchedAt = new Date('2026-05-01T00:00:00.000Z')
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [],
+    shippedShipmentLines: [],
+    strandedTransfers: [
+      {
+        id: 'transfer-1',
+        reference: 'TR-001',
+        fromWarehouseId: 'wh-source',
+        dispatchedAt,
+        lines: [
+          { id: 'line-a', productId: 'prod-a', qty: 5 },
+          { id: 'line-b', productId: 'prod-b', qty: 2 },
+        ],
+      },
+    ],
+  })
+  const stranded = findings.filter((f) => f.code === 'transfer_stranded_in_transit')
+  assert.equal(stranded.length, 2)
+  assert.deepEqual(stranded.map((f) => f.productId).sort(), ['prod-a', 'prod-b'])
+  assert.equal(stranded[0].severity, 'warning')
+  assert.equal(stranded[0].warehouseId, 'wh-source')
+  const details = stranded[0].details as { transferId: string; transferLineId: string; reference: string; dispatchedAt: string }
+  assert.equal(details.transferId, 'transfer-1')
+  assert.equal(details.transferLineId, 'line-a')
+  assert.equal(details.reference, 'TR-001')
+  assert.equal(details.dispatchedAt, dispatchedAt.toISOString())
+  // Message uses the date-only format to match the SQL collector arm.
+  assert.match(stranded[0].message, /in transit since 2026-05-01 —/)
+})
+
+test('audit-C5: no stranded-transfer findings when none are passed (clean path)', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [],
+    shippedShipmentLines: [],
+  })
+  assert.equal(findings.filter((f) => f.code === 'transfer_stranded_in_transit').length, 0)
+})
