@@ -23,6 +23,10 @@ export async function GET(request: Request) {
     if (!token) {
       return NextResponse.json({ skipped: true, reason: 'Xero not connected' })
     }
+    // audit-grob: drain the landed-cost adjustment-journal backstop FIRST so any
+    // journals lost to a crash are re-queued (into AccountingSyncLog) in time for
+    // this run's sync. Idempotent — a no-op when the direct call already queued them.
+    const landedCostJournalOutbox = await drainLandedCostJournalOutbox()
     const { processPendingXeroSync, repairXeroBackReferences } = await import('@/lib/connectors/xero/sync-processor')
     const result = await processPendingXeroSync()
     // audit-H3: repair any documents whose back-reference was never written
@@ -33,7 +37,7 @@ export async function GET(request: Request) {
     } catch (repairError) {
       console.error('accounting-sync cron: back-reference repair sweep failed', repairError)
     }
-    return NextResponse.json({ ...result, backReferenceRepair })
+    return NextResponse.json({ ...result, backReferenceRepair, landedCostJournalOutbox })
   }
 
   if (await isIntegrationPluginEnabled('quickbooks')) {
@@ -45,10 +49,28 @@ export async function GET(request: Request) {
     if (!token) {
       return NextResponse.json({ skipped: true, reason: 'QuickBooks not connected' })
     }
+    // audit-grob: same backstop drain — the landed-cost journals are
+    // connector-agnostic (queueAccountingSync routes to the active connector), so
+    // they must drain under QuickBooks too, not just Xero.
+    const landedCostJournalOutbox = await drainLandedCostJournalOutbox()
     const { processPendingQuickBooksSync } = await import('@/lib/connectors/quickbooks/sync-processor')
     const result = await processPendingQuickBooksSync()
-    return NextResponse.json(result)
+    return NextResponse.json({ ...result, landedCostJournalOutbox })
   }
 
   return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })
+}
+
+// audit-grob: drain the landed-cost adjustment-journal backstop. Called only from
+// within a confirmed active+enabled connector branch, so queueAccountingSync (via
+// the drainer) actually queues rather than no-opping (which would mark a job
+// SUCCEEDED without posting — Codex review).
+async function drainLandedCostJournalOutbox(): Promise<Awaited<ReturnType<typeof import('@/lib/domain/purchasing/landed-cost-journal-outbox')['processLandedCostJournalOutbox']>> | undefined> {
+  try {
+    const { processLandedCostJournalOutbox } = await import('@/lib/domain/purchasing/landed-cost-journal-outbox')
+    return await processLandedCostJournalOutbox()
+  } catch (outboxError) {
+    console.error('accounting-sync cron: landed-cost journal outbox drain failed', outboxError)
+    return undefined
+  }
 }

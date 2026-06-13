@@ -27,6 +27,24 @@ export const MintsoftBookedInOutboxPayloadSchema = z.object({
   eventId: nonEmptyString,
 })
 
+// audit-grob: landed-cost adjustment journals are enqueued into the outbox IN the
+// recalc transaction (durable), then drained idempotently. Payload is the subset
+// of LandedCostRecalcResult the journal builder consumes.
+const LandedCostAdjustmentEntrySchema = z.object({
+  primaryPoId: nonEmptyString,
+  primaryPoRef: z.string(),
+  freightPoId: z.string().nullable().optional().default(null),
+  eventKey: z.string(),
+  totalDelta: z.number().finite(),
+})
+export const LandedCostJournalOutboxPayloadSchema = z.object({
+  // Required (not defaulted): the scheduler only ever enqueues a fully-formed
+  // result with both arrays, so a missing array is a malformed payload that must
+  // retry, not a silent no-op success (Codex review).
+  inventoryTransitAdjustments: z.array(LandedCostAdjustmentEntrySchema),
+  cogsAdjustments: z.array(LandedCostAdjustmentEntrySchema),
+})
+
 type OutboxRegistryEntry<Name extends string = string> = {
   name: Name
   schema: z.ZodTypeAny
@@ -45,6 +63,9 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
   },
   mintsoft: {
     'inbound.booked-in': { name: 'processBookedInEvent', schema: MintsoftBookedInOutboxPayloadSchema },
+  },
+  accounting: {
+    'landed-cost.adjustment-journal': { name: 'processLandedCostAdjustmentJournal', schema: LandedCostJournalOutboxPayloadSchema },
   },
 })
 
@@ -71,6 +92,7 @@ export const INTEGRATION_OUTBOX_OPERATIONS = buildOperationConstants(INTEGRATION
 
 export type RegisteredOutboxConnector = keyof typeof INTEGRATION_OUTBOX_REGISTRY
 
+export type LandedCostJournalOutboxPayload = z.infer<typeof LandedCostJournalOutboxPayloadSchema>
 export type WcStockSyncOutboxPayload = z.infer<typeof WcStockSyncOutboxPayloadSchema>
 export type XeroAccountingOutboxPayload = z.infer<typeof XeroAccountingOutboxPayloadSchema>
 export type MintsoftBookedInOutboxPayload = z.infer<typeof MintsoftBookedInOutboxPayloadSchema>
