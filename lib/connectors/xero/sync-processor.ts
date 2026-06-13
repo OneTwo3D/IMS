@@ -174,28 +174,48 @@ async function hasExistingSyncLog(
   return count > 0
 }
 
+/**
+ * True for a Postgres unique-constraint violation surfaced by Prisma (P2002) —
+ * used so a concurrent follow-up enqueue that loses the race against the
+ * accounting_sync_logs_followup_live_unique index (audit-42co) is swallowed as an
+ * idempotent no-op rather than thrown.
+ */
+export function isUniqueConstraintViolation(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'P2002'
+}
+
 async function enqueueFollowUpSyncLog(
   type: FollowUpSyncType,
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
 ): Promise<void> {
+  // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
+  // for the check-then-create race between concurrent sync runs.
   if (await hasExistingSyncLog(type, referenceType, referenceId)) return
-  await db.$transaction(async (tx) => {
-    const log = await tx.accountingSyncLog.create({
-      data: {
-        connector: XERO_CONNECTOR,
-        type,
-        status: 'PENDING',
-        referenceType,
-        referenceId,
-        payload: payload as never,
-      },
+  try {
+    await db.$transaction(async (tx) => {
+      const log = await tx.accountingSyncLog.create({
+        data: {
+          connector: XERO_CONNECTOR,
+          type,
+          status: 'PENDING',
+          referenceType,
+          referenceId,
+          payload: payload as never,
+        },
+      })
+      await scheduleXeroAccountingOutbox(tx, {
+        accountingSyncLogId: log.id,
+      })
     })
-    await scheduleXeroAccountingOutbox(tx, {
-      accountingSyncLogId: log.id,
-    })
-  })
+  } catch (error) {
+    // A concurrent run created the same live follow-up first — the unique index
+    // rejected ours. That row (and its outbox job) already exist, so this enqueue
+    // is a no-op; anything else is a real failure.
+    if (isUniqueConstraintViolation(error)) return
+    throw error
+  }
 }
 
 function syncLogNextAttemptAt(log: { status: string; processingStartedAt: Date | null }): Date | null {
