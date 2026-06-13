@@ -868,10 +868,12 @@ export async function updateManufacturingOrderStatus(
           }
         }
 
-        // Update order status and qtyProduced
+        // Update order status and qtyProduced. audit-77d1: persist whether the
+        // disassembly fell back to equal-split overhead so the MO detail can flag
+        // the approximate cost split.
         await tx.productionOrder.update({
           where: { id },
-          data: { status, completedAt: now, qtyProduced: qtyPlanned },
+          data: { status, completedAt: now, qtyProduced: qtyPlanned, usedDisassemblyFallback: disassemblyFallback !== null },
         })
       })
 
@@ -1141,6 +1143,7 @@ export type ManufacturingOrderDetail = {
   manufacturerId: string | null
   manufacturerName: string | null
   manufacturerEmail: string | null
+  usedDisassemblyFallback: boolean
   qtyPlanned: number
   qtyProduced: number
   scheduledAt: string | null
@@ -1186,6 +1189,7 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
       currency: true,
       fxRateToBase: true,
       componentSnapshot: true,
+      usedDisassemblyFallback: true,
       outputProduct: {
         select: {
           id: true,
@@ -1289,6 +1293,7 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
     completedAt: o.completedAt?.toISOString() ?? null,
     createdAt: o.createdAt.toISOString(),
     notes: o.notes,
+    usedDisassemblyFallback: o.usedDisassemblyFallback,
     currency: o.currency,
     fxRateToBase: Number(o.fxRateToBase),
     components: effectiveComponents.map((c) => {

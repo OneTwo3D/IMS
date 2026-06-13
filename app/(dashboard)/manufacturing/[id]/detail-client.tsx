@@ -99,6 +99,15 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
               <Badge variant="secondary" className="text-xs">
                 {isDisassembly ? 'Disassembly' : 'Assembly'}
               </Badge>
+              {order.usedDisassemblyFallback && (
+                <Badge
+                  variant="secondary"
+                  className="text-xs bg-amber-100 text-amber-800 border-amber-200"
+                  title="This disassembly's recovered cost layers lacked source lines, so component costs were split using an equal-split overhead fallback — the per-component cost is approximate."
+                >
+                  Approx. cost split
+                </Badge>
+              )}
             </div>
             <p className="text-sm text-muted-foreground mt-0.5">
               Created {fmtDateTime(order.createdAt)}

@@ -1735,6 +1735,10 @@ model ProductionOrder {
   // reservation or change what is consumed/recovered. Null for orders that were
   // never started (direct completion falls back to the live BOM).
   componentSnapshot Json?
+  // audit-77d1: set when a DISASSEMBLY completion fell back to equal-split overhead
+  // (recovered cost layers lacked source lines), so the MO detail can flag that the
+  // component cost split was approximate.
+  usedDisassemblyFallback Boolean @default(false)
 
   bom             Bom                  @relation(fields: [bomId], references: [id])
   outputProduct   Product              @relation(fields: [outputProductId], references: [id])
