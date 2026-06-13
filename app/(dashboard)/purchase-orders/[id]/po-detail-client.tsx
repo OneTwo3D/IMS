@@ -42,6 +42,7 @@ import { getTrackingUrl } from '@/lib/tracking'
 import type { AccountingBankAccount } from '@/lib/accounting'
 import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accounting/rejected-sync-warnings'
 import type { PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
+import type { PrepaidReconciliationSummary } from '@/lib/domain/purchasing/prepaid-reconciliation'
 import type { PurchaseOrderConsumedCostSummary } from '@/lib/domain/purchasing/po-cancellation'
 import type { SupplierRow } from '@/app/actions/suppliers'
 import type { ProductRow } from '@/app/actions/products'
@@ -70,6 +71,7 @@ type Props = {
   mintsoftAsnState: MintsoftPurchaseOrderAsnState
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
   overBilling: PurchaseOrderOverBillingSummary
+  prepaidReconciliation: PrepaidReconciliationSummary
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -1801,7 +1803,7 @@ function ShipDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState, rejectedAccountingSyncs, overBilling }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -2054,6 +2056,29 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               <p className="text-xs">
                 Affected bills (gross total incl. tax): {overBilling.bills.map((b) => `${b.invoiceNumber ?? b.invoiceId} (${formatMoney(Number(b.totalBase), baseCurrency.symbol, baseCurrency.symbolPosition)})`).join(', ')}
               </p>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* audit-C1b: prepaid supplier billed beyond what arrived. */}
+      {prepaidReconciliation.hasShortfall && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          <div className="flex gap-2">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            <div className="space-y-2">
+              <p className="font-medium">
+                Prepaid reconciliation: {prepaidReconciliation.totalShortfallQty} unit(s) prepaid/billed but not received —{' '}
+                {formatMoney(Number(prepaidReconciliation.totalShortfallValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)} paid for but not arrived.
+                Claim a supplier credit (or chase the outstanding delivery). The three-way-match block is intentionally off for prepaid suppliers.
+              </p>
+              <ul className="space-y-1 text-xs">
+                {prepaidReconciliation.lines.map((line) => (
+                  <li key={line.poLineId}>
+                    <span className="font-mono">{line.sku ?? line.productId}</span>: billed {line.billedQty}, received {line.receivedQty} →{' '}
+                    {line.shortfallQty} not arrived ({formatMoney(Number(line.shortfallValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)})
+                  </li>
+                ))}
+              </ul>
             </div>
           </div>
         </div>
