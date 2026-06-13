@@ -39,6 +39,24 @@ test('record validation: passes for a valid request', () => {
   assert.equal(validateRecordSupplierCreditNote({ amountForeign: 120, hasInvoice: true, selectedInvoiceBelongsToPo: null }), null)
 })
 
+test('record validation: rejects over-crediting the bill (Codex review)', () => {
+  // 80 remaining, asking for 100 → blocked.
+  assert.match(
+    validateRecordSupplierCreditNote({ amountForeign: 100, hasInvoice: true, selectedInvoiceBelongsToPo: true, remainingCreditableForeign: 80 }) ?? '',
+    /exceeds the remaining creditable amount/,
+  )
+  // Exactly the remaining amount is allowed (within epsilon).
+  assert.equal(
+    validateRecordSupplierCreditNote({ amountForeign: 80, hasInvoice: true, selectedInvoiceBelongsToPo: true, remainingCreditableForeign: 80 }),
+    null,
+  )
+  // No cap supplied → no over-credit check.
+  assert.equal(
+    validateRecordSupplierCreditNote({ amountForeign: 9999, hasInvoice: true, selectedInvoiceBelongsToPo: true, remainingCreditableForeign: null }),
+    null,
+  )
+})
+
 test('sync payload reverses on the transit account with the supplier contact', () => {
   const payload = buildSupplierCreditNoteSyncPayload({
     creditNoteId: 'scn-1',

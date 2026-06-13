@@ -3353,7 +3353,7 @@ export async function recordSupplierFreightCreditNote(input: {
         currency: true,
         fxRateToBase: true,
         supplierId: true,
-        invoices: { select: { id: true, fxRateToBase: true }, orderBy: { createdAt: 'desc' } },
+        invoices: { select: { id: true, fxRateToBase: true, totalForeign: true }, orderBy: { createdAt: 'desc' } },
       },
     })
     if (!po) return { success: false, error: 'Purchase order not found' }
@@ -3361,10 +3361,23 @@ export async function recordSupplierFreightCreditNote(input: {
     const selectedInvoice = input.purchaseInvoiceId
       ? po.invoices.find((inv) => inv.id === input.purchaseInvoiceId) ?? null
       : po.invoices[0] ?? null
+
+    // Remaining creditable = the bill's total minus credit notes already recorded
+    // against it, so a PO can't be over-credited (Codex review).
+    let remainingCreditableForeign: number | null = null
+    if (selectedInvoice) {
+      const existing = await db.supplierCreditNote.aggregate({
+        where: { purchaseInvoiceId: selectedInvoice.id },
+        _sum: { amountForeign: true },
+      })
+      remainingCreditableForeign = Number(selectedInvoice.totalForeign) - Number(existing._sum.amountForeign ?? 0)
+    }
+
     const validationError = validateRecordSupplierCreditNote({
       amountForeign: input.amountForeign,
       hasInvoice: po.invoices.length > 0,
       selectedInvoiceBelongsToPo: input.purchaseInvoiceId ? Boolean(selectedInvoice) : null,
+      remainingCreditableForeign,
     })
     if (validationError) return { success: false, error: validationError }
 
@@ -3422,20 +3435,26 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     if (!cn) return { success: false, error: 'Credit note not found' }
     if (cn.status !== 'DRAFT') return { success: false, error: 'Credit note is already posted' }
 
-    // Atomic DRAFT->POSTED guard so concurrent posts can't double-queue.
-    const claimed = await db.supplierCreditNote.updateMany({
-      where: { id, status: 'DRAFT' },
-      data: { status: 'POSTED', postedAt: new Date() },
-    })
-    if (claimed.count === 0) return { success: false, error: 'Credit note is already posted' }
-
+    // Resolve connector/settings BEFORE the transaction (Codex review: a lookup
+    // failure must not occur after the row is already POSTED).
     const connector = await getActiveAccountingConnectorInfo()
     const settings = await getAccountingSettings()
-    // Xero-only: the ACCPAYCREDIT poster exists for Xero. Skip the accounting
-    // queue for other connectors (the credit note still records as POSTED in IMS).
-    if (connector?.id === 'xero' && settings.syncEnabled && await isAccountingSyncTypeEnabled('PURCHASE_CREDIT_NOTE')) {
-      try {
-        await queueAccountingSync({
+    // Xero-only: the ACCPAYCREDIT poster exists for Xero. For other connectors the
+    // credit note still records as POSTED in IMS (consistent with sync being off).
+    const shouldQueueXero =
+      connector?.id === 'xero' && settings.syncEnabled && (await isAccountingSyncTypeEnabled('PURCHASE_CREDIT_NOTE'))
+
+    // CRITICAL (Codex review): claim DRAFT->POSTED and enqueue the sync in ONE
+    // transaction. If the queue insert fails, the whole tx rolls back and the row
+    // stays DRAFT (retryable) — never "POSTED in IMS but never sent to Xero".
+    const posted = await db.$transaction(async (tx) => {
+      const claimed = await tx.supplierCreditNote.updateMany({
+        where: { id, status: 'DRAFT' },
+        data: { status: 'POSTED', postedAt: new Date() },
+      })
+      if (claimed.count === 0) return false
+      if (shouldQueueXero) {
+        await queueAccountingSyncTx(tx, {
           type: 'PURCHASE_CREDIT_NOTE',
           referenceType: 'SupplierCreditNote',
           referenceId: cn.id,
@@ -3454,10 +3473,10 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
           }),
           idempotencyKey: `supplier-credit-note:${cn.id}`,
         })
-      } catch {
-        // Accounting queue errors must not strand the POSTED transition.
       }
-    }
+      return true
+    }, STOCK_TX_OPTIONS)
+    if (!posted) return { success: false, error: 'Credit note is already posted' }
 
     revalidatePath(`/purchase-orders/${cn.poId}`)
     await logActivity({

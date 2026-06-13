@@ -17,6 +17,12 @@ export function validateRecordSupplierCreditNote(params: {
   hasInvoice: boolean
   /** null = no specific invoice selected; otherwise whether it belongs to the PO. */
   selectedInvoiceBelongsToPo: boolean | null
+  /**
+   * Remaining creditable amount on the selected bill (its total minus credit
+   * notes already recorded against it). null = no specific bill to cap against.
+   * Guards against over-crediting the supplier bill (Codex review).
+   */
+  remainingCreditableForeign?: number | null
 }): string | null {
   if (!Number.isFinite(params.amountForeign) || params.amountForeign <= 0) {
     return 'Credit note amount must be greater than 0'
@@ -26,6 +32,12 @@ export function validateRecordSupplierCreditNote(params: {
   }
   if (params.selectedInvoiceBelongsToPo === false) {
     return 'The selected invoice does not belong to this purchase order'
+  }
+  if (
+    params.remainingCreditableForeign != null &&
+    params.amountForeign > params.remainingCreditableForeign + 0.0001
+  ) {
+    return `Credit note exceeds the remaining creditable amount on this bill (${params.remainingCreditableForeign.toFixed(2)})`
   }
   return null
 }
