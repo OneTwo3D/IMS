@@ -32,20 +32,26 @@ test('warns for an unknown/future trigger value (safe default)', () => {
   assert.equal(shouldWarnPaidWithoutInvoice({ becamePaid: true, hasInvoiceNumber: false, invoiceTrigger: 'some_future_trigger' }), true)
 })
 
-// audit-s3en: cancel-time gap. Trigger-independent — once cancelled, no
-// auto-generation can fire, so any fully-paid uninvoiced order must be surfaced.
-test('cancel warn: fires for a fully-paid order with no invoice (the on_shipped gap)', () => {
-  assert.equal(shouldWarnPaidOrderCancelledWithoutInvoice({ isPaid: true, hasInvoiceNumber: false }), true)
+// audit-s3en/45kd: cancel-time gap. Trigger-independent — once cancelled, no
+// auto-generation can fire, so any uninvoiced order carrying settled customer
+// money (fully OR partially paid) must be surfaced.
+test('cancel warn: fires for a fully-paid order with no invoice (s3en, the on_shipped gap)', () => {
+  assert.equal(shouldWarnPaidOrderCancelledWithoutInvoice({ hasSettledPayment: true, hasInvoiceNumber: false }), true)
 })
 
-test('cancel warn: does NOT fire when the cancelled order was never fully paid', () => {
-  assert.equal(shouldWarnPaidOrderCancelledWithoutInvoice({ isPaid: false, hasInvoiceNumber: false }), false)
+test('cancel warn: fires for a PARTIALLY-paid order with no invoice (45kd)', () => {
+  // hasSettledPayment is true for a partial prepayment even when paidAt is null.
+  assert.equal(shouldWarnPaidOrderCancelledWithoutInvoice({ hasSettledPayment: true, hasInvoiceNumber: false }), true)
+})
+
+test('cancel warn: does NOT fire when the cancelled order carried no settled money', () => {
+  assert.equal(shouldWarnPaidOrderCancelledWithoutInvoice({ hasSettledPayment: false, hasInvoiceNumber: false }), false)
 })
 
 test('cancel warn: does NOT fire when the paid order already has an invoice (e.g. on_paid)', () => {
-  assert.equal(shouldWarnPaidOrderCancelledWithoutInvoice({ isPaid: true, hasInvoiceNumber: true }), false)
+  assert.equal(shouldWarnPaidOrderCancelledWithoutInvoice({ hasSettledPayment: true, hasInvoiceNumber: true }), false)
 })
 
 test('cancel warn: does NOT fire for an unpaid order with an invoice', () => {
-  assert.equal(shouldWarnPaidOrderCancelledWithoutInvoice({ isPaid: false, hasInvoiceNumber: true }), false)
+  assert.equal(shouldWarnPaidOrderCancelledWithoutInvoice({ hasSettledPayment: false, hasInvoiceNumber: true }), false)
 })
