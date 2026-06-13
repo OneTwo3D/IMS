@@ -6,7 +6,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { enqueueStockSync } from '@/lib/shopping'
 import { roundQuantity } from '@/lib/domain/math/decimal'
 import {
-  assertPurchaseOrderCancellationHasNoInvoices,
+  evaluatePurchaseOrderCancellationInvoiceGate,
   isPurchaseOrderCancellationNoop,
   readPurchaseOrderConsumedCostForCancellation,
   reversePurchaseOrderCostLayersForCancellation,
@@ -107,6 +107,11 @@ export async function cancelPurchaseOrderService(
     }
 
     const cancellation = await deps.transaction(async (tx) => {
+      // audit-g5u2.4 (Codex review): lock the PO before reading the invoice/credit
+      // gate state so a concurrent bill create/credit-note post can't change the
+      // predicate between the read and the CANCELLED write. createInvoice takes the
+      // same row lock, so the two serialise.
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
       const existing = await tx.purchaseOrder.findUnique({
         where: { id },
         select: {
@@ -114,7 +119,10 @@ export async function cancelPurchaseOrderService(
           reference: true,
           type: true,
           lines: { select: { id: true } },
-          _count: { select: { invoices: true } },
+          // Base-currency totals are the GL predicate; per-bill credit attribution
+          // prevents a credit for one bill satisfying another (Codex review).
+          invoices: { select: { id: true, totalBase: true } },
+          supplierCreditNotes: { where: { status: 'POSTED' }, select: { purchaseInvoiceId: true, amountBase: true } },
         },
       })
       if (!existing) throw new Error('PO not found')
@@ -126,7 +134,21 @@ export async function cancelPurchaseOrderService(
       }
       const transition = validatePurchaseOrderStatusTransition(existing.status, 'CANCELLED')
       if (!transition.success) throw new Error(transition.error)
-      assertPurchaseOrderCancellationHasNoInvoices(existing._count.invoices)
+      // audit-g5u2.4: allow cancelling a FREIGHT PO whose bills are EACH fully offset
+      // by POSTED supplier credit notes linked to that bill; otherwise the gate blocks.
+      const creditedBaseByInvoice = new Map<string, number>()
+      for (const cn of existing.supplierCreditNotes) {
+        if (!cn.purchaseInvoiceId) continue // unattributed credits don't offset a specific bill
+        creditedBaseByInvoice.set(cn.purchaseInvoiceId, (creditedBaseByInvoice.get(cn.purchaseInvoiceId) ?? 0) + Number(cn.amountBase))
+      }
+      const invoiceGate = evaluatePurchaseOrderCancellationInvoiceGate({
+        isFreight: existing.type === 'FREIGHT',
+        invoices: existing.invoices.map((inv) => ({
+          totalBase: Number(inv.totalBase),
+          creditedBase: creditedBaseByInvoice.get(inv.id) ?? 0,
+        })),
+      })
+      if (!invoiceGate.allowed) throw new Error(invoiceGate.reason ?? 'Cannot cancel this purchase order.')
 
       const poLineIds = existing.lines.map((line) => line.id)
 
