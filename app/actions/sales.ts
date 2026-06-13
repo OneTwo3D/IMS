@@ -10,6 +10,7 @@ import {
   type AccountingSettings,
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
+import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
@@ -1149,15 +1150,14 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     lines: so.lines.map((l) => {
       const qty = Number(l.qty)
       const discForeign = Number(l.discountAmount ?? 0)
-      const baseTaxType = l.taxRate?.accountingTaxType ?? orderDefaultTaxType ?? undefined
       // Reverse-charge B2B: customer self-accounts, so we swap to the
-      // configured reverse-charge accounting tax type. Falls back to the
-      // resolved baseTaxType when the setting is empty (defensive default —
-      // the admin gets the same posting they'd get without the swap, the
-      // line just isn't reverse-charge-tagged in the accounting system).
-      const taxType = l.taxRate?.reverseCharge && settings.reverseChargeSalesTaxType
-        ? settings.reverseChargeSalesTaxType
-        : baseTaxType
+      // configured reverse-charge accounting tax type (shared helper, same
+      // logic as the credit-note path — see resolveSalesLineTaxType).
+      const taxType = resolveSalesLineTaxType({
+        baseTaxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType,
+        reverseCharge: l.taxRate?.reverseCharge,
+        reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
+      })
       return {
         itemCode: l.sku ?? undefined,
         description: l.description ?? l.sku ?? 'Item',
@@ -1479,7 +1479,7 @@ async function queueRefundAccountingActions(input: {
         lines: {
           select: {
             id: true,
-            taxRate: { select: { accountingTaxType: true } },
+            taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
           },
         },
       },
@@ -1495,9 +1495,27 @@ async function queueRefundAccountingActions(input: {
         select: { accountingTaxType: true },
       })
     : null
+  // Credit-note PRODUCT lines must apply the SAME per-line reverse-charge swap
+  // the original invoice did (audit H1), keyed on each sales line's own
+  // TaxRate.reverseCharge — or a refund of a reverse-charged sale posts under
+  // the standard code and the VAT return no longer balances.
   const taxTypeBySalesLineId = new Map(
-    (orderForCN?.lines ?? []).map((line) => [line.id, line.taxRate?.accountingTaxType ?? undefined]),
+    (orderForCN?.lines ?? []).map((line) => [
+      line.id,
+      resolveSalesLineTaxType({
+        baseTaxType: line.taxRate?.accountingTaxType,
+        reverseCharge: line.taxRate?.reverseCharge,
+        reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
+      }),
+    ]),
   )
+  // Fallback for refund lines with no mapped sales line (shipping, ad-hoc):
+  // the order-level tax type WITHOUT the swap, mirroring exactly how the
+  // invoice posts its shipping/discount lines (shippingTaxType =
+  // orderDefaultTaxType, no swap). Swapping here would post credit-note
+  // shipping under the reverse-charge code while the invoice posted it under
+  // the standard code — an asymmetry the VAT return would flag.
+  const fallbackCnTaxType = cnTaxRate?.accountingTaxType ?? undefined
 
   await queueAccountingSync({
     type: 'CREDIT_NOTE',
@@ -1520,7 +1538,7 @@ async function queueRefundAccountingActions(input: {
         accountCode: line.lineKind === 'shipping'
           ? (settings.shippingAccount || settings.salesAccount)
           : settings.salesAccount,
-        taxType: (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined) ?? cnTaxRate?.accountingTaxType ?? undefined,
+        taxType: (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined) ?? fallbackCnTaxType,
       })),
       lineAmountsIncludeTax: false,
       currencyRateToBase: Number(input.refundFxRate) || undefined,
