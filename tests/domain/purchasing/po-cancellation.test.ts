@@ -10,6 +10,7 @@ import {
   assertPurchaseOrderCancellationHasNoInvoices,
   isPurchaseOrderCancellationNoop,
   reversePurchaseOrderCostLayersForCancellation,
+  summarizeConsumedCostLayers,
 } from '@/lib/domain/purchasing/po-cancellation'
 
 type CostLayerRow = {
@@ -310,6 +311,11 @@ test('cancelPurchaseOrderService is idempotent when called twice', async () => {
         totalReversalValueBase: new Prisma.Decimal('10'),
       }
     },
+    readPurchaseOrderConsumedCostForCancellation: async () => ({
+      consumedQty: '0',
+      consumedValueBase: '0',
+      layers: [],
+    }),
   }
 
   assert.deepEqual(await cancelPurchaseOrderService('po-1', deps), {
@@ -323,6 +329,7 @@ test('cancelPurchaseOrderService is idempotent when called twice', async () => {
       unitCostBase: '5.000000',
       totalValueBase: '10.000000',
     }],
+    consumedCost: { consumedQty: '0', consumedValueBase: '0', layers: [] },
     notice: 'Cancelled PO and reversed 1 remaining receipt cost layer(s).',
   })
   assert.equal(po.status, 'CANCELLED')
@@ -335,4 +342,71 @@ test('cancelPurchaseOrderService is idempotent when called twice', async () => {
   assert.deepEqual(stockSyncs, [{ productIds: ['product-1'], reason: 'IMS_CHANGE' }])
   assert.deepEqual(logs.map((log) => log.action), ['cancelled', 'cancelled_noop'])
   assert.equal(logs.filter((log) => log.action === 'cancelled').length, 1)
+})
+
+test('summarizeConsumedCostLayers totals consumed (received − remaining) value and skips fully-remaining layers', () => {
+  const summary = summarizeConsumedCostLayers([
+    // 70 of 100 consumed @ £5 => £350
+    { id: 'l1', poLineId: 'pol-1', productId: 'p1', receivedQty: '100', remainingQty: '30', unitCostBase: '5' },
+    // nothing consumed yet — excluded
+    { id: 'l2', poLineId: 'pol-1', productId: 'p1', receivedQty: '40', remainingQty: '40', unitCostBase: '5' },
+    // 10 of 10 consumed @ £2.5 => £25
+    { id: 'l3', poLineId: 'pol-2', productId: 'p2', receivedQty: '10', remainingQty: '0', unitCostBase: '2.5' },
+  ])
+  assert.equal(summary.consumedQty, '80')
+  assert.equal(summary.consumedValueBase, '375')
+  assert.equal(summary.layers.length, 2)
+  assert.deepEqual(summary.layers.map((l) => l.costLayerId), ['l1', 'l3'])
+})
+
+test('cancelPurchaseOrderService flags already-consumed COGS with a WARNING and returns consumedCost', async () => {
+  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'PARTIALLY_RECEIVED', reference: 'PO-9' }
+  const logs: Array<{ action: string; level?: string; metadata?: unknown }> = []
+
+  const tx = {
+    purchaseOrder: {
+      findUnique: async () => ({
+        status: po.status,
+        reference: po.reference,
+        lines: [{ id: 'po-line-1' }],
+        _count: { invoices: 0 },
+      }),
+      update: async ({ data }: { data: { status: typeof po.status } }) => {
+        po.status = data.status
+        return { id: 'po-9' }
+      },
+    },
+  }
+  let consumedReadBeforeReversal = false
+  let reversalRan = false
+  const deps: CancelPurchaseOrderServiceDeps = {
+    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
+    transaction: async (fn) => fn(tx as never),
+    logActivity: async (input) => { logs.push({ action: input.action, level: input.level, metadata: input.metadata }) },
+    enqueueStockSync: async () => {},
+    getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
+    queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
+    readPurchaseOrderConsumedCostForCancellation: async () => {
+      // Must be read before the reversal zeroes remaining quantities.
+      consumedReadBeforeReversal = !reversalRan
+      return { consumedQty: '70', consumedValueBase: '350', layers: [{ costLayerId: 'l1', poLineId: 'po-line-1', productId: 'p1', consumedQty: '70', unitCostBase: '5', consumedValueBase: '350' }] }
+    },
+    reversePurchaseOrderCostLayersForCancellation: async () => {
+      reversalRan = true
+      return { reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }
+    },
+  }
+
+  const result = await cancelPurchaseOrderService('po-9', deps)
+  assert.equal(result.success, true)
+  assert.deepEqual(result.consumedCost, {
+    consumedQty: '70',
+    consumedValueBase: '350',
+    layers: [{ costLayerId: 'l1', poLineId: 'po-line-1', productId: 'p1', consumedQty: '70', unitCostBase: '5', consumedValueBase: '350' }],
+  })
+  assert.equal(consumedReadBeforeReversal, true)
+  const warning = logs.find((log) => log.action === 'cancelled_consumed_cogs_standing')
+  assert.ok(warning, 'expected a consumed-COGS WARNING activity log')
+  assert.equal(warning?.level, 'WARNING')
+  assert.deepEqual((warning?.metadata as { consumedValueBase: string }).consumedValueBase, '350')
 })
