@@ -99,11 +99,11 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
               <Badge variant="secondary" className="text-xs">
                 {isDisassembly ? 'Disassembly' : 'Assembly'}
               </Badge>
-              {order.usedDisassemblyFallback && (
+              {isDisassembly && order.usedDisassemblyFallback && (
                 <Badge
                   variant="secondary"
                   className="text-xs bg-amber-100 text-amber-800 border-amber-200"
-                  title="This disassembly's recovered cost layers lacked source lines, so component costs were split using an equal-split overhead fallback — the per-component cost is approximate."
+                  title="This disassembly used an approximate cost-recovery fallback (recovered cost layers lacked source provenance, or there was no recoverable cost so overhead was split equally) — the per-component cost split is approximate."
                 >
                   Approx. cost split
                 </Badge>

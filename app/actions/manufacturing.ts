@@ -869,11 +869,15 @@ export async function updateManufacturingOrderStatus(
         }
 
         // Update order status and qtyProduced. audit-77d1: persist whether the
-        // disassembly fell back to equal-split overhead so the MO detail can flag
-        // the approximate cost split.
+        // disassembly used EITHER approximate-cost fallback so the MO detail can
+        // flag that the per-component cost split is approximate:
+        //   - disassemblyFallback (recoveryPlan.usedLegacyFallback): recovered cost
+        //     layers lacked source lines, so cost was allocated by residual basis;
+        //   - useEqualSplitOverhead: zero recoverable cost, so manufacturing
+        //     overhead was split equally across components.
         await tx.productionOrder.update({
           where: { id },
-          data: { status, completedAt: now, qtyProduced: qtyPlanned, usedDisassemblyFallback: disassemblyFallback !== null },
+          data: { status, completedAt: now, qtyProduced: qtyPlanned, usedDisassemblyFallback: disassemblyFallback !== null || useEqualSplitOverhead },
         })
       })
 
