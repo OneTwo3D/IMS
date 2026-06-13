@@ -70,6 +70,38 @@ test('assertAdjustmentEditFifoFeasible removes the old addition layer from the p
   )
 })
 
+test('assertAdjustmentEditFifoFeasible allows an old-addition→reduction when other layers cover it', () => {
+  // Pool 15 incl. this addition's 10; after deleting the addition layer, 5 remain — remove 4 is fine.
+  const { availableAfterCleanup } = assertAdjustmentEditFifoFeasible({
+    newIsAddition: false,
+    newAbsQty: 4,
+    currentRemainingLayerQty: new Prisma.Decimal('15'),
+    removableLayerQty: new Prisma.Decimal('10'),
+  })
+  assert.equal(availableAfterCleanup, 5)
+})
+
+test('assertAdjustmentEditFifoFeasible rejects an old-addition→reduction that exceeds the residual pool', () => {
+  assert.throws(
+    () => assertAdjustmentEditFifoFeasible({
+      newIsAddition: false,
+      newAbsQty: 6,
+      currentRemainingLayerQty: new Prisma.Decimal('15'),
+      removableLayerQty: new Prisma.Decimal('10'),
+    }),
+    /only 5\.0000 unit\(s\) are available/,
+  )
+})
+
+test('assertAdjustmentEditFifoFeasible accepts a shortfall within the FIFO tolerance (0.0001)', () => {
+  // available 7.99995, need 8 → shortfall 0.00005 ≤ 0.0001, which strict consumption would accept.
+  assert.doesNotThrow(() => assertAdjustmentEditFifoFeasible({
+    newIsAddition: false,
+    newAbsQty: 8,
+    currentRemainingLayerQty: new Prisma.Decimal('7.99995'),
+  }))
+})
+
 test('assertAdjustmentEditFifoFeasible always allows an addition (creates a layer, never consumes)', () => {
   const { availableAfterCleanup } = assertAdjustmentEditFifoFeasible({
     newIsAddition: true,

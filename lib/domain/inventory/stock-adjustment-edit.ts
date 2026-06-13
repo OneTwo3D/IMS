@@ -3,6 +3,11 @@ import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 
 const QUANTITY_EPSILON = 0.000001
 
+// Mirror the shortfall tolerance consumeFifoLayersStrict applies (lib/cost-layers.ts):
+// it accepts a remaining shortfall up to 0.0001. The feasibility pre-check must use the
+// SAME tolerance, or it would over-reject edits that the real consumption would accept.
+const FIFO_SHORTFALL_TOLERANCE = 0.0001
+
 export type AdjustmentStockDeltaInput = {
   oldSignedQty: number
   newSignedQty: number
@@ -65,10 +70,12 @@ export type AdjustmentEditFifoFeasibilityInput = {
  * cleanup is written.
  *
  * consumeFifoLayersStrict only fails on total insufficiency (FIFO order never causes a
- * failure), so a sum comparison is exactly equivalent to a dry-run. Checking up front means
- * an infeasible edit is rejected with a clear, actionable message and zero mutation, instead
- * of deleting the old COGS and then throwing a low-level "insufficient layers" error that only
- * the surrounding transaction rollback saves us from (audit-H9).
+ * failure) and only inspects layers with remainingQty > 0; given the non-negative remainingQty
+ * invariant, a sum of remainingQty (> 0) is exactly equivalent to a dry-run. Checking up front
+ * means an infeasible edit is rejected with a clear, actionable message and zero mutation,
+ * instead of deleting the old COGS and then throwing a low-level "insufficient layers" error
+ * that only the surrounding transaction rollback saves us from (audit-H9). Callers should pass
+ * currentRemainingLayerQty summed over layers with remainingQty > 0 to match that filter.
  *
  * Returns the post-cleanup available quantity (for logging); throws on infeasibility.
  */
@@ -83,12 +90,14 @@ export function assertAdjustmentEditFifoFeasible(
   // Additions create a new layer at average cost — they never consume, so always feasible.
   if (input.newIsAddition) return { availableAfterCleanup }
 
-  if (availableAfterCleanup + QUANTITY_EPSILON < input.newAbsQty) {
+  // Use the same shortfall tolerance as the real strict consumption, so the pre-check never
+  // rejects an edit that consumeFifoLayersStrict would have accepted.
+  if (availableAfterCleanup + FIFO_SHORTFALL_TOLERANCE < input.newAbsQty) {
     throw new Error(
       `Cannot edit this adjustment to remove ${input.newAbsQty} unit(s): only ` +
       `${availableAfterCleanup.toFixed(4)} unit(s) are available in cost layers after accounting ` +
-      `for this adjustment. Later movements consumed the stock — reverse those first, or create a ` +
-      `compensating adjustment instead of editing this one.`,
+      `for this adjustment. If later movements consumed this stock, reverse those first; ` +
+      `otherwise create a compensating adjustment instead of editing this one.`,
     )
   }
   return { availableAfterCleanup }
