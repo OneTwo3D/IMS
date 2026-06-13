@@ -22,7 +22,8 @@ import {
   type StockLevelMapScope,
 } from '@/lib/domain/inventory/stock-level-map'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
-import { calculateAdjustmentStockDelta } from '@/lib/domain/inventory/stock-adjustment-edit'
+import { calculateAdjustmentStockDelta, assertAdjustmentEditFifoFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
+import { addMoney, toDecimal } from '@/lib/domain/math/decimal'
 import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromConsumed,
@@ -719,18 +720,14 @@ export async function updateAdjustmentMovement(
         currentReservedQty: currentLevel?.reservedQty,
       })
 
-      if (stockDelta !== 0) {
-        await tx.stockLevel.upsert({
-          where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
-          create: {
-            productId: movement.productId,
-            warehouseId: newWarehouseId,
-            quantity: resultingQuantity.toString(),
-          },
-          update: { quantity: { increment: stockDelta } },
-        })
-      }
-
+      // audit-H9: validate the edit is feasible BEFORE mutating anything. The
+      // old cleanup deleted the existing COGS/restored layers and only then
+      // re-ran the strict FIFO consumption, so an impossible edit threw a
+      // low-level "insufficient layers" error that just the surrounding
+      // transaction rollback saved. Front-loading these checks rejects the edit
+      // atomically with a clear, actionable message and zero mutation.
+      let restorableConsumedQty: Prisma.Decimal = toDecimal(0)
+      let removableLayerQty: Prisma.Decimal = toDecimal(0)
       if (oldIsAddition) {
         const layer = movement.adjustmentLayers[0]
         if (!layer) {
@@ -746,7 +743,7 @@ export async function updateAdjustmentMovement(
             'Create a reversing adjustment instead of editing it in place.',
           )
         }
-        await tx.costLayer.deleteMany({ where: { adjustmentMovementId: id } })
+        removableLayerQty = toDecimal(layer.remainingQty)
       } else {
         if (movement.cogsEntries.length === 0) {
           throw new Error(
@@ -754,6 +751,45 @@ export async function updateAdjustmentMovement(
             'Create a reversing adjustment instead of editing it in place.',
           )
         }
+        // Decimal accumulation: avoid IEEE-754 drift across many COGS entries.
+        restorableConsumedQty = movement.cogsEntries.reduce(
+          (sum, entry) => addMoney(sum, entry.qty),
+          toDecimal(0),
+        )
+      }
+
+      if (!newIsAddition) {
+        // Match consumeFifoLayersStrict's filter: only layers with remainingQty > 0 form the pool.
+        const layerAgg = await tx.costLayer.aggregate({
+          where: { productId: movement.productId, warehouseId: newWarehouseId, remainingQty: { gt: 0 } },
+          _sum: { remainingQty: true },
+        })
+        assertAdjustmentEditFifoFeasible({
+          newIsAddition,
+          newAbsQty: Math.abs(newSignedQty),
+          currentRemainingLayerQty: layerAgg._sum.remainingQty,
+          restorableConsumedQty,
+          removableLayerQty,
+        })
+      }
+
+      if (stockDelta !== 0) {
+        await tx.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
+          create: {
+            productId: movement.productId,
+            warehouseId: newWarehouseId,
+            quantity: resultingQuantity.toString(),
+          },
+          update: { quantity: { increment: stockDelta } },
+        })
+      }
+
+      // Cleanup — feasibility and the layer/cogs preconditions were already
+      // validated above, so these are pure mutations now.
+      if (oldIsAddition) {
+        await tx.costLayer.deleteMany({ where: { adjustmentMovementId: id } })
+      } else {
         for (const entry of movement.cogsEntries) {
           await tx.costLayer.update({
             where: { id: entry.costLayerId },
@@ -778,7 +814,20 @@ export async function updateAdjustmentMovement(
           adjustmentMovementId: id,
         })
       } else {
-        const { consumed } = await consumeFifoLayersStrict(tx, movement.productId, newWarehouseId, Math.abs(newSignedQty))
+        // Feasibility was pre-checked above against an unlocked aggregate read. If a
+        // concurrent movement consumed the pool in between, the strict consume (which
+        // locks layers FOR UPDATE) is the source of truth — surface the same actionable
+        // message rather than the low-level "insufficient layers" error.
+        let consumed: Awaited<ReturnType<typeof consumeFifoLayersStrict>>['consumed']
+        try {
+          ({ consumed } = await consumeFifoLayersStrict(tx, movement.productId, newWarehouseId, Math.abs(newSignedQty)))
+        } catch {
+          throw new Error(
+            `Cannot edit this adjustment to remove ${Math.abs(newSignedQty)} unit(s): the cost ` +
+            `layers were consumed by another movement during the edit. Retry, reverse the later ` +
+            `movements first, or create a compensating adjustment instead.`,
+          )
+        }
         nextMovementValueFields = buildStockMovementValueFieldsFromConsumed(consumed)
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
