@@ -11,6 +11,7 @@ export type XeroSettings = {
   xero_sync_enabled: string
   xero_sync_sales_invoice: string
   xero_sync_credit_note: string
+  xero_sync_purchase_credit_note: string
   xero_sync_purchase_invoice: string
   xero_sync_cogs_journal: string
   xero_sync_cogs_reversal: string
@@ -42,7 +43,7 @@ export type XeroSettings = {
 
 export const XERO_SETTING_KEYS = [
   'xero_client_id', 'xero_client_secret', 'xero_sync_enabled',
-  'xero_sync_sales_invoice', 'xero_sync_credit_note', 'xero_sync_purchase_invoice',
+  'xero_sync_sales_invoice', 'xero_sync_credit_note', 'xero_sync_purchase_credit_note', 'xero_sync_purchase_invoice',
   'xero_sync_cogs_journal', 'xero_sync_cogs_reversal',
   'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_stock_allocation',
   'xero_sync_realised_fx_journal', 'xero_sync_unrealised_fx_journal',
@@ -66,6 +67,7 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_sync_enabled: 'false',
   xero_sync_sales_invoice: 'submitted',
   xero_sync_credit_note: 'submitted',
+  xero_sync_purchase_credit_note: 'submitted',
   xero_sync_purchase_invoice: 'submitted',
   xero_sync_cogs_journal: 'submitted',
   xero_sync_cogs_reversal: 'submitted',

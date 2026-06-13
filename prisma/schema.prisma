@@ -151,6 +151,8 @@ enum AccountingSyncType {
   INVOICE_EMAIL
   WC_INVOICE_NOTE
   CREDIT_NOTE
+  // audit-g5u2: supplier (purchase) credit note — Xero ACCPAYCREDIT.
+  PURCHASE_CREDIT_NOTE
   STOCK_IN_TRANSIT
   STOCK_RECEIPT
   COGS_REVERSAL
