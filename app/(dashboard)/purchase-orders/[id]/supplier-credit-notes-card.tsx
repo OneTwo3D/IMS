@@ -25,6 +25,10 @@ export function SupplierCreditNotesCard({
 }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
+  // Track WHICH action is in flight so posting one draft doesn't disable every
+  // other row + the dialog (Codex review): 'record' for the dialog, or a credit
+  // note id for its Post button.
+  const [busyId, setBusyId] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
   const [amount, setAmount] = useState('')
   const [reason, setReason] = useState('')
@@ -41,6 +45,7 @@ export function SupplierCreditNotesCard({
       setError('Enter a credit amount greater than 0.')
       return
     }
+    setBusyId('record')
     startTransition(async () => {
       const res = await recordSupplierFreightCreditNote({
         poId,
@@ -48,6 +53,7 @@ export function SupplierCreditNotesCard({
         reason: reason.trim() || undefined,
         creditNoteNumber: creditNoteNumber.trim() || undefined,
       })
+      setBusyId(null)
       if (!res.success) {
         setError(res.error ?? 'Failed to record the credit note.')
         return
@@ -62,8 +68,10 @@ export function SupplierCreditNotesCard({
 
   function post(id: string) {
     setError('')
+    setBusyId(id)
     startTransition(async () => {
       const res = await postSupplierCreditNote(id)
+      setBusyId(null)
       if (!res.success) {
         setError(res.error ?? 'Failed to post the credit note.')
         return
@@ -108,7 +116,7 @@ export function SupplierCreditNotesCard({
                 <span className="font-medium tabular-nums">{currency} {cn.amountForeign.toFixed(2)}</span>
                 {cn.status === 'DRAFT' && (
                   <Button size="sm" variant="outline" disabled={pending} onClick={() => post(cn.id)}>
-                    Post
+                    {busyId === cn.id ? 'Posting…' : 'Post'}
                   </Button>
                 )}
               </div>
@@ -117,7 +125,7 @@ export function SupplierCreditNotesCard({
         </div>
       )}
 
-      {error && !open && <p className="px-4 py-2 text-sm text-destructive">{error}</p>}
+      {error && !open && <p role="alert" className="px-4 py-2 text-sm text-destructive">{error}</p>}
 
       <Dialog open={open} onOpenChange={(o) => setOpen(o)}>
         <DialogContent className="max-w-md">
@@ -137,11 +145,11 @@ export function SupplierCreditNotesCard({
               <Label htmlFor="cn-reason">Reason (optional)</Label>
               <Input id="cn-reason" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Duplicate freight bill" />
             </div>
-            {error && <p className="text-sm text-destructive">{error}</p>}
+            {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)} disabled={pending}>Cancel</Button>
-            <Button onClick={submitRecord} disabled={pending}>{pending ? 'Recording…' : 'Record (draft)'}</Button>
+            <Button onClick={submitRecord} disabled={pending}>{busyId === 'record' ? 'Recording…' : 'Record (draft)'}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
