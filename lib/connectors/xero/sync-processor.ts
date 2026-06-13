@@ -242,6 +242,80 @@ async function deferPaymentUntilEarlierLogsPost(entry: { id: string }): Promise<
   })
 }
 
+// audit-H5: an *_INVOICE_UPDATE must not post before the invoice's CREATE. The
+// CREATE and its UPDATE share (referenceType, referenceId) — SALES_INVOICE /
+// SalesOrder and PURCHASE_INVOICE / PurchaseOrder respectively.
+const INVOICE_UPDATE_TO_CREATE_TYPE: Partial<Record<AccountingSyncType, AccountingSyncType>> = {
+  SALES_INVOICE_UPDATE: 'SALES_INVOICE',
+  PURCHASE_INVOICE_UPDATE: 'PURCHASE_INVOICE',
+}
+
+function invoiceCreateKey(createType: AccountingSyncType, referenceType: string, referenceId: string): string {
+  return `${createType} ${referenceType} ${referenceId}`
+}
+
+/**
+ * audit-H5: find *_INVOICE_UPDATE entries that should be deferred because the
+ * invoice's CREATE row for the same document is still live (PENDING/PROCESSING).
+ * Processing the UPDATE first fails with "invoice not found" and burns retries.
+ * Same shape/pattern as findInvoicePaymentsBlockedByEarlierLiveLogs.
+ */
+export async function findInvoiceUpdatesBlockedByPendingCreate(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entries: InvoicePaymentOrderingEntry[],
+): Promise<Set<string>> {
+  const updateEntries = entries.filter((entry) => INVOICE_UPDATE_TO_CREATE_TYPE[entry.type])
+  if (updateEntries.length === 0) return new Set()
+
+  const orFilters = [...new Map(updateEntries.map((entry) => {
+    const createType = INVOICE_UPDATE_TO_CREATE_TYPE[entry.type]!
+    return [invoiceCreateKey(createType, entry.referenceType, entry.referenceId), {
+      type: createType,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+    }]
+  })).values()]
+
+  const liveCreates = await client.accountingSyncLog.findMany({
+    where: {
+      connector: XERO_CONNECTOR,
+      status: { in: ['PENDING', 'PROCESSING'] },
+      OR: orFilters,
+    },
+    select: { id: true, type: true, referenceType: true, referenceId: true, createdAt: true },
+    orderBy: { createdAt: 'asc' },
+  })
+
+  const earliestLiveCreateByKey = new Map<string, { id: string; createdAt: Date }>()
+  for (const log of liveCreates) {
+    const key = invoiceCreateKey(log.type, log.referenceType, log.referenceId)
+    if (!earliestLiveCreateByKey.has(key)) earliestLiveCreateByKey.set(key, log)
+  }
+
+  const blocked = new Set<string>()
+  for (const entry of updateEntries) {
+    const createType = INVOICE_UPDATE_TO_CREATE_TYPE[entry.type]!
+    const liveCreate = earliestLiveCreateByKey.get(invoiceCreateKey(createType, entry.referenceType, entry.referenceId))
+    // Defer only when the live CREATE was queued no later than the UPDATE — the
+    // normal case (CREATE first). Avoids a deadlock on a pathological later CREATE.
+    if (liveCreate && liveCreate.id !== entry.id && liveCreate.createdAt <= entry.createdAt) {
+      blocked.add(entry.id)
+    }
+  }
+  return blocked
+}
+
+async function deferUpdateUntilCreatePosts(entry: { id: string }): Promise<void> {
+  await db.accountingSyncLog.update({
+    where: { id: entry.id },
+    data: {
+      status: 'PENDING',
+      processingStartedAt: new Date(Date.now() + 60_000),
+      errorMessage: 'Deferred until the invoice CREATE for this document posts',
+    },
+  })
+}
+
 async function ensureXeroOutboxForPendingSyncLogs(limit: number, staleClaimCutoff: Date): Promise<void> {
   const now = new Date()
   const logs = await db.accountingSyncLog.findMany({
@@ -399,6 +473,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     take: MAX_PER_RUN,
   })
   const blockedPaymentEntryIds = await findInvoicePaymentsBlockedByEarlierLiveLogs(db, pending)
+  const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, pending)
 
   for (const entry of pending) {
     const claim = await db.accountingSyncLog.updateMany({
@@ -416,6 +491,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     try {
       if (blockedPaymentEntryIds.has(entry.id)) {
         await deferPaymentUntilEarlierLogsPost(entry)
+        result.skipped++
+        continue
+      }
+      if (blockedUpdateEntryIds.has(entry.id)) {
+        await deferUpdateUntilCreatePosts(entry)
         result.skipped++
         continue
       }
@@ -625,6 +705,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     : []
   const entriesById = new Map(entries.map((entry) => [entry.id, entry]))
   const blockedPaymentEntryIds = await findInvoicePaymentsBlockedByEarlierLiveLogs(db, entries)
+  const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, entries)
 
   for (const { job, syncLogId } of jobWork) {
     const entry = entriesById.get(syncLogId)
@@ -674,6 +755,22 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             },
           })
           await markXeroOutboxRetry(job, 'Deferred until older invoice payment sync logs post', tx)
+        })
+        result.skipped++
+        continue
+      }
+
+      if (blockedUpdateEntryIds.has(entry.id)) {
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'PENDING',
+              processingStartedAt: new Date(Date.now() + 60_000),
+              errorMessage: 'Deferred until the invoice CREATE for this document posts',
+            },
+          })
+          await markXeroOutboxRetry(job, 'Deferred until the invoice CREATE for this document posts', tx)
         })
         result.skipped++
         continue
