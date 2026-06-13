@@ -8,6 +8,7 @@ import { db } from '@/lib/db'
 import { xeroGet } from './api'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+import { detectPaymentReversals } from '@/lib/domain/accounting/payment-reversal'
 
 type XeroInvoice = {
   InvoiceID: string
@@ -19,8 +20,8 @@ type XeroInvoicesResponse = {
   Invoices: XeroInvoice[]
 }
 
-export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid: number; errors: string[] }> {
-  const result = { salesPaid: 0, billsPaid: 0, errors: [] as string[] }
+export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[] }> {
+  const result = { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [] as string[] }
 
   // Read last poll timestamp
   const lastPollSetting = await db.setting.findUnique({ where: { key: 'xero_last_payment_poll' } })
@@ -86,6 +87,45 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     result.errors.push(`Sales polling error: ${String(e)}`)
   }
 
+  // --- Sales payment reversals (audit-M-acct #3) ---
+  // The forward poll only marks unpaid→paid. If a payment is reversed/deleted in
+  // Xero the invoice regresses to AUTHORISED — clear paidAt so IMS stops showing
+  // it paid. Status is not auto-reverted (left for the operator); a WARNING flags it.
+  try {
+    const paidManualOrders = await db.salesOrder.findMany({
+      where: {
+        accountingInvoiceId: { not: null },
+        paidAt: { not: null },
+        shoppingLinks: { none: {} },
+      },
+      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true },
+    })
+    if (paidManualOrders.length > 0) {
+      const modifiedAfter = new Date(lastPoll).toISOString()
+      const res = await xeroGet<XeroInvoicesResponse>(
+        `Invoices?where=Type=="ACCREC"&&Status=="AUTHORISED"&ModifiedAfter=${modifiedAfter}`,
+      )
+      if (res.ok && res.data?.Invoices) {
+        const reversedIds = new Set(res.data.Invoices.map((i) => i.InvoiceID))
+        for (const order of detectPaymentReversals(paidManualOrders, reversedIds)) {
+          await db.salesOrder.update({ where: { id: order.id }, data: { paidAt: null } })
+          result.salesReversed++
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: order.id,
+            action: 'payment_reversal_detected',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Payment reversed in Xero for order ${order.orderNumber ?? order.externalOrderNumber} — cleared paidAt. Review whether the order status should change.`,
+            resolveUser: false,
+          })
+        }
+      }
+    }
+  } catch (e) {
+    result.errors.push(`Sales reversal polling error: ${String(e)}`)
+  }
+
   // --- Purchase bills (all POs) ---
   try {
     const unpaidBills = await db.purchaseInvoice.findMany({
@@ -133,6 +173,38 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     result.errors.push(`Bills polling error: ${String(e)}`)
   }
 
+  // --- Purchase bill payment reversals (audit-M-acct #3) ---
+  try {
+    const paidBills = await db.purchaseInvoice.findMany({
+      where: { accountingInvoiceId: { not: null }, paidAt: { not: null } },
+      select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true } } },
+    })
+    if (paidBills.length > 0) {
+      const modifiedAfter = new Date(lastPoll).toISOString()
+      const res = await xeroGet<XeroInvoicesResponse>(
+        `Invoices?where=Type=="ACCPAY"&&Status=="AUTHORISED"&ModifiedAfter=${modifiedAfter}`,
+      )
+      if (res.ok && res.data?.Invoices) {
+        const reversedIds = new Set(res.data.Invoices.map((i) => i.InvoiceID))
+        for (const bill of detectPaymentReversals(paidBills, reversedIds)) {
+          await db.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
+          result.billsReversed++
+          await logActivity({
+            entityType: 'PURCHASE_ORDER',
+            entityId: bill.poId,
+            action: 'bill_payment_reversal_detected',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Bill payment reversed in Xero for PO ${bill.po.reference} — cleared paidAt.`,
+            resolveUser: false,
+          })
+        }
+      }
+    }
+  } catch (e) {
+    result.errors.push(`Bills reversal polling error: ${String(e)}`)
+  }
+
   if (result.errors.length === 0) {
     await db.setting.upsert({
       where: { key: 'xero_last_payment_poll' },
@@ -151,13 +223,13 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     })
   }
 
-  if (result.salesPaid > 0 || result.billsPaid > 0) {
+  if (result.salesPaid > 0 || result.billsPaid > 0 || result.salesReversed > 0 || result.billsReversed > 0) {
     await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_payment_poll',
       tag: 'sync',
       level: 'INFO',
-      description: `Payment poll: ${result.salesPaid} sales, ${result.billsPaid} bills detected`,
+      description: `Payment poll: ${result.salesPaid} sales paid, ${result.billsPaid} bills paid, ${result.salesReversed} sales reversed, ${result.billsReversed} bills reversed`,
       metadata: result,
       resolveUser: false,
     })
