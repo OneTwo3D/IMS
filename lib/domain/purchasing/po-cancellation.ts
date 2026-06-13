@@ -38,6 +38,89 @@ export type ReversePurchaseOrderCostLayersResult = {
   totalReversalValueBase: Decimal
 }
 
+// ---------------------------------------------------------------------------
+// Already-consumed cost on cancellation (audit-H8)
+//
+// reversePurchaseOrderCostLayersForCancellation only reverses the remaining
+// (still-on-hand) quantity of each cost layer. Units already consumed — sold,
+// used in production, written off — keep their COGS sourced from the now-cancelled
+// PO. Inventory reconciles, but the P&L silently carries cost from a cancelled
+// receipt. This summarises that consumed portion (receivedQty − remainingQty)
+// so the cancellation can flag it for finance review. Read BEFORE the reversal
+// runs, so the about-to-be-reversed remaining quantity is not mistaken for
+// consumption.
+// ---------------------------------------------------------------------------
+
+export type PurchaseOrderConsumedCostLayer = {
+  costLayerId: string
+  poLineId: string | null
+  productId: string
+  consumedQty: string
+  unitCostBase: string
+  consumedValueBase: string
+}
+
+export type PurchaseOrderConsumedCostSummary = {
+  consumedQty: string
+  consumedValueBase: string
+  layers: PurchaseOrderConsumedCostLayer[]
+}
+
+type ConsumedCostLayerRow = {
+  id: string
+  poLineId: string | null
+  productId: string
+  receivedQty: DecimalInput
+  remainingQty: DecimalInput
+  unitCostBase: DecimalInput
+}
+
+export function summarizeConsumedCostLayers(rows: ConsumedCostLayerRow[]): PurchaseOrderConsumedCostSummary {
+  let consumedQty = toDecimal(0)
+  let consumedValueBase = toDecimal(0)
+  const layers: PurchaseOrderConsumedCostLayer[] = []
+
+  for (const row of rows) {
+    const consumed = subtractMoney(row.receivedQty, row.remainingQty)
+    if (consumed.lte(1e-6)) continue
+    const unitCostBase = toDecimal(row.unitCostBase)
+    const valueBase = roundQuantity(multiplyMoney(consumed, unitCostBase), 6)
+    consumedQty = addMoney(consumedQty, consumed)
+    consumedValueBase = addMoney(consumedValueBase, valueBase)
+    layers.push({
+      costLayerId: row.id,
+      poLineId: row.poLineId,
+      productId: row.productId,
+      consumedQty: roundQuantity(consumed, 4).toString(),
+      unitCostBase: roundQuantity(unitCostBase, 6).toString(),
+      consumedValueBase: valueBase.toString(),
+    })
+  }
+
+  return {
+    consumedQty: roundQuantity(consumedQty, 4).toString(),
+    consumedValueBase: roundQuantity(consumedValueBase, 2).toString(),
+    layers,
+  }
+}
+
+export async function readPurchaseOrderConsumedCostForCancellation(
+  tx: TxClient,
+  poLineIds: string[],
+): Promise<PurchaseOrderConsumedCostSummary> {
+  if (poLineIds.length === 0) {
+    return { consumedQty: '0', consumedValueBase: '0', layers: [] }
+  }
+  const rows = await tx.$queryRaw<ConsumedCostLayerRow[]>`
+    SELECT id, "poLineId", "productId", "receivedQty", "remainingQty", "unitCostBase"
+    FROM "cost_layers"
+    WHERE "poLineId" = ANY(${poLineIds}::text[])
+      AND "receivedQty" > "remainingQty"
+    ORDER BY "receivedAt" ASC, id ASC
+  `
+  return summarizeConsumedCostLayers(rows)
+}
+
 export function assertPurchaseOrderCancellationHasNoInvoices(invoiceCount: number): void {
   if (invoiceCount > 0) {
     throw new Error('Cannot cancel a purchase order after supplier invoices have been recorded. Create a supplier credit or bill reversal instead.')

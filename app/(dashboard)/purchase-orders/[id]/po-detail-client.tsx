@@ -41,6 +41,8 @@ import { createMintsoftPurchaseOrderAsn } from '@/app/actions/mintsoft-sync'
 import { getTrackingUrl } from '@/lib/tracking'
 import type { AccountingBankAccount } from '@/lib/accounting'
 import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accounting/rejected-sync-warnings'
+import type { PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
+import type { PurchaseOrderConsumedCostSummary } from '@/lib/domain/purchasing/po-cancellation'
 import type { SupplierRow } from '@/app/actions/suppliers'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
@@ -67,6 +69,7 @@ type Props = {
   accountingBillUrlTemplate: string
   mintsoftAsnState: MintsoftPurchaseOrderAsnState
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
+  overBilling: PurchaseOrderOverBillingSummary
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -1762,7 +1765,7 @@ function ShipDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState, rejectedAccountingSyncs }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState, rejectedAccountingSyncs, overBilling }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -1795,6 +1798,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const [editBillFor, setEditBillFor] = useState<InvoiceRow | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [cancelConsumedCost, setCancelConsumedCost] = useState<PurchaseOrderConsumedCostSummary | null>(null)
 
   const canEdit = po.status === 'DRAFT'
   const canRfq = po.status === 'DRAFT' || po.status === 'RFQ_SENT'
@@ -1867,10 +1871,14 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
     if (!confirm('Cancel this purchase order?')) return
     setError('')
     setNotice('')
+    setCancelConsumedCost(null)
     startTransition(async () => {
       const result = await cancelPurchaseOrder(po.id)
       if (result.success) {
         if (result.notice) setNotice(result.notice)
+        if (result.consumedCost && Number(result.consumedCost.consumedQty) > 0) {
+          setCancelConsumedCost(result.consumedCost)
+        }
         router.refresh()
       }
       else setError(result.error ?? 'Failed')
@@ -1989,6 +1997,45 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {error && <p className="text-sm text-destructive">{error}</p>}
       {notice && <p className="text-sm text-emerald-700 dark:text-emerald-300">{notice}</p>}
+      {overBilling.hasOverBilling && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          <div className="flex gap-2">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            <div className="space-y-2">
+              <p className="font-medium">
+                Returned goods exceed what was billed back. {overBilling.totalOverBilledQty} unit(s) are billed but no longer kept —{' '}
+                {formatMoney(Number(overBilling.totalOverBilledValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)} over-billed.
+                Raise a supplier credit to reduce the AP liability; IMS does not adjust the bill automatically.
+              </p>
+              <ul className="space-y-1 text-xs">
+                {overBilling.lines.map((line) => (
+                  <li key={line.poLineId}>
+                    <span className="font-mono">{line.sku ?? line.productId}</span>: billed {line.billedQty}, kept {line.netReceivedQty} →{' '}
+                    {line.overBilledQty} over-billed ({formatMoney(Number(line.overBilledValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)})
+                  </li>
+                ))}
+              </ul>
+              <p className="text-xs">
+                Bills: {overBilling.bills.map((b) => b.invoiceNumber ?? b.invoiceId).join(', ')}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+      {cancelConsumedCost && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          <div className="flex gap-2">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            <div className="space-y-1">
+              <p className="font-medium">
+                {cancelConsumedCost.consumedQty} unit(s) had already been sold or used from this PO before cancellation.
+                {' '}{formatMoney(Number(cancelConsumedCost.consumedValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)} of COGS
+                remains booked against the now-cancelled receipt. Review with finance — IMS does not reverse COGS for units that have left stock.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
       {rejectedAccountingSyncs.length > 0 && (
         <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
           <div className="flex gap-2">

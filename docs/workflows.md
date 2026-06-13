@@ -109,6 +109,22 @@ closure, and return state. Receipt actions move orders to `PARTIALLY_RECEIVED`
 or `RECEIVED`; supplier return actions can move eligible orders to
 `PARTIALLY_RETURNED` or `RETURNED`.
 
+**Returns vs. supplier bills.** A return reverses stock and FIFO cost layers but
+does **not** adjust supplier invoices already recorded against the PO. When a
+return leaves a line billed for more than the quantity now kept
+(received − returned), the PO detail page shows an amber over-billing alert and a
+`return_overbilled_bill` WARNING activity-log row (naming the bills and the
+over-billed amount). Reducing the AP liability is a manual step — raise a
+supplier credit; IMS does not yet post a credit memo automatically (audit-C4).
+
+**Cancellation and already-consumed cost.** Cancelling a PO reverses the
+remaining (still-on-hand) receipt cost layers. Units already sold or used keep
+their COGS booked against the cancelled receipt. When that consumed quantity is
+non-zero, cancellation emits a `cancelled_consumed_cogs_standing` WARNING and the
+UI surfaces the consumed units and value for finance review — IMS does not
+reverse COGS for stock that has already left (audit-H8). Cancellation remains
+blocked entirely once a supplier invoice exists.
+
 ### Refunds
 
 Refunds do not currently have a persisted status column. The refund workflow is

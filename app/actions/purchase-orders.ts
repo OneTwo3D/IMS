@@ -48,6 +48,7 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
+import { computePurchaseOrderOverBilling } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
 import {
   validateLinkedFreightReceiptStatus,
   validatePurchaseOrderStatusTransition,
@@ -2310,6 +2311,51 @@ export async function returnPurchaseOrder(
       description: `Returned stock for PO ${po.reference}`,
       metadata: { reference: po.reference, lineCount: linesWithQty.length, reason },
     })
+
+    // audit-C4: returns reverse stock/cost but never touch supplier bills. If the
+    // PO has recorded invoices and a line is now billed beyond what is kept, flag
+    // the over-billed bill(s) so finance can raise a supplier credit.
+    try {
+      const billing = await db.purchaseOrder.findUnique({
+        where: { id },
+        select: {
+          lines: { select: { id: true, productId: true, qtyReceived: true, qtyReturned: true, product: { select: { sku: true } } } },
+          invoices: {
+            select: {
+              id: true,
+              invoiceNumber: true,
+              totalBase: true,
+              lines: { select: { poLineId: true, qtyBilled: true, totalBase: true } },
+            },
+          },
+        },
+      })
+      if (billing) {
+        const overBilling = computePurchaseOrderOverBilling({
+          lines: billing.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.product?.sku ?? null, qtyReceived: l.qtyReceived, qtyReturned: l.qtyReturned })),
+          invoices: billing.invoices.map((inv) => ({ id: inv.id, invoiceNumber: inv.invoiceNumber, totalBase: inv.totalBase, lines: inv.lines })),
+        })
+        if (overBilling.hasInvoices && overBilling.hasOverBilling) {
+          await logActivity({
+            entityType: 'PURCHASE_ORDER',
+            entityId: id,
+            action: 'return_overbilled_bill',
+            tag: 'purchase',
+            level: 'WARNING',
+            description: `Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — £${overBilling.totalOverBilledValueBase} over-billed across ${overBilling.bills.length} bill(s). Raise a supplier credit.`,
+            metadata: {
+              reference: po.reference,
+              totalOverBilledQty: overBilling.totalOverBilledQty,
+              totalOverBilledValueBase: overBilling.totalOverBilledValueBase,
+              overBilledLines: overBilling.lines,
+              bills: overBilling.bills,
+            },
+          })
+        }
+      }
+    } catch (billingWarnError) {
+      console.error(billingWarnError)
+    }
 
     try {
       const returnedPairs = linesWithQty.map((rl) => ({

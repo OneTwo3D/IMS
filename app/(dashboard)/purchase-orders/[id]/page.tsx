@@ -14,6 +14,7 @@ import { getOrganisation } from '@/app/actions/company'
 import { getAccountingSettings } from '@/lib/accounting'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
+import { computePurchaseOrderOverBilling } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
 import { PoDetailClient } from './po-detail-client'
 
 export const metadata: Metadata = { title: 'Purchase Order' }
@@ -47,6 +48,13 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
+  // audit-C4: surface bills that are over-billed relative to the quantity kept
+  // after returns, so finance can raise a supplier credit.
+  const overBilling = computePurchaseOrderOverBilling({
+    lines: po.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.product?.sku ?? null, qtyReceived: l.qtyReceived, qtyReturned: l.qtyReturned })),
+    invoices: po.invoices.map((inv) => ({ id: inv.id, invoiceNumber: inv.invoiceNumber, totalBase: inv.totalBase, lines: inv.lines.map((il) => ({ poLineId: il.poLineId, qtyBilled: il.qtyBilled, totalBase: il.totalBase })) })),
+  })
+
   const products = productsResult.products.filter(
     (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type) && (p.lifecycleStatus === 'ACTIVE' || p.lifecycleStatus === 'DRAFT'),
   )
@@ -59,7 +67,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} mintsoftAsnState={mintsoftAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} mintsoftAsnState={mintsoftAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} />
     </div>
   )
 }

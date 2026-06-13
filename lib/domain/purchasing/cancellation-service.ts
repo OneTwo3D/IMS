@@ -8,7 +8,9 @@ import { roundQuantity } from '@/lib/domain/math/decimal'
 import {
   assertPurchaseOrderCancellationHasNoInvoices,
   isPurchaseOrderCancellationNoop,
+  readPurchaseOrderConsumedCostForCancellation,
   reversePurchaseOrderCostLayersForCancellation,
+  type PurchaseOrderConsumedCostSummary,
   type PurchaseOrderCostLayerReversal,
 } from '@/lib/domain/purchasing/po-cancellation'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
@@ -20,6 +22,12 @@ export type CancelPurchaseOrderResult = {
   error?: string
   notice?: string
   reversedCostLayers?: PurchaseOrderCostLayerReversal[]
+  /**
+   * Cost of units already consumed (sold/used) from this PO before cancellation.
+   * Their COGS stays booked against the cancelled receipt — surfaced so finance
+   * can decide whether a correction is needed (audit-H8).
+   */
+  consumedCost?: PurchaseOrderConsumedCostSummary
 }
 
 export type CancelPurchaseOrderServiceDeps = {
@@ -33,6 +41,7 @@ export type CancelPurchaseOrderServiceDeps = {
   getAccountingSettings: typeof getAccountingSettings
   queueAccountingSyncTx: typeof queueAccountingSyncTx
   reversePurchaseOrderCostLayersForCancellation: typeof reversePurchaseOrderCostLayersForCancellation
+  readPurchaseOrderConsumedCostForCancellation: typeof readPurchaseOrderConsumedCostForCancellation
 }
 
 // Production dependencies are captured at module load; tests that need
@@ -48,6 +57,7 @@ const defaultCancelPurchaseOrderServiceDeps: CancelPurchaseOrderServiceDeps = {
   getAccountingSettings,
   queueAccountingSyncTx,
   reversePurchaseOrderCostLayersForCancellation,
+  readPurchaseOrderConsumedCostForCancellation,
 }
 
 async function logPurchaseOrderCancellationNoop(
@@ -101,10 +111,16 @@ export async function cancelPurchaseOrderService(
       if (!transition.success) throw new Error(transition.error)
       assertPurchaseOrderCancellationHasNoInvoices(existing._count.invoices)
 
+      const poLineIds = existing.lines.map((line) => line.id)
+
+      // Read consumed cost BEFORE the reversal, otherwise the remaining quantity
+      // it is about to zero out would be miscounted as already-consumed.
+      const consumedCost = await deps.readPurchaseOrderConsumedCostForCancellation(tx, poLineIds)
+
       const reversal = await deps.reversePurchaseOrderCostLayersForCancellation(tx, {
         poId: id,
         poReference: existing.reference,
-        poLineIds: existing.lines.map((line) => line.id),
+        poLineIds,
       })
 
       await tx.purchaseOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
@@ -140,7 +156,7 @@ export async function cancelPurchaseOrderService(
         }
       }
 
-      return { alreadyCancelled: false as const, existing, reversal }
+      return { alreadyCancelled: false as const, existing, reversal, consumedCost }
     }, PURCHASE_ORDER_CANCELLATION_TX_OPTIONS)
 
     if (cancellation.alreadyCancelled) {
@@ -163,6 +179,24 @@ export async function cancelPurchaseOrderService(
         totalReversalValueBase: roundQuantity(cancellation.reversal.totalReversalValueBase, 6).toString(),
       },
     })
+
+    const consumedCost = cancellation.consumedCost
+    if (Number(consumedCost.consumedQty) > 0) {
+      await deps.logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: 'cancelled_consumed_cogs_standing',
+        tag: 'purchase',
+        level: 'WARNING',
+        description: `Cancelled PO ${cancellation.existing.reference} with ${consumedCost.consumedQty} unit(s) already sold/used — £${consumedCost.consumedValueBase} of COGS remains booked against the cancelled receipt. Review with finance.`,
+        metadata: {
+          reference: cancellation.existing.reference,
+          consumedQty: consumedCost.consumedQty,
+          consumedValueBase: consumedCost.consumedValueBase,
+          consumedLayers: consumedCost.layers,
+        },
+      })
+    }
 
     if (cancellation.reversal.productIds.length > 0) {
       try {
@@ -189,6 +223,7 @@ export async function cancelPurchaseOrderService(
     return {
       success: true,
       reversedCostLayers: cancellation.reversal.reversedLayers,
+      consumedCost,
       notice: cancellation.reversal.reversedLayers.length > 0
         ? `Cancelled PO and reversed ${cancellation.reversal.reversedLayers.length} remaining receipt cost layer(s).`
         : undefined,
