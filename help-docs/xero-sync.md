@@ -361,6 +361,11 @@ stays as configured (usually `0` for B2B services), and only the connector-side 
 the reverse-charge settings are empty, IMS falls back to the parent `TaxRate.accountingTaxType` so
 the bill or invoice still posts, just without the reverse-charge classification.
 
+The swap applies symmetrically to **credit notes**: refunding a reverse-charged sale posts the
+credit note under the same reverse-charge code the original invoice used, so the VAT return's
+debit and credit lines reconcile. (Sales invoices, purchase bills, and credit notes all share one
+resolver, so the three can never drift.)
+
 ## Invoice PDF & Email
 
 When a sales invoice is synced to Xero and payment is registered:
