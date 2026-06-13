@@ -3,37 +3,47 @@ import test from 'node:test'
 
 import { evaluatePurchaseOrderCancellationInvoiceGate } from '@/lib/domain/purchasing/po-cancellation'
 
-// audit-g5u2.4: an invoiced freight PO can be cancelled only when POSTED supplier
-// credit notes fully offset its bills; everything else stays blocked.
+// audit-g5u2.4: an invoiced freight PO can be cancelled only when EVERY bill is
+// fully offset (base currency) by POSTED credit notes attributed to that bill.
 
 test('uninvoiced PO is always cancellable', () => {
-  const r = evaluatePurchaseOrderCancellationInvoiceGate({ invoiceCount: 0, isFreight: false, invoiceTotalForeign: 0, postedCreditTotalForeign: 0 })
-  assert.deepEqual(r, { allowed: true, reason: null })
+  assert.deepEqual(
+    evaluatePurchaseOrderCancellationInvoiceGate({ isFreight: false, invoices: [] }),
+    { allowed: true, reason: null },
+  )
 })
 
-test('freight PO fully offset by posted credit notes is cancellable', () => {
-  const r = evaluatePurchaseOrderCancellationInvoiceGate({ invoiceCount: 1, isFreight: true, invoiceTotalForeign: 120, postedCreditTotalForeign: 120 })
+test('freight PO with every bill fully offset is cancellable', () => {
+  const r = evaluatePurchaseOrderCancellationInvoiceGate({
+    isFreight: true,
+    invoices: [{ totalBase: 120, creditedBase: 120 }, { totalBase: 30, creditedBase: 30 }],
+  })
   assert.equal(r.allowed, true)
 })
 
-test('freight PO offset within epsilon is cancellable', () => {
-  const r = evaluatePurchaseOrderCancellationInvoiceGate({ invoiceCount: 1, isFreight: true, invoiceTotalForeign: 120, postedCreditTotalForeign: 119.995 })
+test('freight PO offset within the half-cent tolerance is cancellable', () => {
+  const r = evaluatePurchaseOrderCancellationInvoiceGate({ isFreight: true, invoices: [{ totalBase: 120, creditedBase: 119.998 }] })
   assert.equal(r.allowed, true)
 })
 
-test('freight PO only PARTIALLY credited is blocked with a guiding reason', () => {
-  const r = evaluatePurchaseOrderCancellationInvoiceGate({ invoiceCount: 1, isFreight: true, invoiceTotalForeign: 120, postedCreditTotalForeign: 50 })
+test('freight PO with ANY under-offset bill is blocked (a credit for one bill cannot satisfy another)', () => {
+  const r = evaluatePurchaseOrderCancellationInvoiceGate({
+    isFreight: true,
+    // First bill over-credited, second uncredited — must still block on the second.
+    invoices: [{ totalBase: 100, creditedBase: 150 }, { totalBase: 40, creditedBase: 0 }],
+  })
   assert.equal(r.allowed, false)
   assert.match(r.reason ?? '', /not fully offset by posted credit notes/)
 })
 
-test('freight PO with no credit notes is blocked', () => {
-  const r = evaluatePurchaseOrderCancellationInvoiceGate({ invoiceCount: 1, isFreight: true, invoiceTotalForeign: 120, postedCreditTotalForeign: 0 })
+test('freight PO with a partial offset is blocked with the shortfall', () => {
+  const r = evaluatePurchaseOrderCancellationInvoiceGate({ isFreight: true, invoices: [{ totalBase: 120, creditedBase: 50 }] })
   assert.equal(r.allowed, false)
+  assert.match(r.reason ?? '', /shortfall 70\.00/)
 })
 
 test('non-freight invoiced PO is blocked even when fully credited', () => {
-  const r = evaluatePurchaseOrderCancellationInvoiceGate({ invoiceCount: 1, isFreight: false, invoiceTotalForeign: 120, postedCreditTotalForeign: 120 })
+  const r = evaluatePurchaseOrderCancellationInvoiceGate({ isFreight: false, invoices: [{ totalBase: 120, creditedBase: 120 }] })
   assert.equal(r.allowed, false)
   assert.match(r.reason ?? '', /after supplier invoices have been recorded/)
 })

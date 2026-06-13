@@ -261,12 +261,14 @@ test('cancelPurchaseOrderService is idempotent when called twice', async () => {
   let reversalCalls = 0
 
   const tx = {
+    $queryRaw: async () => [],
     purchaseOrder: {
       findUnique: async () => ({
         status: po.status,
         reference: po.reference,
         lines: [{ id: 'po-line-1' }],
-        _count: { invoices: 0 },
+        invoices: [],
+        supplierCreditNotes: [],
       }),
       update: async ({ data }: { data: { status: typeof po.status } }) => {
         po.status = data.status
@@ -367,12 +369,14 @@ test('cancelPurchaseOrderService flags already-consumed COGS with a WARNING and 
   const logs: Array<{ action: string; level?: string; metadata?: unknown }> = []
 
   const tx = {
+    $queryRaw: async () => [],
     purchaseOrder: {
       findUnique: async () => ({
         status: po.status,
         reference: po.reference,
         lines: [{ id: 'po-line-1' }],
-        _count: { invoices: 0 },
+        invoices: [],
+        supplierCreditNotes: [],
       }),
       update: async ({ data }: { data: { status: typeof po.status } }) => {
         po.status = data.status
@@ -425,13 +429,15 @@ test('audit-C3: cancelling a FREIGHT PO recalculates landed costs and surfaces t
   let journalsQueued = false
 
   const tx = {
+    $queryRaw: async () => [],
     purchaseOrder: {
       findUnique: async () => ({
         status: po.status,
         reference: po.reference,
         type: 'FREIGHT',
         lines: [],
-        _count: { invoices: 0 },
+        invoices: [],
+        supplierCreditNotes: [],
       }),
       update: async ({ data }: { data: { status: typeof po.status } }) => {
         po.status = data.status
@@ -482,8 +488,9 @@ test('audit-C3: cancelling a GOODS PO does NOT trigger a landed-cost recalc', as
   const po: { status: PurchaseOrderStatus; reference: string } = { status: 'DRAFT', reference: 'PO-2' }
   let recalcCalled = false
   const tx = {
+    $queryRaw: async () => [],
     purchaseOrder: {
-      findUnique: async () => ({ status: po.status, reference: po.reference, type: 'GOODS', lines: [], _count: { invoices: 0 } }),
+      findUnique: async () => ({ status: po.status, reference: po.reference, type: 'GOODS', lines: [], invoices: [], supplierCreditNotes: [] }),
       update: async ({ data }: { data: { status: typeof po.status } }) => { po.status = data.status; return { id: 'po-2' } },
     },
   }
@@ -503,4 +510,50 @@ test('audit-C3: cancelling a GOODS PO does NOT trigger a landed-cost recalc', as
   assert.equal(result.success, true)
   assert.equal(recalcCalled, false)
   assert.equal(result.landedCostRecalc, undefined)
+})
+
+test('audit-g5u2.4: an invoiced FREIGHT PO fully offset by POSTED credit notes can be cancelled; uncredited is blocked', async () => {
+  const mk = (creditBase: number) => {
+    const po: { status: PurchaseOrderStatus; reference: string } = { status: 'PARTIALLY_RECEIVED', reference: 'FRT-CN' }
+    const tx = {
+      $queryRaw: async () => [],
+      purchaseOrder: {
+        findUnique: async () => ({
+          status: po.status,
+          reference: po.reference,
+          type: 'FREIGHT',
+          lines: [],
+          invoices: [{ id: 'inv-1', totalBase: 100 }],
+          supplierCreditNotes: creditBase > 0 ? [{ purchaseInvoiceId: 'inv-1', amountBase: creditBase }] : [],
+        }),
+        update: async ({ data }: { data: { status: typeof po.status } }) => { po.status = data.status; return { id: 'frt-cn' } },
+      },
+    }
+    const deps: CancelPurchaseOrderServiceDeps = {
+      findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
+      transaction: async (fn) => fn(tx as never),
+      logActivity: async () => {},
+      enqueueStockSync: async () => {},
+      getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
+      queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
+      readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
+      reversePurchaseOrderCostLayersForCancellation: async () => ({ reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }),
+      recalculateLandedCosts: (async () => ({ revalidatePoIds: [], auditRunIds: [], cogsAdjustments: [], inventoryTransitAdjustments: [], warnings: [] })) as never,
+      queueLandedCostAdjustmentJournals: async () => {},
+    }
+    return { po, deps }
+  }
+
+  // Fully credited (100 base == bill 100 base) → cancel allowed.
+  const credited = mk(100)
+  const ok = await cancelPurchaseOrderService('frt-cn', credited.deps)
+  assert.equal(ok.success, true)
+  assert.equal(credited.po.status, 'CANCELLED')
+
+  // Uncredited freight bill → blocked (service catches and returns success:false).
+  const uncredited = mk(0)
+  const blocked = await cancelPurchaseOrderService('frt-cn', uncredited.deps)
+  assert.equal(blocked.success, false)
+  assert.match(blocked.error ?? '', /not fully offset by posted credit notes/)
+  assert.equal(uncredited.po.status, 'PARTIALLY_RECEIVED') // unchanged
 })

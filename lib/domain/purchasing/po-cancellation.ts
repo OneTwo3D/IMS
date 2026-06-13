@@ -136,31 +136,37 @@ export function assertPurchaseOrderCancellationHasNoInvoices(invoiceCount: numbe
  *
  * An uninvoiced PO is always cancellable. Once a supplier invoice is recorded,
  * cancellation is normally blocked (the GL would be left unbalanced). The one
- * exception is a FREIGHT PO whose bills are FULLY offset by POSTED supplier
- * credit notes (e.g. a duplicate freight bill that's been credited back): the
- * credit note keeps the GL balanced, so the cancel — which reverts the freight's
- * landed-cost uplift on linked primaries — is safe. A non-freight PO, or a freight
- * PO not fully credited, stays blocked.
+ * exception is a FREIGHT PO where EVERY bill is fully offset by POSTED supplier
+ * credit notes attributed to that bill (e.g. a duplicate freight bill credited
+ * back): the credit note keeps the GL balanced, so the cancel — which reverts the
+ * freight's landed-cost uplift on linked primaries — is safe.
+ *
+ * Comparison is in BASE currency (the GL predicate) and PER-BILL: a credit note
+ * is only counted against the specific invoice it is linked to (unattributed
+ * credits don't offset any bill), so a credit for one bill can't satisfy another
+ * (Codex review). A non-freight PO, or a freight PO with any under-offset bill,
+ * stays blocked.
  */
 export function evaluatePurchaseOrderCancellationInvoiceGate(params: {
-  invoiceCount: number
   isFreight: boolean
-  invoiceTotalForeign: number
-  postedCreditTotalForeign: number
+  /** Per supplier bill: its base-currency total and the POSTED credit base attributed to it. */
+  invoices: Array<{ totalBase: number; creditedBase: number }>
 }): { allowed: boolean; reason: string | null } {
-  if (params.invoiceCount === 0) return { allowed: true, reason: null }
-  if (params.isFreight && params.postedCreditTotalForeign >= params.invoiceTotalForeign - 0.01) {
-    return { allowed: true, reason: null }
-  }
-  if (params.isFreight) {
+  if (params.invoices.length === 0) return { allowed: true, reason: null }
+  if (!params.isFreight) {
     return {
       allowed: false,
-      reason: `Cannot cancel this freight PO: its supplier invoice total (${params.invoiceTotalForeign.toFixed(2)}) is not fully offset by posted credit notes (${params.postedCreditTotalForeign.toFixed(2)}). Record and post a supplier credit note covering the bill first.`,
+      reason: 'Cannot cancel a purchase order after supplier invoices have been recorded. Create a supplier credit or bill reversal instead.',
     }
   }
+  // Half-cent tolerance (DECIMAL(18,4) base amounts) so exact full offsets pass.
+  const TOLERANCE = 0.005
+  const underOffset = params.invoices.filter((inv) => inv.creditedBase < inv.totalBase - TOLERANCE)
+  if (underOffset.length === 0) return { allowed: true, reason: null }
+  const shortfall = underOffset.reduce((sum, inv) => sum + (inv.totalBase - inv.creditedBase), 0)
   return {
     allowed: false,
-    reason: 'Cannot cancel a purchase order after supplier invoices have been recorded. Create a supplier credit or bill reversal instead.',
+    reason: `Cannot cancel this freight PO: ${underOffset.length} supplier bill(s) not fully offset by posted credit notes (shortfall ${shortfall.toFixed(2)}). Post a covering supplier credit note for each bill first.`,
   }
 }
 
