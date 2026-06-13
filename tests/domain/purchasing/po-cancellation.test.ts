@@ -316,6 +316,9 @@ test('cancelPurchaseOrderService is idempotent when called twice', async () => {
       consumedValueBase: '0',
       layers: [],
     }),
+    // Not invoked for GOODS POs (type !== 'FREIGHT'); stub satisfies the type.
+    recalculateLandedCosts: async () => ({} as never),
+    queueLandedCostAdjustmentJournals: async () => {},
   }
 
   assert.deepEqual(await cancelPurchaseOrderService('po-1', deps), {
@@ -395,6 +398,8 @@ test('cancelPurchaseOrderService flags already-consumed COGS with a WARNING and 
       reversalRan = true
       return { reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }
     },
+    recalculateLandedCosts: async () => ({} as never),
+    queueLandedCostAdjustmentJournals: async () => {},
   }
 
   const result = await cancelPurchaseOrderService('po-9', deps)
@@ -409,4 +414,93 @@ test('cancelPurchaseOrderService flags already-consumed COGS with a WARNING and 
   assert.ok(warning, 'expected a consumed-COGS WARNING activity log')
   assert.equal(warning?.level, 'WARNING')
   assert.deepEqual((warning?.metadata as { consumedValueBase: string }).consumedValueBase, '350')
+})
+
+test('audit-C3: cancelling a FREIGHT PO recalculates landed costs and surfaces the COGS corrections', async () => {
+  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'DRAFT', reference: 'FRT-1' }
+  const logs: Array<{ action: string; entityId: string | null | undefined; metadata?: unknown }> = []
+  let recalcCalledWithFreightPoId: string | null = null
+  let recalcRanAfterStatusFlip = false
+  let statusFlipped = false
+  let journalsQueued = false
+
+  const tx = {
+    purchaseOrder: {
+      findUnique: async () => ({
+        status: po.status,
+        reference: po.reference,
+        type: 'FREIGHT',
+        lines: [],
+        _count: { invoices: 0 },
+      }),
+      update: async ({ data }: { data: { status: typeof po.status } }) => {
+        po.status = data.status
+        statusFlipped = true
+        return { id: 'frt-1' }
+      },
+    },
+  }
+  const deps: CancelPurchaseOrderServiceDeps = {
+    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
+    transaction: async (fn) => fn(tx as never),
+    logActivity: async (input) => { logs.push({ action: input.action, entityId: input.entityId, metadata: input.metadata }) },
+    enqueueStockSync: async () => {},
+    getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
+    queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
+    readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
+    reversePurchaseOrderCostLayersForCancellation: async () => ({ reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }),
+    recalculateLandedCosts: (async (_tx: unknown, freightPoId: string) => {
+      recalcCalledWithFreightPoId = freightPoId
+      recalcRanAfterStatusFlip = statusFlipped
+      return {
+        revalidatePoIds: ['primary-1'],
+        auditRunIds: ['audit-1'],
+        cogsAdjustments: [{ primaryPoId: 'primary-1', primaryPoRef: 'PO-1', totalDelta: -12.5 }],
+        inventoryTransitAdjustments: [],
+        warnings: [],
+      }
+    }) as never,
+    queueLandedCostAdjustmentJournals: async () => { journalsQueued = true },
+  }
+
+  const result = await cancelPurchaseOrderService('frt-1', deps)
+  assert.equal(result.success, true)
+  // Recalc was invoked for the freight PO, AFTER its status was flipped to CANCELLED
+  // (so the recalc excludes it).
+  assert.equal(recalcCalledWithFreightPoId, 'frt-1')
+  assert.equal(recalcRanAfterStatusFlip, true)
+  assert.ok(result.landedCostRecalc, 'expected landedCostRecalc on the result')
+  assert.equal(result.landedCostRecalc?.cogsAdjustments.length, 1)
+  assert.equal(journalsQueued, true)
+  // A cogs_adjusted activity log was written against the affected primary PO.
+  const cogsLog = logs.find((log) => log.action === 'cogs_adjusted')
+  assert.ok(cogsLog, 'expected a cogs_adjusted log for the primary PO')
+  assert.equal(cogsLog?.entityId, 'primary-1')
+})
+
+test('audit-C3: cancelling a GOODS PO does NOT trigger a landed-cost recalc', async () => {
+  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'DRAFT', reference: 'PO-2' }
+  let recalcCalled = false
+  const tx = {
+    purchaseOrder: {
+      findUnique: async () => ({ status: po.status, reference: po.reference, type: 'GOODS', lines: [], _count: { invoices: 0 } }),
+      update: async ({ data }: { data: { status: typeof po.status } }) => { po.status = data.status; return { id: 'po-2' } },
+    },
+  }
+  const deps: CancelPurchaseOrderServiceDeps = {
+    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
+    transaction: async (fn) => fn(tx as never),
+    logActivity: async () => {},
+    enqueueStockSync: async () => {},
+    getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
+    queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
+    readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
+    reversePurchaseOrderCostLayersForCancellation: async () => ({ reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }),
+    recalculateLandedCosts: (async () => { recalcCalled = true; return {} as never }) as never,
+    queueLandedCostAdjustmentJournals: async () => {},
+  }
+  const result = await cancelPurchaseOrderService('po-2', deps)
+  assert.equal(result.success, true)
+  assert.equal(recalcCalled, false)
+  assert.equal(result.landedCostRecalc, undefined)
 })

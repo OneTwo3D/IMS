@@ -13,6 +13,11 @@ import {
   type PurchaseOrderConsumedCostSummary,
   type PurchaseOrderCostLayerReversal,
 } from '@/lib/domain/purchasing/po-cancellation'
+import {
+  recalculateLandedCosts,
+  queueLandedCostAdjustmentJournals,
+  type LandedCostRecalcResult,
+} from '@/lib/domain/purchasing/landed-cost-service'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 
 const PURCHASE_ORDER_CANCELLATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -28,6 +33,13 @@ export type CancelPurchaseOrderResult = {
    * can decide whether a correction is needed (audit-H8).
    */
   consumedCost?: PurchaseOrderConsumedCostSummary
+  /**
+   * When a FREIGHT PO is cancelled, the landed-cost uplift it applied to linked
+   * primary POs is reverted (line landedUnitCostBase + cost layers recalculated
+   * excluding it) and COGS-correction journals are queued for consumed quantities
+   * (audit-C3).
+   */
+  landedCostRecalc?: LandedCostRecalcResult
 }
 
 export type CancelPurchaseOrderServiceDeps = {
@@ -42,6 +54,8 @@ export type CancelPurchaseOrderServiceDeps = {
   queueAccountingSyncTx: typeof queueAccountingSyncTx
   reversePurchaseOrderCostLayersForCancellation: typeof reversePurchaseOrderCostLayersForCancellation
   readPurchaseOrderConsumedCostForCancellation: typeof readPurchaseOrderConsumedCostForCancellation
+  recalculateLandedCosts: typeof recalculateLandedCosts
+  queueLandedCostAdjustmentJournals: typeof queueLandedCostAdjustmentJournals
 }
 
 // Production dependencies are captured at module load; tests that need
@@ -58,6 +72,8 @@ const defaultCancelPurchaseOrderServiceDeps: CancelPurchaseOrderServiceDeps = {
   queueAccountingSyncTx,
   reversePurchaseOrderCostLayersForCancellation,
   readPurchaseOrderConsumedCostForCancellation,
+  recalculateLandedCosts,
+  queueLandedCostAdjustmentJournals,
 }
 
 async function logPurchaseOrderCancellationNoop(
@@ -96,6 +112,7 @@ export async function cancelPurchaseOrderService(
         select: {
           status: true,
           reference: true,
+          type: true,
           lines: { select: { id: true } },
           _count: { select: { invoices: true } },
         },
@@ -124,6 +141,20 @@ export async function cancelPurchaseOrderService(
       })
 
       await tx.purchaseOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
+
+      // audit-C3: cancelling a FREIGHT PO must revert the landed-cost uplift it
+      // applied to its linked primary POs. The status is now CANCELLED, so the
+      // recalc (which excludes cancelled freight POs) re-derives each linked
+      // primary's landedUnitCostBase + cost layers WITHOUT this freight, and
+      // returns COGS deltas for already-consumed quantities. It throws if a
+      // linked primary is in a locked (CLOSED) status — blocking the cancel.
+      let landedCostRecalc: LandedCostRecalcResult | null = null
+      if (existing.type === 'FREIGHT') {
+        landedCostRecalc = await deps.recalculateLandedCosts(tx, id, undefined, {
+          triggeredById: null,
+          reason: 'freight_purchase_order_cancelled',
+        })
+      }
 
       if (reversal.totalReversalValueBase.gt(0.000001)) {
         const accountingSettings = await deps.getAccountingSettings()
@@ -156,7 +187,7 @@ export async function cancelPurchaseOrderService(
         }
       }
 
-      return { alreadyCancelled: false as const, existing, reversal, consumedCost }
+      return { alreadyCancelled: false as const, existing, reversal, consumedCost, landedCostRecalc }
     }, PURCHASE_ORDER_CANCELLATION_TX_OPTIONS)
 
     if (cancellation.alreadyCancelled) {
@@ -204,6 +235,33 @@ export async function cancelPurchaseOrderService(
       }
     }
 
+    // audit-C3: queue the COGS-correction journals + log the per-primary
+    // adjustments produced by reverting the freight PO's landed-cost uplift.
+    // Isolated from the success path — the cancellation already committed.
+    const landedCostRecalc = cancellation.landedCostRecalc
+    if (landedCostRecalc) {
+      try {
+        await deps.queueLandedCostAdjustmentJournals(landedCostRecalc)
+      } catch (journalError) {
+        console.error('Failed to queue landed-cost reversal journals on freight cancel:', journalError)
+      }
+      for (const adj of landedCostRecalc.cogsAdjustments) {
+        try {
+          await deps.logActivity({
+            entityType: 'PURCHASE_ORDER',
+            entityId: adj.primaryPoId,
+            action: 'cogs_adjusted',
+            tag: 'purchase',
+            level: 'INFO',
+            description: `Retrospective COGS correction of £${adj.totalDelta.toFixed(2)} for ${adj.primaryPoRef} after cancelling freight PO ${cancellation.existing.reference}`,
+            metadata: { totalDelta: adj.totalDelta, freightPoId: id, freightReference: cancellation.existing.reference },
+          })
+        } catch (logError) {
+          console.error('Failed to log freight-cancel COGS adjustment:', logError)
+        }
+      }
+    }
+
     if (cancellation.reversal.productIds.length > 0) {
       try {
         await deps.enqueueStockSync(cancellation.reversal.productIds, 'IMS_CHANGE')
@@ -226,13 +284,19 @@ export async function cancelPurchaseOrderService(
       }
     }
 
+    const landedNotice = landedCostRecalc && landedCostRecalc.cogsAdjustments.length > 0
+      ? `Reverted landed-cost uplift on ${landedCostRecalc.cogsAdjustments.length} linked PO(s) and queued COGS corrections.`
+      : landedCostRecalc
+        ? 'Reverted landed-cost uplift on linked PO(s).'
+        : undefined
     return {
       success: true,
       reversedCostLayers: cancellation.reversal.reversedLayers,
       consumedCost,
+      ...(landedCostRecalc ? { landedCostRecalc } : {}),
       notice: cancellation.reversal.reversedLayers.length > 0
         ? `Cancelled PO and reversed ${cancellation.reversal.reversedLayers.length} remaining receipt cost layer(s).`
-        : undefined,
+        : landedNotice,
     }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)

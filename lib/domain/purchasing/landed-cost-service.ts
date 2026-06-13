@@ -68,6 +68,7 @@ export const LANDED_COST_REVALUATION_REASONS = [
   'purchase_order_additional_costs_updated',
   'freight_purchase_order_created',
   'freight_purchase_order_costs_updated',
+  'freight_purchase_order_cancelled',
 ] as const
 
 export type LandedCostRevaluationReason = typeof LANDED_COST_REVALUATION_REASONS[number]
@@ -526,7 +527,9 @@ export async function recalculateLandedCosts(
     const beforeJson = revaluationBeforeJson(primaryPo)
 
     const allLinks = await tx.landedCostLink.findMany({
-      where: { primaryPoId },
+      // audit-C3: a CANCELLED freight PO must no longer contribute landed cost —
+      // excluding it here is what lets cancellation revert the uplift it applied.
+      where: { primaryPoId, freightPO: { status: { not: 'CANCELLED' } } },
       select: {
         freightPO: {
           select: {
