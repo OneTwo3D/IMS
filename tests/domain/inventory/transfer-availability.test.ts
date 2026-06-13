@@ -26,3 +26,7 @@ test('canDispatchTransferQty: cannot dispatch into reserved stock', () => {
 test('canDispatchTransferQty: full unreserved stock is transferable', () => {
   assert.equal(canDispatchTransferQty(new Prisma.Decimal('50'), new Prisma.Decimal('0'), 50), true)
 })
+
+test('canDispatchTransferQty: rejects when over-reserved (reservedQty > quantity)', () => {
+  assert.equal(canDispatchTransferQty(new Prisma.Decimal('10'), new Prisma.Decimal('15'), 1), false)
+})

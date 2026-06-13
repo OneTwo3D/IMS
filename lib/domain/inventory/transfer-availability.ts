@@ -13,7 +13,12 @@ import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 // subtraction.
 // ---------------------------------------------------------------------------
 
-/** On-hand minus reserved for a single (product, warehouse) stock level. Never negative. */
+/**
+ * On-hand minus reserved for a single (product, warehouse) stock level, clamped
+ * to >= 0. Correct for dispatch gating; do NOT reuse for data-integrity checks —
+ * the clamp hides an over-reservation (reservedQty > quantity), which raw
+ * subtraction would surface as a negative.
+ */
 export function availableForTransfer(
   quantity: DecimalLike | null | undefined,
   reservedQty: DecimalLike | null | undefined,
