@@ -9,7 +9,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { pushCreditNote } from './credit-notes'
+import { pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
@@ -1277,6 +1277,23 @@ async function processEntry(
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+    }
+
+    case 'PURCHASE_CREDIT_NOTE': {
+      // audit-g5u2: supplier credit note (ACCPAYCREDIT) — e.g. crediting a
+      // duplicate freight bill. The payload carries the supplier contact + the
+      // expense-account lines (built by recordSupplierFreightCreditNote, g5u2.3).
+      return pushPurchaseCreditNote({
+        creditNoteNumber: payload.creditNoteNumber as string,
+        contactName: payload.contactName as string,
+        contactEmail: payload.contactEmail as string | undefined,
+        date: payload.date as string,
+        currency: payload.currency as string,
+        currencyRateToBase: payload.currencyRateToBase as number | undefined,
+        lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
+        reference: payload.reference as string | undefined,
+        lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note'), supplierId: payload.supplierId as string | undefined }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 
     case 'COGS_JOURNAL':

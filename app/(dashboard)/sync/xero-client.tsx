@@ -76,6 +76,7 @@ const SYNC_TYPE_TOGGLES: { key: keyof AccountingConnectorSettings; label: string
   { key: 'xero_sync_sales_invoice', label: 'Sales Invoices', description: 'Push invoices to Xero when generated' },
   { key: 'xero_sync_credit_note', label: 'Credit Notes', description: 'Push credit notes on refund' },
   { key: 'xero_sync_purchase_invoice', label: 'Purchase Bills', description: 'Push supplier bills when PO is invoiced' },
+  { key: 'xero_sync_purchase_credit_note', label: 'Supplier Credit Notes', description: 'Push supplier credit notes (e.g. a credited duplicate freight bill) to Xero as ACCPAYCREDIT' },
   { key: 'xero_sync_stock_receipt', label: 'Stock Receipts', description: 'Journal: DR Inventory / CR Stock in Transit on goods received' },
   { key: 'xero_sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
   { key: 'xero_sync_inventory_adjustment', label: 'Inventory Adjustments', description: 'Journal for manual stock adjustments' },
