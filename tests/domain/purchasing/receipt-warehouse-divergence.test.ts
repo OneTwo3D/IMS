@@ -34,3 +34,10 @@ test('ignores lines with no warehouse chosen (handled by the required-warehouse 
     lines: [{ poLineId: 'l1', warehouseId: '' }],
   }), [])
 })
+
+test('no divergence when destinationWarehouseId is undefined', () => {
+  assert.deepEqual(findDivergentReceiptLines({
+    destinationWarehouseId: undefined,
+    lines: [{ poLineId: 'l1', warehouseId: 'wh-anywhere' }],
+  }), [])
+})

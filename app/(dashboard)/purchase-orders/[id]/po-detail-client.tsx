@@ -141,7 +141,7 @@ function ReceiveDialog({
 
   const defaultWarehouseId = po.destinationWarehouseId ?? warehouses[0]?.id ?? ''
   const destinationWarehouseName = po.destinationWarehouseId
-    ? warehouses.find((w) => w.id === po.destinationWarehouseId)?.name ?? po.destinationWarehouseId
+    ? warehouses.find((w) => w.id === po.destinationWarehouseId)?.name ?? '(unknown warehouse)'
     : null
 
   const [receiptLines, setReceiptLines] = useState<ReceiveLineState[]>(
@@ -161,6 +161,9 @@ function ReceiveDialog({
   )
 
   function updateLine(poLineId: string, field: 'qtyToReceive' | 'warehouseId', value: string | number) {
+    // audit-H7: any warehouse/qty edit invalidates a prior divergence confirmation,
+    // so the operator must re-confirm the current state.
+    setConfirmDivergence(false)
     setReceiptLines((prev) =>
       prev.map((l) => (l.poLineId === poLineId ? { ...l, [field]: value } : l)),
     )

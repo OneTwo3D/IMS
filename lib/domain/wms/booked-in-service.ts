@@ -612,6 +612,7 @@ export async function processBookedInEvent(
             id: true,
             reference: true,
             status: true,
+            destinationWarehouseId: true,
             lines: {
               select: {
                 id: true,
@@ -656,6 +657,26 @@ export async function processBookedInEvent(
         }).filter((receiptLine) => receiptLine.qtyReceived > 0 || receiptLine.reconciledManualQty > 0)
 
         const createdReceiptLines = reconciledLines.filter((receiptLine) => receiptLine.qtyReceived > 0)
+        // audit-H7: the WMS books into the ASN-mapped warehouse, which can differ
+        // from the PO destination. There's no operator to confirm on this
+        // automated path, so record a WARNING (not a block) for reconciliation.
+        if (createdReceiptLines.length > 0 && po.destinationWarehouseId && asnMap.warehouseId !== po.destinationWarehouseId) {
+          await logActivity({
+            entityType: 'PURCHASE_ORDER',
+            entityId: poId,
+            action: 'received_warehouse_divergence',
+            tag: 'purchase',
+            level: 'WARNING',
+            description: `Mintsoft ASN ${lockedEvent.externalAsnId} booked ${createdReceiptLines.length} line(s) of PO ${po.reference} into a warehouse other than the PO destination.`,
+            metadata: {
+              reference: po.reference,
+              externalAsnId: lockedEvent.externalAsnId,
+              receivedWarehouseId: asnMap.warehouseId,
+              destinationWarehouseId: po.destinationWarehouseId,
+              lineCount: createdReceiptLines.length,
+            },
+          })
+        }
         if (createdReceiptLines.length > 0) {
           await tx.purchaseReceipt.create({
             data: {
