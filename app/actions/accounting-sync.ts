@@ -1,9 +1,15 @@
 'use server'
 
+import { revalidatePath } from 'next/cache'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { logActivity } from '@/lib/activity-log'
+import {
+  summarizeCrossConnectorOrphans,
+  type ConnectorOrphanSummary,
+} from '@/lib/domain/accounting/connector-orphans'
 import {
   collectRejectedAccountingDocumentUpdateWarnings,
   type AccountingDocumentUpdateReference,
@@ -66,6 +72,92 @@ async function getActiveConnector(preferredConnector?: AccountingConnectorId): P
 async function getActiveAccountingConnector(preferredConnector?: AccountingConnectorId) {
   const connectorId = await getActiveConnector(preferredConnector)
   return connectorId ? getAccountingConnector(connectorId) : null
+}
+
+// audit-H4: live sync rows are claimable only by their own connector's processor.
+const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING'] as const
+
+/**
+ * audit-H4: count PENDING/PROCESSING accounting sync rows whose connector is not
+ * the active one — they will never be processed (each processor claims only its
+ * own connector's rows), so switching connectors strands them silently.
+ */
+export async function getCrossConnectorOrphanSummary(): Promise<ConnectorOrphanSummary> {
+  await requireAuth()
+  const activeConnector = await getActiveConnector()
+  const groups = await db.accountingSyncLog.groupBy({
+    by: ['connector'],
+    where: { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] } },
+    _count: { id: true },
+  })
+  return summarizeCrossConnectorOrphans(
+    groups.map((group) => ({ connector: group.connector, count: group._count.id })),
+    activeConnector,
+  )
+}
+
+// Match the processor's stale-claim window so an actively-processing row is not
+// clobbered mid-flight by a cancel (audit-H4 review).
+const ORPHAN_CANCEL_STALE_PROCESSING_MS = 15 * 60 * 1000
+
+/**
+ * audit-H4: bulk-cancel orphaned live sync rows. Marks them FAILED (so neither
+ * processor will claim them) with a clear reason and an activity log. When
+ * `connector` is given, only that connector's orphans are cancelled; otherwise
+ * every non-active connector's live rows are cancelled.
+ */
+export async function cancelOrphanedAccountingSyncRows(
+  connector?: string,
+): Promise<{ success: boolean; cancelled: number; error?: string }> {
+  await requirePermission('settings')
+  const activeConnector = await getActiveConnector()
+  // Never cancel the active connector's own queue.
+  if (connector && connector === activeConnector) {
+    return { success: false, cancelled: 0, error: 'Cannot cancel sync rows for the active connector.' }
+  }
+  // With no active connector, an un-scoped cancel would wipe EVERY connector's
+  // queue — require an explicit connector so a transient both-plugins-off state
+  // can't silently destroy all pending work (audit-H4 review).
+  if (!connector && !activeConnector) {
+    return { success: false, cancelled: 0, error: 'No active accounting connector — specify which connector’s orphaned rows to cancel.' }
+  }
+
+  // Don't clobber a row a processor is actively working: only PENDING rows and
+  // PROCESSING rows whose claim has gone stale (audit-H4 review). A mid-flight
+  // row is left to finish; it then leaves the live set on its own.
+  const staleProcessingCutoff = new Date(Date.now() - ORPHAN_CANCEL_STALE_PROCESSING_MS)
+  const where = {
+    AND: [
+      connector ? { connector } : { connector: { not: activeConnector ?? undefined } },
+      {
+        OR: [
+          { status: 'PENDING' as const },
+          { status: 'PROCESSING' as const, processingStartedAt: null },
+          { status: 'PROCESSING' as const, processingStartedAt: { lt: staleProcessingCutoff } },
+        ],
+      },
+    ],
+  }
+
+  const reason = `Cancelled: orphaned accounting sync row for ${connector ?? 'a non-active connector'} (no longer the active connector${activeConnector ? ` — now ${activeConnector}` : ''}).`
+  const result = await db.accountingSyncLog.updateMany({
+    where,
+    data: { status: 'FAILED', errorMessage: reason, processingStartedAt: null },
+  })
+
+  if (result.count > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'accounting_sync_orphans_cancelled',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Cancelled ${result.count} orphaned accounting sync row(s) for ${connector ?? 'non-active connector(s)'}${activeConnector ? ` (active connector: ${activeConnector})` : ''}.`,
+      metadata: { cancelledCount: result.count, connector: connector ?? null, activeConnector },
+    })
+  }
+
+  revalidatePath('/sync')
+  return { success: true, cancelled: result.count }
 }
 
 export async function getAccountingIntegrationConnector() {

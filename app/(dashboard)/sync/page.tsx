@@ -27,7 +27,9 @@ import { getPaymentAccountMap } from '@/lib/accounting'
 import { getTaxRates } from '@/app/actions/settings'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { getCrossConnectorOrphanSummary } from '@/app/actions/accounting-sync'
 import { SyncDashboard } from './sync-dashboard'
+import { ConnectorOrphanBanner } from './connector-orphan-banner'
 
 export const metadata: Metadata = { title: 'Integrations' }
 
@@ -80,6 +82,9 @@ export default async function SyncPage() {
     ? await fetchAccountingTaxRates().catch(() => [])
     : []
 
+  // audit-H4: surface accounting sync rows stranded by a connector switch.
+  const orphanSummary = await getCrossConnectorOrphanSummary().catch(() => null)
+
   return (
     <div className="space-y-6 max-w-5xl">
       <div>
@@ -88,6 +93,7 @@ export default async function SyncPage() {
           Connect One Two Inventory with external platforms.
         </p>
       </div>
+      {orphanSummary && <ConnectorOrphanBanner summary={orphanSummary} />}
       <SyncDashboard
         pluginState={pluginState}
         shoppingSettings={shoppingSettings}
