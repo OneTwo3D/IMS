@@ -1748,8 +1748,8 @@ test('audit-C5: stranded in-transit transfers surface a per-line warning finding
         fromWarehouseId: 'wh-source',
         dispatchedAt,
         lines: [
-          { productId: 'prod-a', qty: 5 },
-          { productId: 'prod-b', qty: 2 },
+          { id: 'line-a', productId: 'prod-a', qty: 5 },
+          { id: 'line-b', productId: 'prod-b', qty: 2 },
         ],
       },
     ],
@@ -1759,10 +1759,13 @@ test('audit-C5: stranded in-transit transfers surface a per-line warning finding
   assert.deepEqual(stranded.map((f) => f.productId).sort(), ['prod-a', 'prod-b'])
   assert.equal(stranded[0].severity, 'warning')
   assert.equal(stranded[0].warehouseId, 'wh-source')
-  const details = stranded[0].details as { transferId: string; reference: string; dispatchedAt: string }
+  const details = stranded[0].details as { transferId: string; transferLineId: string; reference: string; dispatchedAt: string }
   assert.equal(details.transferId, 'transfer-1')
+  assert.equal(details.transferLineId, 'line-a')
   assert.equal(details.reference, 'TR-001')
   assert.equal(details.dispatchedAt, dispatchedAt.toISOString())
+  // Message uses the date-only format to match the SQL collector arm.
+  assert.match(stranded[0].message, /in transit since 2026-05-01 —/)
 })
 
 test('audit-C5: no stranded-transfer findings when none are passed (clean path)', () => {

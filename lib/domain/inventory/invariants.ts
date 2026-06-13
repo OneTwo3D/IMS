@@ -130,7 +130,7 @@ export type InventoryInvariantStrandedTransferRow = {
   reference: string
   fromWarehouseId: string
   dispatchedAt: Date | string | null
-  lines: Array<{ productId: string; qty: DecimalLike }>
+  lines: Array<{ id: string; productId: string; qty: DecimalLike }>
 }
 
 export type InventoryInvariantRows = {
@@ -795,15 +795,18 @@ export function evaluateInventoryInvariantRows(
     const dispatchedAtIso = transfer.dispatchedAt == null
       ? null
       : (transfer.dispatchedAt instanceof Date ? transfer.dispatchedAt.toISOString() : String(transfer.dispatchedAt))
+    // Match the SQL arm's date-only format so findings dedupe across both paths.
+    const dispatchedAtDate = dispatchedAtIso?.slice(0, 10) ?? null
     for (const line of transfer.lines) {
       findings.push({
         severity: 'warning',
         code: 'transfer_stranded_in_transit',
         productId: line.productId,
         warehouseId: transfer.fromWarehouseId,
-        message: `Transfer ${transfer.reference} has been in transit since ${dispatchedAtIso ?? 'an unknown date'} — stock left the source but was never received`,
+        message: `Transfer ${transfer.reference} has been in transit since ${dispatchedAtDate ?? 'an unknown date'} — stock left the source but was never received`,
         details: {
           transferId: transfer.id,
+          transferLineId: line.id,
           reference: transfer.reference,
           productId: line.productId,
           fromWarehouseId: transfer.fromWarehouseId,
@@ -955,7 +958,7 @@ export async function collectInventoryInvariantRows(
             reference: true,
             fromWarehouseId: true,
             dispatchedAt: true,
-            lines: { select: { productId: true, qty: true } },
+            lines: { select: { id: true, productId: true, qty: true } },
           },
         })
       : Promise.resolve(undefined),
@@ -1680,7 +1683,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
           'productId', stl."productId",
           'fromWarehouseId', st."fromWarehouseId",
           'dispatchedAt', st."dispatchedAt",
-          'qty', stl.qty,
+          'qty', stl.qty::float8,
           'thresholdDays', ${STRANDED_TRANSFER_DAYS}
         ) AS details
       FROM "stock_transfers" st

@@ -784,6 +784,7 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
   try {
     await requirePermission('stock_control.transfer')
     let restoredLineCount = 0
+    let linesMissingCostLayers = 0
     await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
       const transfer = await tx.stockTransfer.findUnique({
@@ -799,6 +800,16 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
         where: { transferId: id },
         select: { id: true, productId: true, qty: true, qtyReceived: true, costLayerSnapshot: true },
       })
+
+      // A partially-received transfer (WMS booked some units at the destination)
+      // cannot be cleanly cancel-dispatched: restoring the un-received remainder
+      // to source while leaving the received units at the destination would split
+      // the transfer across both warehouses under a CANCELLED status. Close such a
+      // transfer out via the receive path instead.
+      if (lines.some((line) => Number(line.qtyReceived ?? 0) > 0)) {
+        throw new Error('This transfer has already been partly received — finish receiving it instead of cancelling the dispatch.')
+      }
+
       const productIds = [...new Set(lines.map((line) => line.productId))]
       if (productIds.length > 0) {
         await tx.stockLevel.createMany({
@@ -828,6 +839,10 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
           alreadyReceivedQty: alreadyReceived,
           qtyReceived: restoreQty,
         })
+        // No snapshot (dispatched before snapshot tracking, or source had no FIFO
+        // layers): stock is still restored but no source layers are recreated —
+        // surface it so the stock/cost-layer reconciliation can be reviewed.
+        if (snapshotSlice.length === 0) linesMissingCostLayers += 1
         const totalValueBase = snapshotSlice.reduce(
           (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
           toDecimal(0),
@@ -854,6 +869,9 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
 
         // Recreate FIFO layers at the SOURCE from the snapshot slice (mirrors the
         // destination recreation in receiveTransfer, targeting fromWarehouseId).
+        // Note: the ORIGINAL layers consumed at dispatch are NOT un-consumed; this
+        // creates equivalent replacement layers (same cost basis + source-line
+        // provenance), so source quantity reconciles with cost layers.
         for (const entry of snapshotSlice) {
           const entryQty = toDecimal(entry.qty)
           const unitCostBase = toDecimal(entry.unitCostBase)
@@ -903,8 +921,8 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
       action: 'dispatch_cancelled',
       tag: 'stock',
       level: 'WARNING',
-      description: `Cancelled dispatch of transfer ${cancelled?.reference ?? id} — restored ${restoredLineCount} line(s) to ${cancelled?.fromWarehouse.name ?? 'source'}`,
-      metadata: { reference: cancelled?.reference ?? id, restoredLineCount, fromWarehouseId: cancelled?.fromWarehouseId ?? null },
+      description: `Cancelled dispatch of transfer ${cancelled?.reference ?? id} — restored ${restoredLineCount} line(s) to ${cancelled?.fromWarehouse.name ?? 'source'}${linesMissingCostLayers > 0 ? ` (${linesMissingCostLayers} line(s) had no cost-layer snapshot — review reconciliation)` : ''}`,
+      metadata: { reference: cancelled?.reference ?? id, restoredLineCount, linesMissingCostLayers, fromWarehouseId: cancelled?.fromWarehouseId ?? null },
     })
 
     const restoredProductIds = [...new Set((cancelled?.lines ?? []).map((line) => line.productId))]
