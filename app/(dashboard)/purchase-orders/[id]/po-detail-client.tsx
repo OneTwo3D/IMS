@@ -53,6 +53,7 @@ import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatMoney } from '@/lib/utils'
 import { PoFormDialog } from '../po-form'
+import { SupplierCreditNotesCard } from './supplier-credit-notes-card'
 
 type Warehouse = { id: string; code: string; name: string }
 
@@ -2717,6 +2718,14 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
           )}
         </div>
       )}
+
+      {/* audit-g5u2.5: supplier credit notes (record/post → offsets bills, enables freight-PO cancel) */}
+      <SupplierCreditNotesCard
+        poId={po.id}
+        currency={po.currency}
+        hasInvoices={po.invoices.length > 0}
+        creditNotes={po.supplierCreditNotes}
+      />
     </div>
   )
 }

@@ -169,6 +169,19 @@ export type PoReturn = {
   }[]
 }
 
+export type SupplierCreditNoteRow = {
+  id: string
+  creditNoteNumber: string | null
+  reference: string | null
+  amountForeign: number
+  currency: string
+  reason: string | null
+  status: string
+  accountingCreditNoteId: string | null
+  recordedAt: string
+  postedAt: string | null
+}
+
 export type PoDetail = PoRow & {
   lines: PoLineRow[]
   receipts: {
@@ -189,6 +202,7 @@ export type PoDetail = PoRow & {
   }[]
   returns: PoReturn[]
   invoices: InvoiceRow[]
+  supplierCreditNotes: SupplierCreditNoteRow[]
   freightCostLines: { id: string; description: string; amountForeign: number; amountBase: number; amountBilled: number; vatable: boolean; distributionMethod: string }[]
   linkedFreightPos: {
     linkId: string
@@ -605,6 +619,22 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
         },
         orderBy: { invoiceDate: 'desc' },
       },
+      // audit-g5u2.5: supplier credit notes recorded against this PO.
+      supplierCreditNotes: {
+        select: {
+          id: true,
+          creditNoteNumber: true,
+          reference: true,
+          amountForeign: true,
+          currency: true,
+          reason: true,
+          status: true,
+          accountingCreditNoteId: true,
+          recordedAt: true,
+          postedAt: true,
+        },
+        orderBy: { recordedAt: 'desc' },
+      },
       freightCostLines: {
         select: {
           id: true,
@@ -752,6 +782,18 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           vatable: !isProduct ? !!il.costLine?.vatable : null,
         }
       }),
+    })),
+    supplierCreditNotes: po.supplierCreditNotes.map((cn) => ({
+      id: cn.id,
+      creditNoteNumber: cn.creditNoteNumber,
+      reference: cn.reference,
+      amountForeign: Number(cn.amountForeign),
+      currency: cn.currency,
+      reason: cn.reason,
+      status: cn.status,
+      accountingCreditNoteId: cn.accountingCreditNoteId ?? null,
+      recordedAt: cn.recordedAt.toISOString(),
+      postedAt: cn.postedAt?.toISOString() ?? null,
     })),
     freightCostLines: (po.freightCostLines ?? []).map((cl) => ({
       id: cl.id,
