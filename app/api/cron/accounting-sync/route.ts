@@ -23,9 +23,17 @@ export async function GET(request: Request) {
     if (!token) {
       return NextResponse.json({ skipped: true, reason: 'Xero not connected' })
     }
-    const { processPendingXeroSync } = await import('@/lib/connectors/xero/sync-processor')
+    const { processPendingXeroSync, repairXeroBackReferences } = await import('@/lib/connectors/xero/sync-processor')
     const result = await processPendingXeroSync()
-    return NextResponse.json(result)
+    // audit-H3: repair any documents whose back-reference was never written
+    // (process died after the connector post, or retries exhausted to FAILED).
+    let backReferenceRepair: Awaited<ReturnType<typeof repairXeroBackReferences>> | undefined
+    try {
+      backReferenceRepair = await repairXeroBackReferences()
+    } catch (repairError) {
+      console.error('accounting-sync cron: back-reference repair sweep failed', repairError)
+    }
+    return NextResponse.json({ ...result, backReferenceRepair })
   }
 
   if (await isIntegrationPluginEnabled('quickbooks')) {

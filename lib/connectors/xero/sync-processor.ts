@@ -14,6 +14,7 @@ import { pushManualJournal } from './journals'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
+import { applyBackReference, backReferenceIsMissing, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
@@ -1224,43 +1225,72 @@ async function updateBackReference(
   invoiceNumber?: string,
 ): Promise<void> {
   if (!externalId) return
+  // audit-H3: do NOT swallow failures here. The external id is already persisted
+  // on the sync row (externalTransactionId) before this runs, and the caller's
+  // catch marks the row for retry so the next pass re-applies the back-reference
+  // from the stored id. Swallowing left the document permanently orphaned.
+  await applyBackReference(db, { type, referenceType, referenceId, externalId, invoiceNumber })
+}
 
-  try {
-    if (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') {
-      await db.salesOrder.update({
-        where: { id: referenceId },
-        data: {
-          accountingInvoiceId: externalId,
-          invoiceNumber: invoiceNumber ?? undefined,
-          invoicedAt: new Date(),
-        },
-      })
-    } else if (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') {
-      await db.salesOrderRefund.update({
-        where: { id: referenceId },
-        data: { accountingCreditNoteId: externalId },
-      })
-    } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseInvoice') {
-      await db.purchaseInvoice.update({
-        where: { id: referenceId },
-        data: { accountingInvoiceId: externalId },
-      })
-    } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseOrder') {
-      const invoice = await db.purchaseInvoice.findFirst({
-        where: { poId: referenceId, accountingInvoiceId: null },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true },
-      })
-      if (invoice) {
-        await db.purchaseInvoice.update({
-          where: { id: invoice.id },
-          data: { accountingInvoiceId: externalId },
-        })
-      }
+export type BackReferenceRepairResult = { checked: number; repaired: number; failed: number }
+
+/**
+ * audit-H3 repair sweep. Finds sync rows that posted to the connector (have an
+ * externalTransactionId) but whose source document never received the external
+ * id — e.g. the process died between marking the row SYNCED and writing the
+ * back-reference, or the back-reference retries were exhausted to FAILED. Re-
+ * applies the back-reference from the stored id, so no document is permanently
+ * orphaned. Safe to run repeatedly (idempotent) from cron or on demand.
+ */
+export async function repairXeroBackReferences(limit = 200): Promise<BackReferenceRepairResult> {
+  const candidates = await db.accountingSyncLog.findMany({
+    where: {
+      connector: 'xero',
+      status: { in: ['SYNCED', 'FAILED'] },
+      externalTransactionId: { not: null },
+      type: { in: ['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE'] },
+    },
+    select: { id: true, type: true, referenceType: true, referenceId: true, externalTransactionId: true },
+    orderBy: { createdAt: 'asc' },
+    take: limit,
+  })
+
+  const result: BackReferenceRepairResult = { checked: 0, repaired: 0, failed: 0 }
+  for (const row of candidates) {
+    if (!row.externalTransactionId || !syncTypeWritesBackReference(row.type, row.referenceType)) continue
+    const params = {
+      type: row.type,
+      referenceType: row.referenceType,
+      referenceId: row.referenceId,
+      externalId: row.externalTransactionId,
     }
-  } catch {
-    // Non-critical — log entry already marked as SYNCED
+    let missing: boolean
+    try {
+      missing = await backReferenceIsMissing(db, params)
+    } catch (probeError) {
+      console.error('repairXeroBackReferences: probe failed', row.id, probeError)
+      result.failed++
+      continue
+    }
+    if (!missing) continue
+    result.checked++
+    try {
+      await applyBackReference(db, params)
+      result.repaired++
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'xero_backreference_repaired',
+        tag: 'sync',
+        level: 'INFO',
+        description: `Re-applied missing Xero back-reference for ${row.referenceType} ${row.referenceId} (external id ${row.externalTransactionId}).`,
+        metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
+      })
+    } catch (repairError) {
+      result.failed++
+      console.error('repairXeroBackReferences: repair failed', row.id, repairError)
+    }
   }
+  return result
 }
 
 async function enqueueSalesInvoiceFollowUps(

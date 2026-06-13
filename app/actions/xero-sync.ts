@@ -409,6 +409,13 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
     }
 
     const result = await processPendingXeroSync()
+    // audit-H3: also repair any documents missing their back-reference.
+    try {
+      const { repairXeroBackReferences } = await import('@/lib/connectors/xero/sync-processor')
+      await repairXeroBackReferences()
+    } catch (repairError) {
+      console.error('Manual Xero sync: back-reference repair failed', repairError)
+    }
 
     await logActivity({
       entityType: 'SYSTEM',
