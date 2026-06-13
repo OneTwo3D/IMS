@@ -102,9 +102,16 @@ export function KitConfigurator({ productId, productType, initialComponents, all
       setSaving(false)
       if (result.success) {
         setDuplicateWarnings(result.warnings ?? [])
-        setMessage('Saved.')
+        const inProgress = result.inProgressProductionOrders ?? []
+        if (inProgress.length > 0) {
+          // audit-H6: started orders keep their frozen component snapshot, so the
+          // edit does not apply to them — tell the operator which ones.
+          setMessage(`Saved. ${inProgress.length} in-progress production order(s) (${inProgress.map((o) => o.reference).join(', ')}) keep their frozen component snapshot and are unaffected.`)
+        } else {
+          setMessage('Saved.')
+          setTimeout(() => setMessage(''), 2000)
+        }
         router.refresh()
-        setTimeout(() => setMessage(''), 2000)
       } else {
         setMessage(result.error ?? 'Failed to save.')
       }
