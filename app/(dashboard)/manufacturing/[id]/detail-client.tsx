@@ -380,7 +380,7 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
       </Card>
 
       {/* audit-wght: assembly completion — record the actual produced quantity */}
-      <Dialog open={completionOpen} onOpenChange={(o) => setCompletionOpen(o)}>
+      <Dialog open={completionOpen} onOpenChange={(o) => { setCompletionOpen(o); if (!o) setError(null) }}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>Complete production — {order.reference}</DialogTitle>
