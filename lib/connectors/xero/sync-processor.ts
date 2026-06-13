@@ -1232,14 +1232,24 @@ async function updateBackReference(
   await applyBackReference(db, { type, referenceType, referenceId, externalId, invoiceNumber })
 }
 
-export type BackReferenceRepairResult = { checked: number; repaired: number; failed: number }
+export type BackReferenceRepairResult = {
+  /** Rows whose document was confirmed still missing its id (i.e. needed repair). */
+  checked: number
+  /** Rows whose back-reference was successfully re-applied. */
+  repaired: number
+  /** Rows that errored during probe or repair. */
+  failed: number
+  /** Ambiguous multi-bill POs skipped to avoid misattributing an external id. */
+  skippedAmbiguous: number
+}
 
 /**
  * audit-H3 repair sweep. Finds sync rows that posted to the connector (have an
  * externalTransactionId) but whose source document never received the external
  * id — e.g. the process died between marking the row SYNCED and writing the
  * back-reference, or the back-reference retries were exhausted to FAILED. Re-
- * applies the back-reference from the stored id, so no document is permanently
+ * applies the back-reference from the stored id AND re-enqueues the follow-ups
+ * (PDF/payment/attachment) that never ran, so no document is permanently
  * orphaned. Safe to run repeatedly (idempotent) from cron or on demand.
  */
 export async function repairXeroBackReferences(limit = 200): Promise<BackReferenceRepairResult> {
@@ -1250,19 +1260,45 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
       externalTransactionId: { not: null },
       type: { in: ['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE'] },
     },
-    select: { id: true, type: true, referenceType: true, referenceId: true, externalTransactionId: true },
+    select: { id: true, type: true, referenceType: true, referenceId: true, externalTransactionId: true, status: true, payload: true },
     orderBy: { createdAt: 'asc' },
     take: limit,
   })
 
-  const result: BackReferenceRepairResult = { checked: 0, repaired: 0, failed: 0 }
+  // audit-H3 (review): a PURCHASE_INVOICE row references the PO, not a specific
+  // bill. When a PO has several bills (several such rows), the "latest unlinked
+  // bill" heuristic could stamp one bill's Xero id onto another. Detect POs with
+  // more than one candidate row and skip them — they need manual attribution
+  // rather than a guess that could swap ids.
+  const poCandidateCounts = new Map<string, number>()
+  for (const row of candidates) {
+    if (row.type === 'PURCHASE_INVOICE' && row.referenceType === 'PurchaseOrder') {
+      poCandidateCounts.set(row.referenceId, (poCandidateCounts.get(row.referenceId) ?? 0) + 1)
+    }
+  }
+
+  const result: BackReferenceRepairResult = { checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0 }
   for (const row of candidates) {
     if (!row.externalTransactionId || !syncTypeWritesBackReference(row.type, row.referenceType)) continue
+    if (row.type === 'PURCHASE_INVOICE' && row.referenceType === 'PurchaseOrder' && (poCandidateCounts.get(row.referenceId) ?? 0) > 1) {
+      result.skippedAmbiguous++
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'xero_backreference_repair_ambiguous',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Skipped Xero back-reference repair for PO ${row.referenceId}: multiple bills have unwritten external ids and cannot be attributed automatically. Link them manually.`,
+        metadata: { syncLogId: row.id, referenceId: row.referenceId },
+      })
+      continue
+    }
+    const payload = (row.payload ?? {}) as SyncPayload
     const params = {
       type: row.type,
       referenceType: row.referenceType,
       referenceId: row.referenceId,
       externalId: row.externalTransactionId,
+      invoiceNumber: typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : undefined,
     }
     let missing: boolean
     try {
@@ -1276,6 +1312,17 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
     result.checked++
     try {
       await applyBackReference(db, params)
+      // The follow-ups (PDF, payment, attachment) never ran on the original
+      // failed pass — enqueue them now. hasExistingSyncLog makes this idempotent.
+      try {
+        await enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, { externalId: row.externalTransactionId, invoiceNumber: params.invoiceNumber })
+      } catch (followUpError) {
+        console.error('repairXeroBackReferences: follow-up enqueue failed', row.id, followUpError)
+      }
+      // A FAILED row whose back-reference is now applied is fully reconciled.
+      if (row.status === 'FAILED') {
+        await db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', errorMessage: null } })
+      }
       result.repaired++
       await logActivity({
         entityType: 'SYSTEM',
