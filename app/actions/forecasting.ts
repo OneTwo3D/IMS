@@ -6,6 +6,17 @@ import { logActivity } from '@/lib/activity-log'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
+import { partitionReorderMoCandidates, type ReorderMoSkip } from '@/lib/domain/manufacturing/reorder-mo-planning'
+
+// audit-M-mfg #2: a freshly-created reorder draft within this window suppresses a
+// duplicate re-submit (e.g. a refresh-and-resubmit), without blocking a deliberate
+// re-order later. The UI button is also disabled while the request is in flight
+// (useTransition), which is the first line of defence against a true double-click;
+// this server window catches the slower re-submit that the disabled button misses.
+const REORDER_DEDUP_WINDOW_MS = 10 * 60 * 1000
+// Stable marker for reorder-generated POs — used both to stamp and to dedup, so
+// the two can't drift.
+const REORDER_PO_NOTE = 'Auto-generated from reorder forecast'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -360,7 +371,7 @@ export async function generateForecasts(options: GenerateForecastOptions = {}): 
 export async function createReorderPOs(
   productIds: string[],
   options: { supplierId?: string | null } = {},
-): Promise<{ success: boolean; poCount: number; error?: string }> {
+): Promise<{ success: boolean; poCount: number; skippedSupplierCount?: number; error?: string }> {
   await requirePermission('purchasing.create')
   try {
     const settings = await getForecastSettings()
@@ -383,8 +394,26 @@ export async function createReorderPOs(
     }
 
     const baseCurrency = await getBaseCurrencyCode()
+    // audit-M-mfg #2: double-click idempotency — skip suppliers that already have
+    // a reorder-sourced DRAFT PO created in the last few minutes.
+    const recentReorderPoCutoff = new Date(Date.now() - REORDER_DEDUP_WINDOW_MS)
+    const recentReorderPos = await db.purchaseOrder.findMany({
+      where: {
+        supplierId: { in: [...bySupplier.keys()] },
+        status: 'DRAFT',
+        notes: REORDER_PO_NOTE,
+        createdAt: { gte: recentReorderPoCutoff },
+      },
+      select: { supplierId: true },
+    })
+    const recentReorderSupplierIds = new Set(recentReorderPos.map((po) => po.supplierId))
     let poCount = 0
+    let skippedSupplierCount = 0
     for (const [supplierId, items] of bySupplier) {
+      if (recentReorderSupplierIds.has(supplierId)) {
+        skippedSupplierCount += 1
+        continue
+      }
       // Get supplier info for currency
       const supplier = await db.supplier.findUnique({ where: { id: supplierId }, select: { currency: true } })
       const currency = supplier?.currency ?? 'GBP'
@@ -457,7 +486,7 @@ export async function createReorderPOs(
           taxForeign: 0, taxBase: 0,
           totalForeign: subtotal,
           totalBase: subtotalBase,
-          notes: 'Auto-generated from reorder forecast',
+          notes: REORDER_PO_NOTE,
           lines: { create: lineData },
         },
       })
@@ -468,11 +497,11 @@ export async function createReorderPOs(
       entityType: 'PURCHASE_ORDER',
       tag: 'purchasing',
       action: 'created',
-      description: `Auto-generated ${poCount} reorder PO(s) from forecast`,
-      metadata: { poCount, productIds },
+      description: `Auto-generated ${poCount} reorder PO(s) from forecast${skippedSupplierCount > 0 ? ` (skipped ${skippedSupplierCount} supplier(s) with a recent reorder draft)` : ''}`,
+      metadata: { poCount, skippedSupplierCount, productIds },
     })
 
-    return { success: true, poCount }
+    return { success: true, poCount, skippedSupplierCount }
   } catch (e) {
     return { success: false, poCount: 0, error: String(e) }
   }
@@ -494,7 +523,7 @@ export async function createReorderPOs(
 
 export async function createReorderMOs(
   productIds: string[],
-): Promise<{ success: boolean; moCount: number; error?: string }> {
+): Promise<{ success: boolean; moCount: number; skipped?: ReorderMoSkip[]; error?: string }> {
   await requirePermission('manufacturing')
   try {
     const { getReorderReport } = await import('@/lib/domain/inventory/replenishment-reports')
@@ -553,25 +582,38 @@ export async function createReorderMOs(
       select: { id: true },
     })
 
+    // audit-M-mfg #2: double-click idempotency — skip products that already have
+    // a DRAFT MO created in the last few minutes (a re-order minutes later is
+    // still allowed).
+    const recentDraftCutoff = new Date(Date.now() - REORDER_DEDUP_WINDOW_MS)
+    const recentDraftMos = await db.productionOrder.findMany({
+      where: { outputProductId: { in: eligible }, status: 'DRAFT', createdAt: { gte: recentDraftCutoff } },
+      select: { outputProductId: true },
+    })
+    const recentDraftProductIds = new Set(recentDraftMos.map((mo) => mo.outputProductId))
+
+    // audit-M-mfg #2/#3: partition into create vs skipped(reason) — no silent drops.
+    const { toCreate, skipped } = partitionReorderMoCandidates({
+      productIds: eligible,
+      rowByProduct: new Map([...suggestedByProduct].map(([id, row]) => [id, { sku: row.sku, suggestedReorderQty: Number(row.suggestedReorderQty) }])),
+      bomIdByProduct,
+      warehouseByProduct: new Map(eligible.map((id) => [id, latestByProduct.get(id)?.warehouseId ?? fallbackWarehouse?.id])),
+      recentDraftProductIds,
+    })
+
     let moCount = 0
-    for (const productId of eligible) {
-      const row = suggestedByProduct.get(productId)
-      if (!row) continue
-      const bomId = bomIdByProduct.get(productId)
-      if (!bomId) continue
-      const latest = latestByProduct.get(productId)
-      const warehouseId = latest?.warehouseId ?? fallbackWarehouse?.id
-      if (!warehouseId) continue
+    for (const candidate of toCreate) {
+      const latest = latestByProduct.get(candidate.productId)
       const reference = `MO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
       await db.productionOrder.create({
         data: {
           reference,
           orderType: 'ASSEMBLY',
-          bomId,
-          outputProductId: productId,
-          warehouseId,
+          bomId: candidate.bomId,
+          outputProductId: candidate.productId,
+          warehouseId: candidate.warehouseId,
           manufacturerId: latest?.manufacturerId ?? null,
-          qtyPlanned: Number(row.suggestedReorderQty),
+          qtyPlanned: candidate.qtyPlanned,
           status: 'DRAFT',
         },
       })
@@ -580,12 +622,25 @@ export async function createReorderMOs(
         entityId: reference,
         tag: 'manufacturing',
         action: 'created',
-        description: `Created draft MO ${reference} for ${row.sku} from reorder report (qty ${row.suggestedReorderQty})`,
-        metadata: { productId, bomId, qtyPlanned: row.suggestedReorderQty, source: 'reorder_report' },
+        description: `Created draft MO ${reference} for ${candidate.sku} from reorder report (qty ${candidate.qtyPlanned})`,
+        metadata: { productId: candidate.productId, bomId: candidate.bomId, qtyPlanned: candidate.qtyPlanned, source: 'reorder_report' },
       })
       moCount += 1
     }
-    return { success: true, moCount }
+
+    // audit-M-mfg #3: surface skipped products (no active BOM / no warehouse /
+    // recent duplicate) so the operator knows why fewer MOs were created.
+    if (skipped.length > 0) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'reorder_mos_skipped',
+        tag: 'manufacturing',
+        level: 'WARNING',
+        description: `Reorder MO creation skipped ${skipped.length} product(s): ${skipped.map((s) => `${s.sku} (${s.reason})`).join(', ')}.`,
+        metadata: { skipped },
+      })
+    }
+    return { success: true, moCount, skipped }
   } catch (e) {
     return { success: false, moCount: 0, error: String(e) }
   }

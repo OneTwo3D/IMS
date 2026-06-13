@@ -36,14 +36,21 @@ export function ReorderActionsToolbar({
       try {
         if (purchasedIds.length > 0) {
           const result = await createReorderPOs(purchasedIds)
+          const skipNote = result.success && (result.skippedSupplierCount ?? 0) > 0
+            ? ` (skipped ${result.skippedSupplierCount} supplier(s) with a recent draft)`
+            : ''
           parts.push(result.success
-            ? `${result.poCount} draft PO${result.poCount === 1 ? '' : 's'}`
+            ? `${result.poCount} draft PO${result.poCount === 1 ? '' : 's'}${skipNote}`
             : `PO generation failed: ${result.error ?? 'unknown error'}`)
         }
         if (bomIds.length > 0) {
           const result = await createReorderMOs(bomIds)
+          const skipped = result.skipped ?? []
+          const skipNote = result.success && skipped.length > 0
+            ? ` (skipped ${skipped.length}: ${skipped.map((s) => `${s.sku} — ${s.reason.replace(/_/g, ' ')}`).join(', ')})`
+            : ''
           parts.push(result.success
-            ? `${result.moCount} draft MO${result.moCount === 1 ? '' : 's'}`
+            ? `${result.moCount} draft MO${result.moCount === 1 ? '' : 's'}${skipNote}`
             : `MO generation failed: ${result.error ?? 'unknown error'}`)
         }
         setMessage(parts.length > 0 ? `Created ${parts.join(' · ')}` : 'Nothing to generate')
