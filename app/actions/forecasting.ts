@@ -8,9 +8,15 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { partitionReorderMoCandidates, type ReorderMoSkip } from '@/lib/domain/manufacturing/reorder-mo-planning'
 
-// audit-M-mfg #2: window within which a freshly-created reorder draft suppresses
-// a duplicate (a double-click), without blocking a deliberate re-order later.
+// audit-M-mfg #2: a freshly-created reorder draft within this window suppresses a
+// duplicate re-submit (e.g. a refresh-and-resubmit), without blocking a deliberate
+// re-order later. The UI button is also disabled while the request is in flight
+// (useTransition), which is the first line of defence against a true double-click;
+// this server window catches the slower re-submit that the disabled button misses.
 const REORDER_DEDUP_WINDOW_MS = 10 * 60 * 1000
+// Stable marker for reorder-generated POs — used both to stamp and to dedup, so
+// the two can't drift.
+const REORDER_PO_NOTE = 'Auto-generated from reorder forecast'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -365,7 +371,7 @@ export async function generateForecasts(options: GenerateForecastOptions = {}): 
 export async function createReorderPOs(
   productIds: string[],
   options: { supplierId?: string | null } = {},
-): Promise<{ success: boolean; poCount: number; error?: string }> {
+): Promise<{ success: boolean; poCount: number; skippedSupplierCount?: number; error?: string }> {
   await requirePermission('purchasing.create')
   try {
     const settings = await getForecastSettings()
@@ -395,7 +401,7 @@ export async function createReorderPOs(
       where: {
         supplierId: { in: [...bySupplier.keys()] },
         status: 'DRAFT',
-        notes: 'Auto-generated from reorder forecast',
+        notes: REORDER_PO_NOTE,
         createdAt: { gte: recentReorderPoCutoff },
       },
       select: { supplierId: true },
@@ -480,7 +486,7 @@ export async function createReorderPOs(
           taxForeign: 0, taxBase: 0,
           totalForeign: subtotal,
           totalBase: subtotalBase,
-          notes: 'Auto-generated from reorder forecast',
+          notes: REORDER_PO_NOTE,
           lines: { create: lineData },
         },
       })
@@ -495,7 +501,7 @@ export async function createReorderPOs(
       metadata: { poCount, skippedSupplierCount, productIds },
     })
 
-    return { success: true, poCount }
+    return { success: true, poCount, skippedSupplierCount }
   } catch (e) {
     return { success: false, poCount: 0, error: String(e) }
   }
