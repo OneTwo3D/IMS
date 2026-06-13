@@ -147,6 +147,60 @@ export async function markSyncLogForFollowUpRetry(
   }
 }
 
+/**
+ * audit-om4e: apply a MAIN-sync failure (processEntry failed, not a follow-up)
+ * to the sync-log row with the same optimistic-concurrency guard as
+ * markSyncLogForFollowUpRetry. Two workers handling the same row (stale-claim
+ * reclaim, or duplicate outbox jobs) must not both advance retryCount from a
+ * stale value and double-write the failure transition / mirrored event. The
+ * compound where makes the update a no-op for the loser; on a lost race we
+ * re-read so the caller's outbox permanent/retry decision reflects reality and
+ * we skip the mirrored-event write the winner already did.
+ */
+export async function applyMainSyncFailureRetry(
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog'>,
+  entry: { id: string; retryCount: number; type: AccountingSyncType; referenceType: string; referenceId: string },
+  errorMessage: string,
+  payload: SyncPayload,
+): Promise<{ finalFailure: boolean }> {
+  const retryCount = entry.retryCount + 1
+  const computedFinal = retryCount >= MAX_RETRIES
+  const updated = await tx.accountingSyncLog.updateMany({
+    where: { id: entry.id, retryCount: entry.retryCount },
+    data: {
+      status: computedFinal ? 'FAILED' : 'PENDING',
+      retryCount,
+      errorMessage,
+      processingStartedAt: null,
+    },
+  })
+  if (updated.count > 0) {
+    if (computedFinal) {
+      await updateMirroredEventForSyncLog(tx, {
+        syncLogId: entry.id,
+        type: entry.type,
+        referenceType: entry.referenceType,
+        referenceId: entry.referenceId,
+        payload,
+        status: 'FAILED',
+        message: errorMessage,
+      })
+    }
+    return { finalFailure: computedFinal }
+  }
+  // Lost the race: another worker already advanced this row (and wrote the
+  // mirrored event if it became terminal). Report the persisted state.
+  const current = await tx.accountingSyncLog.findUnique({
+    where: { id: entry.id },
+    select: { retryCount: true, status: true },
+  })
+  return {
+    finalFailure: current
+      ? current.status === 'FAILED' || current.retryCount >= MAX_RETRIES
+      : computedFinal,
+  }
+}
+
 async function logFollowUpRetry(entryId: string, error: unknown): Promise<void> {
   await logActivity({
     entityType: 'SYSTEM',
@@ -626,29 +680,8 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             },
           })
         } else {
-          const retryCount = entry.retryCount + 1
-          const finalFailure = retryCount >= MAX_RETRIES
           await db.$transaction(async (tx) => {
-            await tx.accountingSyncLog.update({
-              where: { id: entry.id },
-              data: {
-                status: finalFailure ? 'FAILED' : 'PENDING',
-                retryCount,
-                errorMessage,
-                processingStartedAt: null,
-              },
-            })
-            if (finalFailure) {
-              await updateMirroredEventForSyncLog(tx, {
-                syncLogId: entry.id,
-                type: entry.type,
-                referenceType: entry.referenceType,
-                referenceId: entry.referenceId,
-                payload,
-                status: 'FAILED',
-                message: errorMessage,
-              })
-            }
+            await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
           })
         }
         result.failed++
@@ -665,29 +698,8 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           },
         })
       } else {
-        const retryCount = entry.retryCount + 1
-        const finalFailure = retryCount >= MAX_RETRIES
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: finalFailure ? 'FAILED' : 'PENDING',
-              retryCount,
-              errorMessage,
-              processingStartedAt: null,
-            },
-          })
-          if (finalFailure) {
-            await updateMirroredEventForSyncLog(tx, {
-              syncLogId: entry.id,
-              type: entry.type,
-              referenceType: entry.referenceType,
-              referenceId: entry.referenceId,
-              payload,
-              status: 'FAILED',
-              message: errorMessage,
-            })
-          }
+          await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
         })
       }
       result.failed++
@@ -926,29 +938,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
           })
         } else {
-          const retryCount = entry.retryCount + 1
-          const finalFailure = retryCount >= MAX_RETRIES
           await db.$transaction(async (tx) => {
-            await tx.accountingSyncLog.update({
-              where: { id: entry.id },
-              data: {
-                status: finalFailure ? 'FAILED' : 'PENDING',
-                retryCount,
-                errorMessage,
-                processingStartedAt: null,
-              },
-            })
-            if (finalFailure) {
-              await updateMirroredEventForSyncLog(tx, {
-                syncLogId: entry.id,
-                type: entry.type,
-                referenceType: entry.referenceType,
-                referenceId: entry.referenceId,
-                payload,
-                status: 'FAILED',
-                message: errorMessage,
-              })
-            }
+            const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
             if (finalFailure) {
               await markXeroOutboxPermanent(job, errorMessage, tx)
             } else {
@@ -975,29 +966,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
         })
       } else {
-        const retryCount = entry.retryCount + 1
-        const finalFailure = retryCount >= MAX_RETRIES
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: finalFailure ? 'FAILED' : 'PENDING',
-              retryCount,
-              errorMessage,
-              processingStartedAt: null,
-            },
-          })
-          if (finalFailure) {
-            await updateMirroredEventForSyncLog(tx, {
-              syncLogId: entry.id,
-              type: entry.type,
-              referenceType: entry.referenceType,
-              referenceId: entry.referenceId,
-              payload,
-              status: 'FAILED',
-              message: errorMessage,
-            })
-          }
+          const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
           if (finalFailure) {
             await markXeroOutboxPermanent(job, errorMessage, tx)
           } else {
