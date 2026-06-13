@@ -42,6 +42,7 @@ import { getTrackingUrl } from '@/lib/tracking'
 import type { AccountingBankAccount } from '@/lib/accounting'
 import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accounting/rejected-sync-warnings'
 import type { PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
+import type { PrepaidReconciliationSummary } from '@/lib/domain/purchasing/prepaid-reconciliation'
 import type { PurchaseOrderConsumedCostSummary } from '@/lib/domain/purchasing/po-cancellation'
 import type { SupplierRow } from '@/app/actions/suppliers'
 import type { ProductRow } from '@/app/actions/products'
@@ -70,6 +71,7 @@ type Props = {
   mintsoftAsnState: MintsoftPurchaseOrderAsnState
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
   overBilling: PurchaseOrderOverBillingSummary
+  prepaidReconciliation: PrepaidReconciliationSummary
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -1801,7 +1803,7 @@ function ShipDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState, rejectedAccountingSyncs, overBilling }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -2033,7 +2035,10 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {error && <p className="text-sm text-destructive">{error}</p>}
       {notice && <p className="text-sm text-emerald-700 dark:text-emerald-300">{notice}</p>}
-      {overBilling.hasOverBilling && (
+      {/* For prepaid suppliers the prepaid-reconciliation banner below owns the
+          billed>net-received case with the right framing, so suppress the C4
+          "returned goods" banner to avoid two amber banners with the same number. */}
+      {overBilling.hasOverBilling && !prepaidReconciliation.isPrepaidSupplier && (
         <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
           <div className="flex gap-2">
             <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
@@ -2056,6 +2061,38 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               </p>
             </div>
           </div>
+        </div>
+      )}
+      {/* audit-C1b: prepaid supplier billed beyond what arrived. */}
+      {prepaidReconciliation.hasShortfall && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          <div className="flex gap-2">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            <div className="space-y-2">
+              <p className="font-medium">
+                Prepaid reconciliation: {prepaidReconciliation.totalShortfallQty} unit(s) prepaid/billed but not received (net of returns) —{' '}
+                {formatMoney(Number(prepaidReconciliation.totalShortfallValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)} (ex-VAT) paid for but not arrived.
+                Claim a supplier credit (or chase the outstanding delivery). The three-way-match block is intentionally off for prepaid suppliers.
+              </p>
+              <ul className="space-y-1 text-xs">
+                {prepaidReconciliation.lines.map((line) => (
+                  <li key={line.poLineId}>
+                    <span className="font-mono">{line.sku ?? line.productId}</span>: billed {line.billedQty}, kept {line.receivedQty} →{' '}
+                    {line.shortfallQty} not arrived ({formatMoney(Number(line.shortfallValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)})
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* audit-C1b: prepaid PO where goods received exceed what was billed — a
+          balancing (final) bill may still be due. */}
+      {prepaidReconciliation.isPrepaidSupplier && prepaidReconciliation.hasUnderBilled && !prepaidReconciliation.hasShortfall && (
+        <div className="rounded-md border border-blue-300 bg-blue-50 p-3 text-sm text-blue-950 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-100">
+          <p>
+            Prepaid reconciliation: goods received on this PO exceed what has been billed so far — a balancing (final) supplier bill may still be due.
+          </p>
         </div>
       )}
       {cancelConsumedCost && (

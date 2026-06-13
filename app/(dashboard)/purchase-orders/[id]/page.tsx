@@ -15,6 +15,7 @@ import { getAccountingSettings } from '@/lib/accounting'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { computePurchaseOrderOverBilling } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
+import { computePrepaidReconciliation } from '@/lib/domain/purchasing/prepaid-reconciliation'
 import { PoDetailClient } from './po-detail-client'
 
 export const metadata: Metadata = { title: 'Purchase Order' }
@@ -55,6 +56,18 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
     invoices: po.invoices.map((inv) => ({ id: inv.id, invoiceNumber: inv.invoiceNumber, totalBase: inv.totalBase, lines: inv.lines.map((il) => ({ poLineId: il.poLineId, qtyBilled: il.qtyBilled, totalBase: il.totalBase })) })),
   })
 
+  // audit-C1b: prepaid suppliers can be billed beyond what arrives (the deposit
+  // was deliberate, so three-way-match is off) — surface a read-time soft
+  // reconciliation banner when billed > received.
+  // Only reconcile once receipt is effectively done — otherwise a still-arriving
+  // PO would alarm mid-delivery. (Receipt-complete / post-receipt statuses.)
+  const PREPAID_RECONCILE_STATUSES = ['RECEIVED', 'INVOICED', 'PARTIALLY_RETURNED', 'RETURNED', 'CLOSED']
+  const prepaidReconciliation = computePrepaidReconciliation({
+    isPrepaidSupplier: po.supplierPrepaid && PREPAID_RECONCILE_STATUSES.includes(po.status),
+    lines: po.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.sku, qtyReceived: l.qtyReceived, qtyReturned: l.qtyReturned })),
+    invoices: po.invoices.map((inv) => ({ lines: inv.lines.map((il) => ({ poLineId: il.poLineId, qtyBilled: il.qtyBilled, totalBase: il.totalBase })) })),
+  })
+
   const products = productsResult.products.filter(
     (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type) && (p.lifecycleStatus === 'ACTIVE' || p.lifecycleStatus === 'DRAFT'),
   )
@@ -67,7 +80,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} mintsoftAsnState={mintsoftAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} mintsoftAsnState={mintsoftAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} />
     </div>
   )
 }
