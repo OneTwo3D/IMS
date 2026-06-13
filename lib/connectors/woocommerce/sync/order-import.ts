@@ -11,6 +11,7 @@ import {
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
 } from './field-mapping'
 import { syncRefundsForOrder } from './refund-sync'
+import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -335,7 +336,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     ]))
     const wcResolvedById = new Map<
       number,
-      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; source?: 'mapped' | 'default' }
+      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; reverseCharge: boolean; source?: 'mapped' | 'default' }
     >()
     for (const id of distinctWcRateIds) {
       wcResolvedById.set(id, await resolveWcTaxRateById(id))
@@ -406,6 +407,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           taxRateName: null,
           taxRateValue: 0,
           accountingTaxType: null,
+          // Tax-exempt lines are never reverse-charged — keeps the union uniform
+          // so the accounting-payload swap reads a real flag, not an absent one.
+          reverseCharge: false,
         }
       }
       if (l.externalTaxRateId != null) {
@@ -693,12 +697,24 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             quantity: l.qty,
             unitAmount: l.unitPriceForeign,
             accountCode: settings.salesAccount,
-            taxType: lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType ?? undefined,
+            // audit-H1b: swap reverse-charge LINE items to the RC tax code, same
+            // as the native invoice push (resolveSalesLineTaxType), so a WC
+            // reverse-charge order's goods lines post on the RC VAT boxes — not
+            // the standard code. Every resolution path (resolver-derived, mapped
+            // WC rate, forceNoTax) now carries a real reverseCharge flag.
+            taxType: resolveSalesLineTaxType({
+              baseTaxType: lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType,
+              reverseCharge: lineTaxResolved[idx]?.reverseCharge,
+              reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
+            }),
             discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,
           })),
           shippingAmount: shippingSendForeign.gt(0) ? roundDecimalNumber(shippingSendForeign, 4) : undefined,
           shippingDescription: 'Shipping',
           shippingAccountCode: settings.shippingAccount || undefined,
+          // audit-H1b: shipping & discount stay on the base tax type (NOT swapped),
+          // matching the native invoice push + credit-note builder (the H1 rule —
+          // only goods lines carry the reverse charge).
           shippingTaxType: accountingTaxType ?? undefined,
           discountAmount: orderDiscount.discountAmount > 0 ? roundDecimalNumber(orderDiscount.discountAmount, 2) : undefined,
           discountAccountCode: settings.discountAccount || undefined,
