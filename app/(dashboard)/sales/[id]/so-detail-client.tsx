@@ -1007,6 +1007,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               </button>
             </span>
           )}
+          {/* audit-M-o2c: the paid→unpaid mismatch from deleting a payment on an
+              advanced-status order is recorded as a payment_status_mismatch WARNING
+              activity log (the durable, accurate signal). A read-time chip on
+              `!paidAt` alone can't tell "shipped on credit, never paid" from
+              "was paid then unpaid", so it isn't shown here; the existing
+              Paid / Part. Paid indicators cover the payment state. */}
 
           {canRefund && (
             <Button type="button" variant="outline" size="sm" onClick={() => setShowRefund(true)} disabled={isPending}>

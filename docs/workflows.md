@@ -41,6 +41,22 @@ state (e.g. cancelled or refunded after dispatch) between the poll's SHIPPED
 query and the under-lock write, the guard rejects the change and the cron logs a
 `delivery_status_skipped` warning instead of forcing it.
 
+**`COMPLETED` vs `DELIVERED`.** Both are manual, operator-set terminal-ish
+statuses reached from `SHIPPED` (and `COMPLETED → DELIVERED`). `DELIVERED` means
+the carrier confirmed delivery and can be set automatically by the delivery-status
+cron; `COMPLETED` is a manual "this order is done from our side" marker for
+businesses that don't track delivery (no automatic trigger sets it). Neither is
+forced by any sync; both still allow `PARTIALLY_REFUNDED`/`REFUNDED` afterwards.
+Use `DELIVERED` when delivery tracking is in play, `COMPLETED` otherwise.
+
+Manual status edits are rejected on **archived** orders (unarchive first);
+automated pushes (WooCommerce force-sync, the delivery-status cron) still apply.
+Deleting a payment that takes an already-paid order in an advanced status
+(`SHIPPED`/`COMPLETED`/`DELIVERED`/`PARTIALLY_REFUNDED`) back below fully-paid
+does not auto-revert the status but raises a `payment_status_mismatch` warning
+activity log so the operator can decide (it fires only on a genuine paid→unpaid
+transition, not for orders that were never fully paid, e.g. credit terms).
+
 ### Shipments
 
 | Status | Allowed next statuses | Notes |
