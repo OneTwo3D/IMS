@@ -994,6 +994,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           {accountingAvailable && accountingSyncEnabled && !so.invoiceNumber && !so.accountingInvoiceId && so.status !== 'DRAFT' && (
             <span className="inline-flex items-center gap-1 text-xs text-muted-foreground"><Clock className="h-3 w-3" />Invoice pending sync</span>
           )}
+          {/* audit-H2: a fully-paid order with no invoice (manual trigger) is a
+              GL receivable/invoice gap — surface it loudly with a one-click fix. */}
+          {so.paidAt && !so.invoiceNumber && (
+            <span className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+              <AlertTriangle className="h-3 w-3" /> Paid without invoice —{' '}
+              <button type="button" onClick={handleGenerateInvoice} disabled={isPending} className="underline hover:no-underline disabled:opacity-50">
+                generate now
+              </button>
+            </span>
+          )}
 
           {canRefund && (
             <Button type="button" variant="outline" size="sm" onClick={() => setShowRefund(true)} disabled={isPending}>
