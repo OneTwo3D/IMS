@@ -12,6 +12,7 @@ import {
   LANDED_COST_DISTRIBUTION_METHODS,
   calculateLayerAdjustmentDeltas,
   computeGrossUnitCostBaseByLine,
+  landedCostAdjustmentEventKey,
   landedCostAdjustmentIdempotencyKey,
   normalizeLandedCostMethod,
   recalculateDirectLandedCosts,
@@ -930,21 +931,25 @@ test('recalculateDirectLandedCosts preserves legacy negative midpoint journal ro
   assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.totalDelta), [-0.01])
 })
 
-test('landed-cost adjustment event keys normalize equivalent decimal input shapes', async () => {
+test('landed-cost adjustment event keys normalize equivalent decimal input shapes', () => {
+  // audit-g4la: the event key is now per-recalc-run unique (a nonce), so equivalent
+  // shapes only collapse to one key when the run id is held FIXED — which is what
+  // proves the LAYER-content normalization (the original intent of this test).
   const inputs = [
     0.3,
     '0.3',
     0.30000000000000004,
     new Prisma.Decimal('0.300000123456'),
   ]
-  const eventKeys = await Promise.all(inputs.map(async (costLayerUnitCostBase) => {
-    const result = await directRecalcForSingleLayer({
-      unitCostBase: '0.30',
-      costLayerUnitCostBase,
-      amountBase: '1.00',
-    })
-    return result.inventoryTransitAdjustments[0]?.eventKey
-  }))
+  const eventKeys = inputs.map((newUnitCost) => landedCostAdjustmentEventKey('po-1', [{
+    costLayerId: 'cl-1',
+    oldUnitCost: new Prisma.Decimal('0.20'),
+    newUnitCost: new Prisma.Decimal(newUnitCost),
+    receivedQty: new Prisma.Decimal('1'),
+    remainingQty: new Prisma.Decimal('1'),
+    returnedQty: new Prisma.Decimal('0'),
+    supplierReturnedQty: new Prisma.Decimal('0'),
+  }], 'fixed-run-id'))
 
   assert.equal(new Set(eventKeys).size, 1)
 })

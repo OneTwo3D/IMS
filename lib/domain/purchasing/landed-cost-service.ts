@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
@@ -319,11 +320,21 @@ export function roundAdjustmentTotalDelta(value: Prisma.Decimal): number {
   return Math.round(value.mul(100).toNumber()) / 100
 }
 
-function landedCostAdjustmentEventKey(
+export function landedCostAdjustmentEventKey(
   primaryPoId: string,
   layers: LandedCostAdjustmentLayerContext[],
+  // audit-g4la: a per-recalc-run nonce so two recalcs that produce IDENTICAL
+  // layer content (e.g. landed cost A→B today, then A→B again later via B→A→B)
+  // still get DISTINCT event keys — otherwise the content-only hash re-collides
+  // and the second real correction's journal is deduped against the first and
+  // silently dropped. The nonce is generated once per recalc and stamped onto
+  // every adjustment, so it flows through the grob durable outbox: the direct
+  // post-commit call and the cron drain read the SAME stored eventKey and still
+  // dedupe each other, while a distinct later recalc gets a distinct key.
+  recalcRunId: string,
 ): string {
   return accountingPayloadKey('landed-cost-adjustment-event', {
+    recalcRunId,
     primaryPoId,
     layers: layers
       .map((layer) => ({
@@ -510,6 +521,8 @@ export async function recalculateLandedCosts(
     select: { primaryPoId: true },
   })
   const result = emptyRecalcResult()
+  // audit-g4la: one nonce per recalc run, stamped onto every adjustment's eventKey.
+  const recalcRunId = randomUUID()
 
   for (const link of links) {
     const primaryPoId = link.primaryPoId
@@ -757,7 +770,7 @@ export async function recalculateLandedCosts(
     }
 
     result.revalidatePoIds.push(primaryPoId)
-    const eventKey = landedCostAdjustmentEventKey(primaryPoId, adjustmentLayers)
+    const eventKey = landedCostAdjustmentEventKey(primaryPoId, adjustmentLayers, recalcRunId)
 
     if (totalCogsDelta.abs().gt(LANDED_COST_JOURNAL_EPSILON)) {
       result.cogsAdjustments.push({
@@ -833,6 +846,8 @@ export async function recalculateDirectLandedCosts(
 ): Promise<LandedCostRecalcResult> {
   const serviceDeps = deps ?? defaultDeps
   const result = emptyRecalcResult()
+  // audit-g4la: one nonce per recalc run, stamped onto every adjustment's eventKey.
+  const recalcRunId = randomUUID()
   const po = await tx.purchaseOrder.findUnique({
     where: { id: poId },
     select: {
@@ -1050,7 +1065,7 @@ export async function recalculateDirectLandedCosts(
   }
 
   result.revalidatePoIds.push(poId)
-  const eventKey = landedCostAdjustmentEventKey(poId, adjustmentLayers)
+  const eventKey = landedCostAdjustmentEventKey(poId, adjustmentLayers, recalcRunId)
   if (totalInventoryDelta.abs().gt(LANDED_COST_JOURNAL_EPSILON)) {
     result.inventoryTransitAdjustments.push({
       primaryPoId: poId,
