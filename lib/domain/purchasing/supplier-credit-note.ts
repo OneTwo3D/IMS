@@ -49,6 +49,12 @@ export function validateRecordSupplierCreditNote(params: {
  * apply the reverse-charge swap (only product lines do). So: if the offset bill
  * carried tax, reverse with the supplier's tax type; otherwise NONE. Without this
  * a vatable freight credit posted on NONE and under-reversed the VAT.
+ *
+ * Scope (Codex review): the credit note is a single amount, so this uses the
+ * bill-level tax signal — it assumes a freight bill is uniformly vatable or not
+ * (the normal case). An unlinked credit note (billHadTax false) reverses on NONE
+ * (conservative — won't fabricate a VAT reversal without a bill to mirror).
+ * Per-line tax bases on a mixed bill are out of scope for a single-amount credit.
  */
 export function resolveSupplierCreditNoteTaxType(params: {
   billHadTax: boolean
@@ -93,6 +99,12 @@ export function buildSupplierCreditNoteSyncPayload(params: {
         taxType: params.taxType,
       },
     ],
+    // audit-oy5p: the entered amount is the GROSS credit (the over-credit cap is
+    // checked against the bill's gross total), so post tax-INCLUSIVE — Xero then
+    // splits net + VAT under the mirrored tax type. Without this the amount would
+    // be treated as net and VAT added on top, over-crediting a vatable bill. With
+    // a NONE tax type inclusive vs exclusive is identical (no VAT).
+    lineAmountsIncludeTax: true,
     reference: params.reference ?? undefined,
     supplierId: params.supplierId,
   }

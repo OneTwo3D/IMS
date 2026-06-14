@@ -84,6 +84,8 @@ test('sync payload reverses on the transit account with the supplier contact', (
   assert.equal(lines[0].unitAmount, 120)
   assert.equal(lines[0].description, 'Duplicate freight bill')
   assert.equal(lines[0].taxType, 'INPUT2') // audit-oy5p: mirrors the bill's tax type
+  // audit-oy5p: the entered amount is gross → post tax-inclusive so Xero splits VAT.
+  assert.equal(payload.lineAmountsIncludeTax, true)
 })
 
 test('credit-note tax type mirrors the bill: supplier tax type when the bill had VAT, else NONE', () => {
