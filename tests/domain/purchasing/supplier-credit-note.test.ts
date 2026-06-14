@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   validateRecordSupplierCreditNote,
   buildSupplierCreditNoteSyncPayload,
+  resolveSupplierCreditNoteTaxType,
 } from '@/lib/domain/purchasing/supplier-credit-note'
 
 // audit-g5u2.3: a supplier credit note can only be recorded against a billed PO,
@@ -69,6 +70,7 @@ test('sync payload reverses on the transit account with the supplier contact', (
     fxRateToBase: 0.85,
     amountForeign: 120,
     transitAccount: '1250',
+    taxType: 'INPUT2',
     date: '2026-06-13',
   })
   assert.equal(payload.contactName, 'Freight Co')
@@ -81,19 +83,30 @@ test('sync payload reverses on the transit account with the supplier contact', (
   assert.equal(lines[0].accountCode, '1250')
   assert.equal(lines[0].unitAmount, 120)
   assert.equal(lines[0].description, 'Duplicate freight bill')
+  assert.equal(lines[0].taxType, 'INPUT2') // audit-oy5p: mirrors the bill's tax type
+  // audit-oy5p: the entered amount is gross → post tax-inclusive so Xero splits VAT.
+  assert.equal(payload.lineAmountsIncludeTax, true)
+})
+
+test('credit-note tax type mirrors the bill: supplier tax type when the bill had VAT, else NONE', () => {
+  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2' }), 'INPUT2')
+  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2' }), 'NONE')
+  // Bill had VAT but the supplier has no mapped tax type → fall back to NONE (defensive).
+  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: null }), 'NONE')
+  assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: undefined }), 'NONE')
 })
 
 test('sync payload falls back to reference then a synthetic number, and a default line description', () => {
   const noNumber = buildSupplierCreditNoteSyncPayload({
     creditNoteId: 'scn-2', creditNoteNumber: null, reference: 'PO-ABC', reason: null,
-    supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: 'T', date: '2026-06-13',
+    supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: 'T', taxType: 'NONE', date: '2026-06-13',
   })
   assert.equal(noNumber.creditNoteNumber, 'PO-ABC')
   assert.equal((noNumber.lines as Array<Record<string, unknown>>)[0].description, 'Supplier credit note')
 
   const noRef = buildSupplierCreditNoteSyncPayload({
     creditNoteId: 'scn-3', creditNoteNumber: null, reference: null, reason: null,
-    supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: 'T', date: '2026-06-13',
+    supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: 'T', taxType: 'NONE', date: '2026-06-13',
   })
   assert.equal(noRef.creditNoteNumber, 'SCN-scn-3')
   assert.equal(noRef.reference, undefined)

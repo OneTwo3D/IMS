@@ -43,9 +43,32 @@ export function validateRecordSupplierCreditNote(params: {
 }
 
 /**
+ * audit-oy5p: resolve the ACCPAYCREDIT line's tax type so the credit MIRRORS the
+ * freight bill it offsets. The freight bill posts its (vatable) cost lines on the
+ * supplier's accounting tax type and zero-tax lines on NONE; freight lines don't
+ * apply the reverse-charge swap (only product lines do). So: if the offset bill
+ * carried tax, reverse with the supplier's tax type; otherwise NONE. Without this
+ * a vatable freight credit posted on NONE and under-reversed the VAT.
+ *
+ * Scope (Codex review): the credit note is a single amount, so this uses the
+ * bill-level tax signal — it assumes a freight bill is uniformly vatable or not
+ * (the normal case). An unlinked credit note (billHadTax false) reverses on NONE
+ * (conservative — won't fabricate a VAT reversal without a bill to mirror).
+ * Per-line tax bases on a mixed bill are out of scope for a single-amount credit.
+ */
+export function resolveSupplierCreditNoteTaxType(params: {
+  billHadTax: boolean
+  supplierTaxType: string | null | undefined
+}): string {
+  if (params.billHadTax && params.supplierTaxType) return params.supplierTaxType
+  return 'NONE'
+}
+
+/**
  * Build the Xero PURCHASE_CREDIT_NOTE (ACCPAYCREDIT) sync payload from a posted
  * credit note. The single line reverses the freight bill on the same account it
- * debited (transit/clearing), so the credit nets the capitalised freight.
+ * debited (transit/clearing) and mirrors its tax type, so the credit nets the
+ * capitalised freight AND reverses the VAT correctly (audit-oy5p).
  */
 export function buildSupplierCreditNoteSyncPayload(params: {
   creditNoteId: string
@@ -58,6 +81,7 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   fxRateToBase: number
   amountForeign: number
   transitAccount: string
+  taxType: string
   date: string
 }): Record<string, unknown> {
   return {
@@ -72,9 +96,15 @@ export function buildSupplierCreditNoteSyncPayload(params: {
         quantity: 1,
         unitAmount: params.amountForeign,
         accountCode: params.transitAccount,
-        taxType: 'NONE',
+        taxType: params.taxType,
       },
     ],
+    // audit-oy5p: the entered amount is the GROSS credit (the over-credit cap is
+    // checked against the bill's gross total), so post tax-INCLUSIVE — Xero then
+    // splits net + VAT under the mirrored tax type. Without this the amount would
+    // be treated as net and VAT added on top, over-crediting a vatable bill. With
+    // a NONE tax type inclusive vs exclusive is identical (no VAT).
+    lineAmountsIncludeTax: true,
     reference: params.reference ?? undefined,
     supplierId: params.supplierId,
   }

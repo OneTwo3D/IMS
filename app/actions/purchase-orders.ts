@@ -23,7 +23,7 @@ import {
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload } from '@/lib/domain/purchasing/supplier-credit-note'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType } from '@/lib/domain/purchasing/supplier-credit-note'
 import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
@@ -3472,11 +3472,19 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       select: {
         id: true, poId: true, supplierId: true, currency: true, fxRateToBase: true,
         amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true,
-        po: { select: { reference: true, supplier: { select: { name: true } } } },
+        // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
+        purchaseInvoice: { select: { taxForeign: true } },
+        po: { select: { reference: true, supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } } } },
       },
     })
     if (!cn) return { success: false, error: 'Credit note not found' }
     if (cn.status !== 'DRAFT') return { success: false, error: 'Credit note is already posted' }
+    // audit-oy5p: mirror the freight bill's tax — the supplier tax type when the
+    // bill carried VAT, else NONE (so a vatable freight credit reverses the VAT).
+    const creditNoteTaxType = resolveSupplierCreditNoteTaxType({
+      billHadTax: Number(cn.purchaseInvoice?.taxForeign ?? 0) > 0,
+      supplierTaxType: cn.po.supplier.taxRate?.accountingTaxType,
+    })
 
     // Resolve connector/settings BEFORE the transaction (Codex review: a lookup
     // failure must not occur after the row is already POSTED).
@@ -3512,6 +3520,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             fxRateToBase: Number(cn.fxRateToBase),
             amountForeign: Number(cn.amountForeign),
             transitAccount: settings.transitAccount,
+            taxType: creditNoteTaxType,
             date: new Date().toISOString().slice(0, 10),
           }),
           idempotencyKey: `supplier-credit-note:${cn.id}`,
