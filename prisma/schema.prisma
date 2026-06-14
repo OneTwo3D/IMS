@@ -153,6 +153,8 @@ enum AccountingSyncType {
   CREDIT_NOTE
   // audit-g5u2: supplier (purchase) credit note — Xero ACCPAYCREDIT.
   PURCHASE_CREDIT_NOTE
+  // audit-v08m: follow-up that allocates the ACCPAYCREDIT to the bill it offsets.
+  PURCHASE_CREDIT_NOTE_ALLOCATION
   STOCK_IN_TRANSIT
   STOCK_RECEIPT
   COGS_REVERSAL

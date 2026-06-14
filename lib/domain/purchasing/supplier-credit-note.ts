@@ -83,6 +83,11 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   transitAccount: string
   taxType: string
   date: string
+  // audit-v08m: the offset bill's external (Xero) id + the amount to apply, so the
+  // post-credit follow-up can allocate the ACCPAYCREDIT to the bill. Omitted (and
+  // allocation skipped) when the bill hasn't synced to Xero yet.
+  allocateToInvoiceId?: string | null
+  allocateAmount?: number | null
 }): Record<string, unknown> {
   return {
     creditNoteNumber: params.creditNoteNumber ?? params.reference ?? `SCN-${params.creditNoteId}`,
@@ -107,5 +112,10 @@ export function buildSupplierCreditNoteSyncPayload(params: {
     lineAmountsIncludeTax: true,
     reference: params.reference ?? undefined,
     supplierId: params.supplierId,
+    // audit-v08m: only carried when the bill has an external id — the follow-up
+    // reads these to allocate the credit to the bill.
+    ...(params.allocateToInvoiceId
+      ? { allocateToInvoiceId: params.allocateToInvoiceId, allocateAmount: params.allocateAmount ?? params.amountForeign }
+      : {}),
   }
 }

@@ -9,7 +9,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
+import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
@@ -50,7 +50,7 @@ type ProcessResult = {
 }
 
 type SyncPayload = Record<string, unknown>
-type FollowUpSyncType = 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE'
+type FollowUpSyncType = 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE' | 'PURCHASE_CREDIT_NOTE_ALLOCATION'
 type InvoicePaymentOrderingEntry = {
   id: string
   type: AccountingSyncType
@@ -1296,6 +1296,27 @@ async function processEntry(
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note'), supplierId: payload.supplierId as string | undefined }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 
+    case 'PURCHASE_CREDIT_NOTE_ALLOCATION': {
+      // audit-v08m: follow-up that applies a posted ACCPAYCREDIT to the freight
+      // bill it offsets, so the bill stops showing as outstanding in Xero's AP
+      // aging. Enqueued by enqueuePurchaseCreditNoteFollowUps once the credit note
+      // itself has posted (and only when the bill already has an external id).
+      const creditNoteId = payload.creditNoteId as string | undefined
+      const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
+      const amount = payload.amount as number | undefined
+      const allocationDate = (payload.date as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
+      if (!creditNoteId || !accountingInvoiceId || amount == null) {
+        return { success: false, error: 'Missing creditNoteId, accountingInvoiceId, or amount for PURCHASE_CREDIT_NOTE_ALLOCATION' }
+      }
+      const result = await allocatePurchaseCreditNote(
+        { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
+        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note-allocation') },
+      )
+      // No externalId to back-reference — the allocation is a sub-resource of the
+      // credit note, not a standalone document.
+      return { success: result.success, error: result.error }
+    }
+
     case 'COGS_JOURNAL':
     case 'INVENTORY_ADJUSTMENT':
     case 'STOCK_IN_TRANSIT':
@@ -1549,6 +1570,31 @@ async function enqueuePurchaseInvoiceFollowUps(
   })
 }
 
+async function enqueuePurchaseCreditNoteFollowUps(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  syncResult: { externalId?: string },
+): Promise<void> {
+  // audit-v08m: after the ACCPAYCREDIT posts, allocate it to the bill it offsets.
+  // Needs both the credit's new external id and the bill's external id. The bill
+  // id is threaded onto the payload at enqueue time (postSupplierCreditNote); if
+  // the bill hasn't synced to Xero yet there's nothing to allocate against, so we
+  // skip — the credit still posts and nets at the supplier level.
+  if (referenceType !== 'SupplierCreditNote' || !syncResult.externalId) return
+  const allocateToInvoiceId = payload.allocateToInvoiceId as string | undefined
+  const allocateAmount = payload.allocateAmount as number | undefined
+  if (!allocateToInvoiceId || allocateAmount == null || allocateAmount <= 0) return
+  await enqueueFollowUpSyncLog('PURCHASE_CREDIT_NOTE_ALLOCATION', referenceType, referenceId, {
+    creditNoteId: syncResult.externalId,
+    accountingInvoiceId: allocateToInvoiceId,
+    amount: allocateAmount,
+    date: payload.date as string | undefined,
+    sourceEntryId: entryId,
+  })
+}
+
 async function enqueueFollowUps(
   entryId: string,
   type: AccountingSyncType,
@@ -1564,6 +1610,11 @@ async function enqueueFollowUps(
 
   if (type === 'PURCHASE_INVOICE') {
     await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
+    return
+  }
+
+  if (type === 'PURCHASE_CREDIT_NOTE') {
+    await enqueuePurchaseCreditNoteFollowUps(entryId, referenceType, referenceId, payload, syncResult)
     return
   }
 

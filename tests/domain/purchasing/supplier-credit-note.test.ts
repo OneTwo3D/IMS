@@ -86,6 +86,28 @@ test('sync payload reverses on the transit account with the supplier contact', (
   assert.equal(lines[0].taxType, 'INPUT2') // audit-oy5p: mirrors the bill's tax type
   // audit-oy5p: the entered amount is gross → post tax-inclusive so Xero splits VAT.
   assert.equal(payload.lineAmountsIncludeTax, true)
+  // audit-v08m: no bill external id supplied → no allocation hints in the payload.
+  assert.equal(payload.allocateToInvoiceId, undefined)
+  assert.equal(payload.allocateAmount, undefined)
+})
+
+test('sync payload carries allocation hints when the bill has an external id (audit-v08m)', () => {
+  const base = {
+    creditNoteId: 'scn-1', creditNoteNumber: 'CN-77', reference: 'PO-9', reason: 'Dup freight',
+    supplierName: 'Freight Co', supplierId: 'sup-1', currency: 'EUR', fxRateToBase: 0.85,
+    amountForeign: 120, transitAccount: '1250', taxType: 'NONE', date: '2026-06-14',
+  }
+  // Bill has an external id → carry the id + default the allocate amount to the credit total.
+  const withBill = buildSupplierCreditNoteSyncPayload({ ...base, allocateToInvoiceId: 'xero-inv-1' })
+  assert.equal(withBill.allocateToInvoiceId, 'xero-inv-1')
+  assert.equal(withBill.allocateAmount, 120)
+  // Explicit allocate amount is preserved.
+  const explicit = buildSupplierCreditNoteSyncPayload({ ...base, allocateToInvoiceId: 'xero-inv-1', allocateAmount: 50 })
+  assert.equal(explicit.allocateAmount, 50)
+  // No bill id → hints omitted even if an amount is passed.
+  const noBill = buildSupplierCreditNoteSyncPayload({ ...base, allocateToInvoiceId: null, allocateAmount: 50 })
+  assert.equal(noBill.allocateToInvoiceId, undefined)
+  assert.equal(noBill.allocateAmount, undefined)
 })
 
 test('credit-note tax type mirrors the bill: supplier tax type when the bill had VAT, else NONE', () => {

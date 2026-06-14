@@ -2,7 +2,7 @@
  * Push credit notes to Xero.
  */
 
-import { xeroPost } from './api'
+import { xeroGet, xeroPost, xeroPut } from './api'
 import { findOrCreateContact } from './contacts'
 import { imsRateToXeroCurrencyRate } from './fx'
 import type { CreditNoteData, InvoiceLine } from '../types'
@@ -147,4 +147,68 @@ export async function pushPurchaseCreditNote(
     return { success: false, error: res.error ?? 'Failed to create purchase credit note' }
   }
   return { success: true, creditNoteId: res.data.CreditNotes[0].CreditNoteID }
+}
+
+/**
+ * audit-v08m: how much of a supplier credit note to allocate to a bill. The
+ * allocation can never exceed (a) what the credit still has un-allocated
+ * (RemainingCredit) or (b) what the bill still owes (AmountDue) — Xero rejects an
+ * over-allocation, which would otherwise retry to permanent failure. Capping here
+ * also makes a retry-after-success a safe no-op: once the credit is fully applied
+ * RemainingCredit is 0, so this returns 0 and the caller skips the PUT. Rounded to
+ * 2dp so floating-point noise can't push a cent over Xero's limit.
+ */
+export function resolveCreditNoteAllocationAmount(params: {
+  requested: number
+  remainingCredit: number
+  amountDue: number
+}): number {
+  const capped = Math.min(params.requested, params.remainingCredit, params.amountDue)
+  if (!Number.isFinite(capped) || capped <= 0) return 0
+  return Math.round(capped * 100) / 100
+}
+
+type XeroCreditNoteRemainingResponse = {
+  CreditNotes?: Array<{ CreditNoteID: string; RemainingCredit?: number }>
+}
+type XeroInvoiceDueResponse = {
+  Invoices?: Array<{ InvoiceID: string; AmountDue?: number }>
+}
+
+/**
+ * audit-v08m: allocate a posted supplier credit note (ACCPAYCREDIT) against the
+ * bill it offsets, so the bill stops showing as outstanding in Xero's AP aging.
+ * Idempotent: re-reads the credit's RemainingCredit and the bill's AmountDue
+ * first, so a retry after a partial/successful allocation only applies the
+ * residual (or nothing). Returns allocatedAmount=0 when there is nothing left to
+ * apply (already settled), which the caller treats as success.
+ */
+export async function allocatePurchaseCreditNote(
+  params: { creditNoteId: string; invoiceId: string; amount: number; date: string },
+  opts?: { idempotencyKey?: string },
+): Promise<{ success: boolean; allocatedAmount?: number; error?: string }> {
+  const cnRes = await xeroGet<XeroCreditNoteRemainingResponse>(`CreditNotes/${params.creditNoteId}`)
+  if (!cnRes.ok || !cnRes.data?.CreditNotes?.length) {
+    return { success: false, error: cnRes.error ?? 'Credit note not found in Xero for allocation' }
+  }
+  const remainingCredit = cnRes.data.CreditNotes[0].RemainingCredit ?? 0
+
+  const billRes = await xeroGet<XeroInvoiceDueResponse>(`Invoices/${params.invoiceId}`)
+  if (!billRes.ok || !billRes.data?.Invoices?.length) {
+    return { success: false, error: billRes.error ?? 'Bill not found in Xero for allocation' }
+  }
+  const amountDue = billRes.data.Invoices[0].AmountDue ?? 0
+
+  const allocateAmount = resolveCreditNoteAllocationAmount({ requested: params.amount, remainingCredit, amountDue })
+  if (allocateAmount <= 0) return { success: true, allocatedAmount: 0 }
+
+  const res = await xeroPut<{ Allocations?: Array<{ Amount: number }> }>(
+    `CreditNotes/${params.creditNoteId}/Allocations`,
+    { Allocations: [{ Invoice: { InvoiceID: params.invoiceId }, Amount: allocateAmount, Date: params.date }] },
+    opts,
+  )
+  if (!res.ok) {
+    return { success: false, error: res.error ?? 'Failed to allocate credit note to bill' }
+  }
+  return { success: true, allocatedAmount: allocateAmount }
 }

@@ -3473,7 +3473,8 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         id: true, poId: true, supplierId: true, currency: true, fxRateToBase: true,
         amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true,
         // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
-        purchaseInvoice: { select: { taxForeign: true } },
+        // audit-v08m: + the bill's external (Xero) id, to allocate the credit to it.
+        purchaseInvoice: { select: { taxForeign: true, accountingInvoiceId: true } },
         po: { select: { reference: true, supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } } } },
       },
     })
@@ -3522,6 +3523,10 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             transitAccount: settings.transitAccount,
             taxType: creditNoteTaxType,
             date: new Date().toISOString().slice(0, 10),
+            // audit-v08m: allocate the credit to the bill once both have posted to
+            // Xero. Skipped when the bill has no external id yet (allocation needs it).
+            allocateToInvoiceId: cn.purchaseInvoice?.accountingInvoiceId ?? null,
+            allocateAmount: Number(cn.amountForeign),
           }),
           idempotencyKey: `supplier-credit-note:${cn.id}`,
         })
