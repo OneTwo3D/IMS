@@ -43,9 +43,26 @@ export function validateRecordSupplierCreditNote(params: {
 }
 
 /**
+ * audit-oy5p: resolve the ACCPAYCREDIT line's tax type so the credit MIRRORS the
+ * freight bill it offsets. The freight bill posts its (vatable) cost lines on the
+ * supplier's accounting tax type and zero-tax lines on NONE; freight lines don't
+ * apply the reverse-charge swap (only product lines do). So: if the offset bill
+ * carried tax, reverse with the supplier's tax type; otherwise NONE. Without this
+ * a vatable freight credit posted on NONE and under-reversed the VAT.
+ */
+export function resolveSupplierCreditNoteTaxType(params: {
+  billHadTax: boolean
+  supplierTaxType: string | null | undefined
+}): string {
+  if (params.billHadTax && params.supplierTaxType) return params.supplierTaxType
+  return 'NONE'
+}
+
+/**
  * Build the Xero PURCHASE_CREDIT_NOTE (ACCPAYCREDIT) sync payload from a posted
  * credit note. The single line reverses the freight bill on the same account it
- * debited (transit/clearing), so the credit nets the capitalised freight.
+ * debited (transit/clearing) and mirrors its tax type, so the credit nets the
+ * capitalised freight AND reverses the VAT correctly (audit-oy5p).
  */
 export function buildSupplierCreditNoteSyncPayload(params: {
   creditNoteId: string
@@ -58,6 +75,7 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   fxRateToBase: number
   amountForeign: number
   transitAccount: string
+  taxType: string
   date: string
 }): Record<string, unknown> {
   return {
@@ -72,7 +90,7 @@ export function buildSupplierCreditNoteSyncPayload(params: {
         quantity: 1,
         unitAmount: params.amountForeign,
         accountCode: params.transitAccount,
-        taxType: 'NONE',
+        taxType: params.taxType,
       },
     ],
     reference: params.reference ?? undefined,
