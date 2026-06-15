@@ -101,9 +101,10 @@ test('encrypted settings keep legacy plaintext readable and require a key for ne
 test('encrypted settings reject non-32-byte key shapes instead of deriving fallback keys', () => {
   withEnv({ SETTINGS_ENCRYPTION_KEY: 'not-32-bytes-but-long-enough-to-hash', ENCRYPTION_KEY: undefined }, () => {
     assert.equal(hasSettingsEncryptionKey(), false)
+    // audit-gzz2: a present-but-invalid key now produces an actionable message.
     assert.throws(
       () => encryptSettingValue(SETTINGS_KEY, 'super-secret'),
-      /SETTINGS_ENCRYPTION_KEY is required/,
+      /SETTINGS_ENCRYPTION_KEY is set but is not a valid 32-byte key/,
     )
   })
 })

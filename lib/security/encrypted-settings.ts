@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto'
 import { decryptSecret, isEncryptedValue as isLegacyEncryptedValue } from '@/lib/secrets'
+import { missingEncryptionKeyMessage, resolveAesEncryptionKey } from '@/lib/security/encryption-key'
 
 // Setting-table ciphertext format. OAuth, TOTP, and other non-Setting secrets
 // still use the legacy secret helpers until their storage paths are migrated.
@@ -8,24 +9,8 @@ const DRAFT_ENCRYPTED_SETTING_PREFIX = 'enc:v2:'
 const IV_LENGTH = 12
 const AUTH_TAG_LENGTH = 16
 
-function resolveSettingsEncryptionKey(): Buffer | null {
-  const raw = process.env.SETTINGS_ENCRYPTION_KEY ?? process.env.ENCRYPTION_KEY
-  if (!raw) return null
-
-  const trimmed = raw.trim()
-
-  try {
-    const base64 = Buffer.from(trimmed, 'base64')
-    if (base64.length === 32) return base64
-  } catch {
-    // Ignore invalid base64 and fall through to raw handling.
-  }
-
-  const utf8 = Buffer.from(trimmed, 'utf8')
-  if (utf8.length === 32) return utf8
-
-  return null
-}
+// audit-gzz2: shared resolver (accepts base64-32, 64-char hex, or raw 32-byte).
+const resolveSettingsEncryptionKey = resolveAesEncryptionKey
 
 function aadForSetting(key: string): Buffer {
   return Buffer.from(`setting:${key}`, 'utf8')
@@ -50,7 +35,7 @@ export function isCurrentEncryptedSettingValue(value: string | null | undefined)
 export function encryptSettingValue(key: string, plaintext: string): string {
   const encryptionKey = resolveSettingsEncryptionKey()
   if (!encryptionKey) {
-    throw new Error('SETTINGS_ENCRYPTION_KEY is required to store encrypted settings')
+    throw new Error(missingEncryptionKeyMessage('store encrypted settings'))
   }
 
   const iv = randomBytes(IV_LENGTH)
@@ -75,7 +60,7 @@ export function decryptSettingValue(key: string, value: string): string {
 
   const encryptionKey = resolveSettingsEncryptionKey()
   if (!encryptionKey) {
-    throw new Error('SETTINGS_ENCRYPTION_KEY is required to read encrypted settings')
+    throw new Error(missingEncryptionKeyMessage('read encrypted settings'))
   }
 
   const payload = Buffer.from(value.slice(prefix.length), 'base64')
