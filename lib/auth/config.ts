@@ -75,6 +75,16 @@ export const authConfig: NextAuthConfig = {
             token.totpVerified = true
           }
         }
+        // Step-up re-auth: refresh sessionAuthTime in place ONLY when the client
+        // presents a one-time token minted by POST /api/auth/step-up after a
+        // successful password (+TOTP) re-verification. Same trust model as
+        // _totpToken — the token is server-issued, single-use, bound to the user.
+        if (typeof session._stepUpToken === 'string' && session._stepUpToken) {
+          const verified = await consumeAuthToken(`step_up:${session._stepUpToken}`)
+          if (verified === token.id) {
+            token.sessionAuthTime = nowSeconds()
+          }
+        }
       }
       if (typeof token.id === 'string') {
         let user

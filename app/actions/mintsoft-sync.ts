@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { getSession, requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, getSession, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
   fetchMintsoftAsns,
@@ -1342,7 +1342,14 @@ export async function saveMintsoftConnectionSettings(
 ): Promise<{ success: boolean; error?: string; message?: string }> {
   // Fresh auth is limited to connection-secret writes; reversible sync triggers
   // and review flows remain protected by their normal permission gates.
-  await requireFreshMintsoftWriteAccess()
+  // audit-ohou: return the structured fresh-auth failure for client step-up.
+  try {
+    await requireFreshMintsoftWriteAccess()
+  } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
+    throw e
+  }
 
   const parsedInput = MintsoftConnectionInputSchema.safeParse(input)
   if (!parsedInput.success) {

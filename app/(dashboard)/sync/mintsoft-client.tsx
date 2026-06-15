@@ -19,6 +19,7 @@ import {
 } from '@/app/actions/mintsoft-sync'
 import { ProductLink } from '@/components/inventory/product-link'
 import { Button } from '@/components/ui/button'
+import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { Card } from '@/components/ui/card'
 import {
   Dialog,
@@ -106,6 +107,17 @@ function ReceiptReviewWarnings({ warnings }: { warnings: string[] }) {
 
 export function MintsoftClient({ data }: Props) {
   const router = useRouter()
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
+
+  // audit-ohou: step-up re-auth + retry once on the fresh_auth_required failure.
+  async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
+    const result = await run()
+    if (isFreshAuthFailure(result) && (await promptReauth())) {
+      return run()
+    }
+    return result
+  }
+
   const [isPending, startTransition] = useTransition()
   const savedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const defaultWarehouseId = data.warehouses.find((warehouse) => warehouse.active)?.id ?? ''
@@ -199,7 +211,7 @@ export function MintsoftClient({ data }: Props) {
   function handleSaveConnection() {
     setError('')
     startTransition(async () => {
-      const result = await saveMintsoftConnectionSettings({
+      const result = await withStepUp(() => saveMintsoftConnectionSettings({
         label,
         baseUrl,
         username,
@@ -207,7 +219,7 @@ export function MintsoftClient({ data }: Props) {
         webhookSecret,
         orderLookupConnector,
         active: active === 'true',
-      })
+      }))
 
       if (!result.success) {
         setError(result.error ?? 'Failed to save Mintsoft connection')
@@ -405,6 +417,7 @@ export function MintsoftClient({ data }: Props) {
 
   return (
     <div className="space-y-6">
+      {stepUpDialog}
       <Card className="p-6 space-y-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>

@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireAuth, requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import {
   summarizeCrossConnectorOrphans,
@@ -220,7 +220,15 @@ export async function saveAccountingConnectionSettings(
   if (!connector) {
     return { success: false, error: 'Enable Xero or QuickBooks first.' }
   }
-  return connector.saveConnectionSettings(clientId, clientSecret)
+  // audit-ohou: surface the fresh-auth gate (thrown deep in the connector) as a
+  // structured result so the client can step-up re-auth and retry.
+  try {
+    return await connector.saveConnectionSettings(clientId, clientSecret)
+  } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
+    throw e
+  }
 }
 
 export async function getAccountingConnectionTestState(): Promise<IntegrationConnectionTestState> {
@@ -257,7 +265,14 @@ export async function connectAccountingConnector(
   if (!connector) {
     return { success: false, error: 'Enable Xero or QuickBooks first.' }
   }
-  return connector.connect(clientId, clientSecret, origin, returnPath)
+  // audit-ohou: same step-up passthrough for the OAuth connect path.
+  try {
+    return await connector.connect(clientId, clientSecret, origin, returnPath)
+  } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
+    throw e
+  }
 }
 
 export async function disconnectAccountingConnector(): Promise<{ success: boolean; error?: string }> {

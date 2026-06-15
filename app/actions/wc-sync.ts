@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
 import {
@@ -250,9 +250,17 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
  * must also call `resetWcProductIdCache()` (or click the "Reset cached
  * product IDs" button) to flush the cache.
  */
-export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; wipedMappings: number; error?: string; message?: string }> {
+export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; wipedMappings: number; error?: string; message?: string; code?: string; reason?: string }> {
   // Direct credential parameters are action intent, not masked echo values.
-  await requireFreshAdmin()
+  // audit-ohou: return the structured fresh-auth failure (so the client can prompt
+  // step-up re-auth and retry) instead of throwing an opaque 500.
+  try {
+    await requireFreshAdmin()
+  } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return { ...freshAuthFailure, wipedMappings: 0 }
+    throw e
+  }
 
   const validatedUrl = validateWooCommerceBaseUrl(url)
   if (!validatedUrl.ok) {

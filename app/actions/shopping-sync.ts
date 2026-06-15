@@ -27,7 +27,7 @@ import {
 } from '@/app/actions/wc-sync'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { shopifyGraphql } from '@/lib/connectors/shopify/api'
 import {
   getActiveSettingEnvOverrides,
@@ -265,8 +265,15 @@ export async function saveShopifyConnectorCredentials(
   storeDomain: string,
   adminApiAccessToken: string,
   webhookSecret: string,
-): Promise<{ success: boolean; error?: string; message?: string }> {
-  await requireFreshShoppingAdmin()
+): Promise<{ success: boolean; error?: string; message?: string; code?: string; reason?: string }> {
+  // audit-ohou: structured fresh-auth failure so the client can step-up + retry.
+  try {
+    await requireFreshShoppingAdmin()
+  } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
+    throw e
+  }
 
   const normalizedDomain = normalizeShopifyStoreDomain(storeDomain)
   if (!normalizedDomain) {
