@@ -30,6 +30,10 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires an authenticated session before setting up, verifying, or disabling TOTP.',
   },
+  '/api/auth/step-up': {
+    access: 'authenticated',
+    reason: 'Requires an existing authenticated session; re-verifies the current user’s password (+TOTP) to issue a step-up re-auth token.',
+  },
   '/api/admin/inventory/invariants': {
     access: 'admin',
     reason: 'Inventory invariant report is restricted through requireApiAdmin.',
