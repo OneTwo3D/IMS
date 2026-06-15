@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
 import { LoadingProgress } from '@/components/ui/loading-progress'
+import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   createShoppingWebhooks,
@@ -430,6 +431,17 @@ function WebhookSecretField({
 
 export function SyncClient({ settings: init, taxMappings, statusMappings, logs, taxRates, shoppingCredentials }: Props) {
   const router = useRouter()
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
+
+  // audit-ohou: prompt step-up re-auth + retry once when a gated save returns the
+  // fresh_auth_required failure (the same 15-min gate that hit onboarding).
+  async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
+    const result = await run()
+    if (isFreshAuthFailure(result) && (await promptReauth())) {
+      return run()
+    }
+    return result
+  }
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
   const [saved, setSaved] = useState(false)
@@ -632,7 +644,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     setConnectionMessage(null)
     setConnectionError(false)
     startTransition(async () => {
-      const credentialResult = await saveShoppingConnectorCredentials(wcUrl.trim(), wcKey.trim(), wcSecret.trim())
+      const credentialResult = await withStepUp(() => saveShoppingConnectorCredentials(wcUrl.trim(), wcKey.trim(), wcSecret.trim()))
       if (!credentialResult.success) {
         setConnectionError(true)
         setConnectionMessage(credentialResult.error ?? 'Failed to save connector settings.')
@@ -768,6 +780,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
 
   return (
     <div className="space-y-4">
+      {stepUpDialog}
       {/* Tab bar */}
       <div className="flex gap-1 border-b border-border">
         {visibleTabs.map((t) => (

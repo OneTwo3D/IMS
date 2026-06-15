@@ -4,6 +4,7 @@ import { useState, useTransition, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, Plus, Trash2, AlertTriangle, Receipt, RotateCcw, ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
@@ -129,6 +130,16 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
 
 export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: Props) {
   const router = useRouter()
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
+
+  // audit-ohou: step-up re-auth + retry once on the fresh_auth_required failure.
+  async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
+    const result = await run()
+    if (isFreshAuthFailure(result) && (await promptReauth())) {
+      return run()
+    }
+    return result
+  }
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
   const [connected, setConnected] = useState(initConnected)
@@ -242,7 +253,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   async function handleSaveConnection() {
     setConnectMsg(null)
     setSavingConnection(true)
-    const result = await saveAccountingConnectionSettings(clientId, clientSecret)
+    const result = await withStepUp(() => saveAccountingConnectionSettings(clientId, clientSecret))
     setSavingConnection(false)
     if (result.success) {
       setConnectMsg(result.message ?? 'Connection settings saved.')
@@ -256,7 +267,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     if (!clientId || !clientSecret) { setConnectMsg('Enter Client ID and Client Secret.'); return }
     setConnectMsg(null)
     setConnecting(true)
-    const result = await connectAccountingConnector(clientId, clientSecret, window.location.origin)
+    const result = await withStepUp(() => connectAccountingConnector(clientId, clientSecret, window.location.origin))
     setConnecting(false)
     if (result.success && result.redirectUrl) {
       setConnectMsg(`Redirecting to ${connectorLabel}…`)
@@ -433,6 +444,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 
   return (
     <div className={`space-y-4 ${showSaveBar ? 'pb-20' : ''}`}>
+      {stepUpDialog}
       {/* Tab bar */}
       <div className="flex gap-1 border-b border-border">
         {XERO_TABS.map((t) => (

@@ -51,6 +51,10 @@ export const authConfig: NextAuthConfig = {
       return false // redirect to /login
     },
     async jwt({ token, user, trigger, session }) {
+      // Set true only after a valid step-up one-time token is consumed below; the
+      // actual sessionAuthTime refresh is applied AFTER session-state validation
+      // so it can't resurrect a force-logged-out session (Codex review).
+      let stepUpVerified = false
       if (user) {
         token.id = user.id
         token.role = (user as { role?: string }).role
@@ -75,6 +79,17 @@ export const authConfig: NextAuthConfig = {
             token.totpVerified = true
           }
         }
+        // Step-up re-auth: refresh sessionAuthTime in place ONLY when the client
+        // presents a one-time token minted by POST /api/auth/step-up after a
+        // successful password (+TOTP) re-verification. Same trust model as
+        // _totpToken — the token is server-issued, single-use, bound to the user.
+        if (typeof session._stepUpToken === 'string' && session._stepUpToken) {
+          const verified = await consumeAuthToken(`step_up:${session._stepUpToken}`)
+          // Defer the refresh — see stepUpVerified declaration and its use after
+          // session-state validation, so a token minted before a force-logout
+          // can't refresh auth time past the forceLogoutAt boundary.
+          if (verified === token.id) stepUpVerified = true
+        }
       }
       if (typeof token.id === 'string') {
         let user
@@ -87,14 +102,19 @@ export const authConfig: NextAuthConfig = {
           })
           return token
         }
-        if (user && typeof token.sessionVersion !== 'number') {
-          token.sessionVersion = user.sessionVersion
-        }
-        if (user && trigger === 'update' && session?._refreshTotp === true) {
-          token.sessionVersion = user.sessionVersion
-        }
+        // Fail closed (Codex review): a token with a missing/non-number
+        // sessionVersion is NOT silently healed to the current version before
+        // validation — that would let a token bypass a sessionVersion bump (the
+        // mechanism behind "log out all other sessions" / post-password-change
+        // invalidation). Such a token falls through to evaluateSessionState and is
+        // rejected as a version mismatch. (The old client-controlled `_refreshTotp`
+        // catch-up was dead code — no caller sent it — and is removed.)
         if (user && !user.forceLogoutAt && typeof token.sessionAuthTime !== 'number') {
-          token.sessionAuthTime = nowSeconds()
+          // Fail closed: a token missing sessionAuthTime (e.g. a legacy JWT minted
+          // before the field existed) must NOT become "fresh" without re-auth.
+          // Stamp 0 — the session stays valid (no forceLogoutAt) but reads as stale,
+          // so any fresh-gated action requires step-up (Codex review).
+          token.sessionAuthTime = 0
         }
         const decision = evaluateSessionState({
           sessionVersion: token.sessionVersion,
@@ -111,6 +131,11 @@ export const authConfig: NextAuthConfig = {
 
         // Reached only after the current user record validates this token.
         token.sessionInvalidReason = null
+        // Step-up granted: force-logout + version checks have now passed using the
+        // PRIOR auth time, so it's safe to refresh freshness in place. Doing it here
+        // (not in the update branch) prevents a pre-force-logout token from
+        // refreshing past the forceLogoutAt boundary (Codex review).
+        if (stepUpVerified) token.sessionAuthTime = nowSeconds()
         // Identity fields such as name/email/role remain the values minted into the token.
         // Security-sensitive changes bump sessionVersion and force a fresh sign-in.
         token.totpEnabled = user.totpEnabled

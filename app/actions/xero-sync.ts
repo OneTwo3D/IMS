@@ -1,6 +1,6 @@
 'use server'
 
-import { requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -233,6 +233,10 @@ export async function saveXeroConnectionSettings(
     revalidatePath('/onboarding')
     return { success: true, message: 'Connection settings saved. OAuth redirect is ready.' }
   } catch (error) {
+    // audit-ohou: surface the fresh-auth gate as a structured failure so the
+    // accounting delegator + client can step-up re-auth and retry.
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
     return { success: false, error: String(error) }
   }
 }
@@ -279,6 +283,8 @@ export async function connectXero(
 
     return { success: true, redirectUrl: authUrl }
   } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
     return { success: false, error: String(e) }
   }
 }

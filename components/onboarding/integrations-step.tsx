@@ -12,6 +12,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
+import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { saveShoppingConnectorCredentials, saveShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import { connectAccountingConnector, saveAccountingConnectionSettings } from '@/app/actions/accounting-sync'
 import { saveMintsoftConnectionSettings } from '@/app/actions/mintsoft-sync'
@@ -54,6 +55,18 @@ export function IntegrationsStep({
 }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
+
+  // audit-ohou: run a gated save; if it returns the fresh-auth failure, prompt
+  // step-up re-auth and retry once so the connector save isn't a dead end.
+  async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
+    const result = await run()
+    if (isFreshAuthFailure(result) && (await promptReauth())) {
+      return run()
+    }
+    return result
+  }
+
   const [plugins, setPlugins] = useState(initialPluginState)
   const [error, setError] = useState('')
   const [savingPlugins, setSavingPlugins] = useState(false)
@@ -220,7 +233,7 @@ export function IntegrationsStep({
     setSavingWc(true)
     void (async () => {
       try {
-        const result = await saveShoppingConnectorCredentials(wcUrl, wcKey, wcSecret)
+        const result = await withStepUp(() => saveShoppingConnectorCredentials(wcUrl, wcKey, wcSecret))
         if (!result.success) {
           setError(result.error ?? 'Failed to save WooCommerce credentials')
           return
@@ -246,7 +259,7 @@ export function IntegrationsStep({
     setSavingShopify(true)
     void (async () => {
       try {
-        const result = await saveShopifyConnectorCredentials(shopifyDomain, shopifyToken, shopifyWebhookSecret)
+        const result = await withStepUp(() => saveShopifyConnectorCredentials(shopifyDomain, shopifyToken, shopifyWebhookSecret))
         if (!result.success) {
           setError(result.error ?? 'Failed to save Shopify credentials')
           return
@@ -272,14 +285,14 @@ export function IntegrationsStep({
     setSavingMintsoft(true)
     void (async () => {
       try {
-        const result = await saveMintsoftConnectionSettings({
+        const result = await withStepUp(() => saveMintsoftConnectionSettings({
           baseUrl: mintsoftBaseUrl,
           username: mintsoftUsername,
           password: mintsoftPassword,
           webhookSecret: mintsoftWebhookSecret,
           orderLookupConnector: mintsoftOrderLookupConnector,
           active: true,
-        })
+        }))
         if (!result.success) {
           setError(result.error ?? 'Failed to save Mintsoft connection')
           return
@@ -307,7 +320,7 @@ export function IntegrationsStep({
     setSavingAccountingConnection(true)
     void (async () => {
       try {
-        const result = await saveAccountingConnectionSettings(acClientId, acClientSecret, selectedAccountingConnector)
+        const result = await withStepUp(() => saveAccountingConnectionSettings(acClientId, acClientSecret, selectedAccountingConnector))
         if (!result.success) {
           setError(result.error ?? `Failed to save ${selectedAccountingLabel} connection settings`)
           return
@@ -332,7 +345,7 @@ export function IntegrationsStep({
     setConnectingAccounting(true)
     void (async () => {
       try {
-        const saveResult = await saveAccountingConnectionSettings(acClientId, acClientSecret, selectedAccountingConnector)
+        const saveResult = await withStepUp(() => saveAccountingConnectionSettings(acClientId, acClientSecret, selectedAccountingConnector))
         if (!saveResult.success) {
           setError(saveResult.error ?? `Failed to save ${selectedAccountingLabel} connection settings`)
           return
@@ -341,7 +354,7 @@ export function IntegrationsStep({
         setAccountingMessage(saveResult.message ?? `${selectedAccountingLabel} app credentials saved. Redirecting to complete OAuth verification.`)
 
         const origin = window.location.origin
-        const result = await connectAccountingConnector(acClientId, acClientSecret, origin, '/onboarding', selectedAccountingConnector)
+        const result = await withStepUp(() => connectAccountingConnector(acClientId, acClientSecret, origin, '/onboarding', selectedAccountingConnector))
         if (result.redirectUrl) {
           window.location.href = result.redirectUrl
         } else if (result.error) {
@@ -396,6 +409,7 @@ export function IntegrationsStep({
 
   return (
     <div className="space-y-6">
+      {stepUpDialog}
       <div>
         <h2 className="text-lg font-semibold">Integrations</h2>
         <p className="text-sm text-muted-foreground mt-1">
