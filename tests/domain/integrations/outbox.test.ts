@@ -277,7 +277,9 @@ test('integration outbox parser passes unknown operation payloads through unchan
 })
 
 test('integration outbox registry operation strings use namespaced lowercase dot notation', () => {
-  const operationPattern = /^[a-z]+\.[a-z-]+$/
+  // Namespace and operation segments are lowercase and may contain hyphens (e.g.
+  // 'landed-cost.adjustment-journal'); each segment must start with a letter.
+  const operationPattern = /^[a-z][a-z-]*\.[a-z][a-z-]*$/
 
   for (const operations of Object.values(INTEGRATION_OUTBOX_REGISTRY)) {
     for (const operation of Object.keys(operations)) {
