@@ -40,7 +40,7 @@ function resetOnboardingState() {
     values
       ('onboarding_complete', 'false', now()),
       ('onboarding_dismissed', 'false', now()),
-      ('onboarding_current_step', '1', now())
+      ('onboarding_current_step', 'company', now())
     on conflict (key) do update
     set value = excluded.value, "updatedAt" = now();
   `)
@@ -74,7 +74,7 @@ test.describe('onboarding workflow', () => {
 
     await expect(page.getByRole('heading', { name: 'Currency & Financial Year' })).toBeVisible()
     expect(psql(`select name from organisations where id = 'default' limit 1;`)).toBe(companyName)
-    await expect.poll(() => psql(`select value from settings where key = 'onboarding_current_step' limit 1;`)).toBe('2')
+    await expect.poll(() => psql(`select value from settings where key = 'onboarding_current_step' limit 1;`)).toBe('currency')
   })
 
   test('admin can resume onboarding from the dashboard banner and complete the wizard', async ({ page }) => {
@@ -95,13 +95,14 @@ test.describe('onboarding workflow', () => {
     await expect(page.getByRole('heading', { name: 'Currency & Financial Year' })).toBeVisible()
     await expect(page.getByText(/Base currency is locked to/i)).toBeVisible()
 
+    // audit-wrwr: integrations now precedes tax.
     await page.getByRole('button', { name: /^Next$/ }).click()
-    await expect(page.getByRole('heading', { name: 'Tax Rates' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Integrations', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: /^Next$/ })).toBeDisabled()
     await expect(page.getByRole('button', { name: 'Skip' })).toBeEnabled()
 
     await page.getByRole('button', { name: 'Skip' }).click()
-    await expect(page.getByRole('heading', { name: 'Integrations', exact: true })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Tax Rates' })).toBeVisible()
     await expect(page.getByRole('button', { name: /^Next$/ })).toBeDisabled()
     await expect(page.getByRole('button', { name: 'Skip' })).toBeEnabled()
 
