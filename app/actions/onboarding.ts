@@ -16,7 +16,7 @@ import { syncCrontab } from '@/app/actions/cron'
 export type OnboardingState = {
   complete: boolean
   dismissed: boolean
-  currentStep: number
+  currentStepKey: string
   hasStoredProgress: boolean
   companyConfigured: boolean
   currencyConfigured: boolean
@@ -29,11 +29,14 @@ export type OnboardingState = {
 }
 
 const DEFAULT_ORG_NAME = 'onetwoInventory'
-const LAST_ONBOARDING_STEP = 8
+const DEFAULT_ONBOARDING_STEP_KEY = 'welcome'
 
-function clampOnboardingStep(step: number): number {
-  if (!Number.isFinite(step)) return 0
-  return Math.max(0, Math.min(LAST_ONBOARDING_STEP, Math.trunc(step)))
+// audit-wrwr: persisted progress is the step KEY (reorder-proof). A legacy numeric
+// value saved before this change is treated as "no key", so the user resumes at
+// the start rather than being mis-routed by a now-shifted index.
+function normalizeStoredStepKey(value: string | null | undefined): string | null {
+  if (!value || /^\d+$/.test(value)) return null
+  return /^[a-z][a-z-]*$/.test(value) ? value : null
 }
 
 function isOrganisationConfigured(org: {
@@ -107,8 +110,7 @@ async function loadOnboardingFacts() {
   const complete = completeVal === 'true'
   const dismissed = dismissedVal === 'true'
   const hasStoredProgress = stepVal != null
-  const parsedStep = stepVal ? Number.parseInt(stepVal, 10) : 0
-  const currentStep = clampOnboardingStep(parsedStep)
+  const currentStepKey = normalizeStoredStepKey(stepVal) ?? DEFAULT_ONBOARDING_STEP_KEY
   const companyConfigured = isOrganisationConfigured(org)
   const pluginsConfigured = Object.values(pluginState).some(Boolean)
   const isLegacyConfigured = !hasStoredProgress && (companyConfigured || currencyConfigured || productCount > 0 || warehouseCount > 1 || pluginsConfigured)
@@ -118,7 +120,7 @@ async function loadOnboardingFacts() {
   return {
     complete,
     dismissed,
-    currentStep,
+    currentStepKey,
     hasStoredProgress,
     companyConfigured,
     currencyConfigured,
@@ -165,13 +167,13 @@ export async function shouldShowOnboardingBanner(): Promise<boolean> {
 // Mutations
 // ---------------------------------------------------------------------------
 
-export async function setOnboardingStep(step: number): Promise<void> {
+export async function setOnboardingStep(stepKey: string): Promise<void> {
   await requireAdmin()
-  const nextStep = clampOnboardingStep(step)
+  const nextStep = normalizeStoredStepKey(stepKey) ?? DEFAULT_ONBOARDING_STEP_KEY
   await db.setting.upsert({
     where: { key: 'onboarding_current_step' },
-    create: { key: 'onboarding_current_step', value: String(nextStep) },
-    update: { value: String(nextStep) },
+    create: { key: 'onboarding_current_step', value: nextStep },
+    update: { value: nextStep },
   })
   await logActivity({
     entityType: 'SETTING',

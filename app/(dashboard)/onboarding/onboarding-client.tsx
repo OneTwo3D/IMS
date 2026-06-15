@@ -16,6 +16,7 @@ import { IntegrationsStep } from '@/components/onboarding/integrations-step'
 import { ProductsStep } from '@/components/onboarding/products-step'
 import { CsvImportFlow } from '@/components/ui/csv-import-flow'
 import { TaxRatesTable } from '@/components/settings/tax-rates-table'
+import { UnifiedTaxRateMapper } from '@/components/settings/unified-tax-rate-mapper'
 import { WarehousesTable } from '@/components/settings/warehouses-table'
 import { setOnboardingStep, completeOnboarding } from '@/app/actions/onboarding'
 import { importOpeningStockCsv } from '@/app/actions/import'
@@ -34,8 +35,10 @@ const STEPS: StepDef[] = [
   { key: 'welcome', label: 'Welcome', icon: Sparkles, skippable: false },
   { key: 'company', label: 'Company Details', icon: Building2, skippable: false },
   { key: 'currency', label: 'Currency & FY', icon: Coins, skippable: false },
-  { key: 'tax', label: 'Tax Rates', icon: Receipt, skippable: true },
+  // audit-wrwr: integrations before tax — provider tax rates can only be imported
+  // once WooCommerce/Xero are connected.
   { key: 'integrations', label: 'Integrations', icon: Plug, skippable: true },
+  { key: 'tax', label: 'Tax Rates', icon: Receipt, skippable: true },
   { key: 'warehouses', label: 'Warehouses', icon: Warehouse, skippable: true },
   { key: 'products', label: 'Import Products', icon: Package, skippable: true },
   { key: 'opening-stock', label: 'Opening Stock', icon: TrendingUp, skippable: true },
@@ -43,7 +46,7 @@ const STEPS: StepDef[] = [
 ]
 
 type Props = {
-  initialStep: number
+  initialStepKey: string
   org: OrganisationData
   baseCurrencyLocked: boolean
   companyConfigured: boolean
@@ -66,7 +69,7 @@ type Props = {
 }
 
 export function OnboardingClient({
-  initialStep,
+  initialStepKey,
   org,
   baseCurrencyLocked,
   companyConfigured: initialCompanyConfigured,
@@ -89,6 +92,8 @@ export function OnboardingClient({
 }: Props) {
   const router = useRouter()
   const companyStepRef = useRef<CompanyStepHandle | null>(null)
+  // audit-wrwr: resume by step KEY (reorder-proof); unknown/legacy → start at 0.
+  const initialStep = Math.max(0, STEPS.findIndex((s) => s.key === initialStepKey))
   const [step, setStep] = useState(initialStep)
   const [completedSteps, setCompletedSteps] = useState<Set<string>>(() => {
     const set = new Set<string>()
@@ -177,7 +182,7 @@ export function OnboardingClient({
 
   async function persistCurrentStepBeforeAdvance(targetIndex: number) {
     if (targetIndex <= step) return true
-    if (step !== 1 || (companyConfigured && !companyStepDirty)) return true
+    if (STEPS[step].key !== 'company' || (companyConfigured && !companyStepDirty)) return true
 
     const saved = await companyStepRef.current?.save()
     return Boolean(saved)
@@ -191,7 +196,7 @@ export function OnboardingClient({
     // Mark current step as visited
     markComplete(STEPS[step].key)
     setStep(index)
-    await setOnboardingStep(index)
+    await setOnboardingStep(STEPS[index].key)
   }
 
   async function handleNext() {
@@ -270,7 +275,7 @@ export function OnboardingClient({
         <div className="flex-1 min-w-0">
           <Card className="p-6">
             {/* Step 0: Welcome */}
-            {step === 0 && (
+            {currentStepDef.key === 'welcome' && (
               <div className="space-y-4">
                 <div className="flex items-center gap-3">
                   <div className="h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">
@@ -294,7 +299,7 @@ export function OnboardingClient({
             )}
 
             {/* Step 1: Company Details */}
-            {step === 1 && (
+            {currentStepDef.key === 'company' && (
               <CompanyStep
                 ref={companyStepRef}
                 org={org}
@@ -312,7 +317,7 @@ export function OnboardingClient({
             )}
 
             {/* Step 2: Currency & Financial Year */}
-            {step === 2 && (
+            {currentStepDef.key === 'currency' && (
               <CurrencyStep
                 baseCurrency={org.baseCurrency}
                 baseCurrencyLocked={baseCurrencyLocked}
@@ -326,21 +331,27 @@ export function OnboardingClient({
             )}
 
             {/* Step 3: Tax Rates */}
-            {step === 3 && (
+            {currentStepDef.key === 'tax' && (
               <div className="space-y-4">
                 <div>
                   <h2 className="text-lg font-semibold">Tax Rates</h2>
                   <p className="text-sm text-muted-foreground mt-1">
-                    Review the pre-configured tax rates below. Add, edit, or remove rates as needed
-                    for your business.
+                    Review the pre-configured tax rates below. Add, edit, or remove rates as needed,
+                    then map them to your WooCommerce and Xero tax rates.
                   </p>
                 </div>
                 <TaxRatesTable taxRates={taxRates} onChanged={() => setTaxTouched(true)} />
+                <UnifiedTaxRateMapper
+                  context="onboarding"
+                  wcConnected={plugins.woocommerce && wcConnected}
+                  xeroConnected={plugins.xero && accountingConnected}
+                  onChanged={() => setTaxTouched(true)}
+                />
               </div>
             )}
 
             {/* Step 4: Integrations */}
-            {step === 4 && (
+            {currentStepDef.key === 'integrations' && (
               <IntegrationsStep
                 pluginState={plugins}
                 wcCredentials={wcCredentials}
@@ -356,7 +367,7 @@ export function OnboardingClient({
             )}
 
             {/* Step 5: Warehouses */}
-            {step === 5 && (
+            {currentStepDef.key === 'warehouses' && (
               <div className="space-y-4">
                 <div>
                   <h2 className="text-lg font-semibold">Warehouses</h2>
@@ -370,7 +381,7 @@ export function OnboardingClient({
             )}
 
             {/* Step 6: Import Products */}
-            {step === 6 && (
+            {currentStepDef.key === 'products' && (
               <ProductsStep
                 shoppingConnectorEnabled={shoppingEnabled}
                 wcEnabled={plugins.woocommerce}
@@ -383,7 +394,7 @@ export function OnboardingClient({
             )}
 
             {/* Step 7: Opening Stock */}
-            {step === 7 && (
+            {currentStepDef.key === 'opening-stock' && (
               <div className="space-y-6">
                 <div>
                   <h2 className="text-lg font-semibold">Opening Stock</h2>
@@ -419,7 +430,7 @@ export function OnboardingClient({
             )}
 
             {/* Step 8: Done */}
-            {step === 8 && (
+            {currentStepDef.key === 'done' && (
               <div className="space-y-6">
                 <div className="flex items-center gap-3">
                   <div className="h-10 w-10 rounded-full bg-green-100 flex items-center justify-center">
@@ -502,7 +513,7 @@ export function OnboardingClient({
           </Card>
 
           {/* Navigation buttons */}
-          {step !== 0 && step !== 8 && (
+          {!isFirst && !isLast && (
             <div className="flex items-center justify-between mt-4">
               <Button variant="ghost" onClick={handleBack} disabled={isFirst}>
                 <ArrowLeft className="h-4 w-4 mr-2" />
