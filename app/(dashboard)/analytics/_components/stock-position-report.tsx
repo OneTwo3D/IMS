@@ -32,6 +32,10 @@ export type StockPositionFilterValues = {
   thresholdDays?: string
   pageSize?: string
   demandWindowDays?: string
+  // audit-00o7: reorder-report-only filters (other reports leave these undefined).
+  abcClass?: string
+  urgency?: string
+  search?: string
 }
 
 type StockPositionReportPageProps<Row> = {
@@ -51,6 +55,11 @@ type StockPositionReportPageProps<Row> = {
   showIncludeZero?: boolean
   showThresholdDays?: boolean
   showDemandWindowDays?: boolean
+  // audit-00o7: extra report-specific filter controls rendered inside the GET
+  // <form> (so Apply/Reset/pagination keep working). Reorder uses this for
+  // ABC class / urgency / text search.
+  extraFilters?: React.ReactNode
+  headerActions?: React.ReactNode
 }
 
 function today(): string {
@@ -74,6 +83,8 @@ export function StockPositionReportPage<Row>({
   showIncludeZero = true,
   showThresholdDays = false,
   showDemandWindowDays = false,
+  extraFilters,
+  headerActions,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
   const csvHref = `${exportBasePath}?${appendParams(params, { type: reportKey })}`
@@ -86,10 +97,13 @@ export function StockPositionReportPage<Row>({
         <div>
           <ReportPageTitle title={title} description={description} notices={notices} />
         </div>
-        <a href={csvHref} className={cn(buttonVariants({ variant: 'outline', size: 'sm' }), 'w-fit')}>
-          <Download className="mr-2 h-4 w-4" />
-          CSV
-        </a>
+        <div className="flex w-fit items-center gap-2">
+          {headerActions}
+          <a href={csvHref} className={cn(buttonVariants({ variant: 'outline', size: 'sm' }), 'w-fit')}>
+            <Download className="mr-2 h-4 w-4" />
+            CSV
+          </a>
+        </div>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -203,6 +217,7 @@ export function StockPositionReportPage<Row>({
               </datalist>
             </div>
           )}
+          {extraFilters}
         </div>
         <div className="mt-3 flex items-center justify-between gap-3">
           {showIncludeZero ? (

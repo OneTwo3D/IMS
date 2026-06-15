@@ -1,13 +1,9 @@
-import type { Metadata } from 'next'
-import { generateForecasts, getForecastSettings } from '@/app/actions/forecasting'
-import { ForecastClient } from './forecast-client'
+import { redirect } from 'next/navigation'
 
-export const metadata: Metadata = { title: 'Reorder Forecast' }
-
-export default async function ForecastPage() {
-  const [forecasts, settings] = await Promise.all([
-    generateForecasts(),
-    getForecastSettings(),
-  ])
-  return <ForecastClient forecasts={forecasts} settings={settings} />
+// audit-00o7: the standalone Reorder Forecast page was retired. Its still-useful
+// pieces — the historical-sales import and the ABC/urgency/search filters — now live
+// on the maintained Reorder Planning report. Keep this route as a redirect so old
+// bookmarks and deep links (e.g. import-complete notifications) keep working.
+export default function ForecastPage() {
+  redirect('/analytics/reorder')
 }

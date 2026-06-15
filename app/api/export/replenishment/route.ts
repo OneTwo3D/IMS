@@ -32,6 +32,17 @@ function positiveInteger(value: string | undefined): number | undefined {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
 }
 
+const ABC_CLASSES = ['A', 'B', 'C'] as const
+const URGENCIES = ['critical', 'reorder', 'watch'] as const
+
+function abcClass(value: string | undefined): StockPositionFilters['abcClass'] {
+  return (ABC_CLASSES as readonly string[]).includes(value ?? '') ? (value as StockPositionFilters['abcClass']) : undefined
+}
+
+function urgency(value: string | undefined): StockPositionFilters['urgency'] {
+  return (URGENCIES as readonly string[]).includes(value ?? '') ? (value as StockPositionFilters['urgency']) : undefined
+}
+
 function filtersFromRequest(req: NextRequest): StockPositionFilters {
   return {
     warehouseId: one(req, 'warehouseId'),
@@ -39,6 +50,13 @@ function filtersFromRequest(req: NextRequest): StockPositionFilters {
     supplierId: one(req, 'supplierId'),
     productType: one(req, 'productType') as StockPositionFilters['productType'],
     thresholdDays: positiveInteger(one(req, 'thresholdDays')),
+    // audit-00o7: reorder-only filters — ignored by backorder/component-shortage,
+    // applied inside getReorderReport so the CSV matches the on-screen filtered set.
+    // Validate enums here (the export route is hit directly, not only via the page)
+    // so an unknown value falls back to "no filter" instead of matching zero rows.
+    abcClass: abcClass(one(req, 'abcClass')),
+    urgency: urgency(one(req, 'urgency')),
+    search: one(req, 'search')?.trim().slice(0, 100) || undefined,
   }
 }
 

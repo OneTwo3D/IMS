@@ -38,7 +38,7 @@ const routeCases = [
   { path: '/analytics/fx-gain-loss', heading: 'FX Gain/Loss' },
   { path: '/analytics/purchase-stats', heading: 'Purchase Statistics' },
   { path: '/analytics/inventory-stats', heading: 'Inventory Report' },
-  { path: '/analytics/forecast', heading: 'Reorder Forecast' },
+  // /analytics/forecast retired (audit-00o7) — now redirects to /analytics/reorder.
   { path: '/analytics/reorder', heading: 'Reorder Planning' },
   { path: '/analytics/backorder', heading: 'Backorders' },
   { path: '/analytics/component-shortage', heading: 'Component Shortages' },

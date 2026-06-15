@@ -858,11 +858,25 @@ export async function getReorderReport(
     })
   }
 
-  rows.sort((a, b) => {
+  // audit-00o7: reorder-only filters (ABC class / urgency / text search) brought
+  // over from the retired forecast page. Applied BEFORE sort/totals/pagination so
+  // the summary cards, row count, pagination, and CSV all reflect the filtered set.
+  const searchQuery = filters.search?.trim().toLowerCase()
+  const displayRows = rows.filter((row) => {
+    if (filters.abcClass && row.abcClass !== filters.abcClass) return false
+    if (filters.urgency && row.urgency !== filters.urgency) return false
+    if (searchQuery) {
+      const haystack = `${row.sku} ${row.productName} ${row.supplierName ?? ''}`.toLowerCase()
+      if (!haystack.includes(searchQuery)) return false
+    }
+    return true
+  })
+
+  displayRows.sort((a, b) => {
     const urgencyOrder = { critical: 0, reorder: 1, watch: 2 }
     return urgencyOrder[a.urgency] - urgencyOrder[b.urgency] || a.sku.localeCompare(b.sku)
   })
-  const totals = rows.reduce(
+  const totals = displayRows.reduce(
     (total, row) => ({
       availableQty: total.availableQty.add(row.availableQty),
       inboundOpenPoQty: total.inboundOpenPoQty.add(row.inboundOpenPoQty),
@@ -871,7 +885,7 @@ export async function getReorderReport(
     { availableQty: new Prisma.Decimal(0), inboundOpenPoQty: new Prisma.Decimal(0), suggestedReorderQty: new Prisma.Decimal(0) },
   )
   const pageSize = clampPageSize(filters.pageSize)
-  const paged = paginate(rows, filters.page, pageSize, options.paginate !== false)
+  const paged = paginate(displayRows, filters.page, pageSize, options.paginate !== false)
   return {
     generatedAt: generatedAt.toISOString(),
     demandWindowDateFrom: dateOnly(window.dateFrom),
