@@ -1,27 +1,12 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto'
+import { missingEncryptionKeyMessage, resolveAesEncryptionKey } from '@/lib/security/encryption-key'
 
 const ENCRYPTED_PREFIX = 'enc:v1:'
 const IV_LENGTH = 12
 const AUTH_TAG_LENGTH = 16
 
-function resolveEncryptionKey(): Buffer | null {
-  const raw = process.env.SETTINGS_ENCRYPTION_KEY ?? process.env.ENCRYPTION_KEY
-  if (!raw) return null
-
-  const trimmed = raw.trim()
-
-  try {
-    const base64 = Buffer.from(trimmed, 'base64')
-    if (base64.length === 32) return base64
-  } catch {
-    // Ignore invalid base64 and fall through to raw handling.
-  }
-
-  const utf8 = Buffer.from(trimmed, 'utf8')
-  if (utf8.length === 32) return utf8
-
-  return null
-}
+// audit-gzz2: shared resolver (accepts base64-32, 64-char hex, or raw 32-byte).
+const resolveEncryptionKey = resolveAesEncryptionKey
 
 export function isEncryptedValue(value: string | null | undefined): value is string {
   return !!value && value.startsWith(ENCRYPTED_PREFIX)
@@ -30,7 +15,7 @@ export function isEncryptedValue(value: string | null | undefined): value is str
 export function encryptSecret(plaintext: string): string {
   const key = resolveEncryptionKey()
   if (!key) {
-    throw new Error('SETTINGS_ENCRYPTION_KEY or ENCRYPTION_KEY is required to store encrypted secrets')
+    throw new Error(missingEncryptionKeyMessage('store encrypted secrets'))
   }
 
   const iv = randomBytes(IV_LENGTH)
@@ -46,7 +31,7 @@ export function decryptSecret(value: string): string {
 
   const key = resolveEncryptionKey()
   if (!key) {
-    throw new Error('SETTINGS_ENCRYPTION_KEY or ENCRYPTION_KEY is required to read encrypted secrets')
+    throw new Error(missingEncryptionKeyMessage('read encrypted secrets'))
   }
 
   const payload = Buffer.from(value.slice(ENCRYPTED_PREFIX.length), 'base64')

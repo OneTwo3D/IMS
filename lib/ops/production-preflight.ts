@@ -81,6 +81,13 @@ function checkSettingsEncryptionKey(checks: PreflightCheck[], env: Env): void {
     return
   }
 
+  // audit-gzz2: a 64-char hex key (openssl rand -hex 32) is 32 bytes. Checked
+  // before base64 because hex chars are also valid base64 (but decode to 48 bytes).
+  if (/^[0-9a-fA-F]{64}$/.test(value)) {
+    add(checks, 'pass', 'settings-encryption-key', 'SETTINGS_ENCRYPTION_KEY', 'Settings encryption key is configured as a 64-character hex (32-byte) key.')
+    return
+  }
+
   if (looksLikeBase64(value)) {
     const decoded = Buffer.from(value, 'base64')
     if (decoded.length === 32) {
