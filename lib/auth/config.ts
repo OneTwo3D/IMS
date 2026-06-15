@@ -102,12 +102,13 @@ export const authConfig: NextAuthConfig = {
           })
           return token
         }
-        if (user && typeof token.sessionVersion !== 'number') {
-          token.sessionVersion = user.sessionVersion
-        }
-        if (user && trigger === 'update' && session?._refreshTotp === true) {
-          token.sessionVersion = user.sessionVersion
-        }
+        // Fail closed (Codex review): a token with a missing/non-number
+        // sessionVersion is NOT silently healed to the current version before
+        // validation — that would let a token bypass a sessionVersion bump (the
+        // mechanism behind "log out all other sessions" / post-password-change
+        // invalidation). Such a token falls through to evaluateSessionState and is
+        // rejected as a version mismatch. (The old client-controlled `_refreshTotp`
+        // catch-up was dead code — no caller sent it — and is removed.)
         if (user && !user.forceLogoutAt && typeof token.sessionAuthTime !== 'number') {
           // Fail closed: a token missing sessionAuthTime (e.g. a legacy JWT minted
           // before the field existed) must NOT become "fresh" without re-auth.
