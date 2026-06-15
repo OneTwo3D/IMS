@@ -54,6 +54,7 @@ export async function getTaxRateMatchData(opts?: {
       externalName: m.externalName,
       externalRatePct: m.externalRatePct,
       taxRateId: m.taxRateId,
+      mappingId: m.id,
     })),
     xeroRates: xeroRows.map((x) => ({ taxType: x.taxType, name: x.name, ratePct: x.rate })),
   }

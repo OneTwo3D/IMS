@@ -12,7 +12,7 @@ import {
   type TaxMatchResult,
 } from '@/lib/tax/tax-rate-match'
 import { getTaxRateMatchData, applyTaxRateMatches, type TaxRateMatchData } from '@/app/actions/tax-mapping'
-import { importShoppingTaxRatesFromApi, updateShoppingTaxRateMapping } from '@/app/actions/shopping-sync'
+import { importShoppingTaxRatesFromApi, updateShoppingTaxRateMapping, deleteShoppingTaxRateMapping } from '@/app/actions/shopping-sync'
 import { updateTaxRate } from '@/app/actions/settings'
 
 const SELECT_CLASS =
@@ -99,11 +99,19 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
   }
 
   async function handleWcChange(imsId: string, externalTaxRateId: string) {
-    if (!externalTaxRateId) return
     setBusy(`wc:${imsId}`); setMessage(null)
     try {
-      const res = await updateShoppingTaxRateMapping(externalTaxRateId, imsId)
-      if (!res.success) { notify('error', 'Failed to update mapping.'); return }
+      if (!externalTaxRateId) {
+        // "Not mapped" — delete the WC mapping that currently points at this IMS rate.
+        const current = data?.wcRates.find((w) => w.taxRateId === imsId)
+        if (current?.mappingId) {
+          const res = await deleteShoppingTaxRateMapping(current.mappingId)
+          if (!res.success) { notify('error', 'Failed to unmap.'); return }
+        }
+      } else {
+        const res = await updateShoppingTaxRateMapping(externalTaxRateId, imsId)
+        if (!res.success) { notify('error', 'Failed to update mapping.'); return }
+      }
       await load(); onChanged?.()
     } finally { setBusy(null) }
   }

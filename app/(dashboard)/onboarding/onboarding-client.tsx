@@ -46,7 +46,7 @@ const STEPS: StepDef[] = [
 ]
 
 type Props = {
-  initialStep: number
+  initialStepKey: string
   org: OrganisationData
   baseCurrencyLocked: boolean
   companyConfigured: boolean
@@ -69,7 +69,7 @@ type Props = {
 }
 
 export function OnboardingClient({
-  initialStep,
+  initialStepKey,
   org,
   baseCurrencyLocked,
   companyConfigured: initialCompanyConfigured,
@@ -92,6 +92,8 @@ export function OnboardingClient({
 }: Props) {
   const router = useRouter()
   const companyStepRef = useRef<CompanyStepHandle | null>(null)
+  // audit-wrwr: resume by step KEY (reorder-proof); unknown/legacy → start at 0.
+  const initialStep = Math.max(0, STEPS.findIndex((s) => s.key === initialStepKey))
   const [step, setStep] = useState(initialStep)
   const [completedSteps, setCompletedSteps] = useState<Set<string>>(() => {
     const set = new Set<string>()
@@ -194,7 +196,7 @@ export function OnboardingClient({
     // Mark current step as visited
     markComplete(STEPS[step].key)
     setStep(index)
-    await setOnboardingStep(index)
+    await setOnboardingStep(STEPS[index].key)
   }
 
   async function handleNext() {

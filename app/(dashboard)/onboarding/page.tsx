@@ -62,7 +62,7 @@ export default async function OnboardingPage() {
 
   return (
     <OnboardingClient
-      initialStep={onboardingState.currentStep}
+      initialStepKey={onboardingState.currentStepKey}
       org={org}
       baseCurrencyLocked={baseCurrencySettings.locked}
       currencies={currencies}

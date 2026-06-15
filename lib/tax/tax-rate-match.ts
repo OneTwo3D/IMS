@@ -28,6 +28,8 @@ export type WcRateLite = {
   externalRatePct: number
   /** The IMS rate this WC rate is already mapped to (if any). */
   taxRateId?: string | null
+  /** ShoppingTaxRateMapping row id — used by the UI to delete (unmap). */
+  mappingId?: string
 }
 
 export type XeroRateLite = {
@@ -95,15 +97,21 @@ function assign<E>(
   externals: E[],
   getName: (e: E) => string,
   getRatePct: (e: E) => number,
+  getId: (e: E) => string,
 ): { byImsId: Map<string, { match: E; confidence: MatchConfidence }>; unmatched: E[] } {
   const byImsId = new Map<string, { match: E; confidence: MatchConfidence }>()
   const taken = new Set<E>()
 
+  // Stable id tie-breakers so output is deterministic even when rate+name collide.
   const sortedIms = [...imsRates].sort(
-    (a, b) => a.ratePct - b.ratePct || normalizeTaxName(a.name).localeCompare(normalizeTaxName(b.name)),
+    (a, b) => a.ratePct - b.ratePct
+      || normalizeTaxName(a.name).localeCompare(normalizeTaxName(b.name))
+      || a.id.localeCompare(b.id),
   )
   const sortedExt = [...externals].sort(
-    (a, b) => getRatePct(a) - getRatePct(b) || normalizeTaxName(getName(a)).localeCompare(normalizeTaxName(getName(b))),
+    (a, b) => getRatePct(a) - getRatePct(b)
+      || normalizeTaxName(getName(a)).localeCompare(normalizeTaxName(getName(b)))
+      || getId(a).localeCompare(getId(b)),
   )
 
   for (const tier of ['rate+name', 'rate', 'name'] as const) {
@@ -138,8 +146,8 @@ export function matchTaxRates(input: {
   wcRates: WcRateLite[]
   xeroRates: XeroRateLite[]
 }): TaxMatchResult {
-  const wc = assign(input.imsRates, input.wcRates, (e) => e.externalName, (e) => e.externalRatePct)
-  const xero = assign(input.imsRates, input.xeroRates, (e) => e.name, (e) => e.ratePct)
+  const wc = assign(input.imsRates, input.wcRates, (e) => e.externalName, (e) => e.externalRatePct, (e) => e.externalTaxRateId)
+  const xero = assign(input.imsRates, input.xeroRates, (e) => e.name, (e) => e.ratePct, (e) => e.taxType)
 
   const rows = input.imsRates.map((ims) => ({
     ims,
@@ -152,9 +160,11 @@ export function matchTaxRates(input: {
 
 /**
  * Best-effort suggested links the UI can auto-apply: only the trustworthy tiers
- * ('rate+name' and 'rate'), and only Xero links that aren't already set. WC links
- * are suggested whenever the WC rate isn't already mapped to this IMS rate.
- * Name-only (rate conflict) matches are intentionally excluded — manual only.
+ * ('rate+name' and 'rate'), and ONLY for links that are currently UNSET — never
+ * overwrite an existing mapping (which may be a deliberate manual override).
+ * - WC: only when the matched WC rate is not yet mapped to any IMS rate.
+ * - Xero: only when the IMS rate has no accountingTaxType yet.
+ * Name-only (rate conflict) matches are excluded — manual only.
  */
 export function suggestedAutoApply(result: TaxMatchResult): {
   wcLinks: Array<{ externalTaxRateId: string; taxRateId: string }>
@@ -165,12 +175,12 @@ export function suggestedAutoApply(result: TaxMatchResult): {
 
   for (const row of result.rows) {
     if (row.wc.match && (row.wc.confidence === 'rate+name' || row.wc.confidence === 'rate')) {
-      if (row.wc.match.taxRateId !== row.ims.id) {
+      if (row.wc.match.taxRateId == null) {
         wcLinks.push({ externalTaxRateId: row.wc.match.externalTaxRateId, taxRateId: row.ims.id })
       }
     }
     if (row.xero.match && (row.xero.confidence === 'rate+name' || row.xero.confidence === 'rate')) {
-      if (row.ims.accountingTaxType !== row.xero.match.taxType) {
+      if (row.ims.accountingTaxType == null) {
         xeroLinks.push({ taxRateId: row.ims.id, accountingTaxType: row.xero.match.taxType })
       }
     }

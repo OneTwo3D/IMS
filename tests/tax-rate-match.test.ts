@@ -92,6 +92,24 @@ test('Xero match sets accountingTaxType suggestion; already-set is not re-sugges
   assert.deepEqual(apply.xeroLinks, [{ taxRateId: 'i1', accountingTaxType: 'OUTPUT2' }])
 })
 
+test('auto-apply never overwrites an already-set accountingTaxType (no clobber)', () => {
+  const result = matchTaxRates({
+    imsRates: [ims('i1', 'Standard', 20, 'MANUAL_TYPE')], // already set, deliberately
+    wcRates: [],
+    xeroRates: [xr('OUTPUT2', 'Standard', 20)],
+  })
+  assert.equal(suggestedAutoApply(result).xeroLinks.length, 0)
+})
+
+test('auto-apply never re-maps a WC rate already mapped to another IMS rate (no clobber)', () => {
+  const result = matchTaxRates({
+    imsRates: [ims('i1', 'Standard', 20), ims('i2', 'Also 20', 20)],
+    wcRates: [wc('w1', 'Standard', 20, 'i2')], // already mapped to i2
+    xeroRates: [],
+  })
+  assert.equal(suggestedAutoApply(result).wcLinks.length, 0)
+})
+
 test('leftover WC rate with no IMS hub appears in unmatchedWc', () => {
   const result = matchTaxRates({
     imsRates: [ims('i1', 'Standard', 20)],
