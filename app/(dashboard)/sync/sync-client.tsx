@@ -12,15 +12,12 @@ import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from 
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   createShoppingWebhooks,
-  deleteShoppingTaxRateMapping,
-  importShoppingTaxRatesFromApi,
   resetShoppingProductIdCache,
   pushShoppingFxRatesNow,
   saveShoppingConnectorCredentials,
   saveShoppingSyncSettings,
   testShoppingConnectorCredentials,
   triggerShoppingManualSync,
-  updateShoppingTaxRateMapping,
   upsertShoppingStatusMapping,
   type ShoppingConnectorCredentials,
   type ShoppingStatusMappingRow,
@@ -28,6 +25,7 @@ import {
   type ShoppingSyncSettings,
   type ShoppingTaxRateMappingRow,
 } from '@/app/actions/shopping-sync'
+import { UnifiedTaxRateMapper } from '@/components/settings/unified-tax-rate-mapper'
 
 type Props = {
   settings: ShoppingSyncSettings
@@ -36,6 +34,8 @@ type Props = {
   logs: ShoppingSyncLogRow[]
   taxRates: { id: string; name: string }[]
   shoppingCredentials: ShoppingConnectorCredentials
+  /** audit-wrwr: whether Xero is the connected accounting connector (for the unified tax mapper). */
+  xeroConnected: boolean
 }
 
 const IMS_STATUSES = [
@@ -429,7 +429,7 @@ function WebhookSecretField({
   )
 }
 
-export function SyncClient({ settings: init, taxMappings, statusMappings, logs, taxRates, shoppingCredentials }: Props) {
+export function SyncClient({ settings: init, statusMappings, logs, shoppingCredentials, xeroConnected }: Props) {
   const router = useRouter()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
 
@@ -450,8 +450,6 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [testingConnection, setTestingConnection] = useState(false)
   const [syncResult, setSyncResult] = useState<{ text: string; isError: boolean } | null>(null)
   const [syncingType, setSyncingType] = useState<'orders' | 'products' | 'stock' | null>(null)
-  const [importingTax, setImportingTax] = useState(false)
-  const [taxImportMsg, setTaxImportMsg] = useState<string | null>(null)
   const [wcUrl, setWcUrl] = useState(shoppingCredentials.url)
   const [wcKey, setWcKey] = useState(shoppingCredentials.key)
   const [wcSecret, setWcSecret] = useState(shoppingCredentials.secret)
@@ -722,47 +720,6 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
       })
       router.refresh()
     })
-  }
-
-  function handleChangeTaxMapping(externalTaxRateId: string, taxRateId: string) {
-    if (!taxRateId) return
-    startTransition(async () => {
-      await updateShoppingTaxRateMapping(externalTaxRateId, taxRateId)
-      router.refresh()
-    })
-  }
-
-  function handleDeleteTaxMapping(id: string) {
-    startTransition(async () => {
-      await deleteShoppingTaxRateMapping(id)
-      router.refresh()
-    })
-  }
-
-  async function handleImportTaxRates() {
-    setTaxImportMsg(null)
-    setImportingTax(true)
-    const result = await importShoppingTaxRatesFromApi()
-    setImportingTax(false)
-    if (result.success) {
-      const imported = result.importedRates ?? 0
-      const reused = result.reusedRates ?? 0
-      const mapped = result.mappedRates ?? 0
-      const parts: string[] = []
-      if (imported > 0) {
-        parts.push(`${imported} new IMS rate(s) created`)
-        if (reused > 0) parts.push(`${reused} reused existing`)
-      } else if (reused > 0) {
-        parts.push(`${reused} IMS rate(s) already existed — no new rates created`)
-      } else {
-        parts.push('No tax rates found in WooCommerce')
-      }
-      parts.push(`${mapped} WC rate(s) mapped`)
-      setTaxImportMsg(parts.join(' · '))
-      router.refresh()
-    } else {
-      setTaxImportMsg(`Import failed: ${result.error}`)
-    }
   }
 
   function handleStatusMappingChange(externalStatus: string, imsStatus: string) {
@@ -1132,67 +1089,9 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
         </div>
       )}
 
-      {/* Tax Rates tab */}
-      {tab === 'tax' && wcConfigured && (
-        <Card className="p-6 space-y-4">
-          <div className="flex items-start justify-between gap-2">
-            <div>
-              <h2 className="text-base font-semibold">Tax Rate Mapping</h2>
-              <p className="text-xs text-muted-foreground">Each WooCommerce tax rate is linked to an IMS VAT rate. Importing from WooCommerce auto-creates any missing IMS rates with matching names.</p>
-            </div>
-            <Button variant="outline" size="sm" className="h-8 shrink-0" onClick={handleImportTaxRates} disabled={importingTax || !wcConfigured}>
-              {importingTax ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowDownToLine className="h-3 w-3 mr-1" />}
-              Import from Store
-            </Button>
-          </div>
-          {taxImportMsg && (
-            <p className="text-xs text-muted-foreground">{taxImportMsg}</p>
-          )}
-
-          {taxMappings.length > 0 ? (
-            <Table className="rounded-md border min-w-[600px]">
-              <TableHeader className="bg-muted/50">
-                <TableRow>
-                  <TableHead className="text-xs">WC Rate</TableHead>
-                  <TableHead className="text-xs">Country</TableHead>
-                  <TableHead className="text-xs text-right">Rate</TableHead>
-                  <TableHead className="text-xs">Class</TableHead>
-                  <TableHead className="text-xs">→ IMS Tax Rate</TableHead>
-                  <TableHead className="w-10" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {taxMappings.map((m) => (
-                  <TableRow key={m.id}>
-                    <TableCell>{m.externalName} <span className="text-muted-foreground text-xs">#{m.externalTaxRateId}</span></TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">{m.externalCountry ?? '—'}</TableCell>
-                    <TableCell className="text-right font-mono text-xs">{m.externalRatePct.toFixed(2)}%</TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">{m.externalClass ?? 'standard'}</TableCell>
-                    <TableCell>
-                      <select
-                        value={m.taxRateId}
-                        onChange={(e) => handleChangeTaxMapping(m.externalTaxRateId, e.target.value)}
-                        className="h-7 rounded-md border border-input bg-background px-2 text-xs w-full max-w-xs"
-                        disabled={isPending}
-                      >
-                        {taxRates.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
-                      </select>
-                    </TableCell>
-                    <TableCell>
-                      <button type="button" onClick={() => handleDeleteTaxMapping(m.id)} className="text-muted-foreground hover:text-destructive">
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          ) : (
-            <p className="text-xs text-muted-foreground italic">
-              No tax rates imported yet. Click &quot;Import from Store&quot; to fetch and auto-map external tax rates.
-            </p>
-          )}
-        </Card>
+      {/* Tax Rates tab — audit-wrwr: unified WC/Xero/IMS mapper */}
+      {tab === 'tax' && (
+        <UnifiedTaxRateMapper context="settings" wcConnected={wcConfigured} xeroConnected={xeroConnected} />
       )}
 
       {/* Status Mapping tab */}
