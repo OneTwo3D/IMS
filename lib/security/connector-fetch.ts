@@ -180,7 +180,7 @@ async function defaultLookup(hostname: string): Promise<LookupAddress[]> {
   }))
 }
 
-async function resolveSafeAddress(hostname: string, options: ConnectorFetchOptions, allowE2eLoopback: boolean): Promise<LookupAddress> {
+async function resolveSafeAddresses(hostname: string, options: ConnectorFetchOptions, allowE2eLoopback: boolean): Promise<LookupAddress[]> {
   const resolved = await (options.lookup ?? defaultLookup)(hostname)
   if (!resolved.length) {
     throw new Error(`${options.connectorName} URL hostname did not resolve.`)
@@ -192,7 +192,23 @@ async function resolveSafeAddress(hostname: string, options: ConnectorFetchOptio
     if (!result.ok) throw new Error(result.error)
   }
 
-  return resolved[0]
+  return resolved
+}
+
+/**
+ * audit-hklv: whether Node invoked the custom lookup in "all addresses" mode.
+ * Node ≥20 enables autoSelectFamily (Happy Eyeballs) by default, which calls the
+ * lookup with `{ all: true }` and expects the callback to receive an ARRAY of
+ * addresses. The previous single-address callback form made Node index the
+ * returned address string as an array (e.g. "1.2.3.4"[0] === "1"), producing an
+ * undefined address and TypeError ERR_INVALID_IP_ADDRESS for dual-stack hosts.
+ */
+export function isAllAddressesLookup(lookupOptions: unknown): boolean {
+  return Boolean(
+    lookupOptions
+    && typeof lookupOptions === 'object'
+    && (lookupOptions as { all?: unknown }).all === true,
+  )
 }
 
 function buildRequestOptions(
@@ -208,9 +224,18 @@ function buildRequestOptions(
     path: `${url.pathname}${url.search}`,
     method,
     headers: Object.fromEntries(headers.entries()),
-    lookup: (hostname, _lookupOptions, callback) => {
-      resolveSafeAddress(hostname, options, allowsE2eLocalHttp(url, options))
-        .then((address) => callback(null, address.address, address.family))
+    lookup: (hostname, lookupOptions, callback) => {
+      resolveSafeAddresses(hostname, options, allowsE2eLocalHttp(url, options))
+        .then((addresses) => {
+          // Honor Node's all-addresses (autoSelectFamily/Happy Eyeballs) mode —
+          // returning the validated array — otherwise fall back to the single
+          // first address. See isAllAddressesLookup (audit-hklv).
+          if (isAllAddressesLookup(lookupOptions)) {
+            ;(callback as unknown as (err: NodeJS.ErrnoException | null, addresses: LookupAddress[]) => void)(null, addresses)
+          } else {
+            callback(null, addresses[0].address, addresses[0].family)
+          }
+        })
         .catch((error: unknown) => callback(error instanceof Error ? error : new Error(String(error)), '', 4))
     },
   }

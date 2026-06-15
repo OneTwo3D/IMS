@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createServer, type ServerResponse } from 'node:http'
 import test from 'node:test'
 
-import { connectorFetch } from '../../lib/security/connector-fetch.ts'
+import { connectorFetch, isAllAddressesLookup } from '../../lib/security/connector-fetch.ts'
 import { validateExternalResolvedAddress } from '../../lib/security/external-url-safety.ts'
 
 function listen(server: ReturnType<typeof createServer>): Promise<number> {
@@ -49,6 +49,47 @@ test('connectorFetch rejects mixed public and blocked DNS results', async () => 
     }),
     /WooCommerce URL resolved to a blocked loopback, link-local, private, or metadata network address/,
   )
+})
+
+// audit-hklv: Node ≥20 autoSelectFamily (Happy Eyeballs) calls the custom lookup
+// with { all: true } and expects an ARRAY of addresses back. The detector decides
+// which callback form to use.
+test('isAllAddressesLookup detects Node all-addresses lookup mode', () => {
+  assert.equal(isAllAddressesLookup({ all: true }), true)
+  assert.equal(isAllAddressesLookup({ all: true, family: 0 }), true)
+  assert.equal(isAllAddressesLookup({ all: false }), false)
+  assert.equal(isAllAddressesLookup({}), false)
+  assert.equal(isAllAddressesLookup(undefined), false)
+  assert.equal(isAllAddressesLookup(null), false)
+  assert.equal(isAllAddressesLookup(4), false)
+})
+
+// audit-hklv: regression — resolving a HOSTNAME (so Node calls the lookup) under
+// autoSelectFamily must not throw ERR_INVALID_IP_ADDRESS. Before the fix, the
+// single-address callback form made Node read the address string as an array,
+// yielding an undefined address for dual-stack hosts.
+test('connectorFetch resolves a hostname under autoSelectFamily without ERR_INVALID_IP_ADDRESS', async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' })
+    response.end(JSON.stringify({ ok: true }))
+  })
+  const port = await listen(server)
+
+  try {
+    const response = await connectorFetch(`http://store.localhost:${port}/wp-json/wc/v3/system_status`, {}, {
+      connectorName: 'WooCommerce',
+      allowE2eLocalHttp: true,
+      env: { E2E_TEST_MODE: '1' },
+      // A hostname forces Node to call the custom lookup; under autoSelectFamily
+      // Node requests { all: true } and the OLD single-address callback form made
+      // it read the address string as an array → undefined → ERR_INVALID_IP_ADDRESS.
+      lookup: async () => [{ address: '127.0.0.1', family: 4 }],
+    })
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { ok: true })
+  } finally {
+    await close(server)
+  }
 })
 
 test('connectorFetch follows redirects and revalidates each hop', async () => {
