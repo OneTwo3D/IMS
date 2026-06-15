@@ -1,3 +1,4 @@
+import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { notify } from '@/lib/notifications'
@@ -90,13 +91,16 @@ export async function startHistoricalImport(dateFrom: string, dateTo: string): P
   }
   await saveProgress(progress)
 
-  // Fire and forget — do NOT await
-  runImport(dateFrom, dateTo, progress).catch(async (e) => {
+  // Run after the response flushes, within a managed lifecycle that keeps a valid
+  // DB connection — a raw fire-and-forget loses the request's DB context once the
+  // response is sent and fails mid-import with P2028 (transaction already closed).
+  // Matches sync/initial-import.ts and sync/product-sync.ts.
+  after(() => runImport(dateFrom, dateTo, progress).catch(async (e) => {
     progress.status = 'error'
     progress.message = String(e)
     progress.errors.push(String(e))
     await saveProgress(progress)
-  })
+  }))
 }
 
 // ---------------------------------------------------------------------------
