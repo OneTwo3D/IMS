@@ -9,6 +9,8 @@ export type MaybeFreshAuthFailure = {
   success?: boolean
   code?: string
   reason?: string
+  // Action results carry other fields (error, message, wipedMappings, …); allow them.
+  [key: string]: unknown
 } | null | undefined
 
 export function isFreshAuthFailure(result: MaybeFreshAuthFailure): boolean {
