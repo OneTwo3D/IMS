@@ -271,12 +271,6 @@ export function OnboardingClient({
 
   return (
     <div className="max-w-5xl mx-auto">
-      <div className="mb-6">
-        <h1 className="text-2xl font-semibold">Setup Wizard</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Configure One Two Inventory for your business — you can leave and resume at any time.
-        </p>
-      </div>
       <div className="flex flex-col lg:flex-row gap-6">
         {/* Left rail — stepper */}
         <aside className="lg:w-56 shrink-0">
