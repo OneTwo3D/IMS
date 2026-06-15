@@ -62,7 +62,6 @@ const SECTION_TITLES: Array<{ prefix: string; title: string }> = [
   { prefix: '/analytics/purchase-stats', title: 'Purchase Statistics' },
   { prefix: '/analytics/sales-stats', title: 'Sales Statistics' },
   { prefix: '/analytics/inventory-stats', title: 'Inventory Report' },
-  { prefix: '/analytics/forecast', title: 'Reorder Forecast' },
   { prefix: '/analytics/product-profitability', title: 'Product Profitability' },
   { prefix: '/analytics/ap-aging', title: 'AP Aging' },
   { prefix: '/analytics/ar-aging', title: 'AR Aging' },

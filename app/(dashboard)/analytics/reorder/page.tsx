@@ -13,6 +13,9 @@ import {
 } from '@/lib/domain/inventory/stock-position-reports'
 import { requireReplenishmentReportAccess } from '@/lib/security/replenishment-report-page-access'
 import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
+import { hasPermission } from '@/lib/permissions'
+import { getForecastSettings } from '@/app/actions/forecasting'
+import { HistoricalImportTrigger } from './historical-import-trigger'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
@@ -32,13 +35,28 @@ function positiveInteger(value: string | undefined): number | undefined {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
 }
 
+const ABC_CLASSES = ['A', 'B', 'C'] as const
+const URGENCIES = ['critical', 'reorder', 'watch'] as const
+
+function abcClassFromSearch(value: string | undefined): StockPositionFilters['abcClass'] {
+  return (ABC_CLASSES as readonly string[]).includes(value ?? '') ? (value as StockPositionFilters['abcClass']) : undefined
+}
+
+function urgencyFromSearch(value: string | undefined): StockPositionFilters['urgency'] {
+  return (URGENCIES as readonly string[]).includes(value ?? '') ? (value as StockPositionFilters['urgency']) : undefined
+}
+
 function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
+  const search = one(searchParams.search)?.trim().slice(0, 100)
   return {
     warehouseId: one(searchParams.warehouseId),
     categoryId: one(searchParams.categoryId),
     supplierId: one(searchParams.supplierId),
     productType: one(searchParams.productType) as StockPositionFilters['productType'],
     thresholdDays: positiveInteger(one(searchParams.thresholdDays)),
+    abcClass: abcClassFromSearch(one(searchParams.abcClass)),
+    urgency: urgencyFromSearch(one(searchParams.urgency)),
+    search: search || undefined,
     page: Number(one(searchParams.page) ?? 1),
     pageSize: Number(one(searchParams.pageSize) ?? 100),
   }
@@ -49,15 +67,21 @@ function urgencyLabel(urgency: ReorderReportRow['urgency']): string {
 }
 
 export default async function ReorderPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await requireReplenishmentReportAccess()
+  const session = await requireReplenishmentReportAccess()
+  // The historical-sales import writes data (StockMovement) and reuses the WC sync
+  // pipeline, so it's gated on `sync` (ADMIN/MANAGER) — FINANCE can read the report
+  // but not import. Only load forecast settings (analytics-gated) when we'll render
+  // the trigger, so FINANCE never hits the analytics permission check.
+  const canImportHistory = hasPermission(session.user.role, 'sync')
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
-  const [report, filterOptions] = await Promise.all([
+  const [report, filterOptions, importSettings] = await Promise.all([
     getReorderReport(filters).catch((error: unknown) => {
       if (isSourceScanTooLargeError(error)) return emptyReorderReportForSourceLimit(filters, error)
       throw error
     }),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
+    canImportHistory ? getForecastSettings() : Promise.resolve(null),
   ])
   const filtersForUi: StockPositionFilterValues = {
     warehouseId: filters.warehouseId,
@@ -65,6 +89,9 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     supplierId: filters.supplierId,
     productType: filters.productType,
     thresholdDays: filters.thresholdDays == null ? undefined : String(filters.thresholdDays),
+    abcClass: filters.abcClass,
+    urgency: filters.urgency,
+    search: filters.search,
     pageSize: String(filters.pageSize ?? 100),
   }
   const columns: Array<StockPositionColumn<ReorderReportRow>> = [
@@ -112,6 +139,33 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       dateMode="none"
       showIncludeZero={false}
       showDemandWindowDays
+      headerActions={importSettings ? <HistoricalImportTrigger settings={importSettings} /> : null}
+      extraFilters={
+        <>
+          <div className="space-y-1.5">
+            <label htmlFor="urgency" className="text-sm font-medium">Status</label>
+            <select id="urgency" name="urgency" defaultValue={filtersForUi.urgency ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
+              <option value="">All statuses</option>
+              <option value="critical">Critical</option>
+              <option value="reorder">Reorder</option>
+              <option value="watch">Watch</option>
+            </select>
+          </div>
+          <div className="space-y-1.5">
+            <label htmlFor="abcClass" className="text-sm font-medium">ABC class</label>
+            <select id="abcClass" name="abcClass" defaultValue={filtersForUi.abcClass ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
+              <option value="">All classes</option>
+              <option value="A">A</option>
+              <option value="B">B</option>
+              <option value="C">C</option>
+            </select>
+          </div>
+          <div className="space-y-1.5">
+            <label htmlFor="search" className="text-sm font-medium">Search</label>
+            <input id="search" name="search" type="search" defaultValue={filtersForUi.search ?? ''} placeholder="SKU, name, supplier…" className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm" />
+          </div>
+        </>
+      }
     />
     </div>
   )

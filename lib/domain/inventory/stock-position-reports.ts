@@ -72,6 +72,11 @@ export type StockPositionFilters = {
   productType?: ProductType
   includeZero?: boolean
   thresholdDays?: number
+  // audit-00o7: reorder-report-only filters (other stock-position reports ignore
+  // these, like thresholdDays). Applied inside getReorderReport.
+  abcClass?: 'A' | 'B' | 'C'
+  urgency?: 'critical' | 'reorder' | 'watch'
+  search?: string
   page?: number
   pageSize?: number
 }

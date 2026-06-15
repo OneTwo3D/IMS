@@ -228,7 +228,7 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
       type: 'success',
       title: 'Historical Import Complete',
       message: `Imported ${progress.ordersProcessed} orders, created ${progress.movementsCreated} demand records.`,
-      actionUrl: '/analytics/forecast',
+      actionUrl: '/analytics/reorder',
     })
   } catch (e) {
     progress.status = 'error'
@@ -246,7 +246,7 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
       type: 'error',
       title: 'Historical Import Failed',
       message: String(e),
-      actionUrl: '/analytics/forecast',
+      actionUrl: '/analytics/reorder',
     })
   }
 }
