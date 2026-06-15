@@ -112,6 +112,7 @@ const SECTION_TITLES: Array<{ prefix: string; title: string }> = [
   { prefix: '/profile', title: 'Profile' },
   { prefix: '/activity', title: 'Activity Log' },
   { prefix: '/help', title: 'Help' },
+  { prefix: '/onboarding', title: 'Setup Wizard' },
   { prefix: '/supplier/products', title: 'My Products' },
   { prefix: '/supplier/rfqs', title: 'Requests for Quotation' },
   { prefix: '/supplier/orders', title: 'Purchase Orders' },
