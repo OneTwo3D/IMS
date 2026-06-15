@@ -1489,6 +1489,117 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
   return result
 }
 
+export type CreditNoteAllocationReenqueueResult = {
+  /** Posted credit notes whose bill now has an id but had no allocation row. */
+  checked: number
+  /** Allocation follow-ups enqueued by this sweep. */
+  enqueued: number
+  /** Candidates that errored while enqueuing. */
+  failed: number
+}
+
+export type CreditNoteAllocationCandidate = {
+  id: string
+  accountingCreditNoteId: string | null
+  amountForeign: unknown
+  purchaseInvoice: { accountingInvoiceId: string | null } | null
+}
+
+/**
+ * audit-w77e: pure selection — from POSTED credit notes that have both a posted
+ * credit and a bill with an external id, keep those that have NO allocation row
+ * yet (the never-enqueued gap). Credit notes that already have a row of any
+ * status are owned by the normal retry/repair path and are skipped here. Returns
+ * the resolved enqueue inputs so the DB-bound caller is a thin loop. Defensive
+ * re-check of the ids guards against a candidate row that lost them.
+ */
+export function selectCreditNotesNeedingAllocation(
+  candidates: CreditNoteAllocationCandidate[],
+  refIdsWithAllocation: Set<string>,
+): Array<{ supplierCreditNoteId: string; creditNoteId: string; accountingInvoiceId: string; amount: number }> {
+  const out: Array<{ supplierCreditNoteId: string; creditNoteId: string; accountingInvoiceId: string; amount: number }> = []
+  for (const cn of candidates) {
+    if (refIdsWithAllocation.has(cn.id)) continue
+    const creditNoteId = cn.accountingCreditNoteId
+    const accountingInvoiceId = cn.purchaseInvoice?.accountingInvoiceId
+    if (!creditNoteId || !accountingInvoiceId) continue
+    out.push({ supplierCreditNoteId: cn.id, creditNoteId, accountingInvoiceId, amount: Number(cn.amountForeign) })
+  }
+  return out
+}
+
+/**
+ * audit-w77e: backstop for the audit-v08m gap. postSupplierCreditNote only
+ * enqueues the PURCHASE_CREDIT_NOTE_ALLOCATION follow-up when the offset bill
+ * already has an external (Xero) id. If the bill's PURCHASE_INVOICE sync hadn't
+ * drained yet when the credit posted, the credit nets at the supplier level but
+ * the bill is never auto-allocated. This sweep finds POSTED supplier credit notes
+ * that now have BOTH a posted credit (accountingCreditNoteId) and a linked bill
+ * with an external id, but no PURCHASE_CREDIT_NOTE_ALLOCATION row of any status,
+ * and enqueues one. Idempotent: skips any credit note that already has an
+ * allocation row (the normal retry/repair path owns those), and the allocation
+ * itself re-reads RemainingCredit/AmountDue. Safe to run repeatedly from cron.
+ */
+export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promise<CreditNoteAllocationReenqueueResult> {
+  const result: CreditNoteAllocationReenqueueResult = { checked: 0, enqueued: 0, failed: 0 }
+  const candidates = await db.supplierCreditNote.findMany({
+    where: {
+      status: 'POSTED',
+      accountingCreditNoteId: { not: null },
+      purchaseInvoiceId: { not: null },
+      purchaseInvoice: { is: { accountingInvoiceId: { not: null } } },
+    },
+    select: {
+      id: true,
+      accountingCreditNoteId: true,
+      amountForeign: true,
+      purchaseInvoice: { select: { accountingInvoiceId: true } },
+    },
+    orderBy: { postedAt: 'asc' },
+    take: limit,
+  })
+  if (candidates.length === 0) return result
+
+  // A credit note that already has an allocation row (live OR terminal) is owned
+  // by the normal retry/repair path — this sweep only fills the never-enqueued gap.
+  const existing = await db.accountingSyncLog.findMany({
+    where: {
+      connector: XERO_CONNECTOR,
+      type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+      referenceType: 'SupplierCreditNote',
+      referenceId: { in: candidates.map((c) => c.id) },
+    },
+    select: { referenceId: true },
+  })
+  const hasAllocation = new Set(existing.map((e) => e.referenceId))
+  const toEnqueue = selectCreditNotesNeedingAllocation(candidates, hasAllocation)
+
+  for (const item of toEnqueue) {
+    result.checked++
+    try {
+      await enqueueFollowUpSyncLog('PURCHASE_CREDIT_NOTE_ALLOCATION', 'SupplierCreditNote', item.supplierCreditNoteId, {
+        creditNoteId: item.creditNoteId,
+        accountingInvoiceId: item.accountingInvoiceId,
+        amount: item.amount,
+        sourceEntryId: 'reenqueue-sweep',
+      })
+      result.enqueued++
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'xero_credit_note_allocation_reenqueued',
+        tag: 'sync',
+        level: 'INFO',
+        description: `Enqueued a missing supplier-credit-note allocation for ${item.supplierCreditNoteId} (bill synced after the credit posted).`,
+        metadata: { supplierCreditNoteId: item.supplierCreditNoteId, creditNoteId: item.creditNoteId, accountingInvoiceId: item.accountingInvoiceId },
+      })
+    } catch (error) {
+      result.failed++
+      console.error('reenqueueMissingCreditNoteAllocations: enqueue failed', item.supplierCreditNoteId, error)
+    }
+  }
+  return result
+}
+
 async function enqueueSalesInvoiceFollowUps(
   entryId: string,
   referenceType: string,

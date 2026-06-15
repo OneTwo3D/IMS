@@ -410,11 +410,13 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
 
     const result = await processPendingXeroSync()
     // audit-H3: also repair any documents missing their back-reference.
+    // audit-w77e: and enqueue allocations for credit notes whose bill synced late.
     try {
-      const { repairXeroBackReferences } = await import('@/lib/connectors/xero/sync-processor')
+      const { repairXeroBackReferences, reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
       await repairXeroBackReferences()
+      await reenqueueMissingCreditNoteAllocations()
     } catch (repairError) {
-      console.error('Manual Xero sync: back-reference repair failed', repairError)
+      console.error('Manual Xero sync: back-reference repair / allocation re-enqueue failed', repairError)
     }
 
     await logActivity({
