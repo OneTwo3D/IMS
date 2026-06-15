@@ -16,7 +16,7 @@ import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { SoListClient } from './so-list-client'
 import { SoFormDialog } from './so-form'
 
-type Warehouse = { id: string; code: string; name: string }
+type Warehouse = { id: string; code: string; name: string; isDefault?: boolean }
 
 type Props = {
   initialOrders: SoRow[]

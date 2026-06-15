@@ -21,7 +21,7 @@ import { formatMoney } from '@/lib/utils'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
-type Warehouse = { id: string; code: string; name: string }
+type Warehouse = { id: string; code: string; name: string; isDefault?: boolean }
 
 type Props = {
   products: ProductRow[]
@@ -158,7 +158,10 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   // Order
   const [currency, setCurrency] = useState(baseCurrency.code)
   const [fxRate, setFxRate] = useState(1)
-  const [warehouseId, setWarehouseId] = useState(warehouses[0]?.id ?? '')
+  // Pre-select the default warehouse (falls back to the first one).
+  const [warehouseId, setWarehouseId] = useState(
+    warehouses.find((w) => w.isDefault)?.id ?? warehouses[0]?.id ?? '',
+  )
   const [expectedDelivery, setExpectedDelivery] = useState('')
   const [salesRep, setSalesRep] = useState(currentUserName)
   const [notes, setNotes] = useState('')

@@ -942,7 +942,7 @@ export async function getWarehouses() {
   await requireAuth()
   return db.warehouse.findMany({
     where: { active: true },
-    select: { id: true, code: true, name: true, type: true, country: true, contactName: true, email: true, phone: true, addressLine1: true, addressLine2: true, city: true, postcode: true },
+    select: { id: true, code: true, name: true, type: true, country: true, contactName: true, email: true, phone: true, addressLine1: true, addressLine2: true, city: true, postcode: true, isDefault: true },
     orderBy: { code: 'asc' },
   })
 }
