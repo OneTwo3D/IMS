@@ -3,7 +3,7 @@
 import { useCallback, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
-  ArrowLeft, ArrowRight, Building2, Check, CheckCircle2, Coins, ExternalLink,
+  ArrowLeft, ArrowRight, Building2, Check, CheckCircle2, Coins, Download, ExternalLink,
   Loader2, Package, Plug, Receipt, Sparkles, TrendingUp, Warehouse,
 } from 'lucide-react'
 import Link from 'next/link'
@@ -239,6 +239,20 @@ export function OnboardingClient({
     }))
   }, [])
 
+  function downloadOpeningStockTemplate() {
+    // Columns accepted by importOpeningStockCsv (app/actions/import.ts) + one
+    // illustrative row the user replaces with their data.
+    const header = 'sku,warehouseCode,qty,unitCostBase,note'
+    const example = 'SKU-001,MAIN,100,12.50,Opening balance'
+    const blob = new Blob([`${header}\n${example}\n`], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'opening-stock-template.csv'
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   async function handleFinish() {
     setFinishing(true)
     setFinishError('')
@@ -411,7 +425,11 @@ export function OnboardingClient({
                   </div>
                 )}
 
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <Button variant="ghost" onClick={downloadOpeningStockTemplate}>
+                    <Download className="h-4 w-4 mr-2" />
+                    Download template
+                  </Button>
                   <CsvImportFlow action={importOpeningStockCsv} onDone={() => setStockImported(true)}>
                     {({ busy, openFilePicker }) => (
                       <Button variant="outline" onClick={openFilePicker} disabled={busy}>
@@ -423,8 +441,11 @@ export function OnboardingClient({
                 </div>
 
                 <p className="text-xs text-muted-foreground">
-                  The CSV should include SKU, warehouse code, quantity, and unit cost columns.
-                  Products must exist before importing stock levels.
+                  Download the template, fill in one row per SKU/warehouse — columns:
+                  <code className="mx-1">sku</code>, <code className="mx-1">warehouseCode</code>,
+                  <code className="mx-1">qty</code>, <code className="mx-1">unitCostBase</code> (cost per unit in your
+                  base currency), and an optional <code className="mx-1">note</code> — then import it. Products and
+                  warehouses must exist first; replace the example row.
                 </p>
               </div>
             )}
