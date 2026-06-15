@@ -1523,7 +1523,11 @@ export function selectCreditNotesNeedingAllocation(
     const creditNoteId = cn.accountingCreditNoteId
     const accountingInvoiceId = cn.purchaseInvoice?.accountingInvoiceId
     if (!creditNoteId || !accountingInvoiceId) continue
-    out.push({ supplierCreditNoteId: cn.id, creditNoteId, accountingInvoiceId, amount: Number(cn.amountForeign) })
+    // Codex review: don't enqueue a useless allocation row for a non-positive /
+    // non-finite amount (the allocation would resolve to a no-op anyway).
+    const amount = Number(cn.amountForeign)
+    if (!Number.isFinite(amount) || amount <= 0) continue
+    out.push({ supplierCreditNoteId: cn.id, creditNoteId, accountingInvoiceId, amount })
   }
   return out
 }
@@ -1539,6 +1543,11 @@ export function selectCreditNotesNeedingAllocation(
  * and enqueues one. Idempotent: skips any credit note that already has an
  * allocation row (the normal retry/repair path owns those), and the allocation
  * itself re-reads RemainingCredit/AmountDue. Safe to run repeatedly from cron.
+ *
+ * Note (Codex review): `status = POSTED` is IMS-posted; if the connector is in
+ * draft posting mode the Xero credit is DRAFT and can't be allocated yet — the
+ * allocation no-ops/retries until it's authorised. This matches the live v08m
+ * enqueue path; freight credits are posted authorised in practice.
  */
 export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promise<CreditNoteAllocationReenqueueResult> {
   const result: CreditNoteAllocationReenqueueResult = { checked: 0, enqueued: 0, failed: 0 }

@@ -41,6 +41,12 @@ test('skips when the credit or bill external id is missing (defensive)', () => {
   assert.equal(selectCreditNotesNeedingAllocation([candidate({ purchaseInvoice: { accountingInvoiceId: null } })], new Set()).length, 0)
 })
 
+test('skips a non-positive or non-finite amount (Codex review — no useless row)', () => {
+  assert.equal(selectCreditNotesNeedingAllocation([candidate({ amountForeign: 0 })], new Set()).length, 0)
+  assert.equal(selectCreditNotesNeedingAllocation([candidate({ amountForeign: -5 })], new Set()).length, 0)
+  assert.equal(selectCreditNotesNeedingAllocation([candidate({ amountForeign: Number.NaN })], new Set()).length, 0)
+})
+
 test('coerces a Decimal-like amount to a number', () => {
   const out = selectCreditNotesNeedingAllocation(
     [candidate({ amountForeign: { toString: () => '99.5' } as unknown as number })],
