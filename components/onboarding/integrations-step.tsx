@@ -439,6 +439,14 @@ export function IntegrationsStep({
               </div>
             ) : null}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <a
+                href="/help/woocommerce"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="sm:col-span-2 text-xs text-primary hover:underline inline-flex items-center gap-1 w-fit"
+              >
+                How to get your WooCommerce API keys <ExternalLink className="h-3 w-3" />
+              </a>
               <div className="space-y-1.5 sm:col-span-2">
                 <Label className="text-xs">Store URL</Label>
                 <Input value={wcUrl} onChange={(e) => setWcUrl(e.target.value)} placeholder="https://yourstore.com" className="h-9" />
@@ -555,6 +563,14 @@ export function IntegrationsStep({
                   </div>
                 )}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <a
+                    href="/help/xero-sync"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="sm:col-span-2 text-xs text-primary hover:underline inline-flex items-center gap-1 w-fit"
+                  >
+                    How to get your Xero Client ID &amp; Secret <ExternalLink className="h-3 w-3" />
+                  </a>
                   <div className="space-y-1.5">
                     <Label className="text-xs">Client ID</Label>
                     <Input value={acClientId} onChange={(e) => setAcClientId(e.target.value)} className="h-9" />

@@ -15,6 +15,20 @@ One Two Inventory connects to your WooCommerce store to automatically import ord
 
 Once connected AND tested, a green "Connected" badge appears and the remaining tabs become available.
 
+### How to get your WooCommerce API keys
+
+The Consumer Key and Consumer Secret are generated inside your WooCommerce store, not the IMS:
+
+1. Sign in to your WooCommerce site's **WordPress admin**.
+2. Go to **WooCommerce → Settings → Advanced → REST API**.
+3. Click **Add key** (or **Create an API key**).
+4. Set a **Description** (e.g. "One Two Inventory"), choose the **User** the key acts as, and set **Permissions** to **Read/Write**.
+5. Click **Generate API key**.
+6. Copy the **Consumer key** (`ck_…`) and **Consumer secret** (`cs_…`) — the secret is shown **only once**, so copy it before leaving the page.
+7. Paste both into the IMS connection form along with your store URL.
+
+Official guide: <https://woocommerce.com/document/woocommerce-rest-api/>
+
 > **Note:** The consumer secret is masked after saving. To change it, enter the full new value — the system detects and ignores the masked placeholder.
 >
 > **Base currency check:** the WooCommerce store currency must match the IMS base currency before credentials or sync settings can be enabled. Order currencies may still vary per transaction; the IMS converts them into its own base currency for reporting and valuation.

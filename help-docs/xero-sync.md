@@ -14,7 +14,21 @@ One Two Inventory integrates with Xero to keep your accounting records in sync. 
 
 Before connection or sync can be enabled, the Xero organisation base currency must match the IMS base currency configured in **Settings > Company**.
 
-### Connection Test Gate
+### How to get your Xero Client ID and Secret
+
+The Client ID and Client Secret come from a **Xero app** you create in the Xero Developer portal:
+
+1. Sign in at <https://developer.xero.com/app/manage> with your Xero account.
+2. Click **New app**.
+3. Choose the **Web app** (OAuth 2.0 / Auth code) integration type.
+4. Enter a **Company or application name** (e.g. "One Two Inventory") and your company URL.
+5. Set the **OAuth 2.0 redirect URI** to your IMS callback — `https://<your-ims-domain>/api/accounting/callback` (it must match exactly, including https). On this install that is shown next to the field in the connection form.
+6. Create the app, then open its **Configuration** page.
+7. Copy the **Client id**.
+8. Click **Generate a secret** and copy the **Client secret** — it is shown **only once**, so copy it before leaving the page.
+9. Paste both into the IMS connection form, then click **Connect to Xero** to authorise.
+
+Official guide: <https://developer.xero.com/documentation/getting-started-guide/>
 
 Like other integrations, Xero sync is gated behind a successful connection test. The fingerprint includes the Client ID, expected tenant ID, and authenticated tenant ID/name. If you rotate the Client Secret or re-authorise to a different Xero tenant, re-test before activating sync.
 
