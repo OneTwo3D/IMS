@@ -27,7 +27,7 @@ export async function GET(request: Request) {
     // journals lost to a crash are re-queued (into AccountingSyncLog) in time for
     // this run's sync. Idempotent — a no-op when the direct call already queued them.
     const landedCostJournalOutbox = await drainLandedCostJournalOutbox()
-    const { processPendingXeroSync, repairXeroBackReferences } = await import('@/lib/connectors/xero/sync-processor')
+    const { processPendingXeroSync, repairXeroBackReferences, reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
     const result = await processPendingXeroSync()
     // audit-H3: repair any documents whose back-reference was never written
     // (process died after the connector post, or retries exhausted to FAILED).
@@ -37,7 +37,15 @@ export async function GET(request: Request) {
     } catch (repairError) {
       console.error('accounting-sync cron: back-reference repair sweep failed', repairError)
     }
-    return NextResponse.json({ ...result, backReferenceRepair, landedCostJournalOutbox })
+    // audit-w77e: enqueue allocations for credit notes whose bill synced to Xero
+    // only after the credit posted (the v08m enqueue is skipped in that window).
+    let creditNoteAllocationReenqueue: Awaited<ReturnType<typeof reenqueueMissingCreditNoteAllocations>> | undefined
+    try {
+      creditNoteAllocationReenqueue = await reenqueueMissingCreditNoteAllocations()
+    } catch (reenqueueError) {
+      console.error('accounting-sync cron: credit-note allocation re-enqueue sweep failed', reenqueueError)
+    }
+    return NextResponse.json({ ...result, backReferenceRepair, creditNoteAllocationReenqueue, landedCostJournalOutbox })
   }
 
   if (await isIntegrationPluginEnabled('quickbooks')) {
