@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
@@ -185,10 +186,19 @@ async function getCurrentWcConnectionFingerprint(): Promise<string> {
   })
 }
 
-export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean; error?: string }> {
+export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
   await requireAdmin()
   if (shouldFreshGateSecretWrite(data, 'wc_webhook_secret')) {
-    await requireFreshAdmin()
+    // audit-ohou: return the structured fresh-auth failure so the client can
+    // prompt step-up re-auth and retry, instead of throwing an opaque 500 that
+    // surfaces as "An unexpected response was received from the server".
+    try {
+      await requireFreshAdmin()
+    } catch (e) {
+      const freshAuthFailure = freshAuthFailureResult(e)
+      if (freshAuthFailure) return freshAuthFailure
+      throw e
+    }
   }
   if (data.wc_sync_enabled === 'true') {
     const validation = await validateWooStoreBaseCurrency()
@@ -829,8 +839,28 @@ export async function triggerManualSync(type: 'orders' | 'products' | 'stock'): 
     }
     if (type === 'stock') {
       const { pushStockToWc } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
-      const result = await pushStockToWc({ forceAll: true, source: 'MANUAL' })
-      return { success: true, result: toSerializableResult(result) }
+      // Pushing every product's stock to WooCommerce can take ~a minute, which
+      // exceeds the request/gateway timeout and surfaces to the user as
+      // "something went wrong" even though the server completes. Run it in the
+      // background (like the manual product sync) and return immediately.
+      after(() =>
+        pushStockToWc({ forceAll: true, source: 'MANUAL' }).catch(async (e) => {
+          await logActivity({
+            entityType: 'SYNC',
+            tag: 'sync',
+            action: 'stock_push_failed',
+            level: 'WARNING',
+            description: `Manual WooCommerce stock push failed: ${String(e).slice(0, 300)}`,
+          })
+        }),
+      )
+      return {
+        success: true,
+        result: {
+          started: true,
+          message: 'Stock push started in the background — pushing all products to WooCommerce can take a minute. Check the sync log for the result.',
+        },
+      }
     }
     return { success: false, error: 'Unknown sync type' }
   } catch (e) {
