@@ -2363,7 +2363,10 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <tfoot className="border-t bg-muted/30 text-sm">
               {(() => {
                 const hasDiscountCol = po.lines.some((l) => l.discountAmount > 0)
-                const labelSpan = 3 + (hasDiscountCol ? 1 : 0) + (po.currency !== baseCurrency.code ? 1 : 0) + (po.totalLandedCostBase > 0 ? 1 : 0)
+                // Columns before "Total ({sym})": 4 always present (thumbnail, Product,
+                // Qty, Unit Cost {sym}) plus each conditional column. labelSpan must
+                // equal that count so the amount cell lands under the Total header.
+                const labelSpan = 4 + (hasDiscountCol ? 1 : 0) + (po.currency !== baseCurrency.code ? 1 : 0) + (po.totalLandedCostBase > 0 ? 1 : 0)
                 // Total discount = sum of line discounts + order-level
                 // discount. The stored `subtotalForeign` is already
                 // post-discount; we surface the breakdown for clarity.
