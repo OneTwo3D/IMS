@@ -52,6 +52,8 @@ type Props = {
     oversellAllowed?: boolean
     active?: boolean
     lifecycleStatus?: 'DRAFT' | 'ACTIVE' | 'EOL' | 'ARCHIVED'
+    leadTimeDays?: number | null
+    observedLeadTimeDays?: number | null
   }
   stockUnitOptions?: string[]
   onClose?: () => void
@@ -112,6 +114,7 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
     heightCm:             defaultValues?.heightCm             ?? '',
     depthCm:              defaultValues?.depthCm              ?? '',
     lifecycleStatus:      defaultValues?.lifecycleStatus      ?? (defaultValues?.active === false ? 'ARCHIVED' : 'ACTIVE'),
+    leadTimeDays:         defaultValues?.leadTimeDays != null ? String(defaultValues.leadTimeDays) : '',
   })
 
 
@@ -504,6 +507,19 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
               placeholder="0.000" />
           </div>
         </div>
+      </div>
+
+      {/* Replenishment lead time */}
+      <div className="space-y-1.5">
+        <Label htmlFor="leadTimeDays" className="text-sm font-medium">Lead time (days)</Label>
+        <Input id="leadTimeDays" name="leadTimeDays" type="number" step="1" min="1"
+          value={fields.leadTimeDays} onChange={(ev) => set('leadTimeDays', ev.target.value)}
+          placeholder={defaultValues?.observedLeadTimeDays != null ? String(defaultValues.observedLeadTimeDays) : '14'} />
+        <p className="text-xs text-muted-foreground">
+          {defaultValues?.observedLeadTimeDays != null
+            ? `Leave blank to use the value auto-derived from purchase-order history (${defaultValues.observedLeadTimeDays} days). Enter a value to override it.`
+            : 'Leave blank to use the auto-derived value once purchase-order history exists (defaults to 14 days). Enter a value to override it.'}
+        </p>
       </div>
 
       {/* Actions */}

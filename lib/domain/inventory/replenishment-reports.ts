@@ -5,7 +5,6 @@ import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/doma
 import { calculateDailyVelocity, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
-import { getObservedLeadTimeP95BySupplierProduct } from '@/lib/domain/purchasing/purchasing-analytics'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -84,6 +83,8 @@ type ProductPlanningRow = {
   reorderPoint: DecimalInput | null
   reorderQty: DecimalInput | null
   safetyStockQty: DecimalInput | null
+  leadTimeDays: number | null
+  observedLeadTimeDays: number | null
   category: { id: string; name: string } | null
   preferredSupplierId: string | null
   preferredSupplier: { id: string; name: string } | null
@@ -669,7 +670,7 @@ export async function getReorderReport(
   // including those with a zero suggested quantity.
   const includeAll = filters.includeZero === true
   const window = demandWindow(generatedAt, demandDays)
-  const [products, stockLevels, velocityInputs, openPoLines, observedLeadTimeP95BySupplierProduct, latestMoRows, bomItemRows] = await Promise.all([
+  const [products, stockLevels, velocityInputs, openPoLines, latestMoRows, bomItemRows] = await Promise.all([
     client.product.findMany({
       where: productWhere(filters),
       select: {
@@ -681,6 +682,8 @@ export async function getReorderReport(
         reorderPoint: true,
         reorderQty: true,
         safetyStockQty: true,
+        leadTimeDays: true,
+        observedLeadTimeDays: true,
         category: { select: { id: true, name: true } },
         preferredSupplierId: true,
         preferredSupplier: { select: { id: true, name: true } },
@@ -702,10 +705,6 @@ export async function getReorderReport(
     loadStockLevels(client, filters),
     loadVelocityRows(client, filters, window),
     loadOpenPoLines(client, filters),
-    getObservedLeadTimeP95BySupplierProduct({
-      client: { purchaseReceipt: client.purchaseReceipt },
-      now: () => generatedAt,
-    }),
     // Latest production order per BOM product, used both for the "Manufactured
     // by <name>" supplier-column label and as the warehouse fallback when
     // createReorderMOs creates a draft MO. Ordering is per-(outputProductId,
@@ -825,9 +824,11 @@ export async function getReorderReport(
     const inboundOpenPoQty = inboundByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const projectedAvailableQty = availableQty.add(inboundOpenPoQty)
     const averageDailyDemand = toDecimal(velocityByProduct.get(product.id)?.dailyQtyVelocity ?? 0)
-    const observedLeadTimeDays = displaySupplier ? observedLeadTimeP95BySupplierProduct.get(`${displaySupplier.id}:${product.id}`) : undefined
-    const leadTimeDays = supplier?.leadTimeDays ?? observedLeadTimeDays ?? DEFAULT_LEAD_TIME_DAYS
-    if (supplier?.leadTimeDays == null && observedLeadTimeDays == null) defaultLeadTimeSkus.push(product.sku)
+    // Product-level effective lead time: manual override, else the auto P95 derived
+    // from PO receipts (Product.observedLeadTimeDays, maintained by the
+    // recompute-product-lead-times cron), else the 14-day default.
+    const leadTimeDays = product.leadTimeDays ?? product.observedLeadTimeDays ?? DEFAULT_LEAD_TIME_DAYS
+    if (product.leadTimeDays == null && product.observedLeadTimeDays == null) defaultLeadTimeSkus.push(product.sku)
     const safetyStockQty = toDecimal(product.safetyStockQty ?? 0)
     const demandDuringLeadTime = averageDailyDemand.mul(leadTimeDays)
     const computedReorderPoint = demandDuringLeadTime.add(safetyStockQty)
@@ -1004,7 +1005,7 @@ export async function getReorderReport(
     },
     notices: [
       `Demand velocity uses SALE_DISPATCH movements from ${dateOnly(window.dateFrom)} to ${dateOnly(window.dateTo)}; returns are not netted.`,
-      'Lead time uses SupplierProduct.leadTimeDays first, observed PurchaseReceipt P95 by supplier/SKU second, and the default 14 days only when neither exists.',
+      'Lead time uses the product manual override first, the auto P95 derived from PO receipts (Product.observedLeadTimeDays) second, and the default 14 days only when neither exists.',
       'Suggested reorder quantity only applies the configured reorder quantity when projected available stock is below the reorder point; a configured reorderQty of 0 opts the SKU out of auto-reorder suggestions.',
       'ABC class is computed by demand volume over the window above (Pareto: top 80% of units = A, next 15% = B, remainder including no-movement = C), not the stored product field.',
       'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',

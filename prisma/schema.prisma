@@ -614,6 +614,8 @@ model Product {
   reorderPoint    Decimal?    @db.Decimal(12, 4)
   reorderQty      Decimal?    @db.Decimal(12, 4)
   safetyStockQty  Decimal?    @db.Decimal(12, 4)
+  leadTimeDays         Int?    // manual lead-time override (days); null = use observed/default
+  observedLeadTimeDays Int?    // auto P95 lead time from PO receipts (cron-maintained)
   abcClass        String?
   preferredSupplierId String?
   preferredSupplierLocked Boolean @default(false)

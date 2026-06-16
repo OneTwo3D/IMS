@@ -164,6 +164,8 @@ export default async function ProductDetailPage({
                 oversellAllowed: product.oversellAllowed,
                 active: product.active,
                 lifecycleStatus: product.lifecycleStatus,
+                leadTimeDays: product.leadTimeDays,
+                observedLeadTimeDays: product.observedLeadTimeDays,
               }}
               stockUnitOptions={stockUnitOptions}
               productCategories={productCategories}
@@ -473,6 +475,20 @@ export default async function ProductDetailPage({
               )}
             </Card>
           )}
+
+          {/* Replenishment */}
+          <Card className="p-4">
+            <h2 className="text-sm font-semibold mb-2">Replenishment</h2>
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-muted-foreground">Lead time</span>
+              <span className="font-medium">
+                {(product.leadTimeDays ?? product.observedLeadTimeDays ?? 14)} days
+                <span className="ml-1 text-xs text-muted-foreground">
+                  ({product.leadTimeDays != null ? 'manual' : product.observedLeadTimeDays != null ? 'auto from POs' : 'default'})
+                </span>
+              </span>
+            </div>
+          </Card>
 
           {/* Suppliers */}
           {(suppliers.length > 0 || product.preferredSupplierName) && (

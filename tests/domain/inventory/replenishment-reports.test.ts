@@ -59,6 +59,7 @@ test('reorder report nets available and inbound open PO against lead-time demand
         reorderPoint: null,
         reorderQty: decimal('12'),
         safetyStockQty: decimal('5'),
+        leadTimeDays: 10,
         category,
         preferredSupplier: null,
         supplierProducts: [{
@@ -119,7 +120,7 @@ test('reorder report orders up to N weeks of supply, not just to the reorder poi
     product: {
       findMany: async () => [{
         id: 'product-1', sku: 'SKU-1', name: 'Widget', type: ProductType.SIMPLE, stockUnit: 'pcs',
-        reorderPoint: null, reorderQty: null, safetyStockQty: decimal('0'), category,
+        reorderPoint: null, reorderQty: null, safetyStockQty: decimal('0'), leadTimeDays: 10, category,
         preferredSupplier: null,
         supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('2'), leadTimeDays: 10, supplier }],
       }],
@@ -393,6 +394,8 @@ test('reorder report prefers the preferred supplier catalog row before stale sup
 
   const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
 
+  // Lead time is now product-level (no product override here -> default 14 for all);
+  // this test pins supplier SELECTION, which is independent of lead time.
   assert.deepEqual(report.rows.map((row) => ({
     sku: row.sku,
     supplierId: row.supplierId,
@@ -400,8 +403,8 @@ test('reorder report prefers the preferred supplier catalog row before stale sup
     supplierSku: row.supplierSku,
     leadTimeDays: row.leadTimeDays,
   })), [
-    { sku: 'SKU-1', supplierId: 'supplier-b', supplierName: 'Supplier B', supplierSku: 'B-SKU', leadTimeDays: 5 },
-    { sku: 'SKU-2', supplierId: 'supplier-a', supplierName: 'Supplier A', supplierSku: 'A2-SKU', leadTimeDays: 8 },
+    { sku: 'SKU-1', supplierId: 'supplier-b', supplierName: 'Supplier B', supplierSku: 'B-SKU', leadTimeDays: 14 },
+    { sku: 'SKU-2', supplierId: 'supplier-a', supplierName: 'Supplier A', supplierSku: 'A2-SKU', leadTimeDays: 14 },
     { sku: 'SKU-3', supplierId: 'supplier-b', supplierName: 'Supplier B', supplierSku: null, leadTimeDays: 14 },
   ])
 })
@@ -520,67 +523,45 @@ test('reorder report suppresses critical urgency when inbound covers a zero-stoc
   assert.match(report.notices.join(' '), /projected available stock/)
 })
 
-test('reorder report falls back to observed supplier-product P95 lead time when configured lead time is absent', async () => {
-  const client: ReplenishmentReportClient = {
+test('reorder report lead time: manual override wins, else persisted observed, else default 14', async () => {
+  // 90 units / 90d = 1/day, no safety stock, so reorderPoint = leadTime x 1.
+  const makeClient = (over: { leadTimeDays: number | null; observedLeadTimeDays: number | null }): ReplenishmentReportClient => ({
     ...unusedClient(),
     product: {
       findMany: async () => [{
-        id: 'product-1',
-        sku: 'SKU-1',
-        name: 'Widget',
-        type: ProductType.SIMPLE,
-        stockUnit: 'pcs',
-        reorderPoint: null,
-        reorderQty: null,
-        safetyStockQty: decimal('0'),
-        category,
-        preferredSupplier: null,
-        supplierProducts: [{
-          supplierId: 'supplier-1',
-          supplierSku: 'SUP-SKU-1',
-          lastUnitCost: decimal('2'),
-          leadTimeDays: null,
-          supplier,
-        }],
+        id: 'product-1', sku: 'SKU-1', name: 'Widget', type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: null, reorderQty: null, safetyStockQty: decimal('0'),
+        leadTimeDays: over.leadTimeDays, observedLeadTimeDays: over.observedLeadTimeDays,
+        category, preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('2'), leadTimeDays: null, supplier }],
       }],
     },
-    stockLevel: {
-      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') }],
-    },
+    stockLevel: { findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') }] },
     stockMovement: {
       findMany: async () => [{
-        productId: 'product-1',
-        qty: decimal('90'),
-        totalValueBase: decimal('180'),
-        createdAt: new Date('2026-06-01T12:00:00.000Z'),
+        productId: 'product-1', qty: decimal('90'), totalValueBase: decimal('0'),
+        createdAt: new Date('2026-05-15T00:00:00.000Z'),
         product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [{ supplier }] },
       }],
     },
-    purchaseReceipt: {
-      findMany: async () => [
-        {
-          id: 'receipt-1',
-          receivedAt: new Date('2026-05-11T00:00:00.000Z'),
-          po: { id: 'po-1', reference: 'PO-1', supplierId: 'supplier-1', expectedDelivery: null, poSentAt: new Date('2026-05-01T00:00:00.000Z'), createdAt: new Date('2026-05-01T00:00:00.000Z'), supplier },
-          lines: [{ poLineId: 'line-1', qtyReceived: decimal('1'), poLine: { qty: decimal('1'), productId: 'product-1', product: { sku: 'SKU-1', name: 'Widget', category } } }],
-        },
-        {
-          id: 'receipt-2',
-          receivedAt: new Date('2026-05-21T00:00:00.000Z'),
-          po: { id: 'po-2', reference: 'PO-2', supplierId: 'supplier-1', expectedDelivery: null, poSentAt: new Date('2026-05-01T00:00:00.000Z'), createdAt: new Date('2026-05-01T00:00:00.000Z'), supplier },
-          lines: [{ poLineId: 'line-2', qtyReceived: decimal('1'), poLine: { qty: decimal('1'), productId: 'product-1', product: { sku: 'SKU-1', name: 'Widget', category } } }],
-        },
-      ],
-    },
-  }
+  })
+  const at = { thresholdDays: 90 }
+  const now = () => new Date('2026-06-01T18:00:00.000Z')
 
-  const report = await getReorderReport(
-    { thresholdDays: 90 },
-    { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } },
-  )
+  // Observed only (no manual) -> uses observed 20.
+  const observed = await getReorderReport(at, { deps: { client: makeClient({ leadTimeDays: null, observedLeadTimeDays: 20 }), now } })
+  assert.equal(observed.rows[0]?.leadTimeDays, 20)
+  assert.equal(observed.rows[0]?.reorderPoint, '20')
 
-  assert.equal(report.rows[0]?.leadTimeDays, 20)
-  assert.equal(report.rows[0]?.reorderPoint, '20')
+  // Manual override wins over observed.
+  const manual = await getReorderReport(at, { deps: { client: makeClient({ leadTimeDays: 9, observedLeadTimeDays: 20 }), now } })
+  assert.equal(manual.rows[0]?.leadTimeDays, 9)
+  assert.equal(manual.rows[0]?.reorderPoint, '9')
+
+  // Neither set -> default 14.
+  const def = await getReorderReport(at, { deps: { client: makeClient({ leadTimeDays: null, observedLeadTimeDays: null }), now } })
+  assert.equal(def.rows[0]?.leadTimeDays, 14)
+  assert.equal(def.rows[0]?.reorderPoint, '14')
 })
 
 test('reorder report surfaces default lead-time fallback; no-movement product defaults to ABC class C', async () => {

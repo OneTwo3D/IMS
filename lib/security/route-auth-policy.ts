@@ -146,6 +146,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Archives exhausted EOL products after stock and incoming supply are depleted; guarded by verifyCron.',
   },
+  '/api/cron/recompute-product-lead-times': {
+    access: 'cron-secret',
+    reason: 'Recomputes Product.observedLeadTimeDays (P95 from PO receipts) for the reorder report; guarded by verifyCron.',
+  },
   '/api/cron/mintsoft-bundle-verify': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',

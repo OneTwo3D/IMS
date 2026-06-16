@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import { Prisma, PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import {
   getLeadTimeReport,
+  getObservedLeadTimeP95ByProduct,
   getOpenPurchaseOrdersReport,
   getPurchasePriceVarianceReport,
   getSpendReport,
@@ -101,6 +102,31 @@ test('purchasing analytics formats base amounts with the configured base currenc
   )
 
   assert.equal(report.totals.outstandingValueBase, '11')
+})
+
+test('getObservedLeadTimeP95ByProduct aggregates receipts per product (across suppliers) as P95 days', async () => {
+  const receipt = (id: string, poId: string, supplierId: string, sentAt: string, receivedAt: string, productId: string) => ({
+    id, receivedAt: new Date(receivedAt),
+    po: { id: poId, reference: poId, supplierId, expectedDelivery: null, poSentAt: new Date(sentAt), createdAt: new Date(sentAt), supplier },
+    lines: [{ poLineId: `${poId}-l`, qtyReceived: decimal('1'), poLine: { qty: decimal('1'), productId, product } }],
+  })
+  const client = {
+    ...unusedClient(),
+    purchaseReceipt: {
+      findMany: async () => [
+        // product-1: two receipts from DIFFERENT suppliers, 10 and 30 day lead times.
+        receipt('r1', 'po-1', 'sup-a', '2026-05-01T00:00:00.000Z', '2026-05-11T00:00:00.000Z', 'product-1'),
+        receipt('r2', 'po-2', 'sup-b', '2026-05-01T00:00:00.000Z', '2026-05-31T00:00:00.000Z', 'product-1'),
+        // product-2: single 5-day receipt.
+        receipt('r3', 'po-3', 'sup-a', '2026-05-01T00:00:00.000Z', '2026-05-06T00:00:00.000Z', 'product-2'),
+      ],
+    },
+  } as unknown as PurchasingAnalyticsClient
+
+  const map = await getObservedLeadTimeP95ByProduct({ client, now: () => new Date('2026-06-01T00:00:00.000Z') })
+  // P95 of [10, 30] ~= 30 (top of range); product keyed by id, supplier-agnostic.
+  assert.equal(map.get('product-1'), 30)
+  assert.equal(map.get('product-2'), 5)
 })
 
 test('supplier performance uses receipt timestamps for on-time and return-rate metrics', async () => {

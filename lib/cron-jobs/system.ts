@@ -53,6 +53,16 @@ registerCronJobs([
     defaultEnabled: false,
   },
   {
+    slug: 'recompute-product-lead-times',
+    settingKey: 'recompute_product_lead_times',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Recompute Product Lead Times',
+    description: 'Recomputes each product\'s observed lead time (P95 of PO receipt times over the last 365 days) used by the Reorder Planning report when no manual override is set.',
+    defaultSchedule: '0 4 * * *',
+    defaultEnabled: true,
+  },
+  {
     slug: 'product-lifecycle-archive',
     settingKey: 'product_lifecycle_archive',
     module: 'system',
