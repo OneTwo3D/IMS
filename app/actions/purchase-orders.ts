@@ -3388,10 +3388,15 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // only when GOODS lines are UNIFORMLY reverse-charge (a single-amount credit
     // can't represent a mixed-tax bill).
     const supplierRate = cn.po.supplier.taxRate
+    // Effective rate per GOODS line: the line's own rate, else the supplier
+    // default (possibly null when the supplier has no rate). Do NOT drop null
+    // effective rates — a line with no rate is NOT reverse-charge, so it must
+    // count against uniform-RC rather than being filtered out (which would let
+    // other RC lines misclassify the whole credit as RC).
     const goodsLineRates = cn.po.type === 'GOODS'
-      ? cn.po.lines.map((l) => l.taxRate ?? supplierRate).filter((r): r is NonNullable<typeof r> => !!r)
+      ? cn.po.lines.map((l) => l.taxRate ?? supplierRate)
       : []
-    const isReverseCharge = goodsLineRates.length > 0 && goodsLineRates.every((r) => r.reverseCharge)
+    const isReverseCharge = goodsLineRates.length > 0 && goodsLineRates.every((r) => !!r?.reverseCharge)
     // Base (non-RC) tax type: the line rate where overridden, else the supplier default.
     const baseTaxType = (cn.po.lines.find((l) => l.taxRate)?.taxRate ?? supplierRate)?.accountingTaxType
 
