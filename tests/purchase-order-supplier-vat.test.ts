@@ -45,3 +45,20 @@ test('PO form previews line VAT as the order/supplier default for purchases', as
     /if \(usedFor === 'PURCHASE'\) \{[\s\S]*?taxRateId: orderDefault\.id[\s\S]*?taxRateValue: orderDefault\.rate[\s\S]*?\}/,
   )
 })
+
+test('PO edit mode tracks the supplier rate so "No VAT" sticks on reopen', async () => {
+  const text = await source(FORM)
+
+  // The header tax rate is matched from the persisted header name, NOT from a
+  // line's rate — a stale 20% line must not force the header back to 20%.
+  assert.match(text, /const initialTaxRate = existingPo\?\.taxRateName/)
+  assert.doesNotMatch(text, /taxRates\.find\(\(t\) => t\.id === existingPo\.lines\[0\]/)
+
+  // Loaded lines re-derive VAT from the order default (auto), so they follow the
+  // supplier rate on reopen instead of being treated as manual overrides.
+  assert.match(text, /const lineOrderDefault = \{/)
+  assert.match(
+    text,
+    /taxRateId: lineOrderDefault\.id,\s*taxRateValue: lineOrderDefault\.rate,\s*taxRateName: lineOrderDefault\.name,\s*taxRateWarning: null,\s*taxRateAutoResolved: true,/,
+  )
+})

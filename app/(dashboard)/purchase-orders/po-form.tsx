@@ -172,14 +172,16 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const isEditMode = !!existingPo
   const baseCurrency = useBaseCurrency()
 
-  // When editing, match the saved order's tax rate by id (fall back to name
-  // matching for legacy rows that pre-date taxRateId on lines).
-  const initialTaxRate = existingPo
-    ? taxRates.find((t) => t.id === existingPo.lines[0]?.taxRateId)
-      ?? taxRates.find(
+  // When editing, the PO HEADER carries the supplier's Default VAT Rate (the
+  // order-level rate that is authoritative for every line). Match it from the
+  // header's stored name/percent — never from a line's rate, since a line may
+  // hold a stale rate from before this PO's supplier was set to "No VAT". A
+  // header with no tax (No VAT supplier) leaves this undefined → order rate 0.
+  const initialTaxRate = existingPo?.taxRateName
+    ? taxRates.find(
         (t) => t.name === existingPo.taxRateName
           && Math.abs(t.rate - (existingPo.taxRatePercent ?? 0)) < 0.0001,
-      )
+      ) ?? taxRates.find((t) => t.name === existingPo.taxRateName)
     : undefined
 
   // Header state — prefilled from existingPo when editing
@@ -236,8 +238,17 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   // "prices exclude VAT" mode.
   const [lines, setLines] = useState<LineItem[]>(() => {
     if (!existingPo) return []
+    // Purchases follow the supplier's Default VAT Rate (the order-level rate)
+    // for every line — there is no per-line auto-resolution and no persisted
+    // per-line override flag, so on reopen every line re-derives its VAT from
+    // the order default. This is what makes a "No VAT" supplier stick across
+    // save → edit → reopen (a stale 20% line rate is dropped, not preserved).
+    const lineOrderDefault = {
+      id: initialTaxRate?.id ?? null,
+      name: initialTaxRate?.name ?? existingPo.taxRateName ?? null,
+      rate: initialTaxRate?.rate ?? 0,
+    }
     return existingPo.lines.map((l) => {
-      const lineTaxRate = taxRates.find((t) => t.id === l.taxRateId)
       // Reconstruct pre-discount unit cost: the stored value is
       // (qty * unitCost - discount) / qty, so adding discount/qty back
       // gives the original entry.
@@ -262,15 +273,14 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         unitCostForeign: Math.round(displayUnitCost * 10000) / 10000,
         discount: l.discountStr ?? '',
         productCategory: (product?.taxCategory ?? 'STANDARD') as TaxCategory,
-        // When the saved line has its own rate (any taxRateId, even matching
-        // the order default), keep it as a manual override to avoid
-        // surprising users on edit. New lines added through `addProduct`
-        // will be auto-resolved.
-        taxRateId: l.taxRateId ?? null,
-        taxRateValue: lineTaxRate?.rate ?? (l.taxRatePercent ?? 0),
-        taxRateName: lineTaxRate?.name ?? l.taxRateName,
+        // Re-derive line VAT from the order/supplier default on load (auto), so
+        // it always tracks the supplier's Default VAT Rate. The net unit cost is
+        // unchanged; only the VAT applied on top follows the order rate.
+        taxRateId: lineOrderDefault.id,
+        taxRateValue: lineOrderDefault.rate,
+        taxRateName: lineOrderDefault.name,
         taxRateWarning: null,
-        taxRateAutoResolved: false,
+        taxRateAutoResolved: true,
       }
     })
   })
@@ -646,9 +656,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           sortOrder: i,
           discountStr: l.discount || undefined,
           discountAmount: discAmount > 0 ? discAmount : undefined,
-          // Only send the id when the user has manually overridden. Auto
-          // lines pass null so the server re-resolves from the canonical
-          // (productCategory, warehouseCountry, PURCHASE) lookup.
+          // Only send the id when the user has manually overridden this line.
+          // Auto lines pass null so the server applies the order/supplier rate.
           taxRateId: l.taxRateAutoResolved ? null : l.taxRateId,
         }
       }),
