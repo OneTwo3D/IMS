@@ -104,9 +104,116 @@ test('reorder report nets available and inbound open PO against lead-time demand
   assert.equal(report.rows[0]?.warehouseAvailabilityBreakdown, 'warehouse-1: 3')
   assert.equal(report.rows[0]?.inboundOpenPoQty, '6')
   assert.equal(report.rows[0]?.reorderPoint, '15')
-  assert.equal(report.rows[0]?.suggestedReorderQty, '12')
+  // Order-up-to: reorderPoint 15 + 8 weeks cover (1/day × 56) = 71 order-up-to level;
+  // minus projected available 9 = 62 (above the configured 12 reorder qty min).
+  assert.equal(report.rows[0]?.suggestedReorderQty, '62')
   assert.equal(report.rows[0]?.leadTimeDays, 10)
   assert.equal(report.rows[0]?.urgency, 'reorder')
+})
+
+test('reorder report orders up to N weeks of supply, not just to the reorder point', async () => {
+  // SIMPLE product, no configured reorderQty/safety, lead time 10, available 0.
+  // 90 units over a 90-day window → 1 unit/day. reorderPoint = 1×10 = 10.
+  const makeClient = (): ReplenishmentReportClient => ({
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1', sku: 'SKU-1', name: 'Widget', type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: null, reorderQty: null, safetyStockQty: decimal('0'), category,
+        preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('2'), leadTimeDays: 10, supplier }],
+      }],
+    },
+    stockLevel: { findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') }] },
+    stockMovement: {
+      findMany: async () => [{
+        productId: 'product-1', qty: decimal('90'), totalValueBase: decimal('0'),
+        createdAt: new Date('2026-05-15T00:00:00.000Z'),
+        product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [{ supplier }] },
+      }],
+    },
+  })
+
+  // Default 8 weeks: order-up-to = 10 + (1/day × 8 × 7 = 56) = 66; minus 0 available = 66.
+  const def = await getReorderReport({ thresholdDays: 90 }, { deps: { client: makeClient(), now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.equal(def.rows[0]?.reorderPoint, '10')
+  assert.equal(def.rows[0]?.suggestedReorderQty, '66')
+
+  // Configurable: 4 weeks → order-up-to = 10 + (1 × 28) = 38.
+  const four = await getReorderReport({ thresholdDays: 90, targetCoverWeeks: 4 }, { deps: { client: makeClient(), now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.equal(four.rows[0]?.suggestedReorderQty, '38')
+
+  // Upper bound: an absurd weeks value is clamped to 52, not honoured literally.
+  const huge = await getReorderReport({ thresholdDays: 90, targetCoverWeeks: 99999 }, { deps: { client: makeClient(), now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.equal(huge.rows[0]?.suggestedReorderQty, String(10 + 52 * 7)) // 10 + 364 = 374
+})
+
+test('order-up-to edge cases: zero-demand degrades to top-up, backorder widens, at-point holds', async () => {
+  const productRow = (over: Record<string, unknown>) => ({
+    id: 'product-1', sku: 'SKU-1', name: 'Widget', type: ProductType.SIMPLE, stockUnit: 'pcs',
+    reorderPoint: decimal('10'), reorderQty: null, safetyStockQty: decimal('0'), category,
+    preferredSupplier: null,
+    supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('2'), leadTimeDays: 7, supplier }],
+    ...over,
+  })
+  const clientWith = (qtyOnHand: string): ReplenishmentReportClient => ({
+    ...unusedClient(),
+    product: { findMany: async () => [productRow({})] },
+    stockLevel: { findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal(qtyOnHand), reservedQty: decimal('0') }] },
+    // No stockMovement mock → zero velocity → targetCoverQty 0 → degrades to top-up.
+  })
+  const at = () => new Date('2026-06-01T18:00:00.000Z')
+
+  // Zero demand, available 3, reorderPoint 10 → plain top-up gap 7 (no weeks cover added).
+  const degrade = await getReorderReport({}, { deps: { client: clientWith('3'), now: at } })
+  assert.equal(degrade.rows[0]?.suggestedReorderQty, '7')
+
+  // Backorder: available -5 → order-up-to gap = 10 − (−5) = 15 (negative handled).
+  const backorder = await getReorderReport({}, { deps: { client: clientWith('-5'), now: at } })
+  assert.equal(backorder.rows[0]?.suggestedReorderQty, '15')
+  assert.equal(backorder.rows[0]?.urgency, 'critical')
+
+  // Exactly at the reorder point → no order, but the row is retained with a 0 suggestion.
+  const atPoint = await getReorderReport({}, { deps: { client: clientWith('10'), now: at } })
+  assert.equal(atPoint.rows[0]?.suggestedReorderQty, '0')
+  assert.equal(atPoint.rows[0]?.urgency, 'reorder')
+})
+
+test('reorder report propagates the BOM parent order-up-to quantity into component demand', async () => {
+  // Oak table (BOM) has sales velocity; oak board (component, 2 per table) does not.
+  // Parent: reorderPoint 5 (configured), 8wk cover at 1/day = 56 → order-up-to 61.
+  // Component demand = 61 × 2 = 122; the component (no velocity) adds no cover of its own.
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        {
+          id: 'raw-oak', sku: 'RAW-OAK', name: 'Oak board', type: ProductType.SIMPLE, stockUnit: 'each',
+          reorderPoint: decimal(0), reorderQty: decimal(0), safetyStockQty: decimal(0), category,
+          preferredSupplierId: null, preferredSupplier: null,
+          supplierProducts: [{ supplierId: 'sup-timber', supplierSku: 'OAK-1', lastUnitCost: decimal(5), leadTimeDays: 7, supplier: { name: 'Timber Co' } }],
+        },
+        {
+          id: 'bom-table', sku: 'BOM-TABLE', name: 'Oak table', type: ProductType.BOM, stockUnit: 'each',
+          reorderPoint: decimal(5), reorderQty: null, safetyStockQty: decimal(0), category,
+          preferredSupplierId: null, preferredSupplier: null, supplierProducts: [],
+        },
+      ],
+    },
+    stockLevel: { findMany: async () => [
+      { productId: 'raw-oak', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') },
+      { productId: 'bom-table', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') },
+    ] },
+    stockMovement: { findMany: async () => [{
+      productId: 'bom-table', qty: decimal('90'), totalValueBase: decimal('0'),
+      createdAt: new Date('2026-05-15T00:00:00.000Z'),
+      product: { sku: 'BOM-TABLE', name: 'Oak table', category, supplierProducts: [] },
+    }] },
+    bomItem: { findMany: async () => [{ parentProductId: 'bom-table', componentProductId: 'raw-oak', qty: decimal(2) }] },
+  }
+  const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.equal(report.rows.find((r) => r.sku === 'BOM-TABLE')?.suggestedReorderQty, '61')
+  assert.equal(report.rows.find((r) => r.sku === 'RAW-OAK')?.suggestedReorderQty, '122')
 })
 
 test('reorder report prefers the preferred supplier catalog row before stale supplier catalog rows', async () => {

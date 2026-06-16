@@ -14,6 +14,13 @@ const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_DEMAND_WINDOW_DAYS = 90
 const DEFAULT_LEAD_TIME_DAYS = 14
+// Default replenishment cover: when a product drops to its reorder point, suggest
+// ordering back up to roughly this many weeks of forecast demand ON TOP of the
+// reorder point (an order-up-to level). Matches the retired forecast's 8-week lot.
+const DEFAULT_TARGET_COVER_WEEKS = 8
+// Upper bound (one year) so a crafted URL/CSV param can't request absurd order-up-to
+// levels and generate runaway suggested quantities.
+const MAX_TARGET_COVER_WEEKS = 52
 const REPLENISHMENT_PRODUCT_TYPES: ProductType[] = [
   ProductType.SIMPLE,
   ProductType.VARIANT,
@@ -383,6 +390,24 @@ function parsePositiveInteger(value: number | undefined, fallback: number): numb
   return Number.isInteger(value) && (value ?? 0) > 0 ? value as number : fallback
 }
 
+// Order-up-to suggested quantity. A product is only replenished once it has dropped
+// below its reorder point (the trigger); the order then brings projected stock back
+// up to an order-up-to level = reorderPoint + targetCoverQty (≈ targetCoverWeeks of
+// forecast demand). A configured per-product reorder qty acts as a minimum lot size.
+// When there's no demand (targetCoverQty = 0) this degrades to a plain top-up to the
+// reorder point, preserving prior behaviour for non-moving stock.
+function suggestedOrderUpToQty(
+  reorderPoint: Prisma.Decimal,
+  projectedAvailableQty: Prisma.Decimal,
+  targetCoverQty: Prisma.Decimal,
+  configuredReorderQty: Prisma.Decimal | null,
+): Prisma.Decimal {
+  if (projectedAvailableQty.gte(reorderPoint)) return new Prisma.Decimal(0)
+  const orderUpToGap = reorderPoint.add(targetCoverQty).sub(projectedAvailableQty)
+  if (orderUpToGap.lte(0)) return new Prisma.Decimal(0)
+  return Prisma.Decimal.max(configuredReorderQty ?? new Prisma.Decimal(0), orderUpToGap)
+}
+
 function quantityString(value: DecimalInput): string {
   return roundQuantity(value, 4).toString()
 }
@@ -614,6 +639,10 @@ export async function getReorderReport(
   const client = clientFromDeps(options.deps)
   const generatedAt = nowFromDeps(options.deps)
   const demandDays = parsePositiveInteger(filters.thresholdDays, DEFAULT_DEMAND_WINDOW_DAYS)
+  const targetCoverWeeks = Math.min(
+    MAX_TARGET_COVER_WEEKS,
+    parsePositiveInteger(filters.targetCoverWeeks, DEFAULT_TARGET_COVER_WEEKS),
+  )
   const window = demandWindow(generatedAt, demandDays)
   const [products, stockLevels, velocityInputs, openPoLines, observedLeadTimeP95BySupplierProduct, latestMoRows, bomItemRows] = await Promise.all([
     client.product.findMany({
@@ -746,6 +775,9 @@ export async function getReorderReport(
     /** Reorder point before BOM-driven demand is folded in. */
     baseReorderPoint: Prisma.Decimal
     configuredReorderQty: Prisma.Decimal | null
+    /** Weeks-of-supply cover (targetCoverWeeks × 7 × avgDailyDemand) added on top
+     * of the reorder point to form the order-up-to level. */
+    targetCoverQty: Prisma.Decimal
     abcClass: ReorderReportRow['abcClass']
   }
   const candidatesByProductId = new Map<string, Candidate>()
@@ -775,6 +807,7 @@ export async function getReorderReport(
     const demandDuringLeadTime = averageDailyDemand.mul(leadTimeDays)
     const computedReorderPoint = demandDuringLeadTime.add(safetyStockQty)
     const baseReorderPoint = product.reorderPoint == null ? computedReorderPoint : toDecimal(product.reorderPoint)
+    const targetCoverQty = averageDailyDemand.mul(new Prisma.Decimal(targetCoverWeeks).mul(7))
     const abcClass = abcByProduct.get(product.id) ?? 'C'
     candidatesByProductId.set(product.id, {
       product,
@@ -787,6 +820,7 @@ export async function getReorderReport(
       safetyStockQty,
       baseReorderPoint,
       configuredReorderQty,
+      targetCoverQty,
       abcClass,
     })
   }
@@ -799,10 +833,12 @@ export async function getReorderReport(
   const orderedCandidates = [...candidatesByProductId.values()].sort((a, b) => a.product.sku.localeCompare(b.product.sku))
   for (const candidate of orderedCandidates) {
     if (candidate.product.type !== ProductType.BOM) continue
-    const gap = candidate.baseReorderPoint.sub(candidate.projectedAvailableQty)
-    const ownSuggested = gap.gt(0)
-      ? Prisma.Decimal.max(candidate.configuredReorderQty ?? new Prisma.Decimal(0), gap)
-      : new Prisma.Decimal(0)
+    const ownSuggested = suggestedOrderUpToQty(
+      candidate.baseReorderPoint,
+      candidate.projectedAvailableQty,
+      candidate.targetCoverQty,
+      candidate.configuredReorderQty,
+    )
     if (ownSuggested.lte(0)) continue
     const bomItems = bomItemsByParent.get(candidate.product.id) ?? []
     for (const item of bomItems) {
@@ -827,10 +863,12 @@ export async function getReorderReport(
     // act, even though no direct reorder cadence was configured.
     if (candidate.configuredReorderQty?.lte(0) && extraDemand.lte(0)) continue
     const reorderPoint = candidate.baseReorderPoint.add(extraDemand)
-    const gapQty = reorderPoint.sub(candidate.projectedAvailableQty)
-    const suggestedReorderQty = gapQty.gt(0)
-      ? Prisma.Decimal.max(candidate.configuredReorderQty ?? new Prisma.Decimal(0), gapQty)
-      : new Prisma.Decimal(0)
+    const suggestedReorderQty = suggestedOrderUpToQty(
+      reorderPoint,
+      candidate.projectedAvailableQty,
+      candidate.targetCoverQty,
+      candidate.configuredReorderQty,
+    )
     if (suggestedReorderQty.lte(0) && candidate.projectedAvailableQty.gt(reorderPoint)) continue
     const urgency: ReorderReportRow['urgency'] = candidate.projectedAvailableQty.lte(0)
       ? 'critical'

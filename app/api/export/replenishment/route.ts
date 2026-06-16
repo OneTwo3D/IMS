@@ -57,6 +57,7 @@ function filtersFromRequest(req: NextRequest): StockPositionFilters {
     abcClass: abcClass(one(req, 'abcClass')),
     urgency: urgency(one(req, 'urgency')),
     search: one(req, 'search')?.trim().slice(0, 100) || undefined,
+    targetCoverWeeks: positiveInteger(one(req, 'targetCoverWeeks')),
   }
 }
 

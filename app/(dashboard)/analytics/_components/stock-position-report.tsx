@@ -36,6 +36,7 @@ export type StockPositionFilterValues = {
   abcClass?: string
   urgency?: string
   search?: string
+  targetCoverWeeks?: string
 }
 
 type StockPositionReportPageProps<Row> = {
