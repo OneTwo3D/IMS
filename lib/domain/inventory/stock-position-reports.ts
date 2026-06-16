@@ -77,6 +77,9 @@ export type StockPositionFilters = {
   abcClass?: 'A' | 'B' | 'C'
   urgency?: 'critical' | 'reorder' | 'watch'
   search?: string
+  // audit-32cl: target weeks of supply for the order-up-to suggested quantity
+  // (reorder-report-only). Defaults to DEFAULT_TARGET_COVER_WEEKS when unset.
+  targetCoverWeeks?: number
   page?: number
   pageSize?: number
 }

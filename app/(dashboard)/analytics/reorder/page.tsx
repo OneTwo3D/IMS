@@ -57,6 +57,7 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
     abcClass: abcClassFromSearch(one(searchParams.abcClass)),
     urgency: urgencyFromSearch(one(searchParams.urgency)),
     search: search || undefined,
+    targetCoverWeeks: positiveInteger(one(searchParams.targetCoverWeeks)),
     page: Number(one(searchParams.page) ?? 1),
     pageSize: Number(one(searchParams.pageSize) ?? 100),
   }
@@ -98,6 +99,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     abcClass: filters.abcClass,
     urgency: filters.urgency,
     search: filters.search,
+    targetCoverWeeks: filters.targetCoverWeeks == null ? undefined : String(filters.targetCoverWeeks),
     pageSize: String(filters.pageSize ?? 100),
   }
   const columns: Array<StockPositionColumn<ReorderReportRow>> = [
@@ -170,6 +172,17 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
           <div className="space-y-1.5">
             <label htmlFor="search" className="text-sm font-medium">Search</label>
             <input id="search" name="search" type="search" defaultValue={filtersForUi.search ?? ''} placeholder="SKU, name, supplier…" className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm" />
+          </div>
+          <div className="space-y-1.5">
+            <label htmlFor="targetCoverWeeks" className="text-sm font-medium">Weeks of supply</label>
+            <input id="targetCoverWeeks" name="targetCoverWeeks" type="number" min="1" max="52" step="1" list="targetCoverWeeksOptions" defaultValue={filtersForUi.targetCoverWeeks ?? '8'} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm" />
+            <datalist id="targetCoverWeeksOptions">
+              <option value="4" />
+              <option value="6" />
+              <option value="8" />
+              <option value="12" />
+              <option value="16" />
+            </datalist>
           </div>
         </>
       }
