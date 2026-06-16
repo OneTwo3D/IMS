@@ -235,23 +235,25 @@ function ReceiveDialog({
 
         {/* Only this middle region scrolls — the header and footer stay put. */}
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 space-y-4">
-          <div className="overflow-x-auto rounded-md border">
-            <Table className="min-w-[680px]">
+          <div className="rounded-md border">
+            <Table className="w-full table-fixed">
               <TableHeader className="bg-muted/40">
                 <TableRow>
                   <TableHead className="px-3 text-xs">Product</TableHead>
                   <TableHead className="px-3 text-xs text-right w-16">Ordered</TableHead>
                   <TableHead className="px-3 text-xs text-right w-20">Received</TableHead>
-                  <TableHead className="px-3 text-xs text-right w-20">Remaining</TableHead>
-                  <TableHead className="px-3 text-xs text-right w-28">Receive Now</TableHead>
-                  <TableHead className="px-3 text-xs w-52">Warehouse</TableHead>
+                  <TableHead className="px-3 text-xs text-right w-24">Remaining</TableHead>
+                  <TableHead className="px-3 text-xs text-right w-24">Receive Now</TableHead>
+                  <TableHead className="px-3 text-xs w-44">Warehouse</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {receiptLines.map((l) => (
                   <TableRow key={l.poLineId} className="align-top">
                     <TableCell className="px-3 py-2">
-                      <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                      <div className="flex min-w-0">
+                        <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                      </div>
                     </TableCell>
                     <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyOrdered}</TableCell>
                     <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReceived}</TableCell>
@@ -264,7 +266,7 @@ function ReceiveDialog({
                         step={1}
                         value={l.qtyToReceive}
                         onChange={(e) => updateLine(l.poLineId, 'qtyToReceive', Number(e.target.value))}
-                        className="h-8 text-sm text-right w-24 ml-auto font-mono"
+                        className="h-8 text-sm text-right w-full font-mono"
                       />
                     </TableCell>
                     <TableCell className="px-3 py-2">
@@ -457,23 +459,25 @@ function ReturnDialog({
             />
           </div>
 
-          <div className="overflow-x-auto rounded-md border">
-            <Table className="min-w-[680px]">
+          <div className="rounded-md border">
+            <Table className="w-full table-fixed">
               <TableHeader className="bg-muted/40">
                 <TableRow>
                   <TableHead className="px-3 text-xs">Product</TableHead>
                   <TableHead className="px-3 text-xs text-right w-20">Received</TableHead>
                   <TableHead className="px-3 text-xs text-right w-20">Returned</TableHead>
                   <TableHead className="px-3 text-xs text-right w-24">Returnable</TableHead>
-                  <TableHead className="px-3 text-xs text-right w-28">Return Now</TableHead>
-                  <TableHead className="px-3 text-xs w-52">From Warehouse</TableHead>
+                  <TableHead className="px-3 text-xs text-right w-24">Return Now</TableHead>
+                  <TableHead className="px-3 text-xs w-44">From Warehouse</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {returnLines.map((l) => (
                   <TableRow key={l.poLineId} className="align-top">
                     <TableCell className="px-3 py-2">
-                      <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                      <div className="flex min-w-0">
+                        <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                      </div>
                     </TableCell>
                     <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyReceived}</TableCell>
                     <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReturned > 0 ? l.qtyAlreadyReturned : '—'}</TableCell>
@@ -486,7 +490,7 @@ function ReturnDialog({
                         step={1}
                         value={l.qtyToReturn}
                         onChange={(e) => updateLine(l.poLineId, 'qtyToReturn', Number(e.target.value))}
-                        className="h-8 text-sm text-right w-24 ml-auto font-mono"
+                        className="h-8 text-sm text-right w-full font-mono"
                       />
                     </TableCell>
                     <TableCell className="px-3 py-2">
