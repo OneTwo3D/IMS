@@ -72,13 +72,21 @@ export function buildStockMovementValueFieldsFromTotal(params: {
   totalValueBase: DecimalInput
 }): StockMovementValueFields {
   const qty = toDecimal(params.qty).abs()
-  const totalValueBase = roundMovementValue(params.totalValueBase).abs()
-  if (qty.isZero() && !totalValueBase.isZero()) {
+  const requestedTotal = roundMovementValue(params.totalValueBase).abs()
+  if (qty.isZero() && !requestedTotal.isZero()) {
     throw new Error('Stock movement total value requires a non-zero quantity')
   }
   const unitCostBase = qty.gt(0)
-    ? roundMovementValue(totalValueBase.div(qty))
+    ? roundMovementValue(requestedTotal.div(qty))
     : toDecimal(0)
+  // The DB invariant `stock_movements_reporting_value_consistent` requires
+  // totalValueBase = ROUND(qty * unitCostBase, 6). Since unitCostBase is stored
+  // rounded to 6dp, a weighted-average cost (e.g. £10 over 3 units → 3.333333)
+  // makes qty * unitCostBase (9.999999) differ from the requested total (10.0),
+  // which previously violated the check on mixed-cost FIFO consumption (notably
+  // supplier returns). Derive the stored total FROM the rounded unit cost so the
+  // two are always consistent; the exact per-layer cost remains in cogs_entries.
+  const totalValueBase = roundMovementValue(multiplyMoney(qty, unitCostBase))
 
   return {
     unitCostBase: decimalField(unitCostBase),

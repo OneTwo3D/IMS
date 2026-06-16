@@ -17,10 +17,13 @@ export function ProductThumb({ productId, imageUrl, name }: ProductThumbProps) {
           alt={name ?? ''}
           width={36}
           height={36}
-          className="h-9 w-9 rounded object-cover border border-border bg-muted"
+          /* max-w-none: Tailwind Preflight caps imgs at max-width:100%, which in a
+             squeezed table column collapses the width while h-9 keeps the height,
+             rendering a thin vertical strip. shrink-0 keeps it from flexing. */
+          className="h-9 w-9 max-w-none shrink-0 rounded object-cover border border-border bg-muted"
         />
       ) : (
-        <span className="flex h-9 w-9 items-center justify-center rounded border border-border bg-muted text-muted-foreground">
+        <span className="flex h-9 w-9 max-w-none shrink-0 items-center justify-center rounded border border-border bg-muted text-muted-foreground">
           <Package className="h-4 w-4" />
         </span>
       )}

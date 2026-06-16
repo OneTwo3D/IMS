@@ -43,6 +43,29 @@ test('stock movement value fields derive weighted unit cost from consumed layers
   )
 })
 
+test('total value stays consistent with the rounded unit cost (DB reporting-value invariant)', () => {
+  // £10 over 3 units → 3.333333 unit cost. The stored total must equal
+  // ROUND(qty * unitCostBase, 6) = 9.999999 (NOT the raw 10.000000), or the
+  // stock_movements_reporting_value_consistent CHECK fails — which is what broke
+  // confirming supplier returns that consumed mixed-cost FIFO layers.
+  const fields = buildStockMovementValueFieldsFromTotal({ qty: 3, totalValueBase: 10 })
+  assert.deepEqual(fields, { unitCostBase: '3.333333', totalValueBase: '9.999999' })
+  // Mirror the DB CHECK exactly: totalValueBase === ROUND(qty * unitCostBase, 6).
+  const dbCheck = new Prisma.Decimal(3).mul(fields.unitCostBase).toDecimalPlaces(6).toFixed(6)
+  assert.equal(fields.totalValueBase, dbCheck)
+})
+
+test('mixed-cost FIFO consumption satisfies the reporting-value DB invariant', () => {
+  const fields = buildStockMovementValueFieldsFromConsumed([
+    { qty: new Prisma.Decimal('1'), unitCostBase: new Prisma.Decimal('1') },
+    { qty: new Prisma.Decimal('2'), unitCostBase: new Prisma.Decimal('2') },
+  ])
+  // total 5 over qty 3 → unit 1.666667, total ROUND(3 * 1.666667, 6) = 5.000001.
+  assert.deepEqual(fields, { unitCostBase: '1.666667', totalValueBase: '5.000001' })
+  const dbCheck = new Prisma.Decimal('3').mul(fields.unitCostBase).toDecimalPlaces(6).toFixed(6)
+  assert.equal(fields.totalValueBase, dbCheck)
+})
+
 test('stock movement value fields support zero-cost historical demand rows', () => {
   assert.deepEqual(
     buildStockMovementValueFieldsFromTotal({ qty: 4, totalValueBase: 0 }),
