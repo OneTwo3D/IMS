@@ -1927,7 +1927,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const supplier = suppliers.find((s) => s.id === po.supplierId)
 
   return (
-    <div className="space-y-4 max-w-4xl">
+    <div className="space-y-4 max-w-6xl">
       {/* Status + Actions bar */}
       <div className="flex flex-wrap items-center gap-3">
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[po.status]}`}>
@@ -2132,7 +2132,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       )}
 
       {/* Header info */}
-      <div className="rounded-md border p-4 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
+      <div className="rounded-md border p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-x-8 gap-y-3 text-sm">
           <div>
             <span className="text-muted-foreground">Supplier</span>
             <p className="font-medium">
@@ -2176,7 +2176,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             </div>
           )}
           {(po.shippingProvider || po.trackingNumber) && (
-            <div className="col-span-2">
+            <div className="sm:col-span-2 lg:col-span-4">
               <span className="text-muted-foreground flex items-center gap-1">
                 Tracking
                 {['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(po.status) && (
@@ -2202,13 +2202,13 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             </div>
           )}
           {po.notes && (
-            <div className="col-span-2">
+            <div className="sm:col-span-2 lg:col-span-4">
               <span className="text-muted-foreground">Notes</span>
               <p className="mt-0.5 whitespace-pre-wrap">{po.notes}</p>
             </div>
           )}
           {po.internalNotes && (
-            <div className="col-span-2">
+            <div className="sm:col-span-2 lg:col-span-4">
               <span className="text-muted-foreground">Internal Notes</span>
               <p className="mt-0.5 whitespace-pre-wrap text-muted-foreground">{po.internalNotes}</p>
             </div>

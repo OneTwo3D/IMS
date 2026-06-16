@@ -426,8 +426,10 @@ export async function createReorderPOs(
       where: {
         supplierId: { in: [...bySupplier.keys()] },
         status: 'DRAFT',
-        notes: REORDER_PO_NOTE,
         createdAt: { gte: recentReorderPoCutoff },
+        // Match the marker in internalNotes (current) OR notes (POs created by the
+        // pre-move code) so the dedup still works across the deploy transition.
+        OR: [{ internalNotes: REORDER_PO_NOTE }, { notes: REORDER_PO_NOTE }],
       },
       select: { supplierId: true },
     })
@@ -509,7 +511,7 @@ export async function createReorderPOs(
           taxForeign: 0, taxBase: 0,
           totalForeign: subtotal,
           totalBase: subtotalBase,
-          notes: REORDER_PO_NOTE,
+          internalNotes: REORDER_PO_NOTE,
           lines: { create: lineData },
         },
       })
