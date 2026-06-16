@@ -15,6 +15,12 @@ export type StockMovementValueFields = {
 // Sentinel for historical demand imports where source FIFO/cost provenance is unavailable.
 export const HISTORICAL_IMPORT_UNIT_COST = 0
 
+// referenceTypes used by the forecasting-only sales-history imports (WooCommerce
+// historical/initial + CSV). Their SALE_DISPATCH movements are zero-cost demand
+// records with no warehouse and no COGS evidence, excluded from stock/stats/COGS/
+// retention — and from the outbound COGS-evidence guard (DB trigger + invariants).
+export const HISTORICAL_IMPORT_REFERENCE_TYPES = ['WcHistorical', 'WcInitialImport', 'CsvHistorical'] as const
+
 export const STOCK_MOVEMENT_VALUE_SOURCE_BY_TYPE: Record<StockMovementType, string> = {
   ADJUSTMENT: 'positive adjustments use average/historical cost; negative adjustments use FIFO consumption',
   KIT_ASSEMBLY_IN: 'reserved legacy type; active manufacturing assembly writes PRODUCTION_IN',

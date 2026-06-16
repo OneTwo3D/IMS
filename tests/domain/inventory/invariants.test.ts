@@ -515,6 +515,71 @@ test('inbound and outbound stock movements require reporting evidence rows', () 
   ])
 })
 
+test('forecasting-only historical-import SALE_DISPATCH movements are exempt from the COGS-evidence guard', () => {
+  // These are zero-cost, warehouse-less demand records seeded for forecasting; they
+  // carry no cogs_entries by design and must not be flagged (matches the DB trigger
+  // exemption in migration 20260616120000).
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: ['WcHistorical', 'CsvHistorical', 'WcInitialImport'].map((referenceType, i) => ({
+      id: `movement-historical-${i}`,
+      type: 'SALE_DISPATCH',
+      productId: `product-${i}`,
+      fromWarehouseId: null,
+      toWarehouseId: null,
+      qty: 1,
+      referenceType,
+      referenceId: `${referenceType}-ref-${i}`,
+      _count: { cogsEntries: 0 },
+      product: { id: `product-${i}`, sku: `HIST-${i}`, type: 'SIMPLE' },
+    })),
+    shippedShipmentLines: [],
+  })
+
+  assert.equal(findings.some((finding) => finding.code === 'stock_movement_missing_cogs_entry'), false)
+})
+
+test('new-migration trigger exemption clause is locked (narrowed to warehouse-less SALE_DISPATCH)', () => {
+  const migration = readFileSync(
+    'prisma/migrations/20260616120000_exempt_historical_imports_from_cogs_guard/migration.sql',
+    'utf8',
+  )
+  assert.match(migration, /CREATE OR REPLACE FUNCTION assert_stock_movement_reporting_evidence/)
+  // The exemption must be the narrowed shape, not a blanket referenceType skip.
+  assert.match(migration, /NEW\.type = 'SALE_DISPATCH'/)
+  assert.match(migration, /NEW\."fromWarehouseId" IS NULL/)
+  assert.match(migration, /NEW\."toWarehouseId" IS NULL/)
+  assert.match(migration, /COALESCE\(NEW\."referenceType", ''\) IN \('WcHistorical', 'WcInitialImport', 'CsvHistorical'\)/)
+  // The inbound cost-layer branch must remain untouched.
+  assert.match(migration, /Inbound stock movement % \(%\) requires matching cost-layer evidence/)
+})
+
+test('COGS-evidence guard is NOT evaded by borrowing a historical referenceType', () => {
+  // Each of these still REQUIRES COGS evidence — only a warehouse-less SALE_DISPATCH
+  // with a historical referenceType is exempt.
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [
+      // warehouse-backed SALE_DISPATCH with a historical referenceType → NOT exempt
+      { id: 'm-wh-sale', type: 'SALE_DISPATCH', productId: 'p1', fromWarehouseId: 'warehouse-1', toWarehouseId: null, qty: 1, referenceType: 'WcHistorical', referenceId: 'r1', _count: { cogsEntries: 0 }, product: { id: 'p1', sku: 'P1', type: 'SIMPLE' } },
+      // PRODUCTION_OUT with a historical referenceType → NOT exempt
+      { id: 'm-prodout', type: 'PRODUCTION_OUT', productId: 'p2', fromWarehouseId: 'warehouse-1', toWarehouseId: null, qty: 1, referenceType: 'WcInitialImport', referenceId: 'r2', _count: { cogsEntries: 0 }, product: { id: 'p2', sku: 'P2', type: 'SIMPLE' } },
+      // outbound ADJUSTMENT with a historical referenceType → NOT exempt
+      { id: 'm-adj', type: 'ADJUSTMENT', productId: 'p3', fromWarehouseId: 'warehouse-1', toWarehouseId: null, qty: 1, referenceType: 'CsvHistorical', referenceId: 'r3', _count: { cogsEntries: 0 }, product: { id: 'p3', sku: 'P3', type: 'SIMPLE' } },
+      // warehouse-less SALE_DISPATCH with null referenceType → NOT exempt
+      { id: 'm-null-ref', type: 'SALE_DISPATCH', productId: 'p4', fromWarehouseId: 'warehouse-1', toWarehouseId: null, qty: 1, referenceType: null, referenceId: null, _count: { cogsEntries: 0 }, product: { id: 'p4', sku: 'P4', type: 'SIMPLE' } },
+      // warehouse-less SALE_DISPATCH with an unrecognised referenceType → NOT exempt
+      { id: 'm-other-ref', type: 'SALE_DISPATCH', productId: 'p5', fromWarehouseId: 'warehouse-1', toWarehouseId: null, qty: 1, referenceType: 'SalesOrder', referenceId: 'r5', _count: { cogsEntries: 0 }, product: { id: 'p5', sku: 'P5', type: 'SIMPLE' } },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  const flagged = findings.filter((f) => f.code === 'stock_movement_missing_cogs_entry').length
+  assert.equal(flagged, 5)
+})
+
 test('purchase receipt evidence must belong to the referenced purchase order', () => {
   const findings = evaluateInventoryInvariantRows({
     stockLevels: [],

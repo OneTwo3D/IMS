@@ -8,6 +8,7 @@ import {
   loadReservationSourceRows,
   type ReservationBreakdownRow,
 } from '@/lib/domain/inventory/reservation-breakdown'
+import { HISTORICAL_IMPORT_REFERENCE_TYPES } from '@/lib/domain/inventory/stock-movement-value'
 
 export type InventoryInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -204,6 +205,7 @@ const FIFO_RECONCILIATION_EXCEPTION = 'Products without FIFO cost layers are exc
 const INVENTORY_INVARIANT_TRUNCATED_CODE = 'invariant_report_truncated'
 const INBOUND_COST_LAYER_MOVEMENT_TYPES = new Set(['PURCHASE_RECEIPT', 'PRODUCTION_IN'])
 const OUTBOUND_COGS_MOVEMENT_TYPES = new Set(['SALE_DISPATCH', 'PURCHASE_REVERSAL', 'PRODUCTION_OUT'])
+const HISTORICAL_IMPORT_REFERENCE_TYPE_SET: ReadonlySet<string> = new Set(HISTORICAL_IMPORT_REFERENCE_TYPES)
 const ADJUSTMENT_MOVEMENT_TYPE = 'ADJUSTMENT'
 
 // KIT availability is derived from components, so KIT parents do not carry
@@ -283,8 +285,22 @@ function requiresCogsEntryEvidence(
   tolerance: number,
 ): boolean {
   if (qty <= tolerance) return false
+  if (isHistoricalImportDemandMovement(movement)) return false
   if (OUTBOUND_COGS_MOVEMENT_TYPES.has(movement.type)) return true
   return movement.type === ADJUSTMENT_MOVEMENT_TYPE && Boolean(movement.fromWarehouseId)
+}
+
+// Forecasting-only demand history: a warehouse-less SALE_DISPATCH carrying a
+// historical-import referenceType. Zero-cost demand records with no COGS entry by
+// design — exempt from the COGS-evidence guard. Narrowed to this exact shape (matches
+// the DB trigger in migration 20260616120000) so a real warehouse-backed dispatch,
+// PRODUCTION_OUT, or outbound ADJUSTMENT cannot evade the guard via referenceType.
+function isHistoricalImportDemandMovement(movement: InventoryInvariantStockMovementRow): boolean {
+  return movement.type === 'SALE_DISPATCH'
+    && !movement.fromWarehouseId
+    && !movement.toWarehouseId
+    && Boolean(movement.referenceType)
+    && HISTORICAL_IMPORT_REFERENCE_TYPE_SET.has(movement.referenceType!)
 }
 
 function hasMatchingInboundCostLayer(
@@ -1610,6 +1626,16 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
           OR (sm.type = 'ADJUSTMENT' AND sm."fromWarehouseId" IS NOT NULL)
         )
         AND sm.qty > ${toleranceSql}
+        -- Exempt forecasting demand history (warehouse-less SALE_DISPATCH with a
+        -- historical-import referenceType) — matches the DB trigger 20260616120000
+        -- and requiresCogsEntryEvidence, so the report doesn't flag rows the DB
+        -- intentionally permits.
+        AND NOT (
+          sm.type = 'SALE_DISPATCH'
+          AND sm."fromWarehouseId" IS NULL
+          AND sm."toWarehouseId" IS NULL
+          AND COALESCE(sm."referenceType", '') IN ('WcHistorical', 'WcInitialImport', 'CsvHistorical')
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM "cogs_entries" ce
