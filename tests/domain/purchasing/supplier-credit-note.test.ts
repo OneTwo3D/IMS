@@ -130,10 +130,15 @@ test('credit-note tax type: reverse-charge goods credit reverses on the RC tax t
     resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }),
     'REVERSECHARGES',
   )
-  // RC but no configured RC tax type → safe fallback (no fabricated reversal),
-  // matching the bill poster which only swaps when the RC tax type is configured.
+  // RC but no configured RC tax type → fall back to the line's own tax type
+  // (NOT NONE), mirroring the bill poster's baseTaxType fallback.
   assert.equal(
     resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: '' }),
+    'INPUT2',
+  )
+  // RC, no RC tax type AND no line tax type → NONE (nothing to mirror).
+  assert.equal(
+    resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: null, isReverseCharge: true, reverseChargeTaxType: '' }),
     'NONE',
   )
   // Not reverse-charge → unchanged behaviour (RC tax type ignored).
@@ -141,6 +146,18 @@ test('credit-note tax type: reverse-charge goods credit reverses on the RC tax t
     resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2', isReverseCharge: false, reverseChargeTaxType: 'REVERSECHARGES' }),
     'INPUT2',
   )
+})
+
+test('sync payload posts EXCLUSIVE for reverse-charge (net amount), INCLUSIVE otherwise', () => {
+  const base = {
+    creditNoteId: 'scn-rc', creditNoteNumber: 'CN-RC', reference: 'PO-RC', reason: 'RC return',
+    supplierName: 'EU Supplier', supplierId: 'sup-eu', currency: 'EUR', fxRateToBase: 0.85,
+    amountForeign: 100, transitAccount: '1250', taxType: 'REVERSECHARGES', date: '2026-06-16',
+  }
+  // Default (standard/freight): inclusive.
+  assert.equal(buildSupplierCreditNoteSyncPayload(base).lineAmountsIncludeTax, true)
+  // Reverse charge: exclusive so Xero adds the notional VAT to the net amount.
+  assert.equal(buildSupplierCreditNoteSyncPayload({ ...base, lineAmountsIncludeTax: false }).lineAmountsIncludeTax, false)
 })
 
 test('sync payload falls back to reference then a synthetic number, and a default line description', () => {

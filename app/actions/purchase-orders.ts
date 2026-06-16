@@ -3363,7 +3363,15 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
         // audit-v08m: + the bill's external (Xero) id, to allocate the credit to it.
         purchaseInvoice: { select: { taxForeign: true, accountingInvoiceId: true } },
-        po: { select: { reference: true, type: true, supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true, reverseCharge: true } } } } } },
+        po: {
+          select: {
+            reference: true, type: true,
+            supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true, reverseCharge: true } } } },
+            // Per-line tax rates drive the bill's per-line tax choice. A null line
+            // rate means the line follows the order/supplier default rate.
+            lines: { select: { taxRate: { select: { accountingTaxType: true, reverseCharge: true } } } },
+          },
+        },
       },
     })
     if (!cn) return { success: false, error: 'Credit note not found' }
@@ -3374,15 +3382,27 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     const connector = await getActiveAccountingConnectorInfo()
     const settings = await getAccountingSettings()
 
-    // Mirror the bill's tax treatment. A reverse-charge goods PO carries no
-    // supplier VAT (taxForeign 0) but its bill posts on the reverse-charge tax
-    // type, so the credit must reverse on that SAME type (not NONE) to unwind the
-    // notional VAT — gated to goods POs, since freight never applies the RC swap.
-    // Otherwise: the supplier tax type when the bill carried VAT, else NONE.
+    // Mirror the bill's tax treatment, derived from the PO LINES' effective tax
+    // rates (a null line rate follows the supplier default) rather than the
+    // supplier default alone, so per-line overrides are respected. Reverse charge
+    // only when GOODS lines are UNIFORMLY reverse-charge (a single-amount credit
+    // can't represent a mixed-tax bill).
+    const supplierRate = cn.po.supplier.taxRate
+    const goodsLineRates = cn.po.type === 'GOODS'
+      ? cn.po.lines.map((l) => l.taxRate ?? supplierRate).filter((r): r is NonNullable<typeof r> => !!r)
+      : []
+    const isReverseCharge = goodsLineRates.length > 0 && goodsLineRates.every((r) => r.reverseCharge)
+    // Base (non-RC) tax type: the line rate where overridden, else the supplier default.
+    const baseTaxType = (cn.po.lines.find((l) => l.taxRate)?.taxRate ?? supplierRate)?.accountingTaxType
+
+    // A reverse-charge goods PO carries no supplier VAT (taxForeign 0) but its bill
+    // posts on the reverse-charge tax type, so the credit must reverse on that SAME
+    // type (not NONE) to unwind the notional VAT. Otherwise: the line/supplier tax
+    // type when the bill carried VAT, else NONE.
     const creditNoteTaxType = resolveSupplierCreditNoteTaxType({
       billHadTax: Number(cn.purchaseInvoice?.taxForeign ?? 0) > 0,
-      supplierTaxType: cn.po.supplier.taxRate?.accountingTaxType,
-      isReverseCharge: cn.po.type === 'GOODS' && !!cn.po.supplier.taxRate?.reverseCharge,
+      supplierTaxType: baseTaxType,
+      isReverseCharge,
       reverseChargeTaxType: settings.reverseChargePurchaseTaxType || null,
     })
     // Xero-only: the ACCPAYCREDIT poster exists for Xero. For other connectors the
@@ -3416,6 +3436,10 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             amountForeign: Number(cn.amountForeign),
             transitAccount: settings.transitAccount,
             taxType: creditNoteTaxType,
+            // Reverse-charge credits carry a NET amount → post EXCLUSIVE so Xero
+            // adds the notional VAT (mirroring the net/exclusive RC bill); all
+            // others carry a GROSS amount → INCLUSIVE.
+            lineAmountsIncludeTax: !isReverseCharge,
             date: new Date().toISOString().slice(0, 10),
             // audit-v08m: allocate the credit to the bill once both have posted to
             // Xero. Skipped when the bill has no external id yet (allocation needs it).

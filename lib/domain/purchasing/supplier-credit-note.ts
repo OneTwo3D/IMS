@@ -70,7 +70,13 @@ export function resolveSupplierCreditNoteTaxType(params: {
   /** The configured reverse-charge purchase tax type (accounting settings). */
   reverseChargeTaxType?: string | null
 }): string {
-  if (params.isReverseCharge && params.reverseChargeTaxType) return params.reverseChargeTaxType
+  if (params.isReverseCharge) {
+    // Mirror the bill poster exactly: the configured RC tax type when set, else
+    // the line's own accounting tax type (baseTaxType) — NOT NONE, so an RC
+    // purchase with no RC tax type configured still posts on the line's tax type
+    // just as the bill did.
+    return params.reverseChargeTaxType || params.supplierTaxType || 'NONE'
+  }
   if (params.billHadTax && params.supplierTaxType) return params.supplierTaxType
   return 'NONE'
 }
@@ -99,6 +105,11 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   // allocation skipped) when the bill hasn't synced to Xero yet.
   allocateToInvoiceId?: string | null
   allocateAmount?: number | null
+  // Reverse-charge credits carry a NET amount and post EXCLUSIVE (like the bill,
+  // which sends net/exclusive lines) so Xero computes the notional VAT on top
+  // rather than netting the amount down. Standard/freight credits carry a GROSS
+  // amount and post INCLUSIVE. Defaults to inclusive.
+  lineAmountsIncludeTax?: boolean
 }): Record<string, unknown> {
   return {
     creditNoteNumber: params.creditNoteNumber ?? params.reference ?? `SCN-${params.creditNoteId}`,
@@ -115,12 +126,13 @@ export function buildSupplierCreditNoteSyncPayload(params: {
         taxType: params.taxType,
       },
     ],
-    // audit-oy5p: the entered amount is the GROSS credit (the over-credit cap is
-    // checked against the bill's gross total), so post tax-INCLUSIVE — Xero then
-    // splits net + VAT under the mirrored tax type. Without this the amount would
-    // be treated as net and VAT added on top, over-crediting a vatable bill. With
-    // a NONE tax type inclusive vs exclusive is identical (no VAT).
-    lineAmountsIncludeTax: true,
+    // Standard/freight: the amount is GROSS (the over-credit cap is the bill's
+    // gross total), so post tax-INCLUSIVE — Xero splits net + VAT under the
+    // mirrored tax type (treating it as net would add VAT on top and over-credit).
+    // Reverse charge: the amount is NET and posts EXCLUSIVE so Xero applies the
+    // notional RC VAT on top, mirroring the net/exclusive RC bill. With a NONE
+    // tax type inclusive vs exclusive is identical (no VAT).
+    lineAmountsIncludeTax: params.lineAmountsIncludeTax ?? true,
     reference: params.reference ?? undefined,
     supplierId: params.supplierId,
     // audit-v08m: only carried when the bill has an external id — the follow-up
