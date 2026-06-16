@@ -367,7 +367,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
       // --- Variations (VARIABLE products) ---
       if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
-        await syncVariations(wcProduct.id, syncedProductId, wcProduct.name)
+        await syncVariations(wcProduct.id, syncedProductId, wcProduct.name, imsCategoryId)
       }
 
       // --- Product options (variation attributes) ---
@@ -434,7 +434,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
       // --- Variations (VARIABLE products) ---
       if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
-        await syncVariations(wcProduct.id, created.id, wcProduct.name)
+        await syncVariations(wcProduct.id, created.id, wcProduct.name, imsCategoryId)
       }
 
       // --- Product options (variation attributes) ---
@@ -498,6 +498,10 @@ async function syncVariations(
   wcParentId: number,
   imsParentId: string,
   parentName: string,
+  // Variants inherit the parent product's resolved category. Only a real (non-null)
+  // category is applied — a variant's category is never cleared by inheritance, even
+  // if the parent currently resolves to no category (matches the backfill's policy).
+  parentCategoryId: string | null | undefined,
 ) {
   let page = 1
   let totalPages = 1
@@ -554,6 +558,7 @@ async function syncVariations(
           parentId: imsParentId,
           externalProductId: BigInt(v.id),
         }
+        if (parentCategoryId != null) updateData.categoryId = parentCategoryId
         if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
         if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
         if (gtin && !existing.barcode) updateData.barcode = gtin
@@ -577,6 +582,7 @@ async function syncVariations(
             lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status),
             type: 'VARIANT',
             parentId: imsParentId,
+            ...(parentCategoryId != null ? { categoryId: parentCategoryId } : {}),
             externalProductId: BigInt(v.id),
           },
         })

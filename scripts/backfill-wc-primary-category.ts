@@ -4,10 +4,12 @@
 // primary-category logic (Yoast / Rank Math primary → deepest fallback), for
 // products imported before that logic existed.
 //
-// Mirrors the importer's scope: pages WooCommerce /products (SIMPLE + VARIABLE
-// parents — the products the importer assigns a category to; variations never
-// carry a category), resolves the category, and updates the matching IMS product
-// (joined by externalProductId, falling back to SKU) only when it actually changes.
+// Phase A — parents: pages WooCommerce /products (SIMPLE + VARIABLE parents),
+// resolves the category, and updates the matching IMS product (joined by
+// externalProductId, falling back to SKU) only when it actually changes.
+// Phase B — variants: VARIANT products inherit their parent's resolved category.
+//
+// Never CLEARS a category (skips when nothing resolves / parent has no category).
 //
 // Dry-run by default. Pass --apply to write. Requires DATABASE_URL,
 // SETTINGS_ENCRYPTION_KEY (to read encrypted WC credentials) in the environment.
@@ -39,11 +41,13 @@ async function main() {
 
   // Index existing IMS products by their WC link and by SKU.
   const imsProducts = await db.product.findMany({
-    select: { id: true, sku: true, externalProductId: true, categoryId: true },
+    select: { id: true, sku: true, type: true, parentId: true, externalProductId: true, categoryId: true },
   })
   const byExternalId = new Map<string, typeof imsProducts[number]>()
   const bySku = new Map<string, typeof imsProducts[number]>()
+  const currentCategoryById = new Map<string, string | null>()
   for (const p of imsProducts) {
+    currentCategoryById.set(p.id, p.categoryId)
     if (p.externalProductId != null) byExternalId.set(p.externalProductId.toString(), p)
     const sku = p.sku?.trim()
     if (sku) bySku.set(sku, p)
@@ -54,6 +58,9 @@ async function main() {
   let unmatched = 0
   let unresolved = 0
   const changes: Array<{ id: string; sku: string; from: string | null; to: string | null }> = []
+  // The category each matched parent WILL have after this run (its resolved value) —
+  // used so variants inherit the post-backfill parent category, in dry-run and apply.
+  const resolvedByImsId = new Map<string, string>()
 
   while (true) {
     const res = await wcFetch('/products', { per_page: '100', page: String(page), status: 'any' })
@@ -75,6 +82,7 @@ async function main() {
       // Never CLEAR a category: if nothing resolves (no mapped/primary WC category),
       // leave the existing IMS category untouched rather than nulling it.
       if (resolved == null) { unresolved++; continue }
+      resolvedByImsId.set(ims.id, resolved)
       if (resolved !== ims.categoryId) {
         changes.push({ id: ims.id, sku: ims.sku, from: ims.categoryId, to: resolved })
       }
@@ -84,8 +92,30 @@ async function main() {
     page += 1
   }
 
+  // Phase B: VARIANT products inherit their parent's (resolved) category. Only VARIANT
+  // children are WooCommerce variations; KIT/BOM children are a different concept and
+  // are intentionally out of scope. Use the parent's post-backfill category when known,
+  // else its current stored category. Only propagate a non-null parent category (never
+  // clear a variant's category).
+  const typeById = new Map(imsProducts.map((p) => [p.id, p.type]))
+  const variantChanges: Array<{ id: string; sku: string; from: string | null; to: string }> = []
+  let orphanVariants = 0
+  for (const p of imsProducts) {
+    if (p.type !== 'VARIANT' || !p.parentId) continue
+    // Defensive: a VARIANT should point at a VARIABLE parent. Skip + count anything else.
+    if (typeById.get(p.parentId) !== 'VARIABLE') { orphanVariants++; continue }
+    const parentCategory = resolvedByImsId.get(p.parentId) ?? currentCategoryById.get(p.parentId) ?? null
+    if (parentCategory != null && parentCategory !== p.categoryId) {
+      variantChanges.push({ id: p.id, sku: p.sku, from: p.categoryId, to: parentCategory })
+    }
+  }
+  if (orphanVariants > 0) {
+    console.warn(`WARNING: ${orphanVariants} VARIANT product(s) have a missing or non-VARIABLE parent — skipped.`)
+  }
+
   // Resolve category names for a readable report.
-  const catIds = Array.from(new Set(changes.flatMap((c) => [c.from, c.to]).filter((x): x is string => Boolean(x))))
+  const allChanges = [...changes, ...variantChanges]
+  const catIds = Array.from(new Set(allChanges.flatMap((c) => [c.from, c.to]).filter((x): x is string => Boolean(x))))
   const cats = catIds.length > 0
     ? await db.productCategory.findMany({ where: { id: { in: catIds } }, select: { id: true, name: true } })
     : []
@@ -93,11 +123,12 @@ async function main() {
   const label = (id: string | null) => (id ? nameById.get(id) ?? id : '(none)')
 
   console.log(`Scanned ${scanned} WC products · matched IMS: ${scanned - unmatched} · unmatched (no IMS SKU/link): ${unmatched} · unresolved (no mapped category, left untouched): ${unresolved}`)
-  console.log(`Category changes to apply: ${changes.length}`)
-  for (const c of changes.slice(0, 25)) {
-    console.log(`  ${c.sku}: ${label(c.from)} -> ${label(c.to)}`)
-  }
-  if (changes.length > 25) console.log(`  … and ${changes.length - 25} more`)
+  console.log(`Phase A — parent category changes: ${changes.length}`)
+  for (const c of changes.slice(0, 15)) console.log(`  ${c.sku}: ${label(c.from)} -> ${label(c.to)}`)
+  if (changes.length > 15) console.log(`  … and ${changes.length - 15} more`)
+  console.log(`Phase B — variant inheritance changes: ${variantChanges.length}`)
+  for (const c of variantChanges.slice(0, 15)) console.log(`  ${c.sku}: ${label(c.from)} -> ${label(c.to)}`)
+  if (variantChanges.length > 15) console.log(`  … and ${variantChanges.length - 15} more`)
 
   if (!APPLY) {
     // Note: ensureWcCategoryTreeMirrored() above mirrors the WC category TREE into
@@ -108,11 +139,11 @@ async function main() {
   }
 
   let updated = 0
-  for (const c of changes) {
+  for (const c of allChanges) {
     await db.product.update({ where: { id: c.id }, data: { categoryId: c.to } })
     updated++
   }
-  console.log(`\nAPPLIED ${updated} category update(s).`)
+  console.log(`\nAPPLIED ${updated} category update(s) (${changes.length} parents, ${variantChanges.length} variants).`)
 }
 
 main()
