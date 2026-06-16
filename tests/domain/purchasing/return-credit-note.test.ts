@@ -92,16 +92,33 @@ test('never credits more than the bill gross (cap), netting existing credits', (
   assert.equal(draft?.amountForeign, 10)
 })
 
-test('credits against the most recent contributing bill on a multi-bill PO', () => {
+test('multi-bill over-billed line falls back to manual (returns null)', () => {
   const older = bill({ invoiceId: 'INV_OLD', createdAt: 1 })
   const newer = bill({ invoiceId: 'INV_NEW', createdAt: 2 })
   const draft = computeReturnCreditNoteDraft({
     poLines: [{ poLineId: 'L1', qtyReceived: 15, qtyReturned: 3 }],
-    // L1 is billed on BOTH bills (qty 15 each = 30 billed); returned 3 of 15 kept 12,
-    // over-billed = 30 − 12 = 18 units. Target the newer bill.
+    // L1 is billed on BOTH bills (mixed tax/FX can't be split from a PO-level
+    // average), so no draft is auto-created — finance handles it manually.
     bills: [older, newer],
   })
-  assert.equal(draft?.invoiceId, 'INV_NEW')
+  assert.equal(draft, null)
+})
+
+test('a second contributing bill on a DIFFERENT line still allows single-bill auto-credit', () => {
+  // L1 billed only on INV1 (returned), L2 billed only on INV2 (kept) → only INV1
+  // is a contributing (over-billed) bill, so the credit is created against it.
+  const draft = computeReturnCreditNoteDraft({
+    poLines: [
+      { poLineId: 'L1', qtyReceived: 15, qtyReturned: 3 },
+      { poLineId: 'L2', qtyReceived: 10, qtyReturned: 0 },
+    ],
+    bills: [
+      bill({ invoiceId: 'INV1', createdAt: 1, lines: [{ poLineId: 'L1', qtyBilled: 15, totalForeign: 150 }] }),
+      bill({ invoiceId: 'INV2', createdAt: 2, subtotalForeign: 100, totalForeign: 120, lines: [{ poLineId: 'L2', qtyBilled: 10, totalForeign: 100 }] }),
+    ],
+  })
+  assert.equal(draft?.invoiceId, 'INV1')
+  assert.equal(draft?.amountForeign, 36)
 })
 
 test('clamps a corrupt qtyReturned > qtyReceived to zero net (no negative credit)', () => {

@@ -99,7 +99,11 @@ export function computePrepaidReconciliation(input: {
     // user to "chase the delivery" for goods they deliberately sent back.
     const everReceived = toDecimal(poLine.qtyReceived)
     const shortfall = subtractMoney(billed.qty, everReceived)
-    if (shortfall.lt(-QTY_EPSILON)) hasUnderBilled = true
+    // Under-billed (a balancing bill may be due) is about goods KEPT beyond what
+    // was billed, so it nets returns: returned goods don't need billing. Using
+    // ever-received here would wrongly flag "final bill due" for returned goods.
+    const netKept = subtractMoney(poLine.qtyReceived, poLine.qtyReturned)
+    if (subtractMoney(netKept, billed.qty).gt(QTY_EPSILON)) hasUnderBilled = true
     if (shortfall.lte(QTY_EPSILON)) continue
 
     // billed.qty > 0 is guaranteed by the early-continue above.

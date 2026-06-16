@@ -70,6 +70,17 @@ test('under-billed prepaid PO (net received > billed) flags a balancing bill, no
   assert.equal(summary.hasUnderBilled, true)
 })
 
+test('under-billed nets returns: received 100, returned 50, billed 50 → kept == billed, no balancing bill', () => {
+  const summary = computePrepaidReconciliation({
+    isPrepaidSupplier: true,
+    lines: [{ id: 'l1', productId: 'p1', sku: 'SKU-1', qtyReceived: 100, qtyReturned: 50 }],
+    invoices: [{ lines: [{ poLineId: 'l1', qtyBilled: 50, totalBase: 500 }] }],
+  })
+  // 50 kept, 50 billed → balanced; ever-received (100) must NOT flag under-billed.
+  assert.equal(summary.hasUnderBilled, false)
+  assert.equal(summary.hasShortfall, false)
+})
+
 test('freight/cost invoice lines with no poLineId are excluded from billed', () => {
   const summary = computePrepaidReconciliation({
     isPrepaidSupplier: true,

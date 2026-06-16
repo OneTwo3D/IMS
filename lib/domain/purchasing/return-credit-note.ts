@@ -113,16 +113,17 @@ export function computeReturnCreditNoteDraft(input: {
   }
   if (overBilledNetForeign.lte(EPSILON)) return null
 
-  // Target the most recent contributing bill (matches the manual model, which
-  // defaults to the latest bill).
-  const targetBill = input.bills
-    .filter((b) => contributingBillIds.has(b.invoiceId))
-    .sort((a, b) => b.createdAt - a.createdAt)[0]
+  // Only auto-create when a SINGLE bill billed the over-billed goods. Spreading
+  // a credit across multiple bills with potentially different tax rates and FX
+  // rates can't be done correctly from a PO-level average, so multi-bill cases
+  // fall back to manual handling (the caller logs a warning).
+  if (contributingBillIds.size !== 1) return null
+  const targetBill = input.bills.find((b) => contributingBillIds.has(b.invoiceId))
   if (!targetBill) return null
 
   // Gross up the net over-billed value by the bill's gross/net ratio so the
-  // credit is tax-inclusive like the bill it offsets. A zero/again net subtotal
-  // (no VAT, or a degenerate bill) falls back to a 1:1 ratio.
+  // credit is tax-inclusive like the bill it offsets. A zero net subtotal (no
+  // VAT, or a degenerate bill) falls back to a 1:1 ratio.
   const subtotal = toDecimal(targetBill.subtotalForeign)
   const grossTotal = toDecimal(targetBill.totalForeign)
   const grossUpRatio = subtotal.gt(0) ? grossTotal.div(subtotal) : toDecimal(1)
@@ -133,14 +134,20 @@ export function computeReturnCreditNoteDraft(input: {
   // to record NOW is that target minus credit notes already against the bill, so
   // repeated returns each top the credit up rather than double-crediting, and a
   // bill already fully credited adds nothing.
-  const billGross = toDecimal(targetBill.totalForeign)
-  const targetCumulative = overBilledGrossForeign.gt(billGross) ? billGross : overBilledGrossForeign
+  const targetCumulative = overBilledGrossForeign.gt(grossTotal) ? grossTotal : overBilledGrossForeign
   const incremental = subtractMoney(targetCumulative, targetBill.alreadyCreditedForeign)
   if (incremental.lte(EPSILON)) return null
 
-  const amountForeign = roundQuantity(incremental, 4).toNumber()
+  // Round to currency precision, then re-cap so rounding can never push the
+  // bill's cumulative credit (already-credited + this draft) above its gross.
+  const remainingToCap = subtractMoney(grossTotal, targetBill.alreadyCreditedForeign)
+  const roundedForeign = roundQuantity(incremental, 4)
+  const finalForeign = roundedForeign.gt(remainingToCap) ? remainingToCap : roundedForeign
+  if (finalForeign.lte(EPSILON)) return null
+
+  const amountForeign = finalForeign.toNumber()
   const fxRateToBase = toDecimal(targetBill.fxRateToBase).toNumber()
-  const amountBase = roundQuantity(multiplyMoney(incremental, targetBill.fxRateToBase), 4).toNumber()
+  const amountBase = roundQuantity(multiplyMoney(finalForeign, targetBill.fxRateToBase), 4).toNumber()
 
   return { invoiceId: targetBill.invoiceId, amountForeign, amountBase, fxRateToBase }
 }

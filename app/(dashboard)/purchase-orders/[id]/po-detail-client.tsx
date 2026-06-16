@@ -2087,10 +2087,11 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {error && <p className="text-sm text-destructive">{error}</p>}
       {notice && <p className="text-sm text-emerald-700 dark:text-emerald-300">{notice}</p>}
-      {/* For prepaid suppliers the prepaid-reconciliation banner below owns the
-          billed>net-received case with the right framing, so suppress the C4
-          "returned goods" banner to avoid two amber banners with the same number. */}
-      {overBilling.hasOverBilling && !prepaidReconciliation.isPrepaidSupplier && (
+      {/* This banner covers RETURNED billed goods (→ auto-created credit note);
+          the prepaid-reconciliation banner below covers genuine NON-delivery.
+          They are distinct concerns and no longer overlap, so both can show
+          (incl. for prepaid suppliers). */}
+      {overBilling.hasOverBilling && (
         <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
           <div className="flex gap-2">
             <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
