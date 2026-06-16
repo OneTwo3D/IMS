@@ -45,12 +45,14 @@ async function main() {
   const bySku = new Map<string, typeof imsProducts[number]>()
   for (const p of imsProducts) {
     if (p.externalProductId != null) byExternalId.set(p.externalProductId.toString(), p)
-    if (p.sku) bySku.set(p.sku, p)
+    const sku = p.sku?.trim()
+    if (sku) bySku.set(sku, p)
   }
 
   let page = 1
   let scanned = 0
   let unmatched = 0
+  let unresolved = 0
   const changes: Array<{ id: string; sku: string; from: string | null; to: string | null }> = []
 
   while (true) {
@@ -61,11 +63,18 @@ async function main() {
 
     for (const wc of products) {
       scanned++
-      const ims = byExternalId.get(String(wc.id)) ?? (wc.sku ? bySku.get(wc.sku) : undefined)
+      // Prefer the durable WC-id link. Only fall back to SKU for products with no
+      // externalProductId yet, and never let a shared SKU hijack a product already
+      // linked to a different WC id.
+      const wcSku = wc.sku?.trim()
+      const skuMatch = wcSku ? bySku.get(wcSku) : undefined
+      const ims = byExternalId.get(String(wc.id))
+        ?? (skuMatch && skuMatch.externalProductId == null ? skuMatch : undefined)
       if (!ims) { unmatched++; continue }
       const resolved = resolveImsCategoryId(wc.categories ?? [], wc.meta_data, mirror)
-      // Only the importer's own resolution drives this column, so only touch rows
-      // where the resolved category actually differs from what's stored.
+      // Never CLEAR a category: if nothing resolves (no mapped/primary WC category),
+      // leave the existing IMS category untouched rather than nulling it.
+      if (resolved == null) { unresolved++; continue }
       if (resolved !== ims.categoryId) {
         changes.push({ id: ims.id, sku: ims.sku, from: ims.categoryId, to: resolved })
       }
@@ -83,7 +92,7 @@ async function main() {
   const nameById = new Map(cats.map((c) => [c.id, c.name]))
   const label = (id: string | null) => (id ? nameById.get(id) ?? id : '(none)')
 
-  console.log(`Scanned ${scanned} WC products · matched IMS: ${scanned - unmatched} · unmatched (no IMS SKU/link): ${unmatched}`)
+  console.log(`Scanned ${scanned} WC products · matched IMS: ${scanned - unmatched} · unmatched (no IMS SKU/link): ${unmatched} · unresolved (no mapped category, left untouched): ${unresolved}`)
   console.log(`Category changes to apply: ${changes.length}`)
   for (const c of changes.slice(0, 25)) {
     console.log(`  ${c.sku}: ${label(c.from)} -> ${label(c.to)}`)
@@ -91,7 +100,10 @@ async function main() {
   if (changes.length > 25) console.log(`  … and ${changes.length - 25} more`)
 
   if (!APPLY) {
-    console.log('\nDRY RUN — no changes written. Re-run with --apply to persist.')
+    // Note: ensureWcCategoryTreeMirrored() above mirrors the WC category TREE into
+    // IMS ProductCategory (idempotent upserts) as a prerequisite for resolution —
+    // that runs in dry-run too. No PRODUCT category assignments are written here.
+    console.log('\nDRY RUN — no product category changes written. Re-run with --apply to persist.')
     return
   }
 
