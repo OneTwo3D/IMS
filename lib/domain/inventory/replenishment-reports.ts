@@ -412,6 +412,17 @@ function quantityString(value: DecimalInput): string {
   return roundQuantity(value, 4).toString()
 }
 
+// audit-5f19: the report deals in whole stockable units, so quantity columns render
+// as integers. Stock/threshold figures round to the nearest unit; the suggested
+// order quantity rounds UP (you must order enough whole units to cover the need).
+function integerQuantityString(value: DecimalInput): string {
+  return roundQuantity(value, 0).toString()
+}
+
+function ceilInteger(value: DecimalInput): Prisma.Decimal {
+  return toDecimal(value).ceil()
+}
+
 function productWhere(filters: StockPositionFilters) {
   const filteredType = filters.productType && REPLENISHMENT_PRODUCT_TYPES.includes(filters.productType)
     ? filters.productType
@@ -506,7 +517,8 @@ function availabilityBreakdownByProduct(stockLevels: StockLevelRow[]): Map<strin
     productId,
     rows
       .sort((a, b) => a.warehouseId.localeCompare(b.warehouseId))
-      .map((row) => `${row.warehouseId}: ${quantityString(row.available)}`)
+      // Whole units, consistent with the integer Available column (audit-5f19).
+      .map((row) => `${row.warehouseId}: ${integerQuantityString(row.available)}`)
       .join('; '),
   ]))
 }
@@ -643,6 +655,10 @@ export async function getReorderReport(
     MAX_TARGET_COVER_WEEKS,
     parsePositiveInteger(filters.targetCoverWeeks, DEFAULT_TARGET_COVER_WEEKS),
   )
+  // audit-5f19: by default only show products needing at least one unit reordered.
+  // includeZero (the "show all products" toggle / CSV export) keeps every candidate,
+  // including those with a zero suggested quantity.
+  const includeAll = filters.includeZero === true
   const window = demandWindow(generatedAt, demandDays)
   const [products, stockLevels, velocityInputs, openPoLines, observedLeadTimeP95BySupplierProduct, latestMoRows, bomItemRows] = await Promise.all([
     client.product.findMany({
@@ -833,12 +849,14 @@ export async function getReorderReport(
   const orderedCandidates = [...candidatesByProductId.values()].sort((a, b) => a.product.sku.localeCompare(b.product.sku))
   for (const candidate of orderedCandidates) {
     if (candidate.product.type !== ProductType.BOM) continue
-    const ownSuggested = suggestedOrderUpToQty(
+    // Ceil to whole units first so component demand is derived from the same
+    // integer build quantity the parent row displays / a draft MO would create.
+    const ownSuggested = ceilInteger(suggestedOrderUpToQty(
       candidate.baseReorderPoint,
       candidate.projectedAvailableQty,
       candidate.targetCoverQty,
       candidate.configuredReorderQty,
-    )
+    ))
     if (ownSuggested.lte(0)) continue
     const bomItems = bomItemsByParent.get(candidate.product.id) ?? []
     for (const item of bomItems) {
@@ -863,13 +881,18 @@ export async function getReorderReport(
     // act, even though no direct reorder cadence was configured.
     if (candidate.configuredReorderQty?.lte(0) && extraDemand.lte(0)) continue
     const reorderPoint = candidate.baseReorderPoint.add(extraDemand)
-    const suggestedReorderQty = suggestedOrderUpToQty(
+    // Round the order quantity UP to whole units — you can't order a fraction, and
+    // it must cover the need. This integer drives the row, the totals, the "needs
+    // reorder" filter, the sort, and downstream draft-PO creation.
+    const suggestedReorderQty = ceilInteger(suggestedOrderUpToQty(
       reorderPoint,
       candidate.projectedAvailableQty,
       candidate.targetCoverQty,
       candidate.configuredReorderQty,
-    )
-    if (suggestedReorderQty.lte(0) && candidate.projectedAvailableQty.gt(reorderPoint)) continue
+    ))
+    // Default view shows only products needing at least one unit; the show-all
+    // toggle / CSV export (includeAll) keeps zero-reorder products too.
+    if (!includeAll && suggestedReorderQty.lt(1)) continue
     const urgency: ReorderReportRow['urgency'] = candidate.projectedAvailableQty.lte(0)
       ? 'critical'
       : candidate.projectedAvailableQty.lte(reorderPoint)
@@ -911,15 +934,16 @@ export async function getReorderReport(
       supplierName,
       supplierSku,
       stockUnit: candidate.product.stockUnit,
-      availableQty: quantityString(candidate.availableQty),
+      availableQty: integerQuantityString(candidate.availableQty),
       warehouseAvailabilityBreakdown: warehouseBreakdown.get(candidate.product.id) ?? '',
-      inboundOpenPoQty: quantityString(candidate.inboundOpenPoQty),
+      inboundOpenPoQty: integerQuantityString(candidate.inboundOpenPoQty),
+      // Daily demand is a rate, not a stock quantity — keep its fractional precision.
       averageDailyDemand: quantityString(candidate.averageDailyDemand),
       leadTimeDays: candidate.leadTimeDays,
-      safetyStockQty: quantityString(candidate.safetyStockQty),
-      reorderPoint: quantityString(reorderPoint),
-      configuredReorderQty: quantityString(candidate.configuredReorderQty ?? 0),
-      suggestedReorderQty: quantityString(suggestedReorderQty),
+      safetyStockQty: integerQuantityString(candidate.safetyStockQty),
+      reorderPoint: integerQuantityString(reorderPoint),
+      configuredReorderQty: integerQuantityString(candidate.configuredReorderQty ?? 0),
+      suggestedReorderQty: suggestedReorderQty.toString(),
       abcClass: candidate.abcClass,
       urgency,
       neededFor,
@@ -940,9 +964,13 @@ export async function getReorderReport(
     return true
   })
 
+  // audit-5f19: highest suggested reorder quantity first so the products needing the
+  // most reordering surface at the top; ties fall back to urgency then SKU.
   displayRows.sort((a, b) => {
     const urgencyOrder = { critical: 0, reorder: 1, watch: 2 }
-    return urgencyOrder[a.urgency] - urgencyOrder[b.urgency] || a.sku.localeCompare(b.sku)
+    return toDecimal(b.suggestedReorderQty).cmp(toDecimal(a.suggestedReorderQty))
+      || urgencyOrder[a.urgency] - urgencyOrder[b.urgency]
+      || a.sku.localeCompare(b.sku)
   })
   const totals = displayRows.reduce(
     (total, row) => ({
@@ -961,9 +989,9 @@ export async function getReorderReport(
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
-      availableQty: quantityString(totals.availableQty),
-      inboundOpenPoQty: quantityString(totals.inboundOpenPoQty),
-      suggestedReorderQty: quantityString(totals.suggestedReorderQty),
+      availableQty: integerQuantityString(totals.availableQty),
+      inboundOpenPoQty: integerQuantityString(totals.inboundOpenPoQty),
+      suggestedReorderQty: integerQuantityString(totals.suggestedReorderQty),
     },
     notices: [
       `Demand velocity uses SALE_DISPATCH movements from ${dateOnly(window.dateFrom)} to ${dateOnly(window.dateTo)}; returns are not netted.`,
