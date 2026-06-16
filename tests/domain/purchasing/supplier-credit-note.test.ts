@@ -118,6 +118,31 @@ test('credit-note tax type mirrors the bill: supplier tax type when the bill had
   assert.equal(resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: undefined }), 'NONE')
 })
 
+test('credit-note tax type: reverse-charge goods credit reverses on the RC tax type, not NONE', () => {
+  // RC purchase: no supplier VAT on the bill (billHadTax false), but the credit
+  // must reverse the notional VAT on the configured RC tax type.
+  assert.equal(
+    resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }),
+    'REVERSECHARGES',
+  )
+  // RC takes precedence even if the bill also somehow carried tax.
+  assert.equal(
+    resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: 'REVERSECHARGES' }),
+    'REVERSECHARGES',
+  )
+  // RC but no configured RC tax type → safe fallback (no fabricated reversal),
+  // matching the bill poster which only swaps when the RC tax type is configured.
+  assert.equal(
+    resolveSupplierCreditNoteTaxType({ billHadTax: false, supplierTaxType: 'INPUT2', isReverseCharge: true, reverseChargeTaxType: '' }),
+    'NONE',
+  )
+  // Not reverse-charge → unchanged behaviour (RC tax type ignored).
+  assert.equal(
+    resolveSupplierCreditNoteTaxType({ billHadTax: true, supplierTaxType: 'INPUT2', isReverseCharge: false, reverseChargeTaxType: 'REVERSECHARGES' }),
+    'INPUT2',
+  )
+})
+
 test('sync payload falls back to reference then a synthetic number, and a default line description', () => {
   const noNumber = buildSupplierCreditNoteSyncPayload({
     creditNoteId: 'scn-2', creditNoteNumber: null, reference: 'PO-ABC', reason: null,

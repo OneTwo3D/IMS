@@ -3363,22 +3363,28 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
         // audit-v08m: + the bill's external (Xero) id, to allocate the credit to it.
         purchaseInvoice: { select: { taxForeign: true, accountingInvoiceId: true } },
-        po: { select: { reference: true, supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } } } },
+        po: { select: { reference: true, type: true, supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true, reverseCharge: true } } } } } },
       },
     })
     if (!cn) return { success: false, error: 'Credit note not found' }
     if (cn.status !== 'DRAFT') return { success: false, error: 'Credit note is already posted' }
-    // audit-oy5p: mirror the freight bill's tax — the supplier tax type when the
-    // bill carried VAT, else NONE (so a vatable freight credit reverses the VAT).
-    const creditNoteTaxType = resolveSupplierCreditNoteTaxType({
-      billHadTax: Number(cn.purchaseInvoice?.taxForeign ?? 0) > 0,
-      supplierTaxType: cn.po.supplier.taxRate?.accountingTaxType,
-    })
 
     // Resolve connector/settings BEFORE the transaction (Codex review: a lookup
     // failure must not occur after the row is already POSTED).
     const connector = await getActiveAccountingConnectorInfo()
     const settings = await getAccountingSettings()
+
+    // Mirror the bill's tax treatment. A reverse-charge goods PO carries no
+    // supplier VAT (taxForeign 0) but its bill posts on the reverse-charge tax
+    // type, so the credit must reverse on that SAME type (not NONE) to unwind the
+    // notional VAT — gated to goods POs, since freight never applies the RC swap.
+    // Otherwise: the supplier tax type when the bill carried VAT, else NONE.
+    const creditNoteTaxType = resolveSupplierCreditNoteTaxType({
+      billHadTax: Number(cn.purchaseInvoice?.taxForeign ?? 0) > 0,
+      supplierTaxType: cn.po.supplier.taxRate?.accountingTaxType,
+      isReverseCharge: cn.po.type === 'GOODS' && !!cn.po.supplier.taxRate?.reverseCharge,
+      reverseChargeTaxType: settings.reverseChargePurchaseTaxType || null,
+    })
     // Xero-only: the ACCPAYCREDIT poster exists for Xero. For other connectors the
     // credit note still records as POSTED in IMS (consistent with sync being off).
     const shouldQueueXero =

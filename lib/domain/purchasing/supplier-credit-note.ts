@@ -43,23 +43,34 @@ export function validateRecordSupplierCreditNote(params: {
 }
 
 /**
- * audit-oy5p: resolve the ACCPAYCREDIT line's tax type so the credit MIRRORS the
- * freight bill it offsets. The freight bill posts its (vatable) cost lines on the
- * supplier's accounting tax type and zero-tax lines on NONE; freight lines don't
- * apply the reverse-charge swap (only product lines do). So: if the offset bill
- * carried tax, reverse with the supplier's tax type; otherwise NONE. Without this
- * a vatable freight credit posted on NONE and under-reversed the VAT.
+ * audit-oy5p / reverse-charge: resolve the ACCPAYCREDIT line's tax type so the
+ * credit MIRRORS the bill it offsets.
  *
- * Scope (Codex review): the credit note is a single amount, so this uses the
- * bill-level tax signal — it assumes a freight bill is uniformly vatable or not
- * (the normal case). An unlinked credit note (billHadTax false) reverses on NONE
- * (conservative — won't fabricate a VAT reversal without a bill to mirror).
- * Per-line tax bases on a mixed bill are out of scope for a single-amount credit.
+ * Reverse charge first: a reverse-charge purchase carries NO supplier VAT
+ * (billHadTax is false because taxForeign is 0), but the goods ARE vatable — the
+ * buyer self-accounts the notional input+output VAT under the reverse-charge tax
+ * type. The bill posts those lines on `reverseChargeTaxType` (see purchase-
+ * invoice-edit.ts), so the credit MUST reverse on that same tax type, NOT NONE,
+ * or the notional VAT is never reversed. Callers set `isReverseCharge` only for
+ * the purchase that actually carries it (a goods PO); freight credits never do.
+ *
+ * Otherwise: if the offset bill carried tax, reverse with the supplier's tax
+ * type; else NONE (conservative — won't fabricate a VAT reversal without a bill
+ * signal to mirror).
+ *
+ * Scope: the credit note is a single amount, so this uses a bill/PO-level tax
+ * signal (uniform tax treatment — the normal case). Per-line tax bases on a
+ * mixed bill remain out of scope for a single-amount credit.
  */
 export function resolveSupplierCreditNoteTaxType(params: {
   billHadTax: boolean
   supplierTaxType: string | null | undefined
+  /** True only when the offset purchase is reverse-charge (a goods PO). */
+  isReverseCharge?: boolean
+  /** The configured reverse-charge purchase tax type (accounting settings). */
+  reverseChargeTaxType?: string | null
 }): string {
+  if (params.isReverseCharge && params.reverseChargeTaxType) return params.reverseChargeTaxType
   if (params.billHadTax && params.supplierTaxType) return params.supplierTaxType
   return 'NONE'
 }
