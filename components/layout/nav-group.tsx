@@ -31,8 +31,12 @@ export function NavGroup({ label, icon: Icon, items, collapsed, onExpand, onNavi
   const isChildActive = (c: NavLink) =>
     pathname === c.href || (pathname.startsWith(c.href + '/') && !linkItems.some((other) => other.href !== c.href && pathname.startsWith(other.href)))
   const isAnyChildActive = linkItems.some(isChildActive)
-  const [expandedByUser, setExpandedByUser] = useState(false)
-  const open = isAnyChildActive || expandedByUser
+  // The group auto-opens when it contains the active route, but an explicit user
+  // toggle must win — otherwise being on a child route force-opens the group and
+  // the collapse click does nothing. `userOpen` (null until the user clicks)
+  // overrides the active-derived default.
+  const [userOpen, setUserOpen] = useState<boolean | null>(null)
+  const open = userOpen ?? isAnyChildActive
 
   const parentClass = cn(
     'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer select-none',
@@ -50,7 +54,7 @@ export function NavGroup({ label, icon: Icon, items, collapsed, onExpand, onNavi
               type="button"
               className={parentClass}
               onClick={() => {
-                setExpandedByUser(true)
+                setUserOpen(true)
                 onExpand?.()
               }}
               aria-label={`Expand ${label}`}
@@ -69,7 +73,7 @@ export function NavGroup({ label, icon: Icon, items, collapsed, onExpand, onNavi
       <button
         type="button"
         className={cn(parentClass, 'w-full')}
-        onClick={() => setExpandedByUser((v) => !v)}
+        onClick={() => setUserOpen(!open)}
       >
         <Icon className="h-4 w-4 shrink-0" />
         <span className="truncate flex-1 text-left">{label}</span>
@@ -168,13 +172,15 @@ function CollapsibleSection({
   onNavigate?: () => void
 }) {
   const hasActiveLink = links.some(isChildActive)
-  const [expandedByUser, setExpandedByUser] = useState(false)
-  const open = hasActiveLink || expandedByUser
+  // User toggle overrides the active-derived default (see NavGroup) so a section
+  // containing the active route can still be collapsed.
+  const [userOpen, setUserOpen] = useState<boolean | null>(null)
+  const open = userOpen ?? hasActiveLink
   return (
     <div className="mt-2 first:mt-0">
       <button
         type="button"
-        onClick={() => setExpandedByUser((v) => !v)}
+        onClick={() => setUserOpen(!open)}
         className={cn(
           'flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm font-semibold transition-colors select-none cursor-pointer',
           'hover:text-foreground',
