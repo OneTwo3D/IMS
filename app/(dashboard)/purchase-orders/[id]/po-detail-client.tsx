@@ -429,14 +429,21 @@ function ReturnDialog({
     })
   }
 
+  const totalToReturn = returnLines.reduce((s, l) => s + (l.qtyToReturn > 0 ? l.qtyToReturn : 0), 0)
+
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl">
-        <DialogHeader>
+      <DialogContent
+        showCloseButton={false}
+        className="flex max-h-[85vh] w-full max-w-4xl flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl"
+      >
+        <DialogHeader className="shrink-0 border-b px-5 py-4">
           <DialogTitle>Return Items — {po.reference}</DialogTitle>
+          <p className="text-xs text-muted-foreground">Return received goods to the supplier and remove them from stock.</p>
         </DialogHeader>
 
-        <div className="space-y-4">
+        {/* Only this middle region scrolls — the header and footer stay put. */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 space-y-4">
           <div className="space-y-1.5">
             <Label htmlFor="returnReason">
               Reason <span className="text-destructive">*</span>
@@ -450,53 +457,55 @@ function ReturnDialog({
             />
           </div>
 
-          <Table className="min-w-[600px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead className="text-xs">Product</TableHead>
-                <TableHead className="text-xs text-right w-20">Received</TableHead>
-                <TableHead className="text-xs text-right w-20">Returned</TableHead>
-                <TableHead className="text-xs text-right w-24">Returnable</TableHead>
-                <TableHead className="text-xs text-right w-24">Return Now</TableHead>
-                <TableHead className="text-xs">From Warehouse</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {returnLines.map((l) => (
-                <TableRow key={l.poLineId}>
-                  <TableCell>
-                    <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
-                  </TableCell>
-                  <TableCell className="text-right tabular-nums text-muted-foreground">{l.qtyReceived}</TableCell>
-                  <TableCell className="text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReturned > 0 ? l.qtyAlreadyReturned : '—'}</TableCell>
-                  <TableCell className="text-right tabular-nums font-medium">{l.netReturnable}</TableCell>
-                  <TableCell>
-                    <Input
-                      type="number"
-                      min={0}
-                      max={l.netReturnable}
-                      step={1}
-                      value={l.qtyToReturn}
-                      onChange={(e) => updateLine(l.poLineId, 'qtyToReturn', Number(e.target.value))}
-                      className="h-7 text-sm text-right w-24 ml-auto font-mono"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <select
-                      value={l.warehouseId}
-                      onChange={(e) => updateLine(l.poLineId, 'warehouseId', e.target.value)}
-                      className="h-7 rounded-md border border-input bg-background px-2 text-xs w-36"
-                    >
-                      <option value="">Select…</option>
-                      {warehouses.map((w) => (
-                        <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
-                      ))}
-                    </select>
-                  </TableCell>
+          <div className="overflow-x-auto rounded-md border">
+            <Table className="min-w-[680px]">
+              <TableHeader className="bg-muted/40">
+                <TableRow>
+                  <TableHead className="px-3 text-xs">Product</TableHead>
+                  <TableHead className="px-3 text-xs text-right w-20">Received</TableHead>
+                  <TableHead className="px-3 text-xs text-right w-20">Returned</TableHead>
+                  <TableHead className="px-3 text-xs text-right w-24">Returnable</TableHead>
+                  <TableHead className="px-3 text-xs text-right w-28">Return Now</TableHead>
+                  <TableHead className="px-3 text-xs w-52">From Warehouse</TableHead>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+              </TableHeader>
+              <TableBody>
+                {returnLines.map((l) => (
+                  <TableRow key={l.poLineId} className="align-top">
+                    <TableCell className="px-3 py-2">
+                      <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                    </TableCell>
+                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyReceived}</TableCell>
+                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReturned > 0 ? l.qtyAlreadyReturned : '—'}</TableCell>
+                    <TableCell className="px-3 py-2 text-right tabular-nums font-medium">{l.netReturnable}</TableCell>
+                    <TableCell className="px-3 py-2">
+                      <Input
+                        type="number"
+                        min={0}
+                        max={l.netReturnable}
+                        step={1}
+                        value={l.qtyToReturn}
+                        onChange={(e) => updateLine(l.poLineId, 'qtyToReturn', Number(e.target.value))}
+                        className="h-8 text-sm text-right w-24 ml-auto font-mono"
+                      />
+                    </TableCell>
+                    <TableCell className="px-3 py-2">
+                      <select
+                        value={l.warehouseId}
+                        onChange={(e) => updateLine(l.poLineId, 'warehouseId', e.target.value)}
+                        className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs"
+                      >
+                        <option value="">Select…</option>
+                        {warehouses.map((w) => (
+                          <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
+                        ))}
+                      </select>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
 
           <div className="space-y-1.5">
             <Label htmlFor="returnNotes">Additional Notes</Label>
@@ -505,6 +514,7 @@ function ReturnDialog({
               value={returnNotes}
               onChange={(e) => setReturnNotes(e.target.value)}
               rows={2}
+              placeholder="Optional — e.g. RMA number, return shipment details…"
               className="text-sm resize-none"
             />
           </div>
@@ -512,12 +522,17 @@ function ReturnDialog({
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
 
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-          <Button onClick={handleConfirm} disabled={isPending}>
-            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-            Confirm Return
-          </Button>
+        <DialogFooter className="shrink-0 items-center gap-2 border-t px-5 py-4 sm:justify-between">
+          <span className="text-xs text-muted-foreground">
+            {totalToReturn > 0 ? `${totalToReturn} unit${totalToReturn === 1 ? '' : 's'} across ${returnLines.filter((l) => l.qtyToReturn > 0).length} line(s)` : 'Nothing to return yet'}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+            <Button onClick={handleConfirm} disabled={isPending || totalToReturn <= 0}>
+              {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              Confirm Return
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>
