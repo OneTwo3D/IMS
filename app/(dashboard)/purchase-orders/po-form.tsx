@@ -173,34 +173,43 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
 
   // When editing, the PO HEADER carries the supplier's Default VAT Rate (the
   // order-level rate that is authoritative for every line). Match it from the
-  // header's stored name/percent — never from a line's rate, since a line may
-  // hold a stale rate from before this PO's supplier was set to "No VAT". A
-  // header with no tax (No VAT supplier) leaves this undefined → order rate 0.
-  // Match on BOTH name and percent — never name alone: a rate may have been
-  // deactivated and replaced by an active same-name rate at a different percent
-  // (e.g. "VAT" 21% → 20%), and matching by name only would silently re-rate the
-  // PO. A name-with-different-percent therefore falls through to synthesis,
-  // which preserves the PO's exact saved percent.
+  // header's stored name + percent — never from a line's rate, since a line may
+  // hold a stale rate from before this PO's supplier was set to "No VAT", and
+  // never by name alone: a rate may have been deactivated and replaced by an
+  // active same-name rate at a different percent (e.g. "VAT" 21% → 20%), and a
+  // name-only match would silently re-rate the PO. A name-with-different-percent
+  // therefore falls through to synthesis, which preserves the exact saved
+  // percent. A header with no tax (No VAT supplier) leaves this undefined → 0.
+  const headerPercent = existingPo?.taxRatePercent ?? 0
+  const headerHasTax = !!(existingPo && (existingPo.taxRateName || headerPercent > 0))
   const matchedHeaderRate = existingPo?.taxRateName
     ? taxRatesProp.find(
         (t) => t.name === existingPo.taxRateName
-          && Math.abs(t.rate - (existingPo.taxRatePercent ?? 0)) < 0.0001,
+          && Math.abs(t.rate - headerPercent) < 0.0001,
       )
     : undefined
 
-  // If the PO's header rate is no longer active (deactivated since the PO was
-  // created), preserve it as a synthetic selectable rate so editing the PO
-  // doesn't silently drop its VAT. The id is recovered from a line that still
-  // carries it (the server resolves rate ids without an active filter); the
-  // sentinel fallback still preserves the percent via the order-rate value.
+  // If the PO's header rate is no longer represented by an active rate at the
+  // saved percent (deactivated, percent edited in place, or a percent-only
+  // legacy header), preserve it as a synthetic selectable rate so editing the
+  // PO doesn't silently drop or change its VAT. Only reuse the line's real
+  // taxRateId when it points to a GENUINELY INACTIVE rate (so the server, which
+  // resolves ids without an active filter, restores its full metadata). If that
+  // id is still active (its percent has since drifted), use a sentinel instead
+  // so the server falls back to the submitted percent rather than the live one.
+  const recoveredLineRateId = existingPo
+    ? existingPo.lines.find((l) => l.taxRateName === existingPo.taxRateName)?.taxRateId ?? null
+    : null
+  const recoveredIdIsInactive =
+    !!recoveredLineRateId && !taxRatesProp.some((t) => t.id === recoveredLineRateId)
   const inactiveHeaderRate: TaxRateRow | undefined =
-    existingPo?.taxRateName && !matchedHeaderRate
+    headerHasTax && !matchedHeaderRate
       ? {
-          id:
-            existingPo.lines.find((l) => l.taxRateName === existingPo.taxRateName)?.taxRateId ??
-            `inactive:${existingPo.taxRateName}`,
-          name: existingPo.taxRateName,
-          rate: existingPo.taxRatePercent ?? 0,
+          id: recoveredIdIsInactive
+            ? (recoveredLineRateId as string)
+            : `inactive:${existingPo!.taxRateName ?? `${Math.round(headerPercent * 100)}pct`}`,
+          name: existingPo!.taxRateName ?? `VAT ${(headerPercent * 100).toFixed(0)}%`,
+          rate: headerPercent,
           type: 'PERCENT',
           usedFor: 'PURCHASE',
           accountingTaxType: null,
