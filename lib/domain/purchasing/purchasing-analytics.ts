@@ -857,7 +857,13 @@ export async function getLeadTimeReport(
   ], options.paginate !== false)
 }
 
-export async function getObservedLeadTimeP95BySupplierProduct(
+
+/**
+ * Observed P95 lead time per PRODUCT (aggregated across all suppliers), from real
+ * PO receipts in the trailing 365 days. Lead time = receivedAt − (poSentAt ?? createdAt).
+ * Returns Map<productId, P95 days>. Used to maintain Product.observedLeadTimeDays.
+ */
+export async function getObservedLeadTimeP95ByProduct(
   options: { client?: Pick<PurchasingAnalyticsClient, 'purchaseReceipt'>; now?: () => Date; dateFrom?: Date; dateTo?: Date } = {},
 ): Promise<Map<string, number>> {
   const client = (options.client ?? db) as unknown as Pick<PurchasingAnalyticsClient, 'purchaseReceipt'>
@@ -868,15 +874,16 @@ export async function getObservedLeadTimeP95BySupplierProduct(
   }
   const receiptWindow = { ...window, dateToExclusive: exclusiveEndOfUtcDay(window.dateTo) }
   const receipts = await loadReceipts(client as PurchasingAnalyticsClient, receiptWindow)
-  const byKey = new Map<string, Prisma.Decimal[]>()
+  const byProduct = new Map<string, Prisma.Decimal[]>()
   for (const receipt of receipts) {
     const sentAt = receipt.po.poSentAt ?? receipt.po.createdAt
     for (const line of receipt.lines) {
-      const key = `${receipt.po.supplierId}:${line.poLine.productId}`
-      const values = byKey.get(key) ?? []
+      const productId = line.poLine.productId
+      if (!productId) continue
+      const values = byProduct.get(productId) ?? []
       values.push(daysBetween(sentAt, receipt.receivedAt))
-      byKey.set(key, values)
+      byProduct.set(productId, values)
     }
   }
-  return new Map([...byKey.entries()].map(([key, values]) => [key, Number(daysString(percentile(values, 95)))]))
+  return new Map([...byProduct.entries()].map(([productId, values]) => [productId, Number(daysString(percentile(values, 95)))]))
 }

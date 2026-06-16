@@ -75,6 +75,8 @@ export type ProductRow = {
 export type ProductDetail = ProductRow & {
   parentId: string | null   // DB id of parent product (for breadcrumb linking)
   description: string | null
+  leadTimeDays: number | null          // manual lead-time override
+  observedLeadTimeDays: number | null  // auto P95 from PO receipts
   widthCm: string | null
   heightCm: string | null
   depthCm: string | null
@@ -464,6 +466,8 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     mpn: p.mpn,
     hsCode: p.hsCode ?? null,
     countryOfOrigin: p.countryOfOrigin ?? null,
+    leadTimeDays: p.leadTimeDays ?? null,
+    observedLeadTimeDays: p.observedLeadTimeDays ?? null,
     weight: p.weight?.toString() ?? null,
     widthCm: p.widthCm?.toString() ?? null,
     heightCm: p.heightCm?.toString() ?? null,
@@ -641,7 +645,15 @@ const productSchema = z.object({
   depthCm: z.string().optional().nullable(),
   active: z.boolean().default(true),
   lifecycleStatus: z.enum(['DRAFT', 'ACTIVE', 'EOL', 'ARCHIVED']).default('ACTIVE'),
+  leadTimeDays: z.string().optional().nullable(),
 })
+
+// Manual lead-time override: blank / non-numeric / <= 0 → null (use observed/default).
+function parseLeadTimeOverride(value: string | null | undefined): number | null {
+  if (value == null) return null
+  const n = Number(value.trim())
+  return Number.isInteger(n) && n > 0 ? n : null
+}
 
 export type ProductFormState = {
   errors?: Record<string, string[]>
@@ -729,6 +741,7 @@ export async function createProduct(
     depthCm: formData.get('depthCm') as string || null,
     active: formData.get('active') !== 'false',
     lifecycleStatus: (formData.get('lifecycleStatus') as string) || deriveLifecycleStatusFromLegacyActive(formData.get('active') !== 'false'),
+    leadTimeDays: formData.get('leadTimeDays') as string || null,
   }
 
   const parsed = productSchema.safeParse(raw)
@@ -789,6 +802,7 @@ export async function createProduct(
         depthCm: data.depthCm || null,
         active: deriveLegacyActiveFromLifecycleStatus(data.lifecycleStatus),
         lifecycleStatus: data.lifecycleStatus,
+        leadTimeDays: parseLeadTimeOverride(data.leadTimeDays),
       },
     })
   })
@@ -863,6 +877,7 @@ export async function updateProduct(
     depthCm: formData.get('depthCm') as string || null,
     active: formData.get('active') !== 'false',
     lifecycleStatus: (formData.get('lifecycleStatus') as string) || deriveLifecycleStatusFromLegacyActive(formData.get('active') !== 'false'),
+    leadTimeDays: formData.get('leadTimeDays') as string || null,
   }
 
   const parsed = productSchema.safeParse(raw)
@@ -937,6 +952,9 @@ export async function updateProduct(
         depthCm: data.depthCm || null,
         active: deriveLegacyActiveFromLifecycleStatus(data.lifecycleStatus),
         lifecycleStatus: data.lifecycleStatus,
+        // Only touch the manual lead-time override when the form actually submitted the
+        // field (blank → clear → null). A caller that omits it leaves the override as-is.
+        ...(formData.has('leadTimeDays') ? { leadTimeDays: parseLeadTimeOverride(data.leadTimeDays) } : {}),
         ...(structureValidation.clearExternalMapping ? { externalProductId: null } : {}),
       },
     })
