@@ -54,6 +54,7 @@ type StockPositionReportPageProps<Row> = {
   notices?: string[]
   dateMode: 'as-of' | 'range' | 'none'
   showIncludeZero?: boolean
+  includeZeroLabel?: string
   showThresholdDays?: boolean
   showDemandWindowDays?: boolean
   // audit-00o7: extra report-specific filter controls rendered inside the GET
@@ -82,6 +83,7 @@ export function StockPositionReportPage<Row>({
   notices = [],
   dateMode,
   showIncludeZero = true,
+  includeZeroLabel = 'Include zero rows',
   showThresholdDays = false,
   showDemandWindowDays = false,
   extraFilters,
@@ -224,7 +226,7 @@ export function StockPositionReportPage<Row>({
           {showIncludeZero ? (
             <label className="flex items-center gap-2 text-sm text-muted-foreground">
               <input type="checkbox" name="includeZero" value="1" defaultChecked={filters.includeZero} className="rounded border-input" />
-              Include zero rows
+              {includeZeroLabel}
             </label>
           ) : <span />}
           <div className="flex gap-2">

@@ -84,7 +84,9 @@ export async function GET(req: NextRequest) {
   try {
     switch (type) {
     case 'reorder': {
-      const report = await getReorderReport(filters, { paginate: false })
+      // audit-5f19: the CSV always lists every product (including zero-reorder),
+      // even when the on-screen report is filtered to products needing replenishment.
+      const report = await getReorderReport({ ...filters, includeZero: true }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))

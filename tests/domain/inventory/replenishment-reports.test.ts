@@ -173,10 +173,120 @@ test('order-up-to edge cases: zero-demand degrades to top-up, backorder widens, 
   assert.equal(backorder.rows[0]?.suggestedReorderQty, '15')
   assert.equal(backorder.rows[0]?.urgency, 'critical')
 
-  // Exactly at the reorder point → no order, but the row is retained with a 0 suggestion.
-  const atPoint = await getReorderReport({}, { deps: { client: clientWith('10'), now: at } })
-  assert.equal(atPoint.rows[0]?.suggestedReorderQty, '0')
-  assert.equal(atPoint.rows[0]?.urgency, 'reorder')
+  // Exactly at the reorder point → no order (0 suggested). Excluded from the default
+  // view (only products needing ≥1), but shown with the show-all toggle (includeZero).
+  const atPointDefault = await getReorderReport({}, { deps: { client: clientWith('10'), now: at } })
+  assert.equal(atPointDefault.rows.length, 0)
+  const atPointAll = await getReorderReport({ includeZero: true }, { deps: { client: clientWith('10'), now: at } })
+  assert.equal(atPointAll.rows[0]?.suggestedReorderQty, '0')
+  assert.equal(atPointAll.rows[0]?.urgency, 'reorder')
+})
+
+test('reorder report: default view excludes zero-reorder; show-all + sort by qty desc', async () => {
+  // Three products with no velocity (targetCoverQty 0): top-up = reorderPoint − available.
+  // A needs 9, B needs 1, C is fully stocked (0). Default view shows A,B (sorted desc);
+  // includeZero shows all three.
+  const products = [
+    { id: 'a', sku: 'SKU-A', reorderPoint: '10', qty: '1' }, // needs 9
+    { id: 'b', sku: 'SKU-B', reorderPoint: '10', qty: '9' }, // needs 1
+    { id: 'c', sku: 'SKU-C', reorderPoint: '10', qty: '50' }, // needs 0
+  ]
+  const makeClient = (): ReplenishmentReportClient => ({
+    ...unusedClient(),
+    product: {
+      findMany: async () => products.map((p) => ({
+        id: p.id, sku: p.sku, name: p.sku, type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: decimal(p.reorderPoint), reorderQty: null, safetyStockQty: decimal('0'), category,
+        preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('1'), leadTimeDays: 7, supplier }],
+      })),
+    },
+    stockLevel: { findMany: async () => products.map((p) => ({ productId: p.id, warehouseId: 'warehouse-1', quantity: decimal(p.qty), reservedQty: decimal('0') })) },
+  })
+  const at = () => new Date('2026-06-01T18:00:00.000Z')
+
+  const def = await getReorderReport({}, { deps: { client: makeClient(), now: at } })
+  assert.deepEqual(def.rows.map((r) => r.sku), ['SKU-A', 'SKU-B']) // zero-reorder C excluded, sorted qty desc
+  assert.deepEqual(def.rows.map((r) => r.suggestedReorderQty), ['9', '1'])
+
+  const all = await getReorderReport({ includeZero: true }, { deps: { client: makeClient(), now: at } })
+  assert.deepEqual(all.rows.map((r) => r.sku), ['SKU-A', 'SKU-B', 'SKU-C']) // C included with 0
+  assert.equal(all.rows[2]?.suggestedReorderQty, '0')
+})
+
+test('reorder report renders quantities as integers (suggested rounds up)', async () => {
+  // 21 units / 90 days = 0.2333/day; lead time 14. reorderPoint 3.2667 → 3 (nearest),
+  // order-up-to 3.2667 + 0.2333×56 = 16.333 → suggested 17 (rounded UP).
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1', sku: 'SKU-1', name: 'Widget', type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: null, reorderQty: null, safetyStockQty: decimal('0'), category,
+        preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('2'), leadTimeDays: 14, supplier }],
+      }],
+    },
+    stockLevel: { findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') }] },
+    stockMovement: {
+      findMany: async () => [{
+        productId: 'product-1', qty: decimal('21'), totalValueBase: decimal('0'),
+        createdAt: new Date('2026-05-15T00:00:00.000Z'),
+        product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [{ supplier }] },
+      }],
+    },
+  }
+  const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.equal(report.rows[0]?.reorderPoint, '3')        // 3.2667 → nearest integer
+  assert.equal(report.rows[0]?.suggestedReorderQty, '17') // 16.333 → rounded up
+  assert.ok(!report.rows[0]?.suggestedReorderQty.includes('.'), 'suggested is an integer string')
+})
+
+test('reorder sort ties break by urgency then SKU at equal suggested quantity', async () => {
+  // All three need exactly 10 (no velocity → suggested = reorderPoint − available):
+  // X critical (avail 0), Y/Z reorder (avail 5). Order: X, then Y, Z by SKU.
+  const products = [
+    { id: 'z', sku: 'SKU-Z', reorderPoint: '15', qty: '5' },
+    { id: 'x', sku: 'SKU-X', reorderPoint: '10', qty: '0' },
+    { id: 'y', sku: 'SKU-Y', reorderPoint: '15', qty: '5' },
+  ]
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => products.map((p) => ({
+        id: p.id, sku: p.sku, name: p.sku, type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: decimal(p.reorderPoint), reorderQty: null, safetyStockQty: decimal('0'), category,
+        preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('1'), leadTimeDays: 7, supplier }],
+      })),
+    },
+    stockLevel: { findMany: async () => products.map((p) => ({ productId: p.id, warehouseId: 'warehouse-1', quantity: decimal(p.qty), reservedQty: decimal('0') })) },
+  }
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.deepEqual(report.rows.map((r) => r.suggestedReorderQty), ['10', '10', '10'])
+  assert.deepEqual(report.rows.map((r) => r.sku), ['SKU-X', 'SKU-Y', 'SKU-Z'])
+})
+
+test('reorder totals are the sum of the displayed rounded rows', async () => {
+  // Two rows with available 2.5 each: each rounds to 3 (half-up), so the footer is
+  // 6, NOT round(5.0)=5 — proving totals sum the displayed integers.
+  const products = [{ id: 'a', sku: 'SKU-A' }, { id: 'b', sku: 'SKU-B' }]
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => products.map((p) => ({
+        id: p.id, sku: p.sku, name: p.sku, type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: decimal('10'), reorderQty: null, safetyStockQty: decimal('0'), category,
+        preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('1'), leadTimeDays: 7, supplier }],
+      })),
+    },
+    stockLevel: { findMany: async () => products.map((p) => ({ productId: p.id, warehouseId: 'warehouse-1', quantity: decimal('2.5'), reservedQty: decimal('0') })) },
+  }
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.deepEqual(report.rows.map((r) => r.availableQty), ['3', '3']) // 2.5 → 3 each
+  assert.equal(report.totals.availableQty, '6')                        // sum of rounded, not round(5.0)=5
+  assert.equal(report.totals.suggestedReorderQty, '16')               // (10−2.5)=7.5 → ceil 8, ×2
 })
 
 test('reorder report propagates the BOM parent order-up-to quantity into component demand', async () => {

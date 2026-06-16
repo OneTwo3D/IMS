@@ -58,6 +58,7 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
     urgency: urgencyFromSearch(one(searchParams.urgency)),
     search: search || undefined,
     targetCoverWeeks: positiveInteger(one(searchParams.targetCoverWeeks)),
+    includeZero: one(searchParams.includeZero) === '1',
     page: Number(one(searchParams.page) ?? 1),
     pageSize: Number(one(searchParams.pageSize) ?? 100),
   }
@@ -100,6 +101,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     urgency: filters.urgency,
     search: filters.search,
     targetCoverWeeks: filters.targetCoverWeeks == null ? undefined : String(filters.targetCoverWeeks),
+    includeZero: filters.includeZero,
     pageSize: String(filters.pageSize ?? 100),
   }
   const columns: Array<StockPositionColumn<ReorderReportRow>> = [
@@ -146,7 +148,8 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       ]}
       notices={report.notices}
       dateMode="none"
-      showIncludeZero={false}
+      showIncludeZero
+      includeZeroLabel="Show all products (incl. zero reorder)"
       showDemandWindowDays
       headerActions={importSettings ? <HistoricalImportTrigger settings={importSettings} /> : null}
       extraFilters={
