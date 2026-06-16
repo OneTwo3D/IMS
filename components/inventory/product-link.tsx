@@ -15,7 +15,7 @@ export function ProductLink({ productId, sku, name, skuClassName, nameClassName 
       target="_blank"
       className="group/pl inline-flex items-baseline gap-1.5 hover:underline decoration-muted-foreground underline-offset-2 min-w-0"
     >
-      <span className={skuClassName ?? 'font-mono text-sm font-medium'}>{sku}</span>
+      <span className={skuClassName ?? 'font-mono text-sm font-medium whitespace-nowrap'}>{sku}</span>
       {name && (
         <span className={nameClassName ?? 'text-xs text-muted-foreground truncate'}>{name}</span>
       )}
