@@ -14,13 +14,26 @@ test('prepaid PO billed 100 / received 90 surfaces a shortfall of 10', () => {
   assert.equal(summary.totalShortfallValueBase, '100')
 })
 
-test('returns are netted: billed 100, received 100, returned 10 → shortfall 10', () => {
+test('returns are NOT counted as non-delivery: billed 100, received 100, returned 10 → no shortfall', () => {
   const summary = computePrepaidReconciliation({
     isPrepaidSupplier: true,
     lines: [{ id: 'l1', productId: 'p1', sku: 'SKU-1', qtyReceived: 100, qtyReturned: 10 }],
     invoices: [{ lines: [{ poLineId: 'l1', qtyBilled: 100, totalBase: 1000 }] }],
   })
-  // net kept = 90, billed 100 → shortfall 10 (matches the C4 over-billing basis)
+  // All 100 were delivered (then 10 returned → handled by the auto credit note),
+  // so the prepaid "not arrived" banner stays silent — it only flags genuine
+  // non-delivery (billed − received).
+  assert.equal(summary.hasShortfall, false)
+  assert.equal(summary.totalShortfallQty, '0')
+})
+
+test('only genuine non-delivery counts; returns are ignored: billed 100, received 90, returned 5 → shortfall 10', () => {
+  const summary = computePrepaidReconciliation({
+    isPrepaidSupplier: true,
+    lines: [{ id: 'l1', productId: 'p1', sku: 'SKU-1', qtyReceived: 90, qtyReturned: 5 }],
+    invoices: [{ lines: [{ poLineId: 'l1', qtyBilled: 100, totalBase: 1000 }] }],
+  })
+  // 10 never arrived (billed 100 − received 90); the 5 returned are not added.
   assert.equal(summary.hasShortfall, true)
   assert.equal(summary.totalShortfallQty, '10')
   assert.equal(summary.lines[0].receivedQty, '90')

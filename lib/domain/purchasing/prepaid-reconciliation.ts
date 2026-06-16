@@ -1,4 +1,3 @@
-import { Prisma } from '@/app/generated/prisma/client'
 import {
   addMoney,
   multiplyMoney,
@@ -93,12 +92,13 @@ export function computePrepaidReconciliation(input: {
   for (const poLine of input.lines) {
     const billed = billedByLine.get(poLine.id)
     if (!billed || billed.qty.lte(0)) continue
-    // Net out returns: goods received then returned are no longer in our
-    // possession, so "prepaid but not arrived" is billed − (received − returned).
-    // This keeps the figure consistent with the C4 over-billing banner and
-    // avoids a prepaid PO with returns showing two contradictory numbers.
-    const netReceived = Prisma.Decimal.max(subtractMoney(poLine.qtyReceived, poLine.qtyReturned), toDecimal(0))
-    const shortfall = subtractMoney(billed.qty, netReceived)
+    // "Prepaid but not arrived" is billed − ever-RECEIVED. Returns are NOT netted
+    // here: goods that were delivered then returned DID arrive, and the returned
+    // value is handled separately by the auto-created supplier credit note.
+    // Netting returns in would mislabel a return as a non-delivery — telling the
+    // user to "chase the delivery" for goods they deliberately sent back.
+    const everReceived = toDecimal(poLine.qtyReceived)
+    const shortfall = subtractMoney(billed.qty, everReceived)
     if (shortfall.lt(-QTY_EPSILON)) hasUnderBilled = true
     if (shortfall.lte(QTY_EPSILON)) continue
 
@@ -112,7 +112,7 @@ export function computePrepaidReconciliation(input: {
       productId: poLine.productId,
       sku: poLine.sku ?? null,
       billedQty: roundQuantity(billed.qty, 4).toString(),
-      receivedQty: roundQuantity(netReceived, 4).toString(),
+      receivedQty: roundQuantity(everReceived, 4).toString(),
       shortfallQty: roundQuantity(shortfall, 4).toString(),
       shortfallValueBase: shortfallValueBase.toString(),
     })

@@ -49,6 +49,7 @@ import {
 import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
 import { computePurchaseOrderOverBilling, type PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
+import { computeReturnCreditNoteDraft } from '@/lib/domain/purchasing/return-credit-note'
 import { findDivergentReceiptLines } from '@/lib/domain/purchasing/receipt-warehouse-divergence'
 import {
   validateLinkedFreightReceiptStatus,
@@ -2023,13 +2024,15 @@ export async function returnPurchaseOrder(
   notes?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('purchasing.receive')
+    const session = await requirePermission('purchasing.receive')
     const po = await db.purchaseOrder.findUnique({
       where: { id },
       select: {
         id: true,
         reference: true,
         status: true,
+        supplierId: true,
+        currency: true,
         lines: {
           select: {
             id: true,
@@ -2071,7 +2074,7 @@ export async function returnPurchaseOrder(
     const returnRef = `RTN-${po.reference}-${Date.now().toString(36).toUpperCase()}`
     let purchaseReturnId = ''
     let totalReturnedCostBase = toDecimal(0)
-    const overBilling = await db.$transaction(async (tx): Promise<PurchaseOrderOverBillingSummary> => {
+    const { overBilling, creditNote } = await db.$transaction(async (tx): Promise<{ overBilling: PurchaseOrderOverBillingSummary; creditNote: { id: string; amountForeign: number; invoiceId: string } | null }> => {
       const purchaseReturn = await tx.purchaseReturn.create({
         data: {
           poId: id,
@@ -2168,12 +2171,64 @@ export async function returnPurchaseOrder(
       })
       const billingInvoices = await tx.purchaseInvoice.findMany({
         where: { poId: id },
-        select: { id: true, invoiceNumber: true, totalBase: true, lines: { select: { poLineId: true, qtyBilled: true, totalBase: true } } },
+        select: {
+          id: true, invoiceNumber: true, totalBase: true,
+          subtotalForeign: true, totalForeign: true, fxRateToBase: true, createdAt: true,
+          lines: { select: { poLineId: true, qtyBilled: true, totalBase: true, totalForeign: true } },
+        },
       })
       const overBillingComputed = computePurchaseOrderOverBilling({
         lines: billingLines.map((l) => ({ id: l.id, productId: l.productId, sku: l.product?.sku ?? null, qtyReceived: l.qtyReceived, qtyReturned: l.qtyReturned })),
         invoices: billingInvoices.map((inv) => ({ id: inv.id, invoiceNumber: inv.invoiceNumber, totalBase: inv.totalBase, lines: inv.lines })),
       })
+
+      // Auto-create a DRAFT supplier credit note for the returned (over-billed)
+      // goods so the AP liability is reduced; finance reviews + posts it. Net out
+      // credit notes already recorded against the bill so repeated returns top up
+      // rather than double-credit.
+      let createdCreditNote: { id: string; amountForeign: number; invoiceId: string } | null = null
+      if (billingInvoices.length > 0) {
+        const invoiceIds = billingInvoices.map((inv) => inv.id)
+        const existingCredits = await tx.supplierCreditNote.groupBy({
+          by: ['purchaseInvoiceId'],
+          where: { purchaseInvoiceId: { in: invoiceIds } },
+          _sum: { amountForeign: true },
+        })
+        const creditedByInvoice = new Map(
+          existingCredits.map((c) => [c.purchaseInvoiceId, Number(c._sum.amountForeign ?? 0)]),
+        )
+        const draft = computeReturnCreditNoteDraft({
+          poLines: billingLines.map((l) => ({ poLineId: l.id, qtyReceived: l.qtyReceived, qtyReturned: l.qtyReturned })),
+          bills: billingInvoices.map((inv) => ({
+            invoiceId: inv.id,
+            subtotalForeign: inv.subtotalForeign,
+            totalForeign: inv.totalForeign,
+            fxRateToBase: inv.fxRateToBase,
+            alreadyCreditedForeign: creditedByInvoice.get(inv.id) ?? 0,
+            createdAt: inv.createdAt.getTime(),
+            lines: inv.lines.map((il) => ({ poLineId: il.poLineId, qtyBilled: il.qtyBilled, totalForeign: il.totalForeign })),
+          })),
+        })
+        if (draft) {
+          const cn = await tx.supplierCreditNote.create({
+            data: {
+              poId: id,
+              purchaseInvoiceId: draft.invoiceId,
+              supplierId: po.supplierId,
+              reference: returnRef,
+              amountForeign: draft.amountForeign,
+              amountBase: draft.amountBase,
+              currency: po.currency,
+              fxRateToBase: draft.fxRateToBase,
+              reason: `Supplier return ${returnRef}${reason ? ` — ${reason}` : ''}`,
+              status: 'DRAFT',
+              createdBy: session.user.id,
+            },
+            select: { id: true },
+          })
+          createdCreditNote = { id: cn.id, amountForeign: draft.amountForeign, invoiceId: draft.invoiceId }
+        }
+      }
 
       if (accountingSettings.syncEnabled && totalReturnedCostBase.gt(0.000001)) {
         const amount = roundQuantity(totalReturnedCostBase, 2).toNumber()
@@ -2202,7 +2257,7 @@ export async function returnPurchaseOrder(
           idempotencyKey: accountingPayloadKey(`purchase-return:${purchaseReturn.id}`, payload),
         })
       }
-      return overBillingComputed
+      return { overBilling: overBillingComputed, creditNote: createdCreditNote }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
@@ -2239,14 +2294,17 @@ export async function returnPurchaseOrder(
           entityId: id,
           action: 'return_overbilled_bill',
           tag: 'purchase',
-          level: 'WARNING',
-          description: `Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — ${overBilling.totalOverBilledValueBase} over-billed (base currency) across ${overBilling.bills.length} bill(s). Raise a supplier credit.`,
+          level: creditNote ? 'INFO' : 'WARNING',
+          description: creditNote
+            ? `Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — a DRAFT supplier credit note of ${po.currency} ${creditNote.amountForeign.toFixed(2)} was created for review. Post it to credit the supplier bill.`
+            : `Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — ${overBilling.totalOverBilledValueBase} over-billed (base currency) across ${overBilling.bills.length} bill(s). Raise a supplier credit.`,
           metadata: {
             reference: po.reference,
             totalOverBilledQty: overBilling.totalOverBilledQty,
             totalOverBilledValueBase: overBilling.totalOverBilledValueBase,
             overBilledLines: overBilling.lines,
             bills: overBilling.bills,
+            ...(creditNote ? { draftCreditNoteId: creditNote.id, draftCreditNoteAmountForeign: creditNote.amountForeign, currency: po.currency } : {}),
           },
         })
       }
