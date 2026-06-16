@@ -101,7 +101,7 @@ export type PoLineRow = {
   qtyToReceive: number  // qty - qtyReceived (still outstanding)
   qtyRemaining: number  // qtyReceived - qtyReturned (net on hand)
   sortOrder: number
-  /** Per-line tax rate id (resolved from product category + destination). */
+  /** Per-line tax rate id (the order/supplier rate, or a per-line override). */
   taxRateId: string | null
   /** Per-line effective rate percentage (0..1). Null when no per-line rate. */
   taxRatePercent: number | null
@@ -231,8 +231,7 @@ export type PoLineInput = {
   sortOrder?: number
   /**
    * Optional manual override of the tax rate for this line. When null/omitted
-   * the server resolves a rate from the product's tax category + destination
-   * warehouse country.
+   * the line takes the order/supplier rate (the PO's order-level tax rate).
    */
   taxRateId?: string | null
   /** Original user input for the per-line discount, e.g. "5%" or "2.50". */
@@ -934,14 +933,11 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
     let totalTaxBase = 0
 
     // --- Tax rate resolution -------------------------------------------
-    // Each line either:
-    //   - has a manual override (`l.taxRateId`) — use that rate
-    //   - is auto-resolved via `(destinationWarehouse.country, productCategory,
-    //     PURCHASE)` against the configured TaxRate rows; falls back to the
-    //     order default if no match.
+    // Each line either has a manual override (`l.taxRateId`) or takes the
+    // order/supplier rate (see resolvePurchaseLineTaxRates).
 
-    // Order-level default rate (used as resolver fallback + for additional
-    // costs / order discount VAT).
+    // Order-level rate = the supplier's Default VAT Rate (or a per-PO override
+    // of it). Applied to every non-override line + additional costs / discount.
     const orderDefaultRate = input.taxRateId
       ? await db.taxRate.findUnique({
           where: { id: input.taxRateId },

@@ -51,8 +51,12 @@ test('PO edit mode tracks the supplier rate so "No VAT" sticks on reopen', async
 
   // The header tax rate is matched from the persisted header name, NOT from a
   // line's rate — a stale 20% line must not force the header back to 20%.
-  assert.match(text, /const initialTaxRate = existingPo\?\.taxRateName/)
-  assert.doesNotMatch(text, /taxRates\.find\(\(t\) => t\.id === existingPo\.lines\[0\]/)
+  assert.match(text, /const matchedHeaderRate = existingPo\?\.taxRateName/)
+  assert.match(text, /const initialTaxRate = matchedHeaderRate \?\? inactiveHeaderRate/)
+  assert.doesNotMatch(text, /find\(\(t\) => t\.id === existingPo\.lines\[0\]/)
+
+  // An applied-but-deactivated header rate is preserved (not silently zeroed).
+  assert.match(text, /const inactiveHeaderRate: TaxRateRow \| undefined =/)
 
   // Loaded lines re-derive VAT from the order default (auto), so they follow the
   // supplier rate on reopen instead of being treated as manual overrides.

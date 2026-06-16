@@ -56,9 +56,8 @@ type LineItem = {
   unitCostForeign: number // cost per purchase unit
   discount: string // user-entered discount, e.g. "5%" or "2.50"
   productCategory: TaxCategory
-  // Per-line tax rate. When `taxRateAutoResolved` is true, the rate was
-  // resolved from `(productCategory, warehouseCountry, PURCHASE)`; when
-  // false the user has manually overridden it.
+  // Per-line tax rate. When `taxRateAutoResolved` is true, the line follows
+  // the order/supplier rate; when false the user has manually overridden it.
   taxRateId: string | null
   taxRateValue: number
   taxRateName: string | null
@@ -74,9 +73,9 @@ type ResolvedRate = {
 }
 
 /**
- * Client-side mirror of lib/tax/resolve-rate.ts `pickTaxRate`. Keep the
- * algorithm identical — the server re-resolves from the DB so it's
- * authoritative, but the client needs it for live previews.
+ * Live tax-rate preview for a line. Purchases follow the order/supplier rate
+ * directly (see the early return below); sales mirror lib/tax/resolve-rate.ts
+ * `pickTaxRate`. The server re-resolves from the DB and is authoritative.
  */
 function resolveRateClientSide(
   category: TaxCategory,
@@ -166,7 +165,7 @@ function parseDiscount(input: string, lineTotal: number): number {
   return isNaN(abs) ? 0 : abs
 }
 
-export function PoFormDialog({ suppliers, products, warehouses, currencies, taxRates, purchaseUnits, companyHomeCountry, onClose, existingPo }: Props) {
+export function PoFormDialog({ suppliers, products, warehouses, currencies, taxRates: taxRatesProp, purchaseUnits, companyHomeCountry, onClose, existingPo }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const isEditMode = !!existingPo
@@ -177,12 +176,44 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   // header's stored name/percent — never from a line's rate, since a line may
   // hold a stale rate from before this PO's supplier was set to "No VAT". A
   // header with no tax (No VAT supplier) leaves this undefined → order rate 0.
-  const initialTaxRate = existingPo?.taxRateName
-    ? taxRates.find(
+  const matchedHeaderRate = existingPo?.taxRateName
+    ? taxRatesProp.find(
         (t) => t.name === existingPo.taxRateName
           && Math.abs(t.rate - (existingPo.taxRatePercent ?? 0)) < 0.0001,
-      ) ?? taxRates.find((t) => t.name === existingPo.taxRateName)
+      ) ?? taxRatesProp.find((t) => t.name === existingPo.taxRateName)
     : undefined
+
+  // If the PO's header rate is no longer active (deactivated since the PO was
+  // created), preserve it as a synthetic selectable rate so editing the PO
+  // doesn't silently drop its VAT. The id is recovered from a line that still
+  // carries it (the server resolves rate ids without an active filter); the
+  // sentinel fallback still preserves the percent via the order-rate value.
+  const inactiveHeaderRate: TaxRateRow | undefined =
+    existingPo?.taxRateName && !matchedHeaderRate
+      ? {
+          id:
+            existingPo.lines.find((l) => l.taxRateName === existingPo.taxRateName)?.taxRateId ??
+            `inactive:${existingPo.taxRateName}`,
+          name: existingPo.taxRateName,
+          rate: existingPo.taxRatePercent ?? 0,
+          type: 'PERCENT',
+          usedFor: 'PURCHASE',
+          accountingTaxType: null,
+          countryCode: null,
+          taxCategory: 'STANDARD',
+          isCompound: false,
+          reverseCharge: false,
+          reportingCategory: null,
+          isDefault: false,
+          active: false,
+          components: [],
+        }
+      : undefined
+
+  const initialTaxRate = matchedHeaderRate ?? inactiveHeaderRate
+  // The working rate list includes the preserved inactive rate (if any) so the
+  // header dropdown and every internal lookup can represent it.
+  const taxRates = inactiveHeaderRate ? [inactiveHeaderRate, ...taxRatesProp] : taxRatesProp
 
   // Header state — prefilled from existingPo when editing
   const [supplierId, setSupplierId] = useState(existingPo?.supplierId ?? '')
@@ -429,8 +460,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   }
 
   /**
-   * Per-line tax rate picker. 'auto' re-resolves from the product's
-   * category + destination country; an explicit id is a manual override.
+   * Per-line tax rate picker. 'auto' makes the line follow the order/supplier
+   * rate; an explicit id is a manual override for this line.
    */
   function setLineTaxRate(lineKey: string, newTaxRateId: string | 'auto') {
     setLines((prev) =>
@@ -501,28 +532,11 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
     )
   }
 
-  // When the destination warehouse changes, re-resolve every auto-resolved
-  // line against the new warehouse country.
+  // The receiving warehouse no longer affects purchase line VAT (lines follow
+  // the order/supplier rate, not the destination country), so this only updates
+  // the warehouse selection.
   function handleDestinationWarehouseChange(newId: string) {
     setDestinationWarehouseId(newId)
-    const newWh = warehouses.find((w) => w.id === newId)
-    const newDest = (newWh?.country && newWh.country.trim()) || companyHomeCountry || null
-    setLines((prev) =>
-      prev.map((l) => {
-        if (!l.taxRateAutoResolved) return l
-        const resolved = resolveRateClientSide(l.productCategory, newDest, taxRates, 'PURCHASE', orderDefault)
-        if (resolved.taxRateValue === l.taxRateValue && resolved.taxRateId === l.taxRateId) {
-          return { ...l, taxRateWarning: resolved.warning }
-        }
-        return rescaleLineForRate(l, resolved.taxRateValue, {
-          taxRateId: resolved.taxRateId,
-          taxRateValue: resolved.taxRateValue,
-          taxRateName: resolved.taxRateName,
-          taxRateWarning: resolved.warning,
-          taxRateAutoResolved: true,
-        })
-      }),
-    )
   }
 
   function updateLine(key: string, field: 'qty' | 'unitCostForeign' | 'purchaseUnitId', value: number | string) {
@@ -955,7 +969,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                           value={line.taxRateAutoResolved ? 'auto' : (line.taxRateId ?? '')}
                           onChange={(e) => setLineTaxRate(line.key, e.target.value as string)}
                           className="h-7 text-xs rounded-md border border-input bg-background px-1.5 font-mono w-28"
-                          title={line.taxRateWarning ?? `Auto-resolved from ${line.productCategory}`}
+                          title={line.taxRateWarning ?? 'Follows the order/supplier VAT rate'}
                         >
                           <option value="auto">Auto {(line.taxRateValue * 100).toFixed(0)}%</option>
                           {purchaseRates.map((t) => (
