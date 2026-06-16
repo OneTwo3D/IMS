@@ -364,7 +364,15 @@ export async function processQueuedWcStockSyncJobs(options?: {
           maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
         })
         summary.failed++
-        summary.errors.push(...result.errors)
+        // Always record a reason: a retained force/abort case (e.g. version_changed
+        // race, disabled/credentials/no-warehouses) returns synced=0 with EMPTY
+        // result.errors and only a result.message, which would otherwise log an
+        // empty errors[] and make the "queued failure" warning undiagnosable.
+        summary.errors.push(
+          ...(result.errors.length > 0
+            ? result.errors
+            : [result.message || `Product ${payload.productId}: stock not pushed (retained for retry)`]),
+        )
         continue
       }
 

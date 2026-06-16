@@ -54,6 +54,12 @@ function formatSyncResult(
   }
   const r = result as Record<string, unknown>
 
+  // Background-started actions (e.g. the stock push runs in after()) return a
+  // {started, message} marker instead of a completed result — show the message.
+  if (r.started === true) {
+    return { text: typeof r.message === 'string' ? r.message : `${type} sync started`, isError: false }
+  }
+
   if (type === 'stock') {
     const message = typeof r.message === 'string' ? r.message : ''
     const synced = Number(r.synced ?? 0)
@@ -674,7 +680,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   function handleSaveSettings() {
     setSaved(false)
     startTransition(async () => {
-      const settingsResult = await saveShoppingSyncSettings(s)
+      const settingsResult = await withStepUp(() => saveShoppingSyncSettings(s))
       if (!settingsResult.success) {
         setSyncResult({ text: `Error: ${settingsResult.error ?? 'Failed to save sync settings.'}`, isError: true })
         return
@@ -820,7 +826,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
             lastFxPushAt={s.last_wc_fx_push_at}
             onFxPushToggle={async (enabled) => {
               setS({ ...s, wc_fx_push_enabled: enabled ? 'true' : 'false' })
-              await saveShoppingSyncSettings({ wc_fx_push_enabled: enabled ? 'true' : 'false' })
+              await withStepUp(() => saveShoppingSyncSettings({ wc_fx_push_enabled: enabled ? 'true' : 'false' }))
             }}
           />
         )}
@@ -937,7 +943,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
               onChange={(v) => setS({ ...s, wc_webhook_secret: v })}
               hadSecretOnLoad={!!init.wc_webhook_secret}
               onSave={async (secret) => {
-                await saveShoppingSyncSettings({ wc_webhook_secret: secret })
+                await withStepUp(() => saveShoppingSyncSettings({ wc_webhook_secret: secret }))
               }}
             />
             <EnvOverrideNotice
