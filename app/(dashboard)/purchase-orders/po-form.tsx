@@ -197,7 +197,9 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   // resolves ids without an active filter, restores its full metadata). If that
   // id is still active (its percent has since drifted), use a sentinel instead
   // so the server falls back to the submitted percent rather than the live one.
-  const recoveredLineRateId = existingPo
+  // Only recover a real id by header NAME (a null-name header can't be matched
+  // to a specific rate, so it must use the sentinel + submitted percent).
+  const recoveredLineRateId = existingPo?.taxRateName
     ? existingPo.lines.find((l) => l.taxRateName === existingPo.taxRateName)?.taxRateId ?? null
     : null
   const recoveredIdIsInactive =
