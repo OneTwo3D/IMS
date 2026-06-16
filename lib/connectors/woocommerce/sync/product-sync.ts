@@ -8,7 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { getSettingValue } from '@/lib/settings-store'
 import { wcFetch, wcPut } from '../api'
-import { ensureWcCategoryTreeMirrored, pickDeepestImsCategoryId } from './category-mirror'
+import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
 import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
 import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
@@ -315,14 +315,15 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
     const lifecycleStatus = deriveLifecycleStatusFromWooStatus(wcProduct.status, existingLifecycleStatus)
     const active = deriveLegacyActiveFromLifecycleStatus(lifecycleStatus)
 
-    // Mirror WC's category tree once per sync run (cached) and resolve the deepest
-    // WC category on this product to an IMS ProductCategory id. Fails open: if the
-    // WC categories endpoint is unreachable, leave categoryId untouched.
+    // Mirror WC's category tree once per sync run (cached) and resolve this product's
+    // IMS ProductCategory id — preferring the WC primary category (Yoast / Rank Math)
+    // and falling back to the deepest mapped category. Fails open: if the WC categories
+    // endpoint is unreachable, leave categoryId untouched.
     const wcCategories = Array.isArray(wcProduct.categories) ? wcProduct.categories : []
     let imsCategoryId: string | null | undefined
     if (wcCategories.length > 0) {
       const mirror = await ensureWcCategoryTreeMirrored()
-      if (mirror) imsCategoryId = pickDeepestImsCategoryId(wcCategories, mirror)
+      if (mirror) imsCategoryId = resolveImsCategoryId(wcCategories, wcProduct.meta_data, mirror)
     }
 
     if (existing) {

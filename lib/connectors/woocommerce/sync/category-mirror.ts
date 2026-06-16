@@ -134,3 +134,63 @@ export function pickDeepestImsCategoryId(
   }
   return bestWcId !== null ? mirror.wcToIms.get(bestWcId) ?? null : null
 }
+
+// WooCommerce itself has no "primary category" concept; the dominant SEO plugins
+// store it in product meta — Yoast as `_yoast_wpseo_primary_product_cat`, Rank Math
+// as `rank_math_primary_product_cat`. Both hold the primary term (category) id.
+// Yoast is checked first: if a store somehow carries both, Yoast wins (intentional).
+const PRIMARY_CATEGORY_META_KEYS = ['_yoast_wpseo_primary_product_cat', 'rank_math_primary_product_cat']
+
+// WC term ids are positive integers; the meta value arrives as a digit string (Yoast)
+// or occasionally a number. Reject blanks, decimals, padded junk, and unsafe integers.
+function toWcTermId(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? value : null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!/^\d+$/.test(trimmed)) return null
+    const id = Number(trimmed)
+    return Number.isSafeInteger(id) && id > 0 ? id : null
+  }
+  return null
+}
+
+/**
+ * Read the WC primary product-category id from a product's meta_data, if a
+ * supported SEO plugin set one. Returns null when absent/blank/non-numeric.
+ */
+export function pickPrimaryWcCategoryId(
+  metaData: ReadonlyArray<{ key: string; value: unknown }> | undefined | null,
+): number | null {
+  if (!Array.isArray(metaData)) return null
+  for (const key of PRIMARY_CATEGORY_META_KEYS) {
+    const entry = metaData.find((m) => m?.key === key)
+    if (!entry) continue
+    const id = toWcTermId(entry.value)
+    if (id !== null) return id
+  }
+  return null
+}
+
+/**
+ * Resolve a product's IMS category id. Prefer the WC primary category (Yoast /
+ * Rank Math) when it's set, is actually one of THIS product's categories, and maps
+ * to a mirrored IMS category — that's the one the operator marked primary for a
+ * multi-category product. Otherwise (no primary, stale primary pointing at a category
+ * the product no longer has, or an unmirrored term) fall back to the deepest mapped
+ * WC category. The fallback is intentional: a sensible category beats none.
+ */
+export function resolveImsCategoryId(
+  productWcCategories: ReadonlyArray<{ id: number }>,
+  metaData: ReadonlyArray<{ key: string; value: unknown }> | undefined | null,
+  mirror: WcCategoryMirror,
+): string | null {
+  const primaryWcId = pickPrimaryWcCategoryId(metaData)
+  if (
+    primaryWcId !== null
+    && productWcCategories.some((c) => c.id === primaryWcId)
+    && mirror.wcToIms.has(primaryWcId)
+  ) {
+    return mirror.wcToIms.get(primaryWcId) ?? null
+  }
+  return pickDeepestImsCategoryId(productWcCategories, mirror)
+}
