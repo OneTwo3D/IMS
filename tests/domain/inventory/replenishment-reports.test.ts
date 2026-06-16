@@ -71,7 +71,7 @@ test('reorder report nets available and inbound open PO against lead-time demand
       }],
     },
     stockLevel: {
-      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],
+      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1'), warehouse: { code: 'WH1', name: 'Main Warehouse' } }],
     },
     stockMovement: {
       findMany: async () => [{
@@ -101,7 +101,7 @@ test('reorder report nets available and inbound open PO against lead-time demand
   assert.equal(report.rows.length, 1)
   assert.equal(report.rows[0]?.averageDailyDemand, '1')
   assert.equal(report.rows[0]?.availableQty, '3')
-  assert.equal(report.rows[0]?.warehouseAvailabilityBreakdown, 'warehouse-1: 3')
+  assert.equal(report.rows[0]?.warehouseAvailabilityBreakdown, 'Main Warehouse: 3') // warehouse name, not the id
   assert.equal(report.rows[0]?.inboundOpenPoQty, '6')
   assert.equal(report.rows[0]?.reorderPoint, '15')
   // Order-up-to: reorderPoint 15 + 8 weeks cover (1/day × 56) = 71 order-up-to level;

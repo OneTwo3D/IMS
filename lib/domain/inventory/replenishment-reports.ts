@@ -95,6 +95,7 @@ type StockLevelRow = {
   warehouseId: string
   quantity: DecimalInput
   reservedQty: DecimalInput
+  warehouse?: { code: string; name: string } | null
 }
 
 type SaleMovementRow = {
@@ -501,24 +502,31 @@ function addToMap(map: Map<string, Prisma.Decimal>, key: string, value: DecimalI
 
 function availabilityBreakdownByProduct(stockLevels: StockLevelRow[]): Map<string, string> {
   const byProductWarehouse = new Map<string, Prisma.Decimal>()
+  // audit-ghuo: label warehouses by name (then code) — not the raw cuid id.
+  const labelByWarehouseId = new Map<string, string>()
   for (const level of stockLevels) {
     addToMap(byProductWarehouse, stockKey(level.productId, level.warehouseId), toDecimal(level.quantity).sub(toDecimal(level.reservedQty)))
+    if (!labelByWarehouseId.has(level.warehouseId)) {
+      labelByWarehouseId.set(level.warehouseId, level.warehouse?.name?.trim() || level.warehouse?.code?.trim() || level.warehouseId)
+    }
   }
-  const byProduct = new Map<string, Array<{ warehouseId: string; available: Prisma.Decimal }>>()
+  const byProduct = new Map<string, Array<{ label: string; warehouseId: string; available: Prisma.Decimal }>>()
   for (const [key, available] of byProductWarehouse.entries()) {
     const separator = key.lastIndexOf(':')
     const productId = key.slice(0, separator)
     const warehouseId = key.slice(separator + 1)
     const rows = byProduct.get(productId) ?? []
-    rows.push({ warehouseId, available })
+    rows.push({ label: labelByWarehouseId.get(warehouseId) ?? warehouseId, warehouseId, available })
     byProduct.set(productId, rows)
   }
   return new Map([...byProduct.entries()].map(([productId, rows]) => [
     productId,
     rows
-      .sort((a, b) => a.warehouseId.localeCompare(b.warehouseId))
+      // Sort by label (explicit locale for cross-environment determinism); warehouseId
+      // breaks ties so two same-named warehouses keep a stable order.
+      .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }) || a.warehouseId.localeCompare(b.warehouseId))
       // Whole units, consistent with the integer Available column (audit-5f19).
-      .map((row) => `${row.warehouseId}: ${integerQuantityString(row.available)}`)
+      .map((row) => `${row.label}: ${integerQuantityString(row.available)}`)
       .join('; '),
   ]))
 }
@@ -637,6 +645,7 @@ async function loadStockLevels(client: ReplenishmentReportClient, filters: Stock
       warehouseId: true,
       quantity: true,
       reservedQty: true,
+      warehouse: { select: { code: true, name: true } },
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as StockLevelRow[]
