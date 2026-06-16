@@ -4,7 +4,7 @@ import { useTransition, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Hammer, ShoppingCart } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { createReorderPOs, createReorderMOs } from '@/app/actions/forecasting'
+import { createReorderPOs, createReorderMOs, type ReorderActionFilters } from '@/app/actions/forecasting'
 
 /**
  * Bulk-generate draft POs + MOs for every row currently visible in the
@@ -18,8 +18,10 @@ import { createReorderPOs, createReorderMOs } from '@/app/actions/forecasting'
  */
 export function ReorderActionsToolbar({
   rows,
+  filters,
 }: {
   rows: Array<{ productId: string; productType: string }>
+  filters: ReorderActionFilters
 }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
@@ -35,16 +37,20 @@ export function ReorderActionsToolbar({
       const parts: string[] = []
       try {
         if (purchasedIds.length > 0) {
-          const result = await createReorderPOs(purchasedIds)
-          const skipNote = result.success && (result.skippedSupplierCount ?? 0) > 0
-            ? ` (skipped ${result.skippedSupplierCount} supplier(s) with a recent draft)`
-            : ''
+          const result = await createReorderPOs(purchasedIds, { filters })
+          const notes: string[] = []
+          if (result.success && (result.skippedSupplierCount ?? 0) > 0) notes.push(`${result.skippedSupplierCount} supplier(s) with a recent draft`)
+          const skippedProducts = result.skippedProducts ?? []
+          if (result.success && skippedProducts.length > 0) {
+            notes.push(`${skippedProducts.length} product(s): ${skippedProducts.map((s) => `${s.sku ?? s.productId} — ${s.reason.replace(/_/g, ' ')}`).join(', ')}`)
+          }
+          const skipNote = notes.length > 0 ? ` (skipped ${notes.join('; ')})` : ''
           parts.push(result.success
             ? `${result.poCount} draft PO${result.poCount === 1 ? '' : 's'}${skipNote}`
             : `PO generation failed: ${result.error ?? 'unknown error'}`)
         }
         if (bomIds.length > 0) {
-          const result = await createReorderMOs(bomIds)
+          const result = await createReorderMOs(bomIds, { filters })
           const skipped = result.skipped ?? []
           const skipNote = result.success && skipped.length > 0
             ? ` (skipped ${skipped.length}: ${skipped.map((s) => `${s.sku} — ${s.reason.replace(/_/g, ' ')}`).join(', ')})`

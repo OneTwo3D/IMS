@@ -7,6 +7,40 @@ import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { partitionReorderMoCandidates, type ReorderMoSkip } from '@/lib/domain/manufacturing/reorder-mo-planning'
+import { selectReorderPoCandidates, type ReorderPoSkip } from '@/lib/domain/purchasing/reorder-po-planning'
+import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
+import { ProductType } from '@/app/generated/prisma/client'
+
+// audit-pcc0: the filter subset the Reorder Planning page passes to the PO/MO
+// buttons so draft quantities are computed from the SAME getReorderReport the
+// operator is looking at (same demand window, weeks-of-supply, warehouse/supplier
+// scope, ABC/urgency/search), instead of a separately-recomputed default.
+export type ReorderActionFilters = Pick<
+  StockPositionFilters,
+  'warehouseId' | 'categoryId' | 'supplierId' | 'productType' | 'thresholdDays' | 'targetCoverWeeks' | 'abcClass' | 'urgency' | 'search'
+>
+
+// Server actions can't trust their argument — the ReorderActionFilters type is only a
+// compile-time hint. Rebuild a clean object from known keys (dropping anything else),
+// clamp the numeric controls, and bound the search string so a crafted call can't push
+// unbounded values into getReorderReport or the persisted reorder evidence. (Quantities
+// are still authoritative — getReorderReport recomputes them server-side.)
+function sanitizeReorderActionFilters(filters?: ReorderActionFilters): ReorderActionFilters {
+  const f = filters ?? {}
+  const positiveInt = (n: unknown): number | undefined => (typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : undefined)
+  const weeks = positiveInt(f.targetCoverWeeks)
+  return {
+    warehouseId: f.warehouseId || undefined,
+    categoryId: f.categoryId || undefined,
+    supplierId: f.supplierId || undefined,
+    productType: f.productType && (Object.values(ProductType) as string[]).includes(f.productType) ? f.productType : undefined,
+    thresholdDays: positiveInt(f.thresholdDays),
+    targetCoverWeeks: weeks === undefined ? undefined : Math.min(52, weeks),
+    abcClass: f.abcClass === 'A' || f.abcClass === 'B' || f.abcClass === 'C' ? f.abcClass : undefined,
+    urgency: f.urgency === 'critical' || f.urgency === 'reorder' || f.urgency === 'watch' ? f.urgency : undefined,
+    search: typeof f.search === 'string' ? f.search.trim().slice(0, 100) || undefined : undefined,
+  }
+}
 
 // audit-M-mfg #2: a freshly-created reorder draft within this window suppresses a
 // duplicate re-submit (e.g. a refresh-and-resubmit), without blocking a deliberate
@@ -370,28 +404,19 @@ export async function generateForecasts(options: GenerateForecastOptions = {}): 
 
 export async function createReorderPOs(
   productIds: string[],
-  options: { supplierId?: string | null } = {},
-): Promise<{ success: boolean; poCount: number; skippedSupplierCount?: number; error?: string }> {
+  options: { filters?: ReorderActionFilters } = {},
+): Promise<{ success: boolean; poCount: number; skippedSupplierCount?: number; skippedProducts?: ReorderPoSkip[]; error?: string }> {
   await requirePermission('purchasing.create')
   try {
-    const settings = await getForecastSettings()
     const generatedAt = new Date().toISOString()
-    const forecasts = await generateForecasts({ supplierId: options.supplierId ?? null })
-    const selected = forecasts.filter((f) =>
-      productIds.includes(f.productId)
-      && f.supplierId
-      && f.recommendedOrderQty > 0
-      && (f.urgency === 'critical' || f.urgency === 'low')
-      && (!options.supplierId || f.supplierId === options.supplierId)
-    )
-
-    // Group by supplier
-    const bySupplier = new Map<string, ProductForecast[]>()
-    for (const f of selected) {
-      const list = bySupplier.get(f.supplierId!) ?? []
-      list.push(f)
-      bySupplier.set(f.supplierId!, list)
-    }
+    const actionFilters = sanitizeReorderActionFilters(options.filters)
+    // audit-pcc0: source draft-PO quantities from the SAME Reorder Planning report
+    // the operator selected from (whole-unit order-up-to suggestedReorderQty, the
+    // page's filters, inbound netting, lowest-cost supplier choice) — not the legacy
+    // generateForecasts engine, which used a different quantity and urgency model.
+    const { getReorderReport } = await import('@/lib/domain/inventory/replenishment-reports')
+    const report = await getReorderReport(actionFilters as StockPositionFilters, { paginate: false })
+    const { bySupplier, skipped: skippedProducts } = selectReorderPoCandidates(report.rows, productIds)
 
     const baseCurrency = await getBaseCurrencyCode()
     // audit-M-mfg #2: double-click idempotency — skip suppliers that already have
@@ -425,7 +450,7 @@ export async function createReorderPOs(
 
       // Get last prices
       const lastPrices = await db.supplierProduct.findMany({
-        where: { supplierId, productId: { in: items.map((i) => i.productId) } },
+        where: { supplierId, productId: { in: items.map((c) => c.row.productId) } },
         select: { productId: true, lastUnitCost: true },
       })
       const priceMap = new Map(lastPrices.map((lp) => [lp.productId, Number(lp.lastUnitCost)]))
@@ -433,36 +458,34 @@ export async function createReorderPOs(
       const ref = `PO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
 
       let subtotal = 0
-      const lineData = items.map((item, i) => {
-        const unitCost = priceMap.get(item.productId) ?? 0
-        const total = item.recommendedOrderQty * unitCost
+      const lineData = items.map((candidate, i) => {
+        const row = candidate.row
+        const qty = candidate.qty
+        const unitCost = priceMap.get(row.productId) ?? 0
+        const total = qty * unitCost
         const unitCostBase = Math.round((unitCost / fxRate) * 1000000) / 1000000
         const totalBase = Math.round((total / fxRate) * 10000) / 10000
         subtotal += total
         const reorderEvidence = {
-          source: 'reorder_forecast',
+          source: 'reorder_planning',
           generatedAt,
-          forecastSettings: settings,
+          filters: actionFilters,
           supplierId,
-          productId: item.productId,
-          sku: item.sku,
-          avgDailyDemand: item.avgDailyDemand,
-          demandTrend: item.demandTrend,
-          coefficientOfVariation: item.coefficientOfVariation,
-          abcClass: item.abcClass,
-          currentStock: item.currentStock,
-          reservedStock: item.reservedStock,
-          availableStock: item.availableStock,
-          avgLeadTimeDays: item.avgLeadTimeDays,
-          reorderPoint: item.reorderPoint,
-          safetyStock: item.safetyStock,
-          recommendedOrderQty: item.recommendedOrderQty,
-          daysUntilStockout: item.daysUntilStockout,
-          urgency: item.urgency,
+          productId: row.productId,
+          sku: row.sku,
+          averageDailyDemand: row.averageDailyDemand,
+          abcClass: row.abcClass,
+          availableQty: row.availableQty,
+          inboundOpenPoQty: row.inboundOpenPoQty,
+          leadTimeDays: row.leadTimeDays,
+          reorderPoint: row.reorderPoint,
+          safetyStockQty: row.safetyStockQty,
+          suggestedReorderQty: row.suggestedReorderQty,
+          urgency: row.urgency,
         }
         return {
-          productId: item.productId,
-          qty: item.recommendedOrderQty,
+          productId: row.productId,
+          qty,
           unitCostForeign: unitCost,
           unitCostBase,
           taxForeign: 0, taxBase: 0,
@@ -497,11 +520,11 @@ export async function createReorderPOs(
       entityType: 'PURCHASE_ORDER',
       tag: 'purchasing',
       action: 'created',
-      description: `Auto-generated ${poCount} reorder PO(s) from forecast${skippedSupplierCount > 0 ? ` (skipped ${skippedSupplierCount} supplier(s) with a recent reorder draft)` : ''}`,
-      metadata: { poCount, skippedSupplierCount, productIds },
+      description: `Auto-generated ${poCount} reorder PO(s) from Reorder Planning${skippedSupplierCount > 0 ? ` (skipped ${skippedSupplierCount} supplier(s) with a recent reorder draft)` : ''}`,
+      metadata: { poCount, skippedSupplierCount, productIds, skippedProducts },
     })
 
-    return { success: true, poCount, skippedSupplierCount }
+    return { success: true, poCount, skippedSupplierCount, skippedProducts }
   } catch (e) {
     return { success: false, poCount: 0, error: String(e) }
   }
@@ -523,11 +546,14 @@ export async function createReorderPOs(
 
 export async function createReorderMOs(
   productIds: string[],
+  options: { filters?: ReorderActionFilters } = {},
 ): Promise<{ success: boolean; moCount: number; skipped?: ReorderMoSkip[]; error?: string }> {
   await requirePermission('manufacturing')
   try {
     const { getReorderReport } = await import('@/lib/domain/inventory/replenishment-reports')
-    const report = await getReorderReport({}, { paginate: false })
+    // audit-pcc0: use the page's filters so the MO quantity matches the report row
+    // the operator selected from, not a default-filtered recompute.
+    const report = await getReorderReport(sanitizeReorderActionFilters(options.filters) as StockPositionFilters, { paginate: false })
     const suggestedByProduct = new Map(report.rows.map((row) => [row.productId, row]))
 
     const eligible = productIds.filter((productId) => {

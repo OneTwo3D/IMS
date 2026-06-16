@@ -6,6 +6,7 @@ import {
   type ReorderReportRow,
 } from '@/lib/domain/inventory/replenishment-reports'
 import { ReorderActionsToolbar } from './reorder-actions-client'
+import type { ReorderActionFilters } from '@/app/actions/forecasting'
 import {
   getStockPositionFilterOptions,
   stockPositionSelectedFilterOptionInputs,
@@ -126,9 +127,22 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
   ]
 
   const toolbarRows = report.rows.map((row) => ({ productId: row.productId, productType: row.productType }))
+  // audit-pcc0: pass the same filters that produced the visible report so the PO/MO
+  // buttons compute draft quantities from identical getReorderReport semantics.
+  const actionFilters: ReorderActionFilters = {
+    warehouseId: filters.warehouseId,
+    categoryId: filters.categoryId,
+    supplierId: filters.supplierId,
+    productType: filters.productType,
+    thresholdDays: filters.thresholdDays,
+    targetCoverWeeks: filters.targetCoverWeeks,
+    abcClass: filters.abcClass,
+    urgency: filters.urgency,
+    search: filters.search,
+  }
   return (
     <div className="space-y-3">
-      <ReorderActionsToolbar rows={toolbarRows} />
+      <ReorderActionsToolbar rows={toolbarRows} filters={actionFilters} />
     <StockPositionReportPage
       title="Reorder Planning"
       description="Demand-driven replenishment suggestions using sales velocity, supplier lead time, safety stock, available stock, and inbound open POs."
