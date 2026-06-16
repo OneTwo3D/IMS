@@ -77,7 +77,6 @@ type ProductPlanningRow = {
   reorderPoint: DecimalInput | null
   reorderQty: DecimalInput | null
   safetyStockQty: DecimalInput | null
-  abcClass: string | null
   category: { id: string; name: string } | null
   preferredSupplierId: string | null
   preferredSupplier: { id: string; name: string } | null
@@ -209,7 +208,8 @@ export type ReorderReportRow = {
   reorderPoint: string
   configuredReorderQty: string
   suggestedReorderQty: string
-  abcClass: string | null
+  // Always computed (by demand volume) — never null. See computeAbcByVolume.
+  abcClass: 'A' | 'B' | 'C'
   urgency: 'critical' | 'reorder' | 'watch'
   /**
    * Why this product needs replenishment. Sources are:
@@ -425,10 +425,34 @@ function supplierNames(product: { supplierProducts: Array<{ supplier: { name: st
   return product.supplierProducts.map((row) => row.supplier.name)
 }
 
-function normalizeAbcClass(value: string | null): string | null {
-  if (!value) return null
-  const normalized = value.trim().toUpperCase()
-  return normalized === 'A' || normalized === 'B' || normalized === 'C' ? normalized : null
+// audit-dxcz: ABC class is computed dynamically by demand volume rather than read
+// from the stored product.abcClass field (which is unset for most products). A
+// Pareto split on units sold in the demand window — top 80% of movement = A, next
+// 15% = B, the rest (incl. zero-movement) = C — keeps the classification meaningful
+// for both real sales and historical imports. Imports carry zero unit cost, so a
+// value-weighted basis would read 0; units stay reliable. Ties break by productId
+// so the A/B/C boundaries are deterministic across runs.
+function computeAbcByVolume(unitsByProduct: Map<string, Prisma.Decimal>): Map<string, 'A' | 'B' | 'C'> {
+  const ranked = [...unitsByProduct.entries()]
+    .filter(([, units]) => units.gt(0))
+    // Descending by units; ties break by a binary productId compare (not
+    // locale-sensitive) so the A/B/C boundaries are deterministic across runs.
+    .sort((a, b) => b[1].cmp(a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  const total = ranked.reduce((sum, [, units]) => sum.add(units), new Prisma.Decimal(0))
+  const result = new Map<string, 'A' | 'B' | 'C'>()
+  if (total.lte(0)) return result
+  // Classify each SKU by the cumulative share of the SKUs ranked ABOVE it — i.e.
+  // BEFORE adding its own units. The run of SKUs that builds up the first 80% of
+  // movement is A, up to 95% is B, the rest is C. Measuring the share "before"
+  // means the single largest mover (or any SKU that alone exceeds a band) still
+  // lands in A, instead of being pushed to C by its own contribution.
+  let cumulative = new Prisma.Decimal(0)
+  for (const [productId, units] of ranked) {
+    const shareBefore = cumulative.div(total)
+    result.set(productId, shareBefore.lt(0.8) ? 'A' : shareBefore.lt(0.95) ? 'B' : 'C')
+    cumulative = cumulative.add(units)
+  }
+  return result
 }
 
 function stockKey(productId: string, warehouseId: string | null | undefined): string {
@@ -603,7 +627,6 @@ export async function getReorderReport(
         reorderPoint: true,
         reorderQty: true,
         safetyStockQty: true,
-        abcClass: true,
         category: { select: { id: true, name: true } },
         preferredSupplierId: true,
         preferredSupplier: { select: { id: true, name: true } },
@@ -679,7 +702,15 @@ export async function getReorderReport(
   const inboundByProduct = inboundOpenPoByProduct(openPoLines)
   const velocityByProduct = new Map(calculateDailyVelocity(velocityInputs, window).map((row) => [row.productId, row]))
   const defaultLeadTimeSkus: string[] = []
-  const invalidAbcClassSkus: string[] = []
+
+  // audit-dxcz: rank products by total units dispatched in the demand window, then
+  // split into A/B/C with computeAbcByVolume. Reuses the velocity rows already loaded
+  // above — no extra query, so the report's source-row limits still bound the work.
+  const unitsByProduct = new Map<string, Prisma.Decimal>()
+  for (const input of velocityInputs) {
+    addToMap(unitsByProduct, input.productId, toDecimal(input.qty))
+  }
+  const abcByProduct = computeAbcByVolume(unitsByProduct)
 
   // Latest production order per product (most recent createdAt). Used to
   // derive the manufacturer label for BOM rows and as the warehouse fallback
@@ -744,8 +775,7 @@ export async function getReorderReport(
     const demandDuringLeadTime = averageDailyDemand.mul(leadTimeDays)
     const computedReorderPoint = demandDuringLeadTime.add(safetyStockQty)
     const baseReorderPoint = product.reorderPoint == null ? computedReorderPoint : toDecimal(product.reorderPoint)
-    const abcClass = normalizeAbcClass(product.abcClass)
-    if (product.abcClass && !abcClass) invalidAbcClassSkus.push(product.sku)
+    const abcClass = abcByProduct.get(product.id) ?? 'C'
     candidatesByProductId.set(product.id, {
       product,
       displaySupplier,
@@ -901,10 +931,9 @@ export async function getReorderReport(
       `Demand velocity uses SALE_DISPATCH movements from ${dateOnly(window.dateFrom)} to ${dateOnly(window.dateTo)}; returns are not netted.`,
       'Lead time uses SupplierProduct.leadTimeDays first, observed PurchaseReceipt P95 by supplier/SKU second, and the default 14 days only when neither exists.',
       'Suggested reorder quantity only applies the configured reorder quantity when projected available stock is below the reorder point; a configured reorderQty of 0 opts the SKU out of auto-reorder suggestions.',
-      'Planning fields are optional for existing products; abcClass is displayed only for A/B/C values and invalid values are ignored with a notice.',
+      'ABC class is computed by demand volume over the window above (Pareto: top 80% of units = A, next 15% = B, remainder including no-movement = C), not the stored product field.',
       'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',
       ...(defaultLeadTimeSkus.length > 0 ? [`Default ${DEFAULT_LEAD_TIME_DAYS}-day lead time used for ${defaultLeadTimeSkus.length} SKU(s) without configured or observed lead time: ${defaultLeadTimeSkus.slice(0, 10).join(', ')}${defaultLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
-      ...(invalidAbcClassSkus.length > 0 ? [`Ignored invalid abcClass values for ${invalidAbcClassSkus.length} SKU(s): ${invalidAbcClassSkus.slice(0, 10).join(', ')}${invalidAbcClassSkus.length > 10 ? ', ...' : ''}.`] : []),
     ],
   }
 }

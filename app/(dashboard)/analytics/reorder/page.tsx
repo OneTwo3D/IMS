@@ -62,6 +62,12 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
   }
 }
 
+const ABC_BADGE: Record<ReorderReportRow['abcClass'], string> = {
+  A: 'bg-amber-100 text-amber-800 border-amber-200',
+  B: 'bg-slate-100 text-slate-700 border-slate-200',
+  C: 'bg-gray-100 text-gray-600 border-gray-200',
+}
+
 function urgencyLabel(urgency: ReorderReportRow['urgency']): string {
   return urgency === 'critical' ? 'Critical' : urgency === 'reorder' ? 'Reorder' : 'Watch'
 }
@@ -104,6 +110,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     { key: 'supplier', label: 'Supplier / source', render: (row) => row.supplierName ?? 'Unassigned' },
     { key: 'neededFor', label: 'Needed for', render: (row) => row.neededFor.join(', ') },
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },
+    { key: 'abcClass', label: 'ABC', render: (row) => <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-bold ${ABC_BADGE[row.abcClass]}`}>{row.abcClass}</span> },
     { key: 'available', label: 'Available', align: 'right', render: (row) => `${row.availableQty} ${row.stockUnit}`, footer: report.totals.availableQty },
     { key: 'warehouseAvailability', label: 'Warehouse availability', render: (row) => row.warehouseAvailabilityBreakdown || 'None' },
     { key: 'inbound', label: 'Inbound PO', align: 'right', render: (row) => row.inboundOpenPoQty, footer: report.totals.inboundOpenPoQty },

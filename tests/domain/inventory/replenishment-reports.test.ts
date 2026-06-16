@@ -59,7 +59,6 @@ test('reorder report nets available and inbound open PO against lead-time demand
         reorderPoint: null,
         reorderQty: decimal('12'),
         safetyStockQty: decimal('5'),
-        abcClass: 'A',
         category,
         preferredSupplier: null,
         supplierProducts: [{
@@ -126,7 +125,6 @@ test('reorder report prefers the preferred supplier catalog row before stale sup
           reorderPoint: decimal('10'),
           reorderQty: decimal('2'),
           safetyStockQty: decimal('0'),
-          abcClass: null,
           category,
           preferredSupplierId: 'supplier-b',
           preferredSupplier: { id: 'supplier-b', name: 'Supplier B' },
@@ -144,7 +142,6 @@ test('reorder report prefers the preferred supplier catalog row before stale sup
           reorderPoint: decimal('10'),
           reorderQty: decimal('2'),
           safetyStockQty: decimal('0'),
-          abcClass: null,
           category,
           preferredSupplierId: null,
           preferredSupplier: null,
@@ -161,7 +158,6 @@ test('reorder report prefers the preferred supplier catalog row before stale sup
           reorderPoint: decimal('10'),
           reorderQty: decimal('2'),
           safetyStockQty: decimal('0'),
-          abcClass: null,
           category,
           preferredSupplierId: 'supplier-b',
           preferredSupplier: { id: 'supplier-b', name: 'Supplier B' },
@@ -254,7 +250,6 @@ test('reorder report treats configured reorderQty zero as opt-out', async () => 
         reorderPoint: decimal('10'),
         reorderQty: decimal('0'),
         safetyStockQty: decimal('0'),
-        abcClass: null,
         category,
         preferredSupplier: null,
         supplierProducts: [],
@@ -283,7 +278,6 @@ test('reorder report suppresses critical urgency when inbound covers a zero-stoc
         reorderPoint: decimal('10'),
         reorderQty: decimal('12'),
         safetyStockQty: decimal('0'),
-        abcClass: 'B',
         category,
         preferredSupplier: null,
         supplierProducts: [],
@@ -322,7 +316,6 @@ test('reorder report falls back to observed supplier-product P95 lead time when 
         reorderPoint: null,
         reorderQty: null,
         safetyStockQty: decimal('0'),
-        abcClass: null,
         category,
         preferredSupplier: null,
         supplierProducts: [{
@@ -373,7 +366,7 @@ test('reorder report falls back to observed supplier-product P95 lead time when 
   assert.equal(report.rows[0]?.reorderPoint, '20')
 })
 
-test('reorder report surfaces default lead-time fallback and invalid ABC class notice', async () => {
+test('reorder report surfaces default lead-time fallback; no-movement product defaults to ABC class C', async () => {
   const client: ReplenishmentReportClient = {
     ...unusedClient(),
     product: {
@@ -389,7 +382,6 @@ test('reorder report surfaces default lead-time fallback and invalid ABC class n
           reorderPoint: decimal('1'),
           reorderQty: null,
           safetyStockQty: decimal('0'),
-          abcClass: 'z',
           category,
           preferredSupplier: null,
           supplierProducts: [],
@@ -403,10 +395,104 @@ test('reorder report surfaces default lead-time fallback and invalid ABC class n
 
   const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
 
-  assert.equal(report.rows[0]?.abcClass, null)
+  // No demand-window movement → product is absent from the ranked map, so it
+  // takes the default class C.
+  assert.equal(report.rows[0]?.abcClass, 'C')
   assert.equal(report.rows[0]?.leadTimeDays, 14)
   assert.match(report.notices.join(' '), /Default 14-day lead time/)
-  assert.match(report.notices.join(' '), /Ignored invalid abcClass/)
+  assert.match(report.notices.join(' '), /ABC class is computed by demand volume/)
+})
+
+test('reorder report computes ABC class by demand volume (Pareto 80/95 on units)', async () => {
+  // Classification uses the cumulative share of the SKUs ranked ABOVE each one.
+  // A=800, B=150, C=49, D=1 (total 1000) → share-before = 0% / 80% / 95% / 99.9%.
+  const movements = [
+    { id: 'a', qty: '800' },
+    { id: 'b', qty: '150' },
+    { id: 'c', qty: '49' },
+    { id: 'd', qty: '1' },
+  ]
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => movements.map((m) => ({
+        id: m.id,
+        sku: `SKU-${m.id.toUpperCase()}`,
+        name: `Product ${m.id}`,
+        type: ProductType.SIMPLE,
+        stockUnit: 'pcs',
+        reorderPoint: decimal('100000'), // force every product into the report
+        reorderQty: decimal('1'),
+        safetyStockQty: decimal('0'),
+        category,
+        preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('1'), leadTimeDays: 7, supplier }],
+      })),
+    },
+    stockLevel: {
+      findMany: async () => movements.map((m) => ({ productId: m.id, warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') })),
+    },
+    stockMovement: {
+      findMany: async () => movements.map((m) => ({
+        productId: m.id,
+        qty: decimal(m.qty),
+        totalValueBase: decimal('0'), // imports carry zero value — volume basis must still classify
+        createdAt: new Date('2026-05-15T00:00:00.000Z'),
+        product: { sku: `SKU-${m.id.toUpperCase()}`, name: `Product ${m.id}`, category, supplierProducts: [{ supplier }] },
+      })),
+    },
+  }
+
+  const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+  const abcBySku = new Map(report.rows.map((row) => [row.sku, row.abcClass]))
+  assert.equal(abcBySku.get('SKU-A'), 'A') // share-before 0%   → A
+  assert.equal(abcBySku.get('SKU-B'), 'B') // share-before 80%  → B
+  assert.equal(abcBySku.get('SKU-C'), 'C') // share-before 95%  → C
+  assert.equal(abcBySku.get('SKU-D'), 'C') // share-before 99.9% → C
+})
+
+test('reorder report: a single dominant mover is class A, not pushed to C by its own volume', async () => {
+  // Regression for the share-after bug: ranking by cumulative share INCLUDING the
+  // SKU would put the 960-unit product at 96% → C. It must be A.
+  const movements = [
+    { id: 'big', qty: '960' },
+    { id: 'small', qty: '40' },
+  ]
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => movements.map((m) => ({
+        id: m.id,
+        sku: `SKU-${m.id.toUpperCase()}`,
+        name: `Product ${m.id}`,
+        type: ProductType.SIMPLE,
+        stockUnit: 'pcs',
+        reorderPoint: decimal('100000'),
+        reorderQty: decimal('1'),
+        safetyStockQty: decimal('0'),
+        category,
+        preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S', lastUnitCost: decimal('1'), leadTimeDays: 7, supplier }],
+      })),
+    },
+    stockLevel: {
+      findMany: async () => movements.map((m) => ({ productId: m.id, warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') })),
+    },
+    stockMovement: {
+      findMany: async () => movements.map((m) => ({
+        productId: m.id,
+        qty: decimal(m.qty),
+        totalValueBase: decimal('0'),
+        createdAt: new Date('2026-05-15T00:00:00.000Z'),
+        product: { sku: `SKU-${m.id.toUpperCase()}`, name: `Product ${m.id}`, category, supplierProducts: [{ supplier }] },
+      })),
+    },
+  }
+
+  const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+  const abcBySku = new Map(report.rows.map((row) => [row.sku, row.abcClass]))
+  assert.equal(abcBySku.get('SKU-BIG'), 'A')   // share-before 0%  → A
+  assert.equal(abcBySku.get('SKU-SMALL'), 'C') // share-before 96% → C
 })
 
 test('reorder report caps velocity source rows', async () => {
@@ -574,7 +660,6 @@ test('reorder report labels BOM products with the latest production order manufa
           reorderPoint: decimal(5),
           reorderQty: decimal(8),
           safetyStockQty: decimal(0),
-          abcClass: null,
           category,
           preferredSupplierId: null,
           preferredSupplier: null,
@@ -615,7 +700,6 @@ test('reorder report falls back to "Manufactured in-house" when no manufacturer 
           reorderPoint: decimal(5),
           reorderQty: decimal(8),
           safetyStockQty: decimal(0),
-          abcClass: null,
           category,
           preferredSupplierId: null,
           preferredSupplier: null,
@@ -658,7 +742,6 @@ test('reorder report folds BOM component demand into the component reorder math'
           reorderPoint: decimal(0),
           reorderQty: decimal(0),
           safetyStockQty: decimal(0),
-          abcClass: null,
           category,
           preferredSupplierId: null,
           preferredSupplier: null,
@@ -675,7 +758,6 @@ test('reorder report folds BOM component demand into the component reorder math'
           reorderPoint: decimal(5),
           reorderQty: decimal(8),
           safetyStockQty: decimal(0),
-          abcClass: null,
           category,
           preferredSupplierId: null,
           preferredSupplier: null,
@@ -711,7 +793,6 @@ test('reorder report aggregates raw-material demand across multiple parent BOMs'
           reorderPoint: decimal(0),
           reorderQty: decimal(0),
           safetyStockQty: decimal(0),
-          abcClass: null,
           category,
           preferredSupplierId: null,
           preferredSupplier: null,
@@ -728,7 +809,6 @@ test('reorder report aggregates raw-material demand across multiple parent BOMs'
           reorderPoint: decimal(5),
           reorderQty: decimal(5),
           safetyStockQty: decimal(0),
-          abcClass: null,
           category,
           preferredSupplierId: null,
           preferredSupplier: null,
@@ -743,7 +823,6 @@ test('reorder report aggregates raw-material demand across multiple parent BOMs'
           reorderPoint: decimal(4),
           reorderQty: decimal(4),
           safetyStockQty: decimal(0),
-          abcClass: null,
           category,
           preferredSupplierId: null,
           preferredSupplier: null,
