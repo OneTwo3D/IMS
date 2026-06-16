@@ -176,11 +176,16 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   // header's stored name/percent — never from a line's rate, since a line may
   // hold a stale rate from before this PO's supplier was set to "No VAT". A
   // header with no tax (No VAT supplier) leaves this undefined → order rate 0.
+  // Match on BOTH name and percent — never name alone: a rate may have been
+  // deactivated and replaced by an active same-name rate at a different percent
+  // (e.g. "VAT" 21% → 20%), and matching by name only would silently re-rate the
+  // PO. A name-with-different-percent therefore falls through to synthesis,
+  // which preserves the PO's exact saved percent.
   const matchedHeaderRate = existingPo?.taxRateName
     ? taxRatesProp.find(
         (t) => t.name === existingPo.taxRateName
           && Math.abs(t.rate - (existingPo.taxRatePercent ?? 0)) < 0.0001,
-      ) ?? taxRatesProp.find((t) => t.name === existingPo.taxRateName)
+      )
     : undefined
 
   // If the PO's header rate is no longer active (deactivated since the PO was
@@ -402,8 +407,10 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
     const s = allSuppliers.find((sup) => sup.id === id)
     if (s) {
       setCurrencyAndRate(s.currency)
-      if (s.taxRateId) setTaxRateId(s.taxRateId)
-      else setTaxRateId('')
+      // Route through handleTaxRateChange so existing auto lines re-resolve to
+      // the new supplier's Default VAT Rate (keeps the live preview in step
+      // with what the server will persist).
+      handleTaxRateChange(s.taxRateId ?? '')
     }
     if (id) {
       const prices = await getSupplierLastPrices(id)
