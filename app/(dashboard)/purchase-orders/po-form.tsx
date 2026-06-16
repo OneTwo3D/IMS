@@ -85,6 +85,19 @@ function resolveRateClientSide(
   usedFor: 'SALES' | 'PURCHASE',
   orderDefault: { id: string | null; name: string | null; rate: number },
 ): ResolvedRate {
+  // Purchases: the supplier's Default VAT Rate (carried as the order-level rate)
+  // is authoritative for every line. There is no destination-country/category
+  // auto-resolution for POs — a "No VAT" supplier (orderDefault.id null, rate 0)
+  // yields 0% on every line, and a manual per-line override still wins upstream.
+  if (usedFor === 'PURCHASE') {
+    return {
+      taxRateId: orderDefault.id,
+      taxRateValue: orderDefault.rate,
+      taxRateName: orderDefault.name,
+      warning: null,
+    }
+  }
+
   const iso = toIsoCountryCode(destinationCountry)
   const dest = iso ? iso.toLowerCase() : (destinationCountry ? destinationCountry.toLowerCase() : null)
   const applicable = rates.filter((r) => {

@@ -15,7 +15,6 @@ import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-erro
 import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
 import {
-  resolveLineTaxRateBatch,
   resolvedTaxRateFromProfile,
   taxRateProfileSelect,
   type ResolvedTaxRate,
@@ -62,7 +61,7 @@ import {
   getRealisedFxAccounts,
   resolveSettlementFxRateToBase,
 } from '@/lib/accounting-fx'
-import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
   buildStockMovementValueFields,
@@ -843,6 +842,66 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
 // Mutations
 // ---------------------------------------------------------------------------
 
+/** Order-level tax context — the supplier's Default VAT Rate (or a per-PO override of it). */
+type OrderDefaultTaxCtx = {
+  id: ResolvedTaxRate['taxRateId']
+  name: ResolvedTaxRate['taxRateName']
+  rate: ResolvedTaxRate['taxRateValue']
+  accountingTaxType: ResolvedTaxRate['accountingTaxType']
+  isCompound: ResolvedTaxRate['isCompound']
+  reverseCharge: ResolvedTaxRate['reverseCharge']
+  reportingCategory: ResolvedTaxRate['reportingCategory']
+  components: ResolvedTaxRate['components']
+}
+
+/**
+ * Resolve the tax rate for each purchase-order line.
+ *
+ * Purchases follow the supplier's Default VAT Rate (carried here as the
+ * order-level `orderDefault`): every non-overridden line takes that rate, so a
+ * "No VAT" supplier (id null, rate 0) yields 0% on every line. There is
+ * intentionally NO destination-country/category auto-resolution for POs — that
+ * is sales-only. A per-line manual override (`line.taxRateId`) still wins and is
+ * looked up from the DB.
+ */
+async function resolvePurchaseLineTaxRates(
+  lines: Array<{ taxRateId?: string | null }>,
+  orderDefault: OrderDefaultTaxCtx,
+): Promise<ResolvedTaxRate[]> {
+  const overrideIds = Array.from(
+    new Set(
+      lines
+        .map((l) => l.taxRateId)
+        .filter((x): x is string => typeof x === 'string' && x.length > 0),
+    ),
+  )
+  const overrideRows = overrideIds.length
+    ? await db.taxRate.findMany({ where: { id: { in: overrideIds } }, select: taxRateProfileSelect })
+    : []
+  const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
+
+  return lines.map((l) => {
+    if (l.taxRateId) {
+      const row = overrideById.get(l.taxRateId)
+      if (row) {
+        return resolvedTaxRateFromProfile(row, 'exact')
+      }
+    }
+    return {
+      taxRateId: orderDefault.id,
+      taxRateName: orderDefault.name,
+      taxRateValue: orderDefault.rate,
+      accountingTaxType: orderDefault.accountingTaxType,
+      isCompound: orderDefault.isCompound,
+      reverseCharge: orderDefault.reverseCharge,
+      reportingCategory: orderDefault.reportingCategory,
+      components: orderDefault.components,
+      matched: 'fallback' as const,
+      warning: null,
+    }
+  })
+}
+
 export async function createPurchaseOrder(input: CreatePoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
     await requirePermission('purchasing.create')
@@ -906,96 +965,21 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       components: orderDefaultProfile?.components ?? [],
     }
 
-    // Destination country: receiving warehouse → company home country.
-    let destCountryRaw: string | null = null
-    if (input.destinationWarehouseId) {
-      const wh = await db.warehouse.findUnique({
-        where: { id: input.destinationWarehouseId },
-        select: { country: true },
-      })
-      destCountryRaw = wh?.country ?? null
-    }
-    if (!destCountryRaw) {
-      try {
-        const { getOrganisation } = await import('./company')
-        const org = await getOrganisation()
-        destCountryRaw = org?.country ?? null
-      } catch { /* fall through to null */ }
-    }
-    const { toIsoCountryCode } = await import('@/lib/countries')
-    const destCountryIso = toIsoCountryCode(destCountryRaw)
-    const destCountry: string | null = destCountryIso
-      ? destCountryIso.toLowerCase()
-      : (destCountryRaw ? destCountryRaw.toLowerCase() : null)
-
-    // Load product categories.
+    // Validate every line's product is purchasable.
     const productIdsForTax = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
-    const productRows = productIdsForTax.length
-      ? await db.product.findMany({
-          where: { id: { in: productIdsForTax } },
-          select: { id: true, taxCategory: true, lifecycleStatus: true },
-        })
-      : []
-    const nonPurchasableProduct = productRows.find((p) => !isPurchasableProductStatus(p.lifecycleStatus))
-    if (nonPurchasableProduct) {
-      return { success: false, error: 'Only active and draft products can be added to new purchase orders' }
-    }
-    const productCategoryById = new Map<string, TaxCategory>(
-      productRows.map((p) => [p.id, p.taxCategory]),
-    )
-
-    // Auto-resolve every line that doesn't have a manual override.
-    const autoLines = input.lines
-      .map((l, idx) => ({
-        id: String(idx),
-        productCategory: (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
-        override: l.taxRateId ?? null,
-      }))
-      .filter((l) => !l.override)
-    const resolvedMap = await resolveLineTaxRateBatch(autoLines, {
-      destinationCountry: destCountry,
-      usedFor: 'PURCHASE',
-      orderDefault: orderDefaultCtx,
-    })
-
-    // Manual overrides → lookup by id in one query.
-    const overrideIds = Array.from(
-      new Set(
-        input.lines
-          .map((l) => l.taxRateId)
-          .filter((x): x is string => typeof x === 'string' && x.length > 0),
-      ),
-    )
-    const overrideRows = overrideIds.length
-      ? await db.taxRate.findMany({
-          where: { id: { in: overrideIds } },
-          select: taxRateProfileSelect,
-        })
-      : []
-    const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
-
-    const lineResolved: ResolvedTaxRate[] = input.lines.map((l, idx) => {
-      if (l.taxRateId) {
-        const row = overrideById.get(l.taxRateId)
-        if (row) {
-          return resolvedTaxRateFromProfile(row, 'exact')
-        }
+    if (productIdsForTax.length) {
+      const productRows = await db.product.findMany({
+        where: { id: { in: productIdsForTax } },
+        select: { id: true, lifecycleStatus: true },
+      })
+      const nonPurchasableProduct = productRows.find((p) => !isPurchasableProductStatus(p.lifecycleStatus))
+      if (nonPurchasableProduct) {
+        return { success: false, error: 'Only active and draft products can be added to new purchase orders' }
       }
-      return (
-        resolvedMap.get(String(idx)) ?? {
-          taxRateId: orderDefaultCtx.id,
-          taxRateName: orderDefaultCtx.name,
-          taxRateValue: orderDefaultCtx.rate,
-          accountingTaxType: orderDefaultCtx.accountingTaxType,
-          isCompound: orderDefaultCtx.isCompound,
-          reverseCharge: orderDefaultCtx.reverseCharge,
-          reportingCategory: orderDefaultCtx.reportingCategory,
-          components: orderDefaultCtx.components,
-          matched: 'fallback',
-          warning: null,
-        }
-      )
-    })
+    }
+
+    // Supplier's Default VAT Rate is authoritative for every line (per-line manual override still wins).
+    const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx)
 
     const lineData = input.lines.map((l, i) => {
       const resolved = lineResolved[i]
@@ -1163,32 +1147,6 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       })
     }
 
-    // Aggregated warning when any line fell back to the order default.
-    const fallbackLines = lineResolved
-      .map((r, i) => ({
-        r,
-        sku: input.lines[i].sku,
-        cat:
-          (input.lines[i].productId && productCategoryById.get(input.lines[i].productId)) ||
-          'STANDARD',
-      }))
-      .filter((x) => x.r.matched === 'fallback')
-    if (fallbackLines.length > 0) {
-      await logActivity({
-        entityType: 'PURCHASE_ORDER',
-        entityId: po.id,
-        action: 'tax_rate_fallback',
-        tag: 'purchase',
-        level: 'WARNING',
-        description: `No matching purchase tax rate for ${destCountry?.toUpperCase() ?? 'unknown country'} on ${fallbackLines.length} line(s); used order default.`,
-        metadata: {
-          reference: poReference,
-          destCountry,
-          lines: fallbackLines.map((x) => ({ sku: x.sku, category: x.cat })),
-        },
-      })
-    }
-
     revalidatePath('/purchase-orders')
     const mapped = mapPoRow(po)
     await logActivity({
@@ -1271,11 +1229,6 @@ export async function updatePurchaseOrder(
       updates.taxRatePercent = vatRate > 0 ? vatRate : null
     }
 
-    let updateFallbackInfo: {
-      destCountry: string | null
-      lines: { sku: string; category: TaxCategory }[]
-    } | null = null
-
     if (input.lines) {
       // --- Tax rate resolution (mirror createPurchaseOrder) -------------
       const orderDefaultRate = input.taxRateId
@@ -1301,125 +1254,21 @@ export async function updatePurchaseOrder(
         components: orderDefaultProfile?.components ?? [],
       }
 
-      // Destination country: receiving warehouse (use new value when set,
-      // else fall back to the existing PO's warehouse) → company home.
-      let destWarehouseId: string | null | undefined =
-        input.destinationWarehouseId !== undefined
-          ? input.destinationWarehouseId || null
-          : undefined
-      if (destWarehouseId === undefined) {
-        const cur = await db.purchaseOrder.findUnique({
-          where: { id },
-          select: { destinationWarehouseId: true },
-        })
-        destWarehouseId = cur?.destinationWarehouseId ?? null
-      }
-      let destCountryRaw: string | null = null
-      if (destWarehouseId) {
-        const wh = await db.warehouse.findUnique({
-          where: { id: destWarehouseId },
-          select: { country: true },
-        })
-        destCountryRaw = wh?.country ?? null
-      }
-      if (!destCountryRaw) {
-        try {
-          const { getOrganisation } = await import('./company')
-          const org = await getOrganisation()
-          destCountryRaw = org?.country ?? null
-        } catch { /* fall through */ }
-      }
-      const { toIsoCountryCode } = await import('@/lib/countries')
-      const destCountryIso = toIsoCountryCode(destCountryRaw)
-      const destCountry: string | null = destCountryIso
-        ? destCountryIso.toLowerCase()
-        : (destCountryRaw ? destCountryRaw.toLowerCase() : null)
-
-      // Load product categories.
+      // Validate every line's product is purchasable.
       const productIdsForTax = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
-      const productRows = productIdsForTax.length
-        ? await db.product.findMany({
-            where: { id: { in: productIdsForTax } },
-            select: { id: true, taxCategory: true, lifecycleStatus: true },
-          })
-        : []
-      const nonPurchasableProduct = productRows.find((p) => !isPurchasableProductStatus(p.lifecycleStatus))
-      if (nonPurchasableProduct) {
-        return { success: false, error: 'Only active and draft products can be added to purchase orders' }
-      }
-      const productCategoryById = new Map<string, TaxCategory>(
-        productRows.map((p) => [p.id, p.taxCategory]),
-      )
-
-      // Auto-resolve every line that doesn't have a manual override.
-      const autoLines = input.lines
-        .map((l, idx) => ({
-          id: String(idx),
-          productCategory:
-            (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
-          override: l.taxRateId ?? null,
-        }))
-        .filter((l) => !l.override)
-      const resolvedMap = await resolveLineTaxRateBatch(autoLines, {
-        destinationCountry: destCountry,
-        usedFor: 'PURCHASE',
-        orderDefault: orderDefaultCtx,
-      })
-
-      // Batch-load any per-line manual overrides.
-      const overrideIds = Array.from(
-        new Set(
-          input.lines
-            .map((l) => l.taxRateId)
-            .filter((x): x is string => typeof x === 'string' && x.length > 0),
-        ),
-      )
-      const overrideRows = overrideIds.length
-        ? await db.taxRate.findMany({
-            where: { id: { in: overrideIds } },
-            select: taxRateProfileSelect,
-          })
-        : []
-      const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
-
-      const lineResolved: ResolvedTaxRate[] = input.lines.map((l, idx) => {
-        if (l.taxRateId) {
-          const row = overrideById.get(l.taxRateId)
-          if (row) {
-            return resolvedTaxRateFromProfile(row, 'exact')
-          }
-        }
-        return (
-          resolvedMap.get(String(idx)) ?? {
-            taxRateId: orderDefaultCtx.id,
-            taxRateName: orderDefaultCtx.name,
-            taxRateValue: orderDefaultCtx.rate,
-            accountingTaxType: orderDefaultCtx.accountingTaxType,
-            isCompound: orderDefaultCtx.isCompound,
-            reverseCharge: orderDefaultCtx.reverseCharge,
-            reportingCategory: orderDefaultCtx.reportingCategory,
-            components: orderDefaultCtx.components,
-            matched: 'fallback',
-            warning: null,
-          }
-        )
-      })
-
-      const fallbackForActivity = lineResolved
-        .map((r, i) => ({
-          r,
-          sku: input.lines![i].sku,
-          cat:
-            (input.lines![i].productId && productCategoryById.get(input.lines![i].productId)) ||
-            ('STANDARD' as TaxCategory),
-        }))
-        .filter((x) => x.r.matched === 'fallback')
-      if (fallbackForActivity.length > 0) {
-        updateFallbackInfo = {
-          destCountry,
-          lines: fallbackForActivity.map((x) => ({ sku: x.sku, category: x.cat })),
+      if (productIdsForTax.length) {
+        const productRows = await db.product.findMany({
+          where: { id: { in: productIdsForTax } },
+          select: { id: true, lifecycleStatus: true },
+        })
+        const nonPurchasableProduct = productRows.find((p) => !isPurchasableProductStatus(p.lifecycleStatus))
+        if (nonPurchasableProduct) {
+          return { success: false, error: 'Only active and draft products can be added to purchase orders' }
         }
       }
+
+      // Supplier's Default VAT Rate is authoritative for every line (per-line manual override still wins).
+      const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx)
 
       // Delete existing lines and recreate
       await db.purchaseOrderLine.deleteMany({ where: { poId: id } })
@@ -1626,21 +1475,6 @@ export async function updatePurchaseOrder(
     // actually re-fetches fresh data.
     revalidatePath('/purchase-orders/[id]', 'page')
     const mapped = mapPoRow(po)
-    if (updateFallbackInfo && updateFallbackInfo.lines.length > 0) {
-      await logActivity({
-        entityType: 'PURCHASE_ORDER',
-        entityId: id,
-        action: 'tax_rate_fallback',
-        tag: 'purchase',
-        level: 'WARNING',
-        description: `No matching purchase tax rate for ${updateFallbackInfo.destCountry?.toUpperCase() ?? 'unknown country'} on ${updateFallbackInfo.lines.length} line(s); used order default.`,
-        metadata: {
-          reference: mapped.reference,
-          destCountry: updateFallbackInfo.destCountry,
-          lines: updateFallbackInfo.lines,
-        },
-      })
-    }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
