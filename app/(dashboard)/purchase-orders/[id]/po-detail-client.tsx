@@ -2087,10 +2087,11 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {error && <p className="text-sm text-destructive">{error}</p>}
       {notice && <p className="text-sm text-emerald-700 dark:text-emerald-300">{notice}</p>}
-      {/* For prepaid suppliers the prepaid-reconciliation banner below owns the
-          billed>net-received case with the right framing, so suppress the C4
-          "returned goods" banner to avoid two amber banners with the same number. */}
-      {overBilling.hasOverBilling && !prepaidReconciliation.isPrepaidSupplier && (
+      {/* This banner covers RETURNED billed goods (→ auto-created credit note);
+          the prepaid-reconciliation banner below covers genuine NON-delivery.
+          They are distinct concerns and no longer overlap, so both can show
+          (incl. for prepaid suppliers). */}
+      {overBilling.hasOverBilling && (
         <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
           <div className="flex gap-2">
             <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
@@ -2098,7 +2099,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               <p className="font-medium">
                 Supplier bill exceeds goods kept after return. {overBilling.totalOverBilledQty} unit(s) are billed but were returned —{' '}
                 {formatMoney(Number(overBilling.totalOverBilledValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)} over-billed.
-                Raise a supplier credit to reduce the AP liability; IMS does not adjust the bill automatically.
+                Returning billed goods raises a DRAFT supplier credit note automatically — review and post it (Supplier credit notes, below) to credit the bill.
               </p>
               <ul className="space-y-1 text-xs">
                 {overBilling.lines.map((line) => (
@@ -2122,14 +2123,14 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
             <div className="space-y-2">
               <p className="font-medium">
-                Prepaid reconciliation: {prepaidReconciliation.totalShortfallQty} unit(s) prepaid/billed but not received (net of returns) —{' '}
+                Prepaid reconciliation: {prepaidReconciliation.totalShortfallQty} unit(s) prepaid/billed but never delivered —{' '}
                 {formatMoney(Number(prepaidReconciliation.totalShortfallValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)} (ex-VAT) paid for but not arrived.
-                Claim a supplier credit (or chase the outstanding delivery). The three-way-match block is intentionally off for prepaid suppliers.
+                Chase the outstanding delivery, or claim a supplier credit for the shortfall. Returned goods are handled separately by an auto-created credit note. The three-way-match block is intentionally off for prepaid suppliers.
               </p>
               <ul className="space-y-1 text-xs">
                 {prepaidReconciliation.lines.map((line) => (
                   <li key={line.poLineId}>
-                    <span className="font-mono">{line.sku ?? line.productId}</span>: billed {line.billedQty}, kept {line.receivedQty} →{' '}
+                    <span className="font-mono">{line.sku ?? line.productId}</span>: billed {line.billedQty}, received {line.receivedQty} →{' '}
                     {line.shortfallQty} not arrived ({formatMoney(Number(line.shortfallValueBase), baseCurrency.symbol, baseCurrency.symbolPosition)})
                   </li>
                 ))}
