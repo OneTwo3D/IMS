@@ -587,6 +587,7 @@ model Product {
   mpn             String?
   hsCode          String?
   countryOfOrigin String?     // 2-letter ISO code
+  customsDescription String?  // free-text goods description for customs paperwork
   weight          Decimal?    @db.Decimal(10, 4) // kg, for landed cost by weight
   active          Boolean     @default(true)
 

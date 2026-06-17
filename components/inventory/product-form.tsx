@@ -39,6 +39,7 @@ type Props = {
     mpn?: string
     hsCode?: string
     countryOfOrigin?: string
+    customsDescription?: string
     weight?: string
     imageUrl?: string | null
     widthCm?: string | null
@@ -102,6 +103,7 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
     mpn:                  defaultValues?.mpn                  ?? '',
     hsCode:               defaultValues?.hsCode               ?? '',
     countryOfOrigin:      defaultValues?.countryOfOrigin      ?? '',
+    customsDescription:   defaultValues?.customsDescription   ?? '',
     weight:               defaultValues?.weight               ?? '',
     salesPriceBase:        defaultValues?.salesPriceBase        ?? '',
     salePriceBase:         defaultValues?.salePriceBase         ?? '',
@@ -368,6 +370,17 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
             ))}
           </Select>
         </div>
+      </div>
+
+      <div className="space-y-1.5">
+        <Label htmlFor="customsDescription">Customs Description</Label>
+        <Input
+          id="customsDescription"
+          name="customsDescription"
+          value={fields.customsDescription}
+          onChange={(ev) => set('customsDescription', ev.target.value)}
+          placeholder="Goods description for customs paperwork"
+        />
       </div>
 
       {/* Pricing — hidden for VARIABLE products (price comes from variants) */}

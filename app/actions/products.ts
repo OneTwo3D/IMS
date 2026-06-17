@@ -82,6 +82,7 @@ export type ProductDetail = ProductRow & {
   depthCm: string | null
   hsCode: string | null
   countryOfOrigin: string | null
+  customsDescription: string | null
   variants: ProductRow[]
   stockByWarehouse: {
     warehouseId: string
@@ -466,6 +467,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     mpn: p.mpn,
     hsCode: p.hsCode ?? null,
     countryOfOrigin: p.countryOfOrigin ?? null,
+    customsDescription: p.customsDescription ?? null,
     leadTimeDays: p.leadTimeDays ?? null,
     observedLeadTimeDays: p.observedLeadTimeDays ?? null,
     weight: p.weight?.toString() ?? null,
@@ -632,6 +634,7 @@ const productSchema = z.object({
   mpn: z.string().max(100).optional().nullable(),
   hsCode: z.string().optional().nullable(),
   countryOfOrigin: z.string().max(2).optional().nullable(),
+  customsDescription: z.string().optional().nullable(),
   weight: z.string().optional().nullable(),
   salesPriceBase: z.string().optional().nullable(),
   salePriceBase: z.string().optional().nullable(),
@@ -728,6 +731,7 @@ export async function createProduct(
     mpn: ((formData.get('mpn') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
+    customsDescription: formData.get('customsDescription') as string || null,
     weight: formData.get('weight') as string || null,
     salesPriceBase: formData.get('salesPriceBase') as string || null,
     salePriceBase: formData.get('salePriceBase') as string || null,
@@ -789,6 +793,7 @@ export async function createProduct(
         mpn: data.mpn || null,
         hsCode: data.hsCode || null,
         countryOfOrigin: data.countryOfOrigin || null,
+        customsDescription: data.customsDescription || null,
         weight: data.weight ? data.weight : null,
         salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
         salePriceBase: data.salePriceBase ? data.salePriceBase : null,
@@ -864,6 +869,7 @@ export async function updateProduct(
     mpn: ((formData.get('mpn') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
+    customsDescription: formData.get('customsDescription') as string || null,
     weight: formData.get('weight') as string || null,
     salesPriceBase: formData.get('salesPriceBase') as string || null,
     salePriceBase: formData.get('salePriceBase') as string || null,
@@ -939,6 +945,7 @@ export async function updateProduct(
         mpn: data.mpn || null,
         hsCode: data.hsCode || null,
         countryOfOrigin: data.countryOfOrigin || null,
+        customsDescription: data.customsDescription || null,
         weight: data.weight ? data.weight : null,
         salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
         salePriceBase: data.salePriceBase ? data.salePriceBase : null,
@@ -1450,7 +1457,7 @@ export async function generateVariantsFromOptions(
   const [product, options] = await Promise.all([
     db.product.findUnique({
       where: { id: productId },
-      select: { sku: true, name: true, type: true, weight: true, widthCm: true, heightCm: true, depthCm: true },
+      select: { sku: true, name: true, type: true, weight: true, widthCm: true, heightCm: true, depthCm: true, hsCode: true, countryOfOrigin: true, customsDescription: true },
     }),
     db.productOption.findMany({ where: { productId }, orderBy: { sortOrder: 'asc' } }),
   ])
@@ -1529,6 +1536,10 @@ export async function generateVariantsFromOptions(
         widthCm:  product.widthCm  ?? undefined,
         heightCm: product.heightCm ?? undefined,
         depthCm:  product.depthCm  ?? undefined,
+        // Variants inherit the parent's customs data; can be overridden per variant afterwards.
+        hsCode:             product.hsCode             ?? undefined,
+        countryOfOrigin:    product.countryOfOrigin    ?? undefined,
+        customsDescription: product.customsDescription ?? undefined,
       },
     })
     createdVariantIds.push(createdVariant.id)

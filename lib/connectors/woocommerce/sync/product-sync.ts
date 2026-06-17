@@ -308,6 +308,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
     const hsCodeAttr = asTrimmedString(getWcAttribute(wcProduct.attributes, 'hs_code', 'hs code', 'hscode'))
     const originAttr = getWcAttribute(wcProduct.attributes, 'country_of_origin', 'Country of Origin', 'coo')
     const originIso = toIsoCountryCode(originAttr)
+    const customsDescriptionAttr = asTrimmedString(getWcAttribute(wcProduct.attributes, 'customs_description', 'customs description', 'customsdescription'))
 
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'
@@ -357,6 +358,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
       // Customs — only set if IMS field is currently null/empty
       if (hsCodeAttr && !existing.hsCode) updateData.hsCode = hsCodeAttr
       if (originIso && !existing.countryOfOrigin) updateData.countryOfOrigin = originIso
+      if (customsDescriptionAttr && !existing.customsDescription) updateData.customsDescription = customsDescriptionAttr
 
       // Category — link to mirrored IMS category for the deepest WC category
       // referenced by this product. If WC dropped all categories, clear the link.
@@ -427,6 +429,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
           type: productType,
           hsCode: hsCodeAttr,
           countryOfOrigin: originIso,
+          customsDescription: customsDescriptionAttr,
           externalProductId: BigInt(wcProduct.id),
           categoryId: imsCategoryId ?? null,
         },

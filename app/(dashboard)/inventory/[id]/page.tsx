@@ -153,6 +153,7 @@ export default async function ProductDetailPage({
                 barcode: product.barcode ?? undefined,
                 mpn: product.mpn ?? undefined,
                 hsCode: product.hsCode ?? undefined,
+                customsDescription: product.customsDescription ?? undefined,
                 countryOfOrigin: product.countryOfOrigin ?? undefined,
                 weight: product.weight ?? undefined,
                 imageUrl: product.imageUrl,
