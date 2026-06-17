@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
@@ -516,6 +517,16 @@ async function directRecalcForSingleLayer(params: {
 
   return recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
 }
+
+test('both landed-cost recalc paths exclude CANCELLED freight POs (audit-izrf)', () => {
+  // Query-level `where` filtering can't be exercised through the mocked tx, so
+  // assert at the source level that BOTH the linked path (recalculateLandedCosts)
+  // and the direct path's landedCostLinks include carry the cancelled-freight
+  // exclusion — a cancelled freight PO must never re-enter landed-cost math.
+  const source = readFileSync('lib/domain/purchasing/landed-cost-service.ts', 'utf8')
+  const matches = source.match(/freightPO:\s*\{\s*status:\s*\{\s*not:\s*'CANCELLED'\s*\}\s*\}/g) ?? []
+  assert.ok(matches.length >= 2, `expected the cancelled-freight filter in both recalc paths, found ${matches.length}`)
+})
 
 test('recalculateDirectLandedCosts rejects CLOSED purchase orders', async () => {
   const { tx } = createDirectTx({
