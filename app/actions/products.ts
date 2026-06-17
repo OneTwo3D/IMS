@@ -1440,9 +1440,13 @@ export async function saveProductOptions(
 }
 
 export async function generateVariantsFromOptions(
-  productId: string
+  productId: string,
+  variantType: 'VARIANT' | 'KIT' | 'BOM' = 'VARIANT'
 ): Promise<{ created: number; skipped: number; error?: string }> {
   await requirePermission('inventory.edit')
+  if (variantType !== 'VARIANT' && variantType !== 'KIT' && variantType !== 'BOM') {
+    return { created: 0, skipped: 0, error: 'Invalid variant type' }
+  }
   const [product, options] = await Promise.all([
     db.product.findUnique({
       where: { id: productId },
@@ -1517,7 +1521,7 @@ export async function generateVariantsFromOptions(
       data: {
         sku,
         name,
-        type: 'VARIANT',
+        type: variantType,
         parentId: productId,
         active: true,
         lifecycleStatus: 'ACTIVE',
