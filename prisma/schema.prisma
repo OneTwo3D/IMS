@@ -1335,6 +1335,10 @@ model SupplierCreditNote {
   reason                String?
   notes                 String?
   status                SupplierCreditNoteStatus @default(DRAFT)
+  // True for credit notes auto-created by the supplier-return flow. Lets the
+  // return-credit top-up net only against prior RETURN credits (not manual
+  // allowances), so a manual credit can't silently suppress return credit.
+  isReturnGenerated     Boolean                  @default(false)
   // Accounting-connector credit-note id (Xero ACCPAYCREDIT), set once POSTED.
   accountingCreditNoteId String?                 @map("accounting_credit_note_id")
   recordedAt            DateTime                 @default(now())
