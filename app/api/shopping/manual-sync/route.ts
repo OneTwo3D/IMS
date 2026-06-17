@@ -52,9 +52,9 @@ export async function POST(request: NextRequest) {
         await startManualWcProductSync()
         return NextResponse.json({ success: true, started: true })
       }
-      const { pushStockToWc } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
-      const result = await pushStockToWc({ forceAll: true, source: 'MANUAL' })
-      return NextResponse.json({ success: true, result: toSerializableResult(result) })
+      const { startManualWcStockSync } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
+      await startManualWcStockSync()
+      return NextResponse.json({ success: true, started: true })
     }
 
     if (type !== 'stock') {
@@ -92,6 +92,12 @@ export async function GET(request: NextRequest) {
   if (connector === 'woocommerce' && type === 'products') {
     const { getManualWcProductSyncProgress } = await import('@/lib/connectors/woocommerce/sync/product-sync')
     const progress = await getManualWcProductSyncProgress()
+    return NextResponse.json(progress)
+  }
+
+  if (connector === 'woocommerce' && type === 'stock') {
+    const { getManualWcStockSyncProgress } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
+    const progress = await getManualWcStockSyncProgress()
     return NextResponse.json(progress)
   }
 

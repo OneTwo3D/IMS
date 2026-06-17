@@ -125,6 +125,27 @@ function formatWcProductSyncProgress(progress: WcProductSyncProgress): { detail:
   }
 }
 
+type WcStockSyncProgress = {
+  status: 'idle' | 'running' | 'done' | 'error'
+  message: string
+  processed: number
+  synced: number
+  total: number
+  errors: string[]
+}
+
+function formatWcStockSyncProgress(progress: WcStockSyncProgress): { detail: string; isError: boolean } {
+  if (progress.total > 0) {
+    const parts = [`Synced ${progress.synced} of ${progress.total} products`]
+    if (progress.errors.length > 0) parts.push(`${progress.errors.length} errors`)
+    return { detail: parts.join(' · '), isError: progress.errors.length > 0 }
+  }
+  return {
+    detail: progress.message || 'Preparing WooCommerce stock push…',
+    isError: progress.status === 'error',
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tabs
 // ---------------------------------------------------------------------------
@@ -493,6 +514,12 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   const productSyncStartedByUserRef = useRef(false)
   const productSyncBusy = productSyncStarting || productSyncProgress?.status === 'running'
 
+  const [stockSyncProgress, setStockSyncProgress] = useState<WcStockSyncProgress | null>(null)
+  const [stockSyncStarting, setStockSyncStarting] = useState(false)
+  const stockPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const stockSyncStartedByUserRef = useRef(false)
+  const stockSyncBusy = stockSyncStarting || stockSyncProgress?.status === 'running'
+
   const stopPolling = useCallback(() => {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
   }, [])
@@ -554,6 +581,42 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
     }, 2000)
   }, [pollProductSyncProgress, stopProductPolling])
 
+  const stopStockPolling = useCallback(() => {
+    if (stockPollRef.current) {
+      clearInterval(stockPollRef.current)
+      stockPollRef.current = null
+    }
+  }, [])
+
+  const pollStockSyncProgress = useCallback(async () => {
+    try {
+      const res = await fetch('/api/shopping/manual-sync?connector=woocommerce&type=stock', {
+        cache: 'no-store',
+      })
+      if (!res.ok) return
+      const data = await res.json() as WcStockSyncProgress
+      setStockSyncProgress(data)
+      if (data.status === 'done' || data.status === 'error') {
+        stopStockPolling()
+        if (stockSyncStartedByUserRef.current) {
+          const formatted = formatWcStockSyncProgress(data)
+          setSyncResult({ text: data.message || formatted.detail, isError: formatted.isError })
+          stockSyncStartedByUserRef.current = false
+          if (data.status === 'done') router.refresh()
+        }
+      }
+    } catch {
+      // Ignore intermittent progress polling failures.
+    }
+  }, [router, stopStockPolling])
+
+  const startStockPolling = useCallback(() => {
+    stopStockPolling()
+    stockPollRef.current = setInterval(() => {
+      void pollStockSyncProgress()
+    }, 2000)
+  }, [pollStockSyncProgress, stopStockPolling])
+
   // Check progress on mount if not completed yet
   useEffect(() => {
     if (wcConfigured && !initialImportDone) {
@@ -582,6 +645,18 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
       startProductPolling()
     }
   }, [productSyncProgress?.status, startProductPolling])
+
+  useEffect(() => {
+    if (!wcConfigured) return undefined
+    void pollStockSyncProgress()
+    return stopStockPolling
+  }, [pollStockSyncProgress, stopStockPolling, wcConfigured])
+
+  useEffect(() => {
+    if (stockSyncProgress?.status === 'running' && !stockPollRef.current) {
+      startStockPolling()
+    }
+  }, [stockSyncProgress?.status, startStockPolling])
 
   async function handleStartInitialImport() {
     setImportStarting(true)
@@ -644,6 +719,51 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
     }
   }
 
+  async function handleStockSync() {
+    setSyncResult(null)
+    setStockSyncStarting(true)
+    stockSyncStartedByUserRef.current = true
+    setStockSyncProgress({
+      status: 'running',
+      message: 'Starting WooCommerce stock push…',
+      processed: 0,
+      synced: 0,
+      total: 0,
+      errors: [],
+    })
+
+    try {
+      const response = await fetch('/api/shopping/manual-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connector: 'woocommerce', type: 'stock' }),
+      })
+
+      const data = await response.json() as { success?: boolean; error?: string }
+      if (!response.ok || !data.success) {
+        stockSyncStartedByUserRef.current = false
+        setStockSyncProgress(null)
+        setSyncResult({
+          text: `Error: ${data.error ?? `Request failed (${response.status})`}`,
+          isError: true,
+        })
+        return
+      }
+
+      await pollStockSyncProgress()
+      startStockPolling()
+    } catch (error) {
+      stockSyncStartedByUserRef.current = false
+      setStockSyncProgress(null)
+      setSyncResult({
+        text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+        isError: true,
+      })
+    } finally {
+      setStockSyncStarting(false)
+    }
+  }
+
   function handleSaveConnection() {
     setConnectionMessage(null)
     setConnectionError(false)
@@ -695,6 +815,10 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   function handleSync(type: 'orders' | 'products' | 'stock') {
     if (type === 'products') {
       void handleProductSync()
+      return
+    }
+    if (type === 'stock') {
+      void handleStockSync()
       return
     }
 
@@ -1056,8 +1180,8 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   </div>
                 </label>
                 <div className="flex items-center gap-2 flex-wrap">
-                  <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending}>
-                    {syncingType === 'stock' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
+                  <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending || stockSyncBusy}>
+                    {stockSyncBusy ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
                     Push Stock Now
                   </Button>
                   <Button
@@ -1072,6 +1196,14 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                     Reset cached IDs
                   </Button>
                 </div>
+                <LoadingProgress
+                  active={stockSyncBusy}
+                  label="Pushing stock to WooCommerce…"
+                  value={stockSyncProgress?.total ? stockSyncProgress.synced : undefined}
+                  max={stockSyncProgress?.total || undefined}
+                  detail={stockSyncProgress ? formatWcStockSyncProgress(stockSyncProgress).detail : 'Preparing WooCommerce stock push…'}
+                  className="max-w-sm"
+                />
               </div>
             )}
           </Card>

@@ -1,7 +1,6 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
@@ -838,27 +837,18 @@ export async function triggerManualSync(type: 'orders' | 'products' | 'stock'): 
       return { success: true, result: toSerializableResult(result) }
     }
     if (type === 'stock') {
-      const { pushStockToWc } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
       // Pushing every product's stock to WooCommerce can take ~a minute, which
       // exceeds the request/gateway timeout and surfaces to the user as
       // "something went wrong" even though the server completes. Run it in the
-      // background (like the manual product sync) and return immediately.
-      after(() =>
-        pushStockToWc({ forceAll: true, source: 'MANUAL' }).catch(async (e) => {
-          await logActivity({
-            entityType: 'SYNC',
-            tag: 'sync',
-            action: 'stock_push_failed',
-            level: 'WARNING',
-            description: `Manual WooCommerce stock push failed: ${String(e).slice(0, 300)}`,
-          })
-        }),
-      )
+      // background (like the manual product sync) with a polled progress record,
+      // and return immediately.
+      const { startManualWcStockSync } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
+      await startManualWcStockSync()
       return {
         success: true,
         result: {
           started: true,
-          message: 'Stock push started in the background — pushing all products to WooCommerce can take a minute. Check the sync log for the result.',
+          message: 'Stock push started in the background — pushing all products to WooCommerce can take a minute.',
         },
       }
     }
