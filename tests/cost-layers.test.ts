@@ -130,12 +130,15 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
 
   const updated = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
     accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    isReversalPostingEnabled: async () => true,
     queueAccountingSync: async (_tx, params) => {
       queued.push(params)
     },
   })
 
-  assert.equal(updated, 1)
+  assert.equal(updated.shipmentsUpdated, 1)
+  // audit-3aph: the helper reports the COGS revaluation it owns (new 27.5 − old 20).
+  assert.equal(updated.cogsRevaluationDelta.toString(), '7.5')
   assert.deepEqual(updates, [{
     where: { id: 'shipment-1' },
     data: { cogsBatchAmount: 27.5 },
@@ -160,6 +163,31 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
       newCogsBase: 27.5,
     },
   }])
+})
+
+test('refreshShipmentCogsForCostLayerChange does not claim the delta when COGS_REVERSAL posting is disabled (audit-3aph)', async () => {
+  // Posted shipment, but COGS_REVERSAL posting is OFF → the reversal won't reach
+  // the ledger, so the helper must NOT report the delta as shipment-owned (else
+  // the caller would drop it from the COGS journal and it would post nowhere).
+  const queued: unknown[] = []
+  const tx = {
+    $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    shipment: {
+      findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z') }),
+      update: async () => {},
+    },
+    shipmentLine: {
+      findMany: async () => [{ costLayerSnapshot: [{ costLayerId: 'layer-1', qty: '5.000000', unitCostBase: '5.500000' }] }],
+    },
+  }
+  const result = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    isReversalPostingEnabled: async () => false,
+    queueAccountingSync: async (_tx, params) => { queued.push(params) },
+  })
+  assert.equal(result.shipmentsUpdated, 1)
+  assert.equal(result.cogsRevaluationDelta.toString(), '0') // not shipment-owned → stays in the COGS journal
+  assert.deepEqual(queued, []) // nothing posted
 })
 
 test('refreshShipmentCogsForCostLayerChange does not queue COGS revaluation sync for unposted shipments', async () => {

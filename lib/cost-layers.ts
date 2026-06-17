@@ -8,7 +8,7 @@
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'
-import { getAccountingSettings, queueAccountingSyncTx } from '@/lib/accounting'
+import { getAccountingSettings, isAccountingSyncTypeEnabled, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import {
@@ -28,6 +28,13 @@ type ShipmentCogsRevaluationSyncOptions = {
     cogsAccount?: string | null
   }
   queueAccountingSync?: typeof queueAccountingSyncTx
+  /**
+   * Whether the COGS_REVERSAL posting type is actually enabled (injectable for
+   * tests). Determines whether this revaluation will reach the ledger — used by
+   * the caller to decide whether the landed-cost COGS journal must still cover
+   * this delta (audit-3aph).
+   */
+  isReversalPostingEnabled?: () => Promise<boolean>
 }
 
 export function buildShipmentCogsRevaluationSyncPayload(input: {
@@ -69,15 +76,20 @@ async function queueShipmentCogsRevaluationSync(
     newCogsBase: DecimalInput
   },
   options: ShipmentCogsRevaluationSyncOptions = {},
-): Promise<void> {
+): Promise<boolean> {
   const settings = options.accountingSettings ?? await getAccountingSettings().catch(() => null)
-  if (!settings?.inventoryAccount || !settings.cogsAccount) return
+  if (!settings?.inventoryAccount || !settings.cogsAccount) return false
   const payload = buildShipmentCogsRevaluationSyncPayload({
     ...input,
     inventoryAccount: settings.inventoryAccount,
     cogsAccount: settings.cogsAccount,
   })
-  if (!payload) return
+  if (!payload) return false
+  // audit-3aph: only treat this revaluation as posted (so the caller drops it
+  // from the COGS journal) when COGS_REVERSAL posting is actually enabled —
+  // otherwise the delta must remain in the COGS journal or it would post NOWHERE.
+  const isEnabled = options.isReversalPostingEnabled ?? (() => isAccountingSyncTypeEnabled('COGS_REVERSAL'))
+  if (!(await isEnabled())) return false
 
   await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
     type: 'COGS_REVERSAL',
@@ -86,6 +98,7 @@ async function queueShipmentCogsRevaluationSync(
     idempotencyKey: `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}`,
     payload,
   })
+  return true
 }
 
 function minDecimal(a: Decimal, b: Decimal): Decimal {
@@ -681,16 +694,35 @@ export async function getDependentOutputSourceLines(
   }))
 }
 
+export type ShipmentCogsRefreshResult = {
+  /** Number of shipments whose stored COGS was recomputed. */
+  shipmentsUpdated: number
+  /**
+   * Total COGS revaluation (newCogs − oldCogs, base currency) that the SHIPMENT
+   * path now owns for this cost-layer change — i.e. the change to already-sold
+   * goods' COGS that is either posted now (journaled shipments → COGS_REVERSAL)
+   * or will be posted by the daily batch (un-journaled shipments → updated
+   * cogsBatchAmount). Callers that ALSO compute a retrospective COGS journal must
+   * subtract this so the same sold-unit delta is not posted to COGS twice
+   * (audit-3aph).
+   */
+  cogsRevaluationDelta: Decimal
+}
+
 /**
  * Recompute stored shipment-level COGS for any shipment whose line snapshots
  * reference the changed cost layer. This keeps shipment COGS aligned with
  * retrospective landed-cost changes, including shipments already journaled.
+ *
+ * Returns the COGS revaluation delta the shipment path owns (see
+ * ShipmentCogsRefreshResult.cogsRevaluationDelta) — callers computing their own
+ * COGS journal must subtract it to avoid double-posting COGS for sold goods.
  */
 export async function refreshShipmentCogsForCostLayerChange(
   tx: TxClient,
   costLayerId: string,
   options: ShipmentCogsRevaluationSyncOptions = {},
-): Promise<number> {
+): Promise<ShipmentCogsRefreshResult> {
   const containsCostLayer = JSON.stringify([{ costLayerId }])
   const shipments = await tx.$queryRawUnsafe<Array<{ id: string }>>(
     `SELECT DISTINCT "shipmentId" AS id FROM "shipment_lines" WHERE "costLayerSnapshot" @> $1::jsonb`,
@@ -698,6 +730,7 @@ export async function refreshShipmentCogsForCostLayerChange(
   )
 
   let updated = 0
+  let cogsRevaluationDelta = toDecimal(0)
   for (const shipment of shipments) {
     const currentShipment = await tx.shipment.findUnique({
       where: { id: shipment.id },
@@ -712,22 +745,34 @@ export async function refreshShipmentCogsForCostLayerChange(
       toDecimal(0),
     )
     const cogs = roundQuantity(cogsTotal, 2).toNumber()
+    // (newCogs − oldCogs) is the layer-revaluation delta for this shipment (only
+    // this layer's snapshot cost changed).
+    const shipmentDelta = subtractMoney(toDecimal(cogs), toDecimal(currentShipment?.cogsBatchAmount ?? 0))
     await tx.shipment.update({
       where: { id: shipment.id },
       data: { cogsBatchAmount: cogs },
     })
     if (currentShipment?.shipmentJournalDate) {
-      await queueShipmentCogsRevaluationSync(tx, {
+      // Already journaled → the revaluation posts NOW via COGS_REVERSAL. Only
+      // count it as shipment-owned (so the caller drops it from the COGS journal)
+      // if that posting is actually enabled; otherwise leave it for the journal so
+      // the delta isn't lost (audit-3aph).
+      const posted = await queueShipmentCogsRevaluationSync(tx, {
         shipmentId: shipment.id,
         costLayerId,
         oldCogsBase: currentShipment.cogsBatchAmount,
         newCogsBase: cogs,
       }, options)
+      if (posted) cogsRevaluationDelta = addMoney(cogsRevaluationDelta, shipmentDelta)
+    } else {
+      // Not yet journaled → the daily batch will post the updated cogsBatchAmount
+      // (new cost), so the shipment path owns this delta.
+      cogsRevaluationDelta = addMoney(cogsRevaluationDelta, shipmentDelta)
     }
     updated++
   }
 
-  return updated
+  return { shipmentsUpdated: updated, cogsRevaluationDelta }
 }
 
 export async function refreshSalesOrderLineCogs(
