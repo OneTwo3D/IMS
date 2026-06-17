@@ -255,6 +255,22 @@ test('consumeFifoLayersStrict throws when locked FIFO rows cannot cover the requ
   )
 })
 
+test('consumeFifoLayersStrict throws on a tiny positive consume with NO cost layers (audit-snxr)', async () => {
+  // No FIFO rows → nothing consumed. A qty within the 0.0001 shortfall tolerance
+  // would otherwise return empty consumed, and the outbound writers (guarding on
+  // consumed.length > 0) would skip cogs_entries, so the deferred evidence guard
+  // would trip at COMMIT. Fail clearly here instead.
+  const tx = {
+    $executeRaw: async () => 0,
+    $queryRaw: async () => [],
+    costLayer: { update: async () => {} },
+  }
+  await assert.rejects(
+    () => consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 0.00005),
+    /No FIFO cost layers to consume for product product-1 in warehouse warehouse-1/,
+  )
+})
+
 test('consumeFifoLayers returns the full remaining quantity when no FIFO rows are available', async () => {
   const tx = {
     $executeRaw: async () => 0,
