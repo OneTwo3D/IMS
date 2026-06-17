@@ -16,6 +16,7 @@ import {
   landedCostAdjustmentEventKey,
   landedCostAdjustmentIdempotencyKey,
   normalizeLandedCostMethod,
+  propagateLandedCostToOutputs,
   recalculateDirectLandedCosts,
   recalculateLandedCosts,
   roundAdjustmentContextValue,
@@ -182,6 +183,89 @@ test('retrospective layer adjustment excludes manufacturing-consumed units from 
   assert.equal(deltas.netConsumedQty.toNumber(), 3) // 6 - 3 manufacturing
   assert.equal(deltas.cogsDelta.toNumber(), 6) // costDelta 2 × 3 net customer-consumed
   assert.equal(deltas.inventoryDelta.toNumber(), 8) // costDelta 2 × 4 on-hand (unchanged)
+})
+
+test('propagateLandedCostToOutputs cascades a component cost change through nested output layers (audit-e7h8)', async () => {
+  // comp-1 (+2/unit) → out-1 consumed 4 → out-2 consumed 2 (nested BOM).
+  const layers: Record<string, { unitCostBase: string; receivedQty: string; remainingQty: string }> = {
+    'out-1': { unitCostBase: '5', receivedQty: '10', remainingQty: '0' },
+    'out-2': { unitCostBase: '7', receivedQty: '5', remainingQty: '5' },
+  }
+  const sources: Record<string, { sourceLineId: string; outputCostLayerId: string; qty: Prisma.Decimal }[]> = {
+    'comp-1': [{ sourceLineId: 'sl1', outputCostLayerId: 'out-1', qty: toDecimal(4) }],
+    'out-1': [{ sourceLineId: 'sl2', outputCostLayerId: 'out-2', qty: toDecimal(2) }],
+    'out-2': [],
+  }
+  const updates: Record<string, string> = {}
+  const tx = {
+    costLayer: {
+      findUnique: async ({ where }: { where: { id: string } }) => layers[where.id] ?? null,
+      update: async ({ where, data }: { where: { id: string }; data: { unitCostBase: unknown } }) => {
+        updates[where.id] = String(data.unitCostBase)
+      },
+    },
+    costLayerSourceLine: { update: async () => ({}) },
+  }
+  let cogs = toDecimal(0)
+  let inv = toDecimal(0)
+  const deps = noopDeps({
+    getDependentOutputSourceLines: async (_tx, id) => sources[id] ?? [],
+    // out-1 is fully consumed into out-2 (manufacturing); out-2 is all on-hand.
+    getManufacturingConsumedQtyForCostLayer: async (_tx, id) => id === 'out-1' ? toDecimal(10) : toDecimal(0),
+  })
+  await propagateLandedCostToOutputs(
+    tx as never, deps, 'comp-1', toDecimal(2),
+    (c, i) => { cogs = cogs.add(c); inv = inv.add(i) },
+    new Set(), 1,
+  )
+  // out-1 unit cost up 2×4/10 = 0.8 → 5.8; out-2 up 0.8×2/5 = 0.32 → 7.32.
+  assert.equal(updates['out-1'], '5.8')
+  assert.equal(updates['out-2'], '7.32')
+  // out-1 fully manufacturing-consumed → 0 COGS/inventory; out-2 all on-hand → inventory 0.32×5 = 1.6.
+  assert.equal(cogs.toString(), '0')
+  assert.equal(inv.toString(), '1.6')
+})
+
+test('propagateLandedCostToOutputs accumulates BOTH paths of a diamond BOM (audit-e7h8)', async () => {
+  // Diamond: comp-1 (+1/unit) feeds out-1 AND out-2 (each qty 1, each received 1
+  // → unitDelta 1); out-1 and out-2 BOTH feed out-3 (each qty 1, received 1).
+  // out-3 must accumulate BOTH contributions (1 + 1 = 2): a global visited set
+  // would process out-3 once (bump 1); the path-based guard processes both (bump 2).
+  const state: Record<string, { unitCostBase: string; receivedQty: string; remainingQty: string }> = {
+    'out-1': { unitCostBase: '3', receivedQty: '1', remainingQty: '0' },
+    'out-2': { unitCostBase: '3', receivedQty: '1', remainingQty: '0' },
+    'out-3': { unitCostBase: '5', receivedQty: '1', remainingQty: '1' },
+  }
+  const sources: Record<string, { sourceLineId: string; outputCostLayerId: string; qty: Prisma.Decimal }[]> = {
+    'comp-1': [
+      { sourceLineId: 's1', outputCostLayerId: 'out-1', qty: toDecimal(1) },
+      { sourceLineId: 's2', outputCostLayerId: 'out-2', qty: toDecimal(1) },
+    ],
+    'out-1': [{ sourceLineId: 's3', outputCostLayerId: 'out-3', qty: toDecimal(1) }],
+    'out-2': [{ sourceLineId: 's4', outputCostLayerId: 'out-3', qty: toDecimal(1) }],
+    'out-3': [],
+  }
+  const tx = {
+    costLayer: {
+      findUnique: async ({ where }: { where: { id: string } }) => state[where.id] ? { ...state[where.id] } : null,
+      update: async ({ where, data }: { where: { id: string }; data: { unitCostBase: unknown } }) => {
+        state[where.id] = { ...state[where.id], unitCostBase: String(data.unitCostBase) }
+      },
+    },
+    costLayerSourceLine: { update: async () => ({}) },
+  }
+  // out-1/out-2 fully consumed into out-3 (manufacturing); out-3 on-hand.
+  const deps = noopDeps({
+    getDependentOutputSourceLines: async (_tx, id) => sources[id] ?? [],
+    getManufacturingConsumedQtyForCostLayer: async (_tx, id) => (id === 'out-1' || id === 'out-2') ? toDecimal(1) : toDecimal(0),
+  })
+  await propagateLandedCostToOutputs(
+    tx as never, deps, 'comp-1', toDecimal(1),
+    () => {}, new Set(), 1,
+  )
+  assert.equal(state['out-1'].unitCostBase, '4')
+  assert.equal(state['out-2'].unitCostBase, '4')
+  assert.equal(state['out-3'].unitCostBase, '7') // 5 + 1 (via out-1) + 1 (via out-2)
 })
 
 test('retrospective layer adjustment uses Decimal arithmetic for fractional landed-cost deltas', () => {
@@ -441,6 +525,7 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     getReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getSupplierReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getManufacturingConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
+    getDependentOutputSourceLines: async () => [],
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => 0,
     refreshSalesOrderLineCogsForCostLayerChange: async () => 0,

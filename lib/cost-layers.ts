@@ -654,6 +654,33 @@ export async function getManufacturingConsumedQtyForCostLayer(
   return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0))
 }
 
+export type DependentOutputSourceLine = {
+  sourceLineId: string
+  outputCostLayerId: string
+  qty: Decimal
+}
+
+/**
+ * Find the cost-layer source lines (produced-output ← source layer) where the
+ * given layer is the SOURCE — i.e. the manufactured output layers that consumed
+ * this layer as a component. Used to propagate a retrospective landed-cost change
+ * on a component layer into the produced output layers it fed (audit-e7h8).
+ */
+export async function getDependentOutputSourceLines(
+  tx: TxClient,
+  sourceCostLayerId: string,
+): Promise<DependentOutputSourceLine[]> {
+  const rows = await tx.costLayerSourceLine.findMany({
+    where: { sourceCostLayerId },
+    select: { id: true, costLayerId: true, qty: true },
+  })
+  return rows.map((row) => ({
+    sourceLineId: row.id,
+    outputCostLayerId: row.costLayerId,
+    qty: toDecimal(row.qty),
+  }))
+}
+
 /**
  * Recompute stored shipment-level COGS for any shipment whose line snapshots
  * reference the changed cost layer. This keeps shipment COGS aligned with
