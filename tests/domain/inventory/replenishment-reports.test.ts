@@ -327,6 +327,57 @@ test('reorder report propagates the BOM parent order-up-to quantity into compone
   assert.equal(report.rows.find((r) => r.sku === 'RAW-OAK')?.suggestedReorderQty, '122')
 })
 
+test('reorder report cascades demand through NESTED (multi-level) BOMs', async () => {
+  // 3-level BOM: Oak table (BOM, has velocity) → 4× Table leg (also a BOM, no
+  // velocity) → 2× Oak board (raw, no velocity).
+  // Parent order-up-to = 61 (reorderPoint 5 + 8wk cover at 1/day = 56).
+  // Leg demand = 61 × 4 = 244; board demand = 244 × 2 = 488.
+  // The leg is itself a BOM, so its demand MUST be folded into its reorder point
+  // BEFORE it explodes to the board — the bug was a single pass that computed the
+  // leg's build qty from its own (zero) availability, leaving the board at 0.
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        {
+          id: 'raw-oak', sku: 'RAW-OAK', name: 'Oak board', type: ProductType.SIMPLE, stockUnit: 'each',
+          reorderPoint: decimal(0), reorderQty: decimal(0), safetyStockQty: decimal(0), category,
+          preferredSupplierId: null, preferredSupplier: null,
+          supplierProducts: [{ supplierId: 'sup-timber', supplierSku: 'OAK-1', lastUnitCost: decimal(5), leadTimeDays: 7, supplier: { name: 'Timber Co' } }],
+        },
+        {
+          id: 'bom-leg', sku: 'BOM-LEG', name: 'Table leg', type: ProductType.BOM, stockUnit: 'each',
+          reorderPoint: decimal(0), reorderQty: null, safetyStockQty: decimal(0), category,
+          preferredSupplierId: null, preferredSupplier: null, supplierProducts: [],
+        },
+        {
+          id: 'bom-table', sku: 'BOM-TABLE', name: 'Oak table', type: ProductType.BOM, stockUnit: 'each',
+          reorderPoint: decimal(5), reorderQty: null, safetyStockQty: decimal(0), category,
+          preferredSupplierId: null, preferredSupplier: null, supplierProducts: [],
+        },
+      ],
+    },
+    stockLevel: { findMany: async () => [
+      { productId: 'raw-oak', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') },
+      { productId: 'bom-leg', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') },
+      { productId: 'bom-table', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') },
+    ] },
+    stockMovement: { findMany: async () => [{
+      productId: 'bom-table', qty: decimal('90'), totalValueBase: decimal('0'),
+      createdAt: new Date('2026-05-15T00:00:00.000Z'),
+      product: { sku: 'BOM-TABLE', name: 'Oak table', category, supplierProducts: [] },
+    }] },
+    bomItem: { findMany: async () => [
+      { parentProductId: 'bom-table', componentProductId: 'bom-leg', qty: decimal(4) },
+      { parentProductId: 'bom-leg', componentProductId: 'raw-oak', qty: decimal(2) },
+    ] },
+  }
+  const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.equal(report.rows.find((r) => r.sku === 'BOM-TABLE')?.suggestedReorderQty, '61')
+  assert.equal(report.rows.find((r) => r.sku === 'BOM-LEG')?.suggestedReorderQty, '244')
+  assert.equal(report.rows.find((r) => r.sku === 'RAW-OAK')?.suggestedReorderQty, '488')
+})
+
 test('reorder report prefers the preferred supplier catalog row before stale supplier catalog rows', async () => {
   const supplierA = { name: 'Supplier A' }
   const supplierB = { name: 'Supplier B' }

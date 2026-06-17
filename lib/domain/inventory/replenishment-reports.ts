@@ -853,22 +853,76 @@ export async function getReorderReport(
 
   // Phase 1: for every BOM candidate that itself needs replenishment, derive
   // the additional demand its components inherit (suggestedReorderQty × bomItem.qty).
-  // Walk in stable SKU order so accumulator ordering is deterministic.
+  //
+  // Multi-level BOMs: a BOM's component can itself be a BOM, so demand must
+  // cascade down. We process BOM candidates TOP-DOWN in topological order
+  // (a parent BOM before any component BOM it drives) so that when we explode a
+  // component BOM, the demand inherited from its parent(s) is already folded into
+  // its reorder point — otherwise nested sub-components are understated. Ties
+  // break by SKU for deterministic accumulation; any cycle remnant (BOMs should
+  // be acyclic) is appended in SKU order so it's still processed once.
   const componentDemand = new Map<string, Prisma.Decimal>()
   const componentNeededFor = new Map<string, string[]>()
   const orderedCandidates = [...candidatesByProductId.values()].sort((a, b) => a.product.sku.localeCompare(b.product.sku))
-  for (const candidate of orderedCandidates) {
-    if (candidate.product.type !== ProductType.BOM) continue
-    // Ceil to whole units first so component demand is derived from the same
-    // integer build quantity the parent row displays / a draft MO would create.
+
+  const bomCandidateIds = new Set(
+    orderedCandidates.filter((c) => c.product.type === ProductType.BOM).map((c) => c.product.id),
+  )
+  // Adjacency (parent BOM → component BOMs) + in-degrees for a topological sort.
+  const childBomsByParent = new Map<string, string[]>()
+  const indegree = new Map<string, number>()
+  for (const id of bomCandidateIds) indegree.set(id, 0)
+  for (const parentId of bomCandidateIds) {
+    const childBoms = [
+      ...new Set(
+        (bomItemsByParent.get(parentId) ?? [])
+          .map((item) => item.componentProductId)
+          .filter((cid) => bomCandidateIds.has(cid)),
+      ),
+    ]
+    childBomsByParent.set(parentId, childBoms)
+    for (const cid of childBoms) indegree.set(cid, (indegree.get(cid) ?? 0) + 1)
+  }
+  // Kahn topological order over BOM candidates (parents before components).
+  const bomCandidateById = new Map(orderedCandidates.filter((c) => bomCandidateIds.has(c.product.id)).map((c) => [c.product.id, c]))
+  const ready = orderedCandidates.filter((c) => bomCandidateIds.has(c.product.id) && (indegree.get(c.product.id) ?? 0) === 0).map((c) => c.product.id)
+  const topoOrder: string[] = []
+  const placed = new Set<string>()
+  while (ready.length > 0) {
+    const id = ready.shift()!
+    if (placed.has(id)) continue
+    placed.add(id)
+    topoOrder.push(id)
+    const children = (childBomsByParent.get(id) ?? []).slice().sort((a, b) =>
+      (bomCandidateById.get(a)?.product.sku ?? '').localeCompare(bomCandidateById.get(b)?.product.sku ?? ''),
+    )
+    for (const cid of children) {
+      indegree.set(cid, (indegree.get(cid) ?? 0) - 1)
+      if ((indegree.get(cid) ?? 0) === 0) ready.push(cid)
+    }
+  }
+  // Defensive: append any BOM not reached (cycle) so it's still exploded once.
+  for (const c of orderedCandidates) {
+    if (bomCandidateIds.has(c.product.id) && !placed.has(c.product.id)) topoOrder.push(c.product.id)
+  }
+
+  for (const productId of topoOrder) {
+    const candidate = bomCandidateById.get(productId)
+    if (!candidate) continue
+    // Fold demand inherited from parent BOM(s) into this BOM's reorder point
+    // BEFORE computing how many to build, so a sub-assembly driven by a parent
+    // explodes the right quantity to ITS components. Ceil to whole units so
+    // component demand matches the integer build quantity the parent row / a
+    // draft MO would create.
+    const inheritedDemand = componentDemand.get(productId) ?? new Prisma.Decimal(0)
     const ownSuggested = ceilInteger(suggestedOrderUpToQty(
-      candidate.baseReorderPoint,
+      candidate.baseReorderPoint.add(inheritedDemand),
       candidate.projectedAvailableQty,
       candidate.targetCoverQty,
       candidate.configuredReorderQty,
     ))
     if (ownSuggested.lte(0)) continue
-    const bomItems = bomItemsByParent.get(candidate.product.id) ?? []
+    const bomItems = bomItemsByParent.get(productId) ?? []
     for (const item of bomItems) {
       const extra = ownSuggested.mul(item.qty)
       const existing = componentDemand.get(item.componentProductId) ?? new Prisma.Decimal(0)
