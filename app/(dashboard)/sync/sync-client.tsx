@@ -26,6 +26,7 @@ import {
   type ShoppingTaxRateMappingRow,
 } from '@/app/actions/shopping-sync'
 import { UnifiedTaxRateMapper } from '@/components/settings/unified-tax-rate-mapper'
+import { formatDateTime } from '@/lib/format-datetime'
 
 type Props = {
   settings: ShoppingSyncSettings
@@ -272,7 +273,7 @@ function HelperPluginCard({
             </Button>
             {lastFxPushAt && (
               <span className="text-xs text-muted-foreground">
-                Last push: {new Date(lastFxPushAt).toLocaleString('en-GB')}
+                Last push: {formatDateTime(lastFxPushAt)}
               </span>
             )}
             {pushResult && (
@@ -921,7 +922,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
           {shoppingCredentials.connectionTest.status !== 'never' && (
             <p className={`text-xs ${shoppingCredentials.connectionTest.status === 'success' ? 'text-green-600' : 'text-destructive'}`}>
               Last connection test: {shoppingCredentials.connectionTest.status === 'success' ? 'passed' : 'failed'}
-              {shoppingCredentials.connectionTest.testedAt ? ` at ${new Date(shoppingCredentials.connectionTest.testedAt).toLocaleString('en-GB')}` : ''}
+              {shoppingCredentials.connectionTest.testedAt ? ` at ${formatDateTime(shoppingCredentials.connectionTest.testedAt)}` : ''}
               {shoppingCredentials.connectionTest.message ? ` — ${shoppingCredentials.connectionTest.message}` : ''}
             </p>
           )}
@@ -1051,7 +1052,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 <Label className={orderWebhookActive ? 'text-muted-foreground' : ''}>Polling interval (minutes)</Label>
                 <Input type="number" min={1} value={s.wc_sync_interval_minutes} onChange={(e) => setS({ ...s, wc_sync_interval_minutes: e.target.value })} className="h-9 text-sm w-24" disabled={orderWebhookActive} />
                 {orderWebhookActive && (
-                  <p className="text-xs text-muted-foreground">Primary order polling is disabled — orders are received in real-time via webhook (last received: {new Date(s.wc_order_webhook_last_received_at).toLocaleString('en-GB')}). Cron now acts only as backup reconciliation, roughly daily.</p>
+                  <p className="text-xs text-muted-foreground">Primary order polling is disabled — orders are received in real-time via webhook (last received: {formatDateTime(s.wc_order_webhook_last_received_at)}). Cron now acts only as backup reconciliation, roughly daily.</p>
                 )}
                 {s.wc_webhook_secret && !orderWebhookActive && (
                   <p className="text-xs text-amber-600">Webhook secret is set but no recent order webhook has been received — polling reconciliation is still active.</p>
@@ -1084,10 +1085,10 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 <span className="text-xs text-muted-foreground">Complete initial import first</span>
               )}
               {s.last_wc_order_sync_at && (
-                <span className="text-xs text-muted-foreground">Last order intake: {new Date(s.last_wc_order_sync_at).toLocaleString('en-GB')}</span>
+                <span className="text-xs text-muted-foreground">Last order intake: {formatDateTime(s.last_wc_order_sync_at)}</span>
               )}
               {s.last_wc_order_reconcile_at && (
-                <span className="text-xs text-muted-foreground">Last reconcile: {new Date(s.last_wc_order_reconcile_at).toLocaleString('en-GB')}</span>
+                <span className="text-xs text-muted-foreground">Last reconcile: {formatDateTime(s.last_wc_order_reconcile_at)}</span>
               )}
             </div>
           </Card>
@@ -1145,13 +1146,13 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   className="max-w-sm"
                 />
                 {productWebhookActive && (
-                  <p className="text-xs text-muted-foreground">Primary product polling is disabled — products are updated via webhook (last received: {new Date(s.wc_product_webhook_last_received_at).toLocaleString('en-GB')}). Cron only runs backup reconciliation.</p>
+                  <p className="text-xs text-muted-foreground">Primary product polling is disabled — products are updated via webhook (last received: {formatDateTime(s.wc_product_webhook_last_received_at)}). Cron only runs backup reconciliation.</p>
                 )}
                 {s.last_wc_product_sync_at && (
-                  <p className="text-xs text-muted-foreground">Last product intake: {new Date(s.last_wc_product_sync_at).toLocaleString('en-GB')}</p>
+                  <p className="text-xs text-muted-foreground">Last product intake: {formatDateTime(s.last_wc_product_sync_at)}</p>
                 )}
                 {s.last_wc_product_reconcile_at && (
-                  <p className="text-xs text-muted-foreground">Last product reconcile: {new Date(s.last_wc_product_reconcile_at).toLocaleString('en-GB')}</p>
+                  <p className="text-xs text-muted-foreground">Last product reconcile: {formatDateTime(s.last_wc_product_reconcile_at)}</p>
                 )}
               </div>
             )}
@@ -1280,7 +1281,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 <TableBody>
                   {logs.map((l) => (
                     <TableRow key={l.id}>
-                      <TableCell className="py-1.5 text-xs text-muted-foreground">{new Date(l.createdAt).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</TableCell>
+                      <TableCell className="py-1.5 text-xs text-muted-foreground">{formatDateTime(l.createdAt, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</TableCell>
                       <TableCell className="py-1.5 text-xs">
                         {l.direction === 'FROM_CONNECTOR' ? <span className="text-blue-600">↓ From Store</span> : <span className="text-green-600">↑ To Store</span>}
                       </TableCell>
