@@ -7,6 +7,7 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
 import { DEFAULT_BASE_CURRENCY, getFallbackCurrencyMeta, isBaseCurrencyLocked } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
+import { DEFAULT_TIMEZONE, isValidTimeZone } from '@/lib/format-datetime'
 import { sendEmailWithSmtpSettings } from '@/lib/mailer'
 import {
   assertIntegrationConnectionTestPassed,
@@ -36,6 +37,7 @@ export type OrganisationData = {
   logoUrl: string | null
   documentLogoUrl: string | null
   baseCurrency: string
+  timezone: string
 }
 
 export async function getOrganisation(): Promise<OrganisationData> {
@@ -58,6 +60,7 @@ export async function getOrganisation(): Promise<OrganisationData> {
     logoUrl: org?.logoUrl ?? null,
     documentLogoUrl: org?.documentLogoUrl ?? null,
     baseCurrency: org?.baseCurrency ?? DEFAULT_BASE_CURRENCY,
+    timezone: org?.timezone ?? DEFAULT_TIMEZONE,
   }
 }
 
@@ -89,6 +92,13 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
         return { success: false, error: 'Select a valid country.' }
       }
       updateData.country = normalizedCountry
+    }
+    if (updateData.timezone !== undefined && updateData.timezone !== null) {
+      const tz = updateData.timezone.trim()
+      if (!isValidTimeZone(tz)) {
+        return { success: false, error: 'Select a valid timezone.' }
+      }
+      updateData.timezone = tz
     }
     const existingOrg = await db.organisation.findFirst({ select: { baseCurrency: true } })
 

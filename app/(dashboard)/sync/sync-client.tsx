@@ -26,7 +26,7 @@ import {
   type ShoppingTaxRateMappingRow,
 } from '@/app/actions/shopping-sync'
 import { UnifiedTaxRateMapper } from '@/components/settings/unified-tax-rate-mapper'
-import { formatDateTime } from '@/lib/format-datetime'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type Props = {
   settings: ShoppingSyncSettings
@@ -191,6 +191,7 @@ function HelperPluginCard({
   lastFxPushAt: string
   onFxPushToggle: (enabled: boolean) => Promise<void>
 }) {
+  const formatDateTime = useFormatDateTime()
   const [pushing, setPushing] = useState(false)
   const [pushResult, setPushResult] = useState<{ ok: boolean; text: string } | null>(null)
 
@@ -456,6 +457,7 @@ function WebhookSecretField({
 
 export function SyncClient({ settings: init, statusMappings, logs, shoppingCredentials, xeroConnected }: Props) {
   const router = useRouter()
+  const formatDateTime = useFormatDateTime()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
 
   // audit-ohou: prompt step-up re-auth + retry once when a gated save returns the

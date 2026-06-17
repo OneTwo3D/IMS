@@ -61,6 +61,12 @@ const TEMPLATE_LABELS: Record<string, string> = {
   manufacturing_order: 'Manufacturing Order',
 }
 
+// All IANA timezones the runtime supports (modern browsers + Node 18+).
+const _intl = Intl as typeof Intl & { supportedValuesOf?: (key: 'timeZone') => string[] }
+const SUPPORTED_TIMEZONES: string[] = _intl.supportedValuesOf
+  ? _intl.supportedValuesOf('timeZone')
+  : ['Europe/London', 'UTC']
+
 export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -217,6 +223,16 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
             allowBlank={false}
             className="h-9"
           />
+        ) : key === 'timezone' ? (
+          <select
+            value={co.timezone}
+            onChange={(e) => setCo((p) => ({ ...p, timezone: e.target.value }))}
+            className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+          >
+            {SUPPORTED_TIMEZONES.map((tz) => (
+              <option key={tz} value={tz}>{tz}</option>
+            ))}
+          </select>
         ) : (
           <Input
             type={opts?.type ?? 'text'}
@@ -372,6 +388,7 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
             {coField('county', 'County')}
             {coField('postcode', 'Postcode')}
             {coField('country', 'Country')}
+            {coField('timezone', 'Timezone')}
           </div>
 
           <h3 className="text-sm font-medium mb-3">Contact</h3>

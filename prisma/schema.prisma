@@ -356,6 +356,9 @@ model Organisation {
   logoUrl        String?   // square icon logo (sidebar, top-left)
   documentLogoUrl String?  // wide/rectangular logo for PDF document headers
   baseCurrency   String  @default("GBP")
+  // IANA timezone for displaying dates/times consistently across SSR + client
+  // (e.g. "Europe/London"). Null falls back to Europe/London.
+  timezone       String?
   financialYearStartMonth Int @default(5) // May = 5
   financialYearStartDay   Int @default(1)
   createdAt      DateTime @default(now())
