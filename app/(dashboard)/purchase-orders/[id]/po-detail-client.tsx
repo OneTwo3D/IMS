@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useEffect } from 'react'
+import { useState, useTransition, useEffect, useMemo } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink, CreditCard, CheckCircle2, AlertTriangle } from 'lucide-react'
@@ -375,6 +375,9 @@ function ReturnDialog({
   const [reason, setReason] = useState('')
   const [returnNotes, setReturnNotes] = useState('')
   const [error, setError] = useState('')
+  // Stable per-dialog idempotency key so double-clicks / retries of THIS return
+  // submission collapse to one server-side return (deduped via a unique key).
+  const idempotencyKey = useMemo(() => crypto.randomUUID(), [])
 
   const defaultWarehouseId = po.destinationWarehouseId ?? warehouses[0]?.id ?? ''
 
@@ -421,6 +424,7 @@ function ReturnDialog({
         })),
         reason,
         returnNotes || undefined,
+        idempotencyKey,
       )
       if (result.success) {
         router.refresh()

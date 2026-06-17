@@ -2022,9 +2022,20 @@ export async function returnPurchaseOrder(
   returnLines: ReturnLineInput[],
   reason: string,
   notes?: string,
+  idempotencyKey?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
     const session = await requirePermission('purchasing.receive')
+
+    // Idempotency: a duplicate submit/retry carrying the same client-generated
+    // key is a no-op (the original return already processed the stock + credit).
+    if (idempotencyKey) {
+      const existing = await db.purchaseReturn.findUnique({
+        where: { idempotencyKey },
+        select: { id: true },
+      })
+      if (existing) return { success: true }
+    }
     const po = await db.purchaseOrder.findUnique({
       where: { id },
       select: {
@@ -2075,10 +2086,74 @@ export async function returnPurchaseOrder(
     let purchaseReturnId = ''
     let totalReturnedCostBase = toDecimal(0)
     const { overBilling, creditNote } = await db.$transaction(async (tx): Promise<{ overBilling: PurchaseOrderOverBillingSummary; creditNote: { id: string; amountForeign: number; invoiceId: string } | null }> => {
+      // audit-18s1: acquire locks in the SAME order the goods-receipt path uses
+      // (stock_levels first, then PO lines) to avoid an AB/BA deadlock — receipt
+      // locks a stock_levels row then updates the PO line, so a return must not
+      // lock them in the opposite order. Lock stock rows in a canonical
+      // (productId, warehouseId) order so two concurrent returns touching
+      // overlapping rows can't deadlock each other either.
+      const stockPairs = Array.from(
+        new Map(
+          linesWithQty.map((rl) => {
+            const productId = po.lines.find((l) => l.id === rl.poLineId)!.productId
+            return [`${productId}::${rl.warehouseId}`, { productId, warehouseId: rl.warehouseId }]
+          }),
+        ).values(),
+      ).sort((a, b) =>
+        a.productId === b.productId
+          ? a.warehouseId.localeCompare(b.warehouseId)
+          : a.productId.localeCompare(b.productId),
+      )
+      for (const pair of stockPairs) {
+        await tx.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: pair.productId, warehouseId: pair.warehouseId } },
+          create: { productId: pair.productId, warehouseId: pair.warehouseId, quantity: 0 },
+          update: {},
+        })
+        await tx.$queryRaw`
+          SELECT "productId" FROM stock_levels
+          WHERE "productId" = ${pair.productId} AND "warehouseId" = ${pair.warehouseId}
+          FOR UPDATE
+        `
+      }
+
+      // Now lock the PO lines being returned and re-validate net-received under
+      // the lock. The pre-tx check reads a stale snapshot, so two concurrent
+      // returns could each pass it and both increment qtyReturned (over-return).
+      // Locking + re-checking here serialises returns against the same lines and
+      // makes a duplicate full submit fail (no returnable qty remains).
+      const poLineIds = Array.from(new Set(linesWithQty.map((rl) => rl.poLineId))).sort()
+      await tx.$queryRaw`
+        SELECT id FROM purchase_order_lines
+        WHERE id IN (${Prisma.join(poLineIds)})
+        ORDER BY id
+        FOR UPDATE
+      `
+      const lockedLines = await tx.purchaseOrderLine.findMany({
+        where: { id: { in: poLineIds } },
+        select: { id: true, productId: true, qtyReceived: true, qtyReturned: true },
+      })
+      const lockedById = new Map(lockedLines.map((l) => [l.id, l]))
+      // Aggregate requested qty per line so multiple return rows for one PO line
+      // are validated against the same remaining-returnable figure.
+      const requestedByLine = new Map<string, number>()
+      for (const rl of linesWithQty) {
+        requestedByLine.set(rl.poLineId, (requestedByLine.get(rl.poLineId) ?? 0) + rl.qtyReturned)
+      }
+      for (const [poLineId, requested] of requestedByLine) {
+        const locked = lockedById.get(poLineId)
+        if (!locked) throw new Error('Invalid PO line')
+        const netReceived = Number(locked.qtyReceived) - Number(locked.qtyReturned)
+        if (requested > netReceived + 1e-6) {
+          throw new Error('Cannot return more than net received quantity')
+        }
+      }
+
       const purchaseReturn = await tx.purchaseReturn.create({
         data: {
           poId: id,
           reference: returnRef,
+          idempotencyKey: idempotencyKey || null,
           reason: reason || null,
           notes: notes || null,
           lines: {
@@ -2339,6 +2414,16 @@ export async function returnPurchaseOrder(
 
     return { success: true }
   } catch (e) {
+    // Idempotency race: two submits with the same key reach the create
+    // concurrently; the unique index rejects the loser. The winner did the work,
+    // so report success rather than a confusing constraint error.
+    if (
+      idempotencyKey &&
+      e instanceof Prisma.PrismaClientKnownRequestError &&
+      e.code === 'P2002'
+    ) {
+      return { success: true }
+    }
     const message = toInventoryConstraintMessage(e, 'Failed to return purchase order stock.')
     await logActivity({
       entityType: 'PURCHASE_ORDER',
