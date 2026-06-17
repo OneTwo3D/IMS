@@ -1495,7 +1495,11 @@ async function recalculateManufacturingCostLayers(
     }
 
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
-    await refreshShipmentCogsForCostLayerChange(tx, li.id)
+    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id)
+    // audit-3aph: the shipment path owns the sold-finished-goods COGS revaluation
+    // (COGS_REVERSAL now / daily batch later), so subtract it from the reclass
+    // journal's COGS leg to avoid double-posting COGS for sold units.
+    netCogsDeltaBase = subtractMoney(netCogsDeltaBase, shipmentRefresh.cogsRevaluationDelta)
     await refreshSalesOrderLineCogsForCostLayerChange(tx, li.id)
   }
 

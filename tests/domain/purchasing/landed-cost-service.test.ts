@@ -527,7 +527,7 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     getManufacturingConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getDependentOutputSourceLines: async () => [],
     updateSnapshotsForCostLayerChange: async () => 0,
-    refreshShipmentCogsForCostLayerChange: async () => 0,
+    refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 0, cogsRevaluationDelta: new Prisma.Decimal(0) }),
     refreshSalesOrderLineCogsForCostLayerChange: async () => 0,
     warnWeightFallback: () => {},
     ...overrides,
@@ -872,6 +872,46 @@ test('recalculateDirectLandedCosts skips snapshot refresh when cost delta is neg
   assert.equal(snapshotRefreshes, 0)
 })
 
+test('landed-cost COGS journal excludes the shipment-revalued portion (audit-3aph: no COGS double-post)', async () => {
+  // 1 unit sold via a shipment, 0 on-hand. Landed cost +£0.10/unit → cogsDelta £0.10.
+  // The shipment path owns that £0.10 (COGS_REVERSAL now / daily batch later), so
+  // the COGS_JOURNAL must net to ZERO — otherwise COGS is debited twice.
+  const { tx } = createDirectTx({
+    id: 'po-1', reference: 'PO-1', status: 'RECEIVED',
+    lines: [{
+      id: 'line-a', qty: '1', unitCostBase: '1.00', totalBase: '1.00', product: { weight: 1 },
+      costLayers: [{ id: 'layer-a', unitCostBase: '1.00', receivedQty: '1', remainingQty: '0' }],
+    }],
+    freightCostLines: [{ amountBase: '0.10', distributionMethod: 'BY_QUANTITY' }],
+    landedCostLinks: [],
+  })
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 1, cogsRevaluationDelta: new Prisma.Decimal('0.10') }),
+  }), TEST_AUDIT_OPTIONS)
+  assert.deepEqual(result.cogsAdjustments, []) // £0.10 cogsDelta − £0.10 shipment reval = 0 → no COGS_JOURNAL
+  assert.deepEqual(result.inventoryTransitAdjustments, []) // 0 on-hand → no inventory adjustment
+})
+
+test('landed-cost COGS journal still posts the NON-shipment consumed portion (audit-3aph)', async () => {
+  // 2 units consumed (0 on-hand), but the shipment path only revalues £0.10 of it
+  // (1 unit sold via shipment); the other unit left via a non-shipment path (e.g. a
+  // write-off), so its £0.10 must STILL post to the COGS_JOURNAL.
+  const { tx } = createDirectTx({
+    id: 'po-1', reference: 'PO-1', status: 'RECEIVED',
+    lines: [{
+      id: 'line-a', qty: '2', unitCostBase: '1.00', totalBase: '2.00', product: { weight: 1 },
+      costLayers: [{ id: 'layer-a', unitCostBase: '1.00', receivedQty: '2', remainingQty: '0' }],
+    }],
+    freightCostLines: [{ amountBase: '0.20', distributionMethod: 'BY_QUANTITY' }],
+    landedCostLinks: [],
+  })
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 1, cogsRevaluationDelta: new Prisma.Decimal('0.10') }),
+  }), TEST_AUDIT_OPTIONS)
+  // cogsDelta £0.20 (2 units × £0.10) − £0.10 shipment reval = £0.10 left for the COGS_JOURNAL.
+  assert.deepEqual(result.cogsAdjustments.map((a) => a.totalDelta), [0.10])
+})
+
 test('recalculateDirectLandedCosts keeps fractional returns and snapshot cost as Decimal inputs', async () => {
   let snapshotUnitCost: string | null = null
   const { tx } = createDirectTx({
@@ -936,7 +976,7 @@ test('recalculateDirectLandedCosts writes an audit run with cost-layer and accou
 
   const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
     updateSnapshotsForCostLayerChange: async () => 2,
-    refreshShipmentCogsForCostLayerChange: async () => 3,
+    refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 3, cogsRevaluationDelta: new Prisma.Decimal(0) }),
     refreshSalesOrderLineCogsForCostLayerChange: async () => 4,
   }), { triggeredById: 'user-1', reason: 'direct_landed_cost_recalculation' })
 
