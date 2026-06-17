@@ -249,7 +249,8 @@ export function drawTable(
   let x = startX
   doc.font('Helvetica-Bold').fontSize(7).fillColor(accentRgb)
   for (const col of columns) {
-    const textOpts = { width: col.width - 8, align: (col.align ?? 'left') as 'left' | 'right' | 'center' }
+    // lineBreak:false keeps each header on the single fixed-height header row.
+    const textOpts = { width: col.width - 8, align: (col.align ?? 'left') as 'left' | 'right' | 'center', lineBreak: false }
     doc.text(col.label.toUpperCase(), x + 4, y + 7, textOpts)
     x += col.width
   }
@@ -276,7 +277,10 @@ export function drawTable(
     for (let ci = 0; ci < columns.length; ci++) {
       const col = columns[ci]
       const val = rows[ri][ci] ?? ''
-      const textOpts = { width: col.width - 8, align: (col.align ?? 'left') as 'left' | 'right' | 'center' }
+      // Rows are a fixed rowHeight, so a value wider than its column must NOT
+      // wrap (it would overflow the row and split mid-value, e.g. MPNs/barcodes).
+      // Keep it on one line and ellipsise anything that still overflows.
+      const textOpts = { width: col.width - 8, align: (col.align ?? 'left') as 'left' | 'right' | 'center', lineBreak: false, ellipsis: true }
       doc.text(val, x + 4, y + 6, textOpts)
       x += col.width
     }
