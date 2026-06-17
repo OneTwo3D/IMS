@@ -30,6 +30,7 @@ import {
   type WarehouseOption,
   type SupplierOption,
 } from '@/app/actions/manufacturing'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 const STATUS_BADGE: Record<string, string> = {
   DRAFT: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
@@ -47,6 +48,7 @@ type Props = {
 }
 
 export function ManufacturingClient({ initialRows, initialTotal }: Props) {
+  const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const [rows, setRows] = useState(initialRows)
   const [total, setTotal] = useState(initialTotal)
@@ -111,7 +113,7 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
 
   function fmtDate(iso: string | null) {
     if (!iso) return '—'
-    return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+    return formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' })
   }
 
   return (
@@ -247,6 +249,7 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
 // ---------------------------------------------------------------------------
 
 function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const formatDateTime = useFormatDateTime()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState<string | null>(null)
 
@@ -561,7 +564,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
               <div className="space-y-1.5">
                 <Label className="text-xs">Created</Label>
                 <Input
-                  value={new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                  value={formatDateTime(new Date(), { day: 'numeric', month: 'short', year: 'numeric' })}
                   disabled
                   className="h-9 bg-muted"
                 />

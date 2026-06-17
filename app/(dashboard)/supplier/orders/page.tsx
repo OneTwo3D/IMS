@@ -3,6 +3,8 @@ import { redirect } from 'next/navigation'
 import { requireAuth } from '@/lib/auth/server'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { getSupplierOrders } from '@/app/actions/supplier-portal'
+import { formatDateTime } from '@/lib/format-datetime'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
 
 export const metadata: Metadata = { title: 'Purchase Orders — Supplier Portal' }
 
@@ -20,6 +22,7 @@ export default async function SupplierOrdersPage() {
   if (session.user.role !== 'SUPPLIER') redirect('/dashboard')
 
   const orders = await getSupplierOrders()
+  const tz = await getDisplayTimeZone()
 
   return (
     <div className="space-y-4 max-w-4xl">
@@ -52,10 +55,10 @@ export default async function SupplierOrdersPage() {
                 </TableCell>
                 <TableCell className="px-4 text-muted-foreground">{o.lineCount}</TableCell>
                 <TableCell className="px-4 text-muted-foreground text-xs">
-                  {o.expectedDelivery ? new Date(o.expectedDelivery).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : '—'}
+                  {o.expectedDelivery ? formatDateTime(o.expectedDelivery, { day: 'numeric', month: 'short' }, tz) : '—'}
                 </TableCell>
                 <TableCell className="px-4 text-muted-foreground text-xs">
-                  {new Date(o.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                  {formatDateTime(o.createdAt, { day: 'numeric', month: 'short', year: 'numeric' }, tz)}
                 </TableCell>
               </TableRow>
             ))}

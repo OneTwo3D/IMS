@@ -8,6 +8,7 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { setSetting } from '@/app/actions/settings'
 import { fetchAllFxRates } from '@/app/actions/currencies'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type Props = {
   enabled: boolean
@@ -16,6 +17,7 @@ type Props = {
 }
 
 export function FxScheduleSettings({ enabled, intervalHours, lastFetched }: Props) {
+  const formatDateTime = useFormatDateTime()
   const [isPending, startTransition] = useTransition()
   const [saved, setSaved] = useState(false)
   const [isEnabled, setIsEnabled] = useState(enabled)
@@ -55,7 +57,7 @@ export function FxScheduleSettings({ enabled, intervalHours, lastFetched }: Prop
       <p className="text-xs text-muted-foreground">
         FX rates are fetched from the ECB via <code className="text-xs bg-muted px-1 rounded">/api/cron/fx-rates</code>.
         {lastFetched && (
-          <span> Last updated: {new Date(lastFetched).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}.</span>
+          <span> Last updated: {formatDateTime(lastFetched, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}.</span>
         )}
       </p>
 

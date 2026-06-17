@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar'
 import { useSession } from 'next-auth/react'
 import { updateProfile, changePassword, updatePictureUrl } from '@/app/actions/profile'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { PasskeyManager } from './passkey-manager'
 
 type UserData = {
@@ -24,6 +25,7 @@ type UserData = {
 }
 
 export function ProfileForm({ user }: { user: UserData }) {
+  const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const { update: updateSession } = useSession()
   const [isPending, startTransition] = useTransition()
@@ -145,7 +147,7 @@ export function ProfileForm({ user }: { user: UserData }) {
           <div>
             <h2 className="text-lg font-semibold">{name}</h2>
             <p className="text-sm text-muted-foreground">{email}</p>
-            <p className="text-xs text-muted-foreground mt-1">{ROLE_LABELS[user.role] ?? user.role} &middot; Joined {new Date(user.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p>
+            <p className="text-xs text-muted-foreground mt-1">{ROLE_LABELS[user.role] ?? user.role} &middot; Joined {formatDateTime(user.createdAt, { day: 'numeric', month: 'long', year: 'numeric' })}</p>
             <div className="flex items-center gap-2 mt-2">
               <Button variant="outline" size="sm" className="text-xs" onClick={() => fileRef.current?.click()} disabled={uploading}>
                 {uploading ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Camera className="h-3 w-3 mr-1" />}

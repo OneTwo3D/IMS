@@ -16,6 +16,7 @@ import {
   type FxHealth,
 } from '@/app/actions/currencies'
 import { probeShoppingFxHelperPlugin } from '@/app/actions/shopping-sync'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type Props = {
   baseCurrency: string
@@ -25,6 +26,7 @@ type Props = {
 }
 
 export function FxRatesTable({ baseCurrency, rates, pushLog, health }: Props) {
+  const formatDateTime = useFormatDateTime()
   const [editing, setEditing] = useState<FxRateRow | null>(null)
 
   return (
@@ -65,7 +67,7 @@ export function FxRatesTable({ baseCurrency, rates, pushLog, health }: Props) {
                   <SourceBadge source={r.source} manualOverride={r.manualOverride} />
                 </TableCell>
                 <TableCell className="text-muted-foreground">
-                  {new Date(r.fetchedAt).toLocaleString('en-GB')}
+                  {formatDateTime(r.fetchedAt)}
                 </TableCell>
                 <TableCell className="text-right">
                   <div className="flex justify-end gap-1">
@@ -209,6 +211,7 @@ function ManualOverrideDialog({
 }
 
 function PushLogSection({ rows }: { rows: FxPushLogRow[] }) {
+  const formatDateTime = useFormatDateTime()
   return (
     <div>
       <h3 className="text-sm font-medium mb-2">Recent pushes to shopping connectors</h3>
@@ -234,7 +237,7 @@ function PushLogSection({ rows }: { rows: FxPushLogRow[] }) {
             {rows.map((r) => (
               <TableRow key={r.id}>
                 <TableCell className="text-muted-foreground whitespace-nowrap">
-                  {new Date(r.pushedAt).toLocaleString('en-GB')}
+                  {formatDateTime(r.pushedAt)}
                 </TableCell>
                 <TableCell className="font-mono">{r.connector}</TableCell>
                 <TableCell className="text-right">{r.ratesCount}</TableCell>
@@ -271,6 +274,7 @@ function formatAge(ms: number | null): string {
 }
 
 function FxHealthCard({ health }: { health: FxHealth }) {
+  const formatDateTime = useFormatDateTime()
   const [probing, setProbing] = useState(false)
   const [probeResult, setProbeResult] = useState<{
     status: string
@@ -302,14 +306,14 @@ function FxHealthCard({ health }: { health: FxHealth }) {
           ok={!health.fetchStale}
           label="Last ECB fetch"
           value={health.lastFetchedAt
-            ? `${new Date(health.lastFetchedAt).toLocaleString('en-GB')} (${formatAge(health.lastFetchAgeMs)})`
+            ? `${formatDateTime(health.lastFetchedAt)} (${formatAge(health.lastFetchAgeMs)})`
             : 'never'}
           warning={health.fetchStale ? 'Stale — fetch hasn\'t run in over 36h. Check the cron schedule.' : null}
         />
         <HealthRow
           ok={health.lastFetchAttemptStatus !== 'failed'}
           label="Last fetch attempt"
-          value={formatFetchAttempt(health)}
+          value={formatFetchAttempt(health, formatDateTime)}
           warning={formatFetchAttemptWarning(health)}
         />
         <HealthRow
@@ -318,7 +322,7 @@ function FxHealthCard({ health }: { health: FxHealth }) {
           value={
             health.wcPushEnabled
               ? health.lastWcPushAt
-                ? `${new Date(health.lastWcPushAt).toLocaleString('en-GB')} (${formatAge(health.lastWcPushAgeMs)})`
+                ? `${formatDateTime(health.lastWcPushAt)} (${formatAge(health.lastWcPushAgeMs)})`
                 : 'pending — not yet pushed'
               : 'disabled'
           }
@@ -354,9 +358,9 @@ function FxHealthCard({ health }: { health: FxHealth }) {
   )
 }
 
-function formatFetchAttempt(health: FxHealth): string {
+function formatFetchAttempt(health: FxHealth, formatDateTime: (value: string | number | Date, options?: Intl.DateTimeFormatOptions) => string): string {
   const status = health.lastFetchAttemptStatus ?? 'unknown'
-  const when = health.lastFetchAttemptAt ? `${new Date(health.lastFetchAttemptAt).toLocaleString('en-GB')} ` : ''
+  const when = health.lastFetchAttemptAt ? `${formatDateTime(health.lastFetchAttemptAt)} ` : ''
   const retrySuffix = health.lastFetchRetryCount > 0 ? ` (${health.lastFetchRetryCount} attempt${health.lastFetchRetryCount === 1 ? '' : 's'})` : ''
   return `${when}${status.replaceAll('_', ' ')}${retrySuffix}`.trim()
 }

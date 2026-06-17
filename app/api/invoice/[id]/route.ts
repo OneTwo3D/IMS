@@ -6,6 +6,8 @@ import { formatCountryDisplay } from '@/lib/countries'
 import { loadInvoicePdf } from '@/lib/invoice-pdf'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, groupVatBreakdown, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { formatMoney } from '@/lib/utils'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
+import { formatDateTime } from '@/lib/format-datetime'
 
 function safeInvoiceFilenamePart(value: string): string {
   const safe = value.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120)
@@ -53,7 +55,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
   const billAddr = so.billingAddress as Record<string, string> | null
   const recipientAddr = billAddr ? [billAddr.line1, billAddr.line2, billAddr.city, billAddr.postcode, formatCountryDisplay(billAddr.country)].filter(Boolean).join('\n') : ''
-  const date = (so.invoicedAt ?? so.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+  const tz = await getDisplayTimeZone()
+  const date = formatDateTime(so.invoicedAt ?? so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
 
   await drawHeader(doc, branding, {
     title: 'Invoice',

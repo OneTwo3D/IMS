@@ -13,10 +13,12 @@ import {
   fetchAllFxRates,
   type CurrencyRow,
 } from '@/app/actions/currencies'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type Props = { currencies: CurrencyRow[] }
 
 export function CurrenciesTable({ currencies }: Props) {
+  const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showAdd, setShowAdd] = useState(false)
@@ -149,7 +151,7 @@ export function CurrenciesTable({ currencies }: Props) {
               </TableCell>
               <TableCell className="text-muted-foreground text-xs">
                 {c.rateDate
-                  ? new Date(c.rateDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                  ? formatDateTime(c.rateDate, { day: 'numeric', month: 'short', year: 'numeric' })
                   : c.isBaseCurrency ? '—' : 'Never'}
               </TableCell>
               <TableCell>

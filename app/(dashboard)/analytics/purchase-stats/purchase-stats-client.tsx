@@ -13,6 +13,7 @@ import { ProductLink } from '@/components/inventory/product-link'
 import type { PurchaseProductRow, ReceivedGoodsRow, BillRow, SupplierAgingRow, PurchaseDetailRow } from '@/app/actions/purchase-stats'
 import { saveView, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 
 type Tab = 'products' | 'received' | 'bills' | 'aging' | 'details'
@@ -26,7 +27,6 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'bills', label: 'Bills' }, { key: 'aging', label: 'Supplier Aging' }, { key: 'details', label: 'Details' },
 ]
 
-function fmtDate(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) }
 function makeId() { return Math.random().toString(36).slice(2, 8) }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +148,8 @@ function SaveViewDialog({ tab, columns, filters, onClose }: { tab: string; colum
 }
 
 export function PurchaseStatsClient({ products, received, bills, aging, details, savedViews }: Props) {
+  const formatDateTime = useFormatDateTime()
+  const fmtDate = (iso: string) => formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' })
   const baseCurrency = useBaseCurrency()
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const moneyLabel = (label: string) => `${label} (${baseCurrency.code})`

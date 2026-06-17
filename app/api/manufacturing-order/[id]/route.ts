@@ -12,6 +12,8 @@ import {
   type PdfTableColumn,
 } from '@/lib/pdf'
 import { formatCountryDisplay } from '@/lib/countries'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
+import { formatDateTime } from '@/lib/format-datetime'
 
 export async function GET(
   _req: NextRequest,
@@ -70,6 +72,7 @@ export async function GET(
 
   if (!order) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
+  const tz = await getDisplayTimeZone()
   const branding = await getBranding()
   const tpl = await db.documentTemplate.findUnique({
     where: { type: 'manufacturing_order' },
@@ -80,7 +83,7 @@ export async function GET(
   const title = isDisassembly ? 'Disassembly Order' : 'Manufacturing Order'
   const { doc } = createPdfDocument({ title: `${title} ${order.reference}` })
 
-  const dateStr = order.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+  const dateStr = formatDateTime(order.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
 
   const recipientAddr = order.manufacturer
     ? [order.manufacturer.addressLine1, order.manufacturer.addressLine2, order.manufacturer.city, order.manufacturer.postcode, formatCountryDisplay(order.manufacturer.country)].filter(Boolean).join('\n')
@@ -119,7 +122,7 @@ export async function GET(
   doc.text(`Quantity: ${Number(order.qtyPlanned)}`, 50, doc.y)
   doc.text(`Type: ${isDisassembly ? 'Disassembly' : 'Assembly'}`, 50, doc.y)
   if (order.scheduledAt) {
-    doc.text(`Scheduled: ${order.scheduledAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}`, 50, doc.y)
+    doc.text(`Scheduled: ${formatDateTime(order.scheduledAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)}`, 50, doc.y)
   }
   doc.y += 12
 

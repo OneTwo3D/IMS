@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { LoadingProgress } from '@/components/ui/loading-progress'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import {
   saveShopifyConnectorCredentials,
   saveShopifySyncSettings,
@@ -66,6 +67,7 @@ function EnvOverrideNotice({ overrides }: { overrides: Record<string, string> })
 }
 
 export function ShopifySyncClient({ settings: initialSettings, credentials, logs }: Props) {
+  const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [syncPending, startSyncTransition] = useTransition()
@@ -320,7 +322,7 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
               </TableRow>
             ) : logs.map((log) => (
               <TableRow key={log.id}>
-                <TableCell className="text-xs text-muted-foreground">{new Date(log.createdAt).toLocaleString()}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">{formatDateTime(log.createdAt)}</TableCell>
                 <TableCell className="text-xs">{log.direction}</TableCell>
                 <TableCell className="text-xs">{log.status}</TableCell>
                 <TableCell className="text-xs">{log.entityType}</TableCell>

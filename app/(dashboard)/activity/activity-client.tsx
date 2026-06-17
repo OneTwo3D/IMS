@@ -18,6 +18,7 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { getActivityLogs, type ActivityLogRow } from '@/app/actions/activity-log'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 const LEVEL_TABS = [
   { key: null, label: 'All' },
@@ -58,6 +59,7 @@ type Props = {
 }
 
 export function ActivityClient({ initialRows, initialTotal, availableTags }: Props) {
+  const formatDateTime = useFormatDateTime()
   const [rows, setRows] = useState(initialRows)
   const [total, setTotal] = useState(initialTotal)
   const [isPending, startTransition] = useTransition()
@@ -122,10 +124,10 @@ export function ActivityClient({ initialRows, initialTotal, availableTags }: Pro
   }
 
   function formatTime(iso: string) {
-    const d = new Date(iso)
-    return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) +
-      ' ' +
-      d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    return formatDateTime(iso, {
+      day: 'numeric', month: 'short', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    })
   }
 
   function relativeTime(iso: string) {

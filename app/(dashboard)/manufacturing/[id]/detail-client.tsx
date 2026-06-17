@@ -20,6 +20,7 @@ import {
 } from '@/app/actions/manufacturing'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { ManufacturingCostLinesEditor } from '@/components/manufacturing/cost-lines-editor'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 const STATUS_BADGE: Record<string, string> = {
   DRAFT: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
@@ -41,24 +42,22 @@ const NEXT_STATUS: Record<string, { label: string; status: 'IN_PROGRESS' | 'COMP
   CANCELLED: [],
 }
 
-function fmtDate(iso: string | null) {
-  if (!iso) return '—'
-  return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-}
-
-function fmtDateTime(iso: string | null) {
-  if (!iso) return '—'
-  const d = new Date(iso)
-  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) +
-    ' ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
-}
-
 function fmtQty(value: number | null) {
   if (value == null) return '—'
   return Number.isInteger(value) ? value.toString() : value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '')
 }
 
 export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
+  const formatDateTime = useFormatDateTime()
+  const fmtDate = (iso: string | null) =>
+    iso ? formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' }) : '—'
+  const fmtDateTime = (iso: string | null) =>
+    iso
+      ? formatDateTime(iso, {
+          day: 'numeric', month: 'short', year: 'numeric',
+          hour: '2-digit', minute: '2-digit',
+        })
+      : '—'
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState<string | null>(null)

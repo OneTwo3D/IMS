@@ -14,6 +14,8 @@ import {
 } from '@/lib/pdf'
 import { formatCountryDisplay } from '@/lib/countries'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
+import { formatDateTime } from '@/lib/format-datetime'
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireApiAuth()
@@ -73,7 +75,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const recipientAddr = addr
     ? [addr.line1, addr.line2, addr.city, addr.postcode, formatCountryDisplay(addr.country)].filter(Boolean).join('\n')
     : ''
-  const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+  const tz = await getDisplayTimeZone()
+  const date = formatDateTime(so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
 
   await drawHeader(doc, branding, {
     title: 'Packing Slip',

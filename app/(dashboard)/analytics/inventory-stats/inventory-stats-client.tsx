@@ -12,6 +12,7 @@ import { ProductLink } from '@/components/inventory/product-link'
 import type { StockOnHandRow, StockMovementRow, StockAllocationRow, ReorderRow } from '@/app/actions/inventory-stats'
 import { saveView, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 
 type Tab = 'onhand' | 'movements' | 'allocations' | 'reorder'
@@ -34,7 +35,6 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'reorder', label: 'Reorder Inventory' },
 ]
 
-function fmtDate(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) }
 function makeId() { return Math.random().toString(36).slice(2, 8) }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +199,8 @@ const MOVEMENT_LABELS: Record<string, string> = {
 }
 
 export function InventoryStatsClient({ stockOnHand, movements, allocations, reorder, savedViews }: Props) {
+  const formatDateTime = useFormatDateTime()
+  const fmtDate = (iso: string) => formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' })
   const baseCurrency = useBaseCurrency()
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const [tab, setTab] = useState<Tab>('onhand')

@@ -5,6 +5,8 @@ import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, groupVatBreakdown, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { formatMoney } from '@/lib/utils'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
+import { formatDateTime } from '@/lib/format-datetime'
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireApiAuth()
@@ -31,8 +33,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     where: { type: 'sales_order' },
     select: { headerNote: true, footerNote: true, termsText: true, customFooter: true, showPaymentTerms: true, paymentTermsText: true },
   })
+  const tz = await getDisplayTimeZone()
   const { doc } = createPdfDocument({ title: `Order ${so.externalOrderNumber}` })
-  const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+  const date = formatDateTime(so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
 
   const shipAddr = so.shippingAddress as Record<string, string> | null
   const recipientAddr = shipAddr ? [shipAddr.line1, shipAddr.line2, shipAddr.city, shipAddr.postcode, formatCountryDisplay(shipAddr.country)].filter(Boolean).join('\n') : ''
@@ -51,7 +54,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   }
 
   if (so.expectedDelivery) {
-    doc.font('Helvetica').fontSize(9).fillColor('#333').text(`Expected delivery: ${so.expectedDelivery.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}`, 50, doc.y)
+    doc.font('Helvetica').fontSize(9).fillColor('#333').text(`Expected delivery: ${formatDateTime(so.expectedDelivery, { day: 'numeric', month: 'long', year: 'numeric' }, tz)}`, 50, doc.y)
     doc.y += 6
   }
   if (so.shippingService) {

@@ -29,6 +29,7 @@ import type { ProductRow } from '@/app/actions/products'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 const STATUS_LABEL: Record<TransferRow['status'], string> = {
   DRAFT: 'Draft',
@@ -44,11 +45,9 @@ const STATUS_CLASS: Record<TransferRow['status'], string> = {
   CANCELLED: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400',
 }
 
-function formatDate(iso: string) {
-  return new Date(iso).toLocaleString('en-GB', {
-    day: '2-digit', month: 'short', year: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  })
+const DATE_TIME_OPTS: Intl.DateTimeFormatOptions = {
+  day: '2-digit', month: 'short', year: 'numeric',
+  hour: '2-digit', minute: '2-digit',
 }
 
 function formatAsnStatus(status: string) {
@@ -237,6 +236,8 @@ function MintsoftTransferAsnDialog({
   onClose: () => void
 }) {
   const router = useRouter()
+  const formatDateTime = useFormatDateTime()
+  const formatDate = (iso: string) => formatDateTime(iso, DATE_TIME_OPTS)
   const [isPending, startTransition] = useTransition()
   const [packagingType, setPackagingType] = useState<NonNullable<MintsoftCreatePurchaseOrderAsnInput['packagingType']>>('PARCEL')
   const [packageCount, setPackageCount] = useState('1')
@@ -452,6 +453,8 @@ function TransferCard({
   onUpdated: (t: TransferRow) => void
 }) {
   const router = useRouter()
+  const formatDateTime = useFormatDateTime()
+  const formatDate = (iso: string) => formatDateTime(iso, DATE_TIME_OPTS)
   const imageMap = new Map(products.map((p) => [p.id, p.imageUrl]))
   const [transfer, setTransfer] = useState(initial)
   const [expanded, setExpanded] = useState(false)
@@ -768,6 +771,8 @@ function MobileTransferCard({
   onUpdated: (t: TransferRow) => void
 }) {
   const router = useRouter()
+  const formatDateTime = useFormatDateTime()
+  const formatDate = (iso: string) => formatDateTime(iso, DATE_TIME_OPTS)
   const imageMap = new Map(products.map((p) => [p.id, p.imageUrl]))
   const [transfer, setTransfer] = useState(initial)
   const [expanded, setExpanded] = useState(false)

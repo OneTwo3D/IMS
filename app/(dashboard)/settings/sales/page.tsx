@@ -6,6 +6,8 @@ import { getRecentInvoicePdfTokenSecurityEvents, getRecentTaxRateFallbackEvents 
 import { InvoiceTriggerSetting } from '@/components/settings/invoice-trigger'
 import { DeliveryTrackingSettings } from '@/components/settings/delivery-tracking'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { formatDateTime } from '@/lib/format-datetime'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
 
 export const metadata: Metadata = { title: 'Sales Settings' }
 
@@ -29,6 +31,7 @@ export default async function SalesSettingsPage() {
     getRecentTaxRateFallbackEvents(5),
     getRecentInvoicePdfTokenSecurityEvents(5),
   ])
+  const tz = await getDisplayTimeZone()
 
   let carriers: string[] = []
   try { carriers = carriersJson ? JSON.parse(carriersJson) : [] } catch { /* empty */ }
@@ -88,7 +91,7 @@ export default async function SalesSettingsPage() {
                   </span>
                 </div>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {new Date(event.createdAt).toLocaleString()} · {event.action}
+                  {formatDateTime(event.createdAt, undefined, tz)} · {event.action}
                 </p>
               </div>
             ))}
@@ -112,7 +115,7 @@ export default async function SalesSettingsPage() {
                   <span className="text-xs font-medium text-destructive">{event.eventCount} warning{event.eventCount === 1 ? '' : 's'}</span>
                 </div>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {event.wrongSessionCount} session mismatch - {event.wrongIpCount} IP mismatch - latest {new Date(event.latestAt).toLocaleString()}
+                  {event.wrongSessionCount} session mismatch - {event.wrongIpCount} IP mismatch - latest {formatDateTime(event.latestAt, undefined, tz)}
                 </p>
                 <p className="mt-2 text-xs text-muted-foreground">{event.latestDescription}</p>
                 {event.userAgents.length > 0 && (

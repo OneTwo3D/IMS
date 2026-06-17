@@ -9,6 +9,7 @@ import {
   type AllocationDetail,
   type IncomingDetail,
 } from '@/app/actions/products'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type PopupProps = {
   children: React.ReactNode
@@ -18,6 +19,7 @@ type PopupProps = {
 }
 
 export function StockDetailPopup({ children, productId, warehouseId, type }: PopupProps) {
+  const formatDateTime = useFormatDateTime()
   const [open, setOpen] = useState(false)
   const [isPending, startTransition] = useTransition()
   const [allocations, setAllocations] = useState<AllocationDetail[] | null>(null)
@@ -115,7 +117,7 @@ export function StockDetailPopup({ children, productId, warehouseId, type }: Pop
                       </span>
                       {inc.expectedDate && (
                         <span className="text-muted-foreground block">
-                          ETA: {new Date(inc.expectedDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
+                          ETA: {formatDateTime(inc.expectedDate, { day: 'numeric', month: 'short' })}
                         </span>
                       )}
                     </div>
