@@ -5,6 +5,7 @@ import {
   buildProductCategoryPathMap,
   buildProductCategoryPathNormalized,
   cleanProductCategoryName,
+  decodeHtmlEntities,
   getProductCategoryAncestry,
   normalizeProductCategoryName,
   PRODUCT_CATEGORY_NAME_MAX_LENGTH,
@@ -18,6 +19,30 @@ test('product category names are trimmed and whitespace-normalized for display',
   assert.equal(cleanProductCategoryName(undefined), null)
   assert.equal(cleanProductCategoryName('   '), null)
   assert.equal(cleanProductCategoryName(null), null)
+})
+
+test('decodeHtmlEntities decodes named + numeric entities and leaves bare text intact', () => {
+  assert.equal(decodeHtmlEntities('Tool Changers &amp; Multi Material'), 'Tool Changers & Multi Material')
+  assert.equal(decodeHtmlEntities('Nuts &#038; Bolts'), 'Nuts & Bolts')      // numeric decimal
+  assert.equal(decodeHtmlEntities('Nuts &#x26; Bolts'), 'Nuts & Bolts')      // numeric hex
+  assert.equal(decodeHtmlEntities('It&#8217;s here'), 'It’s here')      // right single quote
+  assert.equal(decodeHtmlEntities('A &lt;B&gt; &quot;C&quot;'), 'A <B> "C"')
+  // Bare ampersands and unknown entities are preserved (idempotent on clean text).
+  assert.equal(decodeHtmlEntities('R&D and Salt & Pepper'), 'R&D and Salt & Pepper')
+  assert.equal(decodeHtmlEntities('Plain Category'), 'Plain Category')
+  assert.equal(decodeHtmlEntities('Tea &dagger; Co'), 'Tea &dagger; Co')
+})
+
+test('product category names HTML-decode WooCommerce entities for display and matching', () => {
+  assert.equal(cleanProductCategoryName('Tool Changers &amp; Multi Material'), 'Tool Changers & Multi Material')
+  assert.equal(cleanProductCategoryName('Nuts &#038; Bolts'), 'Nuts & Bolts')
+  // The normalized key matches the decoded plain-text form, so a WC re-sync
+  // resolves to the same category instead of creating a duplicate.
+  assert.equal(normalizeProductCategoryName('Tool Changers &amp; Multi Material'), 'tool changers & multi material')
+  assert.equal(
+    normalizeProductCategoryName('Tool Changers &amp; Multi Material'),
+    normalizeProductCategoryName('Tool Changers & Multi Material'),
+  )
 })
 
 test('product category normalized names are stable for case-insensitive import matching', () => {
