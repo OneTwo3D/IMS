@@ -8,7 +8,7 @@
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'
-import { getAccountingSettings, isAccountingSyncTypeEnabled, queueAccountingSyncTx } from '@/lib/accounting'
+import { getAccountingSettings, isAccountingSyncTypeEnabled, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import {
@@ -35,6 +35,13 @@ type ShipmentCogsRevaluationSyncOptions = {
    * this delta (audit-3aph).
    */
   isReversalPostingEnabled?: () => Promise<boolean>
+  /**
+   * Whether the daily batch will post un-journaled shipments' COGS (injectable
+   * for tests). When false, the batch won't carry an un-journaled shipment's
+   * revaluation, so the caller must keep that delta in the COGS journal
+   * (audit-gbzh).
+   */
+  isDailyBatchPostingEnabled?: () => Promise<boolean>
 }
 
 export function buildShipmentCogsRevaluationSyncPayload(input: {
@@ -731,6 +738,9 @@ export async function refreshShipmentCogsForCostLayerChange(
 
   let updated = 0
   let cogsRevaluationDelta = toDecimal(0)
+  // Resolved lazily on the first un-journaled shipment, then reused, so a
+  // settings read happens at most once per call (audit-gbzh).
+  let dailyBatchPosts: boolean | null = null
   for (const shipment of shipments) {
     const currentShipment = await tx.shipment.findUnique({
       where: { id: shipment.id },
@@ -765,9 +775,14 @@ export async function refreshShipmentCogsForCostLayerChange(
       }, options)
       if (posted) cogsRevaluationDelta = addMoney(cogsRevaluationDelta, shipmentDelta)
     } else {
-      // Not yet journaled → the daily batch will post the updated cogsBatchAmount
-      // (new cost), so the shipment path owns this delta.
-      cogsRevaluationDelta = addMoney(cogsRevaluationDelta, shipmentDelta)
+      // Not yet journaled → the daily batch posts the updated cogsBatchAmount
+      // (new cost), so the shipment path owns this delta — but ONLY if the daily
+      // batch is actually enabled; otherwise it posts nowhere, so leave the delta
+      // in the COGS journal (audit-gbzh).
+      if (dailyBatchPosts === null) {
+        dailyBatchPosts = await (options.isDailyBatchPostingEnabled ?? isDailyBatchPostingEnabled)()
+      }
+      if (dailyBatchPosts) cogsRevaluationDelta = addMoney(cogsRevaluationDelta, shipmentDelta)
     }
     updated++
   }
