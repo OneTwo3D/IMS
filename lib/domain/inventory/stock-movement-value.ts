@@ -94,7 +94,10 @@ export function buildStockMovementValueFieldsFromTotal(params: {
   }
 }
 
-export function buildStockMovementValueFieldsFromConsumed(consumed: ConsumedLayerValue[]): StockMovementValueFields {
+export function buildStockMovementValueFieldsFromConsumed(
+  consumed: ConsumedLayerValue[],
+  rowQty?: DecimalInput,
+): StockMovementValueFields {
   // FIFO consumption normally supplies positive quantities. Empty input is a
   // valid legacy-stock path and records zero value; mixed-sign entries are
   // treated as net weighted cost for defensive correction callers.
@@ -104,5 +107,14 @@ export function buildStockMovementValueFieldsFromConsumed(consumed: ConsumedLaye
     toDecimal(0),
   )
 
-  return buildStockMovementValueFieldsFromTotal({ qty: totalQty, totalValueBase })
+  // The DB CHECK stock_movements_reporting_value_consistent evaluates
+  // ROUND(<stored qty> * unitCostBase, 6) against totalValueBase. FIFO tolerates
+  // a sub-0.0001 fractional shortfall, so the consumed qty can be slightly below
+  // the movement's stored qty — and for fractional quantities that gap can flip
+  // the rounded product and re-trigger the violation. Build the value fields
+  // against the MOVEMENT's stored row qty (when the caller supplies it) so they
+  // are consistent with the constraint by construction. The exact per-layer cost
+  // stays in cogs_entries. rowQty defaults to the consumed qty for callers whose
+  // stored qty already equals the consumed qty (integer quantities never short).
+  return buildStockMovementValueFieldsFromTotal({ qty: rowQty ?? totalQty, totalValueBase })
 }

@@ -66,6 +66,30 @@ test('mixed-cost FIFO consumption satisfies the reporting-value DB invariant', (
   assert.equal(fields.totalValueBase, dbCheck)
 })
 
+test('FIFO fractional shortfall: value fields stay consistent with the movement row qty', () => {
+  // FIFO consumeFifoLayersStrict tolerates a sub-0.0001 shortfall, so the
+  // consumed qty (2.4999) can be slightly below the movement's stored row qty
+  // (2.5). The DB CHECK stock_movements_reporting_value_consistent evaluates
+  // ROUND(<row qty> * unitCostBase, 6), so the value fields MUST be built
+  // against the row qty (2.5), not the consumed qty, or the check fails.
+  const consumed = [
+    { qty: new Prisma.Decimal('1.2'), unitCostBase: new Prisma.Decimal('1.0') },
+    { qty: new Prisma.Decimal('1.2999'), unitCostBase: new Prisma.Decimal('2.0') },
+  ]
+  const rowQty = new Prisma.Decimal('2.5')
+  const fields = buildStockMovementValueFieldsFromConsumed(consumed, rowQty)
+  // Mirror the DB CHECK exactly against the ROW qty.
+  const dbCheck = rowQty.mul(fields.unitCostBase).toDecimalPlaces(6).toFixed(6)
+  assert.equal(fields.totalValueBase, dbCheck)
+
+  // Without the row qty (legacy behaviour) the fields are built against the
+  // consumed qty (2.4999); that total would NOT satisfy the check against the
+  // stored row qty (2.5) — which is exactly the fractional-shortfall bug.
+  const legacy = buildStockMovementValueFieldsFromConsumed(consumed)
+  const legacyAgainstRowQty = rowQty.mul(legacy.unitCostBase).toDecimalPlaces(6).toFixed(6)
+  assert.notEqual(legacy.totalValueBase, legacyAgainstRowQty)
+})
+
 test('stock movement value fields support zero-cost historical demand rows', () => {
   assert.deepEqual(
     buildStockMovementValueFieldsFromTotal({ qty: 4, totalValueBase: 0 }),

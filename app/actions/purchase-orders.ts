@@ -2203,7 +2203,7 @@ export async function returnPurchaseOrder(
         const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned)
         await tx.stockMovement.update({
           where: { id: movement.id },
-          data: buildStockMovementValueFieldsFromConsumed(consumed),
+          data: buildStockMovementValueFieldsFromConsumed(consumed, rl.qtyReturned),
         })
         totalReturnedCostBase = consumed.reduce(
           (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
