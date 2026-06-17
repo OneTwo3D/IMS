@@ -134,6 +134,13 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
 
   const formContent = (
     <form action={formAction} className="space-y-6">
+      {inline && (
+        <div className="flex justify-end -mt-2">
+          <Button type="submit" disabled={isPending}>
+            {isPending ? 'Saving…' : 'Save Product'}
+          </Button>
+        </div>
+      )}
       {state.message && (
         <p className="text-sm text-destructive">{state.message}</p>
       )}
@@ -522,14 +529,8 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
         </p>
       </div>
 
-      {/* Actions */}
-      {inline ? (
-        <div className="sticky bottom-0 z-10 -mx-6 -mb-6 px-6 py-3 bg-background/95 backdrop-blur-sm border-t border-border flex justify-end">
-          <Button type="submit" disabled={isPending}>
-            {isPending ? 'Saving…' : 'Save Product'}
-          </Button>
-        </div>
-      ) : (
+      {/* Actions — inline mode shows Save at the top; dialog mode keeps a footer */}
+      {!inline && (
         <DialogFooter>
           {onClose && (
             <Button type="button" variant="outline" onClick={onClose}>
