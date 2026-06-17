@@ -68,8 +68,8 @@ const ACCOUNT_FIELDS: { key: keyof AccountingConnectorSettings; label: string; d
   { key: 'xero_cogs_account', label: 'Cost of Goods Sold', description: 'COGS booked on dispatch' },
   { key: 'xero_inventory_revaluation_account', label: 'Inventory Revaluation', description: 'P&L offset for retrospective COGS corrections on goods already sold (e.g. freight cancelled after dispatch). Leave blank to use Stock in Transit.' },
   { key: 'xero_unearned_revenue_account', label: 'Unearned Revenue', description: 'Liability account for revenue deferred until shipment' },
-  { key: 'xero_accounts_receivable_account', label: 'Accounts Receivable', description: 'Control account adjusted for realised FX on customer payments' },
-  { key: 'xero_accounts_payable_account', label: 'Accounts Payable', description: 'Control account adjusted for realised FX on supplier payments' },
+  { key: 'xero_accounts_receivable_account', label: 'Accounts Receivable', description: 'Your Xero Accounts Receivable control account — used as the control side of realised and unrealised FX journals on foreign-currency customer balances' },
+  { key: 'xero_accounts_payable_account', label: 'Accounts Payable', description: 'Your Xero Accounts Payable control account — used as the control side of realised and unrealised FX journals on foreign-currency supplier balances' },
   { key: 'xero_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss', description: 'P&L account for settlement-rate variances' },
   { key: 'xero_unrealised_fx_gain_loss_account', label: 'Unrealised FX Gain/Loss', description: 'Account for open AR/AP revaluation journals' },
 ]
