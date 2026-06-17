@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { useStepUpReauth } from '@/components/auth/use-step-up-reauth'
 import { resetDatabase, type ResetLevel } from '@/app/actions/reset'
 
 const LEVELS: { key: ResetLevel; label: string; description: string; items: string[] }[] = [
@@ -40,21 +41,37 @@ export function DatabaseReset() {
   const [codeStatus, setCodeStatus] = useState<string | null>(null)
   const [sendingCode, setSendingCode] = useState(false)
   const [result, setResult] = useState<{ message: string; isError: boolean } | null>(null)
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
 
   const level = LEVELS.find((l) => l.key === selectedLevel)
   const confirmText = selectedLevel === 'full' ? 'RESET EVERYTHING' : selectedLevel === 'products' ? 'RESET PRODUCTS' : 'RESET TRANSACTIONS'
   const isConfirmed = confirmation === confirmText
 
+  async function requestResetCode(): Promise<{ ok: boolean; status: number; data: { email?: string; error?: string; code?: string } }> {
+    const res = await fetch('/api/reset/code')
+    const data = await res.json().catch(() => ({}))
+    return { ok: res.ok, status: res.status, data }
+  }
+
   async function handleSendCode() {
     setSendingCode(true)
     setCodeStatus(null)
     try {
-      const res = await fetch('/api/reset/code')
-      const data = await res.json()
-      if (res.ok) {
-        setCodeStatus(`Confirmation code emailed to ${data.email}.`)
+      let attempt = await requestResetCode()
+      // The endpoint requires a fresh admin session; on staleness it returns
+      // 403 {code:'fresh_auth_required'}. Prompt step-up re-auth and retry once.
+      if (!attempt.ok && attempt.status === 403 && attempt.data.code === 'fresh_auth_required') {
+        if (await promptReauth()) {
+          attempt = await requestResetCode()
+        } else {
+          setCodeStatus('Re-authentication is required to send the confirmation code.')
+          return
+        }
+      }
+      if (attempt.ok) {
+        setCodeStatus(`Confirmation code emailed to ${attempt.data.email}.`)
       } else {
-        setCodeStatus(data.error ?? 'Failed to send confirmation code.')
+        setCodeStatus(attempt.data.error ?? 'Failed to send confirmation code.')
       }
     } catch {
       setCodeStatus('Failed to send confirmation code.')
@@ -84,6 +101,7 @@ export function DatabaseReset() {
 
   return (
     <div className="space-y-4">
+      {stepUpDialog}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         {LEVELS.map((l) => (
           <div key={l.key} className={`rounded-md border p-4 flex flex-col ${l.key === 'full' ? 'border-destructive/50' : ''}`}>

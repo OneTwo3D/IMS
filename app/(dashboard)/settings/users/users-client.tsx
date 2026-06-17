@@ -10,6 +10,7 @@ import { Select } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createUser, deleteUser, updateUser, type UserRow } from '@/app/actions/users'
+import { useStepUpReauth, isFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type SupplierOption = { id: string; name: string }
@@ -42,6 +43,7 @@ export function UsersClient({ users, suppliers }: Props) {
   const [showCreate, setShowCreate] = useState(false)
   const [editUser, setEditUser] = useState<UserRow | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<UserRow | null>(null)
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
 
   // Create form
   const [name, setName] = useState('')
@@ -84,7 +86,9 @@ export function UsersClient({ users, suppliers }: Props) {
   function handleCreate() {
     setError('')
     startCreateTransition(async () => {
-      const result = await createUser({ name, email, password, role, supplierId: role === 'SUPPLIER' ? supplierId : undefined })
+      const payload = { name, email, password, role, supplierId: role === 'SUPPLIER' ? supplierId : undefined }
+      let result = await createUser(payload)
+      if (isFreshAuthFailure(result) && (await promptReauth())) result = await createUser(payload)
       if (result.success) { setShowCreate(false); router.refresh() }
       else setError(result.error ?? 'Failed')
     })
@@ -94,12 +98,14 @@ export function UsersClient({ users, suppliers }: Props) {
     if (!editUser) return
     setEditError('')
     startUpdateTransition(async () => {
-      const result = await updateUser(editUser.id, {
+      const payload = {
         name: editName, email: editEmail, role: editRole,
         supplierId: editRole === 'SUPPLIER' ? editSupplierId : null,
         active: editActive,
         password: editPassword || undefined,
-      })
+      }
+      let result = await updateUser(editUser.id, payload)
+      if (isFreshAuthFailure(result) && (await promptReauth())) result = await updateUser(editUser.id, payload)
       if (result.success) { setEditUser(null); router.refresh() }
       else setEditError(result.error ?? 'Failed')
     })
@@ -109,10 +115,12 @@ export function UsersClient({ users, suppliers }: Props) {
     if (!deleteTarget) return
     setDeleteError('')
     startDeleteTransition(async () => {
-      const result = await deleteUser(deleteTarget.id, {
+      const payload = {
         salesOrderMode: deleteSalesOrderMode,
         transferToUserId: deleteSalesOrderMode === 'transfer_user' ? deleteTransferToUserId : undefined,
-      })
+      }
+      let result = await deleteUser(deleteTarget.id, payload)
+      if (isFreshAuthFailure(result) && (await promptReauth())) result = await deleteUser(deleteTarget.id, payload)
       if (result.success) { setDeleteTarget(null); router.refresh() }
       else setDeleteError(result.error ?? 'Failed')
     })
@@ -124,6 +132,7 @@ export function UsersClient({ users, suppliers }: Props) {
 
   return (
     <div className="space-y-4">
+      {stepUpDialog}
       <div className="flex items-center justify-between">
         <span className="text-sm text-muted-foreground">{users.length} user(s)</span>
         <Button size="sm" onClick={openCreate}><Plus className="h-4 w-4 mr-1" />Add User</Button>

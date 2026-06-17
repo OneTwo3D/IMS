@@ -11,6 +11,7 @@ import { Label } from '@/components/ui/label'
 import { LoadingProgress } from '@/components/ui/loading-progress'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
+import { useStepUpReauth, isFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import {
   saveShopifyConnectorCredentials,
   saveShopifySyncSettings,
@@ -84,17 +85,17 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
   const [copied, setCopied] = useState(false)
   const configured = !!storeDomain && !!accessToken
   const webhookPreview = webhookSecret && !webhookSecret.includes('*') ? webhookSecret : ''
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
 
   function handleSaveConnection() {
     setSaveMessage(null)
     setSaveError(false)
 
     startTransition(async () => {
-      const credentialResult = await saveShopifyConnectorCredentials(
-        storeDomain.trim(),
-        accessToken.trim(),
-        webhookSecret.trim(),
-      )
+      const save = () => saveShopifyConnectorCredentials(storeDomain.trim(), accessToken.trim(), webhookSecret.trim())
+      let credentialResult = await save()
+      // saveShopifyConnectorCredentials requires a fresh 'sync' session; re-auth and retry once on staleness.
+      if (isFreshAuthFailure(credentialResult) && (await promptReauth())) credentialResult = await save()
       if (!credentialResult.success) {
         setSaveError(true)
         setSaveMessage(credentialResult.error ?? 'Failed to save Shopify credentials')
@@ -155,6 +156,7 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
 
   return (
     <div className="space-y-4">
+      {stepUpDialog}
       <Card className="p-6 space-y-4">
         <div>
           <h2 className="text-base font-semibold">Connection</h2>
