@@ -914,6 +914,9 @@ export async function recalculateDirectLandedCosts(
         select: { amountBase: true, distributionMethod: true },
       },
       landedCostLinks: {
+        // audit-izrf: a CANCELLED freight PO must no longer contribute landed
+        // cost, mirroring the linked-freight recalc path (recalculateLandedCosts).
+        where: { freightPO: { status: { not: 'CANCELLED' } } },
         select: {
           freightPO: {
             select: {
