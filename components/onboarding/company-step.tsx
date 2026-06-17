@@ -16,6 +16,12 @@ export type CompanyStepHandle = {
   save: () => Promise<boolean>
 }
 
+// All IANA timezones the runtime supports (modern browsers + Node 18+).
+const _intl = Intl as typeof Intl & { supportedValuesOf?: (key: 'timeZone') => string[] }
+const SUPPORTED_TIMEZONES: string[] = _intl.supportedValuesOf
+  ? _intl.supportedValuesOf('timeZone')
+  : ['Europe/London', 'UTC']
+
 type Props = {
   org: OrganisationData
   emailSettings: EmailSettings
@@ -46,6 +52,7 @@ function hasCompanyDraftChanges(
     current.county !== initial.county ||
     current.postcode !== initial.postcode ||
     current.country !== initial.country ||
+    current.timezone !== initial.timezone ||
     current.phone !== initial.phone ||
     current.email !== initial.email ||
     current.website !== initial.website ||
@@ -121,6 +128,16 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
             allowBlank={false}
             className="h-9"
           />
+        ) : key === 'timezone' ? (
+          <select
+            value={co.timezone}
+            onChange={(e) => setCo((p) => ({ ...p, timezone: e.target.value }))}
+            className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
+          >
+            {SUPPORTED_TIMEZONES.map((tz) => (
+              <option key={tz} value={tz}>{tz}</option>
+            ))}
+          </select>
         ) : (
           <Input
             type={opts?.type ?? 'text'}
@@ -293,6 +310,7 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
         {field('county', 'County / State')}
         {field('postcode', 'Postcode / ZIP')}
         {field('country', 'Country')}
+        {field('timezone', 'Timezone')}
         {field('phone', 'Phone', { type: 'tel' })}
         {field('email', 'Email', { type: 'email' })}
         {field('website', 'Website', { type: 'url' })}
