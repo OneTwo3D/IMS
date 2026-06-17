@@ -4,6 +4,7 @@ import { getAccountingSettings, queueAccountingSync, type AccountingSettings } f
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { logActivity } from '@/lib/activity-log'
 import {
+  getManufacturingConsumedQtyForCostLayer,
   getReturnedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
   refreshSalesOrderLineCogsForCostLayerChange,
@@ -59,7 +60,7 @@ export type LandedCostRecalcResult = {
 }
 
 export type LandedCostRevaluationWarning = {
-  code: 'weight_fallback'
+  code: 'weight_fallback' | 'manufacturing_consumption_not_propagated'
   context: string
   message: string
 }
@@ -99,6 +100,7 @@ type CostLayerAdjustmentInput = {
   remainingQty: Prisma.Decimal | number | string
   returnedQty: Prisma.Decimal | number | string
   supplierReturnedQty: Prisma.Decimal | number | string
+  manufacturingConsumedQty: Prisma.Decimal | number | string
 }
 
 type LandedCostAdjustment = LandedCostRecalcResult['inventoryTransitAdjustments'][number]
@@ -110,11 +112,13 @@ type LandedCostAdjustmentLayerContext = {
   remainingQty: Prisma.Decimal
   returnedQty: Prisma.Decimal
   supplierReturnedQty: Prisma.Decimal
+  manufacturingConsumedQty: Prisma.Decimal
 }
 
 export type LandedCostServiceDeps = {
   getReturnedQtyForCostLayer: typeof getReturnedQtyForCostLayer
   getSupplierReturnedQtyForCostLayer: typeof getSupplierReturnedQtyForCostLayer
+  getManufacturingConsumedQtyForCostLayer: typeof getManufacturingConsumedQtyForCostLayer
   updateSnapshotsForCostLayerChange: typeof updateSnapshotsForCostLayerChange
   refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
   refreshSalesOrderLineCogsForCostLayerChange: typeof refreshSalesOrderLineCogsForCostLayerChange
@@ -124,6 +128,7 @@ export type LandedCostServiceDeps = {
 const defaultDeps: LandedCostServiceDeps = {
   getReturnedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
+  getManufacturingConsumedQtyForCostLayer,
   updateSnapshotsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
   refreshSalesOrderLineCogsForCostLayerChange,
@@ -187,9 +192,16 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
 } {
   const costDelta = decimal(input.newUnitCost).sub(decimal(input.oldUnitCost))
   const consumedQty = decimal(input.receivedQty).sub(decimal(input.remainingQty))
+  // audit-jz9i: exclude manufacturing-consumed units. They are not customer COGS —
+  // their cost was capitalised into the produced output's cost layer — so the
+  // retrospective landed-cost delta for those units must not be journalled as COGS.
+  // (Propagating the delta into the produced output layer is a separate concern.)
   const netConsumedQty = Prisma.Decimal.max(
     new Prisma.Decimal(0),
-    consumedQty.sub(decimal(input.returnedQty)).sub(decimal(input.supplierReturnedQty)),
+    consumedQty
+      .sub(decimal(input.returnedQty))
+      .sub(decimal(input.supplierReturnedQty))
+      .sub(decimal(input.manufacturingConsumedQty)),
   )
   return {
     costDelta,
@@ -207,6 +219,19 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
 function makeWeightFallbackWarning(context: string): LandedCostRevaluationWarning {
   const description = `${context}: BY_WEIGHT landed-cost allocation fell back to equal split because every eligible line had zero weight`
   return { code: 'weight_fallback', context, message: description }
+}
+
+// audit-jz9i: the manufacturing-consumed portion of a landed-cost delta is
+// excluded from the COGS adjustment (it's capitalised inventory, not a sale) but
+// is NOT yet propagated into the produced output's cost layer, so that delta is
+// left unreclassified. Surface it so finance can review the produced finished-good
+// valuation. Full propagation through BOM levels is a separate follow-up.
+function makeManufacturingNotPropagatedWarning(costLayerId: string, qty: Prisma.Decimal): LandedCostRevaluationWarning {
+  return {
+    code: 'manufacturing_consumption_not_propagated',
+    context: `costLayer:${costLayerId}`,
+    message: `Landed-cost change affects ${qty.toString()} unit(s) consumed by manufacturing; the delta was excluded from COGS but is not yet propagated into the produced output's cost layer — review the produced finished-good valuation.`,
+  }
 }
 
 function warnWeightFallback(context: string): LandedCostRevaluationWarning {
@@ -345,6 +370,7 @@ export function landedCostAdjustmentEventKey(
         remainingQty: roundAdjustmentContextValue(layer.remainingQty),
         returnedQty: roundAdjustmentContextValue(layer.returnedQty),
         supplierReturnedQty: roundAdjustmentContextValue(layer.supplierReturnedQty),
+        manufacturingConsumedQty: roundAdjustmentContextValue(layer.manufacturingConsumedQty),
       }))
       .sort((left, right) => left.costLayerId.localeCompare(right.costLayerId)),
   })
@@ -659,6 +685,7 @@ export async function recalculateLandedCosts(
         consumedQty: string
         returnedQty: string
         supplierReturnedQty: string
+        manufacturingConsumedQty: string
         cogsDelta: string
         inventoryDelta: string
         affectedRefundSnapshots: number
@@ -684,6 +711,7 @@ export async function recalculateLandedCosts(
         consumedQty: string
         returnedQty: string
         supplierReturnedQty: string
+        manufacturingConsumedQty: string
         cogsDelta: string
         inventoryDelta: string
         affectedRefundSnapshots: number
@@ -708,6 +736,9 @@ export async function recalculateLandedCosts(
         const supplierReturnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
           ? decimal(await serviceDeps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
           : new Prisma.Decimal(0)
+        const manufacturingConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
+          ? decimal(await serviceDeps.getManufacturingConsumedQtyForCostLayer(tx, cl.id))
+          : new Prisma.Decimal(0)
         const deltas = calculateLayerAdjustmentDeltas({
           oldUnitCost,
           newUnitCost,
@@ -715,6 +746,7 @@ export async function recalculateLandedCosts(
           remainingQty,
           returnedQty,
           supplierReturnedQty,
+          manufacturingConsumedQty,
         })
         totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
         totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
@@ -727,7 +759,11 @@ export async function recalculateLandedCosts(
             remainingQty,
             returnedQty,
             supplierReturnedQty,
+            manufacturingConsumedQty,
           })
+        }
+        if (manufacturingConsumedQty.gt(LANDED_COST_DELTA_EPSILON) && deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
+          runWarnings.push(makeManufacturingNotPropagatedWarning(cl.id, manufacturingConsumedQty))
         }
 
         await tx.costLayer.update({
@@ -752,6 +788,7 @@ export async function recalculateLandedCosts(
           consumedQty: consumedQty.toString(),
           returnedQty: returnedQty.toString(),
           supplierReturnedQty: supplierReturnedQty.toString(),
+          manufacturingConsumedQty: manufacturingConsumedQty.toString(),
           cogsDelta: deltas.cogsDelta.toString(),
           inventoryDelta: deltas.inventoryDelta.toString(),
           affectedRefundSnapshots,
@@ -954,6 +991,7 @@ export async function recalculateDirectLandedCosts(
       consumedQty: string
       returnedQty: string
       supplierReturnedQty: string
+      manufacturingConsumedQty: string
       cogsDelta: string
       inventoryDelta: string
       affectedRefundSnapshots: number
@@ -979,6 +1017,7 @@ export async function recalculateDirectLandedCosts(
       consumedQty: string
       returnedQty: string
       supplierReturnedQty: string
+      manufacturingConsumedQty: string
       cogsDelta: string
       inventoryDelta: string
       affectedRefundSnapshots: number
@@ -1003,6 +1042,9 @@ export async function recalculateDirectLandedCosts(
       const supplierReturnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
         ? decimal(await serviceDeps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
         : new Prisma.Decimal(0)
+      const manufacturingConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
+        ? decimal(await serviceDeps.getManufacturingConsumedQtyForCostLayer(tx, cl.id))
+        : new Prisma.Decimal(0)
       const deltas = calculateLayerAdjustmentDeltas({
         oldUnitCost,
         newUnitCost,
@@ -1010,6 +1052,7 @@ export async function recalculateDirectLandedCosts(
         remainingQty,
         returnedQty,
         supplierReturnedQty,
+        manufacturingConsumedQty,
       })
       totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
       totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
@@ -1022,7 +1065,11 @@ export async function recalculateDirectLandedCosts(
           remainingQty,
           returnedQty,
           supplierReturnedQty,
+          manufacturingConsumedQty,
         })
+      }
+      if (manufacturingConsumedQty.gt(LANDED_COST_DELTA_EPSILON) && deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
+        runWarnings.push(makeManufacturingNotPropagatedWarning(cl.id, manufacturingConsumedQty))
       }
 
       await tx.costLayer.update({
@@ -1047,6 +1094,7 @@ export async function recalculateDirectLandedCosts(
         consumedQty: consumedQty.toString(),
         returnedQty: returnedQty.toString(),
         supplierReturnedQty: supplierReturnedQty.toString(),
+        manufacturingConsumedQty: manufacturingConsumedQty.toString(),
         cogsDelta: deltas.cogsDelta.toString(),
         inventoryDelta: deltas.inventoryDelta.toString(),
         affectedRefundSnapshots,

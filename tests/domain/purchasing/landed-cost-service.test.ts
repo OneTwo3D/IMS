@@ -120,6 +120,7 @@ test('retrospective layer adjustment splits inventory and consumed COGS deltas',
     remainingQty: 4,
     returnedQty: 1,
     supplierReturnedQty: 2,
+    manufacturingConsumedQty: 0,
   })), {
     costDelta: 2,
     consumedQty: 6,
@@ -137,6 +138,7 @@ test('retrospective layer adjustment handles landed-cost decreases', () => {
     remainingQty: 5,
     returnedQty: 0,
     supplierReturnedQty: 0,
+    manufacturingConsumedQty: 0,
   })), {
     costDelta: -2,
     consumedQty: 3,
@@ -154,11 +156,31 @@ test('retrospective layer adjustment excludes customer and supplier returns from
     remainingQty: 4,
     returnedQty: 4,
     supplierReturnedQty: 2,
+    manufacturingConsumedQty: 0,
   })
 
   assert.equal(deltas.netConsumedQty.toNumber(), 0)
   assert.equal(deltas.cogsDelta.toNumber(), 0)
   assert.equal(deltas.inventoryDelta.toNumber(), 8)
+})
+
+test('retrospective layer adjustment excludes manufacturing-consumed units from COGS (audit-jz9i)', () => {
+  // received 10, 4 on-hand → 6 consumed; 3 of those were consumed by manufacturing
+  // (capitalised into the produced output), so only 3 are customer COGS.
+  const deltas = calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 12,
+    receivedQty: 10,
+    remainingQty: 4,
+    returnedQty: 0,
+    supplierReturnedQty: 0,
+    manufacturingConsumedQty: 3,
+  })
+
+  assert.equal(deltas.consumedQty.toNumber(), 6)
+  assert.equal(deltas.netConsumedQty.toNumber(), 3) // 6 - 3 manufacturing
+  assert.equal(deltas.cogsDelta.toNumber(), 6) // costDelta 2 × 3 net customer-consumed
+  assert.equal(deltas.inventoryDelta.toNumber(), 8) // costDelta 2 × 4 on-hand (unchanged)
 })
 
 test('retrospective layer adjustment uses Decimal arithmetic for fractional landed-cost deltas', () => {
@@ -169,6 +191,7 @@ test('retrospective layer adjustment uses Decimal arithmetic for fractional land
     remainingQty: '1',
     returnedQty: '0',
     supplierReturnedQty: '0',
+    manufacturingConsumedQty: '0',
   })
 
   assert.equal(deltas.costDelta.toString(), '0.2')
@@ -416,6 +439,7 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
   return {
     getReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getSupplierReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
+    getManufacturingConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => 0,
     refreshSalesOrderLineCogsForCostLayerChange: async () => 0,
@@ -868,6 +892,7 @@ test('recalculateDirectLandedCosts writes an audit run with cost-layer and accou
     consumedQty: '0',
     returnedQty: '0',
     supplierReturnedQty: '0',
+    manufacturingConsumedQty: '0',
     cogsDelta: '0',
     inventoryDelta: '0.1',
     affectedRefundSnapshots: 2,
@@ -949,6 +974,7 @@ test('landed-cost adjustment event keys normalize equivalent decimal input shape
     remainingQty: new Prisma.Decimal('1'),
     returnedQty: new Prisma.Decimal('0'),
     supplierReturnedQty: new Prisma.Decimal('0'),
+    manufacturingConsumedQty: new Prisma.Decimal('0'),
   }], 'fixed-run-id'))
 
   assert.equal(new Set(eventKeys).size, 1)
