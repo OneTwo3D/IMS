@@ -205,14 +205,42 @@ test('refreshShipmentCogsForCostLayerChange does not queue COGS revaluation sync
     },
   }
 
-  await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
+  const result = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
     accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    isDailyBatchPostingEnabled: async () => true,
     queueAccountingSync: async (_tx, params) => {
       queued.push(params)
     },
   })
 
+  assert.deepEqual(queued, []) // un-journaled → no COGS_REVERSAL now
+  // Batch IS enabled → it will post the updated cost, so the shipment path owns
+  // the delta (new 27.5 − old 20 = 7.5) and the caller drops it from the journal.
+  assert.equal(result.cogsRevaluationDelta.toString(), '7.5')
+})
+
+test('refreshShipmentCogsForCostLayerChange keeps the un-journaled delta in the journal when the daily batch is disabled (audit-gbzh)', async () => {
+  // Un-journaled shipment, but the daily batch is OFF → it will never post the
+  // updated cost, so the helper must NOT claim the delta (else the caller drops
+  // it from the COGS journal and it posts nowhere — an under-count).
+  const queued: unknown[] = []
+  const tx = {
+    $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    shipment: {
+      findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: null }),
+      update: async () => {},
+    },
+    shipmentLine: {
+      findMany: async () => [{ costLayerSnapshot: [{ costLayerId: 'layer-1', qty: '5.000000', unitCostBase: '5.500000' }] }],
+    },
+  }
+  const result = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    isDailyBatchPostingEnabled: async () => false,
+    queueAccountingSync: async (_tx, params) => { queued.push(params) },
+  })
   assert.deepEqual(queued, [])
+  assert.equal(result.cogsRevaluationDelta.toString(), '0') // not shipment-owned → stays in the COGS journal
 })
 
 test('consumeFifoLayers selects FIFO candidates with row locks before consuming', async () => {

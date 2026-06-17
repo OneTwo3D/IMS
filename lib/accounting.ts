@@ -171,6 +171,27 @@ async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
   return { connector, postingMode }
 }
 
+/**
+ * Whether the daily batch will actually post shipment COGS for the active
+ * connector — i.e. the connector is active, its sync is enabled, AND its daily
+ * batch is enabled. Used to decide whether an un-journaled shipment's COGS
+ * revaluation will reach the ledger via the batch, or whether the landed-cost
+ * COGS journal must still carry it (audit-gbzh). Mirrors the gate in
+ * app/api/cron/accounting-daily-batch/route.ts.
+ */
+export async function isDailyBatchPostingEnabled(): Promise<boolean> {
+  const connector = await getActiveAccountingConnectorId()
+  if (!connector) return false
+  if (connector === 'xero') {
+    const { getXeroSettings } = await import('@/lib/connectors/xero/settings')
+    const settings = await getXeroSettings()
+    return settings.xero_sync_enabled === 'true' && settings.xero_daily_batch_enabled === 'true'
+  }
+  const { getQuickBooksSettings } = await import('@/lib/connectors/quickbooks/settings')
+  const settings = await getQuickBooksSettings()
+  return settings.quickbooks_sync_enabled === 'true' && settings.quickbooks_daily_batch_enabled === 'true'
+}
+
 export async function isAccountingSyncTypeEnabled(type: AccountingSyncType): Promise<boolean> {
   return (await getAccountingPostingContext(type)) !== null
 }
