@@ -75,6 +75,12 @@ const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
  * mid-run: every request in a run targets the store whose credentials
  * existed when the run started.
  */
+// wcFetch encodes the HTTP status into the error string ("WC API error: 404 …").
+// A 404 from /products/{id}/variations means the parent product is gone in WC.
+function isWcNotFoundError(error: string): boolean {
+  return /WC API error: 404\b/.test(error)
+}
+
 async function safeWcFetch(
   path: string,
   params: Record<string, string>,
@@ -1453,8 +1459,20 @@ async function preflightEffectiveTargets(
         creds,
       )
       if (error) {
-        failedAttempts++
         const sampleSku = productById.get(batch[0]?.productId ?? '')?.sku ?? String(parentWcId)
+        // A 404 means the PARENT product is gone in WC (deleted), so the cached
+        // parent id is permanently stale. Mark the variants CHECKED (but leave
+        // them unverified) so the caller clears their cached ids — next run they
+        // re-resolve via the parent SKU (which re-fetches a fresh parent id).
+        // Otherwise the stale parent id keeps them perpetually skipped+re-seeded.
+        // Don't count it as a failed attempt: a 404 is a definitive answer, not a
+        // transport failure, so it must not contribute to outage detection.
+        if (isWcNotFoundError(error)) {
+          for (const entry of batch) checkedProductIds.add(entry.productId)
+          preflightErrors.push(`variant group ${sampleSku}: parent ${parentWcId} not found (404) — clearing cached ids to re-resolve via parent SKU`)
+          continue
+        }
+        failedAttempts++
         preflightErrors.push(`variant group ${sampleSku}: ${error}`)
         continue
       }
