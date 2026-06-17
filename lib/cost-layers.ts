@@ -635,6 +635,26 @@ export async function getSupplierReturnedQtyForCostLayer(
 }
 
 /**
+ * Sum stock consumed by manufacturing (PRODUCTION_OUT) for a cost layer.
+ * Manufacturing consumption capitalises the component cost INTO the produced
+ * output's cost layer — it is not customer COGS — so landed-cost recalculation
+ * must exclude these units from the retrospective COGS delta (audit-jz9i).
+ */
+export async function getManufacturingConsumedQtyForCostLayer(
+  tx: TxClient,
+  costLayerId: string,
+): Promise<Decimal> {
+  const rows = await tx.cogsEntry.findMany({
+    where: {
+      costLayerId,
+      movement: { type: 'PRODUCTION_OUT' },
+    },
+    select: { qty: true },
+  })
+  return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0))
+}
+
+/**
  * Recompute stored shipment-level COGS for any shipment whose line snapshots
  * reference the changed cost layer. This keeps shipment COGS aligned with
  * retrospective landed-cost changes, including shipments already journaled.

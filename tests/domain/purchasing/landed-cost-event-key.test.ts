@@ -19,6 +19,7 @@ const layers = [
     remainingQty: new Prisma.Decimal('2'),
     returnedQty: new Prisma.Decimal('0'),
     supplierReturnedQty: new Prisma.Decimal('0'),
+    manufacturingConsumedQty: new Prisma.Decimal('0'),
   },
 ]
 
