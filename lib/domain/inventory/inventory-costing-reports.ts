@@ -1116,6 +1116,13 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       // movements leave stock through fromWarehouseId; extend this if a future
       // COGS-producing movement records the warehouse on another side.
       ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
+      // Exclude PRODUCTION_OUT: manufacturing consumes components whose cost is
+      // CAPITALISED into the output product's cost layer, not expensed. Those
+      // cogs_entries exist only to satisfy the outbound-evidence guard; counting
+      // them here would show revenue-less cost and double-count the component
+      // cost again when the finished good is sold (whose SALE_DISPATCH COGS
+      // already includes it).
+      type: { not: StockMovementType.PRODUCTION_OUT },
       product: productWhere(filters),
     },
   }

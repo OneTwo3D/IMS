@@ -8,6 +8,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { queueAccountingSyncTx, getAccountingSettings, isAccountingSyncTypeEnabled } from '@/lib/accounting'
 import {
   addCostLayerSourceLines,
+  cogsEntryDataFromConsumed,
   consumeFifoLayersStrict,
   createCostLayer,
   getReturnedQtyForCostLayer,
@@ -641,8 +642,12 @@ export async function updateManufacturingOrderStatus(
               },
             })
 
-            // Record PRODUCTION_OUT movement
-            await tx.stockMovement.create({
+            // Record PRODUCTION_OUT movement + its COGS evidence. The outbound
+            // evidence guard (stock_movements_reporting_evidence_guard) requires
+            // a cogs_entries row per outbound movement, so the consumed FIFO
+            // layers must be written as cogs_entries against this movement — not
+            // only as output cost-layer source lines.
+            const outMovement = await tx.stockMovement.create({
               data: {
                 type: 'PRODUCTION_OUT',
                 productId: comp.componentId,
@@ -653,7 +658,13 @@ export async function updateManufacturingOrderStatus(
                 referenceType: 'ProductionOrder',
                 referenceId: id,
               },
+              select: { id: true },
             })
+            if (consumed.consumed.length > 0) {
+              await tx.cogsEntry.createMany({
+                data: consumed.consumed.map((entry) => cogsEntryDataFromConsumed(outMovement.id, entry)),
+              })
+            }
           }
 
           // Add output product stock (ACTUAL produced quantity).
@@ -741,7 +752,10 @@ export async function updateManufacturingOrderStatus(
             },
           })
 
-          await tx.stockMovement.create({
+          // PRODUCTION_OUT for the disassembled output + its required COGS
+          // evidence (see the assembly branch above for why cogs_entries — not
+          // just cost-layer source lines — must be written for outbound movements).
+          const disassembleOutMovement = await tx.stockMovement.create({
             data: {
               type: 'PRODUCTION_OUT',
               productId: order.outputProductId,
@@ -752,7 +766,13 @@ export async function updateManufacturingOrderStatus(
               referenceType: 'ProductionOrder',
               referenceId: id,
             },
+            select: { id: true },
           })
+          if (recoveredCost.consumed.length > 0) {
+            await tx.cogsEntry.createMany({
+              data: recoveredCost.consumed.map((entry) => cogsEntryDataFromConsumed(disassembleOutMovement.id, entry)),
+            })
+          }
 
           for (const comp of components) {
             const plannedRecovery = recoveryPlan.entries.find((entry) => entry.componentId === comp.componentId)
