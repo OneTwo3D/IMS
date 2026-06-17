@@ -141,9 +141,9 @@ async function generatePurchaseOrderPreview(branding: Branding) {
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 65 },
-    { label: 'Product', width: 135 },
+    { label: 'Product', width: 120 },
     { label: 'Barcode / EAN', width: 75 },
-    { label: 'MPN', width: 70 },
+    { label: 'MPN', width: 85 },
     { label: 'Qty', width: 45, align: 'right' },
     { label: 'Unit Price', width: 50, align: 'right' },
     { label: 'Total', width: 50, align: 'right' },
@@ -175,9 +175,9 @@ async function generateRfqPreview(branding: Branding) {
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Product', width: 140 },
+    { label: 'Product', width: 125 },
     { label: 'Barcode / EAN', width: 75 },
-    { label: 'MPN', width: 75 },
+    { label: 'MPN', width: 90 },
     { label: 'Quantity', width: 60, align: 'right' },
     { label: 'Unit', width: 45, align: 'right' },
   ]
@@ -278,9 +278,9 @@ async function generateManufacturingOrderPreview(branding: Branding) {
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Component', width: 145 },
+    { label: 'Component', width: 130 },
     { label: 'Barcode / EAN', width: 75 },
-    { label: 'MPN', width: 75 },
+    { label: 'MPN', width: 90 },
     { label: 'Per Unit', width: 50, align: 'right' },
     { label: 'Total Qty', width: 50, align: 'right' },
   ]

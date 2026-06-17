@@ -132,9 +132,9 @@ export async function GET(
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Component', width: 145 },
+    { label: 'Component', width: 130 },
     { label: 'Barcode / EAN', width: 75 },
-    { label: 'MPN', width: 75 },
+    { label: 'MPN', width: 90 },
     { label: 'Per Unit', width: 50, align: 'right' },
     { label: 'Total Qty', width: 50, align: 'right' },
   ]
