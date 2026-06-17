@@ -407,7 +407,7 @@ export async function transitionShipmentStatus(
         totalShipmentCogs = addMoney(totalShipmentCogs, totalCost)
         await tx.stockMovement.update({
           where: { id: movement.id },
-          data: buildStockMovementValueFieldsFromConsumed(consumed),
+          data: buildStockMovementValueFieldsFromConsumed(consumed, qty),
         })
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({

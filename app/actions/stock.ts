@@ -233,7 +233,7 @@ export async function applyStockAdjustment({
     const { consumed } = await consumeFifoLayersStrict(tx, productId, warehouseId, Math.abs(qty))
     await tx.stockMovement.update({
       where: { id: movement.id },
-      data: buildStockMovementValueFieldsFromConsumed(consumed),
+      data: buildStockMovementValueFieldsFromConsumed(consumed, absQty),
     })
     if (consumed.length > 0) {
       await tx.cogsEntry.createMany({
@@ -828,7 +828,7 @@ export async function updateAdjustmentMovement(
             `movements first, or create a compensating adjustment instead.`,
           )
         }
-        nextMovementValueFields = buildStockMovementValueFieldsFromConsumed(consumed)
+        nextMovementValueFields = buildStockMovementValueFieldsFromConsumed(consumed, newAbsQty)
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => cogsEntryDataFromConsumed(id, entry)),

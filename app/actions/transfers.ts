@@ -453,7 +453,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
         const { consumed } = await consumeFifoLayersStrict(tx, line.productId, transfer.fromWarehouseId, qty)
         await tx.stockMovement.update({
           where: { id: movement.id },
-          data: buildStockMovementValueFieldsFromConsumed(consumed),
+          data: buildStockMovementValueFieldsFromConsumed(consumed, qty),
         })
         if (consumed.length > 0) {
           await tx.stockTransferLine.update({
