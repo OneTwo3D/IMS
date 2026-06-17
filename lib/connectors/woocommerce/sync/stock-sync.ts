@@ -34,6 +34,7 @@
  * ids into the freshly wiped cache. See `../sync-lock.ts`.
  */
 
+import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
@@ -283,11 +284,15 @@ function isVariationCandidate(product: Pick<CandidateProduct, 'parent'>): boolea
   return product.parent != null
 }
 
+export type StockPushProgressSnapshot = { processed: number; synced: number; total: number }
+
 type PushStockOptions = {
   productIds?: string[]
   forceProductIds?: string[]
   forceAll?: boolean
   source?: string
+  /** Called before the first batch (with the total) and after every batch. */
+  onProgress?: (snapshot: StockPushProgressSnapshot) => void | Promise<void>
 }
 
 async function persistSuccessfulPushState(
@@ -969,6 +974,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // belong to), but continuing would keep pushing to the old store
   // after the operator explicitly disconnected it. Break out and
   // surface the abort instead.
+  await options?.onProgress?.({ processed: 0, synced: 0, total: pushEntries.length })
   for (let i = 0; i < pushEntries.length; i += WC_BATCH_SIZE) {
     const batch = pushEntries.slice(i, i + WC_BATCH_SIZE)
     const batchOutcome = await pushBatchWithFence(batch, creds, syncVersion)
@@ -995,6 +1001,11 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     result.synced += batchOutcome.outcome.successEntries.length
     result.skipped += batchOutcome.outcome.skipped
     result.errors.push(...batchOutcome.outcome.errors)
+    await options?.onProgress?.({
+      processed: Math.min(i + WC_BATCH_SIZE, pushEntries.length),
+      synced: result.synced,
+      total: pushEntries.length,
+    })
 
     for (const invalidation of batchOutcome.outcome.invalidations) {
       await logActivity({
@@ -1704,4 +1715,109 @@ async function resolveSkusInParallel(
   )
   await Promise.all(workers)
   return { resolved, errors, totalAttempts, failedAttempts }
+}
+
+// ---------------------------------------------------------------------------
+// Manual stock-push progress (mirrors the manual product-sync progress so the
+// UI can show a live "X of Y synced" count while the background push runs).
+// ---------------------------------------------------------------------------
+
+const MANUAL_STOCK_SYNC_JOB_KEY = 'manual_wc_stock_sync_job'
+const MANUAL_STOCK_SYNC_STALE_MS = 30 * 60 * 1000
+
+export type ManualStockSyncProgress = {
+  status: 'idle' | 'running' | 'done' | 'error'
+  message: string
+  processed: number
+  synced: number
+  total: number
+  errors: string[]
+  startedAt?: string
+  updatedAt?: string
+}
+
+const INITIAL_MANUAL_STOCK_SYNC_PROGRESS: ManualStockSyncProgress = {
+  status: 'idle', message: '', processed: 0, synced: 0, total: 0, errors: [],
+}
+
+async function saveManualStockSyncProgress(progress: ManualStockSyncProgress): Promise<void> {
+  await db.setting.upsert({
+    where: { key: MANUAL_STOCK_SYNC_JOB_KEY },
+    create: { key: MANUAL_STOCK_SYNC_JOB_KEY, value: JSON.stringify(progress) },
+    update: { value: JSON.stringify(progress) },
+  })
+}
+
+export async function getManualWcStockSyncProgress(): Promise<ManualStockSyncProgress> {
+  const row = await db.setting.findUnique({ where: { key: MANUAL_STOCK_SYNC_JOB_KEY } })
+  if (!row?.value) return INITIAL_MANUAL_STOCK_SYNC_PROGRESS
+  try {
+    return JSON.parse(row.value) as ManualStockSyncProgress
+  } catch {
+    return INITIAL_MANUAL_STOCK_SYNC_PROGRESS
+  }
+}
+
+/**
+ * Start the manual full stock push in the background and persist a progress
+ * record the UI polls. Deduped: a second start while one is already running
+ * (and fresh) is a no-op.
+ */
+export async function startManualWcStockSync(): Promise<void> {
+  const current = await getManualWcStockSyncProgress()
+  if (current.status === 'running') {
+    const updatedAt = current.updatedAt ? Date.parse(current.updatedAt) : NaN
+    if (Number.isFinite(updatedAt) && Date.now() - updatedAt < MANUAL_STOCK_SYNC_STALE_MS) return
+  }
+
+  const progress: ManualStockSyncProgress = {
+    ...INITIAL_MANUAL_STOCK_SYNC_PROGRESS,
+    status: 'running',
+    message: 'Preparing WooCommerce stock push…',
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }
+  await saveManualStockSyncProgress(progress)
+
+  after(() =>
+    runManualWcStockPush(progress).catch(async (error) => {
+      progress.status = 'error'
+      progress.message = error instanceof Error ? error.message : String(error)
+      progress.errors = [...progress.errors, progress.message]
+      progress.updatedAt = new Date().toISOString()
+      await saveManualStockSyncProgress(progress)
+    }),
+  )
+}
+
+async function runManualWcStockPush(progress: ManualStockSyncProgress): Promise<void> {
+  const result = await pushStockToWc({
+    forceAll: true,
+    source: 'MANUAL',
+    onProgress: async (snap) => {
+      progress.status = 'running'
+      progress.processed = snap.processed
+      progress.synced = snap.synced
+      progress.total = snap.total
+      progress.message = snap.total > 0
+        ? `Pushing stock to WooCommerce — ${snap.synced} of ${snap.total} synced`
+        : 'No changed products to push'
+      progress.updatedAt = new Date().toISOString()
+      await saveManualStockSyncProgress(progress)
+    },
+  })
+
+  progress.status = result.errors.length > 0 ? 'error' : 'done'
+  progress.synced = result.synced
+  progress.total = Math.max(progress.total, result.synced)
+  progress.errors = result.errors.slice(0, 20)
+  progress.message = result.message?.trim()
+    ? result.message.trim()
+    : result.errors.length > 0
+      ? `Stock push finished with ${result.errors.length} error(s) — ${result.synced} synced`
+      : result.synced > 0
+        ? `Stock push complete — ${result.synced} product(s) synced to WooCommerce`
+        : 'Stock push complete — all products already in sync'
+  progress.updatedAt = new Date().toISOString()
+  await saveManualStockSyncProgress(progress)
 }
