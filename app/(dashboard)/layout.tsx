@@ -7,6 +7,8 @@ import { DashboardShell } from '@/components/layout/dashboard-shell'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { BaseCurrencyProvider } from '@/components/providers/base-currency-provider'
+import { TimeZoneProvider } from '@/components/providers/timezone-provider'
+import { DEFAULT_TIMEZONE } from '@/lib/format-datetime'
 
 export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
   const session = await requireAuth()
@@ -14,13 +16,14 @@ export default async function DashboardLayout({ children }: { children: React.Re
   if (session.user.totpEnabled && !session.user.totpVerified) redirect('/2fa')
 
   const [org, pluginState, baseCurrency] = await Promise.all([
-    db.organisation.findFirst({ select: { name: true, logoUrl: true } }),
+    db.organisation.findFirst({ select: { name: true, logoUrl: true, timezone: true } }),
     getIntegrationPluginState(),
     getBaseCurrencyDisplay(),
   ])
 
   return (
     <BaseCurrencyProvider value={baseCurrency}>
+      <TimeZoneProvider value={org?.timezone ?? DEFAULT_TIMEZONE}>
       <DashboardShell
         companyName={org?.name}
         logoUrl={org?.logoUrl}
@@ -34,6 +37,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
       >
         {children}
       </DashboardShell>
+      </TimeZoneProvider>
     </BaseCurrencyProvider>
   )
 }
