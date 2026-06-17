@@ -34,7 +34,6 @@
  * ids into the freshly wiped cache. See `../sync-lock.ts`.
  */
 
-import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
@@ -1779,15 +1778,17 @@ export async function startManualWcStockSync(): Promise<void> {
   }
   await saveManualStockSyncProgress(progress)
 
-  after(() =>
-    runManualWcStockPush(progress).catch(async (error) => {
-      progress.status = 'error'
-      progress.message = error instanceof Error ? error.message : String(error)
-      progress.errors = [...progress.errors, progress.message]
-      progress.updatedAt = new Date().toISOString()
-      await saveManualStockSyncProgress(progress)
-    }),
-  )
+  // Run the push detached rather than via after(): on the self-hosted node
+  // server the unawaited promise runs to completion in the background, whereas
+  // after() callbacks proved unreliable in dev mode (Turbopack) — the callback
+  // never fired and the progress record stayed frozen at "Preparing".
+  void runManualWcStockPush(progress).catch(async (error) => {
+    progress.status = 'error'
+    progress.message = error instanceof Error ? error.message : String(error)
+    progress.errors = [...progress.errors, progress.message]
+    progress.updatedAt = new Date().toISOString()
+    await saveManualStockSyncProgress(progress)
+  })
 }
 
 async function runManualWcStockPush(progress: ManualStockSyncProgress): Promise<void> {
