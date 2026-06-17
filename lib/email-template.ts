@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import type { Branding } from '@/lib/pdf'
 import { getPublicAppUrl } from '@/lib/public-app-url'
+import { formatDateTime } from '@/lib/format-datetime'
 
 export type EmailTemplateType = 'invoice' | 'sales_order' | 'purchase_order' | 'rfq' | 'credit_note' | 'packing_slip' | 'manufacturing_order'
 
@@ -20,7 +21,7 @@ const SAMPLE_DATA: Record<EmailTemplateType, EmailData> = {
     recipientName: 'John Smith',
     recipientEmail: 'john@acme-mfg.co.uk',
     reference: 'INV-2026-00042',
-    date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
+    date: formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }),
     subject: 'Invoice INV-2026-00042',
     bodyLines: [
       'Please find attached your invoice INV-2026-00042 for £629.40.',
@@ -32,7 +33,7 @@ const SAMPLE_DATA: Record<EmailTemplateType, EmailData> = {
     recipientName: 'John Smith',
     recipientEmail: 'john@acme-mfg.co.uk',
     reference: 'SO-2026-00107',
-    date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
+    date: formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }),
     subject: 'Order Confirmation SO-2026-00107',
     bodyLines: [
       'Thank you for your order SO-2026-00107.',
@@ -44,7 +45,7 @@ const SAMPLE_DATA: Record<EmailTemplateType, EmailData> = {
     recipientName: 'Supplier Team',
     recipientEmail: 'orders@filament-supplies.de',
     reference: 'PO-20260405-X7K2',
-    date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
+    date: formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }),
     subject: 'Purchase Order PO-20260405-X7K2',
     bodyLines: [
       'Please find attached our purchase order PO-20260405-X7K2.',
@@ -55,7 +56,7 @@ const SAMPLE_DATA: Record<EmailTemplateType, EmailData> = {
     recipientName: 'Sales Team',
     recipientEmail: 'sales@filament-supplies.de',
     reference: 'RFQ-20260405-R3Q1',
-    date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
+    date: formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }),
     subject: 'Request for Quotation',
     bodyLines: [
       'Please find attached our request for quotation.',
@@ -67,7 +68,7 @@ const SAMPLE_DATA: Record<EmailTemplateType, EmailData> = {
     recipientName: 'John Smith',
     recipientEmail: 'john@acme-mfg.co.uk',
     reference: 'CN-2026-00003',
-    date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
+    date: formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }),
     subject: 'Credit Note CN-2026-00003',
     bodyLines: [
       'Please find attached credit note CN-2026-00003 for £284.85.',
@@ -78,7 +79,7 @@ const SAMPLE_DATA: Record<EmailTemplateType, EmailData> = {
     recipientName: 'Warehouse',
     recipientEmail: 'warehouse@acme-mfg.co.uk',
     reference: 'SO-2026-00107',
-    date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
+    date: formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }),
     subject: 'Packing Slip for SO-2026-00107',
     bodyLines: [
       'The packing slip for order SO-2026-00107 is attached.',
@@ -88,7 +89,7 @@ const SAMPLE_DATA: Record<EmailTemplateType, EmailData> = {
     recipientName: 'Production Team',
     recipientEmail: 'production@acme-mfg.co.uk',
     reference: 'MO-20260405-X7K2',
-    date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
+    date: formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }),
     subject: 'Manufacturing Order MO-20260405-X7K2',
     bodyLines: [
       'Please find attached manufacturing order MO-20260405-X7K2.',

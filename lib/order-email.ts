@@ -12,6 +12,8 @@ import {
   type PdfTableColumn,
 } from '@/lib/pdf'
 import { formatMoney, type SymbolPos } from '@/lib/utils'
+import { formatDateTime } from '@/lib/format-datetime'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
 
 type EmailAttachment = { filename: string; content: Buffer; contentType?: string }
 type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[] }
@@ -88,8 +90,9 @@ async function getSalesOrderEmailOrder(orderId: string): Promise<SoForPdf | null
 
 async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
   const tpl = await getTemplate('sales_order')
+  const tz = await getDisplayTimeZone()
   const { doc } = createPdfDocument({ title: `Order ${so.externalOrderNumber}` })
-  const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+  const date = formatDateTime(so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
   const shipAddr = so.shippingAddress as Record<string, string> | null
   const recipientAddr = shipAddr ? [shipAddr.line1, shipAddr.line2, shipAddr.city, shipAddr.postcode, formatCountryDisplay(shipAddr.country)].filter(Boolean).join('\n') : ''
 
@@ -106,7 +109,7 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
   }
 
   if (so.expectedDelivery) {
-    doc.font('Helvetica').fontSize(9).fillColor('#333').text(`Expected delivery: ${so.expectedDelivery.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}`, 50, doc.y)
+    doc.font('Helvetica').fontSize(9).fillColor('#333').text(`Expected delivery: ${formatDateTime(so.expectedDelivery, { day: 'numeric', month: 'long', year: 'numeric' }, tz)}`, 50, doc.y)
     doc.y += 6
   }
   if (so.shippingService) {
@@ -161,11 +164,12 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
 
 async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
   const tpl = await getTemplate('invoice')
+  const tz = await getDisplayTimeZone()
   const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
   const { doc } = createPdfDocument({ title: `Invoice ${invNum}` })
   const billAddr = so.billingAddress as Record<string, string> | null
   const recipientAddr = billAddr ? [billAddr.line1, billAddr.line2, billAddr.city, billAddr.postcode, formatCountryDisplay(billAddr.country)].filter(Boolean).join('\n') : ''
-  const date = (so.invoicedAt ?? so.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+  const date = formatDateTime(so.invoicedAt ?? so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
 
   await drawHeader(doc, branding, {
     title: 'Invoice',
@@ -268,7 +272,8 @@ async function buildSalesOrderConfirmationEmail(orderId: string): Promise<Prepar
   const ref = so.externalOrderNumber ?? so.id.slice(0, 8)
   const { money } = await getCurrencyFormat(so.currency)
   const pdfBuffer = await generateSalesOrderPdf(so, branding)
-  const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+  const tz = await getDisplayTimeZone()
+  const date = formatDateTime(so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
   const html = await renderEmailHtml(branding, {
     recipientName: so.customerName ?? 'Customer',
     recipientEmail: so.customerEmail,
@@ -305,11 +310,12 @@ async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: bo
     throw new Error(options?.accountingPdf ? 'Invoice PDF file not found on disk' : 'Failed to generate invoice PDF')
   }
 
+  const tz = await getDisplayTimeZone()
   const html = await renderEmailHtml(branding, {
     recipientName: so.customerName ?? 'Customer',
     recipientEmail: so.customerEmail,
     reference: ref,
-    date: (so.invoicedAt ?? so.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
+    date: formatDateTime(so.invoicedAt ?? so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz),
     subject: `Invoice ${ref}`,
     bodyLines: [
       `Please find attached your invoice ${ref} for ${money(Number(so.totalForeign))}.`,
