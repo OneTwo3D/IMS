@@ -268,7 +268,7 @@ type CandidateProduct = {
   type: 'SIMPLE' | 'VARIANT' | 'KIT' | 'BOM'
   lifecycleStatus: 'DRAFT' | 'ACTIVE' | 'EOL' | 'ARCHIVED'
   externalProductId: bigint | null
-  parent: { sku: string } | null
+  parent: { sku: string; externalProductId: bigint | null } | null
   productComponents: {
     componentId: string
     qty: Prisma.Decimal
@@ -283,7 +283,12 @@ function isVariationCandidate(product: Pick<CandidateProduct, 'parent'>): boolea
   return product.parent != null
 }
 
-export type StockPushProgressSnapshot = { processed: number; synced: number; total: number }
+export type StockPushProgressSnapshot = {
+  phase: 'resolving' | 'verifying' | 'pushing'
+  processed: number
+  synced: number
+  total: number
+}
 
 type PushStockOptions = {
   productIds?: string[]
@@ -561,7 +566,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       type: true,
       lifecycleStatus: true,
       externalProductId: true,
-      parent: { select: { sku: true } },
+      parent: { select: { sku: true, externalProductId: true } },
       productComponents: {
         select: {
           componentId: true,
@@ -628,13 +633,26 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // JSON serialization, Map keying, and comparison with the WC response.
   const effectiveTargets = new Map<string, EffectiveTarget>()
   for (const p of products) {
-    if (p.externalProductId != null && !isVariationCandidate(p)) {
+    if (p.externalProductId == null) continue
+    if (!isVariationCandidate(p)) {
       effectiveTargets.set(p.id, { externalId: Number(p.externalProductId) })
+    } else if (p.parent?.externalProductId != null) {
+      // Variant with a cached id AND a cached parent id: trust the cache (with
+      // its parent WC id) instead of re-resolving it live every run — the
+      // preflight below validates it against /products/{parent}/variations and
+      // clears+re-resolves-next-run any stale id, exactly like simple products.
+      // This avoids one live SKU lookup per variant (the slow "Preparing" phase).
+      effectiveTargets.set(p.id, {
+        externalId: Number(p.externalProductId),
+        parentWcId: Number(p.parent.externalProductId),
+      })
     }
   }
 
-  // -------- SKU resolution for uncached products --------
-  const needsResolution = products.filter((p) => p.externalProductId == null || isVariationCandidate(p))
+  // -------- SKU resolution for products without a usable cached mapping --------
+  // (uncached simple products, plus variants missing their own or their parent's
+  // cached id). Everything already seeded above skips the live lookup.
+  const needsResolution = products.filter((p) => !effectiveTargets.has(p.id))
   const unmatchedSkus: string[] = []
 
   // Set to `true` by any caller that observes a version bump and wants
@@ -645,6 +663,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   let versionBumpedMidRun = false
 
   if (needsResolution.length > 0) {
+    await options?.onProgress?.({ phase: 'resolving', processed: 0, synced: 0, total: needsResolution.length })
     const { resolved, errors: lookupErrors, totalAttempts, failedAttempts } =
       await resolveSkusInParallel(needsResolution, creds)
 
@@ -741,6 +760,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // -------- Preflight: validate cached ids against live WC catalog --------
   const skuByProduct = new Map(products.map((p) => [p.id, p.sku]))
   if (effectiveTargets.size > 0) {
+    await options?.onProgress?.({ phase: 'verifying', processed: 0, synced: 0, total: effectiveTargets.size })
     const { verifiedByProductId, checkedProductIds, outageDetected, preflightErrors } =
       await preflightEffectiveTargets(products, effectiveTargets, creds)
 
@@ -973,7 +993,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // belong to), but continuing would keep pushing to the old store
   // after the operator explicitly disconnected it. Break out and
   // surface the abort instead.
-  await options?.onProgress?.({ processed: 0, synced: 0, total: pushEntries.length })
+  await options?.onProgress?.({ phase: 'pushing', processed: 0, synced: 0, total: pushEntries.length })
   for (let i = 0; i < pushEntries.length; i += WC_BATCH_SIZE) {
     const batch = pushEntries.slice(i, i + WC_BATCH_SIZE)
     const batchOutcome = await pushBatchWithFence(batch, creds, syncVersion)
@@ -1001,6 +1021,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     result.skipped += batchOutcome.outcome.skipped
     result.errors.push(...batchOutcome.outcome.errors)
     await options?.onProgress?.({
+      phase: 'pushing',
       processed: Math.min(i + WC_BATCH_SIZE, pushEntries.length),
       synced: result.synced,
       total: pushEntries.length,
@@ -1800,9 +1821,14 @@ async function runManualWcStockPush(progress: ManualStockSyncProgress): Promise<
       progress.processed = snap.processed
       progress.synced = snap.synced
       progress.total = snap.total
-      progress.message = snap.total > 0
-        ? `Pushing stock to WooCommerce — ${snap.synced} of ${snap.total} synced`
-        : 'No changed products to push'
+      progress.message =
+        snap.phase === 'resolving'
+          ? `Resolving ${snap.total} new product(s) against WooCommerce…`
+          : snap.phase === 'verifying'
+            ? `Verifying ${snap.total} product mapping(s) against WooCommerce…`
+            : snap.total > 0
+              ? `Pushing stock to WooCommerce — ${snap.synced} of ${snap.total} synced`
+              : 'No changed products to push'
       progress.updatedAt = new Date().toISOString()
       await saveManualStockSyncProgress(progress)
     },

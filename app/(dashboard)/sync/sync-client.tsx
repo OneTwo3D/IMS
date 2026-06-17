@@ -135,15 +135,12 @@ type WcStockSyncProgress = {
 }
 
 function formatWcStockSyncProgress(progress: WcStockSyncProgress): { detail: string; isError: boolean } {
-  if (progress.total > 0) {
-    const parts = [`Synced ${progress.synced} of ${progress.total} products`]
-    if (progress.errors.length > 0) parts.push(`${progress.errors.length} errors`)
-    return { detail: parts.join(' · '), isError: progress.errors.length > 0 }
-  }
-  return {
-    detail: progress.message || 'Preparing WooCommerce stock push…',
-    isError: progress.status === 'error',
-  }
+  // The server sets a phase-specific message (Resolving… / Verifying… /
+  // Pushing X of Y synced / final summary), so surface it directly.
+  const isError = progress.status === 'error' || progress.errors.length > 0
+  const detail = progress.message
+    || (progress.total > 0 ? `Synced ${progress.synced} of ${progress.total} products` : 'Preparing WooCommerce stock push…')
+  return { detail: isError && progress.errors.length > 0 ? `${detail} · ${progress.errors.length} error(s)` : detail, isError }
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,7 +1196,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 <LoadingProgress
                   active={stockSyncBusy}
                   label="Pushing stock to WooCommerce…"
-                  value={stockSyncProgress?.total ? stockSyncProgress.synced : undefined}
+                  value={stockSyncProgress?.total ? stockSyncProgress.processed : undefined}
                   max={stockSyncProgress?.total || undefined}
                   detail={stockSyncProgress ? formatWcStockSyncProgress(stockSyncProgress).detail : 'Preparing WooCommerce stock push…'}
                   className="max-w-sm"
