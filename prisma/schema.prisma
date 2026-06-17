@@ -1284,6 +1284,9 @@ model PurchaseReturn {
   id          String    @id @default(cuid())
   poId        String
   reference   String?
+  // Client-supplied key (stable per return-dialog submit) that dedupes
+  // double-submits/retries: a second call with the same key is a no-op.
+  idempotencyKey String? @unique
   returnedAt  DateTime  @default(now())
   reason      String?
   notes       String?
