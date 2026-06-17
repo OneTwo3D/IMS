@@ -38,6 +38,18 @@ const TYPE_COLOURS: Record<ProductType, 'default' | 'secondary' | 'outline'> = {
   NON_INVENTORY: 'outline',
 }
 
+// Type label reflects whether a product is a variant parent/child, and — for
+// KIT/BOM — whether it is a standalone bundle or a child variant (has a parent).
+function productTypeLabel(p: Pick<ProductRow, 'type' | 'parentSku'>): string {
+  switch (p.type) {
+    case 'VARIABLE': return 'Variant parent'
+    case 'VARIANT': return 'Variant child'
+    case 'KIT': return p.parentSku ? 'Variant child (Kit)' : 'Kit'
+    case 'BOM': return p.parentSku ? 'Variant child (BOM)' : 'BOM'
+    default: return TYPE_LABELS[p.type]
+  }
+}
+
 // Map column keys to server-side sort fields (only columns that support server sort)
 const SORTABLE: Partial<Record<ColKey, string>> = {
   sku: 'sku', name: 'name', type: 'type',
@@ -207,7 +219,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
           </>
         )
       case 'type':
-        return <Badge variant={TYPE_COLOURS[p.type]}>{TYPE_LABELS[p.type]}</Badge>
+        return <Badge variant={TYPE_COLOURS[p.type]}>{productTypeLabel(p)}</Badge>
       case 'category':
         return p.categoryName ?? '—'
       case 'preferredSupplier':
@@ -355,7 +367,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
                       </p>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <Badge variant={TYPE_COLOURS[p.type]}>{TYPE_LABELS[p.type]}</Badge>
+                      <Badge variant={TYPE_COLOURS[p.type]}>{productTypeLabel(p)}</Badge>
                       <Badge variant={STATUS_VARIANTS[p.lifecycleStatus]}>{STATUS_LABELS[p.lifecycleStatus]}</Badge>
                     </div>
                   </div>
