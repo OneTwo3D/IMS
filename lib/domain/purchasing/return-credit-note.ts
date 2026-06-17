@@ -38,8 +38,18 @@ export type ReturnCreditNoteBill = {
   /** Bill GROSS total (incl-VAT), foreign. The over-credit ceiling. */
   totalForeign: DecimalInput
   fxRateToBase: DecimalInput
-  /** Sum of amountForeign of credit notes ALREADY recorded against this bill. */
+  /**
+   * Sum of amountForeign of ALL credit notes recorded against this bill (manual +
+   * return-generated). Used only as the over-credit CAP — the bill can never be
+   * credited beyond its gross across every credit note.
+   */
   alreadyCreditedForeign: DecimalInput
+  /**
+   * Sum of amountForeign of RETURN-generated credit notes recorded against this
+   * bill. The return-credit top-up nets against THIS (not the all-credits sum) so
+   * a manual allowance can't silently suppress return credit.
+   */
+  alreadyReturnCreditedForeign: DecimalInput
   createdAt: number
   lines: ReturnCreditNoteBillLine[]
 }
@@ -60,23 +70,39 @@ export type ReturnCreditNoteDraft = {
   fxRateToBase: number
 }
 
+export type ReturnCreditNoteComputation = {
+  /** The credit note to auto-create now, or null when there's nothing to create. */
+  draft: ReturnCreditNoteDraft | null
+  /**
+   * GROSS return credit (bill foreign currency) the over-billing warrants but
+   * that could NOT be auto-created because existing credit notes (e.g. manual
+   * allowances) already consumed the bill's creditable capacity. > 0 means
+   * finance should review and raise the remainder manually.
+   */
+  suppressedForeign: number
+}
+
 const EPSILON = 0.0001
 
 /**
- * Compute the DRAFT credit note (if any) to raise after a return. Returns null
- * when there is nothing new to credit (no bills, nothing over-billed, or the
- * over-billed value is already fully covered by existing credit notes).
+ * Compute the DRAFT credit note (if any) to raise after a return, plus any
+ * return credit that's warranted but couldn't be auto-created. `draft` is null
+ * when there's nothing new to credit (no bills, nothing over-billed, or the
+ * return credit is already fully covered by prior RETURN credits). `suppressedForeign`
+ * is > 0 when the over-billing warrants more return credit than the bill's
+ * remaining capacity allows because existing (e.g. manual) credits consumed it —
+ * the caller should warn finance to raise the remainder manually.
  *
  * The credit is raised against a SINGLE bill — the most recent bill that billed
- * an over-billed line — mirroring the manual single-bill credit-note model. If
- * the over-billed value exceeds that bill's remaining creditable amount it is
- * capped there (finance can record any remainder against another bill manually).
+ * an over-billed line — mirroring the manual single-bill credit-note model. The
+ * top-up nets against prior RETURN credits only; the bill's gross (across ALL
+ * credit notes) is the hard over-credit cap.
  */
 export function computeReturnCreditNoteDraft(input: {
   poLines: ReturnCreditNotePoLine[]
   bills: ReturnCreditNoteBill[]
-}): ReturnCreditNoteDraft | null {
-  if (input.bills.length === 0) return null
+}): ReturnCreditNoteComputation {
+  if (input.bills.length === 0) return { draft: null, suppressedForeign: 0 }
 
   const netReceivedByLine = new Map<string, Decimal>()
   for (const l of input.poLines) {
@@ -111,15 +137,15 @@ export function computeReturnCreditNoteDraft(input: {
     overBilledNetForeign = addMoney(overBilledNetForeign, multiplyMoney(overBilledQty, avgNetUnitForeign))
     for (const billId of billed.billIds) contributingBillIds.add(billId)
   }
-  if (overBilledNetForeign.lte(EPSILON)) return null
+  if (overBilledNetForeign.lte(EPSILON)) return { draft: null, suppressedForeign: 0 }
 
   // Only auto-create when a SINGLE bill billed the over-billed goods. Spreading
   // a credit across multiple bills with potentially different tax rates and FX
   // rates can't be done correctly from a PO-level average, so multi-bill cases
   // fall back to manual handling (the caller logs a warning).
-  if (contributingBillIds.size !== 1) return null
+  if (contributingBillIds.size !== 1) return { draft: null, suppressedForeign: 0 }
   const targetBill = input.bills.find((b) => contributingBillIds.has(b.invoiceId))
-  if (!targetBill) return null
+  if (!targetBill) return { draft: null, suppressedForeign: 0 }
 
   // Gross up the net over-billed value by the bill's gross/net ratio so the
   // credit is tax-inclusive like the bill it offsets. A zero net subtotal (no
@@ -129,25 +155,36 @@ export function computeReturnCreditNoteDraft(input: {
   const grossUpRatio = subtotal.gt(0) ? grossTotal.div(subtotal) : toDecimal(1)
   const overBilledGrossForeign = multiplyMoney(overBilledNetForeign, grossUpRatio)
 
-  // The cumulative credit this bill should carry = the over-billed gross, capped
-  // at the bill's own gross total (can't credit more than the bill). The amount
-  // to record NOW is that target minus credit notes already against the bill, so
-  // repeated returns each top the credit up rather than double-crediting, and a
-  // bill already fully credited adds nothing.
+  // The cumulative RETURN credit this bill should carry = the over-billed gross,
+  // capped at the bill's own gross total (can't credit more than the bill). The
+  // amount to record NOW tops that up over prior RETURN credits only — manual
+  // allowances must NOT reduce what the return warrants, otherwise a manual
+  // credit silently suppresses the return credit (the bug this fixes).
   const targetCumulative = overBilledGrossForeign.gt(grossTotal) ? grossTotal : overBilledGrossForeign
-  const incremental = subtractMoney(targetCumulative, targetBill.alreadyCreditedForeign)
-  if (incremental.lte(EPSILON)) return null
+  const incremental = subtractMoney(targetCumulative, targetBill.alreadyReturnCreditedForeign)
+  if (incremental.lte(EPSILON)) return { draft: null, suppressedForeign: 0 }
 
-  // Round to currency precision, then re-cap so rounding can never push the
-  // bill's cumulative credit (already-credited + this draft) above its gross.
-  const remainingToCap = subtractMoney(grossTotal, targetBill.alreadyCreditedForeign)
-  const roundedForeign = roundQuantity(incremental, 4)
-  const finalForeign = roundedForeign.gt(remainingToCap) ? remainingToCap : roundedForeign
-  if (finalForeign.lte(EPSILON)) return null
+  const roundedIncremental = roundQuantity(incremental, 4)
+
+  // The bill can never be credited beyond its gross across ALL credit notes, so
+  // the new draft is capped by the capacity left after EVERY existing credit
+  // (manual + return). Any return credit that doesn't fit is reported as
+  // suppressed so finance can raise it elsewhere rather than it vanishing.
+  const capacity = subtractMoney(grossTotal, targetBill.alreadyCreditedForeign)
+  if (capacity.lte(EPSILON)) {
+    return { draft: null, suppressedForeign: roundedIncremental.toNumber() }
+  }
+  const roundedCapacity = roundQuantity(capacity, 4)
+  const finalForeign = roundedIncremental.gt(roundedCapacity) ? roundedCapacity : roundedIncremental
+  const suppressedForeign = roundQuantity(subtractMoney(roundedIncremental, finalForeign), 4).toNumber()
+  if (finalForeign.lte(EPSILON)) return { draft: null, suppressedForeign }
 
   const amountForeign = finalForeign.toNumber()
   const fxRateToBase = toDecimal(targetBill.fxRateToBase).toNumber()
   const amountBase = roundQuantity(multiplyMoney(finalForeign, targetBill.fxRateToBase), 4).toNumber()
 
-  return { invoiceId: targetBill.invoiceId, amountForeign, amountBase, fxRateToBase }
+  return {
+    draft: { invoiceId: targetBill.invoiceId, amountForeign, amountBase, fxRateToBase },
+    suppressedForeign,
+  }
 }

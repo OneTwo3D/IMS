@@ -2085,7 +2085,7 @@ export async function returnPurchaseOrder(
     const returnRef = `RTN-${po.reference}-${Date.now().toString(36).toUpperCase()}`
     let purchaseReturnId = ''
     let totalReturnedCostBase = toDecimal(0)
-    const { overBilling, creditNote } = await db.$transaction(async (tx): Promise<{ overBilling: PurchaseOrderOverBillingSummary; creditNote: { id: string; amountForeign: number; invoiceId: string } | null }> => {
+    const { overBilling, creditNote, suppressedReturnCredit } = await db.$transaction(async (tx): Promise<{ overBilling: PurchaseOrderOverBillingSummary; creditNote: { id: string; amountForeign: number; invoiceId: string } | null; suppressedReturnCredit: number }> => {
       // audit-18s1: acquire locks in the SAME order the goods-receipt path uses
       // (stock_levels first, then PO lines) to avoid an AB/BA deadlock — receipt
       // locks a stock_levels row then updates the PO line, so a return must not
@@ -2262,28 +2262,41 @@ export async function returnPurchaseOrder(
       // credit notes already recorded against the bill so repeated returns top up
       // rather than double-credit.
       let createdCreditNote: { id: string; amountForeign: number; invoiceId: string } | null = null
+      let suppressedReturnCreditForeign = 0
       if (billingInvoices.length > 0) {
         const invoiceIds = billingInvoices.map((inv) => inv.id)
+        // Split existing credits: ALL credits cap the bill's total credit, but
+        // the return top-up nets against RETURN-generated credits only — a manual
+        // allowance must not silently suppress the return credit (audit-rz6e).
         const existingCredits = await tx.supplierCreditNote.groupBy({
-          by: ['purchaseInvoiceId'],
+          by: ['purchaseInvoiceId', 'isReturnGenerated'],
           where: { purchaseInvoiceId: { in: invoiceIds } },
           _sum: { amountForeign: true },
         })
-        const creditedByInvoice = new Map(
-          existingCredits.map((c) => [c.purchaseInvoiceId, Number(c._sum.amountForeign ?? 0)]),
-        )
-        const draft = computeReturnCreditNoteDraft({
+        const allCreditedByInvoice = new Map<string, number>()
+        const returnCreditedByInvoice = new Map<string, number>()
+        for (const c of existingCredits) {
+          if (!c.purchaseInvoiceId) continue
+          const amount = Number(c._sum.amountForeign ?? 0)
+          allCreditedByInvoice.set(c.purchaseInvoiceId, (allCreditedByInvoice.get(c.purchaseInvoiceId) ?? 0) + amount)
+          if (c.isReturnGenerated) {
+            returnCreditedByInvoice.set(c.purchaseInvoiceId, (returnCreditedByInvoice.get(c.purchaseInvoiceId) ?? 0) + amount)
+          }
+        }
+        const { draft, suppressedForeign } = computeReturnCreditNoteDraft({
           poLines: billingLines.map((l) => ({ poLineId: l.id, qtyReceived: l.qtyReceived, qtyReturned: l.qtyReturned })),
           bills: billingInvoices.map((inv) => ({
             invoiceId: inv.id,
             subtotalForeign: inv.subtotalForeign,
             totalForeign: inv.totalForeign,
             fxRateToBase: inv.fxRateToBase,
-            alreadyCreditedForeign: creditedByInvoice.get(inv.id) ?? 0,
+            alreadyCreditedForeign: allCreditedByInvoice.get(inv.id) ?? 0,
+            alreadyReturnCreditedForeign: returnCreditedByInvoice.get(inv.id) ?? 0,
             createdAt: inv.createdAt.getTime(),
             lines: inv.lines.map((il) => ({ poLineId: il.poLineId, qtyBilled: il.qtyBilled, totalForeign: il.totalForeign })),
           })),
         })
+        suppressedReturnCreditForeign = suppressedForeign
         if (draft) {
           const cn = await tx.supplierCreditNote.create({
             data: {
@@ -2297,6 +2310,7 @@ export async function returnPurchaseOrder(
               fxRateToBase: draft.fxRateToBase,
               reason: `Supplier return ${returnRef}${reason ? ` — ${reason}` : ''}`,
               status: 'DRAFT',
+              isReturnGenerated: true,
               createdBy: session.user.id,
             },
             select: { id: true },
@@ -2332,7 +2346,7 @@ export async function returnPurchaseOrder(
           idempotencyKey: accountingPayloadKey(`purchase-return:${purchaseReturn.id}`, payload),
         })
       }
-      return { overBilling: overBillingComputed, creditNote: createdCreditNote }
+      return { overBilling: overBillingComputed, creditNote: createdCreditNote, suppressedReturnCredit: suppressedReturnCreditForeign }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
@@ -2381,6 +2395,25 @@ export async function returnPurchaseOrder(
             bills: overBilling.bills,
             ...(creditNote ? { draftCreditNoteId: creditNote.id, draftCreditNoteAmountForeign: creditNote.amountForeign, currency: po.currency } : {}),
           },
+        })
+      }
+
+      // audit-rz6e: the over-billing warrants more return credit than could be
+      // auto-created because existing (e.g. manual) credit notes already consumed
+      // the bill's creditable capacity. Surface the CUMULATIVE outstanding amount
+      // (for the current return state) so finance raises it manually instead of
+      // it silently vanishing — treat the latest warning as the running figure,
+      // not additive across repeated returns. Threshold at 1 cent so sub-cent
+      // rounding noise can't warn (and the toFixed(2) figure is meaningful).
+      if (suppressedReturnCredit >= 0.01) {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: id,
+          action: 'return_credit_suppressed',
+          tag: 'purchase',
+          level: 'WARNING',
+          description: `Return on PO ${po.reference}: ${po.currency} ${suppressedReturnCredit.toFixed(2)} of return credit (cumulative) could not be auto-created because existing credit notes (e.g. a manual allowance) already use the bill's creditable amount. Review and raise the outstanding supplier credit manually.`,
+          metadata: { reference: po.reference, suppressedReturnCreditForeign: suppressedReturnCredit, currency: po.currency },
         })
       }
     } catch (billingWarnError) {
