@@ -12,10 +12,12 @@ import {
   deletePasskey,
   renamePasskey,
 } from '@/app/actions/passkey'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type PasskeyEntry = { id: string; name: string; createdAt: Date }
 
 export function PasskeyManager() {
+  const formatDateTime = useFormatDateTime()
   const [passkeys, setPasskeys] = useState<PasskeyEntry[]>([])
   const [loading, setLoading] = useState(true)
   const [isPending, startTransition] = useTransition()
@@ -113,7 +115,7 @@ export function PasskeyManager() {
                   <div>
                     <p className="text-sm">{pk.name}</p>
                     <p className="text-xs text-muted-foreground">
-                      Added {new Date(pk.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                      Added {formatDateTime(pk.createdAt, { day: 'numeric', month: 'short', year: 'numeric' })}
                     </p>
                   </div>
                 )}

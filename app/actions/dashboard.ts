@@ -5,6 +5,8 @@ import { getSetting } from '@/app/actions/settings'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
+import { formatDateTime } from '@/lib/format-datetime'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -160,6 +162,7 @@ export async function getDashboardData(
   compLabel: string
 }> {
   await requirePermission('dashboard')
+  const tz = await getDisplayTimeZone()
   const fyStartStr = await getSetting('financial_year_start') ?? '04-06'
   const [fyMonth, fyDay] = fyStartStr.split('-').map(Number)
 
@@ -388,7 +391,7 @@ export async function getDashboardData(
     today: 'Today', this_week: 'This Week', this_month: 'This Month', this_quarter: 'This Quarter',
     this_year: 'This Year', this_fy: 'Financial Year', last_7d: 'Last 7 Days', last_30d: 'Last 30 Days',
     last_90d: 'Last 90 Days', last_365d: 'Last 365 Days',
-    custom: `${periodFrom.toLocaleDateString('en-GB')} – ${periodTo.toLocaleDateString('en-GB')}`,
+    custom: `${formatDateTime(periodFrom, { dateStyle: 'short' }, tz)} – ${formatDateTime(periodTo, { dateStyle: 'short' }, tz)}`,
   }
   const compLabels: Record<CompareMode, string> = {
     previous_period: 'Previous Period', previous_year: 'Previous Year', previous_fy: 'Previous FY',

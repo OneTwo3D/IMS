@@ -10,6 +10,7 @@ import { Select } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createUser, deleteUser, updateUser, type UserRow } from '@/app/actions/users'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type SupplierOption = { id: string; name: string }
 type Props = { users: UserRow[]; suppliers: SupplierOption[] }
@@ -34,6 +35,7 @@ const ROLE_BADGE: Record<string, string> = {
 
 export function UsersClient({ users, suppliers }: Props) {
   const router = useRouter()
+  const formatDateTime = useFormatDateTime()
   const [isCreatePending, startCreateTransition] = useTransition()
   const [isUpdatePending, startUpdateTransition] = useTransition()
   const [isDeletePending, startDeleteTransition] = useTransition()
@@ -160,7 +162,7 @@ export function UsersClient({ users, suppliers }: Props) {
               </TableCell>
               <TableCell className="px-4 text-xs">{u.totpEnabled ? '✓' : '—'}</TableCell>
               <TableCell className="px-4 text-xs text-muted-foreground">
-                {u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : 'Never'}
+                {u.lastLoginAt ? formatDateTime(u.lastLoginAt, { day: 'numeric', month: 'short' }) : 'Never'}
               </TableCell>
               <TableCell className="px-4">
                 <div className="flex items-center justify-end gap-1">

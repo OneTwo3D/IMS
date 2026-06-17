@@ -51,6 +51,7 @@ import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 import { PoFormDialog } from '../po-form'
 import { SupplierCreditNotesCard } from './supplier-credit-notes-card'
@@ -1861,6 +1862,7 @@ function ShipDialog({
 
 export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation }: Props) {
   const baseCurrency = useBaseCurrency()
+  const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const po = initialPo
@@ -2177,7 +2179,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                   <li key={sync.id}>
                     <span className="font-medium uppercase">{sync.connector}</span>
                     {' '}
-                    {ACCOUNTING_SYNC_TYPE_LABEL[sync.type]} failed on {new Date(sync.createdAt).toLocaleString('en-GB')}
+                    {ACCOUNTING_SYNC_TYPE_LABEL[sync.type]} failed on {formatDateTime(sync.createdAt)}
                     {sync.retryCount > 0 ? ` after ${sync.retryCount} retries` : ''}: {sync.errorMessage}
                   </li>
                 ))}
@@ -2221,7 +2223,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <span className="text-muted-foreground">Expected Delivery</span>
             <p className="font-medium">
               {po.expectedDelivery
-                ? new Date(po.expectedDelivery).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+                ? formatDateTime(po.expectedDelivery, { day: 'numeric', month: 'long', year: 'numeric' })
                 : '—'}
             </p>
           </div>
@@ -2321,14 +2323,14 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     <TableCell className="text-xs">
                       <div className="font-medium">{asn.status}</div>
                       <div className="text-muted-foreground">
-                        {asn.closedAt ? `Closed ${new Date(asn.closedAt).toLocaleDateString('en-GB')}` : 'Open'}
+                        {asn.closedAt ? `Closed ${formatDateTime(asn.closedAt, { dateStyle: 'medium' })}` : 'Open'}
                       </div>
                     </TableCell>
                     <TableCell className="text-right tabular-nums">{asn.lineCount}</TableCell>
                     <TableCell className="text-right tabular-nums">{asn.totalExpectedQty}</TableCell>
                     <TableCell className="text-right tabular-nums">{asn.totalReceivedQty}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">
-                      {new Date(asn.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                      {formatDateTime(asn.createdAt, { day: 'numeric', month: 'short', year: 'numeric' })}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -2554,7 +2556,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                   <div className="flex items-center justify-between">
                     <span className="font-mono text-xs font-medium">{r.reference ?? r.id}</span>
                     <span className="text-muted-foreground text-xs">
-                      {new Date(r.receivedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                      {formatDateTime(r.receivedAt, { day: 'numeric', month: 'short', year: 'numeric' })}
                     </span>
                   </div>
                   {r.notes && <p className="text-muted-foreground text-xs">{r.notes}</p>}
@@ -2596,7 +2598,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                   <div className="flex items-center justify-between">
                     <span className="font-mono text-xs font-medium">{r.reference ?? r.id}</span>
                     <span className="text-muted-foreground text-xs">
-                      {new Date(r.returnedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                      {formatDateTime(r.returnedAt, { day: 'numeric', month: 'short', year: 'numeric' })}
                     </span>
                   </div>
                   {r.reason && (
@@ -2699,7 +2701,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                       )}
                     </div>
                     <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                      <span>{new Date(inv.invoiceDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                      <span>{formatDateTime(inv.invoiceDate, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                       <span className="font-mono font-medium text-foreground">{money(inv.totalForeign)}</span>
                       {inv.supplierInvoiceUrl && (
                         <a
@@ -2749,7 +2751,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                   </div>
                   {inv.paidAt && (
                     <p className="text-[11px] text-muted-foreground">
-                      Paid {new Date(inv.paidAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                      Paid {formatDateTime(inv.paidAt, { day: 'numeric', month: 'short', year: 'numeric' })}
                       {inv.paymentReference ? ` · ref ${inv.paymentReference}` : ''}
                     </p>
                   )}

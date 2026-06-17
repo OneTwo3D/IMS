@@ -14,6 +14,7 @@ import {
 } from '@/components/ui/table'
 import { getProductStockFlow } from '@/app/actions/stock'
 import type { StockFlowRow } from '@/app/actions/stock'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -95,6 +96,7 @@ export function StockFlowButton({ productId, iconOnly }: { productId: string; ic
 // ---------------------------------------------------------------------------
 
 function StockFlowDialog({ productId, onClose }: { productId: string; onClose: () => void }) {
+  const formatDateTime = useFormatDateTime()
   const [rows, setRows] = useState<StockFlowRow[]>([])
   const [loading, startTransition] = useTransition()
   const [loaded, setLoaded] = useState(false)
@@ -205,7 +207,7 @@ function StockFlowDialog({ productId, onClose }: { productId: string; onClose: (
               {paged.map((r) => (
                 <TableRow key={r.id}>
                   <TableCell className="text-xs whitespace-nowrap">
-                    {new Date(r.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: '2-digit' })}
+                    {formatDateTime(r.createdAt, { day: 'numeric', month: 'short', year: '2-digit' })}
                   </TableCell>
                   <TableCell>
                     <Badge variant="outline" className="text-xs font-normal whitespace-nowrap">

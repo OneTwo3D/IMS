@@ -13,6 +13,8 @@ import {
   type PdfTableColumn,
 } from '@/lib/pdf'
 import { formatCountryDisplay } from '@/lib/countries'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
+import { formatDateTime } from '@/lib/format-datetime'
 
 type RfqSession = AuthSession | NextResponse
 type RfqQuantity = Prisma.Decimal | number | string
@@ -157,6 +159,7 @@ async function renderRfqPdf(po: RfqPurchaseOrder, tpl: RfqDocumentTemplate | nul
   // Branding is intentionally outside the route DI surface; auth tests stub the
   // whole renderPdf dependency. Thread getBranding through only for branding-specific tests.
   const branding = await getBranding()
+  const tz = await getDisplayTimeZone()
 
   const supplierAddress = [
     po.supplier.addressLine1,
@@ -168,11 +171,11 @@ async function renderRfqPdf(po: RfqPurchaseOrder, tpl: RfqDocumentTemplate | nul
     .filter(Boolean)
     .join('\n')
 
-  const dateStr = po.createdAt.toLocaleDateString('en-GB', {
+  const dateStr = formatDateTime(po.createdAt, {
     day: 'numeric',
     month: 'long',
     year: 'numeric',
-  })
+  }, tz)
 
   // Build PDF
   const { doc } = createPdfDocument({ title: `RFQ — ${po.reference}` })
@@ -191,11 +194,11 @@ async function renderRfqPdf(po: RfqPurchaseOrder, tpl: RfqDocumentTemplate | nul
 
   // Expected delivery
   if (po.expectedDelivery) {
-    const expectedStr = po.expectedDelivery.toLocaleDateString('en-GB', {
+    const expectedStr = formatDateTime(po.expectedDelivery, {
       day: 'numeric',
       month: 'long',
       year: 'numeric',
-    })
+    }, tz)
     doc
       .font('Helvetica')
       .fontSize(9)

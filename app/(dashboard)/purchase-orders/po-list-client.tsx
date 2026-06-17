@@ -11,6 +11,7 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuSep
 import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableLayout } from '@/components/ui/mobile-records'
 import { ChevronRight, Search, Settings2, Filter } from 'lucide-react'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 
 function timeAgo(iso: string): string {
@@ -21,11 +22,6 @@ function timeAgo(iso: string): string {
   if (hrs < 24) return `${hrs}h ago`
   const days = Math.floor(hrs / 24)
   return `${days}d ago`
-}
-
-function fmtDate(iso: string | null): string {
-  if (!iso) return '—'
-  return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -142,6 +138,8 @@ type Props = {
 
 export function PoListClient({ initialPos, currencySymbols = {}, currencyPositions = {} }: Props) {
   const baseCurrency = useBaseCurrency()
+  const formatDateTime = useFormatDateTime()
+  const fmtDate = (iso: string | null) => (iso ? formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' }) : '—')
   const sym = (code: string) => currencySymbols[code] ?? (code === baseCurrency.code ? baseCurrency.symbol : code)
   const symPos = (code: string) => currencyPositions[code] ?? (code === baseCurrency.code ? baseCurrency.symbolPosition : undefined)
   const fmtForeign = (value: number, code: string) => formatMoney(value, sym(code), symPos(code))

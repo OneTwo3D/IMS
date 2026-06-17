@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { listBackups, deleteBackup, type BackupEntry } from '@/app/actions/backup'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 function fmtSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
@@ -18,11 +19,10 @@ function fmtSize(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function fmtDate(iso: string) {
-  return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
-}
-
 export function BackupRestore() {
+  const formatDateTime = useFormatDateTime()
+  const fmtDate = (iso: string) =>
+    formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [backups, setBackups] = useState<BackupEntry[]>([])

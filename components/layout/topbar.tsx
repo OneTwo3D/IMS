@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useTheme } from '@/components/providers/theme-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { usePageTitleOverride } from '@/lib/page-title'
 
 interface TopbarProps {
@@ -140,6 +141,7 @@ function timeAgo(dateStr: string) {
 
 export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: TopbarProps) {
   const { setTheme, resolvedTheme } = useTheme()
+  const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const pathname = usePathname()
   const titleOverride = usePageTitleOverride()
@@ -313,7 +315,7 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
           <DialogHeader>
             <DialogTitle>{selectedNotification?.title ?? 'Notification'}</DialogTitle>
             <DialogDescription className="text-xs">
-              {selectedNotification ? new Date(selectedNotification.createdAt).toLocaleString() : ''}
+              {selectedNotification ? formatDateTime(selectedNotification.createdAt) : ''}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">

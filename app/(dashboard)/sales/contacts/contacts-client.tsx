@@ -14,6 +14,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { createCustomer, updateCustomer, importContactsCsv, anonymiseCustomer, type CustomerRow, type CustomerInput, type AddressData } from '@/app/actions/customers'
 import { CsvBar } from '@/components/ui/csv-bar'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatCountryDisplay } from '@/lib/countries'
 import { formatMoney } from '@/lib/utils'
 
@@ -55,11 +56,6 @@ function defaultVisibility(): Record<ColKey, boolean> {
 function formatAddr(a: AddressData | null): string {
   if (!a) return '—'
   return [a.line1, a.line2, a.city, a.postcode, formatCountryDisplay(a.country)].filter(Boolean).join(', ') || '—'
-}
-
-function fmtDate(iso: string | null): string {
-  if (!iso) return '—'
-  return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +266,8 @@ type Props = { initialCustomers: CustomerRow[] }
 
 export function ContactsClient({ initialCustomers }: Props) {
   const baseCurrency = useBaseCurrency()
+  const formatDateTime = useFormatDateTime()
+  const fmtDate = (iso: string | null) => (iso ? formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' }) : '—')
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const router = useRouter()
   const [isPending, startTransition] = useTransition()

@@ -4,6 +4,8 @@ import Link from 'next/link'
 import { requireAuth } from '@/lib/auth/server'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { getSupplierRfqs } from '@/app/actions/supplier-portal'
+import { formatDateTime } from '@/lib/format-datetime'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
 
 export const metadata: Metadata = { title: 'RFQs — Supplier Portal' }
 
@@ -12,6 +14,7 @@ export default async function SupplierRfqsPage() {
   if (session.user.role !== 'SUPPLIER') redirect('/dashboard')
 
   const rfqs = await getSupplierRfqs()
+  const tz = await getDisplayTimeZone()
 
   return (
     <div className="space-y-4 max-w-4xl">
@@ -43,7 +46,7 @@ export default async function SupplierRfqsPage() {
                 </TableCell>
                 <TableCell className="px-4 text-muted-foreground">{r.lineCount}</TableCell>
                 <TableCell className="px-4 text-muted-foreground text-xs">
-                  {new Date(r.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                  {formatDateTime(r.createdAt, { day: 'numeric', month: 'short', year: 'numeric' }, tz)}
                 </TableCell>
               </TableRow>
             ))}

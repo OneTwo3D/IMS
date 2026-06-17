@@ -18,6 +18,7 @@ import {
   type MintsoftDashboardData,
 } from '@/app/actions/mintsoft-sync'
 import { ProductLink } from '@/components/inventory/product-link'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { Button } from '@/components/ui/button'
 import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { Card } from '@/components/ui/card'
@@ -106,6 +107,7 @@ function ReceiptReviewWarnings({ warnings }: { warnings: string[] }) {
 }
 
 export function MintsoftClient({ data }: Props) {
+  const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
 
@@ -728,7 +730,7 @@ export function MintsoftClient({ data }: Props) {
                     {link.checksum ? `${link.checksum.slice(0, 12)}…` : '—'}
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
-                    {link.lastSyncedAt ? new Date(link.lastSyncedAt).toLocaleString() : '—'}
+                    {link.lastSyncedAt ? formatDateTime(link.lastSyncedAt) : '—'}
                   </TableCell>
                 </TableRow>
               ))
@@ -769,7 +771,7 @@ export function MintsoftClient({ data }: Props) {
               data.receiptReviewEvents.map((event) => (
                 <TableRow key={event.id}>
                   <TableCell className="text-xs text-muted-foreground">
-                    {new Date(event.receivedAt).toLocaleString()}
+                    {formatDateTime(event.receivedAt)}
                   </TableCell>
                   <TableCell>
                     <div className="font-mono text-xs font-medium">{event.externalAsnId ?? 'Unmapped'}</div>
@@ -981,7 +983,7 @@ export function MintsoftClient({ data }: Props) {
             {data.connection.connectionTest.status !== 'never' ? (
               <p className={`md:col-span-2 text-xs ${data.connection.connectionTest.status === 'success' ? 'text-green-600' : 'text-destructive'}`}>
                 Last connection test: {data.connection.connectionTest.status === 'success' ? 'passed' : 'failed'}
-                {data.connection.connectionTest.testedAt ? ` at ${new Date(data.connection.connectionTest.testedAt).toLocaleString('en-GB')}` : ''}
+                {data.connection.connectionTest.testedAt ? ` at ${formatDateTime(data.connection.connectionTest.testedAt)}` : ''}
                 {data.connection.connectionTest.message ? ` — ${data.connection.connectionTest.message}` : ''}
               </p>
             ) : null}

@@ -12,6 +12,7 @@ import { ProductLink } from '@/components/inventory/product-link'
 import type { KpiSummary, ChartPoint, TopProduct, RecentOrder, IncomingPO, Period, CompareMode } from '@/app/actions/dashboard'
 import { getDashboardData } from '@/app/actions/dashboard'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { OnboardingBanner } from '@/components/layout/onboarding-banner'
 import { formatCompactMoney, formatMoney } from '@/lib/utils'
 
@@ -21,8 +22,6 @@ type Props = {
   periodLabel: string; compLabel: string; initialPeriod: Period; initialCompare: CompareMode
   showOnboardingBanner?: boolean
 }
-
-function fmtDateShort(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) }
 
 function ChangeBadge({ current, previous }: { current: number; previous: number }) {
   if (previous === 0 && current === 0) return <span className="text-[11px] text-muted-foreground">—</span>
@@ -125,6 +124,8 @@ function DesktopChartFrame({
 }
 
 export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare, showOnboardingBanner }: Props) {
+  const formatDateTime = useFormatDateTime()
+  const fmtDateShort = (iso: string) => formatDateTime(iso, { day: 'numeric', month: 'short' })
   const baseCurrency = useBaseCurrency()
   const fmtBase = (value: number) => formatCompactMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const fmtBaseFull = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)

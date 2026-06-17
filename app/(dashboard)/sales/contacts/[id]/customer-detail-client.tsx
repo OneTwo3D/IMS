@@ -12,6 +12,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { anonymiseCustomer, type CustomerDetail, type AddressData } from '@/app/actions/customers'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatCountryDisplay } from '@/lib/countries'
 import { formatMoney } from '@/lib/utils'
 
@@ -45,10 +46,6 @@ const STATUS_CLASS: Record<string, string> = {
   CANCELLED: 'text-destructive border-destructive/30',
   REFUNDED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
   PARTIALLY_REFUNDED: 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900 dark:text-orange-200',
-}
-
-function fmtDate(iso: string): string {
-  return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
 }
 
 function formatAddr(a: AddressData | null): string {
@@ -118,6 +115,8 @@ type Props = { customer: CustomerDetail }
 
 export function CustomerDetailClient({ customer }: Props) {
   const baseCurrency = useBaseCurrency()
+  const formatDateTime = useFormatDateTime()
+  const fmtDate = (iso: string) => formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' })
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const [showGdpr, setShowGdpr] = useState(false)
 

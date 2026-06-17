@@ -19,6 +19,8 @@ import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma
 import { hasExternalProductLink } from '@/lib/shopping'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { formatMoney } from '@/lib/utils'
+import { formatDateTime } from '@/lib/format-datetime'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
 
 const TYPE_LABELS: Record<ProductType, string> = {
   SIMPLE: 'Simple',
@@ -66,6 +68,7 @@ export default async function ProductDetailPage({
     listProductSupplierOptions(),
   ])
   const baseCurrency = await getBaseCurrencyDisplay()
+  const tz = await getDisplayTimeZone()
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
 
   if (!product) notFound()
@@ -461,7 +464,7 @@ export default async function ProductDetailPage({
                     <div key={c.id} className="text-sm">
                       <div className="flex justify-between">
                         <span className="text-muted-foreground">
-                          {new Date(c.receivedAt).toLocaleDateString('en-GB')}
+                          {formatDateTime(c.receivedAt, { dateStyle: 'short' }, tz)}
                         </span>
                         <span className="font-mono">{fmtBase(Number(c.unitCostBase))}</span>
                       </div>
@@ -509,7 +512,7 @@ export default async function ProductDetailPage({
                     <div className="flex items-center justify-between">
                       <span className="font-medium">{s.supplierName}</span>
                       <span className="text-xs text-muted-foreground">
-                        {s.updatedAt.toLocaleDateString('en-GB')}
+                        {formatDateTime(s.updatedAt, { dateStyle: 'short' }, tz)}
                       </span>
                     </div>
                     {s.supplierSku && (
@@ -537,7 +540,7 @@ export default async function ProductDetailPage({
                     </div>
                     {s.fxFetchedAt && s.currency !== baseCurrency.code && (
                       <div className="text-xs text-muted-foreground opacity-60">
-                        Rate as of {s.fxFetchedAt.toLocaleDateString('en-GB')}
+                        Rate as of {formatDateTime(s.fxFetchedAt, { dateStyle: 'short' }, tz)}
                       </div>
                     )}
                   </div>

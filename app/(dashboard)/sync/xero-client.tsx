@@ -34,6 +34,7 @@ import {
 import { savePaymentAccountMap } from '@/app/actions/accounting'
 import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type AccountingAccount = { id: string; externalAccountId: string; code: string | null; name: string; type: string }
 
@@ -130,6 +131,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
 
 export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: Props) {
   const router = useRouter()
+  const formatDateTime = useFormatDateTime()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
 
   // audit-ohou: step-up re-auth + retry once on the fresh_auth_required failure.
@@ -526,7 +528,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
           {connectionTest.status !== 'never' && (
             <p className={`text-xs ${connectionTest.status === 'success' ? 'text-green-600' : 'text-destructive'}`}>
               Last connection test: {connectionTest.status === 'success' ? 'passed' : 'failed'}
-              {connectionTest.testedAt ? ` at ${new Date(connectionTest.testedAt).toLocaleString('en-GB')}` : ''}
+              {connectionTest.testedAt ? ` at ${formatDateTime(connectionTest.testedAt)}` : ''}
               {connectionTest.message ? ` — ${connectionTest.message}` : ''}
             </p>
           )}
@@ -998,7 +1000,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">{log.referenceType}:{log.referenceId.slice(0, 8)}</TableCell>
                           <TableCell className="font-mono text-xs text-muted-foreground">{log.externalTransactionId?.slice(0, 12) ?? '—'}</TableCell>
-                          <TableCell className="text-xs text-muted-foreground">{new Date(log.createdAt).toLocaleString()}</TableCell>
+                          <TableCell className="text-xs text-muted-foreground">{formatDateTime(log.createdAt)}</TableCell>
                           <TableCell className="text-xs text-destructive max-w-48 truncate" title={log.errorMessage ?? undefined}>
                             {log.errorMessage ?? '—'}
                           </TableCell>
@@ -1075,11 +1077,6 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 
 function formatBase(n: number): string {
   return n.toLocaleString('en-GB', { style: 'currency', currency: 'GBP' })
-}
-
-function formatRelative(iso: string): string {
-  const d = new Date(iso)
-  return d.toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })
 }
 
 function DailyBatchPanel({
@@ -1387,6 +1384,8 @@ function HistoryEntryRow({
   entry: NonNullable<AccountingBatchHistoryDay['a1']>
 }) {
   const router = useRouter()
+  const formatDateTime = useFormatDateTime()
+  const formatRelative = (iso: string) => formatDateTime(iso, { dateStyle: 'medium', timeStyle: 'short' })
   const [retrying, setRetrying] = useState(false)
   const [retryMsg, setRetryMsg] = useState<string | null>(null)
   const canRetry = entry.status === 'FAILED' || (entry.status === 'PENDING' && entry.retryCount > 0)

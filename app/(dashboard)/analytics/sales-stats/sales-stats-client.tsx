@@ -12,6 +12,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { ProductLink } from '@/components/inventory/product-link'
 import { saveView, type SalesStatRow, type SalesStatSummary, type ShipmentRow, type DetailRow, type InvoiceRow, type RefundRow, type CustomerAgingRow, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
@@ -38,7 +39,6 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'aging', label: 'Customer Aging' },
 ]
 
-function fmtDate(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) }
 function makeId() { return Math.random().toString(36).slice(2, 8) }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +353,8 @@ function StatusBadge({ status }: { status: string }) {
 // Main
 // ---------------------------------------------------------------------------
 export function SalesStatsClient({ productStats, shipments, details, invoices, refunds, aging, savedViews }: Props) {
+  const formatDateTime = useFormatDateTime()
+  const fmtDate = (iso: string) => formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' })
   const baseCurrency = useBaseCurrency()
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const moneyLabel = (label: string) => `${label} (${baseCurrency.code})`

@@ -32,6 +32,7 @@ import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-poli
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { hasPermission } from '@/lib/permissions'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
@@ -789,6 +790,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
   const baseCurrency = useBaseCurrency()
+  const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showRefund, setShowRefund] = useState(false)
@@ -1092,7 +1094,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   <li key={sync.id}>
                     <span className="font-medium uppercase">{sync.connector}</span>
                     {' '}
-                    {ACCOUNTING_SYNC_TYPE_LABEL[sync.type]} failed on {new Date(sync.createdAt).toLocaleString('en-GB')}
+                    {ACCOUNTING_SYNC_TYPE_LABEL[sync.type]} failed on {formatDateTime(sync.createdAt)}
                     {sync.retryCount > 0 ? ` after ${sync.retryCount} retries` : ''}: {sync.errorMessage}
                   </li>
                 ))}
@@ -1142,9 +1144,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
         )}
         <div>
           <span className="text-muted-foreground">Order Date</span>
-          <p className="font-medium">{new Date(so.externalOrderDate ?? so.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}{', '}{new Date(so.externalOrderDate ?? so.createdAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</p>
+          <p className="font-medium">{formatDateTime(so.externalOrderDate ?? so.createdAt, { day: 'numeric', month: 'short', year: 'numeric' })}{', '}{formatDateTime(so.externalOrderDate ?? so.createdAt, { hour: '2-digit', minute: '2-digit' })}</p>
         </div>
-        {so.expectedDelivery && <div><span className="text-muted-foreground">Expected Delivery</span><p className="font-medium">{new Date(so.expectedDelivery).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
+        {so.expectedDelivery && <div><span className="text-muted-foreground">Expected Delivery</span><p className="font-medium">{formatDateTime(so.expectedDelivery, { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
         {so.salesRep && <div><span className="text-muted-foreground">Sales Rep</span><p className="font-medium">{so.salesRep}</p></div>}
         {so.trackingNumber && <div><span className="text-muted-foreground">Tracking</span>{(() => {
           const url = deliveryTrackingEnabled ? getTrackingUrl(so.shippingService, so.trackingNumber) : null
@@ -1154,7 +1156,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             </a>
           ) : <p className="font-medium font-mono text-xs">{so.trackingNumber}</p>
         })()}</div>}
-        {so.shippedAt && <div><span className="text-muted-foreground">Shipped</span><p className="font-medium">{new Date(so.shippedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
+        {so.shippedAt && <div><span className="text-muted-foreground">Shipped</span><p className="font-medium">{formatDateTime(so.shippedAt, { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
         <div>
           <span className="text-muted-foreground">COGS</span>
           <p className="font-medium font-mono">{so.cogsBase != null ? baseMoney(so.cogsBase) : '—'}</p>
@@ -1369,7 +1371,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           <div className="px-4 py-3 text-sm grid grid-cols-2 md:grid-cols-4 gap-4">
             <div>
               <span className="text-muted-foreground text-xs">Invoice Date</span>
-              <p className="font-medium">{so.invoicedAt ? new Date(so.invoicedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : '—'}</p>
+              <p className="font-medium">{so.invoicedAt ? formatDateTime(so.invoicedAt, { day: 'numeric', month: 'long', year: 'numeric' }) : '—'}</p>
             </div>
             <div>
               <span className="text-muted-foreground text-xs">Total</span>
@@ -1401,7 +1403,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 {so.payments.filter((p) => !p.refundId).map((p) => (
                   <div key={p.id} className="flex items-center justify-between text-xs">
                     <div className="flex items-center gap-2">
-                      <span className="text-muted-foreground">{new Date(p.paidAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                      <span className="text-muted-foreground">{formatDateTime(p.paidAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                       {p.method && <span className="text-muted-foreground">{p.method}</span>}
                       {p.reference && <span className="font-mono text-muted-foreground">{p.reference}</span>}
                     </div>
@@ -1431,7 +1433,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
-                  <span className="text-muted-foreground text-xs">{new Date(r.refundedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                  <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                 </div>
                 <span className="font-mono font-medium text-destructive">-{money(r.totalForeign)}</span>
               </div>
@@ -1445,7 +1447,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   {r.payments.map((p) => (
                     <div key={p.id} className="flex items-center justify-between text-xs">
                       <div className="flex items-center gap-2">
-                        <span className="text-muted-foreground">{new Date(p.paidAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}</span>
+                        <span className="text-muted-foreground">{formatDateTime(p.paidAt, { day: 'numeric', month: 'short' })}</span>
                         {p.method && <span className="text-muted-foreground">{p.method}</span>}
                       </div>
                       <div className="flex items-center gap-2">
@@ -1492,7 +1494,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               </div>
               <div>
                 <span className="text-muted-foreground text-xs">Invoice Date</span>
-                <p className="font-medium">{so.invoicedAt ? new Date(so.invoicedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : '—'}</p>
+                <p className="font-medium">{so.invoicedAt ? formatDateTime(so.invoicedAt, { day: 'numeric', month: 'long', year: 'numeric' }) : '—'}</p>
               </div>
               <div>
                 <span className="text-muted-foreground text-xs">Status</span>
@@ -1556,7 +1558,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
                         {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
-                        <span className="text-muted-foreground text-xs">{new Date(r.refundedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                        <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                       </div>
                       <span className="font-mono font-medium text-destructive">-{money(r.totalForeign)}</span>
                     </div>

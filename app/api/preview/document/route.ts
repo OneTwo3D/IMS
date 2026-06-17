@@ -13,6 +13,8 @@ import {
   type PdfTableColumn,
   type Branding,
 } from '@/lib/pdf'
+import { getDisplayTimeZone } from '@/lib/display-timezone'
+import { formatDateTime } from '@/lib/format-datetime'
 
 const SAMPLE_RECIPIENT = {
   name: 'Acme Manufacturing Ltd',
@@ -29,20 +31,18 @@ const SAMPLE_LINES = [
   { sku: 'BED-PEI-235', name: 'PEI Build Plate 235x235mm', qty: 3, price: 24.99, tax: 1.50, total: 26.49 },
 ]
 
-const TODAY = () => new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
-
 async function getTemplate(type: string) {
   return db.documentTemplate.findUnique({ where: { type } })
 }
 
-async function generateInvoicePreview(branding: Branding) {
+async function generateInvoicePreview(branding: Branding, today: string) {
   const tpl = await getTemplate('invoice')
   const { doc } = createPdfDocument({ title: 'Invoice Preview' })
 
   await drawHeader(doc, branding, {
     title: 'Invoice',
     reference: 'INV-2026-00042',
-    date: TODAY(),
+    date: today,
     recipient: SAMPLE_RECIPIENT,
   })
 
@@ -79,14 +79,14 @@ async function generateInvoicePreview(branding: Branding) {
   return pdfToBuffer(doc)
 }
 
-async function generateSalesOrderPreview(branding: Branding) {
+async function generateSalesOrderPreview(branding: Branding, today: string) {
   const tpl = await getTemplate('sales_order')
   const { doc } = createPdfDocument({ title: 'Sales Order Preview' })
 
   await drawHeader(doc, branding, {
     title: 'Sales Order',
     reference: 'SO-2026-00107',
-    date: TODAY(),
+    date: today,
     recipient: SAMPLE_RECIPIENT,
   })
 
@@ -125,14 +125,14 @@ async function generateSalesOrderPreview(branding: Branding) {
   return pdfToBuffer(doc)
 }
 
-async function generatePurchaseOrderPreview(branding: Branding) {
+async function generatePurchaseOrderPreview(branding: Branding, today: string) {
   const tpl = await getTemplate('purchase_order')
   const { doc } = createPdfDocument({ title: 'Purchase Order Preview' })
 
   await drawHeader(doc, branding, {
     title: 'Purchase Order',
     reference: 'PO-20260405-X7K2',
-    date: TODAY(),
+    date: today,
     recipient: { ...SAMPLE_RECIPIENT, name: 'Filament Supplies GmbH', address: 'Industriestr. 42\n10115 Berlin\nDE' },
   })
 
@@ -156,14 +156,14 @@ async function generatePurchaseOrderPreview(branding: Branding) {
   return pdfToBuffer(doc)
 }
 
-async function generateRfqPreview(branding: Branding) {
+async function generateRfqPreview(branding: Branding, today: string) {
   const tpl = await getTemplate('rfq')
   const { doc } = createPdfDocument({ title: 'RFQ Preview' })
 
   await drawHeader(doc, branding, {
     title: 'Request for Quotation',
     reference: 'PO-20260405-R3Q1',
-    date: TODAY(),
+    date: today,
     recipient: { ...SAMPLE_RECIPIENT, name: 'Filament Supplies GmbH', address: 'Industriestr. 42\n10115 Berlin\nDE' },
   })
 
@@ -189,14 +189,14 @@ async function generateRfqPreview(branding: Branding) {
   return pdfToBuffer(doc)
 }
 
-async function generatePackingSlipPreview(branding: Branding) {
+async function generatePackingSlipPreview(branding: Branding, today: string) {
   const tpl = await getTemplate('packing_slip')
   const { doc } = createPdfDocument({ title: 'Packing Slip Preview' })
 
   await drawHeader(doc, branding, {
     title: 'Packing Slip',
     reference: 'SO-2026-00107',
-    date: TODAY(),
+    date: today,
     recipient: SAMPLE_RECIPIENT,
   })
 
@@ -217,14 +217,14 @@ async function generatePackingSlipPreview(branding: Branding) {
   return pdfToBuffer(doc)
 }
 
-async function generateCreditNotePreview(branding: Branding) {
+async function generateCreditNotePreview(branding: Branding, today: string) {
   const tpl = await getTemplate('credit_note')
   const { doc } = createPdfDocument({ title: 'Credit Note Preview' })
 
   await drawHeader(doc, branding, {
     title: 'Credit Note',
     reference: 'CN-2026-00003',
-    date: TODAY(),
+    date: today,
     recipient: SAMPLE_RECIPIENT,
   })
 
@@ -252,14 +252,14 @@ async function generateCreditNotePreview(branding: Branding) {
   return pdfToBuffer(doc)
 }
 
-async function generateManufacturingOrderPreview(branding: Branding) {
+async function generateManufacturingOrderPreview(branding: Branding, today: string) {
   const tpl = await getTemplate('manufacturing_order')
   const { doc } = createPdfDocument({ title: 'Manufacturing Order Preview' })
 
   await drawHeader(doc, branding, {
     title: 'Manufacturing Order',
     reference: 'MO-20260405-X7K2',
-    date: TODAY(),
+    date: today,
     recipient: { ...SAMPLE_RECIPIENT, name: 'Precision Assembly Ltd', address: '45 Workshop Lane\nSheffield\nS1 4AB\nGB' },
   })
 
@@ -292,7 +292,7 @@ async function generateManufacturingOrderPreview(branding: Branding) {
   return pdfToBuffer(doc)
 }
 
-const GENERATORS: Record<string, (b: Branding) => Promise<Buffer>> = {
+const GENERATORS: Record<string, (b: Branding, today: string) => Promise<Buffer>> = {
   invoice: generateInvoicePreview,
   sales_order: generateSalesOrderPreview,
   purchase_order: generatePurchaseOrderPreview,
@@ -311,7 +311,9 @@ export async function GET(req: NextRequest) {
   if (!type || !GENERATORS[type]) return NextResponse.json({ error: 'Invalid document type' }, { status: 400 })
 
   const branding = await getBranding()
-  const buffer = await GENERATORS[type](branding)
+  const tz = await getDisplayTimeZone()
+  const today = formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }, tz)
+  const buffer = await GENERATORS[type](branding, today)
 
   const label = type.replace(/_/g, '-')
   return new NextResponse(new Uint8Array(buffer), {
