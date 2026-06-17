@@ -13,6 +13,15 @@ const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_DEMAND_WINDOW_DAYS = 90
 const DEFAULT_LEAD_TIME_DAYS = 14
+
+// Median (rounded to whole days) of a set of observed lead times, or null when empty.
+function medianLeadTimeDays(values: number[]): number | null {
+  if (values.length === 0) return null
+  const sorted = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  const raw = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+  return Math.max(1, Math.round(raw))
+}
 // Default replenishment cover: when a product drops to its reorder point, suggest
 // ordering back up to roughly this many weeks of forecast demand ON TOP of the
 // reorder point (an order-up-to level). Matches the retired forecast's 8-week lot.
@@ -755,6 +764,35 @@ export async function getReorderReport(
   const inboundByProduct = inboundOpenPoByProduct(openPoLines)
   const velocityByProduct = new Map(calculateDailyVelocity(velocityInputs, window).map((row) => [row.productId, row]))
   const defaultLeadTimeSkus: string[] = []
+  const derivedLeadTimeSkus: string[] = []
+
+  // audit-ojp5: smarter lead-time default for products with no manual override and
+  // no observed P95 (no PO history). Instead of jumping straight to the flat
+  // DEFAULT_LEAD_TIME_DAYS, fall back to the MEDIAN observed lead time of the
+  // product's supplier, then its category, derived from the catalogue rows already
+  // loaded for this report. So a brand-new SKU inherits a realistic lead time from
+  // its peers and can surface in the report, instead of always assuming 14 days.
+  // (Computed from the loaded candidate set — no extra query; under a supplier/
+  // category filter the medians are naturally scoped to that supplier/category.)
+  const observedBySupplier = new Map<string, number[]>()
+  const observedByCategory = new Map<string, number[]>()
+  for (const product of products) {
+    if (product.observedLeadTimeDays == null) continue
+    const observed = product.observedLeadTimeDays
+    for (const sp of product.supplierProducts) {
+      const list = observedBySupplier.get(sp.supplierId) ?? []
+      list.push(observed)
+      observedBySupplier.set(sp.supplierId, list)
+    }
+    const categoryId = product.category?.id
+    if (categoryId) {
+      const list = observedByCategory.get(categoryId) ?? []
+      list.push(observed)
+      observedByCategory.set(categoryId, list)
+    }
+  }
+  const supplierMedianLeadTime = new Map([...observedBySupplier].map(([k, v]) => [k, medianLeadTimeDays(v)!]))
+  const categoryMedianLeadTime = new Map([...observedByCategory].map(([k, v]) => [k, medianLeadTimeDays(v)!]))
 
   // audit-dxcz: rank products by total units dispatched in the demand window, then
   // split into A/B/C with computeAbcByVolume. Reuses the velocity rows already loaded
@@ -824,11 +862,26 @@ export async function getReorderReport(
     const inboundOpenPoQty = inboundByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const projectedAvailableQty = availableQty.add(inboundOpenPoQty)
     const averageDailyDemand = toDecimal(velocityByProduct.get(product.id)?.dailyQtyVelocity ?? 0)
-    // Product-level effective lead time: manual override, else the auto P95 derived
-    // from PO receipts (Product.observedLeadTimeDays, maintained by the
-    // recompute-product-lead-times cron), else the 14-day default.
-    const leadTimeDays = product.leadTimeDays ?? product.observedLeadTimeDays ?? DEFAULT_LEAD_TIME_DAYS
-    if (product.leadTimeDays == null && product.observedLeadTimeDays == null) defaultLeadTimeSkus.push(product.sku)
+    // Product-level effective lead time. Precedence:
+    //   1. manual override (Product.leadTimeDays)
+    //   2. auto P95 from PO receipts (Product.observedLeadTimeDays, cron-maintained)
+    //   3. smarter default for no-history products: supplier median, then category
+    //      median, of observed lead times (audit-ojp5)
+    //   4. flat DEFAULT_LEAD_TIME_DAYS as the final floor
+    let leadTimeDays = product.leadTimeDays ?? product.observedLeadTimeDays ?? null
+    if (leadTimeDays == null) {
+      const supplierId = product.preferredSupplierId ?? product.supplierProducts[0]?.supplierId ?? null
+      const supplierMedian = supplierId ? supplierMedianLeadTime.get(supplierId) ?? null : null
+      const categoryMedian = product.category?.id ? categoryMedianLeadTime.get(product.category.id) ?? null : null
+      const derived = supplierMedian ?? categoryMedian
+      if (derived != null) {
+        leadTimeDays = derived
+        derivedLeadTimeSkus.push(product.sku)
+      } else {
+        leadTimeDays = DEFAULT_LEAD_TIME_DAYS
+        defaultLeadTimeSkus.push(product.sku)
+      }
+    }
     const safetyStockQty = toDecimal(product.safetyStockQty ?? 0)
     const demandDuringLeadTime = averageDailyDemand.mul(leadTimeDays)
     const computedReorderPoint = demandDuringLeadTime.add(safetyStockQty)
@@ -1059,11 +1112,12 @@ export async function getReorderReport(
     },
     notices: [
       `Demand velocity uses SALE_DISPATCH movements from ${dateOnly(window.dateFrom)} to ${dateOnly(window.dateTo)}; returns are not netted.`,
-      'Lead time uses the product manual override first, the auto P95 derived from PO receipts (Product.observedLeadTimeDays) second, and the default 14 days only when neither exists.',
+      'Lead time uses the product manual override first, the auto P95 derived from PO receipts (Product.observedLeadTimeDays) second, then for products with no history the median observed lead time of their supplier (then category), and the flat 14-day default only when none of those exist.',
       'Suggested reorder quantity only applies the configured reorder quantity when projected available stock is below the reorder point; a configured reorderQty of 0 opts the SKU out of auto-reorder suggestions.',
       'ABC class is computed by demand volume over the window above (Pareto: top 80% of units = A, next 15% = B, remainder including no-movement = C), not the stored product field.',
       'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',
-      ...(defaultLeadTimeSkus.length > 0 ? [`Default ${DEFAULT_LEAD_TIME_DAYS}-day lead time used for ${defaultLeadTimeSkus.length} SKU(s) without configured or observed lead time: ${defaultLeadTimeSkus.slice(0, 10).join(', ')}${defaultLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
+      ...(derivedLeadTimeSkus.length > 0 ? [`Supplier/category median lead time used for ${derivedLeadTimeSkus.length} SKU(s) with no configured or observed lead time of their own: ${derivedLeadTimeSkus.slice(0, 10).join(', ')}${derivedLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
+      ...(defaultLeadTimeSkus.length > 0 ? [`Default ${DEFAULT_LEAD_TIME_DAYS}-day lead time used for ${defaultLeadTimeSkus.length} SKU(s) with no configured/observed lead time and no supplier or category peers to derive one from: ${defaultLeadTimeSkus.slice(0, 10).join(', ')}${defaultLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
     ],
   }
 }

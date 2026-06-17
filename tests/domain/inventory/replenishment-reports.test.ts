@@ -378,6 +378,44 @@ test('reorder report cascades demand through NESTED (multi-level) BOMs', async (
   assert.equal(report.rows.find((r) => r.sku === 'RAW-OAK')?.suggestedReorderQty, '488')
 })
 
+test('reorder report derives a smarter lead-time default from supplier/category peers (audit-ojp5)', async () => {
+  // A peer part from supplier-1 has an observed P95 of 30 days. A brand-new SKU
+  // from the same supplier with no manual override and no observed lead time of
+  // its own should inherit the peer median (30), not the flat 14-day default —
+  // so it surfaces with a realistic reorder point.
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        {
+          id: 'peer', sku: 'SKU-PEER', name: 'Established part', type: ProductType.SIMPLE, stockUnit: 'each',
+          reorderPoint: decimal(0), reorderQty: decimal(0), safetyStockQty: decimal(0),
+          leadTimeDays: null, observedLeadTimeDays: 30, category,
+          preferredSupplierId: 'supplier-1', preferredSupplier: { id: 'supplier-1', name: 'Supplier 1' },
+          supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'P', lastUnitCost: decimal(5), leadTimeDays: null, supplier: { name: 'Supplier 1' } }],
+        },
+        {
+          id: 'newp', sku: 'SKU-NEW', name: 'Brand new part', type: ProductType.SIMPLE, stockUnit: 'each',
+          reorderPoint: null, reorderQty: null, safetyStockQty: decimal(0),
+          leadTimeDays: null, observedLeadTimeDays: null, category,
+          preferredSupplierId: 'supplier-1', preferredSupplier: { id: 'supplier-1', name: 'Supplier 1' },
+          supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'N', lastUnitCost: decimal(5), leadTimeDays: null, supplier: { name: 'Supplier 1' } }],
+        },
+      ],
+    },
+    stockLevel: { findMany: async () => [
+      { productId: 'newp', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') },
+    ] },
+    stockMovement: { findMany: async () => [{
+      productId: 'newp', qty: decimal('90'), totalValueBase: decimal('0'),
+      createdAt: new Date('2026-05-15T00:00:00.000Z'),
+      product: { sku: 'SKU-NEW', name: 'Brand new part', category, supplierProducts: [] },
+    }] },
+  }
+  const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.equal(report.rows.find((r) => r.sku === 'SKU-NEW')?.leadTimeDays, 30)
+})
+
 test('reorder report prefers the preferred supplier catalog row before stale supplier catalog rows', async () => {
   const supplierA = { name: 'Supplier A' }
   const supplierB = { name: 'Supplier B' }
