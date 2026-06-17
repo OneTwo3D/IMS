@@ -232,6 +232,19 @@ export async function consumeFifoLayersStrict(
       `needed ${qty}, only ${subtractMoney(qty, result.remainingQty).toString()} available in cost layers`,
     )
   }
+  // audit-snxr: the sub-0.0001 tolerance above lets a tiny positive consume slip
+  // through with NOTHING consumed when there are no cost layers at all (stock /
+  // cost-layer desync). Callers build cogs_entries only when consumed is
+  // non-empty, so a zero-evidence outbound movement would be written and then
+  // rejected by the deferred reporting-evidence guard at COMMIT (a confusing
+  // P2028). A positive consumption with no FIFO provenance is a hard error here —
+  // fail clearly before the movement is written rather than booking uncosted stock.
+  if (qty > 0 && result.consumed.length === 0) {
+    throw new Error(
+      `No FIFO cost layers to consume for product ${productId} in warehouse ${warehouseId}: ` +
+      `cannot record a costed outbound movement of ${qty} (stock/cost-layer desync — repair the cost layers).`,
+    )
+  }
   return { consumed: result.consumed, totalCost: result.totalCost }
 }
 
