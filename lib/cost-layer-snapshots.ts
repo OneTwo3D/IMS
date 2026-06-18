@@ -63,7 +63,7 @@ export function parseCostLayerSnapshot(value: unknown): CostLayerSnapshotEntry[]
     const row = entry as Record<string, unknown>
     const costLayerId = typeof row.costLayerId === 'string' ? row.costLayerId : ''
     if (row.qty == null || row.unitCostBase == null) {
-      if (costLayerId) warnDroppedSnapshotEntry(costLayerId, 'missing qty/unitCostBase')
+      warnDroppedSnapshotEntry(costLayerId, 'missing qty/unitCostBase')
       return []
     }
     let qty: string
