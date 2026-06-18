@@ -1783,7 +1783,10 @@ export async function receivePurchaseOrder(
         },
       })
 
-      let totalReceiptValue = 0
+      // Accumulate the receipt value in Decimal so the STOCK_RECEIPT journal
+      // debit equals the sum of the cost-layer values (qty * Decimal unitCostBase)
+      // rather than a float running total (cogs-audit scjz.11).
+      let totalReceiptValue = toDecimal(0)
       for (const rl of linesWithQty) {
         const poLine = currentPo.lines.find((l) => l.id === rl.poLineId)
         if (!poLine) continue
@@ -1794,7 +1797,7 @@ export async function receivePurchaseOrder(
           poRef: currentPo.reference,
         })
         const unitCostBase = toDecimal(unitCostBaseInput)
-        totalReceiptValue += rl.qtyReceived * unitCostBase.toNumber()
+        totalReceiptValue = addMoney(totalReceiptValue, multiplyMoney(rl.qtyReceived, unitCostBase))
 
         await tx.stockMovement.create({
           data: {
@@ -1900,8 +1903,8 @@ export async function receivePurchaseOrder(
         }
       }
 
-      if (accountingSettings.syncEnabled && totalReceiptValue > 0) {
-        const amount = Math.round(totalReceiptValue * 100) / 100
+      if (accountingSettings.syncEnabled && totalReceiptValue.gt(0)) {
+        const amount = roundQuantity(totalReceiptValue, 2).toNumber()
         const payload = {
           date: new Date().toISOString().slice(0, 10),
           reference: `Receipt: ${po.reference}`,
@@ -1920,7 +1923,7 @@ export async function receivePurchaseOrder(
         })
       }
 
-      return { allReceived, newStatus, freightPoIds, totalReceiptValue }
+      return { allReceived, newStatus, freightPoIds, totalReceiptValue: totalReceiptValue.toNumber() }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
