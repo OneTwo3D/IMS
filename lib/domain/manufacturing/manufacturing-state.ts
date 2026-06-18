@@ -27,5 +27,19 @@ export function evaluateProductionOrderCancellation(
   status: ProductionOrderStatus,
 ): ManufacturingTransitionDecision<ProductionOrderCancellationAction> {
   if (status === 'IN_PROGRESS') return { allowed: true, action: 'release-reservations' }
-  return { allowed: true, action: 'cancel-without-reservations' }
+  if (status === 'DRAFT') return { allowed: true, action: 'cancel-without-reservations' }
+  // COMPLETED orders have posted PRODUCTION_OUT (component FIFO consumption),
+  // PRODUCTION_IN (output cost layer) and stock movements. "Cancelling" them
+  // used to only flip status and delete manufacturingCostLine rows, which left
+  // the consumed components gone, the output stock/layer in place, and the
+  // overhead audit trail destroyed (inventory overstated, no reversal). Refuse
+  // it: a completed order must be reversed through a dedicated flow, not cancelled.
+  if (status === 'COMPLETED') {
+    return {
+      allowed: false,
+      error: 'Cannot cancel a COMPLETED production order — it has posted stock movements and cost layers. Reverse it instead.',
+    }
+  }
+  // Already CANCELLED — nothing to do.
+  return { allowed: false, error: 'Production order is already cancelled' }
 }

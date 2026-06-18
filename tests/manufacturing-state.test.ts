@@ -51,8 +51,18 @@ test('cancellation transition reports whether reservations should be released', 
     allowed: true,
     action: 'cancel-without-reservations',
   })
+})
+
+test('cancellation transition refuses completed orders (no silent cost-line strip)', () => {
   assert.deepEqual(evaluateProductionOrderCancellation('COMPLETED'), {
-    allowed: true,
-    action: 'cancel-without-reservations',
+    allowed: false,
+    error: 'Cannot cancel a COMPLETED production order — it has posted stock movements and cost layers. Reverse it instead.',
+  })
+})
+
+test('cancellation transition reports already-cancelled orders', () => {
+  assert.deepEqual(evaluateProductionOrderCancellation('CANCELLED'), {
+    allowed: false,
+    error: 'Production order is already cancelled',
   })
 })
