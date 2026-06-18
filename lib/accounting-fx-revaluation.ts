@@ -10,6 +10,7 @@ import {
   type FxSettlementSide,
 } from '@/lib/accounting-fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { addMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 
 const ACTIVE_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
 
@@ -162,9 +163,9 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
 
   return orders.flatMap((order) => {
     const paid = order.payments.reduce((sum, payment) => (
-      payment.currency === order.currency ? sum + Number(payment.amount) : sum
-    ), 0)
-    const outstandingForeign = roundAccountingMoney(Number(order.totalForeign) - paid)
+      payment.currency === order.currency ? addMoney(sum, payment.amount) : sum
+    ), toDecimal(0))
+    const outstandingForeign = roundAccountingMoney(subtractMoney(order.totalForeign, paid))
     if (outstandingForeign < 0.01) return []
     return [{
       id: order.id,
@@ -198,7 +199,9 @@ async function getOpenPayables(baseCurrency: string): Promise<OpenBalance[]> {
     reference: invoice.invoiceNumber ?? invoice.po.reference,
     side: 'payable' as const,
     currency: invoice.po.currency,
-    outstandingForeign: Number(invoice.totalForeign),
+    // Round to the same 2dp precision as the receivable side so AR/AP outstanding
+    // balances are consistent before FX revaluation (cogs-audit scjz.57).
+    outstandingForeign: roundAccountingMoney(invoice.totalForeign),
     bookedRateToBase: Number(invoice.fxRateToBase),
   }))
 }
