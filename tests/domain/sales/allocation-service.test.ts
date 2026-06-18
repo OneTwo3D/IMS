@@ -189,8 +189,16 @@ function createClient(state: MemoryState): AllocationServiceClient {
       updateMany: async () => ({ count: 0 }),
     },
     shipment: {
-      findFirst: async ({ where }: { where: { orderId: string; shipmentJournalDate?: { not: null } } }) => {
+      findFirst: async ({ where }: { where: { orderId: string; shipmentJournalDate?: { not: null }; status?: string; OR?: Array<{ shipmentJournalDate?: { not: null }; status?: string }> } }) => {
         const rows = shipments.filter((shipment) => shipment.orderId === where.orderId)
+        const matchesClause = (clause: { shipmentJournalDate?: { not: null }; status?: string }, shipment: ShipmentRow) => {
+          if (clause.shipmentJournalDate?.not === null) return shipment.shipmentJournalDate != null
+          if (clause.status !== undefined) return shipment.status === clause.status
+          return false
+        }
+        if (where.OR) {
+          return rows.find((shipment) => where.OR!.some((clause) => matchesClause(clause, shipment))) ?? null
+        }
         if (where.shipmentJournalDate?.not === null) {
           return rows.find((shipment) => shipment.shipmentJournalDate != null) ?? null
         }
@@ -740,6 +748,22 @@ test('cancelSalesOrderFulfillmentState aggregates multi-scope reservation releas
     ['product-b', 'warehouse-1', 0],
     ['product-a', 'warehouse-2', 0],
   ])
+})
+
+test('cancelSalesOrderFulfillmentState refuses a partially-shipped order with a journaled shipment', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    // A2 never ran (no inventoryAllocatedDate) but a partial shipment was
+    // dispatched and posted to accounting — cancelling would orphan its COGS.
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-06-01T00:00:00.000Z') }],
+  })
+  const client = createClient(state)
+
+  await assert.rejects(
+    () => cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }),
+    /Cannot cancel an order with a dispatched shipment/,
+  )
+  assert.equal(state.order.status, 'ALLOCATED')
 })
 
 test('updateSalesOrderStatusUnderLock refuses PICKING when allocations disappeared before locked update', async () => {

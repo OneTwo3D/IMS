@@ -369,6 +369,24 @@ export async function cancelSalesOrderFulfillmentState(
     throw new Error('Cannot cancel a shipped order — process a refund instead')
   }
 
+  // A partially-shipped order stays ALLOCATED (it only flips to SHIPPED when ALL
+  // shipments ship), so the order-status guard above is not enough. If any
+  // shipment has already been dispatched/journaled, cancelling would release
+  // reservations and delete pending shipments while the dispatched shipment's
+  // COGS + revenue stay recognised in the ledger with no reversal. The
+  // resetAllocationAccountingIfStaged check below is gated on inventoryAllocatedDate
+  // (it early-returns when A2 hasn't run), so guard here unconditionally.
+  const dispatchedShipment = await tx.shipment.findFirst({
+    where: {
+      orderId: input.orderId,
+      OR: [{ shipmentJournalDate: { not: null } }, { status: 'SHIPPED' }],
+    },
+    select: { id: true },
+  })
+  if (dispatchedShipment) {
+    throw new Error('Cannot cancel an order with a dispatched shipment — process a refund instead')
+  }
+
   const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, 'CANCELLED', {
     bypass: input.bypass,
   })
