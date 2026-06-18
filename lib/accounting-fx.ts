@@ -1,6 +1,6 @@
 import type { AccountingSettings } from '@/lib/accounting'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { roundQuantity } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export type FxSettlementSide = 'receivable' | 'payable'
 
@@ -26,7 +26,7 @@ export type FxJournalLine = {
   taxType?: string
 }
 
-export function roundAccountingMoney(value: number): number {
+export function roundAccountingMoney(value: DecimalInput): number {
   return roundQuantity(value, 2).toNumber()
 }
 
@@ -42,11 +42,18 @@ export function computeRealisedFx(input: RealisedFxInput): RealisedFxResult {
     return { bookedBase: 0, settlementBase: 0, gainLossBase: 0, outcome: 'none' }
   }
 
-  const bookedBase = roundAccountingMoney(amountForeign / bookedRate)
-  const settlementBase = roundAccountingMoney(amountForeign / settlementRate)
+  // Convert each leg in full Decimal precision; round only for the displayed
+  // booked/settlement amounts. The gain/loss is computed from the UNROUNDED
+  // legs and rounded once, so rounding each leg before differencing can no
+  // longer manufacture or drop a penny near the 0.01 emit threshold
+  // (cogs-audit scjz.54 float contamination + scjz.56 double-rounding).
+  const bookedBaseDec = toDecimal(amountForeign).div(bookedRate)
+  const settlementBaseDec = toDecimal(amountForeign).div(settlementRate)
+  const bookedBase = roundAccountingMoney(bookedBaseDec)
+  const settlementBase = roundAccountingMoney(settlementBaseDec)
   const rawGainLoss = input.side === 'receivable'
-    ? settlementBase - bookedBase
-    : bookedBase - settlementBase
+    ? settlementBaseDec.sub(bookedBaseDec)
+    : bookedBaseDec.sub(settlementBaseDec)
   const gainLossBase = roundAccountingMoney(rawGainLoss)
   const outcome = Math.abs(gainLossBase) < 0.01
     ? 'none'
