@@ -1116,13 +1116,14 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       // movements leave stock through fromWarehouseId; extend this if a future
       // COGS-producing movement records the warehouse on another side.
       ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
-      // Exclude PRODUCTION_OUT: manufacturing consumes components whose cost is
-      // CAPITALISED into the output product's cost layer, not expensed. Those
-      // cogs_entries exist only to satisfy the outbound-evidence guard; counting
-      // them here would show revenue-less cost and double-count the component
-      // cost again when the finished good is sold (whose SALE_DISPATCH COGS
-      // already includes it).
-      type: { not: StockMovementType.PRODUCTION_OUT },
+      // COGS/margin must be SALES cost only. cogs_entries are also written for
+      // PRODUCTION_OUT (capitalised into the output layer, not expensed),
+      // negative ADJUSTMENT write-offs, supplier returns (ADJUSTMENT) and
+      // PURCHASE_REVERSAL — none of which are customer COGS and none of which
+      // carry sales revenue. Restricting to SALE_DISPATCH (consistent with the
+      // turnover and margin-analytics reports) avoids understating gross margin
+      // by netting revenue-less consumption cost against sales.
+      type: StockMovementType.SALE_DISPATCH,
       product: productWhere(filters),
     },
   }
