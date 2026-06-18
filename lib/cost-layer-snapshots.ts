@@ -48,24 +48,44 @@ function isSnapshotSource(value: unknown): value is CostLayerSnapshotSource {
   return value === 'allocation' || value === 'shipment'
 }
 
+function warnDroppedSnapshotEntry(costLayerId: string, reason: string): void {
+  // A snapshot entry being silently dropped shrinks the COGS this snapshot
+  // represents (and can lower booked COGS during a retrospective refresh). Make
+  // corruption visible instead of silently reducing value (cogs-audit scjz.8).
+  console.warn(`Dropped costLayerSnapshot entry (costLayerId=${costLayerId || '(missing)'}): ${reason}`)
+}
+
 export function parseCostLayerSnapshot(value: unknown): CostLayerSnapshotEntry[] {
   if (!Array.isArray(value)) return []
 
   return value.flatMap((entry) => {
-    if (!entry || typeof entry !== 'object') return []
+    if (!entry || typeof entry !== 'object') {
+      warnDroppedSnapshotEntry('', 'entry is not an object')
+      return []
+    }
     const row = entry as Record<string, unknown>
     const costLayerId = typeof row.costLayerId === 'string' ? row.costLayerId : ''
-    if (row.qty == null) return []
-    if (row.unitCostBase == null) return []
+    if (row.qty == null || row.unitCostBase == null) {
+      warnDroppedSnapshotEntry(costLayerId, 'missing qty/unitCostBase')
+      return []
+    }
     let qty: string
     let unitCostBase: string
     try {
       qty = roundQuantity(row.qty as DecimalInput, 6).toFixed(6)
       unitCostBase = roundQuantity(row.unitCostBase as DecimalInput, 6).toFixed(6)
     } catch {
+      warnDroppedSnapshotEntry(costLayerId, 'unparseable qty/unitCostBase')
       return []
     }
-    if (!costLayerId || toDecimal(qty).lte(0)) return []
+    if (!costLayerId) {
+      warnDroppedSnapshotEntry('', 'missing costLayerId')
+      return []
+    }
+    if (toDecimal(qty).lte(0)) {
+      warnDroppedSnapshotEntry(costLayerId, 'non-positive qty')
+      return []
+    }
     return [{
       costLayerId,
       qty,
