@@ -199,9 +199,11 @@ async function getOpenPayables(baseCurrency: string): Promise<OpenBalance[]> {
     reference: invoice.invoiceNumber ?? invoice.po.reference,
     side: 'payable' as const,
     currency: invoice.po.currency,
-    // Round to the same 2dp precision as the receivable side so AR/AP outstanding
-    // balances are consistent before FX revaluation (cogs-audit scjz.57).
-    outstandingForeign: roundAccountingMoney(invoice.totalForeign),
+    // Preserve the stored bill precision (totalForeign is Decimal(18,4)); do NOT
+    // 2dp-round here or 3-decimal currencies / 4dp bill totals would be revalued
+    // against an amount that disagrees with the stored payable. computeRealisedFx
+    // still rounds the resulting gain/loss to 2dp for the journal (cogs-audit scjz.57).
+    outstandingForeign: toDecimal(invoice.totalForeign).toNumber(),
     bookedRateToBase: Number(invoice.fxRateToBase),
   }))
 }
