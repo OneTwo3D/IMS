@@ -59,7 +59,10 @@ export function parseCostLayerSnapshot(value: unknown): CostLayerSnapshotEntry[]
   if (!Array.isArray(value)) return []
 
   return value.flatMap((entry) => {
-    if (!entry || typeof entry !== 'object') return []
+    if (!entry || typeof entry !== 'object') {
+      warnDroppedSnapshotEntry('', 'entry is not an object')
+      return []
+    }
     const row = entry as Record<string, unknown>
     const costLayerId = typeof row.costLayerId === 'string' ? row.costLayerId : ''
     if (row.qty == null || row.unitCostBase == null) {
