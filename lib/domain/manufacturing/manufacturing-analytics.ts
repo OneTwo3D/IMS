@@ -156,24 +156,35 @@ async function loadFifoCostLayersByPair(
 ): Promise<Map<string, FifoCostLayer[]>> {
   const byPair = new Map<string, FifoCostLayer[]>()
   if (pairs.length === 0) return byPair
-  const layers = await client.costLayer.findMany({
-    // Pairwise OR (not productId IN x warehouseId IN) so a multi-product,
-    // multi-warehouse report doesn't scan the unrelated cross-combinations.
-    where: { remainingQty: { gt: 0 }, OR: pairs.map((pair) => ({ productId: pair.productId, warehouseId: pair.warehouseId })) },
-    select: { productId: true, warehouseId: true, remainingQty: true, unitCostBase: true },
-    orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
-    take: SOURCE_ROW_LIMIT + 1,
-  }) as CostLayerRow[]
-  // Bound the scan like the order/movement queries so a product with a huge
-  // number of open layers can't make the WIP report load arbitrary rows.
-  if (layers.length > SOURCE_ROW_LIMIT) {
-    throw new ManufacturingAnalyticsSourceLimitError(`WIP cost-layer source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
-  }
-  for (const layer of layers) {
-    const key = costPairKey(layer.productId, layer.warehouseId)
-    const list = byPair.get(key) ?? []
-    list.push({ remainingQty: toDecimal(layer.remainingQty), unitCostBase: toDecimal(layer.unitCostBase) })
-    byPair.set(key, list)
+  // Chunk the pair list: each pair adds two bind parameters to the OR, so a
+  // report with tens of thousands of distinct (product, warehouse) reservations
+  // would otherwise overflow Postgres's parameter limit before reaching the
+  // source-row cap. Each pair lives wholly within one chunk, so per-pair FIFO
+  // ordering is preserved.
+  const PAIR_CHUNK_SIZE = 1000
+  let totalLayers = 0
+  for (let start = 0; start < pairs.length; start += PAIR_CHUNK_SIZE) {
+    const chunk = pairs.slice(start, start + PAIR_CHUNK_SIZE)
+    const layers = await client.costLayer.findMany({
+      // Pairwise OR (not productId IN x warehouseId IN) so a multi-product,
+      // multi-warehouse report doesn't scan the unrelated cross-combinations.
+      where: { remainingQty: { gt: 0 }, OR: chunk.map((pair) => ({ productId: pair.productId, warehouseId: pair.warehouseId })) },
+      select: { productId: true, warehouseId: true, remainingQty: true, unitCostBase: true },
+      orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+      take: SOURCE_ROW_LIMIT + 1 - totalLayers,
+    }) as CostLayerRow[]
+    totalLayers += layers.length
+    // Bound the scan like the order/movement queries so a product with a huge
+    // number of open layers can't make the WIP report load arbitrary rows.
+    if (totalLayers > SOURCE_ROW_LIMIT) {
+      throw new ManufacturingAnalyticsSourceLimitError(`WIP cost-layer source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+    }
+    for (const layer of layers) {
+      const key = costPairKey(layer.productId, layer.warehouseId)
+      const list = byPair.get(key) ?? []
+      list.push({ remainingQty: toDecimal(layer.remainingQty), unitCostBase: toDecimal(layer.unitCostBase) })
+      byPair.set(key, list)
+    }
   }
   return byPair
 }
