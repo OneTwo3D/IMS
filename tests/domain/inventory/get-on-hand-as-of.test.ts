@@ -599,3 +599,159 @@ test('getOnHandAsOf applies transfer movements to both warehouses and reports or
     },
   ])
 })
+
+function captureMovementRanges(base: OnHandAsOfClient): {
+  client: OnHandAsOfClient
+  ranges: Array<{ gt?: Date; gte?: Date; lt?: Date; lte?: Date }>
+} {
+  const ranges: Array<{ gt?: Date; gte?: Date; lt?: Date; lte?: Date }> = []
+  const baseFindMany = (base as { stockMovement: { findMany: (args: unknown) => Promise<unknown> } }).stockMovement.findMany
+  const client = {
+    ...base,
+    stockMovement: {
+      findMany: async (args: unknown) => {
+        const createdAt = (args as { where?: { createdAt?: { gt?: Date; gte?: Date; lt?: Date; lte?: Date } } }).where?.createdAt
+        if (createdAt) ranges.push(createdAt)
+        return baseFindMany(args)
+      },
+    },
+  } as unknown as OnHandAsOfClient
+  return { client, ranges }
+}
+
+test('getOnHandAsOf forward replay bounds a date-only as-of with a half-open next-day boundary', async () => {
+  const base = createClient({
+    snapshots: [{
+      snapshotDate: new Date('2026-05-27T00:00:00.000Z'),
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('10'),
+      valueBase: decimal('20'),
+    }],
+    movements: [{
+      id: 'm1',
+      productId: 'product-1',
+      fromWarehouseId: null,
+      toWarehouseId: 'warehouse-1',
+      qty: decimal('5'),
+      totalValueBase: decimal('15'),
+      createdAt: new Date('2026-05-28T09:00:00.000Z'),
+    }],
+  })
+  const { client, ranges } = captureMovementRanges(base)
+
+  await getOnHandAsOf({ client, asOf: '2026-05-28', now: () => new Date('2026-06-01T12:00:00.000Z') })
+
+  // The upper bound must be the half-open next-day midnight, not an inclusive
+  // lte on the .999Z end-of-day proxy (which drops .999xxx microsecond rows).
+  assert.ok(ranges.length > 0)
+  for (const range of ranges) {
+    assert.equal(range.lte, undefined)
+    assert.deepEqual(range.lt, new Date('2026-05-29T00:00:00.000Z'))
+  }
+})
+
+test('getOnHandAsOf forward replay keeps an inclusive bound for a precise instant as-of', async () => {
+  const base = createClient({
+    snapshots: [{
+      snapshotDate: new Date('2026-05-27T00:00:00.000Z'),
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('10'),
+      valueBase: decimal('20'),
+    }],
+    movements: [{
+      id: 'm1',
+      productId: 'product-1',
+      fromWarehouseId: null,
+      toWarehouseId: 'warehouse-1',
+      qty: decimal('5'),
+      totalValueBase: decimal('15'),
+      createdAt: new Date('2026-05-28T09:00:00.000Z'),
+    }],
+  })
+  const { client, ranges } = captureMovementRanges(base)
+
+  const asOf = new Date('2026-05-28T12:00:00.000Z')
+  await getOnHandAsOf({ client, asOf, now: () => new Date('2026-06-01T12:00:00.000Z') })
+
+  assert.ok(ranges.length > 0)
+  for (const range of ranges) {
+    assert.equal(range.lt, undefined)
+    assert.deepEqual(range.lte, asOf)
+  }
+})
+
+test('getOnHandAsOf reverse replay reverses out only movements from the next day for a date-only as-of', async () => {
+  const base = createClient({
+    snapshots: [{
+      snapshotDate: new Date('2026-05-30T00:00:00.000Z'),
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('10'),
+      valueBase: decimal('20'),
+    }],
+    movements: [{
+      id: 'm1',
+      productId: 'product-1',
+      fromWarehouseId: null,
+      toWarehouseId: 'warehouse-1',
+      qty: decimal('5'),
+      totalValueBase: decimal('15'),
+      createdAt: new Date('2026-05-29T09:00:00.000Z'),
+    }],
+  })
+  const { client, ranges } = captureMovementRanges(base)
+
+  const result = await getOnHandAsOf({ client, asOf: '2026-05-28', now: () => new Date('2026-06-01T12:00:00.000Z') })
+
+  assert.equal(result.source, 'future_snapshot_reverse_replay')
+  // Lower bound is the next-day midnight (half-open gte), not a gt on .999Z, so
+  // a same-day .999xxx movement is not wrongly reversed out of on-hand.
+  assert.ok(ranges.length > 0)
+  for (const range of ranges) {
+    assert.equal(range.gt, undefined)
+    assert.deepEqual(range.gte, new Date('2026-05-29T00:00:00.000Z'))
+  }
+})
+
+test('getOnHandAsOf current reverse replay reverses a midnight movement when now is exactly next-day midnight', async () => {
+  // No snapshots -> current reverse replay. Date-only as-of 2026-05-28 with now
+  // at exactly 2026-05-29T00:00:00.000Z yields { gte: 2026-05-29T00:00, lte: now }
+  // — a single inclusive instant that must still reverse out the 29th's movement.
+  const client = createClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('15') }],
+    costLayers: [{
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      remainingQty: decimal('15'),
+      unitCostBase: decimal('2'),
+    }],
+    movements: [{
+      id: 'midnight',
+      productId: 'product-1',
+      fromWarehouseId: null,
+      toWarehouseId: 'warehouse-1',
+      qty: decimal('5'),
+      totalValueBase: decimal('10'),
+      createdAt: new Date('2026-05-29T00:00:00.000Z'),
+    }],
+  })
+
+  const result = await getOnHandAsOf({
+    client,
+    asOf: '2026-05-28',
+    now: () => new Date('2026-05-29T00:00:00.000Z'),
+  })
+
+  assert.equal(result.source, 'current_reverse_replay')
+  // Current stock is 15; the +5 movement on the 29th must be reversed out for
+  // the as-of-28 state, leaving 10.
+  assert.deepEqual(result.rows, [{
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: '10.000000',
+    valueBase: '20.000000',
+    unitCostBase: '2.000000',
+  }])
+})
