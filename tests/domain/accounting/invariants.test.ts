@@ -452,14 +452,6 @@ test('accounting row collection selects staged orders, posted shipments, and syn
     (calls.salesOrder as { where: { status: unknown } }).where.status,
     { notIn: ['REFUNDED', 'CANCELLED'] },
   )
-  // Posted-but-unpaid orders are collected regardless of the retention window so a
-  // recently-reversed payment on an old posted order is still evaluated (scjz.72).
-  assert.ok(
-    (calls.salesOrder as { where: { OR: Array<Record<string, unknown>> } }).where.OR.some(
-      (clause) => clause.paidAt === null && Array.isArray(clause.OR),
-    ),
-    'expected an OR branch collecting posted-but-unpaid orders (A1/A2/shipment)',
-  )
   assert.deepEqual(
     (calls.shipment as { where: unknown }).where,
     {

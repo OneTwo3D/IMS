@@ -605,22 +605,15 @@ export async function collectAccountingInvariantRows(
           { inventoryAllocatedDate: retainedDateFilter },
           { shipments: { some: { shipmentJournalDate: retainedDateFilter } } },
           { refunds: { some: retentionCutoff ? { refundedAt: { gte: retentionCutoff } } : {} } },
-          // Always collect posted-but-unpaid orders regardless of the retention
-          // window: a payment reversed today on an order posted long ago does not
-          // touch any retained date, so it would otherwise escape the
-          // revenue_posted_without_payment invariant (scjz.72). Mirror the
-          // evaluator's trigger exactly (A1 OR A2 OR a posted shipment) so an
-          // anomalous A2-/shipment-only order is collected too. Posted+unpaid is a
-          // narrow set (chargebacks are rare).
-          {
-            paidAt: null,
-            OR: [
-              { revenueDeferredDate: { not: null } },
-              { inventoryAllocatedDate: { not: null } },
-              { shipments: { some: { shipmentJournalDate: { not: null } } } },
-            ],
-          },
         ],
+        // NB: the revenue_posted_without_payment invariant (scjz.72) only evaluates
+        // orders collected by the retention window above — i.e. recent reversed
+        // payments (the common case). A chargeback on an order posted outside the
+        // window is not caught here; we deliberately do NOT pull those unwindowed,
+        // because the sync-log query is also windowed, so evaluating an old order
+        // would emit false *_without_sync_evidence warnings for its (unloaded) old
+        // batch logs. The full chargeback handling (scjz.42) creates a credit note
+        // / moves the order terminal, which is the durable fix.
       },
       select: {
         id: true,
