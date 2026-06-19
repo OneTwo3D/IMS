@@ -2,7 +2,7 @@ import { Prisma, ProductType, PurchaseOrderStatus, SalesOrderStatus, StockMoveme
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
-import { calculateDailyVelocity, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
+import { calculateDailyVelocity, saleMovementCogsBase, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
@@ -112,6 +112,7 @@ type SaleMovementRow = {
   productId: string
   qty: DecimalInput
   totalValueBase: DecimalInput | null
+  cogsEntries: Array<{ totalCostBase: DecimalInput }>
   createdAt: Date
   product: {
     sku: string
@@ -615,6 +616,7 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
       productId: true,
       qty: true,
       totalValueBase: true,
+      cogsEntries: { select: { totalCostBase: true } },
       createdAt: true,
       product: {
         select: {
@@ -639,7 +641,7 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
     categoryName: movement.product.category?.name ?? null,
     supplierNames: supplierNames(movement.product),
     qty: movement.qty,
-    cogsBase: movement.totalValueBase ?? 0,
+    cogsBase: saleMovementCogsBase(movement),
     occurredAt: movement.createdAt,
   }))
 }

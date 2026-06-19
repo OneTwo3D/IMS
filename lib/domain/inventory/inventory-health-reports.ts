@@ -4,6 +4,7 @@ import {
   bucketInventoryAging,
   calculateDailyVelocity,
   calculateDeadStock,
+  saleMovementCogsBase,
   type AgingBucketDefinition,
   type AgingLayerInput,
   type DeadStockRow,
@@ -213,6 +214,7 @@ type DeadStockSaleMovementRow = {
   fromWarehouseId: string | null
   qty: DecimalInput
   totalValueBase: DecimalInput | null
+  cogsEntries: Array<{ totalCostBase: DecimalInput }>
   createdAt: Date
   product: {
     id: string
@@ -777,6 +779,7 @@ async function loadDeadStockVelocityRows(
       fromWarehouseId: true,
       qty: true,
       totalValueBase: true,
+      cogsEntries: { select: { totalCostBase: true } },
       createdAt: true,
       product: {
         select: {
@@ -810,7 +813,7 @@ async function loadDeadStockVelocityRows(
       categoryName: movement.product.category?.name ?? null,
       supplierNames: supplierNames(movement.product),
       qty,
-      cogsBase: movement.totalValueBase ?? 0,
+      cogsBase: saleMovementCogsBase(movement),
       occurredAt: movement.createdAt,
     }
   })
