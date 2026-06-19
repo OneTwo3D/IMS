@@ -605,6 +605,12 @@ export async function collectAccountingInvariantRows(
           { inventoryAllocatedDate: retainedDateFilter },
           { shipments: { some: { shipmentJournalDate: retainedDateFilter } } },
           { refunds: { some: retentionCutoff ? { refundedAt: { gte: retentionCutoff } } : {} } },
+          // Always collect posted-but-unpaid orders regardless of the retention
+          // window: a payment reversed today on an order posted long ago does not
+          // touch any retained date, so it would otherwise escape the
+          // revenue_posted_without_payment invariant (scjz.72). Posted+unpaid is a
+          // narrow set (chargebacks are rare).
+          { paidAt: null, revenueDeferredDate: { not: null } },
         ],
       },
       select: {
