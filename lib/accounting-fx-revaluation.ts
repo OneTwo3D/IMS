@@ -10,7 +10,7 @@ import {
   type FxSettlementSide,
 } from '@/lib/accounting-fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { addMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 
 const ACTIVE_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
 
@@ -29,6 +29,10 @@ type OpenBalance = {
   currency: string
   outstandingForeign: number
   bookedRateToBase: number
+  // Stored base value of the outstanding portion (document totalBase prorated by
+  // outstandingForeign/totalForeign) — the actual AR/AP carrying value to revalue
+  // against, rather than recomputing outstandingForeign/rate (cogs-audit scjz.55).
+  bookedBase: number
 }
 
 type PriorRevaluation = {
@@ -153,6 +157,7 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
       invoiceNumber: true,
       currency: true,
       totalForeign: true,
+      totalBase: true,
       fxRateToBase: true,
       payments: {
         where: { refundId: null },
@@ -167,6 +172,11 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
     ), toDecimal(0))
     const outstandingForeign = roundAccountingMoney(subtractMoney(order.totalForeign, paid))
     if (outstandingForeign < 0.01) return []
+    // Prorate the stored base by the outstanding share (one fxRate per order).
+    const totalForeign = toDecimal(order.totalForeign)
+    const bookedBase = totalForeign.gt(0)
+      ? multiplyMoney(order.totalBase, outstandingForeign).div(totalForeign).toNumber()
+      : 0
     return [{
       id: order.id,
       reference: order.invoiceNumber ?? order.externalOrderNumber ?? order.orderNumber ?? order.id,
@@ -174,6 +184,7 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
       currency: order.currency,
       outstandingForeign,
       bookedRateToBase: Number(order.fxRateToBase),
+      bookedBase,
     }]
   })
 }
@@ -189,6 +200,7 @@ async function getOpenPayables(baseCurrency: string): Promise<OpenBalance[]> {
       id: true,
       invoiceNumber: true,
       totalForeign: true,
+      totalBase: true,
       fxRateToBase: true,
       po: { select: { reference: true, currency: true } },
     },
@@ -205,6 +217,9 @@ async function getOpenPayables(baseCurrency: string): Promise<OpenBalance[]> {
     // still rounds the resulting gain/loss to 2dp for the journal (cogs-audit scjz.57).
     outstandingForeign: toDecimal(invoice.totalForeign).toNumber(),
     bookedRateToBase: Number(invoice.fxRateToBase),
+    // Open payables are fully unpaid here (paidAt: null), so the outstanding base is
+    // the full stored totalBase — the real AP carrying value (cogs-audit scjz.55).
+    bookedBase: toDecimal(invoice.totalBase).toNumber(),
   }))
 }
 
@@ -234,6 +249,7 @@ async function buildRevaluationLines(params: {
       amountForeign: balance.outstandingForeign,
       bookedRateToBase: balance.bookedRateToBase,
       settlementRateToBase,
+      bookedBase: balance.bookedBase,
     })
     const journalLines = buildRealisedFxJournal({
       side: params.side,
