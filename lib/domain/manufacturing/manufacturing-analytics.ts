@@ -162,7 +162,13 @@ async function loadFifoCostLayersByPair(
     where: { remainingQty: { gt: 0 }, OR: pairs.map((pair) => ({ productId: pair.productId, warehouseId: pair.warehouseId })) },
     select: { productId: true, warehouseId: true, remainingQty: true, unitCostBase: true },
     orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+    take: SOURCE_ROW_LIMIT + 1,
   }) as CostLayerRow[]
+  // Bound the scan like the order/movement queries so a product with a huge
+  // number of open layers can't make the WIP report load arbitrary rows.
+  if (layers.length > SOURCE_ROW_LIMIT) {
+    throw new ManufacturingAnalyticsSourceLimitError(`WIP cost-layer source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  }
   for (const layer of layers) {
     const key = costPairKey(layer.productId, layer.warehouseId)
     const list = byPair.get(key) ?? []

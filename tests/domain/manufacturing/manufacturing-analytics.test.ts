@@ -603,6 +603,34 @@ test('source-row caps surface as typed actionable errors', async () => {
   )
 })
 
+test('WIP cost-layer scan is bounded by the source-row cap', async () => {
+  await assert.rejects(
+    () => getWipReport(
+      {},
+      {},
+      {
+        client: manufacturingClient({
+          orders: [
+            assemblyOrder({
+              id: 'po-wip',
+              status: 'IN_PROGRESS',
+              qtyPlanned: '1',
+              outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '1' }] },
+            }),
+          ],
+          movements: [],
+          costLayers: Array.from({ length: 50001 }, () => ({
+            productId: 'component-a', warehouseId: 'wh-main', remainingQty: '1', unitCostBase: '1',
+          })),
+        }),
+        now: () => new Date('2026-06-03T00:00:00Z'),
+      },
+    ),
+    (error) => error instanceof ManufacturingAnalyticsSourceLimitError &&
+      error.message === 'WIP cost-layer source rows exceed 50,000; narrow the filters and retry.',
+  )
+})
+
 test('manufacturing analytics pagination can be disabled for CSV exports', async () => {
   const report = await getProductionVarianceReport(
     { pageSize: 50 },
