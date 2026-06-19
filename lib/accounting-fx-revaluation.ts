@@ -87,19 +87,24 @@ function parseJournalLines(value: unknown): JournalLine[] {
   })
 }
 
-async function getPriorRevaluations(valuationDate: string): Promise<PriorRevaluation[]> {
-  const logs = await db.accountingSyncLog.findMany({
-    where: {
-      type: 'UNREALISED_FX_JOURNAL',
-      status: { in: [...ACTIVE_SYNC_STATUSES] },
-    },
-    orderBy: { createdAt: 'asc' },
-    select: { id: true, payload: true },
-  })
-
+/**
+ * Pure selection of strictly-earlier revaluations that still need reversing.
+ *
+ * `logs` must already be filtered to ACTIVE statuses (PENDING/PROCESSING/SYNCED),
+ * so a prior whose reversal FAILED is absent from `reversalSources` and is
+ * therefore returned for retry. We deliberately do NOT bail out when a same-date
+ * revaluation already exists: that earlier blanket short-circuit stranded
+ * failed/missing reversals permanently, compounding unrealised FX each period
+ * (scjz.39). A prior with an active reversal is already covered and excluded; a
+ * fresh PENDING reversal for a failed one is allowed because the idempotency
+ * unique index is partial on active statuses.
+ */
+export function selectPriorRevaluationsToReverse(
+  logs: Array<{ id: string; payload: unknown }>,
+  valuationDate: string,
+): PriorRevaluation[] {
   const reversalSources = new Set<string>()
   const prior: PriorRevaluation[] = []
-  let hasSameDateRevaluation = false
 
   for (const log of logs) {
     const payload = log.payload
@@ -109,10 +114,8 @@ async function getPriorRevaluations(valuationDate: string): Promise<PriorRevalua
       continue
     }
     if (payload.kind !== 'revaluation') continue
-    if (payload.valuationDate === valuationDate) {
-      hasSameDateRevaluation = true
-      continue
-    }
+    // Only strictly-earlier revaluations need reversing; >= valuationDate (same
+    // day or future) is excluded here.
     if (typeof payload.valuationDate !== 'string' || payload.valuationDate >= valuationDate) continue
     if (payload.side !== 'receivable' && payload.side !== 'payable') continue
     prior.push({
@@ -123,8 +126,19 @@ async function getPriorRevaluations(valuationDate: string): Promise<PriorRevalua
     })
   }
 
-  if (hasSameDateRevaluation) return []
   return prior.filter((entry) => !reversalSources.has(entry.id) && entry.lines.length > 0)
+}
+
+async function getPriorRevaluations(valuationDate: string): Promise<PriorRevaluation[]> {
+  const logs = await db.accountingSyncLog.findMany({
+    where: {
+      type: 'UNREALISED_FX_JOURNAL',
+      status: { in: [...ACTIVE_SYNC_STATUSES] },
+    },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true, payload: true },
+  })
+  return selectPriorRevaluationsToReverse(logs, valuationDate)
 }
 
 async function hasRevaluationForDate(valuationDate: string): Promise<boolean> {
@@ -287,9 +301,11 @@ export async function runArApFxRevaluation(input?: {
     return { success: false, error: 'Configure AR, AP, and unrealised FX accounts before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0 }
   }
 
-  if (await hasRevaluationForDate(valuationDate)) {
-    return { success: true, skipped: true, reason: 'Revaluation already queued for this date', valuationDate, reversed: 0, revalued: 0, documents: 0 }
-  }
+  // Don't bail the whole run when today's revaluation already exists: the
+  // reversal-retry loop below must still run so a prior reversal that failed (or
+  // never queued) gets retried instead of being stranded (scjz.39). Only the
+  // fresh revaluation step is skipped when it has already been queued today.
+  const alreadyRevaluedForDate = await hasRevaluationForDate(valuationDate)
 
   let reversed = 0
   const priorRevaluations = await getPriorRevaluations(valuationDate)
@@ -316,46 +332,60 @@ export async function runArApFxRevaluation(input?: {
     reversed += 1
   }
 
-  const [receivables, payables] = await Promise.all([
-    getOpenReceivables(baseCurrency),
-    getOpenPayables(baseCurrency),
-  ])
-
   let revalued = 0
   let documents = 0
-  for (const [side, balances, accounts] of [
-    ['receivable', receivables, receivableAccounts],
-    ['payable', payables, payableAccounts],
-  ] as const) {
-    const built = await buildRevaluationLines({
-      balances,
-      side,
-      valuationDate,
-      baseCurrency,
-      controlAccount: accounts.controlAccount,
-      fxGainLossAccount: accounts.fxGainLossAccount,
-    })
-    documents += built.documents
-    if (built.lines.length === 0) continue
+  // Skip only the fresh revaluation when one is already queued for today; the
+  // reversal retries above always run regardless (scjz.39).
+  if (!alreadyRevaluedForDate) {
+    const [receivables, payables] = await Promise.all([
+      getOpenReceivables(baseCurrency),
+      getOpenPayables(baseCurrency),
+    ])
 
-    await queueAccountingSync({
-      type: 'UNREALISED_FX_JOURNAL',
-      referenceType: 'FxRevaluation',
-      referenceId: valuationDate,
-      payload: {
-        kind: 'revaluation',
-        valuationDate,
+    for (const [side, balances, accounts] of [
+      ['receivable', receivables, receivableAccounts],
+      ['payable', payables, payableAccounts],
+    ] as const) {
+      const built = await buildRevaluationLines({
+        balances,
         side,
-        date: valuationDate,
-        reference: `FXREV-${valuationDate}`,
-        narration: `Unrealised ${side === 'receivable' ? 'AR' : 'AP'} FX revaluation at ${valuationDate}`,
-        lines: built.lines,
-        documentCount: built.documents,
-      },
-      idempotencyKey: `unrealised-fx:revaluation:${valuationDate}:${side}`,
-    })
-    revalued += 1
+        valuationDate,
+        baseCurrency,
+        controlAccount: accounts.controlAccount,
+        fxGainLossAccount: accounts.fxGainLossAccount,
+      })
+      documents += built.documents
+      if (built.lines.length === 0) continue
+
+      await queueAccountingSync({
+        type: 'UNREALISED_FX_JOURNAL',
+        referenceType: 'FxRevaluation',
+        referenceId: valuationDate,
+        payload: {
+          kind: 'revaluation',
+          valuationDate,
+          side,
+          date: valuationDate,
+          reference: `FXREV-${valuationDate}`,
+          narration: `Unrealised ${side === 'receivable' ? 'AR' : 'AP'} FX revaluation at ${valuationDate}`,
+          lines: built.lines,
+          documentCount: built.documents,
+        },
+        idempotencyKey: `unrealised-fx:revaluation:${valuationDate}:${side}`,
+      })
+      revalued += 1
+    }
   }
 
-  return { success: true, valuationDate, reversed, revalued, documents }
+  // Report skipped only when nothing happened this run (revaluation already
+  // existed and no reversal needed retrying), preserving the prior signal.
+  const noop = alreadyRevaluedForDate && reversed === 0 && revalued === 0
+  return {
+    success: true,
+    valuationDate,
+    reversed,
+    revalued,
+    documents,
+    ...(noop ? { skipped: true, reason: 'Revaluation already queued for this date' } : {}),
+  }
 }
