@@ -306,7 +306,10 @@ function calendarDayCount(fromDate: Date, toDate: Date): number {
 }
 
 function roundQty(value: DecimalInput): Decimal {
-  return roundQuantity(value, 4)
+  // Persist snapshot quantities at 6dp to match the live stock_levels / cost_layers
+  // precision (cogs-audit scjz.1); rounding to 4dp here would make daily snapshots
+  // and as-of reports disagree with the 6dp live quantities.
+  return roundQuantity(value, 6)
 }
 
 function roundValue(value: DecimalInput): Decimal {

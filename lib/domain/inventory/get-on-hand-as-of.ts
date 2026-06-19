@@ -257,7 +257,9 @@ function formatDateTime(date: Date): string {
 }
 
 function roundQty(value: DecimalInput): Decimal {
-  return roundQuantity(value, 4)
+  // 6dp to match live stock_levels/cost_layers and the persisted snapshots
+  // (cogs-audit scjz.1); 4dp here would make as-of reports disagree with live stock.
+  return roundQuantity(value, 6)
 }
 
 function roundValue(value: DecimalInput): Decimal {
@@ -478,7 +480,7 @@ function rowsFromState(state: OnHandState, options: { excludeZero?: boolean } = 
       return {
         productId: entry.productId,
         warehouseId: entry.warehouseId,
-        qty: qty.toFixed(4),
+        qty: qty.toFixed(6),
         valueBase: valueBase.toFixed(6),
         unitCostBase: qty.gt(0) ? roundValue(valueBase.div(qty)).toFixed(6) : null,
       }

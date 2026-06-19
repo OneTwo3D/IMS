@@ -203,7 +203,7 @@ test('getOnHandAsOf returns the snapshot row on a snapshot day', async () => {
   assert.deepEqual(result.rows, [{
     productId: 'product-1',
     warehouseId: 'warehouse-1',
-    qty: '10.0000',
+    qty: '10.000000',
     valueBase: '20.000000',
     unitCostBase: '2.000000',
   }])
@@ -268,7 +268,7 @@ test('getOnHandAsOf replays movements forward from the nearest prior snapshot', 
   assert.deepEqual(result.rows, [{
     productId: 'product-1',
     warehouseId: 'warehouse-1',
-    qty: '13.0000',
+    qty: '13.000000',
     valueBase: '31.000000',
     unitCostBase: '2.384615',
   }])
@@ -316,7 +316,7 @@ test('getOnHandAsOf reverses from the first later snapshot before the first snap
   assert.deepEqual(result.rows, [{
     productId: 'product-1',
     warehouseId: 'warehouse-1',
-    qty: '8.0000',
+    qty: '8.000000',
     valueBase: '40.000000',
     unitCostBase: '5.000000',
   }])
@@ -341,7 +341,7 @@ test('getOnHandAsOf uses live state for asOf now and reconciles to StockLevel qu
   assert.deepEqual(result.rows, [{
     productId: 'product-1',
     warehouseId: 'warehouse-1',
-    qty: '7.0000',
+    qty: '7.000000',
     valueBase: '18.000000',
     unitCostBase: '2.571429',
   }])
@@ -372,7 +372,7 @@ test('getOnHandAsOf falls back to current reverse replay when no snapshots exist
   assert.deepEqual(result.rows, [{
     productId: 'product-1',
     warehouseId: 'warehouse-1',
-    qty: '5.0000',
+    qty: '5.000000',
     valueBase: '50.000000',
     unitCostBase: '10.000000',
   }])
@@ -417,7 +417,7 @@ test('getOnHandAsOf reports value replay uncertainty for null-value movements', 
   assert.deepEqual(result.rows, [{
     productId: 'product-1',
     warehouseId: 'warehouse-1',
-    qty: '8.0000',
+    qty: '8.000000',
     valueBase: '20.000000',
     unitCostBase: '2.500000',
   }])
@@ -455,7 +455,7 @@ test('getOnHandAsOf replays stock movements across cursor pages', async () => {
   assert.deepEqual(result.rows, [{
     productId: 'product-1',
     warehouseId: 'warehouse-1',
-    qty: '1.0050',
+    qty: '1.005000',
     valueBase: '1.005000',
     unitCostBase: '1.000000',
   }])
@@ -525,7 +525,7 @@ test('getOnHandAsOf applies product, warehouse, category, and excludeZero filter
   assert.deepEqual(result.rows, [{
     productId: 'product-1',
     warehouseId: 'warehouse-1',
-    qty: '10.0000',
+    qty: '10.000000',
     valueBase: '20.000000',
     unitCostBase: '2.000000',
   }])
@@ -586,14 +586,14 @@ test('getOnHandAsOf applies transfer movements to both warehouses and reports or
     {
       productId: 'product-1',
       warehouseId: 'warehouse-1',
-      qty: '7.0000',
+      qty: '7.000000',
       valueBase: '35.000000',
       unitCostBase: '5.000000',
     },
     {
       productId: 'product-1',
       warehouseId: 'warehouse-2',
-      qty: '3.0000',
+      qty: '3.000000',
       valueBase: '15.000000',
       unitCostBase: '5.000000',
     },
