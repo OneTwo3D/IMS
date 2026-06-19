@@ -177,7 +177,20 @@ function validateReplayRange(range: ReplayDateRange): void {
 function isEmptyReplayRange(range: ReplayDateRange): boolean {
   const lower = range.gt ?? range.gte
   const upper = range.lte ?? range.lt
-  return Boolean(lower && upper && lower.getTime() >= upper.getTime())
+  if (!lower || !upper) return false
+  if (lower.getTime() > upper.getTime()) return true
+  if (lower.getTime() === upper.getTime()) {
+    // Equal endpoints form a single instant; it is only non-empty when BOTH
+    // bounds are inclusive (gte..lte). Any exclusive end (gt or lt) makes it
+    // empty. Without this, a date-only as-of whose half-open next-day boundary
+    // (gte) coincides with an inclusive upper bound — e.g. current reverse replay
+    // at exactly next-day midnight, { gte: nextDay, lte: now } — would skip a
+    // movement sitting exactly on that instant (scjz.49).
+    const lowerInclusive = range.gte !== undefined && range.gt === undefined
+    const upperInclusive = range.lte !== undefined && range.lt === undefined
+    return !(lowerInclusive && upperInclusive)
+  }
+  return false
 }
 
 function buildResult(input: {

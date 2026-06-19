@@ -714,3 +714,44 @@ test('getOnHandAsOf reverse replay reverses out only movements from the next day
     assert.deepEqual(range.gte, new Date('2026-05-29T00:00:00.000Z'))
   }
 })
+
+test('getOnHandAsOf current reverse replay reverses a midnight movement when now is exactly next-day midnight', async () => {
+  // No snapshots -> current reverse replay. Date-only as-of 2026-05-28 with now
+  // at exactly 2026-05-29T00:00:00.000Z yields { gte: 2026-05-29T00:00, lte: now }
+  // — a single inclusive instant that must still reverse out the 29th's movement.
+  const client = createClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('15') }],
+    costLayers: [{
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      remainingQty: decimal('15'),
+      unitCostBase: decimal('2'),
+    }],
+    movements: [{
+      id: 'midnight',
+      productId: 'product-1',
+      fromWarehouseId: null,
+      toWarehouseId: 'warehouse-1',
+      qty: decimal('5'),
+      totalValueBase: decimal('10'),
+      createdAt: new Date('2026-05-29T00:00:00.000Z'),
+    }],
+  })
+
+  const result = await getOnHandAsOf({
+    client,
+    asOf: '2026-05-28',
+    now: () => new Date('2026-05-29T00:00:00.000Z'),
+  })
+
+  assert.equal(result.source, 'current_reverse_replay')
+  // Current stock is 15; the +5 movement on the 29th must be reversed out for
+  // the as-of-28 state, leaving 10.
+  assert.deepEqual(result.rows, [{
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: '10.000000',
+    valueBase: '20.000000',
+    unitCostBase: '2.000000',
+  }])
+})
