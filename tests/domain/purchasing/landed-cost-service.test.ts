@@ -969,6 +969,47 @@ test('recalculateDirectLandedCosts warns when BY_WEIGHT gives a positive-qty zer
   assert.deepEqual(zeroLineCalls, [{ context: 'recalculateDirectLandedCosts:PO-1', lineIds: ['line-a'] }])
 })
 
+test('recalculateDirectLandedCosts does not warn on zero-weight lines for a zero/credit BY_WEIGHT cost line', async () => {
+  const zeroLineCalls: string[] = []
+  const { tx } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [
+      {
+        id: 'line-a',
+        qty: 1,
+        unitCostBase: 10,
+        landedUnitCostBase: 10,
+        totalBase: 10,
+        product: { weight: 0 },
+        costLayers: [{ id: 'layer-a', unitCostBase: 10, receivedQty: 1, remainingQty: 1 }],
+      },
+      {
+        id: 'line-b',
+        qty: 1,
+        unitCostBase: 20,
+        landedUnitCostBase: 20,
+        totalBase: 20,
+        product: { weight: 1 },
+        costLayers: [{ id: 'layer-b', unitCostBase: 20, receivedQty: 1, remainingQty: 1 }],
+      },
+    ],
+    freightCostLines: [{ amountBase: 0, distributionMethod: 'BY_WEIGHT' }],
+    landedCostLinks: [],
+  })
+
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    warnWeightZeroLines: (_context, lineIds) => {
+      zeroLineCalls.push(...lineIds)
+      return undefined
+    },
+  }), TEST_AUDIT_OPTIONS)
+
+  assert.deepEqual(result.warnings, [])
+  assert.deepEqual(zeroLineCalls, [])
+})
+
 test('recalculateDirectLandedCosts skips snapshot refresh when cost delta is negligible', async () => {
   let snapshotRefreshes = 0
   const { tx } = createDirectTx({

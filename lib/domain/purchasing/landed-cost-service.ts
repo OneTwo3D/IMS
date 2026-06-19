@@ -821,7 +821,9 @@ export async function recalculateLandedCosts(
         const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
         basisTotal = equalBase
         for (const entry of bases) entry.base = new Prisma.Decimal(1)
-      } else {
+      } else if (decimal(freightCostLine.amountBase).gt(0)) {
+        // Only warn when positive freight was actually distributed away from the
+        // zero-weight line; a zero/credit cost line assigns nothing (scjz.17).
         captureWeightZeroLines(
           result,
           runWarnings,
@@ -857,7 +859,7 @@ export async function recalculateLandedCosts(
           const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
           basisTotal = equalBase
           for (const entry of bases) entry.base = new Prisma.Decimal(1)
-        } else {
+        } else if (decimal(freightCostLine.amountBase).gt(0)) {
           captureWeightZeroLines(
             result,
             runWarnings,
@@ -1197,7 +1199,7 @@ export async function recalculateDirectLandedCosts(
       )
       basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
       for (const entry of bases) entry.base = new Prisma.Decimal(1)
-    } else {
+    } else if (decimal(freightCostLine.amountBase).gt(0)) {
       captureWeightZeroLines(result, runWarnings, serviceDeps, warningContext, zeroWeightEligibleLineIds(method, bases))
     }
     const amountBase = decimal(freightCostLine.amountBase)
