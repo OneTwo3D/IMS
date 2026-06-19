@@ -210,8 +210,15 @@ function stateKey(productId: string, warehouseId: string): string {
   return JSON.stringify([productId, warehouseId])
 }
 
-function parseAsOf(input: AsOfInput): Date {
-  if (input == null) return new Date()
+/**
+ * `isDateOnly` distinguishes a `YYYY-MM-DD` input (an end-of-day proxy whose
+ * `...T23:59:59.999Z` value cannot represent the `.999000`–`.999999` microsecond
+ * band PostgreSQL stores) from a precise Date/number instant. Date-only inputs
+ * must therefore filter with a half-open next-day boundary rather than an
+ * inclusive `lte`/`gt` on the `.999Z` proxy (scjz.49).
+ */
+function parseAsOf(input: AsOfInput): { asOf: Date; isDateOnly: boolean } {
+  if (input == null) return { asOf: new Date(), isDateOnly: false }
 
   if (typeof input === 'string') {
     if (!DATE_ONLY_RE.test(input)) {
@@ -226,14 +233,14 @@ function parseAsOf(input: AsOfInput): Date {
     ) {
       throw new Error(`Invalid inventory as-of date: ${input}`)
     }
-    return value
+    return { asOf: value, isDateOnly: true }
   }
 
   const value = new Date(input)
   if (Number.isNaN(value.getTime())) {
     throw new Error(`Invalid inventory as-of date: ${String(input)}`)
   }
-  return value
+  return { asOf: value, isDateOnly: false }
 }
 
 function startOfUtcDay(date: Date): Date {
@@ -685,7 +692,7 @@ export async function getOnHandAsOf(options: {
 } = {}): Promise<OnHandAsOfResult> {
   const client = options.client ?? db
   const now = options.now?.() ?? new Date()
-  const asOf = parseAsOf(options.asOf)
+  const { asOf, isDateOnly } = parseAsOf(options.asOf)
   if (asOf > endOfUtcDay(now)) {
     throw new InventoryAsOfFutureError()
   }
@@ -714,6 +721,17 @@ export async function getOnHandAsOf(options: {
   }
 
   const asOfDay = startOfUtcDay(asOf)
+  // A date-only as-of covers the whole UTC day, so bound replay at the next-day
+  // midnight (half-open) rather than the `.999Z` end-of-day proxy, which would
+  // drop movements in the `.999000`–`.999999` microsecond band (forward replay)
+  // or wrongly reverse them out (reverse replay). Precise instants keep their
+  // inclusive `lte`/exclusive `gt` semantics (scjz.49).
+  const asOfUpperBound: { lt: Date } | { lte: Date } = isDateOnly
+    ? { lt: startOfNextUtcDay(asOfDay) }
+    : { lte: asOf }
+  const asOfLowerBound: { gte: Date } | { gt: Date } = isDateOnly
+    ? { gte: startOfNextUtcDay(asOfDay) }
+    : { gt: asOf }
   const priorSnapshotDate = await findPriorSnapshotDate(client, asOfDay)
   if (priorSnapshotDate) {
     const state = await loadSnapshotState(client, priorSnapshotDate, filters)
@@ -721,7 +739,7 @@ export async function getOnHandAsOf(options: {
       client,
       state,
       filters,
-      { gte: startOfNextUtcDay(priorSnapshotDate), lte: asOf },
+      { gte: startOfNextUtcDay(priorSnapshotDate), ...asOfUpperBound },
       'forward',
       options.signal,
     )
@@ -743,7 +761,7 @@ export async function getOnHandAsOf(options: {
       client,
       state,
       filters,
-      { gt: asOf, lt: startOfNextUtcDay(futureSnapshotDate) },
+      { ...asOfLowerBound, lt: startOfNextUtcDay(futureSnapshotDate) },
       'reverse',
       options.signal,
     )
@@ -764,7 +782,7 @@ export async function getOnHandAsOf(options: {
       txClient,
       state,
       filters,
-      { gt: asOf, lte: now },
+      { ...asOfLowerBound, lte: now },
       'reverse',
       options.signal,
     )
