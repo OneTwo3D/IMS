@@ -18,7 +18,7 @@ import {
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { canDispatchTransferQty } from '@/lib/domain/inventory/transfer-availability'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import {
   buildStockMovementValueFieldsFromConsumed,
@@ -657,6 +657,35 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
                 })
               }
             }
+          }
+
+          // cogs-audit scjz.5: the destination stock_level was incremented by the
+          // full remainingQty, but the recreated layers only cover the snapshot
+          // slice's quantity. If the dispatch snapshot under-records qty (the
+          // source dispatched legacy/uncosted stock that had no FIFO layer), the
+          // destination would otherwise hold uncosted on-hand (stock_level >
+          // Σ layer remainingQty). Balance the shortfall with a £0-cost layer so
+          // quantity is conserved and no value is invented or destroyed — the
+          // source units were uncosted, so the destination mirrors that. The
+          // underlying source desync is a separate data-quality concern.
+          const sliceQtyTotal = snapshotSlice.reduce((sum, entry) => addMoney(sum, entry.qty), toDecimal(0))
+          const shortfall = subtractMoney(remainingQty, sliceQtyTotal)
+          if (shortfall.gt('0.000001')) {
+            await createCostLayer(tx, {
+              productId: line.productId,
+              warehouseId: transfer.toWarehouseId,
+              qty: shortfall,
+              unitCostBase: 0,
+            })
+            await logActivity({
+              entityType: 'STOCK_ADJUSTMENT',
+              entityId: id,
+              tag: 'stock',
+              action: 'transfer_uncosted_balancing_layer',
+              level: 'WARNING',
+              description: `Transfer ${transfer.reference}: received ${remainingQty} of ${line.productId} but the dispatch snapshot only covered ${sliceQtyTotal.toString()} costed units; created a £0-cost balancing layer for the ${shortfall.toString()}-unit shortfall (source stock/cost-layer desync).`,
+              metadata: { transferId: id, productId: line.productId, warehouseId: transfer.toWarehouseId, remainingQty: remainingQty.toString(), sliceQty: sliceQtyTotal.toString(), shortfall: shortfall.toString() },
+            })
           }
         }
 
