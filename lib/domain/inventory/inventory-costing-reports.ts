@@ -725,13 +725,29 @@ export function inventoryCostingFiltersForUi(filters: InventoryCostingFilters): 
 }
 
 export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsGroupBy): CogsReportRow[] {
+  // A sales-order line (revenueKey = orderId:productId) can be fulfilled from
+  // more than one group (e.g. split-warehouse dispatch produces two COGS
+  // movements with the same revenueKey in different warehouse groups). Counting
+  // the full line revenue in each group double-counts the report total
+  // (cogs-audit scjz.50). Build per-line totals first, then allocate each line's
+  // revenue across its groups in proportion to the qty fulfilled by that group.
+  const lineRevenueByKey = new Map<string, { revenue: Decimal; totalQty: Decimal }>()
+  for (const input of inputs) {
+    if (!input.revenueKey || input.revenueBase == null) continue
+    const existing = lineRevenueByKey.get(input.revenueKey)
+    if (existing) {
+      existing.totalQty = existing.totalQty.add(toDecimal(input.qty))
+    } else {
+      lineRevenueByKey.set(input.revenueKey, { revenue: toDecimal(input.revenueBase), totalQty: toDecimal(input.qty) })
+    }
+  }
+
   const groups = new Map<string, {
     first: CogsAggregationInput
     qty: Decimal
     cogsBase: Decimal
-    revenueBase: Decimal
     revenueCaptured: boolean
-    revenueKeys: Set<string>
+    qtyByRevenueKey: Map<string, Decimal>
     movementIds: Set<string>
   }>()
 
@@ -741,18 +757,16 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
       first: input,
       qty: decimalZero(),
       cogsBase: decimalZero(),
-      revenueBase: decimalZero(),
       revenueCaptured: true,
-      revenueKeys: new Set<string>(),
+      qtyByRevenueKey: new Map<string, Decimal>(),
       movementIds: new Set<string>(),
     }
     existing.qty = existing.qty.add(toDecimal(input.qty))
     existing.cogsBase = existing.cogsBase.add(toDecimal(input.cogsBase))
     if (input.revenueBase == null) {
       existing.revenueCaptured = false
-    } else if (!input.revenueKey || !existing.revenueKeys.has(input.revenueKey)) {
-      existing.revenueBase = existing.revenueBase.add(toDecimal(input.revenueBase))
-      if (input.revenueKey) existing.revenueKeys.add(input.revenueKey)
+    } else if (input.revenueKey) {
+      existing.qtyByRevenueKey.set(input.revenueKey, (existing.qtyByRevenueKey.get(input.revenueKey) ?? decimalZero()).add(toDecimal(input.qty)))
     }
     existing.movementIds.add(input.id)
     groups.set(key, existing)
@@ -760,7 +774,16 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
 
   return [...groups.entries()]
     .map(([key, group]) => {
-      const revenueBase = group.revenueCaptured ? group.revenueBase : null
+      // Sum this group's qty-proportional share of each line's revenue. When a
+      // line's total fulfilled qty is zero (degenerate, e.g. fully reversed),
+      // fall back to the full line revenue rather than dropping it.
+      const groupRevenue = [...group.qtyByRevenueKey.entries()].reduce((sum, [revKey, groupQty]) => {
+        const line = lineRevenueByKey.get(revKey)
+        if (!line) return sum
+        const share = line.totalQty.gt(0) ? line.revenue.mul(groupQty).div(line.totalQty) : line.revenue
+        return sum.add(share)
+      }, decimalZero())
+      const revenueBase = group.revenueCaptured ? groupRevenue : null
       const grossMarginBase = revenueBase ? revenueBase.sub(group.cogsBase) : null
       const grossMarginPct = revenueBase && !revenueBase.isZero()
         ? grossMarginBase!.div(revenueBase).mul(100)

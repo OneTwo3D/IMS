@@ -176,6 +176,58 @@ describe('inventory costing report aggregations', () => {
     assert.equal(row?.revenueCaptured, true)
   })
 
+  it('allocates a split-warehouse line revenue by qty across groups instead of double-counting', () => {
+    // One order line for product-a, 2 units: 1 from WH-A, 1 from WH-B, line
+    // revenue 300. Counting full revenue in each warehouse group would report a
+    // 600 total (double-count). Qty-proportional allocation gives 150 per group.
+    const rows: CogsAggregationInput[] = [
+      {
+        id: 'movement-a',
+        qty: '1',
+        cogsBase: '100',
+        productId: 'product-a',
+        sku: 'A-001',
+        productName: 'Widget A',
+        categoryName: 'Widgets',
+        warehouseId: 'warehouse-a',
+        warehouseCode: 'WHA',
+        warehouseName: 'Warehouse A',
+        customerName: 'Customer One',
+        channel: 'woocommerce',
+        revenueKey: 'order-1:product-a',
+        revenueBase: '300',
+      },
+      {
+        id: 'movement-b',
+        qty: '1',
+        cogsBase: '120',
+        productId: 'product-a',
+        sku: 'A-001',
+        productName: 'Widget A',
+        categoryName: 'Widgets',
+        warehouseId: 'warehouse-b',
+        warehouseCode: 'WHB',
+        warehouseName: 'Warehouse B',
+        customerName: 'Customer One',
+        channel: 'woocommerce',
+        revenueKey: 'order-1:product-a',
+        revenueBase: '300',
+      },
+    ]
+
+    const rowsByGroup = aggregateCogsRows(rows, 'warehouse')
+    const byCode = new Map(rowsByGroup.map((row) => [row.warehouseCode, row]))
+    assert.equal(byCode.get('WHA')?.revenueBase, '150.000000')
+    assert.equal(byCode.get('WHB')?.revenueBase, '150.000000')
+    // Per-group revenue now sums to the true line revenue, not 2x.
+    const totalRevenue = rowsByGroup.reduce((sum, row) => sum + Number(row.revenueBase ?? 0), 0)
+    assert.equal(totalRevenue, 300)
+
+    // Grouping that keeps the line in a single group still shows full revenue.
+    const [productRow] = aggregateCogsRows(rows, 'product')
+    assert.equal(productRow?.revenueBase, '300.000000')
+  })
+
   it('sorts COGS groups numerically rather than lexicographically', () => {
     const rows: CogsAggregationInput[] = [
       {
