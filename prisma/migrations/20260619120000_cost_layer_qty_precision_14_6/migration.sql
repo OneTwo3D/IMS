@@ -27,3 +27,13 @@ ALTER TABLE "stock_levels"
 
 ALTER TABLE "stock_movements"
   ALTER COLUMN "qty" TYPE numeric(14,6);
+
+-- Persisted daily snapshots and reservation snapshots derive from the live
+-- quantities above; widen them (and roundQty now persists 6dp) so as-of/turnover
+-- reports don't disagree with live stock at the 5th/6th dp.
+ALTER TABLE "inventory_snapshots"
+  ALTER COLUMN "qty" TYPE numeric(14,6);
+
+ALTER TABLE "inventory_reservation_snapshots"
+  ALTER COLUMN "reservedQty" TYPE numeric(14,6),
+  ALTER COLUMN "availableQty" TYPE numeric(14,6);
