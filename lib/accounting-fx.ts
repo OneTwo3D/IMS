@@ -9,6 +9,16 @@ export type RealisedFxInput = {
   amountForeign: number
   bookedRateToBase: number
   settlementRateToBase: number
+  /**
+   * The base-currency value at which `amountForeign` was actually booked to the
+   * AR/AP control account (e.g. the stored document totalBase, prorated to the
+   * outstanding portion). When provided this is used as the booked leg instead of
+   * recomputing amountForeign/bookedRate — so the revaluation measures against the
+   * real carrying value and ties back to the control account, rather than a
+   * freshly re-rounded figure that disagrees with the posted base (cogs-audit
+   * scjz.55). Falls back to amountForeign/bookedRate when omitted.
+   */
+  bookedBase?: number
 }
 
 export type RealisedFxResult = {
@@ -47,7 +57,9 @@ export function computeRealisedFx(input: RealisedFxInput): RealisedFxResult {
   // legs and rounded once, so rounding each leg before differencing can no
   // longer manufacture or drop a penny near the 0.01 emit threshold
   // (cogs-audit scjz.54 float contamination + scjz.56 double-rounding).
-  const bookedBaseDec = toDecimal(amountForeign).div(bookedRate)
+  const bookedBaseDec = input.bookedBase != null && Number.isFinite(input.bookedBase)
+    ? toDecimal(input.bookedBase)
+    : toDecimal(amountForeign).div(bookedRate)
   const settlementBaseDec = toDecimal(amountForeign).div(settlementRate)
   const bookedBase = roundAccountingMoney(bookedBaseDec)
   const settlementBase = roundAccountingMoney(settlementBaseDec)

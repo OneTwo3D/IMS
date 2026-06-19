@@ -18,6 +18,24 @@ test('computes realised FX loss on customer payment when settlement base is belo
   })
 })
 
+test('uses the explicit booked base (stored carrying value) instead of recomputing it (scjz.55)', () => {
+  // Stored AR base was 80.0000; recomputing 100/1.25 also gives 80 here, but pass an
+  // explicit booked base that differs (e.g. 4dp carrying value 79.99) to prove it is
+  // used as the booked leg rather than the freshly-derived figure.
+  const result = computeRealisedFx({
+    side: 'receivable',
+    amountForeign: 100,
+    bookedRateToBase: 1.25,
+    settlementRateToBase: 1.25,
+    bookedBase: 79.99,
+  })
+  // Settlement leg = 100/1.25 = 80.00; gain vs the real carrying value 79.99 = +0.01.
+  assert.equal(result.bookedBase, 79.99)
+  assert.equal(result.settlementBase, 80)
+  assert.equal(result.gainLossBase, 0.01)
+  assert.equal(result.outcome, 'gain')
+})
+
 test('computes realised FX gain on supplier payment when settlement base is below booked AP', () => {
   const result = computeRealisedFx({
     side: 'payable',
