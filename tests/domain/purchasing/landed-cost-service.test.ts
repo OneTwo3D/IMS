@@ -390,6 +390,30 @@ test('returned quantity helpers return Decimal without fractional drift', async 
   assert.equal(supplierReturned.toString(), '0.3')
 })
 
+test('snapshot updates lock matching rows FOR UPDATE before rewriting the JSON array', async () => {
+  const selectSqls: string[] = []
+  const tx = {
+    $queryRawUnsafe: async (sql: string) => {
+      selectSqls.push(sql)
+      return sql.includes('"shipment_lines"')
+        ? [{ id: 'row-a', costLayerSnapshot: [{ costLayerId: 'layer-a', qty: 1, unitCostBase: 10 }] }]
+        : []
+    },
+    $executeRawUnsafe: async () => 1,
+    activityLog: { create: async () => ({ id: 'activity-1' }) },
+  }
+
+  await updateSnapshotsForCostLayerChange(tx as never, 'layer-a', new Prisma.Decimal('12'))
+
+  // Every snapshot-row scan must take a row lock so a concurrent revaluation of
+  // another layer sharing the row cannot clobber the JSON array (scjz.7).
+  assert.ok(selectSqls.length > 0)
+  for (const sql of selectSqls) {
+    assert.match(sql, /SELECT id, "costLayerSnapshot"/)
+    assert.match(sql, /FOR UPDATE\s*$/)
+  }
+})
+
 test('snapshot updates accept Decimal input and serialize JSON unit costs as strings', async () => {
   const updates: Array<{ sql: string; snapshot: unknown; id: string }> = []
   const tx = {

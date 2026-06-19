@@ -524,9 +524,15 @@ export async function updateSnapshotsForCostLayerChange(
   const containsCostLayer = JSON.stringify([{ costLayerId }])
 
   for (const table of tables) {
-    // Find rows whose snapshot JSON mentions this cost layer id
+    // Find rows whose snapshot JSON mentions this cost layer id. FOR UPDATE locks
+    // each matching row for the rest of the transaction so a concurrent
+    // revaluation of another layer that shares the same snapshot row cannot
+    // read-modify-write the JSON array in parallel and clobber this change — the
+    // second locker blocks, then re-reads the committed array (cogs-audit scjz.7).
+    // Stays on $queryRawUnsafe (a row-returning query) so the lock is held;
+    // $executeRaw would not (enforced by the row-lock-queryraw gate).
     const rows = await tx.$queryRawUnsafe<Array<{ id: string; costLayerSnapshot: unknown }>>(
-      `SELECT id, "costLayerSnapshot" FROM "${table.model}" WHERE "costLayerSnapshot" @> $1::jsonb`,
+      `SELECT id, "costLayerSnapshot" FROM "${table.model}" WHERE "costLayerSnapshot" @> $1::jsonb FOR UPDATE`,
       containsCostLayer,
     )
 
