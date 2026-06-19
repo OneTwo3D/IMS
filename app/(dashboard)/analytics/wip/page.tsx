@@ -38,6 +38,7 @@ const columns: Array<ManufacturingAnalyticsColumn<WipReportRow>> = [
   { key: 'costLines', label: 'Cost lines', align: 'right', render: (row) => row.costLineCount },
   { key: 'manufacturingCost', label: 'Manufacturing cost', align: 'right', render: (row) => row.manufacturingCostBase },
   { key: 'consumedValue', label: 'Consumed value', align: 'right', render: (row) => row.consumedComponentValueBase },
+  { key: 'reservedValue', label: 'Reserved value', align: 'right', render: (row) => row.reservedComponentValueBase },
   { key: 'expectedOutput', label: 'Expected output value', align: 'right', render: (row) => row.expectedOutputValueBase },
   { key: 'wipValue', label: 'WIP value', align: 'right', render: (row) => row.wipValueBase },
 ]
@@ -64,7 +65,7 @@ export default async function WipPage({ searchParams }: Props) {
   return (
     <ManufacturingAnalyticsReportPage
       title="WIP"
-      description="Current in-progress production orders with WIP value from posted component consumption plus manufacturing cost-line base totals."
+      description="Current in-progress production orders with WIP value from posted component consumption, reserved not-yet-consumed components at current FIFO cost, plus manufacturing cost-line base totals."
       reportKey="wip"
       filters={manufacturingAnalyticsFiltersForUi(reportFilters)}
       pageInfo={report.pageInfo}
@@ -75,6 +76,7 @@ export default async function WipPage({ searchParams }: Props) {
         { label: 'Open orders', value: report.pageInfo.totalRows.toLocaleString(), tone: report.pageInfo.totalRows > 0 ? 'warning' : 'default' },
         { label: 'WIP value', value: report.totals.wipValueBase ?? '0' },
         { label: 'Consumed value', value: report.totals.consumedComponentValueBase ?? '0' },
+        { label: 'Reserved value', value: report.totals.reservedComponentValueBase ?? '0' },
         { label: 'Expected output value', value: report.totals.expectedOutputValueBase ?? '0' },
       ]}
       notices={report.notices}
