@@ -115,6 +115,10 @@ test('combines direct and linked landed-cost sources', () => {
 })
 
 test('retrospective layer adjustment splits inventory and consumed COGS deltas', () => {
+  // 10 received, 4 on hand, 6 consumed. Of the 6: 1 customer-returned (handled via
+  // refund snapshot, excluded) leaves 5 in the COGS delta — supplier-returned units
+  // are NOW included (scjz.10): they ride the same self-contained P&L pair as sold
+  // goods rather than being dropped.
   assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
     oldUnitCost: 10,
     newUnitCost: 12,
@@ -126,9 +130,29 @@ test('retrospective layer adjustment splits inventory and consumed COGS deltas',
   })), {
     costDelta: 2,
     consumedQty: 6,
-    netConsumedQty: 3,
-    cogsDelta: 6,
+    netConsumedQty: 5,
+    cogsDelta: 10,
     inventoryDelta: 8,
+  })
+})
+
+test('retrospective layer adjustment includes supplier-returned units in COGS (scjz.10)', () => {
+  // 10 received, 0 on hand, all 10 consumed: 4 supplier-returned + 6 sold. The
+  // supplier-returned units' late-cost delta must NOT be dropped — netConsumed = 10.
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 11,
+    receivedQty: 10,
+    remainingQty: 0,
+    returnedQty: 0,
+    supplierReturnedQty: 4,
+    manufacturingConsumedQty: 0,
+  })), {
+    costDelta: 1,
+    consumedQty: 10,
+    netConsumedQty: 10,
+    cogsDelta: 10,
+    inventoryDelta: 0,
   })
 })
 
@@ -172,7 +196,9 @@ test('retrospective layer adjustment handles landed-cost decreases', () => {
   })
 })
 
-test('retrospective layer adjustment excludes customer and supplier returns from COGS', () => {
+test('retrospective layer adjustment excludes customer returns but includes supplier returns in COGS (scjz.10)', () => {
+  // 6 consumed = 4 customer-returned (excluded — handled via refund snapshots) +
+  // 2 supplier-returned (now INCLUDED, scjz.10) → netConsumed = 2.
   const deltas = calculateLayerAdjustmentDeltas({
     oldUnitCost: 10,
     newUnitCost: 12,
@@ -183,8 +209,8 @@ test('retrospective layer adjustment excludes customer and supplier returns from
     manufacturingConsumedQty: 0,
   })
 
-  assert.equal(deltas.netConsumedQty.toNumber(), 0)
-  assert.equal(deltas.cogsDelta.toNumber(), 0)
+  assert.equal(deltas.netConsumedQty.toNumber(), 2)
+  assert.equal(deltas.cogsDelta.toNumber(), 4)
   assert.equal(deltas.inventoryDelta.toNumber(), 8)
 })
 
@@ -968,7 +994,9 @@ test('recalculateDirectLandedCosts keeps fractional returns and snapshot cost as
   }), TEST_AUDIT_OPTIONS)
 
   assert.equal(snapshotUnitCost, '1.1')
-  assert.deepEqual(result.cogsAdjustments.map((adj) => adj.totalDelta), [0.02])
+  // scjz.10: supplier-returned (0.2) now counts toward COGS → netConsumed 0.4 ×
+  // costDelta 0.1 = 0.04 (was 0.02 when supplier returns were wrongly dropped).
+  assert.deepEqual(result.cogsAdjustments.map((adj) => adj.totalDelta), [0.04])
   assert.deepEqual(result.cogsAdjustments.map((adj) => adj.freightPoId), [null])
   assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.totalDelta), [0.05])
   assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.freightPoId), [null])
