@@ -288,9 +288,11 @@ test('WIP values reserved not-yet-consumed components at weighted-average curren
   // Cost layers fetched in a single batched query scoped to the BOM components.
   assert.equal(costLayerArgs.length, 1)
   assert.deepEqual((costLayerArgs[0] as { where: unknown }).where, {
-    productId: { in: ['component-a', 'component-b'] },
-    warehouseId: { in: ['wh-main'] },
     remainingQty: { gt: 0 },
+    OR: [
+      { productId: 'component-a', warehouseId: 'wh-main' },
+      { productId: 'component-b', warehouseId: 'wh-main' },
+    ],
   })
 })
 
@@ -357,7 +359,7 @@ test('WIP reservation uses the frozen componentSnapshot over the live BOM (scjz.
 
   // Snapshot: 3 per unit * 2 planned = 6 units @ 4 = 24 (component-a is ignored).
   assert.equal(report.rows[0].reservedComponentValueBase, '24')
-  assert.deepEqual((costLayerArgs[0] as { where: { productId: unknown } }).where.productId, { in: ['component-c'] })
+  assert.deepEqual((costLayerArgs[0] as { where: { OR: unknown } }).where.OR, [{ productId: 'component-c', warehouseId: 'wh-main' }])
 })
 
 test('WIP values an in-progress disassembly from the output product, not its BOM (scjz.31)', async () => {
@@ -394,7 +396,54 @@ test('WIP values an in-progress disassembly from the output product, not its BOM
 
   // 3 output units reserved @ 7 = 21; BOM component layer untouched.
   assert.equal(report.rows[0].reservedComponentValueBase, '21')
-  assert.deepEqual((costLayerArgs[0] as { where: { productId: unknown } }).where.productId, { in: ['fg-disasm'] })
+  assert.deepEqual((costLayerArgs[0] as { where: { OR: unknown } }).where.OR, [{ productId: 'fg-disasm', warehouseId: 'wh-main' }])
+})
+
+test('WIP depletes shared FIFO layers across in-progress orders (scjz.31)', async () => {
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        // Two orders, each reserving 10 of component-a in wh-main, started in order.
+        orders: [
+          assemblyOrder({
+            id: 'po-early',
+            reference: 'MO-EARLY',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '10',
+            qtyProduced: '0',
+            startedAt: new Date('2026-05-01T00:00:00Z'),
+            manufacturingCostLines: [],
+            bom: { items: [{ componentProductId: 'component-a', qty: '1', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+          }),
+          assemblyOrder({
+            id: 'po-late',
+            reference: 'MO-LATE',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '10',
+            qtyProduced: '0',
+            startedAt: new Date('2026-05-02T00:00:00Z'),
+            manufacturingCostLines: [],
+            bom: { items: [{ componentProductId: 'component-a', qty: '1', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+          }),
+        ],
+        movements: [],
+        costLayers: [
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '1' },
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '100' },
+        ],
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  const early = report.rows.find((row) => row.productionOrderReference === 'MO-EARLY')
+  const late = report.rows.find((row) => row.productionOrderReference === 'MO-LATE')
+  // Earliest-started order takes the cheap layer; the later one takes the next.
+  assert.equal(early?.reservedComponentValueBase, '10')
+  assert.equal(late?.reservedComponentValueBase, '1000')
+  assert.equal(report.totals.reservedComponentValueBase, '1010')
 })
 
 test('production variance scopes by completedAt and consumption-capable statuses', async () => {

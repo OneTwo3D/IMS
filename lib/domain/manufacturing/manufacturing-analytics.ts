@@ -153,10 +153,10 @@ async function loadFifoCostLayersByPair(
 ): Promise<Map<string, FifoCostLayer[]>> {
   const byPair = new Map<string, FifoCostLayer[]>()
   if (pairs.length === 0) return byPair
-  const productIds = [...new Set(pairs.map((pair) => pair.productId))]
-  const warehouseIds = [...new Set(pairs.map((pair) => pair.warehouseId))]
   const layers = await client.costLayer.findMany({
-    where: { productId: { in: productIds }, warehouseId: { in: warehouseIds }, remainingQty: { gt: 0 } },
+    // Pairwise OR (not productId IN x warehouseId IN) so a multi-product,
+    // multi-warehouse report doesn't scan the unrelated cross-combinations.
+    where: { remainingQty: { gt: 0 }, OR: pairs.map((pair) => ({ productId: pair.productId, warehouseId: pair.warehouseId })) },
     select: { productId: true, warehouseId: true, remainingQty: true, unitCostBase: true },
     orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
   }) as CostLayerRow[]
@@ -170,22 +170,29 @@ async function loadFifoCostLayersByPair(
 }
 
 /**
- * Value a reservation of `qty` units against FIFO-ordered open layers, matching
- * the cost completion will capitalise. A reservation larger than current on-hand
- * (completion would later block on it) values the uncovered remainder at the
- * newest layer's unit cost, or zero when no layers exist.
+ * Consume `qty` units from FIFO-ordered open layers, returning the cost
+ * completion will capitalise. MUTATES the shared layer list (decrements
+ * remainingQty) so that when several in-progress orders reserve the same
+ * (product, warehouse) each draws fresh layers in turn — orders are valued in
+ * the report's start-order, a reasonable proxy for completion order — rather
+ * than every order re-claiming the same cheap oldest layers. A reservation
+ * larger than current on-hand (completion would later block on it) values the
+ * uncovered remainder at the newest layer's unit cost, or zero when no layers
+ * exist.
  */
-function valueFifoReservation(layers: FifoCostLayer[] | undefined, qty: Prisma.Decimal): Prisma.Decimal {
+function consumeFifoReservation(layers: FifoCostLayer[] | undefined, qty: Prisma.Decimal): Prisma.Decimal {
   if (qty.lte(0)) return new Prisma.Decimal(0)
   let remaining = qty
   let value = new Prisma.Decimal(0)
   let lastUnitCost = new Prisma.Decimal(0)
   for (const layer of layers ?? []) {
     if (remaining.lte(0)) break
+    lastUnitCost = layer.unitCostBase
+    if (layer.remainingQty.lte(0)) continue
     const take = Prisma.Decimal.min(remaining, layer.remainingQty)
     value = value.add(take.mul(layer.unitCostBase))
+    layer.remainingQty = layer.remainingQty.sub(take)
     remaining = remaining.sub(take)
-    lastUnitCost = layer.unitCostBase
   }
   if (remaining.gt(0)) value = value.add(remaining.mul(lastUnitCost))
   return value
@@ -586,7 +593,7 @@ export async function getWipReport(
         ?? new Prisma.Decimal(0)
       const remainingQty = Prisma.Decimal.max(new Prisma.Decimal(0), requirementQty.sub(consumedQty))
       reservedComponentValueBase = reservedComponentValueBase.add(
-        valueFifoReservation(layersByPair.get(costPairKey(productId, order.warehouseId)), remainingQty),
+        consumeFifoReservation(layersByPair.get(costPairKey(productId, order.warehouseId)), remainingQty),
       )
     }
 
