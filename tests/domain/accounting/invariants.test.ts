@@ -133,6 +133,74 @@ test('clean accounting rows produce no findings', () => {
   assert.deepEqual(evaluateAccountingInvariantRows(cleanRows()), [])
 })
 
+test('flags posted revenue whose payment was reversed with no compensating credit note', () => {
+  const rows = cleanRows()
+  // Payment reversed (paidAt cleared) on an order with A1 revenue posted, and the
+  // refund/credit-note that would compensate it is absent (scjz.72).
+  rows.salesOrders[0] = { ...rows.salesOrders[0], paidAt: null, refunds: [] }
+
+  const findings = evaluateAccountingInvariantRows(rows)
+  const finding = findings.find((f) => f.code === 'revenue_posted_without_payment')
+  assert.ok(finding, 'expected a revenue_posted_without_payment finding')
+  assert.equal(finding?.severity, 'critical')
+  assert.equal(finding?.orderId, 'order-1')
+})
+
+test('does not flag reversed payment when a credit note fully covers the posted revenue', () => {
+  const rows = cleanRows()
+  const order = rows.salesOrders[0]
+  // paidAt cleared but a credit note covers the full posted revenue (100).
+  rows.salesOrders[0] = {
+    ...order,
+    paidAt: null,
+    unearnedRevenueAmount: 100,
+    refunds: [{ ...order.refunds[0], totalBase: 100 }],
+  }
+
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(!codes.includes('revenue_posted_without_payment'))
+})
+
+test('flags reversed payment when the credit note has no durable accounting id (only a local number)', () => {
+  const rows = cleanRows()
+  const order = rows.salesOrders[0]
+  // A credit-note number was generated locally but the credit note never synced
+  // (no accountingCreditNoteId) — that is not durable evidence of compensation.
+  rows.salesOrders[0] = {
+    ...order,
+    paidAt: null,
+    unearnedRevenueAmount: 100,
+    refunds: [{ ...order.refunds[0], creditNoteNumber: 'CN-1', accountingCreditNoteId: null, totalBase: 100 }],
+  }
+
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(codes.includes('revenue_posted_without_payment'))
+})
+
+test('flags reversed payment when only a partial credit note covers the posted revenue', () => {
+  const rows = cleanRows()
+  const order = rows.salesOrders[0]
+  // Posted revenue 100, but the only credit note covers 10 — the remaining 90 is
+  // recognized revenue with no cash, so the finding must NOT be suppressed.
+  rows.salesOrders[0] = {
+    ...order,
+    paidAt: null,
+    unearnedRevenueAmount: 100,
+    refunds: [{ ...order.refunds[0], totalBase: 10 }],
+  }
+
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(codes.includes('revenue_posted_without_payment'))
+})
+
+test('does not flag posted revenue while payment is still present', () => {
+  const rows = cleanRows()
+  rows.salesOrders[0] = { ...rows.salesOrders[0], paidAt: A1_DATE, refunds: [] }
+
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(!codes.includes('revenue_posted_without_payment'))
+})
+
 test('posted shipments require live Group B sync evidence and batch amounts', () => {
   const rows = cleanRows()
   rows.postedShipments[0] = {

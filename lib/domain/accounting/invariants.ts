@@ -33,6 +33,10 @@ type SalesOrderAccountingRow = {
   orderNumber: string | null
   externalOrderNumber: string | null
   status: string
+  // Optional so existing pure-evaluator callers/fixtures that don't supply it are
+  // treated as "unknown" (the check below fires only when paidAt is explicitly
+  // null — i.e. a payment reversal cleared it). The DB loader always selects it.
+  paidAt?: Date | string | null
   revenueDeferredDate: Date | string | null
   unearnedRevenueAmount: DecimalLike
   inventoryAllocatedDate: Date | string | null
@@ -322,6 +326,38 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     const hasA2 = order.inventoryAllocatedDate != null
     const postedShipments = order.shipments.filter((shipment) => shipment.shipmentJournalDate != null)
 
+    // A1 revenue deferral is only ever staged for a paid order (the daily batch
+    // selects paidAt != null), so a posted order whose paidAt is now null had its
+    // payment reversed (chargeback) without a compensating credit note — recognized
+    // revenue with no cash, otherwise invisible to reconciliation (scjz.42/.72).
+    // Require durable accounting evidence (the external credit-note id), not the
+    // locally-generated creditNoteNumber which is assigned at refund creation
+    // before the credit-note sync queues — otherwise a never-synced/failed refund
+    // would falsely suppress exactly the missing-accounting case this surfaces.
+    const creditNotes = order.refunds.filter((refund) => refund.accountingCreditNoteId != null)
+    const postedRevenue = decimalToNumber(order.unearnedRevenueAmount)
+    const creditedTotal = creditNotes.reduce((sum, refund) => sum + decimalToNumber(refund.totalBase), 0)
+    // A credit note only compensates the reversed payment if it covers the posted
+    // revenue. A prior PARTIAL refund must NOT suppress the finding. When the posted
+    // amount is unknown (<= 0) fall back to presence to avoid false positives.
+    const fullyCompensated = creditNotes.length > 0
+      && (postedRevenue <= 0 || creditedTotal + 0.01 >= postedRevenue)
+    if ((hasA1 || hasA2 || postedShipments.length > 0) && order.paidAt === null && !fullyCompensated) {
+      findings.push({
+        severity: 'critical',
+        code: 'revenue_posted_without_payment',
+        orderId: order.id,
+        message: `Sales order ${label} has posted revenue/allocation but paidAt is cleared and no compensating credit note exists — a reversed payment left recognized revenue without cash`,
+        details: {
+          status: order.status,
+          revenueDeferredDate: order.revenueDeferredDate,
+          inventoryAllocatedDate: order.inventoryAllocatedDate,
+          postedShipmentCount: postedShipments.length,
+          unearnedRevenueAmount: decimalToNumber(order.unearnedRevenueAmount),
+        },
+      })
+    }
+
     if (hasA1) {
       const expectedReferenceId = expectedDailyBatchReference('A1', order.revenueDeferredDate)
       const hasSyncEvidence = expectedReferenceId
@@ -579,12 +615,21 @@ export async function collectAccountingInvariantRows(
           { shipments: { some: { shipmentJournalDate: retainedDateFilter } } },
           { refunds: { some: retentionCutoff ? { refundedAt: { gte: retentionCutoff } } : {} } },
         ],
+        // NB: the revenue_posted_without_payment invariant (scjz.72) only evaluates
+        // orders collected by the retention window above — i.e. recent reversed
+        // payments (the common case). A chargeback on an order posted outside the
+        // window is not caught here; we deliberately do NOT pull those unwindowed,
+        // because the sync-log query is also windowed, so evaluating an old order
+        // would emit false *_without_sync_evidence warnings for its (unloaded) old
+        // batch logs. The full chargeback handling (scjz.42) creates a credit note
+        // / moves the order terminal, which is the durable fix.
       },
       select: {
         id: true,
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
+        paidAt: true,
         revenueDeferredDate: true,
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
