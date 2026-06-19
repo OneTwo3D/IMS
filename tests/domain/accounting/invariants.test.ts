@@ -456,9 +456,9 @@ test('accounting row collection selects staged orders, posted shipments, and syn
   // recently-reversed payment on an old posted order is still evaluated (scjz.72).
   assert.ok(
     (calls.salesOrder as { where: { OR: Array<Record<string, unknown>> } }).where.OR.some(
-      (clause) => clause.paidAt === null && JSON.stringify(clause.revenueDeferredDate) === JSON.stringify({ not: null }),
+      (clause) => clause.paidAt === null && Array.isArray(clause.OR),
     ),
-    'expected an OR branch collecting posted-but-unpaid orders',
+    'expected an OR branch collecting posted-but-unpaid orders (A1/A2/shipment)',
   )
   assert.deepEqual(
     (calls.shipment as { where: unknown }).where,

@@ -608,9 +608,18 @@ export async function collectAccountingInvariantRows(
           // Always collect posted-but-unpaid orders regardless of the retention
           // window: a payment reversed today on an order posted long ago does not
           // touch any retained date, so it would otherwise escape the
-          // revenue_posted_without_payment invariant (scjz.72). Posted+unpaid is a
+          // revenue_posted_without_payment invariant (scjz.72). Mirror the
+          // evaluator's trigger exactly (A1 OR A2 OR a posted shipment) so an
+          // anomalous A2-/shipment-only order is collected too. Posted+unpaid is a
           // narrow set (chargebacks are rare).
-          { paidAt: null, revenueDeferredDate: { not: null } },
+          {
+            paidAt: null,
+            OR: [
+              { revenueDeferredDate: { not: null } },
+              { inventoryAllocatedDate: { not: null } },
+              { shipments: { some: { shipmentJournalDate: { not: null } } } },
+            ],
+          },
         ],
       },
       select: {
