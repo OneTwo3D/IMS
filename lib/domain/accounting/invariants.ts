@@ -330,10 +330,17 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     // selects paidAt != null), so a posted order whose paidAt is now null had its
     // payment reversed (chargeback) without a compensating credit note — recognized
     // revenue with no cash, otherwise invisible to reconciliation (scjz.42/.72).
-    const hasCompensatingCreditNote = order.refunds.some(
+    const creditNotes = order.refunds.filter(
       (refund) => refund.creditNoteNumber != null || refund.accountingCreditNoteId != null,
     )
-    if ((hasA1 || hasA2 || postedShipments.length > 0) && order.paidAt === null && !hasCompensatingCreditNote) {
+    const postedRevenue = decimalToNumber(order.unearnedRevenueAmount)
+    const creditedTotal = creditNotes.reduce((sum, refund) => sum + decimalToNumber(refund.totalBase), 0)
+    // A credit note only compensates the reversed payment if it covers the posted
+    // revenue. A prior PARTIAL refund must NOT suppress the finding. When the posted
+    // amount is unknown (<= 0) fall back to presence to avoid false positives.
+    const fullyCompensated = creditNotes.length > 0
+      && (postedRevenue <= 0 || creditedTotal + 0.01 >= postedRevenue)
+    if ((hasA1 || hasA2 || postedShipments.length > 0) && order.paidAt === null && !fullyCompensated) {
       findings.push({
         severity: 'critical',
         code: 'revenue_posted_without_payment',
