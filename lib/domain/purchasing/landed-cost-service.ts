@@ -62,7 +62,7 @@ export type LandedCostRecalcResult = {
 }
 
 export type LandedCostRevaluationWarning = {
-  code: 'weight_fallback'
+  code: 'weight_fallback' | 'weight_zero_line'
   context: string
   message: string
 }
@@ -138,6 +138,7 @@ export type LandedCostServiceDeps = {
   refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
   refreshSalesOrderLineCogsForCostLayerChange: typeof refreshSalesOrderLineCogsForCostLayerChange
   warnWeightFallback: (context: string) => LandedCostRevaluationWarning | void
+  warnWeightZeroLines: (context: string, lineIds: string[]) => LandedCostRevaluationWarning | void
 }
 
 const defaultDeps: LandedCostServiceDeps = {
@@ -150,6 +151,7 @@ const defaultDeps: LandedCostServiceDeps = {
   refreshShipmentCogsForCostLayerChange,
   refreshSalesOrderLineCogsForCostLayerChange,
   warnWeightFallback,
+  warnWeightZeroLines,
 }
 
 const LANDED_COST_DELTA_EPSILON = new Prisma.Decimal('0.000001')
@@ -397,6 +399,54 @@ function captureWeightFallback(
   runWarnings.push(warning)
 }
 
+function makeWeightZeroLineWarning(context: string, lineIds: string[]): LandedCostRevaluationWarning {
+  const description = `${context}: BY_WEIGHT landed-cost allocation assigned zero freight to ${lineIds.length} positive-quantity line(s) with zero/blank weight; that freight was distributed onto the weighted lines instead`
+  return { code: 'weight_zero_line', context, message: description }
+}
+
+function warnWeightZeroLines(context: string, lineIds: string[]): LandedCostRevaluationWarning {
+  const warning = makeWeightZeroLineWarning(context, lineIds)
+  console.warn(warning.message)
+  void logActivity({
+    entityType: 'PURCHASE_ORDER',
+    entityId: null,
+    action: 'landed_cost_weight_zero_line',
+    tag: 'purchase',
+    level: 'WARNING',
+    description: warning.message,
+    metadata: { context, lineIds },
+    resolveUser: false,
+  }).catch((error) => console.error(error))
+  return warning
+}
+
+function captureWeightZeroLines(
+  result: LandedCostRecalcResult,
+  runWarnings: LandedCostRevaluationWarning[],
+  deps: LandedCostServiceDeps,
+  context: string,
+  lineIds: string[],
+): void {
+  if (lineIds.length === 0) return
+  const warning = deps.warnWeightZeroLines(context, lineIds) ?? makeWeightZeroLineWarning(context, lineIds)
+  result.warnings.push(warning)
+  runWarnings.push(warning)
+}
+
+/**
+ * Positive-quantity lines that contributed zero weight to a BY_WEIGHT split
+ * (weight 0/null) and therefore received no freight while other lines absorbed
+ * it. Only meaningful on the non-fallback path (basisTotal > 0); the all-zero
+ * case is already reported by the weight-fallback warning (scjz.17).
+ */
+function zeroWeightEligibleLineIds(
+  method: LandedCostDistributionMethod,
+  bases: Array<{ lineId: string; base: Prisma.Decimal }>,
+): string[] {
+  if (method !== 'BY_WEIGHT') return []
+  return bases.filter((entry) => entry.base.lte(0)).map((entry) => entry.lineId)
+}
+
 function decimalText(value: Prisma.Decimal | number | string | null | undefined): string {
   return decimal(value).toString()
 }
@@ -525,6 +575,7 @@ export function computeGrossUnitCostBaseByLine(params: {
   lines: PendingGrossCostLine[]
   directCostLines?: PendingGrossCostLineSource[]
   linkedCostLines?: PendingGrossCostLineSource[]
+  onWeightZeroLines?: (lineIds: string[]) => void
 }): Map<string, number> {
   const eligibleLines = params.lines.filter((line) => decimal(line.qty).gt(0))
   const landedByLine = new Map<string, Prisma.Decimal>()
@@ -557,6 +608,11 @@ export function computeGrossUnitCostBaseByLine(params: {
       if (method === 'BY_WEIGHT') warnWeightFallback('computeGrossUnitCostBaseByLine')
       basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
       for (const entry of bases) entry.base = new Prisma.Decimal(1)
+    } else {
+      const zeroWeightLineIds = zeroWeightEligibleLineIds(method, bases)
+      if (zeroWeightLineIds.length > 0) {
+        (params.onWeightZeroLines ?? ((ids) => warnWeightZeroLines('computeGrossUnitCostBaseByLine', ids)))(zeroWeightLineIds)
+      }
     }
     for (const entry of bases) {
       const share = amountBase.mul(entry.base).div(basisTotal)
@@ -764,6 +820,14 @@ export async function recalculateLandedCosts(
         const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
         basisTotal = equalBase
         for (const entry of bases) entry.base = new Prisma.Decimal(1)
+      } else {
+        captureWeightZeroLines(
+          result,
+          runWarnings,
+          serviceDeps,
+          `recalculateLandedCosts:${primaryPo.reference}`,
+          zeroWeightEligibleLineIds(method, bases),
+        )
       }
 
       const amountBase = decimal(freightCostLine.amountBase)
@@ -792,6 +856,14 @@ export async function recalculateLandedCosts(
           const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
           basisTotal = equalBase
           for (const entry of bases) entry.base = new Prisma.Decimal(1)
+        } else {
+          captureWeightZeroLines(
+            result,
+            runWarnings,
+            serviceDeps,
+            `recalculateLandedCosts:${primaryPo.reference}:linked`,
+            zeroWeightEligibleLineIds(method, bases),
+          )
         }
 
         const amountBase = decimal(freightCostLine.amountBase)
@@ -1124,6 +1196,8 @@ export async function recalculateDirectLandedCosts(
       )
       basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
       for (const entry of bases) entry.base = new Prisma.Decimal(1)
+    } else {
+      captureWeightZeroLines(result, runWarnings, serviceDeps, warningContext, zeroWeightEligibleLineIds(method, bases))
     }
     const amountBase = decimal(freightCostLine.amountBase)
     for (const entry of bases) {

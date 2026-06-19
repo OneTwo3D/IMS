@@ -94,6 +94,40 @@ test('allocates landed cost by total line weight', () => {
   })
 })
 
+test('flags BY_WEIGHT lines that receive zero freight because their weight is zero/blank', () => {
+  // line-a weight 0 (positive qty), line-b weight 1: BY_WEIGHT puts all freight on
+  // line-b and none on line-a, which must raise a per-line diagnostic.
+  const zeroWeightLines: string[][] = []
+  const gross = Object.fromEntries(computeGrossUnitCostBaseByLine({
+    lines: [{ id: 'line-a', qty: 2, unitCostBase: 10, totalBase: 20, weight: 0 }, baseLines[1]],
+    directCostLines: [{ amountBase: 30, distributionMethod: 'BY_WEIGHT' }],
+    onWeightZeroLines: (lineIds) => zeroWeightLines.push(lineIds),
+  }))
+
+  assert.deepEqual(zeroWeightLines, [['line-a']])
+  // All freight landed on the weighted line.
+  assert.equal(gross['line-a'], 10)
+  assert.equal(gross['line-b'], 50)
+})
+
+test('does not flag zero-weight lines when every weight is zero (equal-split fallback) or method is not BY_WEIGHT', () => {
+  const allZero: string[][] = []
+  computeGrossUnitCostBaseByLine({
+    lines: [{ id: 'line-a', qty: 2, unitCostBase: 10, totalBase: 20, weight: 0 }, { id: 'line-b', qty: 1, unitCostBase: 20, totalBase: 20, weight: 0 }],
+    directCostLines: [{ amountBase: 30, distributionMethod: 'BY_WEIGHT' }],
+    onWeightZeroLines: (lineIds) => allZero.push(lineIds),
+  })
+  assert.deepEqual(allZero, [])
+
+  const nonWeight: string[][] = []
+  computeGrossUnitCostBaseByLine({
+    lines: [{ id: 'line-a', qty: 2, unitCostBase: 10, totalBase: 20, weight: 0 }, baseLines[1]],
+    directCostLines: [{ amountBase: 30, distributionMethod: 'BY_QUANTITY' }],
+    onWeightZeroLines: (lineIds) => nonWeight.push(lineIds),
+  })
+  assert.deepEqual(nonWeight, [])
+})
+
 test('allocates landed cost equally by eligible line', () => {
   assert.deepEqual(grossFor(30, 'EQUAL_SPLIT'), {
     'line-a': 17.5,
@@ -579,6 +613,7 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 0, cogsRevaluationDelta: new Prisma.Decimal(0) }),
     refreshSalesOrderLineCogsForCostLayerChange: async () => 0,
     warnWeightFallback: () => {},
+    warnWeightZeroLines: () => {},
     ...overrides,
   }
 }
@@ -891,6 +926,47 @@ test('recalculateDirectLandedCosts records direct and linked weight fallback war
     auditRun.data.warningsJson.map((warning) => warning.context),
     ['recalculateDirectLandedCosts:PO-1', 'recalculateDirectLandedCosts:PO-1:linked'],
   )
+})
+
+test('recalculateDirectLandedCosts warns when BY_WEIGHT gives a positive-qty zero-weight line no freight', async () => {
+  const zeroLineCalls: Array<{ context: string; lineIds: string[] }> = []
+  const { tx } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [
+      {
+        id: 'line-a',
+        qty: 1,
+        unitCostBase: 10,
+        landedUnitCostBase: 10,
+        totalBase: 10,
+        product: { weight: 0 },
+        costLayers: [{ id: 'layer-a', unitCostBase: 10, receivedQty: 1, remainingQty: 1 }],
+      },
+      {
+        id: 'line-b',
+        qty: 1,
+        unitCostBase: 20,
+        landedUnitCostBase: 20,
+        totalBase: 20,
+        product: { weight: 1 },
+        costLayers: [{ id: 'layer-b', unitCostBase: 20, receivedQty: 1, remainingQty: 1 }],
+      },
+    ],
+    freightCostLines: [{ amountBase: 5, distributionMethod: 'BY_WEIGHT' }],
+    landedCostLinks: [],
+  })
+
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    warnWeightZeroLines: (context, lineIds) => {
+      zeroLineCalls.push({ context, lineIds })
+      return { code: 'weight_zero_line', context, message: 'zero weight' }
+    },
+  }), TEST_AUDIT_OPTIONS)
+
+  assert.deepEqual(result.warnings.map((warning) => warning.code), ['weight_zero_line'])
+  assert.deepEqual(zeroLineCalls, [{ context: 'recalculateDirectLandedCosts:PO-1', lineIds: ['line-a'] }])
 })
 
 test('recalculateDirectLandedCosts skips snapshot refresh when cost delta is negligible', async () => {
