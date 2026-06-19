@@ -18,6 +18,7 @@ type FindManyDelegate = {
 export type ManufacturingAnalyticsClient = {
   productionOrder: FindManyDelegate
   stockMovement: FindManyDelegate
+  costLayer: FindManyDelegate
 }
 
 export type ManufacturingAnalyticsDeps = {
@@ -82,6 +83,7 @@ export type WipReportRow = {
   remainingOutputQty: string
   manufacturingCostBase: string
   consumedComponentValueBase: string
+  reservedComponentValueBase: string
   expectedOutputValueBase: string
   wipValueBase: string
   costLineCount: number
@@ -118,7 +120,52 @@ type ProductionVarianceOrderRow = ProductionOrderBaseRow & {
 }
 
 type WipProductionOrderRow = ProductionOrderBaseRow & {
+  warehouseId: string
   manufacturingCostLines: Array<{ amountBase: DecimalInput }>
+  bom: { items: Array<{ componentProductId: string; qty: DecimalInput }> } | null
+}
+
+type CostLayerRow = {
+  productId: string
+  warehouseId: string
+  remainingQty: DecimalInput
+  unitCostBase: DecimalInput
+}
+
+function costPairKey(productId: string, warehouseId: string): string {
+  return `${productId}::${warehouseId}`
+}
+
+/**
+ * Weighted-average current cost per (product, warehouse) from open cost layers —
+ * the cost basis used to value reserved-but-not-yet-consumed WIP components
+ * (scjz.31). Batched into one query to avoid an N+1 over components.
+ */
+async function loadCurrentAverageCosts(
+  client: ManufacturingAnalyticsClient,
+  pairs: Array<{ productId: string; warehouseId: string }>,
+): Promise<Map<string, Prisma.Decimal>> {
+  const avg = new Map<string, Prisma.Decimal>()
+  if (pairs.length === 0) return avg
+  const productIds = [...new Set(pairs.map((pair) => pair.productId))]
+  const warehouseIds = [...new Set(pairs.map((pair) => pair.warehouseId))]
+  const layers = await client.costLayer.findMany({
+    where: { productId: { in: productIds }, warehouseId: { in: warehouseIds }, remainingQty: { gt: 0 } },
+    select: { productId: true, warehouseId: true, remainingQty: true, unitCostBase: true },
+  }) as CostLayerRow[]
+  const totals = new Map<string, { qty: Prisma.Decimal; value: Prisma.Decimal }>()
+  for (const layer of layers) {
+    const key = costPairKey(layer.productId, layer.warehouseId)
+    const current = totals.get(key) ?? { qty: new Prisma.Decimal(0), value: new Prisma.Decimal(0) }
+    const qty = toDecimal(layer.remainingQty)
+    current.qty = current.qty.add(qty)
+    current.value = current.value.add(qty.mul(toDecimal(layer.unitCostBase)))
+    totals.set(key, current)
+  }
+  for (const [key, { qty, value }] of totals) {
+    if (qty.gt(0)) avg.set(key, value.div(qty))
+  }
+  return avg
 }
 
 type ProductionOutMovementRow = {
@@ -435,9 +482,11 @@ export async function getWipReport(
       startedAt: true,
       completedAt: true,
       createdAt: true,
+      warehouseId: true,
       outputProduct: { select: { sku: true, name: true } },
       warehouse: { select: { code: true, name: true } },
       manufacturingCostLines: { select: { amountBase: true } },
+      bom: { select: { items: { select: { componentProductId: true, qty: true } } } },
     },
   }) as WipProductionOrderRow[]
   if (orders.length > SOURCE_ROW_LIMIT) {
@@ -446,9 +495,23 @@ export async function getWipReport(
 
   const movements = await loadProductionOutMovements(client, orders.map((order) => order.id))
   const movementTotals = movementTotalsByOrder(movements)
+  // Per-component consumed qty so reserved value covers only the not-yet-consumed
+  // portion (an IN_PROGRESS order may have partially consumed components) (scjz.31).
+  const consumedByOrderProduct = movementTotalsByOrderAndProduct(movements)
+  const costPairs = new Map<string, { productId: string; warehouseId: string }>()
+  for (const order of orders) {
+    for (const item of order.bom?.items ?? []) {
+      costPairs.set(costPairKey(item.componentProductId, order.warehouseId), {
+        productId: item.componentProductId,
+        warehouseId: order.warehouseId,
+      })
+    }
+  }
+  const avgCostByPair = await loadCurrentAverageCosts(client, [...costPairs.values()])
   const rows: WipReportRow[] = []
   let manufacturingCostTotal = new Prisma.Decimal(0)
   let consumedComponentValueTotal = new Prisma.Decimal(0)
+  let reservedComponentValueTotal = new Prisma.Decimal(0)
   let expectedOutputValueTotal = new Prisma.Decimal(0)
 
   for (const order of orders) {
@@ -457,17 +520,31 @@ export async function getWipReport(
       new Prisma.Decimal(0),
     )
     const movementTotal = movementTotals.get(order.id) ?? { qty: new Prisma.Decimal(0), valueBase: new Prisma.Decimal(0) }
-    const wipValueBase = manufacturingCostBase.add(movementTotal.valueBase)
+    const plannedQty = toDecimal(order.qtyPlanned)
+    const producedQty = toDecimal(order.qtyProduced)
+
+    // Value the reserved components still to be consumed at current cost, so WIP
+    // reflects committed component value before completion posts PRODUCTION_OUT.
+    let reservedComponentValueBase = new Prisma.Decimal(0)
+    for (const item of order.bom?.items ?? []) {
+      const requirementQty = toDecimal(item.qty).mul(plannedQty)
+      const consumedQty = consumedByOrderProduct.get(movementKey(order.id, item.componentProductId))?.qty
+        ?? new Prisma.Decimal(0)
+      const remainingQty = Prisma.Decimal.max(new Prisma.Decimal(0), requirementQty.sub(consumedQty))
+      const unitCost = avgCostByPair.get(costPairKey(item.componentProductId, order.warehouseId)) ?? new Prisma.Decimal(0)
+      reservedComponentValueBase = reservedComponentValueBase.add(remainingQty.mul(unitCost))
+    }
+
+    const wipValueBase = manufacturingCostBase.add(movementTotal.valueBase).add(reservedComponentValueBase)
     const startDate = order.startedAt ?? order.createdAt
     const daysSinceStart = Prisma.Decimal.max(
       new Prisma.Decimal(0),
       elapsedDaysDecimal(startDate, generatedAt),
     )
-    const plannedQty = toDecimal(order.qtyPlanned)
-    const producedQty = toDecimal(order.qtyProduced)
 
     manufacturingCostTotal = manufacturingCostTotal.add(manufacturingCostBase)
     consumedComponentValueTotal = consumedComponentValueTotal.add(movementTotal.valueBase)
+    reservedComponentValueTotal = reservedComponentValueTotal.add(reservedComponentValueBase)
     expectedOutputValueTotal = expectedOutputValueTotal.add(wipValueBase)
     rows.push({
       productionOrderId: order.id,
@@ -485,6 +562,7 @@ export async function getWipReport(
       remainingOutputQty: quantity(Prisma.Decimal.max(plannedQty.sub(producedQty), new Prisma.Decimal(0))),
       manufacturingCostBase: amount(manufacturingCostBase),
       consumedComponentValueBase: amount(movementTotal.valueBase),
+      reservedComponentValueBase: amount(reservedComponentValueBase),
       expectedOutputValueBase: amount(wipValueBase),
       wipValueBase: amount(wipValueBase),
       costLineCount: order.manufacturingCostLines.length,
@@ -495,9 +573,10 @@ export async function getWipReport(
     wipValueBase: amount(expectedOutputValueTotal),
     manufacturingCostBase: amount(manufacturingCostTotal),
     consumedComponentValueBase: amount(consumedComponentValueTotal),
+    reservedComponentValueBase: amount(reservedComponentValueTotal),
     expectedOutputValueBase: amount(expectedOutputValueTotal),
   }, [
     'WIP is a current-state report of all IN_PROGRESS production orders; date filters are not applied.',
-    'WIP value includes posted consumed component value plus ManufacturingCostLine base totals.',
+    'WIP value includes posted consumed component value, reserved not-yet-consumed component value at current cost, plus ManufacturingCostLine base totals.',
   ], options.paginate !== false)
 }

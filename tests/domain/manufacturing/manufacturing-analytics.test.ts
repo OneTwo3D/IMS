@@ -11,8 +11,10 @@ import {
 function manufacturingClient(input: {
   orders: unknown[]
   movements: unknown[]
+  costLayers?: unknown[]
   productionOrderArgs?: unknown[]
   stockMovementArgs?: unknown[]
+  costLayerArgs?: unknown[]
 }): ManufacturingAnalyticsClient {
   return {
     productionOrder: {
@@ -25,6 +27,12 @@ function manufacturingClient(input: {
       async findMany(args?: unknown) {
         input.stockMovementArgs?.push(args)
         return input.movements
+      },
+    },
+    costLayer: {
+      async findMany(args?: unknown) {
+        input.costLayerArgs?.push(args)
+        return input.costLayers ?? []
       },
     },
   }
@@ -42,6 +50,7 @@ function assemblyOrder(overrides: Record<string, unknown> = {}) {
     startedAt: new Date('2026-05-03T00:00:00Z'),
     completedAt: new Date('2026-05-04T00:00:00Z'),
     createdAt: new Date('2026-05-01T00:00:00Z'),
+    warehouseId: 'wh-main',
     outputProduct: { sku: 'FG-1', name: 'Finished good' },
     warehouse: { code: 'MAIN', name: 'Main warehouse' },
     bom: {
@@ -209,9 +218,11 @@ test('WIP value includes consumed component value and ManufacturingCostLine tota
       startedAt: true,
       completedAt: true,
       createdAt: true,
+      warehouseId: true,
       outputProduct: { select: { sku: true, name: true } },
       warehouse: { select: { code: true, name: true } },
       manufacturingCostLines: { select: { amountBase: true } },
+      bom: { select: { items: { select: { componentProductId: true, qty: true } } } },
     },
   })
   assert.equal(report.rows[0].wipValueBase, '43')
@@ -223,6 +234,60 @@ test('WIP value includes consumed component value and ManufacturingCostLine tota
   assert.equal(report.totals.wipValueBase, '43')
   assert.equal(report.totals.consumedComponentValueBase, '30')
   assert.equal(report.totals.expectedOutputValueBase, '43')
+})
+
+test('WIP values reserved not-yet-consumed components at weighted-average current cost (scjz.31)', async () => {
+  const costLayerArgs: unknown[] = []
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        orders: [
+          assemblyOrder({
+            id: 'po-wip',
+            reference: 'MO-WIP',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '10',
+            qtyProduced: '0',
+            startedAt: new Date('2026-05-29T00:00:00Z'),
+            manufacturingCostLines: [{ amountBase: '50' }],
+          }),
+        ],
+        // component-b partially consumed (4 of the 10 required); component-a not yet started.
+        movements: [
+          { referenceId: 'po-wip', productId: 'component-b', qty: '4', totalValueBase: '12' },
+        ],
+        // component-a weighted-average cost = (10*4 + 10*6)/20 = 5; component-b = 3.
+        costLayers: [
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '4' },
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '6' },
+          { productId: 'component-b', warehouseId: 'wh-main', remainingQty: '50', unitCostBase: '3' },
+        ],
+        costLayerArgs,
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  assert.equal(report.rows.length, 1)
+  // Reserved = component-a (20 req - 0 consumed) * 5 + component-b (10 req - 4 consumed) * 3
+  //          = 100 + 18 = 118
+  assert.equal(report.rows[0].reservedComponentValueBase, '118')
+  assert.equal(report.rows[0].consumedComponentValueBase, '12')
+  assert.equal(report.rows[0].manufacturingCostBase, '50')
+  // WIP = manufacturing 50 + consumed 12 + reserved 118 = 180
+  assert.equal(report.rows[0].wipValueBase, '180')
+  assert.equal(report.rows[0].expectedOutputValueBase, '180')
+  assert.equal(report.totals.reservedComponentValueBase, '118')
+  assert.equal(report.totals.wipValueBase, '180')
+  // Cost layers fetched in a single batched query scoped to the BOM components.
+  assert.equal(costLayerArgs.length, 1)
+  assert.deepEqual((costLayerArgs[0] as { where: unknown }).where, {
+    productId: { in: ['component-a', 'component-b'] },
+    warehouseId: { in: ['wh-main'] },
+    remainingQty: { gt: 0 },
+  })
 })
 
 test('production variance scopes by completedAt and consumption-capable statuses', async () => {
