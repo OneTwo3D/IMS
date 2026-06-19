@@ -48,7 +48,7 @@ type JournalLinePayload = {
   debit?: number
   credit?: number
 }
-type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog'>
+type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | 'activityLog'>
 
 const QBO_DAILY_BATCH_LOCK_KEY = 4_112_208_032
 const QBO_CONNECTOR = 'quickbooks'
@@ -202,6 +202,9 @@ async function createPendingSyncLog(
       payload: params.payload as never,
     },
   })
+  // Mirror failure must not abort the whole daily batch: the sync log is already
+  // created (and will post), so swallow + warn here exactly as queueAccountingSyncTx
+  // does, instead of rolling back every order in the group (cogs-audit scjz.40).
   await mirrorAccountingSyncLogToEvent(tx, {
     syncLogId: log.id,
     connector: QBO_CONNECTOR,
@@ -211,7 +214,15 @@ async function createPendingSyncLog(
     payload: params.payload,
     currency: params.currency,
     status: 'PENDING',
-  })
+  }).catch((mirrorError: unknown) => tx.activityLog.create({
+    data: {
+      entityType: 'SYSTEM',
+      action: 'accounting_event_mirror_error',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Daily-batch sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
+    },
+  }).then(() => undefined))
 }
 
 async function lockCostLayers(
