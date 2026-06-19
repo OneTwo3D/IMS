@@ -209,19 +209,24 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
 } {
   const costDelta = decimal(input.newUnitCost).sub(decimal(input.oldUnitCost))
   const consumedQty = decimal(input.receivedQty).sub(decimal(input.remainingQty))
-  // audit-jz9i: exclude manufacturing-consumed units. They are not customer COGS —
-  // their cost was capitalised into the produced output's cost layer — so the
-  // retrospective landed-cost delta for those units is propagated into that output
-  // layer by propagateLandedCostToOutputs (audit-e7h8), not journalled as COGS here.
-  // scjz.14: also exclude PURCHASE_REVERSAL-consumed units (PO cancellation). They
-  // reduced the layer (consumedQty) and wrote cogs_entries for the outbound-evidence
-  // guard, but they were reversed out, not sold — so their retrospective cost delta
-  // is not customer COGS (mirrors the audit-jz9i manufacturing exclusion).
+  // What this delta journals as COGS, and why each class is excluded:
+  // - audit-jz9i: manufacturing-consumed units are not customer COGS — their cost
+  //   was capitalised into the produced output's layer, so the delta is propagated
+  //   into that output by propagateLandedCostToOutputs (audit-e7h8), not here.
+  // - scjz.14: PURCHASE_REVERSAL units (PO cancellation) were reversed out, not
+  //   sold; they wrote cogs_entries only for the outbound-evidence guard.
+  // - returnedQty (customer returns): handled by updateSnapshotsForCostLayerChange
+  //   rewriting the refund-line snapshots, so the refund reversal already carries
+  //   the revalued cost — excluded here to avoid double-counting.
+  // - scjz.10: supplier-returned units ARE included. The late-cost delta on goods
+  //   returned to the supplier was previously dropped (excluded here, handled
+  //   nowhere). Goods that have left stock can't clear through transit (audit-o3yb),
+  //   so they ride the SAME self-contained P&L pair as sold goods — the retrospective
+  //   COGS-adjustment journal (DR cogsAccount / CR inventoryRevaluationAccount).
   const netConsumedQty = Prisma.Decimal.max(
     new Prisma.Decimal(0),
     consumedQty
       .sub(decimal(input.returnedQty))
-      .sub(decimal(input.supplierReturnedQty))
       .sub(decimal(input.manufacturingConsumedQty))
       .sub(decimal(input.reversalConsumedQty ?? 0)),
   )
