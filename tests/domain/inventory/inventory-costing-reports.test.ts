@@ -228,6 +228,33 @@ describe('inventory costing report aggregations', () => {
     assert.equal(productRow?.revenueBase, '300.000000')
   })
 
+  it('still counts revenue for matched rows that carry no revenue key', () => {
+    const rows: CogsAggregationInput[] = [
+      {
+        id: 'movement-1',
+        qty: '1',
+        cogsBase: '4',
+        productId: 'product-a',
+        sku: 'A-001',
+        productName: 'Widget A',
+        categoryName: 'Widgets',
+        warehouseId: null,
+        warehouseCode: null,
+        warehouseName: null,
+        customerName: null,
+        channel: null,
+        revenueKey: null,
+        revenueBase: '10',
+      },
+    ]
+
+    const [row] = aggregateCogsRows(rows, 'product')
+
+    assert.equal(row?.revenueBase, '10.000000')
+    assert.equal(row?.grossMarginBase, '6.000000')
+    assert.equal(row?.revenueCaptured, true)
+  })
+
   it('sorts COGS groups numerically rather than lexicographically', () => {
     const rows: CogsAggregationInput[] = [
       {

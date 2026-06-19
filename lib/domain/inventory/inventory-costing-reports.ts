@@ -747,6 +747,7 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
     qty: Decimal
     cogsBase: Decimal
     revenueCaptured: boolean
+    unkeyedRevenue: Decimal
     qtyByRevenueKey: Map<string, Decimal>
     movementIds: Set<string>
   }>()
@@ -758,6 +759,7 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
       qty: decimalZero(),
       cogsBase: decimalZero(),
       revenueCaptured: true,
+      unkeyedRevenue: decimalZero(),
       qtyByRevenueKey: new Map<string, Decimal>(),
       movementIds: new Set<string>(),
     }
@@ -767,6 +769,10 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
       existing.revenueCaptured = false
     } else if (input.revenueKey) {
       existing.qtyByRevenueKey.set(input.revenueKey, (existing.qtyByRevenueKey.get(input.revenueKey) ?? decimalZero()).add(toDecimal(input.qty)))
+    } else {
+      // Unkeyed revenue cannot be cross-group-deduped or qty-allocated; preserve
+      // the prior per-row behaviour of summing it directly into the group.
+      existing.unkeyedRevenue = existing.unkeyedRevenue.add(toDecimal(input.revenueBase))
     }
     existing.movementIds.add(input.id)
     groups.set(key, existing)
@@ -782,7 +788,7 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
         if (!line) return sum
         const share = line.totalQty.gt(0) ? line.revenue.mul(groupQty).div(line.totalQty) : line.revenue
         return sum.add(share)
-      }, decimalZero())
+      }, group.unkeyedRevenue)
       const revenueBase = group.revenueCaptured ? groupRevenue : null
       const grossMarginBase = revenueBase ? revenueBase.sub(group.cogsBase) : null
       const grossMarginPct = revenueBase && !revenueBase.isZero()
