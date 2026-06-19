@@ -33,6 +33,10 @@ type SalesOrderAccountingRow = {
   orderNumber: string | null
   externalOrderNumber: string | null
   status: string
+  // Optional so existing pure-evaluator callers/fixtures that don't supply it are
+  // treated as "unknown" (the check below fires only when paidAt is explicitly
+  // null — i.e. a payment reversal cleared it). The DB loader always selects it.
+  paidAt?: Date | string | null
   revenueDeferredDate: Date | string | null
   unearnedRevenueAmount: DecimalLike
   inventoryAllocatedDate: Date | string | null
@@ -322,6 +326,29 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     const hasA2 = order.inventoryAllocatedDate != null
     const postedShipments = order.shipments.filter((shipment) => shipment.shipmentJournalDate != null)
 
+    // A1 revenue deferral is only ever staged for a paid order (the daily batch
+    // selects paidAt != null), so a posted order whose paidAt is now null had its
+    // payment reversed (chargeback) without a compensating credit note — recognized
+    // revenue with no cash, otherwise invisible to reconciliation (scjz.42/.72).
+    const hasCompensatingCreditNote = order.refunds.some(
+      (refund) => refund.creditNoteNumber != null || refund.accountingCreditNoteId != null,
+    )
+    if ((hasA1 || hasA2 || postedShipments.length > 0) && order.paidAt === null && !hasCompensatingCreditNote) {
+      findings.push({
+        severity: 'critical',
+        code: 'revenue_posted_without_payment',
+        orderId: order.id,
+        message: `Sales order ${label} has posted revenue/allocation but paidAt is cleared and no compensating credit note exists — a reversed payment left recognized revenue without cash`,
+        details: {
+          status: order.status,
+          revenueDeferredDate: order.revenueDeferredDate,
+          inventoryAllocatedDate: order.inventoryAllocatedDate,
+          postedShipmentCount: postedShipments.length,
+          unearnedRevenueAmount: decimalToNumber(order.unearnedRevenueAmount),
+        },
+      })
+    }
+
     if (hasA1) {
       const expectedReferenceId = expectedDailyBatchReference('A1', order.revenueDeferredDate)
       const hasSyncEvidence = expectedReferenceId
@@ -585,6 +612,7 @@ export async function collectAccountingInvariantRows(
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
+        paidAt: true,
         revenueDeferredDate: true,
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
