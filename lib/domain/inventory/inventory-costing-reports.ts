@@ -942,6 +942,34 @@ export function aggregateInventoryTurnoverRows(
     })
 }
 
+/**
+ * Window-wide average inventory value for the turnover report total row.
+ *
+ * The per-group rows each divide their snapshot value total by that group's own
+ * distinct-day count, so summing the per-group averages (different denominators)
+ * yields a wrong portfolio daily average and turnover ratio (cogs-audit scjz.46).
+ * Instead, build a single window-wide day→value map (summing every group's share
+ * onto the same day) and divide by the distinct snapshot days across the window —
+ * mirroring getAverageInventoryValueBase in inventory-snapshot.ts.
+ */
+export function aggregateInventoryTurnoverTotalAverage(
+  snapshotInputs: InventoryTurnoverSnapshotAggregationInput[],
+  groupBy: InventoryTurnoverGroupBy,
+): { averageInventoryValueBase: Decimal; snapshotDayCount: number } {
+  const valueByDay = new Map<string, Decimal>()
+  for (const input of snapshotInputs) {
+    const day = dateOnly(input.snapshotDate)
+    for (const meta of turnoverGroupMetas(input, groupBy)) {
+      valueByDay.set(day, (valueByDay.get(day) ?? decimalZero()).add(toDecimal(input.inventoryValueBase).mul(meta.share)))
+    }
+  }
+  if (valueByDay.size === 0) {
+    return { averageInventoryValueBase: decimalZero(), snapshotDayCount: 0 }
+  }
+  const total = [...valueByDay.values()].reduce((sum, value) => sum.add(value), decimalZero())
+  return { averageInventoryValueBase: total.div(valueByDay.size), snapshotDayCount: valueByDay.size }
+}
+
 export function aggregateLandedCostMethods(inputs: LandedCostAggregationInput[]): LandedCostReport['methodSummary'] {
   const groups = new Map<LandedCostMethod, { count: number; goodsValueBase: Decimal; landedValueBase: Decimal }>()
   for (const input of inputs) {
@@ -1392,13 +1420,14 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
   const missingSupplierSnapshotRowCount = groupBy === 'supplier'
     ? snapshotInputs.filter((row) => row.suppliers.length === 0).length
     : 0
-  const totals = allRows.reduce(
-    (sum, row) => ({
-      cogsBase: sum.cogsBase.add(toDecimal(row.cogsBase)),
-      averageInventoryValueBase: sum.averageInventoryValueBase.add(toDecimal(row.averageInventoryValueBase)),
-    }),
-    { cogsBase: decimalZero(), averageInventoryValueBase: decimalZero() },
-  )
+  // Total average inventory value must use a window-wide daily total / distinct
+  // snapshot days, not the sum of per-group averages (those divide by different
+  // per-group day counts) (cogs-audit scjz.46).
+  const totalAverage = aggregateInventoryTurnoverTotalAverage(snapshotInputs, groupBy)
+  const totals = {
+    cogsBase: allRows.reduce((sum, row) => sum.add(toDecimal(row.cogsBase)), decimalZero()),
+    averageInventoryValueBase: totalAverage.averageInventoryValueBase,
+  }
   const turnover = calculateInventoryTurnover({
     cogsBase: totals.cogsBase,
     averageInventoryValueBase: totals.averageInventoryValueBase,
@@ -1422,7 +1451,7 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
       turnoverRatio: turnover.turnoverRatio,
       daysInventoryOutstanding: turnover.daysInventoryOutstanding,
       cogsEntryCount: mappedSupplierCogsEntryCount,
-      snapshotDayCount: Math.max(0, ...allRows.map((row) => row.snapshotDayCount)),
+      snapshotDayCount: totalAverage.snapshotDayCount,
     },
     notices: [
       cogsRows.length === 0
