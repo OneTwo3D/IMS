@@ -272,7 +272,11 @@ export async function applyStockAdjustment({
 
   if (accountCode) {
     const settings = await getAccountingSettings()
-    const unitCost = await getProductUnitCost(tx, productId)
+    // For additions, value the GL journal at the SAME unit cost the movement and
+    // cost layer were booked at (additionUnitCost), so Inventory GL ties to the
+    // cost-layer/stock-movement value rather than a blended product average
+    // (cogs-audit scjz.2 / codex review). Removals keep the product-average basis.
+    const unitCost = isAddition ? (additionUnitCost ?? 0) : await getProductUnitCost(tx, productId)
     const journal = buildInventoryAdjustmentJournal({
       reasonAccountCode: accountCode,
       inventoryAccountCode: settings.inventoryAccount,
@@ -499,6 +503,10 @@ export type BulkAdjustLine = {
   warehouseId: string
   reasonId: string   // '' = no reason selected
   qty: number
+  // Optional explicit base-currency unit cost for a positive line. Required (per
+  // cogs-audit scjz.2) when the product has no derivable cost basis, otherwise the
+  // line throws rather than booking £0 stock. Omit to use the derived average.
+  unitCostBase?: number | null
 }
 
 export type BulkAdjustFormState = {
@@ -538,6 +546,7 @@ export async function bulkAdjustStock(
           qty: line.qty,
           reasonId: line.reasonId,
           note: reason?.name ?? null,
+          unitCostBase: line.unitCostBase,
         })
       }
     })

@@ -75,7 +75,7 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
     if (valid.length === 0) { setResult({ message: 'Enter a non-zero quantity for at least one product.' }); return }
     setSaving(true)
     setResult(null)
-    const res = await bulkAdjustStock(valid.map(({ productId, warehouseId, reasonId, qty }) => ({ productId, warehouseId, reasonId, qty })))
+    const res = await bulkAdjustStock(valid.map(({ productId, warehouseId, reasonId, qty, unitCostBase }) => ({ productId, warehouseId, reasonId, qty, unitCostBase })))
     setSaving(false)
     setResult(res)
     if (res.success) {
@@ -130,15 +130,16 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
           ) : (
             <div className="border border-border rounded-lg overflow-x-auto">
               <div className="min-w-[500px]">
-              <div className="grid grid-cols-[2fr_1fr_1fr_auto_auto] gap-3 px-3 py-2 bg-muted/50 text-xs font-medium text-muted-foreground border-b border-border">
+              <div className="grid grid-cols-[2fr_1fr_1fr_auto_auto_auto] gap-3 px-3 py-2 bg-muted/50 text-xs font-medium text-muted-foreground border-b border-border">
                 <span>Product</span>
                 <span>Warehouse</span>
                 <span>Reason</span>
                 <span className="w-28 text-right">Qty (+ / −)</span>
+                <span className="w-24 text-right">Unit cost</span>
                 <span className="w-8" />
               </div>
               {lines.map((line) => (
-                <div key={line.key} className="grid grid-cols-[2fr_1fr_1fr_auto_auto] gap-3 px-3 py-2.5 items-center border-b border-border/50 last:border-0 hover:bg-muted/20">
+                <div key={line.key} className="grid grid-cols-[2fr_1fr_1fr_auto_auto_auto] gap-3 px-3 py-2.5 items-center border-b border-border/50 last:border-0 hover:bg-muted/20">
                   <div className="min-w-0">
                     <ProductLink productId={line.productId} sku={line.productSku} name={line.productName} />
                   </div>
@@ -159,6 +160,14 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
                     onChange={(e) => updateLine(line.key, 'qty', Number(e.target.value) || 0)}
                     placeholder="0"
                     className={`h-8 w-28 text-right text-sm font-mono ${line.qty > 0 ? 'text-green-700 dark:text-green-400' : line.qty < 0 ? 'text-destructive' : ''}`}
+                  />
+                  <Input
+                    type="number" step="any" min="0"
+                    value={line.unitCostBase == null ? '' : line.unitCostBase}
+                    onChange={(e) => updateLine(line.key, 'unitCostBase', e.target.value === '' ? null : (Number(e.target.value) || 0))}
+                    placeholder="avg"
+                    title="Unit cost (base currency). Required for a positive line when the product has no existing cost; 0 for samples."
+                    className="h-8 w-24 text-right text-sm font-mono"
                   />
                   <Button type="button" variant="ghost" size="icon" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="h-8 w-8 text-muted-foreground hover:text-destructive">
                     <X className="h-3.5 w-3.5" />
