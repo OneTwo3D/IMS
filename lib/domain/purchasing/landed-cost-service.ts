@@ -608,11 +608,12 @@ export function computeGrossUnitCostBaseByLine(params: {
       if (method === 'BY_WEIGHT') warnWeightFallback('computeGrossUnitCostBaseByLine')
       basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
       for (const entry of bases) entry.base = new Prisma.Decimal(1)
-    } else {
+    } else if (params.onWeightZeroLines) {
+      // Opt-in only: this helper also runs on read-only cost previews
+      // (getPurchaseOrder, receipt validation), so it must not persist a warning
+      // by default. The recalc paths surface the diagnostic via result.warnings.
       const zeroWeightLineIds = zeroWeightEligibleLineIds(method, bases)
-      if (zeroWeightLineIds.length > 0) {
-        (params.onWeightZeroLines ?? ((ids) => warnWeightZeroLines('computeGrossUnitCostBaseByLine', ids)))(zeroWeightLineIds)
-      }
+      if (zeroWeightLineIds.length > 0) params.onWeightZeroLines(zeroWeightLineIds)
     }
     for (const entry of bases) {
       const share = amountBase.mul(entry.base).div(basisTotal)
