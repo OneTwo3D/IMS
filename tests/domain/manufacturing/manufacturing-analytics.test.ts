@@ -51,6 +51,8 @@ function assemblyOrder(overrides: Record<string, unknown> = {}) {
     completedAt: new Date('2026-05-04T00:00:00Z'),
     createdAt: new Date('2026-05-01T00:00:00Z'),
     warehouseId: 'wh-main',
+    outputProductId: 'fg-1',
+    componentSnapshot: null,
     outputProduct: { sku: 'FG-1', name: 'Finished good' },
     warehouse: { code: 'MAIN', name: 'Main warehouse' },
     bom: {
@@ -219,6 +221,8 @@ test('WIP value includes consumed component value and ManufacturingCostLine tota
       completedAt: true,
       createdAt: true,
       warehouseId: true,
+      outputProductId: true,
+      componentSnapshot: true,
       outputProduct: { select: { sku: true, name: true } },
       warehouse: { select: { code: true, name: true } },
       manufacturingCostLines: { select: { amountBase: true } },
@@ -288,6 +292,109 @@ test('WIP values reserved not-yet-consumed components at weighted-average curren
     warehouseId: { in: ['wh-main'] },
     remainingQty: { gt: 0 },
   })
+})
+
+test('WIP reservation walks layers FIFO, not weighted-average (scjz.31)', async () => {
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        orders: [
+          assemblyOrder({
+            id: 'po-fifo',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '1',
+            qtyProduced: '0',
+            manufacturingCostLines: [],
+            // one component, 1 per unit -> reserve 1 unit
+            bom: { items: [{ componentProductId: 'component-a', qty: '1', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+          }),
+        ],
+        movements: [],
+        // oldest layer is cheap; weighted-average would be ~50.5, FIFO is 1.
+        costLayers: [
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '1' },
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '100' },
+        ],
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  assert.equal(report.rows[0].reservedComponentValueBase, '1')
+  assert.equal(report.rows[0].wipValueBase, '1')
+})
+
+test('WIP reservation uses the frozen componentSnapshot over the live BOM (scjz.31)', async () => {
+  const costLayerArgs: unknown[] = []
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        orders: [
+          assemblyOrder({
+            id: 'po-snap',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '2',
+            qtyProduced: '0',
+            manufacturingCostLines: [],
+            // live BOM says component-a, but the order was started against component-c.
+            bom: { items: [{ componentProductId: 'component-a', qty: '5', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+            componentSnapshot: [{ componentId: 'component-c', qty: 3 }],
+          }),
+        ],
+        movements: [],
+        costLayers: [
+          { productId: 'component-c', warehouseId: 'wh-main', remainingQty: '100', unitCostBase: '4' },
+        ],
+        costLayerArgs,
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  // Snapshot: 3 per unit * 2 planned = 6 units @ 4 = 24 (component-a is ignored).
+  assert.equal(report.rows[0].reservedComponentValueBase, '24')
+  assert.deepEqual((costLayerArgs[0] as { where: { productId: unknown } }).where.productId, { in: ['component-c'] })
+})
+
+test('WIP values an in-progress disassembly from the output product, not its BOM (scjz.31)', async () => {
+  const costLayerArgs: unknown[] = []
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        orders: [
+          assemblyOrder({
+            id: 'po-disasm',
+            orderType: 'DISASSEMBLY',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '3',
+            qtyProduced: '0',
+            outputProductId: 'fg-disasm',
+            manufacturingCostLines: [],
+            // BOM components are recovered at completion, not reserved -> must be ignored.
+            bom: { items: [{ componentProductId: 'component-a', qty: '5', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+          }),
+        ],
+        movements: [],
+        costLayers: [
+          { productId: 'fg-disasm', warehouseId: 'wh-main', remainingQty: '50', unitCostBase: '7' },
+          // a component layer that must NOT be drawn on
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '50', unitCostBase: '999' },
+        ],
+        costLayerArgs,
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  // 3 output units reserved @ 7 = 21; BOM component layer untouched.
+  assert.equal(report.rows[0].reservedComponentValueBase, '21')
+  assert.deepEqual((costLayerArgs[0] as { where: { productId: unknown } }).where.productId, { in: ['fg-disasm'] })
 })
 
 test('production variance scopes by completedAt and consumption-capable statuses', async () => {

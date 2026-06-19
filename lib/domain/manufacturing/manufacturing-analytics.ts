@@ -2,6 +2,7 @@ import { Prisma, ProductionOrderStatus, ProductionOrderType, StockMovementType }
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, elapsedDaysDecimal, exclusiveEndOfUtcDay, parseOptionalDateOnly } from '@/lib/domain/math/date-window'
+import { parseProductionOrderComponentSnapshot } from '@/lib/domain/manufacturing/component-consumption'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
@@ -121,6 +122,8 @@ type ProductionVarianceOrderRow = ProductionOrderBaseRow & {
 
 type WipProductionOrderRow = ProductionOrderBaseRow & {
   warehouseId: string
+  outputProductId: string
+  componentSnapshot: unknown
   manufacturingCostLines: Array<{ amountBase: DecimalInput }>
   bom: { items: Array<{ componentProductId: string; qty: DecimalInput }> } | null
 }
@@ -136,36 +139,83 @@ function costPairKey(productId: string, warehouseId: string): string {
   return `${productId}::${warehouseId}`
 }
 
+type FifoCostLayer = { remainingQty: Prisma.Decimal; unitCostBase: Prisma.Decimal }
+
 /**
- * Weighted-average current cost per (product, warehouse) from open cost layers —
- * the cost basis used to value reserved-but-not-yet-consumed WIP components
- * (scjz.31). Batched into one query to avoid an N+1 over components.
+ * Open cost layers per (product, warehouse) in FIFO consumption order
+ * (receivedAt ASC, id ASC) — mirrors consumeFifoLayersStrict, which is how
+ * completion actually values component/output consumption. Batched into one
+ * query to avoid an N+1 over the reserved products (scjz.31).
  */
-async function loadCurrentAverageCosts(
+async function loadFifoCostLayersByPair(
   client: ManufacturingAnalyticsClient,
   pairs: Array<{ productId: string; warehouseId: string }>,
-): Promise<Map<string, Prisma.Decimal>> {
-  const avg = new Map<string, Prisma.Decimal>()
-  if (pairs.length === 0) return avg
+): Promise<Map<string, FifoCostLayer[]>> {
+  const byPair = new Map<string, FifoCostLayer[]>()
+  if (pairs.length === 0) return byPair
   const productIds = [...new Set(pairs.map((pair) => pair.productId))]
   const warehouseIds = [...new Set(pairs.map((pair) => pair.warehouseId))]
   const layers = await client.costLayer.findMany({
     where: { productId: { in: productIds }, warehouseId: { in: warehouseIds }, remainingQty: { gt: 0 } },
     select: { productId: true, warehouseId: true, remainingQty: true, unitCostBase: true },
+    orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
   }) as CostLayerRow[]
-  const totals = new Map<string, { qty: Prisma.Decimal; value: Prisma.Decimal }>()
   for (const layer of layers) {
     const key = costPairKey(layer.productId, layer.warehouseId)
-    const current = totals.get(key) ?? { qty: new Prisma.Decimal(0), value: new Prisma.Decimal(0) }
-    const qty = toDecimal(layer.remainingQty)
-    current.qty = current.qty.add(qty)
-    current.value = current.value.add(qty.mul(toDecimal(layer.unitCostBase)))
-    totals.set(key, current)
+    const list = byPair.get(key) ?? []
+    list.push({ remainingQty: toDecimal(layer.remainingQty), unitCostBase: toDecimal(layer.unitCostBase) })
+    byPair.set(key, list)
   }
-  for (const [key, { qty, value }] of totals) {
-    if (qty.gt(0)) avg.set(key, value.div(qty))
+  return byPair
+}
+
+/**
+ * Value a reservation of `qty` units against FIFO-ordered open layers, matching
+ * the cost completion will capitalise. A reservation larger than current on-hand
+ * (completion would later block on it) values the uncovered remainder at the
+ * newest layer's unit cost, or zero when no layers exist.
+ */
+function valueFifoReservation(layers: FifoCostLayer[] | undefined, qty: Prisma.Decimal): Prisma.Decimal {
+  if (qty.lte(0)) return new Prisma.Decimal(0)
+  let remaining = qty
+  let value = new Prisma.Decimal(0)
+  let lastUnitCost = new Prisma.Decimal(0)
+  for (const layer of layers ?? []) {
+    if (remaining.lte(0)) break
+    const take = Prisma.Decimal.min(remaining, layer.remainingQty)
+    value = value.add(take.mul(layer.unitCostBase))
+    remaining = remaining.sub(take)
+    lastUnitCost = layer.unitCostBase
   }
-  return avg
+  if (remaining.gt(0)) value = value.add(remaining.mul(lastUnitCost))
+  return value
+}
+
+/**
+ * Reserved (committed-but-not-yet-consumed) quantity per product for an
+ * IN_PROGRESS order. ASSEMBLY reserves its BOM components — using the frozen
+ * componentSnapshot so a mid-production component edit doesn't change the
+ * valuation basis (matches completion), falling back to the live BOM only for
+ * orders started before snapshots existed. DISASSEMBLY instead reserves the
+ * finished good being broken down; its components are recovered at completion,
+ * not reserved (scjz.31).
+ */
+function reservationRequirementsByProduct(order: WipProductionOrderRow): Map<string, Prisma.Decimal> {
+  const plannedQty = toDecimal(order.qtyPlanned)
+  const reserved = new Map<string, Prisma.Decimal>()
+  if (order.orderType === ProductionOrderType.DISASSEMBLY) {
+    if (plannedQty.gt(0)) reserved.set(order.outputProductId, plannedQty)
+    return reserved
+  }
+  const components: Array<{ componentId: string; qty: DecimalInput }> =
+    parseProductionOrderComponentSnapshot(order.componentSnapshot)
+    ?? (order.bom?.items ?? []).map((item) => ({ componentId: item.componentProductId, qty: item.qty }))
+  for (const comp of components) {
+    const requirementQty = toDecimal(comp.qty).mul(plannedQty)
+    if (requirementQty.lte(0)) continue
+    reserved.set(comp.componentId, (reserved.get(comp.componentId) ?? new Prisma.Decimal(0)).add(requirementQty))
+  }
+  return reserved
 }
 
 type ProductionOutMovementRow = {
@@ -483,6 +533,8 @@ export async function getWipReport(
       completedAt: true,
       createdAt: true,
       warehouseId: true,
+      outputProductId: true,
+      componentSnapshot: true,
       outputProduct: { select: { sku: true, name: true } },
       warehouse: { select: { code: true, name: true } },
       manufacturingCostLines: { select: { amountBase: true } },
@@ -495,19 +547,21 @@ export async function getWipReport(
 
   const movements = await loadProductionOutMovements(client, orders.map((order) => order.id))
   const movementTotals = movementTotalsByOrder(movements)
-  // Per-component consumed qty so reserved value covers only the not-yet-consumed
-  // portion (an IN_PROGRESS order may have partially consumed components) (scjz.31).
+  // Per-product consumed qty so reserved value covers only the not-yet-consumed
+  // portion (an IN_PROGRESS order may have partially consumed) (scjz.31).
   const consumedByOrderProduct = movementTotalsByOrderAndProduct(movements)
+  // Reservation requirements per order, used both to batch-load the relevant
+  // cost layers and to value each reservation FIFO below.
+  const reservedByOrder = new Map<string, Map<string, Prisma.Decimal>>()
   const costPairs = new Map<string, { productId: string; warehouseId: string }>()
   for (const order of orders) {
-    for (const item of order.bom?.items ?? []) {
-      costPairs.set(costPairKey(item.componentProductId, order.warehouseId), {
-        productId: item.componentProductId,
-        warehouseId: order.warehouseId,
-      })
+    const requirements = reservationRequirementsByProduct(order)
+    reservedByOrder.set(order.id, requirements)
+    for (const productId of requirements.keys()) {
+      costPairs.set(costPairKey(productId, order.warehouseId), { productId, warehouseId: order.warehouseId })
     }
   }
-  const avgCostByPair = await loadCurrentAverageCosts(client, [...costPairs.values()])
+  const layersByPair = await loadFifoCostLayersByPair(client, [...costPairs.values()])
   const rows: WipReportRow[] = []
   let manufacturingCostTotal = new Prisma.Decimal(0)
   let consumedComponentValueTotal = new Prisma.Decimal(0)
@@ -523,16 +577,17 @@ export async function getWipReport(
     const plannedQty = toDecimal(order.qtyPlanned)
     const producedQty = toDecimal(order.qtyProduced)
 
-    // Value the reserved components still to be consumed at current cost, so WIP
-    // reflects committed component value before completion posts PRODUCTION_OUT.
+    // Value the reservation still to be consumed at the FIFO cost completion
+    // will capitalise, so WIP reflects committed value before completion posts
+    // PRODUCTION_OUT.
     let reservedComponentValueBase = new Prisma.Decimal(0)
-    for (const item of order.bom?.items ?? []) {
-      const requirementQty = toDecimal(item.qty).mul(plannedQty)
-      const consumedQty = consumedByOrderProduct.get(movementKey(order.id, item.componentProductId))?.qty
+    for (const [productId, requirementQty] of reservedByOrder.get(order.id) ?? []) {
+      const consumedQty = consumedByOrderProduct.get(movementKey(order.id, productId))?.qty
         ?? new Prisma.Decimal(0)
       const remainingQty = Prisma.Decimal.max(new Prisma.Decimal(0), requirementQty.sub(consumedQty))
-      const unitCost = avgCostByPair.get(costPairKey(item.componentProductId, order.warehouseId)) ?? new Prisma.Decimal(0)
-      reservedComponentValueBase = reservedComponentValueBase.add(remainingQty.mul(unitCost))
+      reservedComponentValueBase = reservedComponentValueBase.add(
+        valueFifoReservation(layersByPair.get(costPairKey(productId, order.warehouseId)), remainingQty),
+      )
     }
 
     const wipValueBase = manufacturingCostBase.add(movementTotal.valueBase).add(reservedComponentValueBase)
