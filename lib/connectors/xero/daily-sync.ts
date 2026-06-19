@@ -51,7 +51,7 @@ type JournalLinePayload = {
   debit?: number
   credit?: number
 }
-type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | 'integrationOutbox'>
+type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | 'integrationOutbox' | 'activityLog'>
 
 const XERO_DAILY_BATCH_LOCK_KEY = 4_112_208_031
 const XERO_CONNECTOR = 'xero'
@@ -223,6 +223,10 @@ async function createPendingSyncLog(
   await scheduleXeroAccountingOutbox(tx, {
     accountingSyncLogId: log.id,
   })
+  // Mirror failure must not abort the whole daily batch: the sync log + outbox
+  // are already created (and will post), so swallow + warn here exactly as
+  // queueAccountingSyncTx does, instead of rolling back every order in the group
+  // (cogs-audit scjz.40).
   await mirrorAccountingSyncLogToEvent(tx, {
     syncLogId: log.id,
     connector: XERO_CONNECTOR,
@@ -232,7 +236,15 @@ async function createPendingSyncLog(
     payload: params.payload,
     currency: params.currency,
     status: 'PENDING',
-  })
+  }).catch((mirrorError: unknown) => tx.activityLog.create({
+    data: {
+      entityType: 'SYSTEM',
+      action: 'accounting_event_mirror_error',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Daily-batch sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
+    },
+  }).then(() => undefined))
 }
 
 async function lockCostLayers(
