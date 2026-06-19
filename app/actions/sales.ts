@@ -25,7 +25,7 @@ import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { decimalToNumber } from '@/lib/decimal'
-import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -2272,6 +2272,7 @@ export async function addPayment(input: {
           status: true,
           currency: true,
           totalForeign: true,
+          totalBase: true,
           fxRateToBase: true,
           paidAt: true,
           invoiceNumber: true,
@@ -2384,6 +2385,12 @@ export async function addPayment(input: {
             amountForeign: input.amount,
             bookedRateToBase: Number(txResult.so.fxRateToBase),
             settlementRateToBase: txResult.settlementRateToBase,
+            // Booked base for this payment = the order's stored base prorated by the
+            // settled foreign share, so realised FX measures against the real AR
+            // carrying value rather than a re-derived figure (cogs-audit scjz.55).
+            bookedBase: Number(txResult.so.totalForeign) > 0
+              ? multiplyMoney(txResult.so.totalBase, input.amount).div(toDecimal(txResult.so.totalForeign)).toNumber()
+              : undefined,
           })
           const lines = buildRealisedFxJournal({
             side: 'receivable',

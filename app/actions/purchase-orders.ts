@@ -3215,6 +3215,7 @@ export async function markBillPaid(
         poId: true,
         invoiceNumber: true,
         totalForeign: true,
+        totalBase: true,
         fxRateToBase: true,
         paidAt: true,
         accountingInvoiceId: true,
@@ -3319,6 +3320,12 @@ export async function markBillPaid(
           amountForeign: paymentAmount,
           bookedRateToBase: Number(invoice.fxRateToBase),
           settlementRateToBase,
+          // Booked base for the settled portion = stored totalBase prorated by the
+          // settled foreign share, so realised FX measures against the real AP
+          // carrying value rather than a re-derived figure (cogs-audit scjz.55).
+          bookedBase: Number(invoice.totalForeign) > 0
+            ? multiplyMoney(invoice.totalBase, paymentAmount).div(toDecimal(invoice.totalForeign)).toNumber()
+            : undefined,
         })
         const lines = buildRealisedFxJournal({
           side: 'payable',
