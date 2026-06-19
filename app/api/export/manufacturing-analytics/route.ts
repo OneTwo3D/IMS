@@ -60,7 +60,7 @@ export async function GET(req: NextRequest) {
         const report = await getWipReport(filters, { paginate: false })
         const oversized = rejectOversizedExport(report.pageInfo.totalRows)
         if (oversized) return oversized
-        return csvResponse(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'startedAt', 'scheduledAt', 'daysSinceStart', 'plannedOutputQty', 'producedQty', 'remainingOutputQty', 'manufacturingCostBase', 'consumedComponentValueBase', 'expectedOutputValueBase', 'wipValueBase', 'costLineCount']), `wip-${date}.csv`)
+        return csvResponse(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'startedAt', 'scheduledAt', 'daysSinceStart', 'plannedOutputQty', 'producedQty', 'remainingOutputQty', 'manufacturingCostBase', 'consumedComponentValueBase', 'reservedComponentValueBase', 'expectedOutputValueBase', 'wipValueBase', 'costLineCount']), `wip-${date}.csv`)
       }
       default:
         return NextResponse.json({ error: 'Unknown manufacturing analytics export type' }, { status: 400 })

@@ -11,8 +11,10 @@ import {
 function manufacturingClient(input: {
   orders: unknown[]
   movements: unknown[]
+  costLayers?: unknown[]
   productionOrderArgs?: unknown[]
   stockMovementArgs?: unknown[]
+  costLayerArgs?: unknown[]
 }): ManufacturingAnalyticsClient {
   return {
     productionOrder: {
@@ -25,6 +27,12 @@ function manufacturingClient(input: {
       async findMany(args?: unknown) {
         input.stockMovementArgs?.push(args)
         return input.movements
+      },
+    },
+    costLayer: {
+      async findMany(args?: unknown) {
+        input.costLayerArgs?.push(args)
+        return input.costLayers ?? []
       },
     },
   }
@@ -42,7 +50,17 @@ function assemblyOrder(overrides: Record<string, unknown> = {}) {
     startedAt: new Date('2026-05-03T00:00:00Z'),
     completedAt: new Date('2026-05-04T00:00:00Z'),
     createdAt: new Date('2026-05-01T00:00:00Z'),
-    outputProduct: { sku: 'FG-1', name: 'Finished good' },
+    warehouseId: 'wh-main',
+    outputProductId: 'fg-1',
+    componentSnapshot: null,
+    outputProduct: {
+      sku: 'FG-1',
+      name: 'Finished good',
+      productComponents: [
+        { componentId: 'component-a', qty: '2' },
+        { componentId: 'component-b', qty: '1' },
+      ],
+    },
     warehouse: { code: 'MAIN', name: 'Main warehouse' },
     bom: {
       items: [
@@ -209,7 +227,10 @@ test('WIP value includes consumed component value and ManufacturingCostLine tota
       startedAt: true,
       completedAt: true,
       createdAt: true,
-      outputProduct: { select: { sku: true, name: true } },
+      warehouseId: true,
+      outputProductId: true,
+      componentSnapshot: true,
+      outputProduct: { select: { sku: true, name: true, productComponents: { select: { componentId: true, qty: true } } } },
       warehouse: { select: { code: true, name: true } },
       manufacturingCostLines: { select: { amountBase: true } },
     },
@@ -223,6 +244,212 @@ test('WIP value includes consumed component value and ManufacturingCostLine tota
   assert.equal(report.totals.wipValueBase, '43')
   assert.equal(report.totals.consumedComponentValueBase, '30')
   assert.equal(report.totals.expectedOutputValueBase, '43')
+})
+
+test('WIP values reserved not-yet-consumed components at weighted-average current cost (scjz.31)', async () => {
+  const costLayerArgs: unknown[] = []
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        orders: [
+          assemblyOrder({
+            id: 'po-wip',
+            reference: 'MO-WIP',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '10',
+            qtyProduced: '0',
+            startedAt: new Date('2026-05-29T00:00:00Z'),
+            manufacturingCostLines: [{ amountBase: '50' }],
+          }),
+        ],
+        // component-b partially consumed (4 of the 10 required); component-a not yet started.
+        movements: [
+          { referenceId: 'po-wip', productId: 'component-b', qty: '4', totalValueBase: '12' },
+        ],
+        // component-a weighted-average cost = (10*4 + 10*6)/20 = 5; component-b = 3.
+        costLayers: [
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '4' },
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '6' },
+          { productId: 'component-b', warehouseId: 'wh-main', remainingQty: '50', unitCostBase: '3' },
+        ],
+        costLayerArgs,
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  assert.equal(report.rows.length, 1)
+  // Reserved = component-a (20 req - 0 consumed) * 5 + component-b (10 req - 4 consumed) * 3
+  //          = 100 + 18 = 118
+  assert.equal(report.rows[0].reservedComponentValueBase, '118')
+  assert.equal(report.rows[0].consumedComponentValueBase, '12')
+  assert.equal(report.rows[0].manufacturingCostBase, '50')
+  // WIP = manufacturing 50 + consumed 12 + reserved 118 = 180
+  assert.equal(report.rows[0].wipValueBase, '180')
+  assert.equal(report.rows[0].expectedOutputValueBase, '180')
+  assert.equal(report.totals.reservedComponentValueBase, '118')
+  assert.equal(report.totals.wipValueBase, '180')
+  // Cost layers fetched in a single batched query scoped to the BOM components.
+  assert.equal(costLayerArgs.length, 1)
+  assert.deepEqual((costLayerArgs[0] as { where: unknown }).where, {
+    remainingQty: { gt: 0 },
+    OR: [
+      { productId: 'component-a', warehouseId: 'wh-main' },
+      { productId: 'component-b', warehouseId: 'wh-main' },
+    ],
+  })
+})
+
+test('WIP reservation walks layers FIFO, not weighted-average (scjz.31)', async () => {
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        orders: [
+          assemblyOrder({
+            id: 'po-fifo',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '1',
+            qtyProduced: '0',
+            manufacturingCostLines: [],
+            // one component, 1 per unit -> reserve 1 unit
+            outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '1' }] },
+          }),
+        ],
+        movements: [],
+        // oldest layer is cheap; weighted-average would be ~50.5, FIFO is 1.
+        costLayers: [
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '1' },
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '100' },
+        ],
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  assert.equal(report.rows[0].reservedComponentValueBase, '1')
+  assert.equal(report.rows[0].wipValueBase, '1')
+})
+
+test('WIP reservation uses the frozen componentSnapshot over the live BOM (scjz.31)', async () => {
+  const costLayerArgs: unknown[] = []
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        orders: [
+          assemblyOrder({
+            id: 'po-snap',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '2',
+            qtyProduced: '0',
+            manufacturingCostLines: [],
+            // live components say component-a, but the order was started against component-c.
+            outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '5' }] },
+            componentSnapshot: [{ componentId: 'component-c', qty: 3 }],
+          }),
+        ],
+        movements: [],
+        costLayers: [
+          { productId: 'component-c', warehouseId: 'wh-main', remainingQty: '100', unitCostBase: '4' },
+        ],
+        costLayerArgs,
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  // Snapshot: 3 per unit * 2 planned = 6 units @ 4 = 24 (component-a is ignored).
+  assert.equal(report.rows[0].reservedComponentValueBase, '24')
+  assert.deepEqual((costLayerArgs[0] as { where: { OR: unknown } }).where.OR, [{ productId: 'component-c', warehouseId: 'wh-main' }])
+})
+
+test('WIP values an in-progress disassembly from the output product, not its BOM (scjz.31)', async () => {
+  const costLayerArgs: unknown[] = []
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        orders: [
+          assemblyOrder({
+            id: 'po-disasm',
+            orderType: 'DISASSEMBLY',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '3',
+            qtyProduced: '0',
+            outputProductId: 'fg-disasm',
+            manufacturingCostLines: [],
+            // BOM components are recovered at completion, not reserved -> must be ignored.
+            bom: { items: [{ componentProductId: 'component-a', qty: '5', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+          }),
+        ],
+        movements: [],
+        costLayers: [
+          { productId: 'fg-disasm', warehouseId: 'wh-main', remainingQty: '50', unitCostBase: '7' },
+          // a component layer that must NOT be drawn on
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '50', unitCostBase: '999' },
+        ],
+        costLayerArgs,
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  // 3 output units reserved @ 7 = 21; BOM component layer untouched.
+  assert.equal(report.rows[0].reservedComponentValueBase, '21')
+  assert.deepEqual((costLayerArgs[0] as { where: { OR: unknown } }).where.OR, [{ productId: 'fg-disasm', warehouseId: 'wh-main' }])
+})
+
+test('WIP depletes shared FIFO layers across in-progress orders (scjz.31)', async () => {
+  const report = await getWipReport(
+    {},
+    {},
+    {
+      client: manufacturingClient({
+        // Two orders, each reserving 10 of component-a in wh-main, started in order.
+        orders: [
+          assemblyOrder({
+            id: 'po-early',
+            reference: 'MO-EARLY',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '10',
+            qtyProduced: '0',
+            startedAt: new Date('2026-05-01T00:00:00Z'),
+            manufacturingCostLines: [],
+            outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '1' }] },
+          }),
+          assemblyOrder({
+            id: 'po-late',
+            reference: 'MO-LATE',
+            status: 'IN_PROGRESS',
+            qtyPlanned: '10',
+            qtyProduced: '0',
+            startedAt: new Date('2026-05-02T00:00:00Z'),
+            manufacturingCostLines: [],
+            outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '1' }] },
+          }),
+        ],
+        movements: [],
+        costLayers: [
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '1' },
+          { productId: 'component-a', warehouseId: 'wh-main', remainingQty: '10', unitCostBase: '100' },
+        ],
+      }),
+      now: () => new Date('2026-06-03T00:00:00Z'),
+    },
+  )
+
+  const early = report.rows.find((row) => row.productionOrderReference === 'MO-EARLY')
+  const late = report.rows.find((row) => row.productionOrderReference === 'MO-LATE')
+  // Earliest-started order takes the cheap layer; the later one takes the next.
+  assert.equal(early?.reservedComponentValueBase, '10')
+  assert.equal(late?.reservedComponentValueBase, '1000')
+  assert.equal(report.totals.reservedComponentValueBase, '1010')
 })
 
 test('production variance scopes by completedAt and consumption-capable statuses', async () => {
@@ -373,6 +600,34 @@ test('source-row caps surface as typed actionable errors', async () => {
     ),
     (error) => error instanceof ManufacturingAnalyticsSourceLimitError &&
       error.message === 'Production variance source rows exceed 50,000; narrow the filters and retry.',
+  )
+})
+
+test('WIP cost-layer scan is bounded by the source-row cap', async () => {
+  await assert.rejects(
+    () => getWipReport(
+      {},
+      {},
+      {
+        client: manufacturingClient({
+          orders: [
+            assemblyOrder({
+              id: 'po-wip',
+              status: 'IN_PROGRESS',
+              qtyPlanned: '1',
+              outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '1' }] },
+            }),
+          ],
+          movements: [],
+          costLayers: Array.from({ length: 50001 }, () => ({
+            productId: 'component-a', warehouseId: 'wh-main', remainingQty: '1', unitCostBase: '1',
+          })),
+        }),
+        now: () => new Date('2026-06-03T00:00:00Z'),
+      },
+    ),
+    (error) => error instanceof ManufacturingAnalyticsSourceLimitError &&
+      error.message === 'WIP cost-layer source rows exceed 50,000; narrow the filters and retry.',
   )
 })
 
