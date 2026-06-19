@@ -201,6 +201,91 @@ test('does not flag posted revenue while payment is still present', () => {
   assert.ok(!codes.includes('revenue_posted_without_payment'))
 })
 
+test('flags a live accounting journal whose debits and credits do not balance', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push({
+    id: 'unbalanced-journal',
+    connector: 'xero',
+    type: 'COGS_REVERSAL',
+    status: 'SYNCED',
+    referenceType: 'Shipment',
+    referenceId: 'shipment-x',
+    externalTransactionId: 'journal-x',
+    payload: {
+      _idempotencyKey: 'k-x',
+      lines: [
+        { accountCode: '120', description: 'a', debit: 10 },
+        { accountCode: '500', description: 'b', credit: 7 },
+      ],
+    },
+    errorMessage: null,
+    retryCount: 0,
+    createdAt: B_DATE,
+    syncedAt: B_DATE,
+  })
+
+  const finding = evaluateAccountingInvariantRows(rows).find((f) => f.code === 'accounting_sync_journal_unbalanced')
+  assert.ok(finding, 'expected an unbalanced-journal finding')
+  assert.equal(finding?.severity, 'critical')
+  assert.deepEqual([(finding?.details as { debit: number }).debit, (finding?.details as { credit: number }).credit], [10, 7])
+})
+
+test('does not flag a balanced journal or a non-journal metadata payload', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    {
+      id: 'balanced-journal',
+      connector: 'xero',
+      type: 'COGS_REVERSAL',
+      status: 'SYNCED',
+      referenceType: 'Shipment',
+      referenceId: 'shipment-y',
+      externalTransactionId: 'journal-y',
+      payload: {
+        _idempotencyKey: 'k-y',
+        lines: [
+          { accountCode: '120', description: 'a', debit: 10 },
+          { accountCode: '500', description: 'b', credit: 10 },
+        ],
+      },
+      errorMessage: null,
+      retryCount: 0,
+      createdAt: B_DATE,
+      syncedAt: B_DATE,
+    },
+  )
+
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(!codes.includes('accounting_sync_journal_unbalanced'))
+})
+
+test('does not balance-check a failed (unposted) journal', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push({
+    id: 'failed-unbalanced',
+    connector: 'xero',
+    type: 'COGS_REVERSAL',
+    status: 'FAILED',
+    referenceType: 'Shipment',
+    referenceId: 'shipment-z',
+    externalTransactionId: null,
+    payload: {
+      _idempotencyKey: 'k-z',
+      lines: [
+        { accountCode: '120', description: 'a', debit: 10 },
+        { accountCode: '500', description: 'b', credit: 1 },
+      ],
+    },
+    errorMessage: 'boom',
+    retryCount: 1,
+    createdAt: B_DATE,
+    syncedAt: null,
+  })
+
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(!codes.includes('accounting_sync_journal_unbalanced'))
+})
+
 test('posted shipments require live Group B sync evidence and batch amounts', () => {
   const rows = cleanRows()
   rows.postedShipments[0] = {

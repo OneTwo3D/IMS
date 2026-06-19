@@ -147,6 +147,31 @@ function payloadIdempotencyKey(payload: unknown): string | null {
     : null
 }
 
+function lineAmount(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value ?? 0)
+  return Number.isFinite(n) ? n : 0
+}
+
+/**
+ * Sum the debit and credit columns of a journal payload's lines. Returns null
+ * when the payload carries no journal lines (e.g. a daily-batch metadata-only
+ * payload), so callers only balance-check actual journals.
+ */
+function journalLineTotals(payload: unknown): { debit: number; credit: number; lineCount: number } | null {
+  if (!isRecord(payload) || !Array.isArray(payload.lines)) return null
+  let debit = 0
+  let credit = 0
+  let lineCount = 0
+  for (const line of payload.lines) {
+    if (!isRecord(line)) continue
+    debit += lineAmount(line.debit)
+    credit += lineAmount(line.credit)
+    lineCount += 1
+  }
+  if (lineCount === 0) return null
+  return { debit, credit, lineCount }
+}
+
 function retrySyncTypes(value: unknown): Set<string> {
   if (!Array.isArray(value)) return new Set()
   return new Set(value.flatMap((entry) => (
@@ -264,6 +289,30 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
           status: log.status,
         },
       })
+    }
+
+    // A posted (or to-be-posted) journal must balance: total debits == total
+    // credits. The suite previously only checked that evidence existed, never the
+    // amounts, so an unbalanced journal could reach the GL undetected (scjz.38).
+    if (LIVE_SYNC_STATUSES.has(log.status)) {
+      const totals = journalLineTotals(log.payload)
+      if (totals && Math.abs(totals.debit - totals.credit) > 0.005) {
+        findings.push({
+          severity: 'critical',
+          code: 'accounting_sync_journal_unbalanced',
+          syncLogId: log.id,
+          message: `Accounting sync log ${log.id} journal is unbalanced (debit ${totals.debit.toFixed(2)} != credit ${totals.credit.toFixed(2)})`,
+          details: {
+            connector: log.connector,
+            type: log.type,
+            referenceType: log.referenceType,
+            referenceId: log.referenceId,
+            debit: Math.round(totals.debit * 100) / 100,
+            credit: Math.round(totals.credit * 100) / 100,
+            lineCount: totals.lineCount,
+          },
+        })
+      }
     }
 
     if (
