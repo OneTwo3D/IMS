@@ -161,6 +161,22 @@ test('does not flag reversed payment when a credit note fully covers the posted 
   assert.ok(!codes.includes('revenue_posted_without_payment'))
 })
 
+test('flags reversed payment when the credit note has no durable accounting id (only a local number)', () => {
+  const rows = cleanRows()
+  const order = rows.salesOrders[0]
+  // A credit-note number was generated locally but the credit note never synced
+  // (no accountingCreditNoteId) — that is not durable evidence of compensation.
+  rows.salesOrders[0] = {
+    ...order,
+    paidAt: null,
+    unearnedRevenueAmount: 100,
+    refunds: [{ ...order.refunds[0], creditNoteNumber: 'CN-1', accountingCreditNoteId: null, totalBase: 100 }],
+  }
+
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(codes.includes('revenue_posted_without_payment'))
+})
+
 test('flags reversed payment when only a partial credit note covers the posted revenue', () => {
   const rows = cleanRows()
   const order = rows.salesOrders[0]

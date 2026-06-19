@@ -330,9 +330,11 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     // selects paidAt != null), so a posted order whose paidAt is now null had its
     // payment reversed (chargeback) without a compensating credit note — recognized
     // revenue with no cash, otherwise invisible to reconciliation (scjz.42/.72).
-    const creditNotes = order.refunds.filter(
-      (refund) => refund.creditNoteNumber != null || refund.accountingCreditNoteId != null,
-    )
+    // Require durable accounting evidence (the external credit-note id), not the
+    // locally-generated creditNoteNumber which is assigned at refund creation
+    // before the credit-note sync queues — otherwise a never-synced/failed refund
+    // would falsely suppress exactly the missing-accounting case this surfaces.
+    const creditNotes = order.refunds.filter((refund) => refund.accountingCreditNoteId != null)
     const postedRevenue = decimalToNumber(order.unearnedRevenueAmount)
     const creditedTotal = creditNotes.reduce((sum, refund) => sum + decimalToNumber(refund.totalBase), 0)
     // A credit note only compensates the reversed payment if it covers the posted
