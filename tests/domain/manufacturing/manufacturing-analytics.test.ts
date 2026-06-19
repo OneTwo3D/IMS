@@ -53,7 +53,14 @@ function assemblyOrder(overrides: Record<string, unknown> = {}) {
     warehouseId: 'wh-main',
     outputProductId: 'fg-1',
     componentSnapshot: null,
-    outputProduct: { sku: 'FG-1', name: 'Finished good' },
+    outputProduct: {
+      sku: 'FG-1',
+      name: 'Finished good',
+      productComponents: [
+        { componentId: 'component-a', qty: '2' },
+        { componentId: 'component-b', qty: '1' },
+      ],
+    },
     warehouse: { code: 'MAIN', name: 'Main warehouse' },
     bom: {
       items: [
@@ -223,10 +230,9 @@ test('WIP value includes consumed component value and ManufacturingCostLine tota
       warehouseId: true,
       outputProductId: true,
       componentSnapshot: true,
-      outputProduct: { select: { sku: true, name: true } },
+      outputProduct: { select: { sku: true, name: true, productComponents: { select: { componentId: true, qty: true } } } },
       warehouse: { select: { code: true, name: true } },
       manufacturingCostLines: { select: { amountBase: true } },
-      bom: { select: { items: { select: { componentProductId: true, qty: true } } } },
     },
   })
   assert.equal(report.rows[0].wipValueBase, '43')
@@ -310,7 +316,7 @@ test('WIP reservation walks layers FIFO, not weighted-average (scjz.31)', async 
             qtyProduced: '0',
             manufacturingCostLines: [],
             // one component, 1 per unit -> reserve 1 unit
-            bom: { items: [{ componentProductId: 'component-a', qty: '1', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+            outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '1' }] },
           }),
         ],
         movements: [],
@@ -342,8 +348,8 @@ test('WIP reservation uses the frozen componentSnapshot over the live BOM (scjz.
             qtyPlanned: '2',
             qtyProduced: '0',
             manufacturingCostLines: [],
-            // live BOM says component-a, but the order was started against component-c.
-            bom: { items: [{ componentProductId: 'component-a', qty: '5', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+            // live components say component-a, but the order was started against component-c.
+            outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '5' }] },
             componentSnapshot: [{ componentId: 'component-c', qty: 3 }],
           }),
         ],
@@ -415,7 +421,7 @@ test('WIP depletes shared FIFO layers across in-progress orders (scjz.31)', asyn
             qtyProduced: '0',
             startedAt: new Date('2026-05-01T00:00:00Z'),
             manufacturingCostLines: [],
-            bom: { items: [{ componentProductId: 'component-a', qty: '1', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+            outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '1' }] },
           }),
           assemblyOrder({
             id: 'po-late',
@@ -425,7 +431,7 @@ test('WIP depletes shared FIFO layers across in-progress orders (scjz.31)', asyn
             qtyProduced: '0',
             startedAt: new Date('2026-05-02T00:00:00Z'),
             manufacturingCostLines: [],
-            bom: { items: [{ componentProductId: 'component-a', qty: '1', component: { id: 'component-a', sku: 'COMP-A', name: 'A', stockUnit: 'pcs' } }] },
+            outputProduct: { sku: 'FG-1', name: 'Finished good', productComponents: [{ componentId: 'component-a', qty: '1' }] },
           }),
         ],
         movements: [],

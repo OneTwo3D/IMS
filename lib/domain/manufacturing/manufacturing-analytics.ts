@@ -124,8 +124,11 @@ type WipProductionOrderRow = ProductionOrderBaseRow & {
   warehouseId: string
   outputProductId: string
   componentSnapshot: unknown
+  // Live product components (the BOM completion actually falls back to when an
+  // order has no frozen snapshot). NOT the legacy `Bom` row, which component
+  // edits do not update.
+  outputProduct: { sku: string; name: string; productComponents: Array<{ componentId: string; qty: DecimalInput }> }
   manufacturingCostLines: Array<{ amountBase: DecimalInput }>
-  bom: { items: Array<{ componentProductId: string; qty: DecimalInput }> } | null
 }
 
 type CostLayerRow = {
@@ -216,7 +219,7 @@ function reservationRequirementsByProduct(order: WipProductionOrderRow): Map<str
   }
   const components: Array<{ componentId: string; qty: DecimalInput }> =
     parseProductionOrderComponentSnapshot(order.componentSnapshot)
-    ?? (order.bom?.items ?? []).map((item) => ({ componentId: item.componentProductId, qty: item.qty }))
+    ?? order.outputProduct.productComponents
   for (const comp of components) {
     const requirementQty = toDecimal(comp.qty).mul(plannedQty)
     if (requirementQty.lte(0)) continue
@@ -542,10 +545,9 @@ export async function getWipReport(
       warehouseId: true,
       outputProductId: true,
       componentSnapshot: true,
-      outputProduct: { select: { sku: true, name: true } },
+      outputProduct: { select: { sku: true, name: true, productComponents: { select: { componentId: true, qty: true } } } },
       warehouse: { select: { code: true, name: true } },
       manufacturingCostLines: { select: { amountBase: true } },
-      bom: { select: { items: { select: { componentProductId: true, qty: true } } } },
     },
   }) as WipProductionOrderRow[]
   if (orders.length > SOURCE_ROW_LIMIT) {
