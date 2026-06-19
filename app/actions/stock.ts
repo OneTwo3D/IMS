@@ -132,6 +132,15 @@ export type ApplyStockAdjustmentInput = {
   qty: number
   reasonId?: string
   note?: string | null
+  /**
+   * Explicit base-currency unit cost for a positive adjustment. When omitted, the
+   * cost basis is derived (warehouse average → product historical average). If no
+   * basis can be derived (brand-new product, no cost layers anywhere) an explicit
+   * cost is REQUIRED — otherwise the addition would silently book £0 stock and
+   * later sell at zero COGS (cogs-audit scjz.2). Pass 0 only for genuinely
+   * zero-cost stock (samples/consigned).
+   */
+  unitCostBase?: number | null
 }
 
 export type AppliedStockAdjustment = {
@@ -156,6 +165,7 @@ export async function applyStockAdjustment({
   qty,
   reasonId,
   note,
+  unitCostBase,
 }: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
   const isAddition = qty > 0
   const absQty = Math.abs(qty).toString()
@@ -189,8 +199,21 @@ export async function applyStockAdjustment({
 
   let additionUnitCost: number | null = null
   if (isAddition) {
-    const warehouseAvgCost = await getAverageUnitCost(tx, productId, warehouseId)
-    additionUnitCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, productId)
+    if (unitCostBase != null && Number.isFinite(unitCostBase) && unitCostBase >= 0) {
+      // Operator/caller supplied an explicit cost (0 allowed for sample/consigned stock).
+      additionUnitCost = unitCostBase
+    } else {
+      const warehouseAvgCost = await getAverageUnitCost(tx, productId, warehouseId)
+      additionUnitCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, productId)
+      if (!(additionUnitCost > 0)) {
+        // No cost basis anywhere for this product. Booking the layer at £0 would
+        // create real on-hand stock valued at £0 and later sell it at zero COGS
+        // (cogs-audit scjz.2). Require an explicit unit cost instead.
+        throw new Error(
+          'Enter a unit cost for this stock addition — no cost basis could be derived (the product has no existing cost layers). Use 0 only for genuinely zero-cost stock such as samples.',
+        )
+      }
+    }
   }
 
   const movement = await tx.stockMovement.create({
@@ -249,7 +272,11 @@ export async function applyStockAdjustment({
 
   if (accountCode) {
     const settings = await getAccountingSettings()
-    const unitCost = await getProductUnitCost(tx, productId)
+    // For additions, value the GL journal at the SAME unit cost the movement and
+    // cost layer were booked at (additionUnitCost), so Inventory GL ties to the
+    // cost-layer/stock-movement value rather than a blended product average
+    // (cogs-audit scjz.2 / codex review). Removals keep the product-average basis.
+    const unitCost = isAddition ? (additionUnitCost ?? 0) : await getProductUnitCost(tx, productId)
     const journal = buildInventoryAdjustmentJournal({
       reasonAccountCode: accountCode,
       inventoryAccountCode: settings.inventoryAccount,
@@ -365,6 +392,10 @@ const adjustSchema = z.object({
   }),
   reasonId: z.string().optional(),
   note: z.string().optional(),
+  unitCostBase: z.string().optional().refine(
+    (v) => v == null || v === '' || (!isNaN(Number(v)) && Number(v) >= 0),
+    { message: 'Unit cost must be zero or greater' },
+  ),
 })
 
 export async function adjustStock(
@@ -378,13 +409,15 @@ export async function adjustStock(
     qty: formData.get('qty'),
     reasonId: formData.get('reasonId') || undefined,
     note: formData.get('note') || undefined,
+    unitCostBase: formData.get('unitCostBase') || undefined,
   })
 
   if (!parsed.success) {
     return { errors: parsed.error.flatten().fieldErrors }
   }
 
-  const { productId, warehouseId, qty, reasonId, note } = parsed.data
+  const { productId, warehouseId, qty, reasonId, note, unitCostBase } = parsed.data
+  const unitCostBaseNum = unitCostBase != null && unitCostBase !== '' ? Number(unitCostBase) : undefined
   const qtyNum = Number(qty)
 
   let logSku = ''
@@ -399,6 +432,7 @@ export async function adjustStock(
         qty: qtyNum,
         reasonId,
         note,
+        unitCostBase: unitCostBaseNum,
       })
       logSku = applied.productSku
       logWarehouseName = applied.warehouseName
@@ -469,6 +503,10 @@ export type BulkAdjustLine = {
   warehouseId: string
   reasonId: string   // '' = no reason selected
   qty: number
+  // Optional explicit base-currency unit cost for a positive line. Required (per
+  // cogs-audit scjz.2) when the product has no derivable cost basis, otherwise the
+  // line throws rather than booking £0 stock. Omit to use the derived average.
+  unitCostBase?: number | null
 }
 
 export type BulkAdjustFormState = {
@@ -508,6 +546,7 @@ export async function bulkAdjustStock(
           qty: line.qty,
           reasonId: line.reasonId,
           note: reason?.name ?? null,
+          unitCostBase: line.unitCostBase,
         })
       }
     })
