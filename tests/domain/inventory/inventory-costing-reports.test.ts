@@ -4,6 +4,7 @@ import { LandedCostMethod } from '@/app/generated/prisma/client'
 import {
   aggregateCogsRows,
   aggregateInventoryTurnoverRows,
+  aggregateInventoryTurnoverTotalAverage,
   aggregateLandedCostMethods,
   assertInventoryTurnoverSourceLimit,
   getInventoryTurnoverReport,
@@ -469,6 +470,53 @@ describe('inventory costing report aggregations', () => {
       ['supplier-a', 'Supplier A', '10.000000'],
       ['supplier-b', 'Supplier B', '10.000000'],
     ])
+  })
+
+  it('computes total average inventory value window-wide, not as a sum of per-group averages', () => {
+    // Group A: 1000/day over 30 days (per-group avg 1000). Group B: 1000/day over
+    // the first 5 days (per-group avg 1000). Summing per-group averages gives 2000;
+    // the correct portfolio average is the window-wide daily total / distinct days:
+    // (5*2000 + 25*1000) / 30 = 35000/30 = 1166.666667.
+    const snapshotRows: InventoryTurnoverSnapshotAggregationInput[] = []
+    for (let day = 1; day <= 30; day++) {
+      const snapshotDate = `2026-05-${String(day).padStart(2, '0')}`
+      snapshotRows.push({
+        id: `a-${day}`,
+        snapshotDate,
+        inventoryValueBase: '1000',
+        productId: 'product-a',
+        sku: 'A-001',
+        productName: 'Widget A',
+        categoryName: null,
+        warehouseId: 'warehouse-a',
+        warehouseCode: 'WHA',
+        warehouseName: 'Warehouse A',
+        suppliers: [],
+      })
+      if (day <= 5) {
+        snapshotRows.push({
+          id: `b-${day}`,
+          snapshotDate,
+          inventoryValueBase: '1000',
+          productId: 'product-b',
+          sku: 'B-001',
+          productName: 'Widget B',
+          categoryName: null,
+          warehouseId: 'warehouse-a',
+          warehouseCode: 'WHA',
+          warehouseName: 'Warehouse A',
+          suppliers: [],
+        })
+      }
+    }
+
+    // Each per-group row would report a 1000 average (the wrong-denominator trap).
+    const rows = aggregateInventoryTurnoverRows([], snapshotRows, 'product', 30)
+    assert.deepEqual(rows.map((row) => row.averageInventoryValueBase).sort(), ['1000.000000', '1000.000000'])
+
+    const total = aggregateInventoryTurnoverTotalAverage(snapshotRows, 'product')
+    assert.equal(total.snapshotDayCount, 30)
+    assert.equal(total.averageInventoryValueBase.toFixed(6), '1166.666667')
   })
 
   it('rejects inventory turnover source scans over the configured cap', () => {
