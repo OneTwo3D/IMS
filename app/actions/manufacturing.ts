@@ -1,5 +1,6 @@
 'use server'
 
+import { randomUUID } from 'crypto'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -1439,6 +1440,11 @@ async function recalculateManufacturingCostLayers(
   })
   if (!po || po.status !== 'COMPLETED') return { cogsDeltaBase: 0, inventoryDeltaBase: 0 }
 
+  // Per-edit-run nonce so the shipment COGS_REVERSAL idempotency key differs
+  // across repeated manufacturing-cost edits that revalue the same output layer
+  // back to a prior value (cogs-audit scjz.33).
+  const recalcRunId = randomUUID()
+
   const currentMfgCost = po.manufacturingCostLines.reduce(
     (sum, line) => addMoney(sum, line.amountBase),
     toDecimal(0),
@@ -1495,7 +1501,7 @@ async function recalculateManufacturingCostLayers(
     }
 
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
-    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id)
+    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, { recalcRunId })
     // audit-3aph: the shipment path owns the sold-finished-goods COGS revaluation
     // (COGS_REVERSAL now / daily batch later), so subtract it from the reclass
     // journal's COGS leg to avoid double-posting COGS for sold units.
