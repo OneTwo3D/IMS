@@ -92,6 +92,26 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
           </div>
         </div>
 
+        <div className="space-y-1">
+          <Label htmlFor="adj-unit-cost" className="text-xs">
+            Unit cost{' '}
+            <span className="text-muted-foreground">(base currency — required for additions of a product with no existing cost; 0 for samples)</span>
+          </Label>
+          <Input
+            id="adj-unit-cost"
+            name="unitCostBase"
+            type="number"
+            step="any"
+            min="0"
+            placeholder="leave blank to use average cost"
+            className="h-8 text-xs"
+            aria-invalid={!!state.errors?.unitCostBase}
+          />
+          {state.errors?.unitCostBase && (
+            <p className="text-xs text-destructive">{state.errors.unitCostBase[0]}</p>
+          )}
+        </div>
+
         {hasReasons ? (
           <div className="space-y-1">
             <Label htmlFor="adj-reason" className="text-xs">Reason *</Label>
