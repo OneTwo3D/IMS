@@ -1167,7 +1167,13 @@ export async function getAverageInventoryValueBase(options: {
   if (totalByDate.size === 0) return '0.000000'
 
   const total = [...totalByDate.values()].reduce((sum, value) => sum.add(value), toDecimal(0))
-  return roundValue(total.div(calendarDayCount(fromDate, toDate))).toFixed(6)
+  // Divide by the number of days that actually have snapshots, not every calendar
+  // day in the range (cogs-audit scjz.47). Calendar-day division understated the
+  // average when snapshots are missing for some days (cron gap / partial backfill)
+  // — the numerator only covers observed days — which then inflated any turnover
+  // ratio built on this denominator. Consistent with the turnover report, which
+  // also divides by observed snapshot days.
+  return roundValue(total.div(totalByDate.size)).toFixed(6)
 }
 
 export function inventorySnapshotCounts(result: InventorySnapshotWriteResult): Record<string, number> {

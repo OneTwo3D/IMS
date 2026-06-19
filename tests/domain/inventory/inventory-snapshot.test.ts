@@ -1010,17 +1010,32 @@ test('historical backfill rejects inverted and future date ranges', async () => 
   )
 })
 
-test('average inventory value divides by calendar days and handles empty ranges', async () => {
+test('average inventory value divides by observed snapshot days, not calendar days (scjz.47)', async () => {
   const client = createSnapshotClient({
     averageRows: [
       { snapshotDate: new Date('2026-05-27T00:00:00.000Z'), valueBase: decimal('100') },
     ],
   })
 
+  // One snapshot day in a 2-calendar-day range → average is 100/1, not 100/2.
+  // Calendar-day division understated the average when days lack snapshots.
   assert.equal(
     await getAverageInventoryValueBase({ client, fromDate: '2026-05-27', toDate: '2026-05-28' }),
-    '50.000000',
+    '100.000000',
   )
+
+  // Two distinct snapshot days → divide by 2.
+  const twoDayClient = createSnapshotClient({
+    averageRows: [
+      { snapshotDate: new Date('2026-05-27T00:00:00.000Z'), valueBase: decimal('100') },
+      { snapshotDate: new Date('2026-05-28T00:00:00.000Z'), valueBase: decimal('300') },
+    ],
+  })
+  assert.equal(
+    await getAverageInventoryValueBase({ client: twoDayClient, fromDate: '2026-05-27', toDate: '2026-05-31' }),
+    '200.000000',
+  )
+
   assert.equal(
     await getAverageInventoryValueBase({ client: createSnapshotClient(), fromDate: '2026-05-27', toDate: '2026-05-28' }),
     '0.000000',
