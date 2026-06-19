@@ -743,8 +743,8 @@ model StockLevel {
   id              String    @id @default(cuid())
   productId       String
   warehouseId     String
-  quantity        Decimal   @db.Decimal(12, 4) @default(0) // enforced non-negative in DB
-  reservedQty     Decimal   @db.Decimal(12, 4) @default(0) // enforced non-negative in DB; in transit / allocated
+  quantity        Decimal   @db.Decimal(14, 6) @default(0) // enforced non-negative in DB; 6dp matches cost_layers/FIFO engine
+  reservedQty     Decimal   @db.Decimal(14, 6) @default(0) // enforced non-negative in DB; in transit / allocated; 6dp matches cost_layers
   updatedAt       DateTime  @updatedAt
 
   product         Product   @relation(fields: [productId], references: [id])
@@ -831,7 +831,7 @@ model StockMovement {
   productId       String
   fromWarehouseId String?
   toWarehouseId   String?
-  qty             Decimal           @db.Decimal(12, 4) // always positive; enforced non-negative in DB
+  qty             Decimal           @db.Decimal(14, 6) // always positive; enforced non-negative in DB; 6dp matches cost_layers/FIFO engine
   note            String?
   referenceType   String?           // e.g. "PurchaseOrder", "SalesOrder"
   referenceId     String?           // ID of the related entity
