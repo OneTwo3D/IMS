@@ -216,7 +216,7 @@ test('propagateLandedCostToOutputs cascades a component cost change through nest
   await propagateLandedCostToOutputs(
     tx as never, deps, 'comp-1', toDecimal(2),
     (c, i) => { cogs = cogs.add(c); inv = inv.add(i) },
-    new Set(), 1,
+    new Set(), 1, 'test-recalc-run',
   )
   // out-1 unit cost up 2×4/10 = 0.8 → 5.8; out-2 up 0.8×2/5 = 0.32 → 7.32.
   assert.equal(updates['out-1'], '5.8')
@@ -261,7 +261,7 @@ test('propagateLandedCostToOutputs accumulates BOTH paths of a diamond BOM (audi
   })
   await propagateLandedCostToOutputs(
     tx as never, deps, 'comp-1', toDecimal(1),
-    () => {}, new Set(), 1,
+    () => {}, new Set(), 1, 'test-recalc-run',
   )
   assert.equal(state['out-1'].unitCostBase, '4')
   assert.equal(state['out-2'].unitCostBase, '4')

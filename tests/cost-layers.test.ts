@@ -165,6 +165,33 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
   }])
 })
 
+test('refreshShipmentCogsForCostLayerChange stamps the recalc-run nonce into the idempotency key (scjz.33)', async () => {
+  const queued: Array<{ idempotencyKey?: string }> = []
+  const tx = {
+    $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    shipment: {
+      findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z') }),
+      update: async () => {},
+    },
+    shipmentLine: {
+      findMany: async () => [{
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: '5.000000', unitCostBase: '5.500000' }],
+      }],
+    },
+  }
+
+  await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    isReversalPostingEnabled: async () => true,
+    recalcRunId: 'run-abc',
+    queueAccountingSync: async (_tx, params) => { queued.push(params) },
+  })
+
+  // Same (shipment, layer, old, new) as the prior test, but the nonce makes the
+  // key distinct so an A→B→A correction is not falsely deduped.
+  assert.equal(queued[0]?.idempotencyKey, 'shipment-cogs-revalue:shipment-1:layer-1:20:27.5:run-abc')
+})
+
 test('refreshShipmentCogsForCostLayerChange does not claim the delta when COGS_REVERSAL posting is disabled (audit-3aph)', async () => {
   // Posted shipment, but COGS_REVERSAL posting is OFF → the reversal won't reach
   // the ledger, so the helper must NOT report the delta as shipment-owned (else

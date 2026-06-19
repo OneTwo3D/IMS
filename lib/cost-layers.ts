@@ -42,6 +42,16 @@ type ShipmentCogsRevaluationSyncOptions = {
    * (audit-gbzh).
    */
   isDailyBatchPostingEnabled?: () => Promise<boolean>
+  /**
+   * Per-recalc-run nonce (audit-g4la style). The revaluation idempotency key
+   * otherwise encodes only (shipment, layer, oldCogs, newCogs), so correcting a
+   * landed cost A→B→A→B regenerates the first key and the later identical
+   * correction is silently deduped against the earlier one (or a post-failure
+   * retry whose cogsBatchAmount advanced re-posts). Stamping the run nonce into
+   * the key makes each recalc run post a distinct COGS_REVERSAL while a retry
+   * WITHIN a run (same nonce) still dedups correctly (cogs-audit scjz.33).
+   */
+  recalcRunId?: string
 }
 
 export function buildShipmentCogsRevaluationSyncPayload(input: {
@@ -102,7 +112,7 @@ async function queueShipmentCogsRevaluationSync(
     type: 'COGS_REVERSAL',
     referenceType: 'Shipment',
     referenceId: input.shipmentId,
-    idempotencyKey: `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}`,
+    idempotencyKey: `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}${options.recalcRunId ? `:${options.recalcRunId}` : ''}`,
     payload,
   })
   return true

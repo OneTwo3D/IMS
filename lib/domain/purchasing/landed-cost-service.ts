@@ -263,6 +263,7 @@ export async function propagateLandedCostToOutputs(
   ) => void,
   ancestors: Set<string>,
   depth: number,
+  recalcRunId: string,
 ): Promise<void> {
   if (costDeltaPerUnit.abs().lte(LANDED_COST_DELTA_EPSILON)) return
   if (depth > MAX_LANDED_COST_PROPAGATION_DEPTH) return
@@ -330,7 +331,7 @@ export async function propagateLandedCostToOutputs(
     let outputShipmentRevalDelta = new Prisma.Decimal(0)
     if (outDeltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
       await deps.updateSnapshotsForCostLayerChange(tx, outputCostLayerId, newOutputUnitCost)
-      const shipmentRefresh = await deps.refreshShipmentCogsForCostLayerChange(tx, outputCostLayerId)
+      const shipmentRefresh = await deps.refreshShipmentCogsForCostLayerChange(tx, outputCostLayerId, { recalcRunId })
       outputShipmentRevalDelta = shipmentRefresh.cogsRevaluationDelta
       await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, outputCostLayerId)
     }
@@ -343,7 +344,7 @@ export async function propagateLandedCostToOutputs(
     })
 
     // Cascade into outputs that consumed THIS output (nested BOM levels).
-    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1)
+    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId)
   }
 }
 
@@ -897,7 +898,7 @@ export async function recalculateLandedCosts(
             totalInventoryDelta = totalInventoryDelta.add(invD)
             propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
           },
-          new Set(), 1,
+          new Set(), 1, recalcRunId,
         )
 
         let affectedRefundSnapshots = 0
@@ -905,7 +906,7 @@ export async function recalculateLandedCosts(
         let affectedSalesOrderLines = 0
         if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
           affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-          const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
+          const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId })
           affectedShipments = shipmentRefresh.shipmentsUpdated
           // audit-3aph: the shipment path now owns the COGS revaluation for sold
           // goods (COGS_REVERSAL now / daily batch later), so remove it from the
@@ -1223,7 +1224,7 @@ export async function recalculateDirectLandedCosts(
           totalInventoryDelta = totalInventoryDelta.add(invD)
           propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
         },
-        new Set(), 1,
+        new Set(), 1, recalcRunId,
       )
 
       let affectedRefundSnapshots = 0
@@ -1231,7 +1232,7 @@ export async function recalculateDirectLandedCosts(
       let affectedSalesOrderLines = 0
       if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
         affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-        const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
+        const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId })
         affectedShipments = shipmentRefresh.shipmentsUpdated
         // audit-3aph: shipment path owns the sold-goods COGS revaluation — remove
         // it from the COGS_JOURNAL to avoid double-posting COGS for sold units.
