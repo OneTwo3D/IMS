@@ -132,6 +132,36 @@ async function queueShipmentCogsRevaluationSync(
   return true
 }
 
+/**
+ * Ensure the (product, warehouse) stock_levels row exists and take a FOR UPDATE
+ * row lock on it. This serializes concurrent stock-quantity/cost-layer mutations
+ * for the same product+warehouse: a caller must hold this lock before reading
+ * average cost or candidate layers so a concurrent consume between the read and
+ * the layer write cannot leave the new layer costed against stale state
+ * (cogs-audit scjz.3). Mirrors the lock applyStockAdjustment already takes.
+ *
+ * Uses $queryRaw (not $executeRaw) because Prisma's executeRaw path does not
+ * reliably hold SELECT ... FOR UPDATE locks (enforced by row-lock-queryraw test).
+ */
+export async function lockStockLevelRow(
+  tx: TxClient,
+  productId: string,
+  warehouseId: string,
+): Promise<void> {
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: { productId, warehouseId, quantity: 0 },
+    update: {},
+  })
+  await tx.$queryRaw`
+    SELECT "productId", "warehouseId"
+    FROM stock_levels
+    WHERE "productId" = ${productId}
+      AND "warehouseId" = ${warehouseId}
+    FOR UPDATE
+  `
+}
+
 function minDecimal(a: Decimal, b: Decimal): Decimal {
   return a.lte(b) ? a : b
 }

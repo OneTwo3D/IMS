@@ -8,6 +8,7 @@ import {
   consumeFifoLayers,
   consumeFifoLayersStrict,
   createCostLayer,
+  lockStockLevelRow,
   refreshShipmentCogsForCostLayerChange,
 } from '../lib/cost-layers.ts'
 import { manufacturingCostLayerReceivedAt } from '@/lib/domain/manufacturing/manufacturing-action-inputs'
@@ -39,6 +40,37 @@ test('cogsEntryDataFromConsumed pins sub-six-decimal total value rounding', () =
     unitCostBase: '0.000001',
     totalCostBase: '0.000000',
   })
+})
+
+test('lockStockLevelRow upserts the stock-level row then takes a FOR UPDATE lock on it', async () => {
+  const calls: string[] = []
+  let upsertArgs: { where?: unknown; create?: unknown } | undefined
+  let lockValues: unknown[] = []
+  const tx = {
+    stockLevel: {
+      upsert: async (args: { where?: unknown; create?: unknown }) => {
+        calls.push('upsert')
+        upsertArgs = args
+        return {}
+      },
+    },
+    $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      calls.push(`lock:${strings.join('?').replace(/\s+/g, ' ').trim()}`)
+      lockValues = values
+      return []
+    },
+  }
+
+  await lockStockLevelRow(tx as never, 'product-1', 'warehouse-1')
+
+  // Upsert (to guarantee the row exists) must precede the row lock.
+  assert.equal(calls[0], 'upsert')
+  assert.match(calls[1], /^lock:/)
+  assert.match(calls[1], /FROM stock_levels/)
+  assert.match(calls[1], /FOR UPDATE$/)
+  assert.deepEqual(lockValues, ['product-1', 'warehouse-1'])
+  assert.deepEqual(upsertArgs?.where, { productId_warehouseId: { productId: 'product-1', warehouseId: 'warehouse-1' } })
+  assert.deepEqual(upsertArgs?.create, { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 0 })
 })
 
 test('addCostLayerSourceLines rejects source lines without unit cost', async () => {
