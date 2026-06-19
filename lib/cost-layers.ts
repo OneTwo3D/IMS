@@ -66,18 +66,32 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
   const newCogs = roundQuantity(input.newCogsBase, 2)
   if (oldCogs.sub(newCogs).abs().lt(0.01)) return null
 
+  // Use a 4-line reverse + repost journal rather than a 2-line delta so the
+  // accounting audit trail shows both the old and recomputed shipment COGS.
+  // When one side rounds to 0 (e.g. a 0.00 shipment revalued up, or a shipment
+  // revalued down to 0.00) its reverse/post legs would be zero-amount, which the
+  // accounting-event normalizer rejects (a line must carry exactly one positive
+  // debit or credit). Drop the zero side's legs so we emit a balanced 2-line
+  // delta instead of a journal that throws (cogs-audit scjz.35).
+  const lines: Array<Record<string, unknown>> = []
+  if (oldCogs.gt(0)) {
+    lines.push(
+      { accountCode: input.inventoryAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, debit: oldCogs.toNumber() },
+      { accountCode: input.cogsAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, credit: oldCogs.toNumber() },
+    )
+  }
+  if (newCogs.gt(0)) {
+    lines.push(
+      { accountCode: input.cogsAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, debit: newCogs.toNumber() },
+      { accountCode: input.inventoryAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, credit: newCogs.toNumber() },
+    )
+  }
+
   return {
     date: new Date().toISOString().slice(0, 10),
     reference: `Shipment COGS revaluation: ${input.shipmentId}`,
     narration: `Reverse and repost shipment COGS after cost-layer revaluation for shipment ${input.shipmentId}`,
-    // Use a 4-line reverse + repost journal rather than a 2-line delta so the
-    // accounting audit trail shows both the old and recomputed shipment COGS.
-    lines: [
-      { accountCode: input.inventoryAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, debit: oldCogs.toNumber() },
-      { accountCode: input.cogsAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, credit: oldCogs.toNumber() },
-      { accountCode: input.cogsAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, debit: newCogs.toNumber() },
-      { accountCode: input.inventoryAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, credit: newCogs.toNumber() },
-    ],
+    lines,
     sourceCostLayerId: input.costLayerId,
     oldCogsBase: oldCogs.toNumber(),
     newCogsBase: newCogs.toNumber(),

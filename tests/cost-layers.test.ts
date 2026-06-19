@@ -11,6 +11,7 @@ import {
   refreshShipmentCogsForCostLayerChange,
 } from '../lib/cost-layers.ts'
 import { manufacturingCostLayerReceivedAt } from '@/lib/domain/manufacturing/manufacturing-action-inputs'
+import { normalizeAccountingEventLine } from '@/lib/domain/accounting/accounting-event-builder'
 
 test('cogsEntryDataFromConsumed preserves six-decimal consumed quantities', () => {
   assert.deepEqual(cogsEntryDataFromConsumed('movement-1', {
@@ -97,6 +98,50 @@ test('shipment COGS revaluation payload reverses old COGS and posts the recomput
     lines.reduce((sum, line) => sum + (line.debit ?? 0), 0),
     lines.reduce((sum, line) => sum + (line.credit ?? 0), 0),
   )
+})
+
+test('shipment COGS revaluation payload drops zero legs when revaluing up from 0.00', () => {
+  const payload = buildShipmentCogsRevaluationSyncPayload({
+    shipmentId: 'shipment-1',
+    costLayerId: 'layer-1',
+    inventoryAccount: '120',
+    cogsAccount: '500',
+    oldCogsBase: '0.00',
+    newCogsBase: '3.00',
+  })
+
+  const lines = (payload?.lines ?? []) as Array<{ accountCode: string; description: string; debit?: number; credit?: number }>
+  // Only the post legs remain — the zero-amount reverse legs are dropped so the
+  // accounting-event normalizer does not reject them.
+  assert.deepEqual(lines, [
+    { accountCode: '500', description: 'Post revalued shipment COGS shipment-1', debit: 3 },
+    { accountCode: '120', description: 'Post revalued shipment COGS shipment-1', credit: 3 },
+  ])
+  // Each line must carry exactly one positive amount; this would throw on a zero leg.
+  for (const line of lines) {
+    assert.doesNotThrow(() => normalizeAccountingEventLine(line, 'GBP'))
+  }
+})
+
+test('shipment COGS revaluation payload drops zero legs when revaluing down to 0.00', () => {
+  const payload = buildShipmentCogsRevaluationSyncPayload({
+    shipmentId: 'shipment-1',
+    costLayerId: 'layer-1',
+    inventoryAccount: '120',
+    cogsAccount: '500',
+    oldCogsBase: '3.00',
+    newCogsBase: '0.00',
+  })
+
+  const lines = (payload?.lines ?? []) as Array<{ accountCode: string; description: string; debit?: number; credit?: number }>
+  // Only the reverse legs remain.
+  assert.deepEqual(lines, [
+    { accountCode: '120', description: 'Reverse old shipment COGS shipment-1', debit: 3 },
+    { accountCode: '500', description: 'Reverse old shipment COGS shipment-1', credit: 3 },
+  ])
+  for (const line of lines) {
+    assert.doesNotThrow(() => normalizeAccountingEventLine(line, 'GBP'))
+  }
 })
 
 test('shipment COGS revaluation payload ignores sub-cent changes', () => {
