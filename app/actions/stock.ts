@@ -12,7 +12,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
+import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost, lockStockLevelRow } from '@/lib/cost-layers'
 import { decimalToNumber } from '@/lib/decimal'
 import {
   buildStockLevelMap,
@@ -184,18 +184,7 @@ export async function applyStockAdjustment({
     }
   }
 
-  await tx.stockLevel.upsert({
-    where: { productId_warehouseId: { productId, warehouseId } },
-    create: { productId, warehouseId, quantity: 0 },
-    update: {},
-  })
-  await tx.$queryRaw`
-    SELECT "productId", "warehouseId"
-    FROM stock_levels
-    WHERE "productId" = ${productId}
-      AND "warehouseId" = ${warehouseId}
-    FOR UPDATE
-  `
+  await lockStockLevelRow(tx, productId, warehouseId)
 
   let additionUnitCost: number | null = null
   if (isAddition) {
@@ -320,18 +309,7 @@ export async function applyOpeningStock({
     throw new Error('Opening stock unit cost must be zero or greater')
   }
 
-  await tx.stockLevel.upsert({
-    where: { productId_warehouseId: { productId, warehouseId } },
-    create: { productId, warehouseId, quantity: 0 },
-    update: {},
-  })
-  await tx.$queryRaw`
-    SELECT "productId", "warehouseId"
-    FROM stock_levels
-    WHERE "productId" = ${productId}
-      AND "warehouseId" = ${warehouseId}
-    FOR UPDATE
-  `
+  await lockStockLevelRow(tx, productId, warehouseId)
   const existingOpeningLayer = await tx.costLayer.findFirst({
     where: { productId, warehouseId, isOpeningStock: true },
     select: { id: true },
@@ -748,6 +726,11 @@ export async function updateAdjustmentMovement(
       }
 
       const newWarehouseId = oldWarehouseId // warehouse can't be changed via edit
+      // Take the FOR UPDATE lock before any cost-sensitive read (stock level,
+      // candidate layers, average cost) so a concurrent consume between the read
+      // and the new layer's creation cannot cost it against stale state. The
+      // addition branch previously read getAverageUnitCost unlocked (scjz.3).
+      await lockStockLevelRow(tx, movement.productId, newWarehouseId)
       const currentLevel = await tx.stockLevel.findUnique({
         where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
         select: { quantity: true, reservedQty: true },
