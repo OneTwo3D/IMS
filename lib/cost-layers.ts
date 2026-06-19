@@ -684,6 +684,29 @@ export async function getManufacturingConsumedQtyForCostLayer(
   return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0))
 }
 
+/**
+ * Sum stock consumed by PO cancellation reversals (PURCHASE_REVERSAL) for a cost
+ * layer. Cancellation reversals consume FIFO layers and write cogs_entries to
+ * satisfy the outbound-evidence guard, but they are NOT customer COGS — the stock
+ * was reversed out, not sold. Landed-cost recalculation must exclude these units
+ * from the retrospective COGS delta, otherwise a later revaluation of a
+ * partly-cancelled layer would post spurious COGS for reversed stock (cogs-audit
+ * scjz.14; mirrors the audit-jz9i manufacturing exclusion).
+ */
+export async function getReversalConsumedQtyForCostLayer(
+  tx: TxClient,
+  costLayerId: string,
+): Promise<Decimal> {
+  const rows = await tx.cogsEntry.findMany({
+    where: {
+      costLayerId,
+      movement: { type: 'PURCHASE_REVERSAL' },
+    },
+    select: { qty: true },
+  })
+  return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0))
+}
+
 export type DependentOutputSourceLine = {
   sourceLineId: string
   outputCostLayerId: string

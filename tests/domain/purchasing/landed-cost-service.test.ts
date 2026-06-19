@@ -132,6 +132,28 @@ test('retrospective layer adjustment splits inventory and consumed COGS deltas',
   })
 })
 
+test('retrospective layer adjustment excludes PURCHASE_REVERSAL-consumed units from COGS (scjz.14)', () => {
+  // 10 received, 4 on hand, 6 consumed = 4 sold + 2 supplier-returned + ... but 3
+  // of the consumed were PO-cancellation reversals (PURCHASE_REVERSAL), which are
+  // NOT customer COGS. netConsumed = 6 − 0 − 0 − 0 − 3 = 3, so COGS delta covers 3.
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 12,
+    receivedQty: 10,
+    remainingQty: 4,
+    returnedQty: 0,
+    supplierReturnedQty: 0,
+    manufacturingConsumedQty: 0,
+    reversalConsumedQty: 3,
+  })), {
+    costDelta: 2,
+    consumedQty: 6,
+    netConsumedQty: 3,
+    cogsDelta: 6,
+    inventoryDelta: 8,
+  })
+})
+
 test('retrospective layer adjustment handles landed-cost decreases', () => {
   assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
     oldUnitCost: 12,
@@ -525,6 +547,7 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     getReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getSupplierReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getManufacturingConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
+    getReversalConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getDependentOutputSourceLines: async () => [],
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 0, cogsRevaluationDelta: new Prisma.Decimal(0) }),
