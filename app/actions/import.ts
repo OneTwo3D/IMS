@@ -695,6 +695,10 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
     const warehouseCode = row['warehouseCode']?.trim().toUpperCase()
     const qtyStr = row['qty']?.trim()
     const note = row['note']?.trim() || null
+    // Optional unit-cost column: required for a positive adjustment of a product
+    // with no existing cost basis (cogs-audit scjz.2); otherwise the row errors
+    // rather than booking £0 stock. Blank uses the derived average.
+    const unitCostStr = row['unitCost']?.trim()
 
     if (!sku) { result.errors.push(`Row ${lineNum}: missing sku`); result.skipped++; continue }
     if (!warehouseCode) { result.errors.push(`Row ${lineNum}: missing warehouseCode`); result.skipped++; continue }
@@ -711,6 +715,12 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
     if (!warehouseId) { result.errors.push(`Row ${lineNum}: warehouse "${warehouseCode}" not found`); result.skipped++; continue }
 
     const qty = Number(qtyStr)
+    if (unitCostStr != null && unitCostStr !== '' && (isNaN(Number(unitCostStr)) || Number(unitCostStr) < 0)) {
+      result.errors.push(`Row ${lineNum}: invalid unitCost`)
+      result.skipped++
+      continue
+    }
+    const unitCostBase = unitCostStr != null && unitCostStr !== '' ? Number(unitCostStr) : undefined
 
     try {
       if (!preview) {
@@ -721,6 +731,7 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
             warehouseId,
             qty,
             note,
+            unitCostBase,
           })
         })
       }
