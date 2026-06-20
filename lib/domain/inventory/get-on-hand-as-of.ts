@@ -839,11 +839,14 @@ export async function getOnHandAsOf(options: {
   // reported as not point-in-time accurate (scjz.43). A date-only as-of covers the
   // whole UTC day, so "after" starts at next-day midnight (matching the replay
   // upper bound) — a same-day revaluation is already reflected in the day's value.
-  const postAsOfRevaluationCount = await countPostAsOfRevaluations(
-    client,
-    filters,
-    isDateOnly ? { gte: startOfNextUtcDay(asOfDay) } : { gt: asOf },
-  )
+  const postAsOfRevaluationCutoff: Prisma.DateTimeFilter = isDateOnly
+    ? { gte: startOfNextUtcDay(asOfDay) }
+    : { gt: asOf }
+  // Snapshot-based paths value from immutable frozen/historical data, so reading
+  // the count on the outer client is fine. The current-reverse path values from
+  // CURRENT layers inside a serializable transaction and recomputes its own count
+  // there (below) to avoid a TOCTOU against a concurrently-committed revaluation.
+  const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, postAsOfRevaluationCutoff)
   const priorSnapshotDate = await findPriorSnapshotDate(client, asOfDay)
   if (priorSnapshotDate) {
     const state = await loadSnapshotState(client, priorSnapshotDate, filters)
@@ -894,6 +897,10 @@ export async function getOnHandAsOf(options: {
     // Reverse-replay (asOf in the past) reliability comes from the replay, not the
     // live drift flag, so the current-state drift count is not surfaced here.
     const { state } = await loadCurrentState(txClient, filters)
+    // Count revaluations INSIDE this transaction: this path values from CURRENT
+    // layers, so a revaluation committing between the outer count and loadCurrentState
+    // would otherwise be valued in but flagged reliable (scjz.43 TOCTOU).
+    const txPostAsOfRevaluationCount = await countPostAsOfRevaluations(txClient, filters, postAsOfRevaluationCutoff)
     const replay = await replayMovements(
       txClient,
       state,
@@ -910,7 +917,7 @@ export async function getOnHandAsOf(options: {
       state,
       replay,
       excludeZero: options.excludeZero,
-      postAsOfRevaluationCount,
+      postAsOfRevaluationCount: txPostAsOfRevaluationCount,
     })
   }
 
