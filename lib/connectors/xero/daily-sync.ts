@@ -322,13 +322,21 @@ export function takeDailyBatchWindow<T>(
   }
 }
 
-async function hasLiveDailyBatchLog(type: DailyBatchLogType, referenceId: string): Promise<boolean> {
+async function hasLiveDailyBatchLog(type: DailyBatchLogType, bareReferenceId: string): Promise<boolean> {
+  // The live daily-batch posting stamps a digest-suffixed referenceId
+  // (buildDailyBatchReferenceId -> `<group>-<date>-<8 hex>`), so an exact match on
+  // the bare `<group>-<date>` never finds it and recreate would post a duplicate
+  // batch (double-post). Match the bare key OR any digest-suffixed variant for the
+  // same group+date (scjz.37).
   const count = await db.accountingSyncLog.count({
     where: {
       connector: XERO_CONNECTOR,
       type,
-      referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+      OR: [
+        { referenceId: bareReferenceId },
+        { referenceId: { startsWith: `${bareReferenceId}-` } },
+      ],
     },
   })
   return count > 0

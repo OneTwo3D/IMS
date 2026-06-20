@@ -194,11 +194,33 @@ function liveSyncLogIndexKey(type: string, referenceId: string, referenceType: s
   return `${type}\u0000${referenceType}\u0000${referenceId}`
 }
 
+// Live Xero daily-batch logs carry a digest-suffixed referenceId
+// (buildDailyBatchReferenceId -> `<group>-<date>-<8 hex>`), while the invariant's
+// expected key and QBO logs are the bare `<group>-<date>`. Strip a trailing 8-hex
+// digest so a digest-suffixed log still matches the bare expected key (scjz.37).
+function stripDailyBatchDigest(referenceId: string): string {
+  return referenceId.replace(/-[0-9a-f]{8}$/, '')
+}
+
+const DAILY_BATCH_LOG_TYPES = new Set([
+  'DAILY_BATCH_REVENUE_DEFERRAL',
+  'DAILY_BATCH_INVENTORY_ALLOC',
+  'DAILY_BATCH_GROUP_B',
+])
+
 function buildLiveSyncLogIndex(syncLogs: AccountingSyncLogRow[]): Set<string> {
   const index = new Set<string>()
   for (const log of syncLogs) {
     if (!LIVE_SYNC_STATUSES.has(log.status)) continue
     index.add(liveSyncLogIndexKey(log.type, log.referenceId, log.referenceType))
+    // Also index the digest-stripped key so a digest-suffixed Xero daily-batch
+    // log matches the bare `<group>-<date>` the invariant expects.
+    if (DAILY_BATCH_LOG_TYPES.has(log.type)) {
+      const bare = stripDailyBatchDigest(log.referenceId)
+      if (bare !== log.referenceId) {
+        index.add(liveSyncLogIndexKey(log.type, bare, log.referenceType))
+      }
+    }
   }
   return index
 }

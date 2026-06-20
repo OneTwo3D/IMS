@@ -133,6 +133,35 @@ test('clean accounting rows produce no findings', () => {
   assert.deepEqual(evaluateAccountingInvariantRows(cleanRows()), [])
 })
 
+test('digest-suffixed daily-batch logs satisfy the bare-key sync-evidence check (scjz.37)', () => {
+  const rows = cleanRows()
+  // Live Xero daily-batch posting stamps `<group>-<date>-<8 hex>`; the invariant
+  // expects the bare `<group>-<date>`. The digest-suffixed log must still count as
+  // evidence — no shipment_posted_without_sync_evidence false-positive.
+  rows.syncLogs = rows.syncLogs.map((log) =>
+    log.type === 'DAILY_BATCH_GROUP_B'
+      ? { ...log, referenceId: 'B-2026-01-02-abcd1234' }
+      : log.type === 'DAILY_BATCH_REVENUE_DEFERRAL'
+        ? { ...log, referenceId: 'A1-2026-01-01-deadbeef' }
+        : log.type === 'DAILY_BATCH_INVENTORY_ALLOC'
+          ? { ...log, referenceId: 'A2-2026-01-01-0badf00d' }
+          : log,
+  )
+
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(!codes.includes('shipment_posted_without_sync_evidence'),
+    'digest-suffixed Group-B log should satisfy the sync-evidence check')
+})
+
+test('still flags a posted shipment with no Group-B sync evidence at all (scjz.37)', () => {
+  const rows = cleanRows()
+  rows.syncLogs = rows.syncLogs.filter((log) => log.type !== 'DAILY_BATCH_GROUP_B')
+
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(codes.includes('shipment_posted_without_sync_evidence'),
+    'a shipment with no Group-B log must still be flagged')
+})
+
 test('flags posted revenue whose payment was reversed with no compensating credit note', () => {
   const rows = cleanRows()
   // Payment reversed (paidAt cleared) on an order with A1 revenue posted, and the
