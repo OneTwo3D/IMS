@@ -776,11 +776,31 @@ model CostLayer {
 
   cogsEntries     CogsEntry[]
   sourceLines     CostLayerSourceLine[]
+  revaluations    CostLayerRevaluation[]
 
   @@index([productId, warehouseId, receivedAt])
   @@index([adjustmentMovementId])
   @@index([productionOrderId])
   @@map("cost_layers")
+}
+
+// Event log of every change to a cost layer's unitCostBase (landed-cost recalc,
+// manufacturing recompute, FX rebase, adjustment edit), so as-of/historical
+// valuation can reconstruct the cost basis valid at a point in time instead of
+// using the current (post-revaluation) cost (cogs-audit scjz.43/.48).
+model CostLayerRevaluation {
+  id              String    @id @default(cuid())
+  costLayerId     String
+  oldUnitCostBase Decimal   @db.Decimal(18, 6)
+  newUnitCostBase Decimal   @db.Decimal(18, 6)
+  effectiveAt     DateTime
+  reason          String?
+  createdAt       DateTime  @default(now())
+
+  costLayer       CostLayer @relation(fields: [costLayerId], references: [id], onDelete: Cascade)
+
+  @@index([costLayerId, effectiveAt])
+  @@map("cost_layer_revaluations")
 }
 
 model CostLayerSourceLine {

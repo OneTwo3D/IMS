@@ -298,7 +298,7 @@ test('propagateLandedCostToOutputs cascades a component cost change through nest
   await propagateLandedCostToOutputs(
     tx as never, deps, 'comp-1', toDecimal(2),
     (c, i) => { cogs = cogs.add(c); inv = inv.add(i) },
-    new Set(), 1, 'test-recalc-run',
+    new Set(), 1, 'test-recalc-run', new Date('2026-06-20T00:00:00.000Z'),
   )
   // out-1 unit cost up 2×4/10 = 0.8 → 5.8; out-2 up 0.8×2/5 = 0.32 → 7.32.
   assert.equal(updates['out-1'], '5.8')
@@ -343,7 +343,7 @@ test('propagateLandedCostToOutputs accumulates BOTH paths of a diamond BOM (audi
   })
   await propagateLandedCostToOutputs(
     tx as never, deps, 'comp-1', toDecimal(1),
-    () => {}, new Set(), 1, 'test-recalc-run',
+    () => {}, new Set(), 1, 'test-recalc-run', new Date('2026-06-20T00:00:00.000Z'),
   )
   assert.equal(state['out-1'].unitCostBase, '4')
   assert.equal(state['out-2'].unitCostBase, '4')
@@ -636,6 +636,7 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 0, cogsRevaluationDelta: new Prisma.Decimal(0) }),
     refreshSalesOrderLineCogsForCostLayerChange: async () => 0,
+    recordCostLayerRevaluation: async () => false,
     warnWeightFallback: () => {},
     warnWeightZeroLines: () => {},
     ...overrides,
@@ -870,6 +871,46 @@ test('recalculateDirectLandedCosts falls back to equal split when every BY_WEIGH
       { id: 'line-b', landedUnitCostBase: 35 },
     ],
   )
+})
+
+test('recalculateDirectLandedCosts records a cost-layer revaluation for each revalued layer (blq0)', async () => {
+  const { tx } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [
+      {
+        id: 'line-a',
+        qty: 2,
+        unitCostBase: 10,
+        totalBase: 20,
+        product: { weight: 0 },
+        costLayers: [{ id: 'layer-a', unitCostBase: 10, receivedQty: 2, remainingQty: 2 }],
+      },
+    ],
+    freightCostLines: [{ amountBase: 4, distributionMethod: 'BY_VALUE' }],
+    landedCostLinks: [],
+  })
+  const revaluations: Array<{ costLayerId: string; oldUnitCostBase: string; newUnitCostBase: string; reason: string }> = []
+  await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    recordCostLayerRevaluation: async (_tx, input) => {
+      revaluations.push({
+        costLayerId: input.costLayerId,
+        oldUnitCostBase: String(input.oldUnitCostBase),
+        newUnitCostBase: String(input.newUnitCostBase),
+        reason: input.reason,
+      })
+      return true
+    },
+  }), TEST_AUDIT_OPTIONS)
+
+  // Freight 4 spread over 2 units = +2/unit, so layer-a 10 → 12.
+  assert.deepEqual(revaluations, [{
+    costLayerId: 'layer-a',
+    oldUnitCostBase: '10',
+    newUnitCostBase: '12',
+    reason: 'landed_cost_recalc',
+  }])
 })
 
 test('recalculateDirectLandedCosts combines direct and linked landed-cost lines', async () => {

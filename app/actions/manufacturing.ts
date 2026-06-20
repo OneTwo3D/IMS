@@ -13,6 +13,7 @@ import {
   consumeFifoLayersStrict,
   createCostLayer,
   getReturnedQtyForCostLayer,
+  recordCostLayerRevaluation,
   refreshShipmentCogsForCostLayerChange,
   refreshSalesOrderLineCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
@@ -1473,6 +1474,8 @@ async function recalculateManufacturingCostLayers(
     currentMfgCost,
   )
   const oldByLayer = new Map(layerInfos.map((l) => [l.id, l]))
+  // One effective timestamp per recompute run for the revaluation event log (blq0).
+  const revaluedAt = new Date()
 
   let netCogsDeltaBase = toDecimal(0)
   let netInventoryDeltaBase = toDecimal(0)
@@ -1485,6 +1488,13 @@ async function recalculateManufacturingCostLayers(
     await tx.costLayer.update({
       where: { id: li.id },
       data: { unitCostBase: r.newUnitCostBase },
+    })
+    await recordCostLayerRevaluation(tx, {
+      costLayerId: li.id,
+      oldUnitCostBase: li.oldUnitCostBase,
+      newUnitCostBase: r.newUnitCostBase,
+      effectiveAt: revaluedAt,
+      reason: 'manufacturing_recompute',
     })
 
     const returnedQty = await getReturnedQtyForCostLayer(tx, li.id)

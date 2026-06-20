@@ -10,8 +10,10 @@ import {
   copyCostLayerSourceLinesProportionally,
   createCostLayer,
   lockStockLevelRow,
+  recordCostLayerRevaluation,
   refreshSalesOrderLineCogs,
   refreshShipmentCogsForCostLayerChange,
+  updateCostLayerUnitCost,
 } from '../lib/cost-layers.ts'
 import { manufacturingCostLayerReceivedAt } from '@/lib/domain/manufacturing/manufacturing-action-inputs'
 import { normalizeAccountingEventLine } from '@/lib/domain/accounting/accounting-event-builder'
@@ -756,4 +758,143 @@ test('refreshSalesOrderLineCogs nulls cogsBase when a line has no shipment lines
 
   assert.equal(updated, 1)
   assert.deepEqual(updates, [{ where: { id: 'line-1' }, data: { cogsBase: null } }])
+})
+
+test('recordCostLayerRevaluation logs a real basis change', async () => {
+  const created: unknown[] = []
+  const tx = {
+    costLayerRevaluation: { findFirst: async () => null, create: async (args: { data: unknown }) => { created.push(args.data) } },
+  }
+
+  const logged = await recordCostLayerRevaluation(tx as never, {
+    costLayerId: 'layer-1',
+    oldUnitCostBase: '10',
+    newUnitCostBase: '12.5',
+    effectiveAt: new Date('2026-06-10T00:00:00.000Z'),
+    reason: 'landed_cost_recalc',
+  })
+
+  assert.equal(logged, true)
+  assert.deepEqual(created, [{
+    costLayerId: 'layer-1',
+    oldUnitCostBase: '10.000000',
+    newUnitCostBase: '12.500000',
+    effectiveAt: new Date('2026-06-10T00:00:00.000Z'),
+    reason: 'landed_cost_recalc',
+  }])
+})
+
+test('recordCostLayerRevaluation skips a no-op (old == new at 6dp)', async () => {
+  const created: unknown[] = []
+  const tx = {
+    costLayerRevaluation: { findFirst: async () => null, create: async (args: { data: unknown }) => { created.push(args.data) } },
+  }
+
+  const logged = await recordCostLayerRevaluation(tx as never, {
+    costLayerId: 'layer-1',
+    oldUnitCostBase: '10.0000004',
+    newUnitCostBase: '10.0000001',
+    effectiveAt: new Date('2026-06-10T00:00:00.000Z'),
+    reason: 'fx_rebase',
+  })
+
+  assert.equal(logged, false)
+  assert.equal(created.length, 0)
+})
+
+test('updateCostLayerUnitCost updates the layer and logs the delta, returning the old cost', async () => {
+  const updates: unknown[] = []
+  const created: unknown[] = []
+  const tx = {
+    costLayer: {
+      findUnique: async () => ({ unitCostBase: '8' }),
+      update: async (args: unknown) => { updates.push(args) },
+    },
+    costLayerRevaluation: { findFirst: async () => null, create: async (args: { data: unknown }) => { created.push(args.data) } },
+  }
+
+  const oldUnit = await updateCostLayerUnitCost(tx as never, 'layer-1', '9.25', {
+    effectiveAt: new Date('2026-06-11T00:00:00.000Z'),
+    reason: 'manufacturing_recompute',
+  })
+
+  assert.equal(oldUnit.toString(), '8')
+  assert.deepEqual(updates, [{ where: { id: 'layer-1' }, data: { unitCostBase: '9.250000' } }])
+  assert.deepEqual(created, [{
+    costLayerId: 'layer-1',
+    oldUnitCostBase: '8.000000',
+    newUnitCostBase: '9.250000',
+    effectiveAt: new Date('2026-06-11T00:00:00.000Z'),
+    reason: 'manufacturing_recompute',
+  }])
+})
+
+test('updateCostLayerUnitCost updates but logs nothing when the cost is unchanged', async () => {
+  const updates: unknown[] = []
+  const created: unknown[] = []
+  const tx = {
+    costLayer: {
+      findUnique: async () => ({ unitCostBase: '9.25' }),
+      update: async (args: unknown) => { updates.push(args) },
+    },
+    costLayerRevaluation: { findFirst: async () => null, create: async (args: { data: unknown }) => { created.push(args.data) } },
+  }
+
+  await updateCostLayerUnitCost(tx as never, 'layer-1', '9.25', {
+    effectiveAt: new Date('2026-06-11T00:00:00.000Z'),
+    reason: 'landed_cost_recalc',
+  })
+
+  assert.equal(updates.length, 1)
+  assert.equal(created.length, 0)
+})
+
+test('recordCostLayerRevaluation coalesces a repeat for the same layer+run into one net event', async () => {
+  const updates: unknown[] = []
+  const created: unknown[] = []
+  const tx = {
+    costLayerRevaluation: {
+      findFirst: async () => ({ id: 'rev-1', oldUnitCostBase: '5' }),
+      create: async (args: { data: unknown }) => { created.push(args.data) },
+      update: async (args: unknown) => { updates.push(args) },
+      delete: async () => { throw new Error('should not delete on a real net change') },
+    },
+  }
+
+  // First event recorded 5->6 (returned by findFirst); now 6->7 in the same run.
+  const logged = await recordCostLayerRevaluation(tx as never, {
+    costLayerId: 'layer-1',
+    oldUnitCostBase: '6',
+    newUnitCostBase: '7',
+    effectiveAt: new Date('2026-06-12T00:00:00.000Z'),
+    reason: 'landed_cost_output_propagation',
+  })
+
+  assert.equal(logged, true)
+  assert.equal(created.length, 0)
+  // Keeps the original old (5), advances new to 7 → net 5->7.
+  assert.deepEqual(updates, [{ where: { id: 'rev-1' }, data: { newUnitCostBase: '7.000000' } }])
+})
+
+test('recordCostLayerRevaluation drops a coalesced net no-op (5->6->5)', async () => {
+  const deleted: unknown[] = []
+  const tx = {
+    costLayerRevaluation: {
+      findFirst: async () => ({ id: 'rev-1', oldUnitCostBase: '5' }),
+      create: async () => { throw new Error('should not create') },
+      update: async () => { throw new Error('should not update on a net no-op') },
+      delete: async (args: unknown) => { deleted.push(args) },
+    },
+  }
+
+  const logged = await recordCostLayerRevaluation(tx as never, {
+    costLayerId: 'layer-1',
+    oldUnitCostBase: '6',
+    newUnitCostBase: '5',
+    effectiveAt: new Date('2026-06-12T00:00:00.000Z'),
+    reason: 'landed_cost_recalc',
+  })
+
+  assert.equal(logged, true)
+  assert.deepEqual(deleted, [{ where: { id: 'rev-1' } }])
 })
