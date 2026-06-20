@@ -1,6 +1,7 @@
 import { Prisma, type PrismaClient, type ProductType, type StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import {
+  addMoney,
   roundQuantity,
   toDecimal,
   type Decimal,
@@ -43,6 +44,11 @@ export type OnHandAsOfResult = {
   orphanWarehouseMovementCount: number
   missingValueMovementSample: OnHandAsOfMissingValueMovement[]
   valueReplayReliable: boolean
+  // Live valuation (source: 'current') only: number of (product, warehouse) pairs
+  // whose open cost-layer quantity diverges from the stock_levels quantity —
+  // including orphan layers (value with no stock row). >0 means the layer-derived
+  // value can't be trusted against the stock quantities (scjz.44). 0 on replay paths.
+  currentValueDriftCount: number
 }
 
 export type OnHandAsOfClient = Pick<
@@ -87,6 +93,17 @@ type AggregatedCurrentStateRow = {
   warehouseId: string
   quantity: DecimalInput
   valueBase: DecimalInput
+  layerQty: DecimalInput
+}
+
+// A (product, warehouse) pair counts as drifted when its open cost-layer quantity
+// diverges from the stock_levels quantity beyond engine-scale rounding noise. This
+// captures orphan layers (stock row missing → quantity 0, layerQty > 0), stock
+// with too few layers, and plain qty mismatches (scjz.44).
+const CURRENT_VALUE_DRIFT_TOLERANCE = toDecimal('0.0001')
+
+function isCurrentValueDrifted(stockQty: DecimalInput, layerQty: DecimalInput): boolean {
+  return toDecimal(stockQty).sub(toDecimal(layerQty)).abs().gt(CURRENT_VALUE_DRIFT_TOLERANCE)
 }
 
 type MovementRow = {
@@ -202,8 +219,10 @@ function buildResult(input: {
   replay?: ReplayMovementsResult
   excludeZero?: boolean
   currentValueFromCostLayers?: boolean
+  currentValueDriftCount?: number
 }): OnHandAsOfResult {
   const replay = input.replay ?? emptyReplayResult()
+  const currentValueDriftCount = input.currentValueDriftCount ?? 0
   return {
     asOf: formatDateTime(input.asOf),
     generatedAt: formatDateTime(input.generatedAt),
@@ -213,9 +232,12 @@ function buildResult(input: {
     missingValueMovementCount: replay.missingValueMovementCount,
     orphanWarehouseMovementCount: replay.orphanWarehouseMovementCount,
     missingValueMovementSample: replay.missingValueMovementSample,
+    // Live valuation is "reliable" only when its layer-derived value reconciles to
+    // the stock quantities; a stock/cost-layer desync (scjz.44) makes it unreliable.
     valueReplayReliable: input.currentValueFromCostLayers
-      ? true
+      ? currentValueDriftCount === 0
       : replay.missingValueMovementCount === 0 && replay.orphanWarehouseMovementCount === 0,
+    currentValueDriftCount,
   }
 }
 
@@ -545,7 +567,7 @@ async function loadSnapshotState(
 async function loadCurrentState(
   client: OnHandAsOfClient,
   filters: OnHandAsOfFilters,
-): Promise<OnHandState> {
+): Promise<{ state: OnHandState; driftCount: number }> {
   if (client.$queryRaw) {
     const rows = await client.$queryRaw<AggregatedCurrentStateRow[]>(Prisma.sql`
       WITH stock_values AS (
@@ -553,7 +575,8 @@ async function loadCurrentState(
           sl."productId",
           sl."warehouseId",
           sl.quantity,
-          COALESCE(SUM(cl."remainingQty" * cl."unitCostBase"), 0) AS "valueBase"
+          COALESCE(SUM(cl."remainingQty" * cl."unitCostBase"), 0) AS "valueBase",
+          COALESCE(SUM(cl."remainingQty"), 0) AS "layerQty"
         FROM stock_levels sl
         JOIN products p
           ON p.id = sl."productId"
@@ -570,7 +593,8 @@ async function loadCurrentState(
           cl."productId",
           cl."warehouseId",
           0::numeric AS quantity,
-          SUM(cl."remainingQty" * cl."unitCostBase") AS "valueBase"
+          SUM(cl."remainingQty" * cl."unitCostBase") AS "valueBase",
+          SUM(cl."remainingQty") AS "layerQty"
         FROM cost_layers cl
         JOIN products p
           ON p.id = cl."productId"
@@ -587,7 +611,11 @@ async function loadCurrentState(
       SELECT * FROM orphan_layer_values
       ORDER BY "productId", "warehouseId"
     `)
-    return stateFromAggregatedCurrentRows(rows)
+    const driftCount = rows.reduce(
+      (count, row) => count + (isCurrentValueDrifted(row.quantity, row.layerQty) ? 1 : 0),
+      0,
+    )
+    return { state: stateFromAggregatedCurrentRows(rows), driftCount }
   }
 
   const [stockLevels, costLayers] = await Promise.all([
@@ -605,7 +633,34 @@ async function loadCurrentState(
       orderBy: [{ productId: 'asc' }, { warehouseId: 'asc' }, { receivedAt: 'asc' }],
     }),
   ])
-  return stateFromCurrentRows(stockLevels, costLayers)
+  return {
+    state: stateFromCurrentRows(stockLevels, costLayers),
+    driftCount: currentValueDriftCount(stockLevels, costLayers),
+  }
+}
+
+// Count (product, warehouse) pairs whose open cost-layer quantity diverges from
+// the stock_levels quantity — the non-raw mirror of the SQL drift count (scjz.44).
+function currentValueDriftCount(
+  stockLevels: readonly StockLevelRow[],
+  costLayers: readonly CostLayerRow[],
+): number {
+  const stockQtyByPair = new Map<string, Decimal>()
+  for (const stockLevel of stockLevels) {
+    stockQtyByPair.set(stateKey(stockLevel.productId, stockLevel.warehouseId), toDecimal(stockLevel.quantity))
+  }
+  const layerQtyByPair = new Map<string, Decimal>()
+  for (const layer of costLayers) {
+    const key = stateKey(layer.productId, layer.warehouseId)
+    layerQtyByPair.set(key, addMoney(layerQtyByPair.get(key) ?? toDecimal(0), toDecimal(layer.remainingQty)))
+  }
+  let driftCount = 0
+  for (const key of new Set([...stockQtyByPair.keys(), ...layerQtyByPair.keys()])) {
+    const stockQty = stockQtyByPair.get(key) ?? toDecimal(0)
+    const layerQty = layerQtyByPair.get(key) ?? toDecimal(0)
+    if (isCurrentValueDrifted(stockQty, layerQty)) driftCount += 1
+  }
+  return driftCount
 }
 
 async function replayMovements(
@@ -721,7 +776,7 @@ export async function getOnHandAsOf(options: {
   }
 
   if (asOf >= now) {
-    const state = await loadCurrentState(client, filters)
+    const { state, driftCount } = await loadCurrentState(client, filters)
     return buildResult({
       asOf,
       generatedAt: now,
@@ -730,6 +785,7 @@ export async function getOnHandAsOf(options: {
       state,
       excludeZero: options.excludeZero,
       currentValueFromCostLayers: true,
+      currentValueDriftCount: driftCount,
     })
   }
 
@@ -790,7 +846,9 @@ export async function getOnHandAsOf(options: {
   }
 
   const runCurrentReverseReplay = async (txClient: OnHandAsOfClient): Promise<OnHandAsOfResult> => {
-    const state = await loadCurrentState(txClient, filters)
+    // Reverse-replay (asOf in the past) reliability comes from the replay, not the
+    // live drift flag, so the current-state drift count is not surfaced here.
+    const { state } = await loadCurrentState(txClient, filters)
     const replay = await replayMovements(
       txClient,
       state,
