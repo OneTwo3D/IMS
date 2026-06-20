@@ -395,11 +395,11 @@ function currentCostLayerWhere(filters: OnHandAsOfFilters): Prisma.CostLayerWher
 async function countPostAsOfRevaluations(
   client: OnHandAsOfClient,
   filters: OnHandAsOfFilters,
-  asOf: Date,
+  effectiveAt: Prisma.DateTimeFilter,
 ): Promise<number> {
   return client.costLayerRevaluation.count({
     where: {
-      effectiveAt: { gt: asOf },
+      effectiveAt,
       costLayer: currentCostLayerWhere(filters),
     },
   })
@@ -822,11 +822,6 @@ export async function getOnHandAsOf(options: {
     })
   }
 
-  // Historical valuation (asOf in the past): flag when any in-scope layer was
-  // revalued after asOf, so the snapshot/current-layer cost basis it draws on is
-  // reported as not point-in-time accurate (scjz.43).
-  const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, asOf)
-
   const asOfDay = startOfUtcDay(asOf)
   // A date-only as-of covers the whole UTC day, so bound replay at the next-day
   // midnight (half-open) rather than the `.999Z` end-of-day proxy, which would
@@ -839,6 +834,16 @@ export async function getOnHandAsOf(options: {
   const asOfLowerBound: { gte: Date } | { gt: Date } = isDateOnly
     ? { gte: startOfNextUtcDay(asOfDay) }
     : { gt: asOf }
+  // Historical valuation: flag when any in-scope layer was revalued AFTER the
+  // as-of coverage window, so the snapshot/current-layer basis it draws on is
+  // reported as not point-in-time accurate (scjz.43). A date-only as-of covers the
+  // whole UTC day, so "after" starts at next-day midnight (matching the replay
+  // upper bound) — a same-day revaluation is already reflected in the day's value.
+  const postAsOfRevaluationCount = await countPostAsOfRevaluations(
+    client,
+    filters,
+    isDateOnly ? { gte: startOfNextUtcDay(asOfDay) } : { gt: asOf },
+  )
   const priorSnapshotDate = await findPriorSnapshotDate(client, asOfDay)
   if (priorSnapshotDate) {
     const state = await loadSnapshotState(client, priorSnapshotDate, filters)

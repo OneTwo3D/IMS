@@ -1130,11 +1130,13 @@ export async function backfillInventorySnapshots(options: {
   }
 
   // scjz.48: backfilled values seed from CURRENT cost layers, so any revaluation
-  // after fromDate means at least one backfilled date no longer reflects the basis
-  // valid then. Surface the count and downgrade reliability rather than silently
-  // writing post-revaluation values onto historical dates.
+  // after a backfilled day no longer reflects the basis valid then. Backfilled
+  // snapshots are end-of-day, so a revaluation DURING fromDate is already captured
+  // in fromDate's snapshot — only revaluations from next-day midnight onward make
+  // a backfilled date unreliable. Surface the count and downgrade reliability
+  // rather than silently writing post-revaluation values onto historical dates.
   const postBackfillRevaluationCount = await client.costLayerRevaluation.count({
-    where: { effectiveAt: { gt: fromDate } },
+    where: { effectiveAt: { gte: startOfNextUtcDay(fromDate) } },
   })
 
   return {

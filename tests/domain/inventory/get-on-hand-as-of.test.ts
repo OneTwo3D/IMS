@@ -172,11 +172,12 @@ function createClient(input: {
     },
     costLayerRevaluation: {
       count: async (args: unknown) => {
-        const where = (args as { where?: { effectiveAt?: { gt?: Date }; costLayer?: { productId?: string; warehouseId?: string } } }).where ?? {}
-        const gt = where.effectiveAt?.gt
+        const where = (args as { where?: { effectiveAt?: { gt?: Date; gte?: Date }; costLayer?: { productId?: string; warehouseId?: string } } }).where ?? {}
+        const { gt, gte } = where.effectiveAt ?? {}
         const cl = where.costLayer ?? {}
         return (input.postAsOfRevaluations ?? []).filter((row) => (
           (!gt || row.effectiveAt > gt) &&
+          (!gte || row.effectiveAt >= gte) &&
           (!cl.productId || row.productId === cl.productId) &&
           (!cl.warehouseId || row.warehouseId === cl.warehouseId)
         )).length
