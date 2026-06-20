@@ -851,6 +851,15 @@ export async function getOnHandAsOf(options: {
       'forward',
       options.signal,
     )
+    // Revaluations AFTER asOf don't affect a snapshot frozen at/before asOf. But a
+    // revaluation in (priorSnapshotDate, asOf] is NOT reflected: forward movement
+    // replay carries movement value, not cost-layer revaluations, and a backfilled
+    // snapshot can already carry a post-revaluation basis. Flag that window so the
+    // value isn't reported point-in-time accurate when it isn't (scjz.43/.48).
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, {
+      gte: startOfNextUtcDay(priorSnapshotDate),
+      ...asOfUpperBound,
+    })
     return buildResult({
       asOf,
       generatedAt: now,
@@ -859,10 +868,7 @@ export async function getOnHandAsOf(options: {
       state,
       replay,
       excludeZero: options.excludeZero,
-      // A prior snapshot is frozen at/before asOf and forward movements carry their
-      // own historical value, so a LATER cost-layer revaluation does not change this
-      // value (snapshot rows are immutable; backfill staleness is flagged at write
-      // time, scjz.48). No revaluation flag here.
+      postAsOfRevaluationCount,
     })
   }
 

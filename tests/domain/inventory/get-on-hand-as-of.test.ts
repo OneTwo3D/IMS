@@ -172,12 +172,14 @@ function createClient(input: {
     },
     costLayerRevaluation: {
       count: async (args: unknown) => {
-        const where = (args as { where?: { effectiveAt?: { gt?: Date; gte?: Date }; costLayer?: { productId?: string; warehouseId?: string } } }).where ?? {}
-        const { gt, gte } = where.effectiveAt ?? {}
+        const where = (args as { where?: { effectiveAt?: { gt?: Date; gte?: Date; lt?: Date; lte?: Date }; costLayer?: { productId?: string; warehouseId?: string } } }).where ?? {}
+        const { gt, gte, lt, lte } = where.effectiveAt ?? {}
         const cl = where.costLayer ?? {}
         return (input.postAsOfRevaluations ?? []).filter((row) => (
           (!gt || row.effectiveAt > gt) &&
           (!gte || row.effectiveAt >= gte) &&
+          (!lt || row.effectiveAt < lt) &&
+          (!lte || row.effectiveAt <= lte) &&
           (!cl.productId || row.productId === cl.productId) &&
           (!cl.warehouseId || row.warehouseId === cl.warehouseId)
         )).length
@@ -291,6 +293,33 @@ test('getOnHandAsOf does NOT flag a prior-snapshot valuation for a later revalua
   assert.equal(result.source, 'snapshot_forward_replay')
   assert.equal(result.postAsOfRevaluationCount, 0)
   assert.equal(result.valueReplayReliable, true)
+})
+
+test('getOnHandAsOf flags a prior-snapshot valuation for a revaluation between snapshot and asOf (scjz.43)', async () => {
+  // Snapshot 05-25, asOf 05-28, revaluation 05-27 — in (snapshotDate, asOf]; the
+  // forward replay does not apply it (and a backfilled snapshot may already carry
+  // a post-revaluation basis), so the value is not point-in-time accurate.
+  const client = createClient({
+    snapshots: [{
+      snapshotDate: new Date('2026-05-25T00:00:00.000Z'),
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('10'),
+      valueBase: decimal('20'),
+    }],
+    movements: [],
+    postAsOfRevaluations: [{ productId: 'product-1', warehouseId: 'warehouse-1', effectiveAt: new Date('2026-05-27T00:00:00.000Z') }],
+  })
+
+  const result = await getOnHandAsOf({
+    client,
+    asOf: '2026-05-28',
+    now: () => new Date('2026-06-01T12:00:00.000Z'),
+  })
+
+  assert.equal(result.source, 'snapshot_forward_replay')
+  assert.equal(result.postAsOfRevaluationCount, 1)
+  assert.equal(result.valueReplayReliable, false)
 })
 
 test('getOnHandAsOf replays movements forward from the nearest prior snapshot', async () => {
