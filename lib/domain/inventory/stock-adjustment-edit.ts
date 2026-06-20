@@ -4,9 +4,10 @@ import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 const QUANTITY_EPSILON = 0.000001
 
 // Mirror the shortfall tolerance consumeFifoLayersStrict applies (lib/cost-layers.ts):
-// it accepts a remaining shortfall up to 0.0001. The feasibility pre-check must use the
-// SAME tolerance, or it would over-reject edits that the real consumption would accept.
-const FIFO_SHORTFALL_TOLERANCE = 0.0001
+// it accepts a remaining shortfall up to the 6dp engine scale (1e-6). The feasibility
+// pre-check must use the SAME tolerance, or it would accept an edit that the real
+// consumption then rejects (surfacing a misleading concurrent-consumption error).
+const FIFO_SHORTFALL_TOLERANCE = QUANTITY_EPSILON
 
 export type AdjustmentStockDeltaInput = {
   oldSignedQty: number
