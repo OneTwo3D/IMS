@@ -989,6 +989,38 @@ test('historical backfill dry-run does not write and reports null-value movement
   })
 })
 
+test('backfill marks days at/before a reversed null-value movement as not point-in-time reliable (scjz.43/.48)', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('2') }],
+    movements: [
+      {
+        id: 'movement-null',
+        type: StockMovementType.SALE_DISPATCH,
+        productId: 'product-1',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: decimal('2'),
+        totalValueBase: null,
+        createdAt: new Date('2026-05-28T12:00:00.000Z'),
+      },
+    ],
+  })
+
+  await backfillInventorySnapshots({ client, fromDate: '2026-05-27', toDate: '2026-05-28' })
+
+  const byDate = new Map(
+    client.upserts.map((u) => {
+      const create = (u as { create: { snapshotDate: Date; valueReplayReliable: boolean } }).create
+      return [create.snapshotDate.toISOString().slice(0, 10), create.valueReplayReliable]
+    }),
+  )
+  // 05-28 written before the null movement is reversed → reliable; 05-27 written
+  // after it is reversed (baked into state) → unreliable.
+  assert.equal(byDate.get('2026-05-28'), true)
+  assert.equal(byDate.get('2026-05-27'), false)
+})
+
 test('reservation backfill dry-run reports supported reservation work without writing rows or run markers', async () => {
   const client = createSnapshotClient({
     stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],

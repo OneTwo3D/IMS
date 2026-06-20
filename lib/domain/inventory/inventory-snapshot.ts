@@ -1094,7 +1094,11 @@ export async function backfillInventorySnapshots(options: {
     latestRevaluation == null || startOfNextUtcDay(day) > latestRevaluation
 
   for (let day = toDate; day >= fromDate; day = addUtcDays(day, -1)) {
-    const rows = rowsFromState(day, state, dayValueReplayReliable(day))
+    // A day is reliable only if (a) no later revaluation makes its seeded basis
+    // stale AND (b) no missing-value movement has been reversed yet — once a
+    // null-totalValueBase movement is reversed, it is baked into this and every
+    // earlier day's snapshot and will not be replayed again (scjz.43/.48).
+    const rows = rowsFromState(day, state, dayValueReplayReliable(day) && missingValueMovementCount === 0)
     snapshotsWritten += options.dryRun ? rows.length : await writeSnapshotRows(client, rows)
     daysWritten += 1
 
