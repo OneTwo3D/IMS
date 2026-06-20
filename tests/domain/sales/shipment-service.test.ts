@@ -19,7 +19,7 @@ type Order = {
   trackingNumber?: string | null
 }
 type OrderLine = { id: string; orderId: string; productId: string; qty: number; sku: string; description: string; cogsBase?: number | null }
-type Allocation = { orderId: string; lineId: string; productId: string; warehouseId: string; qty: number }
+type Allocation = { id?: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number }
 type Shipment = {
   id: string
   orderId: string
@@ -164,6 +164,14 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
     orderAllocation: {
       findMany: async ({ where }: { where: { orderId: string } }) => state.allocations
         .filter((allocation) => allocation.orderId === where.orderId),
+      findUnique: async ({ where }: { where: { lineId_warehouseId_productId: { lineId: string; warehouseId: string; productId: string } } }) => {
+        const key = where.lineId_warehouseId_productId
+        return state.allocations.find((allocation) => (
+          allocation.lineId === key.lineId
+          && allocation.warehouseId === key.warehouseId
+          && allocation.productId === key.productId
+        )) ?? null
+      },
     },
     shipment: {
       findMany: async ({ where, select }: { where: { orderId: string; status?: string }; select?: Record<string, boolean> }) => state.shipments
@@ -234,12 +242,16 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     shipmentLine: {
-      findMany: async ({ where, select }: { where: { shipment?: { orderId: string; status?: { not: string } }; lineId?: { in: string[] } }; select?: Record<string, boolean> }) => state.shipmentLines
+      findMany: async ({ where, select }: { where: { shipment?: { orderId?: string; status?: string | { not: string } }; lineId?: { in: string[] } }; select?: Record<string, boolean> }) => state.shipmentLines
         .filter((line) => {
           if (where.shipment == null) return true
           const shipment = state.shipments.find((row) => row.id === line.shipmentId)
-          if (!shipment || shipment.orderId !== where.shipment.orderId) return false
-          return where.shipment.status?.not == null || shipment.status !== where.shipment.status.not
+          if (!shipment) return false
+          if (where.shipment.orderId != null && shipment.orderId !== where.shipment.orderId) return false
+          const statusFilter = where.shipment.status
+          if (typeof statusFilter === 'string') return shipment.status === statusFilter
+          if (statusFilter?.not != null) return shipment.status !== statusFilter.not
+          return true
         })
         .filter((line) => where.lineId?.in == null || where.lineId.in.includes(line.lineId))
         .map((line) => {
@@ -406,6 +418,7 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
   const state = baseState({
     shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
     shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+    allocations: [{ id: 'allocation-1', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
   })
   const result = await transitionShipmentStatus(createClient(state), {
     shipmentId: 'shipment-1',
@@ -420,8 +433,10 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
   assert.equal(state.stockLevels[0].reservedQty, 0)
   assert.equal(state.costLayers[0].remainingQty, 0)
   assert.equal(state.shipments[0].cogsBatchAmount, 10)
+  // Dispatch snapshot is decorated with the line's order allocation + source so the
+  // Group B daily batch can relieve the Allocated-Inventory contra (scjz.18).
   assert.deepEqual(state.shipmentLines[0].costLayerSnapshot, [
-    { costLayerId: 'layer-1', qty: '2.000000', unitCostBase: '5.000000' },
+    { costLayerId: 'layer-1', qty: '2.000000', unitCostBase: '5.000000', orderAllocationId: 'allocation-1', shipmentLineId: 'shipment-line-1', source: 'shipment' },
   ])
   assert.deepEqual(state.cogsEntries, [{
     costLayerId: 'layer-1',
@@ -724,7 +739,7 @@ test('transitionShipmentStatus rolls back earlier line mutations when a later di
 test('transitionShipmentStatus consumes fractional FIFO layers without binary remainder drift', async () => {
   const state = baseState({
     lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 0.3, sku: 'SKU-1', description: 'Product 1' }],
-    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 0.3 }],
+    allocations: [{ id: 'allocation-1', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 0.3 }],
     shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
     shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 0.3 }],
     stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 0.3, reservedQty: 0.3 }],
@@ -744,8 +759,8 @@ test('transitionShipmentStatus consumes fractional FIFO layers without binary re
   assert.equal(state.costLayers[1].remainingQty, 0)
   assert.equal(state.shipments[0].cogsBatchAmount, 0.05)
   assert.deepEqual(state.shipmentLines[0].costLayerSnapshot, [
-    { costLayerId: 'layer-1', qty: '0.100000', unitCostBase: '0.100000' },
-    { costLayerId: 'layer-2', qty: '0.200000', unitCostBase: '0.200000' },
+    { costLayerId: 'layer-1', qty: '0.100000', unitCostBase: '0.100000', orderAllocationId: 'allocation-1', shipmentLineId: 'shipment-line-1', source: 'shipment' },
+    { costLayerId: 'layer-2', qty: '0.200000', unitCostBase: '0.200000', orderAllocationId: 'allocation-1', shipmentLineId: 'shipment-line-1', source: 'shipment' },
   ])
   assert.deepEqual(state.cogsEntries, [
     { costLayerId: 'layer-1', movementId: 'movement-1', qty: '0.100000', unitCostBase: '0.100000', totalCostBase: '0.010000' },

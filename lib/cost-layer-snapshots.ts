@@ -126,6 +126,30 @@ export function reduceSnapshotByCostLayer(
   return remaining.filter((entry) => toDecimal(entry.qty).gt('0.0000001'))
 }
 
+/**
+ * Reduce snapshot entries by a flat quantity, FIFO across entries regardless of
+ * costLayerId. Used to relieve a per-allocation Allocated-Inventory contra by the
+ * shipped/refunded qty even when dispatch consumed different cost layers than the
+ * allocation pinned (cogs-audit scjz.21): the contra is a single account, so only
+ * the qty matters for clearing it, not which specific layer was consumed.
+ */
+export function reduceSnapshotByQty(
+  baseEntries: CostLayerSnapshotEntry[],
+  qty: DecimalInput,
+): CostLayerSnapshotEntry[] {
+  const remaining = baseEntries.map((entry) => ({ ...entry }))
+  let qtyToRemove = toDecimal(qty)
+  for (const entry of remaining) {
+    if (qtyToRemove.lte(0)) break
+    const entryQty = toDecimal(entry.qty)
+    const take = entryQty.lt(qtyToRemove) ? entryQty : qtyToRemove
+    if (take.lte(0)) continue
+    entry.qty = roundQuantity(entryQty.sub(take), 6).toFixed(6)
+    qtyToRemove = qtyToRemove.sub(take)
+  }
+  return remaining.filter((entry) => toDecimal(entry.qty).gt('0.0000001'))
+}
+
 export function takeFromSnapshotEntries(
   entries: CostLayerSnapshotEntry[],
   qty: number,
