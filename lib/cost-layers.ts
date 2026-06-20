@@ -425,6 +425,82 @@ export async function createCostLayer(
   return layer.id
 }
 
+/**
+ * Reason codes for a cost-layer unitCostBase revaluation, recorded in the
+ * cost_layer_revaluations event log (cogs-audit scjz.43/.48).
+ */
+export type CostLayerRevaluationReason =
+  | 'landed_cost_recalc'
+  | 'landed_cost_output_propagation'
+  | 'manufacturing_recompute'
+  | 'fx_rebase'
+  | 'adjustment_edit'
+
+/**
+ * Append a cost-layer revaluation event (the basis valid before/after the change,
+ * with its effective timestamp) so as-of/historical valuation can reconstruct the
+ * cost basis at a point in time. No-op deltas (old == new at 6dp) are skipped so
+ * the log only carries real basis changes. Pass the recalc/edit timestamp as
+ * effectiveAt so events order correctly against an as-of date.
+ */
+export async function recordCostLayerRevaluation(
+  tx: TxClient,
+  input: {
+    costLayerId: string
+    oldUnitCostBase: DecimalInput
+    newUnitCostBase: DecimalInput
+    effectiveAt: Date
+    reason: CostLayerRevaluationReason
+  },
+): Promise<boolean> {
+  const oldUnit = roundQuantity(input.oldUnitCostBase, 6)
+  const newUnit = roundQuantity(input.newUnitCostBase, 6)
+  if (oldUnit.eq(newUnit)) return false
+  await tx.costLayerRevaluation.create({
+    data: {
+      costLayerId: input.costLayerId,
+      oldUnitCostBase: oldUnit.toFixed(6),
+      newUnitCostBase: newUnit.toFixed(6),
+      effectiveAt: input.effectiveAt,
+      reason: input.reason,
+    },
+  })
+  return true
+}
+
+/**
+ * Set a cost layer's unitCostBase to an absolute value AND log the revaluation in
+ * one step, so the cost_layer_revaluations event log stays complete. Reads the
+ * prior cost first. Returns the old unit cost (as a Decimal) for callers that need
+ * the delta. Use this instead of a bare costLayer.update whenever a layer is
+ * REVALUED (its cost changes after creation) — not for qty-only changes.
+ */
+export async function updateCostLayerUnitCost(
+  tx: TxClient,
+  costLayerId: string,
+  newUnitCostBase: DecimalInput,
+  options: { effectiveAt: Date; reason: CostLayerRevaluationReason },
+): Promise<Decimal> {
+  const existing = await tx.costLayer.findUnique({
+    where: { id: costLayerId },
+    select: { unitCostBase: true },
+  })
+  const oldUnit = toDecimal(existing?.unitCostBase ?? 0)
+  const newUnit = roundQuantity(newUnitCostBase, 6)
+  await tx.costLayer.update({
+    where: { id: costLayerId },
+    data: { unitCostBase: newUnit.toFixed(6) },
+  })
+  await recordCostLayerRevaluation(tx, {
+    costLayerId,
+    oldUnitCostBase: oldUnit,
+    newUnitCostBase: newUnit,
+    effectiveAt: options.effectiveAt,
+    reason: options.reason,
+  })
+  return oldUnit
+}
+
 export async function addCostLayerSourceLines(
   tx: TxClient,
   costLayerId: string,
