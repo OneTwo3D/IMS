@@ -99,6 +99,8 @@ export type InventoryValuationReport = {
   valueReplayReliable: boolean
   missingValueMovementCount: number
   orphanWarehouseMovementCount: number
+  currentValueDriftCount: number
+  postAsOfRevaluationCount: number
   rows: InventoryValuationReportRow[]
   pageInfo: PageInfo
   totals: {
@@ -1106,6 +1108,8 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     valueReplayReliable: snapshot.valueReplayReliable,
     missingValueMovementCount: snapshot.missingValueMovementCount,
     orphanWarehouseMovementCount: snapshot.orphanWarehouseMovementCount,
+    currentValueDriftCount: snapshot.currentValueDriftCount,
+    postAsOfRevaluationCount: snapshot.postAsOfRevaluationCount,
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
@@ -1114,9 +1118,19 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
       glBalanceBase: gl.glBalanceBase ? moneyString(gl.glBalanceBase) : null,
       glVarianceBase: gl.glVarianceBase ? moneyString(gl.glVarianceBase) : null,
     },
+    // Reason-specific reliability notices so a revaluation/drift cause is not
+    // misreported as missing value evidence (scjz.43/.44).
     notices: [
       ...gl.notices,
-      snapshot.valueReplayReliable ? '' : 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.',
+      (snapshot.missingValueMovementCount > 0 || snapshot.orphanWarehouseMovementCount > 0)
+        ? 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.'
+        : '',
+      snapshot.postAsOfRevaluationCount > 0
+        ? 'This as-of valuation draws on a cost basis that was revalued after the as-of date, so it is not point-in-time accurate.'
+        : '',
+      snapshot.currentValueDriftCount > 0
+        ? 'This valuation has cost-layer quantities that diverge from stock levels (orphan layers or stock/cost-layer desync).'
+        : '',
     ].filter(Boolean),
   }
 }

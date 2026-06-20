@@ -226,18 +226,13 @@ test('getOnHandAsOf returns the snapshot row on a snapshot day', async () => {
   assert.equal(result.valueReplayReliable, true)
 })
 
-test('getOnHandAsOf flags historical valuation unreliable when a layer was revalued after asOf (scjz.43)', async () => {
+test('getOnHandAsOf flags current-reverse valuation unreliable when a layer was revalued after asOf (scjz.43)', async () => {
+  // No snapshot → current_reverse_replay, which values from CURRENT layers; a later
+  // revaluation means the reversed-to-asOf basis is post-revaluation, not point-in-time.
   const client = createClient({
-    snapshots: [{
-      snapshotDate: new Date('2026-05-27T00:00:00.000Z'),
-      productId: 'product-1',
-      warehouseId: 'warehouse-1',
-      qty: decimal('10'),
-      valueBase: decimal('20'),
-    }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('12') }],
     movements: [],
-    // A landed-cost revaluation took effect AFTER the asOf date, so the snapshot's
-    // cost basis no longer reflects the value valid at asOf.
     postAsOfRevaluations: [{ productId: 'product-1', warehouseId: 'warehouse-1', effectiveAt: new Date('2026-05-29T00:00:00.000Z') }],
   })
 
@@ -247,20 +242,15 @@ test('getOnHandAsOf flags historical valuation unreliable when a layer was reval
     now: () => new Date('2026-06-01T12:00:00.000Z'),
   })
 
-  assert.equal(result.source, 'snapshot_forward_replay')
+  assert.equal(result.source, 'current_reverse_replay')
   assert.equal(result.postAsOfRevaluationCount, 1)
   assert.equal(result.valueReplayReliable, false)
 })
 
-test('getOnHandAsOf does not flag a revaluation that took effect at or before asOf (scjz.43)', async () => {
+test('getOnHandAsOf does not flag a current-reverse valuation for a revaluation at/before asOf (scjz.43)', async () => {
   const client = createClient({
-    snapshots: [{
-      snapshotDate: new Date('2026-05-27T00:00:00.000Z'),
-      productId: 'product-1',
-      warehouseId: 'warehouse-1',
-      qty: decimal('10'),
-      valueBase: decimal('20'),
-    }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('10') }],
     movements: [],
     // Revaluation effective on/before asOf is already reflected in the basis — fine.
     postAsOfRevaluations: [{ productId: 'product-1', warehouseId: 'warehouse-1', effectiveAt: new Date('2026-05-20T00:00:00.000Z') }],
@@ -272,6 +262,33 @@ test('getOnHandAsOf does not flag a revaluation that took effect at or before as
     now: () => new Date('2026-06-01T12:00:00.000Z'),
   })
 
+  assert.equal(result.source, 'current_reverse_replay')
+  assert.equal(result.postAsOfRevaluationCount, 0)
+  assert.equal(result.valueReplayReliable, true)
+})
+
+test('getOnHandAsOf does NOT flag a prior-snapshot valuation for a later revaluation (scjz.43)', async () => {
+  // A prior snapshot is frozen at/before asOf, so a later revaluation does not
+  // change its value — must stay reliable (Codex round-4: don't over-flag snapshots).
+  const client = createClient({
+    snapshots: [{
+      snapshotDate: new Date('2026-05-27T00:00:00.000Z'),
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('10'),
+      valueBase: decimal('20'),
+    }],
+    movements: [],
+    postAsOfRevaluations: [{ productId: 'product-1', warehouseId: 'warehouse-1', effectiveAt: new Date('2026-05-29T00:00:00.000Z') }],
+  })
+
+  const result = await getOnHandAsOf({
+    client,
+    asOf: '2026-05-27',
+    now: () => new Date('2026-06-01T12:00:00.000Z'),
+  })
+
+  assert.equal(result.source, 'snapshot_forward_replay')
   assert.equal(result.postAsOfRevaluationCount, 0)
   assert.equal(result.valueReplayReliable, true)
 })

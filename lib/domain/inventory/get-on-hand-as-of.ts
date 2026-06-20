@@ -834,19 +834,12 @@ export async function getOnHandAsOf(options: {
   const asOfLowerBound: { gte: Date } | { gt: Date } = isDateOnly
     ? { gte: startOfNextUtcDay(asOfDay) }
     : { gt: asOf }
-  // Historical valuation: flag when any in-scope layer was revalued AFTER the
-  // as-of coverage window, so the snapshot/current-layer basis it draws on is
-  // reported as not point-in-time accurate (scjz.43). A date-only as-of covers the
+  // Lower edge of "revalued after asOf" (scjz.43). A date-only as-of covers the
   // whole UTC day, so "after" starts at next-day midnight (matching the replay
   // upper bound) — a same-day revaluation is already reflected in the day's value.
-  const postAsOfRevaluationCutoff: Prisma.DateTimeFilter = isDateOnly
+  const postAsOfRevaluationLowerBound: Prisma.DateTimeFilter = isDateOnly
     ? { gte: startOfNextUtcDay(asOfDay) }
     : { gt: asOf }
-  // Snapshot-based paths value from immutable frozen/historical data, so reading
-  // the count on the outer client is fine. The current-reverse path values from
-  // CURRENT layers inside a serializable transaction and recomputes its own count
-  // there (below) to avoid a TOCTOU against a concurrently-committed revaluation.
-  const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, postAsOfRevaluationCutoff)
   const priorSnapshotDate = await findPriorSnapshotDate(client, asOfDay)
   if (priorSnapshotDate) {
     const state = await loadSnapshotState(client, priorSnapshotDate, filters)
@@ -866,7 +859,10 @@ export async function getOnHandAsOf(options: {
       state,
       replay,
       excludeZero: options.excludeZero,
-      postAsOfRevaluationCount,
+      // A prior snapshot is frozen at/before asOf and forward movements carry their
+      // own historical value, so a LATER cost-layer revaluation does not change this
+      // value (snapshot rows are immutable; backfill staleness is flagged at write
+      // time, scjz.48). No revaluation flag here.
     })
   }
 
@@ -881,6 +877,14 @@ export async function getOnHandAsOf(options: {
       'reverse',
       options.signal,
     )
+    // The future snapshot is frozen at a date AFTER asOf, so it already reflects any
+    // revaluation effective up to then; reversing movements does not undo a
+    // revaluation. Flag revaluations in (asOf, futureSnapshotDate] — those make the
+    // reversed-to-asOf basis post-revaluation rather than point-in-time (scjz.43).
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, {
+      ...postAsOfRevaluationLowerBound,
+      lt: startOfNextUtcDay(futureSnapshotDate),
+    })
     return buildResult({
       asOf,
       generatedAt: now,
@@ -897,10 +901,11 @@ export async function getOnHandAsOf(options: {
     // Reverse-replay (asOf in the past) reliability comes from the replay, not the
     // live drift flag, so the current-state drift count is not surfaced here.
     const { state } = await loadCurrentState(txClient, filters)
-    // Count revaluations INSIDE this transaction: this path values from CURRENT
-    // layers, so a revaluation committing between the outer count and loadCurrentState
-    // would otherwise be valued in but flagged reliable (scjz.43 TOCTOU).
-    const txPostAsOfRevaluationCount = await countPostAsOfRevaluations(txClient, filters, postAsOfRevaluationCutoff)
+    // This path values from CURRENT layers, which reflect every revaluation, so flag
+    // any revaluation effective after asOf. Counted INSIDE this transaction so a
+    // revaluation committing between the count and loadCurrentState can't be valued
+    // in yet reported reliable (scjz.43 TOCTOU).
+    const txPostAsOfRevaluationCount = await countPostAsOfRevaluations(txClient, filters, postAsOfRevaluationLowerBound)
     const replay = await replayMovements(
       txClient,
       state,
