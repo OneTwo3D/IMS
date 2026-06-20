@@ -35,3 +35,20 @@ export function canDispatchTransferQty(
 ): boolean {
   return requestedQty <= availableForTransfer(quantity, reservedQty)
 }
+
+// Engine-scale (6dp) shortfall tolerance; mirrors consumeFifoLayersStrict so the
+// advisory pre-check never rejects a dispatch the real strict consume would accept.
+const FIFO_COVERAGE_TOLERANCE = 0.000001
+
+/**
+ * Whether the cost-layer coverage (sum of remaining layer qty) is enough to fully
+ * cost a strict dispatch of `requestedQty`. TRANSFER_OUT is a costed outbound
+ * movement, so positive stock with insufficient cost layers (a stock/cost-layer
+ * desync) must be rejected up front rather than hard-failing mid-dispatch.
+ */
+export function isCostLayerCoverageSufficient(
+  coveredQty: DecimalLike | null | undefined,
+  requestedQty: number,
+): boolean {
+  return requestedQty - decimalToNumber(coveredQty ?? 0) <= FIFO_COVERAGE_TOLERANCE
+}

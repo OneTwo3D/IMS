@@ -17,7 +17,7 @@ import {
 } from '@/lib/cost-layers'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
-import { canDispatchTransferQty } from '@/lib/domain/inventory/transfer-availability'
+import { canDispatchTransferQty, isCostLayerCoverageSufficient } from '@/lib/domain/inventory/transfer-availability'
 import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import {
@@ -397,6 +397,23 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
           const rawAvailable = Number(level?.quantity ?? 0) - Number(level?.reservedQty ?? 0)
           throw new Error(`Insufficient stock for ${line.sku}: ${rawAvailable} available, ${qty} requested`)
         }
+        // TRANSFER_OUT is a costed outbound movement, so dispatch consumes FIFO
+        // layers STRICTLY (consumeFifoLayersStrict below). A source with positive
+        // stock_level but insufficient cost layers (stock/cost-layer desync) would
+        // pass the availability check above and then hard-fail mid-dispatch. Surface
+        // that here, in the same pre-flight phase, with an actionable message. This
+        // is advisory; the FOR UPDATE consume remains the authoritative guard.
+        const layerCoverage = await tx.costLayer.aggregate({
+          where: { productId: line.productId, warehouseId: transfer.fromWarehouseId, remainingQty: { gt: 0 } },
+          _sum: { remainingQty: true },
+        })
+        const coveredQty = layerCoverage._sum.remainingQty
+        if (!isCostLayerCoverageSufficient(coveredQty, qty)) {
+          throw new Error(
+            `Cannot dispatch ${line.sku}: ${toDecimal(coveredQty ?? 0).toString()} unit(s) covered by cost layers, ${qty} requested ` +
+            `(stock/cost-layer desync — repair the cost layers for ${transfer.fromWarehouse.code} before transferring).`,
+          )
+        }
       }
 
       // Book stock out of source warehouse for each line, consuming FIFO
@@ -447,9 +464,11 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
           )
         }
 
-        // Consume FIFO layers from source warehouse — tolerant mode
-        // (legacy stock may not have layers). Store consumed entries on
-        // the transfer line so receiveTransfer can split/recreate them.
+        // Consume FIFO layers from source warehouse — STRICT: TRANSFER_OUT is a
+        // costed outbound movement, so the dispatched qty must be fully covered by
+        // cost layers (un-layered positive stock is a desync, rejected up front
+        // above). Store consumed entries on the transfer line so receiveTransfer
+        // can split/recreate equivalent layers at the destination.
         const { consumed } = await consumeFifoLayersStrict(tx, line.productId, transfer.fromWarehouseId, qty)
         await tx.stockMovement.update({
           where: { id: movement.id },
