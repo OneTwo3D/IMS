@@ -913,7 +913,7 @@ export async function refreshSalesOrderLineCogs(
   })
 
   const cogsByLineId = new Map<string, Decimal>()
-  const hasSnapshotByLineId = new Map<string, boolean>()
+  const snapshotCountByLineId = new Map<string, number>()
   const shipmentLineCountByLineId = new Map<string, number>()
   for (const shipmentLine of shipmentLines) {
     const snapshot = parseCostLayerSnapshot(shipmentLine.costLayerSnapshot)
@@ -929,26 +929,41 @@ export async function refreshSalesOrderLineCogs(
       ),
     )
     if (snapshot.length > 0) {
-      hasSnapshotByLineId.set(shipmentLine.lineId, true)
+      snapshotCountByLineId.set(
+        shipmentLine.lineId,
+        (snapshotCountByLineId.get(shipmentLine.lineId) ?? 0) + 1,
+      )
     }
   }
 
   let updated = 0
   for (const lineId of uniqueLineIds) {
     const cogs = cogsByLineId.get(lineId)
-    const hasShipmentLines = (shipmentLineCountByLineId.get(lineId) ?? 0) > 0
-    if (hasShipmentLines && !hasSnapshotByLineId.get(lineId)) {
+    const totalShipmentLines = shipmentLineCountByLineId.get(lineId) ?? 0
+    const snapshottedShipmentLines = snapshotCountByLineId.get(lineId) ?? 0
+    if (totalShipmentLines > 0 && snapshottedShipmentLines === 0) {
       // Legacy shipped lines may pre-date shipment FIFO snapshots. Preserve
       // their existing COGS instead of nulling historical margin during a
       // retrospective landed-cost refresh.
       continue
     }
+    if (totalShipmentLines > 0 && snapshottedShipmentLines < totalShipmentLines) {
+      // Mixed snapshot presence: some shipment lines for this sales line carry a
+      // FIFO snapshot and others don't (e.g. a partial's snapshot was cleared
+      // between batch runs). Summing only the snapshotted subset would understate
+      // COGS / overstate margin, so preserve the prior cogsBase and flag for
+      // reconciliation rather than writing a partial total.
+      console.warn(
+        `refreshSalesOrderLineCogs: sales line ${lineId} has mixed shipment-snapshot presence ` +
+        `(${snapshottedShipmentLines}/${totalShipmentLines} shipment lines snapshotted); ` +
+        `preserving prior cogsBase instead of summing a partial set.`,
+      )
+      continue
+    }
     await tx.salesOrderLine.update({
       where: { id: lineId },
       data: {
-        cogsBase: cogs == null || !hasSnapshotByLineId.get(lineId)
-          ? null
-          : roundQuantity(cogs, 4).toNumber(),
+        cogsBase: cogs == null ? null : roundQuantity(cogs, 4).toNumber(),
       },
     })
     updated++
