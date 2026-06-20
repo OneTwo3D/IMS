@@ -456,6 +456,30 @@ export async function recordCostLayerRevaluation(
   const oldUnit = roundQuantity(input.oldUnitCostBase, 6)
   const newUnit = roundQuantity(input.newUnitCostBase, 6)
   if (oldUnit.eq(newUnit)) return false
+  // Coalesce repeated revaluations of the same layer within one run (identical
+  // effectiveAt) — e.g. a diamond BOM cascade reaching an output layer twice, or
+  // two revalued components feeding the same output — into a single net
+  // old→final event. This keeps the original "old" cost and advances "new", so
+  // as-of replay can order events by effectiveAt alone, with no ambiguous
+  // intra-run sequence (blq0). Safe without locking: all events in a run share
+  // one transaction, which is serial.
+  const existing = await tx.costLayerRevaluation.findFirst({
+    where: { costLayerId: input.costLayerId, effectiveAt: input.effectiveAt },
+    select: { id: true, oldUnitCostBase: true },
+  })
+  if (existing) {
+    // Net change across the run = original old → latest new. If they now match
+    // (e.g. 5→6→5), the run was a no-op for this layer; drop the event.
+    if (roundQuantity(existing.oldUnitCostBase, 6).eq(newUnit)) {
+      await tx.costLayerRevaluation.delete({ where: { id: existing.id } })
+    } else {
+      await tx.costLayerRevaluation.update({
+        where: { id: existing.id },
+        data: { newUnitCostBase: newUnit.toFixed(6) },
+      })
+    }
+    return true
+  }
   await tx.costLayerRevaluation.create({
     data: {
       costLayerId: input.costLayerId,

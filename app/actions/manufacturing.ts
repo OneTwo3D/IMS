@@ -1474,6 +1474,8 @@ async function recalculateManufacturingCostLayers(
     currentMfgCost,
   )
   const oldByLayer = new Map(layerInfos.map((l) => [l.id, l]))
+  // One effective timestamp per recompute run for the revaluation event log (blq0).
+  const revaluedAt = new Date()
 
   let netCogsDeltaBase = toDecimal(0)
   let netInventoryDeltaBase = toDecimal(0)
@@ -1491,7 +1493,7 @@ async function recalculateManufacturingCostLayers(
       costLayerId: li.id,
       oldUnitCostBase: li.oldUnitCostBase,
       newUnitCostBase: r.newUnitCostBase,
-      effectiveAt: new Date(),
+      effectiveAt: revaluedAt,
       reason: 'manufacturing_recompute',
     })
 
