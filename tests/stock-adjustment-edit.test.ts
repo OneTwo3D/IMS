@@ -93,12 +93,23 @@ test('assertAdjustmentEditFifoFeasible rejects an old-addition→reduction that 
   )
 })
 
-test('assertAdjustmentEditFifoFeasible accepts a shortfall within the FIFO tolerance (0.0001)', () => {
-  // available 7.99995, need 8 → shortfall 0.00005 ≤ 0.0001, which strict consumption would accept.
-  assert.doesNotThrow(() => assertAdjustmentEditFifoFeasible({
+test('assertAdjustmentEditFifoFeasible rejects a shortfall above the engine-scale FIFO tolerance (scjz.6)', () => {
+  // available 7.99995, need 8 → shortfall 0.00005 > 1e-6, which strict consumption now
+  // rejects. The pre-check must reject too, surfacing the intended availability message
+  // before mutation instead of a later misleading concurrent-consumption error.
+  assert.throws(() => assertAdjustmentEditFifoFeasible({
     newIsAddition: false,
     newAbsQty: 8,
     currentRemainingLayerQty: new Prisma.Decimal('7.99995'),
+  }), /Cannot edit this adjustment to remove 8 unit\(s\)/)
+})
+
+test('assertAdjustmentEditFifoFeasible accepts a sub-µ shortfall within the FIFO tolerance (scjz.6)', () => {
+  // available 7.9999995, need 8 → shortfall 5e-7 ≤ 1e-6, which strict consumption accepts.
+  assert.doesNotThrow(() => assertAdjustmentEditFifoFeasible({
+    newIsAddition: false,
+    newAbsQty: 8,
+    currentRemainingLayerQty: new Prisma.Decimal('7.9999995'),
   }))
 })
 

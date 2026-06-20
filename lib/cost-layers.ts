@@ -283,6 +283,13 @@ export async function consumeFifoLayers(
 }
 
 /**
+ * Largest FIFO shortfall tolerated before treating the consume as insufficient.
+ * Set to the engine scale (6dp) so only float→Decimal conversion noise on the
+ * requested qty is absorbed, not a materially under-covered consumption.
+ */
+const FIFO_SHORTFALL_TOLERANCE = toDecimal('0.000001')
+
+/**
  * Consume FIFO layers and throw if layers are exhausted before qty is met.
  * Use this for dispatches and manufacturing where a shortfall is a hard error.
  */
@@ -300,13 +307,27 @@ export async function consumeFifoLayersStrict(
     if (message) throw new Error(message)
     throw error
   }
-  if (result.remainingQty.gt(0.0001)) {
+  // Tolerance is the engine scale (6dp), not 1e-4: the old 0.0001 band silently
+  // absorbed a real shortfall up to a ten-thousandth of a unit — large for
+  // fractional-unit products — and buildStockMovementValueFieldsFromConsumed then
+  // divides the consumed value by the FULL rowQty, understating unit cost while
+  // claiming the qty fully moved. Only sub-µ float→Decimal noise is tolerated now.
+  if (result.remainingQty.gt(FIFO_SHORTFALL_TOLERANCE)) {
     throw new Error(
       `Insufficient FIFO layers for product ${productId} in warehouse ${warehouseId}: ` +
       `needed ${qty}, only ${subtractMoney(qty, result.remainingQty).toString()} available in cost layers`,
     )
   }
-  // audit-snxr: the sub-0.0001 tolerance above lets a tiny positive consume slip
+  // Surface a non-zero shortfall that was absorbed within tolerance as a
+  // reconciliation exception — it indicates the consumed value was spread over a
+  // marginally larger rowQty than the layers covered.
+  if (result.remainingQty.gt(0)) {
+    console.warn(
+      `consumeFifoLayersStrict absorbed a sub-tolerance FIFO shortfall for product ${productId} ` +
+      `in warehouse ${warehouseId}: requested ${qty}, ${result.remainingQty.toString()} uncovered by cost layers.`,
+    )
+  }
+  // audit-snxr: the sub-µ tolerance above lets a tiny positive consume slip
   // through with NOTHING consumed when there are no cost layers at all (stock /
   // cost-layer desync). Callers build cogs_entries only when consumed is
   // non-empty, so a zero-evidence outbound movement would be written and then

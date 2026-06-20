@@ -417,19 +417,51 @@ test('consumeFifoLayersStrict throws when locked FIFO rows cannot cover the requ
 })
 
 test('consumeFifoLayersStrict throws on a tiny positive consume with NO cost layers (audit-snxr)', async () => {
-  // No FIFO rows → nothing consumed. A qty within the 0.0001 shortfall tolerance
+  // No FIFO rows → nothing consumed. A qty within the sub-µ shortfall tolerance
   // would otherwise return empty consumed, and the outbound writers (guarding on
   // consumed.length > 0) would skip cogs_entries, so the deferred evidence guard
-  // would trip at COMMIT. Fail clearly here instead.
+  // would trip at COMMIT. Fail clearly here instead. (A larger qty trips the
+  // Insufficient-FIFO-layers guard first — also a hard error.)
   const tx = {
     $executeRaw: async () => 0,
     $queryRaw: async () => [],
     costLayer: { update: async () => {} },
   }
   await assert.rejects(
-    () => consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 0.00005),
+    () => consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 0.000001),
     /No FIFO cost layers to consume for product product-1 in warehouse warehouse-1/,
   )
+})
+
+test('consumeFifoLayersStrict throws on a >1e-6 shortfall previously absorbed by the 1e-4 band (scjz.6)', async () => {
+  // Layer covers 4.99999 of a requested 5 → shortfall 0.00001. The old 0.0001
+  // tolerance absorbed this (understating unit cost over the full rowQty); the
+  // tightened 1e-6 tolerance surfaces it.
+  const tx = {
+    $executeRaw: async () => 0,
+    $queryRaw: async () => [
+      { id: 'layer-1', remainingQty: new Prisma.Decimal('4.99999'), unitCostBase: new Prisma.Decimal('2') },
+    ],
+    costLayer: { update: async () => {} },
+  }
+  await assert.rejects(
+    () => consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 5),
+    /Insufficient FIFO layers for product product-1 in warehouse warehouse-1: needed 5, only 4.99999 available/,
+  )
+})
+
+test('consumeFifoLayersStrict absorbs a sub-µ shortfall and still returns the consumed layers (scjz.6)', async () => {
+  // 5 - 4.9999995 = 0.0000005 ≤ 1e-6: float→Decimal noise, not a real shortfall.
+  const tx = {
+    $executeRaw: async () => 0,
+    $queryRaw: async () => [
+      { id: 'layer-1', remainingQty: new Prisma.Decimal('4.9999995'), unitCostBase: new Prisma.Decimal('2') },
+    ],
+    costLayer: { update: async () => {} },
+  }
+  const result = await consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 5)
+  assert.equal(result.consumed.length, 1)
+  assert.equal(result.consumed[0].qty.toString(), '4.9999995')
 })
 
 test('consumeFifoLayers returns the full remaining quantity when no FIFO rows are available', async () => {
