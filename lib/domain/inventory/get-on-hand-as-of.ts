@@ -49,11 +49,17 @@ export type OnHandAsOfResult = {
   // including orphan layers (value with no stock row). >0 means the layer-derived
   // value can't be trusted against the stock quantities (scjz.44). 0 on replay paths.
   currentValueDriftCount: number
+  // Historical (as-of-in-the-past) valuation only: number of in-scope cost-layer
+  // revaluations that took effect AFTER asOf. >0 means the layer-derived value
+  // reflects later landed-cost / manufacturing revaluations rather than the basis
+  // valid at asOf, so the value is not point-in-time accurate (scjz.43). 0 on the
+  // live path (nothing is revalued after "now").
+  postAsOfRevaluationCount: number
 }
 
 export type OnHandAsOfClient = Pick<
   PrismaClient,
-  'inventorySnapshot' | 'stockMovement' | 'stockLevel' | 'costLayer'
+  'inventorySnapshot' | 'stockMovement' | 'stockLevel' | 'costLayer' | 'costLayerRevaluation'
 > & {
   $queryRaw?: PrismaClient['$queryRaw']
   $transaction?: PrismaClient['$transaction']
@@ -220,9 +226,11 @@ function buildResult(input: {
   excludeZero?: boolean
   currentValueFromCostLayers?: boolean
   currentValueDriftCount?: number
+  postAsOfRevaluationCount?: number
 }): OnHandAsOfResult {
   const replay = input.replay ?? emptyReplayResult()
   const currentValueDriftCount = input.currentValueDriftCount ?? 0
+  const postAsOfRevaluationCount = input.postAsOfRevaluationCount ?? 0
   return {
     asOf: formatDateTime(input.asOf),
     generatedAt: formatDateTime(input.generatedAt),
@@ -233,11 +241,17 @@ function buildResult(input: {
     orphanWarehouseMovementCount: replay.orphanWarehouseMovementCount,
     missingValueMovementSample: replay.missingValueMovementSample,
     // Live valuation is "reliable" only when its layer-derived value reconciles to
-    // the stock quantities; a stock/cost-layer desync (scjz.44) makes it unreliable.
+    // the stock quantities (scjz.44). Historical valuation is reliable only when no
+    // replayed movement lacked value, no orphan-warehouse movement was seen, AND no
+    // in-scope layer was revalued after asOf — otherwise the value reflects later
+    // revaluations, not the point-in-time basis (scjz.43).
     valueReplayReliable: input.currentValueFromCostLayers
       ? currentValueDriftCount === 0
-      : replay.missingValueMovementCount === 0 && replay.orphanWarehouseMovementCount === 0,
+      : replay.missingValueMovementCount === 0
+        && replay.orphanWarehouseMovementCount === 0
+        && postAsOfRevaluationCount === 0,
     currentValueDriftCount,
+    postAsOfRevaluationCount,
   }
 }
 
@@ -370,6 +384,25 @@ function currentCostLayerWhere(filters: OnHandAsOfFilters): Prisma.CostLayerWher
     ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
     ...(Object.keys(product).length > 0 ? { product } : {}),
   }
+}
+
+/**
+ * Count in-scope cost-layer revaluations that took effect after `asOf` (scjz.43).
+ * A historical valuation that draws cost from layers/snapshots reflecting these
+ * later revaluations is not point-in-time accurate, so the count downgrades
+ * valueReplayReliable rather than silently reporting a post-revaluation basis.
+ */
+async function countPostAsOfRevaluations(
+  client: OnHandAsOfClient,
+  filters: OnHandAsOfFilters,
+  asOf: Date,
+): Promise<number> {
+  return client.costLayerRevaluation.count({
+    where: {
+      effectiveAt: { gt: asOf },
+      costLayer: currentCostLayerWhere(filters),
+    },
+  })
 }
 
 function emptyState(): OnHandState {
@@ -789,6 +822,11 @@ export async function getOnHandAsOf(options: {
     })
   }
 
+  // Historical valuation (asOf in the past): flag when any in-scope layer was
+  // revalued after asOf, so the snapshot/current-layer cost basis it draws on is
+  // reported as not point-in-time accurate (scjz.43).
+  const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, asOf)
+
   const asOfDay = startOfUtcDay(asOf)
   // A date-only as-of covers the whole UTC day, so bound replay at the next-day
   // midnight (half-open) rather than the `.999Z` end-of-day proxy, which would
@@ -820,6 +858,7 @@ export async function getOnHandAsOf(options: {
       state,
       replay,
       excludeZero: options.excludeZero,
+      postAsOfRevaluationCount,
     })
   }
 
@@ -842,6 +881,7 @@ export async function getOnHandAsOf(options: {
       state,
       replay,
       excludeZero: options.excludeZero,
+      postAsOfRevaluationCount,
     })
   }
 
@@ -865,6 +905,7 @@ export async function getOnHandAsOf(options: {
       state,
       replay,
       excludeZero: options.excludeZero,
+      postAsOfRevaluationCount,
     })
   }
 

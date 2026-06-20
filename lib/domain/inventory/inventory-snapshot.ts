@@ -108,6 +108,11 @@ export type InventorySnapshotBackfillResult = {
   daysWritten: number
   snapshotsWritten: number
   missingValueMovementCount: number
+  // Cost-layer revaluations that took effect after fromDate. Backfilled snapshots
+  // seed value from CURRENT cost layers, which already reflect later landed-cost /
+  // manufacturing revaluations, so any such revaluation means at least some
+  // backfilled date's value is not the basis valid then (scjz.48). >0 ⇒ unreliable.
+  postBackfillRevaluationCount: number
   dryRun: boolean
   valueReplayReliable: boolean
   reservationBackfill: InventoryReservationSnapshotBackfillResult
@@ -142,6 +147,7 @@ export type InventorySnapshotClient = Pick<
   | 'salesOrder'
   | 'stockLevel'
   | 'costLayer'
+  | 'costLayerRevaluation'
   | 'stockMovement'
   | 'inventorySnapshot'
   | 'inventoryReservationSnapshot'
@@ -163,6 +169,9 @@ export type InventorySnapshotTestClient = {
   }
   costLayer: {
     findMany(args: unknown): Promise<InventorySnapshotCostLayerRow[]>
+  }
+  costLayerRevaluation: {
+    count(args: unknown): Promise<number>
   }
   stockMovement: {
     findMany(args: unknown): Promise<InventorySnapshotMovementRow[]>
@@ -1120,14 +1129,23 @@ export async function backfillInventorySnapshots(options: {
     await reverseMovementsOnOrAfter(day)
   }
 
+  // scjz.48: backfilled values seed from CURRENT cost layers, so any revaluation
+  // after fromDate means at least one backfilled date no longer reflects the basis
+  // valid then. Surface the count and downgrade reliability rather than silently
+  // writing post-revaluation values onto historical dates.
+  const postBackfillRevaluationCount = await client.costLayerRevaluation.count({
+    where: { effectiveAt: { gt: fromDate } },
+  })
+
   return {
     fromDate: formatSnapshotDate(fromDate),
     toDate: formatSnapshotDate(toDate),
     daysWritten,
     snapshotsWritten,
     missingValueMovementCount,
+    postBackfillRevaluationCount,
     dryRun: options.dryRun === true,
-    valueReplayReliable: missingValueMovementCount === 0,
+    valueReplayReliable: missingValueMovementCount === 0 && postBackfillRevaluationCount === 0,
     reservationBackfill,
   }
 }

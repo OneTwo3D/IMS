@@ -40,6 +40,7 @@ function createSnapshotClient(input: {
   productionUpdatedAt?: Date | null
   hasCommittedShipmentLine?: boolean
   hasAssemblyProductionOrder?: boolean
+  postBackfillRevaluationCount?: number
   allocations?: Array<{
     id: string
     orderId: string
@@ -70,6 +71,9 @@ function createSnapshotClient(input: {
     },
     costLayer: {
       findMany: async () => input.costLayers ?? [],
+    },
+    costLayerRevaluation: {
+      count: async () => input.postBackfillRevaluationCount ?? 0,
     },
     stockMovement: {
       findMany: async (args) => {
@@ -361,6 +365,7 @@ test('historical backfill replays later movements backwards from current state',
     daysWritten: 2,
     snapshotsWritten: 2,
     missingValueMovementCount: 0,
+    postBackfillRevaluationCount: 0,
     dryRun: false,
     valueReplayReliable: true,
     reservationBackfill: {
@@ -387,6 +392,29 @@ test('historical backfill replays later movements backwards from current state',
       { snapshotDate: '2026-05-27T00:00:00.000Z', qty: '12.0000', valueBase: '24.000000' },
     ],
   )
+})
+
+test('backfill flags valueReplayReliable false when a layer was revalued after fromDate (scjz.48)', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') },
+    ],
+    costLayers: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('2') },
+    ],
+    // A cost-layer revaluation took effect after the backfill fromDate, so the
+    // current-layer-seeded historical values are not the basis valid then.
+    postBackfillRevaluationCount: 1,
+  })
+
+  const result = await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-27',
+    toDate: '2026-05-28',
+  })
+
+  assert.equal(result.postBackfillRevaluationCount, 1)
+  assert.equal(result.valueReplayReliable, false)
 })
 
 test('reservation backfill writes sparse rows and run markers for reliable days', async () => {
