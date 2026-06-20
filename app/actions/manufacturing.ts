@@ -13,6 +13,7 @@ import {
   consumeFifoLayersStrict,
   createCostLayer,
   getReturnedQtyForCostLayer,
+  recordCostLayerRevaluation,
   refreshShipmentCogsForCostLayerChange,
   refreshSalesOrderLineCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
@@ -1485,6 +1486,13 @@ async function recalculateManufacturingCostLayers(
     await tx.costLayer.update({
       where: { id: li.id },
       data: { unitCostBase: r.newUnitCostBase },
+    })
+    await recordCostLayerRevaluation(tx, {
+      costLayerId: li.id,
+      oldUnitCostBase: li.oldUnitCostBase,
+      newUnitCostBase: r.newUnitCostBase,
+      effectiveAt: new Date(),
+      reason: 'manufacturing_recompute',
     })
 
     const returnedQty = await getReturnedQtyForCostLayer(tx, li.id)

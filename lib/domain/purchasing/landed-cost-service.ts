@@ -9,6 +9,7 @@ import {
   getReturnedQtyForCostLayer,
   getReversalConsumedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
+  recordCostLayerRevaluation,
   refreshSalesOrderLineCogsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
@@ -137,6 +138,7 @@ export type LandedCostServiceDeps = {
   updateSnapshotsForCostLayerChange: typeof updateSnapshotsForCostLayerChange
   refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
   refreshSalesOrderLineCogsForCostLayerChange: typeof refreshSalesOrderLineCogsForCostLayerChange
+  recordCostLayerRevaluation: typeof recordCostLayerRevaluation
   warnWeightFallback: (context: string) => LandedCostRevaluationWarning | void
   warnWeightZeroLines: (context: string, lineIds: string[]) => LandedCostRevaluationWarning | void
 }
@@ -150,6 +152,7 @@ const defaultDeps: LandedCostServiceDeps = {
   updateSnapshotsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
   refreshSalesOrderLineCogsForCostLayerChange,
+  recordCostLayerRevaluation,
   warnWeightFallback,
   warnWeightZeroLines,
 }
@@ -280,6 +283,7 @@ export async function propagateLandedCostToOutputs(
   ancestors: Set<string>,
   depth: number,
   recalcRunId: string,
+  revaluedAt: Date,
 ): Promise<void> {
   if (costDeltaPerUnit.abs().lte(LANDED_COST_DELTA_EPSILON)) return
   if (depth > MAX_LANDED_COST_PROPAGATION_DEPTH) return
@@ -327,6 +331,13 @@ export async function propagateLandedCostToOutputs(
     const newOutputUnitCost = oldOutputUnitCost.add(outputUnitDelta).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
 
     await tx.costLayer.update({ where: { id: outputCostLayerId }, data: { unitCostBase: newOutputUnitCost } })
+    await deps.recordCostLayerRevaluation(tx, {
+      costLayerId: outputCostLayerId,
+      oldUnitCostBase: oldOutputUnitCost,
+      newUnitCostBase: newOutputUnitCost,
+      effectiveAt: revaluedAt,
+      reason: 'landed_cost_output_propagation',
+    })
 
     const returnedQty = decimal(await deps.getReturnedQtyForCostLayer(tx, outputCostLayerId))
     const supplierReturnedQty = decimal(await deps.getSupplierReturnedQtyForCostLayer(tx, outputCostLayerId))
@@ -362,7 +373,7 @@ export async function propagateLandedCostToOutputs(
     })
 
     // Cascade into outputs that consumed THIS output (nested BOM levels).
-    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId)
+    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId, revaluedAt)
   }
 }
 
@@ -741,6 +752,8 @@ export async function recalculateLandedCosts(
   const result = emptyRecalcResult()
   // audit-g4la: one nonce per recalc run, stamped onto every adjustment's eventKey.
   const recalcRunId = randomUUID()
+  // One effective timestamp per recalc run for the revaluation event log (blq0).
+  const revaluedAt = new Date()
 
   for (const link of links) {
     const primaryPoId = link.primaryPoId
@@ -983,6 +996,13 @@ export async function recalculateLandedCosts(
           where: { id: cl.id },
           data: { unitCostBase: grossUnitCostBase },
         })
+        await serviceDeps.recordCostLayerRevaluation(tx, {
+          costLayerId: cl.id,
+          oldUnitCostBase: oldUnitCost,
+          newUnitCostBase: newUnitCost,
+          effectiveAt: revaluedAt,
+          reason: 'landed_cost_recalc',
+        })
 
         // audit-e7h8: cascade the delta into produced output layers (the
         // manufacturing-consumed portion was excluded from this layer's COGS).
@@ -993,7 +1013,7 @@ export async function recalculateLandedCosts(
             totalInventoryDelta = totalInventoryDelta.add(invD)
             propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
           },
-          new Set(), 1, recalcRunId,
+          new Set(), 1, recalcRunId, revaluedAt,
         )
 
         let affectedRefundSnapshots = 0
@@ -1116,6 +1136,8 @@ export async function recalculateDirectLandedCosts(
   const result = emptyRecalcResult()
   // audit-g4la: one nonce per recalc run, stamped onto every adjustment's eventKey.
   const recalcRunId = randomUUID()
+  // One effective timestamp per recalc run for the revaluation event log (blq0).
+  const revaluedAt = new Date()
   const po = await tx.purchaseOrder.findUnique({
     where: { id: poId },
     select: {
@@ -1315,6 +1337,13 @@ export async function recalculateDirectLandedCosts(
         where: { id: cl.id },
         data: { unitCostBase: grossUnitCostBase },
       })
+      await serviceDeps.recordCostLayerRevaluation(tx, {
+        costLayerId: cl.id,
+        oldUnitCostBase: oldUnitCost,
+        newUnitCostBase: newUnitCost,
+        effectiveAt: revaluedAt,
+        reason: 'landed_cost_recalc',
+      })
 
       // audit-e7h8: cascade the delta into produced output layers (the
       // manufacturing-consumed portion was excluded from this layer's COGS).
@@ -1325,7 +1354,7 @@ export async function recalculateDirectLandedCosts(
           totalInventoryDelta = totalInventoryDelta.add(invD)
           propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
         },
-        new Set(), 1, recalcRunId,
+        new Set(), 1, recalcRunId, revaluedAt,
       )
 
       let affectedRefundSnapshots = 0
