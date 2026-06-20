@@ -124,7 +124,7 @@ test('inventory snapshot cron logs reservation snapshot counts from the real wri
           { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('5'), unitCostBase: decimal('3') },
         ],
       },
-      costLayerRevaluation: { count: async () => 0, aggregate: async () => ({ _max: { effectiveAt: null } }) },
+      costLayerRevaluation: { count: async () => 0, findMany: async () => [] },
       stockMovement: { findMany: async () => [] },
       inventorySnapshot: {
         findMany: async () => [],

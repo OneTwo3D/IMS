@@ -173,7 +173,7 @@ export type InventorySnapshotTestClient = {
   }
   costLayerRevaluation: {
     count(args: unknown): Promise<number>
-    aggregate(args: unknown): Promise<{ _max: { effectiveAt: Date | null } }>
+    findMany(args: unknown): Promise<Array<{ effectiveAt: Date; costLayer: { productId: string; warehouseId: string } | null }>>
   }
   stockMovement: {
     findMany(args: unknown): Promise<InventorySnapshotMovementRow[]>
@@ -388,9 +388,13 @@ function rowFromStateEntry(snapshotDate: Date, entry: SnapshotStateEntry, valueR
   }
 }
 
-function rowsFromState(snapshotDate: Date, state: SnapshotState, valueReplayReliable: boolean): InventorySnapshotRowInput[] {
+function rowsFromState(
+  snapshotDate: Date,
+  state: SnapshotState,
+  isValueReplayReliable: (productId: string, warehouseId: string) => boolean,
+): InventorySnapshotRowInput[] {
   return [...state.values()]
-    .map((entry) => rowFromStateEntry(snapshotDate, entry, valueReplayReliable))
+    .map((entry) => rowFromStateEntry(snapshotDate, entry, isValueReplayReliable(entry.productId, entry.warehouseId)))
     .sort((a, b) => (
       a.productId.localeCompare(b.productId) ||
       a.warehouseId.localeCompare(b.warehouseId)
@@ -438,7 +442,7 @@ export function buildInventorySnapshotRows(input: {
   return {
     snapshotDate,
     // Built from current state at capture time → point-in-time reliable.
-    rows: rowsFromState(snapshotDate, state, true),
+    rows: rowsFromState(snapshotDate, state, () => true),
     drift: findDrift(state, costLayerQtyByKey, input.tolerance),
   }
 }
@@ -910,7 +914,7 @@ export async function writeDailyInventorySnapshot(options: {
   const reservationSnapshot = await loadCurrentReservationSnapshotRows(client, snapshotDate)
   const drift = findDrift(state, costLayerQtyByKey, options.tolerance)
   // Captured from current state today → point-in-time reliable.
-  const rows = rowsFromState(snapshotDate, state, true)
+  const rows = rowsFromState(snapshotDate, state, () => true)
 
   const snapshotsWritten = await writeSnapshotRows(client, rows)
   const reservationSnapshotsWritten = await writeReservationSnapshotRows(client, reservationSnapshot.rows)
@@ -1006,6 +1010,9 @@ export async function backfillInventorySnapshots(options: {
   const { state } = await loadAggregatedCurrentSnapshotState(client)
 
   let missingValueMovementCount = 0
+  // (product, warehouse) keys whose value had a null-totalValueBase movement
+  // reversed into it during the walk — unreliable from that day backward (scjz.43/.48).
+  const nullValueAffectedPairs = new Set<string>()
   let snapshotsWritten = 0
   let daysWritten = 0
   let movementCursor: { id: string } | undefined
@@ -1076,6 +1083,11 @@ export async function backfillInventorySnapshots(options: {
       }
       if (!reverseMovementIntoState(state, movement)) {
         missingValueMovementCount += 1
+        // The (product, warehouse) value just had a null-totalValueBase movement
+        // baked in; flag only those pairs so unrelated SKUs stay reliable (scjz.43/.48).
+        for (const warehouseId of [movement.fromWarehouseId, movement.toWarehouseId]) {
+          if (warehouseId) nullValueAffectedPairs.add(stockKey(movement.productId, warehouseId))
+        }
       }
     }
   }
@@ -1083,22 +1095,29 @@ export async function backfillInventorySnapshots(options: {
   await reverseMovementsOnOrAfter(startOfNextUtcDay(toDate))
 
   // scjz.43/.48: backfilled values seed from CURRENT cost layers. A snapshot for
-  // day D is point-in-time accurate only if no cost layer was revalued after D
-  // (a later revaluation means D's seeded value reflects that newer cost). The
-  // latest revaluation timestamp lets each day's row be flagged without a per-day
-  // query: D is reliable iff next-day-midnight(D) > latest revaluation.
-  const latestRevaluation = (await client.costLayerRevaluation.aggregate({
-    _max: { effectiveAt: true },
-  }))._max.effectiveAt
-  const dayValueReplayReliable = (day: Date): boolean =>
-    latestRevaluation == null || startOfNextUtcDay(day) > latestRevaluation
+  // pair (p,w) on day D is point-in-time accurate only if no cost layer for that
+  // pair was revalued after D. Build the latest revaluation per pair so each row
+  // is flagged precisely (an unrelated SKU's row stays reliable).
+  const latestRevalByPair = new Map<string, Date>()
+  const revaluationRows = await client.costLayerRevaluation.findMany({
+    select: { effectiveAt: true, costLayer: { select: { productId: true, warehouseId: true } } },
+  }) as Array<{ effectiveAt: Date; costLayer: { productId: string; warehouseId: string } | null }>
+  for (const row of revaluationRows) {
+    if (!row.costLayer) continue
+    const key = stockKey(row.costLayer.productId, row.costLayer.warehouseId)
+    const prev = latestRevalByPair.get(key)
+    if (!prev || row.effectiveAt > prev) latestRevalByPair.set(key, row.effectiveAt)
+  }
+  const pairValueReplayReliable = (day: Date) => (productId: string, warehouseId: string): boolean => {
+    const key = stockKey(productId, warehouseId)
+    // A reversed null-value movement is baked into this and every earlier day.
+    if (nullValueAffectedPairs.has(key)) return false
+    const latest = latestRevalByPair.get(key)
+    return latest == null || startOfNextUtcDay(day) > latest
+  }
 
   for (let day = toDate; day >= fromDate; day = addUtcDays(day, -1)) {
-    // A day is reliable only if (a) no later revaluation makes its seeded basis
-    // stale AND (b) no missing-value movement has been reversed yet — once a
-    // null-totalValueBase movement is reversed, it is baked into this and every
-    // earlier day's snapshot and will not be replayed again (scjz.43/.48).
-    const rows = rowsFromState(day, state, dayValueReplayReliable(day) && missingValueMovementCount === 0)
+    const rows = rowsFromState(day, state, pairValueReplayReliable(day))
     snapshotsWritten += options.dryRun ? rows.length : await writeSnapshotRows(client, rows)
     daysWritten += 1
 

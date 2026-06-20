@@ -41,7 +41,7 @@ function createSnapshotClient(input: {
   hasCommittedShipmentLine?: boolean
   hasAssemblyProductionOrder?: boolean
   postBackfillRevaluationCount?: number
-  latestRevaluationEffectiveAt?: Date | null
+  revaluations?: Array<{ effectiveAt: Date; costLayer: { productId: string; warehouseId: string } | null }>
   allocations?: Array<{
     id: string
     orderId: string
@@ -75,7 +75,7 @@ function createSnapshotClient(input: {
     },
     costLayerRevaluation: {
       count: async () => input.postBackfillRevaluationCount ?? 0,
-      aggregate: async () => ({ _max: { effectiveAt: input.latestRevaluationEffectiveAt ?? null } }),
+      findMany: async () => input.revaluations ?? [],
     },
     stockMovement: {
       findMany: async (args) => {
@@ -1019,6 +1019,32 @@ test('backfill marks days at/before a reversed null-value movement as not point-
   // after it is reversed (baked into state) → unreliable.
   assert.equal(byDate.get('2026-05-28'), true)
   assert.equal(byDate.get('2026-05-27'), false)
+})
+
+test('backfill flags only the revalued product per (product,warehouse), not unrelated SKUs (scjz.43/.48)', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') },
+      { productId: 'product-2', warehouseId: 'warehouse-1', quantity: decimal('5') },
+    ],
+    costLayers: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('2') },
+      { productId: 'product-2', warehouseId: 'warehouse-1', remainingQty: decimal('5'), unitCostBase: decimal('3') },
+    ],
+    // Only product-1 was revalued (after the backfill range).
+    revaluations: [{ effectiveAt: new Date('2026-05-29T00:00:00.000Z'), costLayer: { productId: 'product-1', warehouseId: 'warehouse-1' } }],
+  })
+
+  await backfillInventorySnapshots({ client, fromDate: '2026-05-27', toDate: '2026-05-28' })
+
+  const reliableByProduct = new Map(
+    client.upserts.map((u) => {
+      const create = (u as { create: { productId: string; valueReplayReliable: boolean } }).create
+      return [create.productId, create.valueReplayReliable]
+    }),
+  )
+  assert.equal(reliableByProduct.get('product-1'), false)
+  assert.equal(reliableByProduct.get('product-2'), true)
 })
 
 test('reservation backfill dry-run reports supported reservation work without writing rows or run markers', async () => {
