@@ -177,6 +177,7 @@ export type StockOnHandReport = {
   orphanWarehouseMovementCount: number
   currentValueDriftCount: number
   postAsOfRevaluationCount: number
+  staleSnapshotCount: number
   rows: StockOnHandReportRow[]
   pageInfo: PageInfo
   totals: {
@@ -919,6 +920,7 @@ export async function getStockOnHandReport(
     orphanWarehouseMovementCount: asOfResult.orphanWarehouseMovementCount,
     currentValueDriftCount: asOfResult.currentValueDriftCount,
     postAsOfRevaluationCount: asOfResult.postAsOfRevaluationCount,
+    staleSnapshotCount: asOfResult.staleSnapshotCount,
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {

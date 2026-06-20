@@ -50,11 +50,15 @@ export type OnHandAsOfResult = {
   // value can't be trusted against the stock quantities (scjz.44). 0 on replay paths.
   currentValueDriftCount: number
   // Historical (as-of-in-the-past) valuation only: number of in-scope cost-layer
-  // revaluations that took effect AFTER asOf. >0 means the layer-derived value
-  // reflects later landed-cost / manufacturing revaluations rather than the basis
-  // valid at asOf, so the value is not point-in-time accurate (scjz.43). 0 on the
-  // live path (nothing is revalued after "now").
+  // revaluations that took effect AFTER asOf (and were not applied by the replay).
+  // >0 means the value reflects later landed-cost / manufacturing revaluations
+  // rather than the basis valid at asOf (scjz.43). 0 on the live path.
   postAsOfRevaluationCount: number
+  // Snapshot-backed valuation only: number of loaded snapshot rows persisted as
+  // not point-in-time reliable at write (backfilled from a later basis or with a
+  // missing-value movement baked in) (scjz.43/.48). Distinct reason from a live
+  // post-asOf revaluation so reports can explain it correctly.
+  staleSnapshotCount: number
 }
 
 export type OnHandAsOfClient = Pick<
@@ -227,10 +231,12 @@ function buildResult(input: {
   currentValueFromCostLayers?: boolean
   currentValueDriftCount?: number
   postAsOfRevaluationCount?: number
+  staleSnapshotCount?: number
 }): OnHandAsOfResult {
   const replay = input.replay ?? emptyReplayResult()
   const currentValueDriftCount = input.currentValueDriftCount ?? 0
   const postAsOfRevaluationCount = input.postAsOfRevaluationCount ?? 0
+  const staleSnapshotCount = input.staleSnapshotCount ?? 0
   return {
     asOf: formatDateTime(input.asOf),
     generatedAt: formatDateTime(input.generatedAt),
@@ -249,9 +255,11 @@ function buildResult(input: {
       ? currentValueDriftCount === 0
       : replay.missingValueMovementCount === 0
         && replay.orphanWarehouseMovementCount === 0
-        && postAsOfRevaluationCount === 0,
+        && postAsOfRevaluationCount === 0
+        && staleSnapshotCount === 0,
     currentValueDriftCount,
     postAsOfRevaluationCount,
+    staleSnapshotCount,
   }
 }
 
@@ -867,14 +875,13 @@ export async function getOnHandAsOf(options: {
       'forward',
       options.signal,
     )
-    // Two revaluation-caused inaccuracies for a snapshot-backed value: (a) a
-    // revaluation in (priorSnapshotDate, asOf] the forward replay does not apply
-    // (movements carry value, not cost-layer revaluations), and (b) the loaded
-    // snapshot row itself flagged stale at write (backfilled from a later basis).
-    // Either makes the value not point-in-time accurate (scjz.43/.48).
-    const postAsOfRevaluationCount =
-      await countPostAsOfRevaluations(client, filters, { gte: startOfNextUtcDay(priorSnapshotDate), ...asOfUpperBound })
-      + await countUnreliableSnapshots(client, priorSnapshotDate, filters)
+    // Two distinct snapshot-backed inaccuracies: (a) a revaluation in
+    // (priorSnapshotDate, asOf] the forward replay does not apply (movements carry
+    // value, not cost-layer revaluations), and (b) the loaded snapshot row itself
+    // persisted stale at write (backfilled from a later basis or missing-value).
+    // Tracked separately so reports give the right reason (scjz.43/.48).
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { gte: startOfNextUtcDay(priorSnapshotDate), ...asOfUpperBound })
+    const staleSnapshotCount = await countUnreliableSnapshots(client, priorSnapshotDate, filters)
     return buildResult({
       asOf,
       generatedAt: now,
@@ -884,6 +891,7 @@ export async function getOnHandAsOf(options: {
       replay,
       excludeZero: options.excludeZero,
       postAsOfRevaluationCount,
+      staleSnapshotCount,
     })
   }
 
@@ -903,9 +911,8 @@ export async function getOnHandAsOf(options: {
     // revaluation. Flag revaluations in (asOf, futureSnapshotDate], plus a future
     // snapshot row itself flagged stale at write (backfilled from a later basis) —
     // either makes the reversed-to-asOf basis not point-in-time (scjz.43/.48).
-    const postAsOfRevaluationCount =
-      await countPostAsOfRevaluations(client, filters, { ...postAsOfRevaluationLowerBound, lt: startOfNextUtcDay(futureSnapshotDate) })
-      + await countUnreliableSnapshots(client, futureSnapshotDate, filters)
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { ...postAsOfRevaluationLowerBound, lt: startOfNextUtcDay(futureSnapshotDate) })
+    const staleSnapshotCount = await countUnreliableSnapshots(client, futureSnapshotDate, filters)
     return buildResult({
       asOf,
       generatedAt: now,
@@ -915,6 +922,7 @@ export async function getOnHandAsOf(options: {
       replay,
       excludeZero: options.excludeZero,
       postAsOfRevaluationCount,
+      staleSnapshotCount,
     })
   }
 

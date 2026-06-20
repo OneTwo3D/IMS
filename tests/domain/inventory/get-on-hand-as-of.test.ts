@@ -356,7 +356,9 @@ test('getOnHandAsOf flags a prior snapshot row persisted as not point-in-time re
   })
 
   assert.equal(result.source, 'snapshot_forward_replay')
-  assert.equal(result.postAsOfRevaluationCount, 1)
+  // Reason is the persisted stale-snapshot flag, NOT a live post-asOf revaluation.
+  assert.equal(result.staleSnapshotCount, 1)
+  assert.equal(result.postAsOfRevaluationCount, 0)
   assert.equal(result.valueReplayReliable, false)
 })
 
