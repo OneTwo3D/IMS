@@ -907,8 +907,12 @@ export async function refreshSalesOrderLineCogs(
   const uniqueLineIds = [...new Set(lineIds)]
   if (uniqueLineIds.length === 0) return 0
 
+  // Only SHIPPED shipment lines carry a COGS snapshot (it is written at dispatch).
+  // Excluding PENDING/PICKING/PACKED lines keeps the mixed-snapshot detection below
+  // from treating a not-yet-dispatched partial as a desync — those legitimately
+  // have no snapshot yet (scjz.24).
   const shipmentLines = await tx.shipmentLine.findMany({
-    where: { lineId: { in: uniqueLineIds } },
+    where: { lineId: { in: uniqueLineIds }, shipment: { status: 'SHIPPED' } },
     select: { lineId: true, costLayerSnapshot: true },
   })
 

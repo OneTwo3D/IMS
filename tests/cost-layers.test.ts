@@ -676,10 +676,17 @@ test('copyCostLayerSourceLinesProportionally clamps a sub-micro rounding oversho
   }])
 })
 
-function refreshCogsTx(shipmentLines: Array<{ lineId: string; costLayerSnapshot: unknown }>, updates: unknown[]) {
+function refreshCogsTx(
+  shipmentLines: Array<{ lineId: string; costLayerSnapshot: unknown }>,
+  updates: unknown[],
+  findManyArgs?: unknown[],
+) {
   return {
     shipmentLine: {
-      findMany: async () => shipmentLines,
+      findMany: async (args?: unknown) => {
+        findManyArgs?.push(args)
+        return shipmentLines
+      },
     },
     salesOrderLine: {
       update: async (args: unknown) => {
@@ -688,6 +695,18 @@ function refreshCogsTx(shipmentLines: Array<{ lineId: string; costLayerSnapshot:
     },
   }
 }
+
+test('refreshSalesOrderLineCogs only considers SHIPPED shipment lines (scjz.24)', async () => {
+  const findManyArgs: unknown[] = []
+  const tx = refreshCogsTx([], [], findManyArgs)
+
+  await refreshSalesOrderLineCogs(tx as never, ['line-1'])
+
+  assert.deepEqual((findManyArgs[0] as { where: unknown }).where, {
+    lineId: { in: ['line-1'] },
+    shipment: { status: 'SHIPPED' },
+  })
+})
 
 test('refreshSalesOrderLineCogs sums COGS when every shipment line is snapshotted', async () => {
   const updates: unknown[] = []
