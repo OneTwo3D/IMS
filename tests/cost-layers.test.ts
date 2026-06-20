@@ -7,6 +7,7 @@ import {
   cogsEntryDataFromConsumed,
   consumeFifoLayers,
   consumeFifoLayersStrict,
+  copyCostLayerSourceLinesProportionally,
   createCostLayer,
   lockStockLevelRow,
   refreshShipmentCogsForCostLayerChange,
@@ -565,4 +566,79 @@ test('consumeFifoLayersStrict throws when no FIFO rows are available', async () 
     () => consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 3),
     /Insufficient FIFO layers for product product-1 in warehouse warehouse-1: needed 3, only 0 available/,
   )
+})
+
+function copySourceLinesTx(sourceLayer: unknown, createdRows: unknown[]) {
+  return {
+    costLayer: {
+      findUnique: async () => sourceLayer,
+    },
+    costLayerSourceLine: {
+      createMany: async ({ data }: { data: unknown[] }) => {
+        createdRows.push(...data)
+        return { count: data.length }
+      },
+    },
+  }
+}
+
+test('copyCostLayerSourceLinesProportionally copies a proportional slice when copiedQty < receivedQty', async () => {
+  const createdRows: unknown[] = []
+  const tx = copySourceLinesTx({
+    receivedQty: '10',
+    sourceLines: [
+      { sourceProductId: 'comp-a', sourceCostLayerId: 'src-a', qty: '10', unitCostBase: '4', totalCostBase: '40' },
+    ],
+  }, createdRows)
+
+  const count = await copyCostLayerSourceLinesProportionally(tx as never, 'from-1', 'to-1', 4)
+
+  assert.equal(count, 1)
+  assert.deepEqual(createdRows, [{
+    costLayerId: 'to-1',
+    sourceProductId: 'comp-a',
+    sourceCostLayerId: 'src-a',
+    qty: 4,
+    unitCostBase: 4,
+    totalCostBase: 16,
+  }])
+})
+
+test('copyCostLayerSourceLinesProportionally throws when copiedQty exceeds source receivedQty (no silent cost leak)', async () => {
+  const createdRows: unknown[] = []
+  const tx = copySourceLinesTx({
+    receivedQty: '10',
+    sourceLines: [
+      { sourceProductId: 'comp-a', sourceCostLayerId: 'src-a', qty: '10', unitCostBase: '10', totalCostBase: '100' },
+    ],
+  }, createdRows)
+
+  await assert.rejects(
+    () => copyCostLayerSourceLinesProportionally(tx as never, 'from-1', 'to-1', 15),
+    /copiedQty exceeds source receivedQty/,
+  )
+  assert.equal(createdRows.length, 0)
+})
+
+test('copyCostLayerSourceLinesProportionally clamps a sub-micro rounding overshoot to ratio 1', async () => {
+  const createdRows: unknown[] = []
+  const tx = copySourceLinesTx({
+    receivedQty: '10',
+    sourceLines: [
+      { sourceProductId: 'comp-a', sourceCostLayerId: 'src-a', qty: '10', unitCostBase: '10', totalCostBase: '100' },
+    ],
+  }, createdRows)
+
+  // 10.0000005 / 10 = 1.00000005 — within the sub-µ rounding band, clamp to 1.
+  const count = await copyCostLayerSourceLinesProportionally(tx as never, 'from-1', 'to-1', '10.0000005')
+
+  assert.equal(count, 1)
+  assert.deepEqual(createdRows, [{
+    costLayerId: 'to-1',
+    sourceProductId: 'comp-a',
+    sourceCostLayerId: 'src-a',
+    qty: 10,
+    unitCostBase: 10,
+    totalCostBase: 100,
+  }])
 })
