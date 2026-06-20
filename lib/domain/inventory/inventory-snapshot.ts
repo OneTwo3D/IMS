@@ -1099,7 +1099,11 @@ export async function backfillInventorySnapshots(options: {
   // pair was revalued after D. Build the latest revaluation per pair so each row
   // is flagged precisely (an unrelated SKU's row stays reliable).
   const latestRevalByPair = new Map<string, Date>()
+  // Only revaluations on/after next-day-midnight(fromDate) can make any row in
+  // [fromDate, toDate] stale (an earlier one is already reflected for every day
+  // in range), so bound the scan instead of loading the whole log.
   const revaluationRows = await client.costLayerRevaluation.findMany({
+    where: { effectiveAt: { gte: startOfNextUtcDay(fromDate) } },
     select: { effectiveAt: true, costLayer: { select: { productId: true, warehouseId: true } } },
   }) as Array<{ effectiveAt: Date; costLayer: { productId: string; warehouseId: string } | null }>
   for (const row of revaluationRows) {
