@@ -5,6 +5,7 @@ import { copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
+  reduceSnapshotByQty,
   serializeCostLayerSnapshot,
   sumCostLayerSnapshot,
   takeFromSnapshotEntries,
@@ -943,9 +944,14 @@ async function stageRefundAccountingReversals(
         for (const entry of shipmentLineSnapshots.get(shipmentLine.id) ?? []) {
           if (!entry.orderAllocationId) continue
           const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+          // Relieve the allocation by QTY, not exact costLayerId: dispatch consumes
+          // FIFO-oldest layers that can differ from the allocation's pinned ones, so
+          // a costLayerId match would leave the shipped qty available for an unshipped
+          // refund to wrongly reverse allocation cost for already-shipped units
+          // (cogs-audit scjz.21; mirrors the daily-sync relief).
           allocationAvailability.set(
             entry.orderAllocationId,
-            reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+            reduceSnapshotByQty(available, entry.qty),
           )
         }
       }
@@ -963,9 +969,10 @@ async function stageRefundAccountingReversals(
           }
           if (entry.source === 'allocation' && entry.orderAllocationId) {
             const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+            // Qty-based, consistent with the shipment relief above (scjz.21).
             allocationAvailability.set(
               entry.orderAllocationId,
-              reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+              reduceSnapshotByQty(available, entry.qty),
             )
           }
         }

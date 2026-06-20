@@ -29,6 +29,7 @@ import { scheduleXeroAccountingOutbox } from '@/lib/connectors/xero/outbox'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
+  reduceSnapshotByQty,
   sumCostLayerSnapshot,
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
@@ -862,9 +863,13 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         for (const entry of parseCostLayerSnapshot(priorShipmentLine.costLayerSnapshot)) {
           if (!entry.orderAllocationId) continue
           const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+          // Relieve the allocation contra by QTY, not by exact costLayerId: a
+          // dispatch consumes FIFO-oldest layers that can differ from the layers
+          // the allocation pinned, so a costLayerId match would strand the
+          // Allocated-Inventory contra (cogs-audit scjz.21).
           allocationAvailability.set(
             entry.orderAllocationId,
-            reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+            reduceSnapshotByQty(available, entry.qty),
           )
         }
       }
@@ -873,9 +878,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         for (const entry of parseCostLayerSnapshot(priorRefundLine.costLayerSnapshot)) {
           if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
           const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+          // Qty-based, matching the shipment relief above, so allocation availability
+          // tracking is consistent and order-independent in total relieved qty (scjz.21).
           allocationAvailability.set(
             entry.orderAllocationId,
-            reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+            reduceSnapshotByQty(available, entry.qty),
           )
         }
       }

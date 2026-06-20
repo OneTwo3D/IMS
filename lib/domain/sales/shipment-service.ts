@@ -413,6 +413,23 @@ export async function transitionShipmentStatus(
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => cogsEntryDataFromConsumed(movement.id, entry)),
           })
+          // Decorate the dispatch snapshot with its order allocation (one per
+          // line+warehouse+product) so the Group B daily batch can relieve the
+          // Allocated-Inventory contra for the shipped units (cogs-audit scjz.18).
+          // The contra is relieved by QTY against the allocation's pinned layers
+          // (scjz.21), so this works even though dispatch consumed FIFO-oldest
+          // layers that may differ from the allocation's pinned ones.
+          const allocation = await tx.orderAllocation.findUnique({
+            where: {
+              lineId_warehouseId_productId: {
+                lineId: line.lineId,
+                warehouseId: lockedShipment.warehouseId,
+                productId: line.productId,
+              },
+            },
+            select: { id: true },
+          })
+          const allocationId = allocation?.id
           await tx.shipmentLine.update({
             where: { id: line.id },
             data: {
@@ -420,6 +437,8 @@ export async function transitionShipmentStatus(
                 costLayerId: entry.costLayerId,
                 qty: entry.qty,
                 unitCostBase: entry.unitCostBase,
+                shipmentLineId: line.id,
+                ...(allocationId ? { orderAllocationId: allocationId, source: 'shipment' as const } : {}),
               }))),
             },
           })

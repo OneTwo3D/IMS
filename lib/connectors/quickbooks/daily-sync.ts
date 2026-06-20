@@ -26,6 +26,7 @@ import {
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
+  reduceSnapshotByQty,
   sumCostLayerSnapshot,
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
@@ -779,9 +780,12 @@ export async function runDailyBatchSync(): Promise<{
         for (const entry of parseCostLayerSnapshot(priorShipmentLine.costLayerSnapshot)) {
           if (!entry.orderAllocationId) continue
           const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+          // Relieve the allocation contra by QTY, not by exact costLayerId: dispatch
+          // consumes FIFO-oldest layers that can differ from the allocation's pinned
+          // ones, so a costLayerId match would strand the contra (cogs-audit scjz.21).
           allocationAvailability.set(
             entry.orderAllocationId,
-            reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+            reduceSnapshotByQty(available, entry.qty),
           )
         }
       }
@@ -790,9 +794,11 @@ export async function runDailyBatchSync(): Promise<{
         for (const entry of parseCostLayerSnapshot(priorRefundLine.costLayerSnapshot)) {
           if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
           const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+          // Qty-based, matching the shipment relief above, so allocation availability
+          // tracking is consistent and order-independent in total relieved qty (scjz.21).
           allocationAvailability.set(
             entry.orderAllocationId,
-            reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+            reduceSnapshotByQty(available, entry.qty),
           )
         }
       }
