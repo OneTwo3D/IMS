@@ -1126,7 +1126,7 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
         ? 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.'
         : '',
       snapshot.postAsOfRevaluationCount > 0
-        ? 'This as-of valuation draws on a cost basis that was revalued after the as-of date, so it is not point-in-time accurate.'
+        ? 'This as-of valuation draws on a cost basis affected by a later cost-layer revaluation that the as-of replay did not apply, so it is not point-in-time accurate.'
         : '',
       snapshot.currentValueDriftCount > 0
         ? 'This valuation has cost-layer quantities that diverge from stock levels (orphan layers or stock/cost-layer desync).'

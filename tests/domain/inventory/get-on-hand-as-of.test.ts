@@ -19,6 +19,7 @@ type SnapshotFixture = {
   qty: Prisma.Decimal
   valueBase: Prisma.Decimal
   categoryId?: string
+  valueReplayReliable?: boolean
 }
 
 type MovementFixture = {
@@ -82,6 +83,16 @@ function createClient(input: {
             (!where.product?.categoryId || row.categoryId === where.product.categoryId)
           ))
           .map(({ productId, warehouseId, qty, valueBase }) => ({ productId, warehouseId, qty, valueBase }))
+      },
+      count: async (args: unknown) => {
+        const where = (args as { where?: { snapshotDate?: Date; productId?: string; warehouseId?: string; product?: { categoryId?: string }; valueReplayReliable?: boolean } }).where ?? {}
+        return (input.snapshots ?? []).filter((row) => (
+          (!where.snapshotDate || row.snapshotDate.getTime() === where.snapshotDate.getTime()) &&
+          (!where.productId || row.productId === where.productId) &&
+          (!where.warehouseId || row.warehouseId === where.warehouseId) &&
+          (!where.product?.categoryId || row.categoryId === where.product.categoryId) &&
+          (where.valueReplayReliable === undefined || (row.valueReplayReliable ?? true) === where.valueReplayReliable)
+        )).length
       },
     },
     stockMovement: {
@@ -314,6 +325,33 @@ test('getOnHandAsOf flags a prior-snapshot valuation for a revaluation between s
   const result = await getOnHandAsOf({
     client,
     asOf: '2026-05-28',
+    now: () => new Date('2026-06-01T12:00:00.000Z'),
+  })
+
+  assert.equal(result.source, 'snapshot_forward_replay')
+  assert.equal(result.postAsOfRevaluationCount, 1)
+  assert.equal(result.valueReplayReliable, false)
+})
+
+test('getOnHandAsOf flags a prior snapshot row persisted as not point-in-time reliable (scjz.43/.48)', async () => {
+  // The snapshot row itself was flagged stale at write (backfilled from a basis
+  // revalued after its date); no revaluation falls in (snapshotDate, asOf], so only
+  // the persisted flag signals the staleness.
+  const client = createClient({
+    snapshots: [{
+      snapshotDate: new Date('2026-05-27T00:00:00.000Z'),
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('10'),
+      valueBase: decimal('20'),
+      valueReplayReliable: false,
+    }],
+    movements: [],
+  })
+
+  const result = await getOnHandAsOf({
+    client,
+    asOf: '2026-05-27',
     now: () => new Date('2026-06-01T12:00:00.000Z'),
   })
 

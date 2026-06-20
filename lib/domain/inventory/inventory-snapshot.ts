@@ -57,6 +57,7 @@ export type InventorySnapshotRowInput = {
   qty: Decimal
   valueBase: Decimal
   unitCostBase: Decimal | null
+  valueReplayReliable: boolean
 }
 
 export type InventoryReservationSnapshotRowInput = {
@@ -172,6 +173,7 @@ export type InventorySnapshotTestClient = {
   }
   costLayerRevaluation: {
     count(args: unknown): Promise<number>
+    aggregate(args: unknown): Promise<{ _max: { effectiveAt: Date | null } }>
   }
   stockMovement: {
     findMany(args: unknown): Promise<InventorySnapshotMovementRow[]>
@@ -372,7 +374,7 @@ function stateFromCurrentRows(
   return { state, costLayerQtyByKey }
 }
 
-function rowFromStateEntry(snapshotDate: Date, entry: SnapshotStateEntry): InventorySnapshotRowInput {
+function rowFromStateEntry(snapshotDate: Date, entry: SnapshotStateEntry, valueReplayReliable: boolean): InventorySnapshotRowInput {
   const qty = roundQty(entry.qty)
   const valueBase = roundValue(entry.valueBase)
   return {
@@ -382,12 +384,13 @@ function rowFromStateEntry(snapshotDate: Date, entry: SnapshotStateEntry): Inven
     qty,
     valueBase,
     unitCostBase: qty.gt(0) ? roundValue(valueBase.div(qty)) : null,
+    valueReplayReliable,
   }
 }
 
-function rowsFromState(snapshotDate: Date, state: SnapshotState): InventorySnapshotRowInput[] {
+function rowsFromState(snapshotDate: Date, state: SnapshotState, valueReplayReliable: boolean): InventorySnapshotRowInput[] {
   return [...state.values()]
-    .map((entry) => rowFromStateEntry(snapshotDate, entry))
+    .map((entry) => rowFromStateEntry(snapshotDate, entry, valueReplayReliable))
     .sort((a, b) => (
       a.productId.localeCompare(b.productId) ||
       a.warehouseId.localeCompare(b.warehouseId)
@@ -434,7 +437,8 @@ export function buildInventorySnapshotRows(input: {
 
   return {
     snapshotDate,
-    rows: rowsFromState(snapshotDate, state),
+    // Built from current state at capture time → point-in-time reliable.
+    rows: rowsFromState(snapshotDate, state, true),
     drift: findDrift(state, costLayerQtyByKey, input.tolerance),
   }
 }
@@ -801,11 +805,13 @@ async function writeSnapshotRows(
           qty: row.qty,
           valueBase: row.valueBase,
           unitCostBase: row.unitCostBase,
+          valueReplayReliable: row.valueReplayReliable,
         },
         update: {
           qty: row.qty,
           valueBase: row.valueBase,
           unitCostBase: row.unitCostBase,
+          valueReplayReliable: row.valueReplayReliable,
         },
       } as never) as Promise<unknown>
     ))
@@ -903,7 +909,8 @@ export async function writeDailyInventorySnapshot(options: {
   const { state, costLayerQtyByKey } = await loadAggregatedCurrentSnapshotState(client)
   const reservationSnapshot = await loadCurrentReservationSnapshotRows(client, snapshotDate)
   const drift = findDrift(state, costLayerQtyByKey, options.tolerance)
-  const rows = rowsFromState(snapshotDate, state)
+  // Captured from current state today → point-in-time reliable.
+  const rows = rowsFromState(snapshotDate, state, true)
 
   const snapshotsWritten = await writeSnapshotRows(client, rows)
   const reservationSnapshotsWritten = await writeReservationSnapshotRows(client, reservationSnapshot.rows)
@@ -1075,8 +1082,19 @@ export async function backfillInventorySnapshots(options: {
 
   await reverseMovementsOnOrAfter(startOfNextUtcDay(toDate))
 
+  // scjz.43/.48: backfilled values seed from CURRENT cost layers. A snapshot for
+  // day D is point-in-time accurate only if no cost layer was revalued after D
+  // (a later revaluation means D's seeded value reflects that newer cost). The
+  // latest revaluation timestamp lets each day's row be flagged without a per-day
+  // query: D is reliable iff next-day-midnight(D) > latest revaluation.
+  const latestRevaluation = (await client.costLayerRevaluation.aggregate({
+    _max: { effectiveAt: true },
+  }))._max.effectiveAt
+  const dayValueReplayReliable = (day: Date): boolean =>
+    latestRevaluation == null || startOfNextUtcDay(day) > latestRevaluation
+
   for (let day = toDate; day >= fromDate; day = addUtcDays(day, -1)) {
-    const rows = rowsFromState(day, state)
+    const rows = rowsFromState(day, state, dayValueReplayReliable(day))
     snapshotsWritten += options.dryRun ? rows.length : await writeSnapshotRows(client, rows)
     daysWritten += 1
 

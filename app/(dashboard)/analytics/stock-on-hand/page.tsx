@@ -113,7 +113,7 @@ export default async function StockOnHandPage({ searchParams }: { searchParams: 
       ? 'This as-of value replay includes movements without value evidence or orphan warehouse movement rows.'
       : '',
     report.postAsOfRevaluationCount > 0
-      ? 'This as-of value draws on a cost basis that was revalued after the as-of date, so it is not point-in-time accurate.'
+      ? 'This as-of value draws on a cost basis affected by a later cost-layer revaluation that the as-of replay did not apply, so it is not point-in-time accurate.'
       : '',
     report.currentValueDriftCount > 0
       ? 'Cost-layer quantities diverge from stock levels (orphan layers or stock/cost-layer desync).'

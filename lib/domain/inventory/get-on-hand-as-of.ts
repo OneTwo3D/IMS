@@ -597,6 +597,22 @@ async function loadSnapshotState(
   return stateFromSnapshots(rows)
 }
 
+/**
+ * Count in-scope snapshot rows for a date whose stored value was flagged not
+ * point-in-time accurate at write (e.g. a backfilled row seeded from cost layers
+ * revalued after that date). Lets snapshot-backed as-of reads surface a stale
+ * basis instead of trusting it (scjz.43/.48).
+ */
+async function countUnreliableSnapshots(
+  client: OnHandAsOfClient,
+  snapshotDate: Date,
+  filters: OnHandAsOfFilters,
+): Promise<number> {
+  return client.inventorySnapshot.count({
+    where: { ...snapshotWhere(snapshotDate, filters), valueReplayReliable: false },
+  })
+}
+
 async function loadCurrentState(
   client: OnHandAsOfClient,
   filters: OnHandAsOfFilters,
@@ -851,15 +867,14 @@ export async function getOnHandAsOf(options: {
       'forward',
       options.signal,
     )
-    // Revaluations AFTER asOf don't affect a snapshot frozen at/before asOf. But a
-    // revaluation in (priorSnapshotDate, asOf] is NOT reflected: forward movement
-    // replay carries movement value, not cost-layer revaluations, and a backfilled
-    // snapshot can already carry a post-revaluation basis. Flag that window so the
-    // value isn't reported point-in-time accurate when it isn't (scjz.43/.48).
-    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, {
-      gte: startOfNextUtcDay(priorSnapshotDate),
-      ...asOfUpperBound,
-    })
+    // Two revaluation-caused inaccuracies for a snapshot-backed value: (a) a
+    // revaluation in (priorSnapshotDate, asOf] the forward replay does not apply
+    // (movements carry value, not cost-layer revaluations), and (b) the loaded
+    // snapshot row itself flagged stale at write (backfilled from a later basis).
+    // Either makes the value not point-in-time accurate (scjz.43/.48).
+    const postAsOfRevaluationCount =
+      await countPostAsOfRevaluations(client, filters, { gte: startOfNextUtcDay(priorSnapshotDate), ...asOfUpperBound })
+      + await countUnreliableSnapshots(client, priorSnapshotDate, filters)
     return buildResult({
       asOf,
       generatedAt: now,
@@ -885,12 +900,12 @@ export async function getOnHandAsOf(options: {
     )
     // The future snapshot is frozen at a date AFTER asOf, so it already reflects any
     // revaluation effective up to then; reversing movements does not undo a
-    // revaluation. Flag revaluations in (asOf, futureSnapshotDate] — those make the
-    // reversed-to-asOf basis post-revaluation rather than point-in-time (scjz.43).
-    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, {
-      ...postAsOfRevaluationLowerBound,
-      lt: startOfNextUtcDay(futureSnapshotDate),
-    })
+    // revaluation. Flag revaluations in (asOf, futureSnapshotDate], plus a future
+    // snapshot row itself flagged stale at write (backfilled from a later basis) —
+    // either makes the reversed-to-asOf basis not point-in-time (scjz.43/.48).
+    const postAsOfRevaluationCount =
+      await countPostAsOfRevaluations(client, filters, { ...postAsOfRevaluationLowerBound, lt: startOfNextUtcDay(futureSnapshotDate) })
+      + await countUnreliableSnapshots(client, futureSnapshotDate, filters)
     return buildResult({
       asOf,
       generatedAt: now,

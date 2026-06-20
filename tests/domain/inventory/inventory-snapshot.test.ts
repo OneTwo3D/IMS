@@ -41,6 +41,7 @@ function createSnapshotClient(input: {
   hasCommittedShipmentLine?: boolean
   hasAssemblyProductionOrder?: boolean
   postBackfillRevaluationCount?: number
+  latestRevaluationEffectiveAt?: Date | null
   allocations?: Array<{
     id: string
     orderId: string
@@ -74,6 +75,7 @@ function createSnapshotClient(input: {
     },
     costLayerRevaluation: {
       count: async () => input.postBackfillRevaluationCount ?? 0,
+      aggregate: async () => ({ _max: { effectiveAt: input.latestRevaluationEffectiveAt ?? null } }),
     },
     stockMovement: {
       findMany: async (args) => {
