@@ -3640,39 +3640,47 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
     const totalBase = subtotalBase + taxBase
 
     const freightReference = await makeReference()
-    const po = await db.purchaseOrder.create({
-      data: {
-        reference: freightReference,
-        type: 'FREIGHT',
-        supplierId: input.supplierId,
-        currency: input.currency,
-        fxRateToBase: fxRate,
-        subtotalForeign,
-        subtotalBase,
-        taxForeign,
-        taxBase,
-        totalForeign,
-        totalBase,
-        directFreightForeign: subtotalForeign,
-        directFreightBase: subtotalBase,
-        supplierRef: input.supplierRef || null,
-        notes: input.notes || null,
-        freightCostLines: { create: costLineData },
-        asFreightFor: {
-          create: input.primaryPoIds.map((pid) => ({
-            primaryPoId: pid,
-            method: costLineData[0]?.distributionMethod ?? 'BY_VALUE',
-          })),
-        },
+    // Create the freight PO + landed-cost links AND run the initial recalc in ONE
+    // transaction: if the recalc fails (e.g. a linked primary is CLOSED ->
+    // throws, or a lock timeout), the freight PO and its LandedCostLinks roll back
+    // too, so we never leave 'linked but unapplied' freight with no retry path
+    // (scjz.15). The cancellation path already recalcs in-tx; this matches it.
+    const { po, landedResult } = await db.$transaction(
+      async (tx) => {
+        const po = await tx.purchaseOrder.create({
+          data: {
+            reference: freightReference,
+            type: 'FREIGHT',
+            supplierId: input.supplierId,
+            currency: input.currency,
+            fxRateToBase: fxRate,
+            subtotalForeign,
+            subtotalBase,
+            taxForeign,
+            taxBase,
+            totalForeign,
+            totalBase,
+            directFreightForeign: subtotalForeign,
+            directFreightBase: subtotalBase,
+            supplierRef: input.supplierRef || null,
+            notes: input.notes || null,
+            freightCostLines: { create: costLineData },
+            asFreightFor: {
+              create: input.primaryPoIds.map((pid) => ({
+                primaryPoId: pid,
+                method: costLineData[0]?.distributionMethod ?? 'BY_VALUE',
+              })),
+            },
+          },
+          select: PO_SELECT,
+        })
+        const landedResult = await recalculateLandedCosts(tx, po.id, undefined, {
+          triggeredById: session.user.id,
+          reason: 'freight_purchase_order_created',
+          scheduleAdjustmentJournals: true, // audit-grob durable backstop
+        })
+        return { po, landedResult }
       },
-      select: PO_SELECT,
-    })
-    const landedResult = await db.$transaction(
-      async (tx) => recalculateLandedCosts(tx, po.id, undefined, {
-        triggeredById: session.user.id,
-        reason: 'freight_purchase_order_created',
-        scheduleAdjustmentJournals: true, // audit-grob durable backstop
-      }),
       STOCK_TX_OPTIONS,
     )
 
