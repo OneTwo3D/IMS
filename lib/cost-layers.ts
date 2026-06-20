@@ -462,14 +462,20 @@ export async function copyCostLayerSourceLinesProportionally(
   if (sourceReceivedQty.lte(0)) return 0
 
   const rawRatio = copiedQtyDecimal.div(sourceReceivedQty)
-  const ratio = rawRatio.gt(1) ? toDecimal(1) : rawRatio
-  if (ratio.lte(0)) return 0
+  // Every caller copies a SLICE drawn from the source layer (a refund/transfer/
+  // sync portion of what was consumed from it), so copiedQty must never exceed
+  // the source receivedQty. Capping the ratio at 1 silently understated the
+  // copied source cost (cost-value leak); throw instead so the upstream anomaly
+  // surfaces. A sub-µ band above 1 is rounding slack — clamp it to 1.
   if (rawRatio.gt('1.000001')) {
-    console.warn(
-      `copyCostLayerSourceLinesProportionally capped ratio at 1 for ${fromCostLayerId} -> ${toCostLayerId} ` +
-      `(copiedQty=${copiedQtyDecimal.toString()}, sourceReceivedQty=${sourceReceivedQty.toString()})`,
+    throw new Error(
+      `copyCostLayerSourceLinesProportionally: copiedQty exceeds source receivedQty for ${fromCostLayerId} -> ${toCostLayerId} ` +
+      `(copiedQty=${copiedQtyDecimal.toString()}, sourceReceivedQty=${sourceReceivedQty.toString()}); ` +
+      `this would leak source cost into the target layer.`,
     )
   }
+  const ratio = rawRatio.gt(1) ? toDecimal(1) : rawRatio
+  if (ratio.lte(0)) return 0
 
   return addCostLayerSourceLines(
     tx,
