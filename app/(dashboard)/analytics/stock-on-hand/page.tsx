@@ -107,7 +107,20 @@ export default async function StockOnHandPage({ searchParams }: { searchParams: 
         : report.reservedQtyScope === 'mixed_snapshot_current_missing'
           ? `Reservation snapshots cover ${reservationRowsCopy(report.reservationSnapshotCount)} for ${report.reservationSnapshotDate}; ${reservationRowsCopy(report.currentReservationFallbackCount)} fell back to current StockLevel reservations and are marked in the CSV export.`
           : `${reservationRowsCopy(report.missingReservationSnapshotCount)} ${reservationRowsVerb(report.missingReservationSnapshotCount)} missing ${reservationSnapshotsCopy(report.missingReservationSnapshotCount)} for ${report.reservationSnapshotDate}; those rows use current StockLevel reservations and are marked in the CSV export.`,
-    report.valueReplayReliable ? '' : 'This as-of value replay includes movements without value evidence or orphan warehouse movement rows.',
+    // Reason-specific reliability notices so a revaluation / stock-cost-layer drift
+    // cause is not misreported as missing value evidence (scjz.43/.44).
+    (report.missingValueMovementCount > 0 || report.orphanWarehouseMovementCount > 0)
+      ? 'This as-of value replay includes movements without value evidence or orphan warehouse movement rows.'
+      : '',
+    report.postAsOfRevaluationCount > 0
+      ? 'This as-of value draws on a cost basis affected by a later cost-layer revaluation that the as-of replay did not apply, so it is not point-in-time accurate.'
+      : '',
+    report.staleSnapshotCount > 0
+      ? 'This as-of value uses snapshot rows flagged not point-in-time accurate when written (backfilled from a later cost basis or with a missing-value movement baked in).'
+      : '',
+    report.currentValueDriftCount > 0
+      ? 'Cost-layer quantities diverge from stock levels (orphan layers or stock/cost-layer desync).'
+      : '',
   ].filter(Boolean)
 
   return (

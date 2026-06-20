@@ -40,6 +40,8 @@ function createSnapshotClient(input: {
   productionUpdatedAt?: Date | null
   hasCommittedShipmentLine?: boolean
   hasAssemblyProductionOrder?: boolean
+  postBackfillRevaluationCount?: number
+  revaluations?: Array<{ effectiveAt: Date; costLayer: { productId: string; warehouseId: string } | null }>
   allocations?: Array<{
     id: string
     orderId: string
@@ -70,6 +72,10 @@ function createSnapshotClient(input: {
     },
     costLayer: {
       findMany: async () => input.costLayers ?? [],
+    },
+    costLayerRevaluation: {
+      count: async () => input.postBackfillRevaluationCount ?? 0,
+      findMany: async () => input.revaluations ?? [],
     },
     stockMovement: {
       findMany: async (args) => {
@@ -361,6 +367,7 @@ test('historical backfill replays later movements backwards from current state',
     daysWritten: 2,
     snapshotsWritten: 2,
     missingValueMovementCount: 0,
+    postBackfillRevaluationCount: 0,
     dryRun: false,
     valueReplayReliable: true,
     reservationBackfill: {
@@ -387,6 +394,29 @@ test('historical backfill replays later movements backwards from current state',
       { snapshotDate: '2026-05-27T00:00:00.000Z', qty: '12.0000', valueBase: '24.000000' },
     ],
   )
+})
+
+test('backfill flags valueReplayReliable false when a layer was revalued after fromDate (scjz.48)', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') },
+    ],
+    costLayers: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('2') },
+    ],
+    // A cost-layer revaluation took effect after the backfill fromDate, so the
+    // current-layer-seeded historical values are not the basis valid then.
+    postBackfillRevaluationCount: 1,
+  })
+
+  const result = await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-27',
+    toDate: '2026-05-28',
+  })
+
+  assert.equal(result.postBackfillRevaluationCount, 1)
+  assert.equal(result.valueReplayReliable, false)
 })
 
 test('reservation backfill writes sparse rows and run markers for reliable days', async () => {
@@ -957,6 +987,64 @@ test('historical backfill dry-run does not write and reports null-value movement
     warnings: [],
     knownLimitations: [],
   })
+})
+
+test('backfill marks days at/before a reversed null-value movement as not point-in-time reliable (scjz.43/.48)', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('2') }],
+    movements: [
+      {
+        id: 'movement-null',
+        type: StockMovementType.SALE_DISPATCH,
+        productId: 'product-1',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: decimal('2'),
+        totalValueBase: null,
+        createdAt: new Date('2026-05-28T12:00:00.000Z'),
+      },
+    ],
+  })
+
+  await backfillInventorySnapshots({ client, fromDate: '2026-05-27', toDate: '2026-05-28' })
+
+  const byDate = new Map(
+    client.upserts.map((u) => {
+      const create = (u as { create: { snapshotDate: Date; valueReplayReliable: boolean } }).create
+      return [create.snapshotDate.toISOString().slice(0, 10), create.valueReplayReliable]
+    }),
+  )
+  // 05-28 written before the null movement is reversed → reliable; 05-27 written
+  // after it is reversed (baked into state) → unreliable.
+  assert.equal(byDate.get('2026-05-28'), true)
+  assert.equal(byDate.get('2026-05-27'), false)
+})
+
+test('backfill flags only the revalued product per (product,warehouse), not unrelated SKUs (scjz.43/.48)', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') },
+      { productId: 'product-2', warehouseId: 'warehouse-1', quantity: decimal('5') },
+    ],
+    costLayers: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('2') },
+      { productId: 'product-2', warehouseId: 'warehouse-1', remainingQty: decimal('5'), unitCostBase: decimal('3') },
+    ],
+    // Only product-1 was revalued (after the backfill range).
+    revaluations: [{ effectiveAt: new Date('2026-05-29T00:00:00.000Z'), costLayer: { productId: 'product-1', warehouseId: 'warehouse-1' } }],
+  })
+
+  await backfillInventorySnapshots({ client, fromDate: '2026-05-27', toDate: '2026-05-28' })
+
+  const reliableByProduct = new Map(
+    client.upserts.map((u) => {
+      const create = (u as { create: { productId: string; valueReplayReliable: boolean } }).create
+      return [create.productId, create.valueReplayReliable]
+    }),
+  )
+  assert.equal(reliableByProduct.get('product-1'), false)
+  assert.equal(reliableByProduct.get('product-2'), true)
 })
 
 test('reservation backfill dry-run reports supported reservation work without writing rows or run markers', async () => {

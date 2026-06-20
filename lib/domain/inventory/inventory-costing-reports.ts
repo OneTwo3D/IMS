@@ -99,6 +99,9 @@ export type InventoryValuationReport = {
   valueReplayReliable: boolean
   missingValueMovementCount: number
   orphanWarehouseMovementCount: number
+  currentValueDriftCount: number
+  postAsOfRevaluationCount: number
+  staleSnapshotCount: number
   rows: InventoryValuationReportRow[]
   pageInfo: PageInfo
   totals: {
@@ -1106,6 +1109,9 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     valueReplayReliable: snapshot.valueReplayReliable,
     missingValueMovementCount: snapshot.missingValueMovementCount,
     orphanWarehouseMovementCount: snapshot.orphanWarehouseMovementCount,
+    currentValueDriftCount: snapshot.currentValueDriftCount,
+    postAsOfRevaluationCount: snapshot.postAsOfRevaluationCount,
+    staleSnapshotCount: snapshot.staleSnapshotCount,
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
@@ -1114,9 +1120,22 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
       glBalanceBase: gl.glBalanceBase ? moneyString(gl.glBalanceBase) : null,
       glVarianceBase: gl.glVarianceBase ? moneyString(gl.glVarianceBase) : null,
     },
+    // Reason-specific reliability notices so a revaluation/drift cause is not
+    // misreported as missing value evidence (scjz.43/.44).
     notices: [
       ...gl.notices,
-      snapshot.valueReplayReliable ? '' : 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.',
+      (snapshot.missingValueMovementCount > 0 || snapshot.orphanWarehouseMovementCount > 0)
+        ? 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.'
+        : '',
+      snapshot.postAsOfRevaluationCount > 0
+        ? 'This as-of valuation draws on a cost basis affected by a later cost-layer revaluation that the as-of replay did not apply, so it is not point-in-time accurate.'
+        : '',
+      snapshot.staleSnapshotCount > 0
+        ? 'This as-of valuation uses snapshot rows flagged not point-in-time accurate when written (backfilled from a later cost basis or with a missing-value movement baked in).'
+        : '',
+      snapshot.currentValueDriftCount > 0
+        ? 'This valuation has cost-layer quantities that diverge from stock levels (orphan layers or stock/cost-layer desync).'
+        : '',
     ].filter(Boolean),
   }
 }

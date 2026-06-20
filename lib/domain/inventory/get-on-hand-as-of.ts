@@ -49,11 +49,21 @@ export type OnHandAsOfResult = {
   // including orphan layers (value with no stock row). >0 means the layer-derived
   // value can't be trusted against the stock quantities (scjz.44). 0 on replay paths.
   currentValueDriftCount: number
+  // Historical (as-of-in-the-past) valuation only: number of in-scope cost-layer
+  // revaluations that took effect AFTER asOf (and were not applied by the replay).
+  // >0 means the value reflects later landed-cost / manufacturing revaluations
+  // rather than the basis valid at asOf (scjz.43). 0 on the live path.
+  postAsOfRevaluationCount: number
+  // Snapshot-backed valuation only: number of loaded snapshot rows persisted as
+  // not point-in-time reliable at write (backfilled from a later basis or with a
+  // missing-value movement baked in) (scjz.43/.48). Distinct reason from a live
+  // post-asOf revaluation so reports can explain it correctly.
+  staleSnapshotCount: number
 }
 
 export type OnHandAsOfClient = Pick<
   PrismaClient,
-  'inventorySnapshot' | 'stockMovement' | 'stockLevel' | 'costLayer'
+  'inventorySnapshot' | 'stockMovement' | 'stockLevel' | 'costLayer' | 'costLayerRevaluation'
 > & {
   $queryRaw?: PrismaClient['$queryRaw']
   $transaction?: PrismaClient['$transaction']
@@ -220,9 +230,13 @@ function buildResult(input: {
   excludeZero?: boolean
   currentValueFromCostLayers?: boolean
   currentValueDriftCount?: number
+  postAsOfRevaluationCount?: number
+  staleSnapshotCount?: number
 }): OnHandAsOfResult {
   const replay = input.replay ?? emptyReplayResult()
   const currentValueDriftCount = input.currentValueDriftCount ?? 0
+  const postAsOfRevaluationCount = input.postAsOfRevaluationCount ?? 0
+  const staleSnapshotCount = input.staleSnapshotCount ?? 0
   return {
     asOf: formatDateTime(input.asOf),
     generatedAt: formatDateTime(input.generatedAt),
@@ -233,11 +247,19 @@ function buildResult(input: {
     orphanWarehouseMovementCount: replay.orphanWarehouseMovementCount,
     missingValueMovementSample: replay.missingValueMovementSample,
     // Live valuation is "reliable" only when its layer-derived value reconciles to
-    // the stock quantities; a stock/cost-layer desync (scjz.44) makes it unreliable.
+    // the stock quantities (scjz.44). Historical valuation is reliable only when no
+    // replayed movement lacked value, no orphan-warehouse movement was seen, AND no
+    // in-scope layer was revalued after asOf — otherwise the value reflects later
+    // revaluations, not the point-in-time basis (scjz.43).
     valueReplayReliable: input.currentValueFromCostLayers
       ? currentValueDriftCount === 0
-      : replay.missingValueMovementCount === 0 && replay.orphanWarehouseMovementCount === 0,
+      : replay.missingValueMovementCount === 0
+        && replay.orphanWarehouseMovementCount === 0
+        && postAsOfRevaluationCount === 0
+        && staleSnapshotCount === 0,
     currentValueDriftCount,
+    postAsOfRevaluationCount,
+    staleSnapshotCount,
   }
 }
 
@@ -370,6 +392,25 @@ function currentCostLayerWhere(filters: OnHandAsOfFilters): Prisma.CostLayerWher
     ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
     ...(Object.keys(product).length > 0 ? { product } : {}),
   }
+}
+
+/**
+ * Count in-scope cost-layer revaluations that took effect after `asOf` (scjz.43).
+ * A historical valuation that draws cost from layers/snapshots reflecting these
+ * later revaluations is not point-in-time accurate, so the count downgrades
+ * valueReplayReliable rather than silently reporting a post-revaluation basis.
+ */
+async function countPostAsOfRevaluations(
+  client: OnHandAsOfClient,
+  filters: OnHandAsOfFilters,
+  effectiveAt: Prisma.DateTimeFilter,
+): Promise<number> {
+  return client.costLayerRevaluation.count({
+    where: {
+      effectiveAt,
+      costLayer: currentCostLayerWhere(filters),
+    },
+  })
 }
 
 function emptyState(): OnHandState {
@@ -562,6 +603,22 @@ async function loadSnapshotState(
     orderBy: [{ productId: 'asc' }, { warehouseId: 'asc' }],
   })
   return stateFromSnapshots(rows)
+}
+
+/**
+ * Count in-scope snapshot rows for a date whose stored value was flagged not
+ * point-in-time accurate at write (e.g. a backfilled row seeded from cost layers
+ * revalued after that date). Lets snapshot-backed as-of reads surface a stale
+ * basis instead of trusting it (scjz.43/.48).
+ */
+async function countUnreliableSnapshots(
+  client: OnHandAsOfClient,
+  snapshotDate: Date,
+  filters: OnHandAsOfFilters,
+): Promise<number> {
+  return client.inventorySnapshot.count({
+    where: { ...snapshotWhere(snapshotDate, filters), valueReplayReliable: false },
+  })
 }
 
 async function loadCurrentState(
@@ -801,6 +858,12 @@ export async function getOnHandAsOf(options: {
   const asOfLowerBound: { gte: Date } | { gt: Date } = isDateOnly
     ? { gte: startOfNextUtcDay(asOfDay) }
     : { gt: asOf }
+  // Lower edge of "revalued after asOf" (scjz.43). A date-only as-of covers the
+  // whole UTC day, so "after" starts at next-day midnight (matching the replay
+  // upper bound) — a same-day revaluation is already reflected in the day's value.
+  const postAsOfRevaluationLowerBound: Prisma.DateTimeFilter = isDateOnly
+    ? { gte: startOfNextUtcDay(asOfDay) }
+    : { gt: asOf }
   const priorSnapshotDate = await findPriorSnapshotDate(client, asOfDay)
   if (priorSnapshotDate) {
     const state = await loadSnapshotState(client, priorSnapshotDate, filters)
@@ -812,6 +875,13 @@ export async function getOnHandAsOf(options: {
       'forward',
       options.signal,
     )
+    // Two distinct snapshot-backed inaccuracies: (a) a revaluation in
+    // (priorSnapshotDate, asOf] the forward replay does not apply (movements carry
+    // value, not cost-layer revaluations), and (b) the loaded snapshot row itself
+    // persisted stale at write (backfilled from a later basis or missing-value).
+    // Tracked separately so reports give the right reason (scjz.43/.48).
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { gte: startOfNextUtcDay(priorSnapshotDate), ...asOfUpperBound })
+    const staleSnapshotCount = await countUnreliableSnapshots(client, priorSnapshotDate, filters)
     return buildResult({
       asOf,
       generatedAt: now,
@@ -820,6 +890,8 @@ export async function getOnHandAsOf(options: {
       state,
       replay,
       excludeZero: options.excludeZero,
+      postAsOfRevaluationCount,
+      staleSnapshotCount,
     })
   }
 
@@ -834,6 +906,13 @@ export async function getOnHandAsOf(options: {
       'reverse',
       options.signal,
     )
+    // The future snapshot is frozen at a date AFTER asOf, so it already reflects any
+    // revaluation effective up to then; reversing movements does not undo a
+    // revaluation. Flag revaluations in (asOf, futureSnapshotDate], plus a future
+    // snapshot row itself flagged stale at write (backfilled from a later basis) —
+    // either makes the reversed-to-asOf basis not point-in-time (scjz.43/.48).
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { ...postAsOfRevaluationLowerBound, lt: startOfNextUtcDay(futureSnapshotDate) })
+    const staleSnapshotCount = await countUnreliableSnapshots(client, futureSnapshotDate, filters)
     return buildResult({
       asOf,
       generatedAt: now,
@@ -842,6 +921,8 @@ export async function getOnHandAsOf(options: {
       state,
       replay,
       excludeZero: options.excludeZero,
+      postAsOfRevaluationCount,
+      staleSnapshotCount,
     })
   }
 
@@ -849,6 +930,11 @@ export async function getOnHandAsOf(options: {
     // Reverse-replay (asOf in the past) reliability comes from the replay, not the
     // live drift flag, so the current-state drift count is not surfaced here.
     const { state } = await loadCurrentState(txClient, filters)
+    // This path values from CURRENT layers, which reflect every revaluation, so flag
+    // any revaluation effective after asOf. Counted INSIDE this transaction so a
+    // revaluation committing between the count and loadCurrentState can't be valued
+    // in yet reported reliable (scjz.43 TOCTOU).
+    const txPostAsOfRevaluationCount = await countPostAsOfRevaluations(txClient, filters, postAsOfRevaluationLowerBound)
     const replay = await replayMovements(
       txClient,
       state,
@@ -865,6 +951,7 @@ export async function getOnHandAsOf(options: {
       state,
       replay,
       excludeZero: options.excludeZero,
+      postAsOfRevaluationCount: txPostAsOfRevaluationCount,
     })
   }
 

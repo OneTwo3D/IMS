@@ -914,6 +914,10 @@ model InventorySnapshot {
   qty          Decimal  @db.Decimal(14, 6) // 6dp matches live stock_levels/cost_layers
   valueBase    Decimal  @db.Decimal(18, 6)
   unitCostBase Decimal? @db.Decimal(18, 6)
+  // False when this snapshot's value is not point-in-time accurate — e.g. a
+  // backfilled row seeded from current cost layers that were revalued after this
+  // date, so its valueBase reflects a later cost basis (cogs-audit scjz.43/.48).
+  valueReplayReliable Boolean @default(true)
   createdAt    DateTime @default(now())
 
   product      Product   @relation(fields: [productId], references: [id])
