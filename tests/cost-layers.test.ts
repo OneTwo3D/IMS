@@ -10,6 +10,7 @@ import {
   copyCostLayerSourceLinesProportionally,
   createCostLayer,
   lockStockLevelRow,
+  refreshSalesOrderLineCogs,
   refreshShipmentCogsForCostLayerChange,
 } from '../lib/cost-layers.ts'
 import { manufacturingCostLayerReceivedAt } from '@/lib/domain/manufacturing/manufacturing-action-inputs'
@@ -673,4 +674,86 @@ test('copyCostLayerSourceLinesProportionally clamps a sub-micro rounding oversho
     unitCostBase: 10,
     totalCostBase: 100,
   }])
+})
+
+function refreshCogsTx(
+  shipmentLines: Array<{ lineId: string; costLayerSnapshot: unknown }>,
+  updates: unknown[],
+  findManyArgs?: unknown[],
+) {
+  return {
+    shipmentLine: {
+      findMany: async (args?: unknown) => {
+        findManyArgs?.push(args)
+        return shipmentLines
+      },
+    },
+    salesOrderLine: {
+      update: async (args: unknown) => {
+        updates.push(args)
+      },
+    },
+  }
+}
+
+test('refreshSalesOrderLineCogs only considers SHIPPED shipment lines (scjz.24)', async () => {
+  const findManyArgs: unknown[] = []
+  const tx = refreshCogsTx([], [], findManyArgs)
+
+  await refreshSalesOrderLineCogs(tx as never, ['line-1'])
+
+  assert.deepEqual((findManyArgs[0] as { where: unknown }).where, {
+    lineId: { in: ['line-1'] },
+    shipment: { status: 'SHIPPED' },
+  })
+})
+
+test('refreshSalesOrderLineCogs sums COGS when every shipment line is snapshotted', async () => {
+  const updates: unknown[] = []
+  const tx = refreshCogsTx([
+    { lineId: 'line-1', costLayerSnapshot: [{ costLayerId: 'la', qty: '3', unitCostBase: '10' }] },
+    { lineId: 'line-1', costLayerSnapshot: [{ costLayerId: 'lb', qty: '2', unitCostBase: '5' }] },
+  ], updates)
+
+  const updated = await refreshSalesOrderLineCogs(tx as never, ['line-1'])
+
+  assert.equal(updated, 1)
+  assert.deepEqual(updates, [{ where: { id: 'line-1' }, data: { cogsBase: 40 } }])
+})
+
+test('refreshSalesOrderLineCogs preserves prior cogsBase on mixed snapshot presence (scjz.24)', async () => {
+  const updates: unknown[] = []
+  // line-1: one partial snapshotted (30), one partial cleared — must NOT write 30.
+  const tx = refreshCogsTx([
+    { lineId: 'line-1', costLayerSnapshot: [{ costLayerId: 'la', qty: '3', unitCostBase: '10' }] },
+    { lineId: 'line-1', costLayerSnapshot: [] },
+  ], updates)
+
+  const updated = await refreshSalesOrderLineCogs(tx as never, ['line-1'])
+
+  assert.equal(updated, 0)
+  assert.deepEqual(updates, [])
+})
+
+test('refreshSalesOrderLineCogs preserves prior cogsBase when all shipment lines are un-snapshotted (legacy)', async () => {
+  const updates: unknown[] = []
+  const tx = refreshCogsTx([
+    { lineId: 'line-1', costLayerSnapshot: [] },
+    { lineId: 'line-1', costLayerSnapshot: [] },
+  ], updates)
+
+  const updated = await refreshSalesOrderLineCogs(tx as never, ['line-1'])
+
+  assert.equal(updated, 0)
+  assert.deepEqual(updates, [])
+})
+
+test('refreshSalesOrderLineCogs nulls cogsBase when a line has no shipment lines at all', async () => {
+  const updates: unknown[] = []
+  const tx = refreshCogsTx([], updates)
+
+  const updated = await refreshSalesOrderLineCogs(tx as never, ['line-1'])
+
+  assert.equal(updated, 1)
+  assert.deepEqual(updates, [{ where: { id: 'line-1' }, data: { cogsBase: null } }])
 })
