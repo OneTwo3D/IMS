@@ -345,6 +345,48 @@ test('getOnHandAsOf uses live state for asOf now and reconciles to StockLevel qu
     valueBase: '18.000000',
     unitCostBase: '2.571429',
   }])
+  // Stock qty (7) reconciles with the cost-layer qty (4+3) — no drift.
+  assert.equal(result.currentValueDriftCount, 0)
+  assert.equal(result.valueReplayReliable, true)
+})
+
+test('getOnHandAsOf flags live valuation as unreliable when cost layers diverge from stock qty (scjz.44)', async () => {
+  const client = createClient({
+    // Stock says 7 on hand, but cost layers only cover 5 (stock/cost-layer desync).
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('7') }],
+    costLayers: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('5'), unitCostBase: decimal('3') },
+    ],
+  })
+
+  const result = await getOnHandAsOf({
+    client,
+    asOf: new Date('2026-06-01T12:00:00.000Z'),
+    now: () => new Date('2026-06-01T12:00:00.000Z'),
+  })
+
+  assert.equal(result.source, 'current')
+  assert.equal(result.currentValueDriftCount, 1)
+  assert.equal(result.valueReplayReliable, false)
+})
+
+test('getOnHandAsOf flags an orphan cost layer (value with no stock row) as drift (scjz.44)', async () => {
+  const client = createClient({
+    stockLevels: [],
+    // Cost layer with positive value but no stock_levels row — value with no qty.
+    costLayers: [
+      { productId: 'orphan-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('9') },
+    ],
+  })
+
+  const result = await getOnHandAsOf({
+    client,
+    asOf: new Date('2026-06-01T12:00:00.000Z'),
+    now: () => new Date('2026-06-01T12:00:00.000Z'),
+  })
+
+  assert.equal(result.currentValueDriftCount, 1)
+  assert.equal(result.valueReplayReliable, false)
 })
 
 test('getOnHandAsOf falls back to current reverse replay when no snapshots exist', async () => {
