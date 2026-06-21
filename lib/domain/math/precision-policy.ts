@@ -57,13 +57,16 @@ export function roundToGlPrecision(value: DecimalInput): Decimal {
 
 /**
  * Round a base-currency amount to the canonical GL posting precision (number).
- * Mirrors the long-standing `Math.round(v * 100) / 100` used by the daily batch,
- * but sourced from GL_BASE_PRECISION so the precision lives in exactly one place.
+ *
+ * Delegates to the Decimal path so it honours ROUND_HALF_UP for BOTH signs and
+ * stays bit-identical to roundToGlPrecision / round2Decimal. A naive
+ * `Math.round(v * 100) / 100` rounds negative ties toward +Infinity
+ * (e.g. -1.005 -> -1.00 instead of -1.01), which would create penny mismatches
+ * on reversal/credit-style GL postings (cogs-audit scjz.60a).
  */
 export function roundToGlPrecisionNumber(value: number): number {
   if (!Number.isFinite(value)) {
     throw new TypeError(`Invalid GL amount: ${value}`)
   }
-  const factor = 10 ** GL_BASE_PRECISION
-  return Math.round(value * factor) / factor
+  return roundToGlPrecision(value).toNumber()
 }

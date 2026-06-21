@@ -18,9 +18,21 @@ test('canonical precision constants match the documented subledger policy', () =
   assert.equal(GL_BASE_PRECISION, 2)
 })
 
-test('roundToGlPrecisionNumber rounds to 2dp HALF_UP and matches the legacy Math.round form', () => {
-  for (const v of [100.123456, 0.005, 0.004, 2.675, 99.999, 0, -1.005]) {
-    assert.equal(roundToGlPrecisionNumber(v), Math.round(v * 100) / 100, `value ${v}`)
+test('roundToGlPrecisionNumber rounds to 2dp HALF_UP for both signs (away from zero on ties)', () => {
+  assert.equal(roundToGlPrecisionNumber(0.005), 0.01)
+  assert.equal(roundToGlPrecisionNumber(0.004), 0)
+  assert.equal(roundToGlPrecisionNumber(2.675), 2.68)
+  assert.equal(roundToGlPrecisionNumber(100.123456), 100.12)
+  // Negative ties must round AWAY from zero (HALF_UP), not toward +Infinity the
+  // way Math.round would (-1.005 -> -1.00). This matters for reversal/credit GL
+  // postings (cogs-audit scjz.60a).
+  assert.equal(roundToGlPrecisionNumber(-1.005), -1.01)
+  assert.equal(roundToGlPrecisionNumber(-0.004), -0)
+})
+
+test('roundToGlPrecisionNumber is bit-identical to the Decimal roundToGlPrecision path', () => {
+  for (const v of [100.123456, 0.005, 0.004, 2.675, 99.999, 0, -1.005, -2.675, -0.005]) {
+    assert.equal(roundToGlPrecisionNumber(v), roundToGlPrecision(v).toNumber(), `value ${v}`)
   }
 })
 
