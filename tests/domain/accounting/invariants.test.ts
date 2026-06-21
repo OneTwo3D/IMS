@@ -622,3 +622,90 @@ test('accounting row collection selects staged orders, posted shipments, and syn
     },
   )
 })
+
+// --- scjz.75: A1 deferred revenue == Group-B recognized revenue tie-out ---
+
+function fullyShippedNoRefundRows(): AccountingInvariantRows {
+  // A fully-shipped terminal order with all shipments posted and no refunds,
+  // recognized revenue tying out exactly to the A1 deferred amount.
+  return {
+    salesOrders: [{
+      id: 'order-tie',
+      orderNumber: 'SO-TIE',
+      externalOrderNumber: null,
+      status: 'COMPLETED',
+      paidAt: B_DATE,
+      revenueDeferredDate: A1_DATE,
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: A2_DATE,
+      allocationBatchAmount: 30,
+      shipments: [
+        { id: 's1', status: 'SHIPPED', shipmentJournalDate: B_DATE, revenueRecognizedAmount: 60, cogsBatchAmount: 18 },
+        { id: 's2', status: 'SHIPPED', shipmentJournalDate: B_DATE, revenueRecognizedAmount: 40, cogsBatchAmount: 12 },
+      ],
+      refunds: [],
+    }],
+    postedShipments: [],
+    syncLogs: [
+      {
+        id: 'a1', connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'SYNCED',
+        referenceType: 'DailyBatch', referenceId: 'A1-2026-01-01', externalTransactionId: 'j-a1',
+        payload: { date: '2026-01-01' }, errorMessage: null, retryCount: 0, createdAt: A1_DATE, syncedAt: A1_DATE,
+      },
+      {
+        id: 'a2', connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'SYNCED',
+        referenceType: 'DailyBatch', referenceId: 'A2-2026-01-01', externalTransactionId: 'j-a2',
+        payload: { date: '2026-01-01' }, errorMessage: null, retryCount: 0, createdAt: A2_DATE, syncedAt: A2_DATE,
+      },
+      {
+        id: 'b', connector: 'xero', type: 'DAILY_BATCH_GROUP_B', status: 'SYNCED',
+        referenceType: 'DailyBatch', referenceId: 'B-2026-01-02', externalTransactionId: 'j-b',
+        payload: { date: '2026-01-02' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE,
+      },
+    ],
+  }
+}
+
+test('scjz.75: fully-shipped order whose recognized revenue ties out to deferral produces no mismatch', () => {
+  const codes = evaluateAccountingInvariantRows(fullyShippedNoRefundRows()).map((f) => f.code)
+  assert.ok(!codes.includes('sales_order_recognized_revenue_deferral_mismatch'))
+})
+
+test('scjz.75: flags a fully-shipped order whose recognized revenue does not tie out to deferral', () => {
+  const rows = fullyShippedNoRefundRows()
+  // Strand £10: only £90 recognized against £100 deferred.
+  rows.salesOrders[0].shipments[1].revenueRecognizedAmount = 30
+  const finding = evaluateAccountingInvariantRows(rows)
+    .find((f) => f.code === 'sales_order_recognized_revenue_deferral_mismatch')
+  assert.ok(finding, 'expected a deferral mismatch finding')
+  assert.equal(finding!.severity, 'warning')
+  assert.equal((finding!.details as { difference: number }).difference, -10)
+})
+
+test('scjz.75: does not flag an order still mid-recognition (a SHIPPED shipment not yet posted)', () => {
+  const rows = fullyShippedNoRefundRows()
+  // s2 is shipped but its Group-B batch has not run yet — recognized < deferred is expected.
+  rows.salesOrders[0].shipments[1].shipmentJournalDate = null
+  rows.salesOrders[0].shipments[1].revenueRecognizedAmount = 0
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(!codes.includes('sales_order_recognized_revenue_deferral_mismatch'))
+})
+
+test('scjz.75: skips the tie-out for refunded orders (reversal adjusts deferral outside this sum)', () => {
+  const rows = fullyShippedNoRefundRows()
+  rows.salesOrders[0].shipments[1].revenueRecognizedAmount = 30 // would otherwise mismatch
+  rows.salesOrders[0].refunds = [{
+    id: 'r1', creditNoteNumber: 'CN-9', accountingCreditNoteId: 'xc-9', totalBase: 10,
+    accountingRetryRequired: false, accountingWarning: null, accountingRetrySyncs: null,
+  }]
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(!codes.includes('sales_order_recognized_revenue_deferral_mismatch'))
+})
+
+test('scjz.75: does not flag a non-terminal (still-shipping) order even if sums differ', () => {
+  const rows = fullyShippedNoRefundRows()
+  rows.salesOrders[0].status = 'ALLOCATED' // not a fully-shipped terminal status
+  rows.salesOrders[0].shipments[1].revenueRecognizedAmount = 30
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(!codes.includes('sales_order_recognized_revenue_deferral_mismatch'))
+})
