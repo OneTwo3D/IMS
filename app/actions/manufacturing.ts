@@ -586,8 +586,9 @@ export async function updateManufacturingOrderStatus(
         const qtyPlanned = Number(order.qtyPlanned)
         // audit-H6: use the snapshot frozen at IN_PROGRESS, not the live BOM, so
         // a mid-production component edit can't change what is consumed/recovered
-        // or strand the reservation. Fall back to the live BOM only for orders
-        // that were never started (no snapshot).
+        // or strand the reservation. Completion now requires IN_PROGRESS
+        // (DRAFT->complete is blocked, scjz.32), so the live-BOM fallback only
+        // covers legacy orders started before audit-H6 added componentSnapshot.
         const components: ProductionOrderComponentSnapshot | typeof order.outputProduct.productComponents =
           parseProductionOrderComponentSnapshot(order.componentSnapshot) ?? order.outputProduct.productComponents
         completedComponents = components
