@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 // decimal-boundary-ok: report-only (accounting invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
+import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -821,6 +822,28 @@ export async function runAccountingInvariantReport(options: {
     options.client ?? (db as unknown as AccountingInvariantClient),
   )
   const findings = evaluateAccountingInvariantRows(rows)
+
+  // scjz.74/.60c: reconcile the GL inventory balance to the 6dp cost-layer
+  // subledger. Only a gap beyond the rounding-scale sweep limit is a real
+  // discrepancy worth a finding; rounding-scale residue is left for the
+  // rounding-difference sweep (scjz.60c-2). Degrades silently when the inventory
+  // account is unmapped or no trial-balance snapshot exists yet.
+  const inventoryReconciliation = await loadInventoryGlReconciliation()
+  if (inventoryReconciliation.available && inventoryReconciliation.action === 'flag') {
+    findings.push({
+      severity: 'critical',
+      code: 'inventory_gl_subledger_mismatch',
+      message: `GL inventory balance (${inventoryReconciliation.glBalance.toFixed(2)}) does not reconcile to the cost-layer subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
+      details: {
+        accountCode: inventoryReconciliation.accountCode,
+        balanceDate: inventoryReconciliation.balanceDate,
+        glBalance: inventoryReconciliation.glBalance,
+        subledgerValue: inventoryReconciliation.subledgerValue,
+        delta: inventoryReconciliation.delta,
+        sweepLimit: inventoryReconciliation.sweepLimit,
+      },
+    })
+  }
 
   return {
     checkedAt: new Date().toISOString(),
