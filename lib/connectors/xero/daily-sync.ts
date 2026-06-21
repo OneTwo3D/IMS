@@ -36,6 +36,7 @@ import {
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
+import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
@@ -64,6 +65,7 @@ const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
   'DAILY_BATCH_INVENTORY_ALLOC',
   'DAILY_BATCH_GROUP_B',
+  'DAILY_BATCH_INVENTORY_RECONCILIATION',
 ] as const
 
 // GL postings round to the canonical GL precision (cogs-audit scjz.60); these
@@ -209,7 +211,7 @@ function consumeSnapshotLayers(
 async function createPendingSyncLog(
   tx: AccountingMirrorClient,
   params: {
-    type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B'
+    type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION'
     referenceId: string
     payload: Record<string, unknown>
     currency: string
@@ -306,6 +308,10 @@ export type XeroDailyBatchResult = {
   batchLimit: number
   hasMore: Record<DailyBatchGroup, boolean>
   errors: string[]
+  // cogs-audit scjz.60.4: the rounding-residue (GL_BASE_PRECISION units) swept to the
+  // rounding-difference account this run, or null when nothing was swept (balanced,
+  // unavailable, material gap flagged, or no rounding account configured).
+  inventoryReconciliationSwept?: number | null
 }
 
 export function resolveXeroDailyBatchLimit(value = process.env.XERO_DAILY_BATCH_LIMIT): number {
@@ -1152,6 +1158,53 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
   } catch (e) {
     result.errors.push(`Group B error: ${String(e)}`)
   }
+
+    // cogs-audit scjz.60.4: sweep the inventory subledger-vs-GL rounding residue to
+    // the rounding-difference account. Runs after the batch postings so the GL/
+    // subledger snapshots it compares already reflect this run's journals. Guarded:
+    //  - a rounding-difference account must be configured (its absence is the opt-out;
+    //    residue is then accepted within tolerance, no line posted),
+    //  - the comparison must be available (both GL accounts mapped AND point-in-time
+    //    snapshots exist for the as-of date), and
+    //  - the gap must be pure accumulated rounding ('sweep'); a material gap ('flag')
+    //    is surfaced by the reconciliation invariant and NEVER swept (sweeping it
+    //    would mask a genuine misstatement).
+    // Idempotent per as-of date via hasLiveDailyBatchLog, so re-running the batch the
+    // same period never double-posts. A failure here must never abort the batch — the
+    // core postings already committed.
+    result.inventoryReconciliationSwept = null
+    try {
+      const reconciliation = await loadInventoryGlReconciliation()
+      const journal = buildInventoryReconciliationSweepJournal(reconciliation, {
+        inventoryAccount: settings.xero_inventory_account ?? '',
+        roundingAccount: settings.xero_rounding_difference_account ?? '',
+        currency: baseCurrency,
+      })
+      if (journal) {
+        const referenceId = `INVRECON-${journal.date}`
+        if (!(await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_RECONCILIATION', referenceId))) {
+          await db.$transaction((tx) => createPendingSyncLog(tx, {
+            type: 'DAILY_BATCH_INVENTORY_RECONCILIATION',
+            referenceId,
+            currency: baseCurrency,
+            payload: {
+              date: journal.date,
+              reference: `Inventory reconciliation ${journal.date}`,
+              narration: journal.narration,
+              lines: journal.lines,
+              batchReferenceId: referenceId,
+              batchDate: journal.date,
+              batchGroup: 'INVENTORY_RECONCILIATION',
+              _postingMode: 'submitted',
+            },
+          }))
+          // delta is signed (subledger - GL); records both magnitude and direction.
+          result.inventoryReconciliationSwept = journal.subledgerHigher ? journal.amount : -journal.amount
+        }
+      }
+    } catch (e) {
+      result.errors.push(`Inventory reconciliation sweep error: ${String(e)}`)
+    }
 
     // Log summary
     if (result.groupA1 > 0 || result.groupA2 > 0 || result.groupB > 0) {
