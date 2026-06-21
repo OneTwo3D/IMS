@@ -4,6 +4,9 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
+import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
   addMoney,
   multiplyMoney,
@@ -239,62 +242,133 @@ async function computePreview(): Promise<DailyBatchPreview> {
       cogsBatchAmount: true,
       lines: {
         select: {
+          lineId: true,
           productId: true,
           qty: true,
           costLayerSnapshot: true,
-          line: { select: { qty: true, totalBase: true } },
+          line: { select: { id: true, qty: true, totalBase: true } },
         },
       },
       order: {
         select: {
           orderNumber: true,
           externalOrderNumber: true,
+          status: true,
           totalBase: true,
           unearnedRevenueAmount: true,
-          lines: { select: { totalBase: true } },
+          lines: { select: { id: true, productId: true, qty: true, totalBase: true } },
+          shipments: {
+            select: {
+              id: true,
+              shipmentJournalDate: true,
+              revenueRecognizedAmount: true,
+            },
+          },
         },
       },
     },
     orderBy: { createdAt: 'asc' },
   })
 
+  // Mirror the cron daily-sync's grouped revenue recognition so the preview
+  // matches what actually posts (cogs-audit scjz.69). The naive per-shipment
+  // proportional formula never trued up, so the preview under-reported B
+  // revenue: the cron groups a batch's shipments by order and, on the final
+  // shipment of a fully-shipped terminal order, recognizes the *remaining*
+  // deferred revenue (remainingDeferred - runningRevenue) instead of the
+  // rounded proportional slice, and otherwise caps the slice at the remaining
+  // deferred. Use the same BOM-aware coverage-by-line so KIT/BOM shipment
+  // values match too.
+  const bGraph = await loadFulfillmentProductGraph(
+    db,
+    Array.from(new Set(
+      bShipments.flatMap((shipment) => (
+        shipment.order.lines.map((line) => line.productId).filter((value): value is string => !!value)
+      )),
+    )),
+  )
+
+  const bShipmentsByOrder = new Map<string, typeof bShipments>()
+  for (const shipment of bShipments) {
+    const existing = bShipmentsByOrder.get(shipment.orderId) ?? []
+    existing.push(shipment)
+    bShipmentsByOrder.set(shipment.orderId, existing)
+  }
+
+  // Compute per-shipment results grouped by order, then emit in the original
+  // (createdAt asc) order so the displayed list and the 200-cap are stable.
+  const bShipmentResults = new Map<string, { revenue: number; cogs: Decimal }>()
+  for (const [, orderShipments] of bShipmentsByOrder) {
+    const firstShipment = orderShipments[0]
+    const order = firstShipment.order
+    const deferredBase = Number(order.unearnedRevenueAmount ?? order.totalBase)
+    const orderLineTotal = order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
+    const requirementsByLine = new Map(
+      order.lines
+        .filter((line) => !!line.productId)
+        .map((line) => [
+          line.id,
+          requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId!, 1, bGraph)),
+        ]),
+    )
+    const orderLineById = new Map(order.lines.map((line) => [line.id, line]))
+    const recognizedPreviously = order.shipments.reduce((sum, shipment) => (
+      shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
+    ), 0)
+    const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously))
+    let runningRevenue = 0
+
+    for (let index = 0; index < orderShipments.length; index++) {
+      const shipment = orderShipments[index]
+      const shippedCoverageByLine = calculateCoverageByLine(
+        requirementsByLine,
+        shipment.lines.map((line) => ({
+          lineId: line.lineId,
+          productId: line.productId,
+          qty: Number(line.qty),
+        })),
+      )
+      const shipmentLineValue = [...shippedCoverageByLine.entries()].reduce((sum, [lineId, coveredQty]) => {
+        const line = orderLineById.get(lineId)
+        const lineQty = Number(line?.qty ?? 0)
+        if (!line || lineQty <= 0 || coveredQty <= 0) return sum
+        return sum + (Number(line.totalBase) * Math.min(coveredQty, lineQty)) / lineQty
+      }, 0)
+
+      const proportionalRevenue = orderLineTotal > 0
+        ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
+        : 0
+      const revenueProportion = recognizeShipmentRevenue({
+        proportionalRevenue,
+        remainingDeferred,
+        runningRevenue,
+        isFinalShipmentOfFullyShippedTerminalOrder:
+          isFullyShippedTerminalStatus(order.status) && index === orderShipments.length - 1,
+      })
+      runningRevenue += revenueProportion
+
+      const snapshotCogs = shipment.lines.reduce((sum, line) => (
+        addMoney(sum, sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot)))
+      ), toDecimal(0))
+      const cogs = snapshotCogs.gt(0) ? snapshotCogs : toDecimal(shipment.cogsBatchAmount ?? 0)
+
+      bShipmentResults.set(shipment.id, { revenue: revenueProportion, cogs })
+    }
+  }
+
   const bShipmentsComputed: DailyBatchPreviewShipment[] = []
   let bRevenue = 0
   let bCogs = toDecimal(0)
   for (const shipment of bShipments) {
-    const orderLineTotal = shipment.order.lines.reduce(
-      (s, l) => s + Number(l.totalBase),
-      0,
-    )
-    const shipmentLineValue = shipment.lines.reduce(
-      (s, l) => {
-        const lineQty = Number(l.line.qty)
-        const shippedQty = Number(l.qty)
-        if (lineQty <= 0 || shippedQty <= 0) return s
-        return s + (Number(l.line.totalBase) * shippedQty) / lineQty
-      },
-      0,
-    )
-    const deferredBase = Number(
-      shipment.order.unearnedRevenueAmount ?? shipment.order.totalBase,
-    )
-    const revenueProportion = orderLineTotal > 0
-      ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
-      : 0
-
-    const snapshotCogs = shipment.lines.reduce((sum, line) => (
-      addMoney(sum, sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot)))
-    ), toDecimal(0))
-    const cogs = snapshotCogs.gt(0) ? snapshotCogs : toDecimal(shipment.cogsBatchAmount ?? 0)
-
-    bRevenue += revenueProportion
-    bCogs = addMoney(bCogs, cogs)
+    const result = bShipmentResults.get(shipment.id) ?? { revenue: 0, cogs: toDecimal(0) }
+    bRevenue += result.revenue
+    bCogs = addMoney(bCogs, result.cogs)
     bShipmentsComputed.push({
       id: shipment.id,
       orderId: shipment.orderId,
       displayOrderNumber: getSalesOrderReference({ id: shipment.orderId, ...shipment.order }),
-      revenue: revenueProportion,
-      cogs: roundQuantity(cogs, 2).toNumber(),
+      revenue: result.revenue,
+      cogs: roundQuantity(result.cogs, 2).toNumber(),
     })
   }
 

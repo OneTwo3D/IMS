@@ -30,3 +30,34 @@ const FULLY_SHIPPED_TERMINAL_STATUS_SET: ReadonlySet<string> = new Set(FULLY_SHI
 export function isFullyShippedTerminalStatus(status: SalesOrderStatus | string): boolean {
   return FULLY_SHIPPED_TERMINAL_STATUS_SET.has(status)
 }
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+/**
+ * Decide how much deferred revenue a single Group-B shipment recognizes within
+ * its order's daily-batch run, applying the terminal-status true-up.
+ *
+ * On the final shipment of a fully-shipped terminal order, recognize ALL the
+ * remaining deferred revenue (`remainingDeferred - runningRevenue`) so rounding
+ * drift never strands pence in deferral permanently (cogs-audit scjz.41).
+ * Otherwise recognize the proportional slice, capped at the remaining deferred
+ * so an order never recognizes more than it deferred.
+ *
+ * Shared by the cron daily-sync (the posting path) and the daily-batch preview
+ * so the preview matches what actually posts (cogs-audit scjz.69). `round2`
+ * here mirrors the rounding both call sites use, so results are bit-identical.
+ */
+export function recognizeShipmentRevenue(params: {
+  proportionalRevenue: number
+  remainingDeferred: number
+  runningRevenue: number
+  isFinalShipmentOfFullyShippedTerminalOrder: boolean
+}): number {
+  const cap = round2(Math.max(0, params.remainingDeferred - params.runningRevenue))
+  if (params.isFinalShipmentOfFullyShippedTerminalOrder) {
+    return cap
+  }
+  return Math.min(params.proportionalRevenue, cap)
+}

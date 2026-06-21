@@ -33,7 +33,7 @@ import {
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
-import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
+import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 type MutableLayer = {
@@ -847,18 +847,16 @@ export async function runDailyBatchSync(): Promise<{
             return sum + (Number(line.totalBase) * Math.min(coveredQty, lineQty)) / lineQty
           }, 0)
 
-          let revenueProportion = orderLineTotal > 0
+          const proportionalRevenue = orderLineTotal > 0
             ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
             : 0
-
-          if (isFullyShippedTerminalStatus(firstShipment.order.status) && index === orderShipments.length - 1) {
-            revenueProportion = round2(Math.max(0, remainingDeferred - runningRevenue))
-          } else {
-            revenueProportion = Math.min(
-              revenueProportion,
-              round2(Math.max(0, remainingDeferred - runningRevenue)),
-            )
-          }
+          const revenueProportion = recognizeShipmentRevenue({
+            proportionalRevenue,
+            remainingDeferred,
+            runningRevenue,
+            isFinalShipmentOfFullyShippedTerminalOrder:
+              isFullyShippedTerminalStatus(firstShipment.order.status) && index === orderShipments.length - 1,
+          })
 
           const shipmentSnapshotsForLines = shipment.lines.map((line) => (
             parseCostLayerSnapshot(line.costLayerSnapshot)
