@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 // decimal-boundary-ok: report-only (accounting invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
+import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -225,17 +226,19 @@ function buildLiveSyncLogIndex(syncLogs: AccountingSyncLogRow[]): Set<string> {
   return index
 }
 
+// referenceType is required: an earlier version made it optional and, when
+// omitted, matched a sync log of the right type+referenceId under *any*
+// referenceType. That loose match could cross entity kinds (e.g. a DailyBatch
+// log satisfying a SalesOrderRefund lookup that shared a referenceId), so the
+// evidence check is now keyed on the full (type, referenceType, referenceId)
+// triple — every call site already supplies referenceType (scjz.75).
 function hasLiveSyncLog(
   syncLogIndex: Set<string>,
   type: string,
   referenceId: string,
-  referenceType?: string,
+  referenceType: string,
 ): boolean {
-  if (referenceType) return syncLogIndex.has(liveSyncLogIndexKey(type, referenceId, referenceType))
-  for (const key of syncLogIndex) {
-    if (key.startsWith(`${type}\u0000`) && key.endsWith(`\u0000${referenceId}`)) return true
-  }
-  return false
+  return syncLogIndex.has(liveSyncLogIndexKey(type, referenceId, referenceType))
 }
 
 function expectedDailyBatchReference(prefix: 'A1' | 'A2' | 'B', stagedAt: Date | string | null): string | null {
@@ -396,6 +399,45 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     const hasA1 = order.revenueDeferredDate != null
     const hasA2 = order.inventoryAllocatedDate != null
     const postedShipments = order.shipments.filter((shipment) => shipment.shipmentJournalDate != null)
+
+    // Lifecycle tie-out (scjz.75): once an order has fully shipped and every
+    // recognizable (SHIPPED) shipment has posted its Group-B revenue, the sum of
+    // the shipments' recognized revenue must equal the A1 deferred amount — the
+    // terminal-status true-up exists precisely to absorb rounding so it lands
+    // exactly. A divergence beyond rounding means revenue is stranded in
+    // deferral or over-recognized. Refunded orders are skipped: their
+    // UNEARNED_REV_REVERSAL adjusts the deferred base outside this sum, which a
+    // refund-reversal-aware tie-out (scjz.68) must account for separately. The
+    // `every` guard skips orders mid-recognition (a SHIPPED shipment still
+    // awaiting its next daily batch), where recognized < deferred is expected.
+    if (
+      hasA1 &&
+      isFullyShippedTerminalStatus(order.status) &&
+      order.refunds.length === 0 &&
+      postedShipments.length > 0 &&
+      order.shipments.every((shipment) => shipment.shipmentJournalDate != null || shipment.status !== 'SHIPPED')
+    ) {
+      const deferred = decimalToNumber(order.unearnedRevenueAmount)
+      const recognized = postedShipments.reduce(
+        (sum, shipment) => sum + decimalToNumber(shipment.revenueRecognizedAmount),
+        0,
+      )
+      if (deferred > 0 && Math.abs(recognized - deferred) > 0.01) {
+        findings.push({
+          severity: 'warning',
+          code: 'sales_order_recognized_revenue_deferral_mismatch',
+          orderId: order.id,
+          message: `Sales order ${label} is fully shipped but recognized Group-B revenue (${recognized.toFixed(2)}) does not tie out to A1 deferred revenue (${deferred.toFixed(2)})`,
+          details: {
+            status: order.status,
+            unearnedRevenueAmount: deferred,
+            recognizedRevenueTotal: Math.round(recognized * 100) / 100,
+            postedShipmentCount: postedShipments.length,
+            difference: Math.round((recognized - deferred) * 100) / 100,
+          },
+        })
+      }
+    }
 
     // A1 revenue deferral is only ever staged for a paid order (the daily batch
     // selects paidAt != null), so a posted order whose paidAt is now null had its
