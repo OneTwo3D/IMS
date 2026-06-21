@@ -18,9 +18,18 @@ test('production order status tests cover every Prisma enum value', () => {
   assert.deepEqual(Object.values(ProductionOrderStatus).sort(), EXPECTED_PRODUCTION_ORDER_STATUSES.sort())
 })
 
-test('completion state evaluator accepts draft and in-progress orders', () => {
-  assert.deepEqual(evaluateProductionOrderCompletion('DRAFT'), { allowed: true, action: 'complete' })
+test('completion state evaluator accepts in-progress orders', () => {
   assert.deepEqual(evaluateProductionOrderCompletion('IN_PROGRESS'), { allowed: true, action: 'complete' })
+})
+
+test('completion state evaluator blocks completing a never-started DRAFT order (scjz.32)', () => {
+  // A DRAFT order has no frozen component snapshot or stock reservation, so
+  // completing it directly would consume the live BOM at completion time
+  // (non-deterministic, not retry-safe). Require Start first.
+  assert.deepEqual(evaluateProductionOrderCompletion('DRAFT'), {
+    allowed: false,
+    error: 'Cannot complete a production order that has not been started — start production first to reserve stock and freeze the bill of materials.',
+  })
 })
 
 test('completion state evaluator treats completed orders as idempotent', () => {

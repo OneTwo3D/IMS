@@ -12,7 +12,20 @@ export function evaluateProductionOrderCompletion(
   status: ProductionOrderStatus,
 ): ManufacturingTransitionDecision<ProductionOrderCompletionAction> {
   if (status === 'COMPLETED') return { allowed: true, action: 'already-completed' }
-  if (status === 'IN_PROGRESS' || status === 'DRAFT') return { allowed: true, action: 'complete' }
+  if (status === 'IN_PROGRESS') return { allowed: true, action: 'complete' }
+  // A DRAFT order has never been started, so it has neither a reserved stock
+  // position nor a frozen component snapshot (audit-H6 captures both at
+  // IN_PROGRESS). Completing it directly would consume whatever the live BOM
+  // happens to be at completion time — non-deterministic if the BOM was edited
+  // after the order was created, and not retry-safe (cogs-audit scjz.32). The
+  // UI already requires Start Production before Mark Completed; enforce the same
+  // on the server so the snapshot+reservation always exist before completion.
+  if (status === 'DRAFT') {
+    return {
+      allowed: false,
+      error: 'Cannot complete a production order that has not been started — start production first to reserve stock and freeze the bill of materials.',
+    }
+  }
   return { allowed: false, error: `Cannot complete a production order in ${status} status` }
 }
 
