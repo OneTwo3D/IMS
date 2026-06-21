@@ -137,7 +137,11 @@ export function parseXeroTrialBalanceRows(report: XeroTrialBalanceReport): Parse
 }
 
 function configuredAccountCodes(settings: Awaited<ReturnType<typeof getXeroSettings>>): string[] {
-  return [settings.xero_inventory_account, settings.xero_cogs_account]
+  // Allocated Inventory is synced alongside Inventory + COGS so the inventory
+  // GL <-> cost-layer reconciliation (scjz.60c/.74) has both on-hand legs (value
+  // sits in the Allocated-Inventory contra between A2 and dispatch) on a common
+  // balance date; without it the reconciliation stays permanently unavailable.
+  return [settings.xero_inventory_account, settings.xero_allocated_inventory_account, settings.xero_cogs_account]
     .map((code) => code.trim())
     .filter((code): code is string => code.length > 0)
 }
