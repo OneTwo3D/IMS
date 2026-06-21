@@ -88,7 +88,7 @@ type State = {
     shipmentJournalDate: Date | null
     revenueRecognizedAmount: number | null
     cogsBatchAmount: number | null
-    lines: Array<{ id: string; lineId: string; qty: number; costLayerSnapshot: unknown }>
+    lines: Array<{ id: string; lineId: string; productId?: string; qty: number; costLayerSnapshot: unknown }>
   }>
   allocations: Array<{ id: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number; costLayerSnapshot: unknown }>
   costLayers: Array<{ id: string; productId: string; poLineId: string | null; receivedQty: number; unitCostBase: number }>
@@ -109,6 +109,12 @@ type State = {
     createdAt: Date
   }>
   stockLevels: Array<{ productId: string; warehouseId: string; quantity: number; reservedQty: number }>
+  // scjz.20: kit product graph so loadFulfillmentProductGraph can expand KIT lines to
+  // components. Keyed by productId; absent ids default to SIMPLE with no components.
+  productGraph?: Record<string, {
+    type: string
+    productComponents: Array<{ componentId: string; qty: number; component: { sku: string; type: string; oversellAllowed: boolean } }>
+  }>
   activityLogs: unknown[]
   settings: Record<string, string>
   executeRawCalls: number
@@ -264,7 +270,9 @@ function createClient(state: State): RefundServiceClient {
               ...shipment,
               lines: shipment.lines.map((line) => ({
                 ...line,
-                productId: state.lines.find((salesLine) => salesLine.id === line.lineId)?.productId,
+                // KIT shipment lines carry the COMPONENT productId; fall back to the
+                // sales line's product for SIMPLE fixtures that don't set it (scjz.20).
+                productId: line.productId ?? state.lines.find((salesLine) => salesLine.id === line.lineId)?.productId,
               })),
             })),
             refunds: state.refunds
@@ -421,7 +429,17 @@ function createClient(state: State): RefundServiceClient {
       },
     },
     product: {
-      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => ({ id, sku: id.toUpperCase() })),
+      // Includes type + productComponents so loadFulfillmentProductGraph (scjz.20
+      // kit-unit COGS conversion) can build its graph. These fixtures are all SIMPLE
+      // products (1 component unit per sales-line unit); kit-unit conversion is
+      // exercised end-to-end against a real DB in scripts/repro-scjz20.ts.
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
+        where.id.in.map((id) => ({
+          id,
+          sku: id.toUpperCase(),
+          type: state.productGraph?.[id]?.type ?? 'SIMPLE',
+          productComponents: state.productGraph?.[id]?.productComponents ?? [],
+        })),
     },
   }
   return client as unknown as RefundServiceClient
@@ -729,6 +747,84 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-returns')
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
+  assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+})
+
+test('createSalesOrderRefund reverses kit COGS in component units, not kit units', async () => {
+  // scjz.20: refund qty is in KIT units but cost-layer snapshots are in COMPONENT
+  // units. A 1:2 kit refunded for 3 kits must reverse 3 * 2 = 6 component units of
+  // basis (£60), not 3 (£30). Refund only the fully-shipped portion to isolate the
+  // shipment-cost conversion.
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 150,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 150,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 60,
+    }],
+    lines: [{
+      id: 'line-1',
+      orderId: 'order-1',
+      productId: 'kit-1',
+      description: 'Kit',
+      qty: 3,
+      totalBase: 150,
+    }],
+    productGraph: {
+      'kit-1': {
+        type: 'KIT',
+        productComponents: [{
+          componentId: 'comp-1',
+          qty: 2,
+          component: { sku: 'COMP-1', type: 'SIMPLE', oversellAllowed: false },
+        }],
+      },
+    },
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 150,
+      cogsBatchAmount: 60,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        productId: 'comp-1',
+        qty: 6,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 6, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', poLineId: 'po-line-1', receivedQty: 6, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'kit-1', description: 'Kit', qty: 3, totalBase: 150 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  // 3 kits * 2 components = 6 component units of basis at £10 = £60 reversed.
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
+    costLayerId: 'layer-1',
+    qty: '6.000000',
+    unitCostBase: '10.000000',
+    shipmentLineId: 'shipment-line-1',
+    source: 'shipment',
+  }])
+  // Returned stock is restocked in component units against the component product.
+  assert.equal(state.movements[0].productId, 'comp-1')
+  assert.equal(state.movements[0].qty, 6)
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
 })
 
