@@ -47,6 +47,14 @@ test('material discrepancy is flagged (never swept), with a signed delta', () =>
   assert.equal(under.delta, -800) // GL overstated vs subledger
 })
 
+test('zero subledger (zero on-hand stock) against a stale non-zero GL balance is flagged', () => {
+  // The sparse-snapshot zero-stock case: a covered date with no inventory rows
+  // means a 0 subledger, which must still reconcile so a stale GL balance is caught.
+  const r = evaluateInventoryGlReconciliation({ subledgerValue: 0, glBalance: 1234.56, sweepLimit: 1 })
+  assert.equal(r.action, 'flag')
+  assert.equal(r.delta, -1234.56)
+})
+
 test('delta is computed on GL-rounded operands (no float dust)', () => {
   const r = evaluateInventoryGlReconciliation({ subledgerValue: 0.1 + 0.2, glBalance: 0.3, sweepLimit: 1 })
   assert.equal(r.delta, 0)
