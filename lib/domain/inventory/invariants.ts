@@ -1710,7 +1710,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
           'fromWarehouseId', st."fromWarehouseId",
           'dispatchedAt', st."dispatchedAt",
           'qty', stl.qty::float8,
-          'thresholdDays', ${STRANDED_TRANSFER_DAYS}
+          'thresholdDays', ${STRANDED_TRANSFER_DAYS}::int
         ) AS details
       FROM "stock_transfers" st
       INNER JOIN "stock_transfer_lines" stl ON stl."transferId" = st.id
