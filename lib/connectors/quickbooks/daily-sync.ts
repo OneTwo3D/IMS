@@ -32,6 +32,7 @@ import {
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
@@ -60,12 +61,14 @@ const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_GROUP_B',
 ] as const
 
+// GL postings round to the canonical GL precision (cogs-audit scjz.60); these
+// thin aliases keep call sites terse while the precision lives in one place.
 function round2(value: number): number {
-  return Math.round(value * 100) / 100
+  return roundToGlPrecisionNumber(value)
 }
 
 function round2Decimal(value: Decimal): number {
-  return roundQuantity(value, 2).toNumber()
+  return roundQuantity(value, GL_BASE_PRECISION).toNumber()
 }
 
 function normalizeDeferredDiscountBase(order: {
