@@ -132,23 +132,18 @@ export async function loadInventoryGlReconciliation(options?: {
 
   // Subledger value AS OF balanceDate from inventory_snapshots (not live layers).
   // inventory_snapshots is SPARSE — only non-zero (product, warehouse) pairs are
-  // stored — so an empty result for balanceDate means EITHER on-hand stock was
-  // genuinely zero that day OR the snapshot pipeline never covered the date.
-  // Treat empty as a zero subledger only when the pipeline demonstrably reached
-  // this date (a snapshot exists on/after it); otherwise there is no evidence and
-  // a comparison would be meaningless. The zero-stock case must still reconcile so
-  // a stale non-zero GL balance on a zero-stock date is flagged, not skipped.
+  // stored — and, unlike InventoryReservationSnapshot, has NO per-date run marker,
+  // so an empty result for balanceDate is genuinely ambiguous: zero on-hand stock
+  // OR the snapshot job never covered the date. We cannot tell them apart, and a
+  // later snapshot only proves a later capture, so we conservatively return
+  // unavailable rather than risk a false critical against a stale GL on an
+  // uncovered date. (An InventorySnapshotRun coverage marker would let genuinely
+  // zero-stock dates reconcile too — tracked as a follow-up.)
   const snapshotRows = await db.inventorySnapshot.findMany({
     where: { snapshotDate: balanceDate },
     select: { valueBase: true, valueReplayReliable: true },
   })
-  if (snapshotRows.length === 0) {
-    const covered = await db.inventorySnapshot.findFirst({
-      where: { snapshotDate: { gte: balanceDate } },
-      select: { id: true },
-    })
-    if (!covered) return { available: false, reason: 'no_subledger_snapshot' }
-  }
+  if (snapshotRows.length === 0) return { available: false, reason: 'no_subledger_snapshot' }
   if (snapshotRows.some((row) => !row.valueReplayReliable)) {
     return { available: false, reason: 'unreliable_subledger_snapshot' }
   }
