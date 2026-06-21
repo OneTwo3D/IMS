@@ -16,6 +16,8 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
+import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
+import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import {
   isStockMovementIdempotencyConflict,
   refundInboundMovementKey,
@@ -739,6 +741,7 @@ async function stageRefundAccountingReversals(
           select: {
             id: true,
             lineId: true,
+            productId: true,
             warehouseId: true,
             costLayerSnapshot: true,
           },
@@ -761,6 +764,7 @@ async function stageRefundAccountingReversals(
               select: {
                 id: true,
                 lineId: true,
+                productId: true,
                 qty: true,
                 costLayerSnapshot: true,
               },
@@ -875,17 +879,32 @@ async function stageRefundAccountingReversals(
       totalBase: refundBoundaryNumber(line.totalBase),
     }))
 
-    const shippedQtyByLine = new Map<string, number>()
-    let totalRecognized = 0
+    // scjz.20: refund quantities are in SALES-LINE (kit) units, but shipment lines
+    // and cost-layer snapshots are in COMPONENT units (a KIT ships its expanded
+    // components). Build per-line component requirements (component productId ->
+    // units per 1 sales-line unit) so the cost consume can convert kit qty to the
+    // component qty its snapshot is denominated in, and measure shipped qty as
+    // kit-equivalent COVERAGE rather than a raw component-unit sum.
+    const fulfillmentGraph = await loadFulfillmentProductGraph(
+      tx,
+      (orderAccounting?.lines ?? []).map((line) => line.productId).filter((id): id is string => !!id),
+    )
+    const componentFactorsByLine = new Map<string, Map<string, number>>()
+    const requirementsByLine = new Map<string, ReturnType<typeof requirementsMapToRows>>()
+    for (const line of lineContexts) {
+      if (!line.productId) continue
+      const requirements = expandFulfillmentRequirementsDecimal(line.productId, 1, fulfillmentGraph)
+      componentFactorsByLine.set(line.id, new Map([...requirements].map(([productId, factor]) => [productId, toDecimal(factor).toNumber()])))
+      requirementsByLine.set(line.id, requirementsMapToRows(requirements))
+    }
 
+    const shipmentComponentRows = (orderAccounting?.shipments ?? []).flatMap((shipment) =>
+      shipment.lines.map((line) => ({ lineId: line.lineId, productId: line.productId, qty: refundBoundaryNumber(line.qty) })),
+    )
+    const shippedQtyByLine = calculateCoverageByLine(requirementsByLine, shipmentComponentRows)
+    let totalRecognized = 0
     for (const shipment of orderAccounting?.shipments ?? []) {
       totalRecognized += refundBoundaryNumber(shipment.revenueRecognizedAmount)
-      for (const line of shipment.lines) {
-        shippedQtyByLine.set(
-          line.lineId,
-          (shippedQtyByLine.get(line.lineId) ?? 0) + refundBoundaryNumber(line.qty),
-        )
-      }
     }
 
     const remainingShippedQtyByLine = new Map<string, number>()
@@ -984,33 +1003,52 @@ async function stageRefundAccountingReversals(
         .flatMap((shipment) => shipment.lines)
         .filter((line) => line.lineId === lineId)
       if (matchingShipmentLines.length === 0) return []
-      let remainingQty = qty
+      // scjz.20: `qty` is in SALES-LINE (kit) units, but each shipment line's
+      // cost-layer snapshot is denominated in COMPONENT units. A KIT line ships every
+      // component, so reverse `qty * componentFactor` of each component's basis
+      // (componentFactor === 1 for SIMPLE products, leaving them unchanged). Without
+      // this conversion a kit refund reverses only `qty` component units instead of
+      // `qty * factor`, under-reversing COGS so inventory/GL can never reconcile.
+      const factors = componentFactorsByLine.get(lineId)
+      const componentProductIds = new Set(
+        matchingShipmentLines.map((line) => line.productId).filter((id): id is string => !!id),
+      )
       const consumed: CostLayerSnapshotEntry[] = []
-      for (const shipment of orderAccounting?.shipments ?? []) {
-        for (const shipmentLine of shipment.lines) {
-          if (shipmentLine.lineId !== lineId || remainingQty <= 0) continue
-          const available = shipmentLineAvailability.get(shipmentLine.id) ?? []
-          const taken = takeFromSnapshotEntries(available, remainingQty, {
-            shipmentLineId: shipmentLine.id,
-            source: 'shipment',
-          })
-          consumed.push(...refreshSnapshotCosts(taken.taken))
-          remainingQty = taken.remainingQty
-          shipmentLineAvailability.set(
-            shipmentLine.id,
-            reduceSnapshotByCostLayer(
-              available,
-              taken.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
-            ),
+      for (const componentProductId of componentProductIds) {
+        const factor = factors?.get(componentProductId) ?? 1
+        let remainingQty = qty * factor
+        for (const shipment of orderAccounting?.shipments ?? []) {
+          for (const shipmentLine of shipment.lines) {
+            if (
+              shipmentLine.lineId !== lineId ||
+              shipmentLine.productId !== componentProductId ||
+              remainingQty <= 0
+            )
+              continue
+            const available = shipmentLineAvailability.get(shipmentLine.id) ?? []
+            const taken = takeFromSnapshotEntries(available, remainingQty, {
+              shipmentLineId: shipmentLine.id,
+              source: 'shipment',
+            })
+            consumed.push(...refreshSnapshotCosts(taken.taken))
+            remainingQty = taken.remainingQty
+            shipmentLineAvailability.set(
+              shipmentLine.id,
+              reduceSnapshotByCostLayer(
+                available,
+                taken.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
+              ),
+            )
+          }
+        }
+        if (remainingQty > 0.0000001) {
+          throw new Error(
+            `Cannot reverse COGS for refunded line ${lineId} component ${componentProductId}: requested ` +
+            `${(qty * factor).toFixed(4)} unit(s) of shipment cost basis but only ` +
+            `${(qty * factor - remainingQty).toFixed(4)} available across recorded shipments. ` +
+            `This usually means the cost-layer snapshot is stale or was cleared between batch runs.`,
           )
         }
-      }
-      if (remainingQty > 0.0000001) {
-        throw new Error(
-          `Cannot reverse COGS for refunded line ${lineId}: requested ${qty} unit(s) of shipment cost basis ` +
-          `but only ${(qty - remainingQty).toFixed(4)} available across recorded shipments. ` +
-          `This usually means the cost-layer snapshot is stale or was cleared between batch runs.`,
-        )
       }
       return consumed
     }
@@ -1019,31 +1057,46 @@ async function stageRefundAccountingReversals(
       const matchingAllocations = (orderAccounting?.allocations ?? [])
         .filter((allocation) => allocation.lineId === lineId)
       if (matchingAllocations.length === 0) return []
-      let remainingQty = qty
+      // scjz.20: allocations are COMPONENT-level (a KIT allocates each component), so
+      // mirror the shipment consume and reverse `qty * componentFactor` per component.
+      const factors = componentFactorsByLine.get(lineId)
+      const componentProductIds = new Set(
+        matchingAllocations.map((allocation) => allocation.productId).filter((id): id is string => !!id),
+      )
       const consumed: CostLayerSnapshotEntry[] = []
-      for (const allocation of orderAccounting?.allocations ?? []) {
-        if (allocation.lineId !== lineId || remainingQty <= 0) continue
-        const available = allocationAvailability.get(allocation.id) ?? []
-        const taken = takeFromSnapshotEntries(available, remainingQty, {
-          orderAllocationId: allocation.id,
-          source: 'allocation',
-        })
-        consumed.push(...refreshSnapshotCosts(taken.taken))
-        remainingQty = taken.remainingQty
-        allocationAvailability.set(
-          allocation.id,
-          reduceSnapshotByCostLayer(
-            available,
-            taken.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
-          ),
-        )
-      }
-      if (remainingQty > 0.0000001) {
-        throw new Error(
-          `Cannot reverse COGS for refunded line ${lineId}: requested ${qty} unit(s) of allocation cost basis ` +
-          `but only ${(qty - remainingQty).toFixed(4)} available across recorded allocations. ` +
-          `This usually means the cost-layer snapshot is stale or was cleared between batch runs.`,
-        )
+      for (const componentProductId of componentProductIds) {
+        const factor = factors?.get(componentProductId) ?? 1
+        let remainingQty = qty * factor
+        for (const allocation of orderAccounting?.allocations ?? []) {
+          if (
+            allocation.lineId !== lineId ||
+            allocation.productId !== componentProductId ||
+            remainingQty <= 0
+          )
+            continue
+          const available = allocationAvailability.get(allocation.id) ?? []
+          const taken = takeFromSnapshotEntries(available, remainingQty, {
+            orderAllocationId: allocation.id,
+            source: 'allocation',
+          })
+          consumed.push(...refreshSnapshotCosts(taken.taken))
+          remainingQty = taken.remainingQty
+          allocationAvailability.set(
+            allocation.id,
+            reduceSnapshotByCostLayer(
+              available,
+              taken.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
+            ),
+          )
+        }
+        if (remainingQty > 0.0000001) {
+          throw new Error(
+            `Cannot reverse COGS for refunded line ${lineId} component ${componentProductId}: requested ` +
+            `${(qty * factor).toFixed(4)} unit(s) of allocation cost basis but only ` +
+            `${(qty * factor - remainingQty).toFixed(4)} available across recorded allocations. ` +
+            `This usually means the cost-layer snapshot is stale or was cleared between batch runs.`,
+          )
+        }
       }
       return consumed
     }
