@@ -127,7 +127,11 @@ export async function addStockAdjustment(page: Page, sku: string, qty: number, w
       }
     }
   }
-  await dialog.locator('input[type="number"]').last().fill(String(qty))
+  // The qty field is step="1"; a separate required unit-cost field (step="any",
+  // title "Unit cost…") was added later, so target qty specifically rather than the
+  // last number input, and supply a unit cost for the positive new-product line.
+  await dialog.locator('input[type="number"][step="1"]').last().fill(String(qty))
+  await dialog.locator('input[title^="Unit cost"]').last().fill('10')
   await dialog.getByRole('button', { name: /save adjustments/i }).click()
 
   await dialog.getByText(/1 adjustment saved\./i).waitFor()
