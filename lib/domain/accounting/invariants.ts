@@ -835,7 +835,6 @@ export async function runAccountingInvariantReport(options: {
       code: 'inventory_gl_subledger_mismatch',
       message: `GL inventory balance (${inventoryReconciliation.glBalance.toFixed(2)}) does not reconcile to the cost-layer subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
       details: {
-        accountCode: inventoryReconciliation.accountCode,
         balanceDate: inventoryReconciliation.balanceDate,
         glBalance: inventoryReconciliation.glBalance,
         subledgerValue: inventoryReconciliation.subledgerValue,
