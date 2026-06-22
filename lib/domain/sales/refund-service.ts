@@ -161,14 +161,20 @@ export function buildChargebackRefundLines(input: {
     }]
   })
 
+  // Clamp to >= 0: an amount-only/ad-hoc prior refund (no sales line) can push
+  // priorRefundedBase above the order's shipping, making the raw difference
+  // negative. Left unclamped it would *inflate* targetGoodsTotal below (subtracting
+  // a negative) and over-credit the customer. targetNetTotalBase already nets out
+  // every prior refund, so a fully-refunded shipping leg simply contributes 0 here.
   const remainingShipping = input.shipping
     ? roundQuantity(subtractMoney(input.shipping.totalBase, input.shipping.priorRefundedBase ?? 0), 4)
     : toDecimal(0)
+  const remainingShippingClamped = remainingShipping.lt(0) ? toDecimal(0) : remainingShipping
 
   // scjz.71: allocate the order-level discount by scaling the goods (sale lines) down
   // to (net − shipping) when the un-discounted goods total exceeds it.
   if (input.targetNetTotalBase != null) {
-    const targetGoodsTotal = subtractMoney(input.targetNetTotalBase, remainingShipping)
+    const targetGoodsTotal = subtractMoney(input.targetNetTotalBase, remainingShippingClamped)
     const goodsGross = saleLines.reduce((sum, line) => addMoney(sum, line.totalBase), toDecimal(0))
     if (goodsGross.gt(0) && targetGoodsTotal.gte(0) && goodsGross.gt(targetGoodsTotal)) {
       const factor = targetGoodsTotal.div(goodsGross)
@@ -178,13 +184,13 @@ export function buildChargebackRefundLines(input: {
     }
   }
 
-  if (remainingShipping.gt(0)) {
+  if (remainingShippingClamped.gt(0)) {
     saleLines.push({
       lineId: null,
       productId: null,
       description: input.shipping?.description ?? 'Shipping',
       qty: 0,
-      totalBase: remainingShipping.toNumber(),
+      totalBase: remainingShippingClamped.toNumber(),
       lineKind: 'shipping',
     })
   }
@@ -1509,6 +1515,58 @@ export async function createSalesOrderRefund(
             lineKind: line.salesOrderLineId == null ? 'shipping' as const : 'sale' as const,
           })),
           creditNoteNumber: existingExternalRefund.creditNoteNumber ?? '',
+          newStatus: so.status === 'REFUNDED' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
+        }
+      }
+    }
+
+    // scjz.71: chargeback idempotency must be atomic. The pre-check in
+    // raiseChargebackForReversedOrder runs OUTSIDE this lock, so two overlapping
+    // payment-poller runs can both pass it before either commits. Re-check here
+    // under the advisory + row lock so a second run replays the first chargeback
+    // (one credit note per order) instead of posting a duplicate.
+    if (input.chargeback) {
+      const existingChargeback = await tx.salesOrderRefund.findFirst({
+        where: { orderId: input.orderId, chargeback: true },
+        select: {
+          id: true,
+          creditNoteNumber: true,
+          totalBase: true,
+          lines: {
+            select: {
+              id: true,
+              salesOrderLineId: true,
+              productId: true,
+              description: true,
+              qty: true,
+              unitPriceForeign: true,
+              unitPriceBase: true,
+              totalForeign: true,
+              totalBase: true,
+            },
+          },
+        },
+      })
+      if (existingChargeback) {
+        return {
+          replay: true as const,
+          so,
+          fxRate,
+          replayTotalBase: refundBoundaryNumber(existingChargeback.totalBase),
+          createdRefund: { id: existingChargeback.id },
+          createdRefundLines: existingChargeback.lines.map((line) => ({
+            id: line.id,
+            lineId: line.salesOrderLineId ?? null,
+            productId: line.productId,
+            description: line.description,
+            qty: refundBoundaryNumber(line.qty),
+            unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
+            unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
+            totalForeign: refundBoundaryNumber(line.totalForeign),
+            totalBase: refundBoundaryNumber(line.totalBase),
+            lineKind: line.salesOrderLineId == null ? 'shipping' as const : 'sale' as const,
+          })),
+          creditNoteNumber: existingChargeback.creditNoteNumber ?? '',
           newStatus: so.status === 'REFUNDED' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
         }
       }
