@@ -6,8 +6,8 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
-import { isFullyShippedTerminalStatus, recognizeShipmentRevenue, shouldTrueUpPartiallyRefundedDeferral } from '@/lib/domain/accounting/revenue-recognition'
-import { loadPostedUnearnedReversalByOrder } from '@/lib/domain/accounting/deferred-reversal'
+import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
+import { loadPostedUnearnedReversalByOrder, loadFullyShippedNetOfRefundsOrderIds } from '@/lib/domain/accounting/deferred-reversal'
 import {
   addMoney,
   multiplyMoney,
@@ -300,11 +300,13 @@ async function computePreview(): Promise<DailyBatchPreview> {
   // scjz.68: mirror the posting path's reversal-aware deferred true-up so the preview
   // matches what actually posts (scjz.69) for PARTIALLY_REFUNDED orders.
   const bSettings = await getXeroSettings()
+  const previewOrderIds = Array.from(bShipmentsByOrder.keys())
   const previewPostedUnearnedReversalByOrder = await loadPostedUnearnedReversalByOrder(db, {
-    orderIds: Array.from(bShipmentsByOrder.keys()),
+    orderIds: previewOrderIds,
     connector: 'xero',
     unearnedAccountCode: bSettings.xero_unearned_revenue_account,
   })
+  const previewFullyShippedNetOfRefundsOrderIds = await loadFullyShippedNetOfRefundsOrderIds(db, previewOrderIds)
 
   // Compute per-shipment results grouped by order, then emit in the original
   // (createdAt asc) order so the displayed list and the 200-cap are stable.
@@ -351,9 +353,8 @@ async function computePreview(): Promise<DailyBatchPreview> {
       const proportionalRevenue = orderLineTotal > 0
         ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
         : 0
-      // scjz.68: gate the PARTIALLY_REFUNDED true-up on the residual after this batch's
-      // proportional recognition (matching the posting path).
-      const residualAfterProportional = round2(Math.max(0, remainingDeferred - runningRevenue - proportionalRevenue))
+      // scjz.68: mirror the posting path — true up a PARTIALLY_REFUNDED order only when it
+      // is fully shipped net of refunds.
       const revenueProportion = recognizeShipmentRevenue({
         proportionalRevenue,
         remainingDeferred,
@@ -361,7 +362,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
         isFinalShipmentOfFullyShippedTerminalOrder:
           index === orderShipments.length - 1 && (
             isFullyShippedTerminalStatus(order.status) ||
-            (order.status === 'PARTIALLY_REFUNDED' && shouldTrueUpPartiallyRefundedDeferral(residualAfterProportional))
+            (order.status === 'PARTIALLY_REFUNDED' && previewFullyShippedNetOfRefundsOrderIds.has(orderId))
           ),
       })
       runningRevenue += revenueProportion

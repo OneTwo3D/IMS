@@ -34,8 +34,8 @@ import {
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
-import { isFullyShippedTerminalStatus, recognizeShipmentRevenue, shouldTrueUpPartiallyRefundedDeferral } from '@/lib/domain/accounting/revenue-recognition'
-import { loadPostedUnearnedReversalByOrder } from '@/lib/domain/accounting/deferred-reversal'
+import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
+import { loadPostedUnearnedReversalByOrder, loadFullyShippedNetOfRefundsOrderIds } from '@/lib/domain/accounting/deferred-reversal'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
@@ -770,6 +770,8 @@ export async function runDailyBatchSync(): Promise<{
         connector: QBO_CONNECTOR,
         unearnedAccountCode: settings.quickbooks_unearned_revenue_account,
       })
+      // scjz.68: PARTIALLY_REFUNDED orders that are nonetheless fully shipped net of refunds.
+      const fullyShippedNetOfRefundsOrderIds = await loadFullyShippedNetOfRefundsOrderIds(tx, orderIds)
 
       const referencedCostLayerIds = Array.from(new Set(
         orderAllocations.flatMap((allocation) => (
@@ -871,8 +873,6 @@ export async function runDailyBatchSync(): Promise<{
           const proportionalRevenue = orderLineTotal > 0
             ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
             : 0
-          // scjz.68: gate on the residual AFTER this batch's proportional recognition (see Xero).
-          const residualAfterProportional = round2(Math.max(0, remainingDeferred - runningRevenue - proportionalRevenue))
           const revenueProportion = recognizeShipmentRevenue({
             proportionalRevenue,
             remainingDeferred,
@@ -880,7 +880,9 @@ export async function runDailyBatchSync(): Promise<{
             isFinalShipmentOfFullyShippedTerminalOrder:
               index === orderShipments.length - 1 && (
                 isFullyShippedTerminalStatus(firstShipment.order.status) ||
-                (firstShipment.order.status === 'PARTIALLY_REFUNDED' && shouldTrueUpPartiallyRefundedDeferral(residualAfterProportional))
+                // scjz.68: see Xero — true up a PARTIALLY_REFUNDED order only when it is fully
+                // shipped net of refunds.
+                (firstShipment.order.status === 'PARTIALLY_REFUNDED' && fullyShippedNetOfRefundsOrderIds.has(orderId))
               ),
           })
 

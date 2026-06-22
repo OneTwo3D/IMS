@@ -39,8 +39,8 @@ import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/p
 import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
-import { isFullyShippedTerminalStatus, recognizeShipmentRevenue, shouldTrueUpPartiallyRefundedDeferral } from '@/lib/domain/accounting/revenue-recognition'
-import { loadPostedUnearnedReversalByOrder } from '@/lib/domain/accounting/deferred-reversal'
+import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
+import { loadPostedUnearnedReversalByOrder, loadFullyShippedNetOfRefundsOrderIds } from '@/lib/domain/accounting/deferred-reversal'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 type MutableLayer = {
@@ -859,6 +859,9 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         connector: XERO_CONNECTOR,
         unearnedAccountCode: settings.xero_unearned_revenue_account,
       })
+      // scjz.68: PARTIALLY_REFUNDED orders that are nonetheless fully shipped net of refunds
+      // — eligible for the final deferred-revenue true-up.
+      const fullyShippedNetOfRefundsOrderIds = await loadFullyShippedNetOfRefundsOrderIds(tx, orderIds)
 
       const referencedCostLayerIds = Array.from(new Set(
         orderAllocations.flatMap((allocation) => (
@@ -966,11 +969,6 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           const proportionalRevenue = orderLineTotal > 0
             ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
             : 0
-          // scjz.68: the PARTIALLY_REFUNDED true-up gate must look at what remains AFTER this
-          // batch's proportional recognition (the still-unshipped value), not the pre-batch
-          // remainder which still includes the current shipments — otherwise a final batch that
-          // leaves only a penny of stranding wouldn't true it up.
-          const residualAfterProportional = round2(Math.max(0, remainingDeferred - runningRevenue - proportionalRevenue))
           const revenueProportion = recognizeShipmentRevenue({
             proportionalRevenue,
             remainingDeferred,
@@ -978,10 +976,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             isFinalShipmentOfFullyShippedTerminalOrder:
               index === orderShipments.length - 1 && (
                 isFullyShippedTerminalStatus(firstShipment.order.status) ||
-                // a PARTIALLY_REFUNDED order isn't guaranteed fully shipped, but once the deferred
-                // base is reversal-aware, a residual this small means no material unshipped value
-                // is left — safe to clear the rounding stranding.
-                (firstShipment.order.status === 'PARTIALLY_REFUNDED' && shouldTrueUpPartiallyRefundedDeferral(residualAfterProportional))
+                // scjz.68: a PARTIALLY_REFUNDED order isn't a fully-shipped status, but can be
+                // genuinely fully shipped net of refunds — then its remaining (reversal-aware)
+                // deferred revenue, incl. the order-level shipping share, is earned and trued up.
+                (firstShipment.order.status === 'PARTIALLY_REFUNDED' && fullyShippedNetOfRefundsOrderIds.has(orderId))
               ),
           })
 
