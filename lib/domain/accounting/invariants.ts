@@ -58,6 +58,11 @@ type SalesOrderAccountingRow = {
     accountingRetryRequired: boolean
     accountingWarning: string | null
     accountingRetrySyncs: unknown
+    // scjz.70: a revenue-only chargeback intentionally posts NO COGS/unearned
+    // reversal (only the credit note), so it must be exempt from the reversal-
+    // evidence requirement below. Optional: the Prisma select always provides it;
+    // absent (e.g. legacy fixtures) is treated as a normal (non-chargeback) refund.
+    chargeback?: boolean
   }>
 }
 
@@ -617,7 +622,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         refundRetryTypes.size > 0 &&
         (
           !hasCreditNoteEvidence ||
-          (decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence)
+          (decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !refund.chargeback)
         )
       ) {
         findings.push({
@@ -650,7 +655,9 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         })
       }
 
-      if (!hasReversalEvidence && !refund.accountingRetryRequired && decimalToNumber(refund.totalBase) > 0) {
+      // scjz.70: a chargeback is a revenue-only unwind (credit note only) — it has
+      // no COGS/unearned reversal by design, so don't flag it as missing reversal.
+      if (!hasReversalEvidence && !refund.accountingRetryRequired && !refund.chargeback && decimalToNumber(refund.totalBase) > 0) {
         findings.push({
           severity: 'warning',
           code: 'refund_missing_reversal_sync',
@@ -766,6 +773,7 @@ export async function collectAccountingInvariantRows(
             accountingRetryRequired: true,
             accountingWarning: true,
             accountingRetrySyncs: true,
+            chargeback: true,
           },
         },
       },

@@ -56,6 +56,9 @@ type SourceRefundRow = {
   accountingCreditNoteId: string | null
   totalBase: DecimalLike
   accountingRetrySyncs: unknown
+  // scjz.70: revenue-only chargeback — credit note only, no COGS/unearned reversal.
+  // Optional: the Prisma select always provides it; absent is a normal refund.
+  chargeback?: boolean
 }
 
 type AccountingSyncLogRow = {
@@ -463,8 +466,10 @@ export function evaluateAccountingReconciliationRows(
         }
 
         // Zero-total refunds post no COGS/unearned-revenue reversal; only
-        // positive-value refunds require reversal evidence.
-        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence) {
+        // positive-value refunds require reversal evidence. scjz.70: a revenue-only
+        // chargeback also posts no COGS/unearned reversal by design (credit note
+        // only), so it is exempt from the reversal-evidence requirement.
+        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !refund.chargeback) {
           findings.push({
             severity: 'critical',
             code: 'terminal_refunded_order_missing_reversal_evidence',
@@ -680,6 +685,7 @@ export async function collectAccountingReconciliationRows(
         accountingCreditNoteId: true,
         totalBase: true,
         accountingRetrySyncs: true,
+        chargeback: true,
       },
     }),
     client.accountingSyncLog.findMany({
