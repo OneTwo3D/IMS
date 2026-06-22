@@ -21,6 +21,7 @@ import {
 import {
   buildOverheadAccountDeltas,
   compareAccountCodes,
+  disassemblyProvenanceShare,
   recomputeManufacturingUnitCosts,
   stableHash,
 } from '@/lib/domain/manufacturing/production-costing'
@@ -807,14 +808,26 @@ export async function updateManufacturingOrderStatus(
               productionOrderId: id,
               receivedAt: costLayerReceivedAt,
             })
-            if (baseAllocatedCost.gt(0) && totalRecoveredCostBase.gt(0)) {
-              const componentShare = baseAllocatedCost.div(totalRecoveredCostBase)
+            // Cost-layer source-line provenance so a later landed-cost change on the
+            // disassembled OUTPUT layer propagates into this recovered component layer
+            // (scjz.27). The equal-split-overhead path (zero-cost output) previously
+            // wrote no source lines, leaving the recovered layers invisible to
+            // propagateLandedCostToOutputs and permanently understated; it now writes
+            // equal-share lines carrying zero value, which propagation fills in when
+            // the output is later revalued.
+            const provenanceShare = disassemblyProvenanceShare({
+              baseAllocatedCostBase: baseAllocatedCost,
+              totalRecoveredCostBase,
+              useEqualSplitOverhead,
+              componentCount: components.length,
+            })
+            if (provenanceShare) {
               await addCostLayerSourceLines(tx, componentLayerId, recoveredCost.consumed.map((entry) => ({
                 sourceProductId: order.outputProductId,
                 sourceCostLayerId: entry.costLayerId,
-                qty: entry.qty.mul(componentShare),
+                qty: entry.qty.mul(provenanceShare),
                 unitCostBase: entry.unitCostBase,
-                totalCostBase: entry.qty.mul(entry.unitCostBase).mul(componentShare),
+                totalCostBase: entry.qty.mul(entry.unitCostBase).mul(provenanceShare),
               })))
             }
 
