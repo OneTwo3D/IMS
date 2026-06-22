@@ -4,6 +4,7 @@ import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   applyReturnInboundStockTx,
+  buildChargebackRefundLines,
   createSalesOrderRefund,
   retrySalesOrderRefundAccounting,
   type RefundServiceClient,
@@ -1915,4 +1916,45 @@ test('retrySalesOrderRefundAccounting uses persisted sales line identity and ref
   assert.equal(state.movements.length, 2)
   assert.equal(state.movements[1].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[1].referenceId, 'refund-2')
+})
+
+// scjz.70 / .42a: full-order chargeback refund-line selection (pure).
+test('buildChargebackRefundLines: full order with no prior refunds keeps qty + value exact', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [
+      { lineId: 'l1', productId: 'p1', description: 'Widget', qty: 3, totalBase: 30 },
+      { lineId: 'l2', productId: 'p2', description: 'Gadget', qty: 1, totalBase: 12.5 },
+    ],
+  })
+  assert.deepEqual(
+    lines.map((l) => ({ lineId: l.lineId, qty: l.qty, totalBase: l.totalBase, lineKind: l.lineKind })),
+    [
+      { lineId: 'l1', qty: 3, totalBase: 30, lineKind: 'sale' },
+      { lineId: 'l2', qty: 1, totalBase: 12.5, lineKind: 'sale' },
+    ],
+  )
+})
+
+test('buildChargebackRefundLines: prior refunds reduce to remaining qty + proportional value', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 4, totalBase: 100 }],
+    priorRefundedQtyByLineId: { l1: 1 },
+  })
+  // 3 of 4 remaining → 75% of 100 = 75.00.
+  assert.deepEqual(
+    lines.map((l) => ({ qty: l.qty, totalBase: l.totalBase })),
+    [{ qty: 3, totalBase: 75 }],
+  )
+})
+
+test('buildChargebackRefundLines: fully-refunded and zero-qty lines are dropped', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [
+      { lineId: 'l1', productId: 'p1', description: 'Done', qty: 2, totalBase: 20 },
+      { lineId: 'l2', productId: 'p2', description: 'Zero', qty: 0, totalBase: 0 },
+      { lineId: 'l3', productId: 'p3', description: 'Keep', qty: 1, totalBase: 10 },
+    ],
+    priorRefundedQtyByLineId: { l1: 2 },
+  })
+  assert.deepEqual(lines.map((l) => l.lineId), ['l3'])
 })

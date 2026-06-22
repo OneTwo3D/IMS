@@ -106,6 +106,46 @@ export type RefundRequestLine = {
   lineKind?: 'sale' | 'shipping'
 }
 
+export type ChargebackOrderLine = {
+  lineId: string
+  productId: string | null
+  description: string
+  qty: number
+  totalBase: number
+}
+
+/**
+ * Full-order chargeback refund lines (scjz.70 / .42a foundation): every sale line
+ * at its REMAINING (un-refunded) quantity and proportional remaining value. A
+ * chargeback unwinds the WHOLE order's recognised revenue, so it refunds
+ * everything not already refunded. Lines fully refunded already are dropped; a
+ * zero-qty order line contributes nothing. Pure (no IO) so the line selection is
+ * unit-testable in isolation; the caller passes the result to
+ * createSalesOrderRefund with `chargeback: true`.
+ */
+export function buildChargebackRefundLines(input: {
+  lines: readonly ChargebackOrderLine[]
+  priorRefundedQtyByLineId?: Record<string, number>
+}): RefundRequestLine[] {
+  const prior = input.priorRefundedQtyByLineId ?? {}
+  return input.lines.flatMap((line) => {
+    const refundedQty = prior[line.lineId] ?? 0
+    const remainingQty = Math.max(0, line.qty - refundedQty)
+    if (remainingQty <= 0) return []
+    // Proportional remaining value; full order (no prior refund) keeps totalBase exact.
+    const fraction = line.qty > 0 ? remainingQty / line.qty : 0
+    const remainingBase = roundQuantity(toDecimal(line.totalBase).mul(fraction), 2).toNumber()
+    return [{
+      lineId: line.lineId,
+      productId: line.productId,
+      description: line.description,
+      qty: remainingQty,
+      totalBase: remainingBase,
+      lineKind: 'sale' as const,
+    }]
+  })
+}
+
 export type CreatedRefundLine = {
   id: string
   lineId: string | null
