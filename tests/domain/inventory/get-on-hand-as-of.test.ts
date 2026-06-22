@@ -280,6 +280,31 @@ test('getOnHandAsOf does not flag a current-reverse valuation for a revaluation 
   assert.equal(result.valueReplayReliable, true)
 })
 
+test('getOnHandAsOf sums layer values at full precision then rounds once (scjz.65)', async () => {
+  // Three layers for the same (product, warehouse), each value 0.000004 * 0.1 = 0.0000004.
+  // Per-layer rounding: round6(0.0000004) = 0.000000 each -> sum 0.000000 (the old bug).
+  // Sum-then-round: 0.0000012 -> round6 = 0.000001, matching the Postgres
+  // SUM(remainingQty*unitCostBase) aggregate and inventory-snapshot.ts.
+  const client = createClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0.000012') }],
+    costLayers: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('0.000004'), unitCostBase: decimal('0.1') },
+      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('0.000004'), unitCostBase: decimal('0.1') },
+      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('0.000004'), unitCostBase: decimal('0.1') },
+    ],
+    movements: [],
+  })
+
+  const result = await getOnHandAsOf({
+    client,
+    asOf: '2026-05-27',
+    now: () => new Date('2026-06-01T12:00:00.000Z'),
+  })
+
+  assert.equal(result.rows.length, 1)
+  assert.equal(result.rows[0]!.valueBase, '0.000001')
+})
+
 test('getOnHandAsOf does NOT flag a prior-snapshot valuation for a later revaluation (scjz.43)', async () => {
   // A prior snapshot is frozen at/before asOf, so a later revaluation does not
   // change its value — must stay reliable (Codex round-4: don't over-flag snapshots).
