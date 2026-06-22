@@ -463,14 +463,23 @@ function stateFromCurrentRows(
     })
   }
 
+  // scjz.65: sum each (product, warehouse)'s layer values at FULL precision and round
+  // ONCE — matching the Postgres SUM(remainingQty*unitCostBase) aggregate path
+  // (sum-then-round) and inventory-snapshot.ts's stateFromCurrentRows. upsertState
+  // rounds the running total per-add, which diverged from the SQL path at the 6th dp,
+  // leaving two different "inventory value" numbers in the system for the same as-of date.
+  const layerValueByKey = new Map<string, { productId: string; warehouseId: string; value: Decimal }>()
   for (const layer of costLayers) {
-    upsertState(
-      state,
-      layer.productId,
-      layer.warehouseId,
-      0,
-      toDecimal(layer.remainingQty).mul(toDecimal(layer.unitCostBase)),
-    )
+    const key = stateKey(layer.productId, layer.warehouseId)
+    const entry = layerValueByKey.get(key) ?? { productId: layer.productId, warehouseId: layer.warehouseId, value: toDecimal(0) }
+    entry.value = entry.value.add(toDecimal(layer.remainingQty).mul(toDecimal(layer.unitCostBase)))
+    layerValueByKey.set(key, entry)
+  }
+  for (const { productId, warehouseId, value } of layerValueByKey.values()) {
+    const key = stateKey(productId, warehouseId)
+    const existing = state.get(key) ?? { productId, warehouseId, qty: toDecimal(0), valueBase: toDecimal(0) }
+    existing.valueBase = roundValue(value)
+    state.set(key, existing)
   }
 
   return state
