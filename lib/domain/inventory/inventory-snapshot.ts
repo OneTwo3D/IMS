@@ -79,6 +79,15 @@ export type InventoryReservationSnapshotRunInput = {
   reservationSourceCount: number | null
 }
 
+export type InventorySnapshotRunInput = {
+  snapshotDate: Date
+  stockLevelCount: number
+  snapshotCount: number
+  source: 'cron' | 'backfill'
+  checkMethod: string
+  cutoffAt: Date | null
+}
+
 export type InventorySnapshotDrift = {
   productId: string
   warehouseId: string
@@ -151,6 +160,7 @@ export type InventorySnapshotClient = Pick<
   | 'costLayerRevaluation'
   | 'stockMovement'
   | 'inventorySnapshot'
+  | 'inventorySnapshotRun'
   | 'inventoryReservationSnapshot'
   | 'inventoryReservationSnapshotRun'
   | 'orderAllocation'
@@ -180,6 +190,9 @@ export type InventorySnapshotTestClient = {
   }
   inventorySnapshot: {
     findMany(args: unknown): Promise<Array<{ snapshotDate: Date; valueBase: DecimalInput }>>
+    upsert(args: unknown): Promise<unknown>
+  }
+  inventorySnapshotRun: {
     upsert(args: unknown): Promise<unknown>
   }
   inventoryReservationSnapshot: {
@@ -243,6 +256,7 @@ const EMPTY_RESERVATION_BACKFILL_RESULT: InventoryReservationSnapshotBackfillRes
   knownLimitations: [],
 }
 
+const INVENTORY_SNAPSHOT_BACKFILL_CHECK_METHOD = 'aggregated_movement_replay_v1'
 const RESERVATION_BACKFILL_CHECK_METHOD = 'current_sources_updated_at_gate_v2'
 const RESERVATION_BACKFILL_LIMITATIONS = [
   'The mutation check assumes reservation-source writes use Prisma paths that maintain updatedAt values.',
@@ -903,6 +917,32 @@ async function writeReservationSnapshotRun(
   } as never)
 }
 
+async function writeInventorySnapshotRun(
+  client: SnapshotClient,
+  row: InventorySnapshotRunInput,
+): Promise<void> {
+  const updatedAt = new Date()
+  await client.inventorySnapshotRun.upsert({
+    where: { snapshotDate: row.snapshotDate },
+    create: {
+      snapshotDate: row.snapshotDate,
+      stockLevelCount: row.stockLevelCount,
+      snapshotCount: row.snapshotCount,
+      source: row.source,
+      checkMethod: row.checkMethod,
+      cutoffAt: row.cutoffAt,
+    },
+    update: {
+      stockLevelCount: row.stockLevelCount,
+      snapshotCount: row.snapshotCount,
+      source: row.source,
+      checkMethod: row.checkMethod,
+      cutoffAt: row.cutoffAt,
+      updatedAt,
+    },
+  } as never)
+}
+
 export async function writeDailyInventorySnapshot(options: {
   client?: SnapshotClient
   snapshotDate?: SnapshotDateInput
@@ -917,6 +957,16 @@ export async function writeDailyInventorySnapshot(options: {
   const rows = rowsFromState(snapshotDate, state, () => true)
 
   const snapshotsWritten = await writeSnapshotRows(client, rows)
+  // Coverage marker so a future empty inventory_snapshots result for this date is
+  // read as a genuine zero on-hand position rather than an uncovered date (scjz.60.5).
+  await writeInventorySnapshotRun(client, {
+    snapshotDate,
+    stockLevelCount: reservationSnapshot.stockLevelCount,
+    snapshotCount: snapshotsWritten,
+    source: 'cron',
+    checkMethod: 'daily_current_state_v1',
+    cutoffAt: startOfNextUtcDay(snapshotDate),
+  })
   const reservationSnapshotsWritten = await writeReservationSnapshotRows(client, reservationSnapshot.rows)
   await writeReservationSnapshotRun(client, {
     snapshotDate,
@@ -1124,6 +1174,19 @@ export async function backfillInventorySnapshots(options: {
     const rows = rowsFromState(day, state, pairValueReplayReliable(day))
     snapshotsWritten += options.dryRun ? rows.length : await writeSnapshotRows(client, rows)
     daysWritten += 1
+
+    // Coverage marker per backfilled day so empty inventory_snapshots for a genuinely
+    // zero-stock historical date reconciles instead of reading as uncovered (scjz.60.5).
+    if (!options.dryRun) {
+      await writeInventorySnapshotRun(client, {
+        snapshotDate: day,
+        stockLevelCount: rows.length,
+        snapshotCount: rows.length,
+        source: 'backfill',
+        checkMethod: INVENTORY_SNAPSHOT_BACKFILL_CHECK_METHOD,
+        cutoffAt: startOfNextUtcDay(day),
+      })
+    }
 
     if (options.includeReservationSnapshots) {
       const cutoff = startOfNextUtcDay(day)

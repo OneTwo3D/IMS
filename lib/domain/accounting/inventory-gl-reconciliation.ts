@@ -132,18 +132,25 @@ export async function loadInventoryGlReconciliation(options?: {
 
   // Subledger value AS OF balanceDate from inventory_snapshots (not live layers).
   // inventory_snapshots is SPARSE — only non-zero (product, warehouse) pairs are
-  // stored — and, unlike InventoryReservationSnapshot, has NO per-date run marker,
-  // so an empty result for balanceDate is genuinely ambiguous: zero on-hand stock
-  // OR the snapshot job never covered the date. We cannot tell them apart, and a
-  // later snapshot only proves a later capture, so we conservatively return
-  // unavailable rather than risk a false critical against a stale GL on an
-  // uncovered date. (An InventorySnapshotRun coverage marker would let genuinely
-  // zero-stock dates reconcile too — tracked as a follow-up.)
+  // stored — so an empty result for balanceDate is ambiguous on its own: zero
+  // on-hand stock OR the snapshot job never covered the date. The InventorySnapshotRun
+  // coverage marker disambiguates (scjz.60.5): a run row for the exact date proves
+  // the job covered it, so empty snapshot rows mean a genuine zero subledger value
+  // and the GL must still reconcile against it (catching a stale non-zero GL on a
+  // zero-stock date). With no run marker we conservatively return unavailable rather
+  // than risk a false critical against a stale GL on an uncovered date.
   const snapshotRows = await db.inventorySnapshot.findMany({
     where: { snapshotDate: balanceDate },
     select: { valueBase: true, valueReplayReliable: true },
   })
-  if (snapshotRows.length === 0) return { available: false, reason: 'no_subledger_snapshot' }
+  if (snapshotRows.length === 0) {
+    const run = await db.inventorySnapshotRun.findUnique({
+      where: { snapshotDate: balanceDate },
+      select: { id: true },
+    })
+    if (!run) return { available: false, reason: 'no_subledger_snapshot' }
+    // Covered zero-stock date: subledgerValue is genuinely 0; fall through to reconcile.
+  }
   if (snapshotRows.some((row) => !row.valueReplayReliable)) {
     return { available: false, reason: 'unreliable_subledger_snapshot' }
   }

@@ -52,12 +52,19 @@ function createSnapshotClient(input: {
     order: { orderNumber: string | null; externalOrderNumber: string | null; expectedDelivery: Date | null; status: string }
     line: { sku: string | null; description: string }
   }>
-} = {}): InventorySnapshotTestClient & { upserts: unknown[]; reservationUpserts: unknown[]; reservationRunUpserts: unknown[] } {
+} = {}): InventorySnapshotTestClient & {
+  upserts: unknown[]
+  runUpserts: unknown[]
+  reservationUpserts: unknown[]
+  reservationRunUpserts: unknown[]
+} {
   const upserts: unknown[] = []
+  const runUpserts: unknown[] = []
   const reservationUpserts: unknown[] = []
   const reservationRunUpserts: unknown[] = []
   return {
     upserts,
+    runUpserts,
     reservationUpserts,
     reservationRunUpserts,
     salesOrder: {
@@ -105,6 +112,12 @@ function createSnapshotClient(input: {
       findMany: async () => input.averageRows ?? [],
       upsert: async (args) => {
         upserts.push(args)
+        return {}
+      },
+    },
+    inventorySnapshotRun: {
+      upsert: async (args) => {
+        runUpserts.push(args)
         return {}
       },
     },
@@ -257,6 +270,37 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
       reservationSourceCount: 1,
     },
   )
+  assert.equal(client.runUpserts.length, 1)
+  const runUpsert = client.runUpserts[0] as {
+    where: { snapshotDate: Date }
+    create: {
+      snapshotDate: Date
+      stockLevelCount: number
+      snapshotCount: number
+      source: string
+      checkMethod: string
+      cutoffAt: Date
+    }
+  }
+  assert.deepEqual(runUpsert.where, { snapshotDate: new Date('2026-05-28T00:00:00.000Z') })
+  assert.deepEqual(
+    {
+      snapshotDate: runUpsert.create.snapshotDate,
+      stockLevelCount: runUpsert.create.stockLevelCount,
+      snapshotCount: runUpsert.create.snapshotCount,
+      source: runUpsert.create.source,
+      checkMethod: runUpsert.create.checkMethod,
+      cutoffAt: runUpsert.create.cutoffAt,
+    },
+    {
+      snapshotDate: new Date('2026-05-28T00:00:00.000Z'),
+      stockLevelCount: 1,
+      snapshotCount: 1,
+      source: 'cron',
+      checkMethod: 'daily_current_state_v1',
+      cutoffAt: new Date('2026-05-29T00:00:00.000Z'),
+    },
+  )
   assert.equal(client.reservationRunUpserts.length, 1)
   const reservationRunCreate = (client.reservationRunUpserts[0] as {
     create: {
@@ -392,6 +436,27 @@ test('historical backfill replays later movements backwards from current state',
     [
       { snapshotDate: '2026-05-28T00:00:00.000Z', qty: '10.0000', valueBase: '20.000000' },
       { snapshotDate: '2026-05-27T00:00:00.000Z', qty: '12.0000', valueBase: '24.000000' },
+    ],
+  )
+  // A coverage marker is written per backfilled day so a future zero-stock date
+  // reconciles instead of reading as uncovered (scjz.60.5).
+  assert.deepEqual(
+    client.runUpserts.map((upsert) => {
+      const create = (upsert as {
+        create: { snapshotDate: Date; stockLevelCount: number; snapshotCount: number; source: string; checkMethod: string; cutoffAt: Date }
+      }).create
+      return {
+        snapshotDate: create.snapshotDate.toISOString(),
+        stockLevelCount: create.stockLevelCount,
+        snapshotCount: create.snapshotCount,
+        source: create.source,
+        checkMethod: create.checkMethod,
+        cutoffAt: create.cutoffAt.toISOString(),
+      }
+    }),
+    [
+      { snapshotDate: '2026-05-28T00:00:00.000Z', stockLevelCount: 1, snapshotCount: 1, source: 'backfill', checkMethod: 'aggregated_movement_replay_v1', cutoffAt: '2026-05-29T00:00:00.000Z' },
+      { snapshotDate: '2026-05-27T00:00:00.000Z', stockLevelCount: 1, snapshotCount: 1, source: 'backfill', checkMethod: 'aggregated_movement_replay_v1', cutoffAt: '2026-05-28T00:00:00.000Z' },
     ],
   )
 })
@@ -973,6 +1038,7 @@ test('historical backfill dry-run does not write and reports null-value movement
   })
 
   assert.equal(client.upserts.length, 0)
+  assert.equal(client.runUpserts.length, 0)
   assert.equal(result.dryRun, true)
   assert.equal(result.missingValueMovementCount, 1)
   assert.equal(result.valueReplayReliable, false)

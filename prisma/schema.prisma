@@ -934,6 +934,26 @@ model InventorySnapshot {
   @@map("inventory_snapshots")
 }
 
+/// Daily coverage marker for sparse InventorySnapshot rows. If a run exists for a
+/// snapshotDate, absent product/warehouse rows represent a genuine zero on-hand
+/// position for that day, so an empty inventory_snapshots result for the date is a
+/// real zero subledger value (used by the inventory GL reconciliation, scjz.60.5)
+/// rather than an uncovered date. If no run exists, callers must treat empty rows
+/// as missing evidence, not zero. Mirrors InventoryReservationSnapshotRun.
+model InventorySnapshotRun {
+  id              String    @id @default(cuid())
+  snapshotDate    DateTime  @unique @db.Date
+  stockLevelCount Int
+  snapshotCount   Int
+  source          String    @default("cron")
+  checkMethod     String    @default("daily_current_state_v1")
+  cutoffAt        DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("inventory_snapshot_runs")
+}
+
 /// Daily product/warehouse reservation position for true as-of availability
 /// reporting. Rows are captured from StockLevel.reservedQty and current
 /// quantity at snapshot time, with reservationSourceCount recording the count
