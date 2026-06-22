@@ -5,7 +5,37 @@ import {
   FULLY_SHIPPED_TERMINAL_STATUSES,
   isFullyShippedTerminalStatus,
   recognizeShipmentRevenue,
+  shouldTrueUpPartiallyRefundedDeferral,
+  extractUnearnedReversalDebit,
+  DEFERRED_TRUEUP_STRANDING_TOLERANCE,
 } from '@/lib/domain/accounting/revenue-recognition'
+
+test('scjz.68: PARTIALLY_REFUNDED true-up fires only for rounding-scale remainders', () => {
+  // Reversal-aware remainder this small = no material unshipped value left -> safe to clear.
+  assert.equal(shouldTrueUpPartiallyRefundedDeferral(0), true)
+  assert.equal(shouldTrueUpPartiallyRefundedDeferral(0.04), true)
+  assert.equal(shouldTrueUpPartiallyRefundedDeferral(DEFERRED_TRUEUP_STRANDING_TOLERANCE), true)
+  // A material remainder = real unshipped value still deferred -> do NOT recognize.
+  assert.equal(shouldTrueUpPartiallyRefundedDeferral(0.06), false)
+  assert.equal(shouldTrueUpPartiallyRefundedDeferral(50), false)
+})
+
+test('scjz.68: PARTIALLY_REFUNDED is NOT a fully-shipped terminal status', () => {
+  // It must go through the reversal-aware remainder gate, not the unconditional status true-up.
+  assert.equal(isFullyShippedTerminalStatus('PARTIALLY_REFUNDED'), false)
+})
+
+test('scjz.68: extractUnearnedReversalDebit sums the unearned-account debit only', () => {
+  const payload = { lines: [
+    { accountCode: 'UNEARNED', debit: 10 },
+    { accountCode: 'SALES', credit: 10 },
+    { accountCode: 'UNEARNED', debit: 2.5 },
+  ] }
+  assert.equal(extractUnearnedReversalDebit(payload, 'UNEARNED'), 12.5)
+  assert.equal(extractUnearnedReversalDebit(payload, 'SALES'), 0)
+  assert.equal(extractUnearnedReversalDebit(null, 'UNEARNED'), 0)
+  assert.equal(extractUnearnedReversalDebit({}, 'UNEARNED'), 0)
+})
 
 test('fully-shipped terminal statuses true up deferred revenue', () => {
   // These reach a terminal post-shipment state, so the final shipment must

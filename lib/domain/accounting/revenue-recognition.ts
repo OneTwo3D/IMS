@@ -31,6 +31,46 @@ export function isFullyShippedTerminalStatus(status: SalesOrderStatus | string):
   return FULLY_SHIPPED_TERMINAL_STATUS_SET.has(status)
 }
 
+/**
+ * scjz.68: largest remaining (reversal-aware) deferred revenue still treated as pure
+ * rounding stranding — small enough to true up safely. The terminal-status true-up
+ * (scjz.41) clears at-most-a-few-pence of rounding drift; this caps the PARTIALLY_REFUNDED
+ * true-up to the same scale so it can never recognize a unit's worth of unshipped value.
+ */
+export const DEFERRED_TRUEUP_STRANDING_TOLERANCE = 0.05
+
+/**
+ * scjz.68: whether a PARTIALLY_REFUNDED order should true up its remaining deferred
+ * revenue on its final batch shipment.
+ *
+ * PARTIALLY_REFUNDED is NOT a fully-shipped status (the refund workflow can set it from
+ * pre-shipment states by refunding unshipped lines), so — unlike SHIPPED/COMPLETED/
+ * DELIVERED — we can't assume every unit has shipped. But once the already-posted
+ * UNEARNED_REV_REVERSAL is subtracted from the deferred base, the remaining
+ * (reversal-aware) deferred revenue IS exactly the value of units that are neither
+ * recognized-on-shipment nor refunded — i.e. still genuinely unshipped. When that is
+ * only rounding stranding (<= tolerance) the order is effectively fully shipped net of
+ * refunds and the remainder is safe to recognize; a material remainder means real
+ * unshipped value, so leave it deferred (recognizing it would over-debit unearned revenue).
+ */
+export function shouldTrueUpPartiallyRefundedDeferral(reversalAwareRemainingDeferred: number): boolean {
+  return reversalAwareRemainingDeferred <= DEFERRED_TRUEUP_STRANDING_TOLERANCE
+}
+
+/**
+ * scjz.68: sum the debit posted to the unearned-revenue account in an
+ * UNEARNED_REV_REVERSAL journal payload (DR unearned / CR sales). This is the amount of
+ * deferred revenue a refund of unshipped lines already reversed, which the daily-batch
+ * true-up must subtract from the deferred base so it never re-recognizes it.
+ */
+export function extractUnearnedReversalDebit(payload: unknown, unearnedAccountCode: string): number {
+  const lines = (payload as { lines?: Array<{ accountCode?: string; debit?: number }> } | null)?.lines
+  if (!Array.isArray(lines)) return 0
+  return lines.reduce((sum, line) => (
+    line.accountCode === unearnedAccountCode ? sum + (Number(line.debit) || 0) : sum
+  ), 0)
+}
+
 function round2(value: number): number {
   return Math.round(value * 100) / 100
 }

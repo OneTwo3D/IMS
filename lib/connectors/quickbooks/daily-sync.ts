@@ -34,7 +34,7 @@ import {
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
-import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
+import { isFullyShippedTerminalStatus, recognizeShipmentRevenue, shouldTrueUpPartiallyRefundedDeferral, extractUnearnedReversalDebit } from '@/lib/domain/accounting/revenue-recognition'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
@@ -761,6 +761,34 @@ export async function runDailyBatchSync(): Promise<{
         }),
       ])
 
+      // scjz.68: per-order posted UNEARNED_REV_REVERSAL (deferral reversed by refunds of
+      // unshipped lines), so the deferred-revenue true-up below is reversal-aware and the
+      // PARTIALLY_REFUNDED true-up only fires once no material unshipped value remains.
+      const orderRefunds = await tx.salesOrderRefund.findMany({
+        where: { orderId: { in: orderIds } },
+        select: { id: true, orderId: true },
+      })
+      const refundIdToOrderId = new Map(orderRefunds.map((refund) => [refund.id, refund.orderId]))
+      const postedUnearnedReversalByOrder = new Map<string, number>()
+      if (orderRefunds.length > 0) {
+        const unearnedReversalLogs = await tx.accountingSyncLog.findMany({
+          where: {
+            connector: QBO_CONNECTOR,
+            type: 'UNEARNED_REV_REVERSAL',
+            referenceType: 'SalesOrderRefund',
+            referenceId: { in: orderRefunds.map((refund) => refund.id) },
+            status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+          },
+          select: { referenceId: true, payload: true },
+        })
+        for (const log of unearnedReversalLogs) {
+          const reversalOrderId = refundIdToOrderId.get(log.referenceId)
+          if (!reversalOrderId) continue
+          const amount = extractUnearnedReversalDebit(log.payload, settings.quickbooks_unearned_revenue_account)
+          postedUnearnedReversalByOrder.set(reversalOrderId, (postedUnearnedReversalByOrder.get(reversalOrderId) ?? 0) + amount)
+        }
+      }
+
       const referencedCostLayerIds = Array.from(new Set(
         orderAllocations.flatMap((allocation) => (
           parseCostLayerSnapshot(allocation.costLayerSnapshot).map((entry) => entry.costLayerId)
@@ -835,7 +863,10 @@ export async function runDailyBatchSync(): Promise<{
         const recognizedPreviously = firstShipment.order.shipments.reduce((sum, shipment) => (
           shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
         ), 0)
-        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously))
+        // scjz.68: subtract deferral already reversed by refunds of unshipped lines, so a
+        // PARTIALLY_REFUNDED order's remaining deferred reflects only still-unshipped value.
+        const postedUnearnedReversal = postedUnearnedReversalByOrder.get(orderId) ?? 0
+        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
         let runningRevenue = 0
 
         for (let index = 0; index < orderShipments.length; index++) {
@@ -863,7 +894,13 @@ export async function runDailyBatchSync(): Promise<{
             remainingDeferred,
             runningRevenue,
             isFinalShipmentOfFullyShippedTerminalOrder:
-              isFullyShippedTerminalStatus(firstShipment.order.status) && index === orderShipments.length - 1,
+              index === orderShipments.length - 1 && (
+                isFullyShippedTerminalStatus(firstShipment.order.status) ||
+                // scjz.68: a PARTIALLY_REFUNDED order isn't guaranteed fully shipped, but once
+                // the deferred base is reversal-aware, a remainder this small means no material
+                // unshipped value is left — safe to clear the rounding stranding.
+                (firstShipment.order.status === 'PARTIALLY_REFUNDED' && shouldTrueUpPartiallyRefundedDeferral(remainingDeferred))
+              ),
           })
 
           const shipmentSnapshotsForLines = shipment.lines.map((line) => (
