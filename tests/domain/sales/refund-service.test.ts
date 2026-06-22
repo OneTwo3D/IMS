@@ -1935,6 +1935,34 @@ test('buildChargebackRefundLines: full order with no prior refunds keeps qty + v
   )
 })
 
+test('buildChargebackRefundLines: preserves 4dp totals (no cent-rounding) — Codex P2', () => {
+  // Decimal(18,4) totals must survive intact; rounding to 2dp would understate.
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Frac', qty: 1, totalBase: 12.3456 }],
+  })
+  assert.equal(lines[0]!.totalBase, 12.3456)
+})
+
+test('buildChargebackRefundLines: includes remaining shipping as a shipping-kind line — Codex P2', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 10 }],
+    shipping: { totalBase: 5.5, priorRefundedBase: 1.5 },
+  })
+  const ship = lines.find((l) => l.lineKind === 'shipping')
+  assert.ok(ship)
+  assert.equal(ship.productId, null)
+  assert.equal(ship.qty, 0)
+  assert.equal(ship.totalBase, 4) // 5.5 − 1.5 remaining
+})
+
+test('buildChargebackRefundLines: fully-refunded shipping is dropped', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 10 }],
+    shipping: { totalBase: 5, priorRefundedBase: 5 },
+  })
+  assert.equal(lines.some((l) => l.lineKind === 'shipping'), false)
+})
+
 test('buildChargebackRefundLines: prior refunds reduce to remaining qty + proportional value', () => {
   const lines = buildChargebackRefundLines({
     lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 4, totalBase: 100 }],
