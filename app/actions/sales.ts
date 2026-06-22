@@ -1939,6 +1939,14 @@ export async function raiseChargebackForReversedOrder(
     internalBypassToken: INTERNAL_ACTION_BYPASS,
     chargeback: true,
   })
+  // A surfaced accounting warning means the refund row was created but its
+  // credit-note / reversal staging did not fully complete. Treat it as an error so
+  // the payment poller logs the failure and leaves paidAt set, rather than silently
+  // advancing as if the chargeback fully posted — the existing-chargeback pre-check
+  // would otherwise block any further automatic attempt. The refund's
+  // accountingRetryRequired flag still drives the refund-accounting retry sweep that
+  // re-queues the failed credit note.
+  if (result.warning) return { raised: false, error: result.warning }
   return { raised: result.success, error: result.error }
 }
 
