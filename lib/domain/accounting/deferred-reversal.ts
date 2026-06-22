@@ -39,8 +39,10 @@ export async function loadFullyShippedNetOfRefundsOrderIds(
       where: { orderId: { in: orderIds } },
       select: { id: true, orderId: true, qty: true, productId: true, product: { select: { type: true } } },
     }),
+    // Only DISPATCHED (SHIPPED) shipments count as shipped — a PENDING/PICKING/PACKED
+    // shipment hasn't gone out yet (Codex).
     client.shipmentLine.findMany({
-      where: { shipment: { orderId: { in: orderIds } } },
+      where: { shipment: { orderId: { in: orderIds }, status: 'SHIPPED' } },
       select: { lineId: true, qty: true },
     }),
     client.salesOrderRefundLine.findMany({
@@ -56,20 +58,27 @@ export async function loadFullyShippedNetOfRefundsOrderIds(
   const refundedUnshippedByLine = new Map<string, number>()
   for (const rl of refundLines) {
     if (!rl.salesOrderLineId) continue
-    const entries = parseCostLayerSnapshot(rl.costLayerSnapshot)
-    const refundedWhileUnshipped = entries.length > 0 && !entries.some((entry) => entry.source === 'shipment')
-    if (!refundedWhileUnshipped) continue
-    refundedUnshippedByLine.set(rl.salesOrderLineId, (refundedUnshippedByLine.get(rl.salesOrderLineId) ?? 0) + Number(rl.qty))
+    // Count only the allocation-source (unshipped) QTY — a refund line can mix shipped
+    // (returned) and unshipped units; returns don't reduce the ship obligation (Codex).
+    const allocationQty = parseCostLayerSnapshot(rl.costLayerSnapshot)
+      .reduce((sum, entry) => (entry.source === 'allocation' ? sum + Number(entry.qty) : sum), 0)
+    if (allocationQty <= 0) continue
+    refundedUnshippedByLine.set(rl.salesOrderLineId, (refundedUnshippedByLine.get(rl.salesOrderLineId) ?? 0) + allocationQty)
   }
 
-  const linesByOrder = new Map<string, Array<{ id: string; qty: number; shippable: boolean }>>()
+  const linesByOrder = new Map<string, Array<{ id: string; qty: number; shippable: boolean; componentBacked: boolean }>>()
   for (const line of orderLines) {
-    const shippable = !!line.productId && line.product?.type !== 'NON_INVENTORY'
+    const type = line.product?.type
+    const shippable = !!line.productId && type !== 'NON_INVENTORY'
+    // KIT/BOM lines ship at component granularity, so a raw parent-line qty sum can't tell
+    // full shipment safely. Don't risk a false-positive true-up — leave such orders deferred.
+    const componentBacked = type === 'KIT' || type === 'BOM'
     const arr = linesByOrder.get(line.orderId) ?? []
-    arr.push({ id: line.id, qty: Number(line.qty), shippable })
+    arr.push({ id: line.id, qty: Number(line.qty), shippable, componentBacked })
     linesByOrder.set(line.orderId, arr)
   }
   for (const [orderId, lines] of linesByOrder) {
+    if (lines.some((line) => line.componentBacked)) continue
     const fullyShipped = lines.every((line) => (
       !line.shippable ||
       (shippedByLine.get(line.id) ?? 0) + (refundedUnshippedByLine.get(line.id) ?? 0) + FULL_SHIP_QTY_TOLERANCE >= line.qty
