@@ -1859,6 +1859,7 @@ export async function raiseChargebackForReversedOrder(
     select: {
       shippingBase: true,
       totalBase: true,
+      taxBase: true,
       orderNumber: true,
       externalOrderNumber: true,
       lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
@@ -1892,10 +1893,12 @@ export async function raiseChargebackForReversedOrder(
     }
   }
 
-  // scjz.71: the order's NET remaining total (post order-level discount). buildChargeback-
-  // RefundLines scales the goods lines down to (net − shipping) so the credit note
-  // reverses the recognised (net) revenue rather than the gross sale-line totals.
-  const netRemainingTotalBase = decimalToNumber(order.totalBase) - priorRefundedTotalBase
+  // scjz.71: the order's NET remaining total (ex-tax, post order-level discount).
+  // The refund/credit-note line amounts are NET (lineAmountsIncludeTax: false), so the
+  // scaling basis must be ex-tax: totalBase is the tax-INCLUSIVE grand total, hence
+  // (totalBase − taxBase) = net goods (post-discount) + net shipping (Codex P1). prior
+  // refund line totalBase are likewise net, so subtract them directly.
+  const netRemainingTotalBase = decimalToNumber(order.totalBase) - decimalToNumber(order.taxBase) - priorRefundedTotalBase
 
   const lines = buildChargebackRefundLines({
     lines: order.lines.map((line) => ({
