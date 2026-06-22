@@ -11,7 +11,7 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
-import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
@@ -104,6 +104,75 @@ export type RefundRequestLine = {
   totalForeign?: number | null
   totalBase: number
   lineKind?: 'sale' | 'shipping'
+}
+
+export type ChargebackOrderLine = {
+  lineId: string
+  productId: string | null
+  description: string
+  qty: number
+  totalBase: number
+}
+
+/**
+ * Full-order chargeback refund lines (scjz.70 / .42a foundation): every sale line
+ * at its REMAINING (un-refunded) quantity and proportional remaining value, PLUS
+ * any remaining shipping charge as a shipping-kind line (null product) so the
+ * whole order's recognised revenue — goods AND shipping — is unwound. A chargeback
+ * refunds everything not already refunded. Lines/shipping fully refunded already are
+ * dropped; a zero-qty order line contributes nothing.
+ *
+ * Values are kept at 4dp to match the Decimal(18,4) sales/refund columns — rounding
+ * to cents here would understate the credit-note total and could zero out small
+ * lines while still consuming their quantity (Codex). Pure (no IO) so the line
+ * selection is unit-testable; the caller passes the result to createSalesOrderRefund
+ * with `chargeback: true`.
+ */
+export function buildChargebackRefundLines(input: {
+  lines: readonly ChargebackOrderLine[]
+  priorRefundedQtyByLineId?: Record<string, number>
+  priorRefundedBaseByLineId?: Record<string, number>
+  shipping?: { totalBase: number; priorRefundedBase?: number; description?: string }
+}): RefundRequestLine[] {
+  const priorQty = input.priorRefundedQtyByLineId ?? {}
+  const priorBase = input.priorRefundedBaseByLineId ?? {}
+  const saleLines = input.lines.flatMap((line): RefundRequestLine[] => {
+    const remainingQty = Math.max(0, line.qty - (priorQty[line.lineId] ?? 0))
+    // Remaining VALUE is tracked independently of quantity (Codex): prior refunds may
+    // be non-proportional — e.g. a price-only (qty:0) adjustment or 1/4 units refunded
+    // for ≠25% of the line value — so derive it from the prior refunded base, not a
+    // qty fraction, or the chargeback under-reverses / trips the order-total guard.
+    const remainingBase = roundQuantity(subtractMoney(line.totalBase, priorBase[line.lineId] ?? 0), 4)
+    // Mirror createSalesOrderRefund's line filter (qty > 0 OR totalBase > 0).
+    if (remainingQty <= 0 && remainingBase.lte(0)) return []
+    return [{
+      lineId: line.lineId,
+      productId: line.productId,
+      description: line.description,
+      qty: remainingQty,
+      totalBase: Math.max(0, remainingBase.toNumber()),
+      lineKind: 'sale',
+    }]
+  })
+
+  if (input.shipping) {
+    const remainingShipping = roundQuantity(
+      subtractMoney(input.shipping.totalBase, input.shipping.priorRefundedBase ?? 0),
+      4,
+    )
+    if (remainingShipping.gt(0)) {
+      saleLines.push({
+        lineId: null,
+        productId: null,
+        description: input.shipping.description ?? 'Shipping',
+        qty: 0,
+        totalBase: remainingShipping.toNumber(),
+        lineKind: 'shipping',
+      })
+    }
+  }
+
+  return saleLines
 }
 
 export type CreatedRefundLine = {

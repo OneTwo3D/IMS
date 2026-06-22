@@ -4,6 +4,7 @@ import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   applyReturnInboundStockTx,
+  buildChargebackRefundLines,
   createSalesOrderRefund,
   retrySalesOrderRefundAccounting,
   type RefundServiceClient,
@@ -1915,4 +1916,86 @@ test('retrySalesOrderRefundAccounting uses persisted sales line identity and ref
   assert.equal(state.movements.length, 2)
   assert.equal(state.movements[1].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[1].referenceId, 'refund-2')
+})
+
+// scjz.70 / .42a: full-order chargeback refund-line selection (pure).
+test('buildChargebackRefundLines: full order with no prior refunds keeps qty + value exact', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [
+      { lineId: 'l1', productId: 'p1', description: 'Widget', qty: 3, totalBase: 30 },
+      { lineId: 'l2', productId: 'p2', description: 'Gadget', qty: 1, totalBase: 12.5 },
+    ],
+  })
+  assert.deepEqual(
+    lines.map((l) => ({ lineId: l.lineId, qty: l.qty, totalBase: l.totalBase, lineKind: l.lineKind })),
+    [
+      { lineId: 'l1', qty: 3, totalBase: 30, lineKind: 'sale' },
+      { lineId: 'l2', qty: 1, totalBase: 12.5, lineKind: 'sale' },
+    ],
+  )
+})
+
+test('buildChargebackRefundLines: preserves 4dp totals (no cent-rounding) — Codex P2', () => {
+  // Decimal(18,4) totals must survive intact; rounding to 2dp would understate.
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Frac', qty: 1, totalBase: 12.3456 }],
+  })
+  assert.equal(lines[0]!.totalBase, 12.3456)
+})
+
+test('buildChargebackRefundLines: includes remaining shipping as a shipping-kind line — Codex P2', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 10 }],
+    shipping: { totalBase: 5.5, priorRefundedBase: 1.5 },
+  })
+  const ship = lines.find((l) => l.lineKind === 'shipping')
+  assert.ok(ship)
+  assert.equal(ship.productId, null)
+  assert.equal(ship.qty, 0)
+  assert.equal(ship.totalBase, 4) // 5.5 − 1.5 remaining
+})
+
+test('buildChargebackRefundLines: fully-refunded shipping is dropped', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 10 }],
+    shipping: { totalBase: 5, priorRefundedBase: 5 },
+  })
+  assert.equal(lines.some((l) => l.lineKind === 'shipping'), false)
+})
+
+test('buildChargebackRefundLines: prior refunds reduce remaining qty AND remaining value', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 4, totalBase: 100 }],
+    priorRefundedQtyByLineId: { l1: 1 },
+    priorRefundedBaseByLineId: { l1: 25 },
+  })
+  assert.deepEqual(
+    lines.map((l) => ({ qty: l.qty, totalBase: l.totalBase })),
+    [{ qty: 3, totalBase: 75 }],
+  )
+})
+
+test('buildChargebackRefundLines: non-proportional prior refund (price-only) reduces value not qty — Codex P2', () => {
+  // A £10 price-only adjustment with no quantity: remaining qty unchanged, value − 10.
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 4, totalBase: 100 }],
+    priorRefundedBaseByLineId: { l1: 10 },
+  })
+  assert.deepEqual(
+    lines.map((l) => ({ qty: l.qty, totalBase: l.totalBase })),
+    [{ qty: 4, totalBase: 90 }],
+  )
+})
+
+test('buildChargebackRefundLines: fully-refunded (qty + value) and zero lines are dropped', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [
+      { lineId: 'l1', productId: 'p1', description: 'Done', qty: 2, totalBase: 20 },
+      { lineId: 'l2', productId: 'p2', description: 'Zero', qty: 0, totalBase: 0 },
+      { lineId: 'l3', productId: 'p3', description: 'Keep', qty: 1, totalBase: 10 },
+    ],
+    priorRefundedQtyByLineId: { l1: 2 },
+    priorRefundedBaseByLineId: { l1: 20 },
+  })
+  assert.deepEqual(lines.map((l) => l.lineId), ['l3'])
 })
