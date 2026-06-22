@@ -124,6 +124,30 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     if (paidManualOrders.length > 0) {
       const reversedIds = await fetchReversedInvoiceIds('ACCREC', lastPoll)
       for (const order of detectPaymentReversals(paidManualOrders, reversedIds)) {
+        // scjz.71: a reversed payment on a revenue-POSTED order (revenue recognised +
+        // invoiced) is a chargeback — raise a revenue-only credit note that reverses
+        // recognised revenue against AR (COGS kept as a loss, no restock). Idempotent
+        // (one chargeback per order). Dynamic import breaks the lib→action cycle.
+        // CRITICAL: clear paidAt ONLY after the chargeback is recorded — otherwise a
+        // failed chargeback would drop the order out of the next poll's paidManualOrders
+        // (paidAt: not null) and the recognised revenue would never be reversed (Codex P1).
+        let chargebackFailed = false
+        if (order.revenueDeferredDate) {
+          try {
+            const { raiseChargebackForReversedOrder } = await import('@/app/actions/sales')
+            const chargeback = await raiseChargebackForReversedOrder(order.id)
+            if (chargeback.error) {
+              chargebackFailed = true
+              result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${chargeback.error}`)
+            }
+          } catch (chargebackError) {
+            chargebackFailed = true
+            result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${String(chargebackError)}`)
+          }
+        }
+        // Leave paidAt set on a failed chargeback so the reversal is re-attempted and
+        // the order is not silently shown unpaid-and-unreversed.
+        if (chargebackFailed) continue
         await db.salesOrder.update({ where: { id: order.id }, data: { paidAt: null } })
         result.salesReversed++
         await logActivity({
@@ -135,21 +159,6 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
           description: `Payment no longer present in Xero for order ${order.orderNumber ?? order.externalOrderNumber} (status: ${order.status}) — cleared paidAt. Review whether the order status should revert.`,
           resolveUser: false,
         })
-        // scjz.71: a reversed payment on a revenue-POSTED order (revenue was recognised
-        // and invoiced) is a chargeback — raise a revenue-only credit note that reverses
-        // recognised revenue against AR (COGS kept as a loss, no restock). Idempotent
-        // (one chargeback per order). Dynamic import breaks the lib→action cycle.
-        if (order.revenueDeferredDate) {
-          try {
-            const { raiseChargebackForReversedOrder } = await import('@/app/actions/sales')
-            const chargeback = await raiseChargebackForReversedOrder(order.id)
-            if (chargeback.error) {
-              result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${chargeback.error}`)
-            }
-          } catch (chargebackError) {
-            result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${String(chargebackError)}`)
-          }
-        }
       }
     }
   } catch (e) {

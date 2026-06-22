@@ -1858,6 +1858,9 @@ export async function raiseChargebackForReversedOrder(
     where: { id: orderId },
     select: {
       shippingBase: true,
+      discountAmount: true,
+      orderNumber: true,
+      externalOrderNumber: true,
       lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
       refunds: {
         select: {
@@ -1867,6 +1870,25 @@ export async function raiseChargebackForReversedOrder(
     },
   })
   if (!order) return { raised: false, error: 'Order not found' }
+
+  // scjz.71: order-level discounts need careful allocation across the chargeback
+  // lines to match how the invoice posted them (the credit note derives line amounts
+  // from unitPriceBase, so a naive full-order chargeback would over-reverse
+  // revenue/AR). Until that allocation is built + sandbox-validated, do NOT auto-post
+  // a chargeback for a discounted order — surface it for manual handling instead of
+  // posting an incorrect credit note to the live ledger.
+  if (decimalToNumber(order.discountAmount) !== 0) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'chargeback_requires_manual_handling',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId}, which has an order-level discount — auto-chargeback skipped; raise the credit note manually so the order discount is reflected correctly.`,
+      resolveUser: false,
+    })
+    return { raised: false, reason: 'order-level discount — manual chargeback required' }
+  }
 
   // Aggregate prior refunded qty/value per sales line, and prior refunded shipping
   // (refund lines with no sales-line + no product are shipping/ad-hoc).
