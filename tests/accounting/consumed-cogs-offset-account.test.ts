@@ -3,28 +3,22 @@ import test from 'node:test'
 
 import { resolveConsumedCogsOffsetAccount } from '@/lib/domain/purchasing/landed-cost-service'
 
-// audit-o3yb: a retrospective COGS correction on CONSUMED qty (goods already sold)
-// must offset to the inventory-revaluation P&L account when configured, and fall
-// back to the transit/clearing account otherwise (prior behaviour, safe rollout).
+// scjz.34: a retrospective COGS correction on CONSUMED qty (goods already sold)
+// offsets to the transit/clearing account so the freight bill's transit debit
+// drains in full (DR COGS / CR transit on an increase). This reverses the prior
+// audit-o3yb routing to the inventory-revaluation P&L account, which left the sold
+// units' freight share permanently in transit.
 
-test('uses the inventory-revaluation account when configured', () => {
+test('consumed-portion COGS correction offsets to the transit/clearing account', () => {
   assert.equal(
-    resolveConsumedCogsOffsetAccount({ inventoryRevaluationAccount: '8100', transitAccount: '1250' }),
-    '8100',
-  )
-})
-
-test('falls back to the transit account when revaluation is unset', () => {
-  assert.equal(
-    resolveConsumedCogsOffsetAccount({ inventoryRevaluationAccount: '', transitAccount: '1250' }),
+    resolveConsumedCogsOffsetAccount({ transitAccount: '1250' }),
     '1250',
   )
 })
 
-test('treats a whitespace-free empty string as unset (falls back)', () => {
-  // The setting default is '' — confirm the OR fallback engages.
+test('uses whatever transit account is configured', () => {
   assert.equal(
-    resolveConsumedCogsOffsetAccount({ inventoryRevaluationAccount: '', transitAccount: 'TRANSIT' }),
+    resolveConsumedCogsOffsetAccount({ transitAccount: 'TRANSIT' }),
     'TRANSIT',
   )
 })

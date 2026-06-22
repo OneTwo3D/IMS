@@ -225,9 +225,9 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
   //   the revalued cost — excluded here to avoid double-counting.
   // - scjz.10: supplier-returned units ARE included. The late-cost delta on goods
   //   returned to the supplier was previously dropped (excluded here, handled
-  //   nowhere). Goods that have left stock can't clear through transit (audit-o3yb),
-  //   so they ride the SAME self-contained P&L pair as sold goods — the retrospective
-  //   COGS-adjustment journal (DR cogsAccount / CR inventoryRevaluationAccount).
+  //   nowhere). They ride the SAME consumed-qty COGS-adjustment journal as sold
+  //   goods — the retrospective COGS-adjustment journal (DR cogsAccount / CR
+  //   transitAccount on a cost increase; scjz.34).
   const netConsumedQty = Prisma.Decimal.max(
     new Prisma.Decimal(0),
     consumedQty
@@ -651,15 +651,19 @@ export function computeGrossUnitCostBaseByLine(params: {
 }
 
 /**
- * audit-o3yb: the account that offsets a CONSUMED-qty retrospective COGS
- * correction (goods already sold). Uses the inventory-revaluation P&L account
- * when configured; otherwise falls back to the transit/clearing account (the
- * prior behaviour) so deployments that haven't set the new account keep working.
+ * scjz.34: the account that offsets a CONSUMED-qty retrospective COGS correction
+ * (goods already sold). The freight bill debits the transit/clearing account for
+ * ALL received units; the landed-cost recalc then drains transit in full — the
+ * ON-HAND portion via DR inventory / CR transit, and the CONSUMED portion via this
+ * COGS adjustment (DR COGS / CR transit on an increase). Routing the consumed
+ * portion to transit (rather than the inventory-revaluation P&L account, the prior
+ * audit-o3yb behaviour) is what fully clears the freight bill's transit debit;
+ * otherwise the sold units' freight share stayed permanently in transit.
  */
 export function resolveConsumedCogsOffsetAccount(
-  settings: Pick<AccountingSettings, 'inventoryRevaluationAccount' | 'transitAccount'>,
+  settings: Pick<AccountingSettings, 'transitAccount'>,
 ): string {
-  return settings.inventoryRevaluationAccount || settings.transitAccount
+  return settings.transitAccount
 }
 
 export async function queueLandedCostAdjustmentJournals(
@@ -697,11 +701,10 @@ export async function queueLandedCostAdjustmentJournals(
     })
   }
 
-  // audit-o3yb: the CONSUMED-qty correction (goods already sold) offsets COGS to
-  // the inventory-revaluation P&L account, not the transit/clearing account — the
-  // goods have left stock, so a clearing entry there would never reconcile. The
-  // ON-HAND portion is handled by the inventoryTransitAdjustments loop above and
-  // stays on inventory/transit. Falls back to transit until the account is set.
+  // scjz.34: the CONSUMED-qty correction (goods already sold) offsets COGS to the
+  // transit/clearing account so the freight bill's transit debit drains in full.
+  // The ON-HAND portion is handled by the inventoryTransitAdjustments loop above and
+  // also clears through transit; together they fully reconcile the freight liability.
   const consumedCogsOffsetAccount = resolveConsumedCogsOffsetAccount(settings)
   for (const adj of adjustments.cogsAdjustments) {
     const absDelta = Math.abs(adj.totalDelta)
