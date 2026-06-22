@@ -1565,6 +1565,12 @@ model SalesOrderRefund {
   // a loss, goods not returned). Persisted so an accounting retry that re-stages
   // reproduces the treatment.
   chargeback      Boolean    @default(false)
+  // scjz.71: whether this refund STAGED a COGS/unearned reversal (durable, set at
+  // staging time). Distinguishes a fully-shipped chargeback (no reversal staged —
+  // credit-note-only, exempt from reversal-evidence checks) from a partial/deferred
+  // chargeback that staged an UNEARNED_REV_REVERSAL and must still have that evidence.
+  // accountingRetrySyncs is cleared once syncs queue, so it can't carry this.
+  reversalStaged  Boolean    @default(false)
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
 

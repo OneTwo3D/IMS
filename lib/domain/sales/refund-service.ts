@@ -11,7 +11,7 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
-import { roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
@@ -133,6 +133,12 @@ export function buildChargebackRefundLines(input: {
   priorRefundedQtyByLineId?: Record<string, number>
   priorRefundedBaseByLineId?: Record<string, number>
   shipping?: { totalBase: number; priorRefundedBase?: number; description?: string }
+  // scjz.71: the order's NET remaining total (post order-level discount). When the
+  // un-discounted sale-line totals exceed (net − shipping) — i.e. an order-level
+  // discount applied to the goods — the sale lines are scaled DOWN proportionally so
+  // the credit note reverses the recognised (net) revenue, not the gross. Shipping is
+  // left intact (order discounts apply to goods, not carriage). Omit for no discount.
+  targetNetTotalBase?: number
 }): RefundRequestLine[] {
   const priorQty = input.priorRefundedQtyByLineId ?? {}
   const priorBase = input.priorRefundedBaseByLineId ?? {}
@@ -155,21 +161,32 @@ export function buildChargebackRefundLines(input: {
     }]
   })
 
-  if (input.shipping) {
-    const remainingShipping = roundQuantity(
-      subtractMoney(input.shipping.totalBase, input.shipping.priorRefundedBase ?? 0),
-      4,
-    )
-    if (remainingShipping.gt(0)) {
-      saleLines.push({
-        lineId: null,
-        productId: null,
-        description: input.shipping.description ?? 'Shipping',
-        qty: 0,
-        totalBase: remainingShipping.toNumber(),
-        lineKind: 'shipping',
-      })
+  const remainingShipping = input.shipping
+    ? roundQuantity(subtractMoney(input.shipping.totalBase, input.shipping.priorRefundedBase ?? 0), 4)
+    : toDecimal(0)
+
+  // scjz.71: allocate the order-level discount by scaling the goods (sale lines) down
+  // to (net − shipping) when the un-discounted goods total exceeds it.
+  if (input.targetNetTotalBase != null) {
+    const targetGoodsTotal = subtractMoney(input.targetNetTotalBase, remainingShipping)
+    const goodsGross = saleLines.reduce((sum, line) => addMoney(sum, line.totalBase), toDecimal(0))
+    if (goodsGross.gt(0) && targetGoodsTotal.gte(0) && goodsGross.gt(targetGoodsTotal)) {
+      const factor = targetGoodsTotal.div(goodsGross)
+      for (const line of saleLines) {
+        line.totalBase = roundQuantity(toDecimal(line.totalBase).mul(factor), 4).toNumber()
+      }
     }
+  }
+
+  if (remainingShipping.gt(0)) {
+    saleLines.push({
+      lineId: null,
+      productId: null,
+      description: input.shipping?.description ?? 'Shipping',
+      qty: 0,
+      totalBase: remainingShipping.toNumber(),
+      lineKind: 'shipping',
+    })
   }
 
   return saleLines
@@ -1373,6 +1390,17 @@ function refundAccountingSyncsJson(
   return JSON.parse(JSON.stringify(syncs)) as Prisma.InputJsonValue
 }
 
+/**
+ * scjz.71: did the refund stage a COGS/unearned reversal? The UNEARNED_REV_REVERSAL
+ * sync also carries the allocation reversal, so these two types cover every
+ * reversal a refund posts. Persisted on the refund (`reversalStaged`) so the
+ * accounting evidence checks can distinguish a credit-note-only chargeback from one
+ * that still owes reversal evidence.
+ */
+function stagedAReversal(syncs: RefundAccountingSyncRequest[]): boolean {
+  return syncs.some((sync) => sync.type === 'COGS_REVERSAL' || sync.type === 'UNEARNED_REV_REVERSAL')
+}
+
 export async function createSalesOrderRefund(
   client: RefundServiceClient,
   input: {
@@ -1686,6 +1714,12 @@ export async function createSalesOrderRefund(
         where: { id: txResult.createdRefund.id },
         data: {
           accountingRetrySyncs: refundAccountingSyncsJson(accountingSyncs),
+          // scjz.71: durably record whether any COGS/unearned reversal was staged
+          // (the UNEARNED_REV_REVERSAL sync also carries allocation reversal) so the
+          // invariant/reconciliation evidence checks can tell a credit-note-only
+          // chargeback from one that owes reversal evidence — independent of
+          // accountingRetrySyncs, which is cleared once the syncs queue.
+          reversalStaged: stagedAReversal(accountingSyncs),
         },
       })
     } catch (error) {
@@ -1852,6 +1886,7 @@ export async function retrySalesOrderRefundAccounting(
         where: { id: refund.id },
         data: {
           accountingRetrySyncs: refundAccountingSyncsJson(staged.accountingSyncs),
+          reversalStaged: stagedAReversal(staged.accountingSyncs),
         },
       })
 

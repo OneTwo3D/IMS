@@ -59,6 +59,7 @@ type Refund = {
   totalBase: number
   returnWarehouseId: string | null
   chargeback?: boolean
+  reversalStaged?: boolean
   accountingRetryRequired?: boolean
   accountingWarning?: string | null
   accountingRetrySyncs?: unknown
@@ -803,8 +804,10 @@ test('createSalesOrderRefund chargeback mode suppresses COGS reversal AND restoc
   // No inventory restock — the customer keeps the goods.
   assert.equal(result.success && result.returnedRows.length, 0)
   assert.equal(state.movements.length, 0)
-  // The refund is still recorded as a chargeback.
+  // The refund is recorded as a chargeback that staged NO reversal (fully shipped →
+  // credit-note-only), so the accounting evidence checks exempt it durably (scjz.71).
   assert.equal(state.refunds[0]?.chargeback, true)
+  assert.equal(state.refunds[0]?.reversalStaged, false)
 })
 
 test('createSalesOrderRefund reverses kit COGS in component units, not kit units', async () => {
@@ -2009,6 +2012,30 @@ test('buildChargebackRefundLines: includes remaining shipping as a shipping-kind
   assert.equal(ship.productId, null)
   assert.equal(ship.qty, 0)
   assert.equal(ship.totalBase, 4) // 5.5 − 1.5 remaining
+})
+
+test('buildChargebackRefundLines: order discount scales goods down to (net − shipping), shipping intact — scjz.71', () => {
+  // Goods gross 100 + shipping 10; order net total 100 (a £10 discount applied to goods).
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 100 }],
+    shipping: { totalBase: 10 },
+    targetNetTotalBase: 100,
+  })
+  const sale = lines.find((l) => l.lineKind === 'sale')!
+  const ship = lines.find((l) => l.lineKind === 'shipping')!
+  assert.equal(sale.totalBase, 90) // 100 → (net 100 − shipping 10) = 90
+  assert.equal(ship.totalBase, 10) // shipping unchanged
+  assert.equal(sale.totalBase + ship.totalBase, 100) // credit note reverses the net
+})
+
+test('buildChargebackRefundLines: no scaling when net equals gross (no discount) — scjz.71', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 2, totalBase: 50 }],
+    shipping: { totalBase: 5 },
+    targetNetTotalBase: 55,
+  })
+  assert.equal(lines.find((l) => l.lineKind === 'sale')!.totalBase, 50)
+  assert.equal(lines.find((l) => l.lineKind === 'shipping')!.totalBase, 5)
 })
 
 test('buildChargebackRefundLines: fully-refunded shipping is dropped', () => {

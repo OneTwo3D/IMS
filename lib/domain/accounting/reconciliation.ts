@@ -59,6 +59,8 @@ type SourceRefundRow = {
   // scjz.70: revenue-only chargeback — credit note only, no COGS/unearned reversal.
   // Optional: the Prisma select always provides it; absent is a normal refund.
   chargeback?: boolean
+  // scjz.71: durable — whether a COGS/unearned reversal was staged for this refund.
+  reversalStaged?: boolean
 }
 
 type AccountingSyncLogRow = {
@@ -466,16 +468,12 @@ export function evaluateAccountingReconciliationRows(
         }
 
         // Zero-total refunds post no COGS/unearned-revenue reversal; only
-        // positive-value refunds require reversal evidence. scjz.70: a fully-shipped
-        // chargeback stages none (credit note only) so it is exempt; but a
-        // partial/deferred chargeback that staged an UNEARNED_REV_REVERSAL (recorded
-        // in accountingRetrySyncs) must still require that evidence.
-        // TODO(scjz.71 sandbox continuation): stagedReversal is derived from
-        // accountingRetrySyncs, which is cleared once syncs queue successfully, so a
-        // completed deferred chargeback reads as credit-note-only (Codex P2). Replace
-        // with a DURABLE per-refund staged-reversal record (mirror in invariants.ts).
-        const stagedReversal = [...retrySyncTypes(refund.accountingRetrySyncs)].some((type) => REFUND_REVERSAL_TYPES.has(type))
-        const chargebackExemptReversal = Boolean(refund.chargeback) && !stagedReversal
+        // positive-value refunds require reversal evidence. scjz.70/.71: a fully-shipped
+        // chargeback stages none (credit note only) so it is exempt; a partial/deferred
+        // chargeback that staged an UNEARNED_REV_REVERSAL still owes that evidence.
+        // reversalStaged is a DURABLE per-refund flag set at staging time
+        // (accountingRetrySyncs is cleared once syncs queue, so it can't carry this).
+        const chargebackExemptReversal = Boolean(refund.chargeback) && !refund.reversalStaged
         if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !chargebackExemptReversal) {
           findings.push({
             severity: 'critical',
@@ -693,6 +691,7 @@ export async function collectAccountingReconciliationRows(
         totalBase: true,
         accountingRetrySyncs: true,
         chargeback: true,
+        reversalStaged: true,
       },
     }),
     client.accountingSyncLog.findMany({

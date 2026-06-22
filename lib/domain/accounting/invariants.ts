@@ -63,6 +63,8 @@ type SalesOrderAccountingRow = {
     // evidence requirement below. Optional: the Prisma select always provides it;
     // absent (e.g. legacy fixtures) is treated as a normal (non-chargeback) refund.
     chargeback?: boolean
+    // scjz.71: durable — whether a COGS/unearned reversal was staged for this refund.
+    reversalStaged?: boolean
   }>
 }
 
@@ -593,18 +595,12 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
 
     for (const refund of order.refunds) {
       const refundRetryTypes = retrySyncTypes(refund.accountingRetrySyncs)
-      // scjz.70: a chargeback is exempt from the reversal-evidence requirement when
-      // it staged no COGS/unearned reversal (fully-shipped, credit-note-only); a
-      // partial/deferred chargeback that staged an UNEARNED_REV_REVERSAL must still
-      // require it.
-      // TODO(scjz.71 sandbox continuation): `stagedReversal` is derived from
-      // accountingRetrySyncs, which is CLEARED once the syncs queue successfully
-      // (app/actions/sales.ts), so for a *completed* deferred chargeback this reads
-      // false and the exemption is effectively blanket — under-reporting a deferred
-      // chargeback whose UNEARNED_REV_REVERSAL later failed (Codex P2). Replace with a
-      // DURABLE per-refund record of the staged reversal types (mirror in reconciliation.ts).
-      const stagedReversal = [...refundRetryTypes].some((type) => REFUND_REVERSAL_TYPES.has(type))
-      const chargebackExemptReversal = Boolean(refund.chargeback) && !stagedReversal
+      // scjz.70/.71: a chargeback is exempt from the reversal-evidence requirement
+      // ONLY when it staged no COGS/unearned reversal (fully-shipped, credit-note-only).
+      // A partial/deferred chargeback that staged an UNEARNED_REV_REVERSAL must still
+      // have that evidence. `reversalStaged` is a DURABLE per-refund flag set at staging
+      // time (accountingRetrySyncs is cleared once syncs queue, so it can't carry this).
+      const chargebackExemptReversal = Boolean(refund.chargeback) && !refund.reversalStaged
       const hasPostedShipment = postedShipments.length > 0
       if (!hasPostedShipment) continue
 
@@ -787,6 +783,7 @@ export async function collectAccountingInvariantRows(
             accountingWarning: true,
             accountingRetrySyncs: true,
             chargeback: true,
+            reversalStaged: true,
           },
         },
       },

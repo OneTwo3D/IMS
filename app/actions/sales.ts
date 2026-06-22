@@ -1858,7 +1858,7 @@ export async function raiseChargebackForReversedOrder(
     where: { id: orderId },
     select: {
       shippingBase: true,
-      discountAmount: true,
+      totalBase: true,
       orderNumber: true,
       externalOrderNumber: true,
       lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
@@ -1871,32 +1871,16 @@ export async function raiseChargebackForReversedOrder(
   })
   if (!order) return { raised: false, error: 'Order not found' }
 
-  // scjz.71: order-level discounts need careful allocation across the chargeback
-  // lines to match how the invoice posted them (the credit note derives line amounts
-  // from unitPriceBase, so a naive full-order chargeback would over-reverse
-  // revenue/AR). Until that allocation is built + sandbox-validated, do NOT auto-post
-  // a chargeback for a discounted order — surface it for manual handling instead of
-  // posting an incorrect credit note to the live ledger.
-  if (decimalToNumber(order.discountAmount) !== 0) {
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: 'chargeback_requires_manual_handling',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId}, which has an order-level discount — auto-chargeback skipped; raise the credit note manually so the order discount is reflected correctly.`,
-      resolveUser: false,
-    })
-    return { raised: false, reason: 'order-level discount — manual chargeback required' }
-  }
-
-  // Aggregate prior refunded qty/value per sales line, and prior refunded shipping
-  // (refund lines with no sales-line + no product are shipping/ad-hoc).
+  // Aggregate prior refunded qty/value per sales line, prior refunded shipping (refund
+  // lines with no sales-line + no product are shipping/ad-hoc), and the prior refunded
+  // TOTAL — the order's remaining net = totalBase − prior refunded total.
   const priorRefundedQtyByLineId: Record<string, number> = {}
   const priorRefundedBaseByLineId: Record<string, number> = {}
   let priorShippingRefundedBase = 0
+  let priorRefundedTotalBase = 0
   for (const refund of order.refunds) {
     for (const line of refund.lines) {
+      priorRefundedTotalBase += decimalToNumber(line.totalBase)
       if (line.salesOrderLineId) {
         priorRefundedQtyByLineId[line.salesOrderLineId] =
           (priorRefundedQtyByLineId[line.salesOrderLineId] ?? 0) + decimalToNumber(line.qty)
@@ -1907,6 +1891,11 @@ export async function raiseChargebackForReversedOrder(
       }
     }
   }
+
+  // scjz.71: the order's NET remaining total (post order-level discount). buildChargeback-
+  // RefundLines scales the goods lines down to (net − shipping) so the credit note
+  // reverses the recognised (net) revenue rather than the gross sale-line totals.
+  const netRemainingTotalBase = decimalToNumber(order.totalBase) - priorRefundedTotalBase
 
   const lines = buildChargebackRefundLines({
     lines: order.lines.map((line) => ({
@@ -1919,6 +1908,7 @@ export async function raiseChargebackForReversedOrder(
     priorRefundedQtyByLineId,
     priorRefundedBaseByLineId,
     shipping: { totalBase: decimalToNumber(order.shippingBase), priorRefundedBase: priorShippingRefundedBase },
+    targetNetTotalBase: netRemainingTotalBase,
   })
   if (lines.length === 0) return { raised: false, reason: 'nothing left to charge back' }
 
