@@ -130,6 +130,9 @@ test('inventory snapshot cron logs reservation snapshot counts from the real wri
         findMany: async () => [],
         upsert: async () => ({}),
       },
+      inventorySnapshotRun: {
+        upsert: async () => ({}),
+      },
       inventoryReservationSnapshot: {
         upsert: async () => ({}),
       },
