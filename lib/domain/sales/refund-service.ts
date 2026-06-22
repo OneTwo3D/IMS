@@ -131,22 +131,26 @@ export type ChargebackOrderLine = {
 export function buildChargebackRefundLines(input: {
   lines: readonly ChargebackOrderLine[]
   priorRefundedQtyByLineId?: Record<string, number>
+  priorRefundedBaseByLineId?: Record<string, number>
   shipping?: { totalBase: number; priorRefundedBase?: number; description?: string }
 }): RefundRequestLine[] {
-  const prior = input.priorRefundedQtyByLineId ?? {}
+  const priorQty = input.priorRefundedQtyByLineId ?? {}
+  const priorBase = input.priorRefundedBaseByLineId ?? {}
   const saleLines = input.lines.flatMap((line): RefundRequestLine[] => {
-    const refundedQty = prior[line.lineId] ?? 0
-    const remainingQty = Math.max(0, line.qty - refundedQty)
-    if (remainingQty <= 0) return []
-    // Proportional remaining value at 4dp; full order (no prior refund) keeps totalBase exact.
-    const fraction = line.qty > 0 ? remainingQty / line.qty : 0
-    const remainingBase = roundQuantity(toDecimal(line.totalBase).mul(fraction), 4).toNumber()
+    const remainingQty = Math.max(0, line.qty - (priorQty[line.lineId] ?? 0))
+    // Remaining VALUE is tracked independently of quantity (Codex): prior refunds may
+    // be non-proportional — e.g. a price-only (qty:0) adjustment or 1/4 units refunded
+    // for ≠25% of the line value — so derive it from the prior refunded base, not a
+    // qty fraction, or the chargeback under-reverses / trips the order-total guard.
+    const remainingBase = roundQuantity(subtractMoney(line.totalBase, priorBase[line.lineId] ?? 0), 4)
+    // Mirror createSalesOrderRefund's line filter (qty > 0 OR totalBase > 0).
+    if (remainingQty <= 0 && remainingBase.lte(0)) return []
     return [{
       lineId: line.lineId,
       productId: line.productId,
       description: line.description,
       qty: remainingQty,
-      totalBase: remainingBase,
+      totalBase: Math.max(0, remainingBase.toNumber()),
       lineKind: 'sale',
     }]
   })

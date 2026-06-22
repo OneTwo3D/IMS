@@ -1963,19 +1963,31 @@ test('buildChargebackRefundLines: fully-refunded shipping is dropped', () => {
   assert.equal(lines.some((l) => l.lineKind === 'shipping'), false)
 })
 
-test('buildChargebackRefundLines: prior refunds reduce to remaining qty + proportional value', () => {
+test('buildChargebackRefundLines: prior refunds reduce remaining qty AND remaining value', () => {
   const lines = buildChargebackRefundLines({
     lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 4, totalBase: 100 }],
     priorRefundedQtyByLineId: { l1: 1 },
+    priorRefundedBaseByLineId: { l1: 25 },
   })
-  // 3 of 4 remaining → 75% of 100 = 75.00.
   assert.deepEqual(
     lines.map((l) => ({ qty: l.qty, totalBase: l.totalBase })),
     [{ qty: 3, totalBase: 75 }],
   )
 })
 
-test('buildChargebackRefundLines: fully-refunded and zero-qty lines are dropped', () => {
+test('buildChargebackRefundLines: non-proportional prior refund (price-only) reduces value not qty — Codex P2', () => {
+  // A £10 price-only adjustment with no quantity: remaining qty unchanged, value − 10.
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 4, totalBase: 100 }],
+    priorRefundedBaseByLineId: { l1: 10 },
+  })
+  assert.deepEqual(
+    lines.map((l) => ({ qty: l.qty, totalBase: l.totalBase })),
+    [{ qty: 4, totalBase: 90 }],
+  )
+})
+
+test('buildChargebackRefundLines: fully-refunded (qty + value) and zero lines are dropped', () => {
   const lines = buildChargebackRefundLines({
     lines: [
       { lineId: 'l1', productId: 'p1', description: 'Done', qty: 2, totalBase: 20 },
@@ -1983,6 +1995,7 @@ test('buildChargebackRefundLines: fully-refunded and zero-qty lines are dropped'
       { lineId: 'l3', productId: 'p3', description: 'Keep', qty: 1, totalBase: 10 },
     ],
     priorRefundedQtyByLineId: { l1: 2 },
+    priorRefundedBaseByLineId: { l1: 20 },
   })
   assert.deepEqual(lines.map((l) => l.lineId), ['l3'])
 })
