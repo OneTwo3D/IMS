@@ -1601,8 +1601,21 @@ export async function createSalesOrderRefund(
 
     const existingRefunds = await tx.salesOrderRefund.findMany({
       where: { orderId: input.orderId },
-      select: { totalBase: true },
+      select: { totalBase: true, accountingRetryRequired: true },
     })
+    // scjz.22: block a NEW refund while a prior refund on this order still has
+    // unresolved accounting (accountingRetryRequired). A refund whose accounting
+    // staging failed may not have written its cost-layer snapshot, so its quantity
+    // counts toward the refund qty cap while NOT reducing shipment cost availability —
+    // a second refund can then be under qty-budget yet over-draw the cost basis and
+    // throw spuriously (the refund qty cap and the COGS-basis reduction read divergent
+    // state). Requiring the prior refund's accounting to be retried first (manually via
+    // retryRefundAccounting, or automatically by the accounting-sync sweep) keeps the
+    // two sources consistent. Idempotent replays of an existing refund returned earlier,
+    // so this only blocks genuinely-new refunds.
+    if (existingRefunds.some((refund) => refund.accountingRetryRequired)) {
+      return { error: 'A previous refund on this order has unresolved accounting and must be retried before another refund can be created.' } as const
+    }
     const previouslyRefunded = existingRefunds.reduce((sum, refund) => sum + refundBoundaryNumber(refund.totalBase), 0)
     // audit-M-o2c: cumulative refunded must not exceed the order total, with a
     // fixed rounding epsilon (not a 0.1% relative slack, which on a large order
