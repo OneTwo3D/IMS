@@ -2014,28 +2014,34 @@ test('buildChargebackRefundLines: includes remaining shipping as a shipping-kind
   assert.equal(ship.totalBase, 4) // 5.5 − 1.5 remaining
 })
 
-test('buildChargebackRefundLines: order discount scales goods down to (net − shipping), shipping intact — scjz.71', () => {
-  // Goods gross 100 + shipping 10; order net total 100 (a £10 discount applied to goods).
+test('buildChargebackRefundLines: order discount mirrored as a negative discount line, goods at full value — scjz.71', () => {
+  // Goods 100 + shipping 10, a £10 order discount: the invoice posted full goods +
+  // a separate −10 discount line, so the chargeback mirrors it (no goods scaling).
   const lines = buildChargebackRefundLines({
     lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 100 }],
     shipping: { totalBase: 10 },
-    targetNetTotalBase: 100,
+    discount: { totalBase: 10 },
   })
   const sale = lines.find((l) => l.lineKind === 'sale')!
   const ship = lines.find((l) => l.lineKind === 'shipping')!
-  assert.equal(sale.totalBase, 90) // 100 → (net 100 − shipping 10) = 90
-  assert.equal(ship.totalBase, 10) // shipping unchanged
-  assert.equal(sale.totalBase + ship.totalBase, 100) // credit note reverses the net
+  const disc = lines.find((l) => l.lineKind === 'discount')!
+  assert.equal(sale.totalBase, 100) // goods at FULL value — not scaled
+  assert.equal(ship.totalBase, 10)
+  assert.equal(disc.totalBase, -10) // negative discount line, mirrors the invoice
+  assert.equal(disc.productId, null)
+  assert.equal(disc.qty, 0)
+  // Net reversed = goods + shipping − discount = the order's net total.
+  assert.equal(sale.totalBase + ship.totalBase + disc.totalBase, 100)
 })
 
-test('buildChargebackRefundLines: no scaling when net equals gross (no discount) — scjz.71', () => {
+test('buildChargebackRefundLines: no discount line emitted when no order discount — scjz.71', () => {
   const lines = buildChargebackRefundLines({
     lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 2, totalBase: 50 }],
     shipping: { totalBase: 5 },
-    targetNetTotalBase: 55,
   })
   assert.equal(lines.find((l) => l.lineKind === 'sale')!.totalBase, 50)
   assert.equal(lines.find((l) => l.lineKind === 'shipping')!.totalBase, 5)
+  assert.equal(lines.some((l) => l.lineKind === 'discount'), false)
 })
 
 test('buildChargebackRefundLines: fully-refunded shipping is dropped', () => {

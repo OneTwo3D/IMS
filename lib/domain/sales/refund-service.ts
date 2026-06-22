@@ -103,7 +103,7 @@ export type RefundRequestLine = {
   qty: number
   totalForeign?: number | null
   totalBase: number
-  lineKind?: 'sale' | 'shipping'
+  lineKind?: 'sale' | 'shipping' | 'discount'
 }
 
 export type ChargebackOrderLine = {
@@ -133,12 +133,13 @@ export function buildChargebackRefundLines(input: {
   priorRefundedQtyByLineId?: Record<string, number>
   priorRefundedBaseByLineId?: Record<string, number>
   shipping?: { totalBase: number; priorRefundedBase?: number; description?: string }
-  // scjz.71: the order's NET remaining total (post order-level discount). When the
-  // un-discounted sale-line totals exceed (net − shipping) — i.e. an order-level
-  // discount applied to the goods — the sale lines are scaled DOWN proportionally so
-  // the credit note reverses the recognised (net) revenue, not the gross. Shipping is
-  // left intact (order discounts apply to goods, not carriage). Omit for no discount.
-  targetNetTotalBase?: number
+  // scjz.71: the order-level discount to MIRROR. The original invoice never scales the
+  // product lines for an order discount — it posts each line at full value and adds the
+  // discount as a SEPARATE negative line to the discount account at the order-default
+  // tax type (see invoices.ts). To reverse the invoice exactly, emit the same: full
+  // goods + a negative discount line. The caller passes this only when a discount
+  // account is configured (otherwise the invoice posted no discount line at all).
+  discount?: { totalBase: number; description?: string }
 }): RefundRequestLine[] {
   const priorQty = input.priorRefundedQtyByLineId ?? {}
   const priorBase = input.priorRefundedBaseByLineId ?? {}
@@ -171,19 +172,6 @@ export function buildChargebackRefundLines(input: {
     : toDecimal(0)
   const remainingShippingClamped = remainingShipping.lt(0) ? toDecimal(0) : remainingShipping
 
-  // scjz.71: allocate the order-level discount by scaling the goods (sale lines) down
-  // to (net − shipping) when the un-discounted goods total exceeds it.
-  if (input.targetNetTotalBase != null) {
-    const targetGoodsTotal = subtractMoney(input.targetNetTotalBase, remainingShippingClamped)
-    const goodsGross = saleLines.reduce((sum, line) => addMoney(sum, line.totalBase), toDecimal(0))
-    if (goodsGross.gt(0) && targetGoodsTotal.gte(0) && goodsGross.gt(targetGoodsTotal)) {
-      const factor = targetGoodsTotal.div(goodsGross)
-      for (const line of saleLines) {
-        line.totalBase = roundQuantity(toDecimal(line.totalBase).mul(factor), 4).toNumber()
-      }
-    }
-  }
-
   if (remainingShippingClamped.gt(0)) {
     saleLines.push({
       lineId: null,
@@ -192,6 +180,22 @@ export function buildChargebackRefundLines(input: {
       qty: 0,
       totalBase: remainingShippingClamped.toNumber(),
       lineKind: 'shipping',
+    })
+  }
+
+  // Mirror the invoice's separate order-discount line: a NEGATIVE line that the
+  // credit-note staging posts to the discount account at the order-default tax type.
+  // This reverses the discount account exactly (rather than spreading the discount
+  // across the goods), so standard + zero-rated goods with any order discount tie out.
+  const discountBase = input.discount ? roundQuantity(toDecimal(input.discount.totalBase), 4) : toDecimal(0)
+  if (discountBase.gt(0)) {
+    saleLines.push({
+      lineId: null,
+      productId: null,
+      description: input.discount?.description ?? 'Order discount',
+      qty: 0,
+      totalBase: discountBase.neg().toNumber(),
+      lineKind: 'discount',
     })
   }
 
@@ -208,7 +212,7 @@ export type CreatedRefundLine = {
   unitPriceBase: number
   totalForeign: number
   totalBase: number
-  lineKind: 'sale' | 'shipping'
+  lineKind: 'sale' | 'shipping' | 'discount'
 }
 
 export type RefundAccountingSyncRequest = {
@@ -1426,7 +1430,9 @@ export async function createSalesOrderRefund(
     chargeback?: boolean
   },
 ): Promise<CreateSalesOrderRefundResult> {
-  const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0)
+  // Keep discount lines (negative totalBase, qty 0) which the qty>0/totalBase>0 filter
+  // would otherwise drop — a chargeback mirrors the invoice's order-discount line.
+  const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0 || line.lineKind === 'discount')
   if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
 
   // scjz.70: a chargeback never restocks (customer keeps the goods), so neutralise
@@ -1512,7 +1518,9 @@ export async function createSalesOrderRefund(
             unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
             totalForeign: refundBoundaryNumber(line.totalForeign),
             totalBase: refundBoundaryNumber(line.totalBase),
-            lineKind: line.salesOrderLineId == null ? 'shipping' as const : 'sale' as const,
+            lineKind: line.salesOrderLineId != null
+              ? 'sale' as const
+              : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
           })),
           creditNoteNumber: existingExternalRefund.creditNoteNumber ?? '',
           newStatus: so.status === 'REFUNDED' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
@@ -1573,7 +1581,9 @@ export async function createSalesOrderRefund(
             unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
             totalForeign: refundBoundaryNumber(line.totalForeign),
             totalBase: refundBoundaryNumber(line.totalBase),
-            lineKind: line.salesOrderLineId == null ? 'shipping' as const : 'sale' as const,
+            lineKind: line.salesOrderLineId != null
+              ? 'sale' as const
+              : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
           })),
           creditNoteNumber: existingChargeback.creditNoteNumber ?? '',
           newStatus: so.status === 'REFUNDED' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
@@ -1700,7 +1710,7 @@ export async function createSalesOrderRefund(
         unitPriceBase: refundBoundaryNumber(createdLine.unitPriceBase),
         totalForeign: refundBoundaryNumber(createdLine.totalForeign),
         totalBase: refundBoundaryNumber(createdLine.totalBase),
-        lineKind: refundLine.lineKind === 'shipping' ? 'shipping' : 'sale',
+        lineKind: refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale',
       })
     }
 
