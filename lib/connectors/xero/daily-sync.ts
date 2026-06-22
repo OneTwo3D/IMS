@@ -39,7 +39,8 @@ import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/p
 import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
-import { isFullyShippedTerminalStatus, recognizeShipmentRevenue, shouldTrueUpPartiallyRefundedDeferral, extractUnearnedReversalDebit } from '@/lib/domain/accounting/revenue-recognition'
+import { isFullyShippedTerminalStatus, recognizeShipmentRevenue, shouldTrueUpPartiallyRefundedDeferral } from '@/lib/domain/accounting/revenue-recognition'
+import { loadPostedUnearnedReversalByOrder } from '@/lib/domain/accounting/deferred-reversal'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 type MutableLayer = {
@@ -853,30 +854,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // scjz.68: per-order posted UNEARNED_REV_REVERSAL (deferral reversed by refunds of
       // unshipped lines), so the deferred-revenue true-up below is reversal-aware and the
       // PARTIALLY_REFUNDED true-up only fires once no material unshipped value remains.
-      const orderRefunds = await tx.salesOrderRefund.findMany({
-        where: { orderId: { in: orderIds } },
-        select: { id: true, orderId: true },
+      const postedUnearnedReversalByOrder = await loadPostedUnearnedReversalByOrder(tx, {
+        orderIds,
+        connector: XERO_CONNECTOR,
+        unearnedAccountCode: settings.xero_unearned_revenue_account,
       })
-      const refundIdToOrderId = new Map(orderRefunds.map((refund) => [refund.id, refund.orderId]))
-      const postedUnearnedReversalByOrder = new Map<string, number>()
-      if (orderRefunds.length > 0) {
-        const unearnedReversalLogs = await tx.accountingSyncLog.findMany({
-          where: {
-            connector: XERO_CONNECTOR,
-            type: 'UNEARNED_REV_REVERSAL',
-            referenceType: 'SalesOrderRefund',
-            referenceId: { in: orderRefunds.map((refund) => refund.id) },
-            status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-          },
-          select: { referenceId: true, payload: true },
-        })
-        for (const log of unearnedReversalLogs) {
-          const reversalOrderId = refundIdToOrderId.get(log.referenceId)
-          if (!reversalOrderId) continue
-          const amount = extractUnearnedReversalDebit(log.payload, settings.xero_unearned_revenue_account)
-          postedUnearnedReversalByOrder.set(reversalOrderId, (postedUnearnedReversalByOrder.get(reversalOrderId) ?? 0) + amount)
-        }
-      }
 
       const referencedCostLayerIds = Array.from(new Set(
         orderAllocations.flatMap((allocation) => (
@@ -984,6 +966,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           const proportionalRevenue = orderLineTotal > 0
             ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
             : 0
+          // scjz.68: the PARTIALLY_REFUNDED true-up gate must look at what remains AFTER this
+          // batch's proportional recognition (the still-unshipped value), not the pre-batch
+          // remainder which still includes the current shipments — otherwise a final batch that
+          // leaves only a penny of stranding wouldn't true it up.
+          const residualAfterProportional = round2(Math.max(0, remainingDeferred - runningRevenue - proportionalRevenue))
           const revenueProportion = recognizeShipmentRevenue({
             proportionalRevenue,
             remainingDeferred,
@@ -991,10 +978,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             isFinalShipmentOfFullyShippedTerminalOrder:
               index === orderShipments.length - 1 && (
                 isFullyShippedTerminalStatus(firstShipment.order.status) ||
-                // scjz.68: a PARTIALLY_REFUNDED order isn't guaranteed fully shipped, but once
-                // the deferred base is reversal-aware, a remainder this small means no material
-                // unshipped value is left — safe to clear the rounding stranding.
-                (firstShipment.order.status === 'PARTIALLY_REFUNDED' && shouldTrueUpPartiallyRefundedDeferral(remainingDeferred))
+                // a PARTIALLY_REFUNDED order isn't guaranteed fully shipped, but once the deferred
+                // base is reversal-aware, a residual this small means no material unshipped value
+                // is left — safe to clear the rounding stranding.
+                (firstShipment.order.status === 'PARTIALLY_REFUNDED' && shouldTrueUpPartiallyRefundedDeferral(residualAfterProportional))
               ),
           })
 
