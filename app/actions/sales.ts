@@ -1886,6 +1886,7 @@ export async function raiseChargebackForReversedOrder(
       orderNumber: true,
       externalOrderNumber: true,
       lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
+      shipments: { select: { status: true, shipmentJournalDate: true } },
       refunds: {
         select: {
           lines: { select: { salesOrderLineId: true, productId: true, qty: true, totalBase: true } },
@@ -1894,6 +1895,17 @@ export async function raiseChargebackForReversedOrder(
     },
   })
   if (!order) return { raised: false, error: 'Order not found' }
+
+  // Codex P2: a chargeback marks the order REFUNDED and keeps the dispatched-stock
+  // COGS as a loss (no reversal). That is only correct once the dispatch has been
+  // journaled by the Group B daily batch — Group B EXCLUDES REFUNDED orders, so
+  // charging back a shipped-but-unjournaled order would mean its COGS never posts at
+  // all (and the allocation could be unwound as if the stock were still on hand).
+  // Defer until every shipped shipment is journaled: surface an error so the poller
+  // holds paidAt and re-attempts after the next Group B run posts the COGS.
+  if (order.shipments.some((s) => s.status === 'SHIPPED' && s.shipmentJournalDate == null)) {
+    return { raised: false, error: 'shipped quantity not yet journaled by the daily batch — deferring chargeback until COGS is posted' }
+  }
 
   // scjz.71: chargeback lines are NET (ex-tax) — they match the credit note's net
   // unitAmounts, and the credit note carries the order's per-line taxType
