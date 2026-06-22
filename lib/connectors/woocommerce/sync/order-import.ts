@@ -14,7 +14,7 @@ import { syncRefundsForOrder } from './refund-sync'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
-import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 import { getSettingValue } from '@/lib/settings-store'
 import { notify } from '@/lib/notifications'
@@ -74,6 +74,64 @@ function roundDecimalNumber(value: DecimalInput, precision: number): number {
 
 function divideRoundedNumber(value: DecimalInput, divisor: DecimalInput, precision: number): number {
   return roundDecimalNumber(toDecimal(value).div(toDecimal(divisor)), precision)
+}
+
+/**
+ * Parse a WooCommerce money string (e.g. "12.34") into an exact Decimal. WC sends
+ * monetary fields as strings; an empty/missing/invalid value means zero (mirroring
+ * the prior `parseFloat(x) || 0`). Parsing via Decimal — and accumulating with
+ * addMoney — avoids the float drift that `parseFloat` + native `+` accrued across
+ * many tax/line rows before the /fxRate + round-4 boundary (scjz.62).
+ */
+export function parseWcMoney(value: string | number | null | undefined): Decimal {
+  if (value == null || value === '') return toDecimal(0)
+  try {
+    return toDecimal(value)
+  } catch {
+    return toDecimal(0)
+  }
+}
+
+export type WcForeignTotalsLine = {
+  qty: DecimalInput
+  unitPriceForeign: DecimalInput
+  discountAmount: DecimalInput
+  taxForeign: DecimalInput
+  taxRateValue: DecimalInput
+}
+
+/**
+ * Order-level foreign-currency aggregates — subtotal (net of VAT/discount), tax,
+ * and grand total — computed entirely in Decimal so the AR-control / FX-revaluation
+ * amounts don't accumulate float drift across many lines (scjz.62). Callers convert
+ * to base currency at the single /fxRate boundary (divideRoundedNumber).
+ */
+export function computeWcOrderForeignTotals(input: {
+  lines: WcForeignTotalsLine[]
+  shippingTaxForeign: Array<string | number | null | undefined>
+  orderTotal: string | number | null | undefined
+  pricesIncludeVat: boolean
+}): { subtotalForeign: Decimal; taxForeign: Decimal; totalForeign: Decimal } {
+  const subtotalForeign = input.lines.reduce((sum, line) => {
+    const gross = toDecimal(line.qty).mul(toDecimal(line.unitPriceForeign)).sub(toDecimal(line.discountAmount))
+    const net = input.pricesIncludeVat
+      ? gross.div(toDecimal(1).add(toDecimal(line.taxRateValue)))
+      : gross
+    return addMoney(sum, net)
+  }, toDecimal(0))
+  const shippingTaxForeign = input.shippingTaxForeign.reduce<Decimal>(
+    (sum, value) => addMoney(sum, parseWcMoney(value as string | number | null | undefined)),
+    toDecimal(0),
+  )
+  const lineTaxForeign = input.lines.reduce<Decimal>(
+    (sum, line) => addMoney(sum, toDecimal(line.taxForeign)),
+    toDecimal(0),
+  )
+  return {
+    subtotalForeign,
+    taxForeign: addMoney(lineTaxForeign, shippingTaxForeign),
+    totalForeign: parseWcMoney(input.orderTotal),
+  }
 }
 
 function isUniqueConstraintError(error: unknown): error is { code: string } {
@@ -460,15 +518,6 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       return { success: false, error: description }
     }
 
-    // Calculate totals from WC data (per-line rates for net extraction)
-    const subtotalForeign = mappedLines.reduce((s, l, idx) => {
-      const rate = lineTaxResolved[idx].taxRateValue
-      const lineNet = pricesIncludeVat
-        ? (l.qty * l.unitPriceForeign - l.discountAmount) / (1 + rate)
-        : l.qty * l.unitPriceForeign - l.discountAmount
-      return s + lineNet
-    }, 0)
-
     // Order-level discount (from coupons — separate from line discounts)
     const orderDiscount = mapWcOrderDiscount(wcOrder.coupon_lines)
 
@@ -476,12 +525,22 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const shipping = mapWcShipping(wcOrder)
     const shippingForeign = shipping.shippingForeign
 
-    const shippingTaxForeign = wcOrder.shipping_lines.reduce(
-      (sum, line) => sum + (parseFloat(line.total_tax) || 0),
-      0,
-    )
-    const taxForeign = mappedLines.reduce((sum, line) => sum + line.taxForeign, 0) + shippingTaxForeign
-    const totalForeign = parseFloat(wcOrder.total) || 0
+    // Foreign-currency aggregates in exact Decimal (scjz.62): no parseFloat + native
+    // `+` accumulation, so the AR-control / FX-revaluation amounts can't drift across
+    // many tax/line rows. Stored as Decimal @db.Decimal(18,4); base conversions happen
+    // at the single /fxRate boundary below.
+    const { subtotalForeign, taxForeign, totalForeign } = computeWcOrderForeignTotals({
+      lines: mappedLines.map((l, idx) => ({
+        qty: l.qty,
+        unitPriceForeign: l.unitPriceForeign,
+        discountAmount: l.discountAmount,
+        taxForeign: l.taxForeign,
+        taxRateValue: lineTaxResolved[idx].taxRateValue,
+      })),
+      shippingTaxForeign: wcOrder.shipping_lines.map((line) => line.total_tax),
+      orderTotal: wcOrder.total,
+      pricesIncludeVat,
+    })
 
     // GBP conversions
     const subtotalBase = divideRoundedNumber(subtotalForeign, fxRate, 4)
@@ -766,7 +825,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       tag: 'sync',
       level: 'INFO',
       description: `Imported WC order #${wcOrder.number} (${currency} ${totalForeign.toFixed(2)})`,
-      metadata: { externalOrderId: wcOrder.id, wcNumber: wcOrder.number, currency, total: totalForeign },
+      metadata: { externalOrderId: wcOrder.id, wcNumber: wcOrder.number, currency, total: totalForeign.toNumber() },
       resolveUser: false,
     })
 
