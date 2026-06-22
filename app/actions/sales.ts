@@ -1858,13 +1858,24 @@ export async function raiseChargebackForReversedOrder(
   if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
     await requirePermission('sales.refund')
   }
-  // Idempotency: one chargeback per order. A chargeback fully unwinds the order, so
-  // a prior chargeback means there is nothing more to do (avoids duplicate credit notes).
+  // Idempotency: one chargeback per order. A prior chargeback means the refund row
+  // already exists (avoids duplicate credit notes). BUT if that chargeback's
+  // accounting (credit-note / reversal staging) hasn't completed yet
+  // (accountingRetryRequired), the financial reversal is NOT done — surface an error
+  // so the payment poller holds paidAt and re-surfaces the failure instead of
+  // clearing payment state on an incomplete reversal. The refund-accounting retry
+  // sweep re-queues the credit note; once it succeeds the flag clears and a later
+  // poll returns the benign "already exists".
   const existingChargeback = await db.salesOrderRefund.findFirst({
     where: { orderId, chargeback: true },
-    select: { id: true },
+    select: { id: true, accountingRetryRequired: true },
   })
-  if (existingChargeback) return { raised: false, reason: 'chargeback already exists' }
+  if (existingChargeback) {
+    if (existingChargeback.accountingRetryRequired) {
+      return { raised: false, error: 'chargeback exists but its accounting reversal is still pending retry' }
+    }
+    return { raised: false, reason: 'chargeback already exists' }
+  }
 
   const order = await db.salesOrder.findUnique({
     where: { id: orderId },
