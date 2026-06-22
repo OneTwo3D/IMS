@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
-import { roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
+import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { balanceDateString, findLatestAccountBalanceSnapshot } from './account-balance-snapshots'
 
 /**
@@ -159,4 +159,47 @@ export async function loadInventoryGlReconciliation(options?: {
       sweepLimit: options?.sweepLimit,
     }),
   }
+}
+
+export type InventoryReconciliationSweepJournal = {
+  date: string
+  amount: number
+  subledgerHigher: boolean
+  narration: string
+  lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }>
+}
+
+/**
+ * Build the balanced rounding-difference sweep ManualJournal for a reconciliation
+ * result, or return null when nothing should be swept. Pure (no IO) so the money
+ * logic — guard, sign, and the balanced DR/CR pair — is unit-testable in isolation
+ * (cogs-audit scjz.60.4).
+ *
+ * Only sweeps a `sweep`-action gap (pure accumulated rounding within tolerance);
+ * `flag` gaps are material and surfaced by the reconciliation invariant, never
+ * swept. Both accounts must be configured. The gap direction sets the side:
+ * `delta = subledger - GL`, so delta > 0 means the GL inventory asset is
+ * understated → DR Inventory / CR Rounding Difference; delta < 0 → the reverse.
+ */
+export function buildInventoryReconciliationSweepJournal(
+  reconciliation: InventoryGlReconciliationResult,
+  opts: { inventoryAccount: string; roundingAccount: string; currency: string },
+): InventoryReconciliationSweepJournal | null {
+  if (!reconciliation.available || reconciliation.action !== 'sweep') return null
+  const inventoryAccount = opts.inventoryAccount.trim()
+  const roundingAccount = opts.roundingAccount.trim()
+  if (!inventoryAccount || !roundingAccount) return null
+  const amount = roundToGlPrecisionNumber(Math.abs(reconciliation.delta))
+  if (amount === 0) return null
+  const subledgerHigher = reconciliation.delta > 0
+  const description = `Inventory subledger reconciliation ${reconciliation.balanceDate}`
+  const lines = [
+    { accountCode: inventoryAccount, description, ...(subledgerHigher ? { debit: amount } : { credit: amount }) },
+    { accountCode: roundingAccount, description, ...(subledgerHigher ? { credit: amount } : { debit: amount }) },
+  ]
+  const narration =
+    `Inventory subledger-vs-GL rounding sweep: ${subledgerHigher ? 'DR' : 'CR'} Inventory ` +
+    `${opts.currency} ${amount.toFixed(GL_BASE_PRECISION)} ` +
+    `(subledger ${reconciliation.subledgerValue.toFixed(GL_BASE_PRECISION)} vs GL ${reconciliation.glBalance.toFixed(GL_BASE_PRECISION)})`
+  return { date: reconciliation.balanceDate, amount, subledgerHigher, narration, lines }
 }

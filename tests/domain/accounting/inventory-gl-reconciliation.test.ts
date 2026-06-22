@@ -3,8 +3,20 @@ import test from 'node:test'
 
 import {
   DEFAULT_INVENTORY_GL_SWEEP_LIMIT,
+  buildInventoryReconciliationSweepJournal,
   evaluateInventoryGlReconciliation,
+  type InventoryGlReconciliationResult,
 } from '@/lib/domain/accounting/inventory-gl-reconciliation'
+
+const SWEEP_ACCOUNTS = { inventoryAccount: '1200', roundingAccount: '7999', currency: 'GBP' }
+
+function availableResult(subledgerValue: number, glBalance: number): InventoryGlReconciliationResult {
+  return {
+    available: true,
+    balanceDate: '2026-06-20',
+    ...evaluateInventoryGlReconciliation({ subledgerValue, glBalance }),
+  }
+}
 
 test('balanced when the rounded subledger equals the GL balance', () => {
   const r = evaluateInventoryGlReconciliation({ subledgerValue: 1000.0, glBalance: 1000.0 })
@@ -59,4 +71,64 @@ test('delta is computed on GL-rounded operands (no float dust)', () => {
   const r = evaluateInventoryGlReconciliation({ subledgerValue: 0.1 + 0.2, glBalance: 0.3, sweepLimit: 1 })
   assert.equal(r.delta, 0)
   assert.equal(r.action, 'balanced')
+})
+
+test('sweep journal: subledger above GL → DR Inventory / CR Rounding, balanced', () => {
+  // subledger 1000.47 vs GL 1000.00 → delta +0.47, within sweep limit.
+  const journal = buildInventoryReconciliationSweepJournal(availableResult(1000.47, 1000.0), SWEEP_ACCOUNTS)
+  assert.ok(journal)
+  assert.equal(journal.amount, 0.47)
+  assert.equal(journal.subledgerHigher, true)
+  assert.equal(journal.date, '2026-06-20')
+  assert.deepEqual(journal.lines, [
+    { accountCode: '1200', description: 'Inventory subledger reconciliation 2026-06-20', debit: 0.47 },
+    { accountCode: '7999', description: 'Inventory subledger reconciliation 2026-06-20', credit: 0.47 },
+  ])
+  // Balanced: debits === credits.
+  const debit = journal.lines.reduce((s, l) => s + (l.debit ?? 0), 0)
+  const credit = journal.lines.reduce((s, l) => s + (l.credit ?? 0), 0)
+  assert.equal(debit, credit)
+})
+
+test('sweep journal: GL above subledger → CR Inventory / DR Rounding', () => {
+  // subledger 999.50 vs GL 1000.00 → delta -0.50.
+  const journal = buildInventoryReconciliationSweepJournal(availableResult(999.5, 1000.0), SWEEP_ACCOUNTS)
+  assert.ok(journal)
+  assert.equal(journal.amount, 0.5)
+  assert.equal(journal.subledgerHigher, false)
+  assert.deepEqual(journal.lines, [
+    { accountCode: '1200', description: 'Inventory subledger reconciliation 2026-06-20', credit: 0.5 },
+    { accountCode: '7999', description: 'Inventory subledger reconciliation 2026-06-20', debit: 0.5 },
+  ])
+})
+
+test('sweep journal: material gap (flag) is never swept', () => {
+  // £50 gap → action 'flag'.
+  assert.equal(buildInventoryReconciliationSweepJournal(availableResult(1050.0, 1000.0), SWEEP_ACCOUNTS), null)
+})
+
+test('sweep journal: balanced reconciliation produces no journal', () => {
+  assert.equal(buildInventoryReconciliationSweepJournal(availableResult(1000.0, 1000.0), SWEEP_ACCOUNTS), null)
+})
+
+test('sweep journal: unavailable reconciliation produces no journal', () => {
+  assert.equal(
+    buildInventoryReconciliationSweepJournal({ available: false, reason: 'no_gl_snapshot' }, SWEEP_ACCOUNTS),
+    null,
+  )
+})
+
+test('sweep journal: no journal when the rounding-difference account is unconfigured', () => {
+  // The account being blank is the opt-out: residue is accepted within tolerance.
+  assert.equal(
+    buildInventoryReconciliationSweepJournal(availableResult(1000.47, 1000.0), { ...SWEEP_ACCOUNTS, roundingAccount: '  ' }),
+    null,
+  )
+})
+
+test('sweep journal: no journal when the inventory account is unconfigured', () => {
+  assert.equal(
+    buildInventoryReconciliationSweepJournal(availableResult(1000.47, 1000.0), { ...SWEEP_ACCOUNTS, inventoryAccount: '' }),
+    null,
+  )
 })

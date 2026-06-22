@@ -162,6 +162,10 @@ enum AccountingSyncType {
   DAILY_BATCH_REVENUE_DEFERRAL
   DAILY_BATCH_INVENTORY_ALLOC
   DAILY_BATCH_GROUP_B
+  // cogs-audit scjz.60.4: end-of-daily-batch sweep of the inventory subledger-vs-GL
+  // rounding residue to the configured rounding-difference account (guarded; only
+  // when the gap is within the sweep tolerance — material gaps are flagged, never swept).
+  DAILY_BATCH_INVENTORY_RECONCILIATION
   UNEARNED_REV_REVERSAL
   BILL_PAYMENT
   REALISED_FX_JOURNAL
