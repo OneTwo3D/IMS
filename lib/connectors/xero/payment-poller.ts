@@ -148,7 +148,7 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
         if (order.revenueDeferredDate && !invoiceVoided) {
           try {
             const { raiseChargebackForReversedOrder } = await import('@/app/actions/sales')
-            const chargeback = await raiseChargebackForReversedOrder(order.id)
+            const chargeback = await raiseChargebackForReversedOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
             if (chargeback.error) {
               chargebackFailed = true
               result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${chargeback.error}`)

@@ -1847,7 +1847,17 @@ export async function createRefund(
  */
 export async function raiseChargebackForReversedOrder(
   orderId: string,
+  options?: { internalBypassToken?: symbol },
 ): Promise<{ raised: boolean; reason?: string; error?: string }> {
+  // SECURITY: this is a privileged path — it calls createRefund with
+  // INTERNAL_ACTION_BYPASS, skipping the sales.refund permission. As an export of a
+  // 'use server' module it is reachable as a Server Function via direct POST, so it
+  // must gate itself exactly like createRefund: the in-process payment-poller passes
+  // the unforgeable symbol token; any network caller (which cannot transmit a JS
+  // symbol over the RPC boundary) falls through to the sales.refund permission check.
+  if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+    await requirePermission('sales.refund')
+  }
   // Idempotency: one chargeback per order. A chargeback fully unwinds the order, so
   // a prior chargeback means there is nothing more to do (avoids duplicate credit notes).
   const existingChargeback = await db.salesOrderRefund.findFirst({
