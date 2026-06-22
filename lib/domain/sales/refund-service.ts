@@ -1388,6 +1388,12 @@ export async function createSalesOrderRefund(
   const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0)
   if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
 
+  // scjz.70: a chargeback never restocks (customer keeps the goods), so neutralise
+  // the return warehouse entirely — this skips the pre-shipment return guard, the
+  // fallback return-row build, the snapshot return rows AND the inbound movement, so
+  // a chargeback can't fail on a restock path even if a warehouse was supplied (Codex).
+  const effectiveReturnWarehouseId = input.chargeback ? undefined : input.returnWarehouseId
+
   const totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
   const txResult = await runInTransaction(client, async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REFUND_ACCOUNTING_LOCK_KEY})`
@@ -1473,7 +1479,7 @@ export async function createSalesOrderRefund(
     }
 
     if (
-      input.returnWarehouseId &&
+      effectiveReturnWarehouseId &&
       refundLines.some((refundLine) => refundLine.productId && refundLine.qty > 0) &&
       so.shipments.length === 0
     ) {
@@ -1544,7 +1550,7 @@ export async function createSalesOrderRefund(
         reason: input.reason || null,
         totalForeign,
         totalBase,
-        returnWarehouseId: input.returnWarehouseId || null,
+        returnWarehouseId: effectiveReturnWarehouseId || null,
         // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
         // the stored syncs) reproduces the revenue-only treatment.
         chargeback: input.chargeback ?? false,
@@ -1610,7 +1616,7 @@ export async function createSalesOrderRefund(
     // fresher cost-layer snapshot; if that later step fails, the persisted
     // refund is retained and marked for accounting retry like other post-refund
     // side-effect failures.
-    const fallbackReturnRows = input.returnWarehouseId
+    const fallbackReturnRows = effectiveReturnWarehouseId
       ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
       : []
 
@@ -1661,7 +1667,7 @@ export async function createSalesOrderRefund(
         orderRef: refundOrderRef,
         refundId: txResult.createdRefund.id,
         refundLines: txResult.createdRefundLines,
-        returnWarehouseId: input.returnWarehouseId,
+        returnWarehouseId: effectiveReturnWarehouseId,
         accountingSettings: input.accountingSettings,
         so: txResult.so,
         newStatus: txResult.newStatus,
@@ -1688,9 +1694,9 @@ export async function createSalesOrderRefund(
   }
 
   let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
-  // scjz.70: a chargeback does NOT restock — the customer keeps the goods, the
-  // cost stays as a loss. Skip the inbound return movement even if a warehouse is set.
-  if (input.returnWarehouseId && !accountingWarning && !input.chargeback) {
+  // scjz.70: effectiveReturnWarehouseId is undefined for a chargeback, so the
+  // inbound return movement is skipped (the customer keeps the goods).
+  if (effectiveReturnWarehouseId && !accountingWarning) {
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
@@ -1700,7 +1706,7 @@ export async function createSalesOrderRefund(
       applyReturnInboundStockTx(tx, {
         referenceType: 'SalesOrderRefund',
         referenceId: txResult.createdRefund.id,
-        warehouseId: input.returnWarehouseId!,
+        warehouseId: effectiveReturnWarehouseId!,
         rows: returnRows,
         note: 'Refund return',
       })
