@@ -37,6 +37,7 @@ import {
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
+import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
@@ -353,16 +354,20 @@ async function hasLiveDailyBatchLog(type: DailyBatchLogType, bareReferenceId: st
 }
 
 async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getXeroSettings>>, baseCurrency: string): Promise<void> {
+  // scjz.36: only recreate within the sync-log retention window — beyond it, SYNCED
+  // daily-batch logs are pruned by data-retention, so a "missing" log can't be told
+  // apart from one that already posted, and rebuilding would double-post the journal.
+  const journaledDateFilter = await recreateJournaledDateFilter()
   const orphanA1Orders = await db.salesOrder.findMany({
-    where: { revenueDeferredDate: { not: null } },
+    where: { revenueDeferredDate: journaledDateFilter },
     select: { revenueDeferredDate: true, unearnedRevenueAmount: true },
   })
   const orphanA2Orders = await db.salesOrder.findMany({
-    where: { inventoryAllocatedDate: { not: null } },
+    where: { inventoryAllocatedDate: journaledDateFilter },
     select: { inventoryAllocatedDate: true, allocationBatchAmount: true },
   })
   const orphanBShipments = await db.shipment.findMany({
-    where: { shipmentJournalDate: { not: null } },
+    where: { shipmentJournalDate: journaledDateFilter },
     select: { shipmentJournalDate: true, revenueRecognizedAmount: true, cogsBatchAmount: true },
   })
 
