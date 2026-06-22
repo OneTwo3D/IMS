@@ -593,6 +593,13 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
 
     for (const refund of order.refunds) {
       const refundRetryTypes = retrySyncTypes(refund.accountingRetrySyncs)
+      // scjz.70: accountingRetrySyncs records the staged service syncs (even on
+      // success), so this tells whether the refund actually staged a COGS/unearned
+      // reversal. A chargeback is exempt from the reversal-evidence requirement ONLY
+      // when it staged none (fully-shipped, credit-note-only); a partial/deferred
+      // chargeback that DID stage an UNEARNED_REV_REVERSAL must still require it.
+      const stagedReversal = [...refundRetryTypes].some((type) => REFUND_REVERSAL_TYPES.has(type))
+      const chargebackExemptReversal = Boolean(refund.chargeback) && !stagedReversal
       const hasPostedShipment = postedShipments.length > 0
       if (!hasPostedShipment) continue
 
@@ -622,7 +629,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         refundRetryTypes.size > 0 &&
         (
           !hasCreditNoteEvidence ||
-          (decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !refund.chargeback)
+          (decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !chargebackExemptReversal)
         )
       ) {
         findings.push({
@@ -655,9 +662,10 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         })
       }
 
-      // scjz.70: a chargeback is a revenue-only unwind (credit note only) — it has
-      // no COGS/unearned reversal by design, so don't flag it as missing reversal.
-      if (!hasReversalEvidence && !refund.accountingRetryRequired && !refund.chargeback && decimalToNumber(refund.totalBase) > 0) {
+      // scjz.70: a fully-shipped chargeback stages no COGS/unearned reversal (credit
+      // note only), so don't flag it; but a partial/deferred chargeback that staged
+      // an UNEARNED_REV_REVERSAL is still required to have that evidence.
+      if (!hasReversalEvidence && !refund.accountingRetryRequired && !chargebackExemptReversal && decimalToNumber(refund.totalBase) > 0) {
         findings.push({
           severity: 'warning',
           code: 'refund_missing_reversal_sync',

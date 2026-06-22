@@ -35,6 +35,7 @@ import {
 } from '@/lib/accounting-fx'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
+  buildChargebackRefundLines,
   createSalesOrderRefund,
   retrySalesOrderRefundAccounting,
   type CreatedRefundLine,
@@ -1832,6 +1833,78 @@ export async function createRefund(
     })
     return { success: false, error: String(e) }
   }
+}
+
+/**
+ * scjz.71: raise a revenue-only chargeback for an order whose payment was reversed
+ * (detected by the payment-poller). Idempotent — at most one chargeback per order;
+ * a second call (e.g. a later poll) is a no-op. Builds the full remaining-order
+ * refund lines + shipping and runs the chargeback path (credit note reverses
+ * recognised revenue against AR; COGS kept as a loss; no restock). Internal/cron
+ * context, so it bypasses the interactive permission check.
+ */
+export async function raiseChargebackForReversedOrder(
+  orderId: string,
+): Promise<{ raised: boolean; reason?: string; error?: string }> {
+  // Idempotency: one chargeback per order. A chargeback fully unwinds the order, so
+  // a prior chargeback means there is nothing more to do (avoids duplicate credit notes).
+  const existingChargeback = await db.salesOrderRefund.findFirst({
+    where: { orderId, chargeback: true },
+    select: { id: true },
+  })
+  if (existingChargeback) return { raised: false, reason: 'chargeback already exists' }
+
+  const order = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      shippingBase: true,
+      lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
+      refunds: {
+        select: {
+          lines: { select: { salesOrderLineId: true, productId: true, qty: true, totalBase: true } },
+        },
+      },
+    },
+  })
+  if (!order) return { raised: false, error: 'Order not found' }
+
+  // Aggregate prior refunded qty/value per sales line, and prior refunded shipping
+  // (refund lines with no sales-line + no product are shipping/ad-hoc).
+  const priorRefundedQtyByLineId: Record<string, number> = {}
+  const priorRefundedBaseByLineId: Record<string, number> = {}
+  let priorShippingRefundedBase = 0
+  for (const refund of order.refunds) {
+    for (const line of refund.lines) {
+      if (line.salesOrderLineId) {
+        priorRefundedQtyByLineId[line.salesOrderLineId] =
+          (priorRefundedQtyByLineId[line.salesOrderLineId] ?? 0) + decimalToNumber(line.qty)
+        priorRefundedBaseByLineId[line.salesOrderLineId] =
+          (priorRefundedBaseByLineId[line.salesOrderLineId] ?? 0) + decimalToNumber(line.totalBase)
+      } else if (!line.productId) {
+        priorShippingRefundedBase += decimalToNumber(line.totalBase)
+      }
+    }
+  }
+
+  const lines = buildChargebackRefundLines({
+    lines: order.lines.map((line) => ({
+      lineId: line.id,
+      productId: line.productId,
+      description: line.description,
+      qty: decimalToNumber(line.qty),
+      totalBase: decimalToNumber(line.totalBase),
+    })),
+    priorRefundedQtyByLineId,
+    priorRefundedBaseByLineId,
+    shipping: { totalBase: decimalToNumber(order.shippingBase), priorRefundedBase: priorShippingRefundedBase },
+  })
+  if (lines.length === 0) return { raised: false, reason: 'nothing left to charge back' }
+
+  const result = await createRefund(orderId, lines, 'Payment reversed (chargeback)', undefined, {
+    internalBypassToken: INTERNAL_ACTION_BYPASS,
+    chargeback: true,
+  })
+  return { raised: result.success, error: result.error }
 }
 
 export async function retryRefundAccounting(

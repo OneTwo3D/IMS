@@ -466,10 +466,13 @@ export function evaluateAccountingReconciliationRows(
         }
 
         // Zero-total refunds post no COGS/unearned-revenue reversal; only
-        // positive-value refunds require reversal evidence. scjz.70: a revenue-only
-        // chargeback also posts no COGS/unearned reversal by design (credit note
-        // only), so it is exempt from the reversal-evidence requirement.
-        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !refund.chargeback) {
+        // positive-value refunds require reversal evidence. scjz.70: a fully-shipped
+        // chargeback stages none (credit note only) so it is exempt; but a
+        // partial/deferred chargeback that staged an UNEARNED_REV_REVERSAL (recorded
+        // in accountingRetrySyncs) must still require that evidence.
+        const stagedReversal = [...retrySyncTypes(refund.accountingRetrySyncs)].some((type) => REFUND_REVERSAL_TYPES.has(type))
+        const chargebackExemptReversal = Boolean(refund.chargeback) && !stagedReversal
+        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !chargebackExemptReversal) {
           findings.push({
             severity: 'critical',
             code: 'terminal_refunded_order_missing_reversal_evidence',
