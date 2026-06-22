@@ -1884,9 +1884,15 @@ export async function raiseChargebackForReversedOrder(
       totalBase: true,
       taxBase: true,
       discountAmount: true,
+      taxRateName: true,
       orderNumber: true,
       externalOrderNumber: true,
-      lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
+      lines: {
+        select: {
+          id: true, productId: true, description: true, qty: true, totalBase: true,
+          taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
+        },
+      },
       shipments: { select: { status: true, shipmentJournalDate: true } },
       refunds: {
         select: {
@@ -1908,26 +1914,38 @@ export async function raiseChargebackForReversedOrder(
     return { raised: false, error: 'shipped quantity not yet journaled by the daily batch — deferring chargeback until COGS is posted' }
   }
 
-  // Codex P2: the chargeback absorbs an order-level discount by scaling each product
-  // line down, then applies each line's OWN tax type. The invoice instead posts the
-  // order discount as a SEPARATE line at the order-default tax type — which can differ
-  // from the product lines' tax type (e.g. a zero-rated product on a standard-rate
-  // order discount), even when all lines share one rate. Spreading the discount across
-  // the product lines therefore mis-reverses VAT/AR for any tax mismatch. Rather than
-  // reproduce the invoice's separate-discount-line tax logic in the credit note, safe-
-  // skip ALL discounted orders for manual handling; undiscounted orders (the common
-  // chargeback case) scale trivially and post an exact reversal.
+  // Codex P2: the chargeback absorbs an order-level discount by scaling the product
+  // lines and applying each line's own resolved tax type. The invoice instead posts
+  // the discount (and shipping) as SEPARATE lines at the order-default tax type
+  // (so.taxRateName). Spreading the discount across the product lines only reverses
+  // VAT/AR correctly when the discount, shipping and EVERY product line share one tax
+  // code. When they're uniform it is exact, so process it; otherwise (e.g. a zero-rated
+  // product on a standard-rate discount, or a reverse-charged line) the VAT basis can't
+  // be safely spread — safe-skip for manual handling.
   if (decimalToNumber(order.discountAmount) > 0) {
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: 'chargeback_requires_manual_handling',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount — auto-chargeback skipped (the discount's tax basis can't be safely spread across product lines); raise the credit note manually.`,
-      resolveUser: false,
-    })
-    return { raised: false, reason: 'order-level discount — manual chargeback required' }
+    const cbSettings = await getAccountingSettings().catch(() => null)
+    const orderDefaultTaxType = order.taxRateName
+      ? (await db.taxRate.findFirst({ where: { name: order.taxRateName, active: true }, select: { accountingTaxType: true } }))?.accountingTaxType ?? null
+      : null
+    const allLinesShareDefaultTaxCode = order.lines.every((l) => (
+      (resolveSalesLineTaxType({
+        baseTaxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType,
+        reverseCharge: l.taxRate?.reverseCharge,
+        reverseChargeSalesTaxType: cbSettings?.reverseChargeSalesTaxType,
+      }) ?? null) === orderDefaultTaxType
+    ))
+    if (!allLinesShareDefaultTaxCode) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'chargeback_requires_manual_handling',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount across mixed tax codes — auto-chargeback skipped (the discount's tax basis can't be safely spread across differently-taxed lines); raise the credit note manually.`,
+        resolveUser: false,
+      })
+      return { raised: false, reason: 'order-level discount across mixed tax codes — manual chargeback required' }
+    }
   }
 
   // scjz.71: chargeback lines are NET (ex-tax) — they match the credit note's net
