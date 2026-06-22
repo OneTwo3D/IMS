@@ -1188,21 +1188,20 @@ async function stageRefundAccountingReversals(
       shippedQtyRevenue += allocation.shippedRevenue
       unshippedQtyRevenue += allocation.unshippedRevenue
 
-      // scjz.70: a chargeback is a revenue-only unwind — it neither reverses COGS
-      // nor restocks, so skip the cost-layer consume entirely. This keeps the
-      // revenue allocation above (which feeds the unearned-revenue reversal) while
-      // leaving cogsReversal/allocationReversal at zero, and avoids "Cannot reverse
-      // COGS…" failures on stale/missing snapshots that would otherwise strand a
-      // valid chargeback in accounting retry (Codex).
       const costSnapshot: CostLayerSnapshotEntry[] = []
-      if (!params.chargeback) {
-        for (const lineAllocation of allocation.lineAllocations) {
-          if (lineAllocation.shippedQty > 0) {
-            costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
-          }
-          if (lineAllocation.unshippedQty > 0) {
-            costSnapshot.push(...consumeAllocationCostForLine(lineAllocation.lineId, lineAllocation.unshippedQty))
-          }
+      for (const lineAllocation of allocation.lineAllocations) {
+        // scjz.70: a chargeback keeps SHIPPED COGS as a loss (skip the shipment
+        // consume — no COGS reversal, no restock; the customer keeps the goods), and
+        // skipping it also avoids "Cannot reverse COGS…" failures on stale shipment
+        // snapshots stranding the chargeback in retry (Codex). But UNSHIPPED allocated
+        // qty is still in stock — not a loss — so its allocated-inventory contra MUST
+        // still be reversed, or the A2 allocation journal stays unreversed while a
+        // full refund clears inventoryAllocatedDate (Codex).
+        if (lineAllocation.shippedQty > 0 && !params.chargeback) {
+          costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
+        }
+        if (lineAllocation.unshippedQty > 0) {
+          costSnapshot.push(...consumeAllocationCostForLine(lineAllocation.lineId, lineAllocation.unshippedQty))
         }
       }
       refundLayerSnapshots.set(refundLine.id, costSnapshot)
