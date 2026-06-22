@@ -1650,7 +1650,13 @@ async function loadRefundAccountingQueueInput(
       unitPriceBase: decimalToNumber(line.unitPriceBase),
       totalForeign: decimalToNumber(line.totalForeign),
       totalBase: decimalToNumber(line.totalBase),
-      lineKind: line.productId ? 'sale' : 'shipping',
+      // lineKind isn't persisted: a null-product line is shipping, UNLESS its total is
+      // negative — that's the mirrored order-discount line, which must reload as
+      // 'discount' so an accounting RETRY re-posts it to the discount account (not
+      // shipping). Matches the replay reconstruction in refund-service.
+      lineKind: line.productId
+        ? 'sale'
+        : (decimalToNumber(line.totalBase) < 0 ? 'discount' : 'shipping'),
     })),
     accountingSyncs,
   }
@@ -1887,15 +1893,13 @@ export async function raiseChargebackForReversedOrder(
       taxBase: true,
       discountAmount: true,
       fxRateToBase: true,
+      pricesIncludeVat: true,
+      taxRatePercent: true,
       orderNumber: true,
       externalOrderNumber: true,
       lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
       shipments: { select: { status: true, shipmentJournalDate: true } },
-      refunds: {
-        select: {
-          lines: { select: { salesOrderLineId: true, productId: true, qty: true, totalBase: true } },
-        },
-      },
+      refunds: { select: { id: true } },
     },
   })
   if (!order) return { raised: false, error: 'Order not found' }
@@ -1911,6 +1915,25 @@ export async function raiseChargebackForReversedOrder(
     return { raised: false, error: 'shipped quantity not yet journaled by the daily batch — deferring chargeback until COGS is posted' }
   }
 
+  // A chargeback unwinds the WHOLE remaining order. Prior partial refunds make the
+  // remaining balance ambiguous — amount-only/ad-hoc refunds aren't tied to a line, a
+  // prior refund may have already reversed part of the discount/shipping, etc. — so the
+  // auto-mirror can over- or under-credit. Safe-skip any previously-refunded order to
+  // manual handling; the common chargeback case (payment reversal, no prior refund) is
+  // fully covered.
+  if (order.refunds.length > 0) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'chargeback_requires_manual_handling',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} that already has prior refunds — auto-chargeback skipped (remaining balance is ambiguous); raise the credit note manually.`,
+      resolveUser: false,
+    })
+    return { raised: false, reason: 'order has prior refunds — manual chargeback required' }
+  }
+
   // scjz.71: chargeback lines are NET (ex-tax) — they match the credit note's net
   // unitAmounts, and the credit note carries the order's per-line taxType
   // (lineAmountsIncludeTax: false) so Xero grosses them back up to reverse the full
@@ -1919,27 +1942,6 @@ export async function raiseChargebackForReversedOrder(
   // Taxable + non-taxable are both handled; non-taxable simply has taxBase 0.
   // An order-level discount is mirrored as a separate negative discount line below
   // (exactly as the invoice posted it), not spread across the goods.
-
-  // Aggregate prior refunded qty/value per sales line, prior refunded shipping (refund
-  // lines with no sales-line + no product are shipping/ad-hoc), and the prior refunded
-  // TOTAL — the order's remaining net = totalBase − prior refunded total.
-  const priorRefundedQtyByLineId: Record<string, number> = {}
-  const priorRefundedBaseByLineId: Record<string, number> = {}
-  let priorShippingRefundedBase = 0
-  let priorRefundedTotalBase = 0
-  for (const refund of order.refunds) {
-    for (const line of refund.lines) {
-      priorRefundedTotalBase += decimalToNumber(line.totalBase)
-      if (line.salesOrderLineId) {
-        priorRefundedQtyByLineId[line.salesOrderLineId] =
-          (priorRefundedQtyByLineId[line.salesOrderLineId] ?? 0) + decimalToNumber(line.qty)
-        priorRefundedBaseByLineId[line.salesOrderLineId] =
-          (priorRefundedBaseByLineId[line.salesOrderLineId] ?? 0) + decimalToNumber(line.totalBase)
-      } else if (!line.productId) {
-        priorShippingRefundedBase += decimalToNumber(line.totalBase)
-      }
-    }
-  }
 
   // scjz.71: order-level discount handling mirrors the invoice. The invoice posts the
   // discount as a SEPARATE negative line to settings.discountAccount only when that
@@ -1950,20 +1952,30 @@ export async function raiseChargebackForReversedOrder(
   let discountInput: { totalBase: number } | undefined
   if (decimalToNumber(order.discountAmount) > 0) {
     const cbSettings = await getAccountingSettings().catch(() => null)
-    if (!cbSettings?.discountAccount || order.refunds.length > 0) {
+    // The invoice only posts a separate discount line when a discount account is
+    // configured (otherwise it posted full goods, no discount line). Without one we
+    // can't mirror it — safe-skip to manual. (Prior-refund orders were already skipped.)
+    if (!cbSettings?.discountAccount) {
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: orderId,
         action: 'chargeback_requires_manual_handling',
         tag: 'accounting',
         level: 'WARNING',
-        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount that can't be auto-mirrored (${!cbSettings?.discountAccount ? 'no discount account configured' : 'prior partial refunds present'}) — auto-chargeback skipped; raise the credit note manually.`,
+        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount but no discount account is configured — auto-chargeback skipped; raise the credit note manually.`,
         resolveUser: false,
       })
-      return { raised: false, reason: 'order-level discount needs manual chargeback' }
+      return { raised: false, reason: 'order-level discount but no discount account — manual chargeback required' }
     }
+    // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
+    // is false). discountAmount is stored in the order's inclusive/exclusive convention,
+    // so strip VAT when the order is tax-inclusive, then to base currency.
     const fxRate = decimalToNumber(order.fxRateToBase) || 1
-    discountInput = { totalBase: decimalToNumber(order.discountAmount) / fxRate }
+    const vatPct = decimalToNumber(order.taxRatePercent)
+    const discountForeignNet = order.pricesIncludeVat && vatPct > 0
+      ? decimalToNumber(order.discountAmount) / (1 + vatPct)
+      : decimalToNumber(order.discountAmount)
+    discountInput = { totalBase: discountForeignNet / fxRate }
   }
 
   const lines = buildChargebackRefundLines({
@@ -1974,9 +1986,7 @@ export async function raiseChargebackForReversedOrder(
       qty: decimalToNumber(line.qty),
       totalBase: decimalToNumber(line.totalBase),
     })),
-    priorRefundedQtyByLineId,
-    priorRefundedBaseByLineId,
-    shipping: { totalBase: decimalToNumber(order.shippingBase), priorRefundedBase: priorShippingRefundedBase },
+    shipping: { totalBase: decimalToNumber(order.shippingBase) },
     discount: discountInput,
   })
   if (lines.length === 0) return { raised: false, reason: 'nothing left to charge back' }
