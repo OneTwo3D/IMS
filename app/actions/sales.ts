@@ -1691,7 +1691,9 @@ export async function createRefund(
 
     const { getNumberingFormats } = await import('./company')
     const [numbering, accountingSettings] = await Promise.all([
-      getNumberingFormats(),
+      // scjz.71: internal callers (the payment-poller chargeback) have no session, so
+      // pass the bypass through to skip getNumberingFormats' requireAuth (NEXT_REDIRECT).
+      getNumberingFormats(options?.internalBypassToken ? { internalBypassToken: options.internalBypassToken } : undefined),
       getAccountingSettings().catch(() => null),
     ])
 

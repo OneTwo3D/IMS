@@ -28,8 +28,13 @@ async function fetchReversedInvoiceIds(type: 'ACCREC' | 'ACCPAY', lastPoll: stri
   const all = new Set<string>()
   const voided = new Set<string>()
   for (const status of ['AUTHORISED', 'VOIDED'] as const) {
+    // The `where` clause must be a SINGLE url-encoded param — leaving `&&` raw makes
+    // the `&` split it into separate query params, so Xero drops the Status filter and
+    // returns every ACCREC invoice (which made the VOIDED set match AUTHORISED invoices
+    // and wrongly suppressed chargebacks — scjz.71).
+    const where = encodeURIComponent(`Type=="${type}"&&Status=="${status}"`)
     const res = await xeroGet<XeroInvoicesResponse>(
-      `Invoices?where=Type=="${type}"&&Status=="${status}"&ModifiedAfter=${modifiedAfter}`,
+      `Invoices?where=${where}&ModifiedAfter=${modifiedAfter}`,
     )
     if (res.ok && res.data?.Invoices) {
       for (const invoice of res.data.Invoices) {
