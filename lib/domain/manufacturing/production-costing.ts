@@ -114,6 +114,40 @@ export function buildOverheadAccountDeltas(
 }
 
 /**
+ * Per-component share used to attribute a disassembly's recovered cost-layer
+ * provenance back to the consumed OUTPUT layers (cost_layer_source_lines).
+ *
+ * - Proportional (totalRecoveredCostBase > 0): a component claims its planned
+ *   recovery value's share = baseAllocatedCostBase / totalRecoveredCostBase.
+ * - Equal-split (totalRecoveredCostBase === 0, i.e. the disassembled output had
+ *   zero cost): value share is 0/0, so attribute an EQUAL per-component share
+ *   (1 / componentCount) — mirroring the equal-split overhead. The source lines
+ *   carry zero value now; a later landed-cost change on the output layer fills in
+ *   the real value via propagateLandedCostToOutputs (scjz.27). Without provenance
+ *   the recovered layers are invisible to that propagation and stay understated.
+ * - Returns null when no provenance should be written (e.g. zero-cost output with
+ *   no components), so the caller skips the source-line write.
+ *
+ * Across the components the shares sum to 1 (full attribution of each consumed
+ * output layer's quantity), in both paths.
+ */
+export function disassemblyProvenanceShare(input: {
+  baseAllocatedCostBase: DecimalInput
+  totalRecoveredCostBase: DecimalInput
+  useEqualSplitOverhead: boolean
+  componentCount: number
+}): Decimal | null {
+  const totalRecovered = toDecimal(input.totalRecoveredCostBase)
+  if (totalRecovered.gt(0)) {
+    return toDecimal(input.baseAllocatedCostBase).div(totalRecovered)
+  }
+  if (input.useEqualSplitOverhead && input.componentCount > 0) {
+    return toDecimal(1).div(toDecimal(input.componentCount))
+  }
+  return null
+}
+
+/**
  * Spread `currentMfgCostBase` proportionally across `layers` by their
  * component base value, returning the new unit cost per layer.
  *
