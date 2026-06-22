@@ -1532,6 +1532,7 @@ export async function createSalesOrderRefund(
           id: true,
           creditNoteNumber: true,
           totalBase: true,
+          accountingRetryRequired: true,
           lines: {
             select: {
               id: true,
@@ -1548,6 +1549,14 @@ export async function createSalesOrderRefund(
         },
       })
       if (existingChargeback) {
+        // If the first run's reversal staging hasn't completed (accountingRetryRequired),
+        // the financial reversal is incomplete — a pending/deferred chargeback may still
+        // owe its UNEARNED/allocation reversal. Fail closed so the caller (poller) holds
+        // paidAt and re-surfaces it, rather than replaying a clean success that clears
+        // the retry state. The refund-accounting retry sweep completes the staging.
+        if (existingChargeback.accountingRetryRequired) {
+          return { error: 'chargeback exists but its accounting reversal is still pending retry' } as const
+        }
         return {
           replay: true as const,
           so,
