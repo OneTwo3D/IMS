@@ -11,7 +11,7 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
-import { roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
@@ -103,7 +103,7 @@ export type RefundRequestLine = {
   qty: number
   totalForeign?: number | null
   totalBase: number
-  lineKind?: 'sale' | 'shipping'
+  lineKind?: 'sale' | 'shipping' | 'discount'
 }
 
 export type ChargebackOrderLine = {
@@ -133,6 +133,13 @@ export function buildChargebackRefundLines(input: {
   priorRefundedQtyByLineId?: Record<string, number>
   priorRefundedBaseByLineId?: Record<string, number>
   shipping?: { totalBase: number; priorRefundedBase?: number; description?: string }
+  // scjz.71: the order-level discount to MIRROR. The original invoice never scales the
+  // product lines for an order discount — it posts each line at full value and adds the
+  // discount as a SEPARATE negative line to the discount account at the order-default
+  // tax type (see invoices.ts). To reverse the invoice exactly, emit the same: full
+  // goods + a negative discount line. The caller passes this only when a discount
+  // account is configured (otherwise the invoice posted no discount line at all).
+  discount?: { totalBase: number; description?: string }
 }): RefundRequestLine[] {
   const priorQty = input.priorRefundedQtyByLineId ?? {}
   const priorBase = input.priorRefundedBaseByLineId ?? {}
@@ -155,21 +162,41 @@ export function buildChargebackRefundLines(input: {
     }]
   })
 
-  if (input.shipping) {
-    const remainingShipping = roundQuantity(
-      subtractMoney(input.shipping.totalBase, input.shipping.priorRefundedBase ?? 0),
-      4,
-    )
-    if (remainingShipping.gt(0)) {
-      saleLines.push({
-        lineId: null,
-        productId: null,
-        description: input.shipping.description ?? 'Shipping',
-        qty: 0,
-        totalBase: remainingShipping.toNumber(),
-        lineKind: 'shipping',
-      })
-    }
+  // Clamp to >= 0: an amount-only/ad-hoc prior refund (no sales line) can push
+  // priorRefundedBase above the order's shipping, making the raw difference
+  // negative. Left unclamped it would *inflate* targetGoodsTotal below (subtracting
+  // a negative) and over-credit the customer. targetNetTotalBase already nets out
+  // every prior refund, so a fully-refunded shipping leg simply contributes 0 here.
+  const remainingShipping = input.shipping
+    ? roundQuantity(subtractMoney(input.shipping.totalBase, input.shipping.priorRefundedBase ?? 0), 4)
+    : toDecimal(0)
+  const remainingShippingClamped = remainingShipping.lt(0) ? toDecimal(0) : remainingShipping
+
+  if (remainingShippingClamped.gt(0)) {
+    saleLines.push({
+      lineId: null,
+      productId: null,
+      description: input.shipping?.description ?? 'Shipping',
+      qty: 0,
+      totalBase: remainingShippingClamped.toNumber(),
+      lineKind: 'shipping',
+    })
+  }
+
+  // Mirror the invoice's separate order-discount line: a NEGATIVE line that the
+  // credit-note staging posts to the discount account at the order-default tax type.
+  // This reverses the discount account exactly (rather than spreading the discount
+  // across the goods), so standard + zero-rated goods with any order discount tie out.
+  const discountBase = input.discount ? roundQuantity(toDecimal(input.discount.totalBase), 4) : toDecimal(0)
+  if (discountBase.gt(0)) {
+    saleLines.push({
+      lineId: null,
+      productId: null,
+      description: input.discount?.description ?? 'Order discount',
+      qty: 0,
+      totalBase: discountBase.neg().toNumber(),
+      lineKind: 'discount',
+    })
   }
 
   return saleLines
@@ -185,7 +212,7 @@ export type CreatedRefundLine = {
   unitPriceBase: number
   totalForeign: number
   totalBase: number
-  lineKind: 'sale' | 'shipping'
+  lineKind: 'sale' | 'shipping' | 'discount'
 }
 
 export type RefundAccountingSyncRequest = {
@@ -791,6 +818,8 @@ async function stageRefundAccountingReversals(
       unearnedRevenueAmount: Prisma.Decimal | number | string | null
     }
     newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED'
+    /** scjz.70: revenue-only chargeback — suppress the COGS reversal (cost kept as a loss). */
+    chargeback?: boolean
   },
 ): Promise<{
   accountingSyncs: RefundAccountingSyncRequest[]
@@ -1188,7 +1217,14 @@ async function stageRefundAccountingReversals(
 
       const costSnapshot: CostLayerSnapshotEntry[] = []
       for (const lineAllocation of allocation.lineAllocations) {
-        if (lineAllocation.shippedQty > 0) {
+        // scjz.70: a chargeback keeps SHIPPED COGS as a loss (skip the shipment
+        // consume — no COGS reversal, no restock; the customer keeps the goods), and
+        // skipping it also avoids "Cannot reverse COGS…" failures on stale shipment
+        // snapshots stranding the chargeback in retry (Codex). But UNSHIPPED allocated
+        // qty is still in stock — not a loss — so its allocated-inventory contra MUST
+        // still be reversed, or the A2 allocation journal stays unreversed while a
+        // full refund clears inventoryAllocatedDate (Codex).
+        if (lineAllocation.shippedQty > 0 && !params.chargeback) {
           costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
         }
         if (lineAllocation.unshippedQty > 0) {
@@ -1264,7 +1300,11 @@ async function stageRefundAccountingReversals(
     }
   })
 
-  if (reversalAmounts.cogsReversal > 0) {
+  // scjz.70: a chargeback is a revenue-only unwind — the credit note reverses
+  // recognised revenue against AR, but COGS is intentionally KEPT (booked as a
+  // loss), so suppress the COGS reversal. Restock is suppressed separately in
+  // createSalesOrderRefund (the goods are not returned in a chargeback).
+  if (reversalAmounts.cogsReversal > 0 && !params.chargeback) {
     accountingSyncs.push({
       type: 'COGS_REVERSAL',
       referenceType: 'SalesOrderRefund',
@@ -1360,6 +1400,17 @@ function refundAccountingSyncsJson(
   return JSON.parse(JSON.stringify(syncs)) as Prisma.InputJsonValue
 }
 
+/**
+ * scjz.71: did the refund stage a COGS/unearned reversal? The UNEARNED_REV_REVERSAL
+ * sync also carries the allocation reversal, so these two types cover every
+ * reversal a refund posts. Persisted on the refund (`reversalStaged`) so the
+ * accounting evidence checks can distinguish a credit-note-only chargeback from one
+ * that still owes reversal evidence.
+ */
+function stagedAReversal(syncs: RefundAccountingSyncRequest[]): boolean {
+  return syncs.some((sync) => sync.type === 'COGS_REVERSAL' || sync.type === 'UNEARNED_REV_REVERSAL')
+}
+
 export async function createSalesOrderRefund(
   client: RefundServiceClient,
   input: {
@@ -1370,10 +1421,25 @@ export async function createSalesOrderRefund(
     externalRefundId?: number
     creditNotePrefix: string
     accountingSettings?: AccountingSettings | null
+    /**
+     * scjz.70: revenue-only chargeback. The credit note still reverses recognised
+     * revenue against AR, but COGS reversal and inventory restock are suppressed —
+     * the customer keeps the goods and the cost is booked as a loss. Used by the
+     * payment-poller when a payment reversal (chargeback) is detected.
+     */
+    chargeback?: boolean
   },
 ): Promise<CreateSalesOrderRefundResult> {
-  const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0)
+  // Keep discount lines (negative totalBase, qty 0) which the qty>0/totalBase>0 filter
+  // would otherwise drop — a chargeback mirrors the invoice's order-discount line.
+  const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0 || line.lineKind === 'discount')
   if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
+
+  // scjz.70: a chargeback never restocks (customer keeps the goods), so neutralise
+  // the return warehouse entirely — this skips the pre-shipment return guard, the
+  // fallback return-row build, the snapshot return rows AND the inbound movement, so
+  // a chargeback can't fail on a restock path even if a warehouse was supplied (Codex).
+  const effectiveReturnWarehouseId = input.chargeback ? undefined : input.returnWarehouseId
 
   const totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
   const txResult = await runInTransaction(client, async (tx) => {
@@ -1389,6 +1455,7 @@ export async function createSalesOrderRefund(
         status: true,
         fxRateToBase: true,
         totalBase: true,
+        taxBase: true,
         taxRatePercent: true,
         pricesIncludeVat: true,
         revenueDeferredDate: true,
@@ -1451,7 +1518,9 @@ export async function createSalesOrderRefund(
             unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
             totalForeign: refundBoundaryNumber(line.totalForeign),
             totalBase: refundBoundaryNumber(line.totalBase),
-            lineKind: line.salesOrderLineId == null ? 'shipping' as const : 'sale' as const,
+            lineKind: line.salesOrderLineId != null
+              ? 'sale' as const
+              : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
           })),
           creditNoteNumber: existingExternalRefund.creditNoteNumber ?? '',
           newStatus: so.status === 'REFUNDED' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
@@ -1459,8 +1528,71 @@ export async function createSalesOrderRefund(
       }
     }
 
+    // scjz.71: chargeback idempotency must be atomic. The pre-check in
+    // raiseChargebackForReversedOrder runs OUTSIDE this lock, so two overlapping
+    // payment-poller runs can both pass it before either commits. Re-check here
+    // under the advisory + row lock so a second run replays the first chargeback
+    // (one credit note per order) instead of posting a duplicate.
+    if (input.chargeback) {
+      const existingChargeback = await tx.salesOrderRefund.findFirst({
+        where: { orderId: input.orderId, chargeback: true },
+        select: {
+          id: true,
+          creditNoteNumber: true,
+          totalBase: true,
+          accountingRetryRequired: true,
+          lines: {
+            select: {
+              id: true,
+              salesOrderLineId: true,
+              productId: true,
+              description: true,
+              qty: true,
+              unitPriceForeign: true,
+              unitPriceBase: true,
+              totalForeign: true,
+              totalBase: true,
+            },
+          },
+        },
+      })
+      if (existingChargeback) {
+        // If the first run's reversal staging hasn't completed (accountingRetryRequired),
+        // the financial reversal is incomplete — a pending/deferred chargeback may still
+        // owe its UNEARNED/allocation reversal. Fail closed so the caller (poller) holds
+        // paidAt and re-surfaces it, rather than replaying a clean success that clears
+        // the retry state. The refund-accounting retry sweep completes the staging.
+        if (existingChargeback.accountingRetryRequired) {
+          return { error: 'chargeback exists but its accounting reversal is still pending retry' } as const
+        }
+        return {
+          replay: true as const,
+          so,
+          fxRate,
+          replayTotalBase: refundBoundaryNumber(existingChargeback.totalBase),
+          createdRefund: { id: existingChargeback.id },
+          createdRefundLines: existingChargeback.lines.map((line) => ({
+            id: line.id,
+            lineId: line.salesOrderLineId ?? null,
+            productId: line.productId,
+            description: line.description,
+            qty: refundBoundaryNumber(line.qty),
+            unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
+            unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
+            totalForeign: refundBoundaryNumber(line.totalForeign),
+            totalBase: refundBoundaryNumber(line.totalBase),
+            lineKind: line.salesOrderLineId != null
+              ? 'sale' as const
+              : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
+          })),
+          creditNoteNumber: existingChargeback.creditNoteNumber ?? '',
+          newStatus: so.status === 'REFUNDED' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
+        }
+      }
+    }
+
     if (
-      input.returnWarehouseId &&
+      effectiveReturnWarehouseId &&
       refundLines.some((refundLine) => refundLine.productId && refundLine.qty > 0) &&
       so.shipments.length === 0
     ) {
@@ -1531,7 +1663,10 @@ export async function createSalesOrderRefund(
         reason: input.reason || null,
         totalForeign,
         totalBase,
-        returnWarehouseId: input.returnWarehouseId || null,
+        returnWarehouseId: effectiveReturnWarehouseId || null,
+        // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
+        // the stored syncs) reproduces the revenue-only treatment.
+        chargeback: input.chargeback ?? false,
       },
       select: { id: true },
     })
@@ -1575,12 +1710,21 @@ export async function createSalesOrderRefund(
         unitPriceBase: refundBoundaryNumber(createdLine.unitPriceBase),
         totalForeign: refundBoundaryNumber(createdLine.totalForeign),
         totalBase: refundBoundaryNumber(createdLine.totalBase),
-        lineKind: refundLine.lineKind === 'shipping' ? 'shipping' : 'sale',
+        lineKind: refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale',
       })
     }
 
     const totalRefundedNow = previouslyRefunded + totalBase
-    const orderTotal = refundBoundaryNumber(so.totalBase)
+    // Chargebacks unwind recognised revenue on the NET (ex-VAT) basis: the refund
+    // lines are stored net and the credit note grosses them back up via taxType to
+    // reverse the full gross AR. Refund totals (here and in priorRefunded) are net,
+    // so a full chargeback sums to (totalBase − taxBase). Compare against that net
+    // order total — comparing against the gross so.totalBase would leave a full
+    // revenue unwind stuck at PARTIALLY_REFUNDED on taxable orders. Non-taxable
+    // orders have taxBase 0, so this is identical to the gross basis for them.
+    const orderTotal = input.chargeback
+      ? Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase))
+      : refundBoundaryNumber(so.totalBase)
     const newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED' = isFullRefundAmount(totalRefundedNow, orderTotal)
       ? 'REFUNDED'
       : 'PARTIALLY_REFUNDED'
@@ -1594,7 +1738,7 @@ export async function createSalesOrderRefund(
     // fresher cost-layer snapshot; if that later step fails, the persisted
     // refund is retained and marked for accounting retry like other post-refund
     // side-effect failures.
-    const fallbackReturnRows = input.returnWarehouseId
+    const fallbackReturnRows = effectiveReturnWarehouseId
       ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
       : []
 
@@ -1645,10 +1789,11 @@ export async function createSalesOrderRefund(
         orderRef: refundOrderRef,
         refundId: txResult.createdRefund.id,
         refundLines: txResult.createdRefundLines,
-        returnWarehouseId: input.returnWarehouseId,
+        returnWarehouseId: effectiveReturnWarehouseId,
         accountingSettings: input.accountingSettings,
         so: txResult.so,
         newStatus: txResult.newStatus,
+        chargeback: input.chargeback,
       })
       accountingSyncs = staged.accountingSyncs
       snapshotReturnRows = staged.snapshotReturnRows
@@ -1656,6 +1801,12 @@ export async function createSalesOrderRefund(
         where: { id: txResult.createdRefund.id },
         data: {
           accountingRetrySyncs: refundAccountingSyncsJson(accountingSyncs),
+          // scjz.71: durably record whether any COGS/unearned reversal was staged
+          // (the UNEARNED_REV_REVERSAL sync also carries allocation reversal) so the
+          // invariant/reconciliation evidence checks can tell a credit-note-only
+          // chargeback from one that owes reversal evidence — independent of
+          // accountingRetrySyncs, which is cleared once the syncs queue.
+          reversalStaged: stagedAReversal(accountingSyncs),
         },
       })
     } catch (error) {
@@ -1671,7 +1822,9 @@ export async function createSalesOrderRefund(
   }
 
   let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
-  if (input.returnWarehouseId && !accountingWarning) {
+  // scjz.70: effectiveReturnWarehouseId is undefined for a chargeback, so the
+  // inbound return movement is skipped (the customer keeps the goods).
+  if (effectiveReturnWarehouseId && !accountingWarning) {
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
@@ -1681,7 +1834,7 @@ export async function createSalesOrderRefund(
       applyReturnInboundStockTx(tx, {
         referenceType: 'SalesOrderRefund',
         referenceId: txResult.createdRefund.id,
-        warehouseId: input.returnWarehouseId!,
+        warehouseId: effectiveReturnWarehouseId!,
         rows: returnRows,
         note: 'Refund return',
       })
@@ -1722,6 +1875,7 @@ export async function retrySalesOrderRefundAccounting(
           id: true,
           orderId: true,
           returnWarehouseId: true,
+          chargeback: true,
           accountingRetryRequired: true,
           accountingRetrySyncs: true,
           order: {
@@ -1798,10 +1952,11 @@ export async function retrySalesOrderRefundAccounting(
         accountingSettings: input.accountingSettings,
         so: refund.order,
         newStatus,
+        chargeback: refund.chargeback,
       })
 
       let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
-      if (refund.returnWarehouseId) {
+      if (refund.returnWarehouseId && !refund.chargeback) {
         const snapshotRows = staged.snapshotReturnRows ?? []
         const returnRows = snapshotRows.length > 0
           ? snapshotRows
@@ -1818,6 +1973,7 @@ export async function retrySalesOrderRefundAccounting(
         where: { id: refund.id },
         data: {
           accountingRetrySyncs: refundAccountingSyncsJson(staged.accountingSyncs),
+          reversalStaged: stagedAReversal(staged.accountingSyncs),
         },
       })
 

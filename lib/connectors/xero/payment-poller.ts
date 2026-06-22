@@ -23,18 +23,27 @@ type XeroInvoicesResponse = {
 // audit-M-acct #3: an invoice IMS marked paid is "reversed" if it's no longer
 // PAID in Xero. After a payment is removed it returns to AUTHORISED; a voided
 // invoice becomes VOIDED. Both signal IMS should clear paidAt, so collect both.
-async function fetchReversedInvoiceIds(type: 'ACCREC' | 'ACCPAY', lastPoll: string): Promise<Set<string>> {
+async function fetchReversedInvoiceIds(type: 'ACCREC' | 'ACCPAY', lastPoll: string): Promise<{ all: Set<string>; voided: Set<string> }> {
   const modifiedAfter = new Date(lastPoll).toISOString()
-  const ids = new Set<string>()
+  const all = new Set<string>()
+  const voided = new Set<string>()
   for (const status of ['AUTHORISED', 'VOIDED'] as const) {
+    // The `where` clause must be a SINGLE url-encoded param — leaving `&&` raw makes
+    // the `&` split it into separate query params, so Xero drops the Status filter and
+    // returns every ACCREC invoice (which made the VOIDED set match AUTHORISED invoices
+    // and wrongly suppressed chargebacks — scjz.71).
+    const where = encodeURIComponent(`Type=="${type}"&&Status=="${status}"`)
     const res = await xeroGet<XeroInvoicesResponse>(
-      `Invoices?where=Type=="${type}"&&Status=="${status}"&ModifiedAfter=${modifiedAfter}`,
+      `Invoices?where=${where}&ModifiedAfter=${modifiedAfter}`,
     )
     if (res.ok && res.data?.Invoices) {
-      for (const invoice of res.data.Invoices) ids.add(invoice.InvoiceID)
+      for (const invoice of res.data.Invoices) {
+        all.add(invoice.InvoiceID)
+        if (status === 'VOIDED') voided.add(invoice.InvoiceID)
+      }
     }
   }
-  return ids
+  return { all, voided }
 }
 
 export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[] }> {
@@ -119,11 +128,39 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
         paidAt: { not: null },
         shoppingLinks: { none: {} },
       },
-      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true },
+      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true },
     })
     if (paidManualOrders.length > 0) {
       const reversedIds = await fetchReversedInvoiceIds('ACCREC', lastPoll)
-      for (const order of detectPaymentReversals(paidManualOrders, reversedIds)) {
+      for (const order of detectPaymentReversals(paidManualOrders, reversedIds.all)) {
+        // scjz.71: a reversed payment on a revenue-POSTED order (revenue recognised +
+        // invoiced) is a chargeback — raise a revenue-only credit note that reverses
+        // recognised revenue against AR (COGS kept as a loss, no restock). Idempotent
+        // (one chargeback per order). Dynamic import breaks the lib→action cycle.
+        // CRITICAL: clear paidAt ONLY after the chargeback is recorded — otherwise a
+        // failed chargeback would drop the order out of the next poll's paidManualOrders
+        // (paidAt: not null) and the recognised revenue would never be reversed (Codex P1).
+        // A VOIDED invoice has already had its AR/revenue reversed by Xero, so a
+        // separate credit note would double-reverse — only auto-chargeback an
+        // AUTHORISED payment removal where the invoice is still live (Codex P2).
+        const invoiceVoided = order.accountingInvoiceId != null && reversedIds.voided.has(order.accountingInvoiceId)
+        let chargebackFailed = false
+        if (order.revenueDeferredDate && !invoiceVoided) {
+          try {
+            const { raiseChargebackForReversedOrder } = await import('@/app/actions/sales')
+            const chargeback = await raiseChargebackForReversedOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+            if (chargeback.error) {
+              chargebackFailed = true
+              result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${chargeback.error}`)
+            }
+          } catch (chargebackError) {
+            chargebackFailed = true
+            result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${String(chargebackError)}`)
+          }
+        }
+        // Leave paidAt set on a failed chargeback so the reversal is re-attempted and
+        // the order is not silently shown unpaid-and-unreversed.
+        if (chargebackFailed) continue
         await db.salesOrder.update({ where: { id: order.id }, data: { paidAt: null } })
         result.salesReversed++
         await logActivity({
@@ -196,7 +233,7 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     })
     if (paidBills.length > 0) {
       const reversedIds = await fetchReversedInvoiceIds('ACCPAY', lastPoll)
-      for (const bill of detectPaymentReversals(paidBills, reversedIds)) {
+      for (const bill of detectPaymentReversals(paidBills, reversedIds.all)) {
         await db.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
         result.billsReversed++
         await logActivity({

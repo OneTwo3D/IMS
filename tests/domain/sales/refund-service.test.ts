@@ -58,6 +58,8 @@ type Refund = {
   totalForeign: number
   totalBase: number
   returnWarehouseId: string | null
+  chargeback?: boolean
+  reversalStaged?: boolean
   accountingRetryRequired?: boolean
   accountingWarning?: string | null
   accountingRetrySyncs?: unknown
@@ -749,6 +751,63 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+})
+
+test('createSalesOrderRefund chargeback mode suppresses COGS reversal AND restock (scjz.70)', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Payment reversed (chargeback)',
+    // A warehouse is supplied to prove the chargeback suppresses restock regardless.
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    chargeback: true,
+  })
+
+  assert.equal(result.success, true)
+  // No COGS reversal — cost is kept as a loss.
+  assert.equal(
+    result.success && result.accountingSyncs.some((s) => s.type === 'COGS_REVERSAL'),
+    false,
+  )
+  // No inventory restock — the customer keeps the goods.
+  assert.equal(result.success && result.returnedRows.length, 0)
+  assert.equal(state.movements.length, 0)
+  // The refund is recorded as a chargeback that staged NO reversal (fully shipped →
+  // credit-note-only), so the accounting evidence checks exempt it durably (scjz.71).
+  assert.equal(state.refunds[0]?.chargeback, true)
+  assert.equal(state.refunds[0]?.reversalStaged, false)
 })
 
 test('createSalesOrderRefund reverses kit COGS in component units, not kit units', async () => {
@@ -1953,6 +2012,36 @@ test('buildChargebackRefundLines: includes remaining shipping as a shipping-kind
   assert.equal(ship.productId, null)
   assert.equal(ship.qty, 0)
   assert.equal(ship.totalBase, 4) // 5.5 − 1.5 remaining
+})
+
+test('buildChargebackRefundLines: order discount mirrored as a negative discount line, goods at full value — scjz.71', () => {
+  // Goods 100 + shipping 10, a £10 order discount: the invoice posted full goods +
+  // a separate −10 discount line, so the chargeback mirrors it (no goods scaling).
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 100 }],
+    shipping: { totalBase: 10 },
+    discount: { totalBase: 10 },
+  })
+  const sale = lines.find((l) => l.lineKind === 'sale')!
+  const ship = lines.find((l) => l.lineKind === 'shipping')!
+  const disc = lines.find((l) => l.lineKind === 'discount')!
+  assert.equal(sale.totalBase, 100) // goods at FULL value — not scaled
+  assert.equal(ship.totalBase, 10)
+  assert.equal(disc.totalBase, -10) // negative discount line, mirrors the invoice
+  assert.equal(disc.productId, null)
+  assert.equal(disc.qty, 0)
+  // Net reversed = goods + shipping − discount = the order's net total.
+  assert.equal(sale.totalBase + ship.totalBase + disc.totalBase, 100)
+})
+
+test('buildChargebackRefundLines: no discount line emitted when no order discount — scjz.71', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 2, totalBase: 50 }],
+    shipping: { totalBase: 5 },
+  })
+  assert.equal(lines.find((l) => l.lineKind === 'sale')!.totalBase, 50)
+  assert.equal(lines.find((l) => l.lineKind === 'shipping')!.totalBase, 5)
+  assert.equal(lines.some((l) => l.lineKind === 'discount'), false)
 })
 
 test('buildChargebackRefundLines: fully-refunded shipping is dropped', () => {

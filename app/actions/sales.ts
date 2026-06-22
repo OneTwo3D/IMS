@@ -35,6 +35,7 @@ import {
 } from '@/lib/accounting-fx'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
+  buildChargebackRefundLines,
   createSalesOrderRefund,
   retrySalesOrderRefundAccounting,
   type CreatedRefundLine,
@@ -1585,7 +1586,9 @@ async function queueRefundAccountingActions(input: {
           : (line.qty > 0 ? line.unitPriceForeign : line.totalForeign),
         accountCode: line.lineKind === 'shipping'
           ? (settings.shippingAccount || settings.salesAccount)
-          : settings.salesAccount,
+          : line.lineKind === 'discount'
+            ? (settings.discountAccount || settings.salesAccount)
+            : settings.salesAccount,
         taxType: (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined) ?? fallbackCnTaxType,
       })),
       lineAmountsIncludeTax: false,
@@ -1647,7 +1650,13 @@ async function loadRefundAccountingQueueInput(
       unitPriceBase: decimalToNumber(line.unitPriceBase),
       totalForeign: decimalToNumber(line.totalForeign),
       totalBase: decimalToNumber(line.totalBase),
-      lineKind: line.productId ? 'sale' : 'shipping',
+      // lineKind isn't persisted: a null-product line is shipping, UNLESS its total is
+      // negative — that's the mirrored order-discount line, which must reload as
+      // 'discount' so an accounting RETRY re-posts it to the discount account (not
+      // shipping). Matches the replay reconstruction in refund-service.
+      lineKind: line.productId
+        ? 'sale'
+        : (decimalToNumber(line.totalBase) < 0 ? 'discount' : 'shipping'),
     })),
     accountingSyncs,
   }
@@ -1681,7 +1690,7 @@ export async function createRefund(
   lines: RefundRequestLine[],
   reason: string,
   returnWarehouseId?: string,
-  options?: { internalBypassToken?: symbol; externalRefundId?: number },
+  options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
 ): Promise<{ success: boolean; error?: string; warning?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
@@ -1690,7 +1699,9 @@ export async function createRefund(
 
     const { getNumberingFormats } = await import('./company')
     const [numbering, accountingSettings] = await Promise.all([
-      getNumberingFormats(),
+      // scjz.71: internal callers (the payment-poller chargeback) have no session, so
+      // pass the bypass through to skip getNumberingFormats' requireAuth (NEXT_REDIRECT).
+      getNumberingFormats(options?.internalBypassToken ? { internalBypassToken: options.internalBypassToken } : undefined),
       getAccountingSettings().catch(() => null),
     ])
 
@@ -1702,6 +1713,9 @@ export async function createRefund(
       externalRefundId: options?.externalRefundId,
       creditNotePrefix: numbering.cn_prefix,
       accountingSettings,
+      // scjz.70: revenue-only chargeback (credit note reverses recognised revenue,
+      // COGS + restock suppressed). Used by the payment-poller on a payment reversal.
+      chargeback: options?.chargeback,
     })
     if (!refundResult.success) return refundResult
 
@@ -1829,6 +1843,167 @@ export async function createRefund(
     })
     return { success: false, error: String(e) }
   }
+}
+
+/**
+ * scjz.71: raise a revenue-only chargeback for an order whose payment was reversed
+ * (detected by the payment-poller). Idempotent — at most one chargeback per order;
+ * a second call (e.g. a later poll) is a no-op. Builds the full remaining-order
+ * refund lines + shipping and runs the chargeback path (credit note reverses
+ * recognised revenue against AR; COGS kept as a loss; no restock). Internal/cron
+ * context, so it bypasses the interactive permission check.
+ */
+export async function raiseChargebackForReversedOrder(
+  orderId: string,
+  options?: { internalBypassToken?: symbol },
+): Promise<{ raised: boolean; reason?: string; error?: string }> {
+  // SECURITY: this is a privileged path — it calls createRefund with
+  // INTERNAL_ACTION_BYPASS, skipping the sales.refund permission. As an export of a
+  // 'use server' module it is reachable as a Server Function via direct POST, so it
+  // must gate itself exactly like createRefund: the in-process payment-poller passes
+  // the unforgeable symbol token; any network caller (which cannot transmit a JS
+  // symbol over the RPC boundary) falls through to the sales.refund permission check.
+  if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+    await requirePermission('sales.refund')
+  }
+  // Idempotency: one chargeback per order. A prior chargeback means the refund row
+  // already exists (avoids duplicate credit notes). BUT if that chargeback's
+  // accounting (credit-note / reversal staging) hasn't completed yet
+  // (accountingRetryRequired), the financial reversal is NOT done — surface an error
+  // so the payment poller holds paidAt and re-surfaces the failure instead of
+  // clearing payment state on an incomplete reversal. The refund-accounting retry
+  // sweep re-queues the credit note; once it succeeds the flag clears and a later
+  // poll returns the benign "already exists".
+  const existingChargeback = await db.salesOrderRefund.findFirst({
+    where: { orderId, chargeback: true },
+    select: { id: true, accountingRetryRequired: true },
+  })
+  if (existingChargeback) {
+    if (existingChargeback.accountingRetryRequired) {
+      return { raised: false, error: 'chargeback exists but its accounting reversal is still pending retry' }
+    }
+    return { raised: false, reason: 'chargeback already exists' }
+  }
+
+  const order = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      shippingBase: true,
+      totalBase: true,
+      taxBase: true,
+      discountAmount: true,
+      fxRateToBase: true,
+      pricesIncludeVat: true,
+      taxRatePercent: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
+      shipments: { select: { status: true, shipmentJournalDate: true } },
+      refunds: { select: { id: true } },
+    },
+  })
+  if (!order) return { raised: false, error: 'Order not found' }
+
+  // Codex P2: a chargeback marks the order REFUNDED and keeps the dispatched-stock
+  // COGS as a loss (no reversal). That is only correct once the dispatch has been
+  // journaled by the Group B daily batch — Group B EXCLUDES REFUNDED orders, so
+  // charging back a shipped-but-unjournaled order would mean its COGS never posts at
+  // all (and the allocation could be unwound as if the stock were still on hand).
+  // Defer until every shipped shipment is journaled: surface an error so the poller
+  // holds paidAt and re-attempts after the next Group B run posts the COGS.
+  if (order.shipments.some((s) => s.status === 'SHIPPED' && s.shipmentJournalDate == null)) {
+    return { raised: false, error: 'shipped quantity not yet journaled by the daily batch — deferring chargeback until COGS is posted' }
+  }
+
+  // A chargeback unwinds the WHOLE remaining order. Prior partial refunds make the
+  // remaining balance ambiguous — amount-only/ad-hoc refunds aren't tied to a line, a
+  // prior refund may have already reversed part of the discount/shipping, etc. — so the
+  // auto-mirror can over- or under-credit. Safe-skip any previously-refunded order to
+  // manual handling; the common chargeback case (payment reversal, no prior refund) is
+  // fully covered.
+  if (order.refunds.length > 0) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'chargeback_requires_manual_handling',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} that already has prior refunds — auto-chargeback skipped (remaining balance is ambiguous); raise the credit note manually.`,
+      resolveUser: false,
+    })
+    return { raised: false, reason: 'order has prior refunds — manual chargeback required' }
+  }
+
+  // scjz.71: chargeback lines are NET (ex-tax) — they match the credit note's net
+  // unitAmounts, and the credit note carries the order's per-line taxType
+  // (lineAmountsIncludeTax: false) so Xero grosses them back up to reverse the full
+  // tax-inclusive AR. createSalesOrderRefund compares the net refund total against the
+  // net order total for chargebacks so a full taxable unwind reads as REFUNDED.
+  // Taxable + non-taxable are both handled; non-taxable simply has taxBase 0.
+  // An order-level discount is mirrored as a separate negative discount line below
+  // (exactly as the invoice posted it), not spread across the goods.
+
+  // scjz.71: order-level discount handling mirrors the invoice. The invoice posts the
+  // discount as a SEPARATE negative line to settings.discountAccount only when that
+  // account is configured (otherwise it posted no discount line — full goods). And a
+  // discount combined with prior partial refunds makes the remaining discount basis
+  // ambiguous. Safe-skip both edge cases to manual; otherwise pass the discount through
+  // as its own mirrored line (in BASE currency = discountAmount / fxRateToBase).
+  let discountInput: { totalBase: number } | undefined
+  if (decimalToNumber(order.discountAmount) > 0) {
+    const cbSettings = await getAccountingSettings().catch(() => null)
+    // The invoice only posts a separate discount line when a discount account is
+    // configured (otherwise it posted full goods, no discount line). Without one we
+    // can't mirror it — safe-skip to manual. (Prior-refund orders were already skipped.)
+    if (!cbSettings?.discountAccount) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'chargeback_requires_manual_handling',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount but no discount account is configured — auto-chargeback skipped; raise the credit note manually.`,
+        resolveUser: false,
+      })
+      return { raised: false, reason: 'order-level discount but no discount account — manual chargeback required' }
+    }
+    // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
+    // is false). discountAmount is stored in the order's inclusive/exclusive convention,
+    // so strip VAT when the order is tax-inclusive, then to base currency.
+    const fxRate = decimalToNumber(order.fxRateToBase) || 1
+    const vatPct = decimalToNumber(order.taxRatePercent)
+    const discountForeignNet = order.pricesIncludeVat && vatPct > 0
+      ? decimalToNumber(order.discountAmount) / (1 + vatPct)
+      : decimalToNumber(order.discountAmount)
+    discountInput = { totalBase: discountForeignNet / fxRate }
+  }
+
+  const lines = buildChargebackRefundLines({
+    lines: order.lines.map((line) => ({
+      lineId: line.id,
+      productId: line.productId,
+      description: line.description,
+      qty: decimalToNumber(line.qty),
+      totalBase: decimalToNumber(line.totalBase),
+    })),
+    shipping: { totalBase: decimalToNumber(order.shippingBase) },
+    discount: discountInput,
+  })
+  if (lines.length === 0) return { raised: false, reason: 'nothing left to charge back' }
+
+  const result = await createRefund(orderId, lines, 'Payment reversed (chargeback)', undefined, {
+    internalBypassToken: INTERNAL_ACTION_BYPASS,
+    chargeback: true,
+  })
+  // A surfaced accounting warning means the refund row was created but its
+  // credit-note / reversal staging did not fully complete. Treat it as an error so
+  // the payment poller logs the failure and leaves paidAt set, rather than silently
+  // advancing as if the chargeback fully posted — the existing-chargeback pre-check
+  // would otherwise block any further automatic attempt. The refund's
+  // accountingRetryRequired flag still drives the refund-accounting retry sweep that
+  // re-queues the failed credit note.
+  if (result.warning) return { raised: false, error: result.warning }
+  return { raised: result.success, error: result.error }
 }
 
 export async function retryRefundAccounting(

@@ -58,6 +58,13 @@ type SalesOrderAccountingRow = {
     accountingRetryRequired: boolean
     accountingWarning: string | null
     accountingRetrySyncs: unknown
+    // scjz.70: a revenue-only chargeback intentionally posts NO COGS/unearned
+    // reversal (only the credit note), so it must be exempt from the reversal-
+    // evidence requirement below. Optional: the Prisma select always provides it;
+    // absent (e.g. legacy fixtures) is treated as a normal (non-chargeback) refund.
+    chargeback?: boolean
+    // scjz.71: durable — whether a COGS/unearned reversal was staged for this refund.
+    reversalStaged?: boolean
   }>
 }
 
@@ -588,6 +595,12 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
 
     for (const refund of order.refunds) {
       const refundRetryTypes = retrySyncTypes(refund.accountingRetrySyncs)
+      // scjz.70/.71: a chargeback is exempt from the reversal-evidence requirement
+      // ONLY when it staged no COGS/unearned reversal (fully-shipped, credit-note-only).
+      // A partial/deferred chargeback that staged an UNEARNED_REV_REVERSAL must still
+      // have that evidence. `reversalStaged` is a DURABLE per-refund flag set at staging
+      // time (accountingRetrySyncs is cleared once syncs queue, so it can't carry this).
+      const chargebackExemptReversal = Boolean(refund.chargeback) && !refund.reversalStaged
       const hasPostedShipment = postedShipments.length > 0
       if (!hasPostedShipment) continue
 
@@ -617,7 +630,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         refundRetryTypes.size > 0 &&
         (
           !hasCreditNoteEvidence ||
-          (decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence)
+          (decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !chargebackExemptReversal)
         )
       ) {
         findings.push({
@@ -650,7 +663,10 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         })
       }
 
-      if (!hasReversalEvidence && !refund.accountingRetryRequired && decimalToNumber(refund.totalBase) > 0) {
+      // scjz.70: a fully-shipped chargeback stages no COGS/unearned reversal (credit
+      // note only), so don't flag it; but a partial/deferred chargeback that staged
+      // an UNEARNED_REV_REVERSAL is still required to have that evidence.
+      if (!hasReversalEvidence && !refund.accountingRetryRequired && !chargebackExemptReversal && decimalToNumber(refund.totalBase) > 0) {
         findings.push({
           severity: 'warning',
           code: 'refund_missing_reversal_sync',
@@ -766,6 +782,8 @@ export async function collectAccountingInvariantRows(
             accountingRetryRequired: true,
             accountingWarning: true,
             accountingRetrySyncs: true,
+            chargeback: true,
+            reversalStaged: true,
           },
         },
       },
