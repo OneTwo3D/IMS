@@ -1443,6 +1443,7 @@ export async function createSalesOrderRefund(
         status: true,
         fxRateToBase: true,
         totalBase: true,
+        taxBase: true,
         taxRatePercent: true,
         pricesIncludeVat: true,
         revenueDeferredDate: true,
@@ -1637,7 +1638,16 @@ export async function createSalesOrderRefund(
     }
 
     const totalRefundedNow = previouslyRefunded + totalBase
-    const orderTotal = refundBoundaryNumber(so.totalBase)
+    // Chargebacks unwind recognised revenue on the NET (ex-VAT) basis: the refund
+    // lines are stored net and the credit note grosses them back up via taxType to
+    // reverse the full gross AR. Refund totals (here and in priorRefunded) are net,
+    // so a full chargeback sums to (totalBase − taxBase). Compare against that net
+    // order total — comparing against the gross so.totalBase would leave a full
+    // revenue unwind stuck at PARTIALLY_REFUNDED on taxable orders. Non-taxable
+    // orders have taxBase 0, so this is identical to the gross basis for them.
+    const orderTotal = input.chargeback
+      ? Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase))
+      : refundBoundaryNumber(so.totalBase)
     const newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED' = isFullRefundAmount(totalRefundedNow, orderTotal)
       ? 'REFUNDED'
       : 'PARTIALLY_REFUNDED'

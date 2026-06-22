@@ -1875,24 +1875,12 @@ export async function raiseChargebackForReversedOrder(
   if (!order) return { raised: false, error: 'Order not found' }
 
   // scjz.71: chargeback lines are NET (ex-tax) — they match the credit note's net
-  // unitAmounts. For a TAXABLE order the net/gross basis interacts with the credit
-  // note's tax posting AND with createSalesOrderRefund's REFUNDED-vs-PARTIALLY decision
-  // (which compares the refund total to the tax-INCLUSIVE order total), so a full
-  // taxable chargeback could mis-post tax or stay PARTIALLY_REFUNDED. Until that tax
-  // basis is validated on the Xero Demo sandbox, only auto-post for non-taxable orders
-  // (net == gross — fully consistent); surface taxable reversals for manual handling.
-  if (decimalToNumber(order.taxBase) !== 0) {
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: 'chargeback_requires_manual_handling',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: `Payment reversed on taxable order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} — auto-chargeback skipped pending sandbox validation of the tax basis; raise the credit note manually.`,
-      resolveUser: false,
-    })
-    return { raised: false, reason: 'taxable order — manual chargeback required pending sandbox validation' }
-  }
+  // unitAmounts, and the credit note carries the order's per-line taxType
+  // (lineAmountsIncludeTax: false) so Xero grosses them back up to reverse the full
+  // tax-inclusive AR. The net target below (totalBase − taxBase) drives the line
+  // scaling, and createSalesOrderRefund compares the net refund total against the
+  // net order total for chargebacks so a full taxable unwind reads as REFUNDED.
+  // Taxable + non-taxable are both handled; non-taxable simply has taxBase 0.
 
   // Aggregate prior refunded qty/value per sales line, prior refunded shipping (refund
   // lines with no sales-line + no product are shipping/ad-hoc), and the prior refunded
