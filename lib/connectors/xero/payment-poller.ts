@@ -23,18 +23,22 @@ type XeroInvoicesResponse = {
 // audit-M-acct #3: an invoice IMS marked paid is "reversed" if it's no longer
 // PAID in Xero. After a payment is removed it returns to AUTHORISED; a voided
 // invoice becomes VOIDED. Both signal IMS should clear paidAt, so collect both.
-async function fetchReversedInvoiceIds(type: 'ACCREC' | 'ACCPAY', lastPoll: string): Promise<Set<string>> {
+async function fetchReversedInvoiceIds(type: 'ACCREC' | 'ACCPAY', lastPoll: string): Promise<{ all: Set<string>; voided: Set<string> }> {
   const modifiedAfter = new Date(lastPoll).toISOString()
-  const ids = new Set<string>()
+  const all = new Set<string>()
+  const voided = new Set<string>()
   for (const status of ['AUTHORISED', 'VOIDED'] as const) {
     const res = await xeroGet<XeroInvoicesResponse>(
       `Invoices?where=Type=="${type}"&&Status=="${status}"&ModifiedAfter=${modifiedAfter}`,
     )
     if (res.ok && res.data?.Invoices) {
-      for (const invoice of res.data.Invoices) ids.add(invoice.InvoiceID)
+      for (const invoice of res.data.Invoices) {
+        all.add(invoice.InvoiceID)
+        if (status === 'VOIDED') voided.add(invoice.InvoiceID)
+      }
     }
   }
-  return ids
+  return { all, voided }
 }
 
 export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[] }> {
@@ -123,7 +127,7 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     })
     if (paidManualOrders.length > 0) {
       const reversedIds = await fetchReversedInvoiceIds('ACCREC', lastPoll)
-      for (const order of detectPaymentReversals(paidManualOrders, reversedIds)) {
+      for (const order of detectPaymentReversals(paidManualOrders, reversedIds.all)) {
         // scjz.71: a reversed payment on a revenue-POSTED order (revenue recognised +
         // invoiced) is a chargeback — raise a revenue-only credit note that reverses
         // recognised revenue against AR (COGS kept as a loss, no restock). Idempotent
@@ -131,8 +135,12 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
         // CRITICAL: clear paidAt ONLY after the chargeback is recorded — otherwise a
         // failed chargeback would drop the order out of the next poll's paidManualOrders
         // (paidAt: not null) and the recognised revenue would never be reversed (Codex P1).
+        // A VOIDED invoice has already had its AR/revenue reversed by Xero, so a
+        // separate credit note would double-reverse — only auto-chargeback an
+        // AUTHORISED payment removal where the invoice is still live (Codex P2).
+        const invoiceVoided = order.accountingInvoiceId != null && reversedIds.voided.has(order.accountingInvoiceId)
         let chargebackFailed = false
-        if (order.revenueDeferredDate) {
+        if (order.revenueDeferredDate && !invoiceVoided) {
           try {
             const { raiseChargebackForReversedOrder } = await import('@/app/actions/sales')
             const chargeback = await raiseChargebackForReversedOrder(order.id)
@@ -220,7 +228,7 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     })
     if (paidBills.length > 0) {
       const reversedIds = await fetchReversedInvoiceIds('ACCPAY', lastPoll)
-      for (const bill of detectPaymentReversals(paidBills, reversedIds)) {
+      for (const bill of detectPaymentReversals(paidBills, reversedIds.all)) {
         await db.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
         result.billsReversed++
         await logActivity({

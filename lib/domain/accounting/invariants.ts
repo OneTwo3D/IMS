@@ -593,11 +593,16 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
 
     for (const refund of order.refunds) {
       const refundRetryTypes = retrySyncTypes(refund.accountingRetrySyncs)
-      // scjz.70: accountingRetrySyncs records the staged service syncs (even on
-      // success), so this tells whether the refund actually staged a COGS/unearned
-      // reversal. A chargeback is exempt from the reversal-evidence requirement ONLY
-      // when it staged none (fully-shipped, credit-note-only); a partial/deferred
-      // chargeback that DID stage an UNEARNED_REV_REVERSAL must still require it.
+      // scjz.70: a chargeback is exempt from the reversal-evidence requirement when
+      // it staged no COGS/unearned reversal (fully-shipped, credit-note-only); a
+      // partial/deferred chargeback that staged an UNEARNED_REV_REVERSAL must still
+      // require it.
+      // TODO(scjz.71 sandbox continuation): `stagedReversal` is derived from
+      // accountingRetrySyncs, which is CLEARED once the syncs queue successfully
+      // (app/actions/sales.ts), so for a *completed* deferred chargeback this reads
+      // false and the exemption is effectively blanket — under-reporting a deferred
+      // chargeback whose UNEARNED_REV_REVERSAL later failed (Codex P2). Replace with a
+      // DURABLE per-refund record of the staged reversal types (mirror in reconciliation.ts).
       const stagedReversal = [...refundRetryTypes].some((type) => REFUND_REVERSAL_TYPES.has(type))
       const chargebackExemptReversal = Boolean(refund.chargeback) && !stagedReversal
       const hasPostedShipment = postedShipments.length > 0
