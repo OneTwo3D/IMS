@@ -1681,7 +1681,7 @@ export async function createRefund(
   lines: RefundRequestLine[],
   reason: string,
   returnWarehouseId?: string,
-  options?: { internalBypassToken?: symbol; externalRefundId?: number },
+  options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
 ): Promise<{ success: boolean; error?: string; warning?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
@@ -1702,6 +1702,9 @@ export async function createRefund(
       externalRefundId: options?.externalRefundId,
       creditNotePrefix: numbering.cn_prefix,
       accountingSettings,
+      // scjz.70: revenue-only chargeback (credit note reverses recognised revenue,
+      // COGS + restock suppressed). Used by the payment-poller on a payment reversal.
+      chargeback: options?.chargeback,
     })
     if (!refundResult.success) return refundResult
 

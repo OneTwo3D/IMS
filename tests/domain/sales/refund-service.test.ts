@@ -58,6 +58,7 @@ type Refund = {
   totalForeign: number
   totalBase: number
   returnWarehouseId: string | null
+  chargeback?: boolean
   accountingRetryRequired?: boolean
   accountingWarning?: string | null
   accountingRetrySyncs?: unknown
@@ -749,6 +750,61 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+})
+
+test('createSalesOrderRefund chargeback mode suppresses COGS reversal AND restock (scjz.70)', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Payment reversed (chargeback)',
+    // A warehouse is supplied to prove the chargeback suppresses restock regardless.
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    chargeback: true,
+  })
+
+  assert.equal(result.success, true)
+  // No COGS reversal — cost is kept as a loss.
+  assert.equal(
+    result.success && result.accountingSyncs.some((s) => s.type === 'COGS_REVERSAL'),
+    false,
+  )
+  // No inventory restock — the customer keeps the goods.
+  assert.equal(result.success && result.returnedRows.length, 0)
+  assert.equal(state.movements.length, 0)
+  // The refund is still recorded as a chargeback.
+  assert.equal(state.refunds[0]?.chargeback, true)
 })
 
 test('createSalesOrderRefund reverses kit COGS in component units, not kit units', async () => {

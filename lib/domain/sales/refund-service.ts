@@ -791,6 +791,8 @@ async function stageRefundAccountingReversals(
       unearnedRevenueAmount: Prisma.Decimal | number | string | null
     }
     newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED'
+    /** scjz.70: revenue-only chargeback — suppress the COGS reversal (cost kept as a loss). */
+    chargeback?: boolean
   },
 ): Promise<{
   accountingSyncs: RefundAccountingSyncRequest[]
@@ -1264,7 +1266,11 @@ async function stageRefundAccountingReversals(
     }
   })
 
-  if (reversalAmounts.cogsReversal > 0) {
+  // scjz.70: a chargeback is a revenue-only unwind — the credit note reverses
+  // recognised revenue against AR, but COGS is intentionally KEPT (booked as a
+  // loss), so suppress the COGS reversal. Restock is suppressed separately in
+  // createSalesOrderRefund (the goods are not returned in a chargeback).
+  if (reversalAmounts.cogsReversal > 0 && !params.chargeback) {
     accountingSyncs.push({
       type: 'COGS_REVERSAL',
       referenceType: 'SalesOrderRefund',
@@ -1370,6 +1376,13 @@ export async function createSalesOrderRefund(
     externalRefundId?: number
     creditNotePrefix: string
     accountingSettings?: AccountingSettings | null
+    /**
+     * scjz.70: revenue-only chargeback. The credit note still reverses recognised
+     * revenue against AR, but COGS reversal and inventory restock are suppressed —
+     * the customer keeps the goods and the cost is booked as a loss. Used by the
+     * payment-poller when a payment reversal (chargeback) is detected.
+     */
+    chargeback?: boolean
   },
 ): Promise<CreateSalesOrderRefundResult> {
   const refundLines = input.lines.filter((line) => line.qty > 0 || line.totalBase > 0)
@@ -1532,6 +1545,9 @@ export async function createSalesOrderRefund(
         totalForeign,
         totalBase,
         returnWarehouseId: input.returnWarehouseId || null,
+        // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
+        // the stored syncs) reproduces the revenue-only treatment.
+        chargeback: input.chargeback ?? false,
       },
       select: { id: true },
     })
@@ -1649,6 +1665,7 @@ export async function createSalesOrderRefund(
         accountingSettings: input.accountingSettings,
         so: txResult.so,
         newStatus: txResult.newStatus,
+        chargeback: input.chargeback,
       })
       accountingSyncs = staged.accountingSyncs
       snapshotReturnRows = staged.snapshotReturnRows
@@ -1671,7 +1688,9 @@ export async function createSalesOrderRefund(
   }
 
   let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
-  if (input.returnWarehouseId && !accountingWarning) {
+  // scjz.70: a chargeback does NOT restock — the customer keeps the goods, the
+  // cost stays as a loss. Skip the inbound return movement even if a warehouse is set.
+  if (input.returnWarehouseId && !accountingWarning && !input.chargeback) {
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
@@ -1722,6 +1741,7 @@ export async function retrySalesOrderRefundAccounting(
           id: true,
           orderId: true,
           returnWarehouseId: true,
+          chargeback: true,
           accountingRetryRequired: true,
           accountingRetrySyncs: true,
           order: {
@@ -1798,10 +1818,11 @@ export async function retrySalesOrderRefundAccounting(
         accountingSettings: input.accountingSettings,
         so: refund.order,
         newStatus,
+        chargeback: refund.chargeback,
       })
 
       let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
-      if (refund.returnWarehouseId) {
+      if (refund.returnWarehouseId && !refund.chargeback) {
         const snapshotRows = staged.snapshotReturnRows ?? []
         const returnRows = snapshotRows.length > 0
           ? snapshotRows
