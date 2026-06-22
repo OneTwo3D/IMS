@@ -1188,13 +1188,21 @@ async function stageRefundAccountingReversals(
       shippedQtyRevenue += allocation.shippedRevenue
       unshippedQtyRevenue += allocation.unshippedRevenue
 
+      // scjz.70: a chargeback is a revenue-only unwind — it neither reverses COGS
+      // nor restocks, so skip the cost-layer consume entirely. This keeps the
+      // revenue allocation above (which feeds the unearned-revenue reversal) while
+      // leaving cogsReversal/allocationReversal at zero, and avoids "Cannot reverse
+      // COGS…" failures on stale/missing snapshots that would otherwise strand a
+      // valid chargeback in accounting retry (Codex).
       const costSnapshot: CostLayerSnapshotEntry[] = []
-      for (const lineAllocation of allocation.lineAllocations) {
-        if (lineAllocation.shippedQty > 0) {
-          costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
-        }
-        if (lineAllocation.unshippedQty > 0) {
-          costSnapshot.push(...consumeAllocationCostForLine(lineAllocation.lineId, lineAllocation.unshippedQty))
+      if (!params.chargeback) {
+        for (const lineAllocation of allocation.lineAllocations) {
+          if (lineAllocation.shippedQty > 0) {
+            costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
+          }
+          if (lineAllocation.unshippedQty > 0) {
+            costSnapshot.push(...consumeAllocationCostForLine(lineAllocation.lineId, lineAllocation.unshippedQty))
+          }
         }
       }
       refundLayerSnapshots.set(refundLine.id, costSnapshot)
