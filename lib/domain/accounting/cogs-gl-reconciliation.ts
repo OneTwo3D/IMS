@@ -52,6 +52,7 @@ export type CogsGlReconciliationUnavailableReason =
   | 'no_account_configured'
   | 'no_gl_snapshot'
   | 'no_opening_snapshot'
+  | 'ledger_not_covering_window'
 
 export type CogsGlReconciliationResult = AccountGlReconciliationResult<CogsGlReconciliationUnavailableReason>
 
@@ -111,6 +112,22 @@ export async function loadCogsGlReconciliation(options?: {
       return { available: false, reason: 'no_opening_snapshot' }
     }
     throw error
+  }
+
+  // Coverage gate (khdw): the ledger is append-only and starts EMPTY at deploy — it
+  // has no pre-deploy history. Reconciling a window that opened before the ledger
+  // began recording would compare a real GL movement against a partial/empty
+  // subledger and FLAG a false mismatch. So only reconcile windows the ledger fully
+  // covers: its earliest row must have been recorded on or before the window's
+  // opening date (every in-window posting is dated strictly after that, hence after
+  // the ledger went live). Before that, degrade to unavailable (never flag).
+  const firstLedgerRow = await db.cogsSubledgerMovement.findFirst({
+    orderBy: { createdAt: 'asc' },
+    select: { createdAt: true },
+  })
+  if (!firstLedgerRow) return { available: false, reason: 'ledger_not_covering_window' }
+  if (balanceDateString(firstLedgerRow.createdAt) > balanceDateString(movement.opening.balanceDate)) {
+    return { available: false, reason: 'ledger_not_covering_window' }
   }
 
   const subledgerValue = await sumCogsSubledgerMovement(movement.opening.balanceDate, movement.closing.balanceDate)
