@@ -129,7 +129,12 @@ export async function loadCogsGlReconciliation(options?: {
     select: { value: true },
   })
   const coverageStart = coverageRow?.value?.trim()
-  if (!coverageStart) return { available: false, reason: 'ledger_not_covering_window' }
+  // Fail closed: a missing or malformed watermark must NEVER let reconciliation run
+  // against an incompletely-covered ledger (which would false-flag). Only a strict
+  // ISO YYYY-MM-DD watermark is trusted.
+  if (!coverageStart || !/^\d{4}-\d{2}-\d{2}$/.test(coverageStart)) {
+    return { available: false, reason: 'ledger_not_covering_window' }
+  }
   if (balanceDateString(movement.opening.balanceDate) < coverageStart) {
     return { available: false, reason: 'ledger_not_covering_window' }
   }
