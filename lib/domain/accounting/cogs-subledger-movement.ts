@@ -28,8 +28,15 @@ export type CogsSubledgerMovementSource =
 
 type CogsSubledgerMovementClient = Pick<Prisma.TransactionClient, 'cogsSubledgerMovement'>
 
+// Normalise every journal date to UTC date-only (midnight). The reconciliation
+// window is the half-open (opening, closing] between two GL balance-snapshot dates,
+// which are themselves date-only — so a row carrying a wall-clock time would fall
+// OUTSIDE its own GL day's window (e.g. a dispatch posted 15:00 on the closing date
+// is > the closing midnight bound) and the day would perpetually flag. Date inputs
+// (dispatch passes `new Date()`) MUST be truncated to match the string callers.
 function toJournalDate(value: Date | string): Date {
-  return typeof value === 'string' ? new Date(`${value.slice(0, 10)}T00:00:00.000Z`) : value
+  const isoDay = (typeof value === 'string' ? value : value.toISOString()).slice(0, 10)
+  return new Date(`${isoDay}T00:00:00.000Z`)
 }
 
 export async function recordCogsSubledgerMovement(

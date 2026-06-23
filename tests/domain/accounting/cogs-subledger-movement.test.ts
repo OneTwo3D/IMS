@@ -35,6 +35,22 @@ test('records a signed movement, coercing a YYYY-MM-DD journal date to UTC midni
   assert.deepEqual(upserts[0]!.update, {})
 })
 
+test('truncates a Date with a wall-clock time to UTC midnight (dispatch new Date() path)', async () => {
+  // Regression: DISPATCH records `new Date()` (carries a time). The recon window is
+  // (opening, closing] between two date-only GL snapshots, so a row dated mid-afternoon
+  // on the closing date would fall OUTSIDE its own day's window and perpetually flag.
+  const { upserts, client } = mockClient()
+  await recordCogsSubledgerMovement(client, {
+    sourceType: 'DISPATCH',
+    sourceRef: 'shp_9',
+    idempotencyKey: 'dispatch:shp_9',
+    baseDelta: 99.5,
+    journalDate: new Date('2026-06-20T15:30:45.123Z'),
+  })
+  assert.equal(upserts.length, 1)
+  assert.equal(upserts[0]!.create.journalDate.toISOString(), '2026-06-20T00:00:00.000Z')
+})
+
 test('a zero movement is skipped (no ledger noise)', async () => {
   const { upserts, client } = mockClient()
   await recordCogsSubledgerMovement(client, {
