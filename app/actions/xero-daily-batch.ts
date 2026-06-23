@@ -13,6 +13,7 @@ import {
   batchContainsFinalUnjournaledShipment,
 } from '@/lib/domain/accounting/deferred-trueup'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { takeDailyBatchWindow, resolveXeroDailyBatchLimit } from '@/lib/connectors/xero/daily-sync'
 import {
   addMoney,
   multiplyMoney,
@@ -231,7 +232,13 @@ async function computePreview(): Promise<DailyBatchPreview> {
 
   // --- B: shipped shipments whose order has completed A1+A2 but that
   //     haven't had revenue recognised yet ---
-  const bShipments = await db.shipment.findMany({
+  // Apply the SAME batch window the live cron uses (take: batchLimit + 1 →
+  // takeDailyBatchWindow). Otherwise the preview, seeing every unjournaled
+  // shipment, would mark an order's true-up as final while live Xero splits its
+  // shipments across XERO_DAILY_BATCH_LIMIT runs and defers it — overstating the
+  // next batch's revenue (scjz.68/.69 parity).
+  const bBatchLimit = resolveXeroDailyBatchLimit()
+  const bShipments = takeDailyBatchWindow(await db.shipment.findMany({
     where: {
       status: 'SHIPPED',
       shipmentJournalDate: null,
@@ -275,7 +282,8 @@ async function computePreview(): Promise<DailyBatchPreview> {
       },
     },
     orderBy: { createdAt: 'asc' },
-  })
+    take: bBatchLimit + 1,
+  }), bBatchLimit).rows
 
   // Mirror the cron daily-sync's grouped revenue recognition so the preview
   // matches what actually posts (cogs-audit scjz.69). The naive per-shipment
