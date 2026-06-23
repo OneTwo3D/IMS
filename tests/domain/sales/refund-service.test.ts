@@ -119,6 +119,7 @@ type State = {
     productComponents: Array<{ componentId: string; qty: number; component: { sku: string; type: string; oversellAllowed: boolean } }>
   }>
   activityLogs: unknown[]
+  cogsSubledgerMovements: unknown[]
   settings: Record<string, string>
   executeRawCalls: number
   nextRefundId: number
@@ -201,6 +202,7 @@ function baseState(overrides: Partial<State> = {}): State {
     cogsEntries: [],
     stockLevels: [],
     activityLogs: [],
+    cogsSubledgerMovements: [],
     settings: {},
     executeRawCalls: 0,
     nextRefundId: 1,
@@ -370,6 +372,13 @@ function createClient(state: State): RefundServiceClient {
     },
     accountingSyncLog: {
       findMany: async () => [],
+    },
+    cogsSubledgerMovement: {
+      // khdw: refund staging records the COGS reversal into the subledger ledger.
+      upsert: async ({ create }: { create: Record<string, unknown> }) => {
+        state.cogsSubledgerMovements.push(create)
+        return create
+      },
     },
     activityLog: {
       create: async ({ data }: { data: unknown }) => {

@@ -166,6 +166,9 @@ enum AccountingSyncType {
   // rounding residue to the configured rounding-difference account (guarded; only
   // when the gap is within the sweep tolerance — material gaps are flagged, never swept).
   DAILY_BATCH_INVENTORY_RECONCILIATION
+  // khdw: end-of-daily-batch sweep of the COGS subledger-vs-GL rounding residue
+  // (same guard as inventory — sub-penny sweep, material gaps flagged never swept).
+  DAILY_BATCH_COGS_RECONCILIATION
   UNEARNED_REV_REVERSAL
   BILL_PAYMENT
   REALISED_FX_JOURNAL
@@ -840,6 +843,32 @@ model CogsEntry {
   movement      StockMovement     @relation(fields: [movementId], references: [id])
 
   @@map("cogs_entries")
+}
+
+/// khdw: independent subledger of GL COGS-account movements, used by the daily-batch
+/// COGS subledger-vs-GL rounding reconciliation. One signed row per COGS-account
+/// posting that does NOT have a native structured home: refund COGS reversals,
+/// shipment COGS revaluations, and landed-cost COGS adjustments. (Dispatch COGS is
+/// reconciled from its native field Shipment.cogsBatchAmount, so it is not recorded
+/// here.) `baseDelta` is the signed base-currency COGS movement — positive = COGS
+/// debited (increased), negative = credited (decreased) — at the highest precision
+/// the source carries (6dp refund cost-layer total; 2dp-exact reval/landed-cost).
+/// `journalDate` is the GL date the movement posts on, so the reconciliation windows
+/// it the same way it windows Shipment.shipmentJournalDate on the dispatch side.
+model CogsSubledgerMovement {
+  id             String   @id @default(cuid())
+  // 'REFUND_REVERSAL' | 'SHIPMENT_REVALUATION' | 'LANDED_COST_ADJUSTMENT'
+  sourceType     String   @map("source_type")
+  // originating entity (refundId / shipmentId / purchaseOrderId) for traceability
+  sourceRef      String   @map("source_ref")
+  // dedupes re-staged/retried postings; mirrors the COGS journal's idempotency key
+  idempotencyKey String   @unique @map("idempotency_key")
+  baseDelta      Decimal  @db.Decimal(18, 6) @map("base_delta")
+  journalDate    DateTime @map("journal_date")
+  createdAt      DateTime @default(now())
+
+  @@index([journalDate])
+  @@map("cogs_subledger_movements")
 }
 
 /// Governed by additional db-native reporting guarantees from migration

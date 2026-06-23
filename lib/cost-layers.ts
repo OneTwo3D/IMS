@@ -11,6 +11,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, isAccountingSyncTypeEnabled, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
+import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import {
   addMoney,
   multiplyMoney,
@@ -122,12 +123,23 @@ async function queueShipmentCogsRevaluationSync(
   const isEnabled = options.isReversalPostingEnabled ?? (() => isAccountingSyncTypeEnabled('COGS_REVERSAL'))
   if (!(await isEnabled())) return false
 
+  const revaluationIdempotencyKey = `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}${options.recalcRunId ? `:${options.recalcRunId}` : ''}`
   await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
     type: 'COGS_REVERSAL',
     referenceType: 'Shipment',
     referenceId: input.shipmentId,
-    idempotencyKey: `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}${options.recalcRunId ? `:${options.recalcRunId}` : ''}`,
+    idempotencyKey: revaluationIdempotencyKey,
     payload,
+  })
+  // khdw: record the net COGS-account movement of this revaluation (reverse old +
+  // repost new → net debit = newCogs − oldCogs, both 2dp) in the COGS subledger
+  // ledger, keyed identically to the sync so it dedupes across retries.
+  await recordCogsSubledgerMovement(tx, {
+    sourceType: 'SHIPMENT_REVALUATION',
+    sourceRef: input.shipmentId,
+    idempotencyKey: revaluationIdempotencyKey,
+    baseDelta: toDecimal(payload.newCogsBase as number).sub(payload.oldCogsBase as number),
+    journalDate: payload.date as string,
   })
   return true
 }
