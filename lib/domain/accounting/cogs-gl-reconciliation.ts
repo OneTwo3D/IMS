@@ -33,19 +33,20 @@ import {
  * (Manufacturing/stock-adjustment movements write cogs_entries but post to OTHER
  * accounts, so raw cogs_entries is NOT the COGS subledger.)
  *
- * The independent subledger MOVEMENT over the same window is therefore:
+ * The independent subledger MOVEMENT over the same window is the sum of the signed
+ * cogs_subledger_movements ledger over the window:
  *
- *   Σ Shipment.cogsBatchAmount        (dispatch — shipmentJournalDate in window)
- * + Σ CogsSubledgerMovement.baseDelta (every OTHER COGS posting — journalDate in window)
+ *   Σ CogsSubledgerMovement.baseDelta   (journalDate in window)
  *
- * Dispatch keeps its native structured home (Shipment.cogsBatchAmount); every other
- * COGS-account posting (refund reversals, shipment revaluations, landed-cost
- * adjustments) records a signed row in the cogs_subledger_movements ledger at post
- * time (khdw). Both are keyed by the SAME GL date dimension the journal posts on, so
- * the subledger and GL windows line up by construction; the residue is purely the
- * per-batch rounding the sweep exists to absorb. Material gaps (a genuinely
- * missing/double posting, or a new COGS-account flow not yet recording to the
- * ledger) exceed the sweep limit and FLAG — never swept (the scjz.13 trap).
+ * EVERY COGS-account posting records a signed row at post time (khdw) — dispatch
+ * (positive), refund reversals (negative), revaluations and landed-cost adjustments
+ * (signed). Each row is immutable and keyed by the SAME GL date dimension the
+ * journal posts on, so subledger and GL windows line up by construction; the residue
+ * is purely the per-batch rounding the sweep exists to absorb. (Dispatch is NOT read
+ * live from the mutable Shipment.cogsBatchAmount, which revaluation overwrites in
+ * place — that would double-count a same-window dispatch+revaluation.) Material gaps
+ * (a genuinely missing/double posting, or a new COGS-account flow not yet recording
+ * to the ledger) exceed the sweep limit and FLAG — never swept (the scjz.13 trap).
  */
 export type CogsGlReconciliationUnavailableReason =
   | 'no_account_configured'
@@ -57,26 +58,20 @@ export type CogsGlReconciliationResult = AccountGlReconciliationResult<CogsGlRec
 /**
  * Sum the IMS COGS subledger movement (base currency, full precision) over the
  * half-open window `(windowStartExclusive, windowEndInclusive]` keyed by the GL
- * posting date: dispatch COGS recognised (Shipment.cogsBatchAmount) plus every
- * other signed COGS-account movement recorded in the cogs_subledger_movements
- * ledger (refund reversals are negative there, so no separate subtraction).
+ * posting date: the signed total of every COGS-account movement recorded in the
+ * cogs_subledger_movements ledger (dispatch positive, refund reversals negative,
+ * revaluations and landed-cost adjustments signed).
  */
 export async function sumCogsSubledgerMovement(
   windowStartExclusive: Date,
   windowEndInclusive: Date,
-  client: Pick<typeof db, 'shipment' | 'cogsSubledgerMovement'> = db,
+  client: Pick<typeof db, 'cogsSubledgerMovement'> = db,
 ): Promise<number> {
-  const dispatch = await client.shipment.aggregate({
-    _sum: { cogsBatchAmount: true },
-    where: { shipmentJournalDate: { gt: windowStartExclusive, lte: windowEndInclusive } },
-  })
   const ledger = await client.cogsSubledgerMovement.aggregate({
     _sum: { baseDelta: true },
     where: { journalDate: { gt: windowStartExclusive, lte: windowEndInclusive } },
   })
-  return toDecimal(dispatch._sum.cogsBatchAmount ?? 0)
-    .add(toDecimal(ledger._sum.baseDelta ?? 0))
-    .toNumber()
+  return toDecimal(ledger._sum.baseDelta ?? 0).toNumber()
 }
 
 /**

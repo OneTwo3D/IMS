@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
-import { getAccountingSettings, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
+import { getAccountingSettings, isAccountingSyncTypeEnabled, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -708,6 +708,11 @@ export async function queueLandedCostAdjustmentJournals(
   // The ON-HAND portion is handled by the inventoryTransitAdjustments loop above and
   // also clears through transit; together they fully reconcile the freight liability.
   const consumedCogsOffsetAccount = resolveConsumedCogsOffsetAccount(settings)
+  // khdw: only record the COGS subledger movement when the COGS_JOURNAL will actually
+  // post to the GL (connector active, sync enabled, posting mode not off) — the same
+  // gate queueAccountingSync applies. Otherwise the ledger would overcount a journal
+  // that never reached the GL COGS account.
+  const cogsJournalWillPost = await isAccountingSyncTypeEnabled('COGS_JOURNAL')
   for (const adj of adjustments.cogsAdjustments) {
     const absDelta = Math.abs(adj.totalDelta)
     if (absDelta <= 0.01) continue
@@ -740,13 +745,16 @@ export async function queueLandedCostAdjustmentJournals(
     // khdw: record the net COGS-account movement (increase debits COGS, decrease
     // credits it; the offset is the transit account, not COGS) in the COGS subledger
     // ledger so the daily-batch reconciliation nets it against the GL COGS movement.
-    await recordCogsSubledgerMovement(db, {
-      sourceType: 'LANDED_COST_ADJUSTMENT',
-      sourceRef: adj.primaryPoId,
-      idempotencyKey: cogsIdempotencyKey,
-      baseDelta: isIncrease ? absDelta : -absDelta,
-      journalDate: payload.date,
-    })
+    // Gated on the journal actually posting (above).
+    if (cogsJournalWillPost) {
+      await recordCogsSubledgerMovement(db, {
+        sourceType: 'LANDED_COST_ADJUSTMENT',
+        sourceRef: adj.primaryPoId,
+        idempotencyKey: cogsIdempotencyKey,
+        baseDelta: isIncrease ? absDelta : -absDelta,
+        journalDate: payload.date,
+      })
+    }
   }
 }
 

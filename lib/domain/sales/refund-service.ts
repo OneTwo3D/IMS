@@ -1394,6 +1394,39 @@ async function recordRefundCogsReversalMovement(
   })
 }
 
+/**
+ * khdw: when an accounting retry replays an already-persisted COGS_REVERSAL without
+ * re-staging, record its COGS movement into the ledger from the persisted payload
+ * (2dp). Idempotent on the same key, so it's a no-op if the original staging already
+ * recorded the (6dp) row — this only fills the gap for a reversal persisted before
+ * the ledger existed, or whose staging crashed after persisting but before recording.
+ */
+async function recordPersistedRefundCogsReversal(
+  client: RefundServiceClient,
+  refundId: string,
+  persistedSyncs: RefundAccountingSyncRequest[],
+): Promise<void> {
+  const reversal = persistedSyncs.find((sync) => sync.type === 'COGS_REVERSAL')
+  if (!reversal || !isRecord(reversal.payload)) return
+  const date = typeof reversal.payload.date === 'string' ? reversal.payload.date : null
+  const lines = Array.isArray(reversal.payload.lines) ? reversal.payload.lines : null
+  if (!date || !lines) return
+  // The COGS_REVERSAL journal credits the COGS account (debits inventory); that
+  // credit is the reversal amount, so the net COGS movement is its negation.
+  let credit = 0
+  for (const line of lines) {
+    if (isRecord(line) && typeof line.credit === 'number' && Number.isFinite(line.credit)) credit += line.credit
+  }
+  if (credit <= 0) return
+  await recordCogsSubledgerMovement(client, {
+    sourceType: 'REFUND_REVERSAL',
+    sourceRef: refundId,
+    idempotencyKey: `sales-order-refund:${refundId}:cogs-reversal`,
+    baseDelta: -credit,
+    journalDate: date,
+  })
+}
+
 function formatRefundAccountingError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -1960,6 +1993,7 @@ export async function retrySalesOrderRefundAccounting(
       }
       const persistedSyncs = parseRefundAccountingRetrySyncs(refund.accountingRetrySyncs)
       if (persistedSyncs.length > 0) {
+        await recordPersistedRefundCogsReversal(tx, refund.id, persistedSyncs)
         return {
           success: true,
           orderId: refund.orderId,

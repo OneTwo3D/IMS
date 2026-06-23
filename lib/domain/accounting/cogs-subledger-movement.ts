@@ -3,13 +3,17 @@ import { db } from '@/lib/db'
 import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
- * khdw: append-only subledger of GL COGS-account movements that do not have a
- * native structured home, used by the daily-batch COGS subledger-vs-GL rounding
- * reconciliation. Dispatch COGS is reconciled from Shipment.cogsBatchAmount and is
- * NOT recorded here; everything else that posts to the COGS account is:
- *   - REFUND_REVERSAL       — refund COGS reversal (negative: COGS credited)
- *   - SHIPMENT_REVALUATION  — cost-layer revaluation reverse+repost (signed)
- *   - LANDED_COST_ADJUSTMENT — retrospective landed-cost COGS adjustment (signed)
+ * khdw: append-only subledger of EVERY GL COGS-account movement, used by the
+ * daily-batch COGS subledger-vs-GL rounding reconciliation:
+ *   - DISPATCH              — Group B dispatch COGS (positive; 4dp cogsBatchAmount)
+ *   - REFUND_REVERSAL       — refund COGS reversal (negative: COGS credited; 6dp)
+ *   - SHIPMENT_REVALUATION  — cost-layer revaluation reverse+repost (signed; 2dp)
+ *   - LANDED_COST_ADJUSTMENT — retrospective landed-cost COGS adjustment (signed; 2dp)
+ *
+ * Dispatch is recorded here (not read live from Shipment.cogsBatchAmount) BECAUSE
+ * cogsBatchAmount is MUTATED in place by revaluation (cost-layers.ts) — reading it
+ * live would double-count a same-window dispatch+revaluation. The ledger row is the
+ * immutable, correctly-dated record of what dispatch actually posted to the GL.
  *
  * `baseDelta` is the signed base-currency COGS movement (+ = debited/increased,
  * − = credited/decreased) at the highest precision the source carries. Idempotent
@@ -17,6 +21,7 @@ import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
  * postings record exactly once — first write wins.
  */
 export type CogsSubledgerMovementSource =
+  | 'DISPATCH'
   | 'REFUND_REVERSAL'
   | 'SHIPMENT_REVALUATION'
   | 'LANDED_COST_ADJUSTMENT'

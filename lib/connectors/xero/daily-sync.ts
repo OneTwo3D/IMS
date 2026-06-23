@@ -38,6 +38,7 @@ import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from 
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
+import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
@@ -1246,13 +1247,25 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             })
           }
         }
+        const shipmentJournalDate = new Date()
         await tx.shipment.update({
           where: { id: shipment.id },
           data: {
-            shipmentJournalDate: new Date(),
+            shipmentJournalDate,
             cogsBatchAmount: resultForShipment.cogs,
             revenueRecognizedAmount: resultForShipment.revenue,
           },
+        })
+        // khdw: record this shipment's dispatch COGS in the COGS subledger ledger as
+        // an immutable, correctly-dated row. The reconciliation reads the ledger (not
+        // the live, revaluation-mutated cogsBatchAmount), so a same-window dispatch +
+        // revaluation can't double-count. Idempotent per shipment.
+        await recordCogsSubledgerMovement(tx, {
+          sourceType: 'DISPATCH',
+          sourceRef: shipment.id,
+          idempotencyKey: `dispatch:${shipment.id}`,
+          baseDelta: resultForShipment.cogs,
+          journalDate: shipmentJournalDate,
         })
       }
 

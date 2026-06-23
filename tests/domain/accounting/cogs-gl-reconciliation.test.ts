@@ -11,19 +11,13 @@ import { evaluateAccountGlReconciliation } from '@/lib/domain/accounting/account
 type AggregateCall = { where: { [k: string]: { gt: Date; lte: Date } } }
 
 /** Minimal stand-in for the Prisma client surface sumCogsSubledgerMovement uses.
- *  `dispatchSum` = Σ Shipment.cogsBatchAmount; `ledgerSum` = Σ signed ledger delta
- *  (refund reversals are already negative in the ledger). */
-function mockClient(dispatchSum: number | null, ledgerSum: number | null) {
-  const calls: { shipment?: AggregateCall; cogsSubledgerMovement?: AggregateCall } = {}
+ *  `ledgerSum` = Σ signed ledger delta (dispatch positive, refund reversals
+ *  negative, revaluation/landed-cost signed). */
+function mockClient(ledgerSum: number | null) {
+  const calls: { cogsSubledgerMovement?: AggregateCall } = {}
   return {
     calls,
     client: {
-      shipment: {
-        aggregate: async (args: AggregateCall) => {
-          calls.shipment = args
-          return { _sum: { cogsBatchAmount: dispatchSum } }
-        },
-      },
       cogsSubledgerMovement: {
         aggregate: async (args: AggregateCall) => {
           calls.cogsSubledgerMovement = args
@@ -37,31 +31,25 @@ function mockClient(dispatchSum: number | null, ledgerSum: number | null) {
 const W_START = new Date('2026-06-19T00:00:00.000Z')
 const W_END = new Date('2026-06-20T00:00:00.000Z')
 
-test('subledger movement = dispatch + signed ledger delta', async () => {
-  // Ledger delta is signed; a refund reversal of 12.25 sits in the ledger as -12.25.
-  const { client } = mockClient(1000.5, -12.25)
+test('subledger movement is the signed ledger total (dispatch + reversals netted)', async () => {
+  // e.g. 1000.50 dispatch + (-12.25) refund reversal already summed in the ledger.
+  const { client } = mockClient(988.25)
   assert.equal(await sumCogsSubledgerMovement(W_START, W_END, client), 988.25)
 })
 
-test('dispatch-only window (empty ledger) equals the dispatch sum', async () => {
-  const { client } = mockClient(742.123456, null)
-  assert.equal(await sumCogsSubledgerMovement(W_START, W_END, client), 742.123456)
-})
-
-test('empty window (both null) is zero, not NaN', async () => {
-  const { client } = mockClient(null, null)
+test('empty window (null ledger sum) is zero, not NaN', async () => {
+  const { client } = mockClient(null)
   assert.equal(await sumCogsSubledgerMovement(W_START, W_END, client), 0)
 })
 
 test('a net-reversal window (ledger credits exceed dispatch) is negative', async () => {
-  const { client } = mockClient(50, -130) // a quiet day dominated by a large refund/reversal
+  const { client } = mockClient(-80)
   assert.equal(await sumCogsSubledgerMovement(W_START, W_END, client), -80)
 })
 
-test('both sides are windowed half-open on the same GL date dimension', async () => {
-  const { calls, client } = mockClient(0, 0)
+test('the ledger is windowed half-open on the GL date dimension', async () => {
+  const { calls, client } = mockClient(0)
   await sumCogsSubledgerMovement(W_START, W_END, client)
-  assert.deepEqual(calls.shipment?.where.shipmentJournalDate, { gt: W_START, lte: W_END })
   assert.deepEqual(calls.cogsSubledgerMovement?.where.journalDate, { gt: W_START, lte: W_END })
 })
 
