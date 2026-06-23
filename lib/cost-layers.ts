@@ -159,19 +159,28 @@ export async function lockStockLevelRow(
   tx: TxClient,
   productId: string,
   warehouseId: string,
-): Promise<void> {
+): Promise<{ quantity: Decimal; reservedQty: Decimal }> {
   await tx.stockLevel.upsert({
     where: { productId_warehouseId: { productId, warehouseId } },
     create: { productId, warehouseId, quantity: 0 },
     update: {},
   })
-  await tx.$queryRaw`
-    SELECT "productId", "warehouseId"
+  // Return the locked on-hand and reserved quantities so callers can run a
+  // pre-flight availability check against the live, locked row (scjz.3 / ig58)
+  // instead of relying on the DB non-negative CHECK to abort with an opaque
+  // constraint error.
+  const rows = await tx.$queryRaw<Array<{ quantity: unknown; reservedQty: unknown }>>`
+    SELECT "quantity", "reservedQty"
     FROM stock_levels
     WHERE "productId" = ${productId}
       AND "warehouseId" = ${warehouseId}
     FOR UPDATE
   `
+  const row = rows[0]
+  return {
+    quantity: toDecimal((row?.quantity ?? 0) as DecimalInput),
+    reservedQty: toDecimal((row?.reservedQty ?? 0) as DecimalInput),
+  }
 }
 
 function minDecimal(a: Decimal, b: Decimal): Decimal {

@@ -43,6 +43,47 @@ export function calculateAdjustmentStockDelta({
   return { stockDelta, resultingQuantity, reservedQty }
 }
 
+export type ApplyStockAdjustmentFeasibilityInput = {
+  /** Signed quantity of the NEW adjustment (positive = addition, negative = removal). */
+  signedQty: number
+  /** Current on-hand quantity on the locked stock-level row. */
+  currentQuantity?: DecimalLike | null
+  /** Current reserved (allocated / in-transit) quantity on the locked row. */
+  currentReservedQty?: DecimalLike | null
+}
+
+/**
+ * ig58: pre-flight feasibility for a NEW stock adjustment against the locked
+ * stock-level row, BEFORE any movement/cost-layer/upsert is written. A removal
+ * that would drive on-hand below the reserved quantity (stock committed to
+ * orders / in transit) — which includes any removal that would go negative — is
+ * rejected with a clear, actionable message instead of letting the DB
+ * non-negative CHECK abort with an opaque constraint error. Mirrors
+ * calculateAdjustmentStockDelta's reserved guard for the edit path; additions
+ * are always feasible. Returns the resulting on-hand quantity.
+ */
+export function assertStockAdjustmentFeasible({
+  signedQty,
+  currentQuantity,
+  currentReservedQty,
+}: ApplyStockAdjustmentFeasibilityInput): { resultingQuantity: number; reservedQty: number } {
+  const currentQty = decimalToNumber(currentQuantity ?? 0)
+  const reservedQty = decimalToNumber(currentReservedQty ?? 0)
+  const resultingQuantity = currentQty + signedQty
+  const available = currentQty - reservedQty
+
+  if (signedQty < 0 && Math.abs(signedQty) > available + QUANTITY_EPSILON) {
+    throw new Error(
+      `Insufficient stock to remove ${Math.abs(signedQty)} unit(s) — only ${available.toFixed(4)} available ` +
+      `(${currentQty.toFixed(4)} on hand` +
+      (reservedQty > 0 ? `, ${reservedQty.toFixed(4)} reserved for orders` : '') +
+      `). Release reservations/allocations or reverse later movements first.`,
+    )
+  }
+
+  return { resultingQuantity, reservedQty }
+}
+
 export type AdjustmentEditFifoFeasibilityInput = {
   /** True when the edited adjustment will ADD stock (creates a layer — always feasible). */
   newIsAddition: boolean
