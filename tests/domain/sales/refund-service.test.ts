@@ -1228,6 +1228,79 @@ test('createSalesOrderRefund clears accounting deferral dates for full refunds',
   assert.deepEqual(state.refunds[0].accountingRetrySyncs, result.success ? result.accountingSyncs : [])
 })
 
+test('createSalesOrderRefund reverses the FULL deferral on a full refund of a shipped-but-unjournaled order (qn8a)', async () => {
+  // qn8a: a deferred order ships, but Group B has NOT yet journaled its revenue
+  // recognition (shipmentJournalDate: null, revenueRecognizedAmount: 0), then a
+  // FULL refund is issued. A concern was raised that the unearnedReversal cap
+  // (unshippedQtyRevenue + nonQtyRevenue) would drop the shipped portion's
+  // deferral, stranding it in the unearned account once the order flips to
+  // REFUNDED (which Group B then excludes forever).
+  //
+  // It does NOT strand: the refund's shipment query filters to journaled
+  // shipments only (refund-service.ts shipments where shipmentJournalDate not
+  // null), so an unjournaled-but-shipped qty is classified as UNSHIPPED in the
+  // revenue split and lands inside the cap. The full remaining deferral is
+  // reversed; the credit-note ACCRECCREDIT document reverses Sales↔AR, netting
+  // to Dr Unearned / Cr AR — a correct full unwind. This test locks that so the
+  // journaled-only filter cannot silently regress.
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      // Unjournaled: Group B has not run for this shipment yet.
+      shipmentJournalDate: null,
+      revenueRecognizedAmount: 0,
+      cogsBatchAmount: 0,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    allocations: [{
+      id: 'alloc-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Full return',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].status, 'REFUNDED')
+  const unearnedSync = result.success && result.accountingSyncs.find((s) => s.type === 'UNEARNED_REV_REVERSAL')
+  assert.ok(unearnedSync, 'expected an UNEARNED_REV_REVERSAL sync')
+  const debitLine = (unearnedSync.payload as { lines?: Array<{ accountCode?: string; debit?: number }> })
+    .lines?.find((l) => l.accountCode === accountingSettings.unearnedRevenueAccount && l.debit)
+  // The entire £100 deferral is reversed out of the unearned account — nothing stranded.
+  assert.equal(debitLine?.debit, 100)
+})
+
 test('createSalesOrderRefund fallback stock return excludes the current refund from prior returns', async () => {
   const state = baseState({
     orders: [{
