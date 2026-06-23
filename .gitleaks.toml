@@ -63,6 +63,11 @@ tags = ["credential", "secret"]
 [allowlist]
 description = "Documented placeholders and deterministic local/E2E test credentials."
 regexTarget = "line"
+paths = [
+  # Beads issue-tracker exports are generated metadata (issue text + high-entropy
+  # memory-row keys), not source; they routinely trip generic-api-key. Not secrets.
+  '''^\.beads/.*\.jsonl$''',
+]
 regexes = [
   '''CHANGE_ME(?:_[A-Za-z0-9_-]+)?''',
   '''ck_x{20,}''',
