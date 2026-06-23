@@ -62,6 +62,7 @@ type State = {
     productId: string
     qty: number
     idempotencyKey?: string | null
+    shipmentLineId?: string | null
     unitCostBase?: string | number | null
     totalValueBase?: string | number | null
   }>
@@ -314,7 +315,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         if (!movement) return null
         return { id: movement.id }
       },
-      create: async ({ data }: { data: { productId: string; qty: number; idempotencyKey?: string | null } }) => {
+      create: async ({ data }: { data: { productId: string; qty: number; idempotencyKey?: string | null; shipmentLineId?: string | null } }) => {
         if (data.idempotencyKey && state.movements.some((movement) => movement.idempotencyKey === data.idempotencyKey)) {
           throw uniqueStockMovementError()
         }
@@ -323,6 +324,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           productId: data.productId,
           qty: data.qty,
           idempotencyKey: data.idempotencyKey,
+          shipmentLineId: data.shipmentLineId ?? null,
         }
         state.movements.push(movement)
         return { id: movement.id }
@@ -446,6 +448,7 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
     totalCostBase: '10.000000',
   }])
   assert.equal(state.movements[0].idempotencyKey, 'SALE_DISPATCH:shipmentLine:shipment-line-1')
+  assert.equal(state.movements[0].shipmentLineId, 'shipment-line-1')
   assert.equal(state.movements[0].unitCostBase, '5.000000')
   assert.equal(state.movements[0].totalValueBase, '10.000000')
   assert.equal(state.lines[0].cogsBase, 10)
