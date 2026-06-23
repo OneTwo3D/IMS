@@ -645,6 +645,85 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
   }
 }
 
+export type MarginDispatchLinkRow = {
+  /** movement.referenceId when referenceType === 'SalesOrder', else null */
+  orderId: string | null
+  /** movement.productId (== shipmentLine.productId for a real dispatch) */
+  productId: string
+  qty: DecimalInput
+  /** shipmentLine.lineId for a linked dispatch, null for legacy/unlinked rows */
+  shipmentLineLineId: string | null
+}
+
+export type MarginLineRef = {
+  id: string
+  orderId: string
+  productId: string | null
+  qty: DecimalInput
+}
+
+/**
+ * In-window dispatched quantity attributed to each sales-order line, keyed by
+ * `${lineId}|${productId}`, so margin revenue can be prorated to units actually
+ * dispatched in the reporting window (fixes the scjz.51 period mismatch where a
+ * line shipped across periods booked its full revenue against in-window COGS).
+ *
+ * Linked dispatch movements (StockMovement.shipmentLineId set — the common case
+ * after the 4pz6.1 backfill) attribute exactly to their sales line. Any legacy
+ * unlinked residual for an (order, product) is distributed across that order's
+ * lines of the product proportionally to line quantity — never worse than the
+ * old full-revenue behaviour, and exact once every movement is linked.
+ */
+export function computeInWindowDispatchedQtyByLine(
+  dispatchRows: MarginDispatchLinkRow[],
+  orderLines: MarginLineRef[],
+): Map<string, Prisma.Decimal> {
+  const lineKey = (lineId: string, productId: string) => `${lineId}|${productId}`
+  const orderProductKey = (orderId: string, productId: string) => `${orderId}|${productId}`
+
+  const linkedByLineProduct = new Map<string, Prisma.Decimal>()
+  const totalByOrderProduct = new Map<string, Prisma.Decimal>()
+  const linkedByOrderProduct = new Map<string, Prisma.Decimal>()
+  for (const row of dispatchRows) {
+    const qty = toDecimal(row.qty)
+    if (row.orderId) {
+      const opk = orderProductKey(row.orderId, row.productId)
+      totalByOrderProduct.set(opk, (totalByOrderProduct.get(opk) ?? new Prisma.Decimal(0)).add(qty))
+      if (row.shipmentLineLineId) {
+        linkedByOrderProduct.set(opk, (linkedByOrderProduct.get(opk) ?? new Prisma.Decimal(0)).add(qty))
+      }
+    }
+    if (row.shipmentLineLineId) {
+      const k = lineKey(row.shipmentLineLineId, row.productId)
+      linkedByLineProduct.set(k, (linkedByLineProduct.get(k) ?? new Prisma.Decimal(0)).add(qty))
+    }
+  }
+
+  const lineQtySumByOrderProduct = new Map<string, Prisma.Decimal>()
+  for (const line of orderLines) {
+    if (!line.productId) continue
+    const opk = orderProductKey(line.orderId, line.productId)
+    lineQtySumByOrderProduct.set(opk, (lineQtySumByOrderProduct.get(opk) ?? new Prisma.Decimal(0)).add(toDecimal(line.qty)))
+  }
+
+  const effective = new Map<string, Prisma.Decimal>()
+  for (const line of orderLines) {
+    if (!line.productId) continue
+    const opk = orderProductKey(line.orderId, line.productId)
+    let qty = linkedByLineProduct.get(lineKey(line.id, line.productId)) ?? new Prisma.Decimal(0)
+    const residual = (totalByOrderProduct.get(opk) ?? new Prisma.Decimal(0))
+      .sub(linkedByOrderProduct.get(opk) ?? new Prisma.Decimal(0))
+    if (residual.gt(0)) {
+      const lineQtySum = lineQtySumByOrderProduct.get(opk) ?? new Prisma.Decimal(0)
+      if (lineQtySum.gt(0)) {
+        qty = qty.add(residual.mul(toDecimal(line.qty)).div(lineQtySum))
+      }
+    }
+    if (qty.gt(0)) effective.set(lineKey(line.id, line.productId), qty)
+  }
+  return effective
+}
+
 export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<MarginReportRow>> {
   const client = clientFromDeps(deps)
   const generatedAt = nowFromDeps(deps)
@@ -673,6 +752,33 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
   const cogsProductIds = new Set(cogsRows.map((row) => row.movement.productId))
   const orders = await loadSalesOrdersByIds(client, cogsOrderIds)
+  // In-window dispatch movements carry the line-granularity link (scjz.51/4pz6):
+  // we prorate each line's revenue to the units it actually dispatched in the
+  // window instead of booking its full total against in-window COGS.
+  const dispatchRows = await client.stockMovement.findMany({
+    where: {
+      type: StockMovementType.SALE_DISPATCH,
+      referenceType: 'SalesOrder',
+      createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
+    },
+    select: { qty: true, referenceId: true, productId: true, shipmentLine: { select: { lineId: true } } },
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as Array<{ qty: DecimalInput; referenceId: string | null; productId: string; shipmentLine: { lineId: string } | null }>
+  assertSourceLimit(dispatchRows.length, SOURCE_ROW_LIMIT, 'Margin analytics dispatch source rows')
+  const dispatchedQtyByLine = computeInWindowDispatchedQtyByLine(
+    dispatchRows.map((row) => ({
+      orderId: row.referenceId,
+      productId: row.productId,
+      qty: row.qty,
+      shipmentLineLineId: row.shipmentLine?.lineId ?? null,
+    })),
+    orders.flatMap((order) => order.lines.map((line) => ({
+      id: line.id,
+      orderId: order.id,
+      productId: line.productId,
+      qty: line.qty,
+    }))),
+  )
   const groups = new Map<string, MarginReportRow & { revenue: Prisma.Decimal; cogs: Prisma.Decimal; lineIds: Set<string> }>()
   for (const order of orders) {
     for (const line of order.lines) {
@@ -695,7 +801,10 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
       }
       current.lineIds.add(line.id)
       current.lineCount = current.lineIds.size
-      current.revenue = current.revenue.add(toDecimal(line.totalBase))
+      const dispatchedQty = dispatchedQtyByLine.get(`${line.id}|${line.productId}`) ?? new Prisma.Decimal(0)
+      const lineQty = toDecimal(line.qty)
+      const unitRevenue = lineQty.gt(0) ? toDecimal(line.totalBase).div(lineQty) : new Prisma.Decimal(0)
+      current.revenue = current.revenue.add(unitRevenue.mul(dispatchedQty))
       groups.set(key, current)
     }
   }
@@ -755,6 +864,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     notices: [
       'Gross margin is anchored to CogsEntry.createdAt, matches the inventory COGS report period semantics, and uses source SalesOrderLine revenue without recalculating FIFO.',
       'Margin rows are product-level buckets: COGS is grouped by movement productId and revenue is grouped from sales-order lines for COGS-linked orders. Duplicate SKU lines share the same product bucket; this report is not line-level COGS attribution.',
+      'Line revenue is prorated to the quantity each line dispatched within the window (via the shipment-line link on dispatch movements), so a line shipped across periods books only its in-window revenue against in-window COGS.',
     ],
   }
 }
