@@ -22,6 +22,7 @@ import {
   syncAccountingAccounts,
   testAccountingConnection,
   triggerAccountingSync,
+  type AccountingConnectorId,
   type AccountingConnectorSettings,
   type AccountingSyncLogRow,
   type AccountingSyncReadiness,
@@ -32,6 +33,13 @@ import {
   type AccountingBatchHistoryDay,
 } from '@/app/actions/accounting-batch'
 import { savePaymentAccountMap } from '@/app/actions/accounting'
+import {
+  ACCOUNT_FIELDS,
+  SYNC_TYPE_TOGGLES,
+  buildAccountingSettingsPayload,
+  isFieldAvailableForConnector,
+  settingKeyFor,
+} from './accounting-settings-fields'
 import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
@@ -58,35 +66,6 @@ type Props = {
   dailyBatchHistory: AccountingBatchHistoryDay[]
 }
 
-const ACCOUNT_FIELDS: { key: keyof AccountingConnectorSettings; label: string; description: string }[] = [
-  { key: 'xero_sales_account', label: 'Sales Revenue', description: 'Revenue from sales invoices' },
-  { key: 'xero_shipping_account', label: 'Shipping Income', description: 'Shipping charges on sales' },
-  { key: 'xero_discount_account', label: 'Discounts Given', description: 'Order-level discounts' },
-  { key: 'xero_transit_account', label: 'Stock in Transit', description: 'Purchase bills and goods ordered but not yet received' },
-  { key: 'xero_inventory_account', label: 'Inventory Asset', description: 'Stock on hand value' },
-  { key: 'xero_allocated_inventory_account', label: 'Allocated Inventory', description: 'Stock allocated to paid orders awaiting dispatch' },
-  { key: 'xero_cogs_account', label: 'Cost of Goods Sold', description: 'COGS booked on dispatch' },
-  { key: 'xero_manufacturing_overhead_account', label: 'Manufacturing Overhead', description: 'Overhead absorbed into manufactured stock cost on production completion. Leave blank to capitalise components at material cost only.' },
-  { key: 'xero_inventory_revaluation_account', label: 'Inventory Revaluation', description: 'P&L offset for retrospective COGS corrections on goods already sold (e.g. freight cancelled after dispatch). Leave blank to use Stock in Transit.' },
-  { key: 'xero_rounding_difference_account', label: 'Rounding Difference', description: 'Optional. Absorbs the sub-penny residue when 6dp inventory values post to the 2dp ledger, so the inventory subledger ties to the GL exactly. Leave blank to keep accepting residue within tolerance (no rounding line posted).' },
-  { key: 'xero_unearned_revenue_account', label: 'Unearned Revenue', description: 'Liability account for revenue deferred until shipment' },
-  { key: 'xero_accounts_receivable_account', label: 'Accounts Receivable', description: 'Your Xero Accounts Receivable control account — used as the control side of realised and unrealised FX journals on foreign-currency customer balances' },
-  { key: 'xero_accounts_payable_account', label: 'Accounts Payable', description: 'Your Xero Accounts Payable control account — used as the control side of realised and unrealised FX journals on foreign-currency supplier balances' },
-  { key: 'xero_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss', description: 'P&L account for settlement-rate variances' },
-  { key: 'xero_unrealised_fx_gain_loss_account', label: 'Unrealised FX Gain/Loss', description: 'Account for open AR/AP revaluation journals' },
-]
-
-const SYNC_TYPE_TOGGLES: { key: keyof AccountingConnectorSettings; label: string; description: string }[] = [
-  { key: 'xero_sync_sales_invoice', label: 'Sales Invoices', description: 'Push invoices to Xero when generated' },
-  { key: 'xero_sync_credit_note', label: 'Credit Notes', description: 'Push credit notes on refund' },
-  { key: 'xero_sync_purchase_invoice', label: 'Purchase Bills', description: 'Push supplier bills when PO is invoiced' },
-  { key: 'xero_sync_purchase_credit_note', label: 'Supplier Credit Notes', description: 'Push supplier credit notes (e.g. a credited duplicate freight bill) to Xero as ACCPAYCREDIT' },
-  { key: 'xero_sync_stock_receipt', label: 'Stock Receipts', description: 'Journal: DR Inventory / CR Stock in Transit on goods received' },
-  { key: 'xero_sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
-  { key: 'xero_sync_inventory_adjustment', label: 'Inventory Adjustments', description: 'Journal for manual stock adjustments' },
-  { key: 'xero_sync_realised_fx_journal', label: 'Realised FX Journals', description: 'Post settlement-rate gains and losses on foreign payments' },
-  { key: 'xero_sync_unrealised_fx_journal', label: 'Unrealised FX Revaluation', description: 'Post reversible open AR/AP revaluation journals' },
-]
 
 const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline' | 'destructive'; label: string }> = {
   PENDING: { variant: 'outline', label: 'Pending' },
@@ -175,8 +154,18 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [retryingAll, setRetryingAll] = useState(false)
   const [retryMsg, setRetryMsg] = useState<string | null>(null)
   const searchParams = useSearchParams()
-  const connectorId = searchParams.get('connector') === 'quickbooks' ? 'quickbooks' : 'xero'
+  const connectorId: AccountingConnectorId = searchParams.get('connector') === 'quickbooks' ? 'quickbooks' : 'xero'
   const connectorLabel = connectorId === 'quickbooks' ? 'QuickBooks' : 'Xero'
+  // iwrm: resolve a connector-agnostic setting suffix to the active connector's
+  // prefixed key (xero_* vs quickbooks_*). `settings`/`s` are already keyed for
+  // the active connector by the registry, so the form must read/write the same.
+  const settingKey = (suffix: string) => settingKeyFor(connectorId, suffix)
+  const accountFields = ACCOUNT_FIELDS.filter(f => isFieldAvailableForConnector(f, connectorId))
+  const syncTypeToggles = SYNC_TYPE_TOGGLES.filter(t => isFieldAvailableForConnector(t, connectorId))
+  const syncEnabledKey = settingKey('sync_enabled')
+  const attachPdfKey = settingKey('sync_attach_pdf')
+  const dailyBatchKey = settingKey('daily_batch_enabled')
+  const paymentPollingKey = settingKey('payment_polling_enabled')
 
   // Handle OAuth redirect query params
   useEffect(() => {
@@ -211,39 +200,14 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 
   function handleSave() {
     setMsg(null)
+    // iwrm: build the payload with the active connector's prefix so QuickBooks
+    // account mappings actually save (previously hardcoded xero_* keys were
+    // filtered out by saveQuickBooksSettings' allowlist). secretMasked is never a
+    // suffix/account key, so the cast to a plain string map is safe.
+    const payload = buildAccountingSettingsPayload(connectorId, s as unknown as Record<string, string>)
     startTransition(async () => {
       const [xeroResult, mapResult] = await Promise.all([
-        saveAccountingSettings({
-          xero_sync_enabled: s.xero_sync_enabled,
-          xero_sync_sales_invoice: s.xero_sync_sales_invoice,
-          xero_sync_credit_note: s.xero_sync_credit_note,
-          xero_sync_purchase_invoice: s.xero_sync_purchase_invoice,
-          xero_sync_cogs_journal: s.xero_sync_cogs_journal,
-          xero_sync_cogs_reversal: s.xero_sync_cogs_reversal,
-          xero_sync_stock_receipt: s.xero_sync_stock_receipt,
-          xero_sync_inventory_adjustment: s.xero_sync_inventory_adjustment,
-          xero_sync_stock_allocation: s.xero_sync_stock_allocation,
-          xero_sync_realised_fx_journal: s.xero_sync_realised_fx_journal,
-          xero_sync_unrealised_fx_journal: s.xero_sync_unrealised_fx_journal,
-          xero_sync_attach_pdf: s.xero_sync_attach_pdf,
-          xero_sales_account: s.xero_sales_account,
-          xero_shipping_account: s.xero_shipping_account,
-          xero_discount_account: s.xero_discount_account,
-          xero_cogs_account: s.xero_cogs_account,
-          xero_manufacturing_overhead_account: s.xero_manufacturing_overhead_account,
-          xero_inventory_revaluation_account: s.xero_inventory_revaluation_account,
-          xero_inventory_account: s.xero_inventory_account,
-          xero_allocated_inventory_account: s.xero_allocated_inventory_account,
-          xero_transit_account: s.xero_transit_account,
-          xero_rounding_difference_account: s.xero_rounding_difference_account,
-          xero_unearned_revenue_account: s.xero_unearned_revenue_account,
-          xero_accounts_receivable_account: s.xero_accounts_receivable_account,
-          xero_accounts_payable_account: s.xero_accounts_payable_account,
-          xero_realised_fx_gain_loss_account: s.xero_realised_fx_gain_loss_account,
-          xero_unrealised_fx_gain_loss_account: s.xero_unrealised_fx_gain_loss_account,
-          xero_daily_batch_enabled: s.xero_daily_batch_enabled,
-          xero_payment_polling_enabled: s.xero_payment_polling_enabled,
-        }),
+        saveAccountingSettings(payload),
         savePaymentAccountMap(serializePaymentMap(paymentMapRows)),
       ])
       if (!xeroResult.success) {
@@ -571,14 +535,16 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               <p className="text-sm text-muted-foreground">No accounts synced yet. Click &quot;Sync Chart of Accounts&quot; to pull your Xero accounts.</p>
             ) : (
               <div className="grid grid-cols-2 gap-4">
-                {ACCOUNT_FIELDS.map(f => (
-                  <div key={f.key} className="space-y-1.5">
-                    <Label htmlFor={f.key}>{f.label}</Label>
+                {accountFields.map(f => {
+                  const key = settingKey(f.suffix)
+                  return (
+                  <div key={key} className="space-y-1.5">
+                    <Label htmlFor={key}>{f.label}</Label>
                     <select
-                      id={f.key}
+                      id={key}
                       className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                      value={s[f.key]}
-                      onChange={e => handleField(f.key, e.target.value)}
+                      value={s[key] ?? ''}
+                      onChange={e => handleField(key, e.target.value)}
                     >
                       <option value="">— Select —</option>
                       {accounts.map(a => (
@@ -589,7 +555,8 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                     </select>
                     <p className="text-[11px] text-muted-foreground">{f.description}</p>
                   </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </Card>
@@ -846,7 +813,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       {tab === 'sync' && (
         <div className="space-y-6">
           {/* Enable Xero Sync */}
-          {!readiness.ready && s.xero_sync_enabled !== 'true' && (
+          {!readiness.ready && s[syncEnabledKey] !== 'true' && (
             <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-950/30 p-3 space-y-2">
               <div className="flex items-center gap-2 text-sm font-medium text-amber-900 dark:text-amber-200">
                 <AlertTriangle className="h-4 w-4" />
@@ -872,12 +839,12 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             </div>
           )}
 
-          <label className={`flex items-center gap-3 ${readiness.ready || s.xero_sync_enabled === 'true' ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
+          <label className={`flex items-center gap-3 ${readiness.ready || s[syncEnabledKey] === 'true' ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
             <input
               type="checkbox"
-              checked={s.xero_sync_enabled === 'true'}
-              disabled={!readiness.ready && s.xero_sync_enabled !== 'true'}
-              onChange={e => handleField('xero_sync_enabled', e.target.checked ? 'true' : 'false')}
+              checked={s[syncEnabledKey] === 'true'}
+              disabled={!readiness.ready && s[syncEnabledKey] !== 'true'}
+              onChange={e => handleField(syncEnabledKey, e.target.checked ? 'true' : 'false')}
               className="h-4 w-4 accent-primary"
             />
             <div>
@@ -893,14 +860,16 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               <p className="text-xs text-muted-foreground mt-0.5">Choose which documents and transactions are synced to Xero.</p>
             </div>
             <div className="grid grid-cols-2 gap-4">
-              {SYNC_TYPE_TOGGLES.map(t => (
-                <div key={t.key} className="space-y-1.5">
-                  <Label htmlFor={t.key}>{t.label}</Label>
+              {syncTypeToggles.map(t => {
+                const key = settingKey(t.suffix)
+                return (
+                <div key={key} className="space-y-1.5">
+                  <Label htmlFor={key}>{t.label}</Label>
                   <select
-                    id={t.key}
+                    id={key}
                     className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                    value={s[t.key]}
-                    onChange={e => handleField(t.key, e.target.value)}
+                    value={s[key] ?? 'off'}
+                    onChange={e => handleField(key, e.target.value)}
                   >
                     <option value="off">Off</option>
                     <option value="draft">Draft</option>
@@ -908,14 +877,15 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                   </select>
                   <p className="text-[11px] text-muted-foreground">{t.description}</p>
                 </div>
-              ))}
+                )
+              })}
             </div>
             <div className="border-t pt-3">
               <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
                 <input
                   type="checkbox"
-                  checked={s.xero_sync_attach_pdf === 'true'}
-                  onChange={e => handleField('xero_sync_attach_pdf', e.target.checked ? 'true' : 'false')}
+                  checked={s[attachPdfKey] === 'true'}
+                  onChange={e => handleField(attachPdfKey, e.target.checked ? 'true' : 'false')}
                   className="h-4 w-4 accent-primary mt-0.5"
                 />
                 <div>
@@ -935,8 +905,8 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
               <input
                 type="checkbox"
-                checked={s.xero_daily_batch_enabled === 'true'}
-                onChange={e => handleField('xero_daily_batch_enabled', e.target.checked ? 'true' : 'false')}
+                checked={s[dailyBatchKey] === 'true'}
+                onChange={e => handleField(dailyBatchKey, e.target.checked ? 'true' : 'false')}
                 className="h-4 w-4 accent-primary mt-0.5"
               />
               <div>
@@ -947,8 +917,8 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
               <input
                 type="checkbox"
-                checked={s.xero_payment_polling_enabled === 'true'}
-                onChange={e => handleField('xero_payment_polling_enabled', e.target.checked ? 'true' : 'false')}
+                checked={s[paymentPollingKey] === 'true'}
+                onChange={e => handleField(paymentPollingKey, e.target.checked ? 'true' : 'false')}
                 className="h-4 w-4 accent-primary mt-0.5"
               />
               <div>
@@ -969,7 +939,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                     Retry All Failed
                   </Button>
                 )}
-                <Button size="sm" variant="outline" onClick={handleManualSync} disabled={isPending || !connected || s.xero_sync_enabled !== 'true'}>
+                <Button size="sm" variant="outline" onClick={handleManualSync} disabled={isPending || !connected || s[syncEnabledKey] !== 'true'}>
                   {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
                   Process Pending Now
                 </Button>

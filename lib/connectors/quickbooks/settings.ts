@@ -31,6 +31,7 @@ export type QuickBooksSettings = {
   quickbooks_allocated_inventory_account: string
   quickbooks_unearned_revenue_account: string
   quickbooks_transit_account: string
+  quickbooks_rounding_difference_account: string
   quickbooks_accounts_receivable_account: string
   quickbooks_accounts_payable_account: string
   quickbooks_realised_fx_gain_loss_account: string
@@ -53,6 +54,7 @@ export const QUICKBOOKS_SETTING_KEYS = [
   'quickbooks_cogs_account', 'quickbooks_inventory_account', 'quickbooks_allocated_inventory_account',
   'quickbooks_unearned_revenue_account',
   'quickbooks_transit_account',
+  'quickbooks_rounding_difference_account',
   'quickbooks_accounts_receivable_account', 'quickbooks_accounts_payable_account',
   'quickbooks_realised_fx_gain_loss_account', 'quickbooks_unrealised_fx_gain_loss_account',
   'quickbooks_manufacturing_overhead_account',
@@ -85,6 +87,7 @@ const QUICKBOOKS_DEFAULTS: QuickBooksSettings = {
   quickbooks_allocated_inventory_account: '',
   quickbooks_unearned_revenue_account: '',
   quickbooks_transit_account: '',
+  quickbooks_rounding_difference_account: '',
   quickbooks_accounts_receivable_account: '',
   quickbooks_accounts_payable_account: '',
   quickbooks_realised_fx_gain_loss_account: '',
