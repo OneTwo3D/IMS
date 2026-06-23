@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { LandedCostMethod } from '@/app/generated/prisma/client'
+import { LandedCostMethod, Prisma } from '@/app/generated/prisma/client'
 import {
   aggregateCogsRows,
   aggregateInventoryTurnoverRows,
@@ -10,7 +10,9 @@ import {
   getInventoryTurnoverReport,
   inventoryCostingFiltersFromSearch,
   InventoryTurnoverSourceLimitError,
+  resolveCogsRevenueKeys,
   type CogsAggregationInput,
+  type CogsRevenueRowInput,
   type InventoryTurnoverCogsAggregationInput,
   type InventoryTurnoverSnapshotAggregationInput,
   type LandedCostAggregationInput,
@@ -706,5 +708,82 @@ describe('inventory costing report aggregations', () => {
     assert.equal(report.rows.length, 0)
     assert.equal(report.totals.cogsBase, '0.000000')
     assert.match(report.notices.join('\n'), /excluded from supplier grouping/)
+  })
+})
+
+describe('resolveCogsRevenueKeys (scjz.67 line-granularity revenue)', () => {
+  const linked = (lineId: string, lineProductId: string | null, lineTotalBase: string) => ({
+    lineId,
+    lineProductId,
+    lineTotalBase,
+  })
+
+  it('keys revenue per sales line when every COGS row of the pair is line-linked', () => {
+    // Order with two same-product lines at different prices, shipped from two
+    // warehouses. The blended order:product figure would split 150/150; the
+    // line link recovers the true 100/200.
+    const rows: CogsRevenueRowInput[] = [
+      { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-1', 'product-a', '100') },
+      { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-2', 'product-a', '200') },
+    ]
+    const blended = new Map([['order-1:product-a', new Prisma.Decimal('300')]])
+    const resolved = resolveCogsRevenueKeys(rows, blended)
+    assert.deepEqual(resolved.map((r) => r.revenueKey), ['L:line-1', 'L:line-2'])
+    assert.equal(resolved[0]?.revenueBase?.toString(), '100')
+    assert.equal(resolved[1]?.revenueBase?.toString(), '200')
+  })
+
+  it('end-to-end: same-product two-line two-warehouse order reports each line revenue (not blended)', () => {
+    const resolved = resolveCogsRevenueKeys(
+      [
+        { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-1', 'product-a', '100') },
+        { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-2', 'product-a', '200') },
+      ],
+      new Map([['order-1:product-a', new Prisma.Decimal('300')]]),
+    )
+    const base = {
+      qty: '1', cogsBase: '50', productId: 'product-a', sku: 'A-001', productName: 'Widget A',
+      categoryName: 'Widgets', customerName: 'Customer One', channel: 'woocommerce', warehouseName: 'WH',
+    }
+    const rows: CogsAggregationInput[] = [
+      { id: 'm-a', warehouseId: 'wh-a', warehouseCode: 'WHA', ...base, ...resolved[0]! },
+      { id: 'm-b', warehouseId: 'wh-b', warehouseCode: 'WHB', ...base, ...resolved[1]! },
+    ]
+    const byCode = new Map(aggregateCogsRows(rows, 'warehouse').map((row) => [row.warehouseCode, row]))
+    assert.equal(byCode.get('WHA')?.revenueBase, '100.000000')
+    assert.equal(byCode.get('WHB')?.revenueBase, '200.000000')
+  })
+
+  it('falls back to the blended order:product key for the whole pair when any row is unlinked', () => {
+    const rows: CogsRevenueRowInput[] = [
+      { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-1', 'product-a', '100') },
+      { orderId: 'order-1', productId: 'product-a', shipmentLine: null },
+    ]
+    const blended = new Map([['order-1:product-a', new Prisma.Decimal('300')]])
+    const resolved = resolveCogsRevenueKeys(rows, blended)
+    assert.deepEqual(resolved.map((r) => r.revenueKey), ['order-1:product-a', 'order-1:product-a'])
+    assert.equal(resolved[0]?.revenueBase?.toString(), '300')
+    assert.equal(resolved[1]?.revenueBase?.toString(), '300')
+  })
+
+  it('keeps blended fallback for kit-component dispatch (line product != movement product)', () => {
+    // Kit component: dispatch links to the kit line but carries the component
+    // productId, so line-level keying is not applied — preserves today's
+    // behaviour (uncaptured when no component sales line exists).
+    const rows: CogsRevenueRowInput[] = [
+      { orderId: 'order-1', productId: 'component-a', shipmentLine: linked('kit-line', 'kit-product', '500') },
+    ]
+    const resolved = resolveCogsRevenueKeys(rows, new Map())
+    assert.equal(resolved[0]?.revenueKey, 'order-1:component-a')
+    assert.equal(resolved[0]?.revenueBase, null)
+  })
+
+  it('returns a null key for non-sales-order COGS rows', () => {
+    const resolved = resolveCogsRevenueKeys(
+      [{ orderId: null, productId: 'product-a', shipmentLine: null }],
+      new Map(),
+    )
+    assert.equal(resolved[0]?.revenueKey, null)
+    assert.equal(resolved[0]?.revenueBase, null)
   })
 })

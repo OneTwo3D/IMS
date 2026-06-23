@@ -271,6 +271,7 @@ type CogsEntryRow = {
     product: ProductMeta
     fromWarehouse: WarehouseMeta | null
     toWarehouse: WarehouseMeta | null
+    shipmentLine?: { lineId: string; line: { id: string; productId: string | null; totalBase: DecimalInput } } | null
   }
 }
 
@@ -1178,6 +1179,51 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
   return { revenueByOrderProduct, orderMetaById }
 }
 
+export type CogsRevenueRowInput = {
+  orderId: string | null
+  /** movement.productId (the consumed product — component for kit dispatch) */
+  productId: string
+  shipmentLine: { lineId: string; lineProductId: string | null; lineTotalBase: DecimalInput } | null
+}
+
+/**
+ * Resolve the revenue key + base for each COGS row, attributing revenue at
+ * sales-LINE granularity where the shipment-line link makes it unambiguous, so
+ * an order with two same-product lines at different prices/warehouses reports
+ * each line's actual revenue instead of one qty-blended figure (scjz.67).
+ *
+ * Switch is all-or-nothing per (order, product): line-level keys are used only
+ * when EVERY COGS row of that pair links to a sales line of the same product —
+ * otherwise the blended order:product fallback is kept for the whole pair. This
+ * avoids mixing the two keying schemes (which would double-count) and preserves
+ * today's behaviour for kit-component dispatch (line product = kit ≠ component)
+ * and legacy unlinked rows. Returned array is aligned to `rows`.
+ */
+export function resolveCogsRevenueKeys(
+  rows: CogsRevenueRowInput[],
+  revenueByOrderProduct: Map<string, Decimal>,
+): Array<{ revenueKey: string | null; revenueBase: Decimal | null }> {
+  const lineLevelByOrderProduct = new Map<string, boolean>()
+  for (const row of rows) {
+    if (!row.orderId) continue
+    const opk = revenueKey({ orderId: row.orderId, productId: row.productId })
+    const lineLinked = row.shipmentLine != null && row.shipmentLine.lineProductId === row.productId
+    lineLevelByOrderProduct.set(opk, (lineLevelByOrderProduct.get(opk) ?? true) && lineLinked)
+  }
+
+  return rows.map((row) => {
+    if (!row.orderId) return { revenueKey: null, revenueBase: null }
+    const opk = revenueKey({ orderId: row.orderId, productId: row.productId })
+    if (lineLevelByOrderProduct.get(opk) && row.shipmentLine) {
+      return {
+        revenueKey: `L:${row.shipmentLine.lineId}`,
+        revenueBase: toDecimal(row.shipmentLine.lineTotalBase),
+      }
+    }
+    return { revenueKey: opk, revenueBase: revenueByOrderProduct.get(opk) ?? null }
+  })
+}
+
 export async function getCogsReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<CogsReport> {
   const dateFrom = filters.dateFrom ?? daysAgo(30)
   const dateTo = filters.dateTo ?? today()
@@ -1232,6 +1278,10 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
             },
             fromWarehouse: { select: { id: true, code: true, name: true } },
             toWarehouse: { select: { id: true, code: true, name: true } },
+            // Line-granularity revenue link (4pz6.1): when present, attribute each
+            // sales line's actual revenue instead of the blended order:product
+            // figure (scjz.67).
+            shipmentLine: { select: { lineId: true, line: { select: { id: true, productId: true, totalBase: true } } } },
           },
         },
       },
@@ -1247,13 +1297,26 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     .map((row) => row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
   const { revenueByOrderProduct, orderMetaById } = await loadRevenueByOrderProduct(sourceOrderIds)
-  const inputs: CogsAggregationInput[] = rows.map((row) => {
+  const resolvedRevenue = resolveCogsRevenueKeys(
+    rows.map((row) => ({
+      orderId: row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null,
+      productId: row.movement.product.id,
+      shipmentLine: row.movement.shipmentLine
+        ? {
+            lineId: row.movement.shipmentLine.lineId,
+            lineProductId: row.movement.shipmentLine.line.productId,
+            lineTotalBase: row.movement.shipmentLine.line.totalBase,
+          }
+        : null,
+    })),
+    revenueByOrderProduct,
+  )
+  const inputs: CogsAggregationInput[] = rows.map((row, index) => {
     const product = row.movement.product
     const warehouse = row.movement.fromWarehouse ?? row.movement.toWarehouse
     const orderId = row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null
     const meta = orderId ? orderMetaById.get(orderId) : undefined
-    const key = orderId ? revenueKey({ orderId, productId: product.id }) : null
-    const revenueBase = key ? revenueByOrderProduct.get(key) ?? null : null
+    const { revenueKey: key, revenueBase } = resolvedRevenue[index]!
     return {
       id: row.movement.id,
       qty: row.qty,
