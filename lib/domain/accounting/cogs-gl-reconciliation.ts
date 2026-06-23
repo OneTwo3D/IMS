@@ -114,19 +114,23 @@ export async function loadCogsGlReconciliation(options?: {
     throw error
   }
 
-  // Coverage gate (khdw): the ledger is append-only and starts EMPTY at deploy — it
-  // has no pre-deploy history. Reconciling a window that opened before the ledger
-  // began recording would compare a real GL movement against a partial/empty
-  // subledger and FLAG a false mismatch. So only reconcile windows the ledger fully
-  // covers: its earliest row must have been recorded on or before the window's
-  // opening date (every in-window posting is dated strictly after that, hence after
-  // the ledger went live). Before that, degrade to unavailable (never flag).
-  const firstLedgerRow = await db.cogsSubledgerMovement.findFirst({
-    orderBy: { createdAt: 'asc' },
-    select: { createdAt: true },
+  // Coverage watermark (khdw): the ledger is append-only with NO pre-deploy history,
+  // so reconcile only windows whose GL-date range the ledger fully covers. The
+  // watermark (cogs_ledger_coverage_start_date) is set once, durably, to the deploy
+  // date the ledger write-sites went live; from that date every COGS posting records
+  // a row. A window (opening, closing] counts only postings dated strictly after
+  // `opening`, so opening >= watermark guarantees full coverage. Windows that opened
+  // before the watermark are genuinely unreconcilable (no subledger data ever
+  // existed for them), so degrading to unavailable hides nothing and never flags.
+  // We compare the GL DATE dimension (not the row insert time, which can lag a
+  // backdated posting's journalDate). ISO YYYY-MM-DD strings compare correctly.
+  const coverageRow = await db.setting.findUnique({
+    where: { key: 'cogs_ledger_coverage_start_date' },
+    select: { value: true },
   })
-  if (!firstLedgerRow) return { available: false, reason: 'ledger_not_covering_window' }
-  if (balanceDateString(firstLedgerRow.createdAt) > balanceDateString(movement.opening.balanceDate)) {
+  const coverageStart = coverageRow?.value?.trim()
+  if (!coverageStart) return { available: false, reason: 'ledger_not_covering_window' }
+  if (balanceDateString(movement.opening.balanceDate) < coverageStart) {
     return { available: false, reason: 'ledger_not_covering_window' }
   }
 
