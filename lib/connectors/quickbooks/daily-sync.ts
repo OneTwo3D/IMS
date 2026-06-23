@@ -35,6 +35,11 @@ import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from 
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
+import {
+  sumPostedUnearnedReversal,
+  isFullyShippedNetOfRefunds,
+  batchContainsFinalUnjournaledShipment,
+} from '@/lib/domain/accounting/deferred-trueup'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
@@ -704,6 +709,7 @@ export async function runDailyBatchSync(): Promise<{
               shipments: {
                 select: {
                   id: true,
+                  status: true,
                   shipmentJournalDate: true,
                   revenueRecognizedAmount: true,
                 },
@@ -776,6 +782,71 @@ export async function runDailyBatchSync(): Promise<{
         )),
       )
 
+      // --- scjz.68: refund-reversal-aware deferred-revenue true-up inputs ---
+      // (1) posted UNEARNED_REV_REVERSAL per order — deferred revenue a refund credit
+      //     note already took out of the unearned account, which the true-up must not
+      //     recognize again; (2) for PARTIALLY_REFUNDED orders, the per-line coverage
+      //     used to decide whether the order is fully shipped net of refunds.
+      const allocationById = new Map(orderAllocations.map((allocation) => [allocation.id, allocation]))
+      const partialOrderIds = new Set(
+        shipments.filter((shipment) => shipment.order.status === 'PARTIALLY_REFUNDED').map((shipment) => shipment.orderId),
+      )
+
+      const refunds = await tx.salesOrderRefund.findMany({
+        where: { orderId: { in: orderIds } },
+        select: { id: true, orderId: true },
+      })
+      const refundIdToOrderId = new Map(refunds.map((refund) => [refund.id, refund.orderId]))
+      const reversalSyncs = await tx.accountingSyncLog.findMany({
+        where: {
+          connector: QBO_CONNECTOR,
+          type: 'UNEARNED_REV_REVERSAL',
+          status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+          OR: [
+            { referenceType: 'SalesOrder', referenceId: { in: orderIds } },
+            { referenceType: 'SalesOrderRefund', referenceId: { in: refunds.map((refund) => refund.id) } },
+          ],
+        },
+        select: { referenceType: true, referenceId: true, payload: true },
+      })
+      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
+      for (const sync of reversalSyncs) {
+        const targetOrderId = sync.referenceType === 'SalesOrder'
+          ? sync.referenceId
+          : refundIdToOrderId.get(sync.referenceId)
+        if (!targetOrderId) continue
+        const list = reversalSyncsByOrder.get(targetOrderId) ?? []
+        list.push({ payload: sync.payload })
+        reversalSyncsByOrder.set(targetOrderId, list)
+      }
+
+      const shippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
+      const refundedUnshippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
+      if (partialOrderIds.size > 0) {
+        const dispatchedShipmentLines = await tx.shipmentLine.findMany({
+          where: { shipment: { orderId: { in: [...partialOrderIds] }, status: 'SHIPPED' } },
+          select: { lineId: true, productId: true, qty: true, shipment: { select: { orderId: true } } },
+        })
+        for (const line of dispatchedShipmentLines) {
+          if (!line.productId) continue
+          const rows = shippedRowsByOrder.get(line.shipment.orderId) ?? []
+          rows.push({ lineId: line.lineId, productId: line.productId, qty: Number(line.qty) })
+          shippedRowsByOrder.set(line.shipment.orderId, rows)
+        }
+        // Returns of shipped units (shipment-source) do not reduce the ship
+        // obligation, so only allocation-source (unshipped) refund qty counts.
+        for (const refundLine of priorRefundLines) {
+          for (const entry of parseCostLayerSnapshot(refundLine.costLayerSnapshot)) {
+            if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
+            const allocation = allocationById.get(entry.orderAllocationId)
+            if (!allocation?.productId || !partialOrderIds.has(allocation.orderId)) continue
+            const rows = refundedUnshippedRowsByOrder.get(allocation.orderId) ?? []
+            rows.push({ lineId: allocation.lineId, productId: allocation.productId, qty: toDecimal(entry.qty).toNumber() })
+            refundedUnshippedRowsByOrder.set(allocation.orderId, rows)
+          }
+        }
+      }
+
       const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
       for (const allocation of orderAllocations) {
         allocationAvailability.set(
@@ -835,8 +906,41 @@ export async function runDailyBatchSync(): Promise<{
         const recognizedPreviously = firstShipment.order.shipments.reduce((sum, shipment) => (
           shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
         ), 0)
-        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously))
+        // scjz.68: subtract deferred revenue a refund credit note already reversed
+        // out of the unearned account so the true-up never re-recognizes it.
+        const postedUnearnedReversal = sumPostedUnearnedReversal(
+          reversalSyncsByOrder.get(orderId) ?? [],
+          settings.quickbooks_unearned_revenue_account,
+        )
+        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
         let runningRevenue = 0
+
+        // scjz.68: a fully-shipped terminal order trues up the remainder; a
+        // PARTIALLY_REFUNDED order may too, but only once every shippable line is
+        // shipped net of refunds. Either way hold the true-up until this batch holds
+        // the order's final dispatched-but-unjournaled shipment, so a batch-window
+        // split cannot recognize a later shipment's revenue early.
+        let isTrueUpEligible = isFullyShippedTerminalStatus(firstShipment.order.status)
+        if (!isTrueUpEligible && firstShipment.order.status === 'PARTIALLY_REFUNDED') {
+          const combinedCoverageByLine = calculateCoverageByLine(requirementsByLine, [
+            ...(shippedRowsByOrder.get(orderId) ?? []),
+            ...(refundedUnshippedRowsByOrder.get(orderId) ?? []),
+          ])
+          isTrueUpEligible = isFullyShippedNetOfRefunds(
+            firstShipment.order.lines
+              .filter((line) => !!line.productId)
+              .map((line) => ({
+                orderedQty: Number(line.qty),
+                coveredQty: combinedCoverageByLine.get(line.id) ?? 0,
+              })),
+          )
+        }
+        if (isTrueUpEligible) {
+          isTrueUpEligible = batchContainsFinalUnjournaledShipment(
+            firstShipment.order.shipments.filter((shipment) => shipment.status === 'SHIPPED'),
+            new Set(orderShipments.map((shipment) => shipment.id)),
+          )
+        }
 
         for (let index = 0; index < orderShipments.length; index++) {
           const shipment = orderShipments[index]
@@ -863,7 +967,7 @@ export async function runDailyBatchSync(): Promise<{
             remainingDeferred,
             runningRevenue,
             isFinalShipmentOfFullyShippedTerminalOrder:
-              isFullyShippedTerminalStatus(firstShipment.order.status) && index === orderShipments.length - 1,
+              isTrueUpEligible && index === orderShipments.length - 1,
           })
 
           const shipmentSnapshotsForLines = shipment.lines.map((line) => (
