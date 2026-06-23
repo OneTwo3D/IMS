@@ -8,6 +8,13 @@ import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/f
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
+  sumPostedUnearnedReversal,
+  isFullyShippedNetOfRefunds,
+  batchContainsFinalUnjournaledShipment,
+} from '@/lib/domain/accounting/deferred-trueup'
+import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { takeDailyBatchWindow, resolveXeroDailyBatchLimit } from '@/lib/connectors/xero/daily-sync'
+import {
   addMoney,
   multiplyMoney,
   roundQuantity,
@@ -225,7 +232,13 @@ async function computePreview(): Promise<DailyBatchPreview> {
 
   // --- B: shipped shipments whose order has completed A1+A2 but that
   //     haven't had revenue recognised yet ---
-  const bShipments = await db.shipment.findMany({
+  // Apply the SAME batch window the live cron uses (take: batchLimit + 1 →
+  // takeDailyBatchWindow). Otherwise the preview, seeing every unjournaled
+  // shipment, would mark an order's true-up as final while live Xero splits its
+  // shipments across XERO_DAILY_BATCH_LIMIT runs and defers it — overstating the
+  // next batch's revenue (scjz.68/.69 parity).
+  const bBatchLimit = resolveXeroDailyBatchLimit()
+  const bShipments = takeDailyBatchWindow(await db.shipment.findMany({
     where: {
       status: 'SHIPPED',
       shipmentJournalDate: null,
@@ -260,6 +273,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
           shipments: {
             select: {
               id: true,
+              status: true,
               shipmentJournalDate: true,
               revenueRecognizedAmount: true,
             },
@@ -268,7 +282,8 @@ async function computePreview(): Promise<DailyBatchPreview> {
       },
     },
     orderBy: { createdAt: 'asc' },
-  })
+    take: bBatchLimit + 1,
+  }), bBatchLimit).rows
 
   // Mirror the cron daily-sync's grouped revenue recognition so the preview
   // matches what actually posts (cogs-audit scjz.69). The naive per-shipment
@@ -295,10 +310,82 @@ async function computePreview(): Promise<DailyBatchPreview> {
     bShipmentsByOrder.set(shipment.orderId, existing)
   }
 
+  // scjz.68 (mirror of the cron's reversal-aware true-up so the preview matches
+  // what posts — scjz.69): subtract deferred revenue a refund credit note already
+  // reversed out of the unearned account, and only true up a PARTIALLY_REFUNDED
+  // order once it is fully shipped net of refunds.
+  const bOrderIds = Array.from(new Set(bShipments.map((shipment) => shipment.orderId)))
+  const bSettings = await getXeroSettings()
+  const bPartialOrderIds = new Set(
+    bShipments.filter((shipment) => shipment.order.status === 'PARTIALLY_REFUNDED').map((shipment) => shipment.orderId),
+  )
+  const bReversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
+  const bShippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
+  const bRefundedUnshippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
+  if (bOrderIds.length > 0) {
+    const bRefunds = await db.salesOrderRefund.findMany({
+      where: { orderId: { in: bOrderIds } },
+      select: { id: true, orderId: true },
+    })
+    const bRefundIdToOrderId = new Map(bRefunds.map((refund) => [refund.id, refund.orderId]))
+    const bReversalSyncs = await db.accountingSyncLog.findMany({
+      where: {
+        connector: 'xero',
+        type: 'UNEARNED_REV_REVERSAL',
+        status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+        OR: [
+          { referenceType: 'SalesOrder', referenceId: { in: bOrderIds } },
+          { referenceType: 'SalesOrderRefund', referenceId: { in: bRefunds.map((refund) => refund.id) } },
+        ],
+      },
+      select: { referenceType: true, referenceId: true, payload: true },
+    })
+    for (const sync of bReversalSyncs) {
+      const targetOrderId = sync.referenceType === 'SalesOrder' ? sync.referenceId : bRefundIdToOrderId.get(sync.referenceId)
+      if (!targetOrderId) continue
+      const list = bReversalSyncsByOrder.get(targetOrderId) ?? []
+      list.push({ payload: sync.payload })
+      bReversalSyncsByOrder.set(targetOrderId, list)
+    }
+    if (bPartialOrderIds.size > 0) {
+      const [bAllocations, bDispatchedLines, bRefundLines] = await Promise.all([
+        db.orderAllocation.findMany({
+          where: { orderId: { in: [...bPartialOrderIds] } },
+          select: { id: true, orderId: true, lineId: true, productId: true },
+        }),
+        db.shipmentLine.findMany({
+          where: { shipment: { orderId: { in: [...bPartialOrderIds] }, status: 'SHIPPED' } },
+          select: { lineId: true, productId: true, qty: true, shipment: { select: { orderId: true } } },
+        }),
+        db.salesOrderRefundLine.findMany({
+          where: { refund: { orderId: { in: [...bPartialOrderIds] } } },
+          select: { costLayerSnapshot: true },
+        }),
+      ])
+      const bAllocationById = new Map(bAllocations.map((allocation) => [allocation.id, allocation]))
+      for (const line of bDispatchedLines) {
+        if (!line.productId) continue
+        const rows = bShippedRowsByOrder.get(line.shipment.orderId) ?? []
+        rows.push({ lineId: line.lineId, productId: line.productId, qty: Number(line.qty) })
+        bShippedRowsByOrder.set(line.shipment.orderId, rows)
+      }
+      for (const refundLine of bRefundLines) {
+        for (const entry of parseCostLayerSnapshot(refundLine.costLayerSnapshot)) {
+          if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
+          const allocation = bAllocationById.get(entry.orderAllocationId)
+          if (!allocation?.productId || !bPartialOrderIds.has(allocation.orderId)) continue
+          const rows = bRefundedUnshippedRowsByOrder.get(allocation.orderId) ?? []
+          rows.push({ lineId: allocation.lineId, productId: allocation.productId, qty: toDecimal(entry.qty).toNumber() })
+          bRefundedUnshippedRowsByOrder.set(allocation.orderId, rows)
+        }
+      }
+    }
+  }
+
   // Compute per-shipment results grouped by order, then emit in the original
   // (createdAt asc) order so the displayed list and the 200-cap are stable.
   const bShipmentResults = new Map<string, { revenue: number; cogs: Decimal }>()
-  for (const [, orderShipments] of bShipmentsByOrder) {
+  for (const [orderId, orderShipments] of bShipmentsByOrder) {
     const firstShipment = orderShipments[0]
     const order = firstShipment.order
     const deferredBase = Number(order.unearnedRevenueAmount ?? order.totalBase)
@@ -315,8 +402,34 @@ async function computePreview(): Promise<DailyBatchPreview> {
     const recognizedPreviously = order.shipments.reduce((sum, shipment) => (
       shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
     ), 0)
-    const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously))
+    const postedUnearnedReversal = sumPostedUnearnedReversal(
+      bReversalSyncsByOrder.get(orderId) ?? [],
+      bSettings.xero_unearned_revenue_account,
+    )
+    const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
     let runningRevenue = 0
+
+    let isTrueUpEligible = isFullyShippedTerminalStatus(order.status)
+    if (!isTrueUpEligible && order.status === 'PARTIALLY_REFUNDED') {
+      const combinedCoverageByLine = calculateCoverageByLine(requirementsByLine, [
+        ...(bShippedRowsByOrder.get(orderId) ?? []),
+        ...(bRefundedUnshippedRowsByOrder.get(orderId) ?? []),
+      ])
+      isTrueUpEligible = isFullyShippedNetOfRefunds(
+        order.lines
+          .filter((line) => !!line.productId)
+          .map((line) => ({
+            orderedQty: Number(line.qty),
+            coveredQty: combinedCoverageByLine.get(line.id) ?? 0,
+          })),
+      )
+    }
+    if (isTrueUpEligible) {
+      isTrueUpEligible = batchContainsFinalUnjournaledShipment(
+        order.shipments.filter((shipment) => shipment.status === 'SHIPPED'),
+        new Set(orderShipments.map((shipment) => shipment.id)),
+      )
+    }
 
     for (let index = 0; index < orderShipments.length; index++) {
       const shipment = orderShipments[index]
@@ -343,7 +456,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
         remainingDeferred,
         runningRevenue,
         isFinalShipmentOfFullyShippedTerminalOrder:
-          isFullyShippedTerminalStatus(order.status) && index === orderShipments.length - 1,
+          isTrueUpEligible && index === orderShipments.length - 1,
       })
       runningRevenue += revenueProportion
 
