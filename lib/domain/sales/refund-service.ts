@@ -24,6 +24,7 @@ import {
   saleDispatchMovementKey,
 } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
+import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
@@ -1371,19 +1372,26 @@ async function stageRefundAccountingReversals(
 }
 
 /**
- * khdw: map the staged COGS-reversal structured values into the refund-update
- * `data`, so both the initial-staging and accounting-retry update sites persist
- * `cogsReversalBase` + `cogsReversalJournalDate` consistently. Null (chargeback /
- * no COGS reversal) leaves the columns null.
+ * khdw: record the refund's COGS reversal into the cogs_subledger_movements ledger
+ * (negative: a refund credits/decreases COGS) so the daily-batch COGS reconciliation
+ * can net it against the GL COGS movement. Idempotent on the same key as the
+ * COGS_REVERSAL sync, so staging + retry record exactly once. No-op for chargebacks
+ * / no COGS reversal (`cogsReversal` is null). The 6dp base preserves the residue
+ * the GL's 2dp posting drops.
  */
-function refundCogsReversalUpdateData(
+async function recordRefundCogsReversalMovement(
+  client: RefundServiceClient,
+  refundId: string,
   cogsReversal: { base: number; journalDate: string } | null,
-): { cogsReversalBase: number; cogsReversalJournalDate: Date } | Record<string, never> {
-  if (!cogsReversal) return {}
-  return {
-    cogsReversalBase: cogsReversal.base,
-    cogsReversalJournalDate: new Date(`${cogsReversal.journalDate}T00:00:00.000Z`),
-  }
+): Promise<void> {
+  if (!cogsReversal) return
+  await recordCogsSubledgerMovement(client, {
+    sourceType: 'REFUND_REVERSAL',
+    sourceRef: refundId,
+    idempotencyKey: `sales-order-refund:${refundId}:cogs-reversal`,
+    baseDelta: -cogsReversal.base,
+    journalDate: cogsReversal.journalDate,
+  })
 }
 
 function formatRefundAccountingError(error: unknown): string {
@@ -1849,9 +1857,9 @@ export async function createSalesOrderRefund(
           // chargeback from one that owes reversal evidence — independent of
           // accountingRetrySyncs, which is cleared once the syncs queue.
           reversalStaged: stagedAReversal(accountingSyncs),
-          ...refundCogsReversalUpdateData(staged.cogsReversal),
         },
       })
+      await recordRefundCogsReversalMovement(client, txResult.createdRefund.id, staged.cogsReversal)
     } catch (error) {
       accountingWarning = accountingWarningMessage(error)
       await client.salesOrderRefund.update({
@@ -2017,9 +2025,9 @@ export async function retrySalesOrderRefundAccounting(
         data: {
           accountingRetrySyncs: refundAccountingSyncsJson(staged.accountingSyncs),
           reversalStaged: stagedAReversal(staged.accountingSyncs),
-          ...refundCogsReversalUpdateData(staged.cogsReversal),
         },
       })
+      await recordRefundCogsReversalMovement(tx, refund.id, staged.cogsReversal)
 
       return {
         success: true,

@@ -14,7 +14,9 @@ import {
   refreshShipmentCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
+import { db } from '@/lib/db'
 import { toJsonInputValue } from '@/lib/db/json-input'
+import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
 
 export const LANDED_COST_DISTRIBUTION_METHODS = [
@@ -727,12 +729,23 @@ export async function queueLandedCostAdjustmentJournals(
         },
       ],
     }
+    const cogsIdempotencyKey = landedCostAdjustmentIdempotencyKey('cogs', adj)
     await queueAccountingSync({
       type: 'COGS_JOURNAL',
       referenceType: 'PurchaseOrder',
       referenceId: adj.primaryPoId,
       payload,
-      idempotencyKey: landedCostAdjustmentIdempotencyKey('cogs', adj),
+      idempotencyKey: cogsIdempotencyKey,
+    })
+    // khdw: record the net COGS-account movement (increase debits COGS, decrease
+    // credits it; the offset is the transit account, not COGS) in the COGS subledger
+    // ledger so the daily-batch reconciliation nets it against the GL COGS movement.
+    await recordCogsSubledgerMovement(db, {
+      sourceType: 'LANDED_COST_ADJUSTMENT',
+      sourceRef: adj.primaryPoId,
+      idempotencyKey: cogsIdempotencyKey,
+      baseDelta: isIncrease ? absDelta : -absDelta,
+      journalDate: payload.date,
     })
   }
 }

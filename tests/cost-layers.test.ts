@@ -207,6 +207,7 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
         costLayerSnapshot: [{ costLayerId: 'layer-1', qty: '5.000000', unitCostBase: '5.500000' }],
       }],
     },
+    cogsSubledgerMovement: { upsert: async ({ create }: { create: unknown }) => create },
   }
 
   const updated = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
@@ -259,6 +260,7 @@ test('refreshShipmentCogsForCostLayerChange stamps the recalc-run nonce into the
         costLayerSnapshot: [{ costLayerId: 'layer-1', qty: '5.000000', unitCostBase: '5.500000' }],
       }],
     },
+    cogsSubledgerMovement: { upsert: async ({ create }: { create: unknown }) => create },
   }
 
   await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
