@@ -38,6 +38,8 @@ export const MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES = [
   // cogs-audit scjz.60.4: mirror the inventory rounding-difference sweep so the
   // internal accounting-event ledger reflects the same correction posted to Xero.
   'DAILY_BATCH_INVENTORY_RECONCILIATION',
+  // khdw: mirror the COGS rounding-difference sweep on the same basis.
+  'DAILY_BATCH_COGS_RECONCILIATION',
   'COGS_REVERSAL',
   'UNEARNED_REV_REVERSAL',
 ] as const

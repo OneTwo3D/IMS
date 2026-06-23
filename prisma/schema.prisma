@@ -166,6 +166,9 @@ enum AccountingSyncType {
   // rounding residue to the configured rounding-difference account (guarded; only
   // when the gap is within the sweep tolerance — material gaps are flagged, never swept).
   DAILY_BATCH_INVENTORY_RECONCILIATION
+  // khdw: end-of-daily-batch sweep of the COGS subledger-vs-GL rounding residue
+  // (same guard as inventory — sub-penny sweep, material gaps flagged never swept).
+  DAILY_BATCH_COGS_RECONCILIATION
   UNEARNED_REV_REVERSAL
   BILL_PAYMENT
   REALISED_FX_JOURNAL
@@ -1581,6 +1584,16 @@ model SalesOrderRefund {
   // chargeback that staged an UNEARNED_REV_REVERSAL and must still have that evidence.
   // accountingRetrySyncs is cleared once syncs queue, so it can't carry this.
   reversalStaged  Boolean    @default(false)
+  // khdw COGS-reconciliation: structured, independent source for the COGS account's
+  // refund-reversal movement so the daily-batch COGS GL reconciliation can net it
+  // out without scraping the COGS_REVERSAL journal payload. cogsReversalBase is the
+  // pre-round 6dp cost-layer snapshot total that backs the staged COGS_REVERSAL
+  // (null when no COGS reversal was staged — e.g. a chargeback keeps COGS as a loss);
+  // cogsReversalJournalDate is the GL date that reversal posts on (matches the
+  // COGS_REVERSAL journal's `date`), so the reconciliation can window it like
+  // Shipment.shipmentJournalDate on the dispatch side.
+  cogsReversalBase        Decimal?  @db.Decimal(18, 6) @map("cogs_reversal_base")
+  cogsReversalJournalDate DateTime? @map("cogs_reversal_journal_date")
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
 

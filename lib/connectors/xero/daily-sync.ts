@@ -37,6 +37,7 @@ import {
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
+import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
@@ -72,6 +73,7 @@ const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_INVENTORY_ALLOC',
   'DAILY_BATCH_GROUP_B',
   'DAILY_BATCH_INVENTORY_RECONCILIATION',
+  'DAILY_BATCH_COGS_RECONCILIATION',
 ] as const
 
 // GL postings round to the canonical GL precision (cogs-audit scjz.60); these
@@ -217,7 +219,7 @@ function consumeSnapshotLayers(
 async function createPendingSyncLog(
   tx: AccountingMirrorClient,
   params: {
-    type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION'
+    type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION'
     referenceId: string
     payload: Record<string, unknown>
     currency: string
@@ -318,6 +320,8 @@ export type XeroDailyBatchResult = {
   // rounding-difference account this run, or null when nothing was swept (balanced,
   // unavailable, material gap flagged, or no rounding account configured).
   inventoryReconciliationSwept?: number | null
+  // khdw: same, for the COGS subledger-vs-GL rounding sweep.
+  cogsReconciliationSwept?: number | null
 }
 
 export function resolveXeroDailyBatchLimit(value = process.env.XERO_DAILY_BATCH_LIMIT): number {
@@ -1313,6 +1317,45 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       }
     } catch (e) {
       result.errors.push(`Inventory reconciliation sweep error: ${String(e)}`)
+    }
+
+    // khdw: COGS subledger-vs-GL rounding sweep — same guard/idempotency/safety as
+    // the inventory sweep above, on the COGS account. Reconciles the PERIOD MOVEMENT
+    // (Σ dispatch cogsBatchAmount − Σ refund cogsReversalBase over the GL window) vs
+    // the COGS account GL movement; sub-penny → swept, material → flagged (never
+    // swept). Independent of inventory; a failure must never abort the batch.
+    result.cogsReconciliationSwept = null
+    try {
+      const reconciliation = await loadCogsGlReconciliation()
+      const journal = buildCogsReconciliationSweepJournal(reconciliation, {
+        cogsAccount: settings.xero_cogs_account ?? '',
+        roundingAccount: settings.xero_rounding_difference_account ?? '',
+        currency: baseCurrency,
+      })
+      if (journal) {
+        const referenceId = `COGSRECON-${journal.date}`
+        if (!(await hasLiveDailyBatchLog('DAILY_BATCH_COGS_RECONCILIATION', referenceId))) {
+          await db.$transaction((tx) => createPendingSyncLog(tx, {
+            type: 'DAILY_BATCH_COGS_RECONCILIATION',
+            referenceId,
+            currency: baseCurrency,
+            payload: {
+              date: journal.date,
+              reference: `COGS reconciliation ${journal.date}`,
+              narration: journal.narration,
+              lines: journal.lines,
+              batchReferenceId: referenceId,
+              batchDate: journal.date,
+              batchGroup: 'COGS_RECONCILIATION',
+              _postingMode: 'submitted',
+            },
+          }))
+          // delta is signed (subledger - GL); records both magnitude and direction.
+          result.cogsReconciliationSwept = journal.subledgerHigher ? journal.amount : -journal.amount
+        }
+      }
+    } catch (e) {
+      result.errors.push(`COGS reconciliation sweep error: ${String(e)}`)
     }
 
     // Log summary

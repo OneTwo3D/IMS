@@ -824,6 +824,10 @@ async function stageRefundAccountingReversals(
 ): Promise<{
   accountingSyncs: RefundAccountingSyncRequest[]
   snapshotReturnRows: RefundReturnRow[] | null
+  // khdw: structured source for the COGS account's refund-reversal movement, set
+  // only when a COGS_REVERSAL was actually staged (null for chargebacks / no COGS).
+  // base = pre-round 6dp cost-layer total; journalDate = the GL date it posts on.
+  cogsReversal: { base: number; journalDate: string } | null
 }> {
   let snapshotReturnRows: RefundReturnRow[] | null = null
   const accountingSyncs: RefundAccountingSyncRequest[] = []
@@ -1292,6 +1296,10 @@ async function stageRefundAccountingReversals(
 
     return {
       cogsReversal: roundQuantity(sumCostLayerSnapshot(shipmentRefundSnapshot), 2).toNumber(),
+      // khdw: pre-round 6dp basis behind the COGS reversal, captured so the daily-batch
+      // COGS reconciliation has an independent subledger source (the GL gets the 2dp
+      // value above; the 6dp-vs-2dp residue is what the reconciliation sweeps).
+      cogsReversalBase: roundQuantity(sumCostLayerSnapshot(shipmentRefundSnapshot), 6).toNumber(),
       unearnedReversal: Math.min(
         remainingUnearned,
         Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
@@ -1304,14 +1312,19 @@ async function stageRefundAccountingReversals(
   // recognised revenue against AR, but COGS is intentionally KEPT (booked as a
   // loss), so suppress the COGS reversal. Restock is suppressed separately in
   // createSalesOrderRefund (the goods are not returned in a chargeback).
+  // khdw: capture the COGS reversal's GL posting date once so it both drives the
+  // journal payload and is persisted on the refund for the daily-batch reconciliation.
+  let cogsReversalStructured: { base: number; journalDate: string } | null = null
   if (reversalAmounts.cogsReversal > 0 && !params.chargeback) {
+    const cogsReversalJournalDate = new Date().toISOString().slice(0, 10)
+    cogsReversalStructured = { base: reversalAmounts.cogsReversalBase, journalDate: cogsReversalJournalDate }
     accountingSyncs.push({
       type: 'COGS_REVERSAL',
       referenceType: 'SalesOrderRefund',
       referenceId: params.refundId,
       idempotencyKey: `sales-order-refund:${params.refundId}:cogs-reversal`,
       payload: {
-        date: new Date().toISOString().slice(0, 10),
+        date: cogsReversalJournalDate,
         reference: `COGS reversal: ${params.orderRef}`,
         narration: `COGS reversal — refund on order ${params.orderRef}`,
         lines: [
@@ -1354,7 +1367,23 @@ async function stageRefundAccountingReversals(
     })
   }
 
-  return { accountingSyncs, snapshotReturnRows }
+  return { accountingSyncs, snapshotReturnRows, cogsReversal: cogsReversalStructured }
+}
+
+/**
+ * khdw: map the staged COGS-reversal structured values into the refund-update
+ * `data`, so both the initial-staging and accounting-retry update sites persist
+ * `cogsReversalBase` + `cogsReversalJournalDate` consistently. Null (chargeback /
+ * no COGS reversal) leaves the columns null.
+ */
+function refundCogsReversalUpdateData(
+  cogsReversal: { base: number; journalDate: string } | null,
+): { cogsReversalBase: number; cogsReversalJournalDate: Date } | Record<string, never> {
+  if (!cogsReversal) return {}
+  return {
+    cogsReversalBase: cogsReversal.base,
+    cogsReversalJournalDate: new Date(`${cogsReversal.journalDate}T00:00:00.000Z`),
+  }
 }
 
 function formatRefundAccountingError(error: unknown): string {
@@ -1820,6 +1849,7 @@ export async function createSalesOrderRefund(
           // chargeback from one that owes reversal evidence — independent of
           // accountingRetrySyncs, which is cleared once the syncs queue.
           reversalStaged: stagedAReversal(accountingSyncs),
+          ...refundCogsReversalUpdateData(staged.cogsReversal),
         },
       })
     } catch (error) {
@@ -1987,6 +2017,7 @@ export async function retrySalesOrderRefundAccounting(
         data: {
           accountingRetrySyncs: refundAccountingSyncsJson(staged.accountingSyncs),
           reversalStaged: stagedAReversal(staged.accountingSyncs),
+          ...refundCogsReversalUpdateData(staged.cogsReversal),
         },
       })
 

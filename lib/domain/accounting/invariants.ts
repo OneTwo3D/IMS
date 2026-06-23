@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
 import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
+import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -858,6 +859,27 @@ export async function runAccountingInvariantReport(options: {
         subledgerValue: inventoryReconciliation.subledgerValue,
         delta: inventoryReconciliation.delta,
         sweepLimit: inventoryReconciliation.sweepLimit,
+      },
+    })
+  }
+
+  // khdw: reconcile the GL COGS account to its IMS subledger period movement
+  // (Σ dispatch cogsBatchAmount − Σ refund cogsReversalBase). Only a gap beyond the
+  // rounding-scale sweep limit is a real discrepancy; rounding residue is left for
+  // the COGS rounding-difference sweep. Degrades silently when the COGS account is
+  // unmapped or no usable balance snapshots exist yet.
+  const cogsReconciliation = await loadCogsGlReconciliation()
+  if (cogsReconciliation.available && cogsReconciliation.action === 'flag') {
+    findings.push({
+      severity: 'critical',
+      code: 'cogs_gl_subledger_mismatch',
+      message: `GL COGS movement (${cogsReconciliation.glBalance.toFixed(2)}) does not reconcile to the COGS subledger movement (${cogsReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
+      details: {
+        balanceDate: cogsReconciliation.balanceDate,
+        glBalance: cogsReconciliation.glBalance,
+        subledgerValue: cogsReconciliation.subledgerValue,
+        delta: cogsReconciliation.delta,
+        sweepLimit: cogsReconciliation.sweepLimit,
       },
     })
   }
