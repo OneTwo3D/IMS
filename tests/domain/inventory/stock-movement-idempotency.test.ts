@@ -4,6 +4,7 @@ import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   isStockMovementIdempotencyConflict,
+  parseSaleDispatchMovementKey,
   refundInboundMovementKey,
   saleDispatchMovementKey,
   wmsPurchaseReceiptMovementKey,
@@ -50,6 +51,28 @@ test('rejects blank, overlong, or invalid key parts', () => {
   assert.throws(() => saleDispatchMovementKey('a'.repeat(201)), /200 characters or fewer/)
   assert.throws(() => saleDispatchMovementKey('line\n1'), /invalid characters/)
   assert.throws(() => saleDispatchMovementKey('line\u00001'), /invalid characters/)
+})
+
+test('parseSaleDispatchMovementKey round-trips the shipmentLineId the backfill extracts', () => {
+  // Mirrors the migration backfill regex `SALE_DISPATCH:shipmentLine:(.*)$`.
+  for (const id of ['shipment-line-1', 'clxabc123', 'a'.repeat(180)]) {
+    assert.equal(parseSaleDispatchMovementKey(saleDispatchMovementKey(id)), id)
+  }
+})
+
+test('parseSaleDispatchMovementKey returns null for non-sale-dispatch or empty keys', () => {
+  assert.equal(parseSaleDispatchMovementKey(null), null)
+  assert.equal(parseSaleDispatchMovementKey(undefined), null)
+  assert.equal(parseSaleDispatchMovementKey(''), null)
+  assert.equal(parseSaleDispatchMovementKey('SALE_DISPATCH:shipmentLine:'), null)
+  assert.equal(
+    parseSaleDispatchMovementKey('RETURN_INBOUND:refund:r1:line:l1:warehouse:w1'),
+    null,
+  )
+  assert.equal(
+    parseSaleDispatchMovementKey('PURCHASE_RECEIPT:wmsAsnLine:a1:receipt:e1'),
+    null,
+  )
 })
 
 function prismaKnownError(code: string, target?: string[] | string) {

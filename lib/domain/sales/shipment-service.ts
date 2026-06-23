@@ -369,6 +369,7 @@ export async function transitionShipmentStatus(
               note: `Dispatched for order — shipment from ${lockedShipment.warehouse.code}`,
               referenceType: 'SalesOrder',
               referenceId: lockedShipment.orderId,
+              shipmentLineId: line.id,
               idempotencyKey,
             },
             select: { id: true },

@@ -15,8 +15,20 @@ function requireKeyPart(label: string, value: string): string {
   return normalized
 }
 
+const SALE_DISPATCH_KEY_PREFIX = 'SALE_DISPATCH:shipmentLine:'
+
 export function saleDispatchMovementKey(shipmentLineId: string): string {
-  return `SALE_DISPATCH:shipmentLine:${requireKeyPart('shipmentLineId', shipmentLineId)}`
+  return `${SALE_DISPATCH_KEY_PREFIX}${requireKeyPart('shipmentLineId', shipmentLineId)}`
+}
+
+/// Inverse of saleDispatchMovementKey: extract the shipmentLineId encoded in a
+/// SALE_DISPATCH idempotency key, or null when the key is absent or not a
+/// sale-dispatch key. The backfill migration that populates
+/// stock_movements.shipmentLineId relies on this same prefix; keep them in sync.
+export function parseSaleDispatchMovementKey(idempotencyKey: string | null | undefined): string | null {
+  if (!idempotencyKey || !idempotencyKey.startsWith(SALE_DISPATCH_KEY_PREFIX)) return null
+  const shipmentLineId = idempotencyKey.slice(SALE_DISPATCH_KEY_PREFIX.length)
+  return shipmentLineId.length > 0 ? shipmentLineId : null
 }
 
 export function wmsPurchaseReceiptMovementKey(params: {

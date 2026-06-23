@@ -869,11 +869,20 @@ model StockMovement {
   /// Reporting denormalization: total movement value in base currency.
   /// Expected to match qty * unitCostBase within inventory invariant tolerance.
   totalValueBase  Decimal?          @db.Decimal(18, 6)
+  /// Durable line-granularity link from a sale-dispatch movement to the
+  /// originating ShipmentLine (and thus the SalesOrderLine). Populated for
+  /// SALE_DISPATCH movements created from a real shipment; null for other
+  /// movement types and for zero-cost historical-import demand rows.
+  /// Promotes the latent `SALE_DISPATCH:shipmentLine:<id>` idempotency-key
+  /// linkage into a first-class column so revenue↔COGS reporting can join at
+  /// shipment-line granularity (cogs-audit scjz.51/.67, epic 4pz6).
+  shipmentLineId  String?
   createdAt       DateTime          @default(now())
 
   product         Product           @relation(fields: [productId], references: [id])
   fromWarehouse   Warehouse?        @relation("MovementFromWarehouse", fields: [fromWarehouseId], references: [id])
   toWarehouse     Warehouse?        @relation("MovementToWarehouse", fields: [toWarehouseId], references: [id])
+  shipmentLine    ShipmentLine?     @relation(fields: [shipmentLineId], references: [id], onDelete: SetNull)
 
   adjustmentLayers CostLayer[]      @relation("AdjustmentMovementLayer")
   cogsEntries     CogsEntry[]
@@ -882,6 +891,7 @@ model StockMovement {
   @@index([createdAt])
   @@index([productId, createdAt])
   @@index([type, createdAt])
+  @@index([shipmentLineId])
   @@index([referenceType, referenceId])
   @@index([referenceType(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_movements_reference_type_trgm_idx")
   @@index([referenceId(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_movements_reference_id_trgm_idx")
@@ -2799,6 +2809,7 @@ model ShipmentLine {
   shipment    Shipment       @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
   line        SalesOrderLine @relation(fields: [lineId], references: [id])
   product     Product        @relation(fields: [productId], references: [id])
+  stockMovements StockMovement[]
 
   @@index([costLayerSnapshot(ops: JsonbOps)], type: Gin, map: "shipment_lines_costLayerSnapshot_gin_idx")
   @@map("shipment_lines")
