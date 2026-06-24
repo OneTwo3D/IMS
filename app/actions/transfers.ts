@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
@@ -37,6 +38,17 @@ export type TransferLine = {
   productName: string
   qty: number
 }
+
+// o3qo: validate transfer line input. qty must be finite (rejects NaN/Infinity);
+// 0/negative lines are filtered out downstream, matching prior leniency. sku and
+// productName from the client are NOT trusted for persistence — the action
+// re-derives them from the product record (see createTransfer/updateTransferDraft).
+const transferLineSchema = z.object({
+  productId: z.string().min(1, 'productId is required'),
+  sku: z.string(),
+  productName: z.string(),
+  qty: z.number().refine(Number.isFinite, 'qty must be a finite number'),
+})
 
 export type TransferRow = {
   id: string
@@ -204,7 +216,11 @@ export async function createTransfer(
   if (fromWarehouseId === toWarehouseId) {
     return { message: 'Source and destination warehouses must be different.' }
   }
-  const validLines = lines.filter((l) => l.qty > 0 && l.productId)
+  const parsed = z.array(transferLineSchema).safeParse(lines)
+  if (!parsed.success) {
+    return { message: parsed.error.issues[0]?.message ?? 'Invalid transfer line.' }
+  }
+  const validLines = parsed.data.filter((l) => l.qty > 0 && l.productId)
   if (validLines.length === 0) {
     return { message: 'Add at least one product with a quantity.' }
   }
@@ -219,26 +235,38 @@ export async function createTransfer(
   }
   const transferProducts = await db.product.findMany({
     where: { id: { in: [...new Set(validLines.map((line) => line.productId))] } },
-    select: { lifecycleStatus: true },
+    select: { id: true, sku: true, name: true, lifecycleStatus: true },
   })
   if (transferProducts.some((product) => !isOperationalProductStatus(product.lifecycleStatus))) {
     return { message: 'Archived products cannot be transferred.' }
   }
+  // o3qo: re-derive sku/productName from the product record (never trust the
+  // client-supplied values) and reject any line whose product doesn't exist.
+  const productInfoMap = new Map(transferProducts.map((p) => [p.id, p]))
+  if (validLines.some((l) => !productInfoMap.has(l.productId))) {
+    return { message: 'Invalid product in transfer.' }
+  }
 
   try {
-    const transfer = await db.$transaction(async (tx) => {
+    // vp70: an auto-generated reference (TRF-YYYYMMDD-<4 base36>) can collide on a
+    // busy day; retry with a fresh one on a unique-constraint (P2002) violation.
+    // An explicit caller-supplied reference is not retried (its uniqueness was
+    // pre-checked and a clash should surface).
+    const useAutoReference = !reference?.trim()
+    const maxAttempts = useAutoReference ? 5 : 1
+    const createOnce = () => db.$transaction(async (tx) => {
       await validateTransferAvailability(tx, fromWarehouseId, validLines)
       return tx.stockTransfer.create({
         data: {
-          reference: reference || makeReference(),
+          reference: reference?.trim() || makeReference(),
           fromWarehouseId,
           toWarehouseId,
           notes: notes || null,
           lines: {
             create: validLines.map((l) => ({
               productId: l.productId,
-              sku: l.sku,
-              productName: l.productName,
+              sku: productInfoMap.get(l.productId)!.sku,
+              productName: productInfoMap.get(l.productId)!.name,
               qty: l.qty,
             })),
           },
@@ -246,6 +274,19 @@ export async function createTransfer(
         select: TRANSFER_SELECT,
       })
     }, STOCK_TX_OPTIONS)
+
+    let transfer: Awaited<ReturnType<typeof createOnce>> | null = null
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        transfer = await createOnce()
+        break
+      } catch (e) {
+        const code = (e as { code?: string } | null)?.code
+        if (useAutoReference && attempt < maxAttempts && code === 'P2002') continue
+        throw e
+      }
+    }
+    if (!transfer) throw new Error('Failed to create transfer after reference retries.')
     revalidatePath('/stock-control/transfers')
 
     const mapped = await mapRow(transfer)
@@ -288,16 +329,26 @@ export async function updateTransferDraft(
   if (fromWarehouseId === toWarehouseId) {
     return { message: 'Source and destination warehouses must be different.' }
   }
-  const validLines = lines.filter((l) => l.qty > 0 && l.productId)
+  const parsed = z.array(transferLineSchema).safeParse(lines)
+  if (!parsed.success) {
+    return { message: parsed.error.issues[0]?.message ?? 'Invalid transfer line.' }
+  }
+  const validLines = parsed.data.filter((l) => l.qty > 0 && l.productId)
   if (validLines.length === 0) {
     return { message: 'Add at least one product with a quantity.' }
   }
   const transferProducts = await db.product.findMany({
     where: { id: { in: [...new Set(validLines.map((line) => line.productId))] } },
-    select: { lifecycleStatus: true },
+    select: { id: true, sku: true, name: true, lifecycleStatus: true },
   })
   if (transferProducts.some((product) => !isOperationalProductStatus(product.lifecycleStatus))) {
     return { message: 'Archived products cannot be transferred.' }
+  }
+  // o3qo: re-derive sku/productName from the product record (never trust the
+  // client-supplied values) and reject any line whose product doesn't exist.
+  const productInfoMap = new Map(transferProducts.map((p) => [p.id, p]))
+  if (validLines.some((l) => !productInfoMap.has(l.productId))) {
+    return { message: 'Invalid product in transfer.' }
   }
 
   try {
@@ -321,8 +372,8 @@ export async function updateTransferDraft(
           lines: {
             create: validLines.map((l) => ({
               productId: l.productId,
-              sku: l.sku,
-              productName: l.productName,
+              sku: productInfoMap.get(l.productId)!.sku,
+              productName: productInfoMap.get(l.productId)!.name,
               qty: l.qty,
             })),
           },
@@ -375,6 +426,12 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
       if (!transfer) throw new Error('Transfer not found')
       const transition = validateStockTransferStatusTransition(transfer.status, 'IN_TRANSIT')
       if (!transition.success) throw new Error(transition.error)
+
+      // vp70: a draft with no lines would otherwise flip to IN_TRANSIT with no
+      // stock movement and could then be "received" as a no-op. Reject it.
+      if (transfer.lines.length === 0) {
+        throw new Error('Cannot dispatch a transfer with no lines.')
+      }
 
       // Lock stock levels for all affected products in the source warehouse
       const productIds = transfer.lines.map((l) => l.productId)

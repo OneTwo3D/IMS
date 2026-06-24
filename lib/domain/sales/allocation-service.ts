@@ -284,10 +284,27 @@ export async function applyAllocationReservationDelta(
       continue
     }
 
-    await tx.stockLevel.updateMany({
-      where: { productId: row.productId, warehouseId: row.warehouseId },
+    // l4jq: guard the release decrement so it can never drive reservedQty
+    // negative (the reserve branch above already checks updated.count). Decrement
+    // only when reservedQty >= qty; on drift (reservedQty < qty) floor at 0
+    // — max(0, reserved - qty) — instead of relying on the DB non-negative CHECK
+    // to abort the whole transaction.
+    const released = await tx.stockLevel.updateMany({
+      where: { productId: row.productId, warehouseId: row.warehouseId, reservedQty: { gte: qty } },
       data: { reservedQty: { decrement: qty } },
     })
+    if (released.count === 0) {
+      const floored = await tx.stockLevel.updateMany({
+        where: { productId: row.productId, warehouseId: row.warehouseId },
+        data: { reservedQty: 0 },
+      })
+      if (floored.count > 0) {
+        console.warn(
+          `[allocation] reservedQty drift on release for product ${row.productId} @ ${row.warehouseId}: ` +
+          `tried to release ${qty.toString()} but reserved was lower; floored to 0.`,
+        )
+      }
+    }
   }
 }
 
