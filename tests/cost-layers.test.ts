@@ -215,6 +215,7 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
     isReversalPostingEnabled: async () => true,
     queueAccountingSync: async (_tx, params) => {
       queued.push(params)
+      return true
     },
   })
 
@@ -267,7 +268,7 @@ test('refreshShipmentCogsForCostLayerChange stamps the recalc-run nonce into the
     accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
     isReversalPostingEnabled: async () => true,
     recalcRunId: 'run-abc',
-    queueAccountingSync: async (_tx, params) => { queued.push(params) },
+    queueAccountingSync: async (_tx, params) => { queued.push(params); return true },
   })
 
   // Same (shipment, layer, old, new) as the prior test, but the nonce makes the
@@ -293,7 +294,7 @@ test('refreshShipmentCogsForCostLayerChange does not claim the delta when COGS_R
   const result = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
     accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
     isReversalPostingEnabled: async () => false,
-    queueAccountingSync: async (_tx, params) => { queued.push(params) },
+    queueAccountingSync: async (_tx, params) => { queued.push(params); return true },
   })
   assert.equal(result.shipmentsUpdated, 1)
   assert.equal(result.cogsRevaluationDelta.toString(), '0') // not shipment-owned → stays in the COGS journal
@@ -320,6 +321,7 @@ test('refreshShipmentCogsForCostLayerChange does not queue COGS revaluation sync
     isDailyBatchPostingEnabled: async () => true,
     queueAccountingSync: async (_tx, params) => {
       queued.push(params)
+      return true
     },
   })
 
@@ -347,7 +349,7 @@ test('refreshShipmentCogsForCostLayerChange keeps the un-journaled delta in the 
   const result = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
     accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
     isDailyBatchPostingEnabled: async () => false,
-    queueAccountingSync: async (_tx, params) => { queued.push(params) },
+    queueAccountingSync: async (_tx, params) => { queued.push(params); return true },
   })
   assert.deepEqual(queued, [])
   assert.equal(result.cogsRevaluationDelta.toString(), '0') // not shipment-owned → stays in the COGS journal

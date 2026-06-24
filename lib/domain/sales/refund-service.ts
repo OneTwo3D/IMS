@@ -1,7 +1,6 @@
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import type { AccountingSettings } from '@/lib/accounting'
-import { isAccountingSyncTypeEnabled } from '@/lib/accounting'
 import { copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import {
   parseCostLayerSnapshot,
@@ -826,10 +825,6 @@ async function stageRefundAccountingReversals(
 ): Promise<{
   accountingSyncs: RefundAccountingSyncRequest[]
   snapshotReturnRows: RefundReturnRow[] | null
-  // khdw: structured source for the COGS account's refund-reversal movement, set
-  // only when a COGS_REVERSAL was actually staged (null for chargebacks / no COGS).
-  // base = pre-round 6dp cost-layer total; journalDate = the GL date it posts on.
-  cogsReversal: { base: number; journalDate: string } | null
 }> {
   let snapshotReturnRows: RefundReturnRow[] | null = null
   const accountingSyncs: RefundAccountingSyncRequest[] = []
@@ -1316,10 +1311,8 @@ async function stageRefundAccountingReversals(
   // createSalesOrderRefund (the goods are not returned in a chargeback).
   // khdw: capture the COGS reversal's GL posting date once so it both drives the
   // journal payload and is persisted on the refund for the daily-batch reconciliation.
-  let cogsReversalStructured: { base: number; journalDate: string } | null = null
   if (reversalAmounts.cogsReversal > 0 && !params.chargeback) {
     const cogsReversalJournalDate = new Date().toISOString().slice(0, 10)
-    cogsReversalStructured = { base: reversalAmounts.cogsReversalBase, journalDate: cogsReversalJournalDate }
     accountingSyncs.push({
       type: 'COGS_REVERSAL',
       referenceType: 'SalesOrderRefund',
@@ -1329,6 +1322,12 @@ async function stageRefundAccountingReversals(
         date: cogsReversalJournalDate,
         reference: `COGS reversal: ${params.orderRef}`,
         narration: `COGS reversal — refund on order ${params.orderRef}`,
+        // bcz9.4: carry the 6dp cost-layer base so the subledger row, recorded at
+        // queue time (queueRefundAccountingActions) atomically with the COGS_REVERSAL
+        // sync, preserves the residue the GL's 2dp posting drops — without re-deriving
+        // it from the journal's 2dp credit lines. Ignored by the connectors (like the
+        // other private `_`-prefixed payload fields).
+        _cogsReversalBase: reversalAmounts.cogsReversalBase,
         lines: [
           { accountCode: settings.inventoryAccount, description: `COGS reversal: ${params.orderRef}`, debit: reversalAmounts.cogsReversal },
           { accountCode: settings.cogsAccount, description: `COGS reversal: ${params.orderRef}`, credit: reversalAmounts.cogsReversal },
@@ -1369,86 +1368,58 @@ async function stageRefundAccountingReversals(
     })
   }
 
-  return { accountingSyncs, snapshotReturnRows, cogsReversal: cogsReversalStructured }
+  return { accountingSyncs, snapshotReturnRows }
 }
 
 /**
- * bcz9.1: injectable accounting gate so the COGS subledger write can be exercised in
- * unit tests without a live connector. Production resolves to the real per-type check.
+ * bcz9.4: resolve the COGS-reversal base (for the subledger ledger) from a
+ * COGS_REVERSAL sync payload. Prefers the structured 6dp `_cogsReversalBase`
+ * embedded at staging; falls back to summing the journal's 2dp credit lines for
+ * reversals persisted before that field existed. Returns null when no positive
+ * base is present (nothing to record).
  */
-export interface RefundAccountingDeps {
-  isCogsReversalSyncEnabled?: () => Promise<boolean>
-}
-
-async function resolveCogsReversalSyncEnabled(deps?: RefundAccountingDeps): Promise<boolean> {
-  return deps?.isCogsReversalSyncEnabled
-    ? deps.isCogsReversalSyncEnabled()
-    : isAccountingSyncTypeEnabled('COGS_REVERSAL')
-}
-
-/**
- * khdw: record the refund's COGS reversal into the cogs_subledger_movements ledger
- * (negative: a refund credits/decreases COGS) so the daily-batch COGS reconciliation
- * can net it against the GL COGS movement. Idempotent on the same key as the
- * COGS_REVERSAL sync, so staging + retry record exactly once. No-op for chargebacks
- * / no COGS reversal (`cogsReversal` is null). The 6dp base preserves the residue
- * the GL's 2dp posting drops.
- */
-async function recordRefundCogsReversalMovement(
-  client: RefundServiceClient,
-  refundId: string,
-  cogsReversal: { base: number; journalDate: string } | null,
-  cogsReversalSyncEnabled: boolean,
-): Promise<void> {
-  if (!cogsReversal) return
-  // bcz9.1: only record the ledger row when the COGS_REVERSAL journal will actually
-  // post to the GL (mirrors landed-cost-service's COGS_JOURNAL gate). If reversals
-  // are staged while COGS_REVERSAL is disabled the journal no-ops, so recording a
-  // negative ledger row with no GL counterpart would make the recon perpetually flag.
-  if (!cogsReversalSyncEnabled) return
-  await recordCogsSubledgerMovement(client, {
-    sourceType: 'REFUND_REVERSAL',
-    sourceRef: refundId,
-    idempotencyKey: `sales-order-refund:${refundId}:cogs-reversal`,
-    baseDelta: -cogsReversal.base,
-    journalDate: cogsReversal.journalDate,
-  })
-}
-
-/**
- * khdw: when an accounting retry replays an already-persisted COGS_REVERSAL without
- * re-staging, record its COGS movement into the ledger from the persisted payload
- * (2dp). Idempotent on the same key, so it's a no-op if the original staging already
- * recorded the (6dp) row — this only fills the gap for a reversal persisted before
- * the ledger existed, or whose staging crashed after persisting but before recording.
- */
-async function recordPersistedRefundCogsReversal(
-  client: RefundServiceClient,
-  refundId: string,
-  persistedSyncs: RefundAccountingSyncRequest[],
-  cogsReversalSyncEnabled: boolean,
-): Promise<void> {
-  const reversal = persistedSyncs.find((sync) => sync.type === 'COGS_REVERSAL')
-  if (!reversal || !isRecord(reversal.payload)) return
-  const date = typeof reversal.payload.date === 'string' ? reversal.payload.date : null
-  const lines = Array.isArray(reversal.payload.lines) ? reversal.payload.lines : null
-  if (!date || !lines) return
-  // bcz9.1: gate on the journal posting, as in recordRefundCogsReversalMovement. When
-  // a reversal persisted while disabled is later replayed with COGS_REVERSAL enabled,
-  // this records the ledger row so a disabled-then-enabled refund still ties out.
-  if (!cogsReversalSyncEnabled) return
+export function resolveRefundCogsReversalBase(payload: unknown): number | null {
+  if (!isRecord(payload)) return null
+  const structured = payload._cogsReversalBase
+  if (typeof structured === 'number' && Number.isFinite(structured) && structured > 0) return structured
+  const lines = Array.isArray(payload.lines) ? payload.lines : null
+  if (!lines) return null
   // The COGS_REVERSAL journal credits the COGS account (debits inventory); that
   // credit is the reversal amount, so the net COGS movement is its negation.
   let credit = 0
   for (const line of lines) {
     if (isRecord(line) && typeof line.credit === 'number' && Number.isFinite(line.credit)) credit += line.credit
   }
-  if (credit <= 0) return
+  return credit > 0 ? credit : null
+}
+
+/**
+ * bcz9.4: record the refund's COGS reversal into the cogs_subledger_movements ledger
+ * (negative: a refund credits/decreases COGS) ATOMICALLY with queuing the
+ * COGS_REVERSAL sync — call this from queueRefundAccountingActions inside the same
+ * db.$transaction that queues the journal. Recording at queue time (not at refund
+ * staging) guarantees the negative ledger row exists only once the GL reversal is
+ * durably queued, so the daily-batch COGS reconciliation can't sweep a not-yet-queued
+ * reversal as rounding and then double-count it when a retry posts the real journal
+ * (Codex PR #353 F5). Idempotent on the sync's key, so initial + retry record exactly
+ * once. No-op when the journal won't post, for a non-COGS_REVERSAL sync, or when the
+ * payload carries no positive base / date.
+ */
+export async function recordRefundCogsReversalFromSync(
+  client: RefundServiceClient,
+  sync: RefundAccountingSyncRequest,
+  cogsReversalSyncEnabled: boolean,
+): Promise<void> {
+  if (sync.type !== 'COGS_REVERSAL' || !cogsReversalSyncEnabled) return
+  if (!isRecord(sync.payload)) return
+  const date = typeof sync.payload.date === 'string' ? sync.payload.date : null
+  const base = resolveRefundCogsReversalBase(sync.payload)
+  if (!date || base === null) return
   await recordCogsSubledgerMovement(client, {
     sourceType: 'REFUND_REVERSAL',
-    sourceRef: refundId,
-    idempotencyKey: `sales-order-refund:${refundId}:cogs-reversal`,
-    baseDelta: -credit,
+    sourceRef: sync.referenceId,
+    idempotencyKey: sync.idempotencyKey ?? `sales-order-refund:${sync.referenceId}:cogs-reversal`,
+    baseDelta: -base,
     journalDate: date,
   })
 }
@@ -1525,7 +1496,6 @@ export async function createSalesOrderRefund(
      */
     chargeback?: boolean
   },
-  deps?: RefundAccountingDeps,
 ): Promise<CreateSalesOrderRefundResult> {
   // Keep discount lines (negative totalBase, qty 0) which the qty>0/totalBase>0 filter
   // would otherwise drop — a chargeback mirrors the invoice's order-discount line.
@@ -1919,12 +1889,8 @@ export async function createSalesOrderRefund(
           reversalStaged: stagedAReversal(accountingSyncs),
         },
       })
-      await recordRefundCogsReversalMovement(
-        client,
-        txResult.createdRefund.id,
-        staged.cogsReversal,
-        staged.cogsReversal ? await resolveCogsReversalSyncEnabled(deps) : false,
-      )
+      // bcz9.4: the COGS subledger row is recorded later, atomically with queuing the
+      // COGS_REVERSAL sync (queueRefundAccountingActions), not here at staging.
     } catch (error) {
       accountingWarning = accountingWarningMessage(error)
       await client.salesOrderRefund.update({
@@ -1980,7 +1946,6 @@ export async function retrySalesOrderRefundAccounting(
     refundId: string
     accountingSettings: AccountingSettings
   },
-  deps?: RefundAccountingDeps,
 ): Promise<RetrySalesOrderRefundAccountingResult> {
   try {
     return await runInTransaction(client, async (tx) => {
@@ -2026,13 +1991,8 @@ export async function retrySalesOrderRefundAccounting(
       }
       const persistedSyncs = parseRefundAccountingRetrySyncs(refund.accountingRetrySyncs)
       if (persistedSyncs.length > 0) {
-        const hasPersistedCogsReversal = persistedSyncs.some((sync) => sync.type === 'COGS_REVERSAL')
-        await recordPersistedRefundCogsReversal(
-          tx,
-          refund.id,
-          persistedSyncs,
-          hasPersistedCogsReversal ? await resolveCogsReversalSyncEnabled(deps) : false,
-        )
+        // bcz9.4: the COGS subledger row is recorded by queueRefundAccountingActions
+        // when it re-queues these persisted syncs, atomically with the COGS_REVERSAL.
         return {
           success: true,
           orderId: refund.orderId,
@@ -2100,12 +2060,8 @@ export async function retrySalesOrderRefundAccounting(
           reversalStaged: stagedAReversal(staged.accountingSyncs),
         },
       })
-      await recordRefundCogsReversalMovement(
-        tx,
-        refund.id,
-        staged.cogsReversal,
-        staged.cogsReversal ? await resolveCogsReversalSyncEnabled(deps) : false,
-      )
+      // bcz9.4: the COGS subledger row is recorded by queueRefundAccountingActions when
+      // it queues these staged syncs, atomically with the COGS_REVERSAL sync.
 
       return {
         success: true,

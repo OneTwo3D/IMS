@@ -205,9 +205,14 @@ export async function queueAccountingSyncTx(
     payload: Record<string, unknown>
     idempotencyKey?: string
   },
-): Promise<void> {
+): Promise<boolean> {
+  // Returns whether a GL counterpart for this posting exists or will post: false when
+  // the type won't post (no active/enabled connector), true when it was queued or is
+  // already queued. Callers that must stay consistent with the queue decision (e.g. the
+  // COGS subledger ledger writes, bcz9.2/bcz9.4) should record based on THIS result, not
+  // a separate settings recheck — avoiding a TOCTOU if the connector/setting flips.
   const context = await getAccountingPostingContext(params.type)
-  if (!context) return
+  if (!context) return false
 
   const payload = {
     ...params.payload,
@@ -227,7 +232,7 @@ export async function queueAccountingSyncTx(
       },
       select: { id: true },
     })
-    if (existing) return
+    if (existing) return true
   }
 
   try {
@@ -270,8 +275,11 @@ export async function queueAccountingSyncTx(
         description: `Accounting sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
       },
     }).then(() => undefined))
+    return true
   } catch (error) {
-    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
+    // A unique-key collision means a concurrent insert already queued this posting,
+    // so the GL counterpart exists — treat as queued.
+    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return true
     throw error
   }
 }

@@ -37,7 +37,7 @@ type QueueAccountingSyncTxParams = {
 export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx> = {
   getActiveAccountingConnectorInfo: () => Promise<AccountingConnectorInfo>
   isAccountingSyncTypeEnabled: (type: 'PURCHASE_INVOICE_UPDATE') => Promise<boolean>
-  queueAccountingSyncTx: (tx: Tx, params: QueueAccountingSyncTxParams) => Promise<void>
+  queueAccountingSyncTx: (tx: Tx, params: QueueAccountingSyncTxParams) => Promise<boolean>
 }
 
 export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoiceUpdateSyncTx>(params: {
