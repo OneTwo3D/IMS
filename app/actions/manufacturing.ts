@@ -590,8 +590,19 @@ export async function updateManufacturingOrderStatus(
         // or strand the reservation. Completion now requires IN_PROGRESS
         // (DRAFT->complete is blocked, scjz.32), so the live-BOM fallback only
         // covers legacy orders started before audit-H6 added componentSnapshot.
+        // 8fo0: distinguish an ABSENT snapshot (legacy orders started before
+        // audit-H6 — fall back to the live BOM) from a PRESENT-but-malformed one
+        // (corrupt data). parseProductionOrderComponentSnapshot returns null for
+        // both, but silently falling back to the live BOM when a snapshot WAS
+        // frozen defeats audit-H6: a mid-production BOM edit could then change what
+        // is consumed/recovered or strand the reservation. Hard-error instead of
+        // silently consuming the wrong components.
+        const parsedSnapshot = parseProductionOrderComponentSnapshot(order.componentSnapshot)
+        if (order.componentSnapshot != null && parsedSnapshot == null) {
+          throw new Error('This production order has a frozen component snapshot that is present but malformed; refusing to fall back to the live BOM. Resolve the snapshot data before completing this order.')
+        }
         const components: ProductionOrderComponentSnapshot | typeof order.outputProduct.productComponents =
-          parseProductionOrderComponentSnapshot(order.componentSnapshot) ?? order.outputProduct.productComponents
+          parsedSnapshot ?? order.outputProduct.productComponents
         completedComponents = components
         const wasInProgress = order.status === 'IN_PROGRESS'
         const costLayerReceivedAt = manufacturingCostLayerReceivedAt({
@@ -630,6 +641,12 @@ export async function updateManufacturingOrderStatus(
           }> = []
           for (const comp of components) {
             const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
+            // 8fo0: two COMPLEMENTARY gates, not redundant — keep both. This one
+            // validates the RESERVATION contract (requireReserved) + stock_levels
+            // availability; consumeFifoLayersStrict below is the cost-layer
+            // consumption authority. They guard distinct invariants and fail CLOSED
+            // if stock_levels and cost_layers ever disagree (better than consuming
+            // against a single source that the other contradicts).
             await assertStockAvailable(tx, comp.componentId, order.warehouseId, totalQty, {
               includeReserved: wasInProgress,
               requireReserved: wasInProgress,
@@ -689,6 +706,12 @@ export async function updateManufacturingOrderStatus(
           // costs. Spread the FULL run cost across the ACTUAL produced units, so
           // yield loss raises the per-unit cost rather than vanishing.
           const outputTotalCostBase = totalAssemblyCostBase.add(totalManufacturingCostBase)
+          // 8fo0 (split to lxv6, deferred): the PRODUCTION_IN movement below stores
+          // the EXACT outputTotalCostBase, but the layer can only hold a 6dp per-unit
+          // cost, so qty*round6(unitCost) may differ from the exact total by a
+          // sub-penny residual. This is the inherent 6dp cost-layer storage limit
+          // (same class as scjz.12); fixing it needs an engine-level exact-value
+          // change across ALL layers, not a manufacturing-local tweak.
           const outputLayerId = await createCostLayer(tx, {
             productId: order.outputProductId,
             warehouseId: order.warehouseId,
