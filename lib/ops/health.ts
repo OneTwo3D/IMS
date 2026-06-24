@@ -927,25 +927,37 @@ async function getLatestWooCommerceSync(now: Date = new Date()): Promise<LatestO
       return { id: c.id, name: c.name, latest }
     }))
 
-    const withLogs = perConnector.filter((p) => p.latest)
-    if (withLogs.length === 0) {
-      return warningLatest(`No sync log found for ${connectors.map((c) => c.name).join(', ')}`, now)
+    const details = {
+      connectors: perConnector.map((p) => ({
+        connector: p.id,
+        lastRunAt: p.latest ? (p.latest.syncedAt ?? p.latest.createdAt).toISOString() : null,
+        status: p.latest?.status ?? 'NONE',
+      })),
     }
 
-    const runAt = (p: (typeof withLogs)[number]) => p.latest!.syncedAt ?? p.latest!.createdAt
-    const oldest = withLogs.reduce((a, b) => (runAt(a) <= runAt(b) ? a : b))
+    // A configured connector that has NEVER synced is the worst case (blind), so
+    // it represents the slot as a warning rather than being excluded from the
+    // most-stale selection (Codex b8i6.4). null lastStatus => latestOperation
+    // returns 'warning'.
+    const missing = perConnector.filter((p) => !p.latest)
+    if (missing.length > 0) {
+      return latestOperation({
+        lastRunAt: null,
+        lastStatus: null,
+        reference: `no sync log: ${missing.map((m) => m.name).join(', ')}`,
+        details,
+        now,
+      })
+    }
+
+    const runAt = (p: (typeof perConnector)[number]) => p.latest!.syncedAt ?? p.latest!.createdAt
+    const oldest = perConnector.reduce((a, b) => (runAt(a) <= runAt(b) ? a : b))
 
     return latestOperation({
       lastRunAt: runAt(oldest),
       lastStatus: oldest.latest!.status,
       reference: oldest.latest!.entityType,
-      details: {
-        connectors: perConnector.map((p) => ({
-          connector: p.id,
-          lastRunAt: p.latest ? (p.latest.syncedAt ?? p.latest.createdAt).toISOString() : null,
-          status: p.latest?.status ?? 'NONE',
-        })),
-      },
+      details,
       now,
     })
   } catch (error) {
