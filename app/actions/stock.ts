@@ -22,7 +22,7 @@ import {
   type StockLevelMapScope,
 } from '@/lib/domain/inventory/stock-level-map'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
-import { calculateAdjustmentStockDelta, assertAdjustmentEditFifoFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
+import { calculateAdjustmentStockDelta, assertAdjustmentEditFifoFeasible, assertStockAdjustmentFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
 import { addMoney, toDecimal } from '@/lib/domain/math/decimal'
 import {
   buildStockMovementValueFields,
@@ -184,7 +184,18 @@ export async function applyStockAdjustment({
     }
   }
 
-  await lockStockLevelRow(tx, productId, warehouseId)
+  const locked = await lockStockLevelRow(tx, productId, warehouseId)
+
+  // ig58: pre-flight availability check against the locked row, before any
+  // movement/cost-layer/upsert is written. Rejects an infeasible removal (one
+  // that would drive on-hand below the reserved quantity, which includes going
+  // negative) with a clear message instead of letting the DB non-negative CHECK
+  // abort opaquely — and so the upsert create branch never builds a negative.
+  assertStockAdjustmentFeasible({
+    signedQty: qty,
+    currentQuantity: locked.quantity,
+    currentReservedQty: locked.reservedQty,
+  })
 
   let additionUnitCost: number | null = null
   if (isAddition) {
@@ -219,10 +230,13 @@ export async function applyStockAdjustment({
 
   await tx.stockLevel.upsert({
     where: { productId_warehouseId: { productId, warehouseId } },
+    // lockStockLevelRow already upserted the row, so the create branch is
+    // effectively unreachable; keep it non-negative (a removal that reached it
+    // would mean a zero on-hand row, already rejected by the guard above).
     create: {
       productId,
       warehouseId,
-      quantity: isAddition ? absQty : `-${absQty}`,
+      quantity: isAddition ? absQty : '0',
     },
     update: {
       quantity: {

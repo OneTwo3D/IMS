@@ -9,6 +9,16 @@ const QUANTITY_EPSILON = 0.000001
 // consumption then rejects (surfacing a misleading concurrent-consumption error).
 const FIFO_SHORTFALL_TOLERANCE = QUANTITY_EPSILON
 
+// Tolerance for guarding the literal stock_levels.quantity column (Decimal(14,6)) against
+// going negative / below reserved. It MUST be strictly smaller than one representable unit
+// (1e-6) — otherwise the guard would permit a removal that overshoots available by a whole
+// representable unit, writing a real -0.000001 on-hand that only the DB non-negative CHECK
+// then catches opaquely (ig58). It must also stay above double-precision representation noise
+// on a difference of two 6dp values, which at the top of the (14,6) range (~1e8) is ~3e-8, so
+// a legitimate exact-to-the-unit removal is never spuriously rejected. 1e-7 sits in that gap.
+// (Distinct from QUANTITY_EPSILON, which is the 1e-6 FIFO engine-scale layer-sum tolerance.)
+const STOCK_QUANTITY_FP_EPSILON = 0.0000001
+
 export type AdjustmentStockDeltaInput = {
   oldSignedQty: number
   newSignedQty: number
@@ -33,7 +43,7 @@ export function calculateAdjustmentStockDelta({
   const reservedQty = decimalToNumber(currentReservedQty ?? 0)
   const resultingQuantity = currentQty + stockDelta
 
-  if (resultingQuantity + QUANTITY_EPSILON < reservedQty) {
+  if (resultingQuantity + STOCK_QUANTITY_FP_EPSILON < reservedQty) {
     throw new Error(
       `Cannot edit adjustment: resulting stock (${resultingQuantity.toFixed(4)}) ` +
       `would be below reserved quantity (${reservedQty.toFixed(4)}).`,
@@ -41,6 +51,50 @@ export function calculateAdjustmentStockDelta({
   }
 
   return { stockDelta, resultingQuantity, reservedQty }
+}
+
+export type ApplyStockAdjustmentFeasibilityInput = {
+  /** Signed quantity of the NEW adjustment (positive = addition, negative = removal). */
+  signedQty: number
+  /** Current on-hand quantity on the locked stock-level row. */
+  currentQuantity?: DecimalLike | null
+  /** Current reserved (allocated / in-transit) quantity on the locked row. */
+  currentReservedQty?: DecimalLike | null
+}
+
+/**
+ * ig58: pre-flight feasibility for a NEW stock adjustment against the locked
+ * stock-level row, BEFORE any movement/cost-layer/upsert is written. A removal
+ * that would drive on-hand below the reserved quantity (stock committed to
+ * orders / in transit) — which includes any removal that would go negative — is
+ * rejected with a clear, actionable message instead of letting the DB
+ * non-negative CHECK abort with an opaque constraint error. Mirrors
+ * calculateAdjustmentStockDelta's reserved guard for the edit path; additions
+ * are always feasible (a positive adjustment strictly increases on-hand, so it
+ * can never newly drive quantity below reserved or negative — only the edit path
+ * needs a both-signs guard, because an edit's net delta can be negative even when
+ * the adjustment itself is an addition). Returns the resulting on-hand quantity.
+ */
+export function assertStockAdjustmentFeasible({
+  signedQty,
+  currentQuantity,
+  currentReservedQty,
+}: ApplyStockAdjustmentFeasibilityInput): { resultingQuantity: number; reservedQty: number } {
+  const currentQty = decimalToNumber(currentQuantity ?? 0)
+  const reservedQty = decimalToNumber(currentReservedQty ?? 0)
+  const resultingQuantity = currentQty + signedQty
+  const available = currentQty - reservedQty
+
+  if (signedQty < 0 && Math.abs(signedQty) > available + STOCK_QUANTITY_FP_EPSILON) {
+    throw new Error(
+      `Insufficient stock to remove ${Math.abs(signedQty)} unit(s) — only ${available.toFixed(4)} available ` +
+      `(${currentQty.toFixed(4)} on hand` +
+      (reservedQty > 0 ? `, ${reservedQty.toFixed(4)} reserved for orders` : '') +
+      `). Release reservations/allocations or reverse later movements first.`,
+    )
+  }
+
+  return { resultingQuantity, reservedQty }
 }
 
 export type AdjustmentEditFifoFeasibilityInput = {
