@@ -1198,10 +1198,12 @@ export async function updateManufacturingOrderStatus(
     revalidatePath('/inventory')
     revalidatePath('/stock-control')
     try {
-      // audit-H6: on completion, sync the components actually consumed/recovered
-      // (snapshot set); for other transitions no component stock changed, so fall
+      // audit-H6 / 8fo0: on completion, sync exactly the components actually
+      // consumed/recovered (the frozen snapshot set — which may legitimately be
+      // empty for a zero-component frozen order; honour that rather than re-reading
+      // the live BOM). For other transitions no component stock changed, so fall
       // back to the live BOM list (unchanged behaviour).
-      const syncComponentIds = completedComponents.length > 0
+      const syncComponentIds = status === 'COMPLETED'
         ? completedComponents.map((comp) => comp.componentId)
         : orderPreview.outputProduct.productComponents.map((comp) => comp.componentId)
       await enqueueStockSync(
