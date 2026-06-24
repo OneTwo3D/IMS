@@ -160,7 +160,10 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
           </div>
         )}
 
-        <Button type="submit" size="sm" disabled={isPending}>
+        {/* 0tr0: stay disabled through the post-success window (until the form
+            remounts and mints a new token). Otherwise an edit-and-resubmit in that
+            window reuses the same token and the new adjustment is silently deduped. */}
+        <Button type="submit" size="sm" disabled={isPending || !!successMsg}>
           {isPending ? 'Saving…' : 'Apply Adjustment'}
         </Button>
       </form>

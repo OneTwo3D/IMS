@@ -195,7 +195,10 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSave} disabled={saving || lines.length === 0}>
+          {/* 0tr0: stay disabled once saved — the dialog lingers ~1s before close and
+              the token is cleared on success, so a click in that window would mint a
+              fresh token and double-book the whole batch. */}
+          <Button onClick={handleSave} disabled={saving || lines.length === 0 || !!result?.success}>
             {saving ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
             Save Adjustments
           </Button>
