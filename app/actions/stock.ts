@@ -141,6 +141,13 @@ export type ApplyStockAdjustmentInput = {
    * zero-cost stock (samples/consigned).
    */
   unitCostBase?: number | null
+  /**
+   * 8biu: pre-fetched accounting settings. Pass this from a bulk loop so
+   * getAccountingSettings() is read once for the whole batch instead of per line.
+   * Omit for single adjustments (fetched on demand only when a reason has an
+   * account code).
+   */
+  settings?: Awaited<ReturnType<typeof getAccountingSettings>>
 }
 
 export type AppliedStockAdjustment = {
@@ -166,6 +173,7 @@ export async function applyStockAdjustment({
   reasonId,
   note,
   unitCostBase,
+  settings: providedSettings,
 }: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
   const isAddition = qty > 0
   const absQty = Math.abs(qty).toString()
@@ -274,7 +282,7 @@ export async function applyStockAdjustment({
   ])
 
   if (accountCode) {
-    const settings = await getAccountingSettings()
+    const settings = providedSettings ?? await getAccountingSettings()
     // For additions, value the GL journal at the SAME unit cost the movement and
     // cost layer were booked at (additionUnitCost), so Inventory GL ties to the
     // cost-layer/stock-movement value rather than a blended product average
@@ -428,7 +436,7 @@ export async function adjustStock(
       })
       logSku = applied.productSku
       logWarehouseName = applied.warehouseName
-    })
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath(`/inventory/${productId}`)
     revalidatePath('/stock-control')
@@ -507,24 +515,51 @@ export type BulkAdjustFormState = {
   count?: number
 }
 
+// rfdl: schema for a bulk-adjust line. qty must be finite (0 lines are filtered
+// out, not rejected, to match the prior lenient behaviour); unitCostBase, when
+// present, must be a finite number >= 0 (or null for the derived average).
+const bulkAdjustLineSchema = z.object({
+  productId: z.string().min(1, 'productId is required'),
+  warehouseId: z.string().min(1, 'warehouseId is required'),
+  reasonId: z.string(),
+  qty: z.number().refine(Number.isFinite, 'qty must be a finite number'),
+  unitCostBase: z
+    .number()
+    .refine(Number.isFinite, 'unitCostBase must be a finite number')
+    .nonnegative('unitCostBase must be zero or greater')
+    .nullable()
+    .optional(),
+})
+
 export async function bulkAdjustStock(
   lines: BulkAdjustLine[]
 ): Promise<BulkAdjustFormState> {
   await requirePermission('stock_control.adjust')
-  const valid = lines.filter((l) => l.qty !== 0 && l.productId && l.warehouseId)
+
+  // rfdl: validate every line (parity with single adjustStock). Reject non-finite
+  // qty, negative unitCostBase, and missing/non-string ids before any write.
+  const parsed = z.array(bulkAdjustLineSchema).safeParse(lines)
+  if (!parsed.success) {
+    return { message: parsed.error.issues[0]?.message ?? 'Invalid bulk adjustment line.' }
+  }
+  const valid = parsed.data.filter((l) => l.qty !== 0 && l.productId && l.warehouseId)
 
   if (valid.length === 0) {
     return { message: 'No adjustments to save.' }
   }
 
-  // Pre-fetch all unique reasons
+  // Pre-fetch all unique reasons + accounting settings ONCE for the whole batch
+  // (8biu: avoid a per-line getAccountingSettings() inside the transaction loop).
   const reasonIds = [...new Set(valid.map((l) => l.reasonId).filter(Boolean))]
-  const reasons = reasonIds.length
-    ? await db.adjustmentReason.findMany({
-        where: { id: { in: reasonIds } },
-        select: { id: true, name: true, accountCode: true },
-      })
-    : []
+  const [reasons, accountingSettings] = await Promise.all([
+    reasonIds.length
+      ? db.adjustmentReason.findMany({
+          where: { id: { in: reasonIds } },
+          select: { id: true, name: true, accountCode: true },
+        })
+      : Promise.resolve([]),
+    getAccountingSettings(),
+  ])
   const reasonMap = new Map(reasons.map((r) => [r.id, r]))
 
   try {
@@ -539,9 +574,10 @@ export async function bulkAdjustStock(
           reasonId: line.reasonId,
           note: reason?.name ?? null,
           unitCostBase: line.unitCostBase,
+          settings: accountingSettings,
         })
       }
-    })
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
