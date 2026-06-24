@@ -15,7 +15,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
+import { enqueueStockSync, pushOrderDeliveryMetadata, pushSalesOrderStatus } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import {
   resolveLineTaxRateBatch,
@@ -1256,7 +1256,9 @@ export async function applySalesOrderStatusTransition(
         paidAt: true,
         invoiceNumber: true,
         currency: true,
-        shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
+        // b8i6.1: detect a shopping order via ANY connector (not just WooCommerce)
+        // so a Shopify-linked order also gets its IMS status pushed back.
+        shoppingLinks: { select: { id: true }, take: 1 },
         lines: { select: { id: true, productId: true, sku: true, qty: true } },
       },
     })
@@ -1441,18 +1443,22 @@ export async function applySalesOrderStatusTransition(
       metadata: { orderNumber: statusOrderRef, previousStatus: previousStatusForLog, newStatus: targetStatus },
     })
 
-    // Push status to WooCommerce (fire-and-forget)
+    // Push status back to the order's shopping connector(s) (fire-and-forget).
+    // b8i6.1: routed through the facade so it dispatches to the order's actual
+    // connector (WooCommerce pushes; Shopify is skipped until it gains a push).
     if ((options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0) {
-      import('@/lib/connectors/woocommerce/sync/order-status')
-        .then((m) => m.pushImsStatusToWc(id, targetStatus as never))
+      pushSalesOrderStatus(id, targetStatus)
+        .then((res) => {
+          if (!res.success) throw new Error(res.error ?? 'unknown error')
+        })
         .catch(async (syncError) => {
           await logActivity({
             entityType: 'SALES_ORDER',
             entityId: id,
-            action: 'wc_status_push_failed',
+            action: 'shopping_status_push_failed',
             tag: 'sync',
             level: 'WARNING',
-            description: `Failed to push status ${targetStatus} for order ${getSalesOrderReference(so)} to WooCommerce: ${syncError instanceof Error ? syncError.message : String(syncError)}`,
+            description: `Failed to push status ${targetStatus} for order ${getSalesOrderReference(so)} to shopping connector: ${syncError instanceof Error ? syncError.message : String(syncError)}`,
             metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: String(syncError) },
           })
         })

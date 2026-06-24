@@ -8,7 +8,7 @@ import {
   persistShopifyWebhookEvent,
   type PersistShoppingWebhookEventResult,
   type ShoppingWebhookEventRepository,
-} from '@/lib/connectors/woocommerce/webhook-inbox'
+} from '@/lib/connectors/shopping-webhook-inbox'
 import { getShopifyDeliveryStatusForSalesOrder } from './delivery'
 import { extractShopifyLegacyResourceId, getShopifyCredentials, shopifyGraphql, verifyShopifyWebhookSignature } from './api'
 import { getShopifyProductExternalLink, getShopifySalesOrderAdminLink } from './links'
