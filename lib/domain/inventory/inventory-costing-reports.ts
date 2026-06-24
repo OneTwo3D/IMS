@@ -13,9 +13,7 @@ import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domai
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
-import { getXeroSettings } from '@/lib/connectors/xero/settings'
-import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
-import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { getAccountingSettings, getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
 import { cache } from 'react'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -471,13 +469,13 @@ function supplierMetas(product: ProductMeta): Array<{ id: string; name: string }
     .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
 }
 
-const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
-  const [baseCurrency, settings, plugins] = await Promise.all([getBaseCurrencyCode(), getXeroSettings(), getIntegrationPluginState()])
+const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | 'quickbooks' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
+  const [baseCurrency, settings, connectorInfo] = await Promise.all([getBaseCurrencyCode(), getAccountingSettings(), getActiveAccountingConnectorInfo()])
   return {
-    connector: plugins.xero ? 'xero' : null,
+    connector: connectorInfo?.id ?? null,
     baseCurrency,
-    inventoryAccountCode: settings.xero_inventory_account.trim() || null,
-    cogsAccountCode: settings.xero_cogs_account.trim() || null,
+    inventoryAccountCode: settings.inventoryAccount.trim() || null,
+    cogsAccountCode: settings.cogsAccount.trim() || null,
   }
 })
 
@@ -509,14 +507,14 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: ['Xero is not enabled, so GL inventory variance is blank.'],
+      notices: ['No accounting connector is enabled, so GL inventory variance is blank.'],
     }
   }
   if (!context.inventoryAccountCode) {
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: ['No Xero inventory asset account is configured, so GL variance is blank.'],
+      notices: ['No inventory asset account is configured on the active accounting connector, so GL variance is blank.'],
     }
   }
   const snapshot = await findLatestAccountBalanceSnapshot({
@@ -552,14 +550,14 @@ async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBas
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: ['Xero is not enabled, so GL COGS variance is blank.'],
+      notices: ['No accounting connector is enabled, so GL COGS variance is blank.'],
     }
   }
   if (!context.cogsAccountCode) {
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: ['No Xero COGS account is configured, so GL COGS variance is blank.'],
+      notices: ['No COGS account is configured on the active accounting connector, so GL COGS variance is blank.'],
     }
   }
   const movement = await loadCogsGlMovementWithOnDemandSnapshotSync({
@@ -592,9 +590,11 @@ async function loadCogsGlMovementWithOnDemandSnapshotSync(lookup: CogsGlMovement
     return { ok: true, movementBase: movement.movementBase }
   } catch (error) {
     if (!(error instanceof MissingAccountBalanceSnapshotError)) throw error
-    if (lookup.connector !== 'xero') return { ok: false }
 
-    const syncResult = await syncXeroAccountBalanceSnapshots({
+    // Connector-agnostic on-demand snapshot sync: dispatches to the active accounting
+    // connector. Returns ok:false (with a notice) when the active connector can't
+    // produce the snapshot — including QuickBooks, whose ingestion isn't implemented yet.
+    const syncResult = await syncAccountingAccountBalanceSnapshots({
       balanceDate: error.requiredBalanceDate,
       accountCodes: lookup.accountCode ? [lookup.accountCode] : undefined,
       syncRunId: `report-demand:${error.requiredBalanceDate}:${error.reason}`,
@@ -602,7 +602,7 @@ async function loadCogsGlMovementWithOnDemandSnapshotSync(lookup: CogsGlMovement
     if (syncResult.errors.length > 0 || syncResult.persisted === 0) {
       return {
         ok: false,
-        notice: `On-demand Xero Trial Balance sync for ${error.requiredBalanceDate} did not create the required GL balance snapshot.`,
+        notice: `On-demand GL Trial Balance sync for ${error.requiredBalanceDate} did not create the required GL balance snapshot.`,
       }
     }
 

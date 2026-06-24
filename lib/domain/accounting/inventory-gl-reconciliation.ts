@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { getAccountingSettings, getActiveAccountingConnectorInfo } from '@/lib/accounting'
 import { balanceDateString, findLatestAccountBalanceSnapshot } from './account-balance-snapshots'
 import {
   DEFAULT_GL_SWEEP_LIMIT,
@@ -95,14 +95,20 @@ export async function loadInventoryGlReconciliation(options?: {
   now?: Date
   sweepLimit?: number
 }): Promise<InventoryGlReconciliationResult> {
-  const settings = await getXeroSettings()
-  const inventoryAccount = settings.xero_inventory_account?.trim()
-  const allocatedAccount = settings.xero_allocated_inventory_account?.trim()
+  // Connector-agnostic: follow whichever accounting connector is active rather than
+  // reading Xero directly (degrades to unavailable when none is active, or when the
+  // active connector has no GL balance snapshots yet).
+  const connectorInfo = await getActiveAccountingConnectorInfo()
+  if (!connectorInfo) return { available: false, reason: 'no_account_configured' }
+  const connector = connectorInfo.id
+  const settings = await getAccountingSettings()
+  const inventoryAccount = settings.inventoryAccount?.trim()
+  const allocatedAccount = settings.allocatedInventoryAccount?.trim()
   if (!inventoryAccount || !allocatedAccount) return { available: false, reason: 'no_account_configured' }
 
   const currency = await getBaseCurrencyCode()
   const inventorySnapshot = await findLatestAccountBalanceSnapshot({
-    connector: 'xero',
+    connector,
     accountCode: inventoryAccount,
     balanceDate: options?.now ?? new Date(),
     currency,
@@ -112,7 +118,7 @@ export async function loadInventoryGlReconciliation(options?: {
 
   // The Allocated-Inventory balance must be for the SAME date to be comparable.
   const allocatedSnapshot = await findLatestAccountBalanceSnapshot({
-    connector: 'xero',
+    connector,
     accountCode: allocatedAccount,
     balanceDate,
     currency,

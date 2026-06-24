@@ -891,9 +891,11 @@ async function stageRefundAccountingReversals(
       },
     })
 
+    // Connector-agnostic: the referenceType/referenceId + type + status clauses already
+    // uniquely scope to THIS order's reversals, and only one accounting connector is
+    // active at a time, so no connector filter is needed (was hardcoded 'xero').
     const priorReversals = await tx.accountingSyncLog.findMany({
       where: {
-        connector: 'xero',
         OR: [
           { referenceType: 'SalesOrder', referenceId: params.orderId },
           {
