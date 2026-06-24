@@ -126,7 +126,11 @@ export function manualStockAdjustmentMovementKey(params: {
         warehouseId: params.warehouseId,
         qty: params.qty,
         reasonId: params.reasonId ?? null,
-        note: params.note ?? null,
+        // Canonicalize the note: a blank/whitespace note is stored identically to an
+        // absent one (applyStockAdjustment treats '' as falsy), so they must hash to
+        // the same key — otherwise a caller sending '' vs null for the same logical
+        // adjustment could slip a duplicate movement past the dedupe.
+        note: params.note?.trim() || null,
         unitCostBase: params.unitCostBase ?? null,
         referenceType: params.referenceType ?? null,
         referenceId: params.referenceId ?? null,

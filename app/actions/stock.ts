@@ -594,6 +594,9 @@ export type BulkAdjustLine = {
   // — so two lines with identical content don't collapse to a single movement, and
   // removing/reordering a line on retry can't shift another line's key.
   lineId: string
+  // vzlk-2a: optional per-line free-text note (combined with the reason name on the
+  // movement, mirroring the single adjustment form).
+  note?: string | null
 }
 
 export type BulkAdjustFormState = {
@@ -612,6 +615,7 @@ const bulkAdjustLineSchema = z.object({
   // tllm: stable per-line id, restricted to idempotency-key-safe characters so it
   // can be composed into the per-line submission token without escaping.
   lineId: z.string().min(1, 'lineId is required').regex(/^[A-Za-z0-9._-]+$/, 'lineId has invalid characters'),
+  note: z.string().max(500, 'Note must be 500 characters or fewer').nullable().optional(),
   qty: z.number().refine(Number.isFinite, 'qty must be a finite number'),
   unitCostBase: z
     .number()
@@ -639,31 +643,24 @@ export async function bulkAdjustStock(
     return { message: 'No adjustments to save.' }
   }
 
-  // Pre-fetch all unique reasons + accounting settings ONCE for the whole batch
-  // (8biu: avoid a per-line getAccountingSettings() inside the transaction loop).
-  const reasonIds = [...new Set(valid.map((l) => l.reasonId).filter(Boolean))]
-  const [reasons, accountingSettings] = await Promise.all([
-    reasonIds.length
-      ? db.adjustmentReason.findMany({
-          where: { id: { in: reasonIds } },
-          select: { id: true, name: true, accountCode: true },
-        })
-      : Promise.resolve([]),
-    getAccountingSettings(),
-  ])
-  const reasonMap = new Map(reasons.map((r) => [r.id, r]))
+  // Pre-fetch accounting settings ONCE for the whole batch (8biu: avoid a per-line
+  // getAccountingSettings() inside the transaction loop). The reason name is resolved
+  // per line inside applyStockAdjustment.
+  const accountingSettings = await getAccountingSettings()
 
   try {
     await db.$transaction(async (tx) => {
       for (const line of valid) {
-        const reason = line.reasonId ? reasonMap.get(line.reasonId) : null
         await applyStockAdjustment({
           tx,
           productId: line.productId,
           warehouseId: line.warehouseId,
           qty: line.qty,
           reasonId: line.reasonId,
-          note: reason?.name ?? null,
+          // vzlk-2a: pass the per-line free-text note (not the reason name — that was
+          // double-counted, since applyStockAdjustment already prefixes the reason
+          // name, producing "Damaged: Damaged"). Now: reason name [+ ": <note>"].
+          note: line.note ?? null,
           unitCostBase: line.unitCostBase,
           settings: accountingSettings,
           // 0tr0/tllm: per-line token = submission token + the line's STABLE client

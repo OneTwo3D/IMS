@@ -105,15 +105,15 @@ export function AdjustmentHistory({ initialRows }: Props) {
                     </div>
                     {isEditing ? (
                       <div className="flex items-center gap-1">
-                        <Button size="icon" variant="ghost" className="h-7 w-7 text-green-600" onClick={() => saveEdit(row.id)} disabled={editState?.saving}>
+                        <Button size="icon" variant="ghost" className="h-7 w-7 text-green-600" onClick={() => saveEdit(row.id)} disabled={editState?.saving} title="Save" aria-label="Save changes">
                           <Check className="h-4 w-4" />
                         </Button>
-                        <Button size="icon" variant="ghost" className="h-7 w-7" onClick={cancelEdit} disabled={editState?.saving}>
+                        <Button size="icon" variant="ghost" className="h-7 w-7" onClick={cancelEdit} disabled={editState?.saving} title="Cancel" aria-label="Cancel edit">
                           <X className="h-4 w-4" />
                         </Button>
                       </div>
                     ) : (
-                      <Button size="icon" variant="ghost" className="h-7 w-7 shrink-0" onClick={() => startEdit(row)} title="Edit">
+                      <Button size="icon" variant="ghost" className="h-7 w-7 shrink-0" onClick={() => startEdit(row)} title="Edit" aria-label="Edit adjustment">
                         <Pencil className="h-4 w-4" />
                       </Button>
                     )}
@@ -247,18 +247,21 @@ export function AdjustmentHistory({ initialRows }: Props) {
                       {isEditing ? (
                         <div className="flex items-center gap-1">
                           <Button size="icon" variant="ghost" className="h-6 w-6 text-green-600"
-                            onClick={() => saveEdit(row.id)} disabled={editState?.saving}>
+                            onClick={() => saveEdit(row.id)} disabled={editState?.saving} title="Save" aria-label="Save changes">
                             <Check className="h-3.5 w-3.5" />
                           </Button>
                           <Button size="icon" variant="ghost" className="h-6 w-6"
-                            onClick={cancelEdit} disabled={editState?.saving}>
+                            onClick={cancelEdit} disabled={editState?.saving} title="Cancel" aria-label="Cancel edit">
                             <X className="h-3.5 w-3.5" />
                           </Button>
                         </div>
                       ) : (
+                        // vzlk-3: focus-visible:opacity-100 so keyboard users can reach
+                        // the edit affordance (hover-only made it invisible to them);
+                        // aria-label since the icon button has no text.
                         <Button size="icon" variant="ghost"
-                          className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity"
-                          onClick={() => startEdit(row)} title="Edit">
+                          className="h-6 w-6 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                          onClick={() => startEdit(row)} title="Edit" aria-label="Edit adjustment">
                           <Pencil className="h-3 w-3" />
                         </Button>
                       )}

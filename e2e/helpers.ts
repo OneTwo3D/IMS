@@ -116,7 +116,9 @@ export async function addStockAdjustment(page: Page, sku: string, qty: number, w
 
   const dialog = page.getByRole('dialog', { name: 'New Stock Adjustment' })
   await dialog.getByPlaceholder(/search by sku or name/i).fill(sku)
-  await dialog.getByRole('button', { name: new RegExp(sku) }).first().click()
+  // vzlk-2c: the product-search results are now combobox options (role="option"),
+  // not plain buttons.
+  await dialog.getByRole('option', { name: new RegExp(sku) }).first().click()
   if (warehouseCode) {
     const warehouseSelect = dialog.locator('select').first()
     const requestedWarehouse = warehouseSelect.locator('option', { hasText: warehouseCode })
@@ -127,10 +129,10 @@ export async function addStockAdjustment(page: Page, sku: string, qty: number, w
       }
     }
   }
-  // The qty field is step="1"; a separate required unit-cost field (step="any",
-  // title "Unit cost…") was added later, so target qty specifically rather than the
-  // last number input, and supply a unit cost for the positive new-product line.
-  await dialog.locator('input[type="number"][step="1"]').last().fill(String(qty))
+  // vzlk-2b: the qty field is now step="any" and labelled; target it by its
+  // accessible name rather than the step, and supply a unit cost for the positive
+  // new-product line (its own labelled field).
+  await dialog.getByRole('spinbutton', { name: /quantity to add or remove/i }).last().fill(String(qty))
   await dialog.locator('input[title^="Unit cost"]').last().fill('10')
   await dialog.getByRole('button', { name: /save adjustments/i }).click()
 
