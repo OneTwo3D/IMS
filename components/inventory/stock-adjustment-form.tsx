@@ -1,6 +1,6 @@
 'use client'
 
-import { useActionState, useEffect, useState } from 'react'
+import { useActionState, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -26,6 +26,16 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
   )
   const [successMsg, setSuccessMsg] = useState('')
   const [prevSuccess, setPrevSuccess] = useState<boolean | undefined>(undefined)
+  // 0tr0: a per-form-instance idempotency token so a double-click / retry submits
+  // the same token and the server dedups the adjustment. Set imperatively on an
+  // uncontrolled hidden input after mount (not at render) to avoid an SSR/hydration
+  // mismatch; regenerated whenever the form resets (formKey change → input remounts).
+  const idempotencyTokenRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (idempotencyTokenRef.current) {
+      idempotencyTokenRef.current.value = crypto.randomUUID()
+    }
+  }, [formKey])
 
   // Show success message immediately (render-time state adjustment)
   if (state.success && !prevSuccess) {
@@ -56,6 +66,7 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
       )}
       <form key={formKey} action={formAction} className="space-y-3">
         <input type="hidden" name="productId" value={productId} />
+        <input type="hidden" name="idempotencyToken" ref={idempotencyTokenRef} />
 
         {state.message && (
           <p className="text-sm text-destructive">{state.message}</p>
@@ -149,7 +160,10 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
           </div>
         )}
 
-        <Button type="submit" size="sm" disabled={isPending}>
+        {/* 0tr0: stay disabled through the post-success window (until the form
+            remounts and mints a new token). Otherwise an edit-and-resubmit in that
+            window reuses the same token and the new adjustment is silently deduped. */}
+        <Button type="submit" size="sm" disabled={isPending || !!successMsg}>
           {isPending ? 'Saving…' : 'Apply Adjustment'}
         </Button>
       </form>

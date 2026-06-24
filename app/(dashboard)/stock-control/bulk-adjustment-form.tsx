@@ -43,6 +43,8 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
   const [saving, setSaving] = useState(false)
   const [result, setResult] = useState<{ success?: boolean; count?: number; message?: string } | null>(null)
   const searchRef = useRef<HTMLInputElement>(null)
+  // 0tr0: stable idempotency token for this bulk submission (see handleSave).
+  const idempotencyTokenRef = useRef<string | null>(null)
 
   const defaultWarehouseId = warehouses[0]?.id ?? ''
 
@@ -75,10 +77,19 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
     if (valid.length === 0) { setResult({ message: 'Enter a non-zero quantity for at least one product.' }); return }
     setSaving(true)
     setResult(null)
-    const res = await bulkAdjustStock(valid.map(({ productId, warehouseId, reasonId, qty, unitCostBase }) => ({ productId, warehouseId, reasonId, qty, unitCostBase })))
+    // 0tr0: reuse a stable idempotency token across retries of this batch so the
+    // server dedups a double-submit line-for-line; reset only on confirmed success.
+    if (!idempotencyTokenRef.current) {
+      idempotencyTokenRef.current = crypto.randomUUID()
+    }
+    const res = await bulkAdjustStock(
+      valid.map(({ productId, warehouseId, reasonId, qty, unitCostBase }) => ({ productId, warehouseId, reasonId, qty, unitCostBase })),
+      idempotencyTokenRef.current,
+    )
     setSaving(false)
     setResult(res)
     if (res.success) {
+      idempotencyTokenRef.current = null
       router.refresh()
       setTimeout(() => onClose(), 1000)
     }
@@ -184,7 +195,10 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSave} disabled={saving || lines.length === 0}>
+          {/* 0tr0: stay disabled once saved — the dialog lingers ~1s before close and
+              the token is cleared on success, so a click in that window would mint a
+              fresh token and double-book the whole batch. */}
+          <Button onClick={handleSave} disabled={saving || lines.length === 0 || !!result?.success}>
             {saving ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
             Save Adjustments
           </Button>
