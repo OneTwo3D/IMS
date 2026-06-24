@@ -796,7 +796,22 @@ export async function cancelTransfer(id: string): Promise<TransferResult> {
     const transition = validateStockTransferStatusTransition(existing.status, 'CANCELLED')
     if (!transition.success) return { message: transition.error }
 
-    await db.stockTransfer.update({ where: { id }, data: { status: 'CANCELLED' } })
+    // 7ddn: close the dispatch/cancel race. Without the lock + conditional guard, a
+    // concurrent dispatchTransfer (DRAFT→IN_TRANSIT, which decrements source stock)
+    // could be overwritten by this unconditional update, flipping IN_TRANSIT→CANCELLED
+    // and stranding the already-dispatched stock with no compensating movement. Lock
+    // the transfer row and transition only if it is still DRAFT, mirroring the other
+    // state mutations (dispatch/receive). The pre-checks above stay for nice messages;
+    // this conditional update is the authoritative guard.
+    const cancelled = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
+      const updated = await tx.stockTransfer.updateMany({
+        where: { id, status: 'DRAFT' },
+        data: { status: 'CANCELLED' },
+      })
+      return updated.count === 1
+    }, STOCK_TX_OPTIONS)
+    if (!cancelled) return { message: 'Transfer is no longer in a cancellable state.' }
     revalidatePath('/stock-control/transfers')
 
     await logActivity({
