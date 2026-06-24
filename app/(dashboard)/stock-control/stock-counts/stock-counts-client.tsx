@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useEffect, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { ClipboardCheck, ChevronDown, ChevronUp, Ban, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -40,10 +40,17 @@ export function StockCountsClient({
   const [counts, setCounts] = useState(initialCounts)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [showNew, setShowNew] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // Codex: re-sync the list after a router.refresh() re-fetches the server page,
+  // otherwise statuses/counts shown from the initial render go stale.
+  useEffect(() => { setCounts(initialCounts) }, [initialCounts])
+
+  // Called by a row on a successful action (success message, not an error).
   function refresh(message?: string) {
-    setError(message ?? null)
+    setNotice(message ?? null)
+    setError(null)
     router.refresh()
   }
 
@@ -54,9 +61,10 @@ export function StockCountsClient({
           <h1 className="text-xl font-semibold flex items-center gap-2"><ClipboardCheck className="h-5 w-5" /> Stock Counts</h1>
           <p className="text-sm text-muted-foreground">Snapshot a warehouse&apos;s book quantities, enter the physical count, then post the variances as stock adjustments.</p>
         </div>
-        <Button size="sm" onClick={() => { setError(null); setShowNew(true) }} disabled={warehouses.length === 0}>New count</Button>
+        <Button size="sm" onClick={() => { setError(null); setNotice(null); setShowNew(true) }} disabled={warehouses.length === 0}>New count</Button>
       </div>
 
+      {notice && <p className="text-sm text-green-700 dark:text-green-400">{notice}</p>}
       {error && <p className="text-sm text-destructive">{error}</p>}
 
       {counts.length === 0 ? (
@@ -240,11 +248,8 @@ function StockCountRowView({
                   disabled={pending}
                   onClick={() => {
                     if (!confirm('Post this stock count? Variances will be booked as stock adjustments (creating/consuming FIFO layers). This cannot be undone.')) return
-                    run(async () => {
-                      const save = await saveStockCountCounts({ countId: count.id, counts: buildCounts() })
-                      if (!save.success) return save
-                      return postStockCount({ countId: count.id, reasonId: reasonId || undefined })
-                    }, 'Stock count posted.')
+                    // Atomic: the counts are persisted inside the post transaction.
+                    run(() => postStockCount({ countId: count.id, reasonId: reasonId || undefined, counts: buildCounts() }), 'Stock count posted.')
                   }}
                 >
                   Post variances

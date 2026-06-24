@@ -168,13 +168,38 @@ export async function createStockCount(input: unknown): Promise<StockCountResult
   }
 }
 
+// countedQty is stored as Decimal(12,4): bound it so an out-of-range value fails
+// with a clear Zod message instead of a raw DB error (Codex).
+const countedQtySchema = z.number()
+  .refine(Number.isFinite, 'count must be finite')
+  .min(0, 'count cannot be negative')
+  .max(99_999_999.9999, 'count is too large')
+const countLineInputSchema = z.object({
+  lineId: z.string().min(1),
+  countedQty: countedQtySchema.nullable(),
+})
+
 const saveSchema = z.object({
   countId: z.string().min(1),
-  counts: z.array(z.object({
-    lineId: z.string().min(1),
-    countedQty: z.number().refine(Number.isFinite, 'count must be finite').min(0, 'count cannot be negative').nullable(),
-  })),
+  counts: z.array(countLineInputSchema),
 })
+
+type CountLineInput = z.infer<typeof countLineInputSchema>
+
+/** Persist counted quantities + reported variance for a count's lines, in-tx. */
+async function persistCountsTx(
+  tx: Prisma.TransactionClient,
+  counts: CountLineInput[],
+  expectedById: Map<string, number>,
+): Promise<void> {
+  for (const c of counts) {
+    if (!expectedById.has(c.lineId)) continue
+    const variance = c.countedQty == null
+      ? null
+      : new Prisma.Decimal(c.countedQty).sub(expectedById.get(c.lineId)!).toDecimalPlaces(4).toNumber()
+    await tx.stockCountLine.update({ where: { id: c.lineId }, data: { countedQty: c.countedQty, variance } })
+  }
+}
 
 /** Enter/clear counted quantities on a count's lines (DRAFT/IN_PROGRESS only). */
 export async function saveStockCountCounts(input: unknown): Promise<StockCountResult> {
@@ -190,14 +215,7 @@ export async function saveStockCountCounts(input: unknown): Promise<StockCountRe
       if (!count) throw new Error('Stock count not found.')
       if (count.status === 'COMPLETED' || count.status === 'CANCELLED') throw new Error('This stock count can no longer be edited.')
       const expectedById = new Map(count.lines.map((l) => [l.id, Number(l.expectedQty)]))
-      for (const c of counts) {
-        if (!expectedById.has(c.lineId)) continue
-        const variance = c.countedQty == null ? null : new Prisma.Decimal(c.countedQty).sub(expectedById.get(c.lineId)!).toDecimalPlaces(4).toNumber()
-        await tx.stockCountLine.update({
-          where: { id: c.lineId },
-          data: { countedQty: c.countedQty, variance },
-        })
-      }
+      await persistCountsTx(tx, counts, expectedById)
       if (count.status === 'DRAFT') {
         await tx.stockCount.update({ where: { id: countId }, data: { status: 'IN_PROGRESS', startedAt: new Date() } })
       }
@@ -213,6 +231,9 @@ export async function saveStockCountCounts(input: unknown): Promise<StockCountRe
 const postSchema = z.object({
   countId: z.string().min(1),
   reasonId: z.string().min(1).optional(),
+  // Optional final counts persisted within the post transaction so save+post is
+  // atomic (Codex: a concurrent save can't slip between a separate save and post).
+  counts: z.array(countLineInputSchema).optional(),
 })
 
 /**
@@ -225,7 +246,7 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
   await requirePermission('stock_control.adjust')
   const parsed = postSchema.safeParse(input)
   if (!parsed.success) return { message: parsed.error.issues[0]?.message ?? 'Invalid post request.' }
-  const { countId, reasonId } = parsed.data
+  const { countId, reasonId, counts } = parsed.data
 
   let affectedProductIds: string[] = []
   try {
@@ -240,9 +261,22 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
       if (count.status === 'COMPLETED') throw new Error('This stock count has already been posted.')
       if (count.status === 'CANCELLED') throw new Error('This stock count was cancelled and cannot be posted.')
 
+      const expectedById = new Map(count.lines.map((l) => [l.id, Number(l.expectedQty)]))
+      // Atomic save+post: persist any final counts within this transaction.
+      if (counts && counts.length > 0) await persistCountsTx(tx, counts, expectedById)
+      const providedById = new Map((counts ?? []).map((c) => [c.lineId, c.countedQty]))
+
       const countedLines: StockCountLineForPost[] = count.lines
-        .filter((l) => l.countedQty != null)
-        .map((l) => ({ lineId: l.id, productId: l.productId, sku: l.sku, expectedQty: Number(l.expectedQty), countedQty: Number(l.countedQty) }))
+        .map((l) => {
+          const countedQty = providedById.has(l.id)
+            ? providedById.get(l.id)!
+            : (l.countedQty == null ? null : Number(l.countedQty))
+          return { lineId: l.id, productId: l.productId, sku: l.sku, expectedQty: Number(l.expectedQty), countedQty }
+        })
+        .filter((l): l is StockCountLineForPost & { countedQty: number } => l.countedQty != null)
+
+      // Codex: never COMPLETE an empty post (no lines counted).
+      if (countedLines.length === 0) throw new Error('Count at least one line before posting.')
 
       // Read the LIVE book per counted product under lock.
       const productIds = countedLines.map((l) => l.productId)
@@ -257,16 +291,23 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
       const postings = computeStockCountPostings(countedLines, liveBook)
       for (const posting of postings) {
         if (posting.adjustmentQty !== 0) {
-          await applyStockAdjustment({
-            tx,
-            productId: posting.productId,
-            warehouseId: count.warehouseId,
-            qty: posting.adjustmentQty,
-            reasonId,
-            note: `Stock count ${countId}`,
-            referenceType: 'StockCount',
-            referenceId: countId,
-          })
+          try {
+            await applyStockAdjustment({
+              tx,
+              productId: posting.productId,
+              warehouseId: count.warehouseId,
+              qty: posting.adjustmentQty,
+              reasonId,
+              note: `Stock count ${countId}`,
+              referenceType: 'StockCount',
+              referenceId: countId,
+            })
+          } catch (e) {
+            // Codex: name the offending SKU. A surplus of a product with no cost
+            // basis fails here (scjz.2) — surface which line and why so the operator
+            // can resolve it (e.g. add it via a costed stock adjustment first).
+            throw new Error(`Line ${posting.sku}: ${e instanceof Error ? e.message : String(e)}`)
+          }
           affectedProductIds.push(posting.productId)
         }
         // Persist the reported variance (count vs snapshot) on the line.
