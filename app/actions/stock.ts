@@ -56,29 +56,6 @@ async function logStockSideEffectFailure(action: string, error: unknown): Promis
 // Helpers for inventory adjustment accounting journal
 // ---------------------------------------------------------------------------
 
-/**
- * Compute a unit cost (GBP) for a product from its FIFO cost layers.
- * Used to value manual stock adjustments (write-offs, shrinkage, stock found)
- * when queuing the accounting journal. Returns the weighted average of
- * remaining layers; falls back to 0 if no layers exist.
- */
-async function getProductUnitCost(
-  tx: Prisma.TransactionClient,
-  productId: string,
-): Promise<number> {
-  const layers = await tx.costLayer.findMany({
-    where: { productId, remainingQty: { gt: 0 } },
-    select: { remainingQty: true, unitCostBase: true },
-  })
-  let totalQty = 0
-  let totalCost = 0
-  for (const l of layers) {
-    const q = Number(l.remainingQty)
-    totalQty += q
-    totalCost += q * Number(l.unitCostBase)
-  }
-  return totalQty > 0 ? totalCost / totalQty : 0
-}
 
 /**
  * Build the journal payload for an inventory adjustment.
@@ -100,7 +77,13 @@ function buildInventoryAdjustmentJournal(params: {
   warehouseCode: string
   warehouseName: string
   qty: number
-  unitCost: number
+  /**
+   * The base-currency value the movement actually booked (cbxu): for an addition,
+   * qty × the layer unit cost; for a removal, the FIFO cost of the layers consumed.
+   * The journal credits/debits Inventory by ROUND(this, 2) so Inventory GL ties to
+   * the cost-layer reduction, not a product-wide blended average.
+   */
+  totalValueBase: number
   note: string | null
 }): {
   date: string
@@ -108,10 +91,10 @@ function buildInventoryAdjustmentJournal(params: {
   narration: string
   lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }>
 } | null {
-  const { reasonAccountCode, inventoryAccountCode, productSku, productName, warehouseCode, warehouseName, qty, unitCost, note } = params
-  if (qty === 0 || unitCost === 0 || !reasonAccountCode || !inventoryAccountCode) return null
+  const { reasonAccountCode, inventoryAccountCode, productSku, productName, warehouseCode, warehouseName, qty, totalValueBase, note } = params
+  if (qty === 0 || totalValueBase === 0 || !reasonAccountCode || !inventoryAccountCode) return null
 
-  const totalValue = Math.round(Math.abs(qty) * unitCost * 100) / 100
+  const totalValue = Math.round(Math.abs(totalValueBase) * 100) / 100
   if (totalValue === 0) return null
 
   const date = new Date().toISOString().slice(0, 10)
@@ -236,6 +219,7 @@ export async function applyStockAdjustment({
   })
 
   let additionUnitCost: number | null = null
+  let removalCostBase: number | null = null
   if (isAddition) {
     if (unitCostBase != null && Number.isFinite(unitCostBase) && unitCostBase >= 0) {
       // Operator/caller supplied an explicit cost (0 allowed for sample/consigned stock).
@@ -296,7 +280,11 @@ export async function applyStockAdjustment({
       adjustmentMovementId: movement.id,
     })
   } else {
-    const { consumed } = await consumeFifoLayersStrict(tx, productId, warehouseId, Math.abs(qty))
+    const { consumed, totalCost } = await consumeFifoLayersStrict(tx, productId, warehouseId, Math.abs(qty))
+    // cbxu: the actual FIFO cost of the consumed layers — used to value the GL
+    // journal so Inventory GL ties to the cost-layer reduction (matches the
+    // movement's totalValueBase), not a product-wide blended average.
+    removalCostBase = totalCost.toNumber()
     await tx.stockMovement.update({
       where: { id: movement.id },
       data: buildStockMovementValueFieldsFromConsumed(consumed, absQty),
@@ -315,11 +303,14 @@ export async function applyStockAdjustment({
 
   if (accountCode) {
     const settings = providedSettings ?? await getAccountingSettings()
-    // For additions, value the GL journal at the SAME unit cost the movement and
-    // cost layer were booked at (additionUnitCost), so Inventory GL ties to the
-    // cost-layer/stock-movement value rather than a blended product average
-    // (cogs-audit scjz.2 / codex review). Removals keep the product-average basis.
-    const unitCost = isAddition ? (additionUnitCost ?? 0) : await getProductUnitCost(tx, productId)
+    // Value the GL journal at the value the movement/cost-layer actually booked so
+    // Inventory GL ties to the cost-layer change, not a blended product-wide
+    // average: additions use qty × the booked layer unit cost (scjz.2); removals
+    // use the FIFO cost of the layers consumed (cbxu — the prior product-average
+    // basis mis-stated both COGS and inventory, especially across warehouses).
+    const totalValueBase = isAddition
+      ? Math.abs(qty) * (additionUnitCost ?? 0)
+      : (removalCostBase ?? 0)
     const journal = buildInventoryAdjustmentJournal({
       reasonAccountCode: accountCode,
       inventoryAccountCode: settings.inventoryAccount,
@@ -328,7 +319,7 @@ export async function applyStockAdjustment({
       warehouseCode: warehouse?.code ?? '',
       warehouseName: warehouse?.name ?? '',
       qty,
-      unitCost,
+      totalValueBase,
       note: reasonName,
     })
     if (journal) {
