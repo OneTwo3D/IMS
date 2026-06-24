@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
-import { getAccountingSettings, isAccountingSyncTypeEnabled, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
+import { getAccountingSettings, isAccountingSyncTypeEnabled, queueAccountingSync, queueAccountingSyncTx, type AccountingSettings } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -708,11 +708,6 @@ export async function queueLandedCostAdjustmentJournals(
   // The ON-HAND portion is handled by the inventoryTransitAdjustments loop above and
   // also clears through transit; together they fully reconcile the freight liability.
   const consumedCogsOffsetAccount = resolveConsumedCogsOffsetAccount(settings)
-  // khdw: only record the COGS subledger movement when the COGS_JOURNAL will actually
-  // post to the GL (connector active, sync enabled, posting mode not off) — the same
-  // gate queueAccountingSync applies. Otherwise the ledger would overcount a journal
-  // that never reached the GL COGS account.
-  const cogsJournalWillPost = await isAccountingSyncTypeEnabled('COGS_JOURNAL')
   for (const adj of adjustments.cogsAdjustments) {
     const absDelta = Math.abs(adj.totalDelta)
     if (absDelta <= 0.01) continue
@@ -735,26 +730,31 @@ export async function queueLandedCostAdjustmentJournals(
       ],
     }
     const cogsIdempotencyKey = landedCostAdjustmentIdempotencyKey('cogs', adj)
-    await queueAccountingSync({
-      type: 'COGS_JOURNAL',
-      referenceType: 'PurchaseOrder',
-      referenceId: adj.primaryPoId,
-      payload,
-      idempotencyKey: cogsIdempotencyKey,
-    })
-    // khdw: record the net COGS-account movement (increase debits COGS, decrease
-    // credits it; the offset is the transit account, not COGS) in the COGS subledger
-    // ledger so the daily-batch reconciliation nets it against the GL COGS movement.
-    // Gated on the journal actually posting (above).
-    if (cogsJournalWillPost) {
-      await recordCogsSubledgerMovement(db, {
-        sourceType: 'LANDED_COST_ADJUSTMENT',
-        sourceRef: adj.primaryPoId,
+    // bcz9.2: commit the COGS journal queue + its subledger ledger row atomically in
+    // one transaction so a crash (or a posting-setting change) between them can't leave
+    // a queued journal with no ledger row, or a ledger row with no journal — either of
+    // which would make the daily-batch COGS reconciliation perpetually flag. The gate
+    // is re-evaluated per adjustment (not once before the loop) and read inside the
+    // transaction, mirroring the COGS_JOURNAL gate queueAccountingSyncTx applies, so
+    // the ledger row is recorded only when the journal will actually post to the GL.
+    await db.$transaction(async (tx) => {
+      await queueAccountingSyncTx(tx, {
+        type: 'COGS_JOURNAL',
+        referenceType: 'PurchaseOrder',
+        referenceId: adj.primaryPoId,
+        payload,
         idempotencyKey: cogsIdempotencyKey,
-        baseDelta: isIncrease ? absDelta : -absDelta,
-        journalDate: payload.date,
       })
-    }
+      if (await isAccountingSyncTypeEnabled('COGS_JOURNAL')) {
+        await recordCogsSubledgerMovement(tx, {
+          sourceType: 'LANDED_COST_ADJUSTMENT',
+          sourceRef: adj.primaryPoId,
+          idempotencyKey: cogsIdempotencyKey,
+          baseDelta: isIncrease ? absDelta : -absDelta,
+          journalDate: payload.date,
+        })
+      }
+    })
   }
 }
 

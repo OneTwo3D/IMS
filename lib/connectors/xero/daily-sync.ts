@@ -378,7 +378,7 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
   })
   const orphanBShipments = await db.shipment.findMany({
     where: { shipmentJournalDate: journaledDateFilter },
-    select: { shipmentJournalDate: true, revenueRecognizedAmount: true, cogsBatchAmount: true },
+    select: { id: true, shipmentJournalDate: true, revenueRecognizedAmount: true, cogsBatchAmount: true },
   })
 
   const a1ByDate = new Map<string, { orderCount: number; total: number }>()
@@ -403,15 +403,19 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
     a2ByDate.set(key, existing)
   }
 
-  const bByDate = new Map<string, { shipmentCount: number; revenue: number; cogs: number }>()
+  const bByDate = new Map<string, { shipmentCount: number; revenue: number; cogs: number; shipments: Array<{ id: string; cogs: number }> }>()
   for (const shipment of orphanBShipments) {
     const stagedAt = shipment.shipmentJournalDate
     if (!stagedAt) continue
     const key = stagedAt.toISOString().slice(0, 10)
-    const existing = bByDate.get(key) ?? { shipmentCount: 0, revenue: 0, cogs: 0 }
+    const existing = bByDate.get(key) ?? { shipmentCount: 0, revenue: 0, cogs: 0, shipments: [] }
+    const shipmentCogs = Number(shipment.cogsBatchAmount ?? 0)
     existing.shipmentCount += 1
     existing.revenue += Number(shipment.revenueRecognizedAmount ?? 0)
-    existing.cogs += Number(shipment.cogsBatchAmount ?? 0)
+    existing.cogs += shipmentCogs
+    // bcz9.3: carry the per-shipment list so the recreate path can write the same
+    // per-shipment DISPATCH ledger rows the live dispatch path writes.
+    existing.shipments.push({ id: shipment.id, cogs: shipmentCogs })
     bByDate.set(key, existing)
   }
 
@@ -491,6 +495,21 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
           _recreatedFromStage: true,
         },
       })
+      // bcz9.3: the recreated Group B journal moves GL COGS, so write the same
+      // per-shipment DISPATCH ledger rows the live dispatch path writes, dated to the
+      // recreated journal date and keyed identically (dispatch:<shipmentId>). The key
+      // is idempotent: where a live dispatch row already exists (the common case) this
+      // is a no-op preserving the original value; where a shipment never got one it
+      // fills the gap so the COGS reconciliation ties out instead of perpetually flagging.
+      for (const shipment of summary.shipments) {
+        await recordCogsSubledgerMovement(tx, {
+          sourceType: 'DISPATCH',
+          sourceRef: shipment.id,
+          idempotencyKey: `dispatch:${shipment.id}`,
+          baseDelta: shipment.cogs,
+          journalDate: date,
+        })
+      }
     })
   }
 }
