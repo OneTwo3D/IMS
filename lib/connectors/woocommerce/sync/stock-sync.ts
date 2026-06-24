@@ -520,8 +520,25 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         ),
       ]
     : []
+  // d2jd: a scoped VARIABLE parent must expand to its child VARIANTs — the
+  // stockable units are the variants, not the (non-stockable) VARIABLE parent.
+  // Without this, scoping just the parent id (e.g. a parent-product edit
+  // enqueues only the parent) pushed ZERO variant stock until the daily forceAll
+  // reconcile. This is the variant analogue of the KIT-component expansion above.
+  const scopedVariantIds = scopedProductIds
+    ? (
+        await db.product.findMany({
+          where: { parentId: { in: scopedProductIds }, type: 'VARIANT' },
+          select: { id: true },
+        })
+      ).map((row) => row.id)
+    : []
+  // Ids whose OWN stock must be read/pushed: the scoped set + expanded variants.
+  const scopedProductAndVariantIds = scopedProductIds
+    ? [...new Set([...scopedProductIds, ...scopedVariantIds])]
+    : null
   const scopedStockProductIds = scopedProductIds
-    ? [...new Set([...scopedProductIds, ...scopedComponentIds])]
+    ? [...new Set([...scopedProductIds, ...scopedComponentIds, ...scopedVariantIds])]
     : null
 
   const stockLevels = await db.stockLevel.findMany({
@@ -545,7 +562,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       ...(scopedProductIds
         ? {
             OR: [
-              { id: { in: scopedProductIds } },
+              { id: { in: scopedProductAndVariantIds ?? scopedProductIds } },
               {
                 type: 'KIT',
                 productComponents: { some: { componentId: { in: scopedProductIds } } },
