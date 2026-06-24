@@ -51,6 +51,24 @@ test('assertStockAdjustmentFeasible: removing exactly the available (down to res
   )
 })
 
+test('assertStockAdjustmentFeasible: rejects a removal that overshoots available by one representable unit (ig58 fence-post)', () => {
+  // stock_levels.quantity is Decimal(14,6): a 1e-6 overshoot is a REAL negative (-0.000001),
+  // not float noise. The guard must reject it rather than letting the DB CHECK abort opaquely.
+  assert.throws(
+    () => assertStockAdjustmentFeasible({ signedQty: -0.000001, currentQuantity: new Prisma.Decimal('0'), currentReservedQty: new Prisma.Decimal('0') }),
+    /Insufficient stock to remove 0\.000001 unit\(s\)/,
+  )
+})
+
+test('assertStockAdjustmentFeasible: removing exactly the available unit at large scale is allowed (FP noise tolerated)', () => {
+  // Near the top of the (14,6) range, a difference of two doubles carries ~3e-8 noise; an
+  // exact-to-the-unit removal must still pass (tolerance sits above FP noise, below 1e-6).
+  assert.deepEqual(
+    assertStockAdjustmentFeasible({ signedQty: -99999999.999999, currentQuantity: new Prisma.Decimal('99999999.999999'), currentReservedQty: new Prisma.Decimal('0') }),
+    { resultingQuantity: 0, reservedQty: 0 },
+  )
+})
+
 test('calculateAdjustmentStockDelta applies a single net stock delta', () => {
   assert.deepEqual(calculateAdjustmentStockDelta({
     oldSignedQty: -5,
