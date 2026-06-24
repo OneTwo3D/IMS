@@ -906,33 +906,51 @@ async function getLatestAccountingBatch(now: Date = new Date()): Promise<LatestO
   }
 }
 
+// b8i6.4: report the latest shopping sync per CONFIGURED connector, not just
+// WooCommerce, so a Shopify-only or dual setup isn't blind. The slot is
+// represented by the most stale configured connector (so a lagging connector
+// surfaces), with a per-connector breakdown in details. (Field/adapter name
+// kept as latestWooCommerceSync for back-compat with rollout-readiness + UI.)
 async function getLatestWooCommerceSync(now: Date = new Date()): Promise<LatestOperationHealthCheck> {
   try {
     const { db } = await import('@/lib/db')
-    const latest = await db.shoppingSyncLog.findFirst({
-      where: { connector: 'woocommerce' },
-      orderBy: { createdAt: 'desc' },
-      select: {
-        connector: true,
-        entityType: true,
-        status: true,
-        createdAt: true,
-        syncedAt: true,
-      },
-    })
+    const { listActiveShoppingConnectorInfo } = await import('@/lib/shopping')
+    const connectors = await listActiveShoppingConnectorInfo()
+    if (connectors.length === 0) return warningLatest('No shopping connector configured', now)
 
-    if (!latest) return warningLatest('No WooCommerce sync log found', now)
+    const perConnector = await Promise.all(connectors.map(async (c) => {
+      const latest = await db.shoppingSyncLog.findFirst({
+        where: { connector: c.id },
+        orderBy: { createdAt: 'desc' },
+        select: { connector: true, entityType: true, status: true, createdAt: true, syncedAt: true },
+      })
+      return { id: c.id, name: c.name, latest }
+    }))
+
+    const withLogs = perConnector.filter((p) => p.latest)
+    if (withLogs.length === 0) {
+      return warningLatest(`No sync log found for ${connectors.map((c) => c.name).join(', ')}`, now)
+    }
+
+    const runAt = (p: (typeof withLogs)[number]) => p.latest!.syncedAt ?? p.latest!.createdAt
+    const oldest = withLogs.reduce((a, b) => (runAt(a) <= runAt(b) ? a : b))
 
     return latestOperation({
-      lastRunAt: latest.syncedAt ?? latest.createdAt,
-      lastStatus: latest.status,
-      reference: latest.entityType,
-      details: { connector: latest.connector },
+      lastRunAt: runAt(oldest),
+      lastStatus: oldest.latest!.status,
+      reference: oldest.latest!.entityType,
+      details: {
+        connectors: perConnector.map((p) => ({
+          connector: p.id,
+          lastRunAt: p.latest ? (p.latest.syncedAt ?? p.latest.createdAt).toISOString() : null,
+          status: p.latest?.status ?? 'NONE',
+        })),
+      },
       now,
     })
   } catch (error) {
-    console.error('Admin health WooCommerce sync check failed', error)
-    return errorLatest('WooCommerce sync check failed', now)
+    console.error('Admin health shopping sync check failed', error)
+    return errorLatest('Shopping sync check failed', now)
   }
 }
 

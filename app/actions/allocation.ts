@@ -310,7 +310,7 @@ export async function autoAllocateOrder(
         description,
         metadata: {
           orderNumber: allocationResult.orderRef,
-          isWcOrder: allocationResult.isWcOrder,
+          isShoppingOrder: allocationResult.isShoppingOrder,
           shipFromWarehouseId: allocationResult.shipFromWarehouseId,
           allocations: allocationResult.allocationCount,
           unallocatedQty: allocationResult.unallocatedQty,

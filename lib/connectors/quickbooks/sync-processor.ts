@@ -781,6 +781,13 @@ async function enqueueFollowUps(
     if (order?.customerEmail) {
       await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId })
     }
+    // b8i6.6: the post-invoice note follow-up is WooCommerce-only BY DESIGN.
+    // It is already connector-aware — only enqueued when the order has a
+    // WooCommerce link (query above filters connector:'woocommerce'), so a
+    // Shopify-only order never gets a no-op note. Shopify has no order-note /
+    // invoice-link capability to push to yet; adding one needs a Shopify
+    // implementation + live validation before a SHOPPING_INVOICE_NOTE could be
+    // generalised here.
     if (order?.shoppingLinks.length) {
       await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId })
     }

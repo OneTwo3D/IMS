@@ -42,7 +42,7 @@ export type AllocateSalesOrderResult = {
   unallocatedQty: number
   backorderLineCount: number
   orderRef?: string
-  isWcOrder?: boolean
+  isShoppingOrder?: boolean
   shipFromWarehouseId?: string | null
   logAttempt?: boolean
 }
@@ -626,7 +626,9 @@ export async function allocateSalesOrder(
       id: true,
       orderNumber: true,
       externalOrderNumber: true,
-      shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
+      // b8i6.1: any shopping connector (not just WooCommerce) — a storefront order
+      // allocates only from storefront-synced warehouses regardless of connector.
+      shoppingLinks: { select: { id: true }, take: 1 },
       status: true,
       shipFromWarehouseId: true,
       lines: {
@@ -651,22 +653,22 @@ export async function allocateSalesOrder(
   })
   if (!so) return noAllocationResult('Order not found')
 
-  const isWcOrder = so.shoppingLinks.length > 0
+  const isShoppingOrder = so.shoppingLinks.length > 0
   const orderRef = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
   const allWarehouses = await client.warehouse.findMany({
     where: {
       active: true,
       availableForSale: true,
-      ...(isWcOrder ? { syncToStore: true } : {}),
+      ...(isShoppingOrder ? { syncToStore: true } : {}),
     },
     select: { id: true, code: true, name: true, isDefault: true, syncToStore: true },
     orderBy: { isDefault: 'desc' },
   })
   if (!allWarehouses.length) {
     return {
-      ...noAllocationResult(isWcOrder ? 'No WooCommerce-synced warehouses available for sale' : 'No warehouses available for sale'),
+      ...noAllocationResult(isShoppingOrder ? 'No storefront-synced warehouses available for sale' : 'No warehouses available for sale'),
       orderRef,
-      isWcOrder,
+      isShoppingOrder,
       shipFromWarehouseId: so.shipFromWarehouseId,
     }
   }
@@ -914,7 +916,7 @@ export async function allocateSalesOrder(
       unallocatedQty: 0,
       backorderLineCount: 0,
       orderRef,
-      isWcOrder,
+      isShoppingOrder,
       shipFromWarehouseId: so.shipFromWarehouseId,
     }
   }
@@ -935,7 +937,7 @@ export async function allocateSalesOrder(
     unallocatedQty: allocationResult.unallocatedQty,
     backorderLineCount: allocationResult.backorderLineCount,
     orderRef,
-    isWcOrder,
+    isShoppingOrder,
     shipFromWarehouseId: so.shipFromWarehouseId,
     logAttempt: true,
   }

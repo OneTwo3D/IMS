@@ -63,6 +63,22 @@ export function getShoppingConnector(id: ShoppingConnectorId): ShoppingConnector
 }
 
 /**
+ * Resolve a caller-supplied connector value (e.g. a request param) to a known
+ * ShoppingConnectorId. An empty/absent value falls back to `fallback` (default
+ * WooCommerce, for back-compat with endpoints that predate connector routing);
+ * an unknown non-empty value returns null so the caller can reject it (400).
+ * (b8i6.5)
+ */
+export function parseShoppingConnectorId(
+  raw: unknown,
+  fallback: ShoppingConnectorId = 'woocommerce',
+): ShoppingConnectorId | null {
+  if (raw === undefined || raw === null || raw === '') return fallback
+  if (typeof raw !== 'string') return null
+  return SHOPPING_CONNECTORS.some((c) => c.id === raw) ? (raw as ShoppingConnectorId) : null
+}
+
+/**
  * Returns the numbering prefixes for the given shopping connector, honouring
  * legacy Setting keys as a fallback so existing deployments keep working.
  */

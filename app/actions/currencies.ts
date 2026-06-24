@@ -302,45 +302,13 @@ export async function fetchAllFxRatesInternal(): Promise<{
       }
     }
 
-    // Fan out the new rates to enabled shopping connectors so the storefront,
-    // IMS and the accounting platform all use the same rate. Failure here must
-    // never roll back the inbound fetch — log and continue.
+    // b8i6.2: fan the new rates out to every configured shopping connector via
+    // the facade (each owns its own push + telemetry; Shopify is skipped until it
+    // gains an FX push). Failure here must never roll back the inbound fetch.
     if (updated.length) {
       try {
-        const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
-        const pushResult = await pushCurrentFxRatesToWc()
-        if (pushResult.supported && pushResult.errors.length) {
-          await db.fxRatePushLog.create({
-            data: {
-              connector: 'woocommerce',
-              ratesCount: pushResult.pushed,
-              status: 'FAILED',
-              errorMessage: pushResult.errors.join('; ').slice(0, 500),
-            },
-          })
-          await logActivity({
-            entityType: 'SYNC',
-            tag: 'sync',
-            action: 'fx_rates_pushed',
-            level: 'WARNING',
-            description: `FX rate push to WooCommerce failed: ${pushResult.errors.join('; ').slice(0, 240)}`,
-          })
-        } else if (pushResult.supported) {
-          await db.fxRatePushLog.create({
-            data: { connector: 'woocommerce', ratesCount: pushResult.pushed, status: 'OK' },
-          })
-          await db.setting.upsert({
-            where: { key: 'last_wc_fx_push_at' },
-            create: { key: 'last_wc_fx_push_at', value: new Date().toISOString() },
-            update: { value: new Date().toISOString() },
-          })
-          await logActivity({
-            entityType: 'SYNC',
-            tag: 'sync',
-            action: 'fx_rates_pushed',
-            description: `Pushed ${pushResult.pushed} FX rate(s) to WooCommerce`,
-          })
-        }
+        const { pushFxRatesToConnectors } = await import('@/lib/shopping')
+        await pushFxRatesToConnectors()
       } catch (e) {
         await logActivity({
           entityType: 'SYNC',

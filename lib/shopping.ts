@@ -3,7 +3,7 @@
  */
 
 import type { StockSyncReason } from '@/app/generated/prisma/enums'
-import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
+import type { ProductLifecycleStatus, ProductType, SalesOrderStatus } from '@/app/generated/prisma/client'
 import type { DeliveryStatus, StockUpdate } from '@/lib/connectors/types'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getShoppingConnector, type ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
@@ -26,6 +26,13 @@ type StockCandidateProduct = {
 
 export type PushProductMetadataResult = { success: boolean; skipped?: boolean; error?: string }
 export type PushOrderDeliveryMetadataResult = { success: boolean; skipped?: boolean; error?: string }
+export type PushOrderStatusResult = { success: boolean; skipped?: boolean; error?: string }
+export type FxRatePushConnectorResult = {
+  connector: ShoppingConnectorId
+  supported: boolean
+  pushed: number
+  errors: string[]
+}
 export type ShoppingConnectorInfo = { id: ShoppingConnectorId; name: string }
 export type ShoppingWebhookResource = 'orders' | 'products' | 'refunds'
 export type ShoppingExternalLink = {
@@ -403,6 +410,95 @@ export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOr
   }
 
   return { success: true, skipped: results.every((entry) => 'skipped' in entry.result && !!entry.result.skipped) }
+}
+
+/**
+ * Push an IMS sales-order status change back to whichever shopping connector(s)
+ * the order is linked to. Each connector's pusher resolves the order's own link
+ * and no-ops if the order isn't linked to it, so this safely fans out to every
+ * runnable connector. Shopify has no IMS->store status push yet (its delivery
+ * status is read-only), so it is skipped rather than failing the order update.
+ */
+export async function pushSalesOrderStatus(orderId: string, status: SalesOrderStatus): Promise<PushOrderStatusResult> {
+  const connectors = await listRunnableShoppingConnectorIds()
+  if (connectors.length === 0) return { success: true, skipped: true }
+
+  const results = await Promise.all(connectors.map(async (connector): Promise<{ connector: ShoppingConnectorId; result: PushOrderStatusResult }> => {
+    switch (connector) {
+      case 'woocommerce': {
+        const { pushImsStatusToWc } = await import('@/lib/connectors/woocommerce/sync/order-status')
+        await pushImsStatusToWc(orderId, status)
+        return { connector, result: { success: true } }
+      }
+      case 'shopify':
+        return { connector, result: { success: true, skipped: true } }
+    }
+  }))
+
+  const failures = results.filter((entry) => !entry.result.success && !entry.result.skipped)
+  if (failures.length > 0) {
+    return {
+      success: false,
+      error: failures.map((entry) => `${getShoppingConnector(entry.connector).label}: ${entry.result.error ?? 'unknown error'}`).join('; '),
+    }
+  }
+
+  return { success: true, skipped: results.every((entry) => !!entry.result.skipped) }
+}
+
+/**
+ * Fan the current FX rate set out to every configured shopping connector so the
+ * storefront, IMS and the accounting platform share one rate. Each connector
+ * owns its own push + telemetry (e.g. WooCommerce records fxRatePushLog +
+ * last_wc_fx_push_at for the settings UI). Shopify has no FX push capability
+ * yet, so it is reported as unsupported and skipped. Never throws per-connector
+ * failures — they are returned so the caller can decide how to surface them.
+ */
+export async function pushFxRatesToConnectors(): Promise<FxRatePushConnectorResult[]> {
+  const connectors = await listConfiguredShoppingConnectorIds()
+  return Promise.all(connectors.map(async (connector): Promise<FxRatePushConnectorResult> => {
+    switch (connector) {
+      case 'woocommerce': {
+        const { db } = await import('@/lib/db')
+        const { logActivity } = await import('@/lib/activity-log')
+        try {
+          const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
+          const pushResult = await pushCurrentFxRatesToWc()
+          if (!pushResult.supported) return { connector, supported: false, pushed: 0, errors: [] }
+          if (pushResult.errors.length) {
+            await db.fxRatePushLog.create({
+              data: { connector, ratesCount: pushResult.pushed, status: 'FAILED', errorMessage: pushResult.errors.join('; ').slice(0, 500) },
+            })
+            await logActivity({
+              entityType: 'SYNC', tag: 'sync', action: 'fx_rates_pushed', level: 'WARNING',
+              description: `FX rate push to WooCommerce failed: ${pushResult.errors.join('; ').slice(0, 240)}`,
+            })
+          } else {
+            await db.fxRatePushLog.create({ data: { connector, ratesCount: pushResult.pushed, status: 'OK' } })
+            await db.setting.upsert({
+              where: { key: 'last_wc_fx_push_at' },
+              create: { key: 'last_wc_fx_push_at', value: new Date().toISOString() },
+              update: { value: new Date().toISOString() },
+            })
+            await logActivity({
+              entityType: 'SYNC', tag: 'sync', action: 'fx_rates_pushed',
+              description: `Pushed ${pushResult.pushed} FX rate(s) to WooCommerce`,
+            })
+          }
+          return { connector, supported: true, pushed: pushResult.pushed, errors: pushResult.errors }
+        } catch (e) {
+          await logActivity({
+            entityType: 'SYNC', tag: 'sync', action: 'fx_rates_pushed', level: 'ERROR',
+            description: `FX rate push threw: ${String(e).slice(0, 240)}`,
+          })
+          return { connector, supported: true, pushed: 0, errors: [String(e).slice(0, 240)] }
+        }
+      }
+      case 'shopify':
+        // No FX-rate push capability on Shopify yet — skip rather than error.
+        return { connector, supported: false, pushed: 0, errors: [] }
+    }
+  }))
 }
 
 export async function getOrderDeliveryStatus(orderId: string): Promise<DeliveryStatus | null> {
