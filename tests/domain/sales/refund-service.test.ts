@@ -11,6 +11,11 @@ import {
 } from '@/lib/domain/sales/refund-service'
 import type { AccountingSettings } from '@/lib/accounting'
 
+// bcz9.1: the COGS subledger ledger row is gated on the COGS_REVERSAL journal posting.
+// Unit tests have no live connector, so inject the enabled gate to exercise the
+// "reversal will post" path that records the ledger row.
+const cogsReversalEnabledDeps = { isCogsReversalSyncEnabled: async () => true }
+
 type Order = {
   id: string
   externalOrderNumber: string | null
@@ -742,7 +747,7 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
     returnWarehouseId: 'warehouse-returns',
     creditNotePrefix: 'CN-',
     accountingSettings,
-  })
+  }, cogsReversalEnabledDeps)
 
   assert.equal(result.success, true)
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
@@ -760,6 +765,69 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+})
+
+test('createSalesOrderRefund records the COGS subledger row only when COGS_REVERSAL posts (bcz9.1)', async () => {
+  const makeState = () => baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+  const refundInput = {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  }
+
+  // Enabled: the reversal posts, so the ledger gets a negative REFUND_REVERSAL row.
+  const enabledState = makeState()
+  const enabled = await createSalesOrderRefund(createClient(enabledState), refundInput, cogsReversalEnabledDeps)
+  assert.equal(enabled.success, true)
+  assert.equal(enabledState.cogsSubledgerMovements.length, 1)
+  const row = enabledState.cogsSubledgerMovements[0] as Record<string, unknown>
+  assert.equal(row.sourceType, 'REFUND_REVERSAL')
+  assert.equal(row.idempotencyKey, 'sales-order-refund:refund-1:cogs-reversal')
+  assert.equal(Number(row.baseDelta), -10)
+
+  // Disabled: no journal will post, so no ledger row — but the refund still succeeds
+  // and restocks (a flagged-but-safe reconciliation, never a mis-sweep).
+  const disabledState = makeState()
+  const disabled = await createSalesOrderRefund(
+    createClient(disabledState),
+    refundInput,
+    { isCogsReversalSyncEnabled: async () => false },
+  )
+  assert.equal(disabled.success, true)
+  assert.equal(disabledState.cogsSubledgerMovements.length, 0)
+  assert.equal(disabledState.movements[0].productId, 'product-1')
+  assert.equal(disabledState.stockLevels[0].quantity, 1)
 })
 
 test('createSalesOrderRefund chargeback mode suppresses COGS reversal AND restock (scjz.70)', async () => {
@@ -880,7 +948,7 @@ test('createSalesOrderRefund reverses kit COGS in component units, not kit units
     returnWarehouseId: 'warehouse-returns',
     creditNotePrefix: 'CN-',
     accountingSettings,
-  })
+  }, cogsReversalEnabledDeps)
 
   assert.equal(result.success, true)
   // 3 kits * 2 components = 6 component units of basis at £10 = £60 reversed.
@@ -1011,7 +1079,7 @@ test('createSalesOrderRefund reconstructs legacy shipment snapshots from COGS en
     returnWarehouseId: 'warehouse-returns',
     creditNotePrefix: 'CN-',
     accountingSettings,
-  })
+  }, cogsReversalEnabledDeps)
 
   assert.equal(result.success, true)
   assert.equal(result.success && result.accountingWarning, undefined)
@@ -1067,7 +1135,7 @@ test('createSalesOrderRefund uses current cost layer cost after landed cost reva
     returnWarehouseId: 'warehouse-returns',
     creditNotePrefix: 'CN-',
     accountingSettings,
-  })
+  }, cogsReversalEnabledDeps)
 
   assert.equal(result.success, true)
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
@@ -1123,7 +1191,7 @@ test('createSalesOrderRefund uses decreased current cost layer cost after landed
     returnWarehouseId: 'warehouse-returns',
     creditNotePrefix: 'CN-',
     accountingSettings,
-  })
+  }, cogsReversalEnabledDeps)
 
   assert.equal(result.success, true)
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
@@ -1728,7 +1796,7 @@ test('retrySalesOrderRefundAccounting replays persisted syncs after full refund 
   const result = await retrySalesOrderRefundAccounting(createClient(state), {
     refundId: 'refund-1',
     accountingSettings,
-  })
+  }, cogsReversalEnabledDeps)
 
   assert.equal(result.success, true)
   assert.deepEqual(result.success ? result.accountingSyncs : [], persistedSyncs)
@@ -1818,7 +1886,7 @@ test('retrySalesOrderRefundAccounting stages accounting and return stock for an 
   const result = await retrySalesOrderRefundAccounting(createClient(state), {
     refundId: 'refund-1',
     accountingSettings,
-  })
+  }, cogsReversalEnabledDeps)
 
   assert.equal(result.success, true)
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
@@ -2044,7 +2112,7 @@ test('retrySalesOrderRefundAccounting uses persisted sales line identity and ref
   const result = await retrySalesOrderRefundAccounting(createClient(state), {
     refundId: 'refund-2',
     accountingSettings,
-  })
+  }, cogsReversalEnabledDeps)
 
   assert.equal(result.success, true)
   assert.deepEqual(state.refundLines[1].costLayerSnapshot, [{
