@@ -1976,8 +1976,34 @@ export async function receivePurchaseOrder(
     }, STOCK_TX_OPTIONS)
 
     // opys: duplicate submission detected under the lock — the receipt was already
-    // booked by the first submission; report success without re-running side effects.
+    // booked by the first submission. Skip the DB write and the (duplicate) activity
+    // log, but still run the best-effort, idempotent catch-up effects: if the first
+    // submission crashed AFTER commit but before these ran, the retry self-heals them
+    // (they're also covered by the daily reconcile, so a miss is transient either way).
     if ('alreadyApplied' in receiptResult) {
+      revalidatePath('/purchase-orders')
+      revalidatePath(`/purchase-orders/${id}`)
+      const replayProductIds = [
+        ...new Set(
+          linesWithQty
+            .map((rl) => po.lines.find((line) => line.id === rl.poLineId)?.productId)
+            .filter((value): value is string => !!value),
+        ),
+      ]
+      try {
+        await allocateBackordersForProducts(replayProductIds, {
+          source: 'purchase_receipt',
+          referenceId: id,
+          referenceLabel: `PO receipt ${po.reference}`,
+        })
+      } catch (allocError) {
+        console.error(allocError)
+      }
+      try {
+        await enqueueStockSync(replayProductIds, 'IMS_CHANGE')
+      } catch (syncError) {
+        console.error(syncError)
+      }
       return { success: true }
     }
 
