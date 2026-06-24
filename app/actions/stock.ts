@@ -812,8 +812,17 @@ export async function updateAdjustmentMovement(
       // silently drift the GL sub-ledger from inventory. Block the edit once a
       // journal exists; the operator posts a reversing adjustment (which carries
       // its own compensating journal) instead.
+      // Ignore CANCELLED rows (deliberately abandoned — never re-queued, so they
+      // never reach the ledger). PENDING/PROCESSING/SYNCED block (posted or will
+      // post); FAILED also blocks because it can be re-queued by reconciliation
+      // and would then post the OLD value, drifting from the edited inventory.
       const postedJournal = await tx.accountingSyncLog.findFirst({
-        where: { referenceType: 'StockMovement', referenceId: id, type: 'INVENTORY_ADJUSTMENT' },
+        where: {
+          referenceType: 'StockMovement',
+          referenceId: id,
+          type: 'INVENTORY_ADJUSTMENT',
+          status: { not: 'CANCELLED' },
+        },
         select: { id: true },
       })
       if (postedJournal) {
