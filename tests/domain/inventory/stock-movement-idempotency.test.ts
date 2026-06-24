@@ -104,6 +104,20 @@ test('manual adjustment key changes when any meaningful field changes (r9y2)', (
   assert.notEqual(key, manualStockAdjustmentMovementKey({ ...base, token: 'tok-2' }))
 })
 
+test('manual adjustment key canonicalizes a blank/whitespace note to absent (vzlk)', () => {
+  const base = { token: 'tok-1', productId: 'p1', warehouseId: 'w1', qty: -5, reasonId: 'r1' }
+  const absent = manualStockAdjustmentMovementKey(base)
+  // '' / whitespace / null all store identically to an absent note, so they must hash
+  // to the same key — otherwise '' vs null could slip a duplicate movement through.
+  assert.equal(manualStockAdjustmentMovementKey({ ...base, note: '' }), absent)
+  assert.equal(manualStockAdjustmentMovementKey({ ...base, note: '   ' }), absent)
+  assert.equal(manualStockAdjustmentMovementKey({ ...base, note: null }), absent)
+  // A real note still changes the key, and surrounding whitespace is ignored.
+  const noted = manualStockAdjustmentMovementKey({ ...base, note: 'damaged in transit' })
+  assert.notEqual(noted, absent)
+  assert.equal(manualStockAdjustmentMovementKey({ ...base, note: '  damaged in transit  ' }), noted)
+})
+
 test('manual adjustment key rejects a blank/invalid token', () => {
   assert.throws(() => manualStockAdjustmentMovementKey({ token: ' ', productId: 'p1', warehouseId: 'w1', qty: 1 }), /must not be blank/)
   assert.throws(() => manualStockAdjustmentMovementKey({ token: 'tok:1', productId: 'p1', warehouseId: 'w1', qty: 1 }), /invalid characters/)
