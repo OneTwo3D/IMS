@@ -285,10 +285,14 @@ export async function applyAllocationReservationDelta(
     }
 
     // l4jq: guard the release decrement so it can never drive reservedQty
-    // negative (the reserve branch above already checks updated.count). Decrement
-    // only when reservedQty >= qty; on drift (reservedQty < qty) floor at 0
-    // — max(0, reserved - qty) — instead of relying on the DB non-negative CHECK
-    // to abort the whole transaction.
+    // negative (the reserve branch above already checks updated.count).
+    // reservedQty is a per-(product,warehouse) AGGREGATE: in the normal case
+    // (reservedQty >= qty) the guarded decrement below releases exactly this
+    // allocation's qty and PRESERVES any co-existing reservations from other
+    // orders (reservedQty - qty stays positive). The floor branch only runs on
+    // genuine upstream drift — a release exceeding the WHOLE aggregate
+    // (reservedQty < qty) — where max(0, reserved - qty) is 0 anyway; we floor to
+    // 0 rather than rely on the DB non-negative CHECK to abort the transaction.
     const released = await tx.stockLevel.updateMany({
       where: { productId: row.productId, warehouseId: row.warehouseId, reservedQty: { gte: qty } },
       data: { reservedQty: { decrement: qty } },
@@ -299,7 +303,9 @@ export async function applyAllocationReservationDelta(
         data: { reservedQty: 0 },
       })
       if (floored.count > 0) {
-        console.warn(
+        // Loud: releasing more than the entire reserved aggregate means the
+        // reservation ledger drifted upstream and needs reconciliation.
+        console.error(
           `[allocation] reservedQty drift on release for product ${row.productId} @ ${row.warehouseId}: ` +
           `tried to release ${qty.toString()} but reserved was lower; floored to 0.`,
         )

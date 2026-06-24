@@ -281,8 +281,13 @@ export async function createTransfer(
         transfer = await createOnce()
         break
       } catch (e) {
-        const code = (e as { code?: string } | null)?.code
-        if (useAutoReference && attempt < maxAttempts && code === 'P2002') continue
+        // Only retry a unique-constraint (P2002) collision on the `reference`
+        // field — don't mask any other (future/nested) unique violation.
+        const err = e as { code?: string; meta?: { target?: unknown } } | null
+        const target = err?.meta?.target
+        const isReferenceCollision = err?.code === 'P2002'
+          && (Array.isArray(target) ? target.includes('reference') : String(target ?? '').includes('reference'))
+        if (useAutoReference && attempt < maxAttempts && isReferenceCollision) continue
         throw e
       }
     }
