@@ -525,13 +525,21 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       ).map((row) => row.id)
     : []
   // The scoped set "as if each child were scoped directly": parents + their children.
-  // Used for both the candidate-product query and the dependent-KIT component match,
-  // so a KIT that uses an expanded child as a component is also re-synced.
+  // Used for the candidate-product id match.
   const scopedProductAndVariantIds = scopedProductIds
     ? [...new Set([...scopedProductIds, ...scopedChildIds])]
     : null
-  // KIT components of the FULL expanded set (parents + children), so the components
-  // of a child-KIT also have their stock read for availability.
+  // KIT components of the expanded set (parents + children) so a scoped/child KIT has
+  // its component stock loaded for availability.
+  //
+  // NOTE (codex P1): we deliberately do NOT widen the dependent-KIT match (the OR
+  // clause below) to the expanded children. Adding a KIT that uses an expanded child
+  // as a component would make it a candidate WITHOUT loading that kit's OTHER
+  // components' stock, so computeKitAvailability would read them as 0 and could push
+  // the kit's Woo stock to 0 on an unrelated parent edit. The dependent-KIT match
+  // therefore stays on the originally-scoped ids (unchanged pre-existing behaviour);
+  // a kit that only references an expanded child is corrected by the daily forceAll
+  // reconcile — the same safety net the rest of this scoped path relies on.
   const scopedComponentIds = scopedProductAndVariantIds
     ? [
         ...new Set(
@@ -572,9 +580,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
               { id: { in: scopedProductAndVariantIds ?? scopedProductIds } },
               {
                 type: 'KIT',
-                productComponents: {
-                  some: { componentId: { in: scopedProductAndVariantIds ?? scopedProductIds } },
-                },
+                productComponents: { some: { componentId: { in: scopedProductIds } } },
               },
             ],
           }
