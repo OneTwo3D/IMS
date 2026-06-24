@@ -192,8 +192,12 @@ export function computeDistributionBase(
     case 'BY_WEIGHT':
       return decimal(line.product.weight).mul(line.qty)
     case 'BY_QUANTITY':
+      // Per-unit distribution: a 1000-unit line absorbs 1000× a 1-unit line.
       return decimal(line.qty)
     case 'EQUAL_SPLIT':
+      // nmim: EQUAL_SPLIT weights each LINE equally (base 1/line) REGARDLESS of
+      // quantity — this is intentional, the distinct "split freight evenly across
+      // line items" option. Callers wanting per-unit distribution use BY_QUANTITY.
       return new Prisma.Decimal(1)
     case 'BY_VALUE':
     default:
