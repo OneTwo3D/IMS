@@ -280,14 +280,17 @@ export async function applyStockAdjustment({
       adjustmentMovementId: movement.id,
     })
   } else {
-    const { consumed, totalCost } = await consumeFifoLayersStrict(tx, productId, warehouseId, Math.abs(qty))
-    // cbxu: the actual FIFO cost of the consumed layers — used to value the GL
-    // journal so Inventory GL ties to the cost-layer reduction (matches the
-    // movement's totalValueBase), not a product-wide blended average.
-    removalCostBase = totalCost.toNumber()
+    const { consumed } = await consumeFifoLayersStrict(tx, productId, warehouseId, Math.abs(qty))
+    // cbxu (Codex): value the GL journal at the SAME totalValueBase the movement
+    // actually stores — derived from the consumed layers at the movement's row qty
+    // (constraint-consistent) — rather than the raw FIFO sum, which can differ by a
+    // cent at scale and drift the GL from the movement ledger. Ties Inventory GL to
+    // the cost-layer reduction, not a product-wide blended average.
+    const valueFields = buildStockMovementValueFieldsFromConsumed(consumed, absQty)
+    removalCostBase = Number(valueFields.totalValueBase)
     await tx.stockMovement.update({
       where: { id: movement.id },
-      data: buildStockMovementValueFieldsFromConsumed(consumed, absQty),
+      data: valueFields,
     })
     if (consumed.length > 0) {
       await tx.cogsEntry.createMany({
