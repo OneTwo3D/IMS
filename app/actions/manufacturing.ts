@@ -591,14 +591,18 @@ export async function updateManufacturingOrderStatus(
         // (DRAFT->complete is blocked, scjz.32), so the live-BOM fallback only
         // covers legacy orders started before audit-H6 added componentSnapshot.
         // 8fo0: distinguish an ABSENT snapshot (legacy orders started before
-        // audit-H6 — fall back to the live BOM) from a PRESENT-but-malformed one
-        // (corrupt data). parseProductionOrderComponentSnapshot returns null for
-        // both, but silently falling back to the live BOM when a snapshot WAS
-        // frozen defeats audit-H6: a mid-production BOM edit could then change what
-        // is consumed/recovered or strand the reservation. Hard-error instead of
-        // silently consuming the wrong components.
+        // audit-H6 — fall back to the live BOM) from a PRESENT-but-CORRUPT one.
+        // parseProductionOrderComponentSnapshot returns null for absent, empty, AND
+        // malformed input, but silently falling back to the live BOM when a real
+        // snapshot WAS frozen defeats audit-H6: a mid-production BOM edit could then
+        // change what is consumed/recovered or strand the reservation. So hard-error
+        // on a corrupt snapshot — but treat an empty array as the absent/legacy case
+        // (an empty BOM legitimately snapshots [] at IN_PROGRESS start) so we don't
+        // strand a zero-component order. The requireReserved gate below still blocks
+        // any live-BOM fallback from consuming components that were never reserved.
         const parsedSnapshot = parseProductionOrderComponentSnapshot(order.componentSnapshot)
-        if (order.componentSnapshot != null && parsedSnapshot == null) {
+        const snapshotIsEmptyArray = Array.isArray(order.componentSnapshot) && order.componentSnapshot.length === 0
+        if (parsedSnapshot == null && order.componentSnapshot != null && !snapshotIsEmptyArray) {
           throw new Error('This production order has a frozen component snapshot that is present but malformed; refusing to fall back to the live BOM. Resolve the snapshot data before completing this order.')
         }
         const components: ProductionOrderComponentSnapshot | typeof order.outputProduct.productComponents =
