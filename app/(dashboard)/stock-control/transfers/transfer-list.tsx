@@ -468,6 +468,9 @@ function TransferCard({
   }, [initial])
 
   async function handleDispatch() {
+    // bgoq: dispatch irreversibly books stock OUT of the source warehouse and
+    // consumes FIFO cost layers — confirm before this destructive action.
+    if (!confirm('Dispatch this transfer? This books stock out of the source warehouse and consumes FIFO cost layers. It can only be undone with a separate "cancel dispatch".')) return
     setActioning(true); setActionError(null)
     const res = await dispatchTransfer(transfer.id)
     setActioning(false)
@@ -494,6 +497,9 @@ function TransferCard({
   }
 
   async function handleCancel() {
+    // bgoq: confirm before cancelling a draft (a hover-revealed Ban icon is easy
+    // to misclick).
+    if (!confirm('Cancel this draft transfer?')) return
     setActioning(true); setActionError(null)
     const res = await cancelTransfer(transfer.id)
     setActioning(false)
@@ -786,6 +792,9 @@ function MobileTransferCard({
   }, [initial])
 
   async function handleDispatch() {
+    // bgoq: dispatch irreversibly books stock OUT of the source warehouse and
+    // consumes FIFO cost layers — confirm before this destructive action.
+    if (!confirm('Dispatch this transfer? This books stock out of the source warehouse and consumes FIFO cost layers. It can only be undone with a separate "cancel dispatch".')) return
     setActioning(true); setActionError(null)
     const res = await dispatchTransfer(transfer.id)
     setActioning(false)
@@ -810,6 +819,9 @@ function MobileTransferCard({
   }
 
   async function handleCancel() {
+    // bgoq: confirm before cancelling a draft (a hover-revealed Ban icon is easy
+    // to misclick).
+    if (!confirm('Cancel this draft transfer?')) return
     setActioning(true); setActionError(null)
     const res = await cancelTransfer(transfer.id)
     setActioning(false)
