@@ -54,6 +54,7 @@ const SECTION_TITLES: Array<{ prefix: string; title: string }> = [
   { prefix: '/inventory', title: 'Inventory' },
   { prefix: '/stock-control/transfers', title: 'Warehouse Transfers' },
   { prefix: '/stock-control/stock-adjustments', title: 'Stock Adjustments' },
+  { prefix: '/stock-control/stock-counts', title: 'Stock Counts' },
   { prefix: '/stock-control', title: 'Stock Control' },
   { prefix: '/purchase-orders/suppliers', title: 'Suppliers' },
   { prefix: '/purchase-orders', title: 'Purchase Orders' },
