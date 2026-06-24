@@ -159,6 +159,13 @@ export type ApplyStockAdjustmentInput = {
    */
   referenceType?: string
   referenceId?: string
+  /**
+   * 0tr0: deterministic idempotency key for the ADJUSTMENT movement. When supplied,
+   * a re-submission carrying the same key (network retry / double-click / refresh
+   * during pending) is detected under the stock-level lock and skipped instead of
+   * booking a duplicate adjustment. Backed by StockMovement.idempotencyKey @unique.
+   */
+  idempotencyKey?: string | null
 }
 
 export type AppliedStockAdjustment = {
@@ -187,6 +194,7 @@ export async function applyStockAdjustment({
   settings: providedSettings,
   referenceType,
   referenceId,
+  idempotencyKey,
 }: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
   const isAddition = qty > 0
   const absQty = Math.abs(qty).toString()
@@ -206,6 +214,27 @@ export async function applyStockAdjustment({
   }
 
   const locked = await lockStockLevelRow(tx, productId, warehouseId)
+
+  // 0tr0: idempotency check UNDER the stock-level lock. Same-(product,warehouse)
+  // re-submissions serialise here, so a duplicate carrying the same key sees the
+  // first submission's committed movement and returns it instead of double-booking.
+  if (idempotencyKey) {
+    const existing = await tx.stockMovement.findUnique({
+      where: { idempotencyKey },
+      select: { id: true },
+    })
+    if (existing) {
+      const [product, warehouse] = await Promise.all([
+        tx.product.findUnique({ where: { id: productId }, select: { sku: true } }),
+        tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } }),
+      ])
+      return {
+        movementId: existing.id,
+        productSku: product?.sku ?? productId,
+        warehouseName: warehouse?.name ?? warehouseId,
+      }
+    }
+  }
 
   // ig58: pre-flight availability check against the locked row, before any
   // movement/cost-layer/upsert is written. Rejects an infeasible removal (one
@@ -248,6 +277,7 @@ export async function applyStockAdjustment({
       note: reasonName,
       ...(referenceType ? { referenceType } : {}),
       ...(referenceId ? { referenceId } : {}),
+      ...(idempotencyKey ? { idempotencyKey } : {}),
       ...(isAddition ? buildStockMovementValueFields({ qty: absQty, unitCostBase: additionUnitCost ?? 0 }) : {}),
     },
   })
@@ -445,6 +475,12 @@ export async function adjustStock(
   const { productId, warehouseId, qty, reasonId, note, unitCostBase } = parsed.data
   const unitCostBaseNum = unitCostBase != null && unitCostBase !== '' ? Number(unitCostBase) : undefined
   const qtyNum = Number(qty)
+  // 0tr0: per-submission idempotency token from the form (hidden field). Dedups a
+  // double-submit of this single adjustment.
+  const idempotencyToken = (formData.get('idempotencyToken') || '').toString().trim()
+  const adjustmentIdempotencyKey = idempotencyToken
+    ? `stock-adjustment:${idempotencyToken}`
+    : undefined
 
   let logSku = ''
   let logWarehouseName = ''
@@ -459,6 +495,7 @@ export async function adjustStock(
         reasonId,
         note,
         unitCostBase: unitCostBaseNum,
+        idempotencyKey: adjustmentIdempotencyKey,
       })
       logSku = applied.productSku
       logWarehouseName = applied.warehouseName
@@ -558,7 +595,8 @@ const bulkAdjustLineSchema = z.object({
 })
 
 export async function bulkAdjustStock(
-  lines: BulkAdjustLine[]
+  lines: BulkAdjustLine[],
+  idempotencyToken?: string,
 ): Promise<BulkAdjustFormState> {
   await requirePermission('stock_control.adjust')
 
@@ -590,7 +628,7 @@ export async function bulkAdjustStock(
 
   try {
     await db.$transaction(async (tx) => {
-      for (const line of valid) {
+      for (const [lineIndex, line] of valid.entries()) {
         const reason = line.reasonId ? reasonMap.get(line.reasonId) : null
         await applyStockAdjustment({
           tx,
@@ -601,6 +639,11 @@ export async function bulkAdjustStock(
           note: reason?.name ?? null,
           unitCostBase: line.unitCostBase,
           settings: accountingSettings,
+          // 0tr0: deterministic per (submission token, stable line index) so a
+          // double-submitted bulk batch dedups line-for-line.
+          idempotencyKey: idempotencyToken
+            ? `stock-adjustment:${idempotencyToken}:${lineIndex}`
+            : undefined,
         })
       }
     }, STOCK_TX_OPTIONS)
