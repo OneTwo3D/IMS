@@ -26,6 +26,13 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
   )
   const [successMsg, setSuccessMsg] = useState('')
   const [prevSuccess, setPrevSuccess] = useState<boolean | undefined>(undefined)
+  // 0tr0: a per-submission idempotency token so a double-click / retry submits the
+  // same token and the server dedups the adjustment. Held in state with a lazy
+  // initializer so it's present on the very first render — including SSR, so a
+  // no-JS / pre-hydration submit still carries a token (lpg9). The server value and
+  // the client value legitimately differ (random per environment), so the hidden
+  // input is suppressHydrationWarning. Rotated on each successful save (see below).
+  const [idempotencyToken, setIdempotencyToken] = useState(() => crypto.randomUUID())
 
   // Show success message immediately (render-time state adjustment)
   if (state.success && !prevSuccess) {
@@ -41,6 +48,10 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
     if (!state.success) return
     router.refresh()
     const t = setTimeout(() => {
+      // Rotate the token so the next adjustment is a distinct submission (the old
+      // token stays attached until now, but the submit button is disabled while the
+      // success message shows, so it can't be reused).
+      setIdempotencyToken(crypto.randomUUID())
       setFormKey((k) => k + 1)
       setSuccessMsg('')
     }, 1500)
@@ -56,6 +67,7 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
       )}
       <form key={formKey} action={formAction} className="space-y-3">
         <input type="hidden" name="productId" value={productId} />
+        <input type="hidden" name="idempotencyToken" value={idempotencyToken} suppressHydrationWarning />
 
         {state.message && (
           <p className="text-sm text-destructive">{state.message}</p>
@@ -149,7 +161,10 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
           </div>
         )}
 
-        <Button type="submit" size="sm" disabled={isPending}>
+        {/* 0tr0: stay disabled through the post-success window (until the form
+            remounts and mints a new token). Otherwise an edit-and-resubmit in that
+            window reuses the same token and the new adjustment is silently deduped. */}
+        <Button type="submit" size="sm" disabled={isPending || !!successMsg}>
           {isPending ? 'Saving…' : 'Apply Adjustment'}
         </Button>
       </form>
