@@ -8,6 +8,7 @@ import {
   queueAccountingSync,
   queueAccountingSyncTx,
   getAccountingSettings,
+  getActiveAccountingConnectorInfo,
   type AccountingSettings,
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
@@ -1733,6 +1734,7 @@ export async function createRefund(
       // scjz.70: revenue-only chargeback (credit note reverses recognised revenue,
       // COGS + restock suppressed). Used by the payment-poller on a payment reversal.
       chargeback: options?.chargeback,
+      activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
     })
     if (!refundResult.success) return refundResult
 
@@ -2033,6 +2035,7 @@ export async function retryRefundAccounting(
     const result = await retrySalesOrderRefundAccounting(db, {
       refundId,
       accountingSettings,
+      activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
     })
     if (!result.success) {
       const auditContext = await loadRefundAuditContext(refundId)

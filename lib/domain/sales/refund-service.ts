@@ -821,6 +821,13 @@ async function stageRefundAccountingReversals(
     newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED'
     /** scjz.70: revenue-only chargeback — suppress the COGS reversal (cost kept as a loss). */
     chargeback?: boolean
+    /**
+     * The active accounting connector that will receive the new reversal syncs. Scopes
+     * the prior-reversal double-counting guard to that connector so a post-connector-
+     * switch org doesn't subtract reversals posted to a different ledger. Resolved by the
+     * server-action layer (the unit-tested domain path passes none → no connector filter).
+     */
+    activeConnector?: 'xero' | 'quickbooks'
   },
 ): Promise<{
   accountingSyncs: RefundAccountingSyncRequest[]
@@ -891,11 +898,13 @@ async function stageRefundAccountingReversals(
       },
     })
 
-    // Connector-agnostic: the referenceType/referenceId + type + status clauses already
-    // uniquely scope to THIS order's reversals, and only one accounting connector is
-    // active at a time, so no connector filter is needed (was hardcoded 'xero').
+    // Connector-agnostic: scope to the connector that will receive the NEW reversal
+    // syncs (resolved by the caller), not a hardcoded 'xero'. This keeps the double-
+    // reversal guard correct after a connector switch, where accountingSyncLog still
+    // holds the old connector's reversal rows. Undefined (unit-test path) → no filter.
     const priorReversals = await tx.accountingSyncLog.findMany({
       where: {
+        ...(params.activeConnector ? { connector: params.activeConnector } : {}),
         OR: [
           { referenceType: 'SalesOrder', referenceId: params.orderId },
           {
@@ -1497,6 +1506,8 @@ export async function createSalesOrderRefund(
      * payment-poller when a payment reversal (chargeback) is detected.
      */
     chargeback?: boolean
+    /** Active accounting connector (scopes the prior-reversal guard); resolved by the caller. */
+    activeAccountingConnector?: 'xero' | 'quickbooks'
   },
 ): Promise<CreateSalesOrderRefundResult> {
   // Keep discount lines (negative totalBase, qty 0) which the qty>0/totalBase>0 filter
@@ -1876,6 +1887,7 @@ export async function createSalesOrderRefund(
         so: txResult.so,
         newStatus: txResult.newStatus,
         chargeback: input.chargeback,
+        activeConnector: input.activeAccountingConnector,
       })
       accountingSyncs = staged.accountingSyncs
       snapshotReturnRows = staged.snapshotReturnRows
@@ -1947,6 +1959,8 @@ export async function retrySalesOrderRefundAccounting(
   input: {
     refundId: string
     accountingSettings: AccountingSettings
+    /** Active accounting connector (scopes the prior-reversal guard); resolved by the caller. */
+    activeAccountingConnector?: 'xero' | 'quickbooks'
   },
 ): Promise<RetrySalesOrderRefundAccountingResult> {
   try {
@@ -2039,6 +2053,7 @@ export async function retrySalesOrderRefundAccounting(
         so: refund.order,
         newStatus,
         chargeback: refund.chargeback,
+        activeConnector: input.activeAccountingConnector,
       })
 
       let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
