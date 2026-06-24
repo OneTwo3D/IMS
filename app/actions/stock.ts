@@ -767,7 +767,7 @@ export async function updateAdjustmentMovement(
             select: { id: true, costLayerId: true, qty: true },
           },
           adjustmentLayers: {
-            select: { id: true, receivedQty: true, remainingQty: true },
+            select: { id: true, receivedQty: true, remainingQty: true, unitCostBase: true },
           },
         },
       })
@@ -804,6 +804,31 @@ export async function updateAdjustmentMovement(
         throw new Error(
           'This adjustment has later stock movements for the same product and warehouse. ' +
           'Create a reversing adjustment instead of editing it in place.',
+        )
+      }
+
+      // ycnj: an in-place edit re-books qty/cost layers/COGS but cannot revise an
+      // accounting journal that was already posted for this movement — that would
+      // silently drift the GL sub-ledger from inventory. Block the edit once a
+      // journal exists; the operator posts a reversing adjustment (which carries
+      // its own compensating journal) instead.
+      // Ignore CANCELLED rows (deliberately abandoned — never re-queued, so they
+      // never reach the ledger). PENDING/PROCESSING/SYNCED block (posted or will
+      // post); FAILED also blocks because it can be re-queued by reconciliation
+      // and would then post the OLD value, drifting from the edited inventory.
+      const postedJournal = await tx.accountingSyncLog.findFirst({
+        where: {
+          referenceType: 'StockMovement',
+          referenceId: id,
+          type: 'INVENTORY_ADJUSTMENT',
+          status: { not: 'CANCELLED' },
+        },
+        select: { id: true },
+      })
+      if (postedJournal) {
+        throw new Error(
+          'This adjustment has been posted to accounting. Create a reversing adjustment ' +
+          'instead of editing it in place, so the ledger stays consistent.',
         )
       }
 
@@ -905,14 +930,25 @@ export async function updateAdjustmentMovement(
 
       let nextMovementValueFields: ReturnType<typeof buildStockMovementValueFields> | ReturnType<typeof buildStockMovementValueFieldsFromConsumed>
       if (newIsAddition) {
-        const warehouseAvgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
-        const avgCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, movement.productId)
-        nextMovementValueFields = buildStockMovementValueFields({ qty: Math.abs(newSignedQty), unitCostBase: avgCost })
+        // ycnj: preserve the ORIGINAL addition layer's unit cost on a qty edit, so
+        // a re-booked addition isn't silently revalued at the current average
+        // (e.g. a £0 sample, or +10 @ £2 → +12, must keep £2 not become average).
+        // Only a removal→addition edit (no original addition layer to inherit a
+        // cost from) falls back to the derived warehouse/historical average.
+        const originalUnitCost = oldIsAddition ? Number(movement.adjustmentLayers[0]?.unitCostBase) : NaN
+        let unitCostBase: number
+        if (Number.isFinite(originalUnitCost) && originalUnitCost >= 0) {
+          unitCostBase = originalUnitCost
+        } else {
+          const warehouseAvgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
+          unitCostBase = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, movement.productId)
+        }
+        nextMovementValueFields = buildStockMovementValueFields({ qty: Math.abs(newSignedQty), unitCostBase })
         await createCostLayer(tx, {
           productId: movement.productId,
           warehouseId: newWarehouseId,
           qty: Math.abs(newSignedQty),
-          unitCostBase: avgCost,
+          unitCostBase,
           receivedAt: movement.createdAt,
           isOpeningStock: false,
           adjustmentMovementId: id,
