@@ -6,6 +6,8 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
   queueAccountingSync,
+  queueAccountingSyncTx,
+  isAccountingSyncTypeEnabled,
   getAccountingSettings,
   type AccountingSettings,
 } from '@/lib/accounting'
@@ -37,6 +39,7 @@ import { toIsoCountryCode } from '@/lib/countries'
 import {
   buildChargebackRefundLines,
   createSalesOrderRefund,
+  recordRefundCogsReversalFromSync,
   retrySalesOrderRefundAccounting,
   type CreatedRefundLine,
   type RefundAccountingSyncRequest,
@@ -1597,7 +1600,20 @@ async function queueRefundAccountingActions(input: {
   })
 
   for (const sync of input.accountingSyncs) {
-    await queueAccountingSync(sync)
+    if (sync.type === 'COGS_REVERSAL') {
+      // bcz9.4: queue the COGS_REVERSAL journal and record its COGS subledger row in
+      // ONE transaction. Recording at queue time (not at refund staging) guarantees the
+      // negative ledger row exists only once the GL reversal is durably queued, so the
+      // daily-batch COGS reconciliation can't sweep a not-yet-queued reversal as rounding
+      // and then double-count it when a retry posts the real journal (Codex PR #353 F5).
+      // Idempotent on the sync key, so initial + retry record exactly once.
+      await db.$transaction(async (tx) => {
+        await queueAccountingSyncTx(tx, sync)
+        await recordRefundCogsReversalFromSync(tx, sync, await isAccountingSyncTypeEnabled('COGS_REVERSAL'))
+      })
+    } else {
+      await queueAccountingSync(sync)
+    }
   }
 }
 
