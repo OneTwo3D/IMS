@@ -1822,6 +1822,10 @@ export async function receivePurchaseOrder(
         // layer never drifts from the stock level. The shared createCostLayer
         // helper applies the same rounding; the direct writes here mirror it.
         const qtyReceived = roundQuantity(rl.qtyReceived, 6)
+        // rf0l (Codex): a sub-µ positive qty (e.g. 1e-7) passes the >0 filter but
+        // rounds to 0 at the 6dp scale — skip it rather than write a zero-qty
+        // movement/layer/stock row.
+        if (qtyReceived.lte(0)) continue
         const qtyReceivedStr = qtyReceived.toFixed(6)
         totalReceiptValue = addMoney(totalReceiptValue, multiplyMoney(qtyReceived, unitCostBase))
 
