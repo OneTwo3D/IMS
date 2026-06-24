@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
-import { getAccountingSettings, isAccountingSyncTypeEnabled, queueAccountingSync, queueAccountingSyncTx, type AccountingSettings } from '@/lib/accounting'
+import { getAccountingSettings, queueAccountingSync, queueAccountingSyncTx, type AccountingSettings } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -733,19 +733,19 @@ export async function queueLandedCostAdjustmentJournals(
     // bcz9.2: commit the COGS journal queue + its subledger ledger row atomically in
     // one transaction so a crash (or a posting-setting change) between them can't leave
     // a queued journal with no ledger row, or a ledger row with no journal — either of
-    // which would make the daily-batch COGS reconciliation perpetually flag. The gate
-    // is re-evaluated per adjustment (not once before the loop) and read inside the
-    // transaction, mirroring the COGS_JOURNAL gate queueAccountingSyncTx applies, so
-    // the ledger row is recorded only when the journal will actually post to the GL.
+    // which would make the daily-batch COGS reconciliation perpetually flag. The ledger
+    // row is recorded based on the queue's OWN decision (queueAccountingSyncTx's return)
+    // per adjustment, not a separate settings recheck, so a connector/setting flip
+    // mid-loop can't desync queue vs ledger (Codex bcz9.4).
     await db.$transaction(async (tx) => {
-      await queueAccountingSyncTx(tx, {
+      const queued = await queueAccountingSyncTx(tx, {
         type: 'COGS_JOURNAL',
         referenceType: 'PurchaseOrder',
         referenceId: adj.primaryPoId,
         payload,
         idempotencyKey: cogsIdempotencyKey,
       })
-      if (await isAccountingSyncTypeEnabled('COGS_JOURNAL')) {
+      if (queued) {
         await recordCogsSubledgerMovement(tx, {
           sourceType: 'LANDED_COST_ADJUSTMENT',
           sourceRef: adj.primaryPoId,

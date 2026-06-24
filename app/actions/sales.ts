@@ -7,7 +7,6 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
   queueAccountingSync,
   queueAccountingSyncTx,
-  isAccountingSyncTypeEnabled,
   getAccountingSettings,
   type AccountingSettings,
 } from '@/lib/accounting'
@@ -1608,8 +1607,10 @@ async function queueRefundAccountingActions(input: {
       // and then double-count it when a retry posts the real journal (Codex PR #353 F5).
       // Idempotent on the sync key, so initial + retry record exactly once.
       await db.$transaction(async (tx) => {
-        await queueAccountingSyncTx(tx, sync)
-        await recordRefundCogsReversalFromSync(tx, sync, await isAccountingSyncTypeEnabled('COGS_REVERSAL'))
+        // Record based on the queue's OWN decision (not a separate settings recheck) so
+        // a connector/setting flip between the two can't desync queue vs ledger (Codex).
+        const queued = await queueAccountingSyncTx(tx, sync)
+        await recordRefundCogsReversalFromSync(tx, sync, queued)
       })
     } else {
       await queueAccountingSync(sync)
