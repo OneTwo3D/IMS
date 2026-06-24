@@ -573,8 +573,6 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
 
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevels)
-
   const cogsSetting = await db.setting.findUnique({ where: { key: 'wc_cogs_sync_enabled' } })
   const cogsSyncEnabled = cogsSetting?.value === 'true'
 
@@ -619,6 +617,38 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   const products = rawProducts.filter(
     (p): p is CandidateProduct => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY',
   )
+
+  // bghy: a KIT can be selected because it CONTAINS a scoped product as a component,
+  // but the stock fetch above only loaded the scoped ids (+ components of scoped KITs)
+  // — NOT that KIT's OTHER components. computeAvailableByProduct reads missing
+  // component stock as 0 and would understate (often zero out) the KIT. Load the
+  // sibling-component stock for all KIT candidates that wasn't already fetched, so the
+  // availability calc has a full basis. Unscoped runs already load everything.
+  let stockLevelsForMaps = stockLevels
+  // The complete scoped stock id set INCLUDING KIT siblings — passed to the fresh
+  // re-fetch (oversell-window clamp) below so it has the same basis; otherwise the
+  // min(snapshot, fresh) clamp would re-introduce the under-push (bghy).
+  let scopedStockIdsWithSiblings = scopedStockProductIds
+  if (scopedStockProductIds) {
+    const alreadyFetched = new Set(scopedStockProductIds)
+    const missingComponentIds = [
+      ...new Set(
+        products.flatMap((p) =>
+          p.type === 'KIT' ? p.productComponents.map((c) => c.componentId) : [],
+        ),
+      ),
+    ].filter((componentId) => !alreadyFetched.has(componentId))
+    if (missingComponentIds.length > 0) {
+      const siblingStockLevels = await db.stockLevel.findMany({
+        where: { warehouseId: { in: whIds }, productId: { in: missingComponentIds } },
+        select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
+      })
+      stockLevelsForMaps = [...stockLevels, ...siblingStockLevels]
+      scopedStockIdsWithSiblings = [...scopedStockProductIds, ...missingComponentIds]
+    }
+  }
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevelsForMaps)
+
   const result: StockSyncResult = {
     synced: 0, skipped: 0, errors: [],
     candidates: products.length, matched: 0, unmatched: 0,
@@ -960,7 +990,9 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     products,
     productById,
     whIds,
-    scopedStockProductIds,
+    // bghy: include KIT siblings so the fresh re-fetch has the same basis as the
+    // snapshot — otherwise the min(snapshot, fresh) clamp re-zeros the KIT.
+    scopedStockIdsWithSiblings,
   )
 
   // -------- Build push entries --------
