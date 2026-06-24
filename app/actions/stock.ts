@@ -31,6 +31,27 @@ import {
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
+// cv67: post-commit side effects (backorder allocation, over-allocation release,
+// WooCommerce stock-sync enqueue) run best-effort AFTER the adjustment commits, so
+// a failure can't roll the adjustment back. Previously these were swallowed with
+// console.error only — invisible to operators, so a failed enqueue silently drifted
+// store stock. Surface them to the activity log (WARNING) so they're auditable and
+// the operator can re-sync. Never throws (the adjustment already committed).
+async function logStockSideEffectFailure(action: string, error: unknown): Promise<void> {
+  console.error(error)
+  try {
+    await logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      action,
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Post-commit ${action} failed; stock/orders may need re-sync: ${error instanceof Error ? error.message : String(error)}`,
+    })
+  } catch (logError) {
+    console.error(logError)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers for inventory adjustment accounting journal
 // ---------------------------------------------------------------------------
@@ -449,7 +470,7 @@ export async function adjustStock(
           referenceLabel: `stock adjustment (+${qtyNum}) at ${logWarehouseName}`,
         })
       } catch (allocError) {
-        console.error(allocError)
+        await logStockSideEffectFailure('backorder_allocation', allocError)
       }
     } else if (qtyNum < 0) {
       try {
@@ -458,14 +479,14 @@ export async function adjustStock(
           { source: 'stock_adjustment', referenceId: productId, referenceLabel: `stock adjustment (${qtyNum}) at ${logWarehouseName}` },
         )
       } catch (rebalanceError) {
-        console.error(rebalanceError)
+        await logStockSideEffectFailure('overallocation_release', rebalanceError)
       }
     }
 
     try {
       await enqueueStockSync([productId], 'IMS_CHANGE')
     } catch (syncError) {
-      console.error(syncError)
+      await logStockSideEffectFailure('stock_sync_enqueue', syncError)
     }
 
     await logActivity({
@@ -599,7 +620,7 @@ export async function bulkAdjustStock(
           referenceLabel: `bulk stock adjustment (${valid.length} lines)`,
         })
       } catch (rebalanceError) {
-        console.error(rebalanceError)
+        await logStockSideEffectFailure('overallocation_release', rebalanceError)
       }
     }
     if (positiveProductIds.length > 0) {
@@ -609,7 +630,7 @@ export async function bulkAdjustStock(
           referenceLabel: `bulk stock adjustment (${valid.length} lines)`,
         })
       } catch (allocError) {
-        console.error(allocError)
+        await logStockSideEffectFailure('backorder_allocation', allocError)
       }
     }
 
@@ -619,7 +640,7 @@ export async function bulkAdjustStock(
         'IMS_CHANGE',
       )
     } catch (syncError) {
-      console.error(syncError)
+      await logStockSideEffectFailure('stock_sync_enqueue', syncError)
     }
 
     await logActivity({
@@ -627,6 +648,12 @@ export async function bulkAdjustStock(
       action: 'bulk_adjusted',
       tag: 'stock',
       description: `Bulk adjusted stock for ${valid.length} products`,
+      // 27f9: record per-line detail so a bulk adjustment is auditable line-by-line
+      // (which product/warehouse/qty), not just an opaque "N products" summary.
+      metadata: {
+        lineCount: valid.length,
+        lines: valid.map((l) => ({ productId: l.productId, warehouseId: l.warehouseId, qty: l.qty, reasonId: l.reasonId || null })),
+      },
     })
 
     return { success: true, count: valid.length }
@@ -938,7 +965,7 @@ export async function updateAdjustmentMovement(
             referenceLabel: `adjustment edit (net +${netDelta})`,
           })
         } catch (allocError) {
-          console.error(allocError)
+          await logStockSideEffectFailure('backorder_allocation', allocError)
         }
       } else if (netDelta < 0 && warehouseId) {
         try {
@@ -947,13 +974,13 @@ export async function updateAdjustmentMovement(
             { source: 'stock_adjustment', referenceId: id, referenceLabel: `adjustment edit (net ${netDelta})` },
           )
         } catch (rebalanceError) {
-          console.error(rebalanceError)
+          await logStockSideEffectFailure('overallocation_release', rebalanceError)
         }
       }
       try {
         await enqueueStockSync([movement.productId], 'IMS_CHANGE')
       } catch (syncError) {
-        console.error(syncError)
+        await logStockSideEffectFailure('stock_sync_enqueue', syncError)
       }
     }
 

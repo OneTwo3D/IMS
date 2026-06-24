@@ -309,7 +309,7 @@ export async function createTransfer(
 
     await logActivity({
       entityType: 'STOCK_TRANSFER',
-      action: 'created',
+      action: 'create_failed',
       tag: 'stock',
       level: 'ERROR',
       description: e instanceof Error ? e.message : 'Failed to create transfer.',
@@ -404,7 +404,7 @@ export async function updateTransferDraft(
     await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
-      action: 'updated',
+      action: 'update_failed',
       tag: 'stock',
       level: 'ERROR',
       description: e instanceof Error ? e.message : 'Failed to update transfer.',
@@ -611,7 +611,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
     await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
-      action: 'dispatched',
+      action: 'dispatch_failed',
       tag: 'stock',
       level: 'ERROR',
       description: msg,
@@ -836,7 +836,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
     await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
-      action: 'received',
+      action: 'receive_failed',
       tag: 'stock',
       level: 'ERROR',
       description: msg,
@@ -891,7 +891,7 @@ export async function cancelTransfer(id: string): Promise<TransferResult> {
     await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
-      action: 'cancelled',
+      action: 'cancel_failed',
       tag: 'stock',
       level: 'ERROR',
       description: e instanceof Error ? e.message : 'Failed to cancel transfer.',
@@ -1080,7 +1080,7 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
     await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
-      action: 'dispatch_cancelled',
+      action: 'dispatch_cancel_failed',
       tag: 'stock',
       level: 'ERROR',
       description: msg,
