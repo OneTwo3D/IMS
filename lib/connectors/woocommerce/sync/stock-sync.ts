@@ -905,6 +905,23 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     }
   }
 
+  // 1qsb stale-snapshot oversell guard. The availability snapshot above was taken
+  // before SKU resolution and the WooCommerce preflight network round-trips, so a
+  // shipment/allocation may have dropped stock since. Re-read current stock now and
+  // drive the push qty from min(snapshot, fresh) — i.e. CLAMP DOWN ONLY, the per-run
+  // qty can only fall, never rise above what the snapshot saw. This MUST feed the
+  // build loop (not a post-filter pass): the unchanged-product dedupe below compares
+  // the payload qty against lastPushedQty, so a product whose stock dropped has to be
+  // re-valued BEFORE that comparison or it would be skipped and left stale-high at
+  // WooCommerce (the exact oversell scenario this guards). A stale-LOW value is
+  // harmless and self-corrects on the next per-event push / daily forceAll reconcile.
+  const freshAvailableByProduct = await computeFreshAvailableByProduct(
+    products,
+    productById,
+    whIds,
+    scopedStockProductIds,
+  )
+
   // -------- Build push entries --------
   const pushEntries: PushEntry[] = []
   const variantPushEntries: VariantPushEntry[] = []
@@ -914,18 +931,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       if (!result.errors.some((m) => m.includes(product.id))) result.skipped++
       continue
     }
-    const available = shouldForceWooZeroStock(product.lifecycleStatus)
-      ? 0
-      : (availableByProduct.get(product.id) ?? 0)
+    const stockQuantity = resolvePushStockQuantity(
+      availableByProduct.get(product.id) ?? 0,
+      freshAvailableByProduct.get(product.id) ?? 0,
+      shouldForceWooZeroStock(product.lifecycleStatus),
+    )
     const payload: PushEntry['payload'] = {
       id: target.externalId,
-      // 1qsb Part-1 (by design, do NOT "fix"): `available` is summed across all
-      // syncToStore warehouses (see buildStockMaps) and floored DOWN to an integer
-      // because WooCommerce `stock_quantity` is integer-only — it cannot represent
-      // 2.6. IMS keeps the true fractional figure internally; flooring is the
-      // oversell-SAFE direction (WC under-reports, never over-reports). Pushing a
-      // ceil/fractional value would risk overselling the partial unit.
-      stock_quantity: Math.floor(available),
+      stock_quantity: stockQuantity,
       manage_stock: true,
     }
     const cogs = cogsByProduct.get(product.id)
@@ -999,25 +1012,6 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // belong to), but continuing would keep pushing to the old store
   // after the operator explicitly disconnected it. Break out and
   // surface the abort instead.
-  //
-  // 1qsb stale-snapshot oversell guard: the availability snapshot above was taken
-  // before SKU resolution and the WooCommerce preflight network round-trips, so a
-  // shipment/allocation may have dropped stock since. Re-read current stock now,
-  // immediately before pushing, and CLAMP DOWN ONLY — never raise an already-built
-  // payload quantity. Clamping down can only ever reduce an oversell window; a
-  // stale-LOW value is harmless (under-reports availability and self-corrects on
-  // the next per-event push or the daily forceAll reconcile), whereas raising a
-  // value would risk pushing more than is actually on hand. The same flooring +
-  // multi-warehouse-summation + recursive kit-BOM basis is reused via
-  // computeAvailableByProduct so the clamp value is consistent with the snapshot.
-  await clampPushEntriesToFreshStock(
-    pushEntries,
-    variantPushEntries,
-    products,
-    productById,
-    whIds,
-    scopedStockProductIds,
-  )
   await options?.onProgress?.({ phase: 'pushing', processed: 0, synced: 0, total: pushEntries.length })
   for (let i = 0; i < pushEntries.length; i += WC_BATCH_SIZE) {
     const batch = pushEntries.slice(i, i + WC_BATCH_SIZE)
@@ -1411,24 +1405,45 @@ export function computeAvailableByProduct(
 }
 
 /**
- * 1qsb stale-snapshot oversell guard. Re-reads current stock immediately before
- * the batch POST and reduces any already-built push payload whose freshly-computed
- * available quantity is now lower than the snapshot value. Mutates the payloads in
- * place. CLAMP DOWN ONLY: a payload qty is never raised, so this can only ever
- * shrink an oversell window, never create one. Lifecycle-forced-zero products keep
- * their forced 0. Re-uses buildStockMaps + computeAvailableByProduct so the clamp
- * basis (floor, multi-warehouse summation, recursive kit-BOM) matches the snapshot.
+ * 1qsb stale-snapshot oversell guard. Re-reads current stock (the same scope as the
+ * run snapshot) and returns a fresh per-product available map, re-using buildStockMaps
+ * + computeAvailableByProduct so the basis (floor, multi-warehouse summation, recursive
+ * kit-BOM) matches the snapshot. The caller drives each push qty from
+ * min(snapshot, fresh) BEFORE the unchanged-product dedupe, so a product whose stock
+ * dropped after the snapshot is re-valued in time to still be pushed (not skipped as
+ * "unchanged" and left stale-high at WooCommerce).
  */
-async function clampPushEntriesToFreshStock(
-  pushEntries: PushEntry[],
-  variantPushEntries: VariantPushEntry[],
+/**
+ * Resolve the integer `stock_quantity` to push to WooCommerce for one product.
+ *
+ * - `forcedZero` (lifecycle EOL/archived etc.) → 0.
+ * - Otherwise: `min(snapshotAvailable, freshAvailable)` then floored.
+ *
+ * The `min` is the 1qsb oversell guard (CLAMP DOWN ONLY): the per-run qty can fall
+ * to the freshly re-read value but never rise above what the run snapshot saw, so a
+ * stale-high quantity is never pushed.
+ *
+ * The floor is 1qsb Part-1 (by design, do NOT "fix"): the inputs are summed across
+ * all syncToStore warehouses (see buildStockMaps) and WooCommerce `stock_quantity` is
+ * integer-only — it cannot represent 2.6. IMS keeps the true fractional figure
+ * internally; flooring DOWN is the oversell-safe direction (WC under-reports, never
+ * over-reports). Pushing a ceil/fractional value would risk overselling the partial unit.
+ */
+export function resolvePushStockQuantity(
+  snapshotAvailable: number,
+  freshAvailable: number,
+  forcedZero: boolean,
+): number {
+  if (forcedZero) return 0
+  return Math.floor(Math.min(snapshotAvailable, freshAvailable))
+}
+
+async function computeFreshAvailableByProduct(
   products: CandidateProduct[],
   productById: Map<string, CandidateProduct>,
   whIds: string[],
   scopedStockProductIds: string[] | null,
-): Promise<void> {
-  if (pushEntries.length === 0 && variantPushEntries.length === 0) return
-
+): Promise<Map<string, number>> {
   const freshStockLevels = await db.stockLevel.findMany({
     where: {
       warehouseId: { in: whIds },
@@ -1439,7 +1454,7 @@ async function clampPushEntriesToFreshStock(
   const { stockByProduct, stockByProductWarehouse } = buildStockMaps(freshStockLevels)
   // Throwaway error sink: any kit-cycle diagnostics were already surfaced from the
   // snapshot pass; recomputing here must not double-report them.
-  const freshAvailableByProduct = computeAvailableByProduct(
+  return computeAvailableByProduct(
     products,
     whIds,
     stockByProduct,
@@ -1447,30 +1462,6 @@ async function clampPushEntriesToFreshStock(
     productById,
     [],
   )
-
-  clampEntriesToAvailable(pushEntries, freshAvailableByProduct, productById)
-  clampEntriesToAvailable(variantPushEntries, freshAvailableByProduct, productById)
-}
-
-/**
- * Pure clamp: reduce each entry's payload `stock_quantity` to `floor(fresh
- * available)` IFF that is strictly lower than the current value. Never raises.
- * Lifecycle-forced-zero products are left untouched (already 0). Mutates entries
- * in place. Exported for unit testing the oversell-safe decision in isolation.
- */
-export function clampEntriesToAvailable(
-  entries: (PushEntry | VariantPushEntry)[],
-  freshAvailableByProduct: Map<string, number>,
-  productById: Map<string, CandidateProduct>,
-): void {
-  for (const entry of entries) {
-    const product = productById.get(entry.productId)
-    if (product && shouldForceWooZeroStock(product.lifecycleStatus)) continue
-    const freshAvailable = Math.floor(freshAvailableByProduct.get(entry.productId) ?? 0)
-    if (freshAvailable < entry.payload.stock_quantity) {
-      entry.payload.stock_quantity = freshAvailable
-    }
-  }
 }
 
 function computeKitAvailability(

@@ -4,20 +4,17 @@ import test from 'node:test'
 import {
   buildStockMaps,
   computeAvailableByProduct,
-  clampEntriesToAvailable,
+  resolvePushStockQuantity,
   type CandidateProduct,
-  type PushEntry,
   type StockLevelSnapshotRow,
 } from '@/lib/connectors/woocommerce/sync/stock-sync'
 
-const WH = ['wh-a', 'wh-b']
-
-function simpleProduct(id: string, lifecycleStatus: CandidateProduct['lifecycleStatus'] = 'ACTIVE'): CandidateProduct {
+function simpleProduct(id: string): CandidateProduct {
   return {
     id,
     sku: id,
     type: 'SIMPLE',
-    lifecycleStatus,
+    lifecycleStatus: 'ACTIVE',
     externalProductId: null,
     parent: null,
     productComponents: [],
@@ -34,19 +31,10 @@ function kitProduct(id: string, components: { componentId: string; qty: number }
     parent: null,
     productComponents: components.map((c) => ({
       componentId: c.componentId,
-      // Prisma.Decimal-like: computeKitAvailability only does Number(component.qty)
+      // computeKitAvailability only does Number(component.qty)
       qty: c.qty as unknown as CandidateProduct['productComponents'][number]['qty'],
       component: { type: 'SIMPLE', lifecycleStatus: 'ACTIVE' },
     })),
-  }
-}
-
-function pushEntry(productId: string, stockQuantity: number): PushEntry {
-  return {
-    productId,
-    sku: productId,
-    externalId: 1,
-    payload: { id: 1, stock_quantity: stockQuantity, manage_stock: true },
   }
 }
 
@@ -63,72 +51,41 @@ test('buildStockMaps sums available (qty - reserved, floored at 0) across wareho
   const { stockByProduct, stockByProductWarehouse } = buildStockMaps(
     rows(['p1', 'wh-a', 5, 1], ['p1', 'wh-b', 3, 0], ['p2', 'wh-a', 2, 4]),
   )
-  // p1: (5-1) + (3-0) = 7
-  assert.equal(stockByProduct.get('p1'), 7)
-  // p2: max(0, 2-4) = 0 (negative clamped)
-  assert.equal(stockByProduct.get('p2'), 0)
+  assert.equal(stockByProduct.get('p1'), 7) // (5-1) + (3-0)
+  assert.equal(stockByProduct.get('p2'), 0) // max(0, 2-4)
   assert.equal(stockByProductWarehouse.get('p1')?.get('wh-a'), 4)
   assert.equal(stockByProductWarehouse.get('p1')?.get('wh-b'), 3)
 })
 
-test('clampEntriesToAvailable lowers a payload when fresh stock dropped', () => {
-  const products = [simpleProduct('p1')]
-  const productById = new Map(products.map((p) => [p.id, p]))
-  const fresh = computeAvailableByProduct(
-    products,
-    WH,
-    new Map([['p1', 2]]),
-    new Map(),
-    productById,
-    [],
-  )
-  // snapshot pushed 5, but only 2 are available now
-  const entries = [pushEntry('p1', 5)]
-  clampEntriesToAvailable(entries, fresh, productById)
-  assert.equal(entries[0].payload.stock_quantity, 2)
+test('resolvePushStockQuantity clamps DOWN to fresh when stock dropped', () => {
+  // snapshot said 5, fresh re-read says 2 -> push 2 (the oversell guard)
+  assert.equal(resolvePushStockQuantity(5, 2, false), 2)
 })
 
-test('clampEntriesToAvailable never raises a payload when fresh stock grew', () => {
-  const products = [simpleProduct('p1')]
-  const productById = new Map(products.map((p) => [p.id, p]))
-  const fresh = computeAvailableByProduct(products, WH, new Map([['p1', 9]]), new Map(), productById, [])
-  const entries = [pushEntry('p1', 3)]
-  clampEntriesToAvailable(entries, fresh, productById)
-  // stale-low is harmless and must NOT be raised (oversell-safe)
-  assert.equal(entries[0].payload.stock_quantity, 3)
+test('resolvePushStockQuantity never rises above the snapshot when fresh grew', () => {
+  // fresh 9 > snapshot 3 -> stays 3 (clamp DOWN only; never push more than snapshot saw)
+  assert.equal(resolvePushStockQuantity(3, 9, false), 3)
 })
 
-test('clampEntriesToAvailable floors fractional fresh availability down', () => {
-  const products = [simpleProduct('p1')]
-  const productById = new Map(products.map((p) => [p.id, p]))
-  const fresh = computeAvailableByProduct(products, WH, new Map([['p1', 2.6]]), new Map(), productById, [])
-  const entries = [pushEntry('p1', 5)]
-  clampEntriesToAvailable(entries, fresh, productById)
-  assert.equal(entries[0].payload.stock_quantity, 2)
+test('resolvePushStockQuantity floors fractional availability down', () => {
+  assert.equal(resolvePushStockQuantity(2.6, 4, false), 2)
+  assert.equal(resolvePushStockQuantity(5, 2.9, false), 2)
 })
 
-test('clampEntriesToAvailable leaves lifecycle-forced-zero products at 0', () => {
-  const products = [simpleProduct('p1', 'ARCHIVED')]
-  const productById = new Map(products.map((p) => [p.id, p]))
-  // even if fresh stock says 10, an archived product stays forced-zero
-  const fresh = computeAvailableByProduct(products, WH, new Map([['p1', 10]]), new Map(), productById, [])
-  const entries = [pushEntry('p1', 0)]
-  clampEntriesToAvailable(entries, fresh, productById)
-  assert.equal(entries[0].payload.stock_quantity, 0)
+test('resolvePushStockQuantity returns 0 for lifecycle-forced-zero products', () => {
+  assert.equal(resolvePushStockQuantity(10, 10, true), 0)
 })
 
-test('clamp re-evaluates kit availability from fresh component stock', () => {
-  // kit needs 2x component c1 per kit; component stock dropped to 3 -> floor(3/2)=1 kit
+test('computeAvailableByProduct values a kit from fresh component stock (floor of component/required)', () => {
+  // kit needs 2x c1 per kit; component stock 3 -> floor(3/2) = 1 kit
   const c1 = simpleProduct('c1')
   const kit = kitProduct('kit1', [{ componentId: 'c1', qty: 2 }])
   const products = [c1, kit]
   const productById = new Map(products.map((p) => [p.id, p]))
   const { stockByProduct, stockByProductWarehouse } = buildStockMaps(rows(['c1', 'wh-a', 3, 0]))
-  const fresh = computeAvailableByProduct(products, ['wh-a'], stockByProduct, stockByProductWarehouse, productById, [])
-  assert.equal(fresh.get('kit1'), 1)
+  const available = computeAvailableByProduct(products, ['wh-a'], stockByProduct, stockByProductWarehouse, productById, [])
+  assert.equal(available.get('kit1'), 1)
 
-  // snapshot had pushed 3 kits; clamp must drop to 1
-  const entries = [pushEntry('kit1', 3)]
-  clampEntriesToAvailable(entries, fresh, productById)
-  assert.equal(entries[0].payload.stock_quantity, 1)
+  // a kit whose component stock just dropped is re-valued down by resolvePushStockQuantity
+  assert.equal(resolvePushStockQuantity(3 /* snapshot kits */, available.get('kit1') ?? 0, false), 1)
 })
