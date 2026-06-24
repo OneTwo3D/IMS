@@ -28,7 +28,9 @@ type Props = {
   onClose: () => void
 }
 
-type AdjLine = BulkAdjustLine & {
+// The dialog tracks lines by their own stable `key`; the wire-level lineId is
+// derived from it at submit time (see handleSave), so it's omitted here.
+type AdjLine = Omit<BulkAdjustLine, 'lineId'> & {
   key: number
   productSku: string
   productName: string
@@ -83,7 +85,9 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
       idempotencyTokenRef.current = crypto.randomUUID()
     }
     const res = await bulkAdjustStock(
-      valid.map(({ productId, warehouseId, reasonId, qty, unitCostBase }) => ({ productId, warehouseId, reasonId, qty, unitCostBase })),
+      // tllm: send each line's stable dialog key as lineId so the server keys it by a
+      // retry-stable identity, not array position.
+      valid.map(({ key, productId, warehouseId, reasonId, qty, unitCostBase }) => ({ lineId: String(key), productId, warehouseId, reasonId, qty, unitCostBase })),
       idempotencyTokenRef.current,
     )
     setSaving(false)
