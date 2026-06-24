@@ -1130,6 +1130,14 @@ export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Pr
 }
 
 /** Avg COGS per product from FIFO cost layers (weighted avg of remaining stock) */
+/**
+ * Weighted-average remaining cost per product, for the sales-order form's
+ * indicative COGS/margin estimate ONLY (the single caller renders it client-side;
+ * it is never persisted, posted to a GL journal, or used to cost a movement). The
+ * JS-float accumulation below is therefore acceptable — this is NOT a GL path, so
+ * it is intentionally left as Number() math (4ve5: verified display-only, no drift
+ * risk). Anything that posts to accounting must use the Decimal engine instead.
+ */
 export async function getAvgCogsMap(): Promise<Record<string, number>> {
   await requireAuth()
   const layers = await db.costLayer.findMany({

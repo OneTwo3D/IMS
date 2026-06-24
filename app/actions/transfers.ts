@@ -665,14 +665,18 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
       }
 
       for (const line of transfer.lines) {
-        const qty = Number(line.qty)
         // A WMS callback (Mintsoft etc.) may already have booked in part of
         // this line and stamped qtyReceived + cost layers + a TRANSFER_IN
         // movement for that portion. Receive only the remaining quantity to
         // avoid double-counting; skip the line entirely if it is already
         // fully received via WMS.
-        const alreadyReceived = Number(line.qtyReceived ?? 0)
-        const remainingQty = Math.max(0, qty - alreadyReceived)
+        // 4ve5: subtract the Decimal(12,4) qty/qtyReceived columns in the Decimal
+        // engine, not via JS floats, so the remaining qty persisted to the movement,
+        // stock level and value fields carries no last-place IEEE-754 drift.
+        const alreadyReceivedDecimal = toDecimal(line.qtyReceived ?? 0)
+        const alreadyReceived = alreadyReceivedDecimal.toNumber()
+        const remainingDecimal = subtractMoney(line.qty, alreadyReceivedDecimal)
+        const remainingQty = (remainingDecimal.lt(0) ? toDecimal(0) : remainingDecimal).toNumber()
 
         if (remainingQty > 0) {
           // Compute the pure snapshot slice before movement creation so the
@@ -771,9 +775,10 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         }
 
         // Mark line as fully received regardless of which path got us here.
+        // 4ve5: persist the exact Decimal line qty, not a JS-float round-trip.
         await tx.stockTransferLine.update({
           where: { id: line.id },
-          data: { qtyReceived: qty },
+          data: { qtyReceived: line.qty },
         })
       }
 
@@ -956,12 +961,16 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
       }
 
       for (const line of lines) {
-        const qty = Number(line.qty)
         // A WMS partial-receive may already have landed some units at the
         // DESTINATION — those are not stranded. Restore only the portion that
         // never arrived, using the same snapshot slice the receive path uses.
-        const alreadyReceived = Number(line.qtyReceived ?? 0)
-        const restoreQty = Math.max(0, qty - alreadyReceived)
+        // 4ve5: subtract the Decimal(12,4) qty/qtyReceived columns in the Decimal
+        // engine, not via JS floats, so the restored qty persisted back to the
+        // source movement, stock level and value fields carries no IEEE-754 drift.
+        const alreadyReceivedDecimal = toDecimal(line.qtyReceived ?? 0)
+        const alreadyReceived = alreadyReceivedDecimal.toNumber()
+        const restoreDecimal = subtractMoney(line.qty, alreadyReceivedDecimal)
+        const restoreQty = (restoreDecimal.lt(0) ? toDecimal(0) : restoreDecimal).toNumber()
         if (restoreQty <= 0) continue
 
         const snapshotSlice = sliceTransferSnapshotForReceipt({
