@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
@@ -10,7 +11,7 @@ import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-war
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
-import { cogsEntryDataFromConsumed, consumeFifoLayersStrict } from '@/lib/cost-layers'
+import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer } from '@/lib/cost-layers'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
@@ -278,6 +279,18 @@ export type ReceiptLineInput = {
   qtyReceived: number
   warehouseId: string
 }
+
+// rf0l: validate every receipt line before it can drive a cost layer / stock
+// level. qtyReceived must be a finite, positive number (no NaN/Infinity, no
+// negatives); the write path additionally rounds it to the 6dp engine scale.
+const ReceiptLineInputSchema = z.object({
+  poLineId: z.string().min(1, 'poLineId is required'),
+  warehouseId: z.string().min(1, 'Warehouse is required for each line'),
+  qtyReceived: z
+    .number()
+    .refine(Number.isFinite, 'qtyReceived must be a finite number')
+    .gt(0, 'qtyReceived must be greater than 0'),
+})
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1652,7 +1665,14 @@ export async function receivePurchaseOrder(
       return { success: false, error: 'PO cannot be received in its current status' }
     }
 
-    const linesWithQty = receiptLines.filter((rl) => rl.qtyReceived > 0)
+    // rf0l: reject malformed receipt input (NaN/Infinity/negative qty, missing
+    // ids) before it reaches the cost-layer/stock-level write path.
+    const parsed = z.array(ReceiptLineInputSchema).safeParse(receiptLines)
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues[0]?.message ?? 'Invalid receipt line' }
+    }
+
+    const linesWithQty = parsed.data.filter((rl) => rl.qtyReceived > 0)
     if (!linesWithQty.length) return { success: false, error: 'No quantities to receive' }
     const [accountingSettings, receiptWarehouseNames] = await Promise.all([
       getAccountingSettings(),
@@ -1797,31 +1817,38 @@ export async function receivePurchaseOrder(
           poRef: currentPo.reference,
         })
         const unitCostBase = toDecimal(unitCostBaseInput)
-        totalReceiptValue = addMoney(totalReceiptValue, multiplyMoney(rl.qtyReceived, unitCostBase))
+        // rf0l: round the received qty to the 6dp engine scale ONCE and reuse it
+        // everywhere (movement, cost layer, stock level, PO line) so the cost
+        // layer never drifts from the stock level. The shared createCostLayer
+        // helper applies the same rounding; the direct writes here mirror it.
+        const qtyReceived = roundQuantity(rl.qtyReceived, 6)
+        // rf0l (Codex): a sub-µ positive qty (e.g. 1e-7) passes the >0 filter but
+        // rounds to 0 at the 6dp scale — skip it rather than write a zero-qty
+        // movement/layer/stock row.
+        if (qtyReceived.lte(0)) continue
+        const qtyReceivedStr = qtyReceived.toFixed(6)
+        totalReceiptValue = addMoney(totalReceiptValue, multiplyMoney(qtyReceived, unitCostBase))
 
         await tx.stockMovement.create({
           data: {
             type: 'PURCHASE_RECEIPT',
             productId: poLine.productId,
             toWarehouseId: rl.warehouseId,
-            qty: rl.qtyReceived,
-            ...buildStockMovementValueFields({ qty: rl.qtyReceived, unitCostBase }),
+            qty: qtyReceivedStr,
+            ...buildStockMovementValueFields({ qty: qtyReceived, unitCostBase }),
             note: `Received against ${currentPo.reference}`,
             referenceType: 'PurchaseOrder',
             referenceId: id,
           },
         })
 
-        await tx.costLayer.create({
-          data: {
-            productId: poLine.productId,
-            warehouseId: rl.warehouseId,
-            receivedQty: rl.qtyReceived,
-            remainingQty: rl.qtyReceived,
-            unitCostBase,
-            poLineId: poLine.id,
-            isOpeningStock: false,
-          },
+        await createCostLayer(tx, {
+          productId: poLine.productId,
+          warehouseId: rl.warehouseId,
+          qty: qtyReceived,
+          unitCostBase,
+          poLineId: poLine.id,
+          isOpeningStock: false,
         })
 
         await tx.stockLevel.upsert({
@@ -1834,17 +1861,17 @@ export async function receivePurchaseOrder(
           create: {
             productId: poLine.productId,
             warehouseId: rl.warehouseId,
-            quantity: rl.qtyReceived,
+            quantity: qtyReceivedStr,
             reservedQty: 0,
           },
           update: {
-            quantity: { increment: rl.qtyReceived },
+            quantity: { increment: qtyReceivedStr },
           },
         })
 
         await tx.purchaseOrderLine.update({
           where: { id: rl.poLineId },
-          data: { qtyReceived: { increment: rl.qtyReceived } },
+          data: { qtyReceived: { increment: qtyReceivedStr } },
         })
       }
 
