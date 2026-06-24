@@ -508,20 +508,61 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   }
 
   const whIds = warehouses.map((w) => w.id)
-  const scopedComponentIds = scopedProductIds
+  // d2jd: a scoped VARIABLE parent must expand to ALL its child products. The
+  // stockable units are the children, not the non-stockable VARIABLE parent, and
+  // this sync treats ANY product with a parent as a Woo variation candidate — so a
+  // child may be a VARIANT, KIT or BOM (the candidate filter later drops only
+  // VARIABLE/NON_INVENTORY). Without this, scoping just the parent id (e.g. a
+  // parent-product edit enqueues only the parent) pushed ZERO child stock until the
+  // daily forceAll reconcile. Expanding to the children makes a parent-scoped sync
+  // behave as if every child id had been scoped directly.
+  const scopedChildRows = scopedProductIds
+    ? await db.product.findMany({
+        where: { parentId: { in: scopedProductIds } },
+        select: { id: true, parentId: true },
+      })
+    : []
+  const scopedChildIds = scopedChildRows.map((row) => row.id)
+  // d2jd (force parity): if a VARIABLE parent is FORCED, force its children too.
+  // The children are candidates via the expansion above, but the no-change dedupe
+  // below would skip an unchanged child — leaving a forced/webhook job at synced=0
+  // that shouldRetainJob re-queues until it dead-letters at MAX_ATTEMPTS. On a
+  // parent-scoped run no child has its own force entry, so propagate it here.
+  for (const row of scopedChildRows) {
+    if (row.parentId && forceProductIds.has(row.parentId)) {
+      forceProductIds.add(row.id)
+    }
+  }
+  // The scoped set "as if each child were scoped directly": parents + their children.
+  // Used for the candidate-product id match.
+  const scopedProductAndVariantIds = scopedProductIds
+    ? [...new Set([...scopedProductIds, ...scopedChildIds])]
+    : null
+  // KIT components of the expanded set (parents + children) so a scoped/child KIT has
+  // its component stock loaded for availability.
+  //
+  // NOTE (codex P1): we deliberately do NOT widen the dependent-KIT match (the OR
+  // clause below) to the expanded children. Adding a KIT that uses an expanded child
+  // as a component would make it a candidate WITHOUT loading that kit's OTHER
+  // components' stock, so computeKitAvailability would read them as 0 and could push
+  // the kit's Woo stock to 0 on an unrelated parent edit. The dependent-KIT match
+  // therefore stays on the originally-scoped ids (unchanged pre-existing behaviour);
+  // a kit that only references an expanded child is corrected by the daily forceAll
+  // reconcile — the same safety net the rest of this scoped path relies on.
+  const scopedComponentIds = scopedProductAndVariantIds
     ? [
         ...new Set(
           (
             await db.productComponent.findMany({
-              where: { productId: { in: scopedProductIds } },
+              where: { productId: { in: scopedProductAndVariantIds } },
               select: { componentId: true },
             })
           ).map((row) => row.componentId),
         ),
       ]
     : []
-  const scopedStockProductIds = scopedProductIds
-    ? [...new Set([...scopedProductIds, ...scopedComponentIds])]
+  const scopedStockProductIds = scopedProductAndVariantIds
+    ? [...new Set([...scopedProductAndVariantIds, ...scopedComponentIds])]
     : null
 
   const stockLevels = await db.stockLevel.findMany({
@@ -545,7 +586,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       ...(scopedProductIds
         ? {
             OR: [
-              { id: { in: scopedProductIds } },
+              { id: { in: scopedProductAndVariantIds ?? scopedProductIds } },
               {
                 type: 'KIT',
                 productComponents: { some: { componentId: { in: scopedProductIds } } },

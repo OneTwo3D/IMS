@@ -307,7 +307,16 @@ export async function processQueuedWcStockSyncJobs(options?: {
   })
 
   function shouldRetainJob(result: { synced: number; errors: string[]; message: string }, job: { force: boolean; reason: StockSyncReason }) {
-    if (result.errors.length > 0 && result.synced === 0) return true
+    // d2jd (codex): retain on ANY error, not only when nothing synced. A single
+    // outbox job can push MORE than one product — a scoped VARIABLE parent expands
+    // to its children, and a scoped component pulls in dependent kits — and those
+    // expanded products have no outbox job of their own. So a mixed-success run (one
+    // product synced, another hit a transient preflight/lookup error) must still be
+    // retried, or the failed product stays stale until the daily reconcile. Re-pushing
+    // the already-synced products on retry is an idempotent no-op (the lastPushedQty
+    // dedupe skips them); genuinely permanent errors stay bounded by MAX_ATTEMPTS →
+    // PERMANENT_FAILED.
+    if (result.errors.length > 0) return true
     if (job.force && result.synced === 0) return true
     if (job.reason === 'WC_WEBHOOK' && result.synced === 0) return true
     if (
