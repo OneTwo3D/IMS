@@ -609,6 +609,13 @@ export async function updateManufacturingOrderStatus(
           // audit-wght: book the ACTUAL produced quantity (yield loss) into stock +
           // the output cost layer; component consumption below stays at the planned
           // BOM, so the full run cost capitalises into the fewer good units.
+          // 6077: this is a deliberate YIELD-LOSS model, NOT partial completion.
+          // actualQtyProduced < qtyPlanned means "made fewer good units from the
+          // full materials" (scrap/defects), so the full planned BOM is consumed by
+          // design. Stopping early without consuming materials is not expressible
+          // here — the operator cancels or keeps the order In Progress instead (the
+          // completion dialog documents this). Do NOT scale component consumption to
+          // actual without adding an explicit partial-completion workflow + scrap field.
           const outputResolution = resolveAssemblyOutputQty({ qtyPlanned, actualQtyProduced })
           if ('error' in outputResolution) throw new Error(outputResolution.error)
           const outputQty = outputResolution.qty
