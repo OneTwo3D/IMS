@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useEffect, useMemo } from 'react'
+import { useState, useTransition, useEffect, useMemo, useRef } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink, CreditCard, CheckCircle2, AlertTriangle } from 'lucide-react'
@@ -142,6 +142,10 @@ function ReceiveDialog({
   const [error, setError] = useState('')
   // audit-H7: require explicit confirmation when receiving into a non-destination warehouse.
   const [confirmDivergence, setConfirmDivergence] = useState(false)
+  // opys: stable idempotency token for this receive submission. Created lazily on
+  // first submit and reused across double-clicks / retries so the server dedups a
+  // double-booked receipt; reset only after a confirmed success.
+  const idempotencyTokenRef = useRef<string | null>(null)
 
   const defaultWarehouseId = po.destinationWarehouseId ?? warehouses[0]?.id ?? ''
   const destinationWarehouseName = po.destinationWarehouseId
@@ -192,6 +196,9 @@ function ReceiveDialog({
       return
     }
 
+    if (!idempotencyTokenRef.current) {
+      idempotencyTokenRef.current = crypto.randomUUID()
+    }
     startTransition(async () => {
       const result = await receivePurchaseOrder(
         po.id,
@@ -201,9 +208,13 @@ function ReceiveDialog({
           warehouseId: l.warehouseId,
         })),
         receiptNotes || undefined,
-        { confirmWarehouseDivergence: confirmDivergence },
+        {
+          confirmWarehouseDivergence: confirmDivergence,
+          idempotencyToken: idempotencyTokenRef.current ?? undefined,
+        },
       )
       if (result.success) {
+        idempotencyTokenRef.current = null
         router.refresh()
         onClose()
       } else {

@@ -1620,7 +1620,7 @@ export async function receivePurchaseOrder(
   id: string,
   receiptLines: ReceiptLineInput[],
   notes?: string,
-  options?: { confirmWarehouseDivergence?: boolean },
+  options?: { confirmWarehouseDivergence?: boolean; idempotencyToken?: string },
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('purchasing.receive')
@@ -1711,9 +1711,24 @@ export async function receivePurchaseOrder(
     }
 
     const receiptRef = `RCP-${po.reference}-${Date.now().toString(36).toUpperCase()}`
+    const idempotencyToken = options?.idempotencyToken
     const receiptResult = await db.$transaction(async (tx) => {
       // Lock the PO row to prevent concurrent receipts from over-receiving
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+
+      // opys: idempotent receipt. The receiptRef carries Date.now() (unique per
+      // submit), so a network retry / double-click would otherwise double-book a
+      // partial receipt under the outstanding-qty ceiling. With the PO row locked,
+      // detect a prior submission that already FULLY committed its PURCHASE_RECEIPT
+      // movements under the same client token and skip — the receipt tx is atomic, so
+      // those movements exist only if a prior submission committed in full.
+      if (idempotencyToken) {
+        const priorReceipt = await tx.stockMovement.findFirst({
+          where: { idempotencyKey: { startsWith: `purchase-receipt:${idempotencyToken}:` } },
+          select: { id: true },
+        })
+        if (priorReceipt) return { alreadyApplied: true as const }
+      }
 
       const currentPo = await tx.purchaseOrder.findUnique({
         where: { id },
@@ -1807,7 +1822,7 @@ export async function receivePurchaseOrder(
       // debit equals the sum of the cost-layer values (qty * Decimal unitCostBase)
       // rather than a float running total (cogs-audit scjz.11).
       let totalReceiptValue = toDecimal(0)
-      for (const rl of linesWithQty) {
+      for (const [receiptLineIndex, rl] of linesWithQty.entries()) {
         const poLine = currentPo.lines.find((l) => l.id === rl.poLineId)
         if (!poLine) continue
 
@@ -1839,6 +1854,13 @@ export async function receivePurchaseOrder(
             note: `Received against ${currentPo.reference}`,
             referenceType: 'PurchaseOrder',
             referenceId: id,
+            // opys: dedup anchor for double-submit. Deterministic per (token, line
+            // index): the same submission retried with the same lines collides on the
+            // unique idempotencyKey and is caught by the pre-check above. Stable across
+            // retries because the parsed line order is stable for the same input.
+            idempotencyKey: idempotencyToken
+              ? `purchase-receipt:${idempotencyToken}:${receiptLineIndex}`
+              : null,
           },
         })
 
@@ -1952,6 +1974,12 @@ export async function receivePurchaseOrder(
 
       return { allReceived, newStatus, freightPoIds, totalReceiptValue: totalReceiptValue.toNumber() }
     }, STOCK_TX_OPTIONS)
+
+    // opys: duplicate submission detected under the lock — the receipt was already
+    // booked by the first submission; report success without re-running side effects.
+    if ('alreadyApplied' in receiptResult) {
+      return { success: true }
+    }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
