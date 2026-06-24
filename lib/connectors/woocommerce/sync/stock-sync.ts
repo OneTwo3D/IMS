@@ -516,14 +516,23 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // parent-product edit enqueues only the parent) pushed ZERO child stock until the
   // daily forceAll reconcile. Expanding to the children makes a parent-scoped sync
   // behave as if every child id had been scoped directly.
-  const scopedChildIds = scopedProductIds
-    ? (
-        await db.product.findMany({
-          where: { parentId: { in: scopedProductIds } },
-          select: { id: true },
-        })
-      ).map((row) => row.id)
+  const scopedChildRows = scopedProductIds
+    ? await db.product.findMany({
+        where: { parentId: { in: scopedProductIds } },
+        select: { id: true, parentId: true },
+      })
     : []
+  const scopedChildIds = scopedChildRows.map((row) => row.id)
+  // d2jd (force parity): if a VARIABLE parent is FORCED, force its children too.
+  // The children are candidates via the expansion above, but the no-change dedupe
+  // below would skip an unchanged child — leaving a forced/webhook job at synced=0
+  // that shouldRetainJob re-queues until it dead-letters at MAX_ATTEMPTS. On a
+  // parent-scoped run no child has its own force entry, so propagate it here.
+  for (const row of scopedChildRows) {
+    if (row.parentId && forceProductIds.has(row.parentId)) {
+      forceProductIds.add(row.id)
+    }
+  }
   // The scoped set "as if each child were scoped directly": parents + their children.
   // Used for the candidate-product id match.
   const scopedProductAndVariantIds = scopedProductIds
