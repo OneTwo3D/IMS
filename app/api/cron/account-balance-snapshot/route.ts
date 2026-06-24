@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 
-import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
+import { syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit, type CronRateLimitChecker } from '@/lib/cron-rate-limit'
 import { balanceDateString } from '@/lib/domain/accounting/account-balance-snapshots'
@@ -14,7 +14,7 @@ import {
 
 export const runtime = 'nodejs'
 
-type AccountBalanceSnapshotSync = typeof syncXeroAccountBalanceSnapshots
+type AccountBalanceSnapshotSync = typeof syncAccountingAccountBalanceSnapshots
 type AccountBalanceSnapshotCronResult = Awaited<ReturnType<AccountBalanceSnapshotSync>> & {
   balanceDate: string
 }
@@ -55,7 +55,7 @@ export async function handleAccountBalanceSnapshotCron(
   if (maintenance) return maintenance
 
   const now = options.now ?? (() => new Date())
-  const syncSnapshots = options.syncSnapshots ?? syncXeroAccountBalanceSnapshots
+  const syncSnapshots = options.syncSnapshots ?? syncAccountingAccountBalanceSnapshots
   const { runId, result, responseStatus } = await runCronWithLogging({
     jobName: 'account-balance-snapshot',
     now,

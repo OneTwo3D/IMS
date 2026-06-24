@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { getAccountingSettings, getActiveAccountingConnectorInfo } from '@/lib/accounting'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   balanceDateString,
@@ -84,13 +84,20 @@ export async function loadCogsGlReconciliation(options?: {
   now?: Date
   sweepLimit?: number
 }): Promise<CogsGlReconciliationResult> {
-  const settings = await getXeroSettings()
-  const cogsAccount = settings.xero_cogs_account?.trim()
+  // Connector-agnostic: resolve the active accounting connector + its account codes
+  // rather than reading Xero directly, so the reconciliation follows whichever
+  // connector is active (degrades to unavailable when none is, or when the active
+  // connector has no GL balance snapshots yet).
+  const connectorInfo = await getActiveAccountingConnectorInfo()
+  if (!connectorInfo) return { available: false, reason: 'no_account_configured' }
+  const connector = connectorInfo.id
+  const settings = await getAccountingSettings()
+  const cogsAccount = settings.cogsAccount?.trim()
   if (!cogsAccount) return { available: false, reason: 'no_account_configured' }
 
   const currency = await getBaseCurrencyCode()
   const closing = await findLatestAccountBalanceSnapshot({
-    connector: 'xero',
+    connector,
     accountCode: cogsAccount,
     balanceDate: options?.now ?? new Date(),
     currency,
@@ -101,7 +108,7 @@ export async function loadCogsGlReconciliation(options?: {
   let movement
   try {
     movement = await getAccountBalancePeriodMovement({
-      connector: 'xero',
+      connector,
       accountCode: cogsAccount,
       currency,
       dateFrom: closingDate,

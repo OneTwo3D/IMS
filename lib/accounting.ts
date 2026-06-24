@@ -445,3 +445,36 @@ export async function listAccountingBankAccounts(): Promise<AccountingBankAccoun
     }
   }
 }
+
+export type AccountBalanceSnapshotSyncResult = { fetched: number; persisted: number; skipped: number; errors: string[] }
+
+/**
+ * Sync GL account-balance snapshots from the active accounting connector (used by the
+ * account-balance-snapshot cron and the on-demand GL reconciliation refresh). Connector
+ * -agnostic: dispatches to the active connector's implementation. QuickBooks has no
+ * trial-balance/account-balance ingestion yet (needs the QBO trial-balance API + a QBO
+ * sandbox — see onetwo3d-ims-khdw.1), so under QBO it returns a clear unsupported result
+ * rather than silently succeeding; the GL reconciliations then degrade to unavailable.
+ */
+export async function syncAccountingAccountBalanceSnapshots(options?: {
+  balanceDate?: Date | string
+  accountCodes?: string[]
+  syncRunId?: string
+}): Promise<AccountBalanceSnapshotSyncResult> {
+  const connector = await getActiveAccountingConnectorId()
+  if (!connector) return { fetched: 0, persisted: 0, skipped: 0, errors: ['No active accounting connector'] }
+
+  switch (connector) {
+    case 'xero': {
+      const { syncXeroAccountBalanceSnapshots } = await import('@/lib/connectors/xero/account-balances')
+      return syncXeroAccountBalanceSnapshots(options)
+    }
+    case 'quickbooks':
+      return {
+        fetched: 0,
+        persisted: 0,
+        skipped: 0,
+        errors: ['QuickBooks account-balance snapshot ingestion is not implemented (onetwo3d-ims-khdw.1)'],
+      }
+  }
+}
