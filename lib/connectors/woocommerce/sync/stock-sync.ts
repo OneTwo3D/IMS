@@ -38,6 +38,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import type { Prisma } from '@/app/generated/prisma/client'
+import { toDecimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
@@ -898,15 +899,26 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // -------- COGS gathering --------
   const cogsByProduct = new Map<string, number>()
   if (cogsSyncEnabled) {
-    for (const product of products) {
-      if (!effectiveTargets.has(product.id)) continue
-      const oldestLayer = await db.costLayer.findFirst({
-        where: { productId: product.id, remainingQty: { gt: 0 } },
-        orderBy: { receivedAt: 'asc' },
-        select: { unitCostBase: true },
+    // rryh: push the WEIGHTED-AVERAGE remaining unit cost across ALL open FIFO
+    // layers, not just the oldest layer's cost. The oldest-only value made the
+    // store COGS jump each time the oldest layer was exhausted and ignored newer
+    // layers' cost. Accumulate in Decimal to avoid sub-penny float drift.
+    const cogsProductIds = products.filter((p) => effectiveTargets.has(p.id)).map((p) => p.id)
+    if (cogsProductIds.length > 0) {
+      const layers = await db.costLayer.findMany({
+        where: { productId: { in: cogsProductIds }, remainingQty: { gt: 0 } },
+        select: { productId: true, remainingQty: true, unitCostBase: true },
       })
-      if (oldestLayer) {
-        cogsByProduct.set(product.id, Number(oldestLayer.unitCostBase))
+      const agg = new Map<string, { qty: Prisma.Decimal; cost: Prisma.Decimal }>()
+      for (const l of layers) {
+        const cur = agg.get(l.productId) ?? { qty: toDecimal(0), cost: toDecimal(0) }
+        const q = toDecimal(l.remainingQty)
+        cur.qty = cur.qty.add(q)
+        cur.cost = cur.cost.add(q.mul(toDecimal(l.unitCostBase)))
+        agg.set(l.productId, cur)
+      }
+      for (const [pid, { qty, cost }] of agg) {
+        if (qty.gt(0)) cogsByProduct.set(pid, cost.div(qty).toNumber())
       }
     }
   }
