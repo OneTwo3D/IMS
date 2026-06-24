@@ -169,6 +169,13 @@ export type ApplyStockAdjustmentInput = {
    * account code).
    */
   settings?: Awaited<ReturnType<typeof getAccountingSettings>>
+  /**
+   * Optional provenance for the ADJUSTMENT stock movement. Used by stocktake
+   * (om9w) to tie variance movements to their count (referenceType 'StockCount',
+   * referenceId = count id) so the stock-count report can attribute them.
+   */
+  referenceType?: string
+  referenceId?: string
 }
 
 export type AppliedStockAdjustment = {
@@ -195,6 +202,8 @@ export async function applyStockAdjustment({
   note,
   unitCostBase,
   settings: providedSettings,
+  referenceType,
+  referenceId,
 }: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
   const isAddition = qty > 0
   const absQty = Math.abs(qty).toString()
@@ -253,6 +262,8 @@ export async function applyStockAdjustment({
       toWarehouseId: isAddition ? warehouseId : null,
       qty: absQty,
       note: reasonName,
+      ...(referenceType ? { referenceType } : {}),
+      ...(referenceId ? { referenceId } : {}),
       ...(isAddition ? buildStockMovementValueFields({ qty: absQty, unitCostBase: additionUnitCost ?? 0 }) : {}),
     },
   })

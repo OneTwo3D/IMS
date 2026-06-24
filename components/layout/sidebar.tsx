@@ -28,6 +28,7 @@ import { getSidebarAnalyticsChildren } from '@/lib/sidebar/analytics-access'
 const STOCK_CONTROL_CHILDREN = [
   { href: '/stock-control/stock-adjustments', label: 'Stock Adjustments' },
   { href: '/stock-control/transfers',  label: 'Warehouse Transfers' },
+  { href: '/stock-control/stock-counts', label: 'Stock Counts' },
 ]
 
 const PURCHASES_CHILDREN = [
