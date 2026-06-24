@@ -590,23 +590,29 @@ export async function updateManufacturingOrderStatus(
         // or strand the reservation. Completion now requires IN_PROGRESS
         // (DRAFT->complete is blocked, scjz.32), so the live-BOM fallback only
         // covers legacy orders started before audit-H6 added componentSnapshot.
-        // 8fo0: distinguish an ABSENT snapshot (legacy orders started before
-        // audit-H6 — fall back to the live BOM) from a PRESENT-but-CORRUPT one.
-        // parseProductionOrderComponentSnapshot returns null for absent, empty, AND
-        // malformed input, but silently falling back to the live BOM when a real
-        // snapshot WAS frozen defeats audit-H6: a mid-production BOM edit could then
-        // change what is consumed/recovered or strand the reservation. So hard-error
-        // on a corrupt snapshot — but treat an empty array as the absent/legacy case
-        // (an empty BOM legitimately snapshots [] at IN_PROGRESS start) so we don't
-        // strand a zero-component order. The requireReserved gate below still blocks
-        // any live-BOM fallback from consuming components that were never reserved.
-        const parsedSnapshot = parseProductionOrderComponentSnapshot(order.componentSnapshot)
-        const snapshotIsEmptyArray = Array.isArray(order.componentSnapshot) && order.componentSnapshot.length === 0
-        if (parsedSnapshot == null && order.componentSnapshot != null && !snapshotIsEmptyArray) {
+        // 8fo0: honour the frozen snapshot strictly (audit-H6). Three cases:
+        //  - DB NULL: legacy order (pre-audit-H6) — fall back to the live BOM.
+        //  - empty array []: a REAL frozen snapshot of ZERO components (an empty BOM
+        //    snapshots [] at IN_PROGRESS start). Use it as-is (consume/recover
+        //    nothing). Do NOT fall back to the live BOM — a BOM edited after the
+        //    order started would otherwise be silently consumed/recovered with no
+        //    reservation backing it (the disassembly path has no per-component
+        //    reservation gate, so the live-BOM fallback was the sharpest leak).
+        //  - present but not a clean array of {componentId, qty>0}: CORRUPT. Hard-
+        //    error rather than silently consuming the wrong components.
+        const rawSnapshot = order.componentSnapshot
+        let components: ProductionOrderComponentSnapshot | typeof order.outputProduct.productComponents
+        if (rawSnapshot == null) {
+          components = order.outputProduct.productComponents
+        } else if (Array.isArray(rawSnapshot)) {
+          const parsedSnapshot = parseProductionOrderComponentSnapshot(rawSnapshot)
+          if (parsedSnapshot == null && rawSnapshot.length > 0) {
+            throw new Error('This production order has a frozen component snapshot that is present but malformed; refusing to fall back to the live BOM. Resolve the snapshot data before completing this order.')
+          }
+          components = parsedSnapshot ?? []
+        } else {
           throw new Error('This production order has a frozen component snapshot that is present but malformed; refusing to fall back to the live BOM. Resolve the snapshot data before completing this order.')
         }
-        const components: ProductionOrderComponentSnapshot | typeof order.outputProduct.productComponents =
-          parsedSnapshot ?? order.outputProduct.productComponents
         completedComponents = components
         const wasInProgress = order.status === 'IN_PROGRESS'
         const costLayerReceivedAt = manufacturingCostLayerReceivedAt({
@@ -646,11 +652,12 @@ export async function updateManufacturingOrderStatus(
           for (const comp of components) {
             const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
             // 8fo0: two COMPLEMENTARY gates, not redundant — keep both. This one
-            // validates the RESERVATION contract (requireReserved) + stock_levels
-            // availability; consumeFifoLayersStrict below is the cost-layer
-            // consumption authority. They guard distinct invariants and fail CLOSED
-            // if stock_levels and cost_layers ever disagree (better than consuming
-            // against a single source that the other contradicts).
+            // validates aggregate reserved-qty (requireReserved, by product+warehouse
+            // — not scoped to this order) + stock_levels availability;
+            // consumeFifoLayersStrict below is the cost-layer consumption authority.
+            // They guard distinct invariants and fail CLOSED if stock_levels and
+            // cost_layers ever disagree (better than consuming against a single
+            // source that the other contradicts).
             await assertStockAvailable(tx, comp.componentId, order.warehouseId, totalQty, {
               includeReserved: wasInProgress,
               requireReserved: wasInProgress,
