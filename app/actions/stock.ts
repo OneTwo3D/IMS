@@ -28,6 +28,7 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromConsumed,
 } from '@/lib/domain/inventory/stock-movement-value'
+import { manualStockAdjustmentMovementKey } from '@/lib/domain/inventory/stock-movement-idempotency'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -160,12 +161,15 @@ export type ApplyStockAdjustmentInput = {
   referenceType?: string
   referenceId?: string
   /**
-   * 0tr0: deterministic idempotency key for the ADJUSTMENT movement. When supplied,
-   * a re-submission carrying the same key (network retry / double-click / refresh
-   * during pending) is detected under the stock-level lock and skipped instead of
-   * booking a duplicate adjustment. Backed by StockMovement.idempotencyKey @unique.
+   * 0tr0: per-submission idempotency token (a stable client-generated UUID that
+   * survives retries of one submission). When supplied, the ADJUSTMENT movement key
+   * is derived as a content fingerprint of this token plus the adjustment payload
+   * (see manualStockAdjustmentMovementKey): a re-submission of the SAME adjustment
+   * (network retry / double-click / refresh during pending) is detected under the
+   * stock-level lock and skipped, while an edited resubmit gets a fresh key and
+   * applies. Backed by StockMovement.idempotencyKey @unique.
    */
-  idempotencyKey?: string | null
+  idempotencyToken?: string | null
 }
 
 export type AppliedStockAdjustment = {
@@ -194,9 +198,25 @@ export async function applyStockAdjustment({
   settings: providedSettings,
   referenceType,
   referenceId,
-  idempotencyKey,
+  idempotencyToken,
 }: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
   const isAddition = qty > 0
+  // 0tr0/r9y2: content-addressed key from the per-submission token + payload, so an
+  // edited resubmit gets a new key (not deduped) and same-key requests always target
+  // the same stock row (serialised by the lock below).
+  const idempotencyKey = idempotencyToken
+    ? manualStockAdjustmentMovementKey({
+        token: idempotencyToken,
+        productId,
+        warehouseId,
+        qty,
+        reasonId,
+        note,
+        unitCostBase,
+        referenceType,
+        referenceId,
+      })
+    : null
   const absQty = Math.abs(qty).toString()
 
   let reasonName: string | null = note || null
@@ -476,11 +496,9 @@ export async function adjustStock(
   const unitCostBaseNum = unitCostBase != null && unitCostBase !== '' ? Number(unitCostBase) : undefined
   const qtyNum = Number(qty)
   // 0tr0: per-submission idempotency token from the form (hidden field). Dedups a
-  // double-submit of this single adjustment.
-  const idempotencyToken = (formData.get('idempotencyToken') || '').toString().trim()
-  const adjustmentIdempotencyKey = idempotencyToken
-    ? `stock-adjustment:${idempotencyToken}`
-    : undefined
+  // double-submit of this single adjustment; the movement key is derived from it +
+  // the payload inside applyStockAdjustment.
+  const idempotencyToken = (formData.get('idempotencyToken') || '').toString().trim() || undefined
 
   let logSku = ''
   let logWarehouseName = ''
@@ -495,7 +513,7 @@ export async function adjustStock(
         reasonId,
         note,
         unitCostBase: unitCostBaseNum,
-        idempotencyKey: adjustmentIdempotencyKey,
+        idempotencyToken,
       })
       logSku = applied.productSku
       logWarehouseName = applied.warehouseName
@@ -570,6 +588,12 @@ export type BulkAdjustLine = {
   // cogs-audit scjz.2) when the product has no derivable cost basis, otherwise the
   // line throws rather than booking £0 stock. Omit to use the derived average.
   unitCostBase?: number | null
+  // tllm: a stable per-line identity from the client (a dialog-session key that
+  // survives retries of the same submission, unlike array position). Combined with
+  // the submission token it gives each line a distinct, retry-stable idempotency key
+  // — so two lines with identical content don't collapse to a single movement, and
+  // removing/reordering a line on retry can't shift another line's key.
+  lineId: string
 }
 
 export type BulkAdjustFormState = {
@@ -585,6 +609,9 @@ const bulkAdjustLineSchema = z.object({
   productId: z.string().min(1, 'productId is required'),
   warehouseId: z.string().min(1, 'warehouseId is required'),
   reasonId: z.string(),
+  // tllm: stable per-line id, restricted to idempotency-key-safe characters so it
+  // can be composed into the per-line submission token without escaping.
+  lineId: z.string().min(1, 'lineId is required').regex(/^[A-Za-z0-9._-]+$/, 'lineId has invalid characters'),
   qty: z.number().refine(Number.isFinite, 'qty must be a finite number'),
   unitCostBase: z
     .number()
@@ -628,7 +655,7 @@ export async function bulkAdjustStock(
 
   try {
     await db.$transaction(async (tx) => {
-      for (const [lineIndex, line] of valid.entries()) {
+      for (const line of valid) {
         const reason = line.reasonId ? reasonMap.get(line.reasonId) : null
         await applyStockAdjustment({
           tx,
@@ -639,11 +666,12 @@ export async function bulkAdjustStock(
           note: reason?.name ?? null,
           unitCostBase: line.unitCostBase,
           settings: accountingSettings,
-          // 0tr0: deterministic per (submission token, stable line index) so a
-          // double-submitted bulk batch dedups line-for-line.
-          idempotencyKey: idempotencyToken
-            ? `stock-adjustment:${idempotencyToken}:${lineIndex}`
-            : undefined,
+          // 0tr0/tllm: per-line token = submission token + the line's STABLE client
+          // id (not its array position). applyStockAdjustment then keys the movement
+          // by a content fingerprint of that token + payload, so: a re-submitted batch
+          // dedups line-for-line; two lines with identical content stay distinct; and
+          // removing/reordering a line on retry can't shift a key onto another line.
+          idempotencyToken: idempotencyToken ? `${idempotencyToken}.${line.lineId}` : undefined,
         })
       }
     }, STOCK_TX_OPTIONS)
