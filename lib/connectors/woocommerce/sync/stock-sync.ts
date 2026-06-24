@@ -248,7 +248,7 @@ async function invalidateMappingIfVersionMatches(
   }
 }
 
-type PushEntry = {
+export type PushEntry = {
   productId: string
   sku: string
   externalId: number
@@ -260,7 +260,7 @@ type PushEntry = {
   }
 }
 
-type VariantPushEntry = PushEntry & {
+export type VariantPushEntry = PushEntry & {
   parentWcId: number
 }
 
@@ -269,7 +269,7 @@ type EffectiveTarget = {
   parentWcId?: number
 }
 
-type CandidateProduct = {
+export type CandidateProduct = {
   id: string
   sku: string
   type: 'SIMPLE' | 'VARIANT' | 'KIT' | 'BOM'
@@ -532,15 +532,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
 
-  const stockByProduct = new Map<string, number>()
-  const stockByProductWarehouse = new Map<string, Map<string, number>>()
-  for (const sl of stockLevels) {
-    const available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
-    stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
-    const byWarehouse = stockByProductWarehouse.get(sl.productId) ?? new Map<string, number>()
-    byWarehouse.set(sl.warehouseId, available)
-    stockByProductWarehouse.set(sl.productId, byWarehouse)
-  }
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevels)
 
   const cogsSetting = await db.setting.findUnique({ where: { key: 'wc_cogs_sync_enabled' } })
   const cogsSyncEnabled = cogsSetting?.value === 'true'
@@ -592,24 +584,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     pushed: false, message: '', unmatchedSkuSample: [],
   }
   const productById = new Map(products.map((product) => [product.id, product]))
-  const availableByProduct = new Map<string, number>()
-  const kitAvailabilityMemo = new Map<string, number>()
-  const kitAvailabilityErrors = new Set<string>()
-  for (const product of products) {
-    const available = product.type === 'KIT'
-      ? computeKitAvailability(
-          product,
-          whIds,
-          stockByProductWarehouse,
-          productById,
-          kitAvailabilityMemo,
-          new Set<string>(),
-          result.errors,
-          kitAvailabilityErrors,
-        )
-      : (stockByProduct.get(product.id) ?? 0)
-    availableByProduct.set(product.id, available)
-  }
+  const availableByProduct = computeAvailableByProduct(
+    products,
+    whIds,
+    stockByProduct,
+    stockByProductWarehouse,
+    productById,
+    result.errors,
+  )
 
   const previousStates = await db.stockSyncState.findMany({
     where: {
@@ -937,6 +919,12 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       : (availableByProduct.get(product.id) ?? 0)
     const payload: PushEntry['payload'] = {
       id: target.externalId,
+      // 1qsb Part-1 (by design, do NOT "fix"): `available` is summed across all
+      // syncToStore warehouses (see buildStockMaps) and floored DOWN to an integer
+      // because WooCommerce `stock_quantity` is integer-only — it cannot represent
+      // 2.6. IMS keeps the true fractional figure internally; flooring is the
+      // oversell-SAFE direction (WC under-reports, never over-reports). Pushing a
+      // ceil/fractional value would risk overselling the partial unit.
       stock_quantity: Math.floor(available),
       manage_stock: true,
     }
@@ -1011,6 +999,25 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // belong to), but continuing would keep pushing to the old store
   // after the operator explicitly disconnected it. Break out and
   // surface the abort instead.
+  //
+  // 1qsb stale-snapshot oversell guard: the availability snapshot above was taken
+  // before SKU resolution and the WooCommerce preflight network round-trips, so a
+  // shipment/allocation may have dropped stock since. Re-read current stock now,
+  // immediately before pushing, and CLAMP DOWN ONLY — never raise an already-built
+  // payload quantity. Clamping down can only ever reduce an oversell window; a
+  // stale-LOW value is harmless (under-reports availability and self-corrects on
+  // the next per-event push or the daily forceAll reconcile), whereas raising a
+  // value would risk pushing more than is actually on hand. The same flooring +
+  // multi-warehouse-summation + recursive kit-BOM basis is reused via
+  // computeAvailableByProduct so the clamp value is consistent with the snapshot.
+  await clampPushEntriesToFreshStock(
+    pushEntries,
+    variantPushEntries,
+    products,
+    productById,
+    whIds,
+    scopedStockProductIds,
+  )
   await options?.onProgress?.({ phase: 'pushing', processed: 0, synced: 0, total: pushEntries.length })
   for (let i = 0; i < pushEntries.length; i += WC_BATCH_SIZE) {
     const batch = pushEntries.slice(i, i + WC_BATCH_SIZE)
@@ -1337,6 +1344,133 @@ async function recordAttempt() {
     create: { key: 'last_wc_stock_sync_attempt_at', value: now },
     update: { value: now },
   })
+}
+
+export type StockLevelSnapshotRow = {
+  productId: string
+  warehouseId: string
+  quantity: Prisma.Decimal | number
+  reservedQty: Prisma.Decimal | number
+}
+
+/**
+ * Build the per-product and per-(product,warehouse) available-stock maps from a
+ * stockLevel snapshot. `available = max(0, quantity - reservedQty)`. Extracted so
+ * the exact same availability basis can be recomputed against a fresh re-read
+ * immediately before pushing (the 1qsb stale-snapshot oversell guard).
+ */
+export function buildStockMaps(stockLevels: StockLevelSnapshotRow[]): {
+  stockByProduct: Map<string, number>
+  stockByProductWarehouse: Map<string, Map<string, number>>
+} {
+  const stockByProduct = new Map<string, number>()
+  const stockByProductWarehouse = new Map<string, Map<string, number>>()
+  for (const sl of stockLevels) {
+    const available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
+    stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
+    const byWarehouse = stockByProductWarehouse.get(sl.productId) ?? new Map<string, number>()
+    byWarehouse.set(sl.warehouseId, available)
+    stockByProductWarehouse.set(sl.productId, byWarehouse)
+  }
+  return { stockByProduct, stockByProductWarehouse }
+}
+
+/**
+ * Resolve the available quantity per candidate product: KITs are valued via the
+ * recursive component-availability walk; everything else reads its summed
+ * across-warehouse available stock. Pure over the supplied stock maps so it can
+ * run on both the initial snapshot and a fresh re-read.
+ */
+export function computeAvailableByProduct(
+  products: CandidateProduct[],
+  warehouseIds: string[],
+  stockByProduct: Map<string, number>,
+  stockByProductWarehouse: Map<string, Map<string, number>>,
+  productById: Map<string, CandidateProduct>,
+  errors: string[],
+): Map<string, number> {
+  const availableByProduct = new Map<string, number>()
+  const kitAvailabilityMemo = new Map<string, number>()
+  const kitAvailabilityErrors = new Set<string>()
+  for (const product of products) {
+    const available = product.type === 'KIT'
+      ? computeKitAvailability(
+          product,
+          warehouseIds,
+          stockByProductWarehouse,
+          productById,
+          kitAvailabilityMemo,
+          new Set<string>(),
+          errors,
+          kitAvailabilityErrors,
+        )
+      : (stockByProduct.get(product.id) ?? 0)
+    availableByProduct.set(product.id, available)
+  }
+  return availableByProduct
+}
+
+/**
+ * 1qsb stale-snapshot oversell guard. Re-reads current stock immediately before
+ * the batch POST and reduces any already-built push payload whose freshly-computed
+ * available quantity is now lower than the snapshot value. Mutates the payloads in
+ * place. CLAMP DOWN ONLY: a payload qty is never raised, so this can only ever
+ * shrink an oversell window, never create one. Lifecycle-forced-zero products keep
+ * their forced 0. Re-uses buildStockMaps + computeAvailableByProduct so the clamp
+ * basis (floor, multi-warehouse summation, recursive kit-BOM) matches the snapshot.
+ */
+async function clampPushEntriesToFreshStock(
+  pushEntries: PushEntry[],
+  variantPushEntries: VariantPushEntry[],
+  products: CandidateProduct[],
+  productById: Map<string, CandidateProduct>,
+  whIds: string[],
+  scopedStockProductIds: string[] | null,
+): Promise<void> {
+  if (pushEntries.length === 0 && variantPushEntries.length === 0) return
+
+  const freshStockLevels = await db.stockLevel.findMany({
+    where: {
+      warehouseId: { in: whIds },
+      ...(scopedStockProductIds ? { productId: { in: scopedStockProductIds } } : {}),
+    },
+    select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
+  })
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(freshStockLevels)
+  // Throwaway error sink: any kit-cycle diagnostics were already surfaced from the
+  // snapshot pass; recomputing here must not double-report them.
+  const freshAvailableByProduct = computeAvailableByProduct(
+    products,
+    whIds,
+    stockByProduct,
+    stockByProductWarehouse,
+    productById,
+    [],
+  )
+
+  clampEntriesToAvailable(pushEntries, freshAvailableByProduct, productById)
+  clampEntriesToAvailable(variantPushEntries, freshAvailableByProduct, productById)
+}
+
+/**
+ * Pure clamp: reduce each entry's payload `stock_quantity` to `floor(fresh
+ * available)` IFF that is strictly lower than the current value. Never raises.
+ * Lifecycle-forced-zero products are left untouched (already 0). Mutates entries
+ * in place. Exported for unit testing the oversell-safe decision in isolation.
+ */
+export function clampEntriesToAvailable(
+  entries: (PushEntry | VariantPushEntry)[],
+  freshAvailableByProduct: Map<string, number>,
+  productById: Map<string, CandidateProduct>,
+): void {
+  for (const entry of entries) {
+    const product = productById.get(entry.productId)
+    if (product && shouldForceWooZeroStock(product.lifecycleStatus)) continue
+    const freshAvailable = Math.floor(freshAvailableByProduct.get(entry.productId) ?? 0)
+    if (freshAvailable < entry.payload.stock_quantity) {
+      entry.payload.stock_quantity = freshAvailable
+    }
+  }
 }
 
 function computeKitAvailability(
