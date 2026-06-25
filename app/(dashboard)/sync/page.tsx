@@ -77,9 +77,9 @@ export default async function SyncPage() {
   const taxRates = taxRatesRaw.map((r: { id: string; name: string }) => ({ id: r.id, name: r.name }))
   const currencies = currenciesRaw.map((c) => ({ code: c.code, name: c.name }))
 
-  // Only hit the Xero Tax Rates API when the connector is live — otherwise
-  // the sync page would pay for a round-trip on every render.
-  const accountingTaxRates = pluginState.xero && accountingStatus.connected
+  // Only hit the accounting Tax Rates API when an accounting connector is live —
+  // otherwise the sync page would pay for a round-trip on every render.
+  const accountingTaxRates = (pluginState.xero || pluginState.quickbooks) && accountingStatus.connected
     ? await fetchAccountingTaxRates().catch(() => [])
     : []
 

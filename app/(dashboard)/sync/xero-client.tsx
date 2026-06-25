@@ -48,7 +48,7 @@ type AccountingAccount = { id: string; externalAccountId: string; code: string |
 
 type PaymentMapRow = { method: string; currency: string; accountCode: string }
 
-type Props = {
+export type AccountingConnectorClientProps = {
   settings: AccountingConnectorSettings & { secretMasked: boolean }
   connected: boolean
   tenantName?: string
@@ -110,7 +110,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: Props) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: AccountingConnectorClientProps) {
   const router = useRouter()
   const formatDateTime = useFormatDateTime()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
