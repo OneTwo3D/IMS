@@ -348,7 +348,7 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
           logs={shoppingLogs}
           taxRates={taxRates}
           shoppingCredentials={shoppingCredentials}
-          xeroConnected={accountingConnected && pluginState.xero}
+          accountingConnected={accountingConnected && pluginState.xero}
         />
       </div>
     )
