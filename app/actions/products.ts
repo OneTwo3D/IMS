@@ -2,7 +2,6 @@
 
 import { revalidatePath } from 'next/cache'
 import { redirect } from 'next/navigation'
-import { after } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -10,9 +9,7 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
-import { runMintsoftProductSyncForProduct } from '@/lib/connectors/mintsoft/sync/product-sync'
-import { runBundleSyncForProduct } from '@/lib/connectors/mintsoft/sync/bundle-sync'
-import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { scheduleWmsProductSync, isAnyWmsConnectorEnabled } from '@/lib/domain/wms/product-sync-dispatch'
 import {
   COMPONENT_PRODUCT_STATUSES,
   deriveLegacyActiveFromLifecycleStatus,
@@ -663,56 +660,6 @@ export type ProductFormState = {
   message?: string
 }
 
-async function syncMintsoftProductBestEffort(productId: string): Promise<void> {
-  try {
-    if (!await isIntegrationPluginEnabled('mintsoft')) {
-      return
-    }
-    await runMintsoftProductSyncForProduct(productId, 'product_mutation')
-  } catch (syncError) {
-    console.error(syncError)
-  }
-}
-
-async function syncMintsoftBundleBestEffort(productId: string): Promise<void> {
-  try {
-    if (!await isIntegrationPluginEnabled('mintsoft')) {
-      return
-    }
-    await runBundleSyncForProduct(productId, 'product_mutation')
-  } catch (syncError) {
-    console.error(syncError)
-  }
-}
-
-async function syncMintsoftParentBundlesBestEffort(productId: string): Promise<void> {
-  try {
-    if (!await isIntegrationPluginEnabled('mintsoft')) {
-      return
-    }
-    const parents = await db.productComponent.findMany({
-      where: { componentId: productId },
-      select: { productId: true },
-    })
-    const unique = Array.from(new Set(parents.map((parent) => parent.productId)))
-    for (const parentId of unique) {
-      try {
-        await runBundleSyncForProduct(parentId, 'product_mutation')
-      } catch (error) {
-        console.error('[mintsoft bundle sync] parent KIT sync failed', parentId, error)
-      }
-    }
-  } catch (syncError) {
-    console.error(syncError)
-  }
-}
-
-function scheduleMintsoftProductSync(productId: string) {
-  after(() => syncMintsoftProductBestEffort(productId))
-  after(() => syncMintsoftBundleBestEffort(productId))
-  after(() => syncMintsoftParentBundlesBestEffort(productId))
-}
-
 export async function createProduct(
   _prev: ProductFormState,
   formData: FormData
@@ -842,8 +789,8 @@ export async function createProduct(
   } catch (syncError) {
     console.error(syncError)
   }
-  if (hasPermission(session.user.role, 'sync') && await isIntegrationPluginEnabled('mintsoft')) {
-    scheduleMintsoftProductSync(created.id)
+  if (hasPermission(session.user.role, 'sync') && await isAnyWmsConnectorEnabled()) {
+    scheduleWmsProductSync(created.id)
   }
 
   revalidatePath('/inventory')
@@ -1007,8 +954,8 @@ export async function updateProduct(
   } catch (syncError) {
     console.error(syncError)
   }
-  if (hasPermission(session.user.role, 'sync') && await isIntegrationPluginEnabled('mintsoft')) {
-    scheduleMintsoftProductSync(id)
+  if (hasPermission(session.user.role, 'sync') && await isAnyWmsConnectorEnabled()) {
+    scheduleWmsProductSync(id)
   }
 
   revalidatePath('/inventory')
