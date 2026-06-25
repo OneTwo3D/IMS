@@ -101,6 +101,18 @@ function isSignedActionPing(topic: string | null) {
   return !!topic && topic.startsWith('action.')
 }
 
+/**
+ * czuf4: connector-owned rule for whether an empty request body is acceptable for an
+ * inbound WooCommerce webhook — used by the generic shopping webhook route so its
+ * body-reader doesn't hardcode WooCommerce header/topic quirks. WooCommerce may send
+ * unsigned empty-body pings and signed `action.*` hooks with no JSON payload; signed
+ * real webhooks still verify downstream.
+ */
+export function isEmptyWcWebhookBodyAllowed(request: Request): boolean {
+  const { signature, topic } = getWebhookHeaders(request)
+  return isWebhookPing(signature, topic) || isSignedActionPing(topic)
+}
+
 async function advanceWcOrderSyncCursor() {
   await db.setting.upsert({
     where: { key: 'last_wc_order_sync_at' },
