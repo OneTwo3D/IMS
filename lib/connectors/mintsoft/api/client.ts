@@ -7,7 +7,6 @@ import {
   normalizeMintsoftBundle,
   extractMintsoftObjectPayload,
   normalizeMintsoftProduct,
-  normalizeMintsoftProductListItem,
   normalizeMintsoftReturn,
   normalizeMintsoftStockLine,
   normalizeMintsoftWarehouse,
@@ -143,27 +142,40 @@ export async function fetchMintsoftProduct(externalProductId: string): Promise<W
   return normalizeMintsoftProduct(result.data)
 }
 
+/** Parse the bare ProductId returned by /api/Product/LookupProductId (0 = not found). */
+export function parseMintsoftProductId(data: unknown): number | null {
+  if (typeof data === 'number') return Number.isInteger(data) && data > 0 ? data : null
+  if (typeof data === 'string') {
+    const parsed = Number(data.trim())
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null
+  }
+  return null
+}
+
 export async function fetchMintsoftProductBySku(sku: string): Promise<WmsProductRef | null> {
   const normalizedSku = sku.trim()
   if (!normalizedSku) return null
 
-  const result = await mintsoftRequest<unknown>(`/api/Product?${new URLSearchParams({ SKU: normalizedSku }).toString()}`)
-  if (result.status === 404) return null
-  if (result.error) {
-    throw new Error(result.error)
+  // Mintsoft has no GET /api/Product?SKU filter (the base /api/Product GET is by
+  // id only). Resolve SKU → ProductId via the dedicated lookup endpoint, then
+  // fetch the full product by id — per the official Swagger, GET
+  // /api/Product/LookupProductId?SKU= returns a bare int ProductId (0 = absent).
+  const lookup = await mintsoftRequest<unknown>(`/api/Product/LookupProductId?${new URLSearchParams({ SKU: normalizedSku }).toString()}`)
+  if (lookup.status === 404) return null
+  if (lookup.error) {
+    throw new Error(lookup.error)
   }
 
-  const direct = normalizeMintsoftProduct(result.data)
-  if (direct?.sku === normalizedSku) return direct
+  const productId = parseMintsoftProductId(lookup.data)
+  if (productId == null) return null
 
-  const listMatch = extractMintsoftArrayPayload(result.data)
-    .map((item) => normalizeMintsoftProductListItem(item))
-    .find((item): item is WmsProductRef => item != null && item.sku === normalizedSku)
-
-  if (listMatch) return listMatch
-
-  const wrapped = extractMintsoftObjectPayload(result.data)
-  return wrapped && direct?.sku === normalizedSku ? direct : null
+  const product = await fetchMintsoftProduct(String(productId))
+  if (!product) return null
+  // Guard against a stale/alt-SKU mapping: only adopt the product when its echoed
+  // SKU matches the requested base SKU (case-insensitively — Mintsoft may echo a
+  // different case), or the product doesn't echo a SKU at all.
+  if (product.sku && product.sku.toLowerCase() !== normalizedSku.toLowerCase()) return null
+  return product
 }
 
 export async function fetchMintsoftReturns(since: Date): Promise<WmsReturnRecord[]> {
