@@ -7,6 +7,9 @@ import {
   HISTORICAL_IMPORT_UNIT_COST,
   buildStockMovementValueFields,
 } from '@/lib/domain/inventory/stock-movement-value'
+// th34p: the progress type is connector-agnostic and lives in the generic boundary so
+// shared UI consumes it without importing lib/connectors/woocommerce. Re-exported below.
+import type { HistoricalImportProgress } from '@/lib/historical-import'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,18 +31,7 @@ type WcOrder = {
   }[]
 }
 
-export type HistoricalImportProgress = {
-  status: 'idle' | 'running' | 'done' | 'error'
-  message: string
-  ordersProcessed: number
-  movementsCreated: number
-  ordersSkipped: number   // already-imported orders
-  itemsSkipped: number    // line items with no matching SKU
-  totalOrders: number
-  totalPages: number
-  currentPage: number
-  errors: string[]
-}
+export type { HistoricalImportProgress }
 
 const JOB_KEY = 'historical_import_job'
 
