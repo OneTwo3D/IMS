@@ -1,11 +1,11 @@
 import { db } from '@/lib/db'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import { inferShoppingOrderLookupConnector } from '@/lib/fulfillment/shopping-order-lookup'
-import { WMS_CONNECTOR_IDS, type WmsConnectorId } from './types'
+import type { WmsConnectorId } from './types'
 
-export function isWmsConnectorId(value: string | null | undefined): value is WmsConnectorId {
-  return value != null && (WMS_CONNECTOR_IDS as readonly string[]).includes(value)
-}
+// Re-exported for back-compat; the canonical definition lives in ./types (a
+// server-free module, so client components can import the guard too).
+export { isWmsConnectorId } from './types'
 
 /**
  * For a WMS-sourced fulfillment event, resolve which shopping connector the

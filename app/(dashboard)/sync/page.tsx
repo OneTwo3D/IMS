@@ -21,7 +21,8 @@ import {
   getAccountingSyncReadiness,
 } from '@/app/actions/accounting-sync'
 import { getAccountingBatchHistory, getAccountingBatchPreview } from '@/app/actions/accounting-batch'
-import { getMintsoftDashboardData } from '@/app/actions/mintsoft-sync'
+import { getWmsSyncDashboardData } from '@/app/actions/wms-sync'
+import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getPaymentMethodCombos } from '@/app/actions/accounting'
 import { getPaymentAccountMap } from '@/lib/accounting'
 import { getTaxRates } from '@/app/actions/settings'
@@ -38,11 +39,12 @@ export const metadata: Metadata = { title: 'Integrations' }
 
 export default async function SyncPage() {
   const pluginState = await getIntegrationPluginState()
-  if (!pluginState.woocommerce && !pluginState.shopify && !pluginState.xero && !pluginState.quickbooks && !pluginState.mintsoft) {
+  const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => pluginState[id])
+  if (!pluginState.woocommerce && !pluginState.shopify && !pluginState.xero && !pluginState.quickbooks && !wmsEnabled) {
     redirect('/settings/system?tab=plugins')
   }
 
-  const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, taxRatesRaw, accountingSettings, accountingStatus, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory, mintsoftData] = await Promise.all([
+  const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, taxRatesRaw, accountingSettings, accountingStatus, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory, wmsData] = await Promise.all([
     getShoppingSyncSettings(),
     getShoppingTaxRateMappings(),
     getShoppingStatusMappings(),
@@ -73,7 +75,7 @@ export default async function SyncPage() {
     pluginState.woocommerce ? getShoppingConnectorPaymentMethods() : Promise.resolve([]),
     getAccountingBatchPreview(),
     getAccountingBatchHistory(30),
-    pluginState.mintsoft ? getMintsoftDashboardData() : Promise.resolve(null),
+    getWmsSyncDashboardData(),
   ])
 
   const taxRates = taxRatesRaw.map((r: { id: string; name: string }) => ({ id: r.id, name: r.name }))
@@ -129,7 +131,7 @@ export default async function SyncPage() {
         accountingReadiness={accountingReadiness}
         accountingBatchPreview={accountingBatchPreview}
         accountingBatchHistory={accountingBatchHistory}
-        mintsoftData={mintsoftData}
+        wmsData={wmsData}
       />
     </div>
   )
