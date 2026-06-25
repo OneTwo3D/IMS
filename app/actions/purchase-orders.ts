@@ -49,6 +49,7 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
+import { sumReceiptQtyByPoLine } from '@/lib/domain/purchasing/receipt-quantities'
 import { computePurchaseOrderOverBilling, type PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
 import { computeReturnCreditNoteDraft } from '@/lib/domain/purchasing/return-credit-note'
 import { findDivergentReceiptLines } from '@/lib/domain/purchasing/receipt-warehouse-divergence'
@@ -1684,14 +1685,21 @@ export async function receivePurchaseOrder(
     const whNameMap = Object.fromEntries(receiptWarehouseNames.map((w) => [w.id, w.name]))
     const warehouseNamesList = [...new Set(linesWithQty.map((rl) => whNameMap[rl.warehouseId] ?? rl.warehouseId))].join(', ')
 
-    // Validate: can't receive more than outstanding qty
+    // Per-row sanity: warehouse present, PO line exists.
     for (const rl of linesWithQty) {
       if (!rl.warehouseId) return { success: false, error: 'Warehouse is required for each line' }
-      const poLine = po.lines.find((l) => l.id === rl.poLineId)
-      if (!poLine) return { success: false, error: 'Invalid PO line' }
-      const outstanding = Number(poLine.qty) - Number(poLine.qtyReceived)
-      if (rl.qtyReceived > outstanding) {
-        return { success: false, error: `Cannot receive more than outstanding qty (${outstanding})` }
+      if (!po.lines.find((l) => l.id === rl.poLineId)) return { success: false, error: 'Invalid PO line' }
+    }
+    // mgyk: validate SUMMED qty per PO line against outstanding, not per row. A single
+    // receipt may legitimately split one line across warehouses, but the TOTAL must not
+    // over-receive it — the old per-row check let two rows for the same line each pass
+    // (each ≤ outstanding) while their sum exceeded it.
+    const receiveByPoLine = sumReceiptQtyByPoLine(linesWithQty)
+    for (const [poLineId, totalQty] of receiveByPoLine) {
+      const poLine = po.lines.find((l) => l.id === poLineId)!
+      const outstanding = toDecimal(poLine.qty).minus(toDecimal(poLine.qtyReceived))
+      if (roundQuantity(totalQty, 6).greaterThan(roundQuantity(outstanding, 6))) {
+        return { success: false, error: `Cannot receive more than outstanding qty (${roundQuantity(outstanding, 6).toNumber()})` }
       }
     }
 
@@ -1792,14 +1800,15 @@ export async function receivePurchaseOrder(
       })
 
       // Re-validate outstanding qty under lock — the pre-tx check used a
-      // stale snapshot that concurrent receipts could have advanced past.
+      // stale snapshot that concurrent receipts could have advanced past. mgyk:
+      // validate the SUMMED qty per PO line (a line may be split across warehouses).
       const lockedLineMap = new Map(currentPo.lines.map((line) => [line.id, line]))
-      for (const rl of linesWithQty) {
-        const poLine = lockedLineMap.get(rl.poLineId)
+      for (const [poLineId, totalQty] of sumReceiptQtyByPoLine(linesWithQty)) {
+        const poLine = lockedLineMap.get(poLineId)
         if (!poLine) throw new Error('Invalid PO line')
-        const outstanding = Number(poLine.qty) - Number(poLine.qtyReceived)
-        if (rl.qtyReceived > outstanding) {
-          throw new Error(`Cannot receive more than outstanding qty (${outstanding}) for line ${rl.poLineId}`)
+        const outstanding = toDecimal(poLine.qty).minus(toDecimal(poLine.qtyReceived))
+        if (roundQuantity(totalQty, 6).greaterThan(roundQuantity(outstanding, 6))) {
+          throw new Error(`Cannot receive more than outstanding qty (${roundQuantity(outstanding, 6).toNumber()}) for line ${poLineId}`)
         }
       }
 
