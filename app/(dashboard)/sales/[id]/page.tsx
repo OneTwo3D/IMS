@@ -11,6 +11,7 @@ import { getRejectedAccountingDocumentUpdateWarnings } from '@/app/actions/accou
 import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { getSalesOrderAdminLinks } from '@/lib/shopping'
+import { getWmsOrderStatusForSalesOrder } from '@/app/actions/wms-order-status'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requireAuth } from '@/lib/auth/server'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
@@ -22,7 +23,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs, invoiceTrigger] = await Promise.all([
+  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs, invoiceTrigger, wmsOrderStatus] = await Promise.all([
     requireAuth(),
     getSalesOrder(id),
     getWarehouses(),
@@ -38,6 +39,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     isIntegrationPluginEnabled('xero'),
     getRejectedAccountingDocumentUpdateWarnings([{ referenceType: 'SalesOrder', referenceId: id }]),
     getSetting('invoice_trigger'),
+    getWmsOrderStatusForSalesOrder(id),
   ])
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
@@ -71,6 +73,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         warehouses={warehouses}
         currencies={currencies}
         externalOrderLinks={externalOrderLinks}
+        wmsOrderStatus={wmsOrderStatus}
         stockLevels={stockLevels}
         initialAllocations={allocations}
         initialShipments={shipments}

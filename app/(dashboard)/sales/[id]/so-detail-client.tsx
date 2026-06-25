@@ -4,6 +4,8 @@ import { useState, useTransition, useCallback, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
+import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -87,6 +89,7 @@ type Props = {
   warehouses: WarehouseInfo[]
   currencies: CurrencyRow[]
   externalOrderLinks?: Array<{ label: string; url: string }>
+  wmsOrderStatus?: WmsOrderStatusView | null
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -788,7 +791,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1033,6 +1036,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               <ExternalLink className="h-4 w-4 mr-1" />{link.label}
             </Button>
           ))}
+          {wmsOrderStatus && (
+            <span className="inline-flex items-center self-center">
+              <WmsOrderStatusChip status={wmsOrderStatus} />
+            </span>
+          )}
           {canCancel && (
             <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={handleCancel} disabled={isPending}>
               <Ban className="h-4 w-4 mr-1" />Cancel

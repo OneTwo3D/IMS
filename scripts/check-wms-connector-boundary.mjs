@@ -54,7 +54,7 @@ const WAIVER_RE = /wms-connector-boundary-ok:\s*[^:\s]+:\s*\S+/i
  *   lib/integration-connection-test-gate.ts, lib/settings-store.ts, lib/releases.ts.
  * Plugin-enable persistence that enumerates every connector (woo/shopify/xero/qb/wms):
  *   app/actions/onboarding.ts (saveOnboardingPluginState).
- * Known pending generalization (tracked by onetwo3d-ims-h02x.10.7 — WMS product-sync dispatch):
+ * Known pending generalization (tracked by onetwo3d-ims-h02x.10.8 — WMS product-sync dispatch):
  *   app/actions/products.ts.
  */
 const ALLOWLIST = [

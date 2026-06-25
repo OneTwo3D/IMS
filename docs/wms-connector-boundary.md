@@ -28,6 +28,7 @@ This mirrors the shopping (`shopping-registry.ts`) and accounting
 - **`app/actions/wms-asn.ts`** — PO/transfer receive-ASN state + create.
 - **`app/actions/wms-sync.ts`** — `/sync` dashboard data.
 - **`app/actions/wms-onboarding.ts`** — onboarding connection-data.
+- **`app/actions/wms-order-status.ts`** — live order status for the sales-order chip.
 
 Each resolves the active connector and dispatches to its implementation. The
 per-connector UI lives in dedicated dispatchers
