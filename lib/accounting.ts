@@ -123,6 +123,20 @@ export async function getActiveAccountingConnectorInfo(): Promise<AccountingConn
   }
 }
 
+/**
+ * Generic selector for whether an accounting connector has stored OAuth
+ * credentials (i.e. is connected). Wraps the AccountingToken store so
+ * non-connector ingress code (e.g. the sync cron) does not read connector
+ * persistence directly — if token storage changes, only this helper changes.
+ */
+export async function isAccountingConnectorConnected(
+  connector: AccountingConnectorInfo['id'],
+): Promise<boolean> {
+  const { db } = await import('@/lib/db')
+  const token = await db.accountingToken.findFirst({ where: { connector }, select: { id: true } })
+  return token !== null
+}
+
 export async function queueAccountingSync(params: {
   type: AccountingSyncType
   referenceType: string
