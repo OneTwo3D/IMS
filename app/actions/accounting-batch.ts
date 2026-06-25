@@ -1,11 +1,9 @@
 'use server'
 
-import {
-  getXeroDailyBatchHistory,
-  getXeroDailyBatchPreview,
-  refreshXeroDailyBatchPreview,
-  type DailyBatchHistoryDay,
-  type DailyBatchPreview,
+import { getActiveAccountingConnectorInfo } from '@/lib/accounting'
+import type {
+  DailyBatchHistoryDay,
+  DailyBatchPreview,
 } from '@/app/actions/xero-daily-batch'
 
 export type AccountingBatchPreview = DailyBatchPreview
@@ -59,19 +57,44 @@ function mapHistoryDay(day: DailyBatchHistoryDay): AccountingBatchHistoryDay {
   }
 }
 
+// Daily-batch preview/history are connector-owned read surfaces: each queries
+// its own connector's DAILY_BATCH_* sync logs and settings. Only Xero provides
+// one today, so non-Xero connectors get an honest empty surface rather than
+// bleeding Xero's batch data into the UI. The daily-batch *poster* still runs
+// per active connector via /api/cron/accounting-daily-batch.
+// Follow-up: implement a QuickBooks daily-batch preview/history surface.
+function emptyAccountingBatchPreview(): AccountingBatchPreview {
+  return {
+    generatedAt: new Date().toISOString(),
+    cachedFor: 0,
+    groupA1: { orderCount: 0, totalRevenue: 0, orders: [] },
+    groupA2: { orderCount: 0, totalCost: 0, orders: [] },
+    groupB: { shipmentCount: 0, totalRevenue: 0, totalCogs: 0, shipments: [] },
+  }
+}
+
 export async function getAccountingBatchPreview(
   opts?: { force?: boolean },
 ): Promise<AccountingBatchPreview> {
+  const connector = await getActiveAccountingConnectorInfo()
+  if (connector?.id !== 'xero') return emptyAccountingBatchPreview()
+  const { getXeroDailyBatchPreview } = await import('@/app/actions/xero-daily-batch')
   return getXeroDailyBatchPreview(opts)
 }
 
 export async function getAccountingBatchHistory(
   days = 30,
 ): Promise<AccountingBatchHistoryDay[]> {
+  const connector = await getActiveAccountingConnectorInfo()
+  if (connector?.id !== 'xero') return []
+  const { getXeroDailyBatchHistory } = await import('@/app/actions/xero-daily-batch')
   const rows = await getXeroDailyBatchHistory(days)
   return rows.map(mapHistoryDay)
 }
 
 export async function refreshAccountingBatchPreview(): Promise<AccountingBatchPreview> {
+  const connector = await getActiveAccountingConnectorInfo()
+  if (connector?.id !== 'xero') return emptyAccountingBatchPreview()
+  const { refreshXeroDailyBatchPreview } = await import('@/app/actions/xero-daily-batch')
   return refreshXeroDailyBatchPreview()
 }
