@@ -2,10 +2,12 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plus, Pencil, X, Check, Loader2 } from 'lucide-react'
+import { Plus, Pencil, X, Check, Loader2, AlertTriangle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import type { TaxRateDriftStatus } from '@/lib/domain/accounting/tax-rate-drift-status'
 import {
   Dialog,
   DialogContent,
@@ -16,7 +18,39 @@ import {
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createTaxRate, updateTaxRate, type TaxRateRow, type TaxCategoryValue } from '@/app/actions/settings'
 
-type Props = { taxRates: TaxRateRow[]; onChanged?: () => void }
+type Props = {
+  taxRates: TaxRateRow[]
+  onChanged?: () => void
+  /** Current IMS↔Xero drift keyed by taxRateId (Phase 3, 0jls5). */
+  drift?: Record<string, TaxRateDriftStatus>
+  /** Whether IMS→Xero tax-rate sync is enabled (drives the tooltip guidance). */
+  driftSyncEnabled?: boolean
+}
+
+function TaxRateDriftChip({ drift, syncEnabled }: { drift: TaxRateDriftStatus; syncEnabled?: boolean }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300">
+        <AlertTriangle className="h-3 w-3" /> Xero drift
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs text-left whitespace-normal">
+        <p className="font-medium">
+          {drift.status === 'missing-on-xero' ? 'No matching rate in Xero' : 'Differs from the live Xero rate'}
+        </p>
+        {drift.lines.length > 0 && (
+          <ul className="mt-1 list-disc pl-4 text-xs">
+            {drift.lines.map((line, i) => <li key={i}>{line}</li>)}
+          </ul>
+        )}
+        <p className="mt-1 text-xs text-muted-foreground">
+          {syncEnabled
+            ? 'Edit the IMS rate to match Xero, or re-push from IMS.'
+            : 'Tax-rate sync is off — fix the IMS rate, then enable tax-rate sync to push.'}
+        </p>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
 
 const USED_FOR_LABELS: Record<string, string> = {
   SALES: 'Sales',
@@ -332,7 +366,7 @@ function TaxRateFormDialog({
   )
 }
 
-export function TaxRatesTable({ taxRates, onChanged }: Props) {
+export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [editing, setEditing] = useState<TaxRateRow | null | undefined>(undefined)
@@ -374,7 +408,12 @@ export function TaxRatesTable({ taxRates, onChanged }: Props) {
         <TableBody>
           {rates.map((r) => (
             <TableRow key={r.id} className={!r.active ? 'opacity-50' : ''}>
-              <TableCell className="font-medium">{r.name}</TableCell>
+              <TableCell className="font-medium">
+                <span className="inline-flex flex-wrap items-center gap-1.5">
+                  {r.name}
+                  {drift?.[r.id] && <TaxRateDriftChip drift={drift[r.id]} syncEnabled={driftSyncEnabled} />}
+                </span>
+              </TableCell>
               <TableCell className="text-xs">
                 <span className="inline-flex items-center rounded-full px-2 py-0.5 font-medium border bg-muted/50">
                   {TAX_CATEGORY_LABELS[r.taxCategory] ?? r.taxCategory}

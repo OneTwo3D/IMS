@@ -28,9 +28,11 @@ import { getTaxRates } from '@/app/actions/settings'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getCrossConnectorOrphanSummary, getFailedAccountingSyncSummary } from '@/app/actions/accounting-sync'
+import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-status'
 import { SyncDashboard } from './sync-dashboard'
 import { ConnectorOrphanBanner } from './connector-orphan-banner'
 import { FailedSyncBanner } from './failed-sync-banner'
+import { TaxRateDriftBanner } from './tax-rate-drift-banner'
 
 export const metadata: Metadata = { title: 'Integrations' }
 
@@ -87,6 +89,8 @@ export default async function SyncPage() {
   const orphanSummary = await getCrossConnectorOrphanSummary().catch(() => null)
   // audit-6vq0: surface accounting sync rows that exhausted retries (FAILED).
   const failedSyncSummary = await getFailedAccountingSyncSummary().catch(() => null)
+  // 0jls5: surface IMS tax rates that have drifted from the live Xero definition.
+  const taxRateDrift = pluginState.xero ? await getCurrentTaxRateDrift().catch(() => null) : null
 
   return (
     <div className="space-y-6 max-w-5xl">
@@ -98,6 +102,7 @@ export default async function SyncPage() {
       </div>
       {orphanSummary && <ConnectorOrphanBanner summary={orphanSummary} />}
       {failedSyncSummary && <FailedSyncBanner summary={failedSyncSummary} />}
+      {taxRateDrift && <TaxRateDriftBanner drift={taxRateDrift} />}
       <SyncDashboard
         pluginState={pluginState}
         shoppingSettings={shoppingSettings}

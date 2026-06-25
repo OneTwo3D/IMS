@@ -67,6 +67,26 @@ export async function sweepTaxRateDrift(deps: TaxRateDriftSweepDeps): Promise<Ta
 }
 
 export const TAX_RATE_DRIFT_LAST_CHECKED_SETTING = 'xero_tax_rate_drift_last_checked_at'
+/** Snapshot of the drifted rates from the most recent completed sweep (JSON). */
+export const TAX_RATE_DRIFT_SNAPSHOT_SETTING = 'xero_tax_rate_drift_current'
+
+export type TaxRateDriftSnapshotEntry = {
+  taxRateId: string
+  name: string
+  status: 'mismatch' | 'missing-on-xero'
+  lines: string[]
+}
+
+/** Build the drift snapshot (the non-equal items) from a sweep result. */
+export function buildDriftSnapshot(result: TaxRateDriftSweepResult): TaxRateDriftSnapshotEntry[] {
+  const entries: TaxRateDriftSnapshotEntry[] = []
+  for (const item of result.items) {
+    if (item.result.status === 'mismatch' || item.result.status === 'missing-on-xero') {
+      entries.push({ taxRateId: item.taxRateId, name: item.name, status: item.result.status, lines: item.lines })
+    }
+  }
+  return entries
+}
 
 /**
  * Wire the sweep to the real IMS database, the live Xero API, the activity log,
@@ -77,7 +97,7 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
   const { logActivity } = await import('@/lib/activity-log')
   const { fetchXeroTaxRates } = await import('./tax-rates')
 
-  return sweepTaxRateDrift({
+  const result = await sweepTaxRateDrift({
     async loadImsProfiles() {
       const rows = await db.taxRate.findMany({
         where: { active: true, components: { some: { active: true } } },
@@ -123,12 +143,28 @@ export async function runXeroTaxRateDriftSweep(): Promise<TaxRateDriftSweepResul
         },
       })
     },
-    async recordCheckedAt(at) {
-      await db.setting.upsert({
-        where: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING },
-        create: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: at.toISOString() },
-        update: { value: at.toISOString() },
-      })
-    },
+    // Note: the last-checked stamp is advanced AFTER the snapshot below, not
+    // here, so a snapshot-write failure can't leave an old snapshot marked fresh.
   })
+
+  // Persist an atomic snapshot of THIS sweep's drift set for the UI to read —
+  // duration-independent (no activity-log time-window heuristic) and fully
+  // replaced each run, so a fixed rate drops out on the next completed sweep.
+  const snapshot = JSON.stringify(buildDriftSnapshot(result))
+  await db.setting.upsert({
+    where: { key: TAX_RATE_DRIFT_SNAPSHOT_SETTING },
+    create: { key: TAX_RATE_DRIFT_SNAPSHOT_SETTING, value: snapshot },
+    update: { value: snapshot },
+  })
+
+  // Advance last-checked only after the snapshot has persisted, so the reader's
+  // freshness/staleness guard never treats a stale snapshot as current.
+  const checkedAt = new Date().toISOString()
+  await db.setting.upsert({
+    where: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING },
+    create: { key: TAX_RATE_DRIFT_LAST_CHECKED_SETTING, value: checkedAt },
+    update: { value: checkedAt },
+  })
+
+  return result
 }

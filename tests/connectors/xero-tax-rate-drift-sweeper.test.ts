@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  buildDriftSnapshot,
   sweepTaxRateDrift,
   type DriftSweepItem,
   type TaxRateDriftSweepDeps,
@@ -125,4 +126,25 @@ test('empty IMS set: no fetch-derived drift, checked is 0', async () => {
   assert.equal(result.checked, 0)
   assert.equal(result.drifted, 0)
   assert.equal(recorded.length, 0)
+})
+
+test('buildDriftSnapshot keeps only non-equal items with the right shape', async () => {
+  const { deps } = makeDeps(
+    [
+      imsProfile('t1', 'Equal Rate', [{ name: 'VAT', rate: 0.2 }]),
+      imsProfile('t2', 'Drifted Rate', [{ name: 'VAT', rate: 0.2 }]),
+      imsProfile('t3', 'Absent Rate', [{ name: 'VAT', rate: 0.1 }]),
+    ],
+    [
+      xeroRate('Equal Rate', [{ name: 'VAT', rate: 20 }]),
+      xeroRate('Drifted Rate', [{ name: 'VAT', rate: 17.5 }]),
+    ],
+  )
+  const result = await sweepTaxRateDrift(deps)
+  const snapshot = buildDriftSnapshot(result)
+  assert.deepEqual(snapshot.map((s) => s.taxRateId).sort(), ['t2', 't3'])
+  const drifted = snapshot.find((s) => s.taxRateId === 't2')!
+  assert.equal(drifted.status, 'mismatch')
+  assert.ok(drifted.lines.length > 0)
+  assert.equal(snapshot.find((s) => s.taxRateId === 't3')!.status, 'missing-on-xero')
 })
