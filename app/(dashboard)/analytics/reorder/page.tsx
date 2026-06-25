@@ -129,7 +129,11 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     { key: 'urgency', label: 'Status', render: (row) => urgencyLabel(row.urgency) },
   ]
 
-  const toolbarRows = report.rows.map((row) => ({ productId: row.productId, productType: row.productType }))
+  const toolbarRows = report.rows.map((row) => ({
+    productId: row.productId,
+    productType: row.productType,
+    suggestedReorderQty: Number(row.suggestedReorderQty) || 0,
+  }))
   // audit-pcc0: pass the same filters that produced the visible report so the PO/MO
   // buttons compute draft quantities from identical getReorderReport semantics.
   const actionFilters: ReorderActionFilters = {

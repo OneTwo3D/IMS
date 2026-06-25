@@ -8,6 +8,7 @@ import {
   selectAllState,
   selectedVisibleCount,
   serializeSelectedParam,
+  sumSelectedField,
   type ReorderSelectionState,
 } from '../../lib/analytics/reorder-selection.ts'
 
@@ -125,4 +126,27 @@ test('serializeSelectedParam round-trips with parse', () => {
 test('serializeSelectedParam caps at MAX_SELECTED_IDS', () => {
   const ids = Array.from({ length: MAX_SELECTED_IDS + 10 }, (_, i) => `p${i}`)
   assert.equal(serializeSelectedParam(new Set(ids)).split(',').length, MAX_SELECTED_IDS)
+})
+
+test('sumSelectedField totals the field over selected rows only', () => {
+  const rows = [
+    { productId: 'p1', qty: 5 },
+    { productId: 'p2', qty: 10 },
+    { productId: 'p3', qty: 3 },
+  ]
+  assert.equal(sumSelectedField(rows, new Set(['p1', 'p3']), (r) => r.qty), 8)
+  assert.equal(sumSelectedField(rows, new Set(), (r) => r.qty), 0)
+})
+
+test('sumSelectedField ignores non-finite field values', () => {
+  const rows = [
+    { productId: 'p1', qty: Number.NaN },
+    { productId: 'p2', qty: 7 },
+  ]
+  assert.equal(sumSelectedField(rows, new Set(['p1', 'p2']), (r) => r.qty), 7)
+})
+
+test('sumSelectedField ignores selected ids not present in rows', () => {
+  const rows = [{ productId: 'p1', qty: 4 }]
+  assert.equal(sumSelectedField(rows, new Set(['p1', 'p9']), (r) => r.qty), 4)
 })

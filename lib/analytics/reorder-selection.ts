@@ -109,3 +109,21 @@ export function selectedVisibleCount(
   }
   return count
 }
+
+/**
+ * Sum a numeric per-row field (e.g. suggestedReorderQty) over the selected rows,
+ * for the footer forecast total. Non-finite values are treated as 0.
+ */
+export function sumSelectedField<Row extends { productId: string }>(
+  rows: readonly Row[],
+  selected: ReadonlySet<string>,
+  field: (row: Row) => number,
+): number {
+  let total = 0
+  for (const row of rows) {
+    if (!selected.has(row.productId)) continue
+    const value = field(row)
+    if (Number.isFinite(value)) total += value
+  }
+  return total
+}
