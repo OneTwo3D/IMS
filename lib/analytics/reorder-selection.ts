@@ -25,6 +25,30 @@ export type SelectAllState = 'none' | 'some' | 'all'
 
 export const emptyReorderSelection: ReorderSelectionState = { selected: new Set() }
 
+/**
+ * Cap on the number of selected ids persisted to the URL. Keeps the `selected`
+ * query param from growing pathologically; beyond this the operator should use
+ * the "act on all visible" path instead.
+ */
+export const MAX_SELECTED_IDS = 250
+
+/** Parse a comma-separated `selected` URL param into a de-duplicated, capped id list. */
+export function parseSelectedParam(value: string | null | undefined): string[] {
+  if (!value) return []
+  const seen = new Set<string>()
+  for (const raw of value.split(',')) {
+    const id = raw.trim()
+    if (id) seen.add(id)
+    if (seen.size >= MAX_SELECTED_IDS) break
+  }
+  return [...seen]
+}
+
+/** Serialise a selection to the comma-separated `selected` URL value (capped). */
+export function serializeSelectedParam(selected: ReadonlySet<string>): string {
+  return [...selected].slice(0, MAX_SELECTED_IDS).join(',')
+}
+
 export function reorderSelectionReducer(
   state: ReorderSelectionState,
   action: ReorderSelectionAction,

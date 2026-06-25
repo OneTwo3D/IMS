@@ -4,17 +4,20 @@ import { useTransition, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Hammer, ShoppingCart } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { useReorderSelection } from '@/lib/analytics/reorder-selection-context'
 import { createReorderPOs, createReorderMOs, type ReorderActionFilters } from '@/app/actions/forecasting'
 
 /**
- * Bulk-generate draft POs + MOs for every row currently visible in the
- * Reorder Planning report. The operator scopes via the existing filters
- * (supplier, category, warehouse, product type) — whatever the filters
- * leave on the page is what the buttons act on.
+ * Generate draft POs + MOs for the Reorder Planning report.
  *
- * Splits selection by productType: BOM rows route to createReorderMOs
- * (one draft Manufacturing Order per product), non-BOM rows route to
- * createReorderPOs (grouped into one draft Purchase Order per supplier).
+ * When the operator has ticked rows, the buttons act on that selection.
+ * With nothing selected, they fall back to "all visible rows" (scoped by the
+ * existing filters) behind a confirmation modal naming the row count.
+ *
+ * Splits by productType: BOM rows route to createReorderMOs (one draft MO per
+ * product), non-BOM rows route to createReorderPOs (grouped into one draft PO
+ * per supplier).
  */
 export function ReorderActionsToolbar({
   rows,
@@ -24,20 +27,30 @@ export function ReorderActionsToolbar({
   filters: ReorderActionFilters
 }) {
   const router = useRouter()
+  const { selected, selectedVisibleCount, clear } = useReorderSelection()
   const [pending, startTransition] = useTransition()
   const [message, setMessage] = useState<string>('')
+  const [confirmAllOpen, setConfirmAllOpen] = useState(false)
 
-  const purchasedIds = rows.filter((r) => r.productType !== 'BOM').map((r) => r.productId)
-  const bomIds = rows.filter((r) => r.productType === 'BOM').map((r) => r.productId)
-  const hasRows = purchasedIds.length > 0 || bomIds.length > 0
+  const isBom = (productType: string) => productType === 'BOM'
+  const splitIds = (subset: typeof rows) => ({
+    purchasedIds: subset.filter((r) => !isBom(r.productType)).map((r) => r.productId),
+    bomIds: subset.filter((r) => isBom(r.productType)).map((r) => r.productId),
+  })
 
-  const handleGenerate = () => {
+  const hasSelection = selectedVisibleCount > 0
+  const selectedRows = rows.filter((r) => selected.has(r.productId))
+  // Act on the ticked rows when there's a selection, otherwise on every visible row.
+  const { purchasedIds, bomIds } = splitIds(hasSelection ? selectedRows : rows)
+  const hasVisibleRows = rows.length > 0
+
+  const runGeneration = (purchased: string[], bom: string[]) => {
     setMessage('')
     startTransition(async () => {
       const parts: string[] = []
       try {
-        if (purchasedIds.length > 0) {
-          const result = await createReorderPOs(purchasedIds, { filters })
+        if (purchased.length > 0) {
+          const result = await createReorderPOs(purchased, { filters })
           const notes: string[] = []
           if (result.success && (result.skippedSupplierCount ?? 0) > 0) notes.push(`${result.skippedSupplierCount} supplier(s) with a recent draft`)
           const skippedProducts = result.skippedProducts ?? []
@@ -49,8 +62,8 @@ export function ReorderActionsToolbar({
             ? `${result.poCount} draft PO${result.poCount === 1 ? '' : 's'}${skipNote}`
             : `PO generation failed: ${result.error ?? 'unknown error'}`)
         }
-        if (bomIds.length > 0) {
-          const result = await createReorderMOs(bomIds, { filters })
+        if (bom.length > 0) {
+          const result = await createReorderMOs(bom, { filters })
           const skipped = result.skipped ?? []
           const skipNote = result.success && skipped.length > 0
             ? ` (skipped ${skipped.length}: ${skipped.map((s) => `${s.sku} — ${s.reason.replace(/_/g, ' ')}`).join(', ')})`
@@ -60,6 +73,7 @@ export function ReorderActionsToolbar({
             : `MO generation failed: ${result.error ?? 'unknown error'}`)
         }
         setMessage(parts.length > 0 ? `Created ${parts.join(' · ')}` : 'Nothing to generate')
+        clear()
         router.refresh()
       } catch (error) {
         setMessage(`Generation failed: ${String(error)}`)
@@ -67,24 +81,62 @@ export function ReorderActionsToolbar({
     })
   }
 
+  const handleClick = () => {
+    if (hasSelection) {
+      runGeneration(purchasedIds, bomIds)
+    } else {
+      // Act-on-all fallback — confirm first so a full-page generate is deliberate.
+      setConfirmAllOpen(true)
+    }
+  }
+
+  const confirmActOnAll = () => {
+    setConfirmAllOpen(false)
+    const all = splitIds(rows)
+    runGeneration(all.purchasedIds, all.bomIds)
+  }
+
+  const summary = hasSelection
+    ? `${selectedVisibleCount} selected — ${purchasedIds.length} purchased, ${bomIds.length} manufactured`
+    : hasVisibleRows
+      ? `${rows.length} rows in current view — tick rows to scope, or generate for all visible`
+      : 'No rows match the current filters'
+
   return (
     <div className="flex flex-wrap items-center gap-3 rounded-md border bg-muted/20 p-3 text-sm">
-      <span className="text-muted-foreground">
-        {hasRows
-          ? `${rows.length} rows in current view — ${purchasedIds.length} purchased, ${bomIds.length} manufactured`
-          : 'No rows match the current filters'}
-      </span>
+      <span className="text-muted-foreground">{summary}</span>
       <Button
         size="sm"
         className="ml-auto"
-        onClick={handleGenerate}
-        disabled={pending || !hasRows}
+        onClick={handleClick}
+        disabled={pending || !hasVisibleRows}
       >
         <ShoppingCart className="mr-1 h-4 w-4" />
         <Hammer className="mr-2 h-4 w-4" />
-        {pending ? 'Generating…' : 'Generate POs + draft MOs for visible rows'}
+        {pending
+          ? 'Generating…'
+          : hasSelection
+            ? 'Generate from selection'
+            : 'Generate POs + draft MOs for all visible rows'}
       </Button>
       {message && <span className="w-full text-xs text-muted-foreground">{message}</span>}
+
+      <Dialog open={confirmAllOpen} onOpenChange={setConfirmAllOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Generate for all visible rows?</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            No rows are selected. This will create draft POs and MOs for all{' '}
+            <span className="font-medium text-foreground">{rows.length}</span> row{rows.length === 1 ? '' : 's'}{' '}
+            currently shown (scoped by the active filters). Tick individual rows first to generate for a subset instead.
+          </p>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setConfirmAllOpen(false)}>Cancel</Button>
+            <Button size="sm" onClick={confirmActOnAll}>Generate for all {rows.length}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

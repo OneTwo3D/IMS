@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  MAX_SELECTED_IDS,
   emptyReorderSelection,
+  parseSelectedParam,
   reorderSelectionReducer,
   selectAllState,
   selectedVisibleCount,
+  serializeSelectedParam,
   type ReorderSelectionState,
 } from '../../lib/analytics/reorder-selection.ts'
 
@@ -97,4 +100,29 @@ test('selectAllState ignores selected ids that are not visible', () => {
 test('selectedVisibleCount counts only visible selected ids', () => {
   assert.equal(selectedVisibleCount(new Set(['p1', 'p9']), ['p1', 'p2', 'p3']), 1)
   assert.equal(selectedVisibleCount(new Set(['p1', 'p2']), ['p1', 'p2', 'p3']), 2)
+})
+
+test('parseSelectedParam splits, trims and de-dups', () => {
+  assert.deepEqual(parseSelectedParam('p1, p2 ,p1,p3'), ['p1', 'p2', 'p3'])
+})
+
+test('parseSelectedParam returns [] for empty/undefined', () => {
+  assert.deepEqual(parseSelectedParam(undefined), [])
+  assert.deepEqual(parseSelectedParam(''), [])
+  assert.deepEqual(parseSelectedParam(' , , '), [])
+})
+
+test('parseSelectedParam caps at MAX_SELECTED_IDS', () => {
+  const many = Array.from({ length: MAX_SELECTED_IDS + 50 }, (_, i) => `p${i}`).join(',')
+  assert.equal(parseSelectedParam(many).length, MAX_SELECTED_IDS)
+})
+
+test('serializeSelectedParam round-trips with parse', () => {
+  const ids = ['p1', 'p2', 'p3']
+  assert.deepEqual(parseSelectedParam(serializeSelectedParam(new Set(ids))), ids)
+})
+
+test('serializeSelectedParam caps at MAX_SELECTED_IDS', () => {
+  const ids = Array.from({ length: MAX_SELECTED_IDS + 10 }, (_, i) => `p${i}`)
+  assert.equal(serializeSelectedParam(new Set(ids)).split(',').length, MAX_SELECTED_IDS)
 })
