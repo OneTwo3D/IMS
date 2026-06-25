@@ -786,7 +786,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
       }
 
       for (const line of transfer.lines) {
-        // A WMS callback (Mintsoft etc.) may already have booked in part of
+        // A WMS connector callback may already have booked in part of
         // this line and stamped qtyReceived + cost layers + a TRANSFER_IN
         // movement for that portion. Receive only the remaining quantity to
         // avoid double-counting; skip the line entirely if it is already
