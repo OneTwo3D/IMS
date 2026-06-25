@@ -25,9 +25,10 @@ import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow } from '@/app/actions/settings'
 import type { WarehouseRow } from '@/app/actions/settings'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
+import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import type { ShoppingConnectorCredentials, ShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import type { AccountingConnectionStatus, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
-import type { MintsoftOnboardingConnectionData } from '@/app/actions/mintsoft-sync'
+import type { WmsOnboardingConnectionData } from '@/app/actions/wms-onboarding'
 import type { EmailSettings } from '@/app/actions/company'
 import type { PublicAppUrlInfo } from '@/lib/public-app-url'
 
@@ -61,7 +62,7 @@ type Props = {
   shopifyCredentials: ShopifyConnectorCredentials
   accountingSettings: AccountingConnectorSettingsMasked
   accountingStatus: AccountingConnectionStatus
-  mintsoftConnection: MintsoftOnboardingConnectionData
+  wmsConnection: WmsOnboardingConnectionData
   emailSettings: EmailSettings
   publicAppUrlInfo: PublicAppUrlInfo
   suggestedPublicAppUrl: string | null
@@ -84,7 +85,7 @@ export function OnboardingClient({
   shopifyCredentials,
   accountingSettings,
   accountingStatus,
-  mintsoftConnection,
+  wmsConnection,
   emailSettings,
   publicAppUrlInfo,
   suggestedPublicAppUrl,
@@ -109,12 +110,12 @@ export function OnboardingClient({
     wc: boolean | null
     shopify: boolean | null
     accounting: boolean | null
-    mintsoft: boolean | null
+    wms: boolean | null
   }>({
     wc: null,
     shopify: null,
     accounting: null,
-    mintsoft: null,
+    wms: null,
   })
   const [finishing, setFinishing] = useState(false)
   const [finishError, setFinishError] = useState('')
@@ -144,9 +145,10 @@ export function OnboardingClient({
   const wcConnected = integrationConnectedOverride.wc ?? (!!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secretMasked)
   const shopifyConnected = integrationConnectedOverride.shopify ?? (!!shopifyCredentials.storeDomain && !!shopifyCredentials.accessTokenMasked)
   const accountingConnected = integrationConnectedOverride.accounting ?? accountingStatus.connected
-  const mintsoftConnected = integrationConnectedOverride.mintsoft ?? mintsoftConnection.status.configured
+  const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => plugins[id])
+  const wmsConnected = integrationConnectedOverride.wms ?? wmsConnection.configured
   const hasTaxRates = taxRates.some((rate) => rate.active)
-  const anyIntegrationsEnabled = plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || plugins.mintsoft
+  const anyIntegrationsEnabled = plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || wmsEnabled
   const hasAdditionalWarehouses = warehouses.length > 1
 
   function isStepReady(index: number) {
@@ -160,7 +162,7 @@ export function OnboardingClient({
       if (plugins.woocommerce && !wcConnected) return false
       if (plugins.shopify && !shopifyConnected) return false
       if ((plugins.xero || plugins.quickbooks) && !accountingConnected) return false
-      if (plugins.mintsoft && !mintsoftConnected) return false
+      if (wmsEnabled && !wmsConnected) return false
       return true
     }
     if (key === 'warehouses') return hasAdditionalWarehouses || warehousesTouched
@@ -229,13 +231,13 @@ export function OnboardingClient({
     wc?: boolean
     shopify?: boolean
     accounting?: boolean
-    mintsoft?: boolean
+    wms?: boolean
   }) => {
     setIntegrationConnectedOverride((prev) => ({
       wc: updates.wc ?? prev.wc,
       shopify: updates.shopify ?? prev.shopify,
       accounting: updates.accounting ?? prev.accounting,
-      mintsoft: updates.mintsoft ?? prev.mintsoft,
+      wms: updates.wms ?? prev.wms,
     }))
   }, [])
 
@@ -372,7 +374,7 @@ export function OnboardingClient({
                 shopifyCredentials={shopifyCredentials}
                 accountingSettings={accountingSettings}
                 accountingStatus={accountingStatus}
-                mintsoftConnection={mintsoftConnection}
+                wmsConnection={wmsConnection}
                 publicAppUrlInfo={publicAppUrlInfo}
                 onPluginStateChange={handlePluginStateChange}
                 onConnectionStateChange={handleIntegrationConnectionStateChange}
