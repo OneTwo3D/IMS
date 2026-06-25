@@ -27,12 +27,12 @@ const CONFIDENCE_LABEL: Record<MatchConfidence, string> = {
 
 type Props = {
   wcConnected: boolean
-  xeroConnected: boolean
+  accountingConnected: boolean
   onChanged?: () => void
   context: 'onboarding' | 'settings'
 }
 
-export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, context }: Props) {
+export function UnifiedTaxRateMapper({ wcConnected, accountingConnected, onChanged, context }: Props) {
   const [data, setData] = useState<TaxRateMatchData | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null) // action key currently running
@@ -41,14 +41,14 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const next = await getTaxRateMatchData({ includeWc: wcConnected, includeXero: xeroConnected })
+      const next = await getTaxRateMatchData({ includeWc: wcConnected, includeXero: accountingConnected })
       setData(next)
     } catch (e) {
       setMessage({ kind: 'error', text: e instanceof Error ? e.message : 'Failed to load tax rates.' })
     } finally {
       setLoading(false)
     }
-  }, [wcConnected, xeroConnected])
+  }, [wcConnected, accountingConnected])
 
   useEffect(() => { void load() }, [load])
 
@@ -74,9 +74,9 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
     } finally { setBusy(null) }
   }
 
-  async function handleRefreshXero() {
-    setBusy('refresh-xero'); setMessage(null)
-    try { await load(); notify('ok', 'Refreshed Xero tax rates.') }
+  async function handleRefreshAccounting() {
+    setBusy('refresh-accounting'); setMessage(null)
+    try { await load(); notify('ok', 'Refreshed accounting tax rates.') }
     finally { setBusy(null) }
   }
 
@@ -92,7 +92,7 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
       const res = await applyTaxRateMatches(links)
       if (!res.success) { notify('error', res.error ?? 'Failed to apply matches.'); return }
       await load()
-      notify('ok', `Auto-applied ${res.wcLinked} WooCommerce and ${res.xeroLinked} Xero link(s).`)
+      notify('ok', `Auto-applied ${res.wcLinked} WooCommerce and ${res.xeroLinked} accounting link(s).`)
     } catch (e) {
       notify('error', e instanceof Error ? e.message : 'Failed to apply matches.')
     } finally { setBusy(null) }
@@ -116,18 +116,18 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
     } finally { setBusy(null) }
   }
 
-  async function handleXeroChange(imsId: string, taxType: string) {
-    setBusy(`xero:${imsId}`); setMessage(null)
+  async function handleAccountingChange(imsId: string, taxType: string) {
+    setBusy(`accounting:${imsId}`); setMessage(null)
     try {
       const res = await updateTaxRate(imsId, { accountingTaxType: taxType })
-      if (!res.success) { notify('error', res.error ?? 'Failed to set Xero tax type.'); return }
+      if (!res.success) { notify('error', res.error ?? 'Failed to set accounting tax type.'); return }
       await load(); onChanged?.()
     } finally { setBusy(null) }
   }
 
   const showWc = wcConnected
-  const showXero = xeroConnected
-  const hasProviders = showWc || showXero
+  const showAccounting = accountingConnected
+  const hasProviders = showWc || showAccounting
 
   return (
     <Card className="p-4 space-y-4">
@@ -136,8 +136,8 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
           <h3 className="text-sm font-semibold">Tax rate mapping</h3>
           <p className="text-xs text-muted-foreground mt-0.5">
             {hasProviders
-              ? 'Match your WooCommerce and Xero tax rates to the IMS tax rates. Matches are suggested by rate then name — review and adjust below.'
-              : 'Connect WooCommerce or Xero (previous step / Settings) to import and map their tax rates. Your IMS tax rates are shown below.'}
+              ? 'Match your WooCommerce and accounting tax rates to the IMS tax rates. Matches are suggested by rate then name — review and adjust below.'
+              : 'Connect WooCommerce or an accounting connector (previous step / Settings) to import and map their tax rates. Your IMS tax rates are shown below.'}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -147,10 +147,10 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
               Import from store
             </Button>
           )}
-          {showXero && (
-            <Button type="button" variant="outline" size="sm" onClick={handleRefreshXero} disabled={busy != null}>
-              {busy === 'refresh-xero' ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 mr-1" />}
-              Refresh from Xero
+          {showAccounting && (
+            <Button type="button" variant="outline" size="sm" onClick={handleRefreshAccounting} disabled={busy != null}>
+              {busy === 'refresh-accounting' ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 mr-1" />}
+              Refresh accounting rates
             </Button>
           )}
           {hasProviders && (
@@ -177,7 +177,7 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
               <TableHead className="text-xs">IMS Tax Rate</TableHead>
               <TableHead className="text-xs text-right">Rate</TableHead>
               {showWc && <TableHead className="text-xs">WooCommerce rate</TableHead>}
-              {showXero && <TableHead className="text-xs">Xero tax code</TableHead>}
+              {showAccounting && <TableHead className="text-xs">Accounting tax code</TableHead>}
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -186,7 +186,7 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
               const wcCurrent = data?.wcRates.find((w) => w.taxRateId === ims.id)?.externalTaxRateId
                 ?? (row.wc.confidence === 'rate+name' || row.wc.confidence === 'rate' ? row.wc.match?.externalTaxRateId : '')
                 ?? ''
-              const xeroCurrent = ims.accountingTaxType ?? ''
+              const accountingCurrent = ims.accountingTaxType ?? ''
               const wcSuggestionDiffers = row.wc.match && row.wc.match.externalTaxRateId !== wcCurrent
               return (
                 <TableRow key={ims.id} className={row.wc.rateConflict ? 'bg-destructive/5' : undefined}>
@@ -221,26 +221,26 @@ export function UnifiedTaxRateMapper({ wcConnected, xeroConnected, onChanged, co
                       )}
                     </TableCell>
                   )}
-                  {showXero && (
+                  {showAccounting && (
                     <TableCell>
                       <div className="flex items-center gap-2">
                         <select
                           className={SELECT_CLASS}
-                          value={xeroCurrent}
-                          onChange={(e) => handleXeroChange(ims.id, e.target.value)}
+                          value={accountingCurrent}
+                          onChange={(e) => handleAccountingChange(ims.id, e.target.value)}
                           disabled={busy != null}
                         >
                           <option value="">— Not mapped —</option>
                           {data?.xeroRates.map((x) => (
                             <option key={x.taxType} value={x.taxType}>{x.name} ({x.ratePct.toFixed(2)}%) — {x.taxType}</option>
                           ))}
-                          {xeroCurrent && !data?.xeroRates.some((x) => x.taxType === xeroCurrent) && (
-                            <option value={xeroCurrent}>{xeroCurrent} (unknown)</option>
+                          {accountingCurrent && !data?.xeroRates.some((x) => x.taxType === accountingCurrent) && (
+                            <option value={accountingCurrent}>{accountingCurrent} (unknown)</option>
                           )}
                         </select>
-                        {busy === `xero:${ims.id}` && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground shrink-0" />}
+                        {busy === `accounting:${ims.id}` && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground shrink-0" />}
                       </div>
-                      {row.xero.match && !xeroCurrent && (row.xero.confidence === 'rate+name' || row.xero.confidence === 'rate') && (
+                      {row.xero.match && !accountingCurrent && (row.xero.confidence === 'rate+name' || row.xero.confidence === 'rate') && (
                         <p className="mt-0.5 text-[10px] inline-flex items-center gap-1 text-muted-foreground">
                           <Check className="h-3 w-3" /> suggested: {row.xero.match.name} ({row.xero.match.taxType})
                         </p>

@@ -35,8 +35,8 @@ type Props = {
   logs: ShoppingSyncLogRow[]
   taxRates: { id: string; name: string }[]
   shoppingCredentials: ShoppingConnectorCredentials
-  /** audit-wrwr: whether Xero is the connected accounting connector (for the unified tax mapper). */
-  xeroConnected: boolean
+  /** audit-wrwr: whether the active accounting connector is connected (for the unified tax mapper). */
+  accountingConnected: boolean
 }
 
 const IMS_STATUSES = [
@@ -455,7 +455,7 @@ function WebhookSecretField({
   )
 }
 
-export function SyncClient({ settings: init, statusMappings, logs, shoppingCredentials, xeroConnected }: Props) {
+export function SyncClient({ settings: init, statusMappings, logs, shoppingCredentials, accountingConnected }: Props) {
   const router = useRouter()
   const formatDateTime = useFormatDateTime()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
@@ -1227,9 +1227,9 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
         </div>
       )}
 
-      {/* Tax Rates tab — audit-wrwr: unified WC/Xero/IMS mapper */}
+      {/* Tax Rates tab — audit-wrwr: unified WC/accounting/IMS mapper */}
       {tab === 'tax' && (
-        <UnifiedTaxRateMapper context="settings" wcConnected={wcConfigured} xeroConnected={xeroConnected} />
+        <UnifiedTaxRateMapper context="settings" wcConnected={wcConfigured} accountingConnected={accountingConnected} />
       )}
 
       {/* Status Mapping tab */}

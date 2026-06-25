@@ -358,7 +358,7 @@ export function OnboardingClient({
                 <UnifiedTaxRateMapper
                   context="onboarding"
                   wcConnected={plugins.woocommerce && wcConnected}
-                  xeroConnected={plugins.xero && accountingConnected}
+                  accountingConnected={plugins.xero && accountingConnected}
                   onChanged={() => setTaxTouched(true)}
                 />
               </div>
