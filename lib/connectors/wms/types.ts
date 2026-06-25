@@ -10,6 +10,10 @@ export const WMS_CONNECTOR_IDS = ['mintsoft'] as const
 
 export type WmsConnectorId = (typeof WMS_CONNECTOR_IDS)[number]
 
+export function isWmsConnectorId(value: string | null | undefined): value is WmsConnectorId {
+  return value != null && (WMS_CONNECTOR_IDS as readonly string[]).includes(value)
+}
+
 export type WmsConnectionSettings = {
   baseUrl: string
   apiKey: string
