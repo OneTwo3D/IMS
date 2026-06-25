@@ -56,6 +56,13 @@ dolt-server.activity
 # Backup data (auto-exported JSONL, local-only)
 backup/
 
+# Issue export — Dolt is the source of truth (backend: dolt, shared-server) synced via
+# `bd dolt push`. issues.jsonl is a derived, non-deterministically-ordered export bd
+# rewrites on every flush; tracking it in git only produced constant "modified" churn
+# and merge conflicts on feature branches. It was untracked in PR #388; this completes
+# that change by also ignoring it so bd's local rewrites don't reappear as untracked.
+issues.jsonl
+
 # Per-project environment file (Dolt connection config, GH#2520)
 .env
 
