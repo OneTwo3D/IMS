@@ -1548,6 +1548,7 @@ model SalesOrder {
   shipments         Shipment[]
   shoppingLinks     ShoppingOrderLink[]
   wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
+  wmsOrderStatus    WmsOrderStatusSnapshot?
 
   @@index([status])
   @@index([status, updatedAt(sort: Desc)], map: "sales_orders_status_updatedAt_idx")
@@ -2253,6 +2254,35 @@ model ShoppingOrderLink {
   @@index([connector, externalOrderNumber])
   @@index([orderId])
   @@map("shopping_order_links")
+}
+
+// Cached live WMS order status for a sales order, populated by the WMS
+// order-status sweep cron and read by the sales LIST chips (the detail view
+// fetches live). Connector-agnostic — `connector` records which WMS produced it.
+model WmsOrderStatusSnapshot {
+  id                  String   @id @default(cuid())
+  orderId             String   @unique
+  connector           String
+  connectorLabel      String
+  externalOrderId     String
+  externalOrderNumber String
+  status              String
+  statusLabel         String
+  isSplit             Boolean  @default(false)
+  partCount           Int?
+  isMerged            Boolean  @default(false)
+  mergedOrderNumbers  String[] @default([])
+  deepLinkUrl         String?
+  trackingNumber      String?
+  carrier             String?
+  fetchedAt           DateTime @default(now())
+  lastError           String?
+
+  order               SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([connector])
+  @@index([fetchedAt])
+  @@map("wms_order_status_snapshots")
 }
 
 // ---------------------------------------------------------------------------
