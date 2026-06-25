@@ -39,8 +39,10 @@ export const metadata: Metadata = { title: 'Integrations' }
 
 export default async function SyncPage() {
   const pluginState = await getIntegrationPluginState()
-  const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => pluginState[id])
-  if (!pluginState.woocommerce && !pluginState.shopify && !pluginState.xero && !pluginState.quickbooks && !wmsEnabled) {
+  // Resolve the active WMS connector from this single plugin-state read and pass
+  // it to getWmsSyncDashboardData so the facade doesn't read plugin state again.
+  const activeWmsConnector = WMS_CONNECTOR_IDS.find((id) => pluginState[id]) ?? null
+  if (!pluginState.woocommerce && !pluginState.shopify && !pluginState.xero && !pluginState.quickbooks && !activeWmsConnector) {
     redirect('/settings/system?tab=plugins')
   }
 
@@ -75,7 +77,7 @@ export default async function SyncPage() {
     pluginState.woocommerce ? getShoppingConnectorPaymentMethods() : Promise.resolve([]),
     getAccountingBatchPreview(),
     getAccountingBatchHistory(30),
-    getWmsSyncDashboardData(),
+    getWmsSyncDashboardData(activeWmsConnector),
   ])
 
   const taxRates = taxRatesRaw.map((r: { id: string; name: string }) => ({ id: r.id, name: r.name }))

@@ -18,9 +18,22 @@ export type WmsSyncDashboardData = {
   mintsoft: MintsoftDashboardData | null
 }
 
-export async function getWmsSyncDashboardData(): Promise<WmsSyncDashboardData | null> {
+async function resolveEnabledWmsConnectorId(): Promise<WmsConnectorId | null> {
   const state = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
+  return WMS_CONNECTOR_IDS.find((id) => state[id]) ?? null
+}
+
+/**
+ * @param activeConnectorId the enabled WMS connector the caller already resolved
+ *   (the /sync page reads plugin state for its enable gate and passes it here so
+ *   state is read once). Omit it and the facade resolves it itself.
+ */
+export async function getWmsSyncDashboardData(
+  activeConnectorId?: WmsConnectorId | null,
+): Promise<WmsSyncDashboardData | null> {
+  const connectorId = activeConnectorId !== undefined
+    ? activeConnectorId
+    : await resolveEnabledWmsConnectorId()
   if (!connectorId) return null
 
   if (connectorId === 'mintsoft') {
