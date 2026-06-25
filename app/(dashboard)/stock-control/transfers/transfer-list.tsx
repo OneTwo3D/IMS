@@ -349,9 +349,9 @@ function WmsTransferAsnDialog({
 
           <div className="grid gap-3 md:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor="mintsoftTransferPackagingType">Packaging Type</Label>
+              <Label htmlFor="wmsTransferPackagingType">Packaging Type</Label>
               <select
-                id="mintsoftTransferPackagingType"
+                id="wmsTransferPackagingType"
                 value={packagingType}
                 onChange={(event) => setPackagingType(event.target.value as typeof packagingType)}
                 className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
@@ -362,9 +362,9 @@ function WmsTransferAsnDialog({
               </select>
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="mintsoftTransferPackageCount">Package Count</Label>
+              <Label htmlFor="wmsTransferPackageCount">Package Count</Label>
               <Input
-                id="mintsoftTransferPackageCount"
+                id="wmsTransferPackageCount"
                 type="number"
                 min={1}
                 step={1}
@@ -373,27 +373,27 @@ function WmsTransferAsnDialog({
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="mintsoftTransferEta">ETA</Label>
+              <Label htmlFor="wmsTransferEta">ETA</Label>
               <Input
-                id="mintsoftTransferEta"
+                id="wmsTransferEta"
                 type="date"
                 value={eta}
                 onChange={(event) => setEta(event.target.value)}
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="mintsoftTransferCarrier">Carrier</Label>
+              <Label htmlFor="wmsTransferCarrier">Carrier</Label>
               <Input
-                id="mintsoftTransferCarrier"
+                id="wmsTransferCarrier"
                 value={carrier}
                 onChange={(event) => setCarrier(event.target.value)}
                 placeholder="e.g. DPD, DHL Freight"
               />
             </div>
             <div className="space-y-1.5 md:col-span-2">
-              <Label htmlFor="mintsoftTransferReference">Shipment Reference</Label>
+              <Label htmlFor="wmsTransferReference">Shipment Reference</Label>
               <Input
-                id="mintsoftTransferReference"
+                id="wmsTransferReference"
                 value={supplierReference}
                 onChange={(event) => setSupplierReference(event.target.value)}
                 placeholder="Optional shipment or transfer reference"

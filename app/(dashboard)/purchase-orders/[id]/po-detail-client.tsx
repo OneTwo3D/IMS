@@ -643,9 +643,9 @@ function WmsAsnDialog({
 
           <div className="grid gap-3 md:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor="mintsoftPackagingType">Packaging Type</Label>
+              <Label htmlFor="wmsPackagingType">Packaging Type</Label>
               <Select
-                id="mintsoftPackagingType"
+                id="wmsPackagingType"
                 value={packagingType}
                 onChange={(event) => setPackagingType(event.target.value as typeof packagingType)}
                 className="h-9 rounded-md px-3"
@@ -656,9 +656,9 @@ function WmsAsnDialog({
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="mintsoftPackageCount">Package Count</Label>
+              <Label htmlFor="wmsPackageCount">Package Count</Label>
               <Input
-                id="mintsoftPackageCount"
+                id="wmsPackageCount"
                 type="number"
                 min={1}
                 step={1}
@@ -667,27 +667,27 @@ function WmsAsnDialog({
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="mintsoftEta">ETA</Label>
+              <Label htmlFor="wmsEta">ETA</Label>
               <Input
-                id="mintsoftEta"
+                id="wmsEta"
                 type="date"
                 value={eta}
                 onChange={(event) => setEta(event.target.value)}
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="mintsoftCarrier">Carrier</Label>
+              <Label htmlFor="wmsCarrier">Carrier</Label>
               <Input
-                id="mintsoftCarrier"
+                id="wmsCarrier"
                 value={carrier}
                 onChange={(event) => setCarrier(event.target.value)}
                 placeholder="e.g. DPD, DHL Freight"
               />
             </div>
             <div className="space-y-1.5 md:col-span-2">
-              <Label htmlFor="mintsoftSupplierReference">Supplier Reference</Label>
+              <Label htmlFor="wmsSupplierReference">Supplier Reference</Label>
               <Input
-                id="mintsoftSupplierReference"
+                id="wmsSupplierReference"
                 value={supplierReference}
                 onChange={(event) => setSupplierReference(event.target.value)}
                 placeholder="Optional supplier or shipment reference"

@@ -1,0 +1,33 @@
+name: WMS Connector Boundary Guard
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/wms-connector-boundary-guard.yml"
+      - "app/**"
+      - "components/**"
+      - "lib/**"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/check-wms-connector-boundary.mjs"
+  push:
+    branches:
+      - development
+    paths:
+      - ".github/workflows/wms-connector-boundary-guard.yml"
+      - "app/**"
+      - "components/**"
+      - "lib/**"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/check-wms-connector-boundary.mjs"
+
+jobs:
+  wms-connector-boundary-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm run check:wms-connector-boundary
