@@ -57,9 +57,6 @@ connector-specific reference, add the path to the allowlist or add a per-line wa
 // wms-connector-boundary-ok: <ticket-or-date>: <reason>
 ```
 
-## Known pending generalization
-
-- `app/actions/products.ts` still triggers Mintsoft product/bundle sync directly on
-  product mutations (`runMintsoftProductSyncForProduct`). Generalizing this to the
-  active WMS connector is tracked separately (WMS product-sync dispatch); the file
-  is allowlisted until then.
+Product-mutation sync is dispatched generically too: `app/actions/products.ts`
+calls `scheduleWmsProductSync` (`lib/domain/wms/product-sync-dispatch.ts`), which
+resolves the active WMS connector — no connector literal in the product actions.
