@@ -618,6 +618,58 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     (p): p is CandidateProduct => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY',
   )
 
+  // yi4m: a KIT candidate's component may ITSELF be a KIT (nested). computeKitAvailability
+  // recurses only when that nested KIT is present in productById; a scoped sync that
+  // didn't independently select the nested KIT would otherwise read its availability as
+  // 0 and understate the parent. Resolve nested KITs (and deeper nesting) here, for the
+  // availability graph ONLY — they are added to productById below but NOT to `products`,
+  // so they are not themselves pushed. Unscoped runs already select every KIT.
+  const candidateIds = new Set(products.map((p) => p.id))
+  const nestedKitById = new Map<string, CandidateProduct>()
+  if (scopedProductIds) {
+    const kitComponentFrontier = (kits: CandidateProduct[]): string[] =>
+      [
+        ...new Set(
+          kits.flatMap((p) =>
+            p.type === 'KIT'
+              ? p.productComponents.filter((c) => c.component.type === 'KIT').map((c) => c.componentId)
+              : [],
+          ),
+        ),
+      ].filter((id) => !candidateIds.has(id) && !nestedKitById.has(id))
+    let frontier = kitComponentFrontier(products)
+    while (frontier.length > 0) {
+      const fetched = await db.product.findMany({
+        where: { id: { in: frontier } },
+        select: {
+          id: true,
+          sku: true,
+          type: true,
+          lifecycleStatus: true,
+          externalProductId: true,
+          parent: { select: { sku: true, externalProductId: true } },
+          productComponents: {
+            select: {
+              componentId: true,
+              qty: true,
+              component: { select: { type: true, lifecycleStatus: true } },
+            },
+          },
+        },
+      })
+      const fetchedKits = fetched.filter(
+        (p): p is CandidateProduct => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY',
+      )
+      for (const kit of fetchedKits) nestedKitById.set(kit.id, kit)
+      // Deeper nesting; the candidateIds/nestedKitById filter guarantees termination,
+      // even on a KIT cycle (computeKitAvailability separately flags the cycle itself).
+      frontier = kitComponentFrontier(fetchedKits)
+    }
+  }
+  // All KITs whose component stock must be loaded for the availability calc: the push
+  // candidates plus the nested KITs resolved above.
+  const kitsNeedingComponentStock = [...products, ...nestedKitById.values()]
+
   // bghy: a KIT can be selected because it CONTAINS a scoped product as a component,
   // but the stock fetch above only loaded the scoped ids (+ components of scoped KITs)
   // — NOT that KIT's OTHER components. computeAvailableByProduct reads missing
@@ -633,7 +685,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     const alreadyFetched = new Set(scopedStockProductIds)
     const missingComponentIds = [
       ...new Set(
-        products.flatMap((p) =>
+        kitsNeedingComponentStock.flatMap((p) =>
           p.type === 'KIT' ? p.productComponents.map((c) => c.componentId) : [],
         ),
       ),
@@ -654,7 +706,11 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     candidates: products.length, matched: 0, unmatched: 0,
     pushed: false, message: '', unmatchedSkuSample: [],
   }
-  const productById = new Map(products.map((product) => [product.id, product]))
+  // yi4m: include nested KITs so computeKitAvailability can recurse into them; they are
+  // lookup-only here (not in `products`, so not pushed).
+  const productById = new Map(
+    [...products, ...nestedKitById.values()].map((product) => [product.id, product]),
+  )
   const availableByProduct = computeAvailableByProduct(
     products,
     whIds,
@@ -1547,9 +1603,15 @@ function computeKitAvailability(
   errors: string[],
   seenCycleErrors: Set<string>,
 ): number {
-  if (memo.has(product.id)) return memo.get(product.id) ?? 0
+  // yi4m: the result depends on the warehouse set passed in — a nested KIT is evaluated
+  // per single warehouse (computeKitAvailability(nested, [warehouseId], …)) while a
+  // top-level KIT gets the full list. Key the memo by (product, warehouse set) so warehouse
+  // A's nested result is not reused for warehouse B (which would over/under-state the
+  // KIT-of-KIT). Cycle detection (`stack`) stays keyed by product id — it's path-based.
+  const memoKey = `${product.id}|${warehouseIds.join(',')}`
+  if (memo.has(memoKey)) return memo.get(memoKey) ?? 0
   if (product.productComponents.length === 0) {
-    memo.set(product.id, 0)
+    memo.set(memoKey, 0)
     return 0
   }
   if (stack.has(product.id)) {
@@ -1558,7 +1620,7 @@ function computeKitAvailability(
       errors.push(`KIT cycle detected: ${cycleKey}`)
       seenCycleErrors.add(cycleKey)
     }
-    memo.set(product.id, 0)
+    memo.set(memoKey, 0)
     return 0
   }
 
@@ -1590,7 +1652,7 @@ function computeKitAvailability(
   }
 
   stack.delete(product.id)
-  memo.set(product.id, total)
+  memo.set(memoKey, total)
   return total
 }
 
