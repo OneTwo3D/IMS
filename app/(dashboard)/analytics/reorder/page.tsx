@@ -17,6 +17,8 @@ import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { hasPermission } from '@/lib/permissions'
 import { getForecastSettings } from '@/app/actions/forecasting'
 import { HistoricalImportTrigger } from './historical-import-trigger'
+import { ReorderSelectionProvider } from '@/lib/analytics/reorder-selection-context'
+import { ReorderSelectAllCheckbox, ReorderRowCheckbox } from './reorder-selection-checkboxes'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
@@ -140,8 +142,10 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     urgency: filters.urgency,
     search: filters.search,
   }
+  const visibleProductIds = report.rows.map((row) => row.productId)
   return (
     <div className="space-y-3">
+      <ReorderSelectionProvider visibleIds={visibleProductIds}>
       <ReorderActionsToolbar rows={toolbarRows} filters={actionFilters} />
     <StockPositionReportPage
       title="Reorder Planning"
@@ -203,7 +207,12 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
           </div>
         </>
       }
+      selectionColumn={{
+        header: <ReorderSelectAllCheckbox />,
+        cell: (row) => <ReorderRowCheckbox productId={row.productId} label={row.sku} />,
+      }}
     />
+      </ReorderSelectionProvider>
     </div>
   )
 }
