@@ -4,7 +4,7 @@ import { redirect } from 'next/navigation'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth/server'
 import { DashboardShell } from '@/components/layout/dashboard-shell'
-import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { BaseCurrencyProvider } from '@/components/providers/base-currency-provider'
 import { TimeZoneProvider } from '@/components/providers/timezone-provider'
@@ -33,7 +33,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
         userPictureUrl={session.user.pictureUrl}
         shoppingIntegrationEnabled={pluginState.woocommerce || pluginState.shopify}
         accountingIntegrationEnabled={pluginState.xero || pluginState.quickbooks}
-        wmsIntegrationEnabled={pluginState.mintsoft}
+        wmsIntegrationEnabled={isIntegrationModuleVisible('wms', pluginState)}
       >
         {children}
       </DashboardShell>
