@@ -6,7 +6,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { SyncClient } from './sync-client'
 import { ShopifySyncClient } from './shopify-sync-client'
 import { MintsoftClient } from './mintsoft-client'
-import { XeroClient } from './xero-client'
+import { AccountingConnectorPanel, isAccountingConnectorUiId } from './accounting-connector-panel'
 import type { MintsoftDashboardData } from '@/app/actions/mintsoft-sync'
 import type {
   ShopifyConnectorCredentials,
@@ -261,37 +261,30 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
     )
   }
 
-  if (activeConnector === 'xero') {
+  if (isAccountingConnectorUiId(activeConnector)) {
     return (
-      <div className="space-y-4">
-        <button type="button" onClick={() => setActiveConnector(null)} className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
-          ← Back to Integrations
-        </button>
-        <div className="flex items-center gap-3 mb-2">
-          {CONNECTOR_LOGOS.xero}
-          <div>
-            <h2 className="text-lg font-semibold">Xero Connector</h2>
-            <p className="text-xs text-muted-foreground">Sync invoices, journals, and bills to Xero</p>
-          </div>
-        </div>
-        <XeroClient
-          settings={accountingSettings}
-          connected={accountingConnected}
-          tenantName={accountingTenantName}
-          connectionTest={accountingConnectionTest}
-          accounts={accountingAccounts}
-          logs={accountingLogs}
-          paymentMethodCombos={paymentMethodCombos}
-          paymentAccountMap={paymentAccountMap}
-          currencies={currencies}
-          shoppingPaymentMethods={shoppingPaymentMethods}
-          imsTaxRates={imsTaxRates}
-          xeroTaxRates={accountingTaxRates}
-          readiness={accountingReadiness}
-          dailyBatchPreview={accountingBatchPreview}
-          dailyBatchHistory={accountingBatchHistory}
-        />
-      </div>
+      <AccountingConnectorPanel
+        connectorId={activeConnector}
+        logo={CONNECTOR_LOGOS[activeConnector]}
+        onBack={() => setActiveConnector(null)}
+        clientProps={{
+          settings: accountingSettings,
+          connected: accountingConnected,
+          tenantName: accountingTenantName,
+          connectionTest: accountingConnectionTest,
+          accounts: accountingAccounts,
+          logs: accountingLogs,
+          paymentMethodCombos,
+          paymentAccountMap,
+          currencies,
+          shoppingPaymentMethods,
+          imsTaxRates,
+          xeroTaxRates: accountingTaxRates,
+          readiness: accountingReadiness,
+          dailyBatchPreview: accountingBatchPreview,
+          dailyBatchHistory: accountingBatchHistory,
+        }}
+      />
     )
   }
 
@@ -309,40 +302,6 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
           </div>
         </div>
         <MintsoftClient data={mintsoftData} />
-      </div>
-    )
-  }
-
-  if (activeConnector === 'quickbooks') {
-    return (
-      <div className="space-y-4">
-        <button type="button" onClick={() => setActiveConnector(null)} className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
-          ← Back to Integrations
-        </button>
-        <div className="flex items-center gap-3 mb-2">
-          {CONNECTOR_LOGOS.quickbooks}
-          <div>
-            <h2 className="text-lg font-semibold">QuickBooks Connector</h2>
-            <p className="text-xs text-muted-foreground">Sync invoices, journals, and bills to QuickBooks</p>
-          </div>
-        </div>
-        <XeroClient
-          settings={accountingSettings}
-          connected={accountingConnected}
-          tenantName={accountingTenantName}
-          connectionTest={accountingConnectionTest}
-          accounts={accountingAccounts}
-          logs={accountingLogs}
-          paymentMethodCombos={paymentMethodCombos}
-          paymentAccountMap={paymentAccountMap}
-          currencies={currencies}
-          shoppingPaymentMethods={shoppingPaymentMethods}
-          imsTaxRates={imsTaxRates}
-          xeroTaxRates={accountingTaxRates}
-          readiness={accountingReadiness}
-          dailyBatchPreview={accountingBatchPreview}
-          dailyBatchHistory={accountingBatchHistory}
-        />
       </div>
     )
   }
