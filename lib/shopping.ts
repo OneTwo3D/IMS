@@ -625,3 +625,24 @@ export async function handleShoppingWebhook(
     }
   }
 }
+
+/**
+ * czuf4: whether an empty inbound webhook body is acceptable for the given connector.
+ * The generic webhook route consults this before enforcing a non-empty body so it never
+ * hardcodes a connector's webhook quirks (WooCommerce sends unsigned pings / signed
+ * action hooks with no payload). A new connector plugs in here + the registry; the route
+ * needs no changes.
+ */
+export async function isEmptyShoppingWebhookBodyAllowed(
+  connector: ShoppingConnectorId,
+  request: Request,
+): Promise<boolean> {
+  switch (connector) {
+    case 'woocommerce': {
+      const { isEmptyWcWebhookBodyAllowed } = await import('@/lib/connectors/woocommerce/webhooks')
+      return isEmptyWcWebhookBodyAllowed(request)
+    }
+    case 'shopify':
+      return false
+  }
+}
