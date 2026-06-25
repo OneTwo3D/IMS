@@ -1116,7 +1116,7 @@ function DailyBatchPanel({
           </div>
         </div>
 
-        {previewTotal === 0 && preview.groupA1.orderCount === 0 && preview.groupA2.orderCount === 0 && preview.groupB.shipmentCount === 0 ? (
+        {previewTotal === 0 && preview.groupA1.orderCount === 0 && preview.groupA2.orderCount === 0 && preview.groupB.shipmentCount === 0 && preview.groupBPreviewed !== false ? (
           <div className="text-center py-8 text-sm text-muted-foreground">
             Nothing pending. The next batch run will post no journals.
           </div>
@@ -1136,17 +1136,27 @@ function DailyBatchPanel({
               unit="order"
               debit={preview.groupA2.totalCost}
             />
-            <PreviewGroupCard
-              title="B — Shipment Revenue + COGS"
-              subtitle="DR Unearned / CR Sales + DR COGS / CR Allocated"
-              count={preview.groupB.shipmentCount}
-              unit="shipment"
-              debit={preview.groupB.totalRevenue + preview.groupB.totalCogs}
-              splits={[
-                { label: 'Revenue recognised', amount: preview.groupB.totalRevenue },
-                { label: 'COGS matched', amount: preview.groupB.totalCogs },
-              ]}
-            />
+            {preview.groupBPreviewed === false ? (
+              <div className="rounded-lg border border-dashed p-4 text-xs text-muted-foreground">
+                <p className="font-medium text-foreground">B — Shipment Revenue + COGS</p>
+                <p className="mt-1">
+                  Not previewed for this connector yet. The daily batch still posts
+                  shipment revenue and COGS journals when it next runs.
+                </p>
+              </div>
+            ) : (
+              <PreviewGroupCard
+                title="B — Shipment Revenue + COGS"
+                subtitle="DR Unearned / CR Sales + DR COGS / CR Allocated"
+                count={preview.groupB.shipmentCount}
+                unit="shipment"
+                debit={preview.groupB.totalRevenue + preview.groupB.totalCogs}
+                splits={[
+                  { label: 'Revenue recognised', amount: preview.groupB.totalRevenue },
+                  { label: 'COGS matched', amount: preview.groupB.totalCogs },
+                ]}
+              />
+            )}
           </div>
         )}
 
