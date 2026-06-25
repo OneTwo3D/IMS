@@ -1,4 +1,13 @@
+import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
+
 export type AccountingConnectorId = 'xero' | 'quickbooks'
+
+export type AccountingAccountBalanceSnapshotResult = {
+  fetched: number
+  persisted: number
+  skipped: number
+  errors: string[]
+}
 
 export type AccountingConnectorDef = {
   id: AccountingConnectorId
@@ -53,9 +62,12 @@ export type AccountingConnector = AccountingConnectorDef & {
   saveSettings(data: Record<string, string>): Promise<{ success: boolean; error?: string }>
   saveConnectionSettings(clientId: string, clientSecret: string): Promise<{ success: boolean; error?: string; message?: string }>
   getConnectionStatus(): Promise<AccountingConnectionStatus>
+  getConnectionTestState(): Promise<IntegrationConnectionTestState>
+  testConnection(): Promise<{ success: boolean; error?: string; message?: string }>
   connect(clientId: string, clientSecret: string, origin: string, returnPath?: string): Promise<{ success: boolean; redirectUrl?: string; error?: string }>
   disconnect(): Promise<{ success: boolean; error?: string }>
   syncAccounts(): Promise<{ synced: number; errors: string[] }>
+  syncAccountBalanceSnapshots(balanceDate?: string): Promise<AccountingAccountBalanceSnapshotResult>
   getAccounts(): Promise<AccountingAccountRow[]>
   fetchTaxRates(): Promise<AccountingTaxCodeRow[]>
   autoLinkTaxRates(): Promise<{
@@ -113,6 +125,13 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         const { getQuickBooksConnectionStatus } = await import('@/app/actions/quickbooks-sync')
         return getQuickBooksConnectionStatus()
       },
+      async getConnectionTestState() {
+        // QuickBooks does not yet run a fresh-secret connection-test gate.
+        return { status: 'never', testedAt: null, message: '', fingerprint: null }
+      },
+      async testConnection() {
+        return { success: false, error: 'QuickBooks connection testing is not available yet.' }
+      },
       async connect(clientId, clientSecret, origin, returnPath) {
         const { connectQuickBooks } = await import('@/app/actions/quickbooks-sync')
         return connectQuickBooks(clientId, clientSecret, origin, returnPath)
@@ -124,6 +143,9 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
       async syncAccounts() {
         const { syncQuickBooksAccounts } = await import('@/app/actions/quickbooks-sync')
         return syncQuickBooksAccounts()
+      },
+      async syncAccountBalanceSnapshots() {
+        return { fetched: 0, persisted: 0, skipped: 0, errors: ['QuickBooks account-balance snapshot ingestion is not implemented yet.'] }
       },
       async getAccounts() {
         const { getQuickBooksAccounts } = await import('@/app/actions/quickbooks-sync')
@@ -182,6 +204,14 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
       const { getXeroConnectionStatus } = await import('@/app/actions/xero-sync')
       return getXeroConnectionStatus()
     },
+    async getConnectionTestState() {
+      const { getXeroConnectionTestState } = await import('@/app/actions/xero-sync')
+      return getXeroConnectionTestState()
+    },
+    async testConnection() {
+      const { testXeroConnection } = await import('@/app/actions/xero-sync')
+      return testXeroConnection()
+    },
     async connect(clientId, clientSecret, origin, returnPath) {
       const { connectXero } = await import('@/app/actions/xero-sync')
       return connectXero(clientId, clientSecret, origin, returnPath)
@@ -193,6 +223,10 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
     async syncAccounts() {
       const { syncAccountingAccounts } = await import('@/app/actions/xero-sync')
       return syncAccountingAccounts()
+    },
+    async syncAccountBalanceSnapshots(balanceDate) {
+      const { syncAccountingAccountBalanceSnapshots } = await import('@/app/actions/xero-sync')
+      return syncAccountingAccountBalanceSnapshots(balanceDate)
     },
     async getAccounts() {
       const { getAccountingAccounts } = await import('@/app/actions/xero-sync')

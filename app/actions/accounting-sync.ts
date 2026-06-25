@@ -232,21 +232,19 @@ export async function saveAccountingConnectionSettings(
 }
 
 export async function getAccountingConnectionTestState(): Promise<IntegrationConnectionTestState> {
-  const connectorId = await getActiveConnector()
-  if (connectorId !== 'xero') {
+  const connector = await getActiveAccountingConnector()
+  if (!connector) {
     return { status: 'never', testedAt: null, message: '', fingerprint: null }
   }
-  const { getXeroConnectionTestState } = await import('@/app/actions/xero-sync')
-  return getXeroConnectionTestState()
+  return connector.getConnectionTestState()
 }
 
 export async function testAccountingConnection(): Promise<{ success: boolean; error?: string; message?: string }> {
-  const connectorId = await getActiveConnector()
-  if (connectorId !== 'xero') {
-    return { success: false, error: 'Enable Xero before testing the accounting connection.' }
+  const connector = await getActiveAccountingConnector()
+  if (!connector) {
+    return { success: false, error: 'Enable Xero or QuickBooks first.' }
   }
-  const { testXeroConnection } = await import('@/app/actions/xero-sync')
-  return testXeroConnection()
+  return connector.testConnection()
 }
 
 export async function getAccountingConnectionStatus(): Promise<AccountingConnectionStatus> {
@@ -286,17 +284,11 @@ export async function syncAccountingAccounts(): Promise<{ synced: number; errors
 }
 
 export async function syncAccountingAccountBalanceSnapshots(balanceDate?: string): Promise<{ fetched: number; persisted: number; skipped: number; errors: string[] }> {
-  const connectorId = await getActiveConnector()
-  if (connectorId === 'xero') {
-    // Keep this dynamic to avoid making the generic accounting facade eagerly
-    // load Xero server-action code in every accounting connector path.
-    const { syncAccountingAccountBalanceSnapshots: syncXeroBalances } = await import('@/app/actions/xero-sync')
-    return syncXeroBalances(balanceDate)
+  const connector = await getActiveAccountingConnector()
+  if (!connector) {
+    return { fetched: 0, persisted: 0, skipped: 0, errors: ['Enable Xero or QuickBooks first.'] }
   }
-  if (connectorId === 'quickbooks') {
-    return { fetched: 0, persisted: 0, skipped: 0, errors: ['QuickBooks account-balance snapshot ingestion is not implemented yet.'] }
-  }
-  return { fetched: 0, persisted: 0, skipped: 0, errors: ['Enable Xero before syncing account-balance snapshots.'] }
+  return connector.syncAccountBalanceSnapshots(balanceDate)
 }
 
 export async function getAccountingAccounts(): Promise<AccountingAccountRow[]> {
