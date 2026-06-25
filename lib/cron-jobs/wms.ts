@@ -8,4 +8,5 @@
 // Registration is an eager side effect (registerCronJobs at module load), so the
 // imports must be static — keep one line per WMS cron module.
 import './wms-order-status' // connector-agnostic (module 'wms')
+import './wms-order-push' // connector-agnostic (module 'wms')
 import './wms-mintsoft' // Mintsoft connector jobs
