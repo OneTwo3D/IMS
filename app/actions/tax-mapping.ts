@@ -5,7 +5,7 @@ import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import { getTaxRates, updateTaxRate } from '@/app/actions/settings'
 import { getShoppingTaxRateMappings, updateShoppingTaxRateMapping } from '@/app/actions/wc-sync'
-import { fetchXeroTaxRates } from '@/app/actions/xero-sync'
+import { fetchAccountingTaxRates } from '@/app/actions/accounting-sync'
 import type { ImsRateLite, WcRateLite, XeroRateLite } from '@/lib/tax/tax-rate-match'
 
 // ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ export async function getTaxRateMatchData(opts?: {
   const [imsRows, wcMappings, xeroRows] = await Promise.all([
     getTaxRates(false),
     includeWc ? getShoppingTaxRateMappings() : Promise.resolve([]),
-    includeXero ? fetchXeroTaxRates() : Promise.resolve([]),
+    includeXero ? fetchAccountingTaxRates() : Promise.resolve([]),
   ])
 
   return {
