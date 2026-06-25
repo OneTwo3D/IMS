@@ -220,6 +220,12 @@ export type WmsOrderCancelResult = {
   status: string
 }
 
+export type WmsOrderUpdateResult = {
+  /** False when the WMS order is past NEW and can no longer be amended. */
+  updated: boolean
+  status: string
+}
+
 export interface WmsConnector {
   readonly id: WmsConnectorId
   readonly name: string
@@ -240,6 +246,8 @@ export interface WmsConnector {
   fetchOrderStatus?(orderNumber: string): Promise<WmsOrderStatus | null>
   /** Push (create) an order into the WMS for fulfilment; idempotent on re-push. */
   pushOrder?(input: WmsOrderPushInput): Promise<WmsOrderPushResult>
+  /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */
+  updateOrder?(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */
   cancelOrder?(externalOrderId: string): Promise<WmsOrderCancelResult>
   verifyWebhookSignature?(

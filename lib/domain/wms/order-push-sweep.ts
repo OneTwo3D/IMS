@@ -21,9 +21,27 @@ const DEFAULT_BATCH_SIZE = 25
 export type WmsOrderPushSweepResult = {
   skipped?: string
   created: number
+  updated: number
   cancelled: number
+  held: number
+  released: number
   failed: number
   deadLettered: number
+}
+
+type OrderForPush = {
+  id: string
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  currency: string
+  customerName: string | null
+  customerEmail: string | null
+  shippingAddress: unknown
+  shippingService: string | null
+  shippingForeign: unknown
+  taxForeign: unknown
+  discountAmount: unknown
+  lines: CandidateLine[]
 }
 
 function num(value: unknown): number {
@@ -82,10 +100,46 @@ function buildLines(lines: CandidateLine[]): WmsOrderPushLine[] {
   })
 }
 
+// Fields the push payload needs; shared by the create and update passes.
+const ORDER_PUSH_SELECT = {
+  id: true,
+  orderNumber: true,
+  externalOrderNumber: true,
+  currency: true,
+  customerName: true,
+  customerEmail: true,
+  shippingAddress: true,
+  shippingService: true,
+  shippingForeign: true,
+  taxForeign: true,
+  discountAmount: true,
+  lines: { select: { sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
+} as const
+
+function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
+  return {
+    orderNumber: order.orderNumber ?? order.externalOrderNumber ?? order.id,
+    externalReference: order.id,
+    externalWarehouseId,
+    currency: order.currency,
+    shippingAddress: readAddress(order.shippingAddress, order.customerName),
+    email: order.customerEmail,
+    phone: null,
+    comments: null,
+    courierService: order.shippingService,
+    totalVat: num(order.taxForeign),
+    shippingExVat: num(order.shippingForeign),
+    shippingVat: 0,
+    discountExVat: num(order.discountAmount),
+    discountVat: 0,
+    lines: buildLines(order.lines),
+  }
+}
+
 export async function runWmsOrderPushSweep(
   options?: { batchSize?: number },
 ): Promise<WmsOrderPushSweepResult> {
-  const result: WmsOrderPushSweepResult = { created: 0, cancelled: 0, failed: 0, deadLettered: 0 }
+  const result: WmsOrderPushSweepResult = { created: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0 }
 
   const state = await getIntegrationPluginState()
   const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
@@ -102,6 +156,23 @@ export async function runWmsOrderPushSweep(
   })
   const externalWarehouseByWarehouse = new Map(bindings.map((b) => [b.warehouseId, b.externalWarehouseId]))
 
+  // --- Release pass: a HELD order back in a ready+paid state re-enters the
+  // create queue (its WMS order was cancelled when held, so it re-creates). ---
+  const toRelease = await db.wmsOrderPushLink.findMany({
+    where: { connector: connectorId, state: 'HELD', order: { status: { in: [...READY_STATUSES] }, paidAt: { not: null } } },
+    select: { id: true },
+    take: batchSize,
+  })
+  for (const link of toRelease) {
+    await db.wmsOrderPushLink
+      .update({
+        where: { id: link.id },
+        data: { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null },
+      })
+      .catch(() => {})
+    result.released += 1
+  }
+
   // --- Create pass ---
   if (externalWarehouseByWarehouse.size > 0) {
     const candidates = await db.salesOrder.findMany({
@@ -112,19 +183,8 @@ export async function runWmsOrderPushSweep(
         OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
       },
       select: {
-        id: true,
-        orderNumber: true,
-        externalOrderNumber: true,
-        currency: true,
-        customerName: true,
-        customerEmail: true,
-        shippingAddress: true,
+        ...ORDER_PUSH_SELECT,
         shipFromWarehouseId: true,
-        shippingService: true,
-        shippingForeign: true,
-        taxForeign: true,
-        discountAmount: true,
-        lines: { select: { sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
         wmsOrderPush: { select: { attempts: true } },
       },
       take: batchSize,
@@ -139,24 +199,7 @@ export async function runWmsOrderPushSweep(
 
       const now = new Date()
       try {
-        const input: WmsOrderPushInput = {
-          orderNumber: order.orderNumber ?? order.externalOrderNumber ?? order.id,
-          externalReference: order.id,
-          externalWarehouseId,
-          currency: order.currency,
-          shippingAddress: readAddress(order.shippingAddress, order.customerName),
-          email: order.customerEmail,
-          phone: null,
-          comments: null,
-          courierService: order.shippingService,
-          totalVat: num(order.taxForeign),
-          shippingExVat: num(order.shippingForeign),
-          shippingVat: 0,
-          discountExVat: num(order.discountAmount),
-          discountVat: 0,
-          lines: buildLines(order.lines),
-        }
-        const push = await connector.pushOrder(input)
+        const push = await connector.pushOrder(buildPushInput(order, externalWarehouseId))
         await db.wmsOrderPushLink.upsert({
           where: { orderId: order.id },
           create: {
@@ -177,6 +220,7 @@ export async function runWmsOrderPushSweep(
             lastError: null,
             pushedAt: now,
             lastAttemptAt: now,
+            cancelledAt: null,
           },
         })
         result.created += 1
@@ -192,6 +236,89 @@ export async function runWmsOrderPushSweep(
             create: { orderId: order.id, connector: connectorId, state: dead ? 'DEAD_LETTER' : 'PENDING_CREATE', attempts, lastError: message, lastAttemptAt: now },
             update: { state: dead ? 'DEAD_LETTER' : 'PENDING_CREATE', attempts, lastError: message, lastAttemptAt: now },
           })
+          .catch(() => {})
+      }
+    }
+  }
+
+  // --- Update pass: amend already-pushed orders changed since the last push ---
+  if (connector.updateOrder && externalWarehouseByWarehouse.size > 0) {
+    // "order changed since push" is a two-column comparison Prisma can't express;
+    // select the due ids in SQL so changed links aren't starved behind unchanged
+    // ones under the batch limit.
+    const dueRows = await db.$queryRaw<Array<{ id: string }>>`
+      SELECT l.id
+      FROM wms_order_push_links l
+      JOIN sales_orders o ON o.id = l."orderId"
+      WHERE l.connector = ${connectorId}
+        AND l.state::text = 'SYNCED'
+        AND l."externalOrderId" IS NOT NULL
+        AND o.status::text IN ('PROCESSING', 'ALLOCATED')
+        AND o."updatedAt" > COALESCE(l."pushedAt", to_timestamp(0))
+      ORDER BY o."updatedAt" ASC
+      LIMIT ${batchSize}
+    `
+    const dueIds = dueRows.map((row) => row.id)
+    const links = dueIds.length
+      ? await db.wmsOrderPushLink.findMany({
+          where: { id: { in: dueIds } },
+          select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } } },
+        })
+      : []
+    for (const link of links) {
+      const order = link.order
+      const externalWarehouseId = order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(order.shipFromWarehouseId) : undefined
+      if (!externalWarehouseId || !link.externalOrderId) continue
+
+      const now = new Date()
+      try {
+        const update = await connector.updateOrder(link.externalOrderId, buildPushInput(order, externalWarehouseId))
+        // Bump pushedAt either way so we don't re-attempt until the next change;
+        // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
+        await db.wmsOrderPushLink.update({
+          where: { id: link.id },
+          data: { pushedAt: now, lastAttemptAt: now, lastError: update.updated ? null : `Amendment not propagated (WMS status ${update.status})` },
+        })
+        if (update.updated) result.updated += 1
+      } catch (error) {
+        result.failed += 1
+        await db.wmsOrderPushLink
+          .update({ where: { id: link.id }, data: { lastError: error instanceof Error ? error.message : 'WMS order update failed', lastAttemptAt: now } })
+          .catch(() => {})
+      }
+    }
+  }
+
+  // --- Hold pass: an IMS-held order that was pushed is pulled back from the WMS
+  // (cancelled) and parked as HELD so a later release re-pushes it. ---
+  if (connector.cancelOrder) {
+    const toHold = await db.wmsOrderPushLink.findMany({
+      where: { connector: connectorId, state: 'SYNCED', externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
+      select: { id: true, externalOrderId: true },
+      take: batchSize,
+    })
+    for (const link of toHold) {
+      if (!link.externalOrderId) continue
+      const now = new Date()
+      try {
+        const cancel = await connector.cancelOrder(link.externalOrderId)
+        if (cancel.cancelled || cancel.status === 'NOT_FOUND') {
+          await db.wmsOrderPushLink.update({
+            where: { id: link.id },
+            data: { state: 'HELD', cancelledAt: now, lastError: null, lastAttemptAt: now },
+          })
+          result.held += 1
+        } else {
+          result.deadLettered += 1
+          await db.wmsOrderPushLink.update({
+            where: { id: link.id },
+            data: { state: 'DEAD_LETTER', lastError: `Held in IMS but WMS order not cancellable (status ${cancel.status})`, lastAttemptAt: now },
+          })
+        }
+      } catch (error) {
+        result.failed += 1
+        await db.wmsOrderPushLink
+          .update({ where: { id: link.id }, data: { lastError: error instanceof Error ? error.message : 'WMS hold/cancel failed', lastAttemptAt: now } })
           .catch(() => {})
       }
     }
