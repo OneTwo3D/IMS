@@ -1549,6 +1549,7 @@ model SalesOrder {
   shoppingLinks     ShoppingOrderLink[]
   wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
   wmsOrderStatus    WmsOrderStatusSnapshot?
+  wmsOrderPush      WmsOrderPushLink?
 
   @@index([status])
   @@index([status, updatedAt(sort: Desc)], map: "sales_orders_status_updatedAt_idx")
@@ -2283,6 +2284,38 @@ model WmsOrderStatusSnapshot {
   @@index([connector])
   @@index([fetchedAt])
   @@map("wms_order_status_snapshots")
+}
+
+// Outbound push state for an IMS sales order sent to a WMS for fulfilment
+// (Phase 8). The push sweep is the writer; `externalOrderId` is the stable join
+// to the WMS order after a successful create. Connector-agnostic.
+enum WmsOrderPushState {
+  PENDING_CREATE
+  SYNCED
+  PENDING_CANCEL
+  CANCELLED
+  DEAD_LETTER
+}
+
+model WmsOrderPushLink {
+  id                  String            @id @default(cuid())
+  orderId             String            @unique
+  connector           String
+  externalOrderId     String?
+  externalOrderNumber String?
+  state               WmsOrderPushState @default(PENDING_CREATE)
+  attempts            Int               @default(0)
+  lastError           String?
+  lastAttemptAt       DateTime?
+  pushedAt            DateTime?
+  cancelledAt         DateTime?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  order               SalesOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([connector, state])
+  @@map("wms_order_push_links")
 }
 
 // ---------------------------------------------------------------------------

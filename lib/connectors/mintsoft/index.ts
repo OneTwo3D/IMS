@@ -1,4 +1,4 @@
-import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderStatus, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
@@ -6,6 +6,7 @@ import {
 } from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderStatus } from './api/orders'
+import { cancelMintsoftOrder, pushMintsoftOrder } from './api/order-push'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -81,6 +82,14 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftOrderStatus(orderNumber)
   }
 
+  async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
+    return pushMintsoftOrder(input)
+  }
+
+  async cancelOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
+    return cancelMintsoftOrder(externalOrderId)
+  }
+
   async verifyWebhookSignature(
     rawBody: string,
     signatureHeader: string | null,
@@ -126,6 +135,7 @@ export {
   upsertMintsoftProduct,
 } from './api/client'
 export { fetchMintsoftOrderStatus } from './api/orders'
+export { cancelMintsoftOrder, pushMintsoftOrder } from './api/order-push'
 export {
   normalizeMintsoftAsn,
   normalizeMintsoftAsnLine,

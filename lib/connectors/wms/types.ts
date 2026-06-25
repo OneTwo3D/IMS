@@ -167,6 +167,59 @@ export type WmsOrderStatus = {
   raw?: Record<string, unknown> | null
 }
 
+export type WmsOrderAddress = {
+  firstName: string
+  lastName: string
+  company: string
+  address1: string
+  address2: string
+  town: string
+  county: string
+  postCode: string
+  country: string
+}
+
+export type WmsOrderPushLine = {
+  sku: string
+  quantity: number
+  unitPriceExVat: number
+  unitPriceVat: number
+  description: string | null
+}
+
+/** A storefront/IMS order to create in the WMS for fulfilment (Phase 8 push). */
+export type WmsOrderPushInput = {
+  orderNumber: string
+  /** Stable external reference the WMS stores to match the order back (IMS order id). */
+  externalReference: string
+  externalWarehouseId: string
+  currency: string
+  shippingAddress: WmsOrderAddress
+  email: string | null
+  phone: string | null
+  comments: string | null
+  /** Carrier/service name passed through for the WMS to resolve; null = WMS default. */
+  courierService: string | null
+  totalVat: number
+  shippingExVat: number
+  shippingVat: number
+  discountExVat: number
+  discountVat: number
+  lines: WmsOrderPushLine[]
+}
+
+export type WmsOrderPushResult = {
+  externalOrderId: string
+  externalOrderNumber: string | null
+  status: string
+}
+
+export type WmsOrderCancelResult = {
+  cancelled: boolean
+  /** WMS status observed; a non-NEW order is not cancellable and is left as-is. */
+  status: string
+}
+
 export interface WmsConnector {
   readonly id: WmsConnectorId
   readonly name: string
@@ -185,6 +238,10 @@ export interface WmsConnector {
   fetchBundle?(externalProductId: string): Promise<WmsBundleRef | null>
   /** Resolve the live order status for a storefront order number, if supported. */
   fetchOrderStatus?(orderNumber: string): Promise<WmsOrderStatus | null>
+  /** Push (create) an order into the WMS for fulfilment; idempotent on re-push. */
+  pushOrder?(input: WmsOrderPushInput): Promise<WmsOrderPushResult>
+  /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */
+  cancelOrder?(externalOrderId: string): Promise<WmsOrderCancelResult>
   verifyWebhookSignature?(
     rawBody: string,
     signatureHeader: string | null,

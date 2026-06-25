@@ -6,6 +6,7 @@ export type MintsoftSettings = {
   mintsoft_password: string
   mintsoft_webhook_secret: string
   mintsoft_admin_order_url_template: string
+  mintsoft_default_courier_service_id: string
 }
 
 export const MINTSOFT_SETTING_KEYS = [
@@ -14,6 +15,7 @@ export const MINTSOFT_SETTING_KEYS = [
   'mintsoft_password',
   'mintsoft_webhook_secret',
   'mintsoft_admin_order_url_template',
+  'mintsoft_default_courier_service_id',
 ] as const
 
 // `{id}` is substituted with the Mintsoft internal order id. Matches the proven
@@ -26,6 +28,7 @@ const MINTSOFT_DEFAULTS: MintsoftSettings = {
   mintsoft_password: '',
   mintsoft_webhook_secret: '',
   mintsoft_admin_order_url_template: MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE,
+  mintsoft_default_courier_service_id: '',
 }
 
 export async function getMintsoftSettings(): Promise<MintsoftSettings> {
