@@ -134,6 +134,39 @@ export type WmsConnectionCheck = {
   error?: string
 }
 
+export type WmsOrderTracking = {
+  trackingNumber: string | null
+  carrier: string | null
+  despatchedAt: string | null
+}
+
+/**
+ * Live order status for a storefront order as seen by the WMS. Read-only — used
+ * to surface a status chip + deep link on the sales-order view.
+ */
+export type WmsOrderStatus = {
+  /** The WMS's own internal order id (used for the deep link). */
+  externalOrderId: string
+  /** The WMS order number; may carry a merged marker (e.g. "5001+5002"). */
+  externalOrderNumber: string
+  /** Raw status as the WMS reports it (e.g. "DESPATCHED"). */
+  status: string
+  /** Human-readable status label. */
+  statusLabel: string
+  /** True when the WMS split the order into multiple parts. */
+  isSplit: boolean
+  /** Number of parts when split, else null. */
+  partCount: number | null
+  /** True when this order is a merge survivor of several storefront orders. */
+  isMerged: boolean
+  /** The storefront order numbers folded into a merged order. */
+  mergedOrderNumbers: string[]
+  /** Deep link to the order in the WMS web UI, if available. */
+  deepLinkUrl: string | null
+  tracking: WmsOrderTracking[]
+  raw?: Record<string, unknown> | null
+}
+
 export interface WmsConnector {
   readonly id: WmsConnectorId
   readonly name: string
@@ -150,6 +183,8 @@ export interface WmsConnector {
   pollReturns(since: Date): Promise<WmsReturnRecord[]>
   createBundle?(input: WmsBundleDto): Promise<WmsBundleRef>
   fetchBundle?(externalProductId: string): Promise<WmsBundleRef | null>
+  /** Resolve the live order status for a storefront order number, if supported. */
+  fetchOrderStatus?(orderNumber: string): Promise<WmsOrderStatus | null>
   verifyWebhookSignature?(
     rawBody: string,
     signatureHeader: string | null,

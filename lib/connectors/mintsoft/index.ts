@@ -1,10 +1,11 @@
-import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderStatus, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
+import { fetchMintsoftOrderStatus } from './api/orders'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -76,6 +77,10 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftBundle(externalProductId)
   }
 
+  async fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
+    return fetchMintsoftOrderStatus(orderNumber)
+  }
+
   async verifyWebhookSignature(
     rawBody: string,
     signatureHeader: string | null,
@@ -120,6 +125,7 @@ export {
   mintsoftRequest,
   upsertMintsoftProduct,
 } from './api/client'
+export { fetchMintsoftOrderStatus } from './api/orders'
 export {
   normalizeMintsoftAsn,
   normalizeMintsoftAsnLine,
