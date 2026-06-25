@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { planTransferPartialReceipt } from '../app/actions/transfers.ts'
+import { planTransferPartialReceipt } from '../lib/domain/inventory/transfer-partial-receipt.ts'
 
 const lines = [
   { id: 'l1', qty: 100, qtyReceived: 0 },
