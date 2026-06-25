@@ -19,6 +19,7 @@ import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableL
 import {
   dispatchTransfer,
   receiveTransfer,
+  receiveTransferPartial,
   cancelTransfer,
   cancelDispatchedTransfer,
   updateTransferDraft,
@@ -434,6 +435,112 @@ function MintsoftTransferAsnDialog({
 }
 
 // ---------------------------------------------------------------------------
+// Partial receive dialog
+// ---------------------------------------------------------------------------
+
+function PartialReceiveDialog({
+  transfer,
+  onClose,
+  onReceived,
+}: {
+  transfer: TransferRow
+  onClose: () => void
+  onReceived: () => void
+}) {
+  const outstanding = transfer.lines.filter((line) => Number(line.qty) > Number(line.qtyReceived))
+  const [qtys, setQtys] = useState<Record<string, string>>(() =>
+    Object.fromEntries(outstanding.map((line) => [line.id, String(Number(line.qty) - Number(line.qtyReceived))])),
+  )
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function submit() {
+    setError(null)
+    for (const line of outstanding) {
+      const remaining = Number(line.qty) - Number(line.qtyReceived)
+      const entered = Number(qtys[line.id])
+      if (Number.isFinite(entered) && entered > remaining) {
+        setError(`${line.sku}: cannot receive more than the ${remaining} remaining.`)
+        return
+      }
+    }
+    const lineDeltas = outstanding
+      .map((line) => ({ lineId: line.id, qty: Number(qtys[line.id]) }))
+      .filter((delta) => Number.isFinite(delta.qty) && delta.qty > 0)
+    if (lineDeltas.length === 0) {
+      setError('Enter a quantity for at least one line.')
+      return
+    }
+    setSubmitting(true)
+    // One token per submit makes a network retry of this exact call idempotent.
+    const res = await receiveTransferPartial(transfer.id, lineDeltas, crypto.randomUUID())
+    setSubmitting(false)
+    if (res.success) {
+      onReceived()
+      onClose()
+    } else {
+      setError(res.message ?? 'Failed to receive.')
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => { if (!open) onClose() }}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Receive part of {transfer.reference}</DialogTitle>
+          <DialogDescription>
+            Enter how many of each line have physically arrived. The transfer stays in transit until every line is fully received.
+          </DialogDescription>
+        </DialogHeader>
+        {outstanding.length === 0 ? (
+          <p className="text-sm text-muted-foreground">All lines are already received.</p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-xs">Product</TableHead>
+                <TableHead className="text-xs text-right">Remaining</TableHead>
+                <TableHead className="text-xs text-right w-32">Receive now</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {outstanding.map((line) => {
+                const remaining = Number(line.qty) - Number(line.qtyReceived)
+                return (
+                  <TableRow key={line.id}>
+                    <TableCell className="text-xs">{line.sku} — {line.productName}</TableCell>
+                    <TableCell className="text-xs text-right tabular-nums">{remaining}</TableCell>
+                    <TableCell className="text-right">
+                      <Input
+                        type="number"
+                        min={0}
+                        max={remaining}
+                        step="any"
+                        value={qtys[line.id] ?? ''}
+                        onChange={(e) => setQtys((prev) => ({ ...prev, [line.id]: e.target.value }))}
+                        className="h-8 text-right"
+                      />
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        )}
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <DialogFooter>
+          <Button variant="outline" size="sm" onClick={onClose} disabled={submitting}>Cancel</Button>
+          <Button size="sm" onClick={submit} disabled={submitting || outstanding.length === 0}>
+            {submitting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <PackageCheck className="h-3 w-3 mr-1" />}
+            Receive selected
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Single transfer row
 // ---------------------------------------------------------------------------
 
@@ -460,6 +567,7 @@ function TransferCard({
   const [expanded, setExpanded] = useState(false)
   const [editing, setEditing] = useState(false)
   const [showMintsoftDialog, setShowMintsoftDialog] = useState(false)
+  const [showPartialDialog, setShowPartialDialog] = useState(false)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -567,6 +675,10 @@ function TransferCard({
                   disabled={!mintsoftAsnState}>
                   <Upload className="h-3 w-3" /> Mintsoft ASN
                 </Button>
+                <Button size="sm" variant="outline" className="h-7 text-xs gap-1"
+                  onClick={() => setShowPartialDialog(true)} disabled={actioning}>
+                  <PackageCheck className="h-3 w-3" /> Receive Partial
+                </Button>
                 <Button size="sm" variant="outline" className="h-7 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950"
                   onClick={handleReceive} disabled={actioning}>
                   <PackageCheck className="h-3 w-3" /> Mark Received
@@ -650,6 +762,14 @@ function TransferCard({
           transfer={transfer}
           mintsoftAsnState={mintsoftAsnState}
           onClose={() => setShowMintsoftDialog(false)}
+        />
+      )}
+
+      {showPartialDialog && transfer.status === 'IN_TRANSIT' && (
+        <PartialReceiveDialog
+          transfer={transfer}
+          onClose={() => setShowPartialDialog(false)}
+          onReceived={() => router.refresh()}
         />
       )}
     </>
@@ -784,6 +904,7 @@ function MobileTransferCard({
   const [expanded, setExpanded] = useState(false)
   const [editing, setEditing] = useState(false)
   const [showMintsoftDialog, setShowMintsoftDialog] = useState(false)
+  const [showPartialDialog, setShowPartialDialog] = useState(false)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -871,6 +992,9 @@ function MobileTransferCard({
             <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={() => setShowMintsoftDialog(true)} disabled={!mintsoftAsnState}>
               <Upload className="h-3 w-3" /> Mintsoft ASN
             </Button>
+            <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={() => setShowPartialDialog(true)} disabled={actioning}>
+              <PackageCheck className="h-3 w-3" /> Receive Partial
+            </Button>
             <Button size="sm" variant="outline" className="h-8 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950" onClick={handleReceive} disabled={actioning}>
               <PackageCheck className="h-3 w-3" /> Mark Received
             </Button>
@@ -920,6 +1044,14 @@ function MobileTransferCard({
           transfer={transfer}
           mintsoftAsnState={mintsoftAsnState}
           onClose={() => setShowMintsoftDialog(false)}
+        />
+      )}
+
+      {showPartialDialog && transfer.status === 'IN_TRANSIT' && (
+        <PartialReceiveDialog
+          transfer={transfer}
+          onClose={() => setShowPartialDialog(false)}
+          onReceived={() => router.refresh()}
         />
       )}
     </MobileRecordCard>

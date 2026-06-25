@@ -17,9 +17,10 @@ import {
   createCostLayer,
 } from '@/lib/cost-layers'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
+import { isStockMovementIdempotencyConflict } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { canDispatchTransferQty, isCostLayerCoverageSufficient } from '@/lib/domain/inventory/transfer-availability'
-import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, floorQuantity, multiplyMoney, roundQuantity, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import {
   buildStockMovementValueFieldsFromConsumed,
@@ -625,6 +626,154 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
 // Receive (IN_TRANSIT → RECEIVED): books stock into destination warehouse
 // ---------------------------------------------------------------------------
 
+/**
+ * Books `qtyToReceive` units of one transfer line into the destination
+ * warehouse: a TRANSFER_IN movement, a stock-level increment, and recreated
+ * FIFO cost layers sliced from the dispatch snapshot (walking past
+ * `alreadyReceivedQty` so a WMS or earlier partial receipt is not double-costed),
+ * with a £0 balancing layer for any uncosted shortfall. Shared by the full
+ * (receiveTransfer) and partial (receiveTransferPartial) receive paths so they
+ * never drift. Caller is responsible for the line's qtyReceived update + status.
+ */
+async function applyTransferLineReceipt(
+  tx: Prisma.TransactionClient,
+  params: {
+    transferId: string
+    transferReference: string
+    toWarehouseId: string
+    productId: string
+    snapshot: Prisma.JsonValue | null | undefined
+    alreadyReceivedQty: number
+    qtyToReceive: number
+    /** When set, makes the receipt movement idempotent (skips if already booked). */
+    idempotencyKey?: string
+  },
+): Promise<{ booked: boolean }> {
+  const { transferId, transferReference, toWarehouseId, productId, snapshot, alreadyReceivedQty, qtyToReceive, idempotencyKey } = params
+
+  const snapshotSlice = sliceTransferSnapshotForReceipt({
+    snapshot,
+    alreadyReceivedQty,
+    qtyReceived: qtyToReceive,
+  })
+  const totalValueBase = snapshotSlice.reduce(
+    (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
+    toDecimal(0),
+  )
+  try {
+    await tx.stockMovement.create({
+      data: {
+        type: 'TRANSFER_IN',
+        productId,
+        fromWarehouseId: null,
+        toWarehouseId,
+        qty: qtyToReceive.toString(),
+        note: alreadyReceivedQty > 0
+          ? `Transfer ${transferReference} received (${qtyToReceive} after ${alreadyReceivedQty} already booked)`
+          : `Transfer ${transferReference} received`,
+        referenceType: 'StockTransfer',
+        referenceId: transferId,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...buildStockMovementValueFieldsFromTotal({ qty: qtyToReceive, totalValueBase }),
+      },
+    })
+  } catch (error) {
+    // Idempotent path only: a duplicate submit/retry already booked this line, so
+    // skip the rest of its booking (stock level, layers were applied the first time).
+    if (idempotencyKey && isStockMovementIdempotencyConflict(error)) return { booked: false }
+    throw error
+  }
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId: toWarehouseId } },
+    create: { productId, warehouseId: toWarehouseId, quantity: qtyToReceive.toString() },
+    update: { quantity: { increment: qtyToReceive } },
+  })
+
+  // Recreate FIFO layers at the destination from the unconsumed slice of the
+  // dispatch snapshot (the slicer walks past alreadyReceivedQty and returns the
+  // next qtyToReceive units — the same algorithm the WMS booked-in handler uses).
+  for (const entry of snapshotSlice) {
+    const entryQty = toDecimal(entry.qty)
+    const unitCostBase = toDecimal(entry.unitCostBase)
+    if (entryQty.gt(0) && unitCostBase.gte(0)) {
+      const newLayerId = await createCostLayer(tx, {
+        productId,
+        warehouseId: toWarehouseId,
+        qty: entryQty,
+        unitCostBase,
+      })
+      const copied = await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
+      if (copied === 0) {
+        await tx.costLayerSourceLine.create({
+          data: {
+            costLayerId: newLayerId,
+            sourceProductId: productId,
+            sourceCostLayerId: entry.costLayerId,
+            qty: entryQty.toFixed(6),
+            unitCostBase,
+            totalCostBase: roundQuantity(multiplyMoney(entryQty, unitCostBase), 6).toFixed(6),
+          },
+        })
+      }
+    }
+  }
+
+  // cogs-audit scjz.5: conserve quantity when the dispatch snapshot under-records
+  // costed units (source dispatched legacy/uncosted stock). Balance the shortfall
+  // with a £0 layer so on-hand never exceeds Σ layer remainingQty.
+  const sliceQtyTotal = snapshotSlice.reduce((sum, entry) => addMoney(sum, entry.qty), toDecimal(0))
+  const shortfall = subtractMoney(qtyToReceive, sliceQtyTotal)
+  if (shortfall.gt('0.000001')) {
+    await createCostLayer(tx, {
+      productId,
+      warehouseId: toWarehouseId,
+      qty: shortfall,
+      unitCostBase: 0,
+    })
+    await logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: transferId,
+      tag: 'stock',
+      action: 'transfer_uncosted_balancing_layer',
+      level: 'WARNING',
+      description: `Transfer ${transferReference}: received ${qtyToReceive} of ${productId} but the dispatch snapshot only covered ${sliceQtyTotal.toString()} costed units; created a £0-cost balancing layer for the ${shortfall.toString()}-unit shortfall (source stock/cost-layer desync).`,
+      metadata: { transferId, productId, warehouseId: toWarehouseId, remainingQty: qtyToReceive.toString(), sliceQty: sliceQtyTotal.toString(), shortfall: shortfall.toString() },
+    })
+  }
+
+  return { booked: true }
+}
+
+/** Cap each requested per-line delta to its remaining (qty − qtyReceived). */
+export type TransferReceiptPlanLine = { lineId: string; receiveQty: number }
+
+export function planTransferPartialReceipt(
+  lines: ReadonlyArray<{ id: string; qty: number; qtyReceived: number }>,
+  requested: ReadonlyArray<{ lineId: string; qty: number }>,
+): { plan: TransferReceiptPlanLine[]; fullyReceivedAfter: boolean } {
+  const lineById = new Map(lines.map((line) => [line.id, line]))
+  const requestedById = new Map<string, number>()
+  for (const item of requested) {
+    if (!lineById.has(item.lineId)) continue
+    if (!Number.isFinite(item.qty) || item.qty <= 0) continue
+    requestedById.set(item.lineId, (requestedById.get(item.lineId) ?? 0) + item.qty)
+  }
+
+  const plan: TransferReceiptPlanLine[] = []
+  for (const [lineId, requestedQty] of requestedById) {
+    const line = lineById.get(lineId)!
+    const remaining = Math.max(0, line.qty - line.qtyReceived)
+    const receiveQty = Math.min(requestedQty, remaining)
+    if (receiveQty > 0) plan.push({ lineId, receiveQty })
+  }
+
+  const receivedById = new Map(plan.map((p) => [p.lineId, p.receiveQty]))
+  const fullyReceivedAfter = lines.every(
+    (line) => line.qtyReceived + (receivedById.get(line.id) ?? 0) >= line.qty,
+  )
+  return { plan, fullyReceivedAfter }
+}
+
 export async function receiveTransfer(id: string): Promise<TransferResult> {
   try {
     await requirePermission('stock_control.transfer')
@@ -679,99 +828,15 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         const remainingQty = (remainingDecimal.lt(0) ? toDecimal(0) : remainingDecimal).toNumber()
 
         if (remainingQty > 0) {
-          // Compute the pure snapshot slice before movement creation so the
-          // transfer-in value fields and recreated destination layers use the
-          // same cost basis.
-          const snapshotSlice = sliceTransferSnapshotForReceipt({
+          await applyTransferLineReceipt(tx, {
+            transferId: id,
+            transferReference: transfer.reference,
+            toWarehouseId: transfer.toWarehouseId,
+            productId: line.productId,
             snapshot: snapshotByLineId.get(line.id),
             alreadyReceivedQty: alreadyReceived,
-            qtyReceived: remainingQty,
+            qtyToReceive: remainingQty,
           })
-          const totalValueBase = snapshotSlice.reduce(
-            (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
-            toDecimal(0),
-          )
-          await tx.stockMovement.create({
-            data: {
-              type: 'TRANSFER_IN',
-              productId: line.productId,
-              fromWarehouseId: null,
-              toWarehouseId: transfer.toWarehouseId,
-              qty: remainingQty.toString(),
-              note: alreadyReceived > 0
-                ? `Transfer ${transfer.reference} received (manual close-out of ${remainingQty} after ${alreadyReceived} already booked via WMS)`
-                : `Transfer ${transfer.reference} received`,
-              referenceType: 'StockTransfer',
-              referenceId: id,
-              ...buildStockMovementValueFieldsFromTotal({ qty: remainingQty, totalValueBase }),
-            },
-          })
-          await tx.stockLevel.upsert({
-            where: { productId_warehouseId: { productId: line.productId, warehouseId: transfer.toWarehouseId } },
-            create: { productId: line.productId, warehouseId: transfer.toWarehouseId, quantity: remainingQty.toString() },
-            update: { quantity: { increment: remainingQty } },
-          })
-
-          // Recreate FIFO layers at the destination warehouse from the slice
-          // of the snapshot that hasn't already been consumed by a WMS
-          // partial-receive. The snapshot is stored at dispatch and represents
-          // the full transfer's source layers; the slicer walks past
-          // alreadyReceived units and returns only the next remainingQty
-          // units, matching the same algorithm the WMS handler uses.
-          for (const entry of snapshotSlice) {
-            const entryQty = toDecimal(entry.qty)
-            const unitCostBase = toDecimal(entry.unitCostBase)
-            if (entryQty.gt(0) && unitCostBase.gte(0)) {
-              const newLayerId = await createCostLayer(tx, {
-                productId: line.productId,
-                warehouseId: transfer.toWarehouseId,
-                qty: entryQty,
-                unitCostBase,
-              })
-              const copied = await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
-              if (copied === 0) {
-                await tx.costLayerSourceLine.create({
-                  data: {
-                    costLayerId: newLayerId,
-                    sourceProductId: line.productId,
-                    sourceCostLayerId: entry.costLayerId,
-                    qty: entryQty.toFixed(6),
-                    unitCostBase,
-                    totalCostBase: roundQuantity(multiplyMoney(entryQty, unitCostBase), 6).toFixed(6),
-                  },
-                })
-              }
-            }
-          }
-
-          // cogs-audit scjz.5: the destination stock_level was incremented by the
-          // full remainingQty, but the recreated layers only cover the snapshot
-          // slice's quantity. If the dispatch snapshot under-records qty (the
-          // source dispatched legacy/uncosted stock that had no FIFO layer), the
-          // destination would otherwise hold uncosted on-hand (stock_level >
-          // Σ layer remainingQty). Balance the shortfall with a £0-cost layer so
-          // quantity is conserved and no value is invented or destroyed — the
-          // source units were uncosted, so the destination mirrors that. The
-          // underlying source desync is a separate data-quality concern.
-          const sliceQtyTotal = snapshotSlice.reduce((sum, entry) => addMoney(sum, entry.qty), toDecimal(0))
-          const shortfall = subtractMoney(remainingQty, sliceQtyTotal)
-          if (shortfall.gt('0.000001')) {
-            await createCostLayer(tx, {
-              productId: line.productId,
-              warehouseId: transfer.toWarehouseId,
-              qty: shortfall,
-              unitCostBase: 0,
-            })
-            await logActivity({
-              entityType: 'STOCK_ADJUSTMENT',
-              entityId: id,
-              tag: 'stock',
-              action: 'transfer_uncosted_balancing_layer',
-              level: 'WARNING',
-              description: `Transfer ${transfer.reference}: received ${remainingQty} of ${line.productId} but the dispatch snapshot only covered ${sliceQtyTotal.toString()} costed units; created a £0-cost balancing layer for the ${shortfall.toString()}-unit shortfall (source stock/cost-layer desync).`,
-              metadata: { transferId: id, productId: line.productId, warehouseId: transfer.toWarehouseId, remainingQty: remainingQty.toString(), sliceQty: sliceQtyTotal.toString(), shortfall: shortfall.toString() },
-            })
-          }
         }
 
         // Mark line as fully received regardless of which path got us here.
@@ -847,6 +912,182 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
       description: msg,
     })
 
+    return { message: msg }
+  }
+}
+
+const partialReceiptInputSchema = z
+  .array(
+    z.object({
+      lineId: z.string().min(1),
+      qty: z.number().refine(Number.isFinite, 'qty must be a finite number').positive('qty must be greater than zero'),
+    }),
+  )
+  .min(1, 'Select at least one line to receive')
+
+/**
+ * Receive PART of an in-transit transfer: book the operator-specified per-line
+ * quantities (capped at each line's remaining) into the destination, leaving the
+ * transfer IN_TRANSIT until every line is fully received. Shares the per-line
+ * receipt + FIFO recreation with receiveTransfer (applyTransferLineReceipt).
+ */
+export async function receiveTransferPartial(id: string, lineDeltas: unknown, submissionToken: unknown): Promise<TransferResult> {
+  try {
+    await requirePermission('stock_control.transfer')
+
+    const parsed = partialReceiptInputSchema.safeParse(lineDeltas)
+    if (!parsed.success) {
+      return { message: parsed.error.issues[0]?.message ?? 'Invalid receive request.' }
+    }
+    const requested = parsed.data
+    // Client-supplied per-submit token makes each line's receipt idempotent, so a
+    // retry/double-submit of the same partial cannot double-book stock.
+    const token = typeof submissionToken === 'string' ? submissionToken.trim().slice(0, 100) : ''
+    if (!token) return { message: 'Missing receive token — refresh and try again.' }
+
+    let receivedProductIds: string[] = []
+    let bookedCount = 0
+    await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
+      const transfer = await tx.stockTransfer.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          reference: true,
+          status: true,
+          toWarehouseId: true,
+          completedAt: true,
+          lines: { select: { id: true, productId: true, qty: true, qtyReceived: true, costLayerSnapshot: true } },
+        },
+      })
+      if (!transfer) throw new Error('Transfer not found')
+      if (transfer.status !== 'IN_TRANSIT') throw new Error('Only in-transit transfers can be partially received.')
+
+      const lineById = new Map(transfer.lines.map((l) => [l.id, l]))
+      // Fail loudly on lines that aren't part of this transfer (no silent skip).
+      for (const item of requested) {
+        if (!lineById.has(item.lineId)) throw new Error(`Transfer line ${item.lineId} is not part of this transfer.`)
+      }
+
+      const { plan } = planTransferPartialReceipt(
+        transfer.lines.map((l) => ({ id: l.id, qty: Number(l.qty), qtyReceived: Number(l.qtyReceived) })),
+        requested.map((r) => ({ lineId: r.lineId, qty: r.qty })),
+      )
+      // Empty plan = the selected lines are already fully received (e.g. an
+      // idempotent retry whose first submit completed them) — a no-op success,
+      // not an error.
+      const planProductIds = [...new Set(plan.map((p) => lineById.get(p.lineId)!.productId))]
+      await tx.stockLevel.createMany({
+        data: planProductIds.map((productId) => ({ productId, warehouseId: transfer.toWarehouseId, quantity: 0 })),
+        skipDuplicates: true,
+      })
+      await tx.$queryRaw`
+        SELECT "productId", "warehouseId"
+        FROM stock_levels
+        WHERE "productId" = ANY(${planProductIds}::text[])
+          AND "warehouseId" = ${transfer.toWarehouseId}
+        FOR UPDATE
+      `
+
+      for (const planLine of plan) {
+        const line = lineById.get(planLine.lineId)!
+        // Exact-decimal cap against the locked remaining, so qtyReceived reaches
+        // its line qty precisely (no JS-float drift on Decimal(12,4) quantities).
+        const qtyReceivedDecimal = toDecimal(line.qtyReceived)
+        const remainingDecimal = subtractMoney(line.qty, qtyReceivedDecimal)
+        let receiveDecimal = toDecimal(planLine.receiveQty)
+        if (receiveDecimal.gt(remainingDecimal)) receiveDecimal = remainingDecimal
+        // Floor to the transfer line's 4dp precision so the SAME value drives both
+        // the receipt movement and the qtyReceived set (no movement-vs-qtyReceived
+        // drift), and a sub-0.0001 request can never round UP and over-book — it
+        // floors to 0 and is skipped below.
+        receiveDecimal = floorQuantity(receiveDecimal, 4)
+        if (receiveDecimal.lte(0)) continue
+
+        const { booked } = await applyTransferLineReceipt(tx, {
+          transferId: id,
+          transferReference: transfer.reference,
+          toWarehouseId: transfer.toWarehouseId,
+          productId: line.productId,
+          snapshot: line.costLayerSnapshot,
+          alreadyReceivedQty: qtyReceivedDecimal.toNumber(),
+          qtyToReceive: receiveDecimal.toNumber(),
+          idempotencyKey: `transfer-partial:${token}:${line.id}`,
+        })
+        if (!booked) continue // retry of an already-booked line — don't double-count
+
+        await tx.stockTransferLine.update({
+          where: { id: line.id },
+          data: { qtyReceived: addMoney(qtyReceivedDecimal, receiveDecimal).toFixed(4) },
+        })
+        bookedCount++
+      }
+
+      receivedProductIds = planProductIds
+
+      // Recompute completion from the locked, updated rows (Decimal-exact) rather
+      // than the float plan, so the RECEIVED flip is precise.
+      const updatedLines = await tx.stockTransferLine.findMany({
+        where: { transferId: id },
+        select: { qty: true, qtyReceived: true },
+      })
+      const allReceived = updatedLines.every((l) => toDecimal(l.qtyReceived).gte(toDecimal(l.qty)))
+      if (allReceived) {
+        const closed = await tx.stockTransfer.updateMany({
+          where: { id, status: 'IN_TRANSIT' },
+          data: { status: 'RECEIVED', completedAt: transfer.completedAt ?? new Date() },
+        })
+        if (closed.count === 0) throw new Error('Transfer was already received')
+      }
+    }, STOCK_TX_OPTIONS)
+
+    // Nothing newly booked (idempotent retry, or lines already fully received):
+    // succeed quietly without a redundant receive activity or stock re-sync.
+    if (bookedCount === 0) return { success: true }
+
+    revalidatePath('/stock-control/transfers')
+    revalidatePath('/inventory')
+
+    const after = await db.stockTransfer.findUnique({
+      where: { id },
+      select: { reference: true, status: true, toWarehouse: { select: { name: true } } },
+    })
+    const fullyReceived = after?.status === 'RECEIVED'
+    await logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: fullyReceived ? 'received' : 'partially_received',
+      tag: 'stock',
+      description: `${fullyReceived ? 'Received' : 'Partially received'} transfer ${after?.reference ?? id} at ${after?.toWarehouse.name ?? id}`,
+    })
+
+    try {
+      await allocateBackordersForProducts(receivedProductIds, {
+        source: 'transfer_receive',
+        referenceId: id,
+        referenceLabel: `transfer partial receive ${after?.reference ?? id}`,
+      })
+    } catch (allocError) {
+      console.error(allocError)
+    }
+    try {
+      await enqueueStockSync(receivedProductIds, 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
+
+    return { success: true }
+  } catch (e: unknown) {
+    console.error(e)
+    const msg = toInventoryConstraintMessage(e, 'Failed to receive transfer.')
+    await logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'receive_failed',
+      tag: 'stock',
+      level: 'ERROR',
+      description: msg,
+    })
     return { message: msg }
   }
 }
