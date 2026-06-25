@@ -1,5 +1,5 @@
 import type { Metadata } from 'next'
-import { getMintsoftTransferAsnStates } from '@/app/actions/mintsoft-sync'
+import { getWmsTransferAsnStates } from '@/app/actions/wms-asn'
 import { getWarehouses, getScopedStockLevelMap } from '@/app/actions/stock'
 import { listProducts } from '@/app/actions/products'
 import { getTransfers } from '@/app/actions/transfers'
@@ -26,8 +26,8 @@ export default async function WarehouseTransfersPage() {
         return !product || isStockableProduct(product)
       }),
   ]))
-  const [mintsoftAsnStates, stockLevels] = await Promise.all([
-    getMintsoftTransferAsnStates(transfers.map((transfer) => transfer.id)),
+  const [wmsAsnStates, stockLevels] = await Promise.all([
+    getWmsTransferAsnStates(transfers.map((transfer) => transfer.id)),
     getScopedStockLevelMap({
       productIds: stockProductIds,
       warehouseIds: Array.from(new Set([
@@ -42,7 +42,7 @@ export default async function WarehouseTransfersPage() {
       warehouses={warehouses}
       products={stockable}
       initialTransfers={transfers}
-      mintsoftAsnStates={mintsoftAsnStates}
+      wmsAsnStates={wmsAsnStates}
       stockLevels={stockLevels}
     />
   )

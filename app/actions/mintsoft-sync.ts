@@ -47,6 +47,12 @@ import {
 } from '@/lib/integration-connection-test-gate'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsAsnPackagingType } from '@/lib/connectors/wms/types'
+import type {
+  WmsAsnRow,
+  WmsPurchaseOrderAsnStateCore,
+  WmsTransferAsnStateCore,
+  WmsCreateAsnInput,
+} from '@/lib/connectors/wms/asn-types'
 
 type MintsoftOrderLookupConnector = ShoppingConnectorId | ''
 
@@ -212,46 +218,16 @@ type MintsoftReturnRestockActivityMetadata = {
   orderId: string | null
 }
 
-export type MintsoftPurchaseOrderAsnRow = {
-  id: string
-  externalAsnId: string
-  status: string
-  createdAt: string
-  lastCallbackAt: string | null
-  closedAt: string | null
-  lineCount: number
-  totalExpectedQty: string
-  totalReceivedQty: string
-}
+// ASN view-models conform to the connector-agnostic WMS contract
+// (lib/connectors/wms/asn-types.ts); core flows consume the generic types via
+// the app/actions/wms-asn.ts facade.
+export type MintsoftPurchaseOrderAsnRow = WmsAsnRow
 
-export type MintsoftPurchaseOrderAsnState = {
-  pluginEnabled: boolean
-  canCreate: boolean
-  canManage: boolean
-  blockedReason: string | null
-  destinationWarehouseCode: string | null
-  bindingExternalWarehouseId: string | null
-  existingAsns: MintsoftPurchaseOrderAsnRow[]
-}
+export type MintsoftPurchaseOrderAsnState = WmsPurchaseOrderAsnStateCore
 
-export type MintsoftTransferAsnState = {
-  pluginEnabled: boolean
-  canCreate: boolean
-  canManage: boolean
-  blockedReason: string | null
-  destinationWarehouseCode: string | null
-  bindingExternalWarehouseId: string | null
-  existingAsns: MintsoftPurchaseOrderAsnRow[]
-}
+export type MintsoftTransferAsnState = WmsTransferAsnStateCore
 
-export type MintsoftCreatePurchaseOrderAsnInput = {
-  packagingType?: WmsAsnPackagingType | null
-  packageCount?: number | null
-  eta?: string | null
-  supplierReference?: string | null
-  carrier?: string | null
-  autoCallback?: boolean
-}
+export type MintsoftCreatePurchaseOrderAsnInput = WmsCreateAsnInput
 
 export type MintsoftBundleLinkRow = {
   id: string
