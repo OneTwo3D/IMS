@@ -114,6 +114,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/xero-tax-rate-drift': {
+    access: 'cron-secret',
+    reason: 'IMS↔Xero TaxRate drift detection (alert-only); guarded by verifyCron.',
+  },
   '/api/cron/activity-cleanup': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
