@@ -16,7 +16,7 @@ import {
   validateMintsoftBaseUrl,
   type MintsoftSettings,
 } from '@/lib/connectors/mintsoft'
-import { inferMintsoftOrderLookupConnector } from '@/lib/connectors/mintsoft/order-lookup'
+import { inferShoppingOrderLookupConnector } from '@/lib/fulfillment/shopping-order-lookup'
 import {
   clearMintsoftAlignmentCreditsForBinding,
   createMintsoftBindingHandover,
@@ -649,7 +649,7 @@ function buildMintsoftConnectionFingerprint(input: {
 }
 
 async function ensureMintsoftConnectionId(): Promise<string> {
-  const inferredOrderLookupConnector = await inferMintsoftOrderLookupConnector()
+  const inferredOrderLookupConnector = await inferShoppingOrderLookupConnector()
   const existingConnection = await db.wmsConnection.findFirst({
     where: { connector: 'mintsoft' },
     orderBy: [{ createdAt: 'asc' }],

@@ -2,6 +2,17 @@ import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
+/**
+ * Connector-agnostic resolution of which shopping (storefront) connector an
+ * order belongs to. Orders imported from a storefront are linked via
+ * ShoppingOrderLink; a WMS/3PL never owns its own order links — it references
+ * the storefront order — so WMS-sourced flows must resolve the backing
+ * shopping connector before looking an order up.
+ *
+ * Lives in the generic fulfillment layer (not under any connector) so both the
+ * WMS boundary and individual connectors can share it.
+ */
+
 export function isShoppingConnectorId(value: string | null | undefined): value is ShoppingConnectorId {
   return value === 'woocommerce' || value === 'shopify'
 }
@@ -22,7 +33,13 @@ async function getObservedShoppingOrderLinkConnectors(): Promise<ShoppingConnect
     .filter(isShoppingConnectorId)
 }
 
-export async function inferMintsoftOrderLookupConnector(
+/**
+ * Resolve the shopping connector to use for order lookup. Prefers an explicitly
+ * persisted connector; otherwise infers it from the single observed
+ * ShoppingOrderLink connector, falling back to the single enabled shopping
+ * plugin. Returns null when the choice is ambiguous (0 or >1 candidates).
+ */
+export async function inferShoppingOrderLookupConnector(
   persistedConnector?: string | null,
 ): Promise<ShoppingConnectorId | null> {
   if (isShoppingConnectorId(persistedConnector)) {

@@ -1,10 +1,16 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { getMintsoftConnectionRecord } from '@/lib/connectors/mintsoft/api/auth'
-import { inferMintsoftOrderLookupConnector } from '@/lib/connectors/mintsoft/order-lookup'
+import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
+import type { WmsConnectorId } from '@/lib/connectors/wms/types'
+import { isShoppingConnectorId } from '@/lib/fulfillment/shopping-order-lookup'
+import { isWmsConnectorId, resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 
-export type ExternalFulfillmentSource = 'woocommerce' | 'shopify' | 'mintsoft'
+// A fulfillment update originates from either a storefront (shopping) connector
+// that owns the order's ShoppingOrderLink, or a WMS/3PL connector that
+// references a storefront order. Derived from the connector registries so a new
+// connector is included without editing this core flow.
+export type ExternalFulfillmentSource = ShoppingConnectorId | WmsConnectorId
 export type ExternalShipmentStatus = 'PENDING' | 'PICKING' | 'PACKED' | 'SHIPPED'
 
 export type ExternalFulfillmentLookup =
@@ -29,11 +35,10 @@ type ResolvedOrder = {
 
 async function resolveShoppingConnectorForSource(
   source: ExternalFulfillmentSource,
-): Promise<'woocommerce' | 'shopify' | null> {
-  if (source === 'woocommerce' || source === 'shopify') return source
-
-  const connection = await getMintsoftConnectionRecord()
-  return inferMintsoftOrderLookupConnector(connection?.orderLookupConnector)
+): Promise<ShoppingConnectorId | null> {
+  if (isShoppingConnectorId(source)) return source
+  if (isWmsConnectorId(source)) return resolveWmsOrderLookupConnector(source)
+  return null
 }
 
 export async function resolveOrderForExternalFulfillment(
@@ -48,9 +53,9 @@ export async function resolveOrderForExternalFulfillment(
   }
 
   if ('externalOrderId' in lookup) {
-    if (source === 'mintsoft') {
-      // Mintsoft order IDs are Mintsoft's own internal identifiers, not the
-      // storefront order IDs stored on shopping_order_links.
+    if (isWmsConnectorId(source)) {
+      // WMS order IDs are the WMS's own internal identifiers, not the storefront
+      // order IDs stored on shopping_order_links, so this lookup form is N/A.
       return null
     }
 
