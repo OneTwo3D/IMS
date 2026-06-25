@@ -17,6 +17,7 @@ import {
   createCostLayer,
 } from '@/lib/cost-layers'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
+import { planTransferPartialReceipt } from '@/lib/domain/inventory/transfer-partial-receipt'
 import { isStockMovementIdempotencyConflict } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { canDispatchTransferQty, isCostLayerCoverageSufficient } from '@/lib/domain/inventory/transfer-availability'
@@ -744,35 +745,6 @@ async function applyTransferLineReceipt(
   return { booked: true }
 }
 
-/** Cap each requested per-line delta to its remaining (qty − qtyReceived). */
-export type TransferReceiptPlanLine = { lineId: string; receiveQty: number }
-
-export function planTransferPartialReceipt(
-  lines: ReadonlyArray<{ id: string; qty: number; qtyReceived: number }>,
-  requested: ReadonlyArray<{ lineId: string; qty: number }>,
-): { plan: TransferReceiptPlanLine[]; fullyReceivedAfter: boolean } {
-  const lineById = new Map(lines.map((line) => [line.id, line]))
-  const requestedById = new Map<string, number>()
-  for (const item of requested) {
-    if (!lineById.has(item.lineId)) continue
-    if (!Number.isFinite(item.qty) || item.qty <= 0) continue
-    requestedById.set(item.lineId, (requestedById.get(item.lineId) ?? 0) + item.qty)
-  }
-
-  const plan: TransferReceiptPlanLine[] = []
-  for (const [lineId, requestedQty] of requestedById) {
-    const line = lineById.get(lineId)!
-    const remaining = Math.max(0, line.qty - line.qtyReceived)
-    const receiveQty = Math.min(requestedQty, remaining)
-    if (receiveQty > 0) plan.push({ lineId, receiveQty })
-  }
-
-  const receivedById = new Map(plan.map((p) => [p.lineId, p.receiveQty]))
-  const fullyReceivedAfter = lines.every(
-    (line) => line.qtyReceived + (receivedById.get(line.id) ?? 0) >= line.qty,
-  )
-  return { plan, fullyReceivedAfter }
-}
 
 export async function receiveTransfer(id: string): Promise<TransferResult> {
   try {
