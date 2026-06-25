@@ -1,4 +1,14 @@
-export type WmsConnectorId = 'mintsoft'
+/**
+ * Canonical list of WMS/3PL connector ids. This is the single source of truth
+ * the generic WMS boundary derives from — registry entries, plugin-enabled
+ * checks, and module routing all read this list rather than hardcoding a
+ * connector literal. Add a new id here (plus a registry entry, an
+ * IntegrationPluginId + setting key, and per-connector cron/webhook ingress)
+ * when a new WMS connector lands; core sales/PO/transfer/stock flows need no edits.
+ */
+export const WMS_CONNECTOR_IDS = ['mintsoft'] as const
+
+export type WmsConnectorId = (typeof WMS_CONNECTOR_IDS)[number]
 
 export type WmsConnectionSettings = {
   baseUrl: string
