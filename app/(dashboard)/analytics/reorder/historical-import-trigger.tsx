@@ -8,7 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { saveForecastSettings, type ForecastSettings } from '@/app/actions/forecasting'
-import type { HistoricalImportProgress } from '@/lib/connectors/woocommerce/orders'
+import type { HistoricalImportProgress } from '@/lib/historical-import'
 import { importHistoricalSalesCsv } from '@/app/actions/wc-import'
 
 // audit-00o7: moved verbatim from the retired forecast page's TrainingDialog so the
