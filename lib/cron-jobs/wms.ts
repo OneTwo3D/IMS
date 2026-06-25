@@ -6,5 +6,6 @@
 // its registry entry + WMS_CONNECTOR_IDS), not editing index.ts.
 //
 // Registration is an eager side effect (registerCronJobs at module load), so the
-// imports must be static — keep one line per WMS connector cron module.
-import './wms-mintsoft'
+// imports must be static — keep one line per WMS cron module.
+import './wms-order-status' // connector-agnostic (module 'wms')
+import './wms-mintsoft' // Mintsoft connector jobs

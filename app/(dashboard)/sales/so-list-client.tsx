@@ -4,6 +4,7 @@ import { useState, useTransition, useEffect } from 'react'
 import Link from 'next/link'
 import type { SoRow, SoStatus } from '@/app/actions/sales'
 import { getSalesOrders } from '@/app/actions/sales'
+import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
@@ -66,7 +67,7 @@ function timeAgo(iso: string): string {
 
 type ColKey = 'order' | 'customer' | 'status' | 'total' | 'warehouse' | 'created' | 'items'
   | 'source' | 'country' | 'payment' | 'shipping' | 'orderDate' | 'shippedDate'
-  | 'deliveredDate' | 'invoiceStatus' | 'stockStatus' | 'cogs' | 'profit'
+  | 'deliveredDate' | 'invoiceStatus' | 'stockStatus' | 'cogs' | 'profit' | 'wms'
 
 type ColDef = { key: ColKey; label: string; align?: 'right' }
 
@@ -89,6 +90,7 @@ const ALL_COLUMNS: ColDef[] = [
   { key: 'stockStatus', label: 'Stock Status' },
   { key: 'cogs', label: 'COGS', align: 'right' },
   { key: 'profit', label: 'Profit %', align: 'right' },
+  { key: 'wms', label: 'WMS Status' },
 ]
 
 const DEFAULT_VISIBLE: ColKey[] = ['order', 'customer', 'status', 'total', 'warehouse', 'created', 'items']
@@ -328,6 +330,12 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
           </TableCell>
         )
       }
+      case 'wms':
+        return (
+          <TableCell key={key}>
+            {so.wmsStatus ? <WmsOrderStatusChip status={so.wmsStatus} /> : <span className="text-muted-foreground text-xs">—</span>}
+          </TableCell>
+        )
     }
   }
 

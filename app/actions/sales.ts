@@ -2,6 +2,9 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
+import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
@@ -149,6 +152,8 @@ export type SoRow = {
   lineCount: number
   cogsBase: number | null
   profitMarginPercent: number | null
+  /** Cached live WMS order status (sales-list chip); null when none/disabled. */
+  wmsStatus: WmsOrderStatusView | null
 }
 
 export type SoDetail = SoRow & {
@@ -404,6 +409,23 @@ const SO_SELECT = {
   paymentMethodTitle: true,
   externalCreatedAt: true,
   createdAt: true,
+  wmsOrderStatus: {
+    select: {
+      connector: true,
+      connectorLabel: true,
+      externalOrderId: true,
+      externalOrderNumber: true,
+      status: true,
+      statusLabel: true,
+      isSplit: true,
+      partCount: true,
+      isMerged: true,
+      mergedOrderNumbers: true,
+      deepLinkUrl: true,
+      trackingNumber: true,
+      carrier: true,
+    },
+  },
   _count: { select: { lines: true } },
   lines: { select: { cogsBase: true } },
 } as const
@@ -447,6 +469,21 @@ function mapSoRow(so: {
   createdAt: Date
   _count: { lines: number }
   lines: { cogsBase: unknown }[]
+  wmsOrderStatus: {
+    connector: string
+    connectorLabel: string
+    externalOrderId: string
+    externalOrderNumber: string
+    status: string
+    statusLabel: string
+    isSplit: boolean
+    partCount: number | null
+    isMerged: boolean
+    mergedOrderNumbers: string[]
+    deepLinkUrl: string | null
+    trackingNumber: string | null
+    carrier: string | null
+  } | null
 }): SoRow {
   const totalBase = Number(so.totalBase)
   const lineCogs = so.lines.map((l) => l.cogsBase != null ? Number(l.cogsBase) : null)
@@ -457,8 +494,26 @@ function mapSoRow(so: {
     : null
   const externalLink = so.shoppingLinks[0] ?? null
   const hasExternalSource = !!externalLink
+  const wms = so.wmsOrderStatus
   return {
     id: so.id,
+    wmsStatus: wms
+      ? {
+          connectorLabel: wms.connectorLabel,
+          externalOrderId: wms.externalOrderId,
+          externalOrderNumber: wms.externalOrderNumber,
+          status: wms.status,
+          statusLabel: wms.statusLabel,
+          isSplit: wms.isSplit,
+          partCount: wms.partCount,
+          isMerged: wms.isMerged,
+          mergedOrderNumbers: wms.mergedOrderNumbers,
+          deepLinkUrl: wms.deepLinkUrl,
+          tracking: wms.trackingNumber || wms.carrier
+            ? [{ trackingNumber: wms.trackingNumber, carrier: wms.carrier, despatchedAt: null }]
+            : [],
+        }
+      : null,
     externalOrderId: externalLink?.externalOrderId ?? null,
     externalOrderNumber: so.externalOrderNumber,
     orderNumber: so.orderNumber,
@@ -560,13 +615,26 @@ export async function getSalesOrders(
   if (!opts?.includeCompleted) {
     where.status = { notIn: ['COMPLETED', 'DELIVERED'] }
   }
-  const orders = await db.salesOrder.findMany({
-    where,
-    select: SO_SELECT,
-    orderBy: { createdAt: 'desc' },
-    take: limit,
+  const [orders, pluginState] = await Promise.all([
+    db.salesOrder.findMany({
+      where,
+      select: SO_SELECT,
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+    }),
+    getIntegrationPluginState(),
+  ])
+  const activeWmsConnector = WMS_CONNECTOR_IDS.find((id) => pluginState[id]) ?? null
+  return orders.map((order) => {
+    const row = mapSoRow(order)
+    // Only surface a cached chip from the currently-active WMS connector, so
+    // disabling/switching the connector clears stale chips (matching the live
+    // detail view, which returns null when no WMS connector is enabled).
+    if (row.wmsStatus && order.wmsOrderStatus?.connector !== activeWmsConnector) {
+      row.wmsStatus = null
+    }
+    return row
   })
-  return orders.map(mapSoRow)
 }
 
 export async function getSalesOrder(id: string): Promise<SoDetail | null> {
