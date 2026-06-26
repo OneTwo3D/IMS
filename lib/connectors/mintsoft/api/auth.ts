@@ -108,27 +108,28 @@ async function persistMintsoftAuthSession(token: string, expiresAt: Date): Promi
       },
     })
 
+    // Upsert on the (connector, label) unique key so two concurrent refreshes
+    // (e.g. across app instances) can't both create the row and trip the unique
+    // constraint — the findFirst+create pattern was racy. An existing connection's
+    // label is preserved (Mintsoft connections may carry a custom label via the
+    // connection-settings form); only when none exists is the default-labelled
+    // row created.
     const existingConnection = await tx.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
       orderBy: [{ createdAt: 'asc' }],
-      select: { id: true },
+      select: { label: true },
     })
+    const label = existingConnection?.label ?? DEFAULT_MINTSOFT_CONNECTION_LABEL
 
-    if (existingConnection) {
-      await tx.wmsConnection.update({
-        where: { id: existingConnection.id },
-        data: {
-          tokenExpiresAt: expiresAt,
-          lastAuthAt: now,
-        },
-      })
-      return
-    }
-
-    await tx.wmsConnection.create({
-      data: {
+    await tx.wmsConnection.upsert({
+      where: { connector_label: { connector: 'mintsoft', label } },
+      create: {
         connector: 'mintsoft',
-        label: DEFAULT_MINTSOFT_CONNECTION_LABEL,
+        label,
+        tokenExpiresAt: expiresAt,
+        lastAuthAt: now,
+      },
+      update: {
         tokenExpiresAt: expiresAt,
         lastAuthAt: now,
       },
@@ -254,17 +255,23 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
   }
 
   if (!mintsoftAuthRefreshInFlight) {
-    const refreshPromise = (async () => {
+    const tracked = (async () => {
       const session = await requestMintsoftAuthSession(config.baseUrl, config.username, config.password)
       await persistMintsoftAuthSession(session.token, session.expiresAt)
       return session.token
     })()
-
-    mintsoftAuthRefreshInFlight = refreshPromise.finally(() => {
-      if (mintsoftAuthRefreshInFlight === refreshPromise) {
+    mintsoftAuthRefreshInFlight = tracked
+    // Clear the slot once the refresh settles — resolve OR reject — comparing
+    // against the exact promise stored so it always nulls out (the earlier
+    // `.finally()` compared against a different, pre-`.finally` promise, so it
+    // never matched and a failed refresh leaked). `then(clear, clear)` fulfils on
+    // both paths, so the discarded continuation can't surface an unhandled rejection.
+    const clearSlot = () => {
+      if (mintsoftAuthRefreshInFlight === tracked) {
         mintsoftAuthRefreshInFlight = null
       }
-    })
+    }
+    void tracked.then(clearSlot, clearSlot)
   }
 
   return mintsoftAuthRefreshInFlight
