@@ -34,7 +34,7 @@ type CourierOption =
   | { kind: 'none' }
 
 /** Resolve a shipping-service name to a Mintsoft CourierServiceId via the configured map. */
-function resolveMappedCourierId(courierService: string | null, mapJson: string): number | null {
+export function resolveMappedCourierId(courierService: string | null, mapJson: string): number | null {
   if (!courierService || !mapJson.trim()) return null
   try {
     const map = JSON.parse(mapJson) as Record<string, unknown>
@@ -46,7 +46,7 @@ function resolveMappedCourierId(courierService: string | null, mapJson: string):
   }
 }
 
-function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption, includeItems = true): Record<string, unknown> {
+export function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption, includeItems = true): Record<string, unknown> {
   const a = input.shippingAddress
   const payload: Record<string, unknown> = {
     OrderNumber: input.orderNumber,

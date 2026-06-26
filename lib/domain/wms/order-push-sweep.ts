@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import type { WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
+import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
 
 /**
  * Connector-agnostic outbound order-push sweep (Phase 8). Pushes IMS sales
@@ -49,7 +49,7 @@ function num(value: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
-function readAddress(raw: unknown, customerName: string | null): WmsOrderAddress {
+export function readAddress(raw: unknown, customerName: string | null): WmsOrderAddress {
   const a = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
   const str = (...keys: string[]): string => {
     for (const key of keys) {
@@ -80,7 +80,7 @@ type CandidateLine = {
   description: string
 }
 
-function buildLines(lines: CandidateLine[]): WmsOrderPushLine[] {
+export function buildLines(lines: CandidateLine[]): WmsOrderPushLine[] {
   return lines.map((line) => {
     // A line with no SKU can't be fulfilled by the WMS — fail the whole order
     // (caught → retried → dead-lettered) rather than silently dropping the line.
@@ -136,106 +136,98 @@ function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOr
   }
 }
 
-export async function runWmsOrderPushSweep(
-  options?: { batchSize?: number },
+// --- Testability boundary -------------------------------------------------
+// The sweep's data access is behind a port so the state machine can be unit
+// tested with an in-memory fake (see tests/wms-order-push-sweep-state.test.ts),
+// mirroring the repository pattern used by the shopping webhook inbox.
+
+type PushState = 'PENDING_CREATE' | 'SYNCED' | 'PENDING_CANCEL' | 'CANCELLED' | 'DEAD_LETTER' | 'HELD'
+type LinkWrite = {
+  connector?: string
+  externalOrderId?: string | null
+  externalOrderNumber?: string | null
+  state?: PushState
+  attempts?: number
+  lastError?: string | null
+  pushedAt?: Date | null
+  lastAttemptAt?: Date | null
+  cancelledAt?: Date | null
+}
+
+export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
+export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
+export type WmsPushLinkRef = { id: string; externalOrderId: string | null }
+
+export interface WmsOrderPushPort {
+  activeBindings(connector: string): Promise<Array<{ warehouseId: string; externalWarehouseId: string }>>
+  /** HELD links whose order is back in a ready+paid state. */
+  releasableHeldOrders(connector: string, limit: number): Promise<Array<{ id: string }>>
+  /** Ready+paid orders for bound warehouses with no link or a PENDING_CREATE link. */
+  createCandidates(connector: string, boundWarehouseIds: string[], limit: number): Promise<WmsPushCandidate[]>
+  /** SYNCED links for ready orders changed since the last push (updatedAt > pushedAt). */
+  updatableLinks(connector: string, limit: number): Promise<WmsPushUpdateLink[]>
+  /** SYNCED links whose order is ON_HOLD. */
+  holdableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
+  /** SYNCED links whose order is CANCELLED in IMS. */
+  cancellableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
+  upsertByOrder(orderId: string, create: LinkWrite & { connector: string }, update: LinkWrite): Promise<void>
+  updateLink(id: string, data: LinkWrite): Promise<void>
+}
+
+type PushConnector = Pick<WmsConnector, 'pushOrder' | 'updateOrder' | 'cancelOrder'>
+
+/**
+ * Testable core of the order-push sweep — operates purely on the injected
+ * connector + port. The production entry point (runWmsOrderPushSweep) wires the
+ * active connector and the Prisma-backed port.
+ */
+export async function runWmsOrderPushSweepCore(
+  connector: PushConnector,
+  connectorId: string,
+  port: WmsOrderPushPort,
+  options?: { batchSize?: number; now?: () => Date },
 ): Promise<WmsOrderPushSweepResult> {
   const result: WmsOrderPushSweepResult = { created: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0 }
-
-  const state = await getIntegrationPluginState()
-  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
-  if (!connectorId) return { ...result, skipped: 'No WMS connector enabled' }
-
-  const connector = getWmsConnector(connectorId)
   if (!connector.pushOrder) return { ...result, skipped: 'Active WMS connector has no order-push support' }
 
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE
+  const now = options?.now ?? (() => new Date())
 
-  const bindings = await db.externalWmsBinding.findMany({
-    where: { connector: connectorId, active: true, connection: { active: true } },
-    select: { warehouseId: true, externalWarehouseId: true },
-  })
+  const bindings = await port.activeBindings(connectorId)
   const externalWarehouseByWarehouse = new Map(bindings.map((b) => [b.warehouseId, b.externalWarehouseId]))
 
   // --- Release pass: a HELD order back in a ready+paid state re-enters the
   // create queue (its WMS order was cancelled when held, so it re-creates). ---
-  const toRelease = await db.wmsOrderPushLink.findMany({
-    where: { connector: connectorId, state: 'HELD', order: { status: { in: [...READY_STATUSES] }, paidAt: { not: null } } },
-    select: { id: true },
-    take: batchSize,
-  })
-  for (const link of toRelease) {
-    await db.wmsOrderPushLink
-      .update({
-        where: { id: link.id },
-        data: { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null },
-      })
-      .catch(() => {})
+  for (const link of await port.releasableHeldOrders(connectorId, batchSize)) {
+    await port.updateLink(link.id, { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null }).catch(() => {})
     result.released += 1
   }
 
   // --- Create pass ---
   if (externalWarehouseByWarehouse.size > 0) {
-    const candidates = await db.salesOrder.findMany({
-      where: {
-        status: { in: [...READY_STATUSES] },
-        paidAt: { not: null },
-        shipFromWarehouseId: { in: [...externalWarehouseByWarehouse.keys()] },
-        OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
-      },
-      select: {
-        ...ORDER_PUSH_SELECT,
-        shipFromWarehouseId: true,
-        wmsOrderPush: { select: { attempts: true } },
-      },
-      take: batchSize,
-      orderBy: { updatedAt: 'asc' },
-    })
-
+    const candidates = await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
     for (const order of candidates) {
-      const externalWarehouseId = order.shipFromWarehouseId
-        ? externalWarehouseByWarehouse.get(order.shipFromWarehouseId)
-        : undefined
+      const externalWarehouseId = order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId) continue
 
-      const now = new Date()
+      const ts = now()
       try {
-        const push = await connector.pushOrder(buildPushInput(order, externalWarehouseId))
-        await db.wmsOrderPushLink.upsert({
-          where: { orderId: order.id },
-          create: {
-            orderId: order.id,
-            connector: connectorId,
-            externalOrderId: push.externalOrderId,
-            externalOrderNumber: push.externalOrderNumber,
-            state: 'SYNCED',
-            attempts: 0,
-            pushedAt: now,
-            lastAttemptAt: now,
-          },
-          update: {
-            connector: connectorId,
-            externalOrderId: push.externalOrderId,
-            externalOrderNumber: push.externalOrderNumber,
-            state: 'SYNCED',
-            lastError: null,
-            pushedAt: now,
-            lastAttemptAt: now,
-            cancelledAt: null,
-          },
-        })
+        const push = await connector.pushOrder!(buildPushInput(order, externalWarehouseId))
+        await port.upsertByOrder(
+          order.id,
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', attempts: 0, pushedAt: ts, lastAttemptAt: ts },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null },
+        )
         result.created += 1
       } catch (error) {
-        const attempts = (order.wmsOrderPush?.attempts ?? 0) + 1
+        const attempts = order.pushAttempts + 1
         const dead = attempts >= MAX_ATTEMPTS
         const message = error instanceof Error ? error.message : 'WMS order push failed'
         if (dead) result.deadLettered += 1
         else result.failed += 1
-        await db.wmsOrderPushLink
-          .upsert({
-            where: { orderId: order.id },
-            create: { orderId: order.id, connector: connectorId, state: dead ? 'DEAD_LETTER' : 'PENDING_CREATE', attempts, lastError: message, lastAttemptAt: now },
-            update: { state: dead ? 'DEAD_LETTER' : 'PENDING_CREATE', attempts, lastError: message, lastAttemptAt: now },
-          })
+        const state: PushState = dead ? 'DEAD_LETTER' : 'PENDING_CREATE'
+        await port
+          .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: ts }, { state, attempts, lastError: message, lastAttemptAt: ts })
           .catch(() => {})
       }
     }
@@ -243,48 +235,20 @@ export async function runWmsOrderPushSweep(
 
   // --- Update pass: amend already-pushed orders changed since the last push ---
   if (connector.updateOrder && externalWarehouseByWarehouse.size > 0) {
-    // "order changed since push" is a two-column comparison Prisma can't express;
-    // select the due ids in SQL so changed links aren't starved behind unchanged
-    // ones under the batch limit.
-    const dueRows = await db.$queryRaw<Array<{ id: string }>>`
-      SELECT l.id
-      FROM wms_order_push_links l
-      JOIN sales_orders o ON o.id = l."orderId"
-      WHERE l.connector = ${connectorId}
-        AND l.state::text = 'SYNCED'
-        AND l."externalOrderId" IS NOT NULL
-        AND o.status::text IN ('PROCESSING', 'ALLOCATED')
-        AND o."updatedAt" > COALESCE(l."pushedAt", to_timestamp(0))
-      ORDER BY o."updatedAt" ASC
-      LIMIT ${batchSize}
-    `
-    const dueIds = dueRows.map((row) => row.id)
-    const links = dueIds.length
-      ? await db.wmsOrderPushLink.findMany({
-          where: { id: { in: dueIds } },
-          select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } } },
-        })
-      : []
-    for (const link of links) {
-      const order = link.order
-      const externalWarehouseId = order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(order.shipFromWarehouseId) : undefined
+    for (const link of await port.updatableLinks(connectorId, batchSize)) {
+      const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId || !link.externalOrderId) continue
 
-      const now = new Date()
+      const ts = now()
       try {
-        const update = await connector.updateOrder(link.externalOrderId, buildPushInput(order, externalWarehouseId))
+        const update = await connector.updateOrder(link.externalOrderId, buildPushInput(link.order, externalWarehouseId))
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
-        await db.wmsOrderPushLink.update({
-          where: { id: link.id },
-          data: { pushedAt: now, lastAttemptAt: now, lastError: update.updated ? null : `Amendment not propagated (WMS status ${update.status})` },
-        })
+        await port.updateLink(link.id, { pushedAt: ts, lastAttemptAt: ts, lastError: update.updated ? null : `Amendment not propagated (WMS status ${update.status})` })
         if (update.updated) result.updated += 1
       } catch (error) {
         result.failed += 1
-        await db.wmsOrderPushLink
-          .update({ where: { id: link.id }, data: { lastError: error instanceof Error ? error.message : 'WMS order update failed', lastAttemptAt: now } })
-          .catch(() => {})
+        await port.updateLink(link.id, { lastError: error instanceof Error ? error.message : 'WMS order update failed', lastAttemptAt: ts }).catch(() => {})
       }
     }
   }
@@ -292,74 +256,132 @@ export async function runWmsOrderPushSweep(
   // --- Hold pass: an IMS-held order that was pushed is pulled back from the WMS
   // (cancelled) and parked as HELD so a later release re-pushes it. ---
   if (connector.cancelOrder) {
-    const toHold = await db.wmsOrderPushLink.findMany({
-      where: { connector: connectorId, state: 'SYNCED', externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
-      select: { id: true, externalOrderId: true },
-      take: batchSize,
-    })
-    for (const link of toHold) {
+    for (const link of await port.holdableLinks(connectorId, batchSize)) {
       if (!link.externalOrderId) continue
-      const now = new Date()
+      const ts = now()
       try {
         const cancel = await connector.cancelOrder(link.externalOrderId)
         if (cancel.cancelled || cancel.status === 'NOT_FOUND') {
-          await db.wmsOrderPushLink.update({
-            where: { id: link.id },
-            data: { state: 'HELD', cancelledAt: now, lastError: null, lastAttemptAt: now },
-          })
+          await port.updateLink(link.id, { state: 'HELD', cancelledAt: ts, lastError: null, lastAttemptAt: ts })
           result.held += 1
         } else {
           result.deadLettered += 1
-          await db.wmsOrderPushLink.update({
-            where: { id: link.id },
-            data: { state: 'DEAD_LETTER', lastError: `Held in IMS but WMS order not cancellable (status ${cancel.status})`, lastAttemptAt: now },
-          })
+          await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `Held in IMS but WMS order not cancellable (status ${cancel.status})`, lastAttemptAt: ts })
         }
       } catch (error) {
         result.failed += 1
-        await db.wmsOrderPushLink
-          .update({ where: { id: link.id }, data: { lastError: error instanceof Error ? error.message : 'WMS hold/cancel failed', lastAttemptAt: now } })
-          .catch(() => {})
+        await port.updateLink(link.id, { lastError: error instanceof Error ? error.message : 'WMS hold/cancel failed', lastAttemptAt: ts }).catch(() => {})
       }
     }
   }
 
   // --- Cancel pass: IMS-cancelled orders that were pushed (SYNCED) ---
   if (connector.cancelOrder) {
-    const toCancel = await db.wmsOrderPushLink.findMany({
-      where: { connector: connectorId, state: 'SYNCED', externalOrderId: { not: null }, order: { status: 'CANCELLED' } },
-      select: { id: true, externalOrderId: true },
-      take: batchSize,
-    })
-
-    for (const link of toCancel) {
+    for (const link of await port.cancellableLinks(connectorId, batchSize)) {
       if (!link.externalOrderId) continue
-      const now = new Date()
+      const ts = now()
       try {
         const cancel = await connector.cancelOrder(link.externalOrderId)
         if (cancel.cancelled || cancel.status === 'NOT_FOUND') {
-          await db.wmsOrderPushLink.update({
-            where: { id: link.id },
-            data: { state: 'CANCELLED', cancelledAt: now, lastError: null, lastAttemptAt: now },
-          })
+          await port.updateLink(link.id, { state: 'CANCELLED', cancelledAt: ts, lastError: null, lastAttemptAt: ts })
           result.cancelled += 1
         } else {
           // Past NEW in the WMS — already being fulfilled despite the IMS cancel.
           // Surface as a dead-letter conflict rather than retrying forever.
           result.deadLettered += 1
-          await db.wmsOrderPushLink.update({
-            where: { id: link.id },
-            data: { state: 'DEAD_LETTER', lastError: `WMS order not cancellable (status ${cancel.status})`, lastAttemptAt: now },
-          })
+          await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `WMS order not cancellable (status ${cancel.status})`, lastAttemptAt: ts })
         }
       } catch (error) {
         result.failed += 1
-        await db.wmsOrderPushLink
-          .update({ where: { id: link.id }, data: { lastError: error instanceof Error ? error.message : 'WMS cancel failed', lastAttemptAt: now } })
-          .catch(() => {})
+        await port.updateLink(link.id, { lastError: error instanceof Error ? error.message : 'WMS cancel failed', lastAttemptAt: ts }).catch(() => {})
       }
     }
   }
 
   return result
+}
+
+/** Prisma-backed port — the exact queries the sweep used before the extraction. */
+export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
+  return {
+    activeBindings: (connector) =>
+      db.externalWmsBinding.findMany({
+        where: { connector, active: true, connection: { active: true } },
+        select: { warehouseId: true, externalWarehouseId: true },
+      }),
+    releasableHeldOrders: (connector, limit) =>
+      db.wmsOrderPushLink.findMany({
+        where: { connector, state: 'HELD', order: { status: { in: [...READY_STATUSES] }, paidAt: { not: null } } },
+        select: { id: true },
+        take: limit,
+      }),
+    async createCandidates(connector, boundWarehouseIds, limit) {
+      const rows = await db.salesOrder.findMany({
+        where: {
+          status: { in: [...READY_STATUSES] },
+          paidAt: { not: null },
+          shipFromWarehouseId: { in: boundWarehouseIds },
+          OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
+        },
+        select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, wmsOrderPush: { select: { attempts: true } } },
+        take: limit,
+        orderBy: { updatedAt: 'asc' },
+      })
+      return rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
+    },
+    async updatableLinks(connector, limit) {
+      // "order changed since push" is a two-column comparison Prisma can't express.
+      const dueRows = await db.$queryRaw<Array<{ id: string }>>`
+        SELECT l.id
+        FROM wms_order_push_links l
+        JOIN sales_orders o ON o.id = l."orderId"
+        WHERE l.connector = ${connector}
+          AND l.state::text = 'SYNCED'
+          AND l."externalOrderId" IS NOT NULL
+          AND o.status::text IN ('PROCESSING', 'ALLOCATED')
+          AND o."updatedAt" > COALESCE(l."pushedAt", to_timestamp(0))
+        ORDER BY o."updatedAt" ASC
+        LIMIT ${limit}
+      `
+      const dueIds = dueRows.map((row) => row.id)
+      if (!dueIds.length) return []
+      return db.wmsOrderPushLink.findMany({
+        where: { id: { in: dueIds } },
+        select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } } },
+      })
+    },
+    holdableLinks: (connector, limit) =>
+      db.wmsOrderPushLink.findMany({
+        where: { connector, state: 'SYNCED', externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
+        select: { id: true, externalOrderId: true },
+        take: limit,
+      }),
+    cancellableLinks: (connector, limit) =>
+      db.wmsOrderPushLink.findMany({
+        where: { connector, state: 'SYNCED', externalOrderId: { not: null }, order: { status: 'CANCELLED' } },
+        select: { id: true, externalOrderId: true },
+        take: limit,
+      }),
+    async upsertByOrder(orderId, create, update) {
+      await db.wmsOrderPushLink.upsert({ where: { orderId }, create: { orderId, ...create }, update })
+    },
+    async updateLink(id, data) {
+      await db.wmsOrderPushLink.update({ where: { id }, data })
+    },
+  }
+}
+
+export async function runWmsOrderPushSweep(
+  options?: { batchSize?: number },
+): Promise<WmsOrderPushSweepResult> {
+  const empty: WmsOrderPushSweepResult = { created: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0 }
+
+  const state = await getIntegrationPluginState()
+  const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
+  if (!connectorId) return { ...empty, skipped: 'No WMS connector enabled' }
+
+  const connector = getWmsConnector(connectorId)
+  if (!connector.pushOrder) return { ...empty, skipped: 'Active WMS connector has no order-push support' }
+
+  return runWmsOrderPushSweepCore(connector, connectorId, createPrismaWmsOrderPushPort(), options)
 }
