@@ -121,7 +121,7 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Description', width: 195 },
+    { label: 'Description', width: 195, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price (${sym})`, width: 65, align: 'right' },
     { label: 'Discount', width: 50, align: 'right' },
@@ -192,7 +192,7 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   const { sym, symPos } = await getCurrencyFormat(so.currency)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'Description', width: 230 },
+    { label: 'Description', width: 230, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price (${sym})`, width: 65, align: 'right' },
     { label: `Tax (${sym})`, width: 55, align: 'right' },

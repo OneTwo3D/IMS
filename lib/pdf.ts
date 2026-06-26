@@ -73,6 +73,12 @@ export type PdfTableColumn = {
   label: string
   width: number       // in points
   align?: 'left' | 'right' | 'center'
+  /**
+   * When true, the cell wraps onto multiple lines to show the full value, and the
+   * row grows to fit (instead of single-line + ellipsis). Use for free-text columns
+   * like product descriptions where the whole value must be visible.
+   */
+  wrap?: boolean
 }
 
 export type PdfTableRow = string[]
@@ -133,6 +139,8 @@ export async function drawHeader(
     title: string
     reference: string
     date: string
+    /** Optional extra reference shown under Ref (e.g. the order number on an invoice). */
+    secondaryReference?: { label: string; value: string }
     recipient?: {
       name: string
       contact?: string | null
@@ -205,13 +213,16 @@ export async function drawHeader(
     if (opts.recipient.email) { doc.fontSize(8).text(opts.recipient.email, rx, ry) }
   }
 
-  // Reference + date right-aligned
+  // Reference (+ optional secondary reference) + date, right-aligned
   doc
     .font('Helvetica')
     .fontSize(8)
     .fillColor('#888888')
     .text(`Ref: ${opts.reference}`, 50 + colW, startY + 60, { width: colW, align: 'right' })
-    .text(`Date: ${opts.date}`, 50 + colW, doc.y, { width: colW, align: 'right' })
+  if (opts.secondaryReference) {
+    doc.text(`${opts.secondaryReference.label}: ${opts.secondaryReference.value}`, 50 + colW, doc.y, { width: colW, align: 'right' })
+  }
+  doc.text(`Date: ${opts.date}`, 50 + colW, doc.y, { width: colW, align: 'right' })
 
   doc.y = Math.max(doc.y, y) + 20
   doc.fillColor('#000000')
@@ -262,14 +273,27 @@ export function drawTable(
   // Rows
   doc.font('Helvetica').fontSize(8).fillColor('#000000')
   for (let ri = 0; ri < rows.length; ri++) {
-    if (y + rowHeight > 780) {
+    // Compute the height this row needs. A `wrap` column shows its full value over
+    // as many lines as required, so the row grows to fit the tallest wrapped cell;
+    // non-wrap columns stay on the single fixed-height line. (font/size are set
+    // above so heightOfString measures with the row's Helvetica 8.)
+    let thisRowHeight = rowHeight
+    for (let ci = 0; ci < columns.length; ci++) {
+      const col = columns[ci]
+      if (!col.wrap) continue
+      const val = rows[ri][ci] ?? ''
+      const textHeight = doc.heightOfString(val, { width: col.width - 8 })
+      thisRowHeight = Math.max(thisRowHeight, Math.ceil(textHeight) + 10)
+    }
+
+    if (y + thisRowHeight > 780) {
       doc.addPage()
       y = 50
     }
 
     // Zebra stripe
     if (ri % 2 === 1) {
-      doc.rect(startX, y, totalWidth, rowHeight).fill('#fafafa')
+      doc.rect(startX, y, totalWidth, thisRowHeight).fill('#fafafa')
       doc.fillColor('#000000')
     }
 
@@ -277,16 +301,18 @@ export function drawTable(
     for (let ci = 0; ci < columns.length; ci++) {
       const col = columns[ci]
       const val = rows[ri][ci] ?? ''
-      // Rows are a fixed rowHeight, so a value wider than its column must NOT
-      // wrap (it would overflow the row and split mid-value, e.g. MPNs/barcodes).
-      // Keep it on one line and ellipsise anything that still overflows.
-      const textOpts = { width: col.width - 8, align: (col.align ?? 'left') as 'left' | 'right' | 'center', lineBreak: false, ellipsis: true }
+      const align = (col.align ?? 'left') as 'left' | 'right' | 'center'
+      // wrap → multi-line, full value shown; otherwise keep it on one line and
+      // ellipsise so a wide value (e.g. MPN/barcode) never splits mid-row.
+      const textOpts = col.wrap
+        ? { width: col.width - 8, align, lineBreak: true }
+        : { width: col.width - 8, align, lineBreak: false, ellipsis: true }
       doc.text(val, x + 4, y + 6, textOpts)
       x += col.width
     }
 
     // Row border
-    y += rowHeight
+    y += thisRowHeight
     doc.moveTo(startX, y).lineTo(startX + totalWidth, y).lineWidth(0.25).strokeColor('#eeeeee').stroke()
   }
 

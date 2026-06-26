@@ -6,6 +6,7 @@ import { formatCountryDisplay } from '@/lib/countries'
 import { loadInvoicePdf } from '@/lib/invoice-pdf'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, groupVatBreakdown, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { formatMoney } from '@/lib/utils'
+import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
 
@@ -61,6 +62,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   await drawHeader(doc, branding, {
     title: 'Invoice',
     reference: invNum,
+    ...(so.orderNumber ? { secondaryReference: { label: 'Order', value: so.orderNumber } } : {}),
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
@@ -81,9 +83,13 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const sym = currencyRow?.symbol ?? (so.currency === 'GBP' ? '£' : so.currency)
   const symPos: 'PREFIX' | 'POSTFIX' = currencyRow?.symbolPosition ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
+  const base = await getBaseCurrencyDisplay()
+  const baseMoney = (n: number) => formatMoney(n, base.symbol, base.symbolPosition)
+  // Show base-currency equivalents (VAT + total) when the order is in a foreign currency.
+  const showBaseEquivalent = so.currency !== base.code
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'Description', width: 230 },
+    { label: 'Description', width: 230, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price (${sym})`, width: 65, align: 'right' },
     { label: `Tax (${sym})`, width: 55, align: 'right' },
@@ -140,9 +146,15 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
   doc.text(money(Number(so.totalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
 
-  if (so.currency !== 'GBP') {
+  if (showBaseEquivalent) {
+    // Total + VAT in the base currency on one line, e.g. "(GBP equivalent £80.73, 20% VAT £13.46)".
+    const equivParts = [`${base.code} equivalent ${baseMoney(Number(so.totalBase))}`]
+    if (Number(so.taxForeign) > 0) {
+      const vatPct = so.taxRatePercent != null ? `${(Number(so.taxRatePercent) * 100).toFixed(0)}% ` : ''
+      equivParts.push(`${vatPct}VAT ${baseMoney(Number(so.taxBase))}`)
+    }
     doc.font('Helvetica').fontSize(8).fillColor('#888')
-      .text(`(GBP equivalent: ${formatMoney(Number(so.totalBase), '£', 'PREFIX')})`, lX, doc.y + 3, { width: lW + vW, align: 'right' })
+      .text(`(${equivParts.join(', ')})`, lX, doc.y + 3, { width: lW + vW, align: 'right' })
   }
 
   // Footer note from template
