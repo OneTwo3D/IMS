@@ -148,7 +148,7 @@ export function buildShipheroWebhookSweepWhere(now: Date): Prisma.WmsWebhookEven
   }
 }
 
-export function getShipheroWebhookSweeperPageSize(env: NodeJS.ProcessEnv = process.env): number {
+export function getShipheroWebhookSweeperPageSize(env: Record<string, string | undefined> = process.env): number {
   const raw = env[PAGE_SIZE_ENV]?.trim()
   if (!raw) return DEFAULT_PAGE_SIZE
   const parsed = Number.parseInt(raw, 10)
@@ -207,6 +207,13 @@ export async function processShipheroWebhookEvent(
 
       let appliedRank: number | null = null
       if (locked.externalOrderId && locked.statusRank != null) {
+        // Serialize ALL processing for this order so the monotonic guard is
+        // concurrency-safe. The FOR UPDATE above locks only THIS event row, but
+        // sibling events for the same order are different rows — without this a
+        // stale rank-2 and a fresh rank-4 event could both read the same
+        // pre-commit appliedRank and both apply. A per-order advisory xact lock
+        // (auto-released at commit) makes the read-decide-apply atomic per order.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`shiphero:order:${locked.externalOrderId}`}))`
         const applied = await tx.wmsWebhookEvent.aggregate({
           where: {
             connector: CONNECTOR,
@@ -241,7 +248,15 @@ export async function processShipheroWebhookEvent(
   } catch (error) {
     const message = error instanceof Error ? error.message : 'ShipHero webhook processing failed'
     const retry = buildShipheroWebhookRetryUpdate({ attempts: event.processingAttempts, lastError: message, now })
-    await db.wmsWebhookEvent.update({ where: { id: eventId }, data: retry }).catch(() => undefined)
+    // Conditional on processedAt IS NULL so a concurrently-processed event isn't
+    // clobbered back into a retry state. Only report dead/pending if the retry
+    // state actually persisted — otherwise the row is unchanged (processed
+    // elsewhere, or the write failed) and the sweeper will revisit it.
+    const persisted = await db.wmsWebhookEvent
+      .updateMany({ where: { id: eventId, processedAt: null }, data: retry })
+      .then((result) => result.count > 0)
+      .catch(() => false)
+    if (!persisted) return { status: 'duplicate', eventId }
     return retry.processingStatus === 'DEAD'
       ? { status: 'dead', eventId, error: message }
       : { status: 'pending', eventId, error: message }
@@ -258,7 +273,7 @@ function increment(counters: ShipheroWebhookCounters, result: ShipheroWebhookPro
 
 export type SweepShipheroWebhookEventsOptions = ProcessShipheroWebhookEventOptions & {
   pageSize?: number
-  env?: NodeJS.ProcessEnv
+  env?: Record<string, string | undefined>
 }
 
 /** Drain due ShipHero webhook events (PENDING or PENDING_RETRY past nextRetryAt). */
