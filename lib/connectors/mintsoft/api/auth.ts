@@ -108,24 +108,32 @@ async function persistMintsoftAuthSession(token: string, expiresAt: Date): Promi
       },
     })
 
-    // Upsert on the (connector, label) unique key so two concurrent refreshes
-    // (e.g. across app instances) can't both create the row and trip the unique
-    // constraint — the findFirst+create pattern was racy. An existing connection's
-    // label is preserved (Mintsoft connections may carry a custom label via the
-    // connection-settings form); only when none exists is the default-labelled
-    // row created.
     const existingConnection = await tx.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
       orderBy: [{ createdAt: 'asc' }],
-      select: { label: true },
+      select: { id: true },
     })
-    const label = existingConnection?.label ?? DEFAULT_MINTSOFT_CONNECTION_LABEL
 
+    if (existingConnection) {
+      // Update by id (not by label): a Mintsoft connection can be renamed via the
+      // connection-settings form, so a label-keyed write could miss the row if a
+      // rename races this refresh and end up inserting a duplicate. Updating by id
+      // is immune to that.
+      await tx.wmsConnection.update({
+        where: { id: existingConnection.id },
+        data: { tokenExpiresAt: expiresAt, lastAuthAt: now },
+      })
+      return
+    }
+
+    // No connection yet: upsert on the default-label unique so two concurrent
+    // first-time refreshes can't both create the row and trip the (connector,
+    // label) unique constraint — the prior bare create was racy.
     await tx.wmsConnection.upsert({
-      where: { connector_label: { connector: 'mintsoft', label } },
+      where: { connector_label: { connector: 'mintsoft', label: DEFAULT_MINTSOFT_CONNECTION_LABEL } },
       create: {
         connector: 'mintsoft',
-        label,
+        label: DEFAULT_MINTSOFT_CONNECTION_LABEL,
         tokenExpiresAt: expiresAt,
         lastAuthAt: now,
       },
