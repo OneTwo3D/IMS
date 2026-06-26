@@ -6,6 +6,8 @@ import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Lo
 import { Button } from '@/components/ui/button'
 import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
+import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
+import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -90,6 +92,7 @@ type Props = {
   currencies: CurrencyRow[]
   externalOrderLinks?: Array<{ label: string; url: string }>
   wmsOrderStatus?: WmsOrderStatusView | null
+  wmsPushState?: WmsOrderPushStateView | null
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -791,7 +794,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1039,6 +1042,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           {wmsOrderStatus && (
             <span className="inline-flex items-center self-center">
               <WmsOrderStatusChip status={wmsOrderStatus} />
+            </span>
+          )}
+          {wmsPushState && (
+            <span className="inline-flex items-center self-center">
+              <WmsOrderPushChip orderId={so.id} push={wmsPushState} />
             </span>
           )}
           {canCancel && (
