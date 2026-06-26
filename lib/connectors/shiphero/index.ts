@@ -3,6 +3,7 @@ import type {
   WmsAsnRef,
   WmsConnectionCheck,
   WmsConnector,
+  WmsOrderStatus,
   WmsProductDto,
   WmsProductRef,
   WmsReturnRecord,
@@ -16,6 +17,7 @@ import {
   verifyShipheroWebhookSignature,
 } from './api/auth'
 import { fetchShipheroStockLevels, fetchShipheroWarehouses } from './api/client'
+import { fetchShipheroOrderStatus } from './api/orders'
 
 const CONNECTOR = 'ShipHero'
 
@@ -33,7 +35,7 @@ function notImplemented(feature: string, ticket: string): never {
  * labelled "not implemented (h02x.N)" until their child ticket lands.
  *
  * Optional contract methods that aren't implemented yet are intentionally NOT
- * declared, so capability checks (`connector.pushOrder?`, `connector.fetchOrderStatus?`)
+ * declared, so capability checks (`connector.pushOrder?`, `connector.cancelOrder?`)
  * correctly report "unsupported" and core flows skip ShipHero for those features.
  */
 export class ShipheroConnector implements WmsConnector {
@@ -89,6 +91,10 @@ export class ShipheroConnector implements WmsConnector {
     return notImplemented(`returns polling (since ${since.toISOString()})`, 'h02x.7')
   }
 
+  async fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
+    return fetchShipheroOrderStatus(orderNumber)
+  }
+
   async verifyWebhookSignature(
     rawBody: string,
     signatureHeader: string | null,
@@ -137,6 +143,14 @@ export {
   normalizeShipheroStockLine,
   normalizeShipheroWarehouse,
 } from './api/normalizers'
+export {
+  buildShipheroDeepLink,
+  fetchShipheroOrderStatus,
+  humanizeShipheroStatus,
+  mapShipheroOrderStatus,
+  pickShipheroOrderNode,
+  readShipheroTracking,
+} from './api/orders'
 export {
   registerAllShipheroWebhooks,
   registerShipheroWebhook,
