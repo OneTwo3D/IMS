@@ -103,6 +103,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
   drawTable(doc, columns, rows, branding)
 
+  // A wrapped description column can leave the table ending near the page bottom;
+  // keep the totals block together rather than splitting it across the page break.
+  if (doc.y + 90 > 780) doc.addPage()
   // Totals
   doc.y += 5
   const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
