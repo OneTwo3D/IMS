@@ -9,7 +9,7 @@ import {
   parseStockThresholds,
   type StockDiscrepancyFinding,
 } from '@/lib/domain/wms/stock-sync-helpers'
-import { resolveOpenWmsStockDiscrepancies, upsertWmsStockDiscrepancy } from '@/lib/domain/wms/stock-discrepancy'
+import { resolveClearedWmsStockDiscrepancies, upsertWmsStockDiscrepancy } from '@/lib/domain/wms/stock-discrepancy'
 
 const CONNECTOR = 'shiphero'
 
@@ -102,9 +102,7 @@ export async function runShipheroStockSyncForBinding(bindingId: string): Promise
     const findings = computeStockDiscrepancies({ wmsLines: stockLines, productBySku, imsQtyByProductId, imsSkusByProductId })
 
     let thresholdBreaches = 0
-    const conflictedSkus = new Set<string>()
     for (const finding of findings) {
-      conflictedSkus.add(finding.sku)
       if (
         finding.category === 'QTY_MISMATCH'
         && finding.imsQty != null && finding.wmsQty != null
@@ -125,14 +123,11 @@ export async function runShipheroStockSyncForBinding(bindingId: string): Promise
       }, now)
     }
 
-    let resolved = 0
-    for (const line of stockLines) {
-      const product = productBySku.get(line.sku)
-      if (product && !conflictedSkus.has(line.sku)) {
-        await resolveOpenWmsStockDiscrepancies({ connector: CONNECTOR, warehouseId: binding.warehouseId, productId: product.id, sku: line.sku }, now)
-        resolved += 1
-      }
-    }
+    // Set-difference resolve: clear every OPEN discrepancy not in the current
+    // conflict set (reconciled SKUs AND ones that dropped out of the feed).
+    const keepProductIds = [...new Set(findings.filter((f) => f.productId).map((f) => f.productId as string))]
+    const keepSkus = [...new Set(findings.filter((f) => !f.productId).map((f) => f.sku))]
+    const resolved = await resolveClearedWmsStockDiscrepancies({ connector: CONNECTOR, warehouseId: binding.warehouseId, keepProductIds, keepSkus }, now)
 
     await db.externalWmsBinding.update({ where: { id: binding.id }, data: { lastStockSyncAt: now, lastStockSyncStatus: 'SUCCEEDED' } })
     return { bindingId, status: 'SUCCEEDED', checked: stockLines.length, discrepancies: findings.length, resolved, thresholdBreaches }

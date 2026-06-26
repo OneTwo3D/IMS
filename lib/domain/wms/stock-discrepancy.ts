@@ -98,29 +98,39 @@ export async function upsertWmsStockDiscrepancy(input: UpsertWmsStockDiscrepancy
   await db.wmsStockDiscrepancy.updateMany({ where, data: reopen })
 }
 
-/** Resolve OPEN discrepancies for a product/sku no longer in conflict. */
-export async function resolveOpenWmsStockDiscrepancies(input: {
+/**
+ * Resolve every OPEN discrepancy for a connector/warehouse that is NOT in the
+ * current conflict set — i.e. set-difference resolution. This covers SKUs/products
+ * that reconciled AND those that dropped out of the WMS feed (or whose IMS stock
+ * zeroed) entirely, which a per-finding resolve would leave OPEN forever. Mapped
+ * rows are kept by productId; unmapped rows by (productId null, sku).
+ */
+export async function resolveClearedWmsStockDiscrepancies(input: {
   connector: string
   warehouseId: string
-  productId: string | null
-  sku: string
+  keepProductIds: string[]
+  keepSkus: string[]
   note?: string
-}, now: Date = new Date()): Promise<void> {
-  await db.wmsStockDiscrepancy.updateMany({
+}, now: Date = new Date()): Promise<number> {
+  const keepClauses: Prisma.WmsStockDiscrepancyWhereInput[] = [
+    ...(input.keepProductIds.length > 0 ? [{ productId: { in: input.keepProductIds } }] : []),
+    ...(input.keepSkus.length > 0 ? [{ AND: [{ productId: null }, { sku: { in: input.keepSkus } }] }] : []),
+  ]
+
+  const result = await db.wmsStockDiscrepancy.updateMany({
     where: {
       connector: input.connector,
       warehouseId: input.warehouseId,
       status: 'OPEN',
       category: { in: OPEN_CATEGORIES },
-      OR: [
-        ...(input.productId ? [{ productId: input.productId }] : []),
-        { sku: input.sku },
-      ],
+      // No keep-clauses → nothing is still conflicting → resolve all OPEN rows.
+      ...(keepClauses.length > 0 ? { NOT: { OR: keepClauses } } : {}),
     },
     data: {
       status: 'RESOLVED',
       resolvedAt: now,
-      resolvedNote: input.note ?? 'Auto-resolved: WMS and IMS quantities reconciled.',
+      resolvedNote: input.note ?? 'Auto-resolved: no longer in conflict.',
     },
   })
+  return result.count
 }
