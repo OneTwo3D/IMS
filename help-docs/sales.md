@@ -9,6 +9,7 @@ The sales order list provides a searchable, sortable overview of all orders.
 - **Search** by order reference, customer name, or other fields
 - **Filter by status** to focus on orders at a specific stage
 - **Export to CSV** for reporting or use in external tools
+- **WMS status** — when an order ships from a warehouse bound to a WMS (e.g. Mintsoft), a chip shows the WMS's fulfilment state (e.g. new, picking, dispatched, cancelled). The order detail page refreshes it live and deep-links to the order in the WMS admin; the list shows the most recent cached value. An order only pushes to the WMS once it is paid and ready to fulfil and dispatch push is enabled (see Settings → System → Scheduler).
 
 ## Creating a Sales Order
 

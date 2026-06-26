@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   buildPushPayload,
+  parseDefaultCourierId,
   resolveMappedCourierId,
 } from '../lib/connectors/mintsoft/api/order-push.ts'
 import type { WmsOrderPushInput } from '../lib/connectors/wms/types.ts'
@@ -44,6 +45,21 @@ test('resolveMappedCourierId is strict: trailing junk / decimals / non-positive 
   assert.equal(resolveMappedCourierId('A', JSON.stringify({ A: -5 })), null)
   assert.equal(resolveMappedCourierId('A', 'not json'), null)
   assert.equal(resolveMappedCourierId('A', ''), null)
+})
+
+test('parseDefaultCourierId accepts plain positive integers and rejects ambiguous forms', () => {
+  // Plain digits only — so the saved value and the runtime consumer never diverge.
+  assert.equal(parseDefaultCourierId('12'), 12)
+  assert.equal(parseDefaultCourierId('  12  '), 12) // trimmed
+  assert.equal(parseDefaultCourierId('0'), null) // not positive
+  assert.equal(parseDefaultCourierId('-5'), null)
+  assert.equal(parseDefaultCourierId('12.0'), null) // no decimals
+  assert.equal(parseDefaultCourierId('1e3'), null) // would be 1000 via Number but 1 via parseInt — rejected
+  assert.equal(parseDefaultCourierId('0x10'), null) // would be 16 via Number but 0 via parseInt — rejected
+  assert.equal(parseDefaultCourierId('12abc'), null)
+  assert.equal(parseDefaultCourierId(''), null)
+  assert.equal(parseDefaultCourierId(null), null)
+  assert.equal(parseDefaultCourierId(undefined), null)
 })
 
 test('buildPushPayload maps the core order + address fields', () => {

@@ -484,7 +484,7 @@ export function OnboardingClient({
                 </div>
 
                 {/* Integration follow-up reminders */}
-                {(shoppingEnabled || accountingEnabled) && (
+                {(shoppingEnabled || accountingEnabled || wmsEnabled) && (
                   <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 space-y-2">
                     <h3 className="text-sm font-medium text-blue-900">Next Steps for Integrations</h3>
                     <ul className="text-sm text-blue-800 space-y-1.5">
@@ -518,6 +518,29 @@ export function OnboardingClient({
                             <Link href="/sync" className="font-medium hover:underline inline-flex items-center gap-0.5">
                               Integrations <ExternalLink className="h-3 w-3" />
                             </Link>
+                          </span>
+                        </li>
+                      )}
+                      {wmsEnabled && (
+                        <li className="flex items-start gap-2">
+                          <ArrowRight className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                          <span>
+                            Bind a warehouse to your WMS and set the courier mapping / dispatch options in{' '}
+                            <Link href="/sync" className="font-medium hover:underline inline-flex items-center gap-0.5">
+                              Integrations <ExternalLink className="h-3 w-3" />
+                            </Link>
+                          </span>
+                        </li>
+                      )}
+                      {wmsEnabled && (
+                        <li className="flex items-start gap-2">
+                          <ArrowRight className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                          <span>
+                            Enable <span className="font-medium">WMS Order Dispatch Push</span> (off by default) in{' '}
+                            <Link href="/settings/system?tab=scheduler" className="font-medium hover:underline inline-flex items-center gap-0.5">
+                              System Settings → Scheduler <ExternalLink className="h-3 w-3" />
+                            </Link>{' '}
+                            so paid, ready-to-fulfil orders push to the WMS automatically.
                           </span>
                         </li>
                       )}

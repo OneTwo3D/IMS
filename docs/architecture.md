@@ -54,8 +54,9 @@
 | `app/api/` | API Route Handlers — PDF generation, CSV export, cron endpoints, file uploads, webhooks |
 | `components/` | React components organised by module (auth, inventory, layout, profile, settings, ui) |
 | `lib/` | Shared utilities — database client, PDF generation, email templates, CSV handling, activity logging |
-| `lib/connectors/` | External system connectors (WooCommerce, with interfaces for Shopify, Xero, QuickBooks) |
+| `lib/connectors/` | External system connectors behind connector-agnostic boundaries — shopping (WooCommerce, Shopify), accounting (Xero, QuickBooks), and WMS/3PL (Mintsoft). The WMS boundary is contract-enforced; see [`wms-connector-boundary.md`](./wms-connector-boundary.md) |
 | `lib/connectors/woocommerce/` | WooCommerce connector module — order import, status sync, refund sync, product sync, stock sync |
+| `lib/connectors/wms/` | Connector-agnostic WMS contract + registry; `lib/connectors/mintsoft/` is the first implementation (stock sync, ASN, returns, order dispatch push) |
 | `prisma/` | Database schema, migrations, and seed data |
 | `help-docs/` | User-facing help articles rendered in the app |
 | `docs/` | Internal/admin/reference documentation kept in git only, plus repo copies of the user help docs |

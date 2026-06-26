@@ -13,14 +13,8 @@ import type { WmsSyncDashboardData } from '@/app/actions/wms-sync'
 const WMS_PANELS: Record<string, { label: string; logo: React.ReactNode }> = {
   mintsoft: {
     label: 'Mintsoft',
-    logo: (
-      <div className="flex h-8 items-center gap-2">
-        <div className="flex h-8 w-8 items-center justify-center rounded-md bg-amber-100 text-xs font-bold text-amber-700">
-          MS
-        </div>
-        <span className="text-base font-semibold tracking-tight">Mintsoft</span>
-      </div>
-    ),
+    // eslint-disable-next-line @next/next/no-img-element
+    logo: <img src="/images/mintsoft.svg" alt="Mintsoft" className="h-8 object-contain" />,
   },
 }
 

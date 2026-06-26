@@ -444,7 +444,7 @@ export async function updateProduct(id: string, input: unknown) {
 
 ### Testing
 
-- **Unit/business-logic suite:** `npm run test:unit` (node:test + tsx over `tests/**/*.test.ts`) — 1800+ assertions covering FIFO/COGS cost layers, tax/FX, Xero sync/batch/outbox, Woo/Shopify webhooks + stock sync, Mintsoft connector phases, manufacturing, transfers, security, and the WMS order push/status logic. New business logic should ship with a test here; export pure builders/helpers so they can be unit-tested directly (see `tests/wms-order-push-payload.test.ts`).
+- **Unit/business-logic suite:** `npm run test:unit` (node:test + tsx over `tests/**/*.test.ts`) — 1,840+ tests covering FIFO/COGS cost layers, tax/FX, Xero sync/batch/outbox, Woo/Shopify webhooks + stock sync, Mintsoft connector phases, manufacturing, transfers, security, and the WMS order push/status logic. New business logic should ship with a test here; export pure builders/helpers so they can be unit-tested directly (see `tests/wms-order-push-payload.test.ts`).
 - **DB concurrency:** `npm run test:concurrency` (needs a DB; `RUN_DB_CONCURRENCY_TESTS=1`).
 - **E2E:** `npm run e2e` (Playwright; tagged `@wc` / `@xero` / `@external`).
 - **Static gates:** `npm run type-check`, `npm run lint`, and `npm run check:all` (decimal / connector-fetch / WMS-connector / migration-convention boundary guards).
