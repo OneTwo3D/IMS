@@ -15,7 +15,7 @@ import {
   isShipheroConfigured,
   verifyShipheroWebhookSignature,
 } from './api/auth'
-import { fetchShipheroWarehouses } from './api/client'
+import { fetchShipheroStockLevels, fetchShipheroWarehouses } from './api/client'
 
 const CONNECTOR = 'ShipHero'
 
@@ -66,7 +66,7 @@ export class ShipheroConnector implements WmsConnector {
   }
 
   async fetchStockLevels(externalWarehouseId: string): Promise<WmsStockLine[]> {
-    return notImplemented(`stock-level sync (warehouse ${externalWarehouseId})`, 'h02x.4')
+    return fetchShipheroStockLevels(externalWarehouseId)
   }
 
   async fetchProduct(externalProductId: string): Promise<WmsProductRef | null> {
@@ -121,6 +121,8 @@ export {
   verifyShipheroWebhookSignature,
 } from './api/auth'
 export {
+  extractShipheroConnectionNodes,
+  fetchShipheroStockLevels,
   fetchShipheroWarehouses,
   isShipheroInvalidTokenErrors,
   looksLikeShipheroThrottle,
@@ -129,7 +131,12 @@ export {
   type ShipheroGraphqlError,
   type ShipheroGraphqlResult,
 } from './api/client'
-export { extractShipheroWarehouses, normalizeShipheroWarehouse } from './api/normalizers'
+export {
+  extractShipheroStockLines,
+  extractShipheroWarehouses,
+  normalizeShipheroStockLine,
+  normalizeShipheroWarehouse,
+} from './api/normalizers'
 export {
   registerAllShipheroWebhooks,
   registerShipheroWebhook,

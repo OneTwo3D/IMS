@@ -24,4 +24,14 @@ registerCronJobs([
     defaultSchedule: '*/30 * * * *',
     defaultEnabled: true,
   },
+  {
+    slug: 'shiphero-stock-sync',
+    settingKey: 'shiphero_stock_sync',
+    module: 'shiphero',
+    moduleLabel: 'ShipHero',
+    label: 'ShipHero Stock Alignment',
+    description: 'Poll ShipHero warehouse stock for bound warehouses and log discrepancies (NOTIFICATION_ONLY); the reconcile backstop to inventory webhooks.',
+    defaultSchedule: '0 * * * *',
+    defaultEnabled: false,
+  },
 ])

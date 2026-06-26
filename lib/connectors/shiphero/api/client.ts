@@ -1,8 +1,8 @@
 import { getShipheroAccessToken, getShipheroApiConfiguration, invalidateShipheroAccessToken } from './auth'
 import { SHIPHERO_GRAPHQL_PATH } from '@/lib/connectors/shiphero/settings/schema'
-import type { WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import { connectorFetch } from '@/lib/security/connector-fetch'
-import { extractShipheroWarehouses } from './normalizers'
+import { extractShipheroStockLines, extractShipheroWarehouses } from './normalizers'
 
 export type ShipheroGraphqlError = {
   message?: string
@@ -192,4 +192,39 @@ export async function fetchShipheroWarehouses(): Promise<WmsWarehouseRef[]> {
   const result = await shipheroGraphql<ShipheroWarehousesData>(WAREHOUSES_QUERY)
   if (result.error) throw new Error(result.error)
   return extractShipheroWarehouses(result.data?.account?.data?.warehouses)
+}
+
+/**
+ * Pull node objects out of a ShipHero GraphQL field that may be a Relay connection
+ * (`{ data: { edges: [{ node }] } }`), a bare `{ edges: [...] }`, or a plain array.
+ */
+export function extractShipheroConnectionNodes(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value
+  const record = value && typeof value === 'object' ? value as Record<string, unknown> : null
+  if (!record) return []
+  const edgesHost = (record.data && typeof record.data === 'object' ? record.data as Record<string, unknown> : record)
+  const edges = edgesHost.edges
+  if (!Array.isArray(edges)) return Array.isArray(edgesHost.data) ? edgesHost.data : []
+  return edges.map((edge) => (edge && typeof edge === 'object' ? (edge as Record<string, unknown>).node ?? edge : edge))
+}
+
+const STOCK_LEVELS_QUERY = `query ($warehouseId: String!) {
+  warehouse_products(warehouse_id: $warehouseId) {
+    data {
+      edges {
+        node { sku on_hand available warehouse_id product_id }
+      }
+    }
+  }
+}`
+
+type ShipheroStockData = {
+  warehouse_products?: unknown
+}
+
+export async function fetchShipheroStockLevels(externalWarehouseId: string): Promise<WmsStockLine[]> {
+  const result = await shipheroGraphql<ShipheroStockData>(STOCK_LEVELS_QUERY, { warehouseId: externalWarehouseId.trim() })
+  if (result.error) throw new Error(result.error)
+  const nodes = extractShipheroConnectionNodes(result.data?.warehouse_products)
+  return extractShipheroStockLines(nodes)
 }
