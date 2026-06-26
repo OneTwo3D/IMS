@@ -1,4 +1,4 @@
-import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
@@ -6,7 +6,7 @@ import {
 } from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderStatus } from './api/orders'
-import { cancelMintsoftOrder, pushMintsoftOrder } from './api/order-push'
+import { cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -86,6 +86,10 @@ export class MintsoftConnector implements WmsConnector {
     return pushMintsoftOrder(input)
   }
 
+  async updateOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
+    return updateMintsoftOrder(externalOrderId, input)
+  }
+
   async cancelOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
     return cancelMintsoftOrder(externalOrderId)
   }
@@ -135,7 +139,7 @@ export {
   upsertMintsoftProduct,
 } from './api/client'
 export { fetchMintsoftOrderStatus } from './api/orders'
-export { cancelMintsoftOrder, pushMintsoftOrder } from './api/order-push'
+export { cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
 export {
   normalizeMintsoftAsn,
   normalizeMintsoftAsnLine,

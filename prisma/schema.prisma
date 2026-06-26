@@ -2295,6 +2295,7 @@ enum WmsOrderPushState {
   PENDING_CANCEL
   CANCELLED
   DEAD_LETTER
+  HELD
 }
 
 model WmsOrderPushLink {

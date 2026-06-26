@@ -2,6 +2,7 @@ import type {
   WmsOrderCancelResult,
   WmsOrderPushInput,
   WmsOrderPushResult,
+  WmsOrderUpdateResult,
 } from '@/lib/connectors/wms/types'
 import { extractMintsoftArrayPayload, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
@@ -31,7 +32,7 @@ type CourierOption =
   | { kind: 'defaultId'; courierServiceId: number }
   | { kind: 'none' }
 
-function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption): Record<string, unknown> {
+function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption, includeItems = true): Record<string, unknown> {
   const a = input.shippingAddress
   const payload: Record<string, unknown> = {
     OrderNumber: input.orderNumber,
@@ -54,13 +55,17 @@ function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption): Rec
     DiscountTotalExVat: round2(input.discountExVat),
     DiscountTotalVat: round2(input.discountVat),
     Comments: (input.comments ?? '').slice(0, 1000),
-    OrderItems: input.lines.map((line) => ({
+  }
+  if (includeItems) {
+    // Mintsoft's order-update endpoint (NewOrder) does not accept items, so line
+    // amendments are not propagated via update — only on create.
+    payload.OrderItems = input.lines.map((line) => ({
       SKU: line.sku,
       Quantity: line.quantity,
       UnitPrice: line.unitPriceExVat,
       UnitPriceVat: line.unitPriceVat,
       Details: (line.description ?? '').slice(0, 255),
-    })),
+    }))
   }
   const warehouseId = Number.parseInt(input.externalWarehouseId, 10)
   if (Number.isFinite(warehouseId)) payload.WarehouseId = warehouseId
@@ -146,17 +151,38 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   throw new Error(created.message ?? 'Mintsoft order push failed')
 }
 
-export async function cancelMintsoftOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
-  // Only NEW orders are cancellable; check first so a dispatched order is a no-op.
+/** Mintsoft OrderStatusId 1 === NEW; only NEW orders are mutable/cancellable. */
+async function fetchMintsoftOrderStatusId(externalOrderId: string): Promise<{ found: boolean; isNew: boolean }> {
   const current = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`)
-  if (current.status === 404) return { cancelled: false, status: 'NOT_FOUND' }
+  if (current.status === 404) return { found: false, isNew: false }
   if (current.error) throw new Error(current.error)
   const order = extractMintsoftObjectPayload(current.data) as RawOrder | null
   const statusId = order?.OrderStatusId
-  // OrderStatusId 1 === NEW in Mintsoft's status taxonomy.
-  if (statusId !== 1 && statusId !== '1') {
-    return { cancelled: false, status: 'NOT_CANCELLABLE' }
-  }
+  return { found: true, isNew: statusId === 1 || statusId === '1' }
+}
+
+export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
+  const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId)
+  if (!found) return { updated: false, status: 'NOT_FOUND' }
+  if (!isNew) return { updated: false, status: 'NOT_NEW' }
+
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(buildPushPayload(input, { kind: 'name' }, false)),
+  })
+  if (result.error) throw new Error(result.error)
+  const raw = result.data
+  const data: RawOrder | null = Array.isArray(raw) ? ((raw[0] as RawOrder) ?? null) : (extractMintsoftObjectPayload(raw) as RawOrder | null)
+  if (data?.Success === true || data?.OrderId != null) return { updated: true, status: 'NEW' }
+  throw new Error(toStr(data?.Message) ?? 'Mintsoft order update failed')
+}
+
+export async function cancelMintsoftOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
+  // Only NEW orders are cancellable; check first so a dispatched order is a no-op.
+  const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId)
+  if (!found) return { cancelled: false, status: 'NOT_FOUND' }
+  if (!isNew) return { cancelled: false, status: 'NOT_CANCELLABLE' }
 
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Cancel`)
   if (result.error) throw new Error(result.error)
