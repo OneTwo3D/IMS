@@ -69,7 +69,7 @@ async function fetchMintsoftOrderById(externalOrderId: string): Promise<RawOrder
   return extractMintsoftObjectPayload(result.data) as RawOrder | null
 }
 
-function mergedParts(orderNumber: string | null): string[] {
+export function mergedParts(orderNumber: string | null): string[] {
   if (!orderNumber || !orderNumber.includes('+')) return []
   return orderNumber.split('+').map((part) => part.trim()).filter(Boolean)
 }
@@ -81,7 +81,7 @@ function mergedParts(orderNumber: string | null): string[] {
  * a merged survivor that folded this number in — but only when EXACTLY ONE
  * merged candidate matches (fail closed on ambiguity, like the reference plugin).
  */
-function pickOrderRow(orders: RawOrder[], orderNumber: string): RawOrder | null {
+export function pickOrderRow(orders: RawOrder[], orderNumber: string): RawOrder | null {
   const wanted = orderNumber.trim()
   const exact = orders
     .filter((order) => toStr(order.OrderNumber) === wanted)
@@ -92,7 +92,7 @@ function pickOrderRow(orders: RawOrder[], orderNumber: string): RawOrder | null 
   return merged.length === 1 ? merged[0] : null
 }
 
-function readTracking(order: RawOrder): WmsOrderTracking[] {
+export function readTracking(order: RawOrder): WmsOrderTracking[] {
   const trackingNumber = toStr(order.TrackingNumber)
   const carrier = toStr(order.CourierServiceName)
   const despatchedAt = toStr(order.DespatchDate)
@@ -100,7 +100,7 @@ function readTracking(order: RawOrder): WmsOrderTracking[] {
   return [{ trackingNumber, carrier, despatchedAt }]
 }
 
-function buildDeepLink(template: string, externalOrderId: string): string | null {
+export function buildDeepLink(template: string, externalOrderId: string): string | null {
   const base = (template || MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE).trim()
   if (!base.includes('{id}')) return null
   return base.replace('{id}', encodeURIComponent(externalOrderId))

@@ -49,7 +49,7 @@ function num(value: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
-function readAddress(raw: unknown, customerName: string | null): WmsOrderAddress {
+export function readAddress(raw: unknown, customerName: string | null): WmsOrderAddress {
   const a = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
   const str = (...keys: string[]): string => {
     for (const key of keys) {
@@ -80,7 +80,7 @@ type CandidateLine = {
   description: string
 }
 
-function buildLines(lines: CandidateLine[]): WmsOrderPushLine[] {
+export function buildLines(lines: CandidateLine[]): WmsOrderPushLine[] {
   return lines.map((line) => {
     // A line with no SKU can't be fulfilled by the WMS — fail the whole order
     // (caught → retried → dead-lettered) rather than silently dropping the line.
