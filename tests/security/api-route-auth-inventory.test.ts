@@ -44,6 +44,7 @@ test('public-webhook policy entries are tracked for executable behavior coverage
     '/api/shopping/[connector]/invoice-pdf',
     '/api/uploads/branding/[filename]',
     '/api/webhooks/mintsoft/asn-booked-in',
+    '/api/webhooks/shiphero/[event]',
     '/api/webhooks/shopping/[connector]/[resource]',
   ])
 

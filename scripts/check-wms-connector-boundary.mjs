@@ -29,7 +29,9 @@ import { extname, join, sep } from 'node:path'
 const ROOT = process.cwd()
 const SCAN_ROOTS = ['app', 'lib', 'components']
 const SCANNED_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'])
-const SKIPPED_DIRECTORIES = new Set(['.git', '.next', 'node_modules', 'build', 'dist', 'out', 'coverage'])
+// 'generated' skips app/generated/** (the Prisma client embeds the full schema as
+// a string, including model doc-comments that legitimately name connectors).
+const SKIPPED_DIRECTORIES = new Set(['.git', '.next', 'node_modules', 'build', 'dist', 'out', 'coverage', 'generated'])
 // Every registered WMS connector literal. Keep in sync with WMS_CONNECTOR_IDS
 // in lib/connectors/wms/types.ts — no core flow may name any of these.
 const CONNECTOR_LITERAL_RE = /mintsoft|shiphero/i
@@ -67,11 +69,14 @@ const ALLOWLIST = [
   'app/actions/wms-sync.ts',
   'app/actions/wms-onboarding.ts',
   'app/api/cron/mintsoft-',
+  'app/api/cron/shiphero-',
   'app/api/webhooks/mintsoft/',
+  'app/api/webhooks/shiphero/',
   'app/api/e2e/mintsoft',
   'app/api/export/mintsoft-sync/',
   'app/api/admin/wms/',
   'lib/cron-jobs/wms-mintsoft.ts',
+  'lib/cron-jobs/wms-shiphero.ts',
   'lib/cron-jobs/wms.ts',
   'app/(dashboard)/sync/mintsoft-client.tsx',
   'app/(dashboard)/sync/mintsoft-courier-map.tsx',

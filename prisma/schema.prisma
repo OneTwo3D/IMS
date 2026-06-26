@@ -2681,6 +2681,39 @@ model WmsInboundReceiptEvent {
   @@map("wms_inbound_receipt_events")
 }
 
+/// Generic inbound webhook event staging for push-primary WMS connectors (ShipHero).
+/// Distinct from WmsInboundReceiptEvent (Mintsoft's ASN-specific poll model): ShipHero
+/// pushes order/shipment/inventory webhooks, staged here by event type with idempotent
+/// dedupe on (connector, externalEventId), retry/dead-letter state, and a monotonic
+/// status rank guarding the writeback against out-of-order delivery.
+model WmsWebhookEvent {
+  id                 String    @id @default(cuid())
+  connector          String
+  eventType          String
+  externalEventId    String
+  /// Order ref (order_id / legacy_id) for status events; null for inventory events.
+  externalOrderId    String?
+  /// Rank of the event's fulfillment_status at receipt; the monotonic guard refuses
+  /// to apply an event whose rank is below an already-applied one for the same order.
+  statusRank         Int?
+  payload            Json
+  processedAt        DateTime?
+  /// Set when the event applied but was a no-op because a higher-ranked status already won.
+  supersededAt       DateTime?
+  processingStatus   String    @default("PENDING")
+  processingAttempts Int       @default(0)
+  nextRetryAt        DateTime?
+  deadLetteredAt     DateTime?
+  lastError          String?
+  receivedAt         DateTime  @default(now())
+
+  @@unique([connector, externalEventId])
+  @@index([processingStatus, nextRetryAt])
+  @@index([connector, externalOrderId])
+  @@index([deadLetteredAt])
+  @@map("wms_webhook_events")
+}
+
 model WmsReturnsInbox {
   id               String                @id @default(cuid())
   connector        String

@@ -81,6 +81,10 @@ export const publicRouteSecurityPolicy: Partial<Record<ApiRoutePath, PublicRoute
     properties: ['hmac-signature', 'timestamp-replay-protection', 'body-size-limit', 'no-sensitive-output'],
     rationale: 'Mintsoft ASN webhooks require the shared HMAC signature, fresh signed timestamp, and bounded request body.',
   },
+  '/api/webhooks/shiphero/[event]': {
+    properties: ['hmac-signature', 'body-size-limit', 'no-sensitive-output'],
+    rationale: 'ShipHero webhooks require the shared HMAC signature and a bounded request body; ShipHero does not sign a timestamp, so replay safety comes from idempotent dedupe on (connector, externalEventId) plus the monotonic status guard.',
+  },
   '/api/webhooks/shopping/[connector]/[resource]': {
     properties: ['hmac-signature', 'no-sensitive-output'],
     rationale: 'Shopping webhooks dispatch only known connector/resource pairs and connector handlers verify provider HMAC signatures.',
