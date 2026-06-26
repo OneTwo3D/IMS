@@ -12,6 +12,7 @@ import {
   type PdfTableColumn,
 } from '@/lib/pdf'
 import { formatMoney, type SymbolPos } from '@/lib/utils'
+import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { formatDateTime } from '@/lib/format-datetime'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 
@@ -36,6 +37,7 @@ type SoForPdf = {
   taxRatePercent: unknown
   totalForeign: unknown
   totalBase: unknown
+  taxBase: unknown
   discountAmount: unknown
   invoiceNumber: string | null
   invoicedAt: Date | null
@@ -121,7 +123,7 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Description', width: 195 },
+    { label: 'Description', width: 195, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price (${sym})`, width: 65, align: 'right' },
     { label: 'Discount', width: 50, align: 'right' },
@@ -174,6 +176,7 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   await drawHeader(doc, branding, {
     title: 'Invoice',
     reference: invNum,
+    ...(so.orderNumber ? { secondaryReference: { label: 'Order', value: so.orderNumber } } : {}),
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
@@ -192,7 +195,7 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   const { sym, symPos } = await getCurrencyFormat(so.currency)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'Description', width: 230 },
+    { label: 'Description', width: 230, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price (${sym})`, width: 65, align: 'right' },
     { label: `Tax (${sym})`, width: 55, align: 'right' },
@@ -207,14 +210,25 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
     Number(l.totalForeign).toFixed(2),
   ])
   drawTable(doc, columns, rows, branding)
+  // A wrapped description column can leave the table ending near the page bottom;
+  // keep the totals block together rather than splitting it across the page break.
+  if (doc.y + 90 > 780) doc.addPage()
   drawTotals(doc, so, sym, symPos, columns)
 
-  if (so.currency !== 'GBP') {
+  const base = await getBaseCurrencyDisplay()
+  if (so.currency !== base.code) {
     const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
     const vW = columns[columns.length - 1].width
     const lW = 80
+    const baseMoney = (n: number) => formatMoney(n, base.symbol, base.symbolPosition)
+    // Total + VAT in the base currency on one line, e.g. "(GBP equivalent £80.73, 20% VAT £13.46)".
+    const equivParts = [`${base.code} equivalent ${baseMoney(Number(so.totalBase))}`]
+    if (Number(so.taxForeign) > 0) {
+      const vatPct = so.taxRatePercent != null ? `${(Number(so.taxRatePercent) * 100).toFixed(0)}% ` : ''
+      equivParts.push(`${vatPct}VAT ${baseMoney(Number(so.taxBase))}`)
+    }
     doc.font('Helvetica').fontSize(8).fillColor('#888')
-      .text(`(GBP equivalent: ${formatMoney(Number(so.totalBase), '£', 'PREFIX')})`, tableRight - vW - lW, doc.y + 3, { width: lW + vW, align: 'right' })
+      .text(`(${equivParts.join(', ')})`, tableRight - vW - lW, doc.y + 3, { width: lW + vW, align: 'right' })
   }
 
   if (tpl?.footerNote) {
