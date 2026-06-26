@@ -600,6 +600,41 @@ async function requireMintsoftReturnsWriteAccess() {
   return requirePermission('stock_control.adjust')
 }
 
+/** Carrier mapping: IMS shipping-service name → Mintsoft CourierServiceId (Phase 8). */
+export async function getMintsoftCourierServiceMap(): Promise<string> {
+  await requireMintsoftReadAccess()
+  return (await getMintsoftSettings()).mintsoft_courier_service_map
+}
+
+export async function saveMintsoftCourierServiceMap(rawJson: unknown): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftWriteAccess()
+  const json = typeof rawJson === 'string' ? rawJson.trim() : ''
+  if (json) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(json)
+    } catch {
+      return { success: false, error: 'Invalid JSON.' }
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { success: false, error: 'Provide a JSON object of shipping-service name → courier service id.' }
+    }
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const id = typeof value === 'number' ? value : Number(String(value).trim())
+      if (!Number.isInteger(id) || id <= 0) {
+        return { success: false, error: `Value for "${key}" must be a positive integer courier service id.` }
+      }
+    }
+  }
+  await db.setting.upsert({
+    where: { key: 'mintsoft_courier_service_map' },
+    create: { key: 'mintsoft_courier_service_map', value: serializeSettingValue('mintsoft_courier_service_map', json) },
+    update: { value: serializeSettingValue('mintsoft_courier_service_map', json) },
+  })
+  revalidatePath('/sync')
+  return { success: true }
+}
+
 function getAvailableOrderLookupConnectors(pluginState: {
   woocommerce: boolean
   shopify: boolean

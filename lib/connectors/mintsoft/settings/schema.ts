@@ -7,6 +7,8 @@ export type MintsoftSettings = {
   mintsoft_webhook_secret: string
   mintsoft_admin_order_url_template: string
   mintsoft_default_courier_service_id: string
+  /** JSON map of IMS shipping-service name → Mintsoft CourierServiceId. */
+  mintsoft_courier_service_map: string
 }
 
 export const MINTSOFT_SETTING_KEYS = [
@@ -16,6 +18,7 @@ export const MINTSOFT_SETTING_KEYS = [
   'mintsoft_webhook_secret',
   'mintsoft_admin_order_url_template',
   'mintsoft_default_courier_service_id',
+  'mintsoft_courier_service_map',
 ] as const
 
 // `{id}` is substituted with the Mintsoft internal order id. Matches the proven
@@ -29,6 +32,7 @@ const MINTSOFT_DEFAULTS: MintsoftSettings = {
   mintsoft_webhook_secret: '',
   mintsoft_admin_order_url_template: MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE,
   mintsoft_default_courier_service_id: '',
+  mintsoft_courier_service_map: '',
 }
 
 export async function getMintsoftSettings(): Promise<MintsoftSettings> {
