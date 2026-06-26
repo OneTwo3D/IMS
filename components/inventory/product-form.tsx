@@ -1,6 +1,7 @@
 'use client'
 
-import { useActionState, useState } from 'react'
+import { useActionState, useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -89,6 +90,14 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
   const baseCurrency = useBaseCurrency()
   const [state, formAction, isPending] = useActionState(action, {})
 
+  // Inline mode (the product detail page) renders Save in the page header, on the
+  // same row as the product name, via a portal into a slot the page provides.
+  const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- resolving an externally-rendered portal target requires a post-mount DOM read
+    if (inline) setHeaderSlot(document.getElementById('product-detail-actions'))
+  }, [inline])
+
   // All fields are controlled so values survive a failed server-action submission
   const [fields, setFields] = useState({
     sku:                  defaultValues?.sku                  ?? '',
@@ -135,13 +144,12 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
   const willCreateCategory = cleanedCategoryPath.length > 0 && !categoryMatchesExisting
 
   const formContent = (
-    <form action={formAction} className="space-y-6">
-      {inline && (
-        <div className="flex justify-end -mt-2">
-          <Button type="submit" disabled={isPending}>
-            {isPending ? 'Saving…' : 'Save Product'}
-          </Button>
-        </div>
+    <form id="product-detail-form" action={formAction} className="space-y-6">
+      {inline && headerSlot && createPortal(
+        <Button type="submit" form="product-detail-form" disabled={isPending}>
+          {isPending ? 'Saving…' : 'Save Product'}
+        </Button>,
+        headerSlot,
       )}
       {state.message && (
         <p className="text-sm text-destructive">{state.message}</p>
@@ -542,7 +550,7 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
         </p>
       </div>
 
-      {/* Actions — inline mode shows Save at the top; dialog mode keeps a footer */}
+      {/* Actions — inline mode portals Save into the page header; dialog mode keeps a footer */}
       {!inline && (
         <DialogFooter>
           {onClose && (
