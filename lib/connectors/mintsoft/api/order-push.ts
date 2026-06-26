@@ -46,6 +46,18 @@ export function resolveMappedCourierId(courierService: string | null, mapJson: s
   }
 }
 
+/**
+ * Strict parse for the configured default CourierServiceId: a plain positive
+ * integer, else null. Plain-digit only so the saved value and this consumer
+ * agree (avoids `parseInt`/`Number` divergence on `"1e3"`, `"0x10"`, decimals).
+ */
+export function parseDefaultCourierId(raw: string | null | undefined): number | null {
+  const trimmed = (raw ?? '').trim()
+  if (!/^\d+$/.test(trimmed)) return null
+  const id = Number(trimmed)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
 export function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption, includeItems = true): Record<string, unknown> {
   const a = input.shippingAddress
   const payload: Record<string, unknown> = {
@@ -132,19 +144,25 @@ async function createOrder(payload: Record<string, unknown>): Promise<{ ok: bool
 
 export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
   const settings = await getMintsoftSettings()
-  // Prefer a configured shipping-service → CourierServiceId mapping; otherwise
-  // pass the name through for the WMS to resolve.
+  // Courier selection: a configured shipping-service → CourierServiceId mapping
+  // wins; else pass the name through for the WMS to resolve; else (no service on
+  // the order at all) fall straight to the configured default id if one is set.
   const mappedId = resolveMappedCourierId(input.courierService, settings.mintsoft_courier_service_map)
-  const initialCourier: CourierOption = mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId } : { kind: 'name' }
+  const defaultId = parseDefaultCourierId(settings.mintsoft_default_courier_service_id)
+  const initialCourier: CourierOption =
+    mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId }
+    : input.courierService ? { kind: 'name' }
+    : defaultId != null ? { kind: 'defaultId', courierServiceId: defaultId }
+    : { kind: 'name' }
   let created = await createOrder(buildPushPayload(input, initialCourier))
 
-  // Courier name the WMS couldn't resolve → retry with the configured default
-  // courier service id (Mintsoft requires one); if none is set, surface the error.
-  if (!created.ok && created.message && /courierservice/i.test(created.message) && input.courierService) {
-    const defaultId = Number.parseInt(settings.mintsoft_default_courier_service_id, 10)
-    if (Number.isFinite(defaultId)) {
-      created = await createOrder(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
-    }
+  // Courier the WMS couldn't resolve → retry with the configured default id
+  // (unless we already used it). Mintsoft requires a resolvable courier.
+  if (
+    !created.ok && created.message && /courierservice/i.test(created.message)
+    && defaultId != null && initialCourier.kind !== 'defaultId'
+  ) {
+    created = await createOrder(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
   }
 
   if (created.ok && created.data) {

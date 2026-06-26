@@ -25,6 +25,7 @@ import {
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { runMintsoftBundleVerify } from '@/lib/connectors/mintsoft/sync/bundle-sync'
 import { parseMintsoftThresholds, sanitizeMintsoftThresholds } from '@/lib/connectors/mintsoft/sync/stock-sync-helpers'
+import { parseDefaultCourierId } from '@/lib/connectors/mintsoft/api/order-push'
 import {
   mapMintsoftReturnsInboxRow,
   runMintsoftReturnsSync,
@@ -670,11 +671,8 @@ export async function saveMintsoftOrderDispatchSettings(input: {
       : typeof input?.defaultCourierServiceId === 'string'
         ? input.defaultCourierServiceId.trim()
         : ''
-  if (courierRaw) {
-    const id = Number(courierRaw)
-    if (!Number.isInteger(id) || id <= 0) {
-      return { success: false, error: 'Default courier service id must be a positive integer, or blank for no fallback.' }
-    }
+  if (courierRaw && parseDefaultCourierId(courierRaw) == null) {
+    return { success: false, error: 'Default courier service id must be a whole positive number, or blank for no fallback.' }
   }
 
   await db.$transaction([

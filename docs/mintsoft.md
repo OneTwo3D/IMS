@@ -87,14 +87,16 @@ The `timestamp` string must be the exact header value IMS uses for freshness val
 IMS pushes sales orders outbound to the WMS so the 3PL can fulfil them. The work is done by a connector-agnostic sweep (`lib/domain/wms/order-push-sweep.ts`) driven by the `wms-order-push` cron (`/api/cron/wms-order-push`, default every 10 minutes). **The cron ships disabled** — enable it in System Settings → Scheduler once a warehouse is bound.
 
 - **Eligibility.** An order is pushed when it is paid, in a ready status (`PROCESSING` or `ALLOCATED`), and its ship-from warehouse is bound to the active WMS. Orders in unbound warehouses are skipped.
-- **Idempotency.** Each order tracks one `WmsOrderPushLink` (unique per order). Create uses the order's external reference so a re-run never double-creates. State machine: `PENDING_CREATE → SYNCED`, with `HELD`, `PENDING_CANCEL → CANCELLED`, and `DEAD_LETTER`.
+- **Idempotency.** Each order tracks one `WmsOrderPushLink` (unique per order). Create uses the order's external reference so a re-run never double-creates. State machine: `PENDING_CREATE → SYNCED`, then `HELD` (order put on hold), `CANCELLED` (order cancelled), or `DEAD_LETTER` (repeated failures or an unresolvable conflict).
 - **Create / update / cancel.** New eligible orders are created in the WMS; subsequent edits while the WMS order is still `NEW` are amended; orders put on hold are cancelled in the WMS and parked `HELD` (and re-created if released); IMS-cancelled orders propagate a cancel.
 - **Retries.** A failed push increments an attempt counter and retries on the next sweep; after 5 attempts it dead-letters for manual review rather than looping forever. A line with no SKU fails the whole order (never a silent partial push).
 - **Couriers.** The order's shipping service is mapped to a Mintsoft `CourierServiceId` via the courier map; unmapped services fall back to the default courier id, or pass the name through for Mintsoft to resolve.
 
 ## Order Status Chip
 
-In-flight orders show a live WMS status chip on the sales list and detail pages. The cached value is refreshed by the `wms-order-status` cron (`/api/cron/wms-order-status`, default every 15 minutes) and the detail page also fetches live on load. The chip deep-links to the order in the WMS admin using the admin order URL template.
+In-flight orders show a WMS status chip on the sales list and detail pages. The cached value is refreshed by the `wms-order-status` cron (`/api/cron/wms-order-status`, default every 15 minutes) and the detail page also fetches live on load. The chip deep-links to the order in the WMS admin using the admin order URL template.
+
+The connector builds that deep link and stores it on the cached snapshot (core flows never reference a connector-specific URL format — see the connector boundary). So a change to the admin URL template reaches the **list** chips on the next status sweep, while the **detail** page — which queries the connector live — reflects it immediately.
 
 ## Connector Settings
 
