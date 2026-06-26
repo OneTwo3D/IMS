@@ -70,6 +70,7 @@ const ALLOWLIST = [
   'lib/cron-jobs/wms-mintsoft.ts',
   'lib/cron-jobs/wms.ts',
   'app/(dashboard)/sync/mintsoft-client.tsx',
+  'app/(dashboard)/sync/mintsoft-courier-map.tsx',
   'app/(dashboard)/sync/wms-sync-panel.tsx',
   'app/(dashboard)/sync/sync-dashboard.tsx',
   'components/onboarding/wms-onboarding-connection.tsx',

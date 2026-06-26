@@ -29,8 +29,22 @@ function round2(value: number): number {
 
 type CourierOption =
   | { kind: 'name' }
+  | { kind: 'mappedId'; courierServiceId: number }
   | { kind: 'defaultId'; courierServiceId: number }
   | { kind: 'none' }
+
+/** Resolve a shipping-service name to a Mintsoft CourierServiceId via the configured map. */
+function resolveMappedCourierId(courierService: string | null, mapJson: string): number | null {
+  if (!courierService || !mapJson.trim()) return null
+  try {
+    const map = JSON.parse(mapJson) as Record<string, unknown>
+    const raw = map[courierService]
+    const id = typeof raw === 'number' ? raw : Number(String(raw).trim())
+    return Number.isInteger(id) && id > 0 ? id : null
+  } catch {
+    return null
+  }
+}
 
 function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption, includeItems = true): Record<string, unknown> {
   const a = input.shippingAddress
@@ -71,6 +85,10 @@ function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption, incl
   if (Number.isFinite(warehouseId)) payload.WarehouseId = warehouseId
   if (courier.kind === 'name' && input.courierService) {
     payload.CourierService = input.courierService
+  } else if (courier.kind === 'mappedId') {
+    // Configured mapping: send both the name and the resolved service id.
+    if (input.courierService) payload.CourierService = input.courierService
+    payload.CourierServiceId = courier.courierServiceId
   } else if (courier.kind === 'defaultId') {
     // Mintsoft requires a courier identifier; fall back to a configured default
     // service id so the warehouse can re-pick if the name didn't resolve.
@@ -113,12 +131,17 @@ async function createOrder(payload: Record<string, unknown>): Promise<{ ok: bool
 }
 
 export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
-  let created = await createOrder(buildPushPayload(input, { kind: 'name' }))
+  const settings = await getMintsoftSettings()
+  // Prefer a configured shipping-service → CourierServiceId mapping; otherwise
+  // pass the name through for the WMS to resolve.
+  const mappedId = resolveMappedCourierId(input.courierService, settings.mintsoft_courier_service_map)
+  const initialCourier: CourierOption = mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId } : { kind: 'name' }
+  let created = await createOrder(buildPushPayload(input, initialCourier))
 
   // Courier name the WMS couldn't resolve → retry with the configured default
   // courier service id (Mintsoft requires one); if none is set, surface the error.
   if (!created.ok && created.message && /courierservice/i.test(created.message) && input.courierService) {
-    const defaultId = Number.parseInt((await getMintsoftSettings()).mintsoft_default_courier_service_id, 10)
+    const defaultId = Number.parseInt(settings.mintsoft_default_courier_service_id, 10)
     if (Number.isFinite(defaultId)) {
       created = await createOrder(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
     }

@@ -34,6 +34,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { MintsoftCourierMapSection } from './mintsoft-courier-map'
 import { Textarea } from '@/components/ui/textarea'
 
 type Props = {
@@ -482,6 +483,8 @@ export function MintsoftClient({ data }: Props) {
           </div>
         ) : null}
       </Card>
+
+      <MintsoftCourierMapSection />
 
       <Card className="p-6 space-y-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
