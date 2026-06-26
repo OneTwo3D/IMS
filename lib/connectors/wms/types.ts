@@ -6,7 +6,7 @@
  * IntegrationPluginId + setting key, and per-connector cron/webhook ingress)
  * when a new WMS connector lands; core sales/PO/transfer/stock flows need no edits.
  */
-export const WMS_CONNECTOR_IDS = ['mintsoft'] as const
+export const WMS_CONNECTOR_IDS = ['mintsoft', 'shiphero'] as const
 
 export type WmsConnectorId = (typeof WMS_CONNECTOR_IDS)[number]
 

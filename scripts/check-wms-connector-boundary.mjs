@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 /**
- * Static guard: keeps the 3PL/WMS layer connector-agnostic by blocking the
- * `mintsoft` literal from leaking into core app flows. Core flows (sales / PO /
+ * Static guard: keeps the 3PL/WMS layer connector-agnostic by blocking any WMS
+ * connector literal (`mintsoft`, `shiphero`, …) from leaking into core app
+ * flows. Core flows (sales / PO /
  * transfer / stock / onboarding / settings / sync wiring / fulfillment) must go
  * through the generic WMS boundary — the WmsConnector contract
  * (lib/connectors/wms/types.ts), the WMS registry, and the dispatch facades
@@ -29,7 +30,9 @@ const ROOT = process.cwd()
 const SCAN_ROOTS = ['app', 'lib', 'components']
 const SCANNED_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'])
 const SKIPPED_DIRECTORIES = new Set(['.git', '.next', 'node_modules', 'build', 'dist', 'out', 'coverage'])
-const MINTSOFT_RE = /mintsoft/i
+// Every registered WMS connector literal. Keep in sync with WMS_CONNECTOR_IDS
+// in lib/connectors/wms/types.ts — no core flow may name any of these.
+const CONNECTOR_LITERAL_RE = /mintsoft|shiphero/i
 const WAIVER_RE = /wms-connector-boundary-ok:\s*[^:\s]+:\s*\S+/i
 
 /**
@@ -57,6 +60,7 @@ const WAIVER_RE = /wms-connector-boundary-ok:\s*[^:\s]+:\s*\S+/i
  */
 const ALLOWLIST = [
   'lib/connectors/mintsoft/',
+  'lib/connectors/shiphero/',
   'lib/connectors/wms/',
   'app/actions/mintsoft-sync.ts',
   'app/actions/wms-asn.ts',
@@ -129,7 +133,7 @@ function findLeaks(relPath) {
   const lines = readFileSync(join(ROOT, relPath), 'utf8').split(/\r?\n/)
   const findings = []
   for (let i = 0; i < lines.length; i += 1) {
-    if (!MINTSOFT_RE.test(lines[i])) continue
+    if (!CONNECTOR_LITERAL_RE.test(lines[i])) continue
     const onLine = WAIVER_RE.test(lines[i])
     const onPrev = i > 0 && WAIVER_RE.test(lines[i - 1])
     if (onLine || onPrev) continue
@@ -145,7 +149,7 @@ const findings = files
   .flatMap(findLeaks)
 
 if (findings.length > 0) {
-  console.error('WMS connector boundary violation: the `mintsoft` literal is not allowed in core app flows.')
+  console.error('WMS connector boundary violation: a WMS connector literal (mintsoft/shiphero) is not allowed in core app flows.')
   console.error('Route through the generic WMS boundary (WmsConnector contract + wms-* facades). See docs/wms-connector-boundary.md.')
   console.error('If the reference is genuinely connector-specific, add it to the allowlist in this script or add a waiver:')
   console.error('// wms-connector-boundary-ok: <ticket-or-date>: <reason>')
@@ -156,4 +160,4 @@ if (findings.length > 0) {
   process.exit(1)
 }
 
-console.log(`WMS connector boundary clean — scanned ${files.length} files, no mintsoft leaks outside the allowlist.`)
+console.log(`WMS connector boundary clean — scanned ${files.length} files, no connector-literal leaks outside the allowlist.`)
