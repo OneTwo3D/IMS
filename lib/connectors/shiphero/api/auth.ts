@@ -221,14 +221,18 @@ export async function getShipheroAccessToken(options?: { forceRefresh?: boolean 
     })()
     shipheroAuthRefreshInFlight = tracked
     // Clear the slot once the refresh settles — resolve OR reject — comparing
-    // against the exact promise stored in the slot so it always nulls out. The
-    // earlier `.finally()` compared against a different (pre-`.finally`) promise,
-    // so it never matched and a failed refresh leaked permanently.
-    void tracked.finally(() => {
+    // against the exact promise stored so it always nulls out (the earlier
+    // `.finally()` compared against a different, pre-`.finally` promise, so it
+    // never matched and a failed refresh leaked). Use `then(clear, clear)` rather
+    // than `finally`: the derived promise then FULFILS on both paths, so a
+    // rejected refresh can't surface as an unhandled rejection on this discarded
+    // continuation — callers await `tracked` itself and handle the error there.
+    const clearSlot = () => {
       if (shipheroAuthRefreshInFlight === tracked) {
         shipheroAuthRefreshInFlight = null
       }
-    })
+    }
+    void tracked.then(clearSlot, clearSlot)
   }
 
   return shipheroAuthRefreshInFlight
