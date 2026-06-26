@@ -130,3 +130,22 @@ export {
   type ShipheroGraphqlResult,
 } from './api/client'
 export { extractShipheroWarehouses, normalizeShipheroWarehouse } from './api/normalizers'
+export {
+  registerAllShipheroWebhooks,
+  registerShipheroWebhook,
+  deleteShipheroWebhook,
+  SHIPHERO_WEBHOOK_NAMES,
+  type ShipheroWebhookRegistration,
+} from './api/webhooks'
+export {
+  SHIPHERO_WEBHOOK_EVENT_TYPES,
+  deriveShipheroStatusRank,
+  extractShipheroEventId,
+  extractShipheroOrderRef,
+  extractShipheroFulfillmentStatus,
+  isShipheroWebhookEventType,
+  normalizeShipheroEventType,
+  normalizeShipheroFulfillmentStatus,
+  rankShipheroFulfillmentStatus,
+  type ShipheroWebhookEventType,
+} from './webhook-validation'

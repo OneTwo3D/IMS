@@ -10,3 +10,4 @@
 import './wms-order-status' // connector-agnostic (module 'wms')
 import './wms-order-push' // connector-agnostic (module 'wms')
 import './wms-mintsoft' // Mintsoft connector jobs
+import './wms-shiphero' // ShipHero connector jobs
