@@ -635,6 +635,64 @@ export async function saveMintsoftCourierServiceMap(rawJson: unknown): Promise<{
   return { success: true }
 }
 
+/**
+ * Order dispatch deep-link template + courier fallback (Phase 8). Both feed the
+ * outbound order-push / order-status flow and previously had no UI — settable
+ * only via raw DB. A blank template falls back to the proven default; a blank
+ * courier id means "no fallback".
+ */
+export async function getMintsoftOrderDispatchSettings(): Promise<{
+  adminOrderUrlTemplate: string
+  defaultCourierServiceId: string
+}> {
+  await requireMintsoftReadAccess()
+  const settings = await getMintsoftSettings()
+  return {
+    adminOrderUrlTemplate: settings.mintsoft_admin_order_url_template,
+    defaultCourierServiceId: settings.mintsoft_default_courier_service_id,
+  }
+}
+
+export async function saveMintsoftOrderDispatchSettings(input: {
+  adminOrderUrlTemplate?: unknown
+  defaultCourierServiceId?: unknown
+}): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftWriteAccess()
+
+  const template = typeof input?.adminOrderUrlTemplate === 'string' ? input.adminOrderUrlTemplate.trim() : ''
+  if (template && !template.includes('{id}')) {
+    return { success: false, error: 'The order URL template must contain the {id} placeholder.' }
+  }
+
+  const courierRaw =
+    typeof input?.defaultCourierServiceId === 'number'
+      ? String(input.defaultCourierServiceId)
+      : typeof input?.defaultCourierServiceId === 'string'
+        ? input.defaultCourierServiceId.trim()
+        : ''
+  if (courierRaw) {
+    const id = Number(courierRaw)
+    if (!Number.isInteger(id) || id <= 0) {
+      return { success: false, error: 'Default courier service id must be a positive integer, or blank for no fallback.' }
+    }
+  }
+
+  await db.$transaction([
+    db.setting.upsert({
+      where: { key: 'mintsoft_admin_order_url_template' },
+      create: { key: 'mintsoft_admin_order_url_template', value: serializeSettingValue('mintsoft_admin_order_url_template', template) },
+      update: { value: serializeSettingValue('mintsoft_admin_order_url_template', template) },
+    }),
+    db.setting.upsert({
+      where: { key: 'mintsoft_default_courier_service_id' },
+      create: { key: 'mintsoft_default_courier_service_id', value: serializeSettingValue('mintsoft_default_courier_service_id', courierRaw) },
+      update: { value: serializeSettingValue('mintsoft_default_courier_service_id', courierRaw) },
+    }),
+  ])
+  revalidatePath('/sync')
+  return { success: true }
+}
+
 function getAvailableOrderLookupConnectors(pluginState: {
   woocommerce: boolean
   shopify: boolean

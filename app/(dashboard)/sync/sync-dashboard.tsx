@@ -100,7 +100,7 @@ const CONNECTORS: ConnectorDef[] = [
     id: 'mintsoft',
     name: 'Mintsoft',
     description: 'Bind Mintsoft warehouses, store credentials, and stage WMS callbacks',
-    logo: '',
+    logo: '/images/mintsoft.svg',
     category: 'wms',
     available: true,
   },
@@ -135,14 +135,8 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
       <span className="text-base font-bold tracking-tight">REST API</span>
     </div>
   ),
-  mintsoft: (
-    <div className="flex h-8 items-center gap-2">
-      <div className="flex h-8 w-8 items-center justify-center rounded-md bg-amber-100 text-xs font-bold text-amber-700">
-        MS
-      </div>
-      <span className="text-base font-semibold tracking-tight">Mintsoft</span>
-    </div>
-  ),
+  // eslint-disable-next-line @next/next/no-img-element
+  mintsoft: <img src="/images/mintsoft.svg" alt="Mintsoft" className="h-8 object-contain" />,
   // eslint-disable-next-line @next/next/no-img-element
   xero: <img src="/images/xero.svg" alt="Xero" className="h-8 object-contain" />,
   // eslint-disable-next-line @next/next/no-img-element

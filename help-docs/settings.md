@@ -267,6 +267,12 @@ The system relies on scheduled jobs to keep external systems in sync and to main
 | `/api/cron/backup` | Database backup | Daily |
 | `/api/cron/product-lifecycle-archive` | Auto-archive exhausted EOL products | Daily |
 | `/api/cron/mintsoft-webhook-sweeper` | Drain Mintsoft webhook events | Every 5 min |
+| `/api/cron/wms-order-push` | Push paid, ready-to-fulfil orders for WMS-bound warehouses to the WMS, and propagate cancellations (Phase 8 dispatch). **Off by default** | Every 10 min |
+| `/api/cron/wms-order-status` | Refresh cached WMS order statuses that power the sales-list status chips | Every 15 min |
+| `/api/cron/mintsoft-stock-sync` | Poll Mintsoft warehouse stock and queue discrepancy handling for bound warehouses | Hourly |
+| `/api/cron/mintsoft-returns-sync` | Poll the Mintsoft returns feed and stage items for review | Hourly |
+| `/api/cron/mintsoft-product-verify` | Check Mintsoft product/barcode mappings against IMS products | Daily |
+| `/api/cron/mintsoft-bundle-verify` | Check KIT composition against the linked Mintsoft bundle | Daily |
 | `/api/cron/email-outbox` | Send queued emails | Hourly |
 | `/api/cron/activity-cleanup` | Trim old activity log entries | Daily |
 
