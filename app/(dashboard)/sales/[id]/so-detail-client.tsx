@@ -82,6 +82,7 @@ type AllocationPanelLine = {
   productId: string | null
   sku: string
   description: string
+  imageUrl: string | null
   productType: ProductType | null
   oversellAllowed: boolean
   qty: number
@@ -582,7 +583,12 @@ function AllocationPanel({
               const isAdding = showAddLine === l.id
               return (
                 <div key={l.id} className="px-4 py-2.5 flex items-center gap-3">
-                  <div className="w-8 h-8 rounded bg-muted shrink-0" />
+                  {l.imageUrl ? (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img src={l.imageUrl} alt="" className="w-8 h-8 rounded object-cover shrink-0" />
+                  ) : (
+                    <div className="w-8 h-8 rounded bg-muted shrink-0" />
+                  )}
                   <div className="flex-1 min-w-0">
                     {l.productId ? <ProductLink productId={l.productId} sku={l.sku} name={l.description} /> : <span className="text-sm">{l.description}</span>}
                   </div>
