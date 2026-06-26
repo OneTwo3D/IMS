@@ -98,28 +98,19 @@ async function persistShipheroAuthSession(token: string, expiresAt: Date): Promi
       update: { value: serializeSettingValue(SHIPHERO_ACCESS_TOKEN_KEY, token) },
     })
 
-    const existingConnection = await tx.wmsConnection.findFirst({
-      where: { connector: 'shiphero' },
-      orderBy: [{ createdAt: 'asc' }],
-      select: { id: true },
-    })
-
-    if (existingConnection) {
-      await tx.wmsConnection.update({
-        where: { id: existingConnection.id },
-        data: { tokenExpiresAt: expiresAt, lastAuthAt: now },
-      })
-      return
-    }
-
-    await tx.wmsConnection.create({
-      data: {
+    // Upsert on the (connector, label) unique key so two concurrent refreshes
+    // (e.g. across app instances) can't both create the row and trip the unique
+    // constraint — the findFirst+create pattern was racy.
+    await tx.wmsConnection.upsert({
+      where: { connector_label: { connector: 'shiphero', label: DEFAULT_SHIPHERO_CONNECTION_LABEL } },
+      create: {
         connector: 'shiphero',
         label: DEFAULT_SHIPHERO_CONNECTION_LABEL,
         baseUrl: SHIPHERO_DEFAULT_BASE_URL,
         tokenExpiresAt: expiresAt,
         lastAuthAt: now,
       },
+      update: { tokenExpiresAt: expiresAt, lastAuthAt: now },
     })
   })
 }
@@ -223,14 +214,18 @@ export async function getShipheroAccessToken(options?: { forceRefresh?: boolean 
   }
 
   if (!shipheroAuthRefreshInFlight) {
-    const refreshPromise = (async () => {
+    const tracked = (async () => {
       const session = await requestShipheroAuthSession(config.baseUrl, config.refreshToken)
       await persistShipheroAuthSession(session.token, session.expiresAt)
       return session.token
     })()
-
-    shipheroAuthRefreshInFlight = refreshPromise.finally(() => {
-      if (shipheroAuthRefreshInFlight === refreshPromise) {
+    shipheroAuthRefreshInFlight = tracked
+    // Clear the slot once the refresh settles — resolve OR reject — comparing
+    // against the exact promise stored in the slot so it always nulls out. The
+    // earlier `.finally()` compared against a different (pre-`.finally`) promise,
+    // so it never matched and a failed refresh leaked permanently.
+    void tracked.finally(() => {
+      if (shipheroAuthRefreshInFlight === tracked) {
         shipheroAuthRefreshInFlight = null
       }
     })

@@ -103,16 +103,28 @@ async function sendShipheroGraphql<T>(
     allowE2eLocalHttp: true,
   })
 
-  // HTTP-layer auth rejection — surfaced to the caller to drive a refresh+retry.
-  if (response.status === 401 || response.status === 403) {
+  const body = (await response.json().catch(() => null)) as { data?: T; errors?: ShipheroGraphqlError[] } | null
+
+  // HTTP 401 is a definitive token rejection — no body inspection needed.
+  if (response.status === 401) {
     return { data: null, error: 'ShipHero rejected the access token', status: response.status }
   }
 
+  // Other non-2xx (403, 5xx, …): surface WITH any parsed errors[] so the caller
+  // classifies. A 403 may carry a throttle/quota error[], which must not be
+  // mistaken for an auth failure (that would burn a token refresh + retry the
+  // over-budget query). The auth-rejection decision is left to
+  // isShipheroInvalidTokenErrors, which skips throttle-shaped errors.
   if (!response.ok) {
-    return { data: null, error: `ShipHero GraphQL request failed with status ${response.status}`, status: response.status }
+    const errors = body?.errors?.length ? body.errors : undefined
+    return {
+      data: null,
+      errors,
+      error: errors ? summarizeShipheroErrors(errors) : `ShipHero GraphQL request failed with status ${response.status}`,
+      status: response.status,
+    }
   }
 
-  const body = (await response.json().catch(() => null)) as { data?: T; errors?: ShipheroGraphqlError[] } | null
   if (body?.errors?.length) {
     return { data: body.data ?? null, errors: body.errors, error: summarizeShipheroErrors(body.errors), status: response.status }
   }
@@ -137,8 +149,11 @@ export async function shipheroGraphql<T>(
     const accessToken = await getShipheroAccessToken()
     const firstAttempt = await sendShipheroGraphql<T>(config.baseUrl, accessToken, query, variables)
 
+    // HTTP 401 OR an invalid-token errors[] payload (which can ride on a 403 or
+    // even a 200) drives a single refresh + retry. A 403 alone is NOT treated as
+    // auth — its errors[] decides, so a throttle on a 403 falls through to the
+    // caller instead of burning a refresh.
     const authRejected = firstAttempt.status === 401
-      || firstAttempt.status === 403
       || isShipheroInvalidTokenErrors(firstAttempt.errors)
     if (!authRejected) {
       return firstAttempt
