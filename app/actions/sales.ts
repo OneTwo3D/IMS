@@ -154,6 +154,8 @@ export type SoRow = {
   profitMarginPercent: number | null
   /** Cached live WMS order status (sales-list chip); null when none/disabled. */
   wmsStatus: WmsOrderStatusView | null
+  /** Outbound WMS dispatch-push state (sales-list chip); null when never pushed. */
+  wmsPush: { state: string; lastError: string | null } | null
 }
 
 export type SoDetail = SoRow & {
@@ -426,6 +428,7 @@ const SO_SELECT = {
       carrier: true,
     },
   },
+  wmsOrderPush: { select: { state: true, lastError: true } },
   _count: { select: { lines: true } },
   lines: { select: { cogsBase: true } },
 } as const
@@ -484,6 +487,7 @@ function mapSoRow(so: {
     trackingNumber: string | null
     carrier: string | null
   } | null
+  wmsOrderPush: { state: string; lastError: string | null } | null
 }): SoRow {
   const totalBase = Number(so.totalBase)
   const lineCogs = so.lines.map((l) => l.cogsBase != null ? Number(l.cogsBase) : null)
@@ -497,6 +501,7 @@ function mapSoRow(so: {
   const wms = so.wmsOrderStatus
   return {
     id: so.id,
+    wmsPush: so.wmsOrderPush ? { state: so.wmsOrderPush.state, lastError: so.wmsOrderPush.lastError } : null,
     wmsStatus: wms
       ? {
           connectorLabel: wms.connectorLabel,

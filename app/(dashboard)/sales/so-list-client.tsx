@@ -67,7 +67,7 @@ function timeAgo(iso: string): string {
 
 type ColKey = 'order' | 'customer' | 'status' | 'total' | 'warehouse' | 'created' | 'items'
   | 'source' | 'country' | 'payment' | 'shipping' | 'orderDate' | 'shippedDate'
-  | 'deliveredDate' | 'invoiceStatus' | 'stockStatus' | 'cogs' | 'profit' | 'wms'
+  | 'deliveredDate' | 'invoiceStatus' | 'stockStatus' | 'cogs' | 'profit' | 'wms' | 'wmsPush'
 
 type ColDef = { key: ColKey; label: string; align?: 'right' }
 
@@ -91,7 +91,19 @@ const ALL_COLUMNS: ColDef[] = [
   { key: 'cogs', label: 'COGS', align: 'right' },
   { key: 'profit', label: 'Profit %', align: 'right' },
   { key: 'wms', label: 'WMS Status' },
+  { key: 'wmsPush', label: 'WMS Dispatch' },
 ]
+
+const WMS_PUSH_TONE: Record<string, string> = {
+  SYNCED: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
+  PENDING_CREATE: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200',
+  HELD: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200',
+  CANCELLED: 'bg-muted text-muted-foreground',
+  DEAD_LETTER: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+}
+const WMS_PUSH_LABEL: Record<string, string> = {
+  SYNCED: 'Pushed', PENDING_CREATE: 'Queued', PENDING_CANCEL: 'Cancelling', HELD: 'Held', CANCELLED: 'Cancelled', DEAD_LETTER: 'Failed',
+}
 
 const DEFAULT_VISIBLE: ColKey[] = ['order', 'customer', 'status', 'total', 'warehouse', 'created', 'items']
 const FIXED_COLS: ColKey[] = ['order']
@@ -334,6 +346,21 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
         return (
           <TableCell key={key}>
             {so.wmsStatus ? <WmsOrderStatusChip status={so.wmsStatus} /> : <span className="text-muted-foreground text-xs">—</span>}
+          </TableCell>
+        )
+      case 'wmsPush':
+        return (
+          <TableCell key={key}>
+            {so.wmsPush ? (
+              <span
+                className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${WMS_PUSH_TONE[so.wmsPush.state] ?? 'bg-muted text-muted-foreground'}`}
+                title={so.wmsPush.lastError ?? undefined}
+              >
+                {WMS_PUSH_LABEL[so.wmsPush.state] ?? so.wmsPush.state}
+              </span>
+            ) : (
+              <span className="text-muted-foreground text-xs">—</span>
+            )}
           </TableCell>
         )
     }
