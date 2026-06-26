@@ -130,6 +130,8 @@ export default async function ProductDetailPage({
               parentId={product.parentId}
             />
           )}
+          {/* Save (portaled here from the inline ProductForm) sits top-right on the name row */}
+          <div id="product-detail-actions" className="ml-auto flex items-center" />
         </div>
       </div>
 
