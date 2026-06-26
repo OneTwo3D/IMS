@@ -997,6 +997,10 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   <span className="text-sm">Import completed</span>
                 </div>
                 <p className="text-xs text-muted-foreground">{importProgress.message}</p>
+                <Button size="sm" variant="outline" onClick={handleStartInitialImport} disabled={importStarting}>
+                  {importStarting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+                  Re-import active orders
+                </Button>
               </div>
             ) : importProgress?.status === 'error' ? (
               <div className="space-y-2">

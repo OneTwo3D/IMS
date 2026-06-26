@@ -75,6 +75,23 @@ const SYNC_SETTING_KEYS = [
   'wc_fx_push_enabled', 'last_wc_fx_push_at',
 ]
 
+// Machine-managed sync state — written by the import / sync / webhook jobs, never
+// by the settings form. Excluded from saveSyncSettings so a settings save can't
+// silently wipe the initial-import-completed flag or the sync cursors (which would
+// turn live order sync back off).
+const MACHINE_MANAGED_SYNC_KEYS = new Set<string>([
+  'wc_initial_import_completed',
+  'wc_webhook_last_received_at',
+  'wc_order_webhook_last_received_at',
+  'wc_product_webhook_last_received_at',
+  'last_wc_order_sync_at',
+  'last_wc_order_reconcile_at',
+  'last_wc_product_sync_at',
+  'last_wc_product_reconcile_at',
+  'last_wc_stock_sync_at',
+  'last_wc_fx_push_at',
+])
+
 const SYNC_DEFAULTS: WcSyncSettings = {
   wc_sync_enabled: 'false',
   wc_sync_order_statuses: '["processing"]',
@@ -210,7 +227,7 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
   })
   if (!gate.ok) return { success: false, error: gate.error }
   const ops = Object.entries(data)
-    .filter((entry): entry is [string, string] => SYNC_SETTING_KEYS.includes(entry[0]) && typeof entry[1] === 'string')
+    .filter((entry): entry is [string, string] => SYNC_SETTING_KEYS.includes(entry[0]) && !MACHINE_MANAGED_SYNC_KEYS.has(entry[0]) && typeof entry[1] === 'string')
     .map(([k, v]) =>
       db.setting.upsert({
         where: { key: k },
