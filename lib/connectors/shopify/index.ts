@@ -3,6 +3,7 @@ import type { ShoppingProductLinkResult, ShoppingWebhookResource } from '@/lib/s
 import { notImplementedResult } from '@/lib/connectors/not-implemented'
 import { db } from '@/lib/db'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { scheduleInboxDrain } from '@/lib/jobs/shopping/drain-inbox'
 import {
   createShoppingWebhookEventRepository,
   persistShopifyWebhookEvent,
@@ -816,6 +817,13 @@ export async function handleWebhook(options: ShopifyWebhookOptions = {}) {
       payload,
     },
   )
+
+  // Near-realtime: kick a debounced, single-flight inbox drain for newly-received
+  // events instead of waiting for the 5-min cron. Non-blocking — the cron remains
+  // the durability backstop.
+  if (result.status === 'created') {
+    scheduleInboxDrain('shopify')
+  }
 
   return Response.json({
     accepted: true,

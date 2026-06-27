@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { scheduleInboxDrain } from '@/lib/jobs/shopping/drain-inbox'
 import { importWcOrder } from '@/lib/connectors/woocommerce/sync/order-import'
 import { syncWcOrderStatus } from '@/lib/connectors/woocommerce/sync/order-status'
 import { syncRefundsForOrder, syncWcRefund } from '@/lib/connectors/woocommerce/sync/refund-sync'
@@ -399,6 +400,13 @@ export async function handleWcWebhook(
       payload: parsed.value,
     },
   )
+
+  // Near-realtime: kick a debounced, single-flight inbox drain for newly-received
+  // events instead of waiting for the 5-min cron. Non-blocking — the cron remains
+  // the durability backstop.
+  if (result.status === 'created') {
+    scheduleInboxDrain('woocommerce')
+  }
 
   return NextResponse.json({
     accepted: true,
