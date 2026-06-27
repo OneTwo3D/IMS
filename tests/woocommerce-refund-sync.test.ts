@@ -125,6 +125,76 @@ test('syncWcRefund treats repeated WooCommerce refund delivery as already proces
   assert.equal(state.createRefundCalls, 1)
 })
 
+test('syncWcRefund reconciles a VAT line refund on the gross basis (amount includes tax)', async () => {
+  // WooCommerce reports line `total` ex-tax with `total_tax` separate, while the
+  // refund `amount` is gross. A tax-exclusive order line of 19.66 + 3.93 VAT must
+  // not be rejected as an "amount mismatch" against the gross 23.59 amount.
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  const refund = makeRefund({
+    id: 7002,
+    amount: '23.59',
+    line_items: [
+      {
+        id: 501,
+        name: 'Widget',
+        product_id: 10,
+        variation_id: 0,
+        quantity: -1,
+        tax_class: '',
+        subtotal: '-19.66',
+        subtotal_tax: '-3.93',
+        total: '-19.66',
+        total_tax: '-3.93',
+        sku: 'WIDGET',
+        meta_data: [],
+        refund_total: 23.59,
+      },
+    ],
+  })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.deepEqual(result, { success: true })
+  assert.equal(state.createRefundCalls, 1)
+  // No PENDING amount-mismatch log should have been written
+  assert.equal(
+    state.syncLogs.some((log) => /amount mismatch/.test(String((log as { data?: { errorMessage?: string } }).data?.errorMessage ?? ''))),
+    false,
+  )
+})
+
+test('syncWcRefund still rejects a genuine amount mismatch', async () => {
+  // Mapped gross (10.00 + 1.00 tax = 11.00) is far from the claimed 99.00 amount.
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  const refund = makeRefund({
+    id: 7003,
+    amount: '99.00',
+    line_items: [
+      {
+        id: 501,
+        name: 'Widget',
+        product_id: 10,
+        variation_id: 0,
+        quantity: -1,
+        tax_class: '',
+        subtotal: '-10.00',
+        subtotal_tax: '-1.00',
+        total: '-10.00',
+        total_tax: '-1.00',
+        sku: 'WIDGET',
+        meta_data: [],
+        refund_total: 11,
+      },
+    ],
+  })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /amount mismatch/)
+  assert.equal(state.createRefundCalls, 0)
+})
+
 test('syncWcRefund treats external refund unique conflicts as idempotent races', async () => {
   const state = makeDependencies({ alwaysMissExistingRefund: true })
   state.dependencies.createRefund = async () => {

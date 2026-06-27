@@ -71,6 +71,14 @@ export async function syncWcRefund(
     // Restock if any refund line item has qty != 0
     const hasQtyRefund = wcRefund.line_items.some((l) => Math.abs(l.quantity) > 0)
 
+    // Reconciliation is done on a GROSS (tax-inclusive) basis because
+    // wcRefund.amount is the gross amount refunded, whereas WooCommerce reports
+    // line/shipping `total` ex-tax with `total_tax` separate. We accumulate the
+    // gross of every line we map and compare that to wcRefund.amount. The refund
+    // LINES we store stay net (matching the order lines); createRefund grosses
+    // them back up via the order's tax rate.
+    let mappedGrossForeign = toDecimal(0)
+
     // Map refund lines
     const refundLines: {
       lineId?: string
@@ -92,6 +100,7 @@ export async function syncWcRefund(
         const imsLine = so.lines.find((l) => l.externalLineItemId === rl.id)
         const refundTotal = parseDecimalAbs(rl.total)
         const refundGbp = divideRoundedNumber(refundTotal, fxRate, 4)
+        mappedGrossForeign = mappedGrossForeign.add(refundTotal).add(parseDecimalAbs(rl.total_tax))
 
         refundLines.push({
           lineId: imsLine?.id,
@@ -108,6 +117,7 @@ export async function syncWcRefund(
     for (const shippingLine of wcRefund.shipping_lines ?? []) {
       const shippingRefundTotal = parseDecimalAbs(shippingLine.total)
       if (shippingRefundTotal.lte(0.000001)) continue
+      mappedGrossForeign = mappedGrossForeign.add(shippingRefundTotal).add(parseDecimalAbs(shippingLine.total_tax))
       refundLines.push({
         productId: null,
         description: shippingLine.method_title || 'Shipping refund',
@@ -119,6 +129,8 @@ export async function syncWcRefund(
     }
 
     if (refundLines.length === 0) {
+      // Monetary-only refund (no line items / shipping to break down): treat the
+      // whole gross amount as a single line. Its gross equals wcRefund.amount.
       refundLines.push({
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',
@@ -127,14 +139,12 @@ export async function syncWcRefund(
         totalBase: divideRoundedNumber(refundAmountForeign, fxRate, 4),
         lineKind: 'sale',
       })
+      mappedGrossForeign = refundAmountForeign
     }
 
-    const mappedRefundTotalForeign = roundDecimalNumber(
-      refundLines.reduce((sum, line) => sum.add(toDecimal(line.totalForeign ?? 0).abs()), toDecimal(0)),
-      4,
-    )
-    if (refundLines.length > 0 && toDecimal(mappedRefundTotalForeign).sub(refundAmountForeign).abs().gt(0.01)) {
-      const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${mappedRefundTotalForeign.toFixed(2)} but refund total is ${refundAmountForeign.toDecimalPlaces(2).toFixed(2)}`
+    const mappedGrossRounded = roundDecimalNumber(mappedGrossForeign, 4)
+    if (refundLines.length > 0 && toDecimal(mappedGrossRounded).sub(refundAmountForeign).abs().gt(0.01)) {
+      const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${toDecimal(mappedGrossRounded).toFixed(2)} but refund total is ${refundAmountForeign.toDecimalPlaces(2).toFixed(2)}`
       await client.shoppingSyncLog.create({
         data: {
           direction: 'FROM_CONNECTOR',
