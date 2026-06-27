@@ -176,6 +176,8 @@ export type SoDetail = SoRow & {
       productId: string | null
       description: string
       qty: number
+      unitPriceForeign: number
+      totalForeign: number
       totalBase: number
     }[]
   }[]
@@ -666,7 +668,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,
           lines: {
-            select: { id: true, productId: true, description: true, qty: true, totalBase: true },
+            select: { id: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true },
           },
           payments: {
             select: { id: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
@@ -705,6 +707,8 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         productId: rl.productId,
         description: rl.description,
         qty: Number(rl.qty),
+        unitPriceForeign: Number(rl.unitPriceForeign),
+        totalForeign: Number(rl.totalForeign),
         totalBase: Number(rl.totalBase),
       })),
     })),

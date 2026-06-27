@@ -842,6 +842,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const vatRate = so.taxRatePercent ?? 0
   const inclVat = so.pricesIncludeVat && vatRate > 0
   const toGross = (net: number) => inclVat ? net * (1 + vatRate) : net
+  // Refund/credit-note amounts are always shown tax-inclusive (like the order's
+  // grand total), since refund line totals are stored net regardless of inclVat.
+  const grossWithVat = (net: number) => vatRate > 0 ? net * (1 + vatRate) : net
   const subtotalDisplay = toGross(so.subtotalForeign)
   const shippingDisplay = toGross(so.shippingForeign)
   const discountDisplay = so.discountAmount // already gross in inclVat mode
@@ -1457,12 +1460,29 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                   <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                 </div>
-                <span className="font-mono font-medium text-destructive">-{money(r.totalForeign)}</span>
+                <span className="font-mono font-medium text-destructive">-{money(grossWithVat(r.totalForeign))}</span>
               </div>
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
-              <Table className="text-xs"><TableBody>{r.lines.map((rl) => (
-                <TableRow key={rl.id}><TableCell className="py-1 pr-4">{rl.description}</TableCell><TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty}</TableCell><TableCell className="py-1 text-right font-mono">{baseMoney(rl.totalBase)}</TableCell></TableRow>
-              ))}</TableBody></Table>
+              <Table className="text-xs">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="py-1 pr-4 text-xs">Item</TableHead>
+                    <TableHead className="py-1 pr-4 text-xs text-right">Qty</TableHead>
+                    <TableHead className="py-1 pr-4 text-xs text-right">Unit Price</TableHead>
+                    {vatRate > 0 && <TableHead className="py-1 pr-4 text-xs text-right">VAT</TableHead>}
+                    <TableHead className="py-1 text-xs text-right">Total</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>{r.lines.map((rl) => (
+                  <TableRow key={rl.id}>
+                    <TableCell className="py-1 pr-4">{rl.description}</TableCell>
+                    <TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty > 0 ? rl.qty : '—'}</TableCell>
+                    <TableCell className="py-1 pr-4 text-right font-mono tabular-nums">{rl.qty > 0 ? money(rl.unitPriceForeign) : '—'}</TableCell>
+                    {vatRate > 0 && <TableCell className="py-1 pr-4 text-right font-mono tabular-nums text-muted-foreground">{money(rl.totalForeign * vatRate)}</TableCell>}
+                    <TableCell className="py-1 text-right font-mono tabular-nums">{money(toGross(rl.totalForeign))}</TableCell>
+                  </TableRow>
+                ))}</TableBody>
+              </Table>
               {/* Credit note payments */}
               {accountingAvailable && r.payments.length > 0 && (
                 <div className="space-y-1 pt-1 border-t">
