@@ -97,8 +97,8 @@ export default async function ProductDetailPage({
 
   return (
     <div className="space-y-6">
-      {/* Breadcrumb */}
-      <div>
+      {/* Breadcrumb + title — sticky so the Save action stays visible while scrolling */}
+      <div className="sticky top-0 z-10 -mx-3 sm:-mx-4 md:-mx-6 border-b bg-background/95 px-3 sm:px-4 md:px-6 py-3 backdrop-blur">
         <nav className="flex items-center gap-1 text-sm text-muted-foreground mb-2">
           <Link href="/inventory" className="hover:text-foreground">Inventory</Link>
           {product.parentId && product.parentSku && (
