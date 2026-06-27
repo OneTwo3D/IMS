@@ -19,6 +19,7 @@ type Order = {
   externalOrderNumber: string | null
   orderNumber: string | null
   status: string
+  refundStatus?: string
   fxRateToBase: number
   totalBase: number
   revenueDeferredDate: Date | null
@@ -494,10 +495,25 @@ test('createSalesOrderRefund creates a partial refund record', async () => {
 
   assert.equal(result.success, true)
   assert.equal(state.orders[0].status, 'PARTIALLY_REFUNDED')
+  assert.equal(state.orders[0].refundStatus, 'PARTIAL')
   assert.equal(state.refunds[0].creditNoteNumber, 'CN-2026-00001')
   assert.equal(state.refundLines[0].qty, 1)
   assert.equal(state.refundLines[0].unitPriceBase, 50)
   assert.equal(state.refundLines[0].salesOrderLineId, 'line-1')
+})
+
+test('createSalesOrderRefund dual-writes refundStatus=FULL on a full refund', async () => {
+  const state = baseState()
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Full return',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].status, 'REFUNDED')
+  assert.equal(state.orders[0].refundStatus, 'FULL')
 })
 
 test('createSalesOrderRefund converts refund totals from base to foreign currency', async () => {

@@ -40,7 +40,7 @@ async function seedScenario(s: Scenario, wh: { id: string }) {
 
   const order = await db.salesOrder.create({
     data: {
-      orderNumber: `${s.tag}-SO`, customerId: customer.id, status: 'PARTIALLY_REFUNDED',
+      orderNumber: `${s.tag}-SO`, customerId: customer.id, status: 'PARTIALLY_REFUNDED', refundStatus: 'PARTIAL',
       shipFromWarehouseId: wh.id, fxRateToBase: 1,
       subtotalForeign: s.deferredBase, totalForeign: s.deferredBase,
       subtotalBase: s.deferredBase, totalBase: s.deferredBase,

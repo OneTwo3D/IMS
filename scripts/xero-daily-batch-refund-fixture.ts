@@ -66,6 +66,7 @@ async function quarantinePriorFixtures() {
     },
     data: {
       status: 'REFUNDED',
+      refundStatus: 'FULL',
     },
   })
 }

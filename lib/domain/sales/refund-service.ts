@@ -15,6 +15,7 @@ import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } 
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
+import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
@@ -1823,7 +1824,12 @@ export async function createSalesOrderRefund(
       : 'PARTIALLY_REFUNDED'
     const refundTransition = validateRefundSalesOrderStatusUpdate(so.status, newStatus)
     if (!refundTransition.success) throw new Error(refundTransition.error)
-    await tx.salesOrder.update({ where: { id: input.orderId }, data: { status: newStatus } })
+    // Dual-write the orthogonal refund disposition alongside the legacy status. Later
+    // stages move consumers onto refundStatus and stop encoding refund state in status.
+    await tx.salesOrder.update({
+      where: { id: input.orderId },
+      data: { status: newStatus, refundStatus: refundDispositionForStatus(newStatus) },
+    })
 
     // Build fallback rows inside the refund transaction so source-stock errors
     // roll back the refund and its lines. Stock application remains in the

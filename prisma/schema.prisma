@@ -105,6 +105,13 @@ enum SalesOrderStatus {
   PARTIALLY_REFUNDED
 }
 
+// Refund disposition for a sales order, orthogonal to the fulfilment lifecycle status.
+enum RefundDisposition {
+  NONE
+  PARTIAL
+  FULL
+}
+
 enum ShipmentStatus {
   PENDING
   PICKING
@@ -1480,6 +1487,11 @@ model SalesOrder {
   id                String           @id @default(cuid())
   externalOrderNumber String?         // Storefront order number/reference
   status            SalesOrderStatus @default(DRAFT)
+  // Refund disposition, orthogonal to the fulfilment `status` lifecycle (an order can
+  // be e.g. Processing + Partially refunded, or Delivered + Fully refunded). Maintained
+  // by the refund service; the legacy PARTIALLY_REFUNDED/REFUNDED `status` values are
+  // being retired in favour of this field (epic: orthogonal refund status).
+  refundStatus      RefundDisposition @default(NONE)
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 

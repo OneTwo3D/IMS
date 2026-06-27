@@ -11,6 +11,7 @@ import {
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
 } from './field-mapping'
 import { syncRefundsForOrder } from './refund-sync'
+import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
@@ -609,6 +610,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           externalUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
           ...(options.useWcDateAsCreatedAt ? { createdAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
           status: imsStatus,
+          // Keep the orthogonal refund disposition consistent when an order is first
+          // imported already in a refund status (e.g. WC 'refunded' → REFUNDED).
+          refundStatus: refundDispositionForStatus(imsStatus),
           shipFromWarehouseId: wcDefaultWarehouseId,
           currency,
           fxRateToBase: fxRate,
