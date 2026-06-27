@@ -694,10 +694,13 @@ export async function getShoppingSyncLogs(limit = 50): Promise<SyncLogRow[]> {
 // Auto-create WooCommerce webhooks
 // ---------------------------------------------------------------------------
 
+// WooCommerce only supports webhook topics for the coupon/customer/order/product
+// resources — there is no `refund` resource, so a `refund.created` topic is rejected
+// with woocommerce_rest_shop_webhook_invalid_topic. Refunds are covered by the
+// `order.updated` webhook, whose handler calls syncRefundsForOrder().
 const WC_WEBHOOK_DEFS = [
   { name: 'OTI – Order created',   topic: 'order.created',   path: '/api/webhooks/shopping/woocommerce/orders' },
   { name: 'OTI – Order updated',   topic: 'order.updated',   path: '/api/webhooks/shopping/woocommerce/orders' },
-  { name: 'OTI – Refund created',  topic: 'refund.created',  path: '/api/webhooks/shopping/woocommerce/orders' },
   { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/shopping/woocommerce/products' },
 ] as const
 
