@@ -39,6 +39,7 @@ type SourceOrderRow = {
   orderNumber: string | null
   externalOrderNumber: string | null
   status: string
+  refundStatus: string
   revenueDeferredDate: Date | string | null
   inventoryAllocatedDate: Date | string | null
 }
@@ -160,7 +161,6 @@ export const MAX_RECONCILIATION_FINDINGS_PER_RUN = 500
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
 const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'PARTIALLY_REFUNDED', 'CANCELLED', 'COMPLETED', 'DELIVERED'] as const
-const REFUNDED_SALES_ORDER_STATUSES = new Set(['REFUNDED', 'PARTIALLY_REFUNDED'])
 // PENDING/PROCESSING are intentional evidence: reconciliation distinguishes
 // "queued but not mirrored" from "no accounting path was ever scheduled".
 const LIVE_SYNC_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED'])
@@ -447,7 +447,7 @@ export function evaluateAccountingReconciliationRows(
       }
     }
 
-    if (REFUNDED_SALES_ORDER_STATUSES.has(order.status)) {
+    if (order.refundStatus !== 'NONE') {
       for (const refund of orderRefunds) {
         const hasCreditNoteEvidence = hasRefundCreditNoteEvidence(rows, refund)
         const hasReversalEvidence = hasRefundReversalEvidence(rows, refund)
@@ -663,6 +663,7 @@ export async function collectAccountingReconciliationRows(
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
+        refundStatus: true,
         revenueDeferredDate: true,
         inventoryAllocatedDate: true,
       },
