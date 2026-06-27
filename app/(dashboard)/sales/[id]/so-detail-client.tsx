@@ -854,7 +854,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const nextActions = (STATUS_FLOW_SHIPMENTS[so.status] ?? []).filter((a) => a.target !== 'DELIVERED' || deliveryTrackingEnabled)
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
-  const canRefund = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'].includes(so.status)
+  // Refund is allowed once shipped, or to top up an already partially-refunded order.
+  // Reads the orthogonal refundStatus so it keeps working once a partial refund no
+  // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
+  const canRefund = (['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && so.refundStatus !== 'FULL') || so.refundStatus === 'PARTIAL'
   const canRetryRefundAccounting = hasPermission(currentUserRole, 'sales.refund')
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment

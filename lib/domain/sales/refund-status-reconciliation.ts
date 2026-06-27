@@ -29,6 +29,7 @@ export type RefundStatusOrderRow = {
   orderNumber: string | null
   externalOrderNumber: string | null
   status: string
+  refundStatus: string
   totalBase: DecimalInput
   refunds: Array<{
     id: string
@@ -49,7 +50,6 @@ export type RefundStatusReconciliationRows = {
   sourceRowLimitReached: boolean
 }
 
-const REFUNDED_STATUSES = new Set(['REFUNDED', 'PARTIALLY_REFUNDED'])
 const DEFAULT_SOURCE_ROW_LIMIT = 5000
 
 function orderLabel(order: Pick<RefundStatusOrderRow, 'id' | 'orderNumber' | 'externalOrderNumber'>): string {
@@ -67,17 +67,18 @@ function buildSummary(findings: RefundStatusReconciliationFinding[]): RefundStat
   )
 }
 
-function expectedRefundStatus(order: RefundStatusOrderRow): 'REFUNDED' | 'PARTIALLY_REFUNDED' | null {
+// Refund disposition implied by the refund records (null = no refunds = NONE).
+function expectedRefundDisposition(order: RefundStatusOrderRow): 'FULL' | 'PARTIAL' | null {
   if (order.refunds.length === 0) return null
   const orderTotal = toDecimal(order.totalBase)
   const refundedTotal = order.refunds.reduce((sum, refund) => sum.add(toDecimal(refund.totalBase)), toDecimal(0))
 
   if (orderTotal.lte(0)) {
-    return refundedTotal.gte(0) ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
+    return refundedTotal.gte(0) ? 'FULL' : 'PARTIAL'
   }
   return isFullRefundAmount(refundedTotal, orderTotal)
-    ? 'REFUNDED'
-    : 'PARTIALLY_REFUNDED'
+    ? 'FULL'
+    : 'PARTIAL'
 }
 
 export function evaluateRefundStatusReconciliationRows(
@@ -98,37 +99,39 @@ export function evaluateRefundStatusReconciliationRows(
   }
 
   for (const order of rows.salesOrders) {
-    const expectedStatus = expectedRefundStatus(order)
+    const expectedDisposition = expectedRefundDisposition(order)
     const label = orderLabel(order)
     const refundTotalBase = order.refunds.reduce((sum, refund) => sum.add(toDecimal(refund.totalBase)), toDecimal(0))
     const refundIds = order.refunds.map((refund) => refund.id)
 
-    if (!expectedStatus && REFUNDED_STATUSES.has(order.status)) {
+    if (!expectedDisposition && order.refundStatus !== 'NONE') {
       findings.push({
         severity: 'critical',
         code: 'sales_order_refund_status_without_refunds',
         orderId: order.id,
-        message: `Sales order ${label} is marked ${order.status} but has no refund rows`,
+        message: `Sales order ${label} has refundStatus ${order.refundStatus} but no refund rows`,
         details: {
           status: order.status,
+          refundStatus: order.refundStatus,
           totalBase: toDecimal(order.totalBase).toString(),
         },
       })
       continue
     }
 
-    if (!expectedStatus) continue
+    if (!expectedDisposition) continue
 
-    if (order.status !== expectedStatus) {
+    if (order.refundStatus !== expectedDisposition) {
       findings.push({
         severity: 'critical',
         code: 'sales_order_refund_status_mismatch',
         orderId: order.id,
         refundId: refundIds[0],
-        message: `Sales order ${label} refund total implies ${expectedStatus} but status is ${order.status}`,
+        message: `Sales order ${label} refund total implies ${expectedDisposition} but refundStatus is ${order.refundStatus}`,
         details: {
           status: order.status,
-          expectedStatus,
+          refundStatus: order.refundStatus,
+          expectedDisposition,
           totalBase: toDecimal(order.totalBase).toString(),
           refundedTotalBase: refundTotalBase.toString(),
           refundIds,
@@ -149,7 +152,7 @@ export async function collectRefundStatusReconciliationRows(
   const rows = await client.salesOrder.findMany({
     where: {
       OR: [
-        { status: { in: [...REFUNDED_STATUSES] } },
+        { refundStatus: { not: 'NONE' } },
         { refunds: { some: {} } },
       ],
     },
@@ -160,6 +163,7 @@ export async function collectRefundStatusReconciliationRows(
       orderNumber: true,
       externalOrderNumber: true,
       status: true,
+      refundStatus: true,
       totalBase: true,
       refunds: {
         orderBy: { refundedAt: 'asc' },

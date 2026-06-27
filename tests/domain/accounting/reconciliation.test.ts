@@ -24,6 +24,7 @@ function cleanRows(): AccountingReconciliationRows {
       orderNumber: 'SO-1',
       externalOrderNumber: null,
       status: 'SHIPPED',
+      refundStatus: 'NONE',
       revenueDeferredDate: A1_DATE,
       inventoryAllocatedDate: A2_DATE,
     }],
@@ -581,6 +582,7 @@ test('refunded terminal order with posted shipment reports missing credit-note a
   rows.salesOrders = [{
     ...rows.salesOrders[0],
     status: 'REFUNDED',
+    refundStatus: 'FULL',
   }]
   rows.refunds = [{
     ...rows.refunds[0],
@@ -601,6 +603,7 @@ test('zero-value refund on a posted-shipment order does not require reversal evi
   rows.salesOrders = [{
     ...rows.salesOrders[0],
     status: 'REFUNDED',
+    refundStatus: 'FULL',
   }]
   rows.refunds = [{
     ...rows.refunds[0],
@@ -618,7 +621,7 @@ test('zero-value refund on a posted-shipment order does not require reversal evi
 test('live sync status membership gates terminal credit-note evidence', () => {
   for (const status of ['PENDING', 'PROCESSING', 'SYNCED']) {
     const rows = cleanRows()
-    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED' }]
+    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED', refundStatus: 'FULL' }]
     rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null }]
     rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
     rows.accountingEvents = rows.accountingEvents.filter((event) => event.sourceEntityType !== 'SalesOrderRefund' || event.type !== 'CREDIT_NOTE')
@@ -640,7 +643,7 @@ test('live sync status membership gates terminal credit-note evidence', () => {
 
   for (const status of ['FAILED', 'REJECTED']) {
     const rows = cleanRows()
-    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED' }]
+    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED', refundStatus: 'FULL' }]
     rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null }]
     rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
     rows.accountingEvents = rows.accountingEvents.filter((event) => event.sourceEntityType !== 'SalesOrderRefund' || event.type !== 'CREDIT_NOTE')

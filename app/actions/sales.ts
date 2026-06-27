@@ -118,6 +118,7 @@ export type SoRow = {
   hasExternalSource: boolean
   externalOrderDate: string | null
   status: SoStatus
+  refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
   currency: string
   fxRateToBase: number
   customerName: string | null
@@ -382,6 +383,7 @@ const SO_SELECT = {
   },
   orderNumber: true,
   status: true,
+  refundStatus: true,
   currency: true,
   fxRateToBase: true,
   customerName: true,
@@ -441,6 +443,7 @@ function mapSoRow(so: {
   shoppingLinks: { connector: string; externalOrderId: string }[]
   orderNumber: string | null
   status: string
+  refundStatus: string
   currency: string
   fxRateToBase: unknown
   customerName: string | null
@@ -529,6 +532,7 @@ function mapSoRow(so: {
     hasExternalSource,
     externalOrderDate: so.externalCreatedAt?.toISOString() ?? null,
     status: so.status as SoStatus,
+    refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
     currency: so.currency,
     fxRateToBase: Number(so.fxRateToBase),
     customerName: so.customerName,
