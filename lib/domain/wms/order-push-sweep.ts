@@ -15,6 +15,11 @@ import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine
  */
 
 const READY_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
+/** Lifecycle statuses where the WMS order is already dispatched. A (full) refund on a
+ *  dispatched order is a returns/financial matter — never a WMS cancellation. Under the
+ *  orthogonal refund model a fully-refunded order keeps its lifecycle status, so this set
+ *  is what distinguishes "pull it from the WMS" from "goods already gone". */
+const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED'] as const
 const MAX_ATTEMPTS = 5
 const DEFAULT_BATCH_SIZE = 25
 
@@ -290,7 +295,7 @@ export async function runWmsOrderPushSweepCore(
           result.held += 1
         } else {
           result.deadLettered += 1
-          await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `Held in IMS but WMS order not cancellable (status ${cancel.status})`, lastAttemptAt: ts })
+          await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `Held in IMS but WMS order past NEW (status ${cancel.status}) — raise a cancellation query in the WMS`, lastAttemptAt: ts })
         }
       } catch (error) {
         result.failed += 1
@@ -299,7 +304,7 @@ export async function runWmsOrderPushSweepCore(
     }
   }
 
-  // --- Cancel pass: IMS-cancelled orders that were pushed (SYNCED) ---
+  // --- Cancel pass: IMS-cancelled and fully-refunded orders that were pushed (SYNCED) ---
   if (connector.cancelOrder) {
     for (const link of await port.cancellableLinks(connectorId, batchSize)) {
       if (!link.externalOrderId) continue
@@ -310,10 +315,11 @@ export async function runWmsOrderPushSweepCore(
           await port.updateLink(link.id, { state: 'CANCELLED', cancelledAt: ts, lastError: null, lastAttemptAt: ts })
           result.cancelled += 1
         } else {
-          // Past NEW in the WMS — already being fulfilled despite the IMS cancel.
-          // Surface as a dead-letter conflict rather than retrying forever.
+          // Past NEW in the WMS — already being fulfilled despite the IMS cancel/full
+          // refund. Only NEW orders auto-cancel; surface a dead-letter conflict so an
+          // operator raises a cancellation query in the WMS rather than retrying forever.
           result.deadLettered += 1
-          await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `WMS order not cancellable (status ${cancel.status})`, lastAttemptAt: ts })
+          await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `WMS order past NEW (status ${cancel.status}) — raise a cancellation query in the WMS`, lastAttemptAt: ts })
         }
       } catch (error) {
         result.failed += 1
@@ -384,7 +390,20 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       }),
     cancellableLinks: (connector, limit) =>
       db.wmsOrderPushLink.findMany({
-        where: { connector, state: 'SYNCED', externalOrderId: { not: null }, order: { status: 'CANCELLED' } },
+        where: {
+          connector,
+          state: 'SYNCED',
+          externalOrderId: { not: null },
+          order: {
+            OR: [
+              { status: 'CANCELLED' },
+              // A fully-refunded order that has not yet dispatched must be pulled from the
+              // WMS too; it keeps its lifecycle status under the orthogonal refund model,
+              // so refundStatus (not status) is what flags it for cancellation.
+              { refundStatus: 'FULL', status: { notIn: [...POST_DISPATCH_STATUSES, 'CANCELLED'] } },
+            ],
+          },
+        },
         select: { id: true, externalOrderId: true },
         take: limit,
       }),

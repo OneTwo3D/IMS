@@ -180,3 +180,13 @@ test('cancel: a WMS order already gone (NOT_FOUND) is treated as cancelled', asy
   assert.equal(r.cancelled, 1)
   assert.equal(updates[0].data.state, 'CANCELLED')
 })
+
+test('cancel: a past-NEW order (full refund or IMS cancel) dead-letters with a raise-a-query signal', async () => {
+  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'PROCESSING' }) })
+  const { port, updates } = makePort({ cancellable: [{ id: 'link-1', externalOrderId: 'wms-1' }] })
+  const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
+  assert.equal(r.deadLettered, 1)
+  assert.equal(r.cancelled, 0)
+  assert.equal(updates[0].data.state, 'DEAD_LETTER')
+  assert.match(String(updates[0].data.lastError), /raise a cancellation query/i)
+})

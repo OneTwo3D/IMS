@@ -245,6 +245,9 @@ export type CreateSalesOrderRefundResult =
       accountingSyncs: RefundAccountingSyncRequest[]
       accountingWarning?: string
       returnedRows: Array<{ productId: string; sku: string; qty: number }>
+      /** True when this is an idempotent replay of an already-recorded refund (duplicate
+       *  external delivery), not a newly created one — callers skip one-time side effects. */
+      replayed?: boolean
     }
 
 export type RetrySalesOrderRefundAccountingResult =
@@ -1882,6 +1885,7 @@ export async function createSalesOrderRefund(
       so: txResult.so,
       accountingSyncs: [],
       returnedRows: [],
+      replayed: true,
     }
   }
 
