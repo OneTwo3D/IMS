@@ -128,8 +128,9 @@ function loadCols(): ColKey[] {
 // ---------------------------------------------------------------------------
 
 function invoiceStatus(so: SoRow): { label: string; cls: string } {
-  if (so.status === 'REFUNDED') return { label: 'Refunded', cls: 'bg-red-100 text-red-800' }
-  if (so.status === 'PARTIALLY_REFUNDED') return { label: 'Part. Refunded', cls: 'bg-orange-100 text-orange-800' }
+  // Refund state is orthogonal to the lifecycle status now — read refundStatus.
+  if (so.refundStatus === 'FULL') return { label: 'Refunded', cls: 'bg-red-100 text-red-800' }
+  if (so.refundStatus === 'PARTIAL') return { label: 'Part. Refunded', cls: 'bg-orange-100 text-orange-800' }
   if (so.paidAt) return { label: 'Paid', cls: 'bg-green-100 text-green-800' }
   if (so.invoiceNumber) return { label: 'Invoiced', cls: 'bg-purple-100 text-purple-800' }
   return { label: 'Pending', cls: 'bg-gray-100 text-gray-800' }
