@@ -1894,6 +1894,21 @@ export async function createRefund(
       await clearRefundAccountingRetryState(refundResult.createdRefund.id)
     }
 
+    // A refund reduces outstanding demand. For an already-allocated, not-yet-shipped order,
+    // re-run allocation so the refunded units' stock reservation is released — the allocator
+    // nets refunded qty (kit/BOM aware) and re-reserves only the remaining demand. Best-effort,
+    // and refuseIfShipmentsExist makes it a no-op once any shipment exists (the shipment build
+    // caps shippable qty net of refunds for those). Limited to PROCESSING/ALLOCATED so a refund
+    // can't promote a DRAFT/PENDING_PAYMENT order to ALLOCATED.
+    if (refundResult.so.status === 'PROCESSING' || refundResult.so.status === 'ALLOCATED') {
+      try {
+        const { autoAllocateOrder } = await import('./allocation')
+        await autoAllocateOrder(orderId, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true })
+      } catch (reallocationError) {
+        console.error(reallocationError)
+      }
+    }
+
     if (returnWarehouseId && refundResult.returnedRows.length > 0) {
       for (const row of refundResult.returnedRows) {
         await logActivity({
