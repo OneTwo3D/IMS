@@ -17,6 +17,7 @@ import {
   saleDispatchMovementKey,
 } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { buildStockMovementValueFieldsFromConsumed } from '@/lib/domain/inventory/stock-movement-value'
+import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const SHIPMENT_QTY_EPSILON_DECIMAL = new Prisma.Decimal('0.000001')
@@ -194,15 +195,45 @@ export async function confirmSalesOrderShipments(
       )
     }
 
-    const effectiveAllocs = allocs.map((alloc) => {
+    const allocAfterShipments = allocs.map((alloc) => {
       const key = `${alloc.lineId}|${alloc.warehouseId}|${alloc.productId}`
       const committed = committedByAllocationKey.get(key) ?? 0
       const effectiveQty = Math.max(0, shipmentBoundaryNumber(alloc.qty) - committed)
       return { ...alloc, qty: effectiveQty }
     }).filter((alloc) => alloc.qty > 0)
 
+    // Refunded units must not ship even if stale allocation rows still reserve them
+    // (refund state is orthogonal now and a refund does not delete allocations).
+    // Allocations are leaf-product rows, so a refunded sales line is expanded to its
+    // component requirements (kit/BOM aware) before reducing the matching allocations.
+    const shipmentRefundLines = await tx.salesOrderRefundLine.findMany({
+      where: { refund: { orderId } },
+      select: { salesOrderLineId: true, productId: true, qty: true },
+    })
+    const refundProductIds = [...new Set(
+      shipmentRefundLines.map((refundLine) => refundLine.productId).filter((id): id is string => !!id),
+    )]
+    const refundGraph = refundProductIds.length > 0
+      ? await loadFulfillmentProductGraph(tx, refundProductIds)
+      : new Map()
+    for (const refundLine of shipmentRefundLines) {
+      if (!refundLine.salesOrderLineId || !refundLine.productId || shipmentBoundaryNumber(refundLine.qty) <= 0) continue
+      const requirements = expandFulfillmentRequirementsDecimal(refundLine.productId, toDecimal(refundLine.qty), refundGraph)
+      for (const [componentId, componentQty] of requirements) {
+        let remaining = shipmentBoundaryNumber(componentQty)
+        for (const alloc of allocAfterShipments) {
+          if (remaining <= 0) break
+          if (alloc.lineId !== refundLine.salesOrderLineId || alloc.productId !== componentId) continue
+          const take = Math.min(remaining, alloc.qty)
+          alloc.qty -= take
+          remaining -= take
+        }
+      }
+    }
+    const effectiveAllocs = allocAfterShipments.filter((alloc) => alloc.qty > 0)
+
     if (!effectiveAllocs.length) {
-      throw new Error('All allocated lines are already covered by active shipments')
+      throw new Error('All allocated lines are already covered by active shipments or refunds')
     }
 
     const integrityError = await validateAllocationIntegrity(tx, orderId)

@@ -2552,6 +2552,7 @@ export async function addPayment(input: {
           orderNumber: true,
           externalOrderNumber: true,
           status: true,
+          refundStatus: true,
           currency: true,
           totalForeign: true,
           totalBase: true,
@@ -2561,8 +2562,8 @@ export async function addPayment(input: {
         },
       })
       if (!so) return { error: 'Order not found' }
-      if (so.status === 'CANCELLED' || so.status === 'REFUNDED') {
-        return { error: `Cannot add payments to ${so.status.toLowerCase()} orders` }
+      if (so.status === 'CANCELLED' || so.refundStatus === 'FULL') {
+        return { error: `Cannot add payments to ${so.refundStatus === 'FULL' ? 'fully refunded' : so.status.toLowerCase()} orders` }
       }
       if (input.currency !== so.currency) {
         return { error: `Payment currency must match order currency (${so.currency})` }

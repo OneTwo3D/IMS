@@ -53,6 +53,7 @@ type State = {
   orders: Order[]
   lines: OrderLine[]
   allocations: Allocation[]
+  refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
   shipments: Shipment[]
   shipmentLines: ShipmentLine[]
   stockLevels: StockLevel[]
@@ -173,6 +174,11 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           && allocation.productId === key.productId
         )) ?? null
       },
+    },
+    salesOrderRefundLine: {
+      findMany: async ({ where }: { where: { refund: { orderId: string } } }) => (state.refundLines ?? [])
+        .filter((refundLine) => refundLine.orderId === where.refund.orderId)
+        .map((refundLine) => ({ salesOrderLineId: refundLine.salesOrderLineId, productId: refundLine.productId, qty: refundLine.qty })),
     },
     shipment: {
       findMany: async ({ where, select }: { where: { orderId: string; status?: string }; select?: Record<string, boolean> }) => state.shipments
@@ -397,6 +403,19 @@ test('confirmSalesOrderShipments only creates shipment lines for unshipped alloc
   assert.equal(result.shipmentCount, 1)
   const pendingLine = state.shipmentLines.find((line) => line.shipmentId !== 'shipment-active')
   assert.equal(pendingLine?.qty, 2)
+})
+
+test('confirmSalesOrderShipments does not ship refunded quantity from stale allocations', async () => {
+  const state = baseState({
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'product-1', qty: 1 }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 2, sku: 'SKU-1', description: 'Product 1' }],
+  })
+  const result = await confirmSalesOrderShipments(createClient(state), 'order-1')
+
+  assert.equal(result.shipmentCount, 1)
+  assert.equal(result.createdShipments[0].totalQty, 1) // 2 allocated − 1 refunded
+  assert.equal(state.shipmentLines[0].qty, 1)
 })
 
 test('transitionShipmentStatus rejects invalid shipment status jumps', async () => {

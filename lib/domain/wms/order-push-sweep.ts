@@ -42,6 +42,7 @@ type OrderForPush = {
   taxForeign: unknown
   discountAmount: unknown
   lines: CandidateLine[]
+  refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
 }
 
 function num(value: unknown): number {
@@ -73,6 +74,7 @@ export function readAddress(raw: unknown, customerName: string | null): WmsOrder
 }
 
 type CandidateLine = {
+  id?: string
   sku: string | null
   qty: unknown
   taxForeign: unknown
@@ -80,24 +82,33 @@ type CandidateLine = {
   description: string
 }
 
-export function buildLines(lines: CandidateLine[]): WmsOrderPushLine[] {
-  return lines.map((line) => {
+export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>): WmsOrderPushLine[] {
+  const pushLines: WmsOrderPushLine[] = []
+  for (const line of lines) {
     // A line with no SKU can't be fulfilled by the WMS — fail the whole order
     // (caught → retried → dead-lettered) rather than silently dropping the line.
     if (!line.sku) throw new Error('Sales order has a line with no SKU; cannot push to WMS')
-    const qty = num(line.qty) || 1
+    const orderedQty = num(line.qty) || 1
+    // Refunded units must not be pushed to the WMS for fulfilment (refund state is
+    // orthogonal to the lifecycle status now). Net by the line's refunded qty; a fully
+    // refunded line is dropped from the payload entirely.
+    const refunded = (line.id && refundedByLine?.get(line.id)) || 0
+    const quantity = Math.max(0, orderedQty - refunded)
+    if (quantity <= 0) continue
     // IMS stores SalesOrderLine.totalForeign as NET (ex-VAT) in both tax-inclusive
-    // and tax-exclusive cases; taxForeign is the line VAT.
+    // and tax-exclusive cases; taxForeign is the line VAT. Unit prices are per the
+    // ORIGINAL qty so they stay correct when the shipped quantity is reduced.
     const total = num(line.totalForeign)
     const tax = num(line.taxForeign)
-    return {
+    pushLines.push({
       sku: line.sku,
-      quantity: qty,
-      unitPriceExVat: total / qty,
-      unitPriceVat: tax / qty,
+      quantity,
+      unitPriceExVat: total / orderedQty,
+      unitPriceVat: tax / orderedQty,
       description: line.description || null,
-    }
-  })
+    })
+  }
+  return pushLines
 }
 
 // Fields the push payload needs; shared by the create and update passes.
@@ -113,7 +124,8 @@ const ORDER_PUSH_SELECT = {
   shippingForeign: true,
   taxForeign: true,
   discountAmount: true,
-  lines: { select: { sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
+  lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
+  refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
 } as const
 
 function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
@@ -132,8 +144,20 @@ function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOr
     shippingVat: 0,
     discountExVat: num(order.discountAmount),
     discountVat: 0,
-    lines: buildLines(order.lines),
+    lines: buildLines(order.lines, refundedQtyByLine(order)),
   }
+}
+
+// Sum refunded quantity per sales-order line so the WMS payload can exclude it.
+function refundedQtyByLine(order: { refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }> }): Map<string, number> {
+  const map = new Map<string, number>()
+  for (const refund of order.refunds ?? []) {
+    for (const line of refund.lines) {
+      if (!line.salesOrderLineId) continue
+      map.set(line.salesOrderLineId, (map.get(line.salesOrderLineId) ?? 0) + num(line.qty))
+    }
+  }
+  return map
 }
 
 // --- Testability boundary -------------------------------------------------
@@ -311,7 +335,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       }),
     releasableHeldOrders: (connector, limit) =>
       db.wmsOrderPushLink.findMany({
-        where: { connector, state: 'HELD', order: { status: { in: [...READY_STATUSES] }, paidAt: { not: null } } },
+        where: { connector, state: 'HELD', order: { status: { in: [...READY_STATUSES] }, paidAt: { not: null }, refundStatus: { not: 'FULL' } } },
         select: { id: true },
         take: limit,
       }),
@@ -320,6 +344,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         where: {
           status: { in: [...READY_STATUSES] },
           paidAt: { not: null },
+          refundStatus: { not: 'FULL' },
           shipFromWarehouseId: { in: boundWarehouseIds },
           OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
         },
@@ -339,6 +364,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           AND l.state::text = 'SYNCED'
           AND l."externalOrderId" IS NOT NULL
           AND o.status::text IN ('PROCESSING', 'ALLOCATED')
+          AND o."refundStatus"::text <> 'FULL'
           AND o."updatedAt" > COALESCE(l."pushedAt", to_timestamp(0))
         ORDER BY o."updatedAt" ASC
         LIMIT ${limit}

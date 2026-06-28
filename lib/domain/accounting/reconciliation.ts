@@ -654,6 +654,10 @@ export async function collectAccountingReconciliationRows(
           { revenueDeferredDate: { gte: fromDate } },
           { inventoryAllocatedDate: { gte: fromDate } },
           { status: { in: [...TERMINAL_SALES_ORDER_STATUSES] }, updatedAt: { gte: fromDate } },
+          // Refund state is orthogonal to the lifecycle status now, so a recently
+          // refunded order may sit in a non-terminal status (e.g. PROCESSING). Always
+          // scan refunded orders so their credit-note/reversal evidence is checked.
+          { refundStatus: { not: 'NONE' }, updatedAt: { gte: fromDate } },
         ],
       },
       orderBy: { updatedAt: 'desc' },

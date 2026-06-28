@@ -757,13 +757,30 @@ export async function allocateSalesOrder(
       activeShipmentLines,
     )
 
+    // Refunded quantities are no longer outstanding demand — a refund on a not-yet-
+    // shipped order removes those units from what needs allocating. Only ever reduces
+    // demand, so it is safe for every status (already-shipped lines clamp to 0).
+    const refundLines = await tx.salesOrderRefundLine.findMany({
+      where: { refund: { orderId } },
+      select: { salesOrderLineId: true, qty: true },
+    })
+    const refundedByLine = new Map<string, Prisma.Decimal>()
+    for (const refundLine of refundLines) {
+      if (!refundLine.salesOrderLineId) continue
+      refundedByLine.set(
+        refundLine.salesOrderLineId,
+        (refundedByLine.get(refundLine.salesOrderLineId) ?? new Prisma.Decimal(0)).add(toDecimal(refundLine.qty)),
+      )
+    }
+
     const lines = so.lines.filter((line) => line.productId).map((line) => {
       const committed = committedByLine.get(line.id) ?? new Prisma.Decimal(0)
+      const refunded = refundedByLine.get(line.id) ?? new Prisma.Decimal(0)
       return {
         id: line.id,
         productId: line.productId!,
         sku: line.sku ?? line.productId!,
-        qty: Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(committed)),
+        qty: Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(committed).sub(refunded)),
       }
     }).filter((line) => line.qty.gt(0))
 
@@ -869,13 +886,18 @@ export async function allocateSalesOrder(
     }
 
     const report = buildBackorderReport({
+      // Demand is net of refunds here too, so refunded units aren't reported as
+      // unallocated/backordered (which would otherwise mark the result unsuccessful).
       lines: so.lines.map((line) => ({
         id: line.id,
         orderId: line.orderId,
         productId: line.productId,
         sku: line.sku,
         description: line.description,
-        qty: line.qty,
+        qty: Prisma.Decimal.max(
+          new Prisma.Decimal(0),
+          toDecimal(line.qty).sub(refundedByLine.get(line.id) ?? new Prisma.Decimal(0)),
+        ).toNumber(),
         product: line.product,
       })),
       allocations: nextAllocations.map((allocation) => ({

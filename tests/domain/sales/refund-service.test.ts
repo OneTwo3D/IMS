@@ -494,7 +494,7 @@ test('createSalesOrderRefund creates a partial refund record', async () => {
   })
 
   assert.equal(result.success, true)
-  assert.equal(state.orders[0].status, 'PARTIALLY_REFUNDED')
+  assert.equal(state.orders[0].status, 'SHIPPED') // lifecycle status is left untouched
   assert.equal(state.orders[0].refundStatus, 'PARTIAL')
   assert.equal(state.refunds[0].creditNoteNumber, 'CN-2026-00001')
   assert.equal(state.refundLines[0].qty, 1)
@@ -512,7 +512,7 @@ test('createSalesOrderRefund dual-writes refundStatus=FULL on a full refund', as
   })
 
   assert.equal(result.success, true)
-  assert.equal(state.orders[0].status, 'REFUNDED')
+  assert.equal(state.orders[0].status, 'SHIPPED') // lifecycle status is left untouched
   assert.equal(state.orders[0].refundStatus, 'FULL')
 })
 
@@ -1250,7 +1250,7 @@ test('createSalesOrderRefund clears accounting deferral dates for full refunds',
   })
 
   assert.equal(result.success, true)
-  assert.equal(state.orders[0].status, 'REFUNDED')
+  assert.equal(state.orders[0].refundStatus, 'FULL')
   assert.equal(state.orders[0].revenueDeferredDate, null)
   assert.equal(state.orders[0].inventoryAllocatedDate, null)
   assert.deepEqual(state.refunds[0].accountingRetrySyncs, result.success ? result.accountingSyncs : [])
@@ -1320,7 +1320,7 @@ test('createSalesOrderRefund reverses the FULL deferral on a full refund of a sh
   })
 
   assert.equal(result.success, true)
-  assert.equal(state.orders[0].status, 'REFUNDED')
+  assert.equal(state.orders[0].refundStatus, 'FULL')
   const unearnedSync = result.success && result.accountingSyncs.find((s) => s.type === 'UNEARNED_REV_REVERSAL')
   assert.ok(unearnedSync, 'expected an UNEARNED_REV_REVERSAL sync')
   const debitLine = (unearnedSync.payload as { lines?: Array<{ accountCode?: string; debit?: number }> })

@@ -13,7 +13,6 @@ import {
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
-import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
@@ -1534,6 +1533,7 @@ export async function createSalesOrderRefund(
         externalOrderNumber: true,
         orderNumber: true,
         status: true,
+        refundStatus: true,
         fxRateToBase: true,
         totalBase: true,
         taxBase: true,
@@ -1604,7 +1604,7 @@ export async function createSalesOrderRefund(
               : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
           })),
           creditNoteNumber: existingExternalRefund.creditNoteNumber ?? '',
-          newStatus: so.status === 'REFUNDED' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
+          newStatus: so.refundStatus === 'FULL' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
         }
       }
     }
@@ -1667,7 +1667,7 @@ export async function createSalesOrderRefund(
               : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
           })),
           creditNoteNumber: existingChargeback.creditNoteNumber ?? '',
-          newStatus: so.status === 'REFUNDED' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
+          newStatus: so.refundStatus === 'FULL' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
         }
       }
     }
@@ -1819,16 +1819,23 @@ export async function createSalesOrderRefund(
     const orderTotal = input.chargeback
       ? Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase))
       : refundBoundaryNumber(so.totalBase)
+    // `newStatus` is the refund *classification* (drives the accounting reversal
+    // treatment), NOT the order's lifecycle status — refund state is now the
+    // orthogonal refundStatus dimension.
     const newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED' = isFullRefundAmount(totalRefundedNow, orderTotal)
       ? 'REFUNDED'
       : 'PARTIALLY_REFUNDED'
-    const refundTransition = validateRefundSalesOrderStatusUpdate(so.status, newStatus)
-    if (!refundTransition.success) throw new Error(refundTransition.error)
-    // Dual-write the orthogonal refund disposition alongside the legacy status. Later
-    // stages move consumers onto refundStatus and stop encoding refund state in status.
+    // A cancelled order has nothing to refund — preserve the prior reject (the old
+    // status machine blocked CANCELLED → REFUNDED/PARTIALLY_REFUNDED).
+    if (so.status === 'CANCELLED') {
+      return { error: 'Cannot refund a cancelled order' } as const
+    }
+    // The lifecycle status is left untouched; only the refund disposition is written,
+    // so an order can be e.g. Delivered + Fully refunded and keep flowing through
+    // fulfilment for any unrefunded remainder.
     await tx.salesOrder.update({
       where: { id: input.orderId },
-      data: { status: newStatus, refundStatus: refundDispositionForStatus(newStatus) },
+      data: { refundStatus: refundDispositionForStatus(newStatus) },
     })
 
     // Build fallback rows inside the refund transaction so source-stock errors
@@ -1988,6 +1995,7 @@ export async function retrySalesOrderRefundAccounting(
               externalOrderNumber: true,
               orderNumber: true,
               status: true,
+              refundStatus: true,
               revenueDeferredDate: true,
               unearnedRevenueAmount: true,
             },
@@ -2048,7 +2056,9 @@ export async function retrySalesOrderRefundAccounting(
         totalBase: refundBoundaryNumber(line.totalBase),
         lineKind: line.productId ? 'sale' : 'shipping',
       }))
-      const newStatus = refund.order.status === 'REFUNDED' ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
+      // Refund classification comes from the orthogonal refundStatus now (the lifecycle
+      // status is no longer set to REFUNDED on a full refund).
+      const newStatus = refund.order.refundStatus === 'FULL' ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
       const staged = await stageRefundAccountingReversals(tx, {
         orderId: refund.orderId,
         orderRef: refundOrderRef,
