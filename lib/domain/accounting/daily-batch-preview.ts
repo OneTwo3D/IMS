@@ -145,7 +145,7 @@ export async function computeDailyBatchA1A2Preview(): Promise<DailyBatchA1A2Prev
     where: {
       revenueDeferredDate: { not: null },
       inventoryAllocatedDate: null,
-      status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'] },
+      status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'] },
       refundStatus: { not: 'FULL' },
     },
     select: {

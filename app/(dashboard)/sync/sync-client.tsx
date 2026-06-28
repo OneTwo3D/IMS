@@ -39,9 +39,12 @@ type Props = {
   accountingConnected: boolean
 }
 
+// Refund state is the orthogonal refundStatus now, not a lifecycle status — a WC
+// 'refunded' order maps to a lifecycle status and its refund flows through the refund
+// records. So REFUNDED/PARTIALLY_REFUNDED are not offered as mapping targets.
 const IMS_STATUSES = [
   'DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING',
-  'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED', 'REFUNDED', 'PARTIALLY_REFUNDED',
+  'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED',
 ]
 
 const WC_STATUSES = ['pending', 'failed', 'on-hold', 'processing', 'completed', 'cancelled', 'refunded']

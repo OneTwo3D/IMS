@@ -693,7 +693,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     }
 
     // Auto-allocate stock (skip for terminal statuses)
-    const TERMINAL_STATUSES = ['CANCELLED', 'REFUNDED']
+    const TERMINAL_STATUSES = ['CANCELLED']
     if (!TERMINAL_STATUSES.includes(imsStatus)) {
       const { autoAllocateOrder } = await import('@/app/actions/allocation')
       const allocation = await autoAllocateOrder(so.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })

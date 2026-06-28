@@ -50,10 +50,6 @@ const ACTIVE_SALES_ORDER_STATUSES: SalesOrderStatus[] = [
   SalesOrderStatus.PACKING,
   SalesOrderStatus.SHIPPED,
   SalesOrderStatus.DELIVERED,
-  // Kept until the lifecycle migration: partial-refund orders still carry this
-  // status today. The refundStatus:{not:'FULL'} filter on the query excludes only
-  // fully-refunded orders (formerly REFUNDED).
-  SalesOrderStatus.PARTIALLY_REFUNDED,
 ]
 
 type FindManyDelegate = {

@@ -12,7 +12,7 @@ import { resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-looku
  */
 
 // Sales orders past these IMS statuses no longer need WMS status polling.
-const TERMINAL_SALES_STATUSES = ['COMPLETED', 'DELIVERED', 'CANCELLED', 'REFUNDED', 'PARTIALLY_REFUNDED'] as const
+const TERMINAL_SALES_STATUSES = ['COMPLETED', 'DELIVERED', 'CANCELLED'] as const
 const DEFAULT_STALE_MINUTES = 30
 const DEFAULT_BATCH_SIZE = 50
 

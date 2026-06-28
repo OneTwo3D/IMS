@@ -33,7 +33,6 @@ test('isPaymentStatusMismatch: advanced status + became unpaid → mismatch', ()
   assert.equal(isPaymentStatusMismatch('SHIPPED', true), true)
   assert.equal(isPaymentStatusMismatch('COMPLETED', true), true)
   assert.equal(isPaymentStatusMismatch('DELIVERED', true), true)
-  assert.equal(isPaymentStatusMismatch('PARTIALLY_REFUNDED', true), true)
 })
 
 test('isPaymentStatusMismatch: pre-payment status or still-paid → no mismatch', () => {

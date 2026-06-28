@@ -103,7 +103,7 @@ function normalizeAddress(address: AddressData | null | undefined): AddressData 
   return Object.keys(normalized).length > 0 ? normalized : Prisma.JsonNull
 }
 
-const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'])
+const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'])
 
 function mapCustomer(c: {
   id: string
@@ -235,7 +235,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
   }))
 
   // Exclude cancelled/refunded from turnover calculations
-  const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'])
+  const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'])
   const revenueOrders = orders.filter((o) => REVENUE_STATUSES.has(o.status) && o.refundStatus !== 'FULL')
 
   const totalTurnoverBase = revenueOrders.reduce((sum, o) => sum + o.totalBase, 0)
