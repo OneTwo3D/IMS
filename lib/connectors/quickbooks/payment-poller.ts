@@ -96,6 +96,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
     where: {
       accountingInvoiceId: { not: null },
       paidAt: null,
+      refundStatus: { not: 'FULL' }, // a fully refunded order must not be revived as paid
       shoppingLinks: { none: {} }, // manual orders only; shopping orders get channel payment status
     },
     select: { id: true, accountingInvoiceId: true, status: true },

@@ -59,6 +59,7 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
       where: {
         accountingInvoiceId: { not: null },
         paidAt: null,
+        refundStatus: { not: 'FULL' }, // a fully refunded order must not be revived as paid
         shoppingLinks: { none: {} }, // Shopping orders get payment status from their channel
       },
       select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true },

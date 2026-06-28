@@ -362,6 +362,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       },
     })
     const imsStatus = statusMapping?.imsStatus ?? 'PROCESSING'
+    // Refund state is orthogonal to the lifecycle status: never store
+    // REFUNDED/PARTIALLY_REFUNDED as `status`. A refunded-at-import order keeps a base
+    // lifecycle status plus a refundStatus; the allocation/invoice gates below still
+    // key off the mapped imsStatus, and the refund records sync separately.
+    const importRefundDisposition = refundDispositionForStatus(imsStatus)
+    const lifecycleStatus = importRefundDisposition === 'NONE' ? imsStatus : 'PROCESSING'
 
     // Customer
     const customerId = await upsertCustomer(wcOrder)
@@ -609,10 +615,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           externalCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
           externalUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
           ...(options.useWcDateAsCreatedAt ? { createdAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
-          status: imsStatus,
-          // Keep the orthogonal refund disposition consistent when an order is first
-          // imported already in a refund status (e.g. WC 'refunded' → REFUNDED).
-          refundStatus: refundDispositionForStatus(imsStatus),
+          status: lifecycleStatus,
+          refundStatus: importRefundDisposition,
           shipFromWarehouseId: wcDefaultWarehouseId,
           currency,
           fxRateToBase: fxRate,
