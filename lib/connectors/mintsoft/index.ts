@@ -6,7 +6,7 @@ import {
 } from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderStatus } from './api/orders'
-import { cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
+import { addMintsoftOrderComment, cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -92,6 +92,10 @@ export class MintsoftConnector implements WmsConnector {
 
   async cancelOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
     return cancelMintsoftOrder(externalOrderId)
+  }
+
+  async addOrderComment(externalOrderId: string, comment: string): Promise<void> {
+    return addMintsoftOrderComment(externalOrderId, comment)
   }
 
   async verifyWebhookSignature(

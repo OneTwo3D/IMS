@@ -4,7 +4,8 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { WMS_CONNECTOR_IDS, isWmsConnectorId } from '@/lib/connectors/wms/types'
+import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
@@ -1909,33 +1910,56 @@ export async function createRefund(
       }
     }
 
-    // Propagate the refund to a WMS the order was already pushed to. A full refund's
-    // whole-order cancellation is driven by the push sweep (auto-cancel while the WMS
-    // order is still NEW, else dead-lettered for a manual cancellation query). A partial
-    // refund's reduced line quantities are reconciled by the push sweep's update pass while
-    // the WMS order is still NEW; once it has progressed past NEW the WMS cannot amend
-    // lines, so flag that a line-item cancellation query must be raised by hand. Only for
-    // newly-created refunds (not idempotent replays of a duplicate external delivery), and
-    // best-effort so a transient read failure can't fail an already-committed refund.
-    if (refundResult.newStatus === 'PARTIALLY_REFUNDED' && !refundResult.replayed) {
+    // Propagate the refund to a WMS the order was already pushed to. The push sweep drives
+    // the automatic side: a full refund cancels the WMS order while it is still NEW; a
+    // partial refund's reduced line quantities are reconciled while NEW. Past NEW the WMS
+    // can no longer be cancelled/amended via API, so here we (a) drop an operator-facing
+    // comment on the WMS order itself so the warehouse sees the refund, and (b) keep the IMS
+    // activity-log breadcrumb for partial refunds. Only for newly-created refunds (not
+    // idempotent replays), best-effort so a transient failure can't fail a committed refund.
+    if (!refundResult.replayed) {
       try {
         const wmsLink = await db.wmsOrderPushLink.findUnique({
           where: { orderId },
-          select: { state: true, connector: true },
+          select: { state: true, connector: true, externalOrderId: true },
         })
         if (wmsLink?.state === 'SYNCED') {
-          await logActivity({
-            entityType: 'SALES_ORDER',
-            entityId: orderId,
-            action: 'wms_amendment_query_required',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `Partial refund on order ${refundResult.so.orderNumber ?? orderId} already sent to ${wmsLink.connector} — line quantities are auto-amended in the WMS while the order is still NEW; if it has progressed past NEW, raise a line-item cancellation query in the WMS for the refunded items.`,
-            metadata: { connector: wmsLink.connector, creditNoteNumber: refundResult.creditNoteNumber },
-          })
+          const isFull = refundResult.newStatus === 'REFUNDED'
+          // A partial refund only affects WMS fulfilment when it reduces a sale line's
+          // quantity; amount-only partials (shipping / discount / goodwill) leave demand
+          // unchanged, so they need no WMS amendment, note, or operator query.
+          const reducesFulfilment = refundResult.createdRefundLines.some(
+            (line) => line.lineKind === 'sale' && line.qty > 0,
+          )
+          if (isFull || reducesFulfilment) {
+            const orderRef = refundResult.so.orderNumber ?? orderId
+            const creditNote = refundResult.creditNoteNumber
+
+            if (!isFull) {
+              await logActivity({
+                entityType: 'SALES_ORDER',
+                entityId: orderId,
+                action: 'wms_amendment_query_required',
+                tag: 'sync',
+                level: 'WARNING',
+                description: `Partial refund on order ${orderRef} already sent to ${wmsLink.connector} — line quantities are auto-amended in the WMS while the order is still NEW; if it has progressed past NEW, raise a line-item cancellation query in the WMS for the refunded items.`,
+                metadata: { connector: wmsLink.connector, creditNoteNumber: creditNote },
+              })
+            }
+
+            if (wmsLink.externalOrderId && isWmsConnectorId(wmsLink.connector)) {
+              const connector = getWmsConnector(wmsLink.connector)
+              if (connector.addOrderComment) {
+                const comment = isFull
+                  ? `IMS: Order fully refunded (credit note ${creditNote}). If not yet dispatched it will be cancelled automatically; if already in progress please treat this as a cancellation request / raise a cancellation query.`
+                  : `IMS: Partial refund (credit note ${creditNote}). Line quantities have been reduced — if the order is still amendable the items are updated automatically; otherwise please raise a line-item cancellation query for the refunded items.`
+                await connector.addOrderComment(wmsLink.externalOrderId, comment)
+              }
+            }
+          }
         }
-      } catch (wmsQueryError) {
-        console.error(wmsQueryError)
+      } catch (wmsNotifyError) {
+        console.error(wmsNotifyError)
       }
     }
 

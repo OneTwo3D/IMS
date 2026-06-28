@@ -250,6 +250,9 @@ export interface WmsConnector {
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */
   cancelOrder?(externalOrderId: string): Promise<WmsOrderCancelResult>
+  /** Post an operator-facing note onto the WMS order — e.g. to flag a refund to the
+   *  warehouse when the API cannot auto-apply it (a past-NEW order). */
+  addOrderComment?(externalOrderId: string, comment: string): Promise<void>
   verifyWebhookSignature?(
     rawBody: string,
     signatureHeader: string | null,
