@@ -80,7 +80,7 @@ export type SoStatus =
   | 'DRAFT' | 'PENDING_PAYMENT' | 'ON_HOLD'
   | 'PROCESSING' | 'ALLOCATED' | 'PICKING' | 'PACKING'
   | 'SHIPPED' | 'COMPLETED' | 'DELIVERED'
-  | 'CANCELLED' | 'REFUNDED' | 'PARTIALLY_REFUNDED'
+  | 'CANCELLED'
 
 export type SoLineRow = {
   id: string

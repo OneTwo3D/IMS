@@ -29,8 +29,6 @@ const STATUS_LABELS: Record<SoStatus, string> = {
   COMPLETED: 'Completed',
   DELIVERED: 'Delivered',
   CANCELLED: 'Cancelled',
-  REFUNDED: 'Refunded',
-  PARTIALLY_REFUNDED: 'Part. Refunded',
 }
 
 const STATUS_CLASS: Record<SoStatus, string> = {
@@ -45,8 +43,6 @@ const STATUS_CLASS: Record<SoStatus, string> = {
   COMPLETED: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200',
   DELIVERED: 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-900 dark:text-emerald-200',
   CANCELLED: 'text-destructive border-destructive/30',
-  REFUNDED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
-  PARTIALLY_REFUNDED: 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900 dark:text-orange-200',
 }
 
 const FILTER_STATUSES: SoStatus[] = ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED']

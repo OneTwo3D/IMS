@@ -552,7 +552,7 @@ export async function runDailyBatchSync(): Promise<{
       where: {
         revenueDeferredDate: { not: null },
         inventoryAllocatedDate: null,
-        status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'] },
+        status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'] },
         refundStatus: { not: 'FULL' },
       },
       orderBy: { revenueDeferredDate: 'asc' },

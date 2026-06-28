@@ -566,7 +566,7 @@ export async function reconcileOrderAfterShipment(
       select: { status: true },
     })
     if (!currentOrder) return
-    if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'REFUNDED', 'CANCELLED'].includes(currentOrder.status)) return
+    if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(currentOrder.status)) return
 
     const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')
     if (!transition.success) throw new Error(transition.error)

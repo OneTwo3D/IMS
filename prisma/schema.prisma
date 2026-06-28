@@ -101,8 +101,8 @@ enum SalesOrderStatus {
   COMPLETED
   DELIVERED
   CANCELLED
-  REFUNDED
-  PARTIALLY_REFUNDED
+  // REFUNDED / PARTIALLY_REFUNDED retired — refund state is now the orthogonal
+  // RefundDisposition (SalesOrder.refundStatus); an order can be e.g. DELIVERED + FULL.
 }
 
 // Refund disposition for a sales order, orthogonal to the fulfilment lifecycle status.

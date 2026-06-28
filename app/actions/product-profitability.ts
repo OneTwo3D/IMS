@@ -123,7 +123,7 @@ export async function getProductProfitability(): Promise<{
   }
 
   // 4. Sales data — fulfilled orders in both FY windows
-  const FULFILLED = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED', 'REFUNDED'] as const
+  const FULFILLED = ['SHIPPED', 'COMPLETED', 'DELIVERED'] as const
   const [currentFyOrders, previousFyOrders] = await Promise.all([
     db.salesOrder.findMany({
       where: { status: { in: [...FULFILLED] }, createdAt: { gte: currentFyStart, lt: currentFyEnd } },

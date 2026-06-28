@@ -87,24 +87,11 @@ test('sales order state machine allows current forward paths and blocks direct j
   )
 })
 
-test('sales order state machine allows refund status updates from current refund paths', () => {
-  for (const status of [
-    'DRAFT',
-    'PENDING_PAYMENT',
-    'ON_HOLD',
-    'PROCESSING',
-    'ALLOCATED',
-    'PICKING',
-    'PACKING',
-    'SHIPPED',
-    'COMPLETED',
-    'DELIVERED',
-  ] as const) {
-    assert.equal(canTransitionSalesOrder(status, 'PARTIALLY_REFUNDED'), true)
-    assert.equal(canTransitionSalesOrder(status, 'REFUNDED'), true)
-  }
-  assert.equal(canTransitionSalesOrder('PARTIALLY_REFUNDED', 'REFUNDED'), true)
-  assert.equal(canTransitionSalesOrder('REFUNDED', 'PARTIALLY_REFUNDED'), false)
+test('sales order lifecycle has no refund states (refund is the orthogonal refundStatus)', () => {
+  // REFUNDED / PARTIALLY_REFUNDED were retired from the lifecycle enum; refund state is
+  // tracked on SalesOrder.refundStatus and never via a lifecycle transition.
+  assert.equal(SALES_ORDER_STATUSES.includes('REFUNDED' as never), false)
+  assert.equal(SALES_ORDER_STATUSES.includes('PARTIALLY_REFUNDED' as never), false)
 })
 
 test('shipment state machine preserves pick-pack-ship sequence', () => {

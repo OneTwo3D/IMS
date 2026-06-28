@@ -160,7 +160,9 @@ export const MAX_RECONCILIATION_FINDINGS_PER_RUN = 500
 
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
-const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'PARTIALLY_REFUNDED', 'CANCELLED', 'COMPLETED', 'DELIVERED'] as const
+// Refunded orders are picked up by the refundStatus OR-branch in the source query;
+// this set is now purely terminal lifecycle statuses.
+const TERMINAL_SALES_ORDER_STATUSES = ['CANCELLED', 'COMPLETED', 'DELIVERED'] as const
 // PENDING/PROCESSING are intentional evidence: reconciliation distinguishes
 // "queued but not mirrored" from "no accounting path was ever scheduled".
 const LIVE_SYNC_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED'])
