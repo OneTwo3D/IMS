@@ -1,6 +1,7 @@
 import type {
   WmsOrderCancelResult,
   WmsOrderPushInput,
+  WmsOrderPushLine,
   WmsOrderPushResult,
   WmsOrderUpdateResult,
 } from '@/lib/connectors/wms/types'
@@ -83,8 +84,9 @@ export function buildPushPayload(input: WmsOrderPushInput, courier: CourierOptio
     Comments: (input.comments ?? '').slice(0, 1000),
   }
   if (includeItems) {
-    // Mintsoft's order-update endpoint (NewOrder) does not accept items, so line
-    // amendments are not propagated via update — only on create.
+    // The order-update endpoint (NewOrder) ignores items, so creates send them here and
+    // amendments are reconciled separately via the /Items sub-resource endpoints
+    // (see reconcileMintsoftOrderItems).
     payload.OrderItems = input.lines.map((line) => ({
       SKU: line.sku,
       Quantity: line.quantity,
@@ -202,10 +204,131 @@ async function fetchMintsoftOrderStatusId(externalOrderId: string): Promise<{ fo
   return { found: true, isNew: statusId === 1 || statusId === '1' }
 }
 
+type MintsoftOrderItem = { ID: number; SKU: string | null; Quantity: number }
+
+/** One concrete amendment to bring a Mintsoft order's items in line with the desired set. */
+export type MintsoftItemAmendment =
+  | { kind: 'update'; itemId: number; line: WmsOrderPushLine; quantity: number }
+  | { kind: 'add'; line: WmsOrderPushLine; quantity: number }
+  | { kind: 'delete'; itemId: number }
+
+/**
+ * Pure planner: diff a Mintsoft order's current items against the desired (refund-netted)
+ * line set and return the amendments needed. Quantities are absolute. Matched by trimmed
+ * SKU; an order carrying the same SKU on more than one line is aggregated, and any duplicate
+ * WMS rows for that SKU are consolidated into the first (the rest deleted). Lines that net to
+ * zero (or are gone) are deleted; lines not yet on the order are added. The plan is ordered
+ * deletes → updates → adds so a consolidation never transiently overstates demand for a SKU.
+ */
+export function planMintsoftItemAmendments(
+  current: MintsoftOrderItem[],
+  desiredLines: WmsOrderPushLine[],
+): MintsoftItemAmendment[] {
+  const desired = new Map<string, { quantity: number; line: WmsOrderPushLine }>()
+  for (const line of desiredLines) {
+    const sku = line.sku?.trim()
+    if (!sku) continue
+    const existing = desired.get(sku)
+    if (existing) existing.quantity += line.quantity
+    else desired.set(sku, { quantity: line.quantity, line })
+  }
+
+  const currentBySku = new Map<string, MintsoftOrderItem[]>()
+  for (const item of current) {
+    const sku = item.SKU?.trim()
+    if (!sku) continue
+    const list = currentBySku.get(sku) ?? []
+    list.push(item)
+    currentBySku.set(sku, list)
+  }
+
+  const deletes: MintsoftItemAmendment[] = []
+  const updates: MintsoftItemAmendment[] = []
+  const adds: MintsoftItemAmendment[] = []
+  for (const sku of new Set<string>([...desired.keys(), ...currentBySku.keys()])) {
+    const want = desired.get(sku)
+    const have = currentBySku.get(sku) ?? []
+    if (!want || want.quantity <= 0) {
+      for (const item of have) deletes.push({ kind: 'delete', itemId: item.ID })
+      continue
+    }
+    if (have.length === 0) {
+      adds.push({ kind: 'add', line: want.line, quantity: want.quantity })
+      continue
+    }
+    const [primary, ...duplicates] = have
+    for (const dup of duplicates) deletes.push({ kind: 'delete', itemId: dup.ID })
+    if (primary.Quantity !== want.quantity) {
+      updates.push({ kind: 'update', itemId: primary.ID, line: want.line, quantity: want.quantity })
+    }
+  }
+  return [...deletes, ...updates, ...adds]
+}
+
+function buildMintsoftOrderItemPayload(line: WmsOrderPushLine, quantity: number, externalWarehouseId: string): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    SKU: line.sku,
+    Quantity: quantity,
+    UnitPrice: round2(line.unitPriceExVat),
+    UnitPriceVat: round2(line.unitPriceVat),
+    Details: (line.description ?? '').slice(0, 255),
+  }
+  const warehouseId = Number.parseInt(externalWarehouseId, 10)
+  if (Number.isFinite(warehouseId)) payload.WarehouseId = warehouseId
+  return payload
+}
+
+async function fetchMintsoftOrderItems(externalOrderId: string): Promise<MintsoftOrderItem[]> {
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Items`)
+  if (result.error) throw new Error(result.error)
+  return extractMintsoftArrayPayload(result.data)
+    .map((raw) => {
+      const r = raw as RawOrder
+      const id = typeof r.ID === 'number' ? r.ID : Number.parseInt(toStr(r.ID) ?? '', 10)
+      const qty = typeof r.Quantity === 'number' ? r.Quantity : Number.parseInt(toStr(r.Quantity) ?? '', 10)
+      return { ID: id, SKU: toStr(r.SKU), Quantity: Number.isFinite(qty) ? qty : 0 }
+    })
+    .filter((item): item is MintsoftOrderItem => Number.isFinite(item.ID))
+}
+
+/** Bring a NEW Mintsoft order's line items in line with the (refund-netted) desired set. */
+async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOrderPushInput): Promise<void> {
+  // Mintsoft item quantities are whole units. If any desired line is non-integer or
+  // negative, skip item reconciliation rather than send rejects in a retry loop — the
+  // refund still surfaces a manual line-item query. Whole-unit orders (the norm) reconcile.
+  if (input.lines.some((line) => !Number.isInteger(line.quantity) || line.quantity < 0)) return
+
+  const plan = planMintsoftItemAmendments(await fetchMintsoftOrderItems(externalOrderId), input.lines)
+  const base = `/api/Order/${encodeURIComponent(externalOrderId)}/Items`
+  for (const amendment of plan) {
+    let result
+    if (amendment.kind === 'delete') {
+      result = await mintsoftRequest<unknown>(`${base}/${encodeURIComponent(String(amendment.itemId))}`, { method: 'DELETE' })
+    } else if (amendment.kind === 'add') {
+      result = await mintsoftRequest<unknown>(base, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildMintsoftOrderItemPayload(amendment.line, amendment.quantity, input.externalWarehouseId)),
+      })
+    } else {
+      result = await mintsoftRequest<unknown>(`${base}/${encodeURIComponent(String(amendment.itemId))}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildMintsoftOrderItemPayload(amendment.line, amendment.quantity, input.externalWarehouseId)),
+      })
+    }
+    if (result.error) throw new Error(result.error)
+  }
+}
+
 export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
   const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId)
   if (!found) return { updated: false, status: 'NOT_FOUND' }
   if (!isNew) return { updated: false, status: 'NOT_NEW' }
+
+  // Line items are amended via the /Items sub-resource (the order-update endpoint ignores
+  // them); this propagates refund-netted quantities to the still-NEW WMS order.
+  await reconcileMintsoftOrderItems(externalOrderId, input)
 
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`, {
     method: 'POST',
