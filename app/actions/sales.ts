@@ -174,6 +174,7 @@ export type SoDetail = SoRow & {
     payments: PaymentRow[]
     lines: {
       id: string
+      salesOrderLineId: string | null
       productId: string | null
       description: string
       qty: number
@@ -672,7 +673,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,
           lines: {
-            select: { id: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true },
+            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true },
           },
           payments: {
             select: { id: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
@@ -708,6 +709,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       })),
       lines: r.lines.map((rl) => ({
         id: rl.id,
+        salesOrderLineId: rl.salesOrderLineId,
         productId: rl.productId,
         description: rl.description,
         qty: Number(rl.qty),

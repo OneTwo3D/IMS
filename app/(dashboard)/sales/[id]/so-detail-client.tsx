@@ -342,7 +342,7 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
 // Allocation Panel
 // ---------------------------------------------------------------------------
 function AllocationPanel({
-  orderId, allocations, lines, warehouses, status, shipments, requirementsByLine, onRefresh,
+  orderId, allocations, lines, warehouses, status, shipments, requirementsByLine, refundedByLine, onRefresh,
 }: {
   orderId: string
   allocations: AllocationRow[]
@@ -351,6 +351,7 @@ function AllocationPanel({
   status: SoStatus
   shipments: ShipmentRow[]
   requirementsByLine: Map<string, FulfillmentRequirementRow['requirements']>
+  refundedByLine: Map<string, number>
   onRefresh: () => void
 }) {
   const [isPending, startTransition] = useTransition()
@@ -397,7 +398,8 @@ function AllocationPanel({
     const requiresStock = !l.productType || isStockTrackedProductType(l.productType)
     if (!requiresStock) return []
     const committed = shipmentCommittedByLine.get(l.id) ?? 0
-    const remaining = Math.max(0, l.qty - committed)
+    const refunded = refundedByLine.get(l.id) ?? 0
+    const remaining = Math.max(0, l.qty - committed - refunded)
     if (remaining <= 0) return []
     const allocated = allocatedByLine.get(l.id) ?? 0
     const short = remaining - allocated
@@ -871,10 +873,21 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
         qty: line.qty,
       }))),
   )
+  // Refunded quantities are no longer outstanding demand — exclude them from the
+  // "unfulfilled" check and the allocation panel's remaining/backorder math so a
+  // refunded line isn't offered for allocation.
+  const refundedByLine = new Map<string, number>()
+  for (const refund of so.refunds) {
+    for (const rl of refund.lines) {
+      if (!rl.salesOrderLineId || rl.qty <= 0) continue
+      refundedByLine.set(rl.salesOrderLineId, (refundedByLine.get(rl.salesOrderLineId) ?? 0) + rl.qty)
+    }
+  }
   const hasUnfulfilledLines = so.lines.some((l) => {
     if (!l.productId) return false
     const committed = committedByLine.get(l.id) ?? 0
-    return committed < l.qty
+    const refunded = refundedByLine.get(l.id) ?? 0
+    return committed + refunded < l.qty
   })
 
   // Show allocation panel when PROCESSING/ALLOCATED AND (no shipments OR unfulfilled lines remain)
@@ -987,6 +1000,15 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[so.status]}`}>
           {STATUS_LABELS[so.status]}
         </span>
+        {so.refundStatus !== 'NONE' && (
+          <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${
+            so.refundStatus === 'FULL'
+              ? 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200'
+              : 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900 dark:text-orange-200'
+          }`}>
+            {so.refundStatus === 'FULL' ? 'Fully refunded' : 'Partially refunded'}
+          </span>
+        )}
         {isPaid && (
           <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200">
             Paid
@@ -1353,6 +1375,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           status={so.status}
           shipments={shipments}
           requirementsByLine={requirementsByLine}
+          refundedByLine={refundedByLine}
           onRefresh={() => { refreshAllocations(); router.refresh() }}
         />
       )}
