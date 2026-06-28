@@ -7,7 +7,11 @@ export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl
 
   // Public routes — skip auth check entirely
-  const isAuthPage = pathname.startsWith('/login') || pathname.startsWith('/2fa')
+  const isAuthPage =
+    pathname.startsWith('/login') ||
+    pathname.startsWith('/2fa') ||
+    pathname.startsWith('/forgot-password') ||
+    pathname.startsWith('/reset-password')
   const isApiRoute = pathname.startsWith('/api/')
   const isPublic = isAuthPage || isApiRoute
 
