@@ -1912,10 +1912,11 @@ export async function createRefund(
     // Propagate the refund to a WMS the order was already pushed to. A full refund's
     // whole-order cancellation is driven by the push sweep (auto-cancel while the WMS
     // order is still NEW, else dead-lettered for a manual cancellation query). A partial
-    // refund only reduces line quantities, which the WMS order-update API cannot amend —
-    // so flag that a line-item cancellation query must be raised in the WMS by hand. Only
-    // for newly-created refunds (not idempotent replays of a duplicate external delivery),
-    // and best-effort so a transient read failure can't fail an already-committed refund.
+    // refund's reduced line quantities are reconciled by the push sweep's update pass while
+    // the WMS order is still NEW; once it has progressed past NEW the WMS cannot amend
+    // lines, so flag that a line-item cancellation query must be raised by hand. Only for
+    // newly-created refunds (not idempotent replays of a duplicate external delivery), and
+    // best-effort so a transient read failure can't fail an already-committed refund.
     if (refundResult.newStatus === 'PARTIALLY_REFUNDED' && !refundResult.replayed) {
       try {
         const wmsLink = await db.wmsOrderPushLink.findUnique({
@@ -1929,7 +1930,7 @@ export async function createRefund(
             action: 'wms_amendment_query_required',
             tag: 'sync',
             level: 'WARNING',
-            description: `Partial refund on order ${refundResult.so.orderNumber ?? orderId} already sent to ${wmsLink.connector} — raise a line-item cancellation query in the WMS for the refunded items (line amendments cannot be auto-propagated).`,
+            description: `Partial refund on order ${refundResult.so.orderNumber ?? orderId} already sent to ${wmsLink.connector} — line quantities are auto-amended in the WMS while the order is still NEW; if it has progressed past NEW, raise a line-item cancellation query in the WMS for the refunded items.`,
             metadata: { connector: wmsLink.connector, creditNoteNumber: refundResult.creditNoteNumber },
           })
         }

@@ -3,9 +3,14 @@ import test from 'node:test'
 import {
   buildPushPayload,
   parseDefaultCourierId,
+  planMintsoftItemAmendments,
   resolveMappedCourierId,
 } from '../lib/connectors/mintsoft/api/order-push.ts'
-import type { WmsOrderPushInput } from '../lib/connectors/wms/types.ts'
+import type { WmsOrderPushInput, WmsOrderPushLine } from '../lib/connectors/wms/types.ts'
+
+const wmsLine = (sku: string, quantity: number): WmsOrderPushLine => ({
+  sku, quantity, unitPriceExVat: 10, unitPriceVat: 2, description: sku,
+})
 
 const SAMPLE_INPUT: WmsOrderPushInput = {
   orderNumber: 'SO-1001',
@@ -104,4 +109,45 @@ test('buildPushPayload courier branches: name / mappedId / defaultId', () => {
   const fallback = buildPushPayload(SAMPLE_INPUT, { kind: 'defaultId', courierServiceId: 99 })
   assert.equal('CourierService' in fallback, false) // id only
   assert.equal(fallback.CourierServiceId, 99)
+})
+
+test('planMintsoftItemAmendments: reduces a partially-refunded line to its netted quantity', () => {
+  const current = [{ ID: 11, SKU: 'A', Quantity: 3 }, { ID: 12, SKU: 'B', Quantity: 1 }]
+  const plan = planMintsoftItemAmendments(current, [wmsLine('A', 1), wmsLine('B', 1)])
+  assert.deepEqual(plan, [{ kind: 'update', itemId: 11, line: wmsLine('A', 1), quantity: 1 }])
+})
+
+test('planMintsoftItemAmendments: deletes a line refunded down to zero (or gone)', () => {
+  const current = [{ ID: 11, SKU: 'A', Quantity: 2 }, { ID: 12, SKU: 'B', Quantity: 1 }]
+  const plan = planMintsoftItemAmendments(current, [wmsLine('B', 1)])
+  assert.deepEqual(plan, [{ kind: 'delete', itemId: 11 }])
+})
+
+test('planMintsoftItemAmendments: no change when quantities already match', () => {
+  const current = [{ ID: 11, SKU: 'A', Quantity: 2 }]
+  assert.deepEqual(planMintsoftItemAmendments(current, [wmsLine('A', 2)]), [])
+})
+
+test('planMintsoftItemAmendments: adds a desired line not yet on the WMS order, carrying its quantity', () => {
+  const plan = planMintsoftItemAmendments([{ ID: 11, SKU: 'A', Quantity: 1 }], [wmsLine('A', 1), wmsLine('C', 2)])
+  assert.deepEqual(plan, [{ kind: 'add', line: wmsLine('C', 2), quantity: 2 }])
+})
+
+test('planMintsoftItemAmendments: add carries the aggregated quantity for a duplicated desired SKU', () => {
+  const plan = planMintsoftItemAmendments([], [wmsLine('A', 2), wmsLine('A', 1)])
+  assert.deepEqual(plan, [{ kind: 'add', line: wmsLine('A', 2), quantity: 3 }])
+})
+
+test('planMintsoftItemAmendments: aggregates a SKU split across lines and consolidates duplicate WMS rows (delete before update)', () => {
+  const current = [{ ID: 11, SKU: 'A', Quantity: 4 }, { ID: 12, SKU: 'A', Quantity: 1 }]
+  const plan = planMintsoftItemAmendments(current, [wmsLine('A', 2), wmsLine('A', 1)])
+  // desired total = 3: duplicate row deleted first, then the primary set to 3 (never overstates).
+  assert.deepEqual(plan, [
+    { kind: 'delete', itemId: 12 },
+    { kind: 'update', itemId: 11, line: wmsLine('A', 2), quantity: 3 },
+  ])
+})
+
+test('planMintsoftItemAmendments: matches on trimmed SKUs so an unchanged order yields no writes', () => {
+  assert.deepEqual(planMintsoftItemAmendments([{ ID: 11, SKU: ' A ', Quantity: 2 }], [wmsLine('A', 2)]), [])
 })
