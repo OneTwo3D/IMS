@@ -342,6 +342,16 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order update failed')
 }
 
+/** Post an internal (admin) note onto a Mintsoft order via POST /api/Order/{id}/Comments. */
+export async function addMintsoftOrderComment(externalOrderId: string, comment: string): Promise<void> {
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Comments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ Comment: comment.slice(0, 1000), Admin: true }),
+  })
+  if (result.error) throw new Error(result.error)
+}
+
 export async function cancelMintsoftOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
   // Only NEW orders are cancellable; check first so a dispatched order is a no-op.
   const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId)
