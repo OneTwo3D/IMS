@@ -1236,7 +1236,7 @@ test('inventory row collection excludes fully refunded orders from shipped COGS 
       shipment: {
         status: 'SHIPPED',
         order: {
-          status: { not: 'REFUNDED' },
+          refundStatus: { not: 'FULL' },
         },
       },
     },
@@ -1342,7 +1342,7 @@ test('inventory SQL collector keeps partially refunded orders eligible for shipp
   await collectSqlInventoryInvariantFindingsPage(client, { limit: 10 })
 
   const sql = String((capturedQuery as { sql?: string }).sql ?? '')
-  assert.match(sql, /so\.status <> 'REFUNDED'/)
+  assert.match(sql, /so\."refundStatus" <> 'FULL'/)
   assert.match(sql, /ABS\(sm\.qty\) \* sm\."unitCostBase"/)
   assert.match(sql, /sl\."reservedQty" - sl\.quantity > \?::numeric/)
   assert.match(sql, /sm\.qty > \?::numeric/)

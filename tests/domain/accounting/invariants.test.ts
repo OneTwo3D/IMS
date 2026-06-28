@@ -601,14 +601,18 @@ test('accounting row collection selects staged orders, posted shipments, and syn
   assert.ok(calls.shipment)
   assert.ok(calls.accountingSyncLog)
   assert.deepEqual(
-    (calls.salesOrder as { where: { status: unknown } }).where.status,
-    { notIn: ['REFUNDED', 'CANCELLED'] },
+    (calls.salesOrder as { where: { status: unknown; refundStatus: unknown } }).where.status,
+    { not: 'CANCELLED' },
+  )
+  assert.deepEqual(
+    (calls.salesOrder as { where: { status: unknown; refundStatus: unknown } }).where.refundStatus,
+    { not: 'FULL' },
   )
   assert.deepEqual(
     (calls.shipment as { where: unknown }).where,
     {
       shipmentJournalDate: { gte: new Date('2026-02-28T00:00:00.000Z') },
-      order: { status: { notIn: ['REFUNDED', 'CANCELLED'] } },
+      order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
     },
   )
   assert.deepEqual(

@@ -50,6 +50,9 @@ const ACTIVE_SALES_ORDER_STATUSES: SalesOrderStatus[] = [
   SalesOrderStatus.PACKING,
   SalesOrderStatus.SHIPPED,
   SalesOrderStatus.DELIVERED,
+  // Kept until the lifecycle migration: partial-refund orders still carry this
+  // status today. The refundStatus:{not:'FULL'} filter on the query excludes only
+  // fully-refunded orders (formerly REFUNDED).
   SalesOrderStatus.PARTIALLY_REFUNDED,
 ]
 
@@ -1134,7 +1137,7 @@ export async function getBackorderDemandReport(
     client.salesOrderLine.findMany({
       where: {
         productId: { not: null },
-        order: { status: { in: ACTIVE_SALES_ORDER_STATUSES } },
+        order: { status: { in: ACTIVE_SALES_ORDER_STATUSES }, refundStatus: { not: 'FULL' } },
         product: productWhere(filters),
       },
       select: {

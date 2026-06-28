@@ -937,7 +937,7 @@ export async function collectInventoryInvariantRows(
         shipment: {
           status: 'SHIPPED',
           order: {
-            status: { not: 'REFUNDED' },
+            refundStatus: { not: 'FULL' },
           },
         },
       },
@@ -1152,7 +1152,8 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       INNER JOIN "shipments" s ON s.id = sl."shipmentId"
       INNER JOIN "sales_orders" so ON so.id = s."orderId"
       WHERE s.status <> 'PENDING'
-        AND so.status NOT IN ('CANCELLED', 'REFUNDED')
+        AND so.status <> 'CANCELLED'
+        AND so."refundStatus" <> 'FULL'
         ${activeShipmentProductFilter}
         ${activeShipmentWarehouseFilter}
       GROUP BY sl."lineId", sl."productId", s."warehouseId"
@@ -1169,7 +1170,8 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
        AND asl."productId" = oa."productId"
        AND asl."warehouseId" = oa."warehouseId"
       WHERE oa.qty > 0
-        AND so.status NOT IN ('CANCELLED', 'REFUNDED')
+        AND so.status <> 'CANCELLED'
+        AND so."refundStatus" <> 'FULL'
         ${allocationProductFilter}
         ${allocationWarehouseFilter}
       GROUP BY oa."productId", oa."warehouseId"
@@ -1667,7 +1669,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       INNER JOIN "sales_orders" so ON so.id = s."orderId"
       INNER JOIN "products" p ON p.id = sl."productId"
       WHERE s.status = 'SHIPPED'
-        AND so.status <> 'REFUNDED'
+        AND so."refundStatus" <> 'FULL'
         AND p.type::text IN (${sqlFifoProductTypes()})
         AND sl.qty > ${toleranceSql}
         AND CASE

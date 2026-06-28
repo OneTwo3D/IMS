@@ -120,10 +120,10 @@ function mapCustomer(c: {
   createdAt: Date
   gdprAnonymisedAt: Date | null
   _count: { salesOrders: number }
-  salesOrders?: { status: string; totalBase: unknown; createdAt: Date }[]
+  salesOrders?: { status: string; refundStatus: string; totalBase: unknown; createdAt: Date }[]
 }): CustomerRow {
   const currentYear = new Date().getFullYear()
-  const revenueOrders = (c.salesOrders ?? []).filter((o) => REVENUE_STATUSES.has(o.status))
+  const revenueOrders = (c.salesOrders ?? []).filter((o) => REVENUE_STATUSES.has(o.status) && o.refundStatus !== 'FULL')
   const lastOrder = c.salesOrders?.length
     ? c.salesOrders.reduce((latest, o) => (o.createdAt > latest ? o.createdAt : latest), c.salesOrders[0].createdAt)
     : null
@@ -163,7 +163,7 @@ export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
     include: {
       _count: { select: { salesOrders: true } },
       salesOrders: {
-        select: { status: true, totalBase: true, createdAt: true },
+        select: { status: true, refundStatus: true, totalBase: true, createdAt: true },
       },
     },
   })
@@ -183,6 +183,7 @@ export type CustomerOrderRow = {
   id: string
   orderNumber: string | null
   status: string
+  refundStatus: string
   currency: string
   totalForeign: number
   totalBase: number
@@ -208,6 +209,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
           orderNumber: true,
           externalOrderNumber: true,
           status: true,
+          refundStatus: true,
           currency: true,
           totalForeign: true,
           totalBase: true,
@@ -224,6 +226,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
     id: so.id,
     orderNumber: so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8),
     status: so.status,
+    refundStatus: so.refundStatus,
     currency: so.currency,
     totalForeign: Number(so.totalForeign),
     totalBase: Number(so.totalBase),
@@ -233,7 +236,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
 
   // Exclude cancelled/refunded from turnover calculations
   const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'])
-  const revenueOrders = orders.filter((o) => REVENUE_STATUSES.has(o.status))
+  const revenueOrders = orders.filter((o) => REVENUE_STATUSES.has(o.status) && o.refundStatus !== 'FULL')
 
   const totalTurnoverBase = revenueOrders.reduce((sum, o) => sum + o.totalBase, 0)
 
