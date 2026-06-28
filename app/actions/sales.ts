@@ -1909,6 +1909,35 @@ export async function createRefund(
       }
     }
 
+    // Propagate the refund to a WMS the order was already pushed to. A full refund's
+    // whole-order cancellation is driven by the push sweep (auto-cancel while the WMS
+    // order is still NEW, else dead-lettered for a manual cancellation query). A partial
+    // refund only reduces line quantities, which the WMS order-update API cannot amend —
+    // so flag that a line-item cancellation query must be raised in the WMS by hand. Only
+    // for newly-created refunds (not idempotent replays of a duplicate external delivery),
+    // and best-effort so a transient read failure can't fail an already-committed refund.
+    if (refundResult.newStatus === 'PARTIALLY_REFUNDED' && !refundResult.replayed) {
+      try {
+        const wmsLink = await db.wmsOrderPushLink.findUnique({
+          where: { orderId },
+          select: { state: true, connector: true },
+        })
+        if (wmsLink?.state === 'SYNCED') {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: orderId,
+            action: 'wms_amendment_query_required',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Partial refund on order ${refundResult.so.orderNumber ?? orderId} already sent to ${wmsLink.connector} — raise a line-item cancellation query in the WMS for the refunded items (line amendments cannot be auto-propagated).`,
+            metadata: { connector: wmsLink.connector, creditNoteNumber: refundResult.creditNoteNumber },
+          })
+        }
+      } catch (wmsQueryError) {
+        console.error(wmsQueryError)
+      }
+    }
+
     if (returnWarehouseId && refundResult.returnedRows.length > 0) {
       for (const row of refundResult.returnedRows) {
         await logActivity({
