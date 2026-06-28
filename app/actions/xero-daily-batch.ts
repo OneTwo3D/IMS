@@ -143,7 +143,8 @@ async function computePreview(): Promise<DailyBatchPreview> {
       paidAt: { not: null },
       revenueDeferredDate: null,
       accountingInvoiceId: { not: null },
-      status: { notIn: ['CANCELLED', 'REFUNDED', 'DRAFT'] },
+      status: { notIn: ['CANCELLED', 'DRAFT'] },
+      refundStatus: { not: 'FULL' },
     },
     select: {
       id: true,
@@ -172,6 +173,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
       revenueDeferredDate: { not: null },
       inventoryAllocatedDate: null,
       status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'] },
+      refundStatus: { not: 'FULL' },
     },
     select: {
       id: true,
@@ -243,7 +245,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
       status: 'SHIPPED',
       shipmentJournalDate: null,
       order: {
-        status: { not: 'REFUNDED' },
+        refundStatus: { not: 'FULL' },
         revenueDeferredDate: { not: null },
         inventoryAllocatedDate: { not: null },
       },
@@ -267,6 +269,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
           orderNumber: true,
           externalOrderNumber: true,
           status: true,
+          refundStatus: true,
           totalBase: true,
           unearnedRevenueAmount: true,
           lines: { select: { id: true, productId: true, qty: true, totalBase: true } },
@@ -317,7 +320,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
   const bOrderIds = Array.from(new Set(bShipments.map((shipment) => shipment.orderId)))
   const bSettings = await getXeroSettings()
   const bPartialOrderIds = new Set(
-    bShipments.filter((shipment) => shipment.order.status === 'PARTIALLY_REFUNDED').map((shipment) => shipment.orderId),
+    bShipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
   )
   const bReversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
   const bShippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
@@ -409,8 +412,8 @@ async function computePreview(): Promise<DailyBatchPreview> {
     const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
     let runningRevenue = 0
 
-    let isTrueUpEligible = isFullyShippedTerminalStatus(order.status)
-    if (!isTrueUpEligible && order.status === 'PARTIALLY_REFUNDED') {
+    let isTrueUpEligible = isFullyShippedTerminalStatus(order.status) && order.refundStatus !== 'PARTIAL'
+    if (!isTrueUpEligible && order.refundStatus === 'PARTIAL') {
       const combinedCoverageByLine = calculateCoverageByLine(requirementsByLine, [
         ...(bShippedRowsByOrder.get(orderId) ?? []),
         ...(bRefundedUnshippedRowsByOrder.get(orderId) ?? []),

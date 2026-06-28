@@ -161,7 +161,8 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
   const orders = await db.salesOrder.findMany({
     where: {
       currency: { not: baseCurrency },
-      status: { notIn: ['CANCELLED', 'REFUNDED'] },
+      status: { not: 'CANCELLED' },
+      refundStatus: { not: 'FULL' },
       totalForeign: { gt: 0 },
     },
     select: {

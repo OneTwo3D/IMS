@@ -116,7 +116,8 @@ export async function computeDailyBatchA1A2Preview(): Promise<DailyBatchA1A2Prev
       paidAt: { not: null },
       revenueDeferredDate: null,
       accountingInvoiceId: { not: null },
-      status: { notIn: ['CANCELLED', 'REFUNDED', 'DRAFT'] },
+      status: { notIn: ['CANCELLED', 'DRAFT'] },
+      refundStatus: { not: 'FULL' },
     },
     select: {
       id: true,
@@ -145,6 +146,7 @@ export async function computeDailyBatchA1A2Preview(): Promise<DailyBatchA1A2Prev
       revenueDeferredDate: { not: null },
       inventoryAllocatedDate: null,
       status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'] },
+      refundStatus: { not: 'FULL' },
     },
     select: {
       id: true,

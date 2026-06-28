@@ -49,7 +49,7 @@ function createSnapshotClient(input: {
     productId: string
     warehouseId: string
     qty: Prisma.Decimal
-    order: { orderNumber: string | null; externalOrderNumber: string | null; expectedDelivery: Date | null; status: string }
+    order: { orderNumber: string | null; externalOrderNumber: string | null; expectedDelivery: Date | null; status: string; refundStatus: string }
     line: { sku: string | null; description: string }
   }>
 } = {}): InventorySnapshotTestClient & {
@@ -212,7 +212,7 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('0.5'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'CONFIRMED' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'CONFIRMED', refundStatus: 'NONE' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -501,7 +501,7 @@ test('reservation backfill writes sparse rows and run markers for reliable days'
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1.25'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -587,7 +587,7 @@ test('reservation backfill warns and skips run marker when source state changed 
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -634,7 +634,7 @@ test('reservation backfill checks each mutable reservation source path', async (
         productId: 'product-1',
         warehouseId: 'warehouse-1',
         qty: decimal('1'),
-        order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+        order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
         line: { sku: 'SKU-1', description: 'Widget' },
       }],
     })
@@ -669,7 +669,7 @@ test('reservation backfill skips days when shipment-line history is not provable
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -702,7 +702,7 @@ test('reservation backfill skips days when assembly BOM component history is not
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -734,7 +734,7 @@ test('reservation backfill writes negative availability as evidence with a warni
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('2'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -773,7 +773,7 @@ test('reservation backfill handles mixed supported and unsupported days', async 
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -816,7 +816,7 @@ test('reservation backfill reruns are idempotent by snapshot date and stock pair
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -1124,7 +1124,7 @@ test('reservation backfill dry-run reports supported reservation work without wr
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })

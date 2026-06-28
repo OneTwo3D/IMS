@@ -133,7 +133,6 @@ const REFUND_REVERSAL_TYPES = new Set([
   'UNEARNED_REV_REVERSAL',
 ])
 const DEFAULT_SYNC_LOG_RETENTION_MONTHS = 6
-const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'CANCELLED'] as const
 
 function dateKey(value: Date | string | null | undefined): string | null {
   if (!value) return null
@@ -739,7 +738,8 @@ export async function collectAccountingInvariantRows(
   const [salesOrders, postedShipments, syncLogs] = await Promise.all([
     client.salesOrder.findMany({
       where: {
-        status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] },
+        status: { not: 'CANCELLED' },
+        refundStatus: { not: 'FULL' },
         OR: [
           { revenueDeferredDate: retainedDateFilter },
           { inventoryAllocatedDate: retainedDateFilter },
@@ -792,7 +792,7 @@ export async function collectAccountingInvariantRows(
     client.shipment.findMany({
       where: {
         shipmentJournalDate: retainedDateFilter,
-        order: { status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] } },
+        order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
       },
       select: {
         id: true,

@@ -460,7 +460,8 @@ export async function runDailyBatchSync(): Promise<{
         paidAt: { not: null },
         revenueDeferredDate: null,
         accountingInvoiceId: { not: null },
-        status: { notIn: ['CANCELLED', 'REFUNDED', 'DRAFT'] },
+        status: { notIn: ['CANCELLED', 'DRAFT'] },
+        refundStatus: { not: 'FULL' },
       },
       select: {
         id: true,
@@ -552,6 +553,7 @@ export async function runDailyBatchSync(): Promise<{
         revenueDeferredDate: { not: null },
         inventoryAllocatedDate: null,
         status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'] },
+        refundStatus: { not: 'FULL' },
       },
       orderBy: { revenueDeferredDate: 'asc' },
       select: {
@@ -675,7 +677,7 @@ export async function runDailyBatchSync(): Promise<{
           status: 'SHIPPED',
           shipmentJournalDate: null,
           order: {
-            status: { not: 'REFUNDED' },
+            refundStatus: { not: 'FULL' },
             revenueDeferredDate: { not: null },
             inventoryAllocatedDate: { not: null },
           },
@@ -703,6 +705,7 @@ export async function runDailyBatchSync(): Promise<{
               orderNumber: true,
               externalOrderNumber: true,
               status: true,
+              refundStatus: true,
               totalBase: true,
               unearnedRevenueAmount: true,
               lines: { select: { id: true, productId: true, qty: true, totalBase: true } },
@@ -789,7 +792,7 @@ export async function runDailyBatchSync(): Promise<{
       //     used to decide whether the order is fully shipped net of refunds.
       const allocationById = new Map(orderAllocations.map((allocation) => [allocation.id, allocation]))
       const partialOrderIds = new Set(
-        shipments.filter((shipment) => shipment.order.status === 'PARTIALLY_REFUNDED').map((shipment) => shipment.orderId),
+        shipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
       )
 
       const refunds = await tx.salesOrderRefund.findMany({
@@ -920,8 +923,8 @@ export async function runDailyBatchSync(): Promise<{
         // shipped net of refunds. Either way hold the true-up until this batch holds
         // the order's final dispatched-but-unjournaled shipment, so a batch-window
         // split cannot recognize a later shipment's revenue early.
-        let isTrueUpEligible = isFullyShippedTerminalStatus(firstShipment.order.status)
-        if (!isTrueUpEligible && firstShipment.order.status === 'PARTIALLY_REFUNDED') {
+        let isTrueUpEligible = isFullyShippedTerminalStatus(firstShipment.order.status) && firstShipment.order.refundStatus !== 'PARTIAL'
+        if (!isTrueUpEligible && firstShipment.order.refundStatus === 'PARTIAL') {
           const combinedCoverageByLine = calculateCoverageByLine(requirementsByLine, [
             ...(shippedRowsByOrder.get(orderId) ?? []),
             ...(refundedUnshippedRowsByOrder.get(orderId) ?? []),

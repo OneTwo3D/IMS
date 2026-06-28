@@ -622,7 +622,7 @@ async function loadReservationBackfillSupportSnapshot(
       where: {
         shipment: {
           status: { not: 'PENDING' },
-          order: { status: { notIn: ['CANCELLED', 'REFUNDED'] } },
+          order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
         },
       },
       select: { id: true },
