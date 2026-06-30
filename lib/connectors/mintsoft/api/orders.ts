@@ -145,3 +145,59 @@ export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<Wms
     raw: order,
   }
 }
+
+export type MintsoftOrderPart = {
+  /** The Mintsoft order id of this part (used to fetch its line items). */
+  externalId: string
+  /** 1-based part number within the split. */
+  partNumber: number
+  /** Raw Mintsoft status name (uppercased), e.g. "DESPATCHED". */
+  status: string
+  tracking: WmsOrderTracking[]
+}
+
+/**
+ * Every part of a (possibly split) Mintsoft order, by order number. A split order
+ * returns one row per part from `/Order/Search` sharing the OrderNumber; unlike
+ * fetchMintsoftOrderStatus (which collapses to Part 1), we keep every part and
+ * re-read each by id for an authoritative status + tracking (search rows can carry
+ * null status/courier). Used by dispatch-sync to reconcile per-part despatch.
+ */
+export async function fetchMintsoftOrderParts(orderNumber: string): Promise<MintsoftOrderPart[]> {
+  const reference = orderNumber.trim()
+  if (!reference) return []
+  const rows = await searchMintsoftOrdersByNumber(reference)
+  const exact = rows.filter((row) => toStr(row.OrderNumber) === reference)
+  if (exact.length === 0) return []
+
+  const statusMap = await fetchMintsoftOrderStatusMap()
+  const parts: MintsoftOrderPart[] = []
+  for (const row of exact) {
+    const searchId = toStr(row.ID ?? row.Id ?? row.id)
+    if (!searchId) continue
+    const detail = (await fetchMintsoftOrderById(searchId)) ?? row
+    const externalId = toStr(detail.ID ?? detail.Id ?? detail.id) ?? searchId
+    const statusId = toInt(detail.OrderStatusId)
+    parts.push({
+      externalId,
+      partNumber: toInt(detail.Part) ?? toInt(row.Part) ?? 1,
+      status: (statusId !== null ? statusMap.get(statusId) : null) ?? '',
+      tracking: readTracking(detail),
+    })
+  }
+  return parts.sort((a, b) => a.partNumber - b.partNumber)
+}
+
+/** Line items (SKU + whole-unit qty) of a single Mintsoft order/part. */
+export async function fetchMintsoftPartItems(externalOrderId: string): Promise<Array<{ sku: string; qty: number }>> {
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Items`)
+  if (result.error) throw new Error(result.error)
+  const out: Array<{ sku: string; qty: number }> = []
+  for (const raw of extractMintsoftArrayPayload(result.data)) {
+    const r = raw as RawOrder
+    const sku = toStr(r.SKU)
+    const qty = toInt(r.Quantity) ?? 0
+    if (sku && qty > 0) out.push({ sku, qty })
+  }
+  return out
+}

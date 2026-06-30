@@ -4,6 +4,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
+import { fetchMintsoftOrderParts, fetchMintsoftPartItems } from '../api/orders'
 
 /**
  * Phase 8 — Mintsoft dispatch ingestion (q66in.1.1).
@@ -79,6 +80,20 @@ export type DispatchSyncLog = {
   reason: string
 }
 
+export type DispatchOrderPart = {
+  externalId: string
+  partNumber: number
+  status: string
+  tracking: WmsOrderTracking[]
+}
+
+export type DispatchPartialShipmentInput = {
+  part: number
+  totalParts: number
+  trackingNumber?: string | null
+  items: Array<{ sku: string; qty: number }>
+}
+
 export type MintsoftDispatchSyncDeps = {
   listCandidates(limit: number): Promise<DispatchSyncCandidate[]>
   fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null>
@@ -86,6 +101,60 @@ export type MintsoftDispatchSyncDeps = {
     orderId: string,
     tracking: Array<{ trackingNumber: string; shippingService?: string | null }>,
   ): Promise<{ success: boolean; error?: string }>
+  // Split-order reconciliation (q66in.1.5): fetch every part, its line items, and
+  // push each despatched part to the storefront as a partial shipment.
+  fetchOrderParts(orderNumber: string): Promise<DispatchOrderPart[]>
+  fetchPartItems(externalPartId: string): Promise<Array<{ sku: string; qty: number }>>
+  pushPartialShipment(
+    orderId: string,
+    input: DispatchPartialShipmentInput,
+  ): Promise<{ ok: boolean; error?: string }>
+}
+
+/**
+ * Reconcile a SPLIT Mintsoft order: push each despatched part to the storefront as
+ * a partial shipment (idempotent per part on the WC side), and only mark the IMS
+ * order SHIPPED once every part has despatched — line-level at the storefront,
+ * atomic IMS-side (q66in.1.5). A partially-despatched order stays pending.
+ */
+async function reconcileSplitOrder(
+  deps: MintsoftDispatchSyncDeps,
+  candidate: DispatchSyncCandidate,
+): Promise<{ action: 'dispatched' | 'pending' | 'error'; reason: string }> {
+  const parts = await deps.fetchOrderParts(candidate.externalOrderNumber)
+  if (parts.length === 0) {
+    return { action: 'pending', reason: 'Split order has no parts visible in Mintsoft yet' }
+  }
+  const dispatchedParts = parts.filter((part) => isMintsoftDispatched({ status: part.status, tracking: part.tracking }))
+
+  for (const part of dispatchedParts) {
+    const items = await deps.fetchPartItems(part.externalId)
+    if (items.length === 0) continue
+    const push = await deps.pushPartialShipment(candidate.orderId, {
+      part: part.partNumber,
+      totalParts: parts.length,
+      trackingNumber: part.tracking.find((entry) => entry.trackingNumber)?.trackingNumber ?? null,
+      items,
+    })
+    if (!push.ok) {
+      return { action: 'error', reason: push.error ?? `Partial-shipment push failed for part ${part.partNumber}` }
+    }
+  }
+
+  if (dispatchedParts.length < parts.length) {
+    return { action: 'pending', reason: `${dispatchedParts.length}/${parts.length} parts despatched` }
+  }
+
+  // Every part despatched — reconcile the IMS order to SHIPPED with the aggregated
+  // tracking so it leaves the candidate set.
+  const result = await deps.applyDispatch(
+    candidate.orderId,
+    toFulfillmentTracking(dispatchedParts.flatMap((part) => part.tracking)),
+  )
+  if (!result.success) {
+    return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
+  }
+  return { action: 'dispatched', reason: `All ${parts.length} parts despatched` }
 }
 
 /**
@@ -105,28 +174,39 @@ export async function runMintsoftDispatchSyncCore(
     counters.totalChecked += 1
     try {
       const status = await deps.fetchOrderStatus(candidate.externalOrderNumber)
-      if (!status || !isMintsoftDispatched(status)) {
+      if (!status) {
         counters.pending += 1
         logs.push({
           orderId: candidate.orderId,
           externalOrderNumber: candidate.externalOrderNumber,
           action: 'pending',
-          reason: status ? `Not dispatched (status ${status.status || 'Unknown'})` : 'Order not found in Mintsoft',
+          reason: 'Order not found in Mintsoft',
         })
         continue
       }
 
       // A split order's primary row can read DESPATCHED while only some parts have
-      // shipped; applying SHIPPED to the whole IMS order (and index-mapping the
-      // primary row's tracking onto every shipment) would be wrong. Per-part
-      // reconciliation is q66in.1.5 — leave split orders pending until then.
+      // shipped (or the reverse), so check isSplit BEFORE the dispatched gate and
+      // reconcile per part rather than trusting the primary row.
       if (status.isSplit) {
+        const outcome = await reconcileSplitOrder(deps, candidate)
+        counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
+        logs.push({
+          orderId: candidate.orderId,
+          externalOrderNumber: candidate.externalOrderNumber,
+          action: outcome.action,
+          reason: outcome.reason,
+        })
+        continue
+      }
+
+      if (!isMintsoftDispatched(status)) {
         counters.pending += 1
         logs.push({
           orderId: candidate.orderId,
           externalOrderNumber: candidate.externalOrderNumber,
           action: 'pending',
-          reason: `Split order (${status.partCount ?? '?'} parts) — deferred to partial-ship reconciliation (q66in.1.5)`,
+          reason: `Not dispatched (status ${status.status || 'Unknown'})`,
         })
         continue
       }
@@ -206,6 +286,24 @@ function createPrismaDispatchDeps(): MintsoftDispatchSyncDeps {
         targetShipmentStatus: 'SHIPPED',
         tracking,
       })
+    },
+    fetchOrderParts(orderNumber) {
+      return fetchMintsoftOrderParts(orderNumber)
+    },
+    fetchPartItems(externalPartId) {
+      return fetchMintsoftPartItems(externalPartId)
+    },
+    async pushPartialShipment(orderId, input) {
+      // Connector-agnostic: the storefront facade records the partial shipment
+      // (WooCommerce today; Shopify can implement its own representation later).
+      const { pushPartialShipmentToShopping } = await import('@/lib/shopping')
+      const result = await pushPartialShipmentToShopping(orderId, {
+        part: input.part,
+        totalParts: input.totalParts,
+        trackingNumber: input.trackingNumber,
+        items: input.items,
+      })
+      return { ok: result.success, error: result.error }
     },
   }
 }
