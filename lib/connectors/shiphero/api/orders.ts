@@ -84,10 +84,11 @@ export function mapShipheroOrderStatus(node: unknown, adminOrderUrlTemplate: str
     mergedOrderNumbers: [],
     deepLinkUrl: buildShipheroDeepLink(adminOrderUrlTemplate, externalOrderId),
     tracking,
-    // ShipHero's connector-specific dispatched decision: fully fulfilled, or a tracking
-    // entry carrying a despatch date.
-    dispatched: fulfillmentStatus.trim().toLowerCase() === 'fulfilled'
-      || tracking.some((entry) => Boolean(entry.despatchedAt)),
+    // ShipHero's connector-specific dispatched decision: the ORDER is dispatched only when
+    // fully fulfilled. NOT a tracking-date fallback — a `partially_fulfilled` order can have
+    // a dated shipment yet still owe more, so a tracking fallback would mark it dispatched
+    // prematurely. Per-shipment despatch is handled by fetchOrderParts (split orders).
+    dispatched: fulfillmentStatus.trim().toLowerCase() === 'fulfilled',
     raw: record,
   }
 }

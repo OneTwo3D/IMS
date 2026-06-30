@@ -47,6 +47,7 @@ function deps(overrides: Partial<WmsDispatchSweepDeps>): WmsDispatchSweepDeps {
     listCandidates: async () => [],
     fetchOrderStatus: async () => null,
     applyDispatch: async () => ({ success: true }),
+    partsSupported: true,
     fetchOrderParts: async () => [],
     fetchPartItems: async () => [],
     pushPartialShipment: async () => ({ ok: true }),
@@ -270,6 +271,19 @@ test('non-merged split still pushes per-part', async () => {
     pushPartialShipment: async (orderId, input) => { pushed.push(input.part); return { ok: true } },
   }))
   assert.deepEqual(pushed, [1])
+})
+
+test('split order on a connector without part support → clear unsupported pending (not a silent stall)', async () => {
+  let partsFetched = 0
+  const { counters, logs } = await runWmsDispatchSweepCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'SH-1001' }],
+    fetchOrderStatus: async () => status({ status: 'partially_fulfilled', isSplit: true, partCount: 2 }),
+    partsSupported: false,
+    fetchOrderParts: async () => { partsFetched += 1; return [] },
+  }))
+  assert.equal(partsFetched, 0) // never even attempts to fetch parts
+  assert.equal(counters.pending, 1)
+  assert.match(logs[0]?.reason ?? '', /no per-part reconciliation/i)
 })
 
 test('runWmsDispatchSweepCore treats an order missing in the WMS as pending, not an error', async () => {

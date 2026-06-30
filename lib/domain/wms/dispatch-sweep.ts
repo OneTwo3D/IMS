@@ -71,6 +71,10 @@ export type WmsDispatchSweepDeps = {
     orderId: string,
     tracking: Array<{ trackingNumber: string; shippingService?: string | null }>,
   ): Promise<{ success: boolean; error?: string }>
+  // Whether the active connector supports per-part reconciliation (fetchOrderParts). When
+  // false, a split order is surfaced as a clear "unsupported" pending rather than silently
+  // stalling as "no parts visible".
+  partsSupported: boolean
   // Split-order reconciliation: fetch every part, its line items, and push each despatched
   // part to the storefront as a partial shipment.
   fetchOrderParts(orderNumber: string): Promise<import('@/lib/connectors/wms/types').WmsOrderPart[]>
@@ -183,6 +187,9 @@ export async function reconcileOneOrder(
   // A split order's primary row can read dispatched while only some parts have shipped (or
   // the reverse), so handle split BEFORE the dispatched gate and reconcile per part.
   if (status.isSplit) {
+    if (!deps.partsSupported) {
+      return { action: 'pending', reason: 'Split order — this WMS connector has no per-part reconciliation yet' }
+    }
     // A merged survivor's parts mix several original orders → reconcile atomically.
     return reconcileSplitOrder(deps, candidate, effectiveOrderNumber, status.partCount, !status.isMerged)
   }
@@ -280,9 +287,8 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         tracking,
       })
     },
+    partsSupported: Boolean(connector.fetchOrderParts),
     fetchOrderParts(orderNumber) {
-      // A connector without part support (no split handling yet) → no parts; split orders
-      // stay pending rather than erroring.
       return connector.fetchOrderParts ? connector.fetchOrderParts(orderNumber) : Promise.resolve([])
     },
     fetchPartItems(externalPartId) {
