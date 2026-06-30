@@ -3,6 +3,7 @@ import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
+import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { isShoppingConnectorId } from '@/lib/fulfillment/shopping-order-lookup'
 import { isWmsConnectorId, resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 
@@ -113,6 +114,27 @@ function statusesToApply(
   return flow.slice(start + 1, end + 1)
 }
 
+/**
+ * Whether to push the storefront status forward (→ "completed" for WooCommerce) after a
+ * fulfilment update. Only for a WMS-sourced dispatch that just brought the order to
+ * SHIPPED — a storefront-sourced update already has the storefront as the source of truth
+ * (pushing back would echo), and a partial dispatch leaves the order pre-SHIPPED. This is
+ * what makes the storefront fire its customer despatch email (e.g. AST on →completed).
+ *
+ * Restricted to SHIPPED (not COMPLETED/DELIVERED): those later states have no WC status
+ * mapping (IMS_TO_WC) so a push would silently no-op — and a SHIPPED order has already
+ * driven the WC completion, so there's nothing more to push.
+ */
+export function shouldPushStorefrontCompletion(
+  source: ExternalFulfillmentSource,
+  targetShipmentStatus: ExternalShipmentStatus,
+  orderStatus: string,
+): boolean {
+  return targetShipmentStatus === 'SHIPPED'
+    && isWmsConnectorId(source)
+    && orderStatus === 'SHIPPED'
+}
+
 export async function applyExternalFulfillmentUpdate(
   update: ExternalFulfillmentUpdate,
 ): Promise<{ success: boolean; error?: string }> {
@@ -201,6 +223,40 @@ export async function applyExternalFulfillmentUpdate(
     metadata: { source: update.source, targetShipmentStatus: update.targetShipmentStatus, shipmentsProcessed: shipments.length },
     resolveUser: false,
   })
+
+  // When a WMS dispatch has fully shipped the order, push the storefront status
+  // forward (SHIPPED → WooCommerce "completed") so the storefront fires its customer
+  // despatch email — e.g. Advanced Shipment Tracking emails the tracking on the
+  // →completed transition, not on a raw tracking-meta write. Writing the tracking meta
+  // alone (above) leaves the WC order in its prior status and the customer un-emailed.
+  // Gated to WMS sources: a storefront-sourced fulfilment already has the storefront as
+  // the source of truth, so pushing status back would just echo.
+  if (update.targetShipmentStatus === 'SHIPPED' && isWmsConnectorId(update.source)) {
+    const current = await db.salesOrder.findUnique({ where: { id: order.id }, select: { status: true } })
+    if (current && shouldPushStorefrontCompletion(update.source, update.targetShipmentStatus, current.status)) {
+      // Best-effort: the shipment + tracking are already applied; a failed status push
+      // must not fail the dispatch. But log it — a missed completion = a missed customer
+      // despatch email, which would otherwise be invisible.
+      const logCompletionPushFailure = (detail: string) =>
+        logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: order.id,
+          action: 'wc_completion_push_failed',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Storefront completion push failed for despatched order ${order.externalOrderNumber ?? order.orderNumber ?? order.id}: ${detail} — customer despatch email may not have fired`,
+          metadata: { source: update.source },
+          resolveUser: false,
+        }).catch(() => {})
+      try {
+        const { pushSalesOrderStatus } = await import('@/lib/shopping')
+        const pushResult = await pushSalesOrderStatus(order.id, current.status as SalesOrderStatus)
+        if (!pushResult.success) await logCompletionPushFailure(pushResult.error ?? 'unknown error')
+      } catch (error) {
+        await logCompletionPushFailure(error instanceof Error ? error.message : 'unexpected error')
+      }
+    }
+  }
 
   return { success: true }
 }
