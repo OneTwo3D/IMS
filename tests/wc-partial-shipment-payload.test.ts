@@ -51,6 +51,7 @@ test('buildPartialShipmentBody drops blank SKUs and non-positive quantities', ()
       { sku: '', qty: 5 },
       { sku: 'B', qty: 0 },
       { sku: 'C', qty: -3 },
+      { sku: 'D', qty: 0.5 }, // floors to 0 → dropped (not silently passed to PHP)
     ],
   }))
   assert.deepEqual(body.items, [{ sku: 'A', qty: 1 }])

@@ -56,8 +56,11 @@ export function buildPartialShipmentBody(input: WcPartialShipmentPush): string {
     tracking_number: input.trackingNumber ?? '',
     shipment_num: input.shipmentNum ?? '',
     items: input.items
-      .filter((line) => line.sku.trim() !== '' && line.qty > 0)
-      .map((line) => ({ sku: line.sku.trim(), qty: Math.trunc(line.qty) })),
+      // Truncate first, then drop — so a fractional qty that floors to 0 (e.g. 0.5)
+      // is dropped here rather than passing the filter and being silently discarded
+      // by the PHP handler's integer cast.
+      .map((line) => ({ sku: line.sku.trim(), qty: Math.trunc(line.qty) }))
+      .filter((line) => line.sku !== '' && line.qty > 0),
   })
 }
 
