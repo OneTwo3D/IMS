@@ -3,7 +3,11 @@ import type {
   WmsAsnRef,
   WmsConnectionCheck,
   WmsConnector,
+  WmsOrderCancelResult,
+  WmsOrderPushInput,
+  WmsOrderPushResult,
   WmsOrderStatus,
+  WmsOrderUpdateResult,
   WmsProductDto,
   WmsProductRef,
   WmsReturnRecord,
@@ -18,6 +22,12 @@ import {
 } from './api/auth'
 import { fetchShipheroStockLevels, fetchShipheroWarehouses } from './api/client'
 import { fetchShipheroOrderStatus } from './api/orders'
+import {
+  addShipheroOrderComment,
+  cancelShipheroOrder,
+  pushShipheroOrder,
+  updateShipheroOrder,
+} from './api/order-push'
 
 const CONNECTOR = 'ShipHero'
 
@@ -28,11 +38,13 @@ function notImplemented(feature: string, ticket: string): never {
 
 /**
  * ShipHero WMS connector — the second implementation of the generic
- * `WmsConnector` contract (the first being Mintsoft). This shell (epic child
- * h02x.2) delivers the GraphQL client, OAuth token lifecycle, connection/binding
- * settings, and registration. Per-phase feature methods (stock/product/ASN/
- * returns/bundle and the optional order push/status/cancel) throw a clearly
- * labelled "not implemented (h02x.N)" until their child ticket lands.
+ * `WmsConnector` contract (the first being Mintsoft). The shell (epic child
+ * h02x.2) delivered the GraphQL client, OAuth token lifecycle, connection/binding
+ * settings, and registration; later children add stock sync (h02x.4), order
+ * status (h02x.9), and the outbound order push / update / cancel / comment
+ * (h02x.11). Per-phase feature methods not yet ported from Mintsoft
+ * (product/ASN/returns/bundle) throw a clearly labelled "not implemented
+ * (h02x.N)" until their child ticket lands.
  *
  * Optional contract methods that aren't implemented yet are intentionally NOT
  * declared, so capability checks (`connector.pushOrder?`, `connector.cancelOrder?`)
@@ -95,6 +107,22 @@ export class ShipheroConnector implements WmsConnector {
     return fetchShipheroOrderStatus(orderNumber)
   }
 
+  async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
+    return pushShipheroOrder(input)
+  }
+
+  async updateOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
+    return updateShipheroOrder(externalOrderId, input)
+  }
+
+  async cancelOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
+    return cancelShipheroOrder(externalOrderId)
+  }
+
+  async addOrderComment(externalOrderId: string, comment: string): Promise<void> {
+    return addShipheroOrderComment(externalOrderId, comment)
+  }
+
   async verifyWebhookSignature(
     rawBody: string,
     signatureHeader: string | null,
@@ -151,6 +179,15 @@ export {
   pickShipheroOrderNode,
   readShipheroTracking,
 } from './api/orders'
+export {
+  addShipheroOrderComment,
+  buildShipheroCreateInput,
+  cancelShipheroOrder,
+  planShipheroLineAmendments,
+  pushShipheroOrder,
+  updateShipheroOrder,
+  type ShipheroLineAmendment,
+} from './api/order-push'
 export {
   registerAllShipheroWebhooks,
   registerShipheroWebhook,
