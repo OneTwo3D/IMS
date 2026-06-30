@@ -2366,6 +2366,7 @@ enum WmsSyncJobType {
   ASN_CALLBACK
   RETURNS_SYNC
   PRODUCT_VERIFY
+  DISPATCH_SYNC
 }
 
 enum WmsSyncJobStatus {

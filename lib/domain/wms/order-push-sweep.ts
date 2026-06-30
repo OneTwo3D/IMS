@@ -11,7 +11,9 @@ import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine
  * Eligibility (create): ship-from warehouse bound to the active WMS connector,
  * status ready-to-fulfil (PROCESSING/ALLOCATED), and paid. Idempotent via the
  * WmsOrderPushLink (orderId unique); failed pushes retry up to MAX_ATTEMPTS then
- * dead-letter. Inbound dispatch→tracking already flows via applyExternalFulfillmentUpdate.
+ * dead-letter. The reverse direction — inbound dispatch→tracking — flows via the
+ * dispatch-sync poll (lib/connectors/mintsoft/sync/dispatch-sync.ts), which feeds
+ * applyExternalFulfillmentUpdate once Mintsoft reports the order despatched.
  */
 
 const READY_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
