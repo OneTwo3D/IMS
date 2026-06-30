@@ -78,10 +78,13 @@ test('buildPushPayload maps the core order + address fields', () => {
   assert.equal(p.TotalVat, 4) // rounded to 2dp
 })
 
-test('buildPushPayload includes VATNumber only when the order carries one (G6b)', () => {
+test('buildPushPayload includes VATNumber on create only, when the order carries one (G6b)', () => {
   assert.equal(buildPushPayload(SAMPLE_INPUT, { kind: 'name' }).VATNumber, undefined)
-  const withVat = buildPushPayload({ ...SAMPLE_INPUT, vatNumber: 'GB123456789' }, { kind: 'name' })
-  assert.equal(withVat.VATNumber, 'GB123456789')
+  const withVat = { ...SAMPLE_INPUT, vatNumber: 'GB123456789' }
+  // create (includeItems default true) carries it; amend (includeItems false) omits it,
+  // since a Mintsoft order's VAT may be immutable once created.
+  assert.equal(buildPushPayload(withVat, { kind: 'name' }).VATNumber, 'GB123456789')
+  assert.equal(buildPushPayload(withVat, { kind: 'name' }, false).VATNumber, undefined)
 })
 
 test('buildPushPayload includes OrderItems on create, omits them on update', () => {

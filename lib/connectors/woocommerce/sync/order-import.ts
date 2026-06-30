@@ -325,6 +325,7 @@ async function updateExistingWcOrderFromPayload(
       where: { id: orderId },
       data: {
         externalOrderNumber: wcOrder.number,
+        customerVatNumber: readWcCustomerVat(wcOrder),
         billingAddress: mapWcAddress(wcOrder.billing),
         shippingAddress: mapWcAddress(wcOrder.shipping),
         notes: wcOrder.customer_note || null,
