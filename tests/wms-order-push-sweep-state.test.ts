@@ -20,6 +20,7 @@ function candidate(overrides: Partial<WmsPushCandidate> = {}): WmsPushCandidate 
     currency: 'GBP',
     customerName: 'Jane Doe',
     customerEmail: 'jane@example.com',
+    customerVatNumber: null,
     shippingAddress: { line1: '1 St', city: 'Leeds', postcode: 'LS1', country: 'GB' },
     shippingService: 'Royal Mail',
     shippingForeign: 0,
@@ -88,6 +89,28 @@ test('create: a bound, eligible order is pushed and marked SYNCED', async () => 
   assert.equal(upserts.length, 1)
   assert.equal(upserts[0].create.state, 'SYNCED')
   assert.equal(upserts[0].create.externalOrderId, 'wms-1')
+})
+
+test('create: a courier-fallback push posts a warehouse-visible verify-courier comment (G6c)', async () => {
+  const comments: Array<{ externalOrderId: string; comment: string }> = []
+  const fallbackPush = connector({
+    pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', courierFallback: true }),
+    comments,
+  })
+  const { port } = makePort({ createCandidates: [candidate()] })
+  const r = await runWmsOrderPushSweepCore(fallbackPush, 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.equal(comments.length, 1)
+  assert.equal(comments[0].externalOrderId, 'wms-1')
+  assert.match(comments[0].comment, /default courier/i)
+})
+
+test('create: a normal (no-fallback) push posts no courier comment', async () => {
+  const comments: Array<{ externalOrderId: string; comment: string }> = []
+  const { port } = makePort({ createCandidates: [candidate()] })
+  const r = await runWmsOrderPushSweepCore(connector({ comments }), 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.equal(comments.length, 0)
 })
 
 test('create: a candidate whose warehouse is not bound is skipped (no write)', async () => {

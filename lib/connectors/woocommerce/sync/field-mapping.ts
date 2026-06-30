@@ -27,6 +27,39 @@ export function mapWcAddress(a: WcAddress) {
   }
 }
 
+// The EU/UK VAT plugins each store the customer-entered VAT number under their own
+// order-meta key; check the common ones (mirrors the legacy plugin's _read_wc_vat).
+const WC_VAT_META_KEYS = new Set([
+  '_billing_vat', '_vat_number', 'billing_vat_number', '_billing_eu_vat_number',
+  'vat_number', '_vat_id', '_billing_vat_number',
+])
+
+function normaliseVat(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.replace(/\s+/g, ' ').trim()
+  return trimmed || null
+}
+
+/**
+ * Read a customer-entered VAT / IOSS number from a WC order: the common EU/UK VAT
+ * plugin meta keys first, then billing-level fields some blocks-checkouts expose.
+ * Returns a trimmed value or null. Sent on to the WMS for customs declarations.
+ */
+export function readWcCustomerVat(order: WcFullOrder): string | null {
+  for (const meta of order.meta_data ?? []) {
+    if (WC_VAT_META_KEYS.has(meta.key)) {
+      const value = normaliseVat(meta.value)
+      if (value) return value
+    }
+  }
+  const billing = order.billing as Record<string, unknown> | undefined
+  for (const key of ['vat_number', 'vat_id', 'company_vat']) {
+    const value = normaliseVat(billing?.[key])
+    if (value) return value
+  }
+  return null
+}
+
 // ---------------------------------------------------------------------------
 // Customer mapping
 // ---------------------------------------------------------------------------

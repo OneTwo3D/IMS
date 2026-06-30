@@ -3,6 +3,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
+import { scrubWmsError } from './error-scrub'
 
 /**
  * Connector-agnostic outbound order-push sweep (Phase 8). Pushes IMS sales
@@ -43,6 +44,7 @@ type OrderForPush = {
   currency: string
   customerName: string | null
   customerEmail: string | null
+  customerVatNumber: string | null
   shippingAddress: unknown
   shippingService: string | null
   shippingForeign: unknown
@@ -126,6 +128,7 @@ const ORDER_PUSH_SELECT = {
   currency: true,
   customerName: true,
   customerEmail: true,
+  customerVatNumber: true,
   shippingAddress: true,
   shippingService: true,
   shippingForeign: true,
@@ -144,6 +147,7 @@ function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOr
     shippingAddress: readAddress(order.shippingAddress, order.customerName),
     email: order.customerEmail,
     phone: null,
+    vatNumber: order.customerVatNumber,
     comments: null,
     courierService: order.shippingService,
     totalVat: num(order.taxForeign),
@@ -262,10 +266,18 @@ export async function runWmsOrderPushSweepCore(
           { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null },
         )
         result.created += 1
+        // Courier-pending (G6c): the shipping service didn't resolve and the WMS used a
+        // default courier — flag it on the WMS order so the warehouse verifies before despatch.
+        if (push.courierFallback) {
+          await postConflictComment(
+            push.externalOrderId,
+            `IMS: shipping method '${order.shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`,
+          )
+        }
       } catch (error) {
         const attempts = order.pushAttempts + 1
         const dead = attempts >= MAX_ATTEMPTS
-        const message = error instanceof Error ? error.message : 'WMS order push failed'
+        const message = scrubWmsError(error, 'WMS order push failed')
         if (dead) result.deadLettered += 1
         else result.failed += 1
         const state: PushState = dead ? 'DEAD_LETTER' : 'PENDING_CREATE'
@@ -291,7 +303,7 @@ export async function runWmsOrderPushSweepCore(
         if (update.updated) result.updated += 1
       } catch (error) {
         result.failed += 1
-        await port.updateLink(link.id, { lastError: error instanceof Error ? error.message : 'WMS order update failed', lastAttemptAt: ts }).catch(() => {})
+        await port.updateLink(link.id, { lastError: scrubWmsError(error, 'WMS order update failed'), lastAttemptAt: ts }).catch(() => {})
       }
     }
   }
@@ -314,7 +326,7 @@ export async function runWmsOrderPushSweepCore(
         }
       } catch (error) {
         result.failed += 1
-        await port.updateLink(link.id, { lastError: error instanceof Error ? error.message : 'WMS hold/cancel failed', lastAttemptAt: ts }).catch(() => {})
+        await port.updateLink(link.id, { lastError: scrubWmsError(error, 'WMS hold/cancel failed'), lastAttemptAt: ts }).catch(() => {})
       }
     }
   }
@@ -339,7 +351,7 @@ export async function runWmsOrderPushSweepCore(
         }
       } catch (error) {
         result.failed += 1
-        await port.updateLink(link.id, { lastError: error instanceof Error ? error.message : 'WMS cancel failed', lastAttemptAt: ts }).catch(() => {})
+        await port.updateLink(link.id, { lastError: scrubWmsError(error, 'WMS cancel failed'), lastAttemptAt: ts }).catch(() => {})
       }
     }
   }

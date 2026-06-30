@@ -28,9 +28,9 @@ Legend: ✅ done in IMS · ◐ partial · ✗ missing · ➕ IMS exceeds the plu
 | G3 | **Royal Mail Click & Drop label integration** | 12 | ✗ | Plugin's `wc_royalmail_clickdrop.py` fetches the C&D label and forwards it to Mintsoft (Pass 3). IMS has no C&D integration (only courier-service mapping). Standalone feature |
 | G4 | **Mintsoft status/tracking visible in WC admin** | 2/3 | ◐ | Plugin writes raw Mintsoft status + AST tracking into WC so it shows on the WC order screen (chips, meta box). IMS surfaces all this in **IMS's** UI. Only a gap if staff still work in WC admin — process decision |
 | G5 | **AST Pro email trigger** | 3 | ◐ | Plugin calls AST Pro's `add_tracking_item()` (fires AST's customer despatch email). IMS writes `_wc_shipment_tracking_items` meta directly — WC sees the tracking but AST Pro's own email may not fire. Confirm customer still gets a despatch email |
-| G6 | Order-push fidelity nits | 1 | ◐ | Plugin extras to confirm in IMS: VAT penny-precision refuse (>1p drift), customer VAT-number extraction, courier-pending flag (warn + auto-clear on poll-back). Store-credit-as-payment is already handled in IMS |
+| G6 | Order-push fidelity nits | 1 | ◐ mostly DONE | **G6b customer VAT** ✅ (`SalesOrder.customerVatNumber`, extracted at WC import via `readWcCustomerVat`, sent as `VATNumber`). **G6c courier-pending** ✅ (push result `courierFallback` → warehouse comment on the WMS order). **G6a VAT penny-precision guard DEFERRED** — needs careful fee/discount/tax reconstruction vs WC's independent `totalForeign` to avoid false-positives, and is low value since IMS owns its line math. Store-credit-as-payment already handled. |
 | G7 | Product-sync nits | 7 | ◐ | GTIN→EAN-vs-UPC fill rule (never overwrite) + reverse EAN→GTIN; "Parent (SKU-Attr)" variation naming for picking |
-| G8 | Error-message PII scrubbing | 2 | ✗ | Plugin scrubs emails/postcodes/VAT/IBAN from stored error text. IMS stores raw errors in `WmsSyncLog`/`lastError` — minor, but relevant if surfaced |
+| G8 | Error-message PII scrubbing | 2 | ✅ DONE | `scrubWmsError` (emails/secrets via `redactActivityLogText`, plus IBAN + UK postcode, length-capped) applied to `WmsOrderPushLink.lastError` + dispatch-sync `WmsSyncLog.reason`. |
 
 ## Architecture decision (RESOLVED — option B, owner 2026-06-30)
 

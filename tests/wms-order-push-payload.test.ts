@@ -23,6 +23,7 @@ const SAMPLE_INPUT: WmsOrderPushInput = {
   },
   email: 'jane@example.com',
   phone: null,
+  vatNumber: null,
   comments: null,
   courierService: 'Royal Mail Tracked 24',
   totalVat: 4.001,
@@ -75,6 +76,12 @@ test('buildPushPayload maps the core order + address fields', () => {
   assert.equal(p.Town, 'Leeds')
   assert.equal(p.PostCode, 'LS1 1AA')
   assert.equal(p.TotalVat, 4) // rounded to 2dp
+})
+
+test('buildPushPayload includes VATNumber only when the order carries one (G6b)', () => {
+  assert.equal(buildPushPayload(SAMPLE_INPUT, { kind: 'name' }).VATNumber, undefined)
+  const withVat = buildPushPayload({ ...SAMPLE_INPUT, vatNumber: 'GB123456789' }, { kind: 'name' })
+  assert.equal(withVat.VATNumber, 'GB123456789')
 })
 
 test('buildPushPayload includes OrderItems on create, omits them on update', () => {
