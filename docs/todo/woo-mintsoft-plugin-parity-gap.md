@@ -23,8 +23,8 @@ Legend: ✅ done in IMS · ◐ partial · ✗ missing · ➕ IMS exceeds the plu
 
 | # | Gap | Cat | Status | Scope |
 |---|---|---|---|---|
-| G1 | **Split order → WC partial shipments** | 4 | ✗ | The big one. Plugin records each despatched part into `wp_partial_shipment` tables, sets WC partial-shipped/completed, per-part status chip, fires wphub emails. IMS has detection only. = `q66in.1.5` + a new WC-writeback piece |
-| G2 | **Merge handling** | 5 | ◐ | IMS detects merges read-only (`mergedParts`/`isMerged`). Plugin repoints the order id, prevents dual-sync (drops the second push), shows a merged chip. Missing: repoint + dual-sync prevention |
+| G1 | **Split order → WC partial shipments** | 4 | ✅ DONE | Companion plugin (`onetwoinventory-helper.php`) gained a WMS-neutral `oti/v1/order/{id}/partial-shipment` route that records into `wp_partial_shipment` + sets WC status + fires wphub emails (PR #449); dispatch-sync pushes each despatched part to it via the shopping facade (PR #450, `q66in.1.5`). Deep IMS-internal line-level shipment re-modelling stays deferred (woo-level for now). |
+| G2 | **Merge handling** | 5 | ✅ DONE | dispatch-sync repoints the link to the survivor and parks it `MERGED` (PR #450, `vn92.2`); the order-push sweep's `SYNCED`-only passes auto-skip `MERGED` = dual-sync prevention. Merged+split survivors reconcile atomically. (A merged **chip** in IMS is cosmetic — covered by the existing status chip.) |
 | G3 | **Royal Mail Click & Drop label integration** | 12 | ✗ | Plugin's `wc_royalmail_clickdrop.py` fetches the C&D label and forwards it to Mintsoft (Pass 3). IMS has no C&D integration (only courier-service mapping). Standalone feature |
 | G4 | **Mintsoft status/tracking visible in WC admin** | 2/3 | ◐ | Plugin writes raw Mintsoft status + AST tracking into WC so it shows on the WC order screen (chips, meta box). IMS surfaces all this in **IMS's** UI. Only a gap if staff still work in WC admin — process decision |
 | G5 | **AST Pro email trigger** | 3 | ◐ | Plugin calls AST Pro's `add_tracking_item()` (fires AST's customer despatch email). IMS writes `_wc_shipment_tracking_items` meta directly — WC sees the tracking but AST Pro's own email may not fire. Confirm customer still gets a despatch email |
@@ -32,27 +32,24 @@ Legend: ✅ done in IMS · ◐ partial · ✗ missing · ➕ IMS exceeds the plu
 | G7 | Product-sync nits | 7 | ◐ | GTIN→EAN-vs-UPC fill rule (never overwrite) + reverse EAN→GTIN; "Parent (SKU-Attr)" variation naming for picking |
 | G8 | Error-message PII scrubbing | 2 | ✗ | Plugin scrubs emails/postcodes/VAT/IBAN from stored error text. IMS stores raw errors in `WmsSyncLog`/`lastError` — minor, but relevant if surfaced |
 
-## Key architecture decision (blocks G1 WC-writeback)
+## Architecture decision (RESOLVED — option B, owner 2026-06-30)
 
-The plugin writes WC partial shipments by **inserting into the `wphub-partial-shipment`
-tables from inside WordPress** (PHP) and via HMAC-signed custom REST routes. IMS talks to
-WC over the **standard WC REST API** (consumer key/secret) — which cannot write those
-wphub tables. So IMS's partial-shipment writeback needs one of:
+The plugin writes WC partial shipments by inserting into the `wphub-partial-shipment`
+tables from inside WordPress; IMS talks to WC over the standard REST API, which cannot.
+**Resolved: extend the existing IMS companion plugin** (`onetwoinventory-helper.php`) with a
+new HMAC-signed `oti/v1/order/{id}/partial-shipment` route that writes the wphub tables —
+so only the **single** IMS companion plugin is needed for WooCommerce (no dependency on the
+legacy woo-mintsoft plugin). The partial-shipment functionality stays at the woo level for
+now (reuse wphub UI/emails); deep IMS-internal line-level shipment re-modelling is deferred.
 
-- **A. Call the plugin's existing `/order/{id}/status` HMAC route** (reuse its wphub-table +
-  email machinery during transition). Fastest; keeps a plugin dependency.
-- **B. Build a thin IMS-owned WC endpoint / companion** that writes the wphub tables (or a
-  replacement representation). Full independence; more work.
-- **C. Represent partial shipments in WC without wphub** — e.g. multiple AST tracking
-  entries + order notes + status. No wphub emails / partial-shipment records.
+**Cutover rule (coexistence):** while both IMS and the legacy Python bridge run, only one may
+write back to WC or customers get double partial-shipment records / double emails. Deactivate
+the legacy plugin/bridge when IMS owns writeback for a store. (This is why the companion
+plugin uses neutral `_oti_wms_*` metas and its own lock name rather than re-coupling to the
+legacy `_mintsoft_*` keys.)
 
-Plus a coexistence rule: while both IMS and the plugin's Python bridge run, only one may
-write back to WC or customers get double partial-shipment records / double emails.
-
-## Recommended sequencing
-1. `q66in.1.5` IMS-side line-level partial fulfilment (no WC dependency) — see
-   `mintsoft-partial-ship-reconciliation.md`.
-2. Decide the WC-writeback architecture (A/B/C) → G1 WC side.
-3. G2 merge repoint/dual-sync (small, high value).
-4. G5/G4 confirm customer despatch email + WC-admin visibility need.
-5. G3 Click & Drop, G6/G7/G8 fidelity nits as needed.
+## Sequencing / status
+1. ✅ `q66in.1.5` split reconcile + G1 WC writeback (PRs #449, #450).
+2. ✅ G2 merge repoint / dual-sync (PR #450).
+3. ◐ G5/G4 — confirm customer despatch email actually fires + decide WC-admin visibility need.
+4. ◻ G6/G7/G8 fidelity nits as needed. G3 Click & Drop is **out of scope** (owner).

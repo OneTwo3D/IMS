@@ -4,6 +4,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
+import { fetchMintsoftOrderParts, fetchMintsoftPartItems } from '../api/orders'
 
 /**
  * Phase 8 — Mintsoft dispatch ingestion (q66in.1.1).
@@ -79,6 +80,20 @@ export type DispatchSyncLog = {
   reason: string
 }
 
+export type DispatchOrderPart = {
+  externalId: string
+  partNumber: number
+  status: string
+  tracking: WmsOrderTracking[]
+}
+
+export type DispatchPartialShipmentInput = {
+  part: number
+  totalParts: number
+  trackingNumber?: string | null
+  items: Array<{ sku: string; qty: number }>
+}
+
 export type MintsoftDispatchSyncDeps = {
   listCandidates(limit: number): Promise<DispatchSyncCandidate[]>
   fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null>
@@ -86,6 +101,90 @@ export type MintsoftDispatchSyncDeps = {
     orderId: string,
     tracking: Array<{ trackingNumber: string; shippingService?: string | null }>,
   ): Promise<{ success: boolean; error?: string }>
+  // Split-order reconciliation (q66in.1.5): fetch every part, its line items, and
+  // push each despatched part to the storefront as a partial shipment.
+  fetchOrderParts(orderNumber: string): Promise<DispatchOrderPart[]>
+  fetchPartItems(externalPartId: string): Promise<Array<{ sku: string; qty: number }>>
+  pushPartialShipment(
+    orderId: string,
+    input: DispatchPartialShipmentInput,
+  ): Promise<{ ok: boolean; error?: string }>
+  // Merge handling (vn92.2 / G2): repoint the push link to the surviving WMS order
+  // when this order was merged into another (its own WMS order is destroyed).
+  repointLink(linkId: string, to: { externalOrderId: string; externalOrderNumber: string }): Promise<void>
+}
+
+/**
+ * Reconcile a SPLIT Mintsoft order: push each despatched part to the storefront as
+ * a partial shipment (idempotent per part on the WC side), and only mark the IMS
+ * order SHIPPED once every part has despatched — line-level at the storefront,
+ * atomic IMS-side (q66in.1.5). A partially-despatched order stays pending.
+ */
+async function reconcileSplitOrder(
+  deps: MintsoftDispatchSyncDeps,
+  candidate: DispatchSyncCandidate,
+  orderNumber: string,
+  expectedParts: number | null,
+  // When false (a MERGED survivor), don't push per-part partial shipments — the
+  // survivor's parts mix several original orders' items, so they don't map cleanly
+  // to this one IMS order. Reconcile atomically: just complete when all parts ship.
+  recordPartials: boolean,
+): Promise<{ action: 'dispatched' | 'pending' | 'error'; reason: string }> {
+  const parts = await deps.fetchOrderParts(orderNumber)
+  if (parts.length === 0) {
+    return { action: 'pending', reason: 'Split order has no parts visible in Mintsoft yet' }
+  }
+  // Trust Mintsoft's NumberOfParts when present so we don't complete early off a
+  // partial set of part rows (some may not be visible to the search yet).
+  const totalParts = Math.max(expectedParts ?? 0, parts.length)
+  const dispatchedParts = parts.filter((part) => isMintsoftDispatched({ status: part.status, tracking: part.tracking }))
+
+  // Push every despatched part to the storefront. A despatched part with no
+  // recordable line items can't become a partial shipment — don't let it count
+  // toward completion (that would ship the IMS order with a part never recorded).
+  let allRecorded = true
+  if (recordPartials) {
+    for (const part of dispatchedParts) {
+      const items = await deps.fetchPartItems(part.externalId)
+      if (items.length === 0) {
+        allRecorded = false
+        continue
+      }
+      const push = await deps.pushPartialShipment(candidate.orderId, {
+        part: part.partNumber,
+        totalParts,
+        trackingNumber: part.tracking.find((entry) => entry.trackingNumber)?.trackingNumber ?? null,
+        items,
+      })
+      if (!push.ok) {
+        return { action: 'error', reason: push.error ?? `Partial-shipment push failed for part ${part.partNumber}` }
+      }
+    }
+  }
+
+  if (!allRecorded || dispatchedParts.length < totalParts) {
+    return {
+      action: 'pending',
+      reason: !allRecorded
+        ? 'A despatched part returned no line items — holding off completion'
+        : `${dispatchedParts.length}/${totalParts} parts despatched`,
+    }
+  }
+
+  // Every part despatched + recorded — mark the IMS order SHIPPED. The IMS order has
+  // a single shipment and applyExternalFulfillmentUpdate maps tracking[i]→shipment[i],
+  // so aggregate all parts' tracking numbers into ONE entry (the storefront already
+  // has per-part tracking via the partial shipments above).
+  const allTracking = dispatchedParts.flatMap((part) => part.tracking)
+  const trackingNumbers = allTracking.map((entry) => entry.trackingNumber).filter((n): n is string => !!n)
+  const aggregated = trackingNumbers.length > 0
+    ? [{ trackingNumber: trackingNumbers.join(', '), shippingService: allTracking.find((e) => e.carrier)?.carrier ?? null }]
+    : []
+  const result = await deps.applyDispatch(candidate.orderId, aggregated)
+  if (!result.success) {
+    return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
+  }
+  return { action: 'dispatched', reason: `All ${totalParts} parts despatched` }
 }
 
 /**
@@ -105,28 +204,55 @@ export async function runMintsoftDispatchSyncCore(
     counters.totalChecked += 1
     try {
       const status = await deps.fetchOrderStatus(candidate.externalOrderNumber)
-      if (!status || !isMintsoftDispatched(status)) {
+      if (!status) {
         counters.pending += 1
         logs.push({
           orderId: candidate.orderId,
           externalOrderNumber: candidate.externalOrderNumber,
           action: 'pending',
-          reason: status ? `Not dispatched (status ${status.status || 'Unknown'})` : 'Order not found in Mintsoft',
+          reason: 'Order not found in Mintsoft',
         })
         continue
       }
 
+      // Merge (vn92.2): Mintsoft merged this order into a survivor (combined
+      // OrderNumber "a+b"); our original WMS order is gone. Repoint the link to the
+      // survivor so this and the push-sweep track the right order, then process the
+      // survivor's dispatch under its number. Connector-agnostic — driven by the
+      // contract's isMerged + survivor externalOrderId/Number, not Mintsoft internals.
+      if (status.isMerged && status.externalOrderNumber !== candidate.externalOrderNumber) {
+        await deps.repointLink(candidate.linkId, {
+          externalOrderId: status.externalOrderId,
+          externalOrderNumber: status.externalOrderNumber,
+        })
+      }
+      // Use the live (possibly survivor) order number for any per-part lookups.
+      const effectiveOrderNumber = status.externalOrderNumber || candidate.externalOrderNumber
+
       // A split order's primary row can read DESPATCHED while only some parts have
-      // shipped; applying SHIPPED to the whole IMS order (and index-mapping the
-      // primary row's tracking onto every shipment) would be wrong. Per-part
-      // reconciliation is q66in.1.5 — leave split orders pending until then.
+      // shipped (or the reverse), so check isSplit BEFORE the dispatched gate and
+      // reconcile per part rather than trusting the primary row.
       if (status.isSplit) {
+        // A merged survivor's parts mix several original orders → reconcile it
+        // atomically (no per-part partial shipments to this single IMS order).
+        const outcome = await reconcileSplitOrder(deps, candidate, effectiveOrderNumber, status.partCount, !status.isMerged)
+        counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
+        logs.push({
+          orderId: candidate.orderId,
+          externalOrderNumber: candidate.externalOrderNumber,
+          action: outcome.action,
+          reason: outcome.reason,
+        })
+        continue
+      }
+
+      if (!isMintsoftDispatched(status)) {
         counters.pending += 1
         logs.push({
           orderId: candidate.orderId,
           externalOrderNumber: candidate.externalOrderNumber,
           action: 'pending',
-          reason: `Split order (${status.partCount ?? '?'} parts) — deferred to partial-ship reconciliation (q66in.1.5)`,
+          reason: `Not dispatched (status ${status.status || 'Unknown'})`,
         })
         continue
       }
@@ -181,7 +307,9 @@ function createPrismaDispatchDeps(): MintsoftDispatchSyncDeps {
       const rows = await db.wmsOrderPushLink.findMany({
         where: {
           connector: 'mintsoft',
-          state: 'SYNCED',
+          // MERGED links are repointed-to-survivor orders that still need despatch
+          // tracking; the push-sweep skips them (SYNCED-only) so they aren't re-pushed.
+          state: { in: ['SYNCED', 'MERGED'] },
           externalOrderNumber: { not: null },
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },
@@ -205,6 +333,32 @@ function createPrismaDispatchDeps(): MintsoftDispatchSyncDeps {
         lookup: { orderId },
         targetShipmentStatus: 'SHIPPED',
         tracking,
+      })
+    },
+    fetchOrderParts(orderNumber) {
+      return fetchMintsoftOrderParts(orderNumber)
+    },
+    fetchPartItems(externalPartId) {
+      return fetchMintsoftPartItems(externalPartId)
+    },
+    async pushPartialShipment(orderId, input) {
+      // Connector-agnostic: the storefront facade records the partial shipment
+      // (WooCommerce today; Shopify can implement its own representation later).
+      const { pushPartialShipmentToShopping } = await import('@/lib/shopping')
+      const result = await pushPartialShipmentToShopping(orderId, {
+        part: input.part,
+        totalParts: input.totalParts,
+        trackingNumber: input.trackingNumber,
+        items: input.items,
+      })
+      return { ok: result.success, error: result.error }
+    },
+    async repointLink(linkId, to) {
+      // Park as MERGED so the push-sweep's SYNCED-filtered passes skip it (no dual-sync
+      // amending the survivor with this order's lines); dispatch-sync still polls it.
+      await db.wmsOrderPushLink.update({
+        where: { id: linkId },
+        data: { externalOrderId: to.externalOrderId, externalOrderNumber: to.externalOrderNumber, state: 'MERGED' },
       })
     },
   }

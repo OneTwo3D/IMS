@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import * as dispatchSyncNs from '../lib/connectors/mintsoft/sync/dispatch-sync.ts'
+import type { MintsoftDispatchSyncDeps, DispatchOrderPart } from '../lib/connectors/mintsoft/sync/dispatch-sync.ts'
 import type { WmsOrderStatus, WmsOrderTracking } from '../lib/connectors/wms/types.ts'
 
 const dispatchSync = 'default' in dispatchSyncNs
@@ -31,6 +32,24 @@ function status(partial: Partial<WmsOrderStatus>): WmsOrderStatus {
     tracking: [],
     raw: null,
     ...partial,
+  }
+}
+
+function part(partial: Partial<DispatchOrderPart>): DispatchOrderPart {
+  return { externalId: 'M-1', partNumber: 1, status: 'PROCESSING', tracking: [], ...partial }
+}
+
+// Default no-op deps so each test overrides only what it exercises.
+function deps(overrides: Partial<MintsoftDispatchSyncDeps>): MintsoftDispatchSyncDeps {
+  return {
+    listCandidates: async () => [],
+    fetchOrderStatus: async () => null,
+    applyDispatch: async () => ({ success: true }),
+    fetchOrderParts: async () => [],
+    fetchPartItems: async () => [],
+    pushPartialShipment: async () => ({ ok: true }),
+    repointLink: async () => {},
+    ...overrides,
   }
 }
 
@@ -65,7 +84,7 @@ test('toFulfillmentTracking maps carrier->shippingService and drops entries with
 
 test('runMintsoftDispatchSyncCore applies dispatch for despatched orders only', async () => {
   const applied: Array<{ orderId: string; tracking: unknown }> = []
-  const { counters, logs } = await runMintsoftDispatchSyncCore({
+  const { counters, logs } = await runMintsoftDispatchSyncCore(deps({
     listCandidates: async () => [
       { linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' },
       { linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1002' },
@@ -78,7 +97,7 @@ test('runMintsoftDispatchSyncCore applies dispatch for despatched orders only', 
       applied.push({ orderId, tracking: t })
       return { success: true }
     },
-  })
+  }))
 
   assert.equal(counters.totalChecked, 2)
   assert.equal(counters.dispatched, 1)
@@ -89,40 +108,188 @@ test('runMintsoftDispatchSyncCore applies dispatch for despatched orders only', 
   assert.equal(logs.find((l) => l.orderId === 'o2')?.action, 'pending')
 })
 
-test('runMintsoftDispatchSyncCore defers a despatched SPLIT order instead of marking it fully shipped', async () => {
-  const applied: string[] = []
-  const { counters, logs } = await runMintsoftDispatchSyncCore({
+test('split reconcile: all parts despatched → each part pushed + IMS order marked dispatched', async () => {
+  const pushed: Array<{ part: number; totalParts: number; items: unknown }> = []
+  const applied: Array<{ orderId: string; tracking: unknown }> = []
+  const { counters, logs } = await runMintsoftDispatchSyncCore(deps({
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
-    fetchOrderStatus: async () =>
-      status({ status: 'DESPATCHED', isSplit: true, partCount: 2, tracking: [tracking({ trackingNumber: 'TN1' })] }),
-    applyDispatch: async (orderId) => {
-      applied.push(orderId)
-      return { success: true }
-    },
-  })
-  assert.deepEqual(applied, [])
-  assert.equal(counters.dispatched, 0)
+    fetchOrderStatus: async () => status({ status: 'PROCESSING', isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [
+      part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A', carrier: 'DPD' })] }),
+      part({ externalId: 'M-2', partNumber: 2, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-B', carrier: 'RM' })] }),
+    ],
+    fetchPartItems: async (id) => id === 'M-1' ? [{ sku: 'A', qty: 1 }] : [{ sku: 'B', qty: 2 }],
+    pushPartialShipment: async (orderId, input) => { pushed.push({ part: input.part, totalParts: input.totalParts, items: input.items }); return { ok: true } },
+    applyDispatch: async (orderId, t) => { applied.push({ orderId, tracking: t }); return { success: true } },
+  }))
+
+  assert.equal(counters.dispatched, 1)
+  assert.equal(counters.pending, 0)
+  assert.deepEqual(pushed, [
+    { part: 1, totalParts: 2, items: [{ sku: 'A', qty: 1 }] },
+    { part: 2, totalParts: 2, items: [{ sku: 'B', qty: 2 }] },
+  ])
+  // IMS order marked SHIPPED with all parts' tracking aggregated into ONE entry
+  // (single IMS shipment); the storefront got per-part tracking via the pushes above.
+  assert.deepEqual(applied, [{ orderId: 'o1', tracking: [{ trackingNumber: 'TN-A, TN-B', shippingService: 'DPD' }] }])
+  assert.equal(logs[0]?.action, 'dispatched')
+})
+
+test('split reconcile: a despatched part with no line items holds off completion (not silently shipped)', async () => {
+  let appliedCount = 0
+  const pushed: number[] = []
+  const { counters, logs } = await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => status({ status: 'DESPATCHED', isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [
+      part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] }),
+      part({ externalId: 'M-2', partNumber: 2, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-B' })] }),
+    ],
+    fetchPartItems: async (id) => id === 'M-1' ? [{ sku: 'A', qty: 1 }] : [], // part 2 has no items
+    pushPartialShipment: async (orderId, input) => { pushed.push(input.part); return { ok: true } },
+    applyDispatch: async () => { appliedCount += 1; return { success: true } },
+  }))
+  assert.deepEqual(pushed, [1])      // only the part with items was pushed
+  assert.equal(appliedCount, 0)      // order NOT marked shipped
   assert.equal(counters.pending, 1)
-  assert.match(logs[0]?.reason ?? '', /split/i)
+  assert.equal(counters.dispatched, 0)
+  assert.match(logs[0]?.reason ?? '', /no line items/)
+})
+
+test('split reconcile: uses NumberOfParts as the authoritative total (no early completion)', async () => {
+  let appliedCount = 0
+  const { counters } = await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    // Mintsoft says 3 parts but only 2 rows are visible so far, both despatched.
+    fetchOrderStatus: async () => status({ status: 'DESPATCHED', isSplit: true, partCount: 3 }),
+    fetchOrderParts: async () => [
+      part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] }),
+      part({ externalId: 'M-2', partNumber: 2, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-B' })] }),
+    ],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    applyDispatch: async () => { appliedCount += 1; return { success: true } },
+  }))
+  assert.equal(appliedCount, 0)      // 2/3 → not completed even though both visible parts shipped
+  assert.equal(counters.pending, 1)
+})
+
+test('split reconcile: only some parts despatched → pushes despatched parts, stays pending, no IMS dispatch', async () => {
+  const pushed: number[] = []
+  let appliedCount = 0
+  const { counters, logs } = await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => status({ status: 'PROCESSING', isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [
+      part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] }),
+      part({ externalId: 'M-2', partNumber: 2, status: 'ONBACKORDER' }),
+    ],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (orderId, input) => { pushed.push(input.part); return { ok: true } },
+    applyDispatch: async () => { appliedCount += 1; return { success: true } },
+  }))
+
+  assert.deepEqual(pushed, [1])
+  assert.equal(appliedCount, 0)
+  assert.equal(counters.pending, 1)
+  assert.equal(counters.dispatched, 0)
+  assert.match(logs[0]?.reason ?? '', /1\/2 parts/)
+})
+
+test('split reconcile: a failed partial-shipment push surfaces as an error', async () => {
+  const { counters, logs } = await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => status({ status: 'DESPATCHED', isSplit: true, partCount: 1 }),
+    fetchOrderParts: async () => [part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] })],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async () => ({ ok: false, error: 'WC unreachable' }),
+  }))
+  assert.equal(counters.errors, 1)
+  assert.equal(counters.dispatched, 0)
+  assert.equal(logs[0]?.action, 'error')
+  assert.match(logs[0]?.reason ?? '', /WC unreachable/)
+})
+
+test('merge: a merged order repoints its link to the survivor, then dispatches under the survivor number', async () => {
+  const repoints: Array<{ linkId: string; to: { externalOrderId: string; externalOrderNumber: string } }> = []
+  const partsFetchedFor: string[] = []
+  const { counters, logs } = await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    // Polling by "WC-1001" returns the merged survivor "WC-1001+WC-1002".
+    fetchOrderStatus: async () => status({
+      externalOrderId: 'M-SURV',
+      externalOrderNumber: 'WC-1001+WC-1002',
+      status: 'DESPATCHED',
+      isMerged: true,
+      tracking: [tracking({ trackingNumber: 'TN-S', carrier: 'DPD' })],
+    }),
+    repointLink: async (linkId, to) => { repoints.push({ linkId, to }) },
+    applyDispatch: async () => ({ success: true }),
+  }))
+  assert.deepEqual(repoints, [{ linkId: 'l1', to: { externalOrderId: 'M-SURV', externalOrderNumber: 'WC-1001+WC-1002' } }])
+  assert.equal(counters.dispatched, 1)
+  assert.equal(logs[0]?.action, 'dispatched')
+  void partsFetchedFor
+})
+
+test('merge + split: survivor number used to fetch parts; reconciled ATOMICALLY (no per-part pushes)', async () => {
+  const partsFetchedFor: string[] = []
+  const pushed: number[] = []
+  let appliedCount = 0
+  const { counters } = await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => status({
+      externalOrderId: 'M-SURV',
+      externalOrderNumber: 'WC-1001+WC-1002',
+      status: 'PROCESSING',
+      isMerged: true,
+      isSplit: true,
+      partCount: 2,
+    }),
+    fetchOrderParts: async (orderNumber) => {
+      partsFetchedFor.push(orderNumber)
+      return [
+        part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] }),
+        part({ externalId: 'M-2', partNumber: 2, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-B' })] }),
+      ]
+    },
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (orderId, input) => { pushed.push(input.part); return { ok: true } },
+    applyDispatch: async () => { appliedCount += 1; return { success: true } },
+  }))
+  assert.deepEqual(partsFetchedFor, ['WC-1001+WC-1002']) // survivor number, not "WC-1001"
+  assert.deepEqual(pushed, [])      // merged → NO per-part partial shipments (would cross-contaminate)
+  assert.equal(appliedCount, 1)     // but still marked shipped atomically once all parts despatched
+  assert.equal(counters.dispatched, 1)
+})
+
+test('non-merged split still pushes per-part (recordPartials stays on)', async () => {
+  const pushed: number[] = []
+  await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => status({ status: 'PROCESSING', isSplit: true, partCount: 1 }),
+    fetchOrderParts: async () => [part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] })],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (orderId, input) => { pushed.push(input.part); return { ok: true } },
+  }))
+  assert.deepEqual(pushed, [1])
 })
 
 test('runMintsoftDispatchSyncCore treats an order missing in Mintsoft as pending, not an error', async () => {
-  const { counters } = await runMintsoftDispatchSyncCore({
+  const { counters } = await runMintsoftDispatchSyncCore(deps({
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
     fetchOrderStatus: async () => null,
-    applyDispatch: async () => ({ success: true }),
-  })
+  }))
   assert.equal(counters.pending, 1)
   assert.equal(counters.dispatched, 0)
   assert.equal(counters.errors, 0)
 })
 
 test('runMintsoftDispatchSyncCore records a failed apply as an error without throwing', async () => {
-  const { counters, logs } = await runMintsoftDispatchSyncCore({
+  const { counters, logs } = await runMintsoftDispatchSyncCore(deps({
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
     fetchOrderStatus: async () => status({ status: 'DESPATCHED' }),
     applyDispatch: async () => ({ success: false, error: 'on backorder' }),
-  })
+  }))
   assert.equal(counters.errors, 1)
   assert.equal(counters.dispatched, 0)
   assert.equal(logs[0]?.action, 'error')
@@ -130,7 +297,7 @@ test('runMintsoftDispatchSyncCore records a failed apply as an error without thr
 })
 
 test('runMintsoftDispatchSyncCore isolates a thrown fetch as a per-order error', async () => {
-  const { counters } = await runMintsoftDispatchSyncCore({
+  const { counters } = await runMintsoftDispatchSyncCore(deps({
     listCandidates: async () => [
       { linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' },
       { linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1002' },
@@ -139,8 +306,7 @@ test('runMintsoftDispatchSyncCore isolates a thrown fetch as a per-order error',
       if (orderNumber === 'WC-1001') throw new Error('Mintsoft 500')
       return status({ status: 'DESPATCHED' })
     },
-    applyDispatch: async () => ({ success: true }),
-  })
+  }))
   assert.equal(counters.totalChecked, 2)
   assert.equal(counters.errors, 1)
   assert.equal(counters.dispatched, 1)

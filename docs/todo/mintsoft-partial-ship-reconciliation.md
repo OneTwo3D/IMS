@@ -4,6 +4,15 @@ Line-level reconciliation of split/partial Mintsoft despatches back into IMS, an
 onward display in WooCommerce. Part of Phase 8 and a concrete step toward replacing
 the woo-mintsoft WordPress plugin with IMS-native functionality.
 
+> **STATUS — IMPLEMENTED (PRs #449, #450).** Final shape differs from the exploratory
+> design below: line-level partial fulfilment lives **at the storefront** (each despatched
+> part = a WooCommerce partial shipment via the `oti/v1/order/{id}/partial-shipment` route
+> in the companion plugin), while the **IMS order is reconciled atomically** (marked SHIPPED
+> once all parts despatch). Deep IMS-internal per-line shipment splitting (the `createExternalLineShipment`
+> sketch in §"IMS-side building blocks") was **deferred** — "stay at woo level for now" (owner).
+> Merged survivors reconcile atomically without per-part pushes. See `docs/mintsoft.md`
+> → "Dispatch Ingestion & Reconciliation" for the shipped behaviour.
+
 ## Problem
 
 - A Mintsoft order can split into N parts; each part despatches independently with its
