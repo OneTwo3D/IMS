@@ -1,6 +1,6 @@
 # Mintsoft Connector
 
-Mintsoft is the first WMS connector behind the connector-agnostic WMS boundary (see [`wms-connector-boundary.md`](./wms-connector-boundary.md)). It covers stock alignment, ASN creation, product verification, bundle sync, returns polling, signed ASN booked-in webhooks, outbound order-dispatch push (Phase 8), and order-status tracking on sales orders.
+Mintsoft is the first WMS connector behind the connector-agnostic WMS boundary (see [`wms-connector-boundary.md`](./wms-connector-boundary.md)). It covers stock alignment, ASN creation, product verification, bundle sync, returns polling, signed ASN booked-in webhooks, outbound order-dispatch push (Phase 8), inbound dispatch ingestion (despatch → IMS shipment, with per-part partial shipments to the storefront for split orders and survivor reconciliation for merged orders), and order-status tracking on sales orders.
 
 ## Authentication And Bindings
 
@@ -91,6 +91,16 @@ IMS pushes sales orders outbound to the WMS so the 3PL can fulfil them. The work
 - **Create / update / cancel.** New eligible orders are created in the WMS; subsequent edits while the WMS order is still `NEW` are amended; orders put on hold are cancelled in the WMS and parked `HELD` (and re-created if released); IMS-cancelled orders propagate a cancel.
 - **Retries.** A failed push increments an attempt counter and retries on the next sweep; after 5 attempts it dead-letters for manual review rather than looping forever. A line with no SKU fails the whole order (never a silent partial push).
 - **Couriers.** The order's shipping service is mapped to a Mintsoft `CourierServiceId` via the courier map; unmapped services fall back to the default courier id, or pass the name through for Mintsoft to resolve.
+
+## Dispatch Ingestion & Reconciliation (Phase 8)
+
+The reverse direction — Mintsoft despatch → IMS shipment — is driven by the `mintsoft-dispatch-sync` cron (`/api/cron/mintsoft-dispatch-sync`, every 15 min). It polls pushed-but-not-shipped links (`WmsOrderPushLink.state` in `SYNCED`/`MERGED`) and feeds despatches into `applyExternalFulfillmentUpdate`, which progresses the IMS shipment to `SHIPPED` and carries the tracking number/courier through (and, for storefront orders, onward to WooCommerce so the customer is emailed — see [`woo-mintsoft-plugin-parity-gap.md`](./todo/woo-mintsoft-plugin-parity-gap.md)).
+
+- **Despatch detection.** A part/order counts as despatched when its Mintsoft status is `DESPATCHED`/`INVOICED`, or any tracking entry carries a despatch date.
+- **Split orders.** Mintsoft can split an order into N parts that despatch independently. Each despatched part is pushed to the storefront as a **partial shipment** (the onetwoInventory Helper plugin records it into the storefront's partial-shipment UI + customer email; idempotent per part). The IMS order is marked `SHIPPED` only once **every** part has despatched, using `NumberOfParts` as the authoritative total. Tracking from all parts is aggregated onto the single IMS shipment.
+- **Merged orders.** When Mintsoft merges an order into a survivor (combined `a+b` OrderNumber), the original WMS order is destroyed. The link is **repointed** to the survivor and parked `MERGED` so the outbound push sweep's `SYNCED`-only update/cancel/hold passes skip it (no dual-sync amending the survivor). A merged **and** split survivor is reconciled **atomically** (no per-part partial shipments — its parts mix several original orders), completing the IMS order when the survivor is fully despatched.
+- **Idempotency.** A dispatched order reconciles to `SHIPPED` and drops out of the poll set; partial-shipment pushes are de-duplicated per `(order, part)` on the storefront side.
+- **Tool-agnostic.** Detection (`isMerged`/`isSplit`), the storefront write (via the shopping facade), and reconciliation are driven by the generic contract and facade so another WMS/storefront can implement the same behaviour.
 
 ## Order Status Chip
 

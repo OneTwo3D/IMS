@@ -125,6 +125,10 @@ async function reconcileSplitOrder(
   candidate: DispatchSyncCandidate,
   orderNumber: string,
   expectedParts: number | null,
+  // When false (a MERGED survivor), don't push per-part partial shipments — the
+  // survivor's parts mix several original orders' items, so they don't map cleanly
+  // to this one IMS order. Reconcile atomically: just complete when all parts ship.
+  recordPartials: boolean,
 ): Promise<{ action: 'dispatched' | 'pending' | 'error'; reason: string }> {
   const parts = await deps.fetchOrderParts(orderNumber)
   if (parts.length === 0) {
@@ -139,20 +143,22 @@ async function reconcileSplitOrder(
   // recordable line items can't become a partial shipment — don't let it count
   // toward completion (that would ship the IMS order with a part never recorded).
   let allRecorded = true
-  for (const part of dispatchedParts) {
-    const items = await deps.fetchPartItems(part.externalId)
-    if (items.length === 0) {
-      allRecorded = false
-      continue
-    }
-    const push = await deps.pushPartialShipment(candidate.orderId, {
-      part: part.partNumber,
-      totalParts,
-      trackingNumber: part.tracking.find((entry) => entry.trackingNumber)?.trackingNumber ?? null,
-      items,
-    })
-    if (!push.ok) {
-      return { action: 'error', reason: push.error ?? `Partial-shipment push failed for part ${part.partNumber}` }
+  if (recordPartials) {
+    for (const part of dispatchedParts) {
+      const items = await deps.fetchPartItems(part.externalId)
+      if (items.length === 0) {
+        allRecorded = false
+        continue
+      }
+      const push = await deps.pushPartialShipment(candidate.orderId, {
+        part: part.partNumber,
+        totalParts,
+        trackingNumber: part.tracking.find((entry) => entry.trackingNumber)?.trackingNumber ?? null,
+        items,
+      })
+      if (!push.ok) {
+        return { action: 'error', reason: push.error ?? `Partial-shipment push failed for part ${part.partNumber}` }
+      }
     }
   }
 
@@ -227,7 +233,9 @@ export async function runMintsoftDispatchSyncCore(
       // shipped (or the reverse), so check isSplit BEFORE the dispatched gate and
       // reconcile per part rather than trusting the primary row.
       if (status.isSplit) {
-        const outcome = await reconcileSplitOrder(deps, candidate, effectiveOrderNumber, status.partCount)
+        // A merged survivor's parts mix several original orders → reconcile it
+        // atomically (no per-part partial shipments to this single IMS order).
+        const outcome = await reconcileSplitOrder(deps, candidate, effectiveOrderNumber, status.partCount, !status.isMerged)
         counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
         logs.push({
           orderId: candidate.orderId,

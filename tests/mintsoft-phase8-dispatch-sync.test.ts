@@ -231,9 +231,11 @@ test('merge: a merged order repoints its link to the survivor, then dispatches u
   void partsFetchedFor
 })
 
-test('merge + split: the survivor number is used to fetch parts (not the merged-away original)', async () => {
+test('merge + split: survivor number used to fetch parts; reconciled ATOMICALLY (no per-part pushes)', async () => {
   const partsFetchedFor: string[] = []
-  await runMintsoftDispatchSyncCore(deps({
+  const pushed: number[] = []
+  let appliedCount = 0
+  const { counters } = await runMintsoftDispatchSyncCore(deps({
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
     fetchOrderStatus: async () => status({
       externalOrderId: 'M-SURV',
@@ -241,15 +243,35 @@ test('merge + split: the survivor number is used to fetch parts (not the merged-
       status: 'PROCESSING',
       isMerged: true,
       isSplit: true,
-      partCount: 1,
+      partCount: 2,
     }),
     fetchOrderParts: async (orderNumber) => {
       partsFetchedFor.push(orderNumber)
-      return [part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] })]
+      return [
+        part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] }),
+        part({ externalId: 'M-2', partNumber: 2, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-B' })] }),
+      ]
     },
     fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (orderId, input) => { pushed.push(input.part); return { ok: true } },
+    applyDispatch: async () => { appliedCount += 1; return { success: true } },
   }))
   assert.deepEqual(partsFetchedFor, ['WC-1001+WC-1002']) // survivor number, not "WC-1001"
+  assert.deepEqual(pushed, [])      // merged → NO per-part partial shipments (would cross-contaminate)
+  assert.equal(appliedCount, 1)     // but still marked shipped atomically once all parts despatched
+  assert.equal(counters.dispatched, 1)
+})
+
+test('non-merged split still pushes per-part (recordPartials stays on)', async () => {
+  const pushed: number[] = []
+  await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => status({ status: 'PROCESSING', isSplit: true, partCount: 1 }),
+    fetchOrderParts: async () => [part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] })],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (orderId, input) => { pushed.push(input.part); return { ok: true } },
+  }))
+  assert.deepEqual(pushed, [1])
 })
 
 test('runMintsoftDispatchSyncCore treats an order missing in Mintsoft as pending, not an error', async () => {
