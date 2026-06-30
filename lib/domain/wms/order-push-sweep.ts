@@ -205,7 +205,7 @@ export interface WmsOrderPushPort {
   updateLink(id: string, data: LinkWrite): Promise<void>
 }
 
-type PushConnector = Pick<WmsConnector, 'pushOrder' | 'updateOrder' | 'cancelOrder'>
+type PushConnector = Pick<WmsConnector, 'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment'>
 
 /**
  * Testable core of the order-push sweep — operates purely on the injected
@@ -223,6 +223,18 @@ export async function runWmsOrderPushSweepCore(
 
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE
   const now = options?.now ?? (() => new Date())
+
+  // Best-effort warehouse-visible note when IMS can't propagate a hold/cancel
+  // because the WMS order is already past NEW. Mirrors the refund-conflict comment
+  // (onetwo3d-ims-ql59); never fail the sweep on a comment error.
+  const postConflictComment = async (externalOrderId: string, comment: string) => {
+    if (!connector.addOrderComment) return
+    try {
+      await connector.addOrderComment(externalOrderId, comment)
+    } catch (error) {
+      console.error('[wms-order-push] failed to post conflict comment', error)
+    }
+  }
 
   const bindings = await port.activeBindings(connectorId)
   const externalWarehouseByWarehouse = new Map(bindings.map((b) => [b.warehouseId, b.externalWarehouseId]))
@@ -298,6 +310,7 @@ export async function runWmsOrderPushSweepCore(
         } else {
           result.deadLettered += 1
           await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `Held in IMS but WMS order past NEW (status ${cancel.status}) — raise a cancellation query in the WMS`, lastAttemptAt: ts })
+          await postConflictComment(link.externalOrderId, `IMS: This order has been placed ON HOLD in IMS but is already being fulfilled here (status ${cancel.status}) and could not be auto-cancelled. Please pause it if possible, or raise a cancellation query.`)
         }
       } catch (error) {
         result.failed += 1
@@ -322,6 +335,7 @@ export async function runWmsOrderPushSweepCore(
           // operator raises a cancellation query in the WMS rather than retrying forever.
           result.deadLettered += 1
           await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `WMS order past NEW (status ${cancel.status}) — raise a cancellation query in the WMS`, lastAttemptAt: ts })
+          await postConflictComment(link.externalOrderId, `IMS: This order has been cancelled / fully refunded in IMS but is already being fulfilled here (status ${cancel.status}) and could not be auto-cancelled. Please raise a cancellation query.`)
         }
       } catch (error) {
         result.failed += 1
