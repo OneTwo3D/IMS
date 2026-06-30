@@ -120,19 +120,30 @@ export type MintsoftDispatchSyncDeps = {
 async function reconcileSplitOrder(
   deps: MintsoftDispatchSyncDeps,
   candidate: DispatchSyncCandidate,
+  expectedParts: number | null,
 ): Promise<{ action: 'dispatched' | 'pending' | 'error'; reason: string }> {
   const parts = await deps.fetchOrderParts(candidate.externalOrderNumber)
   if (parts.length === 0) {
     return { action: 'pending', reason: 'Split order has no parts visible in Mintsoft yet' }
   }
+  // Trust Mintsoft's NumberOfParts when present so we don't complete early off a
+  // partial set of part rows (some may not be visible to the search yet).
+  const totalParts = Math.max(expectedParts ?? 0, parts.length)
   const dispatchedParts = parts.filter((part) => isMintsoftDispatched({ status: part.status, tracking: part.tracking }))
 
+  // Push every despatched part to the storefront. A despatched part with no
+  // recordable line items can't become a partial shipment — don't let it count
+  // toward completion (that would ship the IMS order with a part never recorded).
+  let allRecorded = true
   for (const part of dispatchedParts) {
     const items = await deps.fetchPartItems(part.externalId)
-    if (items.length === 0) continue
+    if (items.length === 0) {
+      allRecorded = false
+      continue
+    }
     const push = await deps.pushPartialShipment(candidate.orderId, {
       part: part.partNumber,
-      totalParts: parts.length,
+      totalParts,
       trackingNumber: part.tracking.find((entry) => entry.trackingNumber)?.trackingNumber ?? null,
       items,
     })
@@ -141,20 +152,29 @@ async function reconcileSplitOrder(
     }
   }
 
-  if (dispatchedParts.length < parts.length) {
-    return { action: 'pending', reason: `${dispatchedParts.length}/${parts.length} parts despatched` }
+  if (!allRecorded || dispatchedParts.length < totalParts) {
+    return {
+      action: 'pending',
+      reason: !allRecorded
+        ? 'A despatched part returned no line items — holding off completion'
+        : `${dispatchedParts.length}/${totalParts} parts despatched`,
+    }
   }
 
-  // Every part despatched — reconcile the IMS order to SHIPPED with the aggregated
-  // tracking so it leaves the candidate set.
-  const result = await deps.applyDispatch(
-    candidate.orderId,
-    toFulfillmentTracking(dispatchedParts.flatMap((part) => part.tracking)),
-  )
+  // Every part despatched + recorded — mark the IMS order SHIPPED. The IMS order has
+  // a single shipment and applyExternalFulfillmentUpdate maps tracking[i]→shipment[i],
+  // so aggregate all parts' tracking numbers into ONE entry (the storefront already
+  // has per-part tracking via the partial shipments above).
+  const allTracking = dispatchedParts.flatMap((part) => part.tracking)
+  const trackingNumbers = allTracking.map((entry) => entry.trackingNumber).filter((n): n is string => !!n)
+  const aggregated = trackingNumbers.length > 0
+    ? [{ trackingNumber: trackingNumbers.join(', '), shippingService: allTracking.find((e) => e.carrier)?.carrier ?? null }]
+    : []
+  const result = await deps.applyDispatch(candidate.orderId, aggregated)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
   }
-  return { action: 'dispatched', reason: `All ${parts.length} parts despatched` }
+  return { action: 'dispatched', reason: `All ${totalParts} parts despatched` }
 }
 
 /**
@@ -189,7 +209,7 @@ export async function runMintsoftDispatchSyncCore(
       // shipped (or the reverse), so check isSplit BEFORE the dispatched gate and
       // reconcile per part rather than trusting the primary row.
       if (status.isSplit) {
-        const outcome = await reconcileSplitOrder(deps, candidate)
+        const outcome = await reconcileSplitOrder(deps, candidate, status.partCount)
         counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
         logs.push({
           orderId: candidate.orderId,

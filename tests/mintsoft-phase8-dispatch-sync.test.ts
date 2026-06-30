@@ -128,9 +128,48 @@ test('split reconcile: all parts despatched → each part pushed + IMS order mar
     { part: 1, totalParts: 2, items: [{ sku: 'A', qty: 1 }] },
     { part: 2, totalParts: 2, items: [{ sku: 'B', qty: 2 }] },
   ])
-  // IMS order marked SHIPPED with aggregated tracking from both parts.
-  assert.deepEqual(applied, [{ orderId: 'o1', tracking: [{ trackingNumber: 'TN-A', shippingService: 'DPD' }, { trackingNumber: 'TN-B', shippingService: 'RM' }] }])
+  // IMS order marked SHIPPED with all parts' tracking aggregated into ONE entry
+  // (single IMS shipment); the storefront got per-part tracking via the pushes above.
+  assert.deepEqual(applied, [{ orderId: 'o1', tracking: [{ trackingNumber: 'TN-A, TN-B', shippingService: 'DPD' }] }])
   assert.equal(logs[0]?.action, 'dispatched')
+})
+
+test('split reconcile: a despatched part with no line items holds off completion (not silently shipped)', async () => {
+  let appliedCount = 0
+  const pushed: number[] = []
+  const { counters, logs } = await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => status({ status: 'DESPATCHED', isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [
+      part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] }),
+      part({ externalId: 'M-2', partNumber: 2, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-B' })] }),
+    ],
+    fetchPartItems: async (id) => id === 'M-1' ? [{ sku: 'A', qty: 1 }] : [], // part 2 has no items
+    pushPartialShipment: async (orderId, input) => { pushed.push(input.part); return { ok: true } },
+    applyDispatch: async () => { appliedCount += 1; return { success: true } },
+  }))
+  assert.deepEqual(pushed, [1])      // only the part with items was pushed
+  assert.equal(appliedCount, 0)      // order NOT marked shipped
+  assert.equal(counters.pending, 1)
+  assert.equal(counters.dispatched, 0)
+  assert.match(logs[0]?.reason ?? '', /no line items/)
+})
+
+test('split reconcile: uses NumberOfParts as the authoritative total (no early completion)', async () => {
+  let appliedCount = 0
+  const { counters } = await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    // Mintsoft says 3 parts but only 2 rows are visible so far, both despatched.
+    fetchOrderStatus: async () => status({ status: 'DESPATCHED', isSplit: true, partCount: 3 }),
+    fetchOrderParts: async () => [
+      part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] }),
+      part({ externalId: 'M-2', partNumber: 2, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-B' })] }),
+    ],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    applyDispatch: async () => { appliedCount += 1; return { success: true } },
+  }))
+  assert.equal(appliedCount, 0)      // 2/3 → not completed even though both visible parts shipped
+  assert.equal(counters.pending, 1)
 })
 
 test('split reconcile: only some parts despatched → pushes despatched parts, stays pending, no IMS dispatch', async () => {

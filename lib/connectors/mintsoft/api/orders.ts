@@ -180,7 +180,10 @@ export async function fetchMintsoftOrderParts(orderNumber: string): Promise<Mint
     const statusId = toInt(detail.OrderStatusId)
     parts.push({
       externalId,
-      partNumber: toInt(detail.Part) ?? toInt(row.Part) ?? 1,
+      // Fall back to a running index (not a constant 1) when Mintsoft omits Part, so
+      // two part-less rows can't collapse to the same number and have the storefront's
+      // per-part idempotency dedupe distinct despatches into one.
+      partNumber: toInt(detail.Part) ?? toInt(row.Part) ?? (parts.length + 1),
       status: (statusId !== null ? statusMap.get(statusId) : null) ?? '',
       tracking: readTracking(detail),
     })
