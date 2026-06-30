@@ -13,8 +13,8 @@ import { scrubWmsError } from './error-scrub'
  * status ready-to-fulfil (PROCESSING/ALLOCATED), and paid. Idempotent via the
  * WmsOrderPushLink (orderId unique); failed pushes retry up to MAX_ATTEMPTS then
  * dead-letter. The reverse direction — inbound dispatch→tracking — flows via the
- * dispatch-sync poll (lib/connectors/mintsoft/sync/dispatch-sync.ts), which feeds
- * applyExternalFulfillmentUpdate once Mintsoft reports the order despatched.
+ * connector-agnostic dispatch sweep (lib/domain/wms/dispatch-sweep.ts), which feeds
+ * applyExternalFulfillmentUpdate once the WMS reports the order despatched.
  */
 
 const READY_STATUSES = ['PROCESSING', 'ALLOCATED'] as const

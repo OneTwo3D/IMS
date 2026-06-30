@@ -69,6 +69,7 @@ export function mapShipheroOrderStatus(node: unknown, adminOrderUrlTemplate: str
 
   const fulfillmentStatus = str(record.fulfillment_status) ?? ''
   const shipmentNodes = extractShipheroConnectionNodes(record.shipments)
+  const tracking = readShipheroTracking(shipmentNodes)
 
   return {
     externalOrderId,
@@ -82,7 +83,11 @@ export function mapShipheroOrderStatus(node: unknown, adminOrderUrlTemplate: str
     isMerged: false,
     mergedOrderNumbers: [],
     deepLinkUrl: buildShipheroDeepLink(adminOrderUrlTemplate, externalOrderId),
-    tracking: readShipheroTracking(shipmentNodes),
+    tracking,
+    // ShipHero's connector-specific dispatched decision: fully fulfilled, or a tracking
+    // entry carrying a despatch date.
+    dispatched: fulfillmentStatus.trim().toLowerCase() === 'fulfilled'
+      || tracking.some((entry) => Boolean(entry.despatchedAt)),
     raw: record,
   }
 }

@@ -164,7 +164,27 @@ export type WmsOrderStatus = {
   /** Deep link to the order in the WMS web UI, if available. */
   deepLinkUrl: string | null
   tracking: WmsOrderTracking[]
+  /** Normalised "the goods have left the warehouse" flag — the connector decides the
+   *  semantics from its own status names/tracking, so core dispatch reconciliation stays
+   *  connector-agnostic. */
+  dispatched: boolean
   raw?: Record<string, unknown> | null
+}
+
+/**
+ * One part of a (possibly split) WMS order — a Mintsoft split part or a ShipHero shipment.
+ * Used by the generic dispatch sweep to reconcile per-part despatch.
+ */
+export type WmsOrderPart = {
+  /** The WMS's own id for this part (used to fetch its line items). */
+  externalId: string
+  /** 1-based part number within the split. */
+  partNumber: number
+  /** Raw per-part status as the WMS reports it. */
+  status: string
+  /** Normalised dispatched flag for this part (connector-decided). */
+  dispatched: boolean
+  tracking: WmsOrderTracking[]
 }
 
 export type WmsOrderAddress = {
@@ -249,6 +269,11 @@ export interface WmsConnector {
   fetchBundle?(externalProductId: string): Promise<WmsBundleRef | null>
   /** Resolve the live order status for a storefront order number, if supported. */
   fetchOrderStatus?(orderNumber: string): Promise<WmsOrderStatus | null>
+  /** All parts of a (possibly split) order, each with its own status/tracking/dispatched
+   *  flag — for per-part dispatch reconciliation. */
+  fetchOrderParts?(orderNumber: string): Promise<WmsOrderPart[]>
+  /** Line items (SKU + whole-unit qty) of a single order/part. */
+  fetchOrderPartItems?(externalPartId: string): Promise<Array<{ sku: string; qty: number }>>
   /** Push (create) an order into the WMS for fulfilment; idempotent on re-push. */
   pushOrder?(input: WmsOrderPushInput): Promise<WmsOrderPushResult>
   /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */

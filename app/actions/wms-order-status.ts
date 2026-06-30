@@ -8,7 +8,9 @@ import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/regist
 import { resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 import type { WmsOrderStatus } from '@/lib/connectors/wms/types'
 
-export type WmsOrderStatusView = WmsOrderStatus & { connectorLabel: string }
+// `dispatched` is a reconciliation signal (used by the dispatch sweep), not a display
+// field — exclude it from the chip view so the cached-snapshot view need not store it.
+export type WmsOrderStatusView = Omit<WmsOrderStatus, 'dispatched'> & { connectorLabel: string }
 
 /**
  * Live WMS order status for an IMS sales order, for the read-only status chip.

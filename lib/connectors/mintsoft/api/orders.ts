@@ -130,6 +130,7 @@ export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<Wms
   const partCount = toInt(order.NumberOfParts)
   const merged = mergedParts(externalOrderNumber)
   const settings = await getMintsoftSettings()
+  const tracking = readTracking(order)
 
   return {
     externalOrderId,
@@ -141,9 +142,24 @@ export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<Wms
     isMerged: merged.length > 0,
     mergedOrderNumbers: merged,
     deepLinkUrl: buildDeepLink(settings.mintsoft_admin_order_url_template, externalOrderId),
-    tracking: readTracking(order),
+    tracking,
+    dispatched: isMintsoftDispatched({ status, tracking }),
     raw: order,
   }
+}
+
+/**
+ * Raw Mintsoft order statuses that mean the goods have left the warehouse. Mintsoft
+ * invoices only after despatch, so INVOICED is strictly post-despatch (the SO chip
+ * treats it as terminal/green); the despatchedAt fallback covers feeds where the status
+ * row lags. If a proforma-style pre-despatch INVOICED ever appears, tighten to DESPATCHED.
+ */
+export const MINTSOFT_DISPATCHED_STATUSES = new Set(['DESPATCHED', 'INVOICED'])
+
+/** Mintsoft's connector-specific "dispatched" decision (normalised onto WmsOrderStatus). */
+export function isMintsoftDispatched(status: { status: string; tracking: WmsOrderTracking[] }): boolean {
+  if (MINTSOFT_DISPATCHED_STATUSES.has(status.status.trim().toUpperCase())) return true
+  return status.tracking.some((entry) => Boolean(entry.despatchedAt))
 }
 
 export type MintsoftOrderPart = {
@@ -153,6 +169,8 @@ export type MintsoftOrderPart = {
   partNumber: number
   /** Raw Mintsoft status name (uppercased), e.g. "DESPATCHED". */
   status: string
+  /** Normalised dispatched flag for this part. */
+  dispatched: boolean
   tracking: WmsOrderTracking[]
 }
 
@@ -178,14 +196,17 @@ export async function fetchMintsoftOrderParts(orderNumber: string): Promise<Mint
     const detail = (await fetchMintsoftOrderById(searchId)) ?? row
     const externalId = toStr(detail.ID ?? detail.Id ?? detail.id) ?? searchId
     const statusId = toInt(detail.OrderStatusId)
+    const partStatus = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
+    const partTracking = readTracking(detail)
     parts.push({
       externalId,
       // Fall back to a running index (not a constant 1) when Mintsoft omits Part, so
       // two part-less rows can't collapse to the same number and have the storefront's
       // per-part idempotency dedupe distinct despatches into one.
       partNumber: toInt(detail.Part) ?? toInt(row.Part) ?? (parts.length + 1),
-      status: (statusId !== null ? statusMap.get(statusId) : null) ?? '',
-      tracking: readTracking(detail),
+      status: partStatus,
+      dispatched: isMintsoftDispatched({ status: partStatus, tracking: partTracking }),
+      tracking: partTracking,
     })
   }
   return parts.sort((a, b) => a.partNumber - b.partNumber)
