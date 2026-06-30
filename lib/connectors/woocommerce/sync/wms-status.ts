@@ -47,7 +47,13 @@ export function buildWmsStatusMetaPatch(
   input: WmsOrderStatusMeta,
   existingMeta: WcFullOrder['meta_data'] | undefined,
 ): Array<{ id?: number; key: string; value: string }> {
-  const byKey = new Map((existingMeta ?? []).map((meta) => [meta.key, meta.id]))
+  // Keep the FIRST id per key — WC's get_meta() (the PHP side reads with it) returns the
+  // first row, so update that one. If stale duplicates exist, we still update the displayed
+  // row rather than a trailing duplicate.
+  const byKey = new Map<string, number>()
+  for (const meta of existingMeta ?? []) {
+    if (!byKey.has(meta.key)) byKey.set(meta.key, meta.id)
+  }
   return buildWmsStatusMetaValues(input).map((entry) => {
     const id = byKey.get(entry.key)
     return id != null ? { id, key: entry.key, value: entry.value } : { key: entry.key, value: entry.value }

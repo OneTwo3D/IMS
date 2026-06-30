@@ -2290,6 +2290,9 @@ model WmsOrderStatusSnapshot {
   carrier             String?
   fetchedAt           DateTime @default(now())
   lastError           String?
+  // Last WMS status successfully pushed to the storefront (G4). Decoupled from `status`
+  // so a failed storefront push isn't masked by the cached-status change gate — it retries.
+  wcPushedStatus      String?
 
   order               SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
