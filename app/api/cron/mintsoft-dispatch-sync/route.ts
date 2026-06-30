@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
-import { runMintsoftDispatchSync } from '@/lib/connectors/mintsoft/sync/dispatch-sync'
+import { runWmsDispatchSweep } from '@/lib/domain/wms/dispatch-sweep'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
@@ -18,5 +18,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ skipped: true, reason: 'Mintsoft plugin disabled' })
   }
 
-  return NextResponse.json(await runMintsoftDispatchSync('cron'))
+  // The dispatch poll is Mintsoft's path (ShipHero ingests despatch via webhooks); the
+  // sweep itself is connector-agnostic and resolves the active WMS.
+  return NextResponse.json(await runWmsDispatchSweep('cron'))
 }

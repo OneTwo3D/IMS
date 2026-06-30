@@ -1,11 +1,11 @@
-import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
-import { fetchMintsoftOrderStatus } from './api/orders'
+import { fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems } from './api/orders'
 import { addMintsoftOrderComment, cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
 
 const CONNECTOR = 'Mintsoft'
@@ -80,6 +80,14 @@ export class MintsoftConnector implements WmsConnector {
 
   async fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
     return fetchMintsoftOrderStatus(orderNumber)
+  }
+
+  async fetchOrderParts(orderNumber: string): Promise<WmsOrderPart[]> {
+    return fetchMintsoftOrderParts(orderNumber)
+  }
+
+  async fetchOrderPartItems(externalPartId: string): Promise<Array<{ sku: string; qty: number }>> {
+    return fetchMintsoftPartItems(externalPartId)
   }
 
   async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
