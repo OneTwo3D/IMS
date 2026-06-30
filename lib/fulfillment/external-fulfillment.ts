@@ -3,6 +3,7 @@ import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
+import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { isShoppingConnectorId } from '@/lib/fulfillment/shopping-order-lookup'
 import { isWmsConnectorId, resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 
@@ -113,6 +114,26 @@ function statusesToApply(
   return flow.slice(start + 1, end + 1)
 }
 
+/** Order lifecycle statuses that mean the order is fully shipped. */
+const POST_SHIP_ORDER_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED']
+
+/**
+ * Whether to push the storefront status forward (→ "completed" for WooCommerce) after a
+ * fulfilment update. Only for a WMS-sourced dispatch that fully shipped the order — a
+ * storefront-sourced update already has the storefront as the source of truth (pushing
+ * back would echo), and a partial dispatch leaves the order pre-SHIPPED. This is what
+ * makes the storefront fire its customer despatch email (e.g. AST on →completed).
+ */
+export function shouldPushStorefrontCompletion(
+  source: ExternalFulfillmentSource,
+  targetShipmentStatus: ExternalShipmentStatus,
+  orderStatus: string,
+): boolean {
+  return targetShipmentStatus === 'SHIPPED'
+    && isWmsConnectorId(source)
+    && POST_SHIP_ORDER_STATUSES.includes(orderStatus)
+}
+
 export async function applyExternalFulfillmentUpdate(
   update: ExternalFulfillmentUpdate,
 ): Promise<{ success: boolean; error?: string }> {
@@ -201,6 +222,27 @@ export async function applyExternalFulfillmentUpdate(
     metadata: { source: update.source, targetShipmentStatus: update.targetShipmentStatus, shipmentsProcessed: shipments.length },
     resolveUser: false,
   })
+
+  // When a WMS dispatch has fully shipped the order, push the storefront status
+  // forward (SHIPPED → WooCommerce "completed") so the storefront fires its customer
+  // despatch email — e.g. Advanced Shipment Tracking emails the tracking on the
+  // →completed transition, not on a raw tracking-meta write. Writing the tracking meta
+  // alone (above) leaves the WC order in its prior status and the customer un-emailed.
+  // Gated to WMS sources: a storefront-sourced fulfilment already has the storefront as
+  // the source of truth, so pushing status back would just echo.
+  if (update.targetShipmentStatus === 'SHIPPED' && isWmsConnectorId(update.source)) {
+    const current = await db.salesOrder.findUnique({ where: { id: order.id }, select: { status: true } })
+    if (current && shouldPushStorefrontCompletion(update.source, update.targetShipmentStatus, current.status)) {
+      try {
+        const { pushSalesOrderStatus } = await import('@/lib/shopping')
+        await pushSalesOrderStatus(order.id, current.status as SalesOrderStatus)
+      } catch (error) {
+        // Best-effort: the shipment + tracking are already applied; a failed status
+        // push must not fail the dispatch (it retries next sweep / can be re-pushed).
+        console.error('[external-fulfillment] storefront status push failed', error)
+      }
+    }
+  }
 
   return { success: true }
 }
