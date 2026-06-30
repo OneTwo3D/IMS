@@ -11,10 +11,14 @@ const { shouldPushStorefrontCompletion } = 'default' in efNs
 // →completed transition). Idempotent — safe even while the WMS also pushes completed
 // today; correct once IMS becomes the sole integration.
 
-test('pushes storefront completion for a WMS dispatch that fully shipped the order', () => {
+test('pushes storefront completion for a WMS dispatch that just brought the order to SHIPPED', () => {
   assert.equal(shouldPushStorefrontCompletion('mintsoft', 'SHIPPED', 'SHIPPED'), true)
-  assert.equal(shouldPushStorefrontCompletion('mintsoft', 'SHIPPED', 'COMPLETED'), true)
-  assert.equal(shouldPushStorefrontCompletion('shiphero', 'SHIPPED', 'DELIVERED'), true)
+  assert.equal(shouldPushStorefrontCompletion('shiphero', 'SHIPPED', 'SHIPPED'), true)
+})
+
+test('does NOT push for COMPLETED/DELIVERED (no WC status mapping → would silently no-op)', () => {
+  assert.equal(shouldPushStorefrontCompletion('mintsoft', 'SHIPPED', 'COMPLETED'), false)
+  assert.equal(shouldPushStorefrontCompletion('mintsoft', 'SHIPPED', 'DELIVERED'), false)
 })
 
 test('does NOT push for a storefront-sourced update (storefront is already the source of truth)', () => {

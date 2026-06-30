@@ -114,15 +114,16 @@ function statusesToApply(
   return flow.slice(start + 1, end + 1)
 }
 
-/** Order lifecycle statuses that mean the order is fully shipped. */
-const POST_SHIP_ORDER_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED']
-
 /**
  * Whether to push the storefront status forward (→ "completed" for WooCommerce) after a
- * fulfilment update. Only for a WMS-sourced dispatch that fully shipped the order — a
- * storefront-sourced update already has the storefront as the source of truth (pushing
- * back would echo), and a partial dispatch leaves the order pre-SHIPPED. This is what
- * makes the storefront fire its customer despatch email (e.g. AST on →completed).
+ * fulfilment update. Only for a WMS-sourced dispatch that just brought the order to
+ * SHIPPED — a storefront-sourced update already has the storefront as the source of truth
+ * (pushing back would echo), and a partial dispatch leaves the order pre-SHIPPED. This is
+ * what makes the storefront fire its customer despatch email (e.g. AST on →completed).
+ *
+ * Restricted to SHIPPED (not COMPLETED/DELIVERED): those later states have no WC status
+ * mapping (IMS_TO_WC) so a push would silently no-op — and a SHIPPED order has already
+ * driven the WC completion, so there's nothing more to push.
  */
 export function shouldPushStorefrontCompletion(
   source: ExternalFulfillmentSource,
@@ -131,7 +132,7 @@ export function shouldPushStorefrontCompletion(
 ): boolean {
   return targetShipmentStatus === 'SHIPPED'
     && isWmsConnectorId(source)
-    && POST_SHIP_ORDER_STATUSES.includes(orderStatus)
+    && orderStatus === 'SHIPPED'
 }
 
 export async function applyExternalFulfillmentUpdate(
@@ -233,13 +234,26 @@ export async function applyExternalFulfillmentUpdate(
   if (update.targetShipmentStatus === 'SHIPPED' && isWmsConnectorId(update.source)) {
     const current = await db.salesOrder.findUnique({ where: { id: order.id }, select: { status: true } })
     if (current && shouldPushStorefrontCompletion(update.source, update.targetShipmentStatus, current.status)) {
+      // Best-effort: the shipment + tracking are already applied; a failed status push
+      // must not fail the dispatch. But log it — a missed completion = a missed customer
+      // despatch email, which would otherwise be invisible.
+      const logCompletionPushFailure = (detail: string) =>
+        logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: order.id,
+          action: 'wc_completion_push_failed',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Storefront completion push failed for despatched order ${order.externalOrderNumber ?? order.orderNumber ?? order.id}: ${detail} — customer despatch email may not have fired`,
+          metadata: { source: update.source },
+          resolveUser: false,
+        }).catch(() => {})
       try {
         const { pushSalesOrderStatus } = await import('@/lib/shopping')
-        await pushSalesOrderStatus(order.id, current.status as SalesOrderStatus)
+        const pushResult = await pushSalesOrderStatus(order.id, current.status as SalesOrderStatus)
+        if (!pushResult.success) await logCompletionPushFailure(pushResult.error ?? 'unknown error')
       } catch (error) {
-        // Best-effort: the shipment + tracking are already applied; a failed status
-        // push must not fail the dispatch (it retries next sweep / can be re-pushed).
-        console.error('[external-fulfillment] storefront status push failed', error)
+        await logCompletionPushFailure(error instanceof Error ? error.message : 'unexpected error')
       }
     }
   }
