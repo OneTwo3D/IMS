@@ -83,6 +83,10 @@ export function buildPushPayload(input: WmsOrderPushInput, courier: CourierOptio
     DiscountTotalVat: round2(input.discountVat),
     Comments: (input.comments ?? '').slice(0, 1000),
   }
+  // VAT goes on the create payload only (with the items); amends reuse this builder
+  // with includeItems=false, and a Mintsoft order's VAT number may be immutable once
+  // created — don't risk an amend rejection by re-sending it.
+  if (includeItems && input.vatNumber) payload.VATNumber = input.vatNumber
   if (includeItems) {
     // The order-update endpoint (NewOrder) ignores items, so creates send them here and
     // amendments are reconciled separately via the /Items sub-resource endpoints
@@ -160,10 +164,12 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
 
   // Courier the WMS couldn't resolve → retry with the configured default id
   // (unless we already used it). Mintsoft requires a resolvable courier.
+  let courierFallback = false
   if (
     !created.ok && created.message && /courierservice/i.test(created.message)
     && defaultId != null && initialCourier.kind !== 'defaultId'
   ) {
+    courierFallback = true
     created = await createOrder(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
   }
 
@@ -174,6 +180,7 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         externalOrderId,
         externalOrderNumber: toStr(created.data.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
+        courierFallback,
       }
     }
   }

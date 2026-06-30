@@ -9,6 +9,7 @@ import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
+  readWcCustomerVat,
 } from './field-mapping'
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
@@ -324,6 +325,7 @@ async function updateExistingWcOrderFromPayload(
       where: { id: orderId },
       data: {
         externalOrderNumber: wcOrder.number,
+        customerVatNumber: readWcCustomerVat(wcOrder),
         billingAddress: mapWcAddress(wcOrder.billing),
         shippingAddress: mapWcAddress(wcOrder.shipping),
         notes: wcOrder.customer_note || null,
@@ -623,6 +625,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           customerId,
           customerName,
           customerEmail: wcOrder.billing.email || null,
+          customerVatNumber: readWcCustomerVat(wcOrder),
           billingAddress: mapWcAddress(wcOrder.billing),
           shippingAddress: mapWcAddress(wcOrder.shipping),
           subtotalForeign,

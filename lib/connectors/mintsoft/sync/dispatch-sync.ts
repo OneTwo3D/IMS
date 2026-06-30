@@ -5,6 +5,7 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { fetchMintsoftOrderParts, fetchMintsoftPartItems } from '../api/orders'
+import { scrubWmsError } from '@/lib/domain/wms/error-scrub'
 
 /**
  * Phase 8 — Mintsoft dispatch ingestion (q66in.1.1).
@@ -282,7 +283,7 @@ export async function runMintsoftDispatchSyncCore(
         orderId: candidate.orderId,
         externalOrderNumber: candidate.externalOrderNumber,
         action: 'error',
-        reason: error instanceof Error ? error.message : 'Mintsoft dispatch sync error',
+        reason: scrubWmsError(error, 'Mintsoft dispatch sync error'),
       })
     }
   }

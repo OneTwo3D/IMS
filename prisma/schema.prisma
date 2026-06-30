@@ -1499,6 +1499,7 @@ model SalesOrder {
   customerId        String?
   customerName      String?
   customerEmail     String?
+  customerVatNumber String?          // customer-entered VAT/IOSS number from the storefront, sent to the WMS for customs
   billingAddress    Json?
   shippingAddress   Json?
 

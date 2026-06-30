@@ -197,6 +197,8 @@ export type WmsOrderPushInput = {
   shippingAddress: WmsOrderAddress
   email: string | null
   phone: string | null
+  /** Customer VAT/IOSS number for customs declarations; null when not provided. */
+  vatNumber: string | null
   comments: string | null
   /** Carrier/service name passed through for the WMS to resolve; null = WMS default. */
   courierService: string | null
@@ -212,6 +214,9 @@ export type WmsOrderPushResult = {
   externalOrderId: string
   externalOrderNumber: string | null
   status: string
+  /** True when the order's shipping service didn't resolve and the WMS fell back to a
+   *  default courier — the warehouse should verify the courier before despatch. */
+  courierFallback?: boolean
 }
 
 export type WmsOrderCancelResult = {
