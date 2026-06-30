@@ -2308,6 +2308,7 @@ enum WmsOrderPushState {
   CANCELLED
   DEAD_LETTER
   HELD
+  MERGED
 }
 
 model WmsOrderPushLink {

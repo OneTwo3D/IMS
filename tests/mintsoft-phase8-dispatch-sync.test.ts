@@ -48,6 +48,7 @@ function deps(overrides: Partial<MintsoftDispatchSyncDeps>): MintsoftDispatchSyn
     fetchOrderParts: async () => [],
     fetchPartItems: async () => [],
     pushPartialShipment: async () => ({ ok: true }),
+    repointLink: async () => {},
     ...overrides,
   }
 }
@@ -206,6 +207,49 @@ test('split reconcile: a failed partial-shipment push surfaces as an error', asy
   assert.equal(counters.dispatched, 0)
   assert.equal(logs[0]?.action, 'error')
   assert.match(logs[0]?.reason ?? '', /WC unreachable/)
+})
+
+test('merge: a merged order repoints its link to the survivor, then dispatches under the survivor number', async () => {
+  const repoints: Array<{ linkId: string; to: { externalOrderId: string; externalOrderNumber: string } }> = []
+  const partsFetchedFor: string[] = []
+  const { counters, logs } = await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    // Polling by "WC-1001" returns the merged survivor "WC-1001+WC-1002".
+    fetchOrderStatus: async () => status({
+      externalOrderId: 'M-SURV',
+      externalOrderNumber: 'WC-1001+WC-1002',
+      status: 'DESPATCHED',
+      isMerged: true,
+      tracking: [tracking({ trackingNumber: 'TN-S', carrier: 'DPD' })],
+    }),
+    repointLink: async (linkId, to) => { repoints.push({ linkId, to }) },
+    applyDispatch: async () => ({ success: true }),
+  }))
+  assert.deepEqual(repoints, [{ linkId: 'l1', to: { externalOrderId: 'M-SURV', externalOrderNumber: 'WC-1001+WC-1002' } }])
+  assert.equal(counters.dispatched, 1)
+  assert.equal(logs[0]?.action, 'dispatched')
+  void partsFetchedFor
+})
+
+test('merge + split: the survivor number is used to fetch parts (not the merged-away original)', async () => {
+  const partsFetchedFor: string[] = []
+  await runMintsoftDispatchSyncCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    fetchOrderStatus: async () => status({
+      externalOrderId: 'M-SURV',
+      externalOrderNumber: 'WC-1001+WC-1002',
+      status: 'PROCESSING',
+      isMerged: true,
+      isSplit: true,
+      partCount: 1,
+    }),
+    fetchOrderParts: async (orderNumber) => {
+      partsFetchedFor.push(orderNumber)
+      return [part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', tracking: [tracking({ trackingNumber: 'TN-A' })] })]
+    },
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+  }))
+  assert.deepEqual(partsFetchedFor, ['WC-1001+WC-1002']) // survivor number, not "WC-1001"
 })
 
 test('runMintsoftDispatchSyncCore treats an order missing in Mintsoft as pending, not an error', async () => {
