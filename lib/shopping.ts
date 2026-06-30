@@ -5,6 +5,8 @@
 import type { StockSyncReason } from '@/app/generated/prisma/enums'
 import type { ProductLifecycleStatus, ProductType, SalesOrderStatus } from '@/app/generated/prisma/client'
 import type { DeliveryStatus, StockUpdate } from '@/lib/connectors/types'
+import type { WcPartialShipmentPush, PartialShipmentPushResult } from '@/lib/connectors/woocommerce/sync/partial-shipment'
+export type { WcPartialShipmentPush, WcPartialShipmentLine } from '@/lib/connectors/woocommerce/sync/partial-shipment'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getShoppingConnector, type ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import { getShopifySettings } from '@/lib/connectors/shopify/settings'
@@ -410,6 +412,45 @@ export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOr
   }
 
   return { success: true, skipped: results.every((entry) => 'skipped' in entry.result && !!entry.result.skipped) }
+}
+
+/**
+ * Push one despatched part of a split fulfilment to whichever shopping
+ * connector(s) own the order. WMS-neutral: any WMS reconciler calls this via the
+ * facade so the storefront representation stays connector-agnostic (WooCommerce
+ * records a partial shipment today; Shopify can implement its own later).
+ */
+export async function pushPartialShipmentToShopping(
+  orderId: string,
+  input: WcPartialShipmentPush,
+): Promise<PushOrderDeliveryMetadataResult & { allDone?: boolean }> {
+  const connectors = await listRunnableShoppingConnectorIds()
+  if (connectors.length === 0) return { success: false, error: 'No runnable shopping connector configured' }
+
+  const results = await Promise.all(connectors.map(async (connector) => {
+    switch (connector) {
+      case 'woocommerce': {
+        const { pushPartialShipmentToWc } = await import('@/lib/connectors/woocommerce/sync/partial-shipment')
+        return { connector, result: await pushPartialShipmentToWc(orderId, input) }
+      }
+      case 'shopify':
+        // Shopify has no partial-shipment representation wired yet.
+        return { connector, result: { supported: false, ok: true, skipped: true } as PartialShipmentPushResult }
+    }
+  }))
+
+  const failures = results.filter((entry) => entry.result.supported && !entry.result.ok && !entry.result.skipped)
+  if (failures.length > 0) {
+    return {
+      success: false,
+      error: failures.map((entry) => `${getShoppingConnector(entry.connector).label}: ${entry.result.error ?? 'unknown error'}`).join('; '),
+    }
+  }
+  return {
+    success: true,
+    skipped: results.every((entry) => !!entry.result.skipped),
+    allDone: results.some((entry) => entry.result.allDone),
+  }
 }
 
 /**
