@@ -62,11 +62,17 @@ function connector(overrides: {
   pushOrder?: () => Promise<WmsOrderPushResult>
   updateOrder?: () => Promise<WmsOrderUpdateResult>
   cancelOrder?: () => Promise<WmsOrderCancelResult>
+  comments?: Array<{ externalOrderId: string; comment: string }>
+  addOrderComment?: () => Promise<void>
 } = {}) {
   return {
     pushOrder: overrides.pushOrder ?? okPush,
     updateOrder: overrides.updateOrder ?? (async () => ({ updated: true, status: 'NEW' })),
     cancelOrder: overrides.cancelOrder ?? (async () => ({ cancelled: true, status: 'CANCELLED' })),
+    addOrderComment: overrides.addOrderComment
+      ?? (overrides.comments
+        ? async (externalOrderId: string, comment: string) => { overrides.comments!.push({ externalOrderId, comment }) }
+        : undefined),
   }
 }
 
@@ -157,12 +163,35 @@ test('hold: an ON_HOLD pushed order is cancelled in the WMS and parked HELD', as
   assert.equal(updates[0].data.state, 'HELD')
 })
 
-test('hold: a no-longer-cancellable WMS order becomes a dead-letter conflict', async () => {
-  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) })
+test('hold: a no-longer-cancellable WMS order becomes a dead-letter conflict + posts a warehouse comment', async () => {
+  const comments: Array<{ externalOrderId: string; comment: string }> = []
+  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }), comments })
   const { port, updates } = makePort({ holdable: [{ id: 'link-1', externalOrderId: 'wms-1' }] })
   const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
   assert.equal(r.deadLettered, 1)
   assert.equal(r.held, 0)
+  assert.equal(updates[0].data.state, 'DEAD_LETTER')
+  assert.equal(comments.length, 1)
+  assert.equal(comments[0].externalOrderId, 'wms-1')
+  assert.match(comments[0].comment, /ON HOLD/)
+})
+
+test('hold: a successful (NEW) cancel does not post a warehouse comment', async () => {
+  const comments: Array<{ externalOrderId: string; comment: string }> = []
+  const { port } = makePort({ holdable: [{ id: 'link-1', externalOrderId: 'wms-1' }] })
+  const r = await runWmsOrderPushSweepCore(connector({ comments }), 'mintsoft', port, { now: NOW })
+  assert.equal(r.held, 1)
+  assert.equal(comments.length, 0)
+})
+
+test('hold: a thrown addOrderComment does not break the dead-letter path', async () => {
+  const dispatched = connector({
+    cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }),
+    addOrderComment: async () => { throw new Error('comments endpoint down') },
+  })
+  const { port, updates } = makePort({ holdable: [{ id: 'link-1', externalOrderId: 'wms-1' }] })
+  const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
+  assert.equal(r.deadLettered, 1)
   assert.equal(updates[0].data.state, 'DEAD_LETTER')
 })
 
@@ -181,12 +210,15 @@ test('cancel: a WMS order already gone (NOT_FOUND) is treated as cancelled', asy
   assert.equal(updates[0].data.state, 'CANCELLED')
 })
 
-test('cancel: a past-NEW order (full refund or IMS cancel) dead-letters with a raise-a-query signal', async () => {
-  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'PROCESSING' }) })
+test('cancel: a past-NEW order (full refund or IMS cancel) dead-letters with a raise-a-query signal + warehouse comment', async () => {
+  const comments: Array<{ externalOrderId: string; comment: string }> = []
+  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'PROCESSING' }), comments })
   const { port, updates } = makePort({ cancellable: [{ id: 'link-1', externalOrderId: 'wms-1' }] })
   const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
   assert.equal(r.deadLettered, 1)
   assert.equal(r.cancelled, 0)
   assert.equal(updates[0].data.state, 'DEAD_LETTER')
   assert.match(String(updates[0].data.lastError), /raise a cancellation query/i)
+  assert.equal(comments.length, 1)
+  assert.match(comments[0].comment, /cancelled \/ fully refunded/i)
 })
