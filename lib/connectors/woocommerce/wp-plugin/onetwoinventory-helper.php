@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -19,6 +19,12 @@
  *      that One Two Inventory pushes daily ECB rates to. Stored rates are
  *      surfaced to the Aelia Currency Switcher (and other plugins via filter)
  *      so the storefront converts at the same rate as IMS and Xero.
+ *   3. Partial-Shipment Receiver — signed REST endpoint
+ *      POST /wp-json/oti/v1/order/{id}/partial-shipment that IMS posts each
+ *      despatched part of a split fulfilment to (WMS-neutral: Mintsoft, ShipHero,
+ *      ...). Mirrors the part into the wphub-partial-shipment tables (storefront
+ *      partial-shipment UI + customer emails) and transitions the order to
+ *      partial-shipped / completed.
  */
 
 defined('ABSPATH') || exit;
@@ -179,6 +185,18 @@ add_action('rest_api_init', function () {
             ],
         ],
     ]);
+    register_rest_route(OTI_FX_NAMESPACE, '/order/(?P<order_id>\d+)/partial-shipment', [
+        'methods'             => 'POST',
+        // Same HMAC-of-raw-body check as the FX route (the verifier is generic).
+        'permission_callback' => 'oti_verify_fx_signature',
+        'callback'            => 'oti_handle_partial_shipment',
+        'args'                => [
+            'order_id' => [
+                'required'          => true,
+                'sanitize_callback' => 'absint',
+            ],
+        ],
+    ]);
 });
 
 if (!function_exists('oti_verify_fx_signature')) {
@@ -247,6 +265,195 @@ if (!function_exists('oti_handle_fx_push')) {
             'pushed'  => count($clean),
             'skipped' => $skipped,
         ]);
+    }
+}
+
+if (!function_exists('oti_ps_parts_done')) {
+    /** Read the deduped, int-normalised list of already-recorded part numbers. */
+    function oti_ps_parts_done($order): array
+    {
+        $done = $order->get_meta('_oti_wms_parts_done');
+        if (is_array($done)) {
+            return array_values(array_filter(array_map('intval', $done)));
+        }
+        if (is_string($done) && $done !== '') {
+            return array_values(array_filter(array_map('intval', explode(',', $done))));
+        }
+        return [];
+    }
+}
+
+if (!function_exists('oti_handle_partial_shipment')) {
+    /**
+     * WMS-neutral partial-shipment writeback. IMS posts each despatched part of a
+     * split fulfilment here (Mintsoft, ShipHero, ... — the route does not care
+     * which WMS produced it). We mirror the part into the wphub-partial-shipment
+     * tables (the storefront's partial-shipment UI + customer emails), stamp split
+     * metadata, and transition the WC order to partial-shipped / completed.
+     *
+     * Body: { part:int, total_parts:int, tracking_number?:str, shipment_num?:str,
+     *         items:[{ sku:str, qty:int }] }
+     *
+     * Idempotent per (order, part): the IMS poll re-sends despatched parts until
+     * the order is fully reconciled, so an already-recorded part is a no-op.
+     */
+    function oti_handle_partial_shipment(WP_REST_Request $request)
+    {
+        if (!function_exists('wc_get_order')) {
+            return new WP_Error('oti_ps_no_wc', 'WooCommerce not active', ['status' => 500]);
+        }
+        $order_id = absint($request['order_id']);
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            return new WP_Error('oti_ps_not_found', 'Order not found', ['status' => 404]);
+        }
+
+        $payload      = $request->get_json_params();
+        $part         = (int) ($payload['part'] ?? 0);
+        $total        = (int) ($payload['total_parts'] ?? 0);
+        $tracking     = sanitize_text_field((string) ($payload['tracking_number'] ?? ''));
+        $shipment_num = sanitize_text_field((string) ($payload['shipment_num'] ?? ''));
+        $raw_items    = $payload['items'] ?? [];
+        if ($part <= 0 || $total <= 0 || !is_array($raw_items) || empty($raw_items)) {
+            return new WP_Error('oti_ps_bad_payload', 'Malformed partial-shipment payload', ['status' => 400]);
+        }
+
+        // Idempotency guard — skip a part we've already recorded.
+        $done = oti_ps_parts_done($order);
+        if (in_array($part, $done, true)) {
+            return new WP_REST_Response(['ok' => true, 'duplicate' => true, 'part' => $part], 200);
+        }
+
+        // Map SKU → WC line item id (first match wins; same-SKU duplicate lines
+        // are aggregated by the WMS side anyway).
+        $items_by_sku = [];
+        foreach ($order->get_items() as $item_id => $item) {
+            $product = $item->get_product();
+            if (!$product) continue;
+            $sku = trim((string) $product->get_sku());
+            if ($sku !== '' && !isset($items_by_sku[$sku])) {
+                $items_by_sku[$sku] = $item_id;
+            }
+        }
+        $to_ship = [];
+        foreach ($raw_items as $row) {
+            if (!is_array($row)) continue;
+            $sku = trim(sanitize_text_field((string) ($row['sku'] ?? '')));
+            $qty = max(0, (int) ($row['qty'] ?? 0));
+            if ($sku === '' || $qty <= 0 || !isset($items_by_sku[$sku])) continue;
+            $to_ship[(int) $items_by_sku[$sku]] = $qty;
+        }
+        if (empty($to_ship)) {
+            // Stamp split metadata so the badge still appears, but nothing to record.
+            $order->update_meta_data('_oti_wms_total_parts', $total);
+            $order->update_meta_data('_oti_wms_this_part', $part);
+            $order->save();
+            return new WP_Error('oti_ps_no_sku_match', 'No SKUs matched WC line items', ['status' => 422]);
+        }
+
+        // Per-order shipment_id counter + INSERT, serialised by a named lock so two
+        // concurrent IMS posts can't collide on MAX(shipment_id)+1. The route is a
+        // standalone REST call (not nested in a WC save tx), so a plain transaction
+        // is sufficient — no SAVEPOINT dance.
+        global $wpdb;
+        $lock_name = 'oti_partial_ship_' . $order_id;
+        if ((int) $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, %d)', $lock_name, 5)) !== 1) {
+            return new WP_Error('oti_ps_lock', 'Could not acquire partial-shipment lock', ['status' => 409]);
+        }
+        $shipment_pk = 0;
+        $next_shipment_id = 0;
+        try {
+            $wpdb->query('START TRANSACTION');
+            $last = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT MAX(shipment_id) FROM {$wpdb->prefix}partial_shipment WHERE order_id = %d",
+                $order_id
+            ));
+            $next_shipment_id = $last + 1;
+            $ok = $wpdb->insert($wpdb->prefix . 'partial_shipment', [
+                'order_id'      => $order_id,
+                'shipment_id'   => $next_shipment_id,
+                'shipment_url'  => '',
+                'shipment_num'  => $shipment_num !== '' ? $shipment_num : $tracking,
+                'shipment_date' => (string) current_time('timestamp', 0),
+            ], ['%d', '%d', '%s', '%s', '%s']);
+            if (!$ok) {
+                $wpdb->query('ROLLBACK');
+                error_log(sprintf('[OTI] partial_shipment INSERT failed for WC %d: %s', $order_id, $wpdb->last_error));
+                return new WP_Error('oti_ps_insert', 'partial_shipment insert failed', ['status' => 500]);
+            }
+            $shipment_pk = (int) $wpdb->insert_id;
+            $rows = [];
+            $vals = [];
+            foreach ($to_ship as $iid => $q) {
+                $rows[] = '(%d, %d, %d)';
+                $vals[] = $shipment_pk;
+                $vals[] = (int) $iid;
+                $vals[] = (int) $q;
+            }
+            $sql = "INSERT INTO {$wpdb->prefix}partial_shipment_items (shipment_id, item_id, item_qty) VALUES "
+                 . implode(', ', $rows);
+            if ($wpdb->query($wpdb->prepare($sql, $vals)) === false) {
+                $wpdb->query('ROLLBACK');
+                error_log(sprintf('[OTI] partial_shipment_items INSERT failed for WC %d shipment %d: %s', $order_id, $shipment_pk, $wpdb->last_error));
+                return new WP_Error('oti_ps_items', 'partial_shipment_items insert failed', ['status' => 500]);
+            }
+            $wpdb->query('COMMIT');
+        } finally {
+            $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name));
+        }
+
+        // Split metadata + parts_done (deduped, sorted).
+        $done[] = $part;
+        $done = array_values(array_unique(array_map('intval', $done)));
+        sort($done);
+        $order->update_meta_data('_oti_wms_total_parts', $total);
+        $order->update_meta_data('_oti_wms_this_part', $part);
+        $order->update_meta_data('_oti_wms_parts_done', $done);
+        $all_done = (count($done) >= $total);
+
+        $order->add_order_note(sprintf(
+            'WMS split despatch: Part %d/%d shipped via %s (%d line item(s))%s',
+            $part, $total,
+            $tracking !== '' ? $tracking : '(no tracking)',
+            count($to_ship),
+            $all_done ? ' — all parts despatched.' : ''
+        ));
+
+        if ($all_done) {
+            // Skip the partial-shipped intermediate when this part closes the order.
+            $order->update_status('completed', sprintf('WMS: all %d split parts despatched.', $total));
+        } elseif (has_action('wphub_partial_shipment_status')) {
+            // Persist metas, then let wphub-partial-shipment do its own transition
+            // (equivalent to clicking "Add Shipment" in its UI) + customer email.
+            $order->save();
+            do_action('wphub_partial_shipment_status', $order_id);
+            if (has_action('wphub_partial_shipment_new_email')) {
+                do_action('wphub_partial_shipment_new_email', $order_id, $shipment_pk);
+            }
+        } else {
+            // wphub absent — fall back to wc-partial-shipped if registered, else
+            // leave status untouched and log so an operator notices.
+            $statuses = function_exists('wc_get_order_statuses') ? wc_get_order_statuses() : [];
+            if (isset($statuses['wc-partial-shipped'])) {
+                $order->update_status('partial-shipped', sprintf(
+                    'WMS: Part %d/%d despatched (wphub-partial-shipment unavailable — direct transition).',
+                    $part, $total
+                ));
+            } else {
+                $order->save();
+                error_log(sprintf(
+                    '[OTI] partial-shipment recorded for WC %d Part %d/%d but no wphub plugin / wc-partial-shipped status to transition to.',
+                    $order_id, $part, $total
+                ));
+            }
+        }
+
+        return new WP_REST_Response([
+            'ok'          => true,
+            'part'        => $part,
+            'all_done'    => $all_done,
+            'shipment_id' => $next_shipment_id,
+        ], 200);
     }
 }
 
