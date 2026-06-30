@@ -59,6 +59,9 @@ export async function runWmsOrderStatusSweep(
         select: { externalOrderNumber: true },
         take: 1,
       },
+      // Last status pushed to the storefront, to push only on change (G4). Tracked
+      // separately from `status` so a failed push isn't masked by the change gate.
+      wmsOrderStatus: { select: { wcPushedStatus: true } },
     },
     take: batchSize,
     orderBy: { updatedAt: 'desc' },
@@ -115,6 +118,33 @@ export async function runWmsOrderStatusSweep(
         update: { ...fields, fetchedAt: new Date() },
       })
       if (status) updated += 1
+
+      // G4: surface the WMS status in the storefront admin (the companion plugin renders
+      // `_oti_wms_*` meta). Push only when it changed vs the LAST SUCCESSFUL push — so a
+      // transient WC failure retries next tick instead of being permanently skipped.
+      // Best-effort: a failed push must not fail the status sweep, but it is logged and
+      // wcPushedStatus is left unchanged so it's re-attempted.
+      if (status && status.status && status.status !== order.wmsOrderStatus?.wcPushedStatus) {
+        try {
+          const { pushWmsOrderStatusToShopping } = await import('@/lib/shopping')
+          const pushResult = await pushWmsOrderStatusToShopping(order.id, {
+            status: status.status,
+            statusLabel: status.statusLabel,
+            connectorLabel,
+            deepLinkUrl: status.deepLinkUrl,
+          })
+          if (pushResult.success) {
+            await db.wmsOrderStatusSnapshot.update({
+              where: { orderId: order.id },
+              data: { wcPushedStatus: status.status },
+            }).catch(() => {})
+          } else if (!pushResult.skipped) {
+            console.warn(`[wms-order-status-sweep] storefront WMS-status push failed for order ${order.id}: ${pushResult.error}`)
+          }
+        } catch (pushError) {
+          console.error('[wms-order-status-sweep] storefront WMS-status push errored', pushError)
+        }
+      }
     } catch (error) {
       failed += 1
       const message = error instanceof Error ? error.message : 'WMS order-status sweep failed'

@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.1.0
+ * Version:     1.2.0
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -19,6 +19,9 @@
  *      that One Two Inventory pushes daily ECB rates to. Stored rates are
  *      surfaced to the Aelia Currency Switcher (and other plugins via filter)
  *      so the storefront converts at the same rate as IMS and Xero.
+ *   1b. Warehouse (WMS) Status — renders the live WMS order status that IMS pushes
+ *      onto the WC order as `_oti_wms_*` meta: an order-edit meta box + an orders-list
+ *      "Warehouse" column. Read-only; WMS-neutral.
  *   3. Partial-Shipment Receiver — signed REST endpoint
  *      POST /wp-json/oti/v1/order/{id}/partial-shipment that IMS posts each
  *      despatched part of a split fulfilment to (WMS-neutral: Mintsoft, ShipHero,
@@ -136,6 +139,104 @@ if (!function_exists('oti_render_invoice_meta_box')) {
         }
     }
 }
+
+/* ============================================================
+ * Module 1b — Warehouse (WMS) status display
+ * ============================================================
+ *
+ * One Two Inventory pushes the live WMS order status onto the WC order as
+ * WMS-neutral `_oti_wms_*` meta (any WMS connector: see the IMS wms-status push).
+ * Here we render it: an order-edit meta box + an orders-list column. Read-only.
+ */
+
+add_action('add_meta_boxes', function () {
+    $screen = class_exists(\Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController::class)
+        && wc_get_container()->get(\Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController::class)->custom_orders_table_usage_is_enabled()
+        ? wc_get_page_screen_id('shop-order')
+        : 'shop_order';
+
+    add_meta_box(
+        'oti_wms_status_meta_box',
+        __('Warehouse (WMS)', 'woocommerce'),
+        'oti_render_wms_status_meta_box',
+        $screen,
+        'side',
+        'default'
+    );
+});
+
+if (!function_exists('oti_render_wms_status_meta_box')) {
+    function oti_render_wms_status_meta_box($post_or_order): void
+    {
+        $order_id  = $post_or_order instanceof WP_Post ? $post_or_order->ID : $post_or_order->get_id();
+        $status    = oti_get_order_meta($order_id, '_oti_wms_status');
+        $label     = oti_get_order_meta($order_id, '_oti_wms_status_label');
+        $connector = oti_get_order_meta($order_id, '_oti_wms_connector');
+        $deeplink  = oti_get_order_meta($order_id, '_oti_wms_deeplink');
+
+        if ($status === '') {
+            echo '<p>' . esc_html__('No warehouse status yet.', 'woocommerce') . '</p>';
+            return;
+        }
+
+        printf(
+            '<p><strong>%s:</strong> %s</p>',
+            esc_html($connector !== '' ? $connector : __('WMS', 'woocommerce')),
+            esc_html($label !== '' ? $label : $status)
+        );
+        if ($deeplink !== '') {
+            printf(
+                '<p><a href="%s" class="button" target="_blank" rel="noopener noreferrer">%s</a></p>',
+                esc_url($deeplink),
+                esc_html__('Open in warehouse', 'woocommerce')
+            );
+        }
+    }
+}
+
+if (!function_exists('oti_wms_status_column')) {
+    /** Insert a "Warehouse" column after the order status column. */
+    function oti_wms_status_column(array $columns): array
+    {
+        $out = [];
+        foreach ($columns as $key => $label) {
+            $out[$key] = $label;
+            if ($key === 'order_status') {
+                $out['oti_wms_status'] = __('Warehouse', 'woocommerce');
+            }
+        }
+        if (!isset($out['oti_wms_status'])) {
+            $out['oti_wms_status'] = __('Warehouse', 'woocommerce');
+        }
+        return $out;
+    }
+}
+
+if (!function_exists('oti_wms_status_column_value')) {
+    function oti_wms_status_column_value(int $order_id): void
+    {
+        $status = oti_get_order_meta($order_id, '_oti_wms_status');
+        $label  = oti_get_order_meta($order_id, '_oti_wms_status_label');
+        echo $status !== '' ? esc_html($label !== '' ? $label : $status) : '—';
+    }
+}
+
+// Legacy CPT orders screen.
+add_filter('manage_edit-shop_order_columns', 'oti_wms_status_column');
+add_action('manage_shop_order_posts_custom_column', function ($column, $post_id) {
+    if ($column === 'oti_wms_status') {
+        oti_wms_status_column_value((int) $post_id);
+    }
+}, 10, 2);
+
+// HPOS orders screen.
+add_filter('manage_woocommerce_page_wc-orders_columns', 'oti_wms_status_column');
+add_action('manage_woocommerce_page_wc-orders_custom_column', function ($column, $order) {
+    if ($column === 'oti_wms_status') {
+        $order_id = ($order instanceof WC_Order) ? $order->get_id() : (int) $order;
+        oti_wms_status_column_value($order_id);
+    }
+}, 10, 2);
 
 /* ============================================================
  * Module 2 — FX Rate Receiver
