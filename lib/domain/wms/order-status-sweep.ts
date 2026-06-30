@@ -59,6 +59,8 @@ export async function runWmsOrderStatusSweep(
         select: { externalOrderNumber: true },
         take: 1,
       },
+      // Prior cached status, to push to the storefront only when it changes (G4).
+      wmsOrderStatus: { select: { status: true } },
     },
     take: batchSize,
     orderBy: { updatedAt: 'desc' },
@@ -115,6 +117,23 @@ export async function runWmsOrderStatusSweep(
         update: { ...fields, fetchedAt: new Date() },
       })
       if (status) updated += 1
+
+      // G4: surface the WMS status in the storefront admin (the companion plugin renders
+      // `_oti_wms_*` meta). Push only when it changed, to avoid a write per sweep tick.
+      // Best-effort — a failed push must not fail the status sweep.
+      if (status && status.status && status.status !== order.wmsOrderStatus?.status) {
+        try {
+          const { pushWmsOrderStatusToShopping } = await import('@/lib/shopping')
+          await pushWmsOrderStatusToShopping(order.id, {
+            status: status.status,
+            statusLabel: status.statusLabel,
+            connectorLabel,
+            deepLinkUrl: status.deepLinkUrl,
+          })
+        } catch (pushError) {
+          console.error('[wms-order-status-sweep] storefront WMS-status push failed', pushError)
+        }
+      }
     } catch (error) {
       failed += 1
       const message = error instanceof Error ? error.message : 'WMS order-status sweep failed'

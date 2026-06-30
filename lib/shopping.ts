@@ -7,6 +7,8 @@ import type { ProductLifecycleStatus, ProductType, SalesOrderStatus } from '@/ap
 import type { DeliveryStatus, StockUpdate } from '@/lib/connectors/types'
 import type { WcPartialShipmentPush, PartialShipmentPushResult } from '@/lib/connectors/woocommerce/sync/partial-shipment'
 export type { WcPartialShipmentPush, WcPartialShipmentLine } from '@/lib/connectors/woocommerce/sync/partial-shipment'
+import type { WmsOrderStatusMeta } from '@/lib/connectors/woocommerce/sync/wms-status'
+export type { WmsOrderStatusMeta } from '@/lib/connectors/woocommerce/sync/wms-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getShoppingConnector, type ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import { getShopifySettings } from '@/lib/connectors/shopify/settings'
@@ -451,6 +453,39 @@ export async function pushPartialShipmentToShopping(
     skipped: results.every((entry) => !!entry.result.skipped),
     allDone: results.some((entry) => entry.result.allDone),
   }
+}
+
+/**
+ * Push the live WMS order status onto the order's storefront record so storefront admins
+ * can see it (WooCommerce writes `_oti_wms_*` meta the companion plugin renders). WMS- and
+ * storefront-neutral; Shopify can implement its own surface later.
+ */
+export async function pushWmsOrderStatusToShopping(
+  orderId: string,
+  input: WmsOrderStatusMeta,
+): Promise<PushOrderDeliveryMetadataResult> {
+  const connectors = await listRunnableShoppingConnectorIds()
+  if (connectors.length === 0) return { success: false, error: 'No runnable shopping connector configured' }
+
+  const results = await Promise.all(connectors.map(async (connector) => {
+    switch (connector) {
+      case 'woocommerce': {
+        const { pushWmsOrderStatusToWc } = await import('@/lib/connectors/woocommerce/sync/wms-status')
+        return { connector, result: await pushWmsOrderStatusToWc(orderId, input) }
+      }
+      case 'shopify':
+        return { connector, result: { success: true, skipped: true } as { success: boolean; skipped?: boolean; error?: string } }
+    }
+  }))
+
+  const failures = results.filter((entry) => !entry.result.success && !entry.result.skipped)
+  if (failures.length > 0) {
+    return {
+      success: false,
+      error: failures.map((entry) => `${getShoppingConnector(entry.connector).label}: ${entry.result.error ?? 'unknown error'}`).join('; '),
+    }
+  }
+  return { success: true, skipped: results.every((entry) => !!entry.result.skipped) }
 }
 
 /**
