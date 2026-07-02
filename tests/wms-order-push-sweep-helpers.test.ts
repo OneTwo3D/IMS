@@ -2,8 +2,56 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   buildLines,
+  orderTotalDriftPence,
   readAddress,
 } from '../lib/domain/wms/order-push-sweep.ts'
+
+const baseOrder = {
+  subtotalForeign: 0,
+  taxForeign: 0,
+  taxRatePercent: null as unknown,
+  shippingForeign: 0,
+  discountAmount: 0,
+  totalForeign: 0,
+  pricesIncludeVat: false,
+}
+
+test('orderTotalDriftPence: consistent VAT-exclusive order → 0 drift', () => {
+  // subtotal 100 + tax 20 + shipping 5 − discount 0 = 125
+  assert.equal(orderTotalDriftPence({ ...baseOrder, subtotalForeign: 100, taxForeign: 20, shippingForeign: 5, totalForeign: 125 }), 0)
+})
+
+test('orderTotalDriftPence: VAT-exclusive order with a net discount reconciles', () => {
+  // subtotal 100 + tax 18 − discount 10 (net) = 108
+  assert.equal(orderTotalDriftPence({ ...baseOrder, subtotalForeign: 100, taxForeign: 18, discountAmount: 10, totalForeign: 108 }), 0)
+})
+
+test('orderTotalDriftPence: VAT-inclusive discount adds back its embedded VAT (real SO-CBINCL case)', () => {
+  // The order that a naive subtotal+tax+shipping−discount guard would wrongly flag:
+  // subtotal 100 (net) + tax 18 − discount 12 (gross = 10 net + 2 VAT @20%) → total 108.
+  assert.equal(
+    orderTotalDriftPence({ ...baseOrder, subtotalForeign: 100, taxForeign: 18, taxRatePercent: 0.2, discountAmount: 12, totalForeign: 108, pricesIncludeVat: true }),
+    0,
+  )
+})
+
+test('orderTotalDriftPence: VAT-inclusive discount derives the rate when taxRatePercent is absent', () => {
+  // Same order but no named rate — effective rate tax/(total−tax) = 18/90 = 0.2 → still reconciles.
+  assert.equal(
+    orderTotalDriftPence({ ...baseOrder, subtotalForeign: 100, taxForeign: 18, taxRatePercent: null, discountAmount: 12, totalForeign: 108, pricesIncludeVat: true }),
+    0,
+  )
+})
+
+test('orderTotalDriftPence: a genuinely mis-totalled order is flagged (in pence)', () => {
+  // subtotal 100 + tax 20 = 120, but total says 118 → 200p drift.
+  assert.equal(orderTotalDriftPence({ ...baseOrder, subtotalForeign: 100, taxForeign: 20, totalForeign: 118 }), 200)
+})
+
+test('orderTotalDriftPence: sub-penny rounding noise stays within tolerance', () => {
+  // 33.33 + 6.67 = 40.00 vs 40.004 → 0.4p → rounds to 0p.
+  assert.equal(orderTotalDriftPence({ ...baseOrder, subtotalForeign: 33.33, taxForeign: 6.67, totalForeign: 40.004 }), 0)
+})
 
 test('buildLines derives per-unit ex-VAT (totalForeign is NET) and per-unit VAT', () => {
   const lines = buildLines([

@@ -23,9 +23,13 @@ function candidate(overrides: Partial<WmsPushCandidate> = {}): WmsPushCandidate 
     customerVatNumber: null,
     shippingAddress: { line1: '1 St', city: 'Leeds', postcode: 'LS1', country: 'GB' },
     shippingService: 'Royal Mail',
+    subtotalForeign: 10,
     shippingForeign: 0,
     taxForeign: 0,
+    taxRatePercent: null,
+    pricesIncludeVat: false,
     discountAmount: 0,
+    totalForeign: 10,
     shipFromWarehouseId: 'wh-1',
     pushAttempts: 0,
     lines: [{ sku: 'A', qty: 1, taxForeign: 0, totalForeign: 10, description: 'Widget' }],
@@ -89,6 +93,9 @@ test('create: a bound, eligible order is pushed and marked SYNCED', async () => 
   assert.equal(upserts.length, 1)
   assert.equal(upserts[0].create.state, 'SYNCED')
   assert.equal(upserts[0].create.externalOrderId, 'wms-1')
+  // G6: a reconciled, mapped-courier order carries no review flags.
+  assert.equal(upserts[0].create.courierPending, false)
+  assert.equal(upserts[0].create.totalMismatchPence, null)
 })
 
 test('create: a courier-fallback push posts a warehouse-visible verify-courier comment (G6c)', async () => {
@@ -97,12 +104,25 @@ test('create: a courier-fallback push posts a warehouse-visible verify-courier c
     pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', courierFallback: true }),
     comments,
   })
-  const { port } = makePort({ createCandidates: [candidate()] })
+  const { port, upserts } = makePort({ createCandidates: [candidate()] })
   const r = await runWmsOrderPushSweepCore(fallbackPush, 'mintsoft', port, { now: NOW })
   assert.equal(r.created, 1)
   assert.equal(comments.length, 1)
   assert.equal(comments[0].externalOrderId, 'wms-1')
   assert.match(comments[0].comment, /default courier/i)
+  // G6: the courier-pending flag is persisted on the link for the operator view.
+  assert.equal(upserts[0].create.courierPending, true)
+})
+
+test('create: a mis-totalled order is pushed but flagged for review (G6, non-blocking)', async () => {
+  // subtotal 100 + tax 20 = 120 but total says 118 → 200p drift; still SYNCED (never blocks).
+  const { port, upserts } = makePort({
+    createCandidates: [candidate({ subtotalForeign: 100, taxForeign: 20, totalForeign: 118, lines: [{ sku: 'A', qty: 1, taxForeign: 20, totalForeign: 100, description: 'Widget' }] })],
+  })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'SYNCED')
+  assert.equal(upserts[0].create.totalMismatchPence, 200)
 })
 
 test('create: a normal (no-fallback) push posts no courier comment', async () => {

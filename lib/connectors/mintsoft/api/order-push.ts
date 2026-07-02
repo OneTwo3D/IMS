@@ -163,8 +163,10 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   let created = await createOrder(buildPushPayload(input, initialCourier))
 
   // Courier the WMS couldn't resolve → retry with the configured default id
-  // (unless we already used it). Mintsoft requires a resolvable courier.
-  let courierFallback = false
+  // (unless we already used it). Mintsoft requires a resolvable courier. A default id
+  // used from the outset (order had no shipping service) is equally "pending" — the
+  // warehouse should still confirm the courier before despatch (G6).
+  let courierFallback = initialCourier.kind === 'defaultId'
   if (
     !created.ok && created.message && /courierservice/i.test(created.message)
     && defaultId != null && initialCourier.kind !== 'defaultId'
@@ -194,6 +196,7 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         externalOrderId,
         externalOrderNumber: toStr(existing.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
+        courierFallback,
       }
     }
   }

@@ -47,9 +47,13 @@ type OrderForPush = {
   customerVatNumber: string | null
   shippingAddress: unknown
   shippingService: string | null
+  subtotalForeign: unknown
   shippingForeign: unknown
   taxForeign: unknown
+  taxRatePercent: unknown
+  pricesIncludeVat: boolean
   discountAmount: unknown
+  totalForeign: unknown
   lines: CandidateLine[]
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
 }
@@ -58,6 +62,52 @@ function num(value: unknown): number {
   const n = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(n) ? n : 0
 }
+
+/**
+ * G6 (vn92.5) penny-precision guard. Returns the absolute drift, in pence, between an
+ * order's declared total and the total re-derived from its own component fields
+ * (subtotal + tax + shipping − discount). For a VAT-inclusive order the stored discount
+ * is gross, so its embedded VAT must be added back (IMS computes tax on the discounted
+ * net): validated against real orders — a £12 gross discount on a 20% order reconciles
+ * only once its £2 VAT is added back. The effective rate is taken from taxRatePercent,
+ * falling back to tax/(total−tax) when the named rate is absent.
+ *
+ * This is advisory only: the caller records the drift on the push link for operator
+ * review but still pushes the order (a mis-derived formula must never block fulfilment).
+ */
+export function orderTotalDriftPence(order: {
+  subtotalForeign: unknown
+  taxForeign: unknown
+  taxRatePercent: unknown
+  shippingForeign: unknown
+  discountAmount: unknown
+  totalForeign: unknown
+  pricesIncludeVat: boolean
+}): number {
+  const subtotal = num(order.subtotalForeign)
+  const tax = num(order.taxForeign)
+  const shipping = num(order.shippingForeign)
+  const discount = num(order.discountAmount)
+  const total = num(order.totalForeign)
+
+  let discountVat = 0
+  if (order.pricesIncludeVat && discount > 0) {
+    const named = num(order.taxRatePercent)
+    const rate = named > 0 ? named : total > tax ? tax / (total - tax) : 0
+    if (rate > 0) discountVat = (discount * rate) / (1 + rate)
+  }
+
+  const computed = subtotal + tax + shipping - discount + discountVat
+  return Math.round(Math.abs(computed - total) * 100)
+}
+
+/**
+ * Rounded-pence drift ABOVE this is surfaced for review. orderTotalDriftPence rounds to
+ * whole pence, so with `> 1` the effective trigger is ≥2p (a raw drift up to ~1.5p rounds
+ * to 1 and is tolerated) — a rounded penny of slack, deliberately lenient for an advisory
+ * flag so ordinary sub-penny VAT rounding never trips it.
+ */
+const TOTAL_DRIFT_TOLERANCE_PENCE = 1
 
 export function readAddress(raw: unknown, customerName: string | null): WmsOrderAddress {
   const a = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
@@ -131,9 +181,13 @@ const ORDER_PUSH_SELECT = {
   customerVatNumber: true,
   shippingAddress: true,
   shippingService: true,
+  subtotalForeign: true,
   shippingForeign: true,
   taxForeign: true,
+  taxRatePercent: true,
+  pricesIncludeVat: true,
   discountAmount: true,
+  totalForeign: true,
   lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true } },
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
 } as const
@@ -187,6 +241,8 @@ type LinkWrite = {
   pushedAt?: Date | null
   lastAttemptAt?: Date | null
   cancelledAt?: Date | null
+  courierPending?: boolean
+  totalMismatchPence?: number | null
 }
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
@@ -260,15 +316,23 @@ export async function runWmsOrderPushSweepCore(
       const ts = now()
       try {
         const push = await connector.pushOrder!(buildPushInput(order, externalWarehouseId))
+        const courierPending = push.courierFallback ?? false
+        // Penny-precision guard (G6): record (never block) when the order's own totals
+        // don't reconcile to the penny, so an operator can investigate a mis-totalled order.
+        const driftPence = orderTotalDriftPence(order)
+        const totalMismatchPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? driftPence : null
+        if (totalMismatchPence !== null) {
+          console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: ${totalMismatchPence}p drift vs derived total (pushed, flagged for review)`)
+        }
         await port.upsertByOrder(
           order.id,
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', attempts: 0, pushedAt: ts, lastAttemptAt: ts },
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, totalMismatchPence },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence },
         )
         result.created += 1
         // Courier-pending (G6c): the shipping service didn't resolve and the WMS used a
         // default courier — flag it on the WMS order so the warehouse verifies before despatch.
-        if (push.courierFallback) {
+        if (courierPending) {
           await postConflictComment(
             push.externalOrderId,
             `IMS: shipping method '${order.shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`,

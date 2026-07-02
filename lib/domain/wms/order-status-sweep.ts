@@ -119,6 +119,18 @@ export async function runWmsOrderStatusSweep(
       })
       if (status) updated += 1
 
+      // G6: clear the courier-pending review flag once the order is actually despatched
+      // (a tracking NUMBER is present) — that's the point the courier is final and operator
+      // verification is moot. Deliberately NOT keyed on carrier alone: the fallback default
+      // courier yields a CourierServiceName immediately, so clearing on the name would drop
+      // the flag while the order is still pre-despatch and still on the default courier.
+      // updateMany is a no-op when there's no link or the flag is already clear.
+      if (status && tracking?.trackingNumber) {
+        await db.wmsOrderPushLink
+          .updateMany({ where: { orderId: order.id, courierPending: true }, data: { courierPending: false } })
+          .catch(() => {})
+      }
+
       // G4: surface the WMS status in the storefront admin (the companion plugin renders
       // `_oti_wms_*` meta). Push only when it changed vs the LAST SUCCESSFUL push — so a
       // transient WC failure retries next tick instead of being permanently skipped.

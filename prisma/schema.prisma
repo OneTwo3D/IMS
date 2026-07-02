@@ -2327,6 +2327,13 @@ model WmsOrderPushLink {
   lastAttemptAt       DateTime?
   pushedAt            DateTime?
   cancelledAt         DateTime?
+  // G6 review flags (non-blocking; the order is still pushed). courierPending: the order's
+  // shipping service didn't map to a WMS courier and we fell back to a configured default id,
+  // so an operator should confirm/pick the courier in the WMS; auto-cleared when the WMS
+  // order-status sweep reports a resolved courier name. totalMismatchPence: the order's own
+  // totals did not reconcile to within a penny at push time (surfaced for review).
+  courierPending      Boolean           @default(false)
+  totalMismatchPence  Int?
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
