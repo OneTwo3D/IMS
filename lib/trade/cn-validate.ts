@@ -30,6 +30,17 @@ export function isDeclarableCn8(code: string | null | undefined): boolean {
   return CN2026.has(digits)
 }
 
+/**
+ * Whether the first 8 digits of `code` are present in the 2026 CN list (status "current" vs
+ * "absent"). Unlike isDeclarableCn8 this does NOT require the input to be exactly 8 digits —
+ * it mirrors the plugin's code_status (normalize8 → membership), used by the confidence
+ * validator (6igm.2) where malformed/overlong codes are scored, not hard-rejected.
+ */
+export function isCurrentCn8(code: string | null | undefined): boolean {
+  if (!code) return false
+  return CN2026.has(normalizeCn8(code))
+}
+
 /** Number of codes in the loaded 2026 reference (for diagnostics / tests). */
 export function cn2026CodeCount(): number {
   return CN2026.size
