@@ -8,6 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
+import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import { scheduleWmsProductSync, isAnyWmsConnectorEnabled } from '@/lib/domain/wms/product-sync-dispatch'
 import {
@@ -739,7 +740,9 @@ export async function createProduct(
         barcode: data.barcode || null,
         mpn: data.mpn || null,
         hsCode: data.hsCode || null,
-        countryOfOrigin: data.countryOfOrigin || null,
+        // New products with no origin default to China for customs parity with hs-code-woo
+        // (bhdm.5). Only on create — see updateProduct for why update must not default.
+        countryOfOrigin: data.countryOfOrigin || DEFAULT_COUNTRY_OF_ORIGIN,
         customsDescription: data.customsDescription || null,
         weight: data.weight ? data.weight : null,
         salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
@@ -891,6 +894,9 @@ export async function updateProduct(
         barcode: data.barcode || null,
         mpn: data.mpn || null,
         hsCode: data.hsCode || null,
+        // Do NOT default origin on update: a deliberate clear must not silently overwrite a
+        // real country with CN (customs misdeclaration). New products default at create; the
+        // WMS product push still declares CN for any null origin, so customs stays covered (bhdm.5).
         countryOfOrigin: data.countryOfOrigin || null,
         customsDescription: data.customsDescription || null,
         weight: data.weight ? data.weight : null,

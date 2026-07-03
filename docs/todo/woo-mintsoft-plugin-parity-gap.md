@@ -11,7 +11,7 @@ Legend: ✅ done in IMS · ◐ partial · ✗ missing · ➕ IMS exceeds the plu
 |---|---|---|
 | Order push (create/amend/cancel/dedup/courier-map/line-reconcile) | ✅ | `order-push.ts` + `order-push-sweep.ts`; adds refund-netting, hold/release, retry+dead-letter the plugin's Python sweep also has |
 | Stock / inventory sync | ➕ | Plugin is **audit-only** (`inventory_compare.py`). IMS has live two-way sync, ALIGN_TO_WMS, discrepancy + cost-layer preservation |
-| Product sync (incl. customs HS/COO/desc, barcode) | ✅ | `product-sync.ts` both directions + verify cron; plugin parity plus more. WC pa_* trade fields authoritative (overwrite-on-change, bhdm.2); sends the dedicated `customsDescription` (bhdm.1); fail-closed 2026 CN8 validation before Mintsoft push — non-declarable codes omitted + `INVALID_HS_CODE` discrepancy (bhdm.3) |
+| Product sync (incl. customs HS/COO/desc, barcode) | ✅ | `product-sync.ts` both directions + verify cron; plugin parity plus more. WC pa_* trade fields authoritative (overwrite-on-change, bhdm.2); sends the dedicated `customsDescription` (bhdm.1); fail-closed 2026 CN8 validation before Mintsoft push — non-declarable codes omitted + `INVALID_HS_CODE` discrepancy (bhdm.3); country-of-origin defaults to China when empty (`DEFAULT_COUNTRY_OF_ORIGIN`, bhdm.5) |
 | Bundle / kit sync | ➕ | Plugin: none. IMS: full create/checksum/verify |
 | Inbound ASN / booked-in | ➕ | Plugin: none. IMS: ASN create, booked-in webhook, dry-run, approval, PO reconcile |
 | Returns | ➕ | Plugin: none. IMS: polling + linkage + reconcile |

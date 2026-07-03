@@ -12,7 +12,7 @@ import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-m
 import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
 import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
-import { toIsoCountryCode } from '@/lib/countries'
+import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import {
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromWooStatus,
@@ -476,7 +476,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
           lifecycleStatus,
           type: productType,
           hsCode: hsCodeAttr,
-          countryOfOrigin: originIso,
+          countryOfOrigin: originIso ?? DEFAULT_COUNTRY_OF_ORIGIN,
           customsDescription: customsDescriptionAttr,
           externalProductId: BigInt(wcProduct.id),
           categoryId: imsCategoryId ?? null,

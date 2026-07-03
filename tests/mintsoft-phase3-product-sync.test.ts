@@ -225,6 +225,36 @@ test('buildMintsoftProductDto never sends marketing copy as the customs descript
   )
 })
 
+test('buildMintsoftProductDto defaults country of manufacture to CN when origin is empty', () => {
+  const base = {
+    id: 'prod-3',
+    sku: 'SKU-3',
+    name: 'Origin Widget',
+    barcode: null,
+    hsCode: null,
+    customsDescription: null,
+    weight: null,
+    widthCm: null,
+    heightCm: null,
+    depthCm: null,
+    imageUrl: null,
+    type: ProductType.SIMPLE,
+    lifecycleStatus: ProductLifecycleStatus.ACTIVE,
+    wmsProductLinks: [],
+  }
+
+  // No origin -> defaults to China (customs parity with hs-code-woo).
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: null }).countryOfManufacture,
+    'CN',
+  )
+  // A real origin is preserved untouched.
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: 'GB' }).countryOfManufacture,
+    'GB',
+  )
+})
+
 test('resolveMintsoftCommodityCode omits a non-declarable CN code and reports it', () => {
   // Valid 2026 CN8 passes through untouched.
   assert.deepEqual(productSync.resolveMintsoftCommodityCode('01012100'), {

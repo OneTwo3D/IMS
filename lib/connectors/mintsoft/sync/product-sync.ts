@@ -4,6 +4,7 @@ import type { WmsDiscrepancyCategory } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
+import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 
@@ -170,7 +171,7 @@ export function buildMintsoftProductDto(product: ProductSyncCandidate): WmsProdu
     customsDescription: trimToNull(product.customsDescription),
     barcode: trimToNull(product.barcode),
     commodityCode: trimToNull(product.hsCode),
-    countryOfManufacture: trimToNull(product.countryOfOrigin),
+    countryOfManufacture: trimToNull(product.countryOfOrigin) ?? DEFAULT_COUNTRY_OF_ORIGIN,
     weightKg: toNullableNumber(product.weight),
     heightCm: toNullableNumber(product.heightCm),
     widthCm: toNullableNumber(product.widthCm),
