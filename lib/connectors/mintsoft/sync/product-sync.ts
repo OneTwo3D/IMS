@@ -1,7 +1,9 @@
 import { createHash } from 'crypto'
 import { Prisma, ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
+import type { WmsDiscrepancyCategory } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
 import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 
@@ -177,6 +179,26 @@ export function buildMintsoftProductDto(product: ProductSyncCandidate): WmsProdu
   }
 }
 
+/**
+ * Gate a commodity (HS/CN) code before it is declared to the WMS. A code that is not a
+ * declarable 2026 CN8 (see isDeclarableCn8) is omitted — commodityCode is nulled and the
+ * offending value returned as invalidCnCode so the caller can raise a discrepancy. A valid
+ * code is normalised to its canonical 8 digits (punctuation/spacing stripped) so the WMS
+ * always receives e.g. "01012100", never "0101.2100". An absent code passes through as null.
+ */
+export function resolveMintsoftCommodityCode(commodityCode: string | null): {
+  commodityCode: string | null
+  invalidCnCode: string | null
+} {
+  if (!commodityCode) {
+    return { commodityCode: null, invalidCnCode: null }
+  }
+  if (!isDeclarableCn8(commodityCode)) {
+    return { commodityCode: null, invalidCnCode: commodityCode }
+  }
+  return { commodityCode: normalizeCn8(commodityCode), invalidCnCode: null }
+}
+
 export function hashMintsoftProductDto(product: WmsProductDto): string {
   const orderedEntries = Object.entries(product).sort(([left], [right]) => left.localeCompare(right))
   return createHash('sha256').update(JSON.stringify(Object.fromEntries(orderedEntries))).digest('hex')
@@ -319,10 +341,11 @@ async function recordMintsoftProductLinkError(productId: string, error: string) 
   })
 }
 
-async function upsertBarcodeConflict(params: {
+async function upsertProductDiscrepancy(params: {
   scopes: MintsoftProductSyncScope[]
   productId: string
   sku: string
+  category: WmsDiscrepancyCategory
   imsValue: string | null
   wmsValue: string | null
   message: string
@@ -334,7 +357,7 @@ async function upsertBarcodeConflict(params: {
         connector: 'mintsoft',
         warehouseId: scope.warehouseId,
         productId: params.productId,
-        category: 'BARCODE_CONFLICT',
+        category: params.category,
         status: 'OPEN',
       },
       data: {
@@ -361,7 +384,7 @@ async function upsertBarcodeConflict(params: {
           warehouseId: scope.warehouseId,
           productId: params.productId,
           sku: params.sku,
-          category: 'BARCODE_CONFLICT',
+          category: params.category,
           status: 'OPEN',
           imsValue: params.imsValue,
           wmsValue: params.wmsValue,
@@ -382,7 +405,7 @@ async function upsertBarcodeConflict(params: {
         connector: 'mintsoft',
         warehouseId: scope.warehouseId,
         productId: params.productId,
-        category: 'BARCODE_CONFLICT',
+        category: params.category,
         status: 'OPEN',
       },
       data: {
@@ -402,7 +425,11 @@ async function upsertBarcodeConflict(params: {
   }
 }
 
-async function resolveBarcodeConflict(scopes: MintsoftProductSyncScope[], productId: string) {
+async function resolveProductDiscrepancy(
+  scopes: MintsoftProductSyncScope[],
+  productId: string,
+  category: WmsDiscrepancyCategory,
+) {
   const warehouseIds = scopes.map((scope) => scope.warehouseId)
   if (warehouseIds.length === 0) return
 
@@ -411,7 +438,7 @@ async function resolveBarcodeConflict(scopes: MintsoftProductSyncScope[], produc
       connector: 'mintsoft',
       warehouseId: { in: warehouseIds },
       productId,
-      category: 'BARCODE_CONFLICT',
+      category,
       status: 'OPEN',
     },
     data: {
@@ -504,7 +531,7 @@ async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode:
       sku: context.product.sku,
       barcode,
     })
-    await resolveBarcodeConflict(context.scopes, context.product.id)
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'BARCODE_CONFLICT')
 
     return { ok: true }
   } catch (error) {
@@ -517,10 +544,11 @@ async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode:
   const ownerSummary = owner ? `${owner.sku} (${owner.id})` : 'another IMS product'
   const message = `Cannot backfill from WMS — barcode already owned by IMS product ${ownerSummary}.`
 
-  await upsertBarcodeConflict({
+  await upsertProductDiscrepancy({
     scopes: context.scopes,
     productId: context.product.id,
     sku: context.product.sku,
+    category: 'BARCODE_CONFLICT',
     imsValue: null,
     wmsValue: barcode,
     message,
@@ -547,6 +575,13 @@ async function syncOneMintsoftProduct(
   const authoritativeLookup = await fetchAuthoritativeMintsoftProduct(context)
   const authoritative = authoritativeLookup.product
   let dto = buildMintsoftProductDto(context.product)
+  // CN validation (bhdm.3): never declare a malformed / non-2026 CN8 to the WMS. A valid code is
+  // normalised to canonical 8 digits; a bad code is omitted (the rest of the product still syncs)
+  // and recorded as a discrepancy below.
+  const { commodityCode: validatedCommodityCode, invalidCnCode } = resolveMintsoftCommodityCode(dto.commodityCode)
+  if (validatedCommodityCode !== dto.commodityCode) {
+    dto = { ...dto, commodityCode: validatedCommodityCode }
+  }
   let payloadHash = hashMintsoftProductDto(dto)
   const wmsBarcode = trimToNull(authoritative?.barcode)
   const barcodePlan = resolveMintsoftBarcodePlan(dto.barcode, wmsBarcode)
@@ -584,16 +619,32 @@ async function syncOneMintsoftProduct(
   }
 
   if (barcodePlan.kind === 'conflict') {
-    await upsertBarcodeConflict({
+    await upsertProductDiscrepancy({
       scopes: context.scopes,
       productId: context.product.id,
       sku: context.product.sku,
+      category: 'BARCODE_CONFLICT',
       imsValue: dto.barcode,
       wmsValue: wmsBarcode,
       message: `IMS barcode ${dto.barcode} differs from Mintsoft barcode ${wmsBarcode}. Barcode was not overwritten.`,
     })
   } else {
-    await resolveBarcodeConflict(context.scopes, context.product.id)
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'BARCODE_CONFLICT')
+  }
+
+  // Invalid HS/CN code (bhdm.3): flag the omitted code as a discrepancy, or clear a prior one.
+  if (invalidCnCode) {
+    await upsertProductDiscrepancy({
+      scopes: context.scopes,
+      productId: context.product.id,
+      sku: context.product.sku,
+      category: 'INVALID_HS_CODE',
+      imsValue: invalidCnCode,
+      wmsValue: null,
+      message: `IMS HS/CN code "${invalidCnCode}" is not a declarable 2026 CN8 (must be exactly 8 digits and present in the EU CN list). Code was omitted from the Mintsoft push.`,
+    })
+  } else {
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'INVALID_HS_CODE')
   }
 
   const externalProductId = resolveMintsoftExternalProductId({

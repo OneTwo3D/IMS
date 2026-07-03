@@ -225,6 +225,34 @@ test('buildMintsoftProductDto never sends marketing copy as the customs descript
   )
 })
 
+test('resolveMintsoftCommodityCode omits a non-declarable CN code and reports it', () => {
+  // Valid 2026 CN8 passes through untouched.
+  assert.deepEqual(productSync.resolveMintsoftCommodityCode('01012100'), {
+    commodityCode: '01012100',
+    invalidCnCode: null,
+  })
+  // Valid but punctuated code is normalised to canonical 8 digits, not omitted.
+  assert.deepEqual(productSync.resolveMintsoftCommodityCode('0101.2100'), {
+    commodityCode: '01012100',
+    invalidCnCode: null,
+  })
+  // Absent-from-2026 code is omitted and surfaced.
+  assert.deepEqual(productSync.resolveMintsoftCommodityCode('99999999'), {
+    commodityCode: null,
+    invalidCnCode: '99999999',
+  })
+  // Malformed (too short) code is omitted and surfaced.
+  assert.deepEqual(productSync.resolveMintsoftCommodityCode('9020'), {
+    commodityCode: null,
+    invalidCnCode: '9020',
+  })
+  // No code is a no-op (not a discrepancy).
+  assert.deepEqual(productSync.resolveMintsoftCommodityCode(null), {
+    commodityCode: null,
+    invalidCnCode: null,
+  })
+})
+
 test('isMintsoftProductEligible excludes parent and archived products', () => {
   assert.equal(
     productSync.isMintsoftProductEligible({
