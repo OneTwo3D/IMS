@@ -22,10 +22,10 @@ const PRODUCT_SYNC_CANDIDATE_SELECT = {
   id: true,
   sku: true,
   name: true,
-  description: true,
   barcode: true,
   hsCode: true,
   countryOfOrigin: true,
+  customsDescription: true,
   weight: true,
   widthCm: true,
   heightCm: true,
@@ -56,10 +56,10 @@ type ProductSyncCandidate = {
   id: string
   sku: string
   name: string
-  description: string | null
   barcode: string | null
   hsCode: string | null
   countryOfOrigin: string | null
+  customsDescription: string | null
   weight: Prisma.Decimal | null
   widthCm: Prisma.Decimal | null
   heightCm: Prisma.Decimal | null
@@ -165,7 +165,7 @@ export function buildMintsoftProductDto(product: ProductSyncCandidate): WmsProdu
   return {
     sku: product.sku,
     name: product.name,
-    customsDescription: trimToNull(product.description),
+    customsDescription: trimToNull(product.customsDescription),
     barcode: trimToNull(product.barcode),
     commodityCode: trimToNull(product.hsCode),
     countryOfManufacture: trimToNull(product.countryOfOrigin),

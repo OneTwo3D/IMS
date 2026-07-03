@@ -158,10 +158,10 @@ test('buildMintsoftProductDto and hashMintsoftProductDto are stable for equivale
     id: 'prod-1',
     sku: 'SKU-1',
     name: 'Mintsoft Widget',
-    description: 'Warehouse safe description',
     barcode: '5012345678900',
     hsCode: '902000',
     countryOfOrigin: 'GB',
+    customsDescription: 'Cotton widget for customs',
     weight: { toString: () => '1.25', valueOf: () => 1.25 } as never,
     widthCm: { toString: () => '10', valueOf: () => 10 } as never,
     heightCm: { toString: () => '11', valueOf: () => 11 } as never,
@@ -175,7 +175,7 @@ test('buildMintsoftProductDto and hashMintsoftProductDto are stable for equivale
   assert.deepEqual(dto, {
     sku: 'SKU-1',
     name: 'Mintsoft Widget',
-    customsDescription: 'Warehouse safe description',
+    customsDescription: 'Cotton widget for customs',
     barcode: '5012345678900',
     commodityCode: '902000',
     countryOfManufacture: 'GB',
@@ -189,6 +189,39 @@ test('buildMintsoftProductDto and hashMintsoftProductDto are stable for equivale
   assert.equal(
     productSync.hashMintsoftProductDto(dto),
     productSync.hashMintsoftProductDto({ ...dto }),
+  )
+})
+
+test('buildMintsoftProductDto never sends marketing copy as the customs description', () => {
+  const base = {
+    id: 'prod-2',
+    sku: 'SKU-2',
+    name: 'Customs Widget',
+    barcode: null,
+    hsCode: null,
+    countryOfOrigin: null,
+    weight: null,
+    widthCm: null,
+    heightCm: null,
+    depthCm: null,
+    imageUrl: null,
+    type: ProductType.SIMPLE,
+    lifecycleStatus: ProductLifecycleStatus.ACTIVE,
+    wmsProductLinks: [],
+  }
+
+  // Strict policy: only the dedicated customsDescription is sent; missing/blank -> null.
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, customsDescription: 'Real customs text' }).customsDescription,
+    'Real customs text',
+  )
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, customsDescription: null }).customsDescription,
+    null,
+  )
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, customsDescription: '   ' }).customsDescription,
+    null,
   )
 })
 
