@@ -172,6 +172,32 @@ function asTrimmedString(value: unknown): string | null {
   return null
 }
 
+// Trade fields (HS code / country-of-origin / customs description) are owned upstream by
+// hs-code-woo, which writes authoritative WC pa_* attributes. Policy: WC wins when present.
+// When WC supplies a differing value we overwrite IMS (so re-classifications/corrections
+// propagate); when WC omits the attribute we preserve the existing IMS value (never null it).
+// Inputs are expected already-trimmed (see asTrimmedString / toIsoCountryCode at the call
+// site); an empty string is treated as absent via truthiness.
+export const WC_TRADE_FIELDS = ['hsCode', 'countryOfOrigin', 'customsDescription'] as const
+export type WcTradeField = (typeof WC_TRADE_FIELDS)[number]
+export type WcTradeSnapshot = Record<WcTradeField, string | null>
+export type WcTradeFieldChange = { field: WcTradeField; from: string | null; to: string }
+
+export function resolveWcTradeFieldUpdates(
+  existing: WcTradeSnapshot,
+  incoming: WcTradeSnapshot,
+): WcTradeFieldChange[] {
+  const changes: WcTradeFieldChange[] = []
+  for (const field of WC_TRADE_FIELDS) {
+    const next = incoming[field]
+    // WC value absent/empty -> preserve IMS; present and different -> overwrite.
+    if (next && next !== existing[field]) {
+      changes.push({ field, from: existing[field], to: next })
+    }
+  }
+  return changes
+}
+
 /** Parse a WC numeric-ish value, returning null if empty/NaN. */
 function parseNum(val: unknown): number | null {
   const normalized = asTrimmedString(val)
@@ -355,10 +381,19 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
       // GTIN — only set if IMS field is currently null/empty
       if (gtin && !existing.barcode) updateData.barcode = gtin
 
-      // Customs — only set if IMS field is currently null/empty
-      if (hsCodeAttr && !existing.hsCode) updateData.hsCode = hsCodeAttr
-      if (originIso && !existing.countryOfOrigin) updateData.countryOfOrigin = originIso
-      if (customsDescriptionAttr && !existing.customsDescription) updateData.customsDescription = customsDescriptionAttr
+      // Trade fields — hs-code-woo (WC pa_*) is authoritative: overwrite IMS when WC supplies
+      // a differing value so re-classifications propagate; preserve IMS when WC omits it.
+      const tradeChanges = resolveWcTradeFieldUpdates(
+        {
+          hsCode: existing.hsCode,
+          countryOfOrigin: existing.countryOfOrigin,
+          customsDescription: existing.customsDescription,
+        },
+        { hsCode: hsCodeAttr, countryOfOrigin: originIso, customsDescription: customsDescriptionAttr },
+      )
+      for (const change of tradeChanges) {
+        updateData[change.field] = change.to
+      }
 
       // Category — link to mirrored IMS category for the deepest WC category
       // referenced by this product. If WC dropped all categories, clear the link.
@@ -366,6 +401,19 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
       const saved = await db.product.update({ where: { id: existing.id }, data: updateData })
       const syncedProductId = saved.id
+
+      // Audit trail when hs-code-woo overwrote IMS trade fields (bhdm.2).
+      if (tradeChanges.length > 0) {
+        await logActivity({
+          entityType: 'PRODUCT',
+          entityId: syncedProductId,
+          action: 'wc_trade_fields_updated',
+          tag: 'sync',
+          description: `WC trade fields updated on ${saved.sku}: ${tradeChanges
+            .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to}`)
+            .join(', ')}`,
+        })
+      }
 
       // --- Variations (VARIABLE products) ---
       if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
