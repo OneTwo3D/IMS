@@ -46,6 +46,7 @@
     "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
     "@aws-sdk/client-s3": "^3.1030.0",
     "@base-ui/react": "^1.4.0",
     "@prisma/adapter-pg": "^7.7.0",
