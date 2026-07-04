@@ -600,7 +600,7 @@ export async function previewMissingXeroTaxRates(): Promise<MissingTaxRatePrevie
         name: rate.name,
         ratePct: rate.rate * 100,
         reportingCategory: rate.reportingCategory,
-        reportType: xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name }),
+        reportType: xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name, rate: rate.rate }),
       })),
       alreadyMapped: plan.alreadyMapped.length,
       skippedExisting: plan.skippedExisting.length,
@@ -651,7 +651,7 @@ export async function generateMissingXeroTaxRates(
         const override = reportTypeOverrides?.[rate.id]
         const reportTaxType = isXeroReportTaxType(override)
           ? override
-          : xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name })
+          : xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name, rate: rate.rate })
         const components = taxComponentsForCreation(rate)
         const res = await putXeroTaxRate({ name: rate.name, reportTaxType, components, status: 'ACTIVE' })
         if (!res.success || !res.taxType) {

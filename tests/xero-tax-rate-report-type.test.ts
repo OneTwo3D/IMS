@@ -22,11 +22,19 @@ test('EC_SALES splits by usedFor', () => {
   assert.equal(xeroReportTaxType({ reportingCategory: 'EC_SALES', usedFor: 'PURCHASE' }), 'ECACQUISITIONS')
 })
 
-test('OSS rates outside EU/IOSS/VOEC are treated as exempt (Xero rejects NONE at creation)', () => {
-  // Channel Islands / Isle of Man / Monaco — non-EU, non-VOEC → EXEMPT.
-  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'SALES', name: 'CI VAT' }), 'EXEMPTOUTPUT')
-  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'BOTH', name: 'MC VAT' }), 'EXEMPTOUTPUT')
-  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'PURCHASE', name: 'IM VAT' }), 'EXEMPTINPUT')
+test('zero-rated OSS rates outside EU/IOSS/VOEC are exempt (Xero rejects NONE at creation)', () => {
+  // Channel Islands at 0% → EXEMPT (a valid exempt rate has a zero component).
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'SALES', name: 'CI VAT', rate: 0 }), 'EXEMPTOUTPUT')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'PURCHASE', name: 'CI VAT', rate: 0 }), 'EXEMPTINPUT')
+  // Missing rate is treated as zero-rated (defaults to exempt).
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'BOTH', name: 'CI VAT' }), 'EXEMPTOUTPUT')
+})
+
+test('non-zero OSS rates outside EU/IOSS/VOEC fall back to OUTPUT/INPUT (Xero forbids non-zero exempt)', () => {
+  // Isle of Man / Monaco at 20% can't be exempt → safe default the operator overrides.
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'SALES', name: 'IM VAT', rate: 0.2 }), 'OUTPUT')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'BOTH', name: 'MC VAT', rate: 0.2 }), 'OUTPUT')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'PURCHASE', name: 'MC VAT', rate: 0.2 }), 'INPUT')
 })
 
 test('VOEC (Norway/NO) sales report via MOSS Sales, like the EU OSS rates', () => {

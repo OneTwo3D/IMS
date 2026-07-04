@@ -15,8 +15,8 @@
  *   REVERSE_CHARGE any         -> REVERSECHARGES
  *   EC_SALES       SALES/BOTH  -> ECOUTPUTSERVICES
  *   EC_SALES       PURCHASE    -> ECACQUISITIONS
- *   OSS (non-EU/   SALES/BOTH  -> EXEMPTOUTPUT
- *    non-VOEC)     PURCHASE    -> EXEMPTINPUT
+ *   OSS (non-EU/   0% SALES/BOTH -> EXEMPTOUTPUT   0% PURCHASE -> EXEMPTINPUT
+ *    non-VOEC)     ≠0 SALES/BOTH -> OUTPUT         ≠0 PURCHASE -> INPUT
  *   (unset)        SALES/BOTH  -> OUTPUT
  *   (unset)        PURCHASE    -> INPUT
  *
@@ -29,8 +29,9 @@
  * MOSSSALES (Xero "MOSS Sales"). This overrides the category default for every
  * case EXCEPT an explicit REVERSE_CHARGE (which still wins) and purchase-only
  * rates. OSS rates outside those schemes (e.g. Channel Islands, Isle of Man,
- * Monaco) are treated as exempt (EXEMPTOUTPUT / EXEMPTINPUT) — the operator can
- * still change any of these per-rate in the confirmation dialog.
+ * Monaco) are treated as exempt when zero-rated (EXEMPTOUTPUT / EXEMPTINPUT);
+ * ones that still charge VAT can't be exempt in Xero, so they fall back to
+ * OUTPUT / INPUT. The operator can change any of these per-rate in the dialog.
  *
  * Pure — no IO. Unit-tested in tests/xero-tax-rate-report-type.test.ts.
  */
@@ -108,13 +109,17 @@ function leadingIsoCode(name: string | null | undefined): string | null {
 export function xeroReportTaxType(input: {
   reportingCategory: string | null | undefined
   usedFor: string | null | undefined
-  /** Rate name — used to detect the EU-distance-selling (MOSS) default. */
+  /** Rate name — used to detect the EU/VOEC-distance-selling (MOSS) default. */
   name?: string | null
+  /** Effective rate as a decimal fraction (e.g. 0.2 for 20%). Used to keep the
+   *  exempt default valid — Xero rejects an exempt rate with a non-zero component. */
+  rate?: number | null
 }): XeroReportTaxType {
   const category = normalizeCategory(input.reportingCategory)
   const purchase = isPurchaseOnly(input.usedFor)
   const code = leadingIsoCode(input.name)
   const isEuOrVoec = code != null && (EU_ISO_CODES.has(code) || VOEC_ISO_CODES.has(code))
+  const isZeroRated = Math.abs(input.rate ?? 0) < 1e-9
 
   // Reverse charge is a deliberate, fundamentally different treatment — it wins
   // even for EU-named rates.
@@ -127,10 +132,13 @@ export function xeroReportTaxType(input: {
     case 'EC_SALES':
       return purchase ? 'ECACQUISITIONS' : 'ECOUTPUTSERVICES'
     case 'OSS':
-      // OSS rates that AREN'T EU/IOSS or VOEC (e.g. Channel Islands, Isle of Man,
-      // Monaco) fall outside those schemes → treated as exempt. Xero rejects NONE
-      // at creation, so we use EXEMPTOUTPUT/EXEMPTINPUT.
-      return purchase ? 'EXEMPTINPUT' : 'EXEMPTOUTPUT'
+      // OSS rates outside EU/IOSS/VOEC (e.g. Channel Islands, Isle of Man,
+      // Monaco) are treated as exempt — but Xero rejects a non-zero exempt
+      // component, so only zero-rated ones map to EXEMPT. Any that still charge
+      // VAT get a safe standard default the operator changes per-rate in the
+      // confirmation dialog.
+      if (isZeroRated) return purchase ? 'EXEMPTINPUT' : 'EXEMPTOUTPUT'
+      return purchase ? 'INPUT' : 'OUTPUT'
     case 'DOMESTIC':
     default:
       return purchase ? 'INPUT' : 'OUTPUT'
