@@ -4,6 +4,7 @@ import { CalendarDays, Receipt, Coins, RefreshCw, ArrowLeftRight } from 'lucide-
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
 import { getSetting, getTaxRates } from '@/app/actions/settings'
+import { getAccountingConnectionStatus } from '@/app/actions/accounting-sync'
 import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-status'
 import { getCurrencies, getLatestFxRates, getFxPushLog, getFxHealth } from '@/app/actions/currencies'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -87,7 +88,7 @@ export default async function AccountingSettingsPage({
             Define VAT rates for sales and purchases. Rates marked &quot;Both&quot; apply to sales and purchases.
             {' '}These rates still apply even when no accounting connector is enabled.
           </p>
-          <TaxRatesTable taxRates={taxData.taxRates} drift={taxData.drift?.byTaxRateId} driftSyncEnabled={taxData.drift?.syncEnabled} />
+          <TaxRatesTable taxRates={taxData.taxRates} drift={taxData.drift?.byTaxRateId} driftSyncEnabled={taxData.drift?.syncEnabled} accountingConnected={taxData.accountingConnected} />
         </Card>
       )}
 
@@ -151,11 +152,12 @@ async function loadFinancialYear() {
 }
 
 async function loadTaxRates() {
-  const [taxRates, drift] = await Promise.all([
+  const [taxRates, drift, accountingStatus] = await Promise.all([
     getTaxRates(false),
     getCurrentTaxRateDrift().catch(() => null),
+    getAccountingConnectionStatus().catch(() => ({ connected: false })),
   ])
-  return { taxRates, drift }
+  return { taxRates, drift, accountingConnected: accountingStatus.connected }
 }
 
 async function loadCurrencies() {

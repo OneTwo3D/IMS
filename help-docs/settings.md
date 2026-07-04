@@ -172,18 +172,11 @@ Setting `TaxRate.reverseCharge` to true changes how IMS posts the line to the ac
 
 If the reverse-charge tax type settings are empty, IMS falls back to the parent `TaxRate.accountingTaxType` — the line still posts but is not flagged as reverse-charge on the accounting side.
 
-### Tax rate mapping (IMS ↔ accounting ↔ WooCommerce)
+### Generate missing accounting tax rates
 
-The **Tax rate mapping** card (open the **Sync** page → **WooCommerce** connector, or the onboarding "connect accounting" step) reconciles your IMS VAT rates with the tax codes in your accounting connector and WooCommerce. IMS is the hub: every IMS rate should map to one connector tax type (`TaxRate.accountingTaxType`) and, if WooCommerce is connected, to one WC tax rate. The card offers:
+**Where:** the VAT rates screen itself — **Settings > Accounting > Tax** (the same page where you add and enable/disable rates). When an accounting connector is connected, a **Generate missing rates** button appears next to **Add VAT Rate**. This complements the **Xero drift** chips on each rate ("no matching rate in Xero").
 
-- **Import from store** (WooCommerce connected) — pull WC tax rates in so they can be matched.
-- **Refresh accounting rates** (accounting connected) — reload the connector's current tax codes.
-- **Auto-apply suggestions** — apply confident matches automatically. Matching is rate-first, then normalized name; rate conflicts and low-confidence matches are left for manual review.
-- **Generate missing rates** (accounting connected) — create the tax codes an IMS rate needs but the connector doesn't have yet, then auto-map them.
-
-#### Generate missing rates
-
-For every **active, unmapped** IMS rate (`accountingTaxType` blank) that has **no name-match** among the connector's existing rates, IMS can create the rate in the connector and write the returned tax type back onto the IMS rate. Rates that already name-match an existing connector rate are **skipped** (use Auto-apply for those — no duplicates are created). Clicking the button first shows a read-only **preview dialog** listing each rate to be created with its rate and derived report type; nothing is written until you confirm.
+For every **active, unmapped** IMS rate (`accountingTaxType` blank) that has **no name-match** among the connector's existing rates, IMS can create the rate in the connector and write the returned tax type back onto the IMS rate. Rates that already name-match an existing connector rate are **skipped** (map those with the WooCommerce-connector tax-rate mapper's **Auto-apply** — no duplicates are created). Clicking the button first shows a read-only **preview dialog** listing each rate to be created with its rate and derived report type; nothing is written until you confirm.
 
 - **Xero** — fully supported. Creates each rate via `POST /TaxRates` (mirroring any tax components) and sets `ReportTaxType` from the IMS `Reporting category` + `Used for`:
 
