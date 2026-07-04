@@ -22,12 +22,18 @@ test('EC_SALES splits by usedFor', () => {
   assert.equal(xeroReportTaxType({ reportingCategory: 'EC_SALES', usedFor: 'PURCHASE' }), 'ECACQUISITIONS')
 })
 
-test('OSS sales file to MOSSSALES (Xero rejects NONE at creation); OSS purchases to INPUT', () => {
-  // Non-EU-named OSS rate (e.g. Channel Islands "CI VAT") still gets a valid
-  // report type — regression for onetwo3d-ims-tdzp (NONE was rejected by Xero).
-  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'SALES', name: 'CI VAT' }), 'MOSSSALES')
-  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'BOTH', name: 'MC VAT' }), 'MOSSSALES')
-  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'PURCHASE', name: 'IM VAT' }), 'INPUT')
+test('OSS rates outside EU/IOSS/VOEC are treated as exempt (Xero rejects NONE at creation)', () => {
+  // Channel Islands / Isle of Man / Monaco — non-EU, non-VOEC → EXEMPT.
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'SALES', name: 'CI VAT' }), 'EXEMPTOUTPUT')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'BOTH', name: 'MC VAT' }), 'EXEMPTOUTPUT')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'PURCHASE', name: 'IM VAT' }), 'EXEMPTINPUT')
+})
+
+test('VOEC (Norway/NO) sales report via MOSS Sales, like the EU OSS rates', () => {
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'SALES', name: 'NO VAT' }), 'MOSSSALES')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'BOTH', name: 'NO VAT' }), 'MOSSSALES')
+  // VOEC is a sales scheme — a purchase-only NO rate falls back to the exempt default.
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'PURCHASE', name: 'NO VAT' }), 'EXEMPTINPUT')
 })
 
 test('unset category defaults to OUTPUT/INPUT by usedFor', () => {

@@ -15,21 +15,22 @@
  *   REVERSE_CHARGE any         -> REVERSECHARGES
  *   EC_SALES       SALES/BOTH  -> ECOUTPUTSERVICES
  *   EC_SALES       PURCHASE    -> ECACQUISITIONS
- *   OSS            SALES/BOTH  -> MOSSSALES
- *   OSS            PURCHASE    -> INPUT
+ *   OSS (non-EU/   SALES/BOTH  -> EXEMPTOUTPUT
+ *    non-VOEC)     PURCHASE    -> EXEMPTINPUT
  *   (unset)        SALES/BOTH  -> OUTPUT
  *   (unset)        PURCHASE    -> INPUT
  *
  * NOTE (onetwo3d-ims-tdzp): Xero rejects ReportTaxType `NONE` at rate creation
- * ("not valid for this organisation"), so it is never emitted or offered. OSS
- * sales report via MOSS (One Stop Shop = the MOSS successor), which Xero accepts.
+ * ("not valid for this organisation"), so it is never emitted or offered.
  *
- * EU distance-selling override (onetwo3d-ims-tdzp): a rate whose NAME starts
- * with an EU member-state ISO code (e.g. "DE Standard", "FR 20%") is an OSS/MOSS
- * distance sale, so it defaults to MOSSSALES (Xero "MOSS Sales"). This overrides
- * the category default for every case EXCEPT an explicit REVERSE_CHARGE (a
- * deliberately different VAT treatment that still wins) and purchase-only rates
- * (MOSS Sales is a sales report type).
+ * EU / VOEC distance-selling override (onetwo3d-ims-tdzp): a SALES rate whose
+ * NAME starts with an EU member-state ISO code (e.g. "DE Standard", "FR 20%") or
+ * a VOEC code (Norway "NO") is an OSS/IOSS/VOEC distance sale, so it reports via
+ * MOSSSALES (Xero "MOSS Sales"). This overrides the category default for every
+ * case EXCEPT an explicit REVERSE_CHARGE (which still wins) and purchase-only
+ * rates. OSS rates outside those schemes (e.g. Channel Islands, Isle of Man,
+ * Monaco) are treated as exempt (EXEMPTOUTPUT / EXEMPTINPUT) — the operator can
+ * still change any of these per-rate in the confirmation dialog.
  *
  * Pure — no IO. Unit-tested in tests/xero-tax-rate-report-type.test.ts.
  */
@@ -41,6 +42,8 @@ export type XeroReportTaxType =
   | 'ECOUTPUTSERVICES'
   | 'ECACQUISITIONS'
   | 'MOSSSALES'
+  | 'EXEMPTOUTPUT'
+  | 'EXEMPTINPUT'
 
 /**
  * The report types the generator can produce / the operator may pick in the
@@ -55,6 +58,8 @@ export const XERO_REPORT_TAX_TYPES: XeroReportTaxType[] = [
   'ECOUTPUTSERVICES',
   'ECACQUISITIONS',
   'MOSSSALES',
+  'EXEMPTOUTPUT',
+  'EXEMPTINPUT',
   'REVERSECHARGES',
 ]
 
@@ -73,6 +78,12 @@ const EU_ISO_CODES = new Set([
   'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE',
 ])
 
+/**
+ * VOEC (VAT On E-Commerce) ISO codes — Norway's low-value-goods scheme. Like the
+ * EU OSS/IOSS rates, VOEC sales report via MOSS Sales (onetwo3d-ims-tdzp).
+ */
+const VOEC_ISO_CODES = new Set(['NO'])
+
 /** Normalise reportingCategory to the canonical uppercase token, or null. */
 function normalizeCategory(category: string | null | undefined): string | null {
   if (!category) return null
@@ -85,15 +96,13 @@ function isPurchaseOnly(usedFor: string | null | undefined): boolean {
 }
 
 /**
- * The EU ISO code a rate name starts with, or null. Only matches a leading
- * 2-letter token that is NOT part of a longer word — so "DE Standard",
- * "FR-20%" and "NL" match, but "Deutschland" (DE followed by a letter) does not.
+ * The leading ISO 3166-1 alpha-2 code a rate name starts with, or null. Only
+ * matches a leading 2-letter token that is NOT part of a longer word — so
+ * "DE Standard", "FR-20%" and "NL" match, but "Deutschland" does not.
  */
-function euIsoPrefix(name: string | null | undefined): string | null {
+function leadingIsoCode(name: string | null | undefined): string | null {
   const match = (name ?? '').trim().match(/^([A-Za-z]{2})(?![A-Za-z])/)
-  if (!match) return null
-  const code = match[1].toUpperCase()
-  return EU_ISO_CODES.has(code) ? code : null
+  return match ? match[1].toUpperCase() : null
 }
 
 export function xeroReportTaxType(input: {
@@ -104,20 +113,24 @@ export function xeroReportTaxType(input: {
 }): XeroReportTaxType {
   const category = normalizeCategory(input.reportingCategory)
   const purchase = isPurchaseOnly(input.usedFor)
+  const code = leadingIsoCode(input.name)
+  const isEuOrVoec = code != null && (EU_ISO_CODES.has(code) || VOEC_ISO_CODES.has(code))
 
   // Reverse charge is a deliberate, fundamentally different treatment — it wins
   // even for EU-named rates.
   if (category === 'REVERSE_CHARGE') return 'REVERSECHARGES'
 
-  // EU distance-selling: an EU-ISO-prefixed sales rate defaults to MOSS Sales.
-  if (!purchase && euIsoPrefix(input.name)) return 'MOSSSALES'
+  // EU distance-selling (OSS/IOSS) and VOEC both report sales via MOSS Sales.
+  if (!purchase && isEuOrVoec) return 'MOSSSALES'
 
   switch (category) {
     case 'EC_SALES':
       return purchase ? 'ECACQUISITIONS' : 'ECOUTPUTSERVICES'
     case 'OSS':
-      // OSS (One Stop Shop) sales report via MOSS; Xero rejects NONE at creation.
-      return purchase ? 'INPUT' : 'MOSSSALES'
+      // OSS rates that AREN'T EU/IOSS or VOEC (e.g. Channel Islands, Isle of Man,
+      // Monaco) fall outside those schemes → treated as exempt. Xero rejects NONE
+      // at creation, so we use EXEMPTOUTPUT/EXEMPTINPUT.
+      return purchase ? 'EXEMPTINPUT' : 'EXEMPTOUTPUT'
     case 'DOMESTIC':
     default:
       return purchase ? 'INPUT' : 'OUTPUT'
