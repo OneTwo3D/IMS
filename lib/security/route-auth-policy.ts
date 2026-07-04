@@ -138,6 +138,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/hs-classify': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
   '/api/cron/invariant-check': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',

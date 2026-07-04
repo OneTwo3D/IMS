@@ -5,10 +5,9 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { classifyHsCode } from '@/lib/trade/hs-classifier'
 import { validateHsCode, isApprovableHsValidation } from '@/lib/trade/hs-validate'
-import { Prisma } from '@/app/generated/prisma/client'
 import type { HsCodeProposalStatus } from '@/app/generated/prisma/client'
+import { upsertHsCodeProposal } from '@/lib/trade/hs-proposal-service'
 
 export type HsProposalRow = {
   id: string
@@ -87,61 +86,8 @@ export async function listHsCodeProposals(status: HsCodeProposalStatus = 'PENDIN
  */
 export async function proposeHsCodeForProduct(productId: string): Promise<HsProposalRow | null> {
   await requirePermission('inventory.edit')
-  const product = await db.product.findUnique({
-    where: { id: productId },
-    select: {
-      id: true,
-      sku: true,
-      name: true,
-      description: true,
-      customsDescription: true,
-      category: { select: { name: true } },
-    },
-  })
-  if (!product) return null
-
-  const categoryPath = product.category?.name ?? null
-  const classification = await classifyHsCode({
-    name: product.name,
-    description: product.description,
-    categoryPath,
-  })
-  const validation = validateHsCode({
-    cnCode: classification.cnCode,
-    customsDescription: product.customsDescription,
-    name: product.name,
-    categoryPath,
-  })
-
-  const data = {
-    proposedHsCode: classification.cnCode,
-    proposedCustomsDescription: product.customsDescription,
-    source: classification.source,
-    modelConfidence: classification.modelConfidence,
-    confidence: validation.confidence,
-    band: validation.band,
-    flags: validation.flags.join(','),
-    writeBlocking: validation.writeBlockingFlags.length > 0,
-    declarable: validation.declarable,
-    reasoning: classification.reasoning || validation.notes,
-    status: 'PENDING' as const,
-  }
-
-  const include = { product: { select: { sku: true, name: true } } } as const
-  // Create-first: the partial unique index guarantees ≤1 PENDING per product. If one already
-  // exists we get P2002 and update it in place (WHERE status='PENDING', so we can never resurrect
-  // an already-reviewed proposal). If none exists (e.g. the prior one was just approved), create
-  // makes a fresh PENDING row.
-  let saved
-  try {
-    saved = await db.hsCodeProposal.create({ data: { productId, ...data }, include })
-  } catch (error) {
-    if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002')) throw error
-    await db.hsCodeProposal.updateMany({ where: { productId, status: 'PENDING' }, data })
-    saved = await db.hsCodeProposal.findFirst({ where: { productId, status: 'PENDING' }, include })
-    if (!saved) return null // the pending row was reviewed between the update and the read (rare)
-  }
-
+  const saved = await upsertHsCodeProposal(productId)
+  if (!saved) return null
   revalidatePath('/trade/hs-code-review')
   return toRow(saved)
 }
