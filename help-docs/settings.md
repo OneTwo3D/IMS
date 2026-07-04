@@ -174,7 +174,7 @@ If the reverse-charge tax type settings are empty, IMS falls back to the parent 
 
 ### Tax rate mapping (IMS ↔ accounting ↔ WooCommerce)
 
-The **Tax rate mapping** card (Settings > Accounting, and the onboarding "connect accounting" step) reconciles your IMS VAT rates with the tax codes in your accounting connector and WooCommerce. IMS is the hub: every IMS rate should map to one connector tax type (`TaxRate.accountingTaxType`) and, if WooCommerce is connected, to one WC tax rate. The card offers:
+The **Tax rate mapping** card (open the **Sync** page → **WooCommerce** connector, or the onboarding "connect accounting" step) reconciles your IMS VAT rates with the tax codes in your accounting connector and WooCommerce. IMS is the hub: every IMS rate should map to one connector tax type (`TaxRate.accountingTaxType`) and, if WooCommerce is connected, to one WC tax rate. The card offers:
 
 - **Import from store** (WooCommerce connected) — pull WC tax rates in so they can be matched.
 - **Refresh accounting rates** (accounting connected) — reload the connector's current tax codes.
