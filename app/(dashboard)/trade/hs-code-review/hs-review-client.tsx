@@ -25,6 +25,7 @@ import {
 import {
   approveHsCodeProposal,
   rejectHsCodeProposal,
+  proposeHsCodeForProduct,
   type HsProposalRow,
 } from '@/app/actions/hs-proposals'
 
@@ -49,6 +50,13 @@ export function HsReviewClient({ initialProposals }: Props) {
     setCode(row.proposedHsCode ?? '')
     setNote('')
     setError('')
+  }
+
+  function handleReclassify(productId: string) {
+    startTransition(async () => {
+      await proposeHsCodeForProduct(productId, true) // force a fresh classification
+      router.refresh()
+    })
   }
 
   function close() {
@@ -139,9 +147,20 @@ export function HsReviewClient({ initialProposals }: Props) {
               </TableCell>
               <TableCell className="text-xs text-muted-foreground">{row.source}</TableCell>
               <TableCell className="text-right">
-                <Button size="sm" onClick={() => openReview(row)} disabled={isPending}>
-                  Review
-                </Button>
+                <div className="flex justify-end gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleReclassify(row.productId)}
+                    disabled={isPending}
+                    title="Re-run the classifier for this product"
+                  >
+                    Re-classify
+                  </Button>
+                  <Button size="sm" onClick={() => openReview(row)} disabled={isPending}>
+                    Review
+                  </Button>
+                </div>
               </TableCell>
             </TableRow>
           ))}

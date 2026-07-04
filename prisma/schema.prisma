@@ -2534,11 +2534,14 @@ model HsCodeProposal {
   productId                  String
   proposedHsCode             String?
   proposedCustomsDescription String?
-  source                     String
+  source                     String               @default("pending")
   modelConfidence            Int                  @default(0)
   confidence                 Int                  @default(0)
-  band                       String
+  band                       String               @default("low")
   flags                      String               @default("")
+  /// Hash of the classification-relevant fields (name/description/category) at classify time,
+  /// so a product edit that changes them can invalidate this proposal for re-classification (6igm.5).
+  classificationFieldsHash   String?
   writeBlocking              Boolean              @default(false)
   declarable                 Boolean              @default(false)
   reasoning                  String               @default("")

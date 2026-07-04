@@ -13,6 +13,7 @@ import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock
 import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
 import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
+import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
 import {
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromWooStatus,
@@ -401,6 +402,11 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
       const saved = await db.product.update({ where: { id: existing.id }, data: updateData })
       const syncedProductId = saved.id
+
+      // If WC changed the classification-relevant fields, drop the stale HS-code proposal so the
+      // sweep re-classifies (6igm.5/.7). Fire-and-forget (not after() — this runs in non-request
+      // sync/cron contexts too); never affects the import result.
+      void invalidateStaleHsProposal(syncedProductId).catch((err) => console.error(err))
 
       // Audit trail when hs-code-woo overwrote IMS trade fields (bhdm.2).
       if (tradeChanges.length > 0) {

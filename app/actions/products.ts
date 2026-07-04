@@ -9,6 +9,7 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
+import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import { scheduleWmsProductSync, isAnyWmsConnectorEnabled } from '@/lib/domain/wms/product-sync-dispatch'
 import {
@@ -962,6 +963,13 @@ export async function updateProduct(
   }
   if (hasPermission(session.user.role, 'sync') && await isAnyWmsConnectorEnabled()) {
     scheduleWmsProductSync(id)
+  }
+  // If the classification-relevant fields changed, drop the stale HS-code proposal so the
+  // sweep re-classifies (6igm.5/.7). Best-effort — never block the product save.
+  try {
+    await invalidateStaleHsProposal(id)
+  } catch (hsError) {
+    console.error(hsError)
   }
 
   revalidatePath('/inventory')

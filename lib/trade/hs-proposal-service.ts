@@ -8,6 +8,7 @@ import { db } from '@/lib/db'
 import { Prisma } from '@/app/generated/prisma/client'
 import { classifyHsCode } from '@/lib/trade/hs-classifier'
 import { validateHsCode } from '@/lib/trade/hs-validate'
+import { hsClassificationFieldsHash, shouldSkipHsReclassification } from '@/lib/trade/hs-classification-fields'
 
 const PROPOSAL_INCLUDE = { product: { select: { sku: true, name: true } } } as const
 
@@ -19,7 +20,10 @@ export type HsCodeProposalWithProduct = Prisma.HsCodeProposalGetPayload<{ includ
  * update that row in place (WHERE status='PENDING'); otherwise a fresh PENDING row is created.
  * Returns null if the product no longer exists (or the pending row was reviewed mid-flight).
  */
-export async function upsertHsCodeProposal(productId: string): Promise<HsCodeProposalWithProduct | null> {
+export async function upsertHsCodeProposal(
+  productId: string,
+  { force = false }: { force?: boolean } = {},
+): Promise<HsCodeProposalWithProduct | null> {
   const product = await db.product.findUnique({
     where: { id: productId },
     select: {
@@ -33,6 +37,23 @@ export async function upsertHsCodeProposal(productId: string): Promise<HsCodePro
   if (!product) return null
 
   const categoryPath = product.category?.name ?? null
+  const fieldsHash = hsClassificationFieldsHash({
+    name: product.name,
+    description: product.description,
+    categoryPath,
+  })
+
+  // 6igm.5: if a PENDING proposal already reflects the current classification-relevant fields,
+  // don't re-bill the API on a routine re-run (the sweep or an unchanged save). `force` (the
+  // Re-classify button) bypasses this. This also prevents two overlapping sweeps double-classifying.
+  const existing = await db.hsCodeProposal.findFirst({
+    where: { productId, status: 'PENDING' },
+    select: { id: true, classificationFieldsHash: true },
+  })
+  if (existing && shouldSkipHsReclassification(existing.classificationFieldsHash, fieldsHash, force)) {
+    return db.hsCodeProposal.findUnique({ where: { id: existing.id }, include: PROPOSAL_INCLUDE })
+  }
+
   const classification = await classifyHsCode({
     name: product.name,
     description: product.description,
@@ -56,9 +77,13 @@ export async function upsertHsCodeProposal(productId: string): Promise<HsCodePro
     writeBlocking: validation.writeBlockingFlags.length > 0,
     declarable: validation.declarable,
     reasoning: classification.reasoning || validation.notes,
+    classificationFieldsHash: fieldsHash,
     status: 'PENDING' as const,
   }
 
+  if (existing) {
+    return db.hsCodeProposal.update({ where: { id: existing.id }, data, include: PROPOSAL_INCLUDE })
+  }
   try {
     return await db.hsCodeProposal.create({ data: { productId, ...data }, include: PROPOSAL_INCLUDE })
   } catch (error) {

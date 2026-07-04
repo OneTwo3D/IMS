@@ -84,9 +84,13 @@ export async function listHsCodeProposals(status: HsCodeProposalStatus = 'PENDIN
  * proposal for review. One PENDING proposal per product — a re-classification replaces it.
  * Called ad-hoc from the UI and in bulk by the background sweep (6igm.4).
  */
-export async function proposeHsCodeForProduct(productId: string): Promise<HsProposalRow | null> {
+export async function proposeHsCodeForProduct(
+  productId: string,
+  force = false,
+): Promise<HsProposalRow | null> {
   await requirePermission('inventory.edit')
-  const saved = await upsertHsCodeProposal(productId)
+  // force=true is the "Re-classify" action — re-run even if a fresh proposal already exists.
+  const saved = await upsertHsCodeProposal(productId, { force })
   if (!saved) return null
   revalidatePath('/trade/hs-code-review')
   return toRow(saved)
