@@ -187,13 +187,13 @@ For every **active, unmapped** IMS rate (`accountingTaxType` blank) that has **n
   | `REVERSE_CHARGE` | any | `REVERSECHARGES` |
   | `EC_SALES` | SALES / BOTH | `ECOUTPUTSERVICES` |
   | `EC_SALES` | PURCHASE | `ECACQUISITIONS` |
-  | `OSS` (non-EU / non-VOEC) | SALES / BOTH | `EXEMPTOUTPUT` |
-  | `OSS` (non-EU / non-VOEC) | PURCHASE | `EXEMPTINPUT` |
+  | `OSS` (non-EU / non-VOEC) **at 0%** | SALES / BOTH → `EXEMPTOUTPUT`, PURCHASE → `EXEMPTINPUT` | |
+  | `OSS` (non-EU / non-VOEC) **charging VAT** | SALES / BOTH → `OUTPUT`, PURCHASE → `INPUT` | |
   | (unset) | SALES / BOTH → `OUTPUT`, PURCHASE → `INPUT` | |
 
   > Xero rejects the `NONE` report type when creating a rate ("not valid for this organisation"), so it is never used or offered.
 
-  **EU / VOEC distance-selling override:** a **sales** rate whose **name starts with an EU member-state ISO code** (e.g. `DE Standard`, `FR 20%`; Greece as `GR` or `EL`) or a **VOEC** code (Norway `NO`) is an OSS/IOSS/VOEC distance sale and defaults to **`MOSSSALES`** ("MOSS Sales" in Xero). This overrides the category default above — except an explicit `REVERSE_CHARGE` (which still files to `REVERSECHARGES`) and purchase-only rates. OSS rates **outside** those schemes (e.g. Channel Islands `CI`, Isle of Man `IM`, Monaco `MC`) are treated as **exempt** (`EXEMPTOUTPUT` / `EXEMPTINPUT`). The match is on a leading 2-letter token only, so `Deutschland` does not count as `DE`. Any of these can be changed per-rate in the confirmation dialog.
+  **EU / VOEC distance-selling override:** a **sales** rate whose **name starts with an EU member-state ISO code** (e.g. `DE Standard`, `FR 20%`; Greece as `GR` or `EL`) or a **VOEC** code (Norway `NO`) is an OSS/IOSS/VOEC distance sale and defaults to **`MOSSSALES`** ("MOSS Sales" in Xero). This overrides the category default above — except an explicit `REVERSE_CHARGE` (which still files to `REVERSECHARGES`) and purchase-only rates. OSS rates **outside** those schemes (e.g. Channel Islands `CI`, Isle of Man `IM`, Monaco `MC`) are treated as **exempt** (`EXEMPTOUTPUT` / `EXEMPTINPUT`) when they're 0% — Xero forbids a non-zero exempt rate, so any that still charge VAT fall back to `OUTPUT` / `INPUT`. The match is on a leading 2-letter token only, so `Deutschland` does not count as `DE`. Any of these can be changed per-rate in the confirmation dialog.
 
   The creation is idempotent — Xero keys by `Name`, so a rate that already exists is matched rather than duplicated. Each generate run is recorded in the Activity log (`xero_tax_rates_generated`); partial failures are reported per rate and don't roll back rates already created.
 
