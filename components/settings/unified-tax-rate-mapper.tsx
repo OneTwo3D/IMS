@@ -1,18 +1,28 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { ArrowDownToLine, Check, Loader2, RefreshCw, Sparkles, AlertTriangle } from 'lucide-react'
+import { ArrowDownToLine, Check, Loader2, RefreshCw, Sparkles, AlertTriangle, Wand2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import {
   matchTaxRates,
   suggestedAutoApply,
   type MatchConfidence,
   type TaxMatchResult,
 } from '@/lib/tax/tax-rate-match'
+import type { MissingTaxRatePreviewResult } from '@/lib/tax/generate-missing-tax-rates'
 import { getTaxRateMatchData, applyTaxRateMatches, type TaxRateMatchData } from '@/app/actions/tax-mapping'
 import { importShoppingTaxRatesFromApi, updateShoppingTaxRateMapping, deleteShoppingTaxRateMapping } from '@/app/actions/shopping-sync'
+import { previewMissingAccountingTaxRates, generateMissingAccountingTaxRates } from '@/app/actions/accounting-sync'
 import { updateTaxRate } from '@/app/actions/settings'
 
 const SELECT_CLASS =
@@ -37,6 +47,7 @@ export function UnifiedTaxRateMapper({ wcConnected, accountingConnected, onChang
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null) // action key currently running
   const [message, setMessage] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
+  const [generatePreview, setGeneratePreview] = useState<MissingTaxRatePreviewResult | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -116,6 +127,40 @@ export function UnifiedTaxRateMapper({ wcConnected, accountingConnected, onChang
     } finally { setBusy(null) }
   }
 
+  async function handleGeneratePreview() {
+    setBusy('generate-preview'); setMessage(null)
+    try {
+      const res = await previewMissingAccountingTaxRates()
+      if (!res.success) { notify('error', res.error ?? 'Failed to preview missing tax rates.'); return }
+      if (!res.supported) { notify('error', res.error ?? 'Generating tax rates is not supported for this connector.'); return }
+      if (res.toCreate.length === 0) {
+        notify('ok', 'No missing tax rates to create — every active IMS rate is already mapped or matches an existing accounting rate.')
+        return
+      }
+      setGeneratePreview(res)
+    } catch (e) {
+      notify('error', e instanceof Error ? e.message : 'Failed to preview missing tax rates.')
+    } finally { setBusy(null) }
+  }
+
+  async function handleGenerateConfirm() {
+    if (!generatePreview) return
+    const ids = generatePreview.toCreate.map((rate) => rate.taxRateId)
+    setBusy('generate-run'); setMessage(null)
+    try {
+      const res = await generateMissingAccountingTaxRates(ids)
+      if (!res.success) { notify('error', res.error ?? 'Failed to generate tax rates.'); return }
+      setGeneratePreview(null)
+      await load()
+      const failedNote = res.failed.length > 0
+        ? ` ${res.failed.length} failed (${res.failed.map((f) => f.name).join(', ')}).`
+        : ''
+      notify(res.failed.length > 0 ? 'error' : 'ok', `Created and mapped ${res.created} tax rate(s).${failedNote}`)
+    } catch (e) {
+      notify('error', e instanceof Error ? e.message : 'Failed to generate tax rates.')
+    } finally { setBusy(null) }
+  }
+
   async function handleAccountingChange(imsId: string, taxType: string) {
     setBusy(`accounting:${imsId}`); setMessage(null)
     try {
@@ -153,6 +198,12 @@ export function UnifiedTaxRateMapper({ wcConnected, accountingConnected, onChang
               Refresh accounting rates
             </Button>
           )}
+          {showAccounting && (
+            <Button type="button" variant="outline" size="sm" onClick={handleGeneratePreview} disabled={busy != null}>
+              {busy === 'generate-preview' ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Wand2 className="h-3.5 w-3.5 mr-1" />}
+              Generate missing rates
+            </Button>
+          )}
           {hasProviders && (
             <Button type="button" size="sm" onClick={handleAutoApply} disabled={busy != null || !result}>
               {busy === 'auto' ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Sparkles className="h-3.5 w-3.5 mr-1" />}
@@ -161,6 +212,57 @@ export function UnifiedTaxRateMapper({ wcConnected, accountingConnected, onChang
           )}
         </div>
       </div>
+
+      <Dialog open={generatePreview != null} onOpenChange={(open) => { if (!open) setGeneratePreview(null) }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Generate missing tax rates</DialogTitle>
+            <DialogDescription>
+              These active IMS tax rates aren&apos;t mapped and have no matching rate in your accounting
+              connector. Confirm to create each one in the accounting system and map it back automatically.
+            </DialogDescription>
+          </DialogHeader>
+          {generatePreview && (
+            <div className="space-y-3">
+              <div className="max-h-72 overflow-y-auto rounded-md border">
+                <Table>
+                  <TableHeader className="bg-muted/50">
+                    <TableRow>
+                      <TableHead className="text-xs">IMS rate</TableHead>
+                      <TableHead className="text-xs text-right">Rate</TableHead>
+                      <TableHead className="text-xs">Report type</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {generatePreview.toCreate.map((rate) => (
+                      <TableRow key={rate.taxRateId}>
+                        <TableCell className="font-medium">{rate.name}</TableCell>
+                        <TableCell className="text-right font-mono text-xs text-muted-foreground">{rate.ratePct.toFixed(2)}%</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">{rate.reportType ?? '—'}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+              {(generatePreview.skippedExisting > 0 || generatePreview.alreadyMapped > 0) && (
+                <p className="text-[11px] text-muted-foreground">
+                  Skipping {generatePreview.alreadyMapped} already-mapped and {generatePreview.skippedExisting} rate(s)
+                  that already match an existing accounting rate (use Auto-apply for those).
+                </p>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button type="button" variant="outline" size="sm" onClick={() => setGeneratePreview(null)} disabled={busy === 'generate-run'}>
+              Cancel
+            </Button>
+            <Button type="button" size="sm" onClick={handleGenerateConfirm} disabled={busy === 'generate-run'}>
+              {busy === 'generate-run' ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Wand2 className="h-3.5 w-3.5 mr-1" />}
+              Create {generatePreview?.toCreate.length ?? 0} rate(s)
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {message && (
         <p className={`text-xs ${message.kind === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>{message.text}</p>

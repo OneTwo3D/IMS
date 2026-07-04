@@ -1,4 +1,5 @@
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
+import type { MissingTaxRatePreviewResult, MissingTaxRateGenerateResult } from '@/lib/tax/generate-missing-tax-rates'
 
 export type AccountingConnectorId = 'xero' | 'quickbooks'
 
@@ -78,6 +79,12 @@ export type AccountingConnector = AccountingConnectorDef & {
     externalRatesCount: number
     error?: string
   }>
+  /** Preview which external tax rates would be created for active, unmapped IMS
+   *  rates with no existing external name-match. Read-only — no writes. */
+  previewMissingTaxRates(): Promise<MissingTaxRatePreviewResult>
+  /** Create the confirmed missing tax rates in the connector and map each back
+   *  onto its IMS rate. Only writes the passed (user-confirmed) IMS rate ids. */
+  generateMissingTaxRates(taxRateIds: string[]): Promise<MissingTaxRateGenerateResult>
   getSyncLogs(limit?: number): Promise<AccountingSyncLogRow[]>
   triggerSync(): Promise<{ success: boolean; result?: unknown; error?: string }>
   retryFailedSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }>
@@ -167,6 +174,14 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
           error: result.error,
         }
       },
+      async previewMissingTaxRates() {
+        const { previewMissingQuickBooksTaxRates } = await import('@/app/actions/settings')
+        return previewMissingQuickBooksTaxRates()
+      },
+      async generateMissingTaxRates(taxRateIds) {
+        const { generateMissingQuickBooksTaxRates } = await import('@/app/actions/settings')
+        return generateMissingQuickBooksTaxRates(taxRateIds)
+      },
       async getSyncLogs(limit = 50) {
         const { getQuickBooksSyncLogs } = await import('@/app/actions/quickbooks-sync')
         return getQuickBooksSyncLogs(limit)
@@ -254,6 +269,14 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         externalRatesCount: result.xeroRatesCount,
         error: result.error,
       }
+    },
+    async previewMissingTaxRates() {
+      const { previewMissingXeroTaxRates } = await import('@/app/actions/settings')
+      return previewMissingXeroTaxRates()
+    },
+    async generateMissingTaxRates(taxRateIds) {
+      const { generateMissingXeroTaxRates } = await import('@/app/actions/settings')
+      return generateMissingXeroTaxRates(taxRateIds)
     },
     async getSyncLogs(limit = 50) {
       const { getXeroSyncLogs } = await import('@/app/actions/xero-sync')

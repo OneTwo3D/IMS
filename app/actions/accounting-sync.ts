@@ -16,6 +16,7 @@ import {
   type RejectedAccountingDocumentUpdateWarning,
 } from '@/lib/domain/accounting/rejected-sync-warnings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
+import type { MissingTaxRatePreviewResult, MissingTaxRateGenerateResult } from '@/lib/tax/generate-missing-tax-rates'
 
 export type AccountingAccountRow = {
   id: string
@@ -311,6 +312,26 @@ export async function autoLinkAccountingTaxRates(): Promise<{
 }> {
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).autoLinkTaxRates()
+}
+
+/**
+ * Preview which tax rates would be created in the active accounting connector
+ * for active, unmapped IMS rates with no existing external name-match.
+ * Read-only — nothing is written to the accounting system. Connector-agnostic.
+ */
+export async function previewMissingAccountingTaxRates(): Promise<MissingTaxRatePreviewResult> {
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).previewMissingTaxRates()
+}
+
+/**
+ * Create the confirmed missing tax rates in the active accounting connector and
+ * map each back onto its IMS rate. Only writes the user-confirmed IMS rate ids.
+ * Connector-agnostic.
+ */
+export async function generateMissingAccountingTaxRates(taxRateIds: string[]): Promise<MissingTaxRateGenerateResult> {
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).generateMissingTaxRates(taxRateIds)
 }
 
 export async function getAccountingSyncLogs(limit = 50): Promise<AccountingSyncLogRow[]> {
