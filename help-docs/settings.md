@@ -172,6 +172,35 @@ Setting `TaxRate.reverseCharge` to true changes how IMS posts the line to the ac
 
 If the reverse-charge tax type settings are empty, IMS falls back to the parent `TaxRate.accountingTaxType` — the line still posts but is not flagged as reverse-charge on the accounting side.
 
+### Tax rate mapping (IMS ↔ accounting ↔ WooCommerce)
+
+The **Tax rate mapping** card (Settings > Accounting, and the onboarding "connect accounting" step) reconciles your IMS VAT rates with the tax codes in your accounting connector and WooCommerce. IMS is the hub: every IMS rate should map to one connector tax type (`TaxRate.accountingTaxType`) and, if WooCommerce is connected, to one WC tax rate. The card offers:
+
+- **Import from store** (WooCommerce connected) — pull WC tax rates in so they can be matched.
+- **Refresh accounting rates** (accounting connected) — reload the connector's current tax codes.
+- **Auto-apply suggestions** — apply confident matches automatically. Matching is rate-first, then normalized name; rate conflicts and low-confidence matches are left for manual review.
+- **Generate missing rates** (accounting connected) — create the tax codes an IMS rate needs but the connector doesn't have yet, then auto-map them.
+
+#### Generate missing rates
+
+For every **active, unmapped** IMS rate (`accountingTaxType` blank) that has **no name-match** among the connector's existing rates, IMS can create the rate in the connector and write the returned tax type back onto the IMS rate. Rates that already name-match an existing connector rate are **skipped** (use Auto-apply for those — no duplicates are created). Clicking the button first shows a read-only **preview dialog** listing each rate to be created with its rate and derived report type; nothing is written until you confirm.
+
+- **Xero** — fully supported. Creates each rate via `POST /TaxRates` (mirroring any tax components) and sets `ReportTaxType` from the IMS `Reporting category` + `Used for`:
+
+  | Reporting category | Used for | Xero ReportTaxType |
+  |---|---|---|
+  | `DOMESTIC` | SALES / BOTH | `OUTPUT` |
+  | `DOMESTIC` | PURCHASE | `INPUT` |
+  | `REVERSE_CHARGE` | any | `REVERSECHARGES` |
+  | `EC_SALES` | SALES / BOTH | `ECOUTPUTSERVICES` |
+  | `EC_SALES` | PURCHASE | `ECACQUISITIONS` |
+  | `OSS` | any | `NONE` |
+  | (unset) | SALES / BOTH → `OUTPUT`, PURCHASE → `INPUT` | |
+
+  The creation is idempotent — Xero keys by `Name`, so a rate that already exists is matched rather than duplicated. Each generate run is recorded in the Activity log (`xero_tax_rates_generated`); partial failures are reported per rate and don't roll back rates already created.
+
+- **QuickBooks** — not supported (QBO has no programmatic tax-code creation on the public API). The action degrades gracefully: create the tax codes in QuickBooks, then use **Auto-apply** to map them.
+
 ## Backup & Restore
 
 Full system backup and restore functionality is available for administrator-led backups and restores. See `docs/backup-restore.md` for the deployment-level details.
