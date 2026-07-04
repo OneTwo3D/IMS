@@ -5,12 +5,15 @@
  * (6igm.1) + deterministic validator (6igm.2) and upserts the single PENDING proposal for review.
  */
 import { db } from '@/lib/db'
-import { Prisma } from '@/app/generated/prisma/client'
+import { Prisma, ProductType, ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { classifyHsCode } from '@/lib/trade/hs-classifier'
 import { validateHsCode } from '@/lib/trade/hs-validate'
 import { hsClassificationFieldsHash, shouldSkipHsReclassification } from '@/lib/trade/hs-classification-fields'
 
 const PROPOSAL_INCLUDE = { product: { select: { sku: true, name: true } } } as const
+
+/** Product types the classifier applies to — physical goods only (matches the sweep filter). */
+const ELIGIBLE_TYPES: ProductType[] = [ProductType.SIMPLE, ProductType.VARIANT, ProductType.KIT, ProductType.BOM]
 
 export type HsCodeProposalWithProduct = Prisma.HsCodeProposalGetPayload<{ include: typeof PROPOSAL_INCLUDE }>
 
@@ -31,10 +34,17 @@ export async function upsertHsCodeProposal(
       name: true,
       description: true,
       customsDescription: true,
+      type: true,
+      lifecycleStatus: true,
       category: { select: { name: true } },
     },
   })
   if (!product) return null
+  // Only classify eligible, non-archived products — a VARIABLE parent or NON_INVENTORY item is not
+  // classifiable. Defence-in-depth: the sweep already filters, but this guards direct callers too.
+  if (!ELIGIBLE_TYPES.includes(product.type) || product.lifecycleStatus === ProductLifecycleStatus.ARCHIVED) {
+    return null
+  }
 
   const categoryPath = product.category?.name ?? null
   const fieldsHash = hsClassificationFieldsHash({

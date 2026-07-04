@@ -5,7 +5,9 @@ import { db } from '@/lib/db'
 import { getProduct, getVariableProducts, listProductCategories, listProductSupplierOptions, updateProduct, getProductOptions, getProductSuppliers, getProductComponents, getKitStock } from '@/app/actions/products'
 import { getWarehouses, getActiveAdjustmentReasons } from '@/app/actions/stock'
 import { getStockUnitOptions } from '@/app/actions/settings'
+import { getPendingHsProposalForProduct } from '@/app/actions/hs-proposals'
 import { ProductForm } from '@/components/inventory/product-form'
+import { HsProposalPanel } from '@/components/inventory/hs-proposal-panel'
 import { StockAdjustmentForm } from '@/components/inventory/stock-adjustment-form'
 import { VariantGenerator } from '@/components/inventory/variant-generator'
 import { KitConfigurator } from '@/components/inventory/kit-configurator'
@@ -75,11 +77,12 @@ export default async function ProductDetailPage({
 
   const isKitOrBom = product.type === 'KIT' || product.type === 'BOM'
 
-  const [productOptions, suppliers, productComponents, kitStock] = await Promise.all([
+  const [productOptions, suppliers, productComponents, kitStock, hsProposal] = await Promise.all([
     product.type === 'VARIABLE' ? getProductOptions(id) : Promise.resolve([]),
     getProductSuppliers(id),
     isKitOrBom ? getProductComponents(id) : Promise.resolve([]),
     product.type === 'KIT' ? getKitStock(id) : Promise.resolve([]),
+    getPendingHsProposalForProduct(id),
   ])
 
   const hasStoreLink = await hasExternalProductLink(id)
@@ -179,6 +182,20 @@ export default async function ProductDetailPage({
               inline
             />
           </Card>
+
+          {/* HS-code classification proposal (6igm.6) — classifiable product types only */}
+          {product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && (
+            <Card className="p-6">
+              <h2 className="text-base font-semibold mb-4">HS Code Classification</h2>
+              {/* key on the proposal identity + code so the editable input re-seeds after a
+                  Classify/Re-classify refresh (App Router preserves client state otherwise). */}
+              <HsProposalPanel
+                key={`${hsProposal?.id ?? 'none'}:${hsProposal?.proposedHsCode ?? ''}`}
+                productId={id}
+                proposal={hsProposal}
+              />
+            </Card>
+          )}
 
           {/* Variants + generator (for VARIABLE products) */}
           {product.type === 'VARIABLE' && (

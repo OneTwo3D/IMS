@@ -79,6 +79,18 @@ export async function listHsCodeProposals(status: HsCodeProposalStatus = 'PENDIN
   return rows.map(toRow)
 }
 
+/** The single PENDING proposal for a product (for the inline panel on the product edit page, 6igm.6). */
+export async function getPendingHsProposalForProduct(productId: string): Promise<HsProposalRow | null> {
+  // Read-only data — gate at view level ('inventory') so read-only roles can still open the product
+  // detail page. The approve/reject/propose mutations keep 'inventory.edit'.
+  await requirePermission('inventory')
+  const row = await db.hsCodeProposal.findFirst({
+    where: { productId, status: 'PENDING' },
+    include: { product: { select: { sku: true, name: true } } },
+  })
+  return row ? toRow(row) : null
+}
+
 /**
  * Classify a product's HS code (classifier + deterministic validator) and upsert a PENDING
  * proposal for review. One PENDING proposal per product — a re-classification replaces it.
