@@ -690,6 +690,7 @@ model Product {
   wmsSyncLogs      WmsSyncLog[]          @relation("WmsSyncLogProduct")
   wmsStockSnapshots WmsStockSnapshot[]   @relation("WmsStockSnapshotProduct")
   wmsStockDiscrepancies WmsStockDiscrepancy[] @relation("WmsStockDiscrepancyProduct")
+  hsCodeProposals  HsCodeProposal[]
   wmsReturnsInbox  WmsReturnsInbox[]     @relation("WmsReturnsInboxProduct")
 
   @@index([parentId])
@@ -2408,6 +2409,12 @@ enum WmsDiscrepancyStatus {
   IGNORED
 }
 
+enum HsCodeProposalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 enum WmsReturnsInboxStatus {
   NEW
   UNDER_REVIEW
@@ -2516,6 +2523,37 @@ model WmsProductLink {
   @@unique([connector, productId])
   @@index([productId])
   @@map("wms_product_links")
+}
+
+/// AI HS-code classification proposal awaiting human review (6igm.3). A proposal is only
+/// authoritative once APPROVED, at which point its code is written to the product. Carries both
+/// the classifier's self-report (modelConfidence, source) and the deterministic validator output
+/// (confidence, band, flags, declarable) so the review queue needs no recomputation to display.
+model HsCodeProposal {
+  id                         String               @id @default(cuid())
+  productId                  String
+  proposedHsCode             String?
+  proposedCustomsDescription String?
+  source                     String
+  modelConfidence            Int                  @default(0)
+  confidence                 Int                  @default(0)
+  band                       String
+  flags                      String               @default("")
+  writeBlocking              Boolean              @default(false)
+  declarable                 Boolean              @default(false)
+  reasoning                  String               @default("")
+  status                     HsCodeProposalStatus @default(PENDING)
+  reviewedBy                 String?
+  reviewedAt                 DateTime?
+  reviewNote                 String?
+  createdAt                  DateTime             @default(now())
+  updatedAt                  DateTime             @updatedAt
+
+  product                    Product              @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([productId])
+  @@map("hs_code_proposals")
 }
 
 model WmsBundleLink {

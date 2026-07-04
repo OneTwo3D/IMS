@@ -113,6 +113,22 @@ test('an overlong code scores clean (lenient) but declarable:false must still bl
   assert.equal(r.declarable, false)
 })
 
+test('isApprovableHsValidation is fail-closed: declarable AND no write-blocking flags', () => {
+  // Clean declarable code with only advisory flags -> approvable.
+  const clean = hs.validateHsCode({ cnCode: '85011099', customsDescription: 'x', name: 'y' }) // desc fails -> description_problem (advisory)
+  assert.equal(clean.declarable, true)
+  assert.deepEqual(clean.writeBlockingFlags, [])
+  assert.equal(hs.isApprovableHsValidation(clean), true)
+
+  // Overlong (lenient-clean but not strictly declarable) -> NOT approvable.
+  const overlong = hs.validateHsCode({ cnCode: '8501109900', customsDescription: 'electric stepper motor' })
+  assert.equal(hs.isApprovableHsValidation(overlong), false)
+
+  // Absent code -> write-blocking -> NOT approvable.
+  const absent = hs.validateHsCode({ cnCode: '99999999', customsDescription: 'electric stepper motor' })
+  assert.equal(hs.isApprovableHsValidation(absent), false)
+})
+
 test('brand-only and stop-word descriptions are flagged; a real article passes', () => {
   assert.equal(hs.descriptionIsBrandOnly('Voron LDO'), true)
   assert.equal(hs.descriptionIsBrandOnly('brass nozzle'), false)

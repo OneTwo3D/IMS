@@ -205,6 +205,16 @@ export function writeBlockingFlags(flags: string[]): string[] {
 }
 
 /**
+ * Fail-closed approval gate (6igm.3): an HS-code validation may be committed to a product only if
+ * the code is strictly declarable (exactly-8 + in the 2026 list) AND carries no write-blocking
+ * flag. Advisory flags (category_mismatch, description_problem) are the operator's call and never
+ * block. Both conditions are required — writeBlockingFlags alone is lenient (see HsValidation).
+ */
+export function isApprovableHsValidation(validation: HsValidation): boolean {
+  return validation.declarable && validation.writeBlockingFlags.length === 0
+}
+
+/**
  * Full validation + transparent confidence score. Faithful port of the plugin's validate():
  * code presence/status, category plausibility, description quality, and parts-basket specificity,
  * clamped to 0-100 and banded. See hs-code-woo SPEC.md.
