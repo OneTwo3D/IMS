@@ -69,6 +69,9 @@ export type MissingTaxRatePreviewResult = {
   externalRatesCount: number
   /** Whether the active connector supports creating tax rates at all. */
   supported: boolean
+  /** Report types the operator may pick per rate in the confirmation dialog
+   *  (connector-specific; empty when the connector has no editable report type). */
+  reportTypeOptions?: string[]
   error?: string
 }
 

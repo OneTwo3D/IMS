@@ -16,7 +16,7 @@ import {
   type MissingTaxRatePreviewResult,
   type MissingTaxRateGenerateResult,
 } from '@/lib/tax/generate-missing-tax-rates'
-import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
+import { xeroReportTaxType, XERO_REPORT_TAX_TYPES, isXeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 import {
   effectiveTaxRateFromComponents,
   normalizeTaxRateComponents,
@@ -600,12 +600,13 @@ export async function previewMissingXeroTaxRates(): Promise<MissingTaxRatePrevie
         name: rate.name,
         ratePct: rate.rate * 100,
         reportingCategory: rate.reportingCategory,
-        reportType: xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor }),
+        reportType: xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name }),
       })),
       alreadyMapped: plan.alreadyMapped.length,
       skippedExisting: plan.skippedExisting.length,
       externalRatesCount: result.taxRates.length,
       supported: true,
+      reportTypeOptions: XERO_REPORT_TAX_TYPES,
     }
   } catch (e) {
     return { success: false, toCreate: [], alreadyMapped: 0, skippedExisting: 0, externalRatesCount: 0, supported: true, error: String(e) }
@@ -619,7 +620,10 @@ export async function previewMissingXeroTaxRates(): Promise<MissingTaxRatePrevie
  * re-planned at write time, so nothing is duplicated if state changed since the
  * preview.
  */
-export async function generateMissingXeroTaxRates(taxRateIds: string[]): Promise<MissingTaxRateGenerateResult> {
+export async function generateMissingXeroTaxRates(
+  taxRateIds: string[],
+  reportTypeOverrides?: Record<string, string>,
+): Promise<MissingTaxRateGenerateResult> {
   await requirePermission('settings.company')
   try {
     const { getXeroTaxRates } = await import('@/lib/connectors/xero/accounts')
@@ -641,7 +645,13 @@ export async function generateMissingXeroTaxRates(taxRateIds: string[]): Promise
 
     for (const rate of targets) {
       try {
-        const reportTaxType = xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor })
+        // Honour a user override from the confirmation dialog, but only if it's a
+        // report type we know Xero accepts — otherwise fall back to the computed
+        // default so we never post an invalid ReportTaxType.
+        const override = reportTypeOverrides?.[rate.id]
+        const reportTaxType = isXeroReportTaxType(override)
+          ? override
+          : xeroReportTaxType({ reportingCategory: rate.reportingCategory, usedFor: rate.usedFor, name: rate.name })
         const components = taxComponentsForCreation(rate)
         const res = await putXeroTaxRate({ name: rate.name, reportTaxType, components, status: 'ACTIVE' })
         if (!res.success || !res.taxType) {
@@ -689,7 +699,7 @@ export async function previewMissingQuickBooksTaxRates(): Promise<MissingTaxRate
   }
 }
 
-export async function generateMissingQuickBooksTaxRates(_taxRateIds: string[]): Promise<MissingTaxRateGenerateResult> {
+export async function generateMissingQuickBooksTaxRates(_taxRateIds: string[], _reportTypeOverrides?: Record<string, string>): Promise<MissingTaxRateGenerateResult> {
   await requirePermission('settings.company')
   return {
     success: false,

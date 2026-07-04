@@ -379,6 +379,9 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
   const [genBusy, setGenBusy] = useState<'preview' | 'run' | null>(null)
   const [genPreview, setGenPreview] = useState<MissingTaxRatePreviewResult | null>(null)
   const [genMessage, setGenMessage] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
+  // Per-rate report type chosen in the confirmation dialog, keyed by taxRateId.
+  // Seeded from the computed default when the preview opens; user-editable.
+  const [reportTypeEdits, setReportTypeEdits] = useState<Record<string, string>>({})
 
   function handleToggle(rate: TaxRateRow) {
     startTransition(async () => {
@@ -398,6 +401,7 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
         setGenMessage({ kind: 'ok', text: 'No missing tax rates to create — every active rate is already mapped or matches an existing accounting rate.' })
         return
       }
+      setReportTypeEdits(Object.fromEntries(res.toCreate.map((rate) => [rate.taxRateId, rate.reportType ?? ''])))
       setGenPreview(res)
     } catch (e) {
       setGenMessage({ kind: 'error', text: e instanceof Error ? e.message : 'Failed to preview missing tax rates.' })
@@ -407,9 +411,15 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
   async function handleGenerateConfirm() {
     if (!genPreview) return
     const ids = genPreview.toCreate.map((rate) => rate.taxRateId)
+    // Only send overrides that differ from the computed default.
+    const overrides: Record<string, string> = {}
+    for (const rate of genPreview.toCreate) {
+      const chosen = reportTypeEdits[rate.taxRateId]
+      if (chosen && chosen !== (rate.reportType ?? '')) overrides[rate.taxRateId] = chosen
+    }
     setGenBusy('run'); setGenMessage(null)
     try {
-      const res = await generateMissingAccountingTaxRates(ids)
+      const res = await generateMissingAccountingTaxRates(ids, overrides)
       if (!res.success) { setGenMessage({ kind: 'error', text: res.error ?? 'Failed to generate tax rates.' }); return }
       setGenPreview(null)
       const failedNote = res.failed.length > 0 ? ` ${res.failed.length} failed (${res.failed.map((f) => f.name).join(', ')}).` : ''
@@ -520,7 +530,8 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
             <DialogTitle>Generate missing tax rates</DialogTitle>
             <DialogDescription>
               These active tax rates aren&apos;t mapped and have no matching rate in your accounting
-              connector. Confirm to create each one in the accounting system and map it back automatically.
+              connector. The report type is pre-filled with a sensible default — adjust any of them
+              before confirming. Confirm to create each rate in the accounting system and map it back automatically.
             </DialogDescription>
           </DialogHeader>
           {genPreview && (
@@ -534,13 +545,32 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {genPreview.toCreate.map((rate) => (
-                    <TableRow key={rate.taxRateId}>
-                      <TableCell className="font-medium">{rate.name}</TableCell>
-                      <TableCell className="text-right font-mono text-xs text-muted-foreground">{rate.ratePct.toFixed(2)}%</TableCell>
-                      <TableCell className="text-xs text-muted-foreground">{rate.reportType ?? '—'}</TableCell>
-                    </TableRow>
-                  ))}
+                  {genPreview.toCreate.map((rate) => {
+                    const options = genPreview.reportTypeOptions ?? []
+                    const value = reportTypeEdits[rate.taxRateId] ?? rate.reportType ?? ''
+                    return (
+                      <TableRow key={rate.taxRateId}>
+                        <TableCell className="font-medium">{rate.name}</TableCell>
+                        <TableCell className="text-right font-mono text-xs text-muted-foreground">{rate.ratePct.toFixed(2)}%</TableCell>
+                        <TableCell>
+                          {options.length > 0 ? (
+                            <select
+                              className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                              value={value}
+                              onChange={(e) => setReportTypeEdits((prev) => ({ ...prev, [rate.taxRateId]: e.target.value }))}
+                              disabled={genBusy === 'run'}
+                            >
+                              {/* Include the current value even if it isn't in the options list. */}
+                              {value && !options.includes(value) && <option value={value}>{value}</option>}
+                              {options.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                            </select>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">{value || '—'}</span>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
                 </TableBody>
               </Table>
             </div>

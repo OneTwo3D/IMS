@@ -176,7 +176,7 @@ If the reverse-charge tax type settings are empty, IMS falls back to the parent 
 
 **Where:** the VAT rates screen itself — **Settings > Accounting > Tax** (the same page where you add and enable/disable rates). When an accounting connector is connected, a **Generate missing rates** button appears next to **Add VAT Rate**. This complements the **Xero drift** chips on each rate ("no matching rate in Xero").
 
-For every **active, unmapped** IMS rate (`accountingTaxType` blank) that has **no name-match** among the connector's existing rates, IMS can create the rate in the connector and write the returned tax type back onto the IMS rate. Rates that already name-match an existing connector rate are **skipped** (map those with the WooCommerce-connector tax-rate mapper's **Auto-apply** — no duplicates are created). Clicking the button first shows a read-only **preview dialog** listing each rate to be created with its rate and derived report type; nothing is written until you confirm.
+For every **active, unmapped** IMS rate (`accountingTaxType` blank) that has **no name-match** among the connector's existing rates, IMS can create the rate in the connector and write the returned tax type back onto the IMS rate. Rates that already name-match an existing connector rate are **skipped** (map those with the WooCommerce-connector tax-rate mapper's **Auto-apply** — no duplicates are created). Clicking the button first shows a **confirmation dialog** listing each rate to be created with its rate and report type; the **report type is a per-rate dropdown pre-filled with the default below** — change any of them before confirming. Nothing is written until you confirm.
 
 - **Xero** — fully supported. Creates each rate via `POST /TaxRates` (mirroring any tax components) and sets `ReportTaxType` from the IMS `Reporting category` + `Used for`:
 
@@ -187,8 +187,13 @@ For every **active, unmapped** IMS rate (`accountingTaxType` blank) that has **n
   | `REVERSE_CHARGE` | any | `REVERSECHARGES` |
   | `EC_SALES` | SALES / BOTH | `ECOUTPUTSERVICES` |
   | `EC_SALES` | PURCHASE | `ECACQUISITIONS` |
-  | `OSS` | any | `NONE` |
+  | `OSS` | SALES / BOTH | `MOSSSALES` |
+  | `OSS` | PURCHASE | `INPUT` |
   | (unset) | SALES / BOTH → `OUTPUT`, PURCHASE → `INPUT` | |
+
+  > Xero rejects the `NONE` report type when creating a rate ("not valid for this organisation"), so it is never used or offered — OSS sales report via MOSS instead.
+
+  **EU distance-selling override:** a rate whose **name starts with an EU member-state ISO code** (e.g. `DE Standard`, `FR 20%`, `NL Reduced`; Greece as `GR` or `EL`) is treated as an OSS/MOSS distance sale and defaults to **`MOSSSALES`** ("MOSS Sales" in Xero). This overrides the category default above for sales rates — except an explicit `REVERSE_CHARGE` (which still files to `REVERSECHARGES`) and purchase-only rates (MOSS Sales is a sales report type, so they keep `INPUT`/`ECACQUISITIONS`). The match is on a leading 2-letter token only, so `Deutschland` does not count as `DE`.
 
   The creation is idempotent — Xero keys by `Name`, so a rate that already exists is matched rather than duplicated. Each generate run is recorded in the Activity log (`xero_tax_rates_generated`); partial failures are reported per rate and don't roll back rates already created.
 

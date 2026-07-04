@@ -83,8 +83,13 @@ export type AccountingConnector = AccountingConnectorDef & {
    *  rates with no existing external name-match. Read-only — no writes. */
   previewMissingTaxRates(): Promise<MissingTaxRatePreviewResult>
   /** Create the confirmed missing tax rates in the connector and map each back
-   *  onto its IMS rate. Only writes the passed (user-confirmed) IMS rate ids. */
-  generateMissingTaxRates(taxRateIds: string[]): Promise<MissingTaxRateGenerateResult>
+   *  onto its IMS rate. Only writes the passed (user-confirmed) IMS rate ids.
+   *  `reportTypeOverrides` maps a taxRateId to a user-chosen report type from the
+   *  preview's `reportTypeOptions`; omitted rates use the computed default. */
+  generateMissingTaxRates(
+    taxRateIds: string[],
+    reportTypeOverrides?: Record<string, string>,
+  ): Promise<MissingTaxRateGenerateResult>
   getSyncLogs(limit?: number): Promise<AccountingSyncLogRow[]>
   triggerSync(): Promise<{ success: boolean; result?: unknown; error?: string }>
   retryFailedSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }>
@@ -178,9 +183,9 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         const { previewMissingQuickBooksTaxRates } = await import('@/app/actions/settings')
         return previewMissingQuickBooksTaxRates()
       },
-      async generateMissingTaxRates(taxRateIds) {
+      async generateMissingTaxRates(taxRateIds, reportTypeOverrides) {
         const { generateMissingQuickBooksTaxRates } = await import('@/app/actions/settings')
-        return generateMissingQuickBooksTaxRates(taxRateIds)
+        return generateMissingQuickBooksTaxRates(taxRateIds, reportTypeOverrides)
       },
       async getSyncLogs(limit = 50) {
         const { getQuickBooksSyncLogs } = await import('@/app/actions/quickbooks-sync')
@@ -274,9 +279,9 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
       const { previewMissingXeroTaxRates } = await import('@/app/actions/settings')
       return previewMissingXeroTaxRates()
     },
-    async generateMissingTaxRates(taxRateIds) {
+    async generateMissingTaxRates(taxRateIds, reportTypeOverrides) {
       const { generateMissingXeroTaxRates } = await import('@/app/actions/settings')
-      return generateMissingXeroTaxRates(taxRateIds)
+      return generateMissingXeroTaxRates(taxRateIds, reportTypeOverrides)
     },
     async getSyncLogs(limit = 50) {
       const { getXeroSyncLogs } = await import('@/app/actions/xero-sync')

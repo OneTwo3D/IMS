@@ -329,9 +329,12 @@ export async function previewMissingAccountingTaxRates(): Promise<MissingTaxRate
  * map each back onto its IMS rate. Only writes the user-confirmed IMS rate ids.
  * Connector-agnostic.
  */
-export async function generateMissingAccountingTaxRates(taxRateIds: string[]): Promise<MissingTaxRateGenerateResult> {
+export async function generateMissingAccountingTaxRates(
+  taxRateIds: string[],
+  reportTypeOverrides?: Record<string, string>,
+): Promise<MissingTaxRateGenerateResult> {
   const connector = await getActiveAccountingConnector()
-  return (connector ?? getAccountingConnector('xero')).generateMissingTaxRates(taxRateIds)
+  return (connector ?? getAccountingConnector('xero')).generateMissingTaxRates(taxRateIds, reportTypeOverrides)
 }
 
 export async function getAccountingSyncLogs(limit = 50): Promise<AccountingSyncLogRow[]> {

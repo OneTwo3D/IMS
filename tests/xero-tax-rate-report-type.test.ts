@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { xeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
+import { xeroReportTaxType, XERO_REPORT_TAX_TYPES, isXeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
 
 // onetwo3d-ims-30tg: IMS reportingCategory + usedFor -> Xero ReportTaxType.
 
@@ -22,9 +22,12 @@ test('EC_SALES splits by usedFor', () => {
   assert.equal(xeroReportTaxType({ reportingCategory: 'EC_SALES', usedFor: 'PURCHASE' }), 'ECACQUISITIONS')
 })
 
-test('OSS files to NONE (no UK VAT-return box)', () => {
-  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'SALES' }), 'NONE')
-  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'PURCHASE' }), 'NONE')
+test('OSS sales file to MOSSSALES (Xero rejects NONE at creation); OSS purchases to INPUT', () => {
+  // Non-EU-named OSS rate (e.g. Channel Islands "CI VAT") still gets a valid
+  // report type — regression for onetwo3d-ims-tdzp (NONE was rejected by Xero).
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'SALES', name: 'CI VAT' }), 'MOSSSALES')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'BOTH', name: 'MC VAT' }), 'MOSSSALES')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'PURCHASE', name: 'IM VAT' }), 'INPUT')
 })
 
 test('unset category defaults to OUTPUT/INPUT by usedFor', () => {
@@ -38,4 +41,57 @@ test('category and usedFor are normalized (case, separators, whitespace)', () =>
   assert.equal(xeroReportTaxType({ reportingCategory: 'reverse-charge', usedFor: 'sales' }), 'REVERSECHARGES')
   assert.equal(xeroReportTaxType({ reportingCategory: ' ec_sales ', usedFor: ' purchase ' }), 'ECACQUISITIONS')
   assert.equal(xeroReportTaxType({ reportingCategory: 'Domestic', usedFor: 'Purchase' }), 'INPUT')
+})
+
+// onetwo3d-ims-tdzp: EU-ISO-prefixed sales rates default to MOSS Sales.
+
+test('EU-ISO-prefixed sales rate defaults to MOSSSALES, overriding the category default', () => {
+  assert.equal(xeroReportTaxType({ reportingCategory: null, usedFor: 'SALES', name: 'DE Standard' }), 'MOSSSALES')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'DOMESTIC', usedFor: 'BOTH', name: 'FR 20%' }), 'MOSSSALES')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'OSS', usedFor: 'SALES', name: 'NL Reduced' }), 'MOSSSALES')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'EC_SALES', usedFor: 'SALES', name: 'IT 22%' }), 'MOSSSALES')
+})
+
+test('EU-ISO match only on a leading 2-letter token, not a longer word', () => {
+  // "Deutschland" starts with DE but is one word → not an ISO prefix.
+  assert.equal(xeroReportTaxType({ reportingCategory: 'DOMESTIC', usedFor: 'SALES', name: 'Deutschland VAT' }), 'OUTPUT')
+  // Hyphen / punctuation boundaries still match.
+  assert.equal(xeroReportTaxType({ reportingCategory: null, usedFor: 'SALES', name: 'ES-IVA' }), 'MOSSSALES')
+  // Greece variant EL is recognised.
+  assert.equal(xeroReportTaxType({ reportingCategory: null, usedFor: 'SALES', name: 'EL 24%' }), 'MOSSSALES')
+})
+
+test('non-EU ISO prefixes (GB, US) do not trigger MOSS', () => {
+  assert.equal(xeroReportTaxType({ reportingCategory: 'DOMESTIC', usedFor: 'SALES', name: 'GB Standard' }), 'OUTPUT')
+  assert.equal(xeroReportTaxType({ reportingCategory: null, usedFor: 'SALES', name: 'US Sales Tax' }), 'OUTPUT')
+})
+
+test('explicit REVERSE_CHARGE wins over the EU MOSS default', () => {
+  assert.equal(xeroReportTaxType({ reportingCategory: 'REVERSE_CHARGE', usedFor: 'SALES', name: 'DE Reverse Charge' }), 'REVERSECHARGES')
+})
+
+test('MOSS is sales-only — a purchase-only EU rate keeps its category default', () => {
+  assert.equal(xeroReportTaxType({ reportingCategory: 'DOMESTIC', usedFor: 'PURCHASE', name: 'DE Standard' }), 'INPUT')
+  assert.equal(xeroReportTaxType({ reportingCategory: 'EC_SALES', usedFor: 'PURCHASE', name: 'FR 20%' }), 'ECACQUISITIONS')
+})
+
+// onetwo3d-ims-tdzp: report-type override validation (guards the user-editable
+// confirmation dialog before anything is sent to Xero).
+
+test('isXeroReportTaxType accepts every advertised option and every computed default', () => {
+  for (const opt of XERO_REPORT_TAX_TYPES) assert.equal(isXeroReportTaxType(opt), true)
+  assert.equal(isXeroReportTaxType('MOSSSALES'), true)
+})
+
+test('isXeroReportTaxType rejects unknown / empty / wrong-case values', () => {
+  assert.equal(isXeroReportTaxType('BOGUS'), false)
+  assert.equal(isXeroReportTaxType('output'), false)
+  assert.equal(isXeroReportTaxType(''), false)
+  assert.equal(isXeroReportTaxType(null), false)
+  assert.equal(isXeroReportTaxType(undefined), false)
+})
+
+test('NONE is not an offered/accepted report type (Xero rejects it at creation)', () => {
+  assert.equal(XERO_REPORT_TAX_TYPES.includes('NONE' as never), false)
+  assert.equal(isXeroReportTaxType('NONE'), false)
 })
