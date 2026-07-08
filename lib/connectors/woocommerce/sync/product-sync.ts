@@ -14,6 +14,7 @@ import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
 import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
+import { clampCustomsDescription } from '@/lib/trade/customs-description'
 import {
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromWooStatus,
@@ -335,7 +336,12 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
     const hsCodeAttr = asTrimmedString(getWcAttribute(wcProduct.attributes, 'hs_code', 'hs code', 'hscode'))
     const originAttr = getWcAttribute(wcProduct.attributes, 'country_of_origin', 'Country of Origin', 'coo')
     const originIso = toIsoCountryCode(originAttr)
-    const customsDescriptionAttr = asTrimmedString(getWcAttribute(wcProduct.attributes, 'customs_description', 'customs description', 'customsdescription'))
+    const customsDescriptionRaw = asTrimmedString(getWcAttribute(wcProduct.attributes, 'customs_description', 'customs description', 'customsdescription'))
+    // Cap at the downstream WMS 50-char customs-description limit on the way in,
+    // so the stored value matches what we can push downstream (and never blocks
+    // a WMS product create). Preserve null/blank so "WC omitted it" semantics
+    // are unchanged.
+    const customsDescriptionAttr = customsDescriptionRaw ? clampCustomsDescription(customsDescriptionRaw) : customsDescriptionRaw
 
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'

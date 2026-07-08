@@ -1,6 +1,7 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
 import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { clampCustomsDescription } from '@/lib/trade/customs-description'
 import {
   extractMintsoftArrayPayload,
   normalizeMintsoftAsn,
@@ -196,7 +197,8 @@ function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolea
     Name: product.name,
   }
 
-  if (product.customsDescription) payload.CustomsDescription = product.customsDescription
+  const customsDescription = clampCustomsDescription(product.customsDescription)
+  if (customsDescription) payload.CustomsDescription = customsDescription
   if (!omitBarcode && product.barcode) payload.EAN = product.barcode
   if (product.weightKg != null) payload.Weight = product.weightKg
   if (product.heightCm != null) payload.Height = product.heightCm
