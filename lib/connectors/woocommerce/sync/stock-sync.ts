@@ -448,18 +448,24 @@ async function pushBatchWithFence(
   })
 }
 
-function emptyResult(message: string): StockSyncResult {
+// A gate-refusal result: the run was refused before any work started. Marked
+// `aborted` so a manual push surfaces it as an error and the job queue
+// retains the job for retry (see shouldRetainJob) instead of treating it as
+// a benign "nothing to push" no-op. Not for benign empty outcomes — those are
+// built inline with aborted unset.
+function gateRefusalResult(message: string): StockSyncResult {
   return {
     synced: 0, skipped: 0, errors: [],
     candidates: 0, matched: 0, unmatched: 0,
     pushed: false, message, unmatchedSkuSample: [],
+    aborted: true,
   }
 }
 
 export async function pushStockToWc(options?: PushStockOptions): Promise<StockSyncResult> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (enabled?.value !== 'true') {
-    return emptyResult('Stock sync is disabled in settings')
+    return gateRefusalResult('Stock sync is disabled in settings')
   }
   const scopedProductIds = options?.productIds ? [...new Set(options.productIds)] : null
   const forceProductIds = new Set(options?.forceProductIds ?? [])
@@ -496,7 +502,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // run — see the concurrency-safety note at the top of this file.
   const { creds, syncVersion } = await snapshotSyncContext()
   if (!creds) {
-    return emptyResult('WooCommerce credentials are not configured')
+    return gateRefusalResult('WooCommerce credentials are not configured')
   }
 
   const warehouses = await db.warehouse.findMany({
@@ -504,7 +510,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     select: { id: true },
   })
   if (!warehouses.length) {
-    return emptyResult('No warehouses flagged syncToStore')
+    return gateRefusalResult('No warehouses flagged syncToStore')
   }
 
   const whIds = warehouses.map((w) => w.id)
@@ -2124,17 +2130,22 @@ async function runManualWcStockPush(progress: ManualStockSyncProgress): Promise<
     },
   })
 
-  progress.status = result.errors.length > 0 ? 'error' : 'done'
+  // A gate abort (sync disabled, no credentials, no syncToStore warehouses)
+  // carries no errors[] but must not read as success: the operator explicitly
+  // asked for a push and nothing was pushed.
+  progress.status = result.errors.length > 0 || result.aborted === true ? 'error' : 'done'
   progress.synced = result.synced
   progress.total = Math.max(progress.total, result.synced)
   progress.errors = result.errors.slice(0, 20)
-  progress.message = result.message?.trim()
-    ? result.message.trim()
-    : result.errors.length > 0
-      ? `Stock push finished with ${result.errors.length} error(s) — ${result.synced} synced`
-      : result.synced > 0
-        ? `Stock push complete — ${result.synced} product(s) synced to WooCommerce`
-        : 'Stock push complete — all products already in sync'
+  progress.message = result.aborted === true
+    ? `${result.message?.trim() || 'Stock push refused'} — nothing was pushed`
+    : result.message?.trim()
+      ? result.message.trim()
+      : result.errors.length > 0
+        ? `Stock push finished with ${result.errors.length} error(s) — ${result.synced} synced`
+        : result.synced > 0
+          ? `Stock push complete — ${result.synced} product(s) synced to WooCommerce`
+          : 'Stock push complete — all products already in sync'
   progress.updatedAt = new Date().toISOString()
   await saveManualStockSyncProgress(progress)
 }

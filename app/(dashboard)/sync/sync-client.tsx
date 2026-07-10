@@ -475,6 +475,21 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
   const [saved, setSaved] = useState(false)
+  // The server-side value of the stock-push toggle. Ticking the checkbox only
+  // mutates local state (`s`), but the manual push runs against the SAVED
+  // setting — pushing with an unsaved toggle is guaranteed to no-op on the
+  // server gate, so the button blocks until Save Settings has persisted it.
+  // Resynced from the prop during render (React's derived-state adjustment
+  // pattern) so an out-of-band save (another tab/session) followed by
+  // router.refresh() doesn't leave the button falsely blocked.
+  const serverStockSyncEnabled = init.wc_stock_sync_enabled === 'true'
+  const [savedStockSyncEnabled, setSavedStockSyncEnabled] = useState(serverStockSyncEnabled)
+  const [lastServerStockSyncEnabled, setLastServerStockSyncEnabled] = useState(serverStockSyncEnabled)
+  if (lastServerStockSyncEnabled !== serverStockSyncEnabled) {
+    setLastServerStockSyncEnabled(serverStockSyncEnabled)
+    setSavedStockSyncEnabled(serverStockSyncEnabled)
+  }
+  const isStockPushUnsaved = s.wc_stock_sync_enabled === 'true' && !savedStockSyncEnabled
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null)
   const [connectionError, setConnectionError] = useState(false)
   const [testingConnection, setTestingConnection] = useState(false)
@@ -723,6 +738,15 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   }
 
   async function handleStockSync() {
+    // Belt-and-braces behind the disabled button: the server gate reads the
+    // SAVED setting, so a push with an unsaved toggle can only no-op.
+    if (isStockPushUnsaved) {
+      setSyncResult({
+        text: 'Stock push is still disabled on the server — click "Save Settings" first, then push.',
+        isError: true,
+      })
+      return
+    }
     setSyncResult(null)
     setStockSyncStarting(true)
     stockSyncStartedByUserRef.current = true
@@ -808,6 +832,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
         setSyncResult({ text: `Error: ${settingsResult.error ?? 'Failed to save sync settings.'}`, isError: true })
         return
       }
+      setSavedStockSyncEnabled(s.wc_stock_sync_enabled === 'true')
       router.refresh()
       setSyncResult(null)
       setSaved(true)
@@ -1186,8 +1211,13 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                     <p className="text-xs text-muted-foreground">Pushes the next FIFO unit cost to WooCommerce&apos;s native Cost of Goods Sold field</p>
                   </div>
                 </label>
+                {isStockPushUnsaved && (
+                  <p className="text-xs text-amber-600">
+                    Stock push is not enabled on the server yet — click Save Settings below before pushing.
+                  </p>
+                )}
                 <div className="flex items-center gap-2 flex-wrap">
-                  <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending || stockSyncBusy}>
+                  <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending || stockSyncBusy || isStockPushUnsaved}>
                     {stockSyncBusy ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
                     Push Stock Now
                   </Button>

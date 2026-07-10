@@ -164,6 +164,8 @@ Stock levels are pushed from One Two Inventory to WooCommerce. Enable this in th
 
 Use **Push Stock Now** for an immediate sync. Stock is still primarily event-driven from IMS changes, but the daily WooCommerce reconcile job also performs a forced stock catch-up and drains queued retry jobs as a safety net.
 
+The manual push runs against the **saved** setting: ticking "Push stock levels to WooCommerce" takes effect only after **Save Settings**. Until then the Push Stock Now button is blocked with a hint. If a push is refused server-side anyway (sync disabled, missing credentials, or no Sync-to-Store warehouses), it reports a red error — e.g. "Stock sync is disabled in settings — nothing was pushed" — rather than completing quietly.
+
 ## Tax Rates
 
 The **Tax Rates** tab maps WooCommerce tax rates to One Two Inventory tax rates. This ensures imported orders have the correct tax treatment.
