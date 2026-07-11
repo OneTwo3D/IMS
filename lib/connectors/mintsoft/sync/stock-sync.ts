@@ -20,6 +20,35 @@ import {
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { enqueueStockSync } from '@/lib/shopping'
+
+/**
+ * Codex P2 (6oyu.1): an applied alignment changes IMS on-hand, so the storefront
+ * sync must be enqueued like every other stock mutation — otherwise WooCommerce
+ * keeps advertising the pre-alignment quantity until an unrelated event syncs it
+ * (for align-down that re-opens the oversell window the correction just closed).
+ * Best-effort post-commit: a failure is surfaced as a WARNING, never thrown.
+ */
+async function enqueueAlignmentStockSync(binding: SyncBinding, productId: string, sku: string): Promise<void> {
+  try {
+    await enqueueStockSync([productId], 'IMS_CHANGE')
+  } catch (error) {
+    console.error(error)
+    try {
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: binding.id,
+        tag: 'sync',
+        action: 'mintsoft_alignment_stock_sync_enqueue_failed',
+        description: `Storefront stock sync enqueue failed after Mintsoft alignment for ${sku}; store stock may be stale until the next sync: ${error instanceof Error ? error.message : String(error)}`,
+        level: 'WARNING',
+        resolveUser: false,
+      })
+    } catch (logError) {
+      console.error(logError)
+    }
+  }
+}
 
 type SyncBinding = {
   id: string
@@ -847,6 +876,7 @@ async function applyMintsoftAlignmentForProduct(params: {
       level: reservedExceedsAvailable ? 'WARNING' : undefined,
       resolveUser: false,
     })
+    await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
   }
 
   return {
@@ -1022,6 +1052,7 @@ async function applyMintsoftAlignDownForProduct(params: {
       level: 'WARNING',
       resolveUser: false,
     })
+    await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
   }
 
   return { applied: outcome.applied, dryRun: false, reason: outcome.reason }
