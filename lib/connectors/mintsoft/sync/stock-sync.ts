@@ -913,7 +913,7 @@ async function applyMintsoftAlignDownForProduct(params: {
   dryRun: boolean
   reason: string
 }> {
-  const [priorDiscrepancy, openAsnPendingQty, stockLevel] = await Promise.all([
+  const [priorDiscrepancy, openAsnPendingQty, stockLevel, alignDownReason] = await Promise.all([
     db.wmsStockDiscrepancy.findFirst({
       where: buildDiscrepancyWhere(params.binding, 'QTY_MISMATCH', params.productId, params.sku),
       select: { delta: true, lastSeenAt: true },
@@ -928,6 +928,16 @@ async function applyMintsoftAlignDownForProduct(params: {
       },
       select: { reservedQty: true },
     }),
+    // Codex P2: the save-time active + GL-account validation can go stale (the
+    // reason deactivated or its account removed after binding save). Without a
+    // live account code applyStockAdjustment would silently skip the inventory
+    // journal, so revalidate here — a stale reason degrades to a manual hold.
+    params.binding.alignDownReasonId
+      ? db.adjustmentReason.findUnique({
+          where: { id: params.binding.alignDownReasonId },
+          select: { active: true, accountCode: true },
+        })
+      : Promise.resolve(null),
   ])
 
   const decision = planMintsoftAlignDown({
@@ -935,7 +945,7 @@ async function applyMintsoftAlignDownForProduct(params: {
     imsQty: params.imsQty,
     wmsQty: params.wmsQty,
     reservedQty: Number(stockLevel?.reservedQty ?? 0),
-    reasonConfigured: Boolean(params.binding.alignDownReasonId),
+    reasonConfigured: Boolean(alignDownReason?.active && alignDownReason?.accountCode),
     thresholds: parseMintsoftThresholds(params.binding.discrepancyThresholds),
     openAsnPendingQty,
     priorDiscrepancy: priorDiscrepancy
