@@ -128,7 +128,7 @@ See [Settings > Sales](#delivery-tracking-settings) for configuration details.
 
 ## Dispatch Email (direct orders)
 
-Direct (non-storefront) orders can optionally email the customer a branded dispatch notification when the order transitions to SHIPPED. It includes the dispatched items, carrier and tracking number(s), and a tracking link, and is sent at most once per order. Storefront orders are excluded — the storefront sends its own dispatch email once IMS pushes tracking back.
+Direct (non-storefront) orders can optionally email the customer a branded dispatch notification when the order transitions to SHIPPED. It includes the dispatched items, carrier and tracking number(s), and a tracking link, and is queued at most once per order. Storefront orders are excluded — the storefront sends its own dispatch email once IMS pushes tracking back.
 
 Off by default; enable in **Settings > Sales > Dispatch Email**. See [Documents & Email](documents-email.md) for details.
 

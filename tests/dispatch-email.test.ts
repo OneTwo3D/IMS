@@ -5,7 +5,7 @@ import { evaluateDispatchEmailEligibility } from '@/lib/dispatch-email'
 
 const eligibleInput = {
   settingValue: 'true',
-  order: { customerEmail: 'customer@example.com', shoppingLinkCount: 0 },
+  order: { status: 'SHIPPED', customerEmail: 'customer@example.com', shoppingLinkCount: 0 },
   alreadyQueued: false,
 }
 
@@ -22,11 +22,23 @@ test('dispatch email is off by default (absent or non-true setting)', () => {
   }
 })
 
+test('dispatch email only fires while the order is exactly SHIPPED', () => {
+  for (const status of ['PROCESSING', 'ALLOCATED', 'PICKING', 'COMPLETED', 'DELIVERED', 'CANCELLED']) {
+    assert.deepEqual(
+      evaluateDispatchEmailEligibility({
+        ...eligibleInput,
+        order: { ...eligibleInput.order, status },
+      }),
+      { eligible: false, reason: 'order_not_shipped' },
+    )
+  }
+})
+
 test('dispatch email skips storefront-linked orders so WC is not doubled up', () => {
   assert.deepEqual(
     evaluateDispatchEmailEligibility({
       ...eligibleInput,
-      order: { customerEmail: 'customer@example.com', shoppingLinkCount: 1 },
+      order: { ...eligibleInput.order, shoppingLinkCount: 1 },
     }),
     { eligible: false, reason: 'storefront_order' },
   )
@@ -37,7 +49,7 @@ test('dispatch email skips orders without a customer email', () => {
     assert.deepEqual(
       evaluateDispatchEmailEligibility({
         ...eligibleInput,
-        order: { customerEmail, shoppingLinkCount: 0 },
+        order: { ...eligibleInput.order, customerEmail },
       }),
       { eligible: false, reason: 'no_customer_email' },
     )

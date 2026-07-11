@@ -105,7 +105,7 @@ Set the **invoice generation trigger** to control when invoices are created auto
 
 ### Dispatch Email
 
-Toggle the dispatch email for direct (non-storefront) orders (off by default). When enabled, customers of direct orders receive a branded dispatch notification with the dispatched items, carrier, tracking number(s), and a tracking link when their order ships — at most once per order. Storefront orders are always excluded so the storefront's own dispatch email is not duplicated.
+Toggle the dispatch email for direct (non-storefront) orders (off by default). When enabled, customers of direct orders receive a branded dispatch notification with the dispatched items, carrier, tracking number(s), and a tracking link when their order ships — queued at most once per order. Storefront orders are always excluded so the storefront's own dispatch email is not duplicated.
 
 ### Delivery Tracking
 

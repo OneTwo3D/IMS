@@ -70,8 +70,6 @@ export type ShipmentTransitionResult =
 export type ShipmentReconciliationResult = {
   shouldGenerateInvoice: boolean
   orderId: string
-  /** True only for the call that actually transitioned the order to SHIPPED. */
-  orderJustShipped: boolean
 }
 
 function canRunTransaction(
@@ -549,7 +547,7 @@ export async function reconcileOrderAfterShipment(
   })
   const allShipped = allShipments.every((row) => row.status === 'SHIPPED')
   if (!allShipped) {
-    return { shouldGenerateInvoice: false, orderId: shipment.orderId, orderJustShipped: false }
+    return { shouldGenerateInvoice: false, orderId: shipment.orderId }
   }
 
   const shippedShipments = await client.shipment.findMany({
@@ -561,14 +559,14 @@ export async function reconcileOrderAfterShipment(
     .filter(Boolean)
     .join(', ')
 
-  const orderJustShipped = await runInTransaction(client, async (tx) => {
+  await runInTransaction(client, async (tx) => {
     await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${shipment.orderId} FOR UPDATE`
     const currentOrder = await tx.salesOrder.findUnique({
       where: { id: shipment.orderId },
       select: { status: true },
     })
-    if (!currentOrder) return false
-    if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(currentOrder.status)) return false
+    if (!currentOrder) return
+    if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(currentOrder.status)) return
 
     const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')
     if (!transition.success) throw new Error(transition.error)
@@ -580,13 +578,11 @@ export async function reconcileOrderAfterShipment(
         trackingNumber: trackingNumbers || (extra?.trackingNumber ?? null),
       },
     })
-    return true
   })
 
   const trigger = await client.setting.findUnique({ where: { key: 'invoice_trigger' } })
   return {
     shouldGenerateInvoice: trigger?.value === 'on_shipped',
     orderId: shipment.orderId,
-    orderJustShipped,
   }
 }

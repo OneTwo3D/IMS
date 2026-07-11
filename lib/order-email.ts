@@ -365,10 +365,15 @@ async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
         where: { status: 'SHIPPED' },
         select: { trackingNumber: true, shippingService: true },
       },
+      _count: { select: { shoppingLinks: true } },
     },
   })
   if (!so) throw new Error('Order not found')
   if (!so.customerEmail) throw new Error('No customer email address')
+  // Re-check at send time: if the order gained a storefront link after the
+  // email was queued, the storefront sends its own dispatch email — bail out
+  // rather than double-emailing the customer.
+  if (so._count.shoppingLinks > 0) throw new Error('Order is storefront-linked; dispatch email suppressed')
 
   const branding = await getBranding()
   const ref = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
@@ -388,8 +393,14 @@ async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
   const trackingLines = trackingEntries.map((t) =>
     t.carrier ? `${t.carrier} — tracking number ${t.trackingNumber}` : `Tracking number ${t.trackingNumber}`)
 
+  // getTrackingUrl returns null when the carrier is blank; a tracking number
+  // is still useful, so fall back to the same universal tracker it uses for
+  // unknown carriers.
   const firstTracked = trackingEntries[0]
-  const trackingUrl = firstTracked ? getTrackingUrl(firstTracked.carrier, firstTracked.trackingNumber) : null
+  const trackingUrl = firstTracked
+    ? getTrackingUrl(firstTracked.carrier, firstTracked.trackingNumber)
+      ?? `https://t.17track.net/en#nums=${encodeURIComponent(firstTracked.trackingNumber)}`
+    : null
 
   const subject = `Your order ${ref} has been dispatched`
   const html = await renderEmailHtml(branding, {

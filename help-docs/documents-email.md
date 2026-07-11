@@ -114,7 +114,7 @@ Both functions attach the generated PDF document to the email automatically.
 Direct (non-storefront) sales orders can optionally email the customer a branded dispatch notification when the order ships. Storefront orders are always excluded — the storefront (e.g. WooCommerce) sends its own dispatch email once IMS pushes tracking back, so customers are never emailed twice.
 
 - **Opt-in** — off by default; enable in **Settings > Sales > Dispatch Email** (`dispatch_email_enabled`).
-- **Trigger** — queued when the order transitions to SHIPPED (all shipments dispatched), at most once per order.
+- **Trigger** — queued when the order transitions to SHIPPED (all shipments dispatched); queued at most once per order, deduped under the order row lock.
 - **Content** — branded HTML email (no PDF attachment) with the order reference, the dispatched items, carrier and tracking number(s) per shipment, and a "Track your delivery" button linking to the carrier's tracking page (falls back to a universal tracker for unknown carriers).
 - **Delivery** — sent through the email outbox (`SHIPMENT_DISPATCHED` kind) with the same retry/suppression handling as other queued emails.
 
