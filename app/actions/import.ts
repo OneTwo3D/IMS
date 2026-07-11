@@ -685,7 +685,7 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
 
   const warehouses = await db.warehouse.findMany({ select: { id: true, code: true } })
   const codeToWarehouseId = new Map(warehouses.map((w) => [w.code.toUpperCase(), w.id]))
-  const { applyStockAdjustment } = await import('./stock')
+  const { applyStockAdjustment } = await import('@/lib/domain/inventory/stock-adjustment-apply')
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]

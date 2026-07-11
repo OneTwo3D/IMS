@@ -15,6 +15,7 @@ import {
   saveMintsoftConnectionSettings,
   testMintsoftConnection,
   updateMintsoftReturnInboxStatus,
+  type MintsoftBindingRow,
   type MintsoftDashboardData,
 } from '@/app/actions/mintsoft-sync'
 import { ProductLink } from '@/components/inventory/product-link'
@@ -139,6 +140,7 @@ export function MintsoftClient({ data }: Props) {
   const [warehouseId, setWarehouseId] = useState(defaultWarehouseId)
   const [externalWarehouseId, setExternalWarehouseId] = useState(defaultExternalWarehouseId)
   const [stockSyncMode, setStockSyncMode] = useState<'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'>('NOTIFICATION_ONLY')
+  const [alignDownReasonId, setAlignDownReasonId] = useState('')
   const [bundleSyncDirection, setBundleSyncDirection] = useState<'DISABLED' | 'IMS_TO_WMS' | 'WMS_TO_IMS'>('DISABLED')
   const [returnsMode, setReturnsMode] = useState<'DISABLED' | 'POLL' | 'WEBHOOK'>('DISABLED')
   const [syncFrequencyMinutes, setSyncFrequencyMinutes] = useState('60')
@@ -182,6 +184,7 @@ export function MintsoftClient({ data }: Props) {
     setWarehouseId(defaultWarehouseId)
     setExternalWarehouseId(defaultExternalWarehouseId)
     setStockSyncMode('NOTIFICATION_ONLY')
+    setAlignDownReasonId('')
     setBundleSyncDirection('DISABLED')
     setReturnsMode('DISABLED')
     setSyncFrequencyMinutes('60')
@@ -270,6 +273,7 @@ export function MintsoftClient({ data }: Props) {
         externalWarehouseId,
         active: bindingActive === 'true',
         stockSyncMode,
+        alignDownReasonId: stockSyncMode === 'ALIGN_TO_WMS' && alignDownReasonId ? alignDownReasonId : null,
         bundleSyncDirection,
         returnsMode,
         syncFrequencyMinutes: Number.parseInt(syncFrequencyMinutes, 10) || 60,
@@ -290,6 +294,37 @@ export function MintsoftClient({ data }: Props) {
 
       handleBindingDialogOpenChange(false)
       flashSaved('Mintsoft binding saved')
+      router.refresh()
+    })
+  }
+
+  // 6oyu.1: change the align-down write-off reason on an existing ALIGN binding.
+  // saveMintsoftBinding replaces the whole binding, so send the row's current
+  // values alongside the new reason.
+  function handleChangeAlignDownReason(binding: MintsoftBindingRow, nextReasonId: string) {
+    setError('')
+    startTransition(async () => {
+      const result = await saveMintsoftBinding({
+        id: binding.id,
+        warehouseId: binding.warehouseId,
+        externalWarehouseId: binding.externalWarehouseId,
+        active: binding.active,
+        stockSyncMode: binding.stockSyncMode as 'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS',
+        stockMasterSystem: binding.stockMasterSystem as 'IMS' | 'WMS',
+        bundleSyncDirection: binding.bundleSyncDirection as 'DISABLED' | 'IMS_TO_WMS' | 'WMS_TO_IMS',
+        returnsMode: binding.returnsMode as 'DISABLED' | 'POLL' | 'WEBHOOK',
+        syncFrequencyMinutes: binding.syncFrequencyMinutes,
+        discrepancyThresholds: binding.discrepancyThresholds ?? undefined,
+        reportRecipients: binding.reportRecipients,
+        alignDownReasonId: nextReasonId || null,
+      })
+
+      if (!result.success) {
+        setError(result.error ?? 'Failed to update the align-down reason')
+        return
+      }
+
+      flashSaved(nextReasonId ? 'Align-down reason saved — downward corrections enabled' : 'Align-down reason cleared — downward corrections manual')
       router.refresh()
     })
   }
@@ -535,8 +570,23 @@ export function MintsoftClient({ data }: Props) {
                     <div className="text-xs text-muted-foreground">
                       {binding.stockMasterSystem}
                       {binding.stockSyncMode === 'ALIGN_TO_WMS' && !binding.alignmentConfirmedAt ? ' · Dry run only' : ''}
-                      {binding.stockSyncMode === 'ALIGN_TO_WMS' ? ' · Align up only' : ''}
+                      {binding.stockSyncMode === 'ALIGN_TO_WMS' ? (binding.alignDownReasonId ? ' · Align up + down' : ' · Align up only') : ''}
                     </div>
+                    {binding.stockSyncMode === 'ALIGN_TO_WMS' ? (
+                      <Select
+                        className="mt-1 h-7 w-44 text-xs"
+                        value={binding.alignDownReasonId ?? ''}
+                        disabled={isPending || !binding.active}
+                        onChange={(event) => handleChangeAlignDownReason(binding, event.target.value)}
+                      >
+                        <option value="">Align-down: manual</option>
+                        {data.adjustmentReasons.map((reason) => (
+                          <option key={reason.id} value={reason.id} disabled={!reason.hasAccountCode}>
+                            {reason.name}{reason.hasAccountCode ? '' : ' (needs GL account)'}
+                          </option>
+                        ))}
+                      </Select>
+                    ) : null}
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {formatThresholdSummary(binding.discrepancyThresholds)}
@@ -1071,9 +1121,25 @@ export function MintsoftClient({ data }: Props) {
                 <option value="ALIGN_TO_WMS">Align To WMS</option>
               </Select>
               <p className="text-xs text-muted-foreground">
-                Stock master: {stockSyncMode === 'ALIGN_TO_WMS' ? 'WMS for upward corrections only (first sync is a dry run until confirmed)' : 'IMS'}
+                Stock master: {stockSyncMode === 'ALIGN_TO_WMS' ? 'WMS (first sync is a dry run until confirmed; downward corrections need a write-off reason)' : 'IMS'}
               </p>
             </div>
+            {stockSyncMode === 'ALIGN_TO_WMS' ? (
+              <div className="space-y-1.5">
+                <Label className="text-xs">Align-Down Write-Off Reason</Label>
+                <Select value={alignDownReasonId} onChange={(event) => setAlignDownReasonId(event.target.value)}>
+                  <option value="">None — downward corrections stay manual</option>
+                  {data.adjustmentReasons.map((reason) => (
+                    <option key={reason.id} value={reason.id} disabled={!reason.hasAccountCode}>
+                      {reason.name}{reason.hasAccountCode ? '' : ' (needs GL account)'}
+                    </option>
+                  ))}
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  When set, a persistent lower Mintsoft balance within the thresholds is written off against this reason&apos;s GL account.
+                </p>
+              </div>
+            ) : null}
             <div className="space-y-1.5">
               <Label className="text-xs">Bundle Sync</Label>
               <Select

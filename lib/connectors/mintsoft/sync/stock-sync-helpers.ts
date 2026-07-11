@@ -209,3 +209,119 @@ export function planMintsoftAlignmentAllocations(input: {
     unallocatedQty: remaining,
   }
 }
+
+// ---------------------------------------------------------------------------
+// Align-down (6oyu.1)
+// ---------------------------------------------------------------------------
+
+export type MintsoftAlignDownPriorDiscrepancy = {
+  delta: number | null
+  lastSeenAt: Date | string
+}
+
+export type MintsoftAlignDownInput = {
+  /** wmsQty - imsQty; align-down only considers negative deltas. */
+  delta: number
+  imsQty: number
+  wmsQty: number
+  reservedQty: number
+  /** Whether the binding has an align-down adjustment reason configured. */
+  reasonConfigured: boolean
+  thresholds: ThresholdConfig
+  /**
+   * Outstanding inbound quantity for this product on OPEN ASNs: max(expected -
+   * processed-receipts, 0) plus unreconciled alignment snapshot credits. A
+   * positive value means IMS stock may include receipts Mintsoft has not booked
+   * in yet, so the negative delta could be receipt timing, not shrinkage.
+   */
+  openAsnPendingQty: number
+  /**
+   * The OPEN QTY_MISMATCH discrepancy recorded by a PREVIOUS run, read BEFORE this
+   * run upserts it. Null when this is the first run that sees the mismatch.
+   */
+  priorDiscrepancy: MintsoftAlignDownPriorDiscrepancy | null
+  /** Start of the current sync run; the prior discrepancy must predate it. */
+  runStartedAt: Date | string
+}
+
+export type MintsoftAlignDownDecision =
+  | { action: 'apply'; qty: number }
+  | { action: 'hold'; reason: string }
+
+/**
+ * Decide whether a NEGATIVE Mintsoft delta (IMS holds more than the WMS — the
+ * shrinkage / already-shipped / oversell case) is safe to auto-correct by posting
+ * a downward stock adjustment, or must stay a manual discrepancy.
+ *
+ * Gates, in order:
+ *  1. reason configured    — align-down books a write-off; without an adjustment
+ *                            reason (and its GL account) it never runs.
+ *  2. thresholds configured — the discrepancy thresholds double as the auto-fix
+ *                            ceiling. Unconfigured thresholds would make align-down
+ *                            unbounded (a WMS API glitch returning zeros could
+ *                            write off a warehouse), so both-null holds.
+ *  3. within thresholds    — a breach means the delta is large enough to alert on;
+ *                            large deltas stay manual.
+ *  4. receipt timing       — open-ASN pending receipts can explain IMS holding
+ *                            more than Mintsoft (booked-in not yet processed);
+ *                            never write those off.
+ *  5. persistence          — the SAME delta must have been recorded by a previous
+ *                            run (dispatch webhooks/sweeps get a full cycle to
+ *                            land before we treat the delta as real shrinkage).
+ *  6. reservations         — never drive on-hand below reservedQty; the operator
+ *                            must resolve the reserving orders first (this IS the
+ *                            oversell aftermath).
+ */
+export function planMintsoftAlignDown(input: MintsoftAlignDownInput): MintsoftAlignDownDecision {
+  if (input.delta >= 0) {
+    return { action: 'hold', reason: 'Align-down only handles negative deltas.' }
+  }
+
+  if (!input.reasonConfigured) {
+    return {
+      action: 'hold',
+      reason: 'Align To WMS auto-corrects downward deltas only when the binding has an align-down adjustment reason configured; set one in the Mintsoft binding settings.',
+    }
+  }
+
+  if (input.thresholds.absoluteDelta == null && input.thresholds.percentDelta == null) {
+    return {
+      action: 'hold',
+      reason: 'Align-down needs discrepancy thresholds configured — they cap how large a delta may be auto-corrected.',
+    }
+  }
+
+  if (hasMintsoftThresholdBreach(input.imsQty, input.wmsQty, input.thresholds)) {
+    return {
+      action: 'hold',
+      reason: 'Delta breaches the discrepancy thresholds; deltas this large stay manual.',
+    }
+  }
+
+  if (input.openAsnPendingQty > 0) {
+    return {
+      action: 'hold',
+      reason: `Open ASN lines still expect ${input.openAsnPendingQty} inbound for this product — the lower Mintsoft balance may be receipt timing, not shrinkage.`,
+    }
+  }
+
+  const prior = input.priorDiscrepancy
+  const priorSeenAt = prior ? new Date(prior.lastSeenAt).getTime() : null
+  const runStart = new Date(input.runStartedAt).getTime()
+  const priorMatchesCurrentDelta = prior?.delta != null && Math.abs(prior.delta - input.delta) < 0.0001
+  if (!prior || priorSeenAt == null || priorSeenAt >= runStart || !priorMatchesCurrentDelta) {
+    return {
+      action: 'hold',
+      reason: 'Armed: will auto-correct on the next sync run if the same delta persists (in-flight dispatches get one cycle to land).',
+    }
+  }
+
+  if (input.wmsQty < input.reservedQty) {
+    return {
+      action: 'hold',
+      reason: `Aligning down to ${input.wmsQty} would drive on-hand below the ${input.reservedQty} reserved for open orders; resolve the reserving orders first.`,
+    }
+  }
+
+  return { action: 'apply', qty: input.delta }
+}

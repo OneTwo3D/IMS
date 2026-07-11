@@ -70,6 +70,12 @@ type MintsoftBindingSelect = {
   discrepancyThresholds: true
   reportRecipients: true
   alignmentConfirmedAt: true
+  alignDownReasonId: true
+  alignDownReason: {
+    select: {
+      name: true
+    }
+  }
   lastStockSyncAt: true
   lastStockSyncStatus: true
   warehouse: {
@@ -95,6 +101,12 @@ const mintsoftBindingSelect = {
   discrepancyThresholds: true,
   reportRecipients: true,
   alignmentConfirmedAt: true,
+  alignDownReasonId: true,
+  alignDownReason: {
+    select: {
+      name: true,
+    },
+  },
   lastStockSyncAt: true,
   lastStockSyncStatus: true,
   warehouse: {
@@ -162,6 +174,8 @@ export type MintsoftBindingRow = {
   reportRecipients: string[]
   alignmentConfirmedAt: string | null
   alignmentDryRunReady: boolean
+  alignDownReasonId: string | null
+  alignDownReasonName: string | null
   lastStockSyncAt: string | null
   lastStockSyncStatus: string | null
 }
@@ -265,6 +279,14 @@ export type MintsoftDashboardData = {
   receiptReviewEventCount: number
   availableOrderLookupConnectors: ShoppingConnectorId[]
   orderLookupConnectorRequired: boolean
+  /** Active adjustment reasons for the align-down reason picker (6oyu.1). */
+  adjustmentReasons: MintsoftAdjustmentReasonOption[]
+}
+
+export type MintsoftAdjustmentReasonOption = {
+  id: string
+  name: string
+  hasAccountCode: boolean
 }
 
 export type MintsoftOnboardingConnectionData = {
@@ -297,6 +319,7 @@ export type MintsoftBindingInput = {
     percentDelta?: number | null
   }
   reportRecipients?: string[]
+  alignDownReasonId?: string | null
 }
 
 const MintsoftConnectionInputSchema = z.object({
@@ -324,6 +347,7 @@ const MintsoftBindingInputSchema = z.object({
     percentDelta: z.number().nonnegative().nullable().optional(),
   }).optional(),
   reportRecipients: z.array(z.string().email('Report recipients must be valid email addresses.')).optional(),
+  alignDownReasonId: z.string().min(1).nullable().optional(),
 })
 
 const MintsoftBindingDeleteSchema = z.string().min(1, 'Binding ID is required.')
@@ -391,6 +415,8 @@ function mapMintsoftBinding(row: {
   discrepancyThresholds: Prisma.JsonValue | null
   reportRecipients: string[]
   alignmentConfirmedAt: Date | null
+  alignDownReasonId: string | null
+  alignDownReason: { name: string } | null
   lastStockSyncAt: Date | null
   lastStockSyncStatus: string | null
   warehouse: {
@@ -419,6 +445,8 @@ function mapMintsoftBinding(row: {
     reportRecipients: row.reportRecipients,
     alignmentConfirmedAt: row.alignmentConfirmedAt?.toISOString() ?? null,
     alignmentDryRunReady: options?.alignmentDryRunReady ?? false,
+    alignDownReasonId: row.alignDownReasonId,
+    alignDownReasonName: row.alignDownReason?.name ?? null,
     lastStockSyncAt: row.lastStockSyncAt?.toISOString() ?? null,
     lastStockSyncStatus: row.lastStockSyncStatus,
   }
@@ -1008,6 +1036,11 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     }),
     getIntegrationPluginState(),
   ])
+  const adjustmentReasons = await db.adjustmentReason.findMany({
+    where: { active: true },
+    orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+    select: { id: true, name: true, accountCode: true },
+  })
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
   const alignmentDryRunReadyWarehouseIds = new Set(
     dryRunReadyJobs
@@ -1075,6 +1108,11 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     receiptReviewEventCount,
     availableOrderLookupConnectors,
     orderLookupConnectorRequired: availableOrderLookupConnectors.length > 1,
+    adjustmentReasons: adjustmentReasons.map((reason) => ({
+      id: reason.id,
+      name: reason.name,
+      hasAccountCode: Boolean(reason.accountCode),
+    })),
   }
 }
 
@@ -1634,6 +1672,23 @@ export async function saveMintsoftBinding(
     }
   }
 
+  // 6oyu.1: the align-down reason must be an active reason WITH a GL account —
+  // align-down books a write-off, and without an account code the inventory GL
+  // would silently diverge from the stock it removes.
+  const alignDownReasonId = data.alignDownReasonId ?? null
+  if (alignDownReasonId) {
+    const reason = await db.adjustmentReason.findUnique({
+      where: { id: alignDownReasonId },
+      select: { active: true, accountCode: true },
+    })
+    if (!reason || !reason.active) {
+      return { success: false, error: 'The align-down adjustment reason no longer exists or is inactive.' }
+    }
+    if (!reason.accountCode) {
+      return { success: false, error: 'The align-down adjustment reason needs a GL account code so write-offs post to the ledger.' }
+    }
+  }
+
   const connectionId = await ensureMintsoftConnectionId()
   const reportRecipients = Array.from(new Set((data.reportRecipients ?? []).map((recipient) => recipient.trim().toLowerCase()).filter(Boolean)))
   const discrepancyThresholds = sanitizeMintsoftThresholds(data.discrepancyThresholds)
@@ -1649,6 +1704,7 @@ export async function saveMintsoftBinding(
     returnsMode: data.returnsMode ?? 'DISABLED',
     syncFrequencyMinutes: Math.max(1, Math.trunc(data.syncFrequencyMinutes ?? 60)),
     reportRecipients,
+    alignDownReasonId: nextStockSyncMode === 'ALIGN_TO_WMS' ? alignDownReasonId : null,
     ...(discrepancyThresholds
       ? { discrepancyThresholds }
       : { discrepancyThresholds: Prisma.JsonNull }),

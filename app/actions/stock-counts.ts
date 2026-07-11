@@ -9,7 +9,7 @@ import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { computeStockCountPostings, makeStockCountReference, type StockCountLineForPost } from '@/lib/domain/inventory/stock-count'
-import { applyStockAdjustment } from '@/app/actions/stock'
+import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 30000 }
 
