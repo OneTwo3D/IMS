@@ -419,6 +419,8 @@ model AdjustmentReason {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
+  alignDownBindings ExternalWmsBinding[] @relation("ExternalWmsBindingAlignDownReason")
+
   @@map("adjustment_reasons")
 }
 
@@ -2490,6 +2492,10 @@ model ExternalWmsBinding {
   discrepancyThresholds Json?
   reportRecipients     String[]               @default([])
   alignmentConfirmedAt DateTime?
+  /// Adjustment reason used to book ALIGN_TO_WMS downward corrections (6oyu.1).
+  /// Align-down only auto-applies while this is set; deleting the reason nulls it
+  /// and align-down falls back to manual discrepancies.
+  alignDownReasonId    String?
   lastStockSyncAt      DateTime?
   lastStockSyncStatus  WmsSyncJobStatus?
   createdAt            DateTime               @default(now())
@@ -2497,6 +2503,7 @@ model ExternalWmsBinding {
 
   connection           WmsConnection          @relation(fields: [connectionId], references: [id], onDelete: Cascade)
   warehouse            Warehouse              @relation(fields: [warehouseId], references: [id])
+  alignDownReason      AdjustmentReason?      @relation("ExternalWmsBindingAlignDownReason", fields: [alignDownReasonId], references: [id], onDelete: SetNull)
 
   @@unique([connector, warehouseId])
   @@unique([connector, externalWarehouseId])

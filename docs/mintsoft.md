@@ -19,6 +19,22 @@ Mintsoft connector settings cannot be marked active until a **Test Connection** 
 - Open discrepancies are stored in `wms_stock_discrepancies`; partial unique indexes prevent duplicate open discrepancy rows for the same connector, warehouse, category, and product/SKU.
 - Alignment should only change IMS stock after the binding permits it and discrepancy thresholds are satisfied.
 
+### Align up (Mintsoft holds more)
+
+Upward deltas are absorbed into open ASN lines as provisional goods-in receipts (cost layers from the source PO/transfer line), tracked as alignment snapshot credits that the booked-in webhook later reconciles. A delta no open ASN line can explain stays a manual discrepancy.
+
+### Align down (Mintsoft holds less — shrinkage / already-shipped)
+
+Downward deltas are auto-corrected by posting a negative stock adjustment (FIFO consumption + inventory GL journal via `applyStockAdjustment`), but only when EVERY gate passes; otherwise the discrepancy stays open carrying the hold reason:
+
+1. **Write-off reason configured** — the binding's *Align-Down Write-Off Reason* (an active `AdjustmentReason` **with a GL account code**) must be set; the write-off posts `DR reason-account / CR Inventory`. No reason → align-down never runs.
+2. **Thresholds configured and not breached** — the binding's discrepancy thresholds double as the auto-fix ceiling; unconfigured thresholds or a breaching delta stay manual (a WMS API glitch must not write off a warehouse).
+3. **No pending inbound** — open ASN lines with outstanding expected receipts or unreconciled alignment credits hold the correction (the lower Mintsoft balance may be receipt timing, not shrinkage).
+4. **Persistence across two runs** — the same delta must have been recorded by a *previous* sync run, so in-flight dispatch webhooks/sweeps get a full cycle to land before stock is written off.
+5. **Reservations** — on-hand is never driven below `reservedQty`; the oversell aftermath (orders reserving stock that doesn't exist) must be resolved by an operator.
+
+Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/after quantities and the movement id, and are idempotent per sync job. Dry-run mode (before alignment confirmation) previews align-down the same way it previews align-up.
+
 ## ASN Flow
 
 - IMS creates outbound ASN payloads for purchase orders and transfer lines.
