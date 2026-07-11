@@ -25,7 +25,7 @@ The through-line: when the 3PL holds **less** than IMS believes (shrinkage, alre
 
 | # | Item | Evidence | bd |
 |---|------|----------|----|
-| B1 | Transit (`STOCK_IN_TRANSIT`) GL account has **no** reconciliation sweep — khdw intent unmet; only INVENTORY + COGS are tied out | `account-gl-reconciliation.ts:20`; `daily-sync.ts:1325,1364`; no transit module | **6oyu.4 (P2)** |
+| B1 | Transit (`STOCK_IN_TRANSIT`) GL account has **no** reconciliation sweep — only INVENTORY + COGS are tied out. This is epic `khdw`'s remaining deliverable; design spec + open finance question (expected-transit-balance basis) live there | `account-gl-reconciliation.ts:20`; `daily-sync.ts:1325,1364`; no transit module | **6oyu.4 (P2)** → epic khdw |
 | B2 | Refund COGS reversal uses **current** layer cost, not originally-posted COGS — landed-cost revaluation after dispatch leaves a residual. Needs a finance decision (carrying-value vs posted-COGS reversal) | `refund-service.ts:962-968` (explicit trade-off comment) | **6oyu.5 (P2)** |
 | B3 | Xero payment-reversal/chargeback detection covers MANUAL orders only — WC-paid orders (most of onetwo3d's volume) are excluded; order status never auto-reverts on reversal | `payment-poller.ts:130` (`shoppingLinks:{none:{}}`), `:121-175` | **6oyu.6 (P2)** |
 | B4 | Retrospective-COGS exclusion lists are hand-maintained per movement type — a future non-customer movement type silently corrupts revaluation COGS | `cost-layers.ts:865-906` | **6oyu.7 (P3)** |
