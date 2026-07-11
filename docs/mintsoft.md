@@ -32,7 +32,7 @@ Mintsoft connector settings cannot be marked active until a **Test Connection** 
 
 ### Receipt Review
 
-Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings.
+Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings. Events that instead exhaust their retries go `DEAD` and surface in the cross-connector [sync exception inbox](./sync-exceptions.md) (`/sync/exceptions`), which can safely re-queue them.
 
 - Structural warnings block approval until the underlying IMS or Mintsoft data is fixed: remote quantity regression, missing IMS source line, unsupported source type, or missing transfer cost-layer snapshot.
 - `received_over_expected` is a variance warning. It always requires admin review, but approval accepts the over-receipt and lets processing continue.
