@@ -15,6 +15,7 @@ import { formatMoney, type SymbolPos } from '@/lib/utils'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { formatDateTime } from '@/lib/format-datetime'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
+import { getTrackingUrl } from '@/lib/tracking'
 
 type EmailAttachment = { filename: string; content: Buffer; contentType?: string }
 type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[] }
@@ -346,6 +347,71 @@ async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: bo
   }
 }
 
+async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
+  const so = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      id: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      customerName: true,
+      customerEmail: true,
+      shippedAt: true,
+      trackingNumber: true,
+      shippingService: true,
+      createdAt: true,
+      lines: { select: { description: true, sku: true, qty: true } },
+      shipments: {
+        where: { status: 'SHIPPED' },
+        select: { trackingNumber: true, shippingService: true },
+      },
+    },
+  })
+  if (!so) throw new Error('Order not found')
+  if (!so.customerEmail) throw new Error('No customer email address')
+
+  const branding = await getBranding()
+  const ref = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
+  const tz = await getDisplayTimeZone()
+  const date = formatDateTime(so.shippedAt ?? new Date(), { day: 'numeric', month: 'long', year: 'numeric' }, tz)
+
+  // Shipment-level tracking first; fall back to the order-level fields set by
+  // reconcileOrderAfterShipment for legacy/manual flows.
+  const trackingEntries = so.shipments
+    .filter((s) => s.trackingNumber)
+    .map((s) => ({ trackingNumber: s.trackingNumber!, carrier: s.shippingService ?? so.shippingService }))
+  if (trackingEntries.length === 0 && so.trackingNumber) {
+    trackingEntries.push({ trackingNumber: so.trackingNumber, carrier: so.shippingService })
+  }
+
+  const itemLines = so.lines.map((l) => `${Number(l.qty)} × ${l.description}${l.sku ? ` (${l.sku})` : ''}`)
+  const trackingLines = trackingEntries.map((t) =>
+    t.carrier ? `${t.carrier} — tracking number ${t.trackingNumber}` : `Tracking number ${t.trackingNumber}`)
+
+  const firstTracked = trackingEntries[0]
+  const trackingUrl = firstTracked ? getTrackingUrl(firstTracked.carrier, firstTracked.trackingNumber) : null
+
+  const subject = `Your order ${ref} has been dispatched`
+  const html = await renderEmailHtml(branding, {
+    recipientName: so.customerName ?? 'Customer',
+    recipientEmail: so.customerEmail,
+    reference: ref,
+    date,
+    subject,
+    bodyLines: [
+      `Good news — your order ${ref} has been dispatched.`,
+      ...(itemLines.length > 0 ? ['Items in this order:', ...itemLines] : []),
+      ...trackingLines,
+      ...(trackingUrl ? ['You can follow your delivery using the tracking link below.'] : []),
+      'If you have any questions about your delivery, please don\'t hesitate to contact us.',
+    ],
+    ...(trackingUrl ? { ctaLabel: 'Track your delivery', ctaUrl: trackingUrl } : {}),
+    hideAttachmentNote: true,
+  })
+
+  return { to: so.customerEmail, subject, html }
+}
+
 export async function getSalesOrderConfirmationQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
@@ -385,5 +451,6 @@ export async function prepareQueuedEmail(kind: string, referenceType: string | n
   if (kind === 'SALES_ORDER_CONFIRMATION') return buildSalesOrderConfirmationEmail(referenceId)
   if (kind === 'INVOICE') return buildInvoiceEmail(referenceId)
   if (kind === 'ACCOUNTING_INVOICE') return buildInvoiceEmail(referenceId, { accountingPdf: true })
+  if (kind === 'SHIPMENT_DISPATCHED') return buildDispatchEmail(referenceId)
   return null
 }

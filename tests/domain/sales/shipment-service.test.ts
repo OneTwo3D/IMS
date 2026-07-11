@@ -817,7 +817,7 @@ test('reconcileOrderAfterShipment leaves order open until every shipment is ship
 
   const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
 
-  assert.deepEqual(result, { shouldGenerateInvoice: false, orderId: 'order-1' })
+  assert.deepEqual(result, { shouldGenerateInvoice: false, orderId: 'order-1', orderJustShipped: false })
   assert.equal(state.orders[0].status, 'ALLOCATED')
   assert.equal(state.orders[0].trackingNumber, undefined)
 })
@@ -834,7 +834,7 @@ test('reconcileOrderAfterShipment marks fully shipped order and returns invoice 
 
   const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
 
-  assert.deepEqual(result, { shouldGenerateInvoice: true, orderId: 'order-1' })
+  assert.deepEqual(result, { shouldGenerateInvoice: true, orderId: 'order-1', orderJustShipped: true })
   assert.equal(state.orders[0].status, 'SHIPPED')
   assert.equal(state.orders[0].trackingNumber, 'TRACK-1, TRACK-2')
   assert.ok(state.orders[0].shippedAt instanceof Date)
@@ -859,7 +859,7 @@ test('reconcileOrderAfterShipment does not rewrite terminal orders', async () =>
 
   const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
 
-  assert.deepEqual(result, { shouldGenerateInvoice: true, orderId: 'order-1' })
+  assert.deepEqual(result, { shouldGenerateInvoice: true, orderId: 'order-1', orderJustShipped: false })
   assert.equal(state.orders[0].status, 'COMPLETED')
   assert.equal(state.orders[0].trackingNumber, 'EXISTING')
   assert.equal(state.orders[0].shippedAt, shippedAt)

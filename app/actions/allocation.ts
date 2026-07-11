@@ -718,6 +718,12 @@ export async function updateShipmentStatus(
         const { generateInvoiceNumber } = await import('./sales')
         await generateInvoiceNumber(reconciliation.orderId)
       }
+      if (reconciliation.orderJustShipped) {
+        // Direct (non-storefront) orders: courtesy dispatch email, opt-in and
+        // once per order. Never throws.
+        const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
+        await queueDispatchEmailIfEligible(reconciliation.orderId)
+      }
     }
     if (!result.transitioned) return { success: true }
 
