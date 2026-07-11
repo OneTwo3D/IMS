@@ -1512,6 +1512,11 @@ export async function applySalesOrderStatusTransition(
       if (trigger?.value === 'on_shipped') {
         await generateInvoiceNumber(id, { skipLog: true })
       }
+      // Direct (non-storefront) orders: courtesy dispatch email, opt-in and
+      // queued at most once per order. Self-guarded (order must be SHIPPED,
+      // dedup under the order row lock) and never throws.
+      const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
+      await queueDispatchEmailIfEligible(id)
     }
 
     revalidatePath('/sales')
