@@ -180,7 +180,11 @@ export function buildNotPushedDriftWhere(input: {
       { wmsOrderPush: { state: 'PENDING_CREATE' as const, updatedAt: { lt: input.cutoff } } },
       // A ready+paid order stuck on a HELD link should have been re-created by
       // the push sweep's release pass — if it lingers, that cron is dead.
-      { wmsOrderPush: { state: 'HELD' as const, updatedAt: { lt: input.cutoff } } },
+      // Freshness keys on cancelledAt (stamped when the hold parked the link):
+      // the link's own updatedAt is churned by check C's reconcileCheckedAt
+      // stamp, which would make a stale HELD finding self-resolve mid-run
+      // (Codex r7). cancelledAt only moves when the hold state itself does.
+      { wmsOrderPush: { state: 'HELD' as const, cancelledAt: { lt: input.cutoff } } },
     ],
   }
 }
