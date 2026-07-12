@@ -84,10 +84,26 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   let overdueAsnAlerts = 0
   let staleBindingAlerts = 0
 
-  // 1 — overdue ASNs (bounded: un-alerted open ASNs only).
+  // 1 — overdue ASNs. The overdue shape is pushed into SQL (Codex: an
+  // unordered take before the predicate let 200 newer non-overdue rows shadow
+  // a real breach forever) and ordered oldest-first; CREATE_PENDING
+  // reservations are excluded — they were never created in the WMS (synthetic
+  // external id), so an overdue-shipment alert would be misleading. The
+  // lastCallbackAt-vs-ETA refinement stays in isAsnOverdue (not expressible as
+  // a column comparison in Prisma).
   const openAsns = await db.wmsAsnMap.findMany({
-    where: { connector: connectorId, closedAt: null, sloAlertedAt: null },
+    where: {
+      connector: connectorId,
+      closedAt: null,
+      sloAlertedAt: null,
+      status: { not: 'CREATE_PENDING' },
+      OR: [
+        { eta: { lt: new Date(now.getTime() - ASN_OVERDUE_GRACE_MS) } },
+        { eta: null, lastCallbackAt: null, createdAt: { lt: new Date(now.getTime() - ASN_NO_ETA_FALLBACK_AGE_MS) } },
+      ],
+    },
     take: 200,
+    orderBy: [{ eta: { sort: 'asc', nulls: 'last' } }, { createdAt: 'asc' }],
     select: {
       id: true,
       externalAsnId: true,
