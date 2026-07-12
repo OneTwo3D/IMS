@@ -124,6 +124,24 @@ export function pickShipheroOrderNode(nodes: unknown[], reference: string): unkn
   return exact ?? nodes[0]
 }
 
+/**
+ * Tri-state presence probe (q66in.4.4). Zero nodes is a VERIFIABLE absence;
+ * an EXACT order_number hit is presence. Candidates WITHOUT an exact match are
+ * AMBIGUOUS (Codex r26): the search matched something related, so absence is
+ * not proven — and reconciliation must fail closed rather than re-create a
+ * possibly-live order or mistake unrelated hits for health.
+ */
+export async function probeShipheroOrderPresence(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
+  const reference = orderNumber.trim()
+  if (!reference) return 'MISSING'
+  const result = await shipheroGraphql<ShipheroOrdersData>(ORDER_STATUS_QUERY, { orderNumber: reference })
+  if (result.error) throw new Error(result.error)
+  const nodes = extractShipheroConnectionNodes((result.data?.orders as { data?: unknown })?.data ?? result.data?.orders)
+  if (nodes.length === 0) return 'MISSING'
+  const exact = nodes.some((node) => str(asRecord(node)?.order_number) === reference)
+  return exact ? 'FOUND' : 'AMBIGUOUS'
+}
+
 export async function fetchShipheroOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
   const reference = orderNumber.trim()
   if (!reference) return null

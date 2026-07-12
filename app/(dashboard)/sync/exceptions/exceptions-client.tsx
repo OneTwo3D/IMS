@@ -23,6 +23,7 @@ import {
   replayDeadWebhookEvent,
   replayOutboxException,
   replayStuckDispatch,
+  repushMissingWmsOrder,
   retryRefundSyncPark,
   type ExceptionInboxData,
 } from '@/app/actions/sync-exceptions'
@@ -336,6 +337,55 @@ export function ExceptionsClient({ data }: Props) {
                     >
                       <RotateCcw className="h-3 w-3 mr-1" />Replay
                     </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.orderReconcileDrift.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Order reconciliation — drift (${data.summary.orderReconcileDrift})`}
+            detail="Findings from the latest scheduled IMS-vs-WMS order reconciliation. NOT_PUSHED: eligible order never reached the WMS (check the push cron). MISSING_IN_WMS: the WMS lost the order — re-push it. ACTIVE_AFTER_CANCEL: a cancelled order is still live in the WMS and may ship — cancel it there."
+            shown={data.orderReconcileDrift.length}
+            total={data.summary.orderReconcileDrift}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Order</TableHead>
+                <TableHead>WMS order</TableHead>
+                <TableHead>Category</TableHead>
+                <TableHead>Detail</TableHead>
+                <TableHead>Found</TableHead>
+                <TableHead className="text-right">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.orderReconcileDrift.map((row, index) => (
+                <TableRow key={`${row.orderId}-${row.category}-${index}`}>
+                  <TableCell>
+                    <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
+                  </TableCell>
+                  <TableCell className="text-xs font-mono">{row.externalOrderNumber ?? '—'}</TableCell>
+                  <TableCell className="text-xs">{row.category.replaceAll('_', ' ').toLowerCase()}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.detail ?? ''}>{row.detail ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.foundAt ? formatDateTime(row.foundAt) : '—'}</TableCell>
+                  <TableCell className="text-right">
+                    {row.category === 'MISSING_IN_WMS' ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => runAction(() => repushMissingWmsOrder(row.orderId), 'Order re-queued for the next push sweep.')}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Re-push
+                      </Button>
+                    ) : null}
                   </TableCell>
                 </TableRow>
               ))}

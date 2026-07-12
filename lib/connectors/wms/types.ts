@@ -269,6 +269,14 @@ export interface WmsConnector {
   fetchBundle?(externalProductId: string): Promise<WmsBundleRef | null>
   /** Resolve the live order status for a storefront order number, if supported. */
   fetchOrderStatus?(orderNumber: string): Promise<WmsOrderStatus | null>
+  /**
+   * Tri-state order-presence probe for reconciliation (q66in.4.4). Distinct from
+   * fetchOrderStatus, whose null CONFLATES "definitively absent" with
+   * "ambiguous match" (e.g. several merged candidates) — a reconcile that reads
+   * ambiguity as deletion would offer a re-push that DUPLICATES the WMS order.
+   * MISSING must mean the WMS verifiably has no trace of the order.
+   */
+  probeOrderPresence?(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'>
   /** All parts of a (possibly split) order, each with its own status/tracking/dispatched
    *  flag — for per-part dispatch reconciliation. */
   fetchOrderParts?(orderNumber: string): Promise<WmsOrderPart[]>

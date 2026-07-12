@@ -246,6 +246,7 @@ type LinkWrite = {
   dispatchFailureCount?: number
   dispatchLastError?: string | null
   dispatchDeadLetteredAt?: Date | null
+  reconcileCheckedAt?: Date | null
 }
 
 /**
@@ -258,6 +259,9 @@ const RESET_DISPATCH_FAILURES = {
   dispatchFailureCount: 0,
   dispatchLastError: null,
   dispatchDeadLetteredAt: null,
+  // Same rationale for the reconcile stamp: the recency belonged to the OLD
+  // WMS order; the fresh one must rotate to the front of verification.
+  reconcileCheckedAt: null,
 } satisfies LinkWrite
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
@@ -396,7 +400,10 @@ export async function runWmsOrderPushSweepCore(
       try {
         const cancel = await connector.cancelOrder(link.externalOrderId)
         if (cancel.cancelled || cancel.status === 'NOT_FOUND') {
-          await port.updateLink(link.id, { state: 'HELD', cancelledAt: ts, lastError: null, lastAttemptAt: ts })
+          // reconcileCheckedAt reset (q66in.4.4): a freshly held/cancelled link
+          // must rotate to the FRONT of the reconcile's safety check, not
+          // inherit its pre-transition verification recency.
+          await port.updateLink(link.id, { state: 'HELD', cancelledAt: ts, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null })
           result.held += 1
         } else {
           result.deadLettered += 1
@@ -418,7 +425,7 @@ export async function runWmsOrderPushSweepCore(
       try {
         const cancel = await connector.cancelOrder(link.externalOrderId)
         if (cancel.cancelled || cancel.status === 'NOT_FOUND') {
-          await port.updateLink(link.id, { state: 'CANCELLED', cancelledAt: ts, lastError: null, lastAttemptAt: ts })
+          await port.updateLink(link.id, { state: 'CANCELLED', cancelledAt: ts, lastError: null, lastAttemptAt: ts , reconcileCheckedAt: null })
           result.cancelled += 1
         } else {
           // Past NEW in the WMS — already being fulfilled despite the IMS cancel/full

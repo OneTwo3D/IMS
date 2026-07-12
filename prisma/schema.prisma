@@ -1566,6 +1566,7 @@ model SalesOrder {
   wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
   wmsOrderStatus    WmsOrderStatusSnapshot?
   wmsOrderPush      WmsOrderPushLink?
+  wmsOrderDiscrepancies WmsOrderDiscrepancy[]
 
   @@index([status])
   @@index([status, updatedAt(sort: Desc)], map: "sales_orders_status_updatedAt_idx")
@@ -2344,6 +2345,9 @@ model WmsOrderPushLink {
   dispatchFailureCount   Int            @default(0)
   dispatchLastError      String?
   dispatchDeadLetteredAt DateTime?
+  /// q66in.4.4: when the order reconcile last verified this link against the
+  /// WMS — the capped daily sweep rotates least-recently-checked first.
+  reconcileCheckedAt     DateTime?
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
@@ -2390,6 +2394,7 @@ enum WmsSyncJobType {
   RETURNS_SYNC
   PRODUCT_VERIFY
   DISPATCH_SYNC
+  ORDER_RECONCILE
 }
 
 enum WmsSyncJobStatus {
@@ -2701,6 +2706,30 @@ model WmsStockSnapshot {
   @@unique([connector, warehouseId, productId])
   @@index([warehouseId, productId])
   @@map("wms_stock_snapshots")
+}
+
+/// q66in.4.4: durable ORDER-level reconcile finding. The capped daily sweep can
+/// never produce a complete snapshot, so findings persist as OPEN rows —
+/// upserted when detected, resolved only when THAT order re-verifies clean (or
+/// the drift predicate no longer holds). One OPEN row per (order, category),
+/// enforced by a partial unique index in SQL.
+model WmsOrderDiscrepancy {
+  id                  String    @id @default(cuid())
+  connector           String
+  orderId             String
+  category            String
+  status              String    @default("OPEN")
+  detail              String?
+  externalOrderNumber String?
+  firstSeenAt         DateTime  @default(now())
+  lastSeenAt          DateTime  @default(now())
+  resolvedAt          DateTime?
+
+  order               SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([status, category])
+  @@index([orderId])
+  @@map("wms_order_discrepancies")
 }
 
 model WmsStockDiscrepancy {

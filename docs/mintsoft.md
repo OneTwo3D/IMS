@@ -98,6 +98,10 @@ The `timestamp` string must be the exact header value IMS uses for freshness val
 - Operators review unmatched returns and choose restock/refund handling.
 - Restocking preserves the selected destination warehouse on subsequent polling updates.
 
+## Order Reconciliation (scheduled)
+
+The `wms-order-reconcile` cron (default daily, ships disabled — enable in System Settings → Scheduler) runs a connector-agnostic order-level reconcile of IMS intent vs WMS truth (`lib/domain/wms/order-reconcile-sweep.ts`). Because the WMS API cannot enumerate orders, it verifies IMS-known truth per order: eligible orders with no live push link (`NOT_PUSHED`), live links whose WMS order vanished (`MISSING_IN_WMS`), and cancelled/held orders still active in the WMS (`ACTIVE_AFTER_CANCEL` — admins are belled; the warehouse may ship them). Findings land on an `ORDER_RECONCILE` sync job and surface in the [sync exception inbox](./sync-exceptions.md).
+
 ## Order Dispatch Push (Phase 8)
 
 IMS pushes sales orders outbound to the WMS so the 3PL can fulfil them. The work is done by a connector-agnostic sweep (`lib/domain/wms/order-push-sweep.ts`) driven by the `wms-order-push` cron (`/api/cron/wms-order-push`, default every 10 minutes). **The cron ships disabled** — enable it in System Settings → Scheduler once a warehouse is bound.

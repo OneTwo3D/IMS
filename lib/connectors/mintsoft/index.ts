@@ -5,7 +5,7 @@ import {
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
-import { fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems } from './api/orders'
+import { fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
 import { addMintsoftOrderComment, cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
 
 const CONNECTOR = 'Mintsoft'
@@ -80,6 +80,10 @@ export class MintsoftConnector implements WmsConnector {
 
   async fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
     return fetchMintsoftOrderStatus(orderNumber)
+  }
+
+  async probeOrderPresence(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
+    return probeMintsoftOrderPresence(orderNumber)
   }
 
   async fetchOrderParts(orderNumber: string): Promise<WmsOrderPart[]> {

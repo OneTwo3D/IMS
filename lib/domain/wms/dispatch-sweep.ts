@@ -356,6 +356,8 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           dispatchFailureCount: 0,
           dispatchLastError: null,
           dispatchDeadLetteredAt: null,
+          // The survivor is a DIFFERENT WMS order — reconcile recency resets too.
+          reconcileCheckedAt: null,
         },
       })
     },

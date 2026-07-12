@@ -21,6 +21,7 @@ export function ExceptionsBanner({ summary }: { summary: ExceptionInboxSummary }
     summary.refundSyncParks > 0 ? `${summary.refundSyncParks} parked refund(s)` : null,
     summary.stuckDispatches > 0 ? `${summary.stuckDispatches} stuck dispatch(es)` : null,
     summary.pennyMismatches > 0 ? `${summary.pennyMismatches} order-total mismatch(es)` : null,
+    summary.orderReconcileDrift > 0 ? `${summary.orderReconcileDrift} order reconcile drift(s)` : null,
   ].filter(Boolean)
 
   return (
