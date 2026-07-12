@@ -80,6 +80,9 @@ export type WmsWatchdogResult = {
   reason?: string
 }
 
+/** Thrown when delivery finds zero recipients — the sweep aborts on the first one (Codex r8). */
+class NoActiveAdminsError extends Error {}
+
 /**
  * Insert a warning notification for every CURRENTLY active admin, inside the
  * caller's claim transaction — deliberately NOT lib/notifications.notify(),
@@ -94,7 +97,7 @@ async function notifyActiveAdmins(
   message: string,
 ): Promise<void> {
   const admins = await tx.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-  if (admins.length === 0) throw new Error('no active ADMIN users to notify')
+  if (admins.length === 0) throw new NoActiveAdminsError('no active ADMIN users to notify')
   await tx.notification.createMany({
     data: admins.map((admin) => ({
       userId: admin.id,
@@ -204,6 +207,12 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     } catch (deliveryError) {
       deliveryFailures += 1
       console.error(`[wms-watchdog] overdue-ASN alert delivery failed for ${asn.externalAsnId}:`, deliveryError)
+      // The up-front storm guard is TOCTOU (Codex r8): if the last admins
+      // vanished mid-sweep, every remaining breach would claim/roll back/log.
+      // Abort on the first zero-recipient failure — nothing later can deliver.
+      if (deliveryError instanceof NoActiveAdminsError) {
+        return { status: 'FAILED', overdueAsnAlerts, staleBindingAlerts, deliveryFailures, reason: 'No active ADMIN users to notify' }
+      }
       continue
     }
     if (!claimed) continue
@@ -285,6 +294,10 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     } catch (deliveryError) {
       deliveryFailures += 1
       console.error(`[wms-watchdog] stale-sync alert delivery failed for ${binding.warehouse.code}:`, deliveryError)
+      // Same first-zero-recipient abort as the ASN path (Codex r8).
+      if (deliveryError instanceof NoActiveAdminsError) {
+        return { status: 'FAILED', overdueAsnAlerts, staleBindingAlerts, deliveryFailures, reason: 'No active ADMIN users to notify' }
+      }
       continue
     }
     if (!claimed) continue
