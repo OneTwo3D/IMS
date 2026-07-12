@@ -146,7 +146,13 @@ const REFUND_PARK_WHERE = {
 // 6oyu.2: stuck dispatches are now first-class — the dispatch sweep dead-letters
 // a link after DISPATCH_MAX_CONSECUTIVE_FAILURES consecutive reconcile errors
 // (dispatchDeadLetteredAt set, link leaves the sweep's candidate set).
-const STUCK_DISPATCH_WHERE = { dispatchDeadLetteredAt: { not: null } }
+// Scoped to the sweep's own candidate states (Codex r4): a link that later goes
+// HELD/CANCELLED/push-DEAD_LETTER is no longer a dispatch question — those
+// surface through their own flows — so it must not linger here as an exception.
+const STUCK_DISPATCH_WHERE = {
+  dispatchDeadLetteredAt: { not: null },
+  state: { in: ['SYNCED' as const, 'MERGED' as const] },
+}
 
 function countStuckDispatches(): Promise<number> {
   return db.wmsOrderPushLink.count({ where: STUCK_DISPATCH_WHERE })
