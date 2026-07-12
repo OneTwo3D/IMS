@@ -113,7 +113,11 @@ export async function runWmsOrderReconcileCore(
   // large live-link backlog can never starve the safety-critical check (Codex).
   const verifiedSyncedOrderIds: string[] = []
   const verifiedCancelledOrderIds: string[] = []
-  const cancelledLinks = await deps.listCancelledLinksToVerify(lookupLimit)
+  // C is fetched first (safety priority) but capped at HALF the budget so a
+  // large cancellation window can never zero out check B either (Codex r11 —
+  // the starvation existed in both directions). Each check's rotation covers
+  // its own backlog across runs.
+  const cancelledLinks = await deps.listCancelledLinksToVerify(Math.ceil(lookupLimit / 2))
   for (const link of cancelledLinks) {
     counters.cancelledVerified += 1
     try {
@@ -415,7 +419,9 @@ export async function runWmsOrderReconcileSweep(
     // Resolve B/C rows PER CATEGORY (Codex r8): each check only speaks for its
     // own category — an order found ACTIVE_AFTER_CANCEL this run still resolves
     // its old MISSING_IN_WMS row if check B verified it, and vice versa.
-    const foundKey = new Set(core.findings.map((finding) => `${finding.orderId}:${finding.category}`))
+    // Keyed on validFindings (Codex r11): a finding dropped by the state
+    // revalidation must not block resolving the order's existing open row.
+    const foundKey = new Set(validFindings.map((finding) => `${finding.orderId}:${finding.category}`))
     const cleanFor = (verifiedIds: string[], category: string) => verifiedIds.filter((orderId) => !foundKey.has(`${orderId}:${category}`))
     const cleanSynced = cleanFor(core.verifiedSyncedOrderIds, 'MISSING_IN_WMS')
     if (cleanSynced.length > 0) {
@@ -431,6 +437,27 @@ export async function runWmsOrderReconcileSweep(
         data: { status: 'RESOLVED', resolvedAt: now },
       })
     }
+
+    // State-scope cleanup (Codex r11): an open B/C row whose link has LEFT the
+    // category's state can never be rescanned by its check (B only walks
+    // SYNCED/MERGED, C only CANCELLED/HELD) — the finding is moot in the new
+    // state, which surfaces through its own flows. Resolve wholesale.
+    await db.wmsOrderDiscrepancy.updateMany({
+      where: {
+        category: 'MISSING_IN_WMS',
+        status: 'OPEN',
+        order: { wmsOrderPush: { isNot: { state: { in: ['SYNCED', 'MERGED'] } } } },
+      },
+      data: { status: 'RESOLVED', resolvedAt: now },
+    })
+    await db.wmsOrderDiscrepancy.updateMany({
+      where: {
+        category: 'ACTIVE_AFTER_CANCEL',
+        status: 'OPEN',
+        order: { wmsOrderPush: { isNot: { state: { in: ['CANCELLED', 'HELD'] } } } },
+      },
+      data: { status: 'RESOLVED', resolvedAt: now },
+    })
 
     // Resolve NOT_PUSHED rows whose drift predicate no longer holds — the order
     // gained a live link, or stopped being eligible. Re-evaluated per open row
