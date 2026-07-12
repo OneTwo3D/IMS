@@ -644,6 +644,16 @@ export async function replayStuckDispatch(orderId: string): Promise<MutationResu
 export async function repushMissingWmsOrder(orderId: string): Promise<MutationResult> {
   try {
     const session = await requireFreshPermission('sync')
+    // Codex: an OPEN finding is the AUTHORIZATION for this reset — resolving it
+    // first (compare-and-set) means a stale page or direct invocation cannot
+    // wipe a healthy order's external identifiers.
+    const finding = await db.wmsOrderDiscrepancy.updateMany({
+      where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
+      data: { status: 'RESOLVED', resolvedAt: new Date() },
+    })
+    if (finding.count === 0) {
+      return { success: false, error: 'No open missing-in-WMS finding for this order (already resolved or re-verified).' }
+    }
     const updated = await db.wmsOrderPushLink.updateMany({
       where: { orderId, state: { in: ['SYNCED', 'MERGED'] } },
       data: {
@@ -660,10 +670,6 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     if (updated.count === 0) {
       return { success: false, error: 'The push link is no longer in a re-pushable state.' }
     }
-    await db.wmsOrderDiscrepancy.updateMany({
-      where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
-      data: { status: 'RESOLVED', resolvedAt: new Date() },
-    })
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,

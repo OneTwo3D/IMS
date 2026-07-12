@@ -181,6 +181,9 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
           OR: [
             { wmsOrderPush: null },
             { wmsOrderPush: { state: 'PENDING_CREATE', updatedAt: { lt: cutoff } } },
+            // A ready+paid order stuck on a HELD link should have been re-created
+            // by the push sweep's release pass — if it lingers, that cron is dead.
+            { wmsOrderPush: { state: 'HELD', updatedAt: { lt: cutoff } } },
           ],
         },
         select: { id: true, orderNumber: true },
@@ -214,20 +217,24 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
     },
     async listCancelledLinksToVerify(limit) {
       // Recent window only: a long-cancelled order that once verified clean
-      // doesn't need re-checking forever.
+      // doesn't need re-checking forever. Windowed on cancelledAt — a STABLE
+      // timestamp (both the cancel and hold passes set it). updatedAt would be
+      // refreshed by our own reconcileCheckedAt stamp, so checked links would
+      // never age out and would eventually consume the whole shared budget,
+      // permanently starving check B (Codex P1).
       const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
       const links = await db.wmsOrderPushLink.findMany({
         where: {
           connector: connectorId,
           state: { in: ['CANCELLED', 'HELD'] },
           externalOrderNumber: { not: null },
-          updatedAt: { gte: since },
+          cancelledAt: { gte: since },
         },
         select: { orderId: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
         take: limit,
         // Rotate like check B: least-recently-verified first, so a window with
         // more cancellations than the cap still gets full coverage over days.
-        orderBy: [{ reconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { updatedAt: 'desc' }],
+        orderBy: [{ reconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { cancelledAt: 'desc' }],
       })
       return links.flatMap((link) => (
         link.externalOrderNumber
@@ -349,17 +356,31 @@ export async function runWmsOrderReconcileSweep(
       select: { id: true, orderId: true },
     })
     if (openNotPushed.length > 0) {
+      // Same predicate as detection — including the bound-warehouse condition
+      // (Codex: an order whose binding was disabled or that moved to an unbound
+      // warehouse is out of WMS scope and must resolve, not linger).
+      const bindings = await db.externalWmsBinding.findMany({
+        where: { connector: connectorId, active: true, connection: { active: true } },
+        select: { warehouseId: true },
+      })
       const stillDrifting = new Set(
-        (await db.salesOrder.findMany({
-          where: {
-            id: { in: openNotPushed.map((row) => row.orderId) },
-            status: { in: ['PROCESSING', 'ALLOCATED'] },
-            paidAt: { not: null },
-            refundStatus: { not: 'FULL' },
-            OR: [{ wmsOrderPush: null }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
-          },
-          select: { id: true },
-        })).map((order) => order.id),
+        bindings.length === 0
+          ? []
+          : (await db.salesOrder.findMany({
+              where: {
+                id: { in: openNotPushed.map((row) => row.orderId) },
+                status: { in: ['PROCESSING', 'ALLOCATED'] },
+                paidAt: { not: null },
+                refundStatus: { not: 'FULL' },
+                shipFromWarehouseId: { in: bindings.map((b) => b.warehouseId) },
+                OR: [
+                  { wmsOrderPush: null },
+                  { wmsOrderPush: { state: 'PENDING_CREATE' } },
+                  { wmsOrderPush: { state: 'HELD' } },
+                ],
+              },
+              select: { id: true },
+            })).map((order) => order.id),
       )
       const resolvableIds = openNotPushed.filter((row) => !stillDrifting.has(row.orderId)).map((row) => row.id)
       if (resolvableIds.length > 0) {
