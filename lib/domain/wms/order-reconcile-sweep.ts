@@ -323,9 +323,19 @@ export async function runWmsOrderReconcileSweep(
     const core = await runWmsOrderReconcileCore(deps, options)
     counters = core.counters
 
-    if (core.verifiedOrderIds.length > 0) {
+    // Stamp recency ONLY on links still in the state each check verified: a
+    // concurrent push sweep may have cancelled/held (or re-created) a link
+    // mid-run, deliberately nulling the stamp so the transition rotates to the
+    // front — an unconditional overwrite here would undo that (Codex r10 P1).
+    if (core.verifiedSyncedOrderIds.length > 0) {
       await db.wmsOrderPushLink.updateMany({
-        where: { orderId: { in: core.verifiedOrderIds } },
+        where: { orderId: { in: core.verifiedSyncedOrderIds }, state: { in: ['SYNCED', 'MERGED'] } },
+        data: { reconcileCheckedAt: new Date() },
+      })
+    }
+    if (core.verifiedCancelledOrderIds.length > 0) {
+      await db.wmsOrderPushLink.updateMany({
+        where: { orderId: { in: core.verifiedCancelledOrderIds }, state: { in: ['CANCELLED', 'HELD'] } },
         data: { reconcileCheckedAt: new Date() },
       })
     }
@@ -352,9 +362,33 @@ export async function runWmsOrderReconcileSweep(
     // Durable findings (Codex): a capped run is never a complete snapshot, so
     // OPEN rows persist until the SPECIFIC order re-verifies clean — they are
     // never cleared wholesale by a newer run.
+    //
+    // Revalidate the link state per finding first (Codex r10 P1): with the push
+    // sweep running concurrently, a link snapshotted as SYNCED may have been
+    // cancelled before its lookup — the null status is then EXPECTED, and a
+    // MISSING_IN_WMS row recorded for it could never re-verify clean (check B
+    // only rescans SYNCED/MERGED links).
+    const EXPECTED_LINK_STATES: Record<WmsReconcileFindingCategory, string[] | null> = {
+      NOT_PUSHED: null, // no link precondition; the resolution predicate self-heals races
+      MISSING_IN_WMS: ['SYNCED', 'MERGED'],
+      ACTIVE_AFTER_CANCEL: ['CANCELLED', 'HELD'],
+    }
+    const findingLinkStates = new Map(
+      (await db.wmsOrderPushLink.findMany({
+        where: { orderId: { in: core.findings.map((finding) => finding.orderId) } },
+        select: { orderId: true, state: true },
+      })).map((link) => [link.orderId, link.state as string]),
+    )
+    const validFindings = core.findings.filter((finding) => {
+      const expected = EXPECTED_LINK_STATES[finding.category]
+      if (!expected) return true
+      const state = findingLinkStates.get(finding.orderId)
+      return state != null && expected.includes(state)
+    })
+
     const now = new Date()
     const newlyOpened: WmsReconcileFinding[] = []
-    for (const finding of core.findings) {
+    for (const finding of validFindings) {
       const updated = await db.wmsOrderDiscrepancy.updateMany({
         where: { orderId: finding.orderId, category: finding.category, status: 'OPEN' },
         data: { detail: finding.detail, externalOrderNumber: finding.externalOrderNumber, lastSeenAt: now },
