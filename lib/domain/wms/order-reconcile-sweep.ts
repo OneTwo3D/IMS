@@ -154,6 +154,37 @@ export async function runWmsOrderReconcileCore(
   return { counters, findings, verifiedOrderIds }
 }
 
+/**
+ * The ONE NOT_PUSHED drift predicate, shared verbatim by detection and
+ * resolution (Codex r6: they diverged twice — grace-window and binding
+ * conditions — leaving stale rows open; a single builder makes that
+ * structurally impossible). An order drifts when it meets the push sweep's own
+ * eligibility, sits in a WMS-bound warehouse, has no live link (or a stale
+ * PENDING_CREATE/HELD one), and nothing about it changed within the grace
+ * window.
+ */
+export function buildNotPushedDriftWhere(input: {
+  boundWarehouseIds: string[]
+  cutoff: Date
+  orderIds?: string[]
+}) {
+  return {
+    ...(input.orderIds ? { id: { in: input.orderIds } } : {}),
+    status: { in: ['PROCESSING' as const, 'ALLOCATED' as const] },
+    paidAt: { not: null, lt: input.cutoff },
+    updatedAt: { lt: input.cutoff },
+    refundStatus: { not: 'FULL' as const },
+    shipFromWarehouseId: { in: input.boundWarehouseIds },
+    OR: [
+      { wmsOrderPush: null },
+      { wmsOrderPush: { state: 'PENDING_CREATE' as const, updatedAt: { lt: input.cutoff } } },
+      // A ready+paid order stuck on a HELD link should have been re-created by
+      // the push sweep's release pass — if it lingers, that cron is dead.
+      { wmsOrderPush: { state: 'HELD' as const, updatedAt: { lt: input.cutoff } } },
+    ],
+  }
+}
+
 /** Prisma + active-connector wiring, mirroring the other WMS sweeps. */
 export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector: WmsConnector): WmsOrderReconcileDeps {
   return {
@@ -165,26 +196,9 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
       if (bindings.length === 0) return []
 
       const cutoff = new Date(Date.now() - RECONCILE_UNPUSHED_GRACE_MS)
-      // Mirrors order-push-sweep createCandidates, minus the PENDING_CREATE
-      // freshness the sweep itself provides: here a missing link OR one still
-      // PENDING_CREATE past the grace window is drift.
       const orders = await db.salesOrder.findMany({
         where: {
-          status: { in: ['PROCESSING', 'ALLOCATED'] },
-          paidAt: { not: null, lt: cutoff },
-          // Codex: paidAt alone mis-fires for an order paid long ago that only
-          // JUST became PROCESSING/ALLOCATED — any recent change to the order
-          // (incl. that status transition) restarts the grace window.
-          updatedAt: { lt: cutoff },
-          refundStatus: { not: 'FULL' },
-          shipFromWarehouseId: { in: bindings.map((b) => b.warehouseId) },
-          OR: [
-            { wmsOrderPush: null },
-            { wmsOrderPush: { state: 'PENDING_CREATE', updatedAt: { lt: cutoff } } },
-            // A ready+paid order stuck on a HELD link should have been re-created
-            // by the push sweep's release pass — if it lingers, that cron is dead.
-            { wmsOrderPush: { state: 'HELD', updatedAt: { lt: cutoff } } },
-          ],
+          ...buildNotPushedDriftWhere({ boundWarehouseIds: bindings.map((b) => b.warehouseId), cutoff }),
           // Rotation (Codex): findings are durable, so already-flagged orders
           // need no re-scan — every run's slots go to UNDISCOVERED drift, and a
           // backlog larger than the cap is fully reported across runs.
@@ -378,18 +392,11 @@ export async function runWmsOrderReconcileSweep(
         bindings.length === 0
           ? []
           : (await db.salesOrder.findMany({
-              where: {
-                id: { in: openNotPushed.map((row) => row.orderId) },
-                status: { in: ['PROCESSING', 'ALLOCATED'] },
-                paidAt: { not: null },
-                refundStatus: { not: 'FULL' },
-                shipFromWarehouseId: { in: bindings.map((b) => b.warehouseId) },
-                OR: [
-                  { wmsOrderPush: null },
-                  { wmsOrderPush: { state: 'PENDING_CREATE' } },
-                  { wmsOrderPush: { state: 'HELD' } },
-                ],
-              },
+              where: buildNotPushedDriftWhere({
+                boundWarehouseIds: bindings.map((b) => b.warehouseId),
+                cutoff: new Date(Date.now() - RECONCILE_UNPUSHED_GRACE_MS),
+                orderIds: openNotPushed.map((row) => row.orderId),
+              }),
               select: { id: true },
             })).map((order) => order.id),
       )
