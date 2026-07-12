@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { freshAuthFailureResult, requireAuth, requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
   listIntegrationOutboxAdminRows,
@@ -110,11 +110,23 @@ const OUTBOX_FAILURE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
 ]
 
+// Codex P2: order-import writes FROM_CONNECTOR/SalesOrder rows too (failed
+// imports have NO entityId; the missing-FX queue rows have NO entityId and a
+// payload.reason marker). Refund-sync rows always carry entityId = the IMS
+// order id, so require it — and exclude the FX-queue marker defensively so a
+// future entityId-carrying FX row can never be "retried" as a refund.
 const REFUND_PARK_WHERE = {
   connector: 'woocommerce',
   direction: 'FROM_CONNECTOR' as const,
   entityType: 'SalesOrder',
   status: { in: ['PENDING' as const, 'FAILED' as const] },
+  entityId: { not: null },
+  NOT: {
+    payload: {
+      path: ['reason'],
+      equals: 'missing_fx_rate',
+    },
+  },
 }
 
 /**
@@ -162,7 +174,10 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
 }
 
 export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary> {
-  await requireAuth()
+  // Codex P1: failure rows carry order ids, connector errors and refund ids —
+  // gate reads on the sync permission (READONLY/SUPPLIER must not see them).
+  // The /sync banner loader .catch()es, so the banner just hides for them.
+  await requirePermission('sync')
 
   const [wmsPushDeadLetters, outboxFailures, deadReceiptEvents, refundSyncParks, pennyMismatches, stuckDispatches] = await Promise.all([
     db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
@@ -185,7 +200,7 @@ export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary>
 }
 
 export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
-  await requireAuth()
+  await requirePermission('sync')
 
   const [pushLinks, outbox, deadEvents, refundLogs, stuckDispatches, mismatchLinks] = await Promise.all([
     db.wmsOrderPushLink.findMany({
