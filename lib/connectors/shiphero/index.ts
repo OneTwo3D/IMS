@@ -21,7 +21,7 @@ import {
   verifyShipheroWebhookSignature,
 } from './api/auth'
 import { fetchShipheroStockLevels, fetchShipheroWarehouses } from './api/client'
-import { fetchShipheroOrderStatus } from './api/orders'
+import { fetchShipheroOrderStatus, probeShipheroOrderPresence } from './api/orders'
 import {
   addShipheroOrderComment,
   cancelShipheroOrder,
@@ -105,6 +105,10 @@ export class ShipheroConnector implements WmsConnector {
 
   async fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
     return fetchShipheroOrderStatus(orderNumber)
+  }
+
+  async probeOrderPresence(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
+    return probeShipheroOrderPresence(orderNumber)
   }
 
   async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
