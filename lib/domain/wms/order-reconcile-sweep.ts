@@ -76,6 +76,8 @@ export type WmsOrderReconcileDeps = {
   /** Check C: recently cancelled/held links whose WMS order should be gone or cancelled. */
   listCancelledLinksToVerify(limit: number): Promise<Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>>
   fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null>
+  /** All parts of a (possibly split) order — [] when the connector has no part support. */
+  fetchOrderParts(orderNumber: string): Promise<import('@/lib/connectors/wms/types').WmsOrderPart[]>
   /**
    * Tri-state presence probe; null when the connector cannot distinguish
    * MISSING from AMBIGUOUS — check B is then skipped entirely (a re-push based
@@ -141,6 +143,33 @@ export async function runWmsOrderReconcileCore(
         }
         continue
       }
+      // Split orders: the collapsed top-level status speaks only for Part 1
+      // (Codex r16 P1) — a cancelled Part 1 must not mask an active Part 2 that
+      // can still ship. EVERY part must be dispatched or cancelled.
+      if (status.isSplit || (status.partCount ?? 1) > 1) {
+        const parts = await deps.fetchOrderParts(status.externalOrderNumber || link.externalOrderNumber)
+        if (parts.length === 0) {
+          // Split but parts not inspectable — fail closed, never verified-clean.
+          counters.errors += 1
+          console.error(`[wms-order-reconcile] split order ${link.externalOrderNumber} has no inspectable parts; skipping`)
+          continue
+        }
+        verifiedCancelledOrderIds.push(link.orderId)
+        const activeParts = parts.filter((part) => (
+          !part.dispatched && !isLikelyCancelledWmsStatus({ status: part.status, statusLabel: part.status })
+        ))
+        if (activeParts.length > 0) {
+          findings.push({
+            category: 'ACTIVE_AFTER_CANCEL',
+            orderId: link.orderId,
+            orderNumber: link.orderNumber,
+            externalOrderNumber: link.externalOrderNumber,
+            detail: `IMS cancelled/held this order but ${activeParts.length} of its ${parts.length} WMS parts still look active (${activeParts.map((part) => `part ${part.partNumber}: ${part.status}`).join(', ')}) — the warehouse may ship them. Cancel them in the WMS.`,
+          })
+        }
+        continue
+      }
+
       verifiedCancelledOrderIds.push(link.orderId)
       if (!status.dispatched && !isLikelyCancelledWmsStatus(status)) {
         findings.push({
@@ -321,6 +350,9 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
     },
     fetchOrderStatus(orderNumber) {
       return connector.fetchOrderStatus ? connector.fetchOrderStatus(orderNumber) : Promise.resolve(null)
+    },
+    fetchOrderParts(orderNumber) {
+      return connector.fetchOrderParts ? connector.fetchOrderParts(orderNumber) : Promise.resolve([])
     },
     probeOrderPresence: connector.probeOrderPresence
       ? (orderNumber) => connector.probeOrderPresence!(orderNumber)

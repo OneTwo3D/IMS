@@ -31,6 +31,7 @@ function deps(overrides: Partial<reconcileNs.WmsOrderReconcileDeps>): reconcileN
     listSyncedLinksToVerify: async () => [],
     listCancelledLinksToVerify: async () => [],
     fetchOrderStatus: async () => null,
+    fetchOrderParts: async () => [],
     probeOrderPresence: async () => 'FOUND' as const,
     ...overrides,
   }
@@ -160,4 +161,39 @@ test('reconcile core: returns the ids it actually verified for rotation stamping
   }))
   // The errored lookup must NOT be stamped as verified (it would dodge rotation).
   assert.deepEqual(verifiedOrderIds, ['o2'])
+})
+
+test('reconcile core: a split cancelled order is judged by ALL its parts, not the collapsed Part 1', async () => {
+  const splitStatus = status({ isSplit: true, partCount: 2, status: 'Cancelled', statusLabel: 'Cancelled' })
+  const partOf = (partNumber: number, partStatus: string, dispatched = false) => ({
+    externalId: `M-${partNumber}`, partNumber, status: partStatus, dispatched, tracking: [],
+  })
+
+  // Part 1 cancelled but part 2 active → finding.
+  const activeCase = await reconcile.runWmsOrderReconcileCore(deps({
+    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' }],
+    fetchOrderStatus: async () => splitStatus,
+    fetchOrderParts: async () => [partOf(1, 'Cancelled'), partOf(2, 'PROCESSING')],
+  }))
+  assert.equal(activeCase.findings.length, 1)
+  assert.match(activeCase.findings[0].detail, /part 2: PROCESSING/)
+
+  // Every part cancelled or dispatched → verified clean.
+  const cleanCase = await reconcile.runWmsOrderReconcileCore(deps({
+    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' }],
+    fetchOrderStatus: async () => splitStatus,
+    fetchOrderParts: async () => [partOf(1, 'Cancelled'), partOf(2, 'DESPATCHED', true)],
+  }))
+  assert.equal(cleanCase.findings.length, 0)
+  assert.equal(cleanCase.verifiedOrderIds.includes('o1'), true)
+
+  // Split but parts not inspectable → fail closed (error, not verified).
+  const opaqueCase = await reconcile.runWmsOrderReconcileCore(deps({
+    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' }],
+    fetchOrderStatus: async () => splitStatus,
+    fetchOrderParts: async () => [],
+  }))
+  assert.equal(opaqueCase.findings.length, 0)
+  assert.equal(opaqueCase.counters.errors, 1)
+  assert.equal(opaqueCase.verifiedOrderIds.includes('o1'), false)
 })
