@@ -202,7 +202,10 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
  */
 async function findLatestOrderReconcileJob(): Promise<{ id: string; finishedAt: Date | null } | null> {
   return db.wmsSyncJob.findFirst({
-    where: { type: 'ORDER_RECONCILE', finishedAt: { not: null } },
+    // Codex P1: a FAILED run writes finishedAt but no logs — selecting it would
+    // silently clear every previously-detected finding (incl. ACTIVE_AFTER_CANCEL).
+    // Only a run that actually completed its checks replaces the truth.
+    where: { type: 'ORDER_RECONCILE', finishedAt: { not: null }, status: { in: ['SUCCEEDED', 'PARTIAL'] } },
     orderBy: { startedAt: 'desc' },
     select: { id: true, finishedAt: true },
   })

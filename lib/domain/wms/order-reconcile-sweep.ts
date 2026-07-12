@@ -100,8 +100,11 @@ export async function runWmsOrderReconcileCore(
     })
   }
 
-  // B — verify each live link still has a WMS order behind it.
-  for (const link of await deps.listSyncedLinksToVerify(lookupLimit)) {
+  // B — verify each live link still has a WMS order behind it. B and C share
+  // ONE lookup budget (Codex): each fetchOrderStatus is a WMS API call, and the
+  // advertised per-run cap must bound the total, not each check.
+  const syncedLinks = await deps.listSyncedLinksToVerify(lookupLimit)
+  for (const link of syncedLinks) {
     counters.linksVerified += 1
     try {
       const status = await deps.fetchOrderStatus(link.externalOrderNumber)
@@ -120,8 +123,10 @@ export async function runWmsOrderReconcileCore(
     }
   }
 
-  // C — verify cancelled/held orders are actually gone or cancelled in the WMS.
-  for (const link of await deps.listCancelledLinksToVerify(lookupLimit)) {
+  // C — verify cancelled/held orders are actually gone or cancelled in the WMS,
+  // within whatever lookup budget B left over.
+  const cancelledBudget = Math.max(0, lookupLimit - syncedLinks.length)
+  for (const link of await deps.listCancelledLinksToVerify(cancelledBudget)) {
     counters.cancelledVerified += 1
     try {
       const status = await deps.fetchOrderStatus(link.externalOrderNumber)
@@ -162,6 +167,10 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
         where: {
           status: { in: ['PROCESSING', 'ALLOCATED'] },
           paidAt: { not: null, lt: cutoff },
+          // Codex: paidAt alone mis-fires for an order paid long ago that only
+          // JUST became PROCESSING/ALLOCATED — any recent change to the order
+          // (incl. that status transition) restarts the grace window.
+          updatedAt: { lt: cutoff },
           refundStatus: { not: 'FULL' },
           shipFromWarehouseId: { in: bindings.map((b) => b.warehouseId) },
           OR: [
@@ -281,7 +290,7 @@ export async function runWmsOrderReconcileSweep(
         status,
         finishedAt: new Date(),
         totalChecked: counters.intentChecked + counters.linksVerified + counters.cancelledVerified,
-        matched: counters.linksVerified + counters.cancelledVerified - counters.findings,
+        matched: Math.max(0, counters.intentChecked + counters.linksVerified + counters.cancelledVerified - counters.findings),
         mismatched: counters.findings,
         errors: counters.errors,
       },

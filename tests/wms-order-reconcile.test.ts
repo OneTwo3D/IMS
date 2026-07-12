@@ -100,3 +100,18 @@ test('reconcile core: lookup failures count as errors and never abort the run', 
   assert.equal(findings.length, 1)
   assert.equal(findings[0].externalOrderNumber, 'WC-2')
 })
+
+test('reconcile core: checks B and C share one lookup budget', async () => {
+  let cancelledLimitSeen = -1
+  await reconcile.runWmsOrderReconcileCore(deps({
+    listSyncedLinksToVerify: async () => Array.from({ length: 8 }, (_, index) => ({
+      orderId: `o${index}`, orderNumber: `SO-${index}`, externalOrderNumber: `WC-${index}`,
+    })),
+    listCancelledLinksToVerify: async (limit) => {
+      cancelledLimitSeen = limit
+      return []
+    },
+    fetchOrderStatus: async () => status({}),
+  }), { lookupLimit: 10 })
+  assert.equal(cancelledLimitSeen, 2)
+})
