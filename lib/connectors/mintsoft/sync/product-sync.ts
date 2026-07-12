@@ -741,6 +741,9 @@ async function syncOneMintsoftProduct(
 
   // The event records only AFTER the local link persisted (Codex r2) — a link
   // failure after a remote success is flagged, not silently reported clean.
+  // The catch covers ONLY the link upsert (Codex r3: a failure of the
+  // follow-up error-flag cleanup must not forge a false linkPersistFailed —
+  // the link itself is already durably written by then).
   try {
     await upsertMintsoftProductLink({
       productId: context.product.id,
@@ -751,7 +754,6 @@ async function syncOneMintsoftProduct(
       lastError: null,
       touchLastSyncedAt: true,
     })
-    await clearMintsoftProductLinkError(context.product.id)
   } catch (persistError) {
     await recordWmsMutationEvent({
       ...upsertEvent,
@@ -762,6 +764,7 @@ async function syncOneMintsoftProduct(
     throw persistError
   }
   await recordWmsMutationEvent(upsertEvent)
+  await clearMintsoftProductLinkError(context.product.id)
 
   return {
     sku: context.product.sku,
