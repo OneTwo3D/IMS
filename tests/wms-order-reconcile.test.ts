@@ -57,9 +57,9 @@ test('reconcile core: eligible-but-unpushed orders become NOT_PUSHED findings', 
 test('reconcile core: a verifiably missing WMS order is MISSING_IN_WMS; found and AMBIGUOUS are not', async () => {
   const { findings, counters, verifiedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
     listSyncedLinksToVerify: async () => [
-      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },
-      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },
-      { orderId: 'o3', orderNumber: 'SO-3', externalOrderNumber: 'WC-3' },
+      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'SYNCED' },
+      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2', linkState: 'SYNCED' },
+      { orderId: 'o3', orderNumber: 'SO-3', externalOrderNumber: 'WC-3', linkState: 'SYNCED' },
     ],
     probeOrderPresence: async (orderNumber) => (
       orderNumber === 'WC-1' ? 'MISSING' : orderNumber === 'WC-3' ? 'AMBIGUOUS' : 'FOUND'
@@ -87,11 +87,11 @@ test('reconcile core: check B is skipped entirely without a tri-state probe', as
 test('reconcile core: a cancelled link still active in the WMS is ACTIVE_AFTER_CANCEL', async () => {
   const { findings, counters, verifiedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
     listCancelledLinksToVerify: async () => [
-      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },   // still active → finding
-      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },   // cancelled in WMS → clean
-      { orderId: 'o3', orderNumber: 'SO-3', externalOrderNumber: 'WC-3' },   // verifiably gone from WMS → clean
-      { orderId: 'o4', orderNumber: 'SO-4', externalOrderNumber: 'WC-4' },   // dispatched → goods gone, not a cancel question
-      { orderId: 'o5', orderNumber: 'SO-5', externalOrderNumber: 'WC-5' },   // null status + AMBIGUOUS probe → fail closed
+      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'CANCELLED' },   // still active → finding
+      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2', linkState: 'CANCELLED' },   // cancelled in WMS → clean
+      { orderId: 'o3', orderNumber: 'SO-3', externalOrderNumber: 'WC-3', linkState: 'CANCELLED' },   // verifiably gone from WMS → clean
+      { orderId: 'o4', orderNumber: 'SO-4', externalOrderNumber: 'WC-4', linkState: 'CANCELLED' },   // dispatched → goods gone, not a cancel question
+      { orderId: 'o5', orderNumber: 'SO-5', externalOrderNumber: 'WC-5', linkState: 'SYNCED' },   // null status + AMBIGUOUS probe → fail closed
     ],
     fetchOrderStatus: async (orderNumber) => {
       if (orderNumber === 'WC-1') return status({ status: 'PROCESSING', statusLabel: 'Processing' })
@@ -114,8 +114,8 @@ test('reconcile core: a cancelled link still active in the WMS is ACTIVE_AFTER_C
 test('reconcile core: lookup failures count as errors and never abort the run', async () => {
   const { findings, counters } = await reconcile.runWmsOrderReconcileCore(deps({
     listSyncedLinksToVerify: async () => [
-      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },
-      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },
+      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'SYNCED' },
+      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2', linkState: 'SYNCED' },
     ],
     probeOrderPresence: async (orderNumber) => {
       if (orderNumber === 'WC-1') throw new Error('WMS API down')
@@ -136,7 +136,7 @@ test('reconcile core: C leads the budget but is floored at half so neither check
       // let 200+ cancellations zero out check B).
       assert.equal(limit, 5)
       return Array.from({ length: 3 }, (_, index) => ({
-        orderId: `c${index}`, orderNumber: `SO-C${index}`, externalOrderNumber: `WCC-${index}`,
+        orderId: `c${index}`, orderNumber: `SO-C${index}`, externalOrderNumber: `WCC-${index}`, linkState: 'CANCELLED',
       }))
     },
     listSyncedLinksToVerify: async (limit) => {
@@ -152,8 +152,8 @@ test('reconcile core: C leads the budget but is floored at half so neither check
 test('reconcile core: returns the ids it actually verified for rotation stamping', async () => {
   const { verifiedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
     listSyncedLinksToVerify: async () => [
-      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },
-      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },
+      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'SYNCED' },
+      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2', linkState: 'SYNCED' },
     ],
     probeOrderPresence: async (orderNumber) => {
       if (orderNumber === 'WC-1') throw new Error('down')
@@ -165,10 +165,10 @@ test('reconcile core: returns the ids it actually verified for rotation stamping
 })
 
 test('reconcile core: errored lookups still count as ATTEMPTED so they rotate to the back', async () => {
-  const { attemptedSyncedOrderIds, verifiedSyncedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
+  const { attemptedSynced, verifiedSyncedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
     listSyncedLinksToVerify: async () => [
-      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },
-      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },
+      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'SYNCED' },
+      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2', linkState: 'SYNCED' },
     ],
     probeOrderPresence: async (orderNumber) => {
       if (orderNumber === 'WC-1') throw new Error('down')
@@ -176,8 +176,13 @@ test('reconcile core: errored lookups still count as ATTEMPTED so they rotate to
     },
   }))
   // …but IS attempted (stamped), or persistent failures would pin the
-  // nulls-first rotation and starve the rest of the corpus (Codex r19).
-  assert.deepEqual(attemptedSyncedOrderIds, ['o1', 'o2'])
+  // nulls-first rotation and starve the rest of the corpus (Codex r19). The
+  // attempt records the SNAPSHOT state so the stamp can require it unchanged
+  // (a concurrent transition's stamp reset must survive — Codex r23).
+  assert.deepEqual(attemptedSynced, [
+    { orderId: 'o1', linkState: 'SYNCED' },
+    { orderId: 'o2', linkState: 'SYNCED' },
+  ])
   assert.deepEqual(verifiedSyncedOrderIds, ['o2'])
 })
 
@@ -186,7 +191,7 @@ test('reconcile core: fallback probes are charged against the WMS call budget', 
   await reconcile.runWmsOrderReconcileCore(deps({
     // 3 cancelled links, each null status + probe = 2 calls each = 6 calls.
     listCancelledLinksToVerify: async () => Array.from({ length: 3 }, (_, index) => ({
-      orderId: `c${index}`, orderNumber: `SO-C${index}`, externalOrderNumber: `WCC-${index}`,
+      orderId: `c${index}`, orderNumber: `SO-C${index}`, externalOrderNumber: `WCC-${index}`, linkState: 'CANCELLED',
     })),
     fetchOrderStatus: async () => null,
     probeOrderPresence: async () => 'MISSING',
@@ -207,7 +212,7 @@ test('reconcile core: a split cancelled order is judged by ALL its parts, not th
 
   // Part 1 cancelled but part 2 active → finding.
   const activeCase = await reconcile.runWmsOrderReconcileCore(deps({
-    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' }],
+    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'CANCELLED' }],
     fetchOrderStatus: async () => splitStatus,
     fetchOrderParts: async () => [partOf(1, 'Cancelled'), partOf(2, 'PROCESSING')],
   }))
@@ -216,7 +221,7 @@ test('reconcile core: a split cancelled order is judged by ALL its parts, not th
 
   // Every part cancelled or dispatched → verified clean.
   const cleanCase = await reconcile.runWmsOrderReconcileCore(deps({
-    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' }],
+    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'CANCELLED' }],
     fetchOrderStatus: async () => splitStatus,
     fetchOrderParts: async () => [partOf(1, 'Cancelled'), partOf(2, 'DESPATCHED', true)],
   }))
@@ -225,7 +230,7 @@ test('reconcile core: a split cancelled order is judged by ALL its parts, not th
 
   // Split but parts not inspectable → fail closed (error, not verified).
   const opaqueCase = await reconcile.runWmsOrderReconcileCore(deps({
-    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' }],
+    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'CANCELLED' }],
     fetchOrderStatus: async () => splitStatus,
     fetchOrderParts: async () => [],
   }))
@@ -239,7 +244,7 @@ test('reconcile core: a split order on a parts-less connector is judged by its w
   // WHOLE order (no Part-1 collapse), so it remains authoritative.
   const { findings } = await reconcile.runWmsOrderReconcileCore(deps({
     partsSupported: false,
-    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' }],
+    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'CANCELLED' }],
     fetchOrderStatus: async () => status({ isSplit: true, partCount: 2, status: 'PROCESSING', statusLabel: 'Processing' }),
   }))
   assert.equal(findings.length, 1)
@@ -252,4 +257,18 @@ test('isLikelyCancelledWmsStatus: both US and UK spellings count (Codex r22 fals
   assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'canceled', statusLabel: '' }), true)
   assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'Canceled', statusLabel: '' }), true)
   assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: '', statusLabel: 'canceled' }), true)
+})
+
+test('reconcile core: an unpropagated cancellation (SYNCED link, cancelled order) reaches check C', async () => {
+  // The C list itself supplies these rows (the deps query covers SYNCED links
+  // whose order ought to be cancelled — Codex r23); the core must classify them
+  // exactly like propagated cancellations.
+  const { findings } = await reconcile.runWmsOrderReconcileCore(deps({
+    listCancelledLinksToVerify: async () => [
+      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'SYNCED' },
+    ],
+    fetchOrderStatus: async () => status({ status: 'PROCESSING', statusLabel: 'Processing' }),
+  }))
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].category, 'ACTIVE_AFTER_CANCEL')
 })

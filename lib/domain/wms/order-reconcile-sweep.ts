@@ -72,9 +72,15 @@ export type WmsOrderReconcileDeps = {
   /** Check A: eligible orders with no live push link past the grace window. */
   listUnpushedIntentOrders(limit: number): Promise<Array<{ orderId: string; orderNumber: string | null }>>
   /** Check B: live links whose WMS order should exist. */
-  listSyncedLinksToVerify(limit: number): Promise<Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>>
-  /** Check C: recently cancelled/held links whose WMS order should be gone or cancelled. */
-  listCancelledLinksToVerify(limit: number): Promise<Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>>
+  listSyncedLinksToVerify(limit: number): Promise<Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string; linkState: string }>>
+  /**
+   * Check C: links whose WMS order OUGHT to be cancelled — CANCELLED/HELD links
+   * (propagation done) AND SYNCED/MERGED links whose IMS order is cancelled/
+   * on-hold/fully-refunded (propagation NOT yet done — the push cron may be
+   * dead or its cancel threw; Codex r23: precisely the case where the WMS may
+   * still ship).
+   */
+  listCancelledLinksToVerify(limit: number): Promise<Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string; linkState: string }>>
   fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null>
   /** Whether the connector exposes per-part inspection (fetchOrderParts). */
   partsSupported: boolean
@@ -98,8 +104,8 @@ export async function runWmsOrderReconcileCore(
   verifiedOrderIds: string[]
   verifiedSyncedOrderIds: string[]
   verifiedCancelledOrderIds: string[]
-  attemptedSyncedOrderIds: string[]
-  attemptedCancelledOrderIds: string[]
+  attemptedSynced: Array<{ orderId: string; linkState: string }>
+  attemptedCancelled: Array<{ orderId: string; linkState: string }>
 }> {
   const lookupLimit = options?.lookupLimit ?? RECONCILE_DEFAULT_LOOKUP_LIMIT
   const counters: WmsReconcileCounters = { intentChecked: 0, linksVerified: 0, cancelledVerified: 0, findings: 0, errors: 0 }
@@ -129,8 +135,8 @@ export async function runWmsOrderReconcileCore(
   // (Codex r19 P1): an errored/ambiguous lookup is never verified, but it must
   // still rotate to the back of the queue — otherwise persistently-failing
   // links pin `nulls: first` ordering and starve the rest of the corpus.
-  const attemptedSyncedOrderIds: string[] = []
-  const attemptedCancelledOrderIds: string[] = []
+  const attemptedSynced: Array<{ orderId: string; linkState: string }> = []
+  const attemptedCancelled: Array<{ orderId: string; linkState: string }> = []
   // Actual WMS CALLS are budgeted (Codex r19 P2): fallback probes and part
   // fetches count too, not just link rows.
   let lookupsUsed = 0
@@ -146,7 +152,7 @@ export async function runWmsOrderReconcileCore(
   for (const link of cancelledLinks) {
     if (lookupsUsed >= cancelledCallBudget) break
     counters.cancelledVerified += 1
-    attemptedCancelledOrderIds.push(link.orderId)
+    attemptedCancelled.push({ orderId: link.orderId, linkState: link.linkState })
     try {
       lookupsUsed += 1
       const status = await deps.fetchOrderStatus(link.externalOrderNumber)
@@ -222,7 +228,7 @@ export async function runWmsOrderReconcileCore(
     for (const link of await deps.listSyncedLinksToVerify(syncedBudget)) {
       if (lookupsUsed >= lookupLimit) break
       counters.linksVerified += 1
-      attemptedSyncedOrderIds.push(link.orderId)
+      attemptedSynced.push({ orderId: link.orderId, linkState: link.linkState })
       try {
         lookupsUsed += 1
         const presence = await probe(link.externalOrderNumber)
@@ -257,8 +263,8 @@ export async function runWmsOrderReconcileCore(
     verifiedOrderIds: [...verifiedCancelledOrderIds, ...verifiedSyncedOrderIds],
     verifiedSyncedOrderIds,
     verifiedCancelledOrderIds,
-    attemptedSyncedOrderIds,
-    attemptedCancelledOrderIds,
+    attemptedSynced,
+    attemptedCancelled,
   }
 }
 
@@ -341,9 +347,14 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
           // Orders already past dispatch don't need existence verification, and
           // dispatch-dead-lettered links are already surfaced exceptions.
           dispatchDeadLetteredAt: null,
-          order: { status: { notIn: ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] } },
+          // ON_HOLD/CANCELLED/fully-refunded orders on SYNCED links belong to
+          // check C (their WMS order OUGHT to be cancelled), not here.
+          order: {
+            status: { notIn: ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED', 'ON_HOLD'] },
+            refundStatus: { not: 'FULL' },
+          },
         },
-        select: { orderId: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
+        select: { orderId: true, state: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
         take: limit,
         // Rotate: least-recently-verified first (never-checked links lead), so a
         // corpus larger than the per-run cap still gets full coverage over days.
@@ -351,33 +362,48 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
       })
       return links.flatMap((link) => (
         link.externalOrderNumber
-          ? [{ orderId: link.orderId, orderNumber: link.order.orderNumber, externalOrderNumber: link.externalOrderNumber }]
+          ? [{ orderId: link.orderId, orderNumber: link.order.orderNumber, externalOrderNumber: link.externalOrderNumber, linkState: link.state }]
           : []
       ))
     },
     async listCancelledLinksToVerify(limit) {
       // Recent window only: a long-cancelled order that once verified clean
       // doesn't need re-checking forever. Windowed on cancelledAt — a STABLE
-      // timestamp (both the cancel and hold passes set it). updatedAt would be
-      // refreshed by our own reconcileCheckedAt stamp, so checked links would
-      // never age out and would eventually consume the whole shared budget,
-      // permanently starving check B (Codex P1).
+      // timestamp (both the cancel and hold passes set it; our own
+      // reconcileCheckedAt stamp churns updatedAt, which would never age out).
       const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
       const links = await db.wmsOrderPushLink.findMany({
         where: {
           connector: connectorId,
-          state: { in: ['CANCELLED', 'HELD'] },
           externalOrderNumber: { not: null },
-          // Window on the stable cancellation time — but a link with an OPEN
-          // finding stays verifiable forever (Codex: otherwise a fix applied in
-          // the WMS after the window could never re-verify clean and the
-          // durable finding would be permanent).
           OR: [
-            { cancelledAt: { gte: since } },
-            { order: { wmsOrderDiscrepancies: { some: { category: 'ACTIVE_AFTER_CANCEL', status: 'OPEN' } } } },
+            // Propagated cancellations/holds within the window — or carrying an
+            // OPEN finding, which stays verifiable forever (a WMS-side fix after
+            // the window must still be able to re-verify clean).
+            {
+              state: { in: ['CANCELLED', 'HELD'] },
+              OR: [
+                { cancelledAt: { gte: since } },
+                { order: { wmsOrderDiscrepancies: { some: { category: 'ACTIVE_AFTER_CANCEL', status: 'OPEN' } } } },
+              ],
+            },
+            // UNPROPAGATED (Codex r23 P1): the IMS order is cancelled/on-hold/
+            // fully-refunded but the link is still SYNCED/MERGED — the push
+            // cron hasn't cancelled the WMS order (dead cron, or a cancel that
+            // keeps throwing), and the warehouse may still ship it. Mirrors the
+            // push sweep's holdable/cancellable intent sets.
+            {
+              state: { in: ['SYNCED', 'MERGED'] },
+              order: {
+                OR: [
+                  { status: { in: ['CANCELLED', 'ON_HOLD'] } },
+                  { status: { notIn: ['SHIPPED', 'COMPLETED', 'DELIVERED'] }, refundStatus: 'FULL' },
+                ],
+              },
+            },
           ],
         },
-        select: { orderId: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
+        select: { orderId: true, state: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
         take: limit,
         // Rotate like check B: least-recently-verified first, so a window with
         // more cancellations than the cap still gets full coverage over days.
@@ -385,7 +411,7 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
       })
       return links.flatMap((link) => (
         link.externalOrderNumber
-          ? [{ orderId: link.orderId, orderNumber: link.order.orderNumber, externalOrderNumber: link.externalOrderNumber }]
+          ? [{ orderId: link.orderId, orderNumber: link.order.orderNumber, externalOrderNumber: link.externalOrderNumber, linkState: link.state }]
           : []
       ))
     },
@@ -451,18 +477,19 @@ export async function runWmsOrderReconcileSweep(
     // front — an unconditional overwrite here would undo that (Codex r10 P1).
     // Stamp ATTEMPTS, not verifications (Codex r19 P1): a persistently-failing
     // link must rotate to the back like any other, or `nulls: first` reselects
-    // the same failing rows forever and the rest of the corpus is never
-    // examined. Verification (finding resolution) remains a separate, stricter
-    // notion.
-    if (core.attemptedSyncedOrderIds.length > 0) {
-      await db.wmsOrderPushLink.updateMany({
-        where: { orderId: { in: core.attemptedSyncedOrderIds }, state: { in: ['SYNCED', 'MERGED'] } },
-        data: { reconcileCheckedAt: new Date() },
-      })
+    // the same failing rows forever. Each stamp is conditional on the link
+    // still holding its EXACT snapshot state (Codex r23 P2): any concurrent
+    // transition — cancel, hold, merge repoint — deliberately nulls the stamp
+    // so the changed link jumps the queue, and must never be overwritten.
+    const attemptedByState = new Map<string, string[]>()
+    for (const attempt of [...core.attemptedSynced, ...core.attemptedCancelled]) {
+      const bucket = attemptedByState.get(attempt.linkState) ?? []
+      bucket.push(attempt.orderId)
+      attemptedByState.set(attempt.linkState, bucket)
     }
-    if (core.attemptedCancelledOrderIds.length > 0) {
+    for (const [linkState, orderIds] of attemptedByState) {
       await db.wmsOrderPushLink.updateMany({
-        where: { orderId: { in: core.attemptedCancelledOrderIds }, state: { in: ['CANCELLED', 'HELD'] } },
+        where: { orderId: { in: orderIds }, state: linkState as never },
         data: { reconcileCheckedAt: new Date() },
       })
     }
@@ -475,7 +502,10 @@ export async function runWmsOrderReconcileSweep(
     const EXPECTED_LINK_STATES: Record<WmsReconcileFindingCategory, string[] | null> = {
       NOT_PUSHED: null, // no link precondition; the resolution predicate self-heals races
       MISSING_IN_WMS: ['SYNCED', 'MERGED'],
-      ACTIVE_AFTER_CANCEL: ['CANCELLED', 'HELD'],
+      // Valid for propagated (CANCELLED/HELD) AND unpropagated (SYNCED/MERGED
+      // with a cancelled/on-hold/refunded order — Codex r23) cancellations; the
+      // state-scope cleanup below prunes rows that leave BOTH shapes.
+      ACTIVE_AFTER_CANCEL: ['CANCELLED', 'HELD', 'SYNCED', 'MERGED'],
     }
     const findingLinkStates = new Map(
       (await db.wmsOrderPushLink.findMany({
@@ -579,7 +609,19 @@ export async function runWmsOrderReconcileSweep(
       where: {
         category: 'ACTIVE_AFTER_CANCEL',
         status: 'OPEN',
-        order: { wmsOrderPush: { isNot: { state: { in: ['CANCELLED', 'HELD'] } } } },
+        // Moot only when NEITHER cancellation shape holds any more: not a
+        // propagated CANCELLED/HELD link, and not an unpropagated SYNCED/MERGED
+        // link whose order is still cancelled/on-hold/fully-refunded.
+        order: {
+          wmsOrderPush: { isNot: { state: { in: ['CANCELLED', 'HELD'] } } },
+          NOT: {
+            wmsOrderPush: { state: { in: ['SYNCED', 'MERGED'] } },
+            OR: [
+              { status: { in: ['CANCELLED', 'ON_HOLD'] } },
+              { status: { notIn: ['SHIPPED', 'COMPLETED', 'DELIVERED'] }, refundStatus: 'FULL' },
+            ],
+          },
+        },
       },
       data: { status: 'RESOLVED', resolvedAt: now },
     })
