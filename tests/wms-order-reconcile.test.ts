@@ -160,8 +160,43 @@ test('reconcile core: returns the ids it actually verified for rotation stamping
       return 'FOUND'
     },
   }))
-  // The errored lookup must NOT be stamped as verified (it would dodge rotation).
+  // The errored lookup is never VERIFIED (no finding resolution)…
   assert.deepEqual(verifiedOrderIds, ['o2'])
+})
+
+test('reconcile core: errored lookups still count as ATTEMPTED so they rotate to the back', async () => {
+  const { attemptedSyncedOrderIds, verifiedSyncedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
+    listSyncedLinksToVerify: async () => [
+      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },
+      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },
+    ],
+    probeOrderPresence: async (orderNumber) => {
+      if (orderNumber === 'WC-1') throw new Error('down')
+      return 'FOUND'
+    },
+  }))
+  // …but IS attempted (stamped), or persistent failures would pin the
+  // nulls-first rotation and starve the rest of the corpus (Codex r19).
+  assert.deepEqual(attemptedSyncedOrderIds, ['o1', 'o2'])
+  assert.deepEqual(verifiedSyncedOrderIds, ['o2'])
+})
+
+test('reconcile core: fallback probes are charged against the WMS call budget', async () => {
+  let syncedLimitSeen = -1
+  await reconcile.runWmsOrderReconcileCore(deps({
+    // 3 cancelled links, each null status + probe = 2 calls each = 6 calls.
+    listCancelledLinksToVerify: async () => Array.from({ length: 3 }, (_, index) => ({
+      orderId: `c${index}`, orderNumber: `SO-C${index}`, externalOrderNumber: `WCC-${index}`,
+    })),
+    fetchOrderStatus: async () => null,
+    probeOrderPresence: async () => 'MISSING',
+    listSyncedLinksToVerify: async (limit) => {
+      syncedLimitSeen = limit
+      return []
+    },
+  }), { lookupLimit: 10 })
+  // B's budget reflects the 6 CALLS spent, not the 3 links listed.
+  assert.equal(syncedLimitSeen, 4)
 })
 
 test('reconcile core: a split cancelled order is judged by ALL its parts, not the collapsed Part 1', async () => {

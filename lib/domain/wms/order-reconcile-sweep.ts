@@ -98,6 +98,8 @@ export async function runWmsOrderReconcileCore(
   verifiedOrderIds: string[]
   verifiedSyncedOrderIds: string[]
   verifiedCancelledOrderIds: string[]
+  attemptedSyncedOrderIds: string[]
+  attemptedCancelledOrderIds: string[]
 }> {
   const lookupLimit = options?.lookupLimit ?? RECONCILE_DEFAULT_LOOKUP_LIMIT
   const counters: WmsReconcileCounters = { intentChecked: 0, linksVerified: 0, cancelledVerified: 0, findings: 0, errors: 0 }
@@ -123,20 +125,34 @@ export async function runWmsOrderReconcileCore(
   // large live-link backlog can never starve the safety-critical check (Codex).
   const verifiedSyncedOrderIds: string[] = []
   const verifiedCancelledOrderIds: string[] = []
+  // ATTEMPTED ids drive the rotation stamp; VERIFIED ids drive resolution
+  // (Codex r19 P1): an errored/ambiguous lookup is never verified, but it must
+  // still rotate to the back of the queue — otherwise persistently-failing
+  // links pin `nulls: first` ordering and starve the rest of the corpus.
+  const attemptedSyncedOrderIds: string[] = []
+  const attemptedCancelledOrderIds: string[] = []
+  // Actual WMS CALLS are budgeted (Codex r19 P2): fallback probes and part
+  // fetches count too, not just link rows.
+  let lookupsUsed = 0
   // C is fetched first (safety priority) but capped at HALF the budget so a
   // large cancellation window can never zero out check B either (Codex r11 —
   // the starvation existed in both directions). Each check's rotation covers
   // its own backlog across runs.
   const cancelledLinks = await deps.listCancelledLinksToVerify(Math.ceil(lookupLimit / 2))
   for (const link of cancelledLinks) {
+    if (lookupsUsed >= lookupLimit) break
     counters.cancelledVerified += 1
+    attemptedCancelledOrderIds.push(link.orderId)
     try {
+      lookupsUsed += 1
       const status = await deps.fetchOrderStatus(link.externalOrderNumber)
       if (!status) {
         // Null conflates "gone" with "ambiguous merged match" (Codex r15 P1):
         // counting it as verified-clean could resolve a live ACTIVE_AFTER_CANCEL
         // finding. Only the tri-state probe's MISSING verdict verifies absence.
-        const presence = deps.probeOrderPresence ? await deps.probeOrderPresence(link.externalOrderNumber) : null
+        const presence = deps.probeOrderPresence
+          ? (lookupsUsed += 1, await deps.probeOrderPresence(link.externalOrderNumber))
+          : null
         if (presence === 'MISSING') {
           verifiedCancelledOrderIds.push(link.orderId)
         } else {
@@ -152,6 +168,7 @@ export async function runWmsOrderReconcileCore(
       // its top-level status is computed for the whole order, not collapsed)
       // falls through to the top-level classification below.
       if (deps.partsSupported && (status.isSplit || (status.partCount ?? 1) > 1)) {
+        lookupsUsed += 1
         const parts = await deps.fetchOrderParts(status.externalOrderNumber || link.externalOrderNumber)
         if (parts.length === 0) {
           // Split but parts not inspectable — fail closed, never verified-clean.
@@ -197,10 +214,13 @@ export async function runWmsOrderReconcileCore(
   // and re-pushing an ambiguous-but-live order would duplicate it in the WMS.
   if (deps.probeOrderPresence) {
     const probe = deps.probeOrderPresence
-    const syncedBudget = Math.max(0, lookupLimit - cancelledLinks.length)
+    const syncedBudget = Math.max(0, lookupLimit - lookupsUsed)
     for (const link of await deps.listSyncedLinksToVerify(syncedBudget)) {
+      if (lookupsUsed >= lookupLimit) break
       counters.linksVerified += 1
+      attemptedSyncedOrderIds.push(link.orderId)
       try {
+        lookupsUsed += 1
         const presence = await probe(link.externalOrderNumber)
         if (presence === 'AMBIGUOUS') {
           // Exists but not resolvable — fail closed: neither a finding nor a
@@ -233,6 +253,8 @@ export async function runWmsOrderReconcileCore(
     verifiedOrderIds: [...verifiedCancelledOrderIds, ...verifiedSyncedOrderIds],
     verifiedSyncedOrderIds,
     verifiedCancelledOrderIds,
+    attemptedSyncedOrderIds,
+    attemptedCancelledOrderIds,
   }
 }
 
@@ -418,15 +440,20 @@ export async function runWmsOrderReconcileSweep(
     // concurrent push sweep may have cancelled/held (or re-created) a link
     // mid-run, deliberately nulling the stamp so the transition rotates to the
     // front — an unconditional overwrite here would undo that (Codex r10 P1).
-    if (core.verifiedSyncedOrderIds.length > 0) {
+    // Stamp ATTEMPTS, not verifications (Codex r19 P1): a persistently-failing
+    // link must rotate to the back like any other, or `nulls: first` reselects
+    // the same failing rows forever and the rest of the corpus is never
+    // examined. Verification (finding resolution) remains a separate, stricter
+    // notion.
+    if (core.attemptedSyncedOrderIds.length > 0) {
       await db.wmsOrderPushLink.updateMany({
-        where: { orderId: { in: core.verifiedSyncedOrderIds }, state: { in: ['SYNCED', 'MERGED'] } },
+        where: { orderId: { in: core.attemptedSyncedOrderIds }, state: { in: ['SYNCED', 'MERGED'] } },
         data: { reconcileCheckedAt: new Date() },
       })
     }
-    if (core.verifiedCancelledOrderIds.length > 0) {
+    if (core.attemptedCancelledOrderIds.length > 0) {
       await db.wmsOrderPushLink.updateMany({
-        where: { orderId: { in: core.verifiedCancelledOrderIds }, state: { in: ['CANCELLED', 'HELD'] } },
+        where: { orderId: { in: core.attemptedCancelledOrderIds }, state: { in: ['CANCELLED', 'HELD'] } },
         data: { reconcileCheckedAt: new Date() },
       })
     }
