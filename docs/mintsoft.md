@@ -104,7 +104,7 @@ An IMS-side stock count against a WMS-bound warehouse is coordinated with the st
 
 ## Silent-Failure Watchdog (scheduled)
 
-The `wms-watchdog` cron (hourly, ships disabled — enable in System Settings → Scheduler) alerts once per breach (WARNING activity + admin bell, deduped until the condition heals): **open ASNs past their ETA** (persisted from the ASN dialog) **with no booked-in callback** — naming any unreconciled alignment credits, which silently suppress real PO receipts until the callback arrives — and **bindings without a successful stock sync** for 3× their own cadence (dead cron — or one whose every attempt fails; FAILED attempts don't count as freshness). A fresh callback / ASN close, or the next successful sync, re-arms the alert.
+The `wms-watchdog` cron (hourly, ships disabled — enable in System Settings → Scheduler) alerts once per breach (WARNING activity + admin bell, deduped until the condition heals): **open ASNs past their ETA** (persisted from the ASN dialog) **with no booked-in callback** — naming any unreconciled alignment credits, which silently suppress real PO receipts until the callback arrives — and **bindings without a successful stock sync** for 3× their own cadence (dead cron — or one whose every attempt fails; FAILED attempts don't count as freshness). A fresh callback / ASN close, or the next successful sync, re-arms the alert. If a breach alert cannot be delivered (notification insert fails, or no active admin exists) the breach stays unclaimed for retry and the run returns HTTP 500 so scheduler monitoring goes red.
 
 ## Order Reconciliation (scheduled)
 

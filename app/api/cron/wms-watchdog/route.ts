@@ -15,5 +15,7 @@ export async function GET(request: Request) {
   if (maintenance) return maintenance
 
   const result = await runWmsWatchdog()
-  return NextResponse.json(result)
+  // FAILED = breaches exist that no one was alerted to (undeliverable
+  // notifications) — surface as 500 so scheduler monitoring goes red.
+  return NextResponse.json(result, { status: result.status === 'FAILED' ? 500 : 200 })
 }

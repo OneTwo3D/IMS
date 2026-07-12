@@ -72,43 +72,44 @@ export function isBindingSyncStale(
 }
 
 export type WmsWatchdogResult = {
-  status: 'SKIPPED' | 'SUCCEEDED'
+  /** FAILED = one or more breaches could not be alerted; the cron route maps it to HTTP 500. */
+  status: 'SKIPPED' | 'SUCCEEDED' | 'FAILED'
   overdueAsnAlerts: number
   staleBindingAlerts: number
-  skippedReason?: string
+  deliveryFailures?: number
+  reason?: string
 }
 
-/**
- * Durable admin notification — deliberately NOT lib/notifications.notify(),
- * which swallows insert failures: the watchdog's dedupe stamp must only stick
- * when the alert verifiably persisted (Codex), so this THROWS on failure and
- * the caller reverts the stamp.
- */
-async function notifyAdminsDurably(title: string, message: string): Promise<void> {
-  const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-  // Zero active admins is NOT delivery (Codex r5): returning normally would
-  // keep the dedupe stamp and the breach would never reach a later-created or
-  // reactivated admin. Throw so the caller reverts the stamp and retries.
-  if (admins.length === 0) throw new Error('no active ADMIN users to notify')
-  await db.notification.createMany({
-    data: admins.map((admin) => ({
-      userId: admin.id,
-      type: 'warning',
-      title,
-      message,
-      actionUrl: '/sync',
-    })),
-  })
+/** Notification rows for every active admin — deliberately NOT lib/notifications.notify(), which swallows insert failures. */
+function adminNotificationRows(admins: { id: string }[], title: string, message: string) {
+  return admins.map((admin) => ({
+    userId: admin.id,
+    type: 'warning',
+    title,
+    message,
+    actionUrl: '/sync',
+  }))
 }
 
 export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   const state = await getIntegrationPluginState()
   const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
-  if (!connectorId) return { status: 'SKIPPED', overdueAsnAlerts: 0, staleBindingAlerts: 0, skippedReason: 'No WMS connector enabled' }
+  if (!connectorId) return { status: 'SKIPPED', overdueAsnAlerts: 0, staleBindingAlerts: 0, reason: 'No WMS connector enabled' }
+
+  // Zero active admins is NOT delivery (Codex r5/r6): claiming breaches with
+  // nowhere to send them would either lose alerts or (rolled back per entity)
+  // re-claim up to 200 ASNs every run in a write/log storm. Fail the whole run
+  // instead — the cron goes red until an admin exists.
+  const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+  if (admins.length === 0) {
+    console.error('[wms-watchdog] no active ADMIN users — breach alerts are undeliverable')
+    return { status: 'FAILED', overdueAsnAlerts: 0, staleBindingAlerts: 0, reason: 'No active ADMIN users to notify' }
+  }
 
   const now = new Date()
   let overdueAsnAlerts = 0
   let staleBindingAlerts = 0
+  let deliveryFailures = 0
 
   // 1 — overdue ASNs. The overdue shape is pushed into SQL (Codex: an
   // unordered take before the predicate let 200 newer non-overdue rows shadow
@@ -146,18 +147,6 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   })
   for (const asn of openAsns) {
     if (!isAsnOverdue(asn, now)) continue
-    // CAS the dedupe stamp: a concurrent run must not double-alert, and the
-    // callback state is pinned to the snapshot (Codex) — a booked-in callback
-    // landing mid-sweep heals the ASN, and stamping over it would alert from
-    // stale data AND re-suppress the healed entity.
-    const stamped = await db.wmsAsnMap.updateMany({
-      where: { id: asn.id, sloAlertedAt: null, closedAt: null, lastCallbackAt: asn.lastCallbackAt },
-      data: { sloAlertedAt: now },
-    })
-    if (stamped.count === 0) continue
-
-    try {
-
     const creditLines = asn.lines.filter((line) => Number(line.qtyAccountedViaSnapshot) > Number(line.lastProcessedReceivedQty))
     const creditNote = creditLines.length > 0
       ? ` ${creditLines.length} line(s) carry unreconciled alignment credits (e.g. ${creditLines[0].sku}) — until the booked-in callback arrives, REAL receipts for those lines are silently suppressed.`
@@ -172,13 +161,41 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       : asn.eta
         ? `is past its ETA (${asn.eta.toISOString().slice(0, 10)}) with no booked-in callback`
         : `has been open for ${daysSince(asn.createdAt)} days with no booked-in callback`
-    // Deliver the THROWING notification FIRST (Codex r3): logActivity swallows
-    // insert failures, so the stamp's keep/revert decision must ride on the
-    // notification insert. The activity line is best-effort colour.
-    await notifyAdminsDurably(
-      'WMS ASN overdue',
-      `ASN ${asn.externalAsnId} (${asn.warehouse.code}) ${breach}.${creditNote} Chase the shipment / callback in the WMS.`,
-    )
+
+    // Claim the dedupe stamp AND insert the notifications in ONE transaction
+    // (Codex r6): stamping first and delivering second left a crash window in
+    // which the stamp committed with no alert — permanently suppressing the
+    // breach — and the compensating un-stamp could itself fail. The CAS pins
+    // the callback snapshot (a booked-in callback landing mid-sweep heals the
+    // ASN; stamping over it would alert from stale data AND re-suppress it)
+    // and dedupes concurrent runs. A callback landing AFTER commit clears the
+    // stamp again — at worst one spurious alert, never a suppressed one.
+    let claimed = false
+    try {
+      claimed = await db.$transaction(async (tx) => {
+        const stamped = await tx.wmsAsnMap.updateMany({
+          where: { id: asn.id, sloAlertedAt: null, closedAt: null, lastCallbackAt: asn.lastCallbackAt },
+          data: { sloAlertedAt: now },
+        })
+        if (stamped.count === 0) return false
+        await tx.notification.createMany({
+          data: adminNotificationRows(
+            admins,
+            'WMS ASN overdue',
+            `ASN ${asn.externalAsnId} (${asn.warehouse.code}) ${breach}.${creditNote} Chase the shipment / callback in the WMS.`,
+          ),
+        })
+        return true
+      })
+    } catch (deliveryError) {
+      deliveryFailures += 1
+      console.error(`[wms-watchdog] overdue-ASN alert delivery failed for ${asn.externalAsnId}:`, deliveryError)
+      continue
+    }
+    if (!claimed) continue
+
+    // The activity line is best-effort colour (logActivity swallows failures);
+    // the stamp's fate rides on the transaction above, not on this.
     await logActivity({
       entityType: 'SYNC',
       entityId: asn.id,
@@ -197,25 +214,6 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       resolveUser: false,
     })
     overdueAsnAlerts += 1
-    } catch (deliveryError) {
-      console.error(`[wms-watchdog] overdue-ASN alert delivery failed for ${asn.externalAsnId}:`, deliveryError)
-      // Delivery failed — un-stamp so the next sweep retries the alert
-      // (a stuck stamp would suppress it permanently; Codex). If the revert
-      // ITSELF fails, the stamp is stuck with no alert delivered: fail the
-      // whole run loudly rather than report SUCCEEDED over a permanently
-      // suppressed breach (Codex r5).
-      try {
-        await db.wmsAsnMap.updateMany({
-          where: { id: asn.id, sloAlertedAt: now },
-          data: { sloAlertedAt: null },
-        })
-      } catch (rollbackError) {
-        throw new Error(
-          `wms-watchdog: failed to revert the alert stamp for ASN ${asn.externalAsnId} after failed delivery — breach would be permanently suppressed`,
-          { cause: rollbackError },
-        )
-      }
-    }
   }
 
   // 2 — stale binding stock sync.
@@ -238,23 +236,47 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   })
   for (const binding of bindings) {
     if (!isBindingSyncStale(binding, now)) continue
-    // Pin the snapshot freshness (Codex): a sync completing mid-sweep refreshes
-    // lastStockSyncSuccessAt and clears the stamp — alerting over it would be
-    // false and would re-suppress the recovered binding.
-    const stamped = await db.externalWmsBinding.updateMany({
-      where: { id: binding.id, staleSyncAlertedAt: null, lastStockSyncSuccessAt: binding.lastStockSyncSuccessAt },
-      data: { staleSyncAlertedAt: now },
-    })
-    if (stamped.count === 0) continue
-
-    try {
-
     const last = binding.lastStockSyncSuccessAt ? binding.lastStockSyncSuccessAt.toISOString() : 'never'
     const failing = binding.lastStockSyncStatus === 'FAILED' ? ' Recent attempts are FAILING.' : ''
-    await notifyAdminsDurably(
-      'WMS stock sync stale',
-      `Stock sync for ${binding.warehouse.code} has not completed successfully since ${last}.${failing} Check the scheduler and the WMS connection.`,
-    )
+
+    // Same one-transaction claim+deliver contract as the ASN path (Codex r6).
+    // The CAS pins the success snapshot (a sync completing mid-sweep refreshes
+    // lastStockSyncSuccessAt and clears the stamp — alerting over it would be
+    // false and would re-suppress the recovered binding) AND re-checks the
+    // selection predicates (Codex r6: a binding disabled between selection and
+    // stamping must not receive a stamp it would carry back on re-enable,
+    // suppressing the genuine alert).
+    let claimed = false
+    try {
+      claimed = await db.$transaction(async (tx) => {
+        const stamped = await tx.externalWmsBinding.updateMany({
+          where: {
+            id: binding.id,
+            staleSyncAlertedAt: null,
+            lastStockSyncSuccessAt: binding.lastStockSyncSuccessAt,
+            active: true,
+            connection: { active: true },
+            stockSyncMode: { not: 'DISABLED' },
+          },
+          data: { staleSyncAlertedAt: now },
+        })
+        if (stamped.count === 0) return false
+        await tx.notification.createMany({
+          data: adminNotificationRows(
+            admins,
+            'WMS stock sync stale',
+            `Stock sync for ${binding.warehouse.code} has not completed successfully since ${last}.${failing} Check the scheduler and the WMS connection.`,
+          ),
+        })
+        return true
+      })
+    } catch (deliveryError) {
+      deliveryFailures += 1
+      console.error(`[wms-watchdog] stale-sync alert delivery failed for ${binding.warehouse.code}:`, deliveryError)
+      continue
+    }
+    if (!claimed) continue
+
     await logActivity({
       entityType: 'SYNC',
       entityId: binding.id,
@@ -272,23 +294,13 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       resolveUser: false,
     })
     staleBindingAlerts += 1
-    } catch (deliveryError) {
-      console.error(`[wms-watchdog] stale-sync alert delivery failed for ${binding.warehouse.code}:`, deliveryError)
-      // Same revert-or-fail contract as the ASN path (Codex r5): a swallowed
-      // rollback failure leaves the stamp stuck while the run reports success.
-      try {
-        await db.externalWmsBinding.updateMany({
-          where: { id: binding.id, staleSyncAlertedAt: now },
-          data: { staleSyncAlertedAt: null },
-        })
-      } catch (rollbackError) {
-        throw new Error(
-          `wms-watchdog: failed to revert the stale-sync stamp for ${binding.warehouse.code} after failed delivery — breach would be permanently suppressed`,
-          { cause: rollbackError },
-        )
-      }
-    }
   }
 
+  // Any undelivered breach fails the run (Codex r6): the cron route maps
+  // FAILED to HTTP 500, so scheduler monitoring goes red instead of reporting
+  // a healthy watchdog that alerted no one. Un-claimed breaches retry next run.
+  if (deliveryFailures > 0) {
+    return { status: 'FAILED', overdueAsnAlerts, staleBindingAlerts, deliveryFailures, reason: `${deliveryFailures} breach alert(s) could not be delivered` }
+  }
   return { status: 'SUCCEEDED', overdueAsnAlerts, staleBindingAlerts }
 }

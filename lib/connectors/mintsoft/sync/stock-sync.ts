@@ -1738,7 +1738,13 @@ export async function createMintsoftBindingHandover(
     where: { id: binding.id },
     data: {
       lastStockSyncAt: new Date(),
+      // A handover records a successful STOCK_SYNC, so it is watchdog
+      // freshness too (Codex r6): without these, leaving alignment mode kept
+      // the old/null success anchor (immediate false stale alert) or carried
+      // a stale stamp that suppressed later genuine breaches.
+      lastStockSyncSuccessAt: new Date(),
       lastStockSyncStatus: 'SUCCEEDED',
+      staleSyncAlertedAt: null,
     },
   })
 
