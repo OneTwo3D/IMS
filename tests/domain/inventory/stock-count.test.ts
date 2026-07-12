@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { computeStockCountPostings, makeStockCountReference, type StockCountLineForPost } from '@/lib/domain/inventory/stock-count'
+import { classifyStockCountWmsPolicy, computeStockCountPostings, makeStockCountReference, type StockCountLineForPost } from '@/lib/domain/inventory/stock-count'
 
 const line = (over: Partial<StockCountLineForPost> & Pick<StockCountLineForPost, 'productId'>): StockCountLineForPost => ({
   lineId: `l-${over.productId}`,
@@ -60,4 +60,26 @@ test('computeStockCountPostings: 6dp rounding on adjustment, 4dp on reported var
 
 test('makeStockCountReference formats SC-YYYYMMDD-XXXX', () => {
   assert.equal(makeStockCountReference(new Date('2026-06-24T10:00:00Z'), 'ab12cd'), 'SC-20260624-AB12')
+})
+
+// --- 6oyu.3: WMS coordination policy ---
+
+test('classifyStockCountWmsPolicy: unbound or disabled warehouses count freely', () => {
+  assert.deepEqual(classifyStockCountWmsPolicy(null), { policy: 'allow' })
+  assert.deepEqual(
+    classifyStockCountWmsPolicy({ connector: 'mintsoft', stockSyncMode: 'DISABLED' }),
+    { policy: 'allow' },
+  )
+})
+
+test('classifyStockCountWmsPolicy: ALIGN_TO_WMS blocks — the WMS is the stock master', () => {
+  const result = classifyStockCountWmsPolicy({ connector: 'mintsoft', stockSyncMode: 'ALIGN_TO_WMS' })
+  assert.equal(result.policy, 'block')
+  assert.match((result as { message: string }).message, /stock master/)
+})
+
+test('classifyStockCountWmsPolicy: NOTIFICATION_ONLY warns and requires acknowledgement', () => {
+  const result = classifyStockCountWmsPolicy({ connector: 'mintsoft', stockSyncMode: 'NOTIFICATION_ONLY' })
+  assert.equal(result.policy, 'warn')
+  assert.match((result as { message: string }).message, /re-flagged/)
 })

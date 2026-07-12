@@ -98,6 +98,10 @@ The `timestamp` string must be the exact header value IMS uses for freshness val
 - Operators review unmatched returns and choose restock/refund handling.
 - Restocking preserves the selected destination warehouse on subsequent polling updates.
 
+## Stocktakes and Mirrored Warehouses
+
+An IMS-side stock count against a WMS-bound warehouse is coordinated with the stock sync (6oyu.3): under **Align To WMS** posting is **blocked** — the WMS is the stock master, so perform the stocktake there and let the sync import the corrections; under **notification-only** posting **warns and requires acknowledgement**, since any remaining divergence against the WMS is re-flagged as a discrepancy on the next sync. Unbound (or sync-disabled) warehouses are unaffected.
+
 ## Order Reconciliation (scheduled)
 
 The `wms-order-reconcile` cron (default daily, ships disabled — enable in System Settings → Scheduler) runs a connector-agnostic order-level reconcile of IMS intent vs WMS truth (`lib/domain/wms/order-reconcile-sweep.ts`). Because the WMS API cannot enumerate orders, it verifies IMS-known truth per order: eligible orders with no live push link (`NOT_PUSHED`), live links whose WMS order vanished (`MISSING_IN_WMS`), and cancelled/held orders still active in the WMS (`ACTIVE_AFTER_CANCEL` — admins are belled; the warehouse may ship them). Findings land on an `ORDER_RECONCILE` sync job and surface in the [sync exception inbox](./sync-exceptions.md).

@@ -8,7 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
-import { computeStockCountPostings, makeStockCountReference, type StockCountLineForPost } from '@/lib/domain/inventory/stock-count'
+import { classifyStockCountWmsPolicy, computeStockCountPostings, makeStockCountReference, type StockCountLineForPost } from '@/lib/domain/inventory/stock-count'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 30000 }
@@ -39,7 +39,14 @@ export type StockCountRow = {
   lines: StockCountLineRow[]
 }
 
-export type StockCountResult = { success?: boolean; message?: string; count?: StockCountRow }
+export type StockCountResult = {
+  success?: boolean
+  message?: string
+  count?: StockCountRow
+  /** 6oyu.3: the warehouse is WMS-synced (notification-only) — the client must
+   * confirm and re-submit with acknowledgeWmsWarning: true. */
+  requiresWmsAcknowledgement?: boolean
+}
 
 const COUNT_SELECT = {
   id: true,
@@ -229,6 +236,7 @@ export async function saveStockCountCounts(input: unknown): Promise<StockCountRe
 }
 
 const postSchema = z.object({
+  acknowledgeWmsWarning: z.boolean().optional(),
   countId: z.string().min(1),
   reasonId: z.string().min(1).optional(),
   // Optional final counts persisted within the post transaction so save+post is
@@ -242,6 +250,9 @@ const postSchema = z.object({
  * consuming FIFO layers and the inventory journal (via applyStockAdjustment), tied
  * to the count (referenceType 'StockCount'). Atomic; double-post guarded by status.
  */
+/** 6oyu.3: marker to unwind the transaction and return a confirmable result. */
+class WmsAcknowledgementRequired extends Error {}
+
 export async function postStockCount(input: unknown): Promise<StockCountResult> {
   await requirePermission('stock_control.adjust')
   const parsed = postSchema.safeParse(input)
@@ -260,6 +271,19 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
       if (!count) throw new Error('Stock count not found.')
       if (count.status === 'COMPLETED') throw new Error('This stock count has already been posted.')
       if (count.status === 'CANCELLED') throw new Error('This stock count was cancelled and cannot be posted.')
+
+      // 6oyu.3: a WMS-mirrored warehouse's book is a reflection of WMS stock —
+      // block counts under ALIGN_TO_WMS (the sync would fight them) and require
+      // explicit acknowledgement under NOTIFICATION_ONLY.
+      const binding = await tx.externalWmsBinding.findFirst({
+        where: { warehouseId: count.warehouseId, active: true, connection: { active: true } },
+        select: { connector: true, stockSyncMode: true },
+      })
+      const wmsPolicy = classifyStockCountWmsPolicy(binding)
+      if (wmsPolicy.policy === 'block') throw new Error(wmsPolicy.message)
+      if (wmsPolicy.policy === 'warn' && !parsed.data.acknowledgeWmsWarning) {
+        throw new WmsAcknowledgementRequired(wmsPolicy.message)
+      }
 
       const expectedById = new Map(count.lines.map((l) => [l.id, Number(l.expectedQty)]))
       // Atomic save+post: persist any final counts within this transaction.
@@ -330,8 +354,11 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
     })
     return { success: true }
   } catch (e) {
+    if (e instanceof WmsAcknowledgementRequired) {
+      return { requiresWmsAcknowledgement: true, message: e.message }
+    }
     console.error(e)
-    return { message: e instanceof Error ? e.message : 'Failed to post stock count.' }
+    return { message: e instanceof Error ? e.message : 'Failed to post the stock count.' }
   }
 }
 

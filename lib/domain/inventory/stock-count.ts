@@ -77,3 +77,45 @@ export function makeStockCountReference(now: Date, rand: string): string {
   const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')
   return `SC-${ymd}-${rand.slice(0, 4).toUpperCase()}`
 }
+
+// ---------------------------------------------------------------------------
+// WMS coordination (6oyu.3)
+// ---------------------------------------------------------------------------
+
+export type StockCountWmsPolicy =
+  | { policy: 'allow' }
+  | { policy: 'warn'; message: string }
+  | { policy: 'block'; message: string }
+
+/**
+ * 6oyu.3: whether an IMS-side stocktake may post against a warehouse, given its
+ * WMS binding. For a mirrored warehouse the IMS book is a REFLECTION of WMS
+ * stock, so a manual count fights the stock sync:
+ *
+ *  - ALIGN_TO_WMS: the WMS is the stock master — an IMS adjustment would be
+ *    re-flagged and (upward) re-corrected by the next sync, oscillating the
+ *    book and polluting ASN alignment credits. BLOCK: physical counts belong in
+ *    the WMS; the sync imports the corrections.
+ *  - NOTIFICATION_ONLY: IMS is authoritative and a count is a legitimate way to
+ *    fix the book after investigating a discrepancy — but any remaining
+ *    divergence vs the WMS will be re-flagged on the next sync. WARN and
+ *    require explicit acknowledgement.
+ *  - DISABLED binding or no binding: unmanaged warehouse — ALLOW.
+ */
+export function classifyStockCountWmsPolicy(
+  binding: { connector: string; stockSyncMode: string } | null,
+): StockCountWmsPolicy {
+  if (!binding || binding.stockSyncMode === 'DISABLED') return { policy: 'allow' }
+
+  if (binding.stockSyncMode === 'ALIGN_TO_WMS') {
+    return {
+      policy: 'block',
+      message: `This warehouse mirrors the WMS (${binding.connector}) in Align To WMS mode — the WMS is the stock master, and an IMS-side count would be re-corrected by the next stock sync. Perform the stocktake in the WMS instead; the sync imports the corrections.`,
+    }
+  }
+
+  return {
+    policy: 'warn',
+    message: `This warehouse is synced with the WMS (${binding.connector}) in notification-only mode. Posting this count adjusts the IMS book, and any remaining divergence against the WMS will be re-flagged as a discrepancy on the next stock sync. Resolve the physical difference in the WMS too, or expect the discrepancy.`,
+  }
+}
