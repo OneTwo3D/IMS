@@ -344,29 +344,6 @@ export async function runWmsOrderReconcileSweep(
       })
     }
 
-    // Run ledger (per-run history stays on the job).
-    if (core.findings.length > 0) {
-      await db.wmsSyncLog.createMany({
-        data: core.findings.map((finding) => ({
-          jobId: job.id,
-          sku: null,
-          productId: null,
-          action: 'discrepancy' as const,
-          reason: finding.detail,
-          payload: {
-            category: finding.category,
-            orderId: finding.orderId,
-            orderNumber: finding.orderNumber,
-            externalOrderNumber: finding.externalOrderNumber,
-          } as Prisma.InputJsonValue,
-        })),
-      })
-    }
-
-    // Durable findings (Codex): a capped run is never a complete snapshot, so
-    // OPEN rows persist until the SPECIFIC order re-verifies clean — they are
-    // never cleared wholesale by a newer run.
-    //
     // Revalidate the link state per finding first (Codex r10 P1): with the push
     // sweep running concurrently, a link snapshotted as SYNCED may have been
     // cancelled before its lookup — the null status is then EXPECTED, and a
@@ -390,6 +367,31 @@ export async function runWmsOrderReconcileSweep(
       return state != null && expected.includes(state)
     })
 
+    // Run ledger (per-run history stays on the job) — valid findings only
+    // (Codex r12: a race-invalidated finding must appear nowhere, ledger included).
+    counters.findings = validFindings.length
+    if (validFindings.length > 0) {
+      await db.wmsSyncLog.createMany({
+        data: validFindings.map((finding) => ({
+          jobId: job.id,
+          sku: null,
+          productId: null,
+          action: 'discrepancy' as const,
+          reason: finding.detail,
+          payload: {
+            category: finding.category,
+            orderId: finding.orderId,
+            orderNumber: finding.orderNumber,
+            externalOrderNumber: finding.externalOrderNumber,
+          } as Prisma.InputJsonValue,
+        })),
+      })
+    }
+
+    // Durable findings (Codex): a capped run is never a complete snapshot, so
+    // OPEN rows persist until the SPECIFIC order re-verifies clean — they are
+    // never cleared wholesale by a newer run.
+    //
     const now = new Date()
     const newlyOpened: WmsReconcileFinding[] = []
     for (const finding of validFindings) {
