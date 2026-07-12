@@ -1,11 +1,10 @@
 import type { NextConfig } from "next";
 
-// Baseline security response headers applied to every route. These are safe,
-// script-agnostic defenses (framing, MIME-sniffing, referrer leakage, transport
-// security). A full script-src CSP is intentionally left out here because it
-// requires per-request nonces to coexist with Next.js inline hydration; it is
-// tracked as a follow-up. `frame-ancestors`/`object-src`/`base-uri` below do
-// not affect legitimate script loading, so they are safe to enforce now.
+// Baseline security response headers applied to every route (framing,
+// MIME-sniffing, referrer leakage, transport security). The full Content-Security-Policy
+// is NOT set here: it needs a per-request nonce, so it is built in the middleware
+// (proxy.ts / lib/security/csp.ts) and applied to HTML responses. Keeping CSP out
+// of this static list also avoids emitting two conflicting CSP headers on pages.
 const securityHeaders = [
   { key: 'X-Frame-Options', value: 'DENY' },
   { key: 'X-Content-Type-Options', value: 'nosniff' },
@@ -14,10 +13,6 @@ const securityHeaders = [
   {
     key: 'Strict-Transport-Security',
     value: 'max-age=63072000; includeSubDomains; preload',
-  },
-  {
-    key: 'Content-Security-Policy',
-    value: "frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
   },
 ];
 
