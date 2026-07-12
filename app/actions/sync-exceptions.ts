@@ -667,6 +667,21 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     if (!connector.probeOrderPresence) {
       return { success: false, error: 'The active WMS connector cannot verify order absence, so a safe re-push is not possible.' }
     }
+    // Codex r30 P1: the push sweep's create pass only selects ready
+    // (PROCESSING/ALLOCATED), paid, not-fully-refunded orders — resetting the
+    // link for e.g. a PICKING/PACKING order would resolve the finding while the
+    // order is never re-created and silently never fulfils. Refuse; the
+    // operator must return the order to a ready status first.
+    const order = await db.salesOrder.findUnique({
+      where: { id: orderId },
+      select: { status: true, paidAt: true, refundStatus: true },
+    })
+    if (!order || !['PROCESSING', 'ALLOCATED'].includes(order.status) || !order.paidAt || order.refundStatus === 'FULL') {
+      return {
+        success: false,
+        error: `The push sweep only re-creates paid, ready (Processing/Allocated) orders — this order is ${order?.status ?? 'missing'}. Return it to a ready status (or resolve it manually in the WMS); the finding stays open meanwhile.`,
+      }
+    }
     const link = await db.wmsOrderPushLink.findUnique({
       where: { orderId },
       select: { externalOrderNumber: true },

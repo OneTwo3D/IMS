@@ -293,6 +293,7 @@ export async function runWmsOrderReconcileCore(
  * window.
  */
 export function buildNotPushedDriftWhere(input: {
+  connectorId: string
   boundWarehouseIds: string[]
   cutoff: Date
   orderIds?: string[]
@@ -311,6 +312,11 @@ export function buildNotPushedDriftWhere(input: {
     shipFromWarehouseId: { in: input.boundWarehouseIds },
     OR: [
       { wmsOrderPush: null },
+      // A link belonging to a PREVIOUS connector (Codex r30): after a connector
+      // switch the old link satisfies neither check B (filtered to the active
+      // connector) nor any branch below — the order would silently never reach
+      // the new WMS.
+      { wmsOrderPush: { connector: { not: input.connectorId } } },
       { wmsOrderPush: { state: 'PENDING_CREATE' as const, updatedAt: { lt: input.cutoff } } },
       // A ready+paid order stuck on a HELD link should have been re-created by
       // the push sweep's release pass — if it lingers, that cron is dead.
@@ -341,7 +347,7 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
       const cutoff = new Date(Date.now() - RECONCILE_UNPUSHED_GRACE_MS)
       const orders = await db.salesOrder.findMany({
         where: {
-          ...buildNotPushedDriftWhere({ boundWarehouseIds: bindings.map((b) => b.warehouseId), cutoff }),
+          ...buildNotPushedDriftWhere({ connectorId, boundWarehouseIds: bindings.map((b) => b.warehouseId), cutoff }),
           // Rotation (Codex): findings are durable, so already-flagged orders
           // need no re-scan — every run's slots go to UNDISCOVERED drift, and a
           // backlog larger than the cap is fully reported across runs.
@@ -764,6 +770,9 @@ export async function runWmsOrderReconcileSweep(
           ? []
           : (await db.salesOrder.findMany({
               where: buildNotPushedDriftWhere({
+                // connectorId is narrowed by the early return above; TS can't
+                // carry that into a hoisted function declaration.
+                connectorId: connectorId!,
                 boundWarehouseIds: bindings.map((b) => b.warehouseId),
                 cutoff: new Date(Date.now() - RECONCILE_UNPUSHED_GRACE_MS),
                 orderIds: openNotPushed.map((row) => row.orderId),
