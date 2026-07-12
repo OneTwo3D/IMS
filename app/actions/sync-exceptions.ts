@@ -136,12 +136,23 @@ const REFUND_PARK_WHERE = {
  * finished DISPATCH_SYNC sweep. Anything listed here failed on the latest run
  * and will keep failing until an operator intervenes.
  */
-async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
-  const latestJob = await db.wmsSyncJob.findFirst({
+async function findLatestDispatchSweepJob(): Promise<{ id: string; finishedAt: Date | null } | null> {
+  return db.wmsSyncJob.findFirst({
     where: { type: 'DISPATCH_SYNC', finishedAt: { not: null } },
     orderBy: { startedAt: 'desc' },
     select: { id: true, finishedAt: true },
   })
+}
+
+/** Codex P2: the banner count must not inherit the 50-row display limit. */
+async function countStuckDispatches(): Promise<number> {
+  const latestJob = await findLatestDispatchSweepJob()
+  if (!latestJob) return 0
+  return db.wmsSyncLog.count({ where: { jobId: latestJob.id, action: 'error' } })
+}
+
+async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
+  const latestJob = await findLatestDispatchSweepJob()
   if (!latestJob) return []
 
   const errorLogs = await db.wmsSyncLog.findMany({
@@ -186,7 +197,7 @@ export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary>
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.shoppingSyncLog.count({ where: REFUND_PARK_WHERE }),
     db.wmsOrderPushLink.count({ where: { totalMismatchPence: { not: null } } }),
-    loadStuckDispatches().then((rows) => rows.length),
+    countStuckDispatches(),
   ])
 
   return {
