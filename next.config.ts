@@ -23,6 +23,8 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   compress: false,
+  // Do not advertise the framework/version in responses.
+  poweredByHeader: false,
   serverExternalPackages: ['pdfkit', 'sharp', 'ssh2-sftp-client'],
   allowedDevOrigins: [
     'localhost',

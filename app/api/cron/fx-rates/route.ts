@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { fetchAllFxRatesInternal } from '@/app/actions/currencies'
+import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 
 export async function GET(request: Request) {
