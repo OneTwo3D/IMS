@@ -241,34 +241,39 @@ export async function runWmsDispatchSweepCore(
   const candidates = await deps.listCandidates(batchSize)
   for (const candidate of candidates) {
     counters.totalChecked += 1
+
+    // Reconcile first; the failure-tracking bookkeeping below runs OUTSIDE this
+    // try/catch so a bookkeeping error can never count as another reconcile
+    // failure (Codex: recordDispatchError throwing inside the catch would have
+    // recursed into itself) nor abort the rest of the batch.
+    let outcome: { action: 'dispatched' | 'pending' | 'error'; reason: string }
     try {
-      const outcome = await reconcileOneOrder(deps, candidate)
-      counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
-      // 6oyu.2: only CONSECUTIVE errors dead-letter — any non-error outcome resets.
-      let reason = outcome.reason
+      outcome = await reconcileOneOrder(deps, candidate)
+    } catch (error) {
+      outcome = { action: 'error', reason: scrubWmsError(error, 'WMS dispatch sweep error') }
+    }
+    counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
+
+    // 6oyu.2: only CONSECUTIVE errors dead-letter — any non-error outcome resets.
+    let reason = outcome.reason
+    try {
       if (outcome.action === 'error') {
         const { deadLettered } = await deps.recordDispatchError(candidate, outcome.reason)
         if (deadLettered) reason = `${outcome.reason} — dead-lettered after ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures`
       } else {
         await deps.clearDispatchFailures(candidate.linkId)
       }
-      logs.push({
-        orderId: candidate.orderId,
-        externalOrderNumber: candidate.externalOrderNumber,
-        action: outcome.action,
-        reason,
-      })
-    } catch (error) {
-      counters.errors += 1
-      const scrubbed = scrubWmsError(error, 'WMS dispatch sweep error')
-      const { deadLettered } = await deps.recordDispatchError(candidate, scrubbed)
-      logs.push({
-        orderId: candidate.orderId,
-        externalOrderNumber: candidate.externalOrderNumber,
-        action: 'error',
-        reason: deadLettered ? `${scrubbed} — dead-lettered after ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures` : scrubbed,
-      })
+    } catch (bookkeepingError) {
+      // Best-effort: the streak just doesn't move this run.
+      console.error('[wms-dispatch-sweep] failure-tracking bookkeeping failed:', bookkeepingError)
     }
+
+    logs.push({
+      orderId: candidate.orderId,
+      externalOrderNumber: candidate.externalOrderNumber,
+      action: outcome.action,
+      reason,
+    })
   }
 
   return { counters, logs }
@@ -341,9 +346,17 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
     async repointLink(linkId, to) {
       // Park as MERGED so the push-sweep's SYNCED-filtered passes skip it (no dual-sync
       // amending the survivor with this order's lines); the dispatch sweep still polls it.
+      // The failure streak belonged to the OLD WMS order — the survivor starts clean.
       await db.wmsOrderPushLink.update({
         where: { id: linkId },
-        data: { externalOrderId: to.externalOrderId, externalOrderNumber: to.externalOrderNumber, state: 'MERGED' },
+        data: {
+          externalOrderId: to.externalOrderId,
+          externalOrderNumber: to.externalOrderNumber,
+          state: 'MERGED',
+          dispatchFailureCount: 0,
+          dispatchLastError: null,
+          dispatchDeadLetteredAt: null,
+        },
       })
     },
     async recordDispatchError(candidate, reason) {

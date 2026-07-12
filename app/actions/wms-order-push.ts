@@ -51,7 +51,16 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
   // still applies, so a no-longer-eligible order simply won't re-push.
   await db.wmsOrderPushLink.update({
     where: { id: link.id },
-    data: { state: 'PENDING_CREATE', attempts: 0, lastError: null },
+    // The replay re-creates the WMS order, so any dispatch dead-letter state
+    // from the previous order must not carry over (6oyu.2).
+    data: {
+      state: 'PENDING_CREATE',
+      attempts: 0,
+      lastError: null,
+      dispatchFailureCount: 0,
+      dispatchLastError: null,
+      dispatchDeadLetteredAt: null,
+    },
   })
   await logActivity({
     entityType: 'SALES_ORDER',

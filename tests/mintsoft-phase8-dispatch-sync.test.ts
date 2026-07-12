@@ -393,3 +393,25 @@ test('sweep core: success and pending outcomes clear the failure streak', async 
   }))
   assert.deepEqual(cleared.sort(), ['l-ok', 'l-pending'])
 })
+
+test('sweep core: a bookkeeping failure never aborts the batch or recurses into the counter', async () => {
+  let recordCalls = 0
+  const result = await sweep.runWmsDispatchSweepCore(deps({
+    listCandidates: async () => [
+      { linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1' },
+      { linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-2' },
+    ],
+    fetchOrderStatus: async () => status({ status: 'DESPATCHED', dispatched: true }),
+    applyDispatch: async () => ({ success: false, error: 'no stock' }),
+    recordDispatchError: async () => {
+      recordCalls += 1
+      throw new Error('activity log down')
+    },
+  }))
+  // Both candidates still processed; exactly ONE recordDispatchError call per
+  // candidate (no recursion), and the reconcile errors still counted.
+  assert.equal(result.counters.totalChecked, 2)
+  assert.equal(result.counters.errors, 2)
+  assert.equal(recordCalls, 2)
+  assert.equal(result.logs.length, 2)
+})
