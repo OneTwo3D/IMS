@@ -60,12 +60,15 @@ export const RECONCILE_UNPUSHED_GRACE_MS = 6 * 60 * 60 * 1000
 export const RECONCILE_DEFAULT_LOOKUP_LIMIT = 200
 
 /**
- * Pure, connector-lenient "does this WMS status read as cancelled" test for
- * check C. Case-insensitive substring so Mintsoft's "Cancelled" and variants
- * ("Cancel Requested", …) all count as safely cancelled.
+ * Pure "does this WMS status read as TERMINALLY cancelled" test for check C.
+ * Requires a completed cancellation word (cancelled/canceled — both spellings)
+ * and rejects in-flight or failed forms ("Cancel Requested", "Cancellation
+ * Failed", "Cancel Pending"): those orders may still fulfil, so treating them
+ * as safe would suppress the ACTIVE_AFTER_CANCEL finding (Codex r24).
  */
 export function isLikelyCancelledWmsStatus(status: Pick<WmsOrderStatus, 'status' | 'statusLabel'>): boolean {
-  return /cancel/i.test(status.status) || /cancel/i.test(status.statusLabel)
+  const combined = `${status.status} ${status.statusLabel}`
+  return /\bcancell?ed\b/i.test(combined) && !/request|fail|pending/i.test(combined)
 }
 
 export type WmsOrderReconcileDeps = {
@@ -104,8 +107,8 @@ export async function runWmsOrderReconcileCore(
   verifiedOrderIds: string[]
   verifiedSyncedOrderIds: string[]
   verifiedCancelledOrderIds: string[]
-  attemptedSynced: Array<{ orderId: string; linkState: string }>
-  attemptedCancelled: Array<{ orderId: string; linkState: string }>
+  attemptedSynced: Array<{ orderId: string; linkState: string; externalOrderNumber: string }>
+  attemptedCancelled: Array<{ orderId: string; linkState: string; externalOrderNumber: string }>
 }> {
   const lookupLimit = options?.lookupLimit ?? RECONCILE_DEFAULT_LOOKUP_LIMIT
   const counters: WmsReconcileCounters = { intentChecked: 0, linksVerified: 0, cancelledVerified: 0, findings: 0, errors: 0 }
@@ -135,8 +138,8 @@ export async function runWmsOrderReconcileCore(
   // (Codex r19 P1): an errored/ambiguous lookup is never verified, but it must
   // still rotate to the back of the queue — otherwise persistently-failing
   // links pin `nulls: first` ordering and starve the rest of the corpus.
-  const attemptedSynced: Array<{ orderId: string; linkState: string }> = []
-  const attemptedCancelled: Array<{ orderId: string; linkState: string }> = []
+  const attemptedSynced: Array<{ orderId: string; linkState: string; externalOrderNumber: string }> = []
+  const attemptedCancelled: Array<{ orderId: string; linkState: string; externalOrderNumber: string }> = []
   // Actual WMS CALLS are budgeted (Codex r19 P2): fallback probes and part
   // fetches count too, not just link rows.
   let lookupsUsed = 0
@@ -152,7 +155,7 @@ export async function runWmsOrderReconcileCore(
   for (const link of cancelledLinks) {
     if (lookupsUsed >= cancelledCallBudget) break
     counters.cancelledVerified += 1
-    attemptedCancelled.push({ orderId: link.orderId, linkState: link.linkState })
+    attemptedCancelled.push({ orderId: link.orderId, linkState: link.linkState, externalOrderNumber: link.externalOrderNumber })
     try {
       lookupsUsed += 1
       const status = await deps.fetchOrderStatus(link.externalOrderNumber)
@@ -228,7 +231,7 @@ export async function runWmsOrderReconcileCore(
     for (const link of await deps.listSyncedLinksToVerify(syncedBudget)) {
       if (lookupsUsed >= lookupLimit) break
       counters.linksVerified += 1
-      attemptedSynced.push({ orderId: link.orderId, linkState: link.linkState })
+      attemptedSynced.push({ orderId: link.orderId, linkState: link.linkState, externalOrderNumber: link.externalOrderNumber })
       try {
         lookupsUsed += 1
         const presence = await probe(link.externalOrderNumber)
@@ -481,16 +484,19 @@ export async function runWmsOrderReconcileSweep(
     // still holding its EXACT snapshot state (Codex r23 P2): any concurrent
     // transition — cancel, hold, merge repoint — deliberately nulls the stamp
     // so the changed link jumps the queue, and must never be overwritten.
-    const attemptedByState = new Map<string, string[]>()
+    // Per-attempt CAS on state AND the exact WMS reference (Codex r24: a
+    // MERGED→MERGED repoint keeps the state but swaps the reference — the old
+    // lookup must not stamp the new survivor as checked). Bounded by the run's
+    // lookup cap, so a per-row update loop is fine for a daily cron.
+    const stampAt = new Date()
     for (const attempt of [...core.attemptedSynced, ...core.attemptedCancelled]) {
-      const bucket = attemptedByState.get(attempt.linkState) ?? []
-      bucket.push(attempt.orderId)
-      attemptedByState.set(attempt.linkState, bucket)
-    }
-    for (const [linkState, orderIds] of attemptedByState) {
       await db.wmsOrderPushLink.updateMany({
-        where: { orderId: { in: orderIds }, state: linkState as never },
-        data: { reconcileCheckedAt: new Date() },
+        where: {
+          orderId: attempt.orderId,
+          state: attempt.linkState as never,
+          externalOrderNumber: attempt.externalOrderNumber,
+        },
+        data: { reconcileCheckedAt: stampAt },
       })
     }
 
@@ -507,17 +513,20 @@ export async function runWmsOrderReconcileSweep(
       // state-scope cleanup below prunes rows that leave BOTH shapes.
       ACTIVE_AFTER_CANCEL: ['CANCELLED', 'HELD', 'SYNCED', 'MERGED'],
     }
-    const findingLinkStates = new Map(
+    const findingLinks = new Map(
       (await db.wmsOrderPushLink.findMany({
         where: { orderId: { in: core.findings.map((finding) => finding.orderId) } },
-        select: { orderId: true, state: true },
-      })).map((link) => [link.orderId, link.state as string]),
+        select: { orderId: true, state: true, externalOrderNumber: true },
+      })).map((link) => [link.orderId, { state: link.state as string, externalOrderNumber: link.externalOrderNumber }]),
     )
     const validFindings = core.findings.filter((finding) => {
       const expected = EXPECTED_LINK_STATES[finding.category]
       if (!expected) return true
-      const state = findingLinkStates.get(finding.orderId)
-      return state != null && expected.includes(state)
+      const link = findingLinks.get(finding.orderId)
+      if (!link || !expected.includes(link.state)) return false
+      // The finding speaks about the reference that was LOOKED UP — a repoint
+      // to a different WMS order (even same-state, Codex r24) invalidates it.
+      return finding.externalOrderNumber == null || finding.externalOrderNumber === link.externalOrderNumber
     })
 
     // Run ledger (per-run history stays on the job) — valid findings only

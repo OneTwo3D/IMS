@@ -38,11 +38,14 @@ function deps(overrides: Partial<reconcileNs.WmsOrderReconcileDeps>): reconcileN
   }
 }
 
-test('isLikelyCancelledWmsStatus: cancel-ish statuses in either field count', () => {
+test('isLikelyCancelledWmsStatus: only TERMINAL cancellations count', () => {
   assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'Cancelled', statusLabel: '' }), true)
-  assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'CANCEL REQUESTED', statusLabel: '' }), true)
   assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: '', statusLabel: 'Cancelled by user' }), true)
   assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'PROCESSING', statusLabel: 'Processing' }), false)
+  // In-flight or failed cancellations may still fulfil (Codex r24): not safe.
+  assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'CANCEL REQUESTED', statusLabel: '' }), false)
+  assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'Cancellation Failed', statusLabel: '' }), false)
+  assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'Cancel Pending', statusLabel: '' }), false)
 })
 
 test('reconcile core: eligible-but-unpushed orders become NOT_PUSHED findings', async () => {
@@ -180,8 +183,8 @@ test('reconcile core: errored lookups still count as ATTEMPTED so they rotate to
   // attempt records the SNAPSHOT state so the stamp can require it unchanged
   // (a concurrent transition's stamp reset must survive — Codex r23).
   assert.deepEqual(attemptedSynced, [
-    { orderId: 'o1', linkState: 'SYNCED' },
-    { orderId: 'o2', linkState: 'SYNCED' },
+    { orderId: 'o1', linkState: 'SYNCED', externalOrderNumber: 'WC-1' },
+    { orderId: 'o2', linkState: 'SYNCED', externalOrderNumber: 'WC-2' },
   ])
   assert.deepEqual(verifiedSyncedOrderIds, ['o2'])
 })
