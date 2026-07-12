@@ -7,6 +7,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS, isWmsConnectorId } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
   queueAccountingSync,
@@ -1958,7 +1959,28 @@ export async function createRefund(
                 const comment = isFull
                   ? `IMS: Order fully refunded (credit note ${creditNote}). If not yet dispatched it will be cancelled automatically; if already in progress please treat this as a cancellation request / raise a cancellation query.`
                   : `IMS: Partial refund (credit note ${creditNote}). Line quantities have been reduced — if the order is still amendable the items are updated automatically; otherwise please raise a line-item cancellation query for the refunded items.`
-                await connector.addOrderComment(wmsLink.externalOrderId, comment)
+                // q66in.4.6 audit timeline (Codex r1): the refund note is a WMS
+                // mutation outside the order-push sweep, so it records here.
+                try {
+                  await connector.addOrderComment(wmsLink.externalOrderId, comment)
+                  await recordWmsMutationEvent({
+                    connector: wmsLink.connector, direction: 'OUTBOUND', action: 'order_comment', outcome: 'SUCCEEDED',
+                    entityType: 'SALES_ORDER', entityId: orderId, externalId: wmsLink.externalOrderId,
+                    summary: `Refund note (credit note ${creditNote}) posted on WMS order ${orderRef}`,
+                    after: { comment },
+                    triggeredBy: 'refund',
+                  })
+                } catch (commentError) {
+                  await recordWmsMutationEvent({
+                    connector: wmsLink.connector, direction: 'OUTBOUND', action: 'order_comment', outcome: 'FAILED',
+                    entityType: 'SALES_ORDER', entityId: orderId, externalId: wmsLink.externalOrderId,
+                    summary: `Failed to post refund note (credit note ${creditNote}) on WMS order ${orderRef}`,
+                    after: { comment },
+                    error: commentError instanceof Error ? commentError.message : 'WMS comment failed',
+                    triggeredBy: 'refund',
+                  })
+                  throw commentError
+                }
               }
             }
           }

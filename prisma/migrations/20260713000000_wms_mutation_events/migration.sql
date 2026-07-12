@@ -23,6 +23,9 @@ CREATE TABLE "wms_mutation_events" (
     CONSTRAINT "wms_mutation_events_pkey" PRIMARY KEY ("id")
 );
 
+-- Leading createdAt index: the unfiltered timeline feed sorts on (createdAt, id)
+-- and the retention purge filters on createdAt alone (Codex r1).
+CREATE INDEX "wms_mutation_events_createdAt_idx" ON "wms_mutation_events"("createdAt");
 CREATE INDEX "wms_mutation_events_connector_createdAt_idx" ON "wms_mutation_events"("connector", "createdAt");
 CREATE INDEX "wms_mutation_events_entityType_entityId_idx" ON "wms_mutation_events"("entityType", "entityId");
 CREATE INDEX "wms_mutation_events_action_createdAt_idx" ON "wms_mutation_events"("action", "createdAt");

@@ -1,7 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
+import { recordWmsMutationEvents, type WmsMutationEventInput } from '@/lib/domain/wms/mutation-audit'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsReturnRecord } from '@/lib/connectors/wms/types'
 import { resolveOrderForExternalFulfillment } from '@/lib/fulfillment/external-fulfillment'
@@ -320,6 +320,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
     errors: 0,
   }
   const logRows: Prisma.WmsSyncLogCreateManyInput[] = []
+  const auditEvents: WmsMutationEventInput[] = []
   let createdCount = 0
   let updatedCount = 0
   let maxReceivedAtSeen: Date | null = null
@@ -417,7 +418,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
           createdCount += 1
           counters.corrected += 1
         }
-        await recordWmsMutationEvent({
+        auditEvents.push({
           connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED',
           entityType: 'RETURN', entityId: saved.id, externalId: record.externalReturnId, jobId: job.id,
           summary: existing
@@ -470,6 +471,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
       }
     }
 
+    await recordWmsMutationEvents(auditEvents)
     if (logRows.length > 0) {
       await db.wmsSyncLog.createMany({ data: logRows })
     }

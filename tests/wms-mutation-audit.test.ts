@@ -58,3 +58,12 @@ test('scrub: dates and decimal-like objects serialize to strings', () => {
   assert.equal(scrubbed.at, '2026-07-12T00:00:00.000Z')
   assert.equal(scrubbed.qty, '12.5')
 })
+
+test('scrub: PII inside free-text VALUES is redacted (Codex r1)', () => {
+  const scrubbed = scrubWmsMutationPayload({
+    reason: 'Customer jane.doe@example.com asked for a refund',
+    note: 'auth: Bearer abc123def',
+  }) as Record<string, string>
+  assert.equal(scrubbed.reason, 'Customer [redacted-email] asked for a refund')
+  assert.match(scrubbed.note, /Bearer \[redacted\]/)
+})

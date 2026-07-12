@@ -2,6 +2,8 @@
 
 import { requirePermission } from '@/lib/auth/server'
 import { db } from '@/lib/db'
+import { WMS_MUTATION_ACTIONS } from '@/lib/domain/wms/mutation-audit'
+import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 
 /**
  * q66in.4.6: read model for the WMS mutation-audit timeline — a chronological
@@ -63,16 +65,12 @@ export async function getWmsMutationEvents(
     ...(entity ? { OR: [{ entityId: entity }, { externalId: entity }] } : {}),
   }
 
-  const [rows, actionGroups, connectorGroups] = await Promise.all([
-    db.wmsMutationEvent.findMany({
-      where,
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      take: PAGE_SIZE + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-    }),
-    db.wmsMutationEvent.groupBy({ by: ['action'], orderBy: { action: 'asc' } }),
-    db.wmsMutationEvent.groupBy({ by: ['connector'], orderBy: { connector: 'asc' } }),
-  ])
+  const rows = await db.wmsMutationEvent.findMany({
+    where,
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: PAGE_SIZE + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+  })
 
   const hasMore = rows.length > PAGE_SIZE
   const page = hasMore ? rows.slice(0, PAGE_SIZE) : rows
@@ -96,7 +94,9 @@ export async function getWmsMutationEvents(
       createdAt: row.createdAt.toISOString(),
     })),
     nextCursor: hasMore ? page[page.length - 1].id : null,
-    actions: actionGroups.map((group) => group.action),
-    connectors: connectorGroups.map((group) => group.connector),
+    // Static lists (Codex r1): a groupBy over the full audit table on every
+    // filter change scales with table size for no benefit.
+    actions: [...WMS_MUTATION_ACTIONS],
+    connectors: [...WMS_CONNECTOR_IDS],
   }
 }

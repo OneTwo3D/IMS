@@ -2743,6 +2743,7 @@ model WmsMutationEvent {
   triggeredBy String?
   createdAt   DateTime             @default(now())
 
+  @@index([createdAt])
   @@index([connector, createdAt])
   @@index([entityType, entityId])
   @@index([action, createdAt])

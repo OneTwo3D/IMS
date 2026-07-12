@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { redactActivityLogText } from '@/lib/activity-log'
 
 /**
  * q66in.4.6: audit-grade timeline of connector mutations. Every IMS↔WMS state
@@ -42,11 +43,19 @@ const MAX_PAYLOAD_DEPTH = 6
 const MAX_ARRAY_LENGTH = 200
 const MAX_STRING_LENGTH = 2000
 
-/** Recursively drop PII-keyed values and clamp size so a payload mistake can't leak or bloat. */
+/**
+ * Recursively drop PII-keyed values, redact PII-shaped content INSIDE free
+ * text (emails, tokens — Codex r1: a Mintsoft return reason or error message
+ * can carry a customer email under an innocent key), and clamp size so a
+ * payload mistake can't leak or bloat.
+ */
 export function scrubWmsMutationPayload(value: unknown, depth = 0): unknown {
   if (value === null || value === undefined) return value ?? null
   if (depth >= MAX_PAYLOAD_DEPTH) return '[truncated]'
-  if (typeof value === 'string') return value.length > MAX_STRING_LENGTH ? `${value.slice(0, MAX_STRING_LENGTH)}…` : value
+  if (typeof value === 'string') {
+    const redacted = redactActivityLogText(value)
+    return redacted.length > MAX_STRING_LENGTH ? `${redacted.slice(0, MAX_STRING_LENGTH)}…` : redacted
+  }
   if (typeof value === 'number' || typeof value === 'boolean') return value
   if (typeof value === 'bigint') return value.toString()
   if (value instanceof Date) return value.toISOString()
@@ -81,29 +90,69 @@ function toJson(value: unknown): object | undefined {
   }
 }
 
+function toRow(input: WmsMutationEventInput) {
+  return {
+    connector: input.connector,
+    direction: input.direction,
+    action: input.action,
+    outcome: input.outcome,
+    entityType: input.entityType,
+    entityId: input.entityId ?? null,
+    externalId: input.externalId ?? null,
+    // summary/error are free text and take the same content redaction as
+    // payload strings (Codex r1: raw exception messages bypassed the scrub).
+    summary: redactActivityLogText(input.summary).slice(0, 500),
+    before: toJson(input.before),
+    after: toJson(input.after),
+    error: input.error ? redactActivityLogText(input.error).slice(0, 1000) : null,
+    jobId: input.jobId ?? null,
+    triggeredBy: input.triggeredBy ?? null,
+  }
+}
+
 export async function recordWmsMutationEvent(input: WmsMutationEventInput): Promise<void> {
   try {
-    await db.wmsMutationEvent.create({
-      data: {
-        connector: input.connector,
-        direction: input.direction,
-        action: input.action,
-        outcome: input.outcome,
-        entityType: input.entityType,
-        entityId: input.entityId ?? null,
-        externalId: input.externalId ?? null,
-        summary: input.summary.slice(0, 500),
-        before: toJson(input.before),
-        after: toJson(input.after),
-        error: input.error ? input.error.slice(0, 1000) : null,
-        jobId: input.jobId ?? null,
-        triggeredBy: input.triggeredBy ?? null,
-      },
-    })
+    await db.wmsMutationEvent.create({ data: toRow(input) })
   } catch (error) {
     console.error(`[wms-mutation-audit] failed to record ${input.action} event:`, error)
   }
 }
+
+/**
+ * Batch variant for high-volume loops (Codex r1: a returns backlog must not
+ * pay one serial audit round trip per record). Same best-effort contract.
+ */
+export async function recordWmsMutationEvents(inputs: WmsMutationEventInput[]): Promise<void> {
+  if (inputs.length === 0) return
+  try {
+    await db.wmsMutationEvent.createMany({ data: inputs.map(toRow) })
+  } catch (error) {
+    console.error(`[wms-mutation-audit] failed to record ${inputs.length} events:`, error)
+  }
+}
+
+/**
+ * Every action name the instrumented call sites emit — the timeline UI's
+ * filter dropdown reads this static list instead of a groupBy over the whole
+ * table on every request (Codex r1). Keep in sync when instrumenting a new
+ * mutation.
+ */
+export const WMS_MUTATION_ACTIONS = [
+  'align_down',
+  'align_up',
+  'asn_create',
+  'booked_in_receipt',
+  'bundle_create',
+  'dispatch_applied',
+  'order_cancel',
+  'order_comment',
+  'order_create',
+  'order_hold',
+  'order_release',
+  'order_update',
+  'product_upsert',
+  'return_inbox',
+] as const
 
 /** Retention window for the mutation timeline (days). Audit-grade: a full year. */
 export const WMS_MUTATION_EVENT_RETENTION_DAYS = 365

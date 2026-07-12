@@ -357,3 +357,34 @@ test('audit: a recordEvent failure never fails the sweep', async () => {
   assert.equal(r.created, 1)
   assert.equal(upserts[0].create.state, 'SYNCED')
 })
+
+test('audit: remote create succeeds but the link write fails → event stays SUCCEEDED with linkPersistFailed (Codex r1)', async () => {
+  const { port, events } = makePort({ createCandidates: [candidate()] })
+  port.upsertByOrder = async () => { throw new Error('db down') }
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 0)
+  const event = events.find((entry) => entry.action === 'order_create')
+  assert.ok(event)
+  assert.equal(event.outcome, 'SUCCEEDED')
+  assert.equal(event.externalId, 'wms-1')
+  assert.equal((event.after as { linkPersistFailed?: boolean }).linkPersistFailed, true)
+  assert.match(event.error ?? '', /db down/)
+})
+
+test('audit: a failed release records no event and does not count (Codex r1)', async () => {
+  const { port, events } = makePort({ releasable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-old' }] })
+  port.updateLink = async () => { throw new Error('db down') }
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.released, 0)
+  assert.equal(events.filter((entry) => entry.action === 'order_release').length, 0)
+})
+
+test('audit: remote cancel succeeds but the link write fails → SUCCEEDED with linkPersistFailed (Codex r1)', async () => {
+  const { port, events } = makePort({ cancellable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
+  port.updateLink = async () => { throw new Error('db down') }
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  const event = events.find((entry) => entry.action === 'order_cancel')
+  assert.ok(event)
+  assert.equal(event.outcome, 'SUCCEEDED')
+  assert.equal((event.after as { linkPersistFailed?: boolean }).linkPersistFailed, true)
+})
