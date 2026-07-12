@@ -113,13 +113,13 @@ test('parseXeroTrialBalanceRows uses explicit balance column when present', () =
   assert.equal(rows[0]?.amount.toFixed(6), '150.000000')
 })
 
-test('buildXeroAccountBalanceSnapshotInputs reports partial matches and prefers external id', () => {
+test('buildXeroAccountBalanceSnapshotInputs synthesizes a zero snapshot for a configured account omitted from a non-empty Trial Balance, and prefers external id', () => {
   const result = buildXeroAccountBalanceSnapshotInputs({
     balanceDate: '2026-06-01',
     baseCurrency: 'GBP',
     accounts: [
       { externalAccountId: 'account-x', code: '500', name: 'Inventory Asset' },
-      { externalAccountId: 'account-missing', code: '600', name: 'COGS' },
+      { externalAccountId: 'account-missing', code: '600', name: 'Allocated Inventory' },
     ],
     parsedRows: [
       { externalAccountId: 'other-account', accountCode: '500', accountName: 'Archived Inventory', amount: toDecimal('999') },
@@ -127,11 +127,27 @@ test('buildXeroAccountBalanceSnapshotInputs reports partial matches and prefers 
     ],
   })
 
-  assert.equal(result.snapshots.length, 1)
-  const [snapshot] = result.snapshots
-  assert.ok(snapshot)
-  assert.equal(snapshot.externalAccountId, 'account-x')
-  assert.equal(snapshot.accountName, 'Inventory Asset')
-  assert.equal(toDecimal(snapshot.amountBase).toString(), '123')
-  assert.deepEqual(result.errors, ['No Trial Balance row matched configured account 600 (COGS).'])
+  // account-x matches by external id (not the 500-coded archived row).
+  const inventory = result.snapshots.find((s) => s.externalAccountId === 'account-x')
+  assert.ok(inventory)
+  assert.equal(toDecimal(inventory.amountBase).toString(), '123')
+
+  // The omitted account is a real chart account Xero left out because it is
+  // zero — synthesize a zero snapshot rather than failing the whole sync (scjz.60c-1).
+  const allocated = result.snapshots.find((s) => s.externalAccountId === 'account-missing')
+  assert.ok(allocated)
+  assert.equal(toDecimal(allocated.amountBase).toString(), '0')
+  assert.deepEqual(result.errors, [])
+})
+
+test('buildXeroAccountBalanceSnapshotInputs still errors when the Trial Balance parsed no rows at all (fetch/parse failure, not a genuine zero)', () => {
+  const result = buildXeroAccountBalanceSnapshotInputs({
+    balanceDate: '2026-06-01',
+    baseCurrency: 'GBP',
+    accounts: [{ externalAccountId: 'account-x', code: '500', name: 'Inventory Asset' }],
+    parsedRows: [],
+  })
+
+  assert.equal(result.snapshots.length, 0)
+  assert.deepEqual(result.errors, ['No Trial Balance row matched configured account 500 (Inventory Asset).'])
 })

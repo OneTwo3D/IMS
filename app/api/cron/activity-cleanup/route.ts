@@ -4,6 +4,7 @@ import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { purgeExpiredActivityLogs, purgeExpiredCronRuns } from '@/lib/activity-log-cleanup'
 import { purgeExpiredDemandHistory } from '@/lib/connectors/woocommerce/sync/initial-import'
 import { purgeExpiredData } from '@/lib/data-retention'
+import { purgeExpiredWmsMutationEvents, WMS_MUTATION_EVENT_RETENTION_DAYS } from '@/lib/domain/wms/mutation-audit'
 import { logActivity } from '@/lib/activity-log'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 
@@ -33,5 +34,17 @@ export async function GET(request: Request) {
   // Data retention cleanup (archive/delete expired records)
   const dataRetention = await purgeExpiredData()
 
-  return NextResponse.json({ totalDeleted, retention, demandDeleted, cronRuns, dataRetention })
+  // q66in.4.6: WMS mutation-audit timeline retention (single window).
+  const wmsMutationEvents = await purgeExpiredWmsMutationEvents()
+  if (wmsMutationEvents > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'cleanup',
+      tag: 'system',
+      description: `Purged ${wmsMutationEvents} WMS mutation-audit events older than ${WMS_MUTATION_EVENT_RETENTION_DAYS}d`,
+      metadata: { wmsMutationEvents },
+    })
+  }
+
+  return NextResponse.json({ totalDeleted, retention, demandDeleted, cronRuns, dataRetention, wmsMutationEvents })
 }

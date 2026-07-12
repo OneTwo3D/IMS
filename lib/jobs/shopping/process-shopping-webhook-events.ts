@@ -7,7 +7,7 @@ import {
   type ShoppingWebhookEventConnector,
   type ShoppingWebhookEventRepository,
   type ShoppingWebhookEventRow,
-} from '@/lib/connectors/woocommerce/webhook-inbox'
+} from '@/lib/connectors/shopping-webhook-inbox'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
 
 export type ProcessShoppingWebhookEventResult =

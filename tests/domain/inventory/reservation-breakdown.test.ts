@@ -23,6 +23,7 @@ function createClient(): ReservationBreakdownClient {
             externalOrderNumber: null,
             expectedDelivery: new Date('2026-02-03T00:00:00.000Z'),
             status: 'ALLOCATED',
+            refundStatus: 'NONE',
           },
           line: {
             sku: 'SKU-1',
@@ -41,6 +42,7 @@ function createClient(): ReservationBreakdownClient {
             externalOrderNumber: null,
             expectedDelivery: null,
             status: 'CANCELLED',
+            refundStatus: 'NONE',
           },
           line: {
             sku: 'SKU-1',

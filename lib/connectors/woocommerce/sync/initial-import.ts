@@ -32,6 +32,24 @@ export type InitialImportProgress = {
 
 const JOB_KEY = 'initial_order_import_job'
 
+/**
+ * Decide whether an initial-import pass counts as COMPLETE (which unlocks ongoing
+ * live order sync) or FAILED. A pass that errored on every order and imported
+ * nothing must NOT count as complete — otherwise the UI shows a dead-end
+ * "completed" with no orders, live sync stays silently gated off, and there's no
+ * way to retry. A pass that imported/reconciled at least one order, or had no
+ * active orders to import, is complete (per-order errors are surfaced but don't
+ * block, since live sync of new orders can still proceed).
+ */
+export function decideInitialImportOutcome(input: {
+  imported: number
+  skipped: number
+  errorCount: number
+}): 'complete' | 'failed' {
+  const madeProgress = input.imported > 0 || input.skipped > 0
+  return input.errorCount > 0 && !madeProgress ? 'failed' : 'complete'
+}
+
 const INITIAL_PROGRESS: InitialImportProgress = {
   status: 'idle',
   message: '',
@@ -164,6 +182,38 @@ async function runInitialImport(progress: InitialImportProgress) {
     // -----------------------------------------------------------------------
     // Completion
     // -----------------------------------------------------------------------
+    const outcome = decideInitialImportOutcome({
+      imported: progress.activeOrdersImported,
+      skipped: progress.activeOrdersSkipped,
+      errorCount: progress.errors.length,
+    })
+
+    if (outcome === 'failed') {
+      // Every order errored and nothing was imported \u2014 a systemic failure (e.g.
+      // no storefront-synced warehouse). Do NOT mark the import complete: that
+      // would falsely unlock live sync and leave a dead-end "done" state with no
+      // retry. Surface it as an error so the UI shows Retry and live order sync
+      // stays gated off until a real import succeeds.
+      progress.status = 'error'
+      progress.message = `Import failed \u2014 0 of ${progress.totalOrders} order${progress.totalOrders === 1 ? '' : 's'} imported (${progress.errors.length} error${progress.errors.length === 1 ? '' : 's'}). Resolve the cause and retry; live order sync stays off until the initial import succeeds.`
+      await saveProgress(progress)
+
+      await logActivity({
+        entityType: 'IMPORT',
+        tag: 'import',
+        action: 'failed',
+        description: `Active WC order import failed: ${progress.message}`,
+        resolveUser: false,
+      })
+      notify({
+        type: 'error',
+        title: 'Active Order Import Failed',
+        message: progress.message,
+        actionUrl: '/sync',
+      })
+      return
+    }
+
     await db.setting.upsert({
       where: { key: 'wc_initial_import_completed' },
       create: { key: 'wc_initial_import_completed', value: 'true' },

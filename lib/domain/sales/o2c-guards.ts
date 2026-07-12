@@ -19,7 +19,6 @@ export const PAID_EXPECTED_SALES_STATUSES: ReadonlySet<string> = new Set([
   'SHIPPED',
   'COMPLETED',
   'DELIVERED',
-  'PARTIALLY_REFUNDED',
 ])
 
 /**

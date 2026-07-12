@@ -90,7 +90,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 90 },
-    { label: 'Product', width: 245 },
+    { label: 'Product', width: 245, wrap: true },
     { label: 'Loc.', width: 40 },
     { label: 'Qty', width: 45, align: 'right' },
     { label: 'Packed', width: 50, align: 'center' },

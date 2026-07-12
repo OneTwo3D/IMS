@@ -1,6 +1,6 @@
 import type { AccountingSettings } from '@/lib/accounting'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { roundQuantity } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export type FxSettlementSide = 'receivable' | 'payable'
 
@@ -9,6 +9,16 @@ export type RealisedFxInput = {
   amountForeign: number
   bookedRateToBase: number
   settlementRateToBase: number
+  /**
+   * The base-currency value at which `amountForeign` was actually booked to the
+   * AR/AP control account (e.g. the stored document totalBase, prorated to the
+   * outstanding portion). When provided this is used as the booked leg instead of
+   * recomputing amountForeign/bookedRate — so the revaluation measures against the
+   * real carrying value and ties back to the control account, rather than a
+   * freshly re-rounded figure that disagrees with the posted base (cogs-audit
+   * scjz.55). Falls back to amountForeign/bookedRate when omitted.
+   */
+  bookedBase?: number
 }
 
 export type RealisedFxResult = {
@@ -26,7 +36,7 @@ export type FxJournalLine = {
   taxType?: string
 }
 
-export function roundAccountingMoney(value: number): number {
+export function roundAccountingMoney(value: DecimalInput): number {
   return roundQuantity(value, 2).toNumber()
 }
 
@@ -42,11 +52,20 @@ export function computeRealisedFx(input: RealisedFxInput): RealisedFxResult {
     return { bookedBase: 0, settlementBase: 0, gainLossBase: 0, outcome: 'none' }
   }
 
-  const bookedBase = roundAccountingMoney(amountForeign / bookedRate)
-  const settlementBase = roundAccountingMoney(amountForeign / settlementRate)
+  // Convert each leg in full Decimal precision; round only for the displayed
+  // booked/settlement amounts. The gain/loss is computed from the UNROUNDED
+  // legs and rounded once, so rounding each leg before differencing can no
+  // longer manufacture or drop a penny near the 0.01 emit threshold
+  // (cogs-audit scjz.54 float contamination + scjz.56 double-rounding).
+  const bookedBaseDec = input.bookedBase != null && Number.isFinite(input.bookedBase)
+    ? toDecimal(input.bookedBase)
+    : toDecimal(amountForeign).div(bookedRate)
+  const settlementBaseDec = toDecimal(amountForeign).div(settlementRate)
+  const bookedBase = roundAccountingMoney(bookedBaseDec)
+  const settlementBase = roundAccountingMoney(settlementBaseDec)
   const rawGainLoss = input.side === 'receivable'
-    ? settlementBase - bookedBase
-    : bookedBase - settlementBase
+    ? settlementBaseDec.sub(bookedBaseDec)
+    : bookedBaseDec.sub(settlementBaseDec)
   const gainLossBase = roundAccountingMoney(rawGainLoss)
   const outcome = Math.abs(gainLossBase) < 0.01
     ? 'none'

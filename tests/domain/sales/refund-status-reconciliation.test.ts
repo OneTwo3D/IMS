@@ -16,24 +16,25 @@ function order(overrides: Partial<RefundStatusOrderRow> = {}): RefundStatusOrder
     orderNumber: 'SO-1',
     externalOrderNumber: null,
     status: 'SHIPPED',
+    refundStatus: 'NONE',
     totalBase: '100.00',
     refunds: [],
     ...overrides,
   }
 }
 
-test('clean refund status rows produce no findings', () => {
+test('clean refund disposition rows produce no findings', () => {
   const findings = evaluateRefundStatusReconciliationRows({
     sourceRowLimitReached: false,
     salesOrders: [
       order({
-        status: 'PARTIALLY_REFUNDED',
+        refundStatus: 'PARTIAL',
         refunds: [{ id: 'refund-1', creditNoteNumber: 'CN-1', totalBase: '25.00', refundedAt: REFUNDED_AT }],
       }),
       order({
         id: 'order-2',
         orderNumber: 'SO-2',
-        status: 'REFUNDED',
+        refundStatus: 'FULL',
         refunds: [{ id: 'refund-2', creditNoteNumber: 'CN-2', totalBase: '99.90', refundedAt: REFUNDED_AT }],
       }),
     ],
@@ -42,21 +43,21 @@ test('clean refund status rows produce no findings', () => {
   assert.deepEqual(findings, [])
 })
 
-test('refund status reconciliation pins full-refund threshold and zero-total behavior', () => {
+test('refund disposition reconciliation pins full-refund threshold and zero-total behavior', () => {
   const findings = evaluateRefundStatusReconciliationRows({
     sourceRowLimitReached: false,
     salesOrders: [
       order({
         id: 'order-threshold',
         orderNumber: 'SO-THRESHOLD',
-        status: 'REFUNDED',
+        refundStatus: 'FULL',
         totalBase: '100.00',
         refunds: [{ id: 'refund-threshold', creditNoteNumber: 'CN-THRESHOLD', totalBase: '99.90', refundedAt: REFUNDED_AT }],
       }),
       order({
         id: 'order-zero-total',
         orderNumber: 'SO-ZERO',
-        status: 'REFUNDED',
+        refundStatus: 'FULL',
         totalBase: '0.00',
         refunds: [{ id: 'refund-zero', creditNoteNumber: 'CN-ZERO', totalBase: '0.00', refundedAt: REFUNDED_AT }],
       }),
@@ -66,14 +67,14 @@ test('refund status reconciliation pins full-refund threshold and zero-total beh
   assert.deepEqual(findings, [])
 })
 
-test('refund status reconciliation applies negative correction totals to the effective refund sum', () => {
+test('refund disposition reconciliation applies negative correction totals to the effective refund sum', () => {
   const findings = evaluateRefundStatusReconciliationRows({
     sourceRowLimitReached: false,
     salesOrders: [
       order({
         id: 'order-corrected',
         orderNumber: 'SO-CORRECTED',
-        status: 'REFUNDED',
+        refundStatus: 'FULL',
         totalBase: '100.00',
         refunds: [
           { id: 'refund-full', creditNoteNumber: 'CN-FULL', totalBase: '100.00', refundedAt: REFUNDED_AT },
@@ -85,30 +86,33 @@ test('refund status reconciliation applies negative correction totals to the eff
 
   assert.equal(findings.length, 1)
   assert.equal(findings[0]?.code, 'sales_order_refund_status_mismatch')
-  assert.equal((findings[0]?.details as { expectedStatus: string }).expectedStatus, 'PARTIALLY_REFUNDED')
+  assert.equal((findings[0]?.details as { expectedDisposition: string }).expectedDisposition, 'PARTIAL')
   assert.equal((findings[0]?.details as { refundedTotalBase: string }).refundedTotalBase, '90')
 })
 
-test('refund status reconciliation flags stale and unsupported refund statuses', () => {
+test('refund disposition reconciliation flags stale and unsupported dispositions', () => {
   const findings = evaluateRefundStatusReconciliationRows({
     sourceRowLimitReached: false,
     salesOrders: [
+      // Has a refund (implies PARTIAL) but refundStatus is still NONE → mismatch.
       order({
         id: 'order-refund-row-status-open',
         orderNumber: 'SO-OPEN',
-        status: 'SHIPPED',
+        refundStatus: 'NONE',
         refunds: [{ id: 'refund-open', creditNoteNumber: 'CN-OPEN', totalBase: '10.00', refundedAt: REFUNDED_AT }],
       }),
+      // Fully refunded by records but marked PARTIAL → mismatch.
       order({
         id: 'order-full-status-partial',
         orderNumber: 'SO-FULL',
-        status: 'PARTIALLY_REFUNDED',
+        refundStatus: 'PARTIAL',
         refunds: [{ id: 'refund-full', creditNoteNumber: 'CN-FULL', totalBase: '100.00', refundedAt: REFUNDED_AT }],
       }),
+      // Marked FULL but no refund rows → without_refunds.
       order({
         id: 'order-refunded-without-rows',
         orderNumber: 'SO-NO-REFUNDS',
-        status: 'REFUNDED',
+        refundStatus: 'FULL',
       }),
     ],
   })
@@ -125,12 +129,12 @@ test('refund status reconciliation flags stale and unsupported refund statuses',
   ])
   assert.deepEqual(findings.map((finding) => finding.severity), ['critical', 'critical', 'critical'])
   assert.deepEqual(
-    findings.slice(0, 2).map((finding) => (finding.details as { expectedStatus: string }).expectedStatus),
-    ['PARTIALLY_REFUNDED', 'REFUNDED'],
+    findings.slice(0, 2).map((finding) => (finding.details as { expectedDisposition: string }).expectedDisposition),
+    ['PARTIAL', 'FULL'],
   )
 })
 
-test('refund status reconciliation reports source row cap and caps collected rows', async () => {
+test('refund disposition reconciliation reports source row cap and caps collected rows', async () => {
   const requestedArgs: unknown[] = []
   const client: RefundStatusReconciliationClient = {
     salesOrder: {
@@ -154,7 +158,7 @@ test('refund status reconciliation reports source row cap and caps collected row
   assert.deepEqual(requestedArgs, [{
     where: {
       OR: [
-        { status: { in: ['REFUNDED', 'PARTIALLY_REFUNDED'] } },
+        { refundStatus: { not: 'NONE' } },
         { refunds: { some: {} } },
       ],
     },
@@ -165,6 +169,7 @@ test('refund status reconciliation reports source row cap and caps collected row
       orderNumber: true,
       externalOrderNumber: true,
       status: true,
+      refundStatus: true,
       totalBase: true,
       refunds: {
         orderBy: { refundedAt: 'asc' },

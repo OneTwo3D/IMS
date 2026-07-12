@@ -84,8 +84,9 @@ test.describe('@external @wc WooCommerce existing-product stock push', () => {
       await page.getByRole('button', { name: /new adjustment/i }).click()
       const dialog = page.getByRole('dialog', { name: 'New Stock Adjustment' })
       await dialog.getByPlaceholder(/search by sku or name/i).fill(productName)
-      await expect(dialog.getByRole('button').filter({ hasText: productSku }).first()).toBeVisible({ timeout: 30000 })
-      await dialog.getByRole('button').filter({ hasText: productSku }).first().click()
+      // vzlk-2c: search results are combobox options now, not plain buttons.
+      await expect(dialog.getByRole('option').filter({ hasText: productSku }).first()).toBeVisible({ timeout: 30000 })
+      await dialog.getByRole('option').filter({ hasText: productSku }).first().click()
       const warehouseSelect = dialog.locator('select').first()
       const requestedWarehouse = warehouseSelect.locator('option', { hasText: 'DEFAULT' })
       if (await requestedWarehouse.count()) {
@@ -94,7 +95,10 @@ test.describe('@external @wc WooCommerce existing-product stock push', () => {
           await warehouseSelect.selectOption({ label: requestedWarehouseLabel })
         }
       }
-      await dialog.locator('input[type="number"]').last().fill('5')
+      // vzlk-2b: target the labelled qty field (the last number input is the unit-cost
+      // field) and supply a unit cost for the positive line.
+      await dialog.getByRole('spinbutton', { name: /quantity to add or remove/i }).last().fill('5')
+      await dialog.locator('input[title^="Unit cost"]').last().fill('10')
       await dialog.getByRole('button', { name: /save adjustments/i }).click()
       await dialog.getByText(/1 adjustment saved\./i).waitFor({ timeout: 30000 })
       await dialog.waitFor({ state: 'hidden' })

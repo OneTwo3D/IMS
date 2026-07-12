@@ -1,0 +1,79 @@
+# Hardened staging/production unit for One Two Inventory.
+#
+# Replaces ims-stage-dev.service (which ran `next dev` as root on 0.0.0.0).
+# This unit runs a production build via `next start` as a dedicated
+# unprivileged user, bound to loopback only (a reverse proxy terminates TLS and
+# forwards to 127.0.0.1:3000), with systemd sandboxing.
+#
+# See deploy/README.md for the one-time migration (create user, relocate app,
+# build, env). Tune the paths below to your install location before enabling.
+
+[Unit]
+Description=One Two Inventory (production build)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- Identity: dedicated unprivileged account (never root) ---
+User=ims
+Group=ims
+
+# App must live outside /root so a non-root user can read it (e.g. /opt/ims).
+WorkingDirectory=/opt/ims/onetwo3d-ims
+EnvironmentFile=-/opt/ims/onetwo3d-ims/.env
+
+# --- Runtime configuration ---
+Environment=NODE_ENV=production
+Environment=NEXT_PUBLIC_APP_URL=https://ims-stage.onetwo3d.co.uk
+Environment=AUTH_URL=https://ims-stage.onetwo3d.co.uk
+Environment=PORT=3000
+# Bind to loopback ONLY. The public hostname is served by the fronting reverse
+# proxy, which forwards to 127.0.0.1:3000. Do not use 0.0.0.0.
+Environment=HOSTNAME=127.0.0.1
+
+# Persist backups / connector tokens under the managed StateDirectory below,
+# not under the (read-only) app tree.
+Environment=BACKUP_DIR=/var/lib/onetwoinventory/backups
+Environment=XERO_TOKEN_PATH=/var/lib/onetwoinventory/xero-token.json
+
+# Requires a prior `next build` (see deploy/README.md). Fails fast if the build
+# output is missing rather than silently falling back to dev.
+ExecStartPre=/usr/bin/test -d /opt/ims/onetwo3d-ims/.next
+ExecStart=/usr/bin/npm run start -- --hostname 127.0.0.1 --port 3000
+
+Restart=always
+RestartSec=5
+
+# --- systemd sandboxing ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# NOTE: do NOT set MemoryDenyWriteExecute — it breaks the V8 JIT.
+
+# systemd creates/owns /var/lib/onetwoinventory (0750) for the service user.
+StateDirectory=onetwoinventory
+StateDirectoryMode=0750
+
+# ProtectSystem=strict makes the whole filesystem read-only except these. The
+# app writes its Next build cache and uploaded files inside its own tree; adjust
+# if you relocate uploads via UPLOAD_STORAGE_DIR / PUBLIC_UPLOAD_STORAGE_DIR.
+ReadWritePaths=/opt/ims/onetwo3d-ims/.next
+ReadWritePaths=/opt/ims/onetwo3d-ims/uploads
+ReadWritePaths=/opt/ims/onetwo3d-ims/public/uploads
+
+[Install]
+WantedBy=multi-user.target

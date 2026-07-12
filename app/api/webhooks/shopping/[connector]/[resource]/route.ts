@@ -1,9 +1,8 @@
-import { handleShoppingWebhook, type ShoppingWebhookResource } from '@/lib/shopping'
-import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
+import { handleShoppingWebhook, isEmptyShoppingWebhookBodyAllowed, type ShoppingWebhookResource } from '@/lib/shopping'
+import { SHOPPING_CONNECTORS, type ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { readLimitedRequestBody } from '@/lib/security/read-limited-request-body'
 
-const CONNECTORS: ShoppingConnectorId[] = ['woocommerce', 'shopify']
 const RESOURCES: ShoppingWebhookResource[] = ['orders', 'products', 'refunds']
 const DEFAULT_SHOPPING_WEBHOOK_MAX_BODY_BYTES = 262_144
 const DEFAULT_SHOPPING_WEBHOOK_READ_TIMEOUT_MS = 30_000
@@ -32,21 +31,14 @@ function shoppingWebhookReadTimeoutMs(): number {
   )
 }
 
+// czuf4: registry-driven — a connector is valid iff it's registered. Adding a connector
+// needs only a SHOPPING_CONNECTORS entry, not an edit here.
 function isConnector(value: string): value is ShoppingConnectorId {
-  return CONNECTORS.includes(value as ShoppingConnectorId)
+  return SHOPPING_CONNECTORS.some((c) => c.id === value)
 }
 
 function isResource(value: string): value is ShoppingWebhookResource {
   return RESOURCES.includes(value as ShoppingWebhookResource)
-}
-
-function isEmptyBodyAllowed(connector: ShoppingConnectorId, request: Request): boolean {
-  if (connector !== 'woocommerce') return false
-  const signature = request.headers.get('x-wc-webhook-signature')
-  const topic = request.headers.get('x-wc-webhook-topic')
-  // WooCommerce may send unsigned empty-body pings and signed action hooks
-  // with no JSON payload; signed real webhooks still verify downstream.
-  return (!signature && !topic) || (topic?.startsWith('action.') ?? false)
 }
 
 export async function POST(
@@ -72,7 +64,7 @@ export async function handleShoppingWebhookRoute(
   const bodyResult = await readLimitedRequestBody(request, {
     maxBytes: shoppingWebhookMaxBodyBytes(),
     timeoutMs: shoppingWebhookReadTimeoutMs(),
-    emptyBodyAllowed: isEmptyBodyAllowed(connector, request),
+    emptyBodyAllowed: await isEmptyShoppingWebhookBodyAllowed(connector, request),
     tooLargeMessage: 'Shopping webhook body is too large.',
     emptyBodyMessage: 'Shopping webhook body is required.',
   })

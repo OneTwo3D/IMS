@@ -4,6 +4,10 @@ import { useState, useTransition, useCallback, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
+import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
+import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
+import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -78,6 +82,7 @@ type AllocationPanelLine = {
   productId: string | null
   sku: string
   description: string
+  imageUrl: string | null
   productType: ProductType | null
   oversellAllowed: boolean
   qty: number
@@ -87,6 +92,8 @@ type Props = {
   warehouses: WarehouseInfo[]
   currencies: CurrencyRow[]
   externalOrderLinks?: Array<{ label: string; url: string }>
+  wmsOrderStatus?: WmsOrderStatusView | null
+  wmsPushState?: WmsOrderPushStateView | null
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -106,7 +113,7 @@ const STATUS_LABELS: Record<SoStatus, string> = {
   DRAFT: 'Draft', PENDING_PAYMENT: 'Pending Payment', ON_HOLD: 'On Hold',
   PROCESSING: 'Processing', ALLOCATED: 'Allocated', PICKING: 'Picking', PACKING: 'Packing',
   SHIPPED: 'Shipped', COMPLETED: 'Completed', DELIVERED: 'Delivered',
-  CANCELLED: 'Cancelled', REFUNDED: 'Refunded', PARTIALLY_REFUNDED: 'Part. Refunded',
+  CANCELLED: 'Cancelled',
 }
 const STATUS_CLASS: Record<SoStatus, string> = {
   DRAFT: 'bg-gray-100 text-gray-800 border-gray-200 dark:bg-gray-800 dark:text-gray-200',
@@ -120,8 +127,6 @@ const STATUS_CLASS: Record<SoStatus, string> = {
   COMPLETED: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200',
   DELIVERED: 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-900 dark:text-emerald-200',
   CANCELLED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
-  REFUNDED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
-  PARTIALLY_REFUNDED: 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900 dark:text-orange-200',
 }
 // Status flow for orders WITH shipments (shipment-level picking/packing/shipping)
 const STATUS_FLOW_SHIPMENTS: Record<string, { label: string; icon: typeof Truck; target: SoStatus }[]> = {
@@ -335,7 +340,7 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
 // Allocation Panel
 // ---------------------------------------------------------------------------
 function AllocationPanel({
-  orderId, allocations, lines, warehouses, status, shipments, requirementsByLine, onRefresh,
+  orderId, allocations, lines, warehouses, status, shipments, requirementsByLine, refundedByLine, onRefresh,
 }: {
   orderId: string
   allocations: AllocationRow[]
@@ -344,6 +349,7 @@ function AllocationPanel({
   status: SoStatus
   shipments: ShipmentRow[]
   requirementsByLine: Map<string, FulfillmentRequirementRow['requirements']>
+  refundedByLine: Map<string, number>
   onRefresh: () => void
 }) {
   const [isPending, startTransition] = useTransition()
@@ -390,7 +396,8 @@ function AllocationPanel({
     const requiresStock = !l.productType || isStockTrackedProductType(l.productType)
     if (!requiresStock) return []
     const committed = shipmentCommittedByLine.get(l.id) ?? 0
-    const remaining = Math.max(0, l.qty - committed)
+    const refunded = refundedByLine.get(l.id) ?? 0
+    const remaining = Math.max(0, l.qty - committed - refunded)
     if (remaining <= 0) return []
     const allocated = allocatedByLine.get(l.id) ?? 0
     const short = remaining - allocated
@@ -576,7 +583,12 @@ function AllocationPanel({
               const isAdding = showAddLine === l.id
               return (
                 <div key={l.id} className="px-4 py-2.5 flex items-center gap-3">
-                  <div className="w-8 h-8 rounded bg-muted shrink-0" />
+                  {l.imageUrl ? (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img src={l.imageUrl} alt="" className="w-8 h-8 rounded object-cover shrink-0" />
+                  ) : (
+                    <div className="w-8 h-8 rounded bg-muted shrink-0" />
+                  )}
                   <div className="flex-1 min-w-0">
                     {l.productId ? <ProductLink productId={l.productId} sku={l.sku} name={l.description} /> : <span className="text-sm">{l.description}</span>}
                   </div>
@@ -788,7 +800,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -830,6 +842,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const vatRate = so.taxRatePercent ?? 0
   const inclVat = so.pricesIncludeVat && vatRate > 0
   const toGross = (net: number) => inclVat ? net * (1 + vatRate) : net
+  // Refund/credit-note amounts are always shown tax-inclusive (like the order's
+  // grand total), since refund line totals are stored net regardless of inclVat.
+  const grossWithVat = (net: number) => vatRate > 0 ? net * (1 + vatRate) : net
   const subtotalDisplay = toGross(so.subtotalForeign)
   const shippingDisplay = toGross(so.shippingForeign)
   const discountDisplay = so.discountAmount // already gross in inclVat mode
@@ -839,7 +854,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const nextActions = (STATUS_FLOW_SHIPMENTS[so.status] ?? []).filter((a) => a.target !== 'DELIVERED' || deliveryTrackingEnabled)
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
-  const canRefund = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'].includes(so.status)
+  // Refund is allowed once shipped, or to top up an already partially-refunded order.
+  // Reads the orthogonal refundStatus so it keeps working once a partial refund no
+  // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
+  const canRefund = (['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && so.refundStatus !== 'FULL') || so.refundStatus === 'PARTIAL'
   const canRetryRefundAccounting = hasPermission(currentUserRole, 'sales.refund')
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment
@@ -853,10 +871,21 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
         qty: line.qty,
       }))),
   )
+  // Refunded quantities are no longer outstanding demand — exclude them from the
+  // "unfulfilled" check and the allocation panel's remaining/backorder math so a
+  // refunded line isn't offered for allocation.
+  const refundedByLine = new Map<string, number>()
+  for (const refund of so.refunds) {
+    for (const rl of refund.lines) {
+      if (!rl.salesOrderLineId || rl.qty <= 0) continue
+      refundedByLine.set(rl.salesOrderLineId, (refundedByLine.get(rl.salesOrderLineId) ?? 0) + rl.qty)
+    }
+  }
   const hasUnfulfilledLines = so.lines.some((l) => {
     if (!l.productId) return false
     const committed = committedByLine.get(l.id) ?? 0
-    return committed < l.qty
+    const refunded = refundedByLine.get(l.id) ?? 0
+    return committed + refunded < l.qty
   })
 
   // Show allocation panel when PROCESSING/ALLOCATED AND (no shipments OR unfulfilled lines remain)
@@ -969,6 +998,15 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[so.status]}`}>
           {STATUS_LABELS[so.status]}
         </span>
+        {so.refundStatus !== 'NONE' && (
+          <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${
+            so.refundStatus === 'FULL'
+              ? 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200'
+              : 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900 dark:text-orange-200'
+          }`}>
+            {so.refundStatus === 'FULL' ? 'Fully refunded' : 'Partially refunded'}
+          </span>
+        )}
         {isPaid && (
           <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200">
             Paid
@@ -1033,6 +1071,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               <ExternalLink className="h-4 w-4 mr-1" />{link.label}
             </Button>
           ))}
+          {wmsOrderStatus && (
+            <span className="inline-flex items-center self-center">
+              <WmsOrderStatusChip status={wmsOrderStatus} />
+            </span>
+          )}
+          {wmsPushState && (
+            <span className="inline-flex items-center self-center">
+              <WmsOrderPushChip orderId={so.id} push={wmsPushState} />
+            </span>
+          )}
           {canCancel && (
             <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={handleCancel} disabled={isPending}>
               <Ban className="h-4 w-4 mr-1" />Cancel
@@ -1325,6 +1373,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           status={so.status}
           shipments={shipments}
           requirementsByLine={requirementsByLine}
+          refundedByLine={refundedByLine}
           onRefresh={() => { refreshAllocations(); router.refresh() }}
         />
       )}
@@ -1435,12 +1484,29 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                   <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                 </div>
-                <span className="font-mono font-medium text-destructive">-{money(r.totalForeign)}</span>
+                <span className="font-mono font-medium text-destructive">-{money(grossWithVat(r.totalForeign))}</span>
               </div>
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
-              <Table className="text-xs"><TableBody>{r.lines.map((rl) => (
-                <TableRow key={rl.id}><TableCell className="py-1 pr-4">{rl.description}</TableCell><TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty}</TableCell><TableCell className="py-1 text-right font-mono">{baseMoney(rl.totalBase)}</TableCell></TableRow>
-              ))}</TableBody></Table>
+              <Table className="text-xs">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="py-1 pr-4 text-xs">Item</TableHead>
+                    <TableHead className="py-1 pr-4 text-xs text-right">Qty</TableHead>
+                    <TableHead className="py-1 pr-4 text-xs text-right">Unit Price</TableHead>
+                    {vatRate > 0 && <TableHead className="py-1 pr-4 text-xs text-right">VAT</TableHead>}
+                    <TableHead className="py-1 text-xs text-right">Total</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>{r.lines.map((rl) => (
+                  <TableRow key={rl.id}>
+                    <TableCell className="py-1 pr-4">{rl.description}</TableCell>
+                    <TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty > 0 ? rl.qty : '—'}</TableCell>
+                    <TableCell className="py-1 pr-4 text-right font-mono tabular-nums">{rl.qty > 0 ? money(rl.unitPriceForeign) : '—'}</TableCell>
+                    {vatRate > 0 && <TableCell className="py-1 pr-4 text-right font-mono tabular-nums text-muted-foreground">{money(rl.totalForeign * vatRate)}</TableCell>}
+                    <TableCell className="py-1 text-right font-mono tabular-nums">{money(toGross(rl.totalForeign))}</TableCell>
+                  </TableRow>
+                ))}</TableBody>
+              </Table>
               {/* Credit note payments */}
               {accountingAvailable && r.payments.length > 0 && (
                 <div className="space-y-1 pt-1 border-t">

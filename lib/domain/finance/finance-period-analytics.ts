@@ -3,7 +3,7 @@ import { computeRealisedFx, type FxSettlementSide } from '@/lib/accounting-fx'
 import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
-import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
@@ -256,6 +256,8 @@ type SalesPaymentFxRow = {
     invoiceNumber: string | null
     currency: string
     fxRateToBase: DecimalInput
+    totalForeign: DecimalInput
+    totalBase: DecimalInput
     customerName: string | null
     customerEmail: string | null
   }
@@ -267,6 +269,7 @@ type PurchaseInvoiceFxRow = {
   invoiceDate: Date
   paidAt: Date | null
   totalForeign: DecimalInput
+  totalBase: DecimalInput
   fxRateToBase: DecimalInput
   po: {
     reference: string
@@ -1027,6 +1030,8 @@ export async function getFxGainLossReport(
             invoiceNumber: true,
             currency: true,
             fxRateToBase: true,
+            totalForeign: true,
+            totalBase: true,
             customerName: true,
             customerEmail: true,
           },
@@ -1045,6 +1050,7 @@ export async function getFxGainLossReport(
         invoiceDate: true,
         paidAt: true,
         totalForeign: true,
+        totalBase: true,
         fxRateToBase: true,
         po: { select: { reference: true, currency: true, supplier: { select: { name: true } } } },
       },
@@ -1057,11 +1063,18 @@ export async function getFxGainLossReport(
   const rows: FxGainLossReportRow[] = []
   for (const payment of payments) {
     const settlementRate = latestRateToBase(fxRates, baseCurrency, payment.currency, payment.paidAt, payment.order.fxRateToBase)
+    const paymentForeign = toDecimal(payment.amount).abs()
+    const orderTotalForeign = toDecimal(payment.order.totalForeign)
     const result = computeRealisedFx({
       side: 'receivable',
-      amountForeign: toDecimal(payment.amount).abs().toNumber(),
+      amountForeign: paymentForeign.toNumber(),
       bookedRateToBase: toDecimal(payment.order.fxRateToBase).toNumber(),
       settlementRateToBase: settlementRate.toNumber(),
+      // Booked base for this payment = the order's stored base prorated by this
+      // payment's share of the order's foreign total (cogs-audit scjz.55).
+      bookedBase: orderTotalForeign.gt(0)
+        ? multiplyMoney(payment.order.totalBase, paymentForeign).div(orderTotalForeign).toNumber()
+        : undefined,
     })
     rows.push({
       side: 'receivable',
@@ -1090,6 +1103,9 @@ export async function getFxGainLossReport(
       amountForeign: toDecimal(invoice.totalForeign).abs().toNumber(),
       bookedRateToBase: toDecimal(invoice.fxRateToBase).toNumber(),
       settlementRateToBase: settlementRate.toNumber(),
+      // The whole bill settles here, so the booked base is the stored totalBase
+      // (cogs-audit scjz.55).
+      bookedBase: toDecimal(invoice.totalBase).toNumber(),
     })
     rows.push({
       side: 'payable',

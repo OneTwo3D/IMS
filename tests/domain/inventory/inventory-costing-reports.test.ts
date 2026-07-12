@@ -1,15 +1,18 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { LandedCostMethod } from '@/app/generated/prisma/client'
+import { LandedCostMethod, Prisma } from '@/app/generated/prisma/client'
 import {
   aggregateCogsRows,
   aggregateInventoryTurnoverRows,
+  aggregateInventoryTurnoverTotalAverage,
   aggregateLandedCostMethods,
   assertInventoryTurnoverSourceLimit,
   getInventoryTurnoverReport,
   inventoryCostingFiltersFromSearch,
   InventoryTurnoverSourceLimitError,
+  resolveCogsRevenueKeys,
   type CogsAggregationInput,
+  type CogsRevenueRowInput,
   type InventoryTurnoverCogsAggregationInput,
   type InventoryTurnoverSnapshotAggregationInput,
   type LandedCostAggregationInput,
@@ -172,6 +175,85 @@ describe('inventory costing report aggregations', () => {
     assert.equal(row?.cogsBase, '7.000000')
     assert.equal(row?.revenueBase, '10.000000')
     assert.equal(row?.grossMarginBase, '3.000000')
+    assert.equal(row?.revenueCaptured, true)
+  })
+
+  it('allocates a split-warehouse line revenue by qty across groups instead of double-counting', () => {
+    // One order line for product-a, 2 units: 1 from WH-A, 1 from WH-B, line
+    // revenue 300. Counting full revenue in each warehouse group would report a
+    // 600 total (double-count). Qty-proportional allocation gives 150 per group.
+    const rows: CogsAggregationInput[] = [
+      {
+        id: 'movement-a',
+        qty: '1',
+        cogsBase: '100',
+        productId: 'product-a',
+        sku: 'A-001',
+        productName: 'Widget A',
+        categoryName: 'Widgets',
+        warehouseId: 'warehouse-a',
+        warehouseCode: 'WHA',
+        warehouseName: 'Warehouse A',
+        customerName: 'Customer One',
+        channel: 'woocommerce',
+        revenueKey: 'order-1:product-a',
+        revenueBase: '300',
+      },
+      {
+        id: 'movement-b',
+        qty: '1',
+        cogsBase: '120',
+        productId: 'product-a',
+        sku: 'A-001',
+        productName: 'Widget A',
+        categoryName: 'Widgets',
+        warehouseId: 'warehouse-b',
+        warehouseCode: 'WHB',
+        warehouseName: 'Warehouse B',
+        customerName: 'Customer One',
+        channel: 'woocommerce',
+        revenueKey: 'order-1:product-a',
+        revenueBase: '300',
+      },
+    ]
+
+    const rowsByGroup = aggregateCogsRows(rows, 'warehouse')
+    const byCode = new Map(rowsByGroup.map((row) => [row.warehouseCode, row]))
+    assert.equal(byCode.get('WHA')?.revenueBase, '150.000000')
+    assert.equal(byCode.get('WHB')?.revenueBase, '150.000000')
+    // Per-group revenue now sums to the true line revenue, not 2x.
+    const totalRevenue = rowsByGroup.reduce((sum, row) => sum + Number(row.revenueBase ?? 0), 0)
+    assert.equal(totalRevenue, 300)
+
+    // Grouping that keeps the line in a single group still shows full revenue.
+    const [productRow] = aggregateCogsRows(rows, 'product')
+    assert.equal(productRow?.revenueBase, '300.000000')
+  })
+
+  it('still counts revenue for matched rows that carry no revenue key', () => {
+    const rows: CogsAggregationInput[] = [
+      {
+        id: 'movement-1',
+        qty: '1',
+        cogsBase: '4',
+        productId: 'product-a',
+        sku: 'A-001',
+        productName: 'Widget A',
+        categoryName: 'Widgets',
+        warehouseId: null,
+        warehouseCode: null,
+        warehouseName: null,
+        customerName: null,
+        channel: null,
+        revenueKey: null,
+        revenueBase: '10',
+      },
+    ]
+
+    const [row] = aggregateCogsRows(rows, 'product')
+
+    assert.equal(row?.revenueBase, '10.000000')
+    assert.equal(row?.grossMarginBase, '6.000000')
     assert.equal(row?.revenueCaptured, true)
   })
 
@@ -471,6 +553,53 @@ describe('inventory costing report aggregations', () => {
     ])
   })
 
+  it('computes total average inventory value window-wide, not as a sum of per-group averages', () => {
+    // Group A: 1000/day over 30 days (per-group avg 1000). Group B: 1000/day over
+    // the first 5 days (per-group avg 1000). Summing per-group averages gives 2000;
+    // the correct portfolio average is the window-wide daily total / distinct days:
+    // (5*2000 + 25*1000) / 30 = 35000/30 = 1166.666667.
+    const snapshotRows: InventoryTurnoverSnapshotAggregationInput[] = []
+    for (let day = 1; day <= 30; day++) {
+      const snapshotDate = `2026-05-${String(day).padStart(2, '0')}`
+      snapshotRows.push({
+        id: `a-${day}`,
+        snapshotDate,
+        inventoryValueBase: '1000',
+        productId: 'product-a',
+        sku: 'A-001',
+        productName: 'Widget A',
+        categoryName: null,
+        warehouseId: 'warehouse-a',
+        warehouseCode: 'WHA',
+        warehouseName: 'Warehouse A',
+        suppliers: [],
+      })
+      if (day <= 5) {
+        snapshotRows.push({
+          id: `b-${day}`,
+          snapshotDate,
+          inventoryValueBase: '1000',
+          productId: 'product-b',
+          sku: 'B-001',
+          productName: 'Widget B',
+          categoryName: null,
+          warehouseId: 'warehouse-a',
+          warehouseCode: 'WHA',
+          warehouseName: 'Warehouse A',
+          suppliers: [],
+        })
+      }
+    }
+
+    // Each per-group row would report a 1000 average (the wrong-denominator trap).
+    const rows = aggregateInventoryTurnoverRows([], snapshotRows, 'product', 30)
+    assert.deepEqual(rows.map((row) => row.averageInventoryValueBase).sort(), ['1000.000000', '1000.000000'])
+
+    const total = aggregateInventoryTurnoverTotalAverage(snapshotRows, 'product')
+    assert.equal(total.snapshotDayCount, 30)
+    assert.equal(total.averageInventoryValueBase.toFixed(6), '1166.666667')
+  })
+
   it('rejects inventory turnover source scans over the configured cap', () => {
     assert.doesNotThrow(() => assertInventoryTurnoverSourceLimit(100000, 100000, 'COGS'))
     assert.throws(
@@ -579,5 +708,82 @@ describe('inventory costing report aggregations', () => {
     assert.equal(report.rows.length, 0)
     assert.equal(report.totals.cogsBase, '0.000000')
     assert.match(report.notices.join('\n'), /excluded from supplier grouping/)
+  })
+})
+
+describe('resolveCogsRevenueKeys (scjz.67 line-granularity revenue)', () => {
+  const linked = (lineId: string, lineProductId: string | null, lineTotalBase: string) => ({
+    lineId,
+    lineProductId,
+    lineTotalBase,
+  })
+
+  it('keys revenue per sales line when every COGS row of the pair is line-linked', () => {
+    // Order with two same-product lines at different prices, shipped from two
+    // warehouses. The blended order:product figure would split 150/150; the
+    // line link recovers the true 100/200.
+    const rows: CogsRevenueRowInput[] = [
+      { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-1', 'product-a', '100') },
+      { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-2', 'product-a', '200') },
+    ]
+    const blended = new Map([['order-1:product-a', new Prisma.Decimal('300')]])
+    const resolved = resolveCogsRevenueKeys(rows, blended)
+    assert.deepEqual(resolved.map((r) => r.revenueKey), ['L:line-1', 'L:line-2'])
+    assert.equal(resolved[0]?.revenueBase?.toString(), '100')
+    assert.equal(resolved[1]?.revenueBase?.toString(), '200')
+  })
+
+  it('end-to-end: same-product two-line two-warehouse order reports each line revenue (not blended)', () => {
+    const resolved = resolveCogsRevenueKeys(
+      [
+        { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-1', 'product-a', '100') },
+        { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-2', 'product-a', '200') },
+      ],
+      new Map([['order-1:product-a', new Prisma.Decimal('300')]]),
+    )
+    const base = {
+      qty: '1', cogsBase: '50', productId: 'product-a', sku: 'A-001', productName: 'Widget A',
+      categoryName: 'Widgets', customerName: 'Customer One', channel: 'woocommerce', warehouseName: 'WH',
+    }
+    const rows: CogsAggregationInput[] = [
+      { id: 'm-a', warehouseId: 'wh-a', warehouseCode: 'WHA', ...base, ...resolved[0]! },
+      { id: 'm-b', warehouseId: 'wh-b', warehouseCode: 'WHB', ...base, ...resolved[1]! },
+    ]
+    const byCode = new Map(aggregateCogsRows(rows, 'warehouse').map((row) => [row.warehouseCode, row]))
+    assert.equal(byCode.get('WHA')?.revenueBase, '100.000000')
+    assert.equal(byCode.get('WHB')?.revenueBase, '200.000000')
+  })
+
+  it('falls back to the blended order:product key for the whole pair when any row is unlinked', () => {
+    const rows: CogsRevenueRowInput[] = [
+      { orderId: 'order-1', productId: 'product-a', shipmentLine: linked('line-1', 'product-a', '100') },
+      { orderId: 'order-1', productId: 'product-a', shipmentLine: null },
+    ]
+    const blended = new Map([['order-1:product-a', new Prisma.Decimal('300')]])
+    const resolved = resolveCogsRevenueKeys(rows, blended)
+    assert.deepEqual(resolved.map((r) => r.revenueKey), ['order-1:product-a', 'order-1:product-a'])
+    assert.equal(resolved[0]?.revenueBase?.toString(), '300')
+    assert.equal(resolved[1]?.revenueBase?.toString(), '300')
+  })
+
+  it('keeps blended fallback for kit-component dispatch (line product != movement product)', () => {
+    // Kit component: dispatch links to the kit line but carries the component
+    // productId, so line-level keying is not applied — preserves today's
+    // behaviour (uncaptured when no component sales line exists).
+    const rows: CogsRevenueRowInput[] = [
+      { orderId: 'order-1', productId: 'component-a', shipmentLine: linked('kit-line', 'kit-product', '500') },
+    ]
+    const resolved = resolveCogsRevenueKeys(rows, new Map())
+    assert.equal(resolved[0]?.revenueKey, 'order-1:component-a')
+    assert.equal(resolved[0]?.revenueBase, null)
+  })
+
+  it('returns a null key for non-sales-order COGS rows', () => {
+    const resolved = resolveCogsRevenueKeys(
+      [{ orderId: null, productId: 'product-a', shipmentLine: null }],
+      new Map(),
+    )
+    assert.equal(resolved[0]?.revenueKey, null)
+    assert.equal(resolved[0]?.revenueBase, null)
   })
 })

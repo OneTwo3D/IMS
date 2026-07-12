@@ -31,8 +31,6 @@ const WORKFLOWS: Array<{
     transitions: SALES_ORDER_TRANSITIONS,
     notes: {
       CANCELLED: 'Terminal.',
-      REFUNDED: 'Terminal.',
-      PARTIALLY_REFUNDED: 'Can move only to `REFUNDED`.',
     },
   },
   {

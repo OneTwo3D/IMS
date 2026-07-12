@@ -11,6 +11,7 @@ import { Label } from '@/components/ui/label'
 import { LoadingProgress } from '@/components/ui/loading-progress'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
+import { useStepUpReauth, isFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import {
   saveShopifyConnectorCredentials,
   saveShopifySyncSettings,
@@ -36,17 +37,17 @@ function generateSecret(): string {
   return result
 }
 
-function formatManualSyncResult(result: unknown): string {
-  if (!result || typeof result !== 'object') return 'Stock sync completed'
+function formatManualSyncResult(result: unknown): { text: string; isError: boolean } {
+  if (!result || typeof result !== 'object') return { text: 'Stock sync completed', isError: false }
   const payload = result as Record<string, unknown>
   const synced = Number(payload.synced ?? 0)
   const errors = Array.isArray(payload.errors) ? (payload.errors as string[]) : []
 
   if (errors.length > 0) {
-    return `Stock sync finished with ${errors.length} error(s) — ${errors.join('; ')}`
+    return { text: `Stock sync finished with ${errors.length} error(s) — ${errors.join('; ')}`, isError: true }
   }
 
-  return `Stock sync completed — ${synced} product(s) updated`
+  return { text: `Stock sync completed — ${synced} product(s) updated`, isError: false }
 }
 
 function EnvOverrideNotice({ overrides }: { overrides: Record<string, string> }) {
@@ -75,6 +76,19 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
   const [accessToken, setAccessToken] = useState(credentials.adminApiAccessToken)
   const [webhookSecret, setWebhookSecret] = useState(credentials.webhookSecret)
   const [syncEnabled, setSyncEnabled] = useState(initialSettings.shopify_sync_enabled === 'true')
+  // Server-side value of the toggle: the manual push runs against the SAVED
+  // setting, so a push with an unsaved checkbox would only no-op on the gate.
+  // Resynced from the prop during render (React's derived-state adjustment
+  // pattern) so an out-of-band save (another tab/session) followed by
+  // router.refresh() doesn't leave the button falsely blocked.
+  const serverSyncEnabled = initialSettings.shopify_sync_enabled === 'true'
+  const [savedSyncEnabled, setSavedSyncEnabled] = useState(serverSyncEnabled)
+  const [lastServerSyncEnabled, setLastServerSyncEnabled] = useState(serverSyncEnabled)
+  if (lastServerSyncEnabled !== serverSyncEnabled) {
+    setLastServerSyncEnabled(serverSyncEnabled)
+    setSavedSyncEnabled(serverSyncEnabled)
+  }
+  const isSyncEnabledUnsaved = syncEnabled && !savedSyncEnabled
   const [saveMessage, setSaveMessage] = useState<string | null>(null)
   const [saveError, setSaveError] = useState(false)
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null)
@@ -84,17 +98,17 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
   const [copied, setCopied] = useState(false)
   const configured = !!storeDomain && !!accessToken
   const webhookPreview = webhookSecret && !webhookSecret.includes('*') ? webhookSecret : ''
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
 
   function handleSaveConnection() {
     setSaveMessage(null)
     setSaveError(false)
 
     startTransition(async () => {
-      const credentialResult = await saveShopifyConnectorCredentials(
-        storeDomain.trim(),
-        accessToken.trim(),
-        webhookSecret.trim(),
-      )
+      const save = () => saveShopifyConnectorCredentials(storeDomain.trim(), accessToken.trim(), webhookSecret.trim())
+      let credentialResult = await save()
+      // saveShopifyConnectorCredentials requires a fresh 'sync' session; re-auth and retry once on staleness.
+      if (isFreshAuthFailure(credentialResult) && (await promptReauth())) credentialResult = await save()
       if (!credentialResult.success) {
         setSaveError(true)
         setSaveMessage(credentialResult.error ?? 'Failed to save Shopify credentials')
@@ -120,12 +134,21 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
         return
       }
 
+      setSavedSyncEnabled(syncEnabled)
       setSettingsMessage('Shopify settings saved')
       router.refresh()
     })
   }
 
   function handleManualStockSync() {
+    // Belt-and-braces behind the disabled button (parity with the WooCommerce
+    // client): the server gate reads the SAVED setting, so a push with an
+    // unsaved toggle can only no-op.
+    if (isSyncEnabledUnsaved) {
+      setSyncError(true)
+      setSyncMessage('Stock sync is still disabled on the server — click "Save Settings" first, then push.')
+      return
+    }
     setSyncMessage(null)
     setSyncError(false)
 
@@ -137,7 +160,9 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
         return
       }
 
-      setSyncMessage(formatManualSyncResult(result.result))
+      const formatted = formatManualSyncResult(result.result)
+      setSyncError(formatted.isError)
+      setSyncMessage(formatted.text)
       router.refresh()
     })
   }
@@ -155,6 +180,7 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
 
   return (
     <div className="space-y-4">
+      {stepUpDialog}
       <Card className="p-6 space-y-4">
         <div>
           <h2 className="text-base font-semibold">Connection</h2>
@@ -267,8 +293,13 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
           </p>
         </div>
 
+        {isSyncEnabledUnsaved && (
+          <p className="text-xs text-amber-600">
+            Stock sync is not enabled on the server yet — click Save Settings above before pushing.
+          </p>
+        )}
         <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={handleManualStockSync} disabled={syncPending || !configured || !syncEnabled}>
+          <Button variant="outline" onClick={handleManualStockSync} disabled={syncPending || !configured || !syncEnabled || isSyncEnabledUnsaved}>
             {syncPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
             Push Stock Now
           </Button>

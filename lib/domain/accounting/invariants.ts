@@ -1,6 +1,9 @@
 import { db } from '@/lib/db'
 // decimal-boundary-ok: report-only (accounting invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
+import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
+import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
+import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -33,6 +36,10 @@ type SalesOrderAccountingRow = {
   orderNumber: string | null
   externalOrderNumber: string | null
   status: string
+  // Optional so existing pure-evaluator callers/fixtures that don't supply it are
+  // treated as "unknown" (the check below fires only when paidAt is explicitly
+  // null — i.e. a payment reversal cleared it). The DB loader always selects it.
+  paidAt?: Date | string | null
   revenueDeferredDate: Date | string | null
   unearnedRevenueAmount: DecimalLike
   inventoryAllocatedDate: Date | string | null
@@ -52,6 +59,13 @@ type SalesOrderAccountingRow = {
     accountingRetryRequired: boolean
     accountingWarning: string | null
     accountingRetrySyncs: unknown
+    // scjz.70: a revenue-only chargeback intentionally posts NO COGS/unearned
+    // reversal (only the credit note), so it must be exempt from the reversal-
+    // evidence requirement below. Optional: the Prisma select always provides it;
+    // absent (e.g. legacy fixtures) is treated as a normal (non-chargeback) refund.
+    chargeback?: boolean
+    // scjz.71: durable — whether a COGS/unearned reversal was staged for this refund.
+    reversalStaged?: boolean
   }>
 }
 
@@ -119,7 +133,6 @@ const REFUND_REVERSAL_TYPES = new Set([
   'UNEARNED_REV_REVERSAL',
 ])
 const DEFAULT_SYNC_LOG_RETENTION_MONTHS = 6
-const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'CANCELLED'] as const
 
 function dateKey(value: Date | string | null | undefined): string | null {
   if (!value) return null
@@ -141,6 +154,31 @@ function payloadIdempotencyKey(payload: unknown): string | null {
   return typeof payload._idempotencyKey === 'string' && payload._idempotencyKey.trim()
     ? payload._idempotencyKey
     : null
+}
+
+function lineAmount(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value ?? 0)
+  return Number.isFinite(n) ? n : 0
+}
+
+/**
+ * Sum the debit and credit columns of a journal payload's lines. Returns null
+ * when the payload carries no journal lines (e.g. a daily-batch metadata-only
+ * payload), so callers only balance-check actual journals.
+ */
+function journalLineTotals(payload: unknown): { debit: number; credit: number; lineCount: number } | null {
+  if (!isRecord(payload) || !Array.isArray(payload.lines)) return null
+  let debit = 0
+  let credit = 0
+  let lineCount = 0
+  for (const line of payload.lines) {
+    if (!isRecord(line)) continue
+    debit += lineAmount(line.debit)
+    credit += lineAmount(line.credit)
+    lineCount += 1
+  }
+  if (lineCount === 0) return null
+  return { debit, credit, lineCount }
 }
 
 function retrySyncTypes(value: unknown): Set<string> {
@@ -165,26 +203,50 @@ function liveSyncLogIndexKey(type: string, referenceId: string, referenceType: s
   return `${type}\u0000${referenceType}\u0000${referenceId}`
 }
 
+// Live Xero daily-batch logs carry a digest-suffixed referenceId
+// (buildDailyBatchReferenceId -> `<group>-<date>-<8 hex>`), while the invariant's
+// expected key and QBO logs are the bare `<group>-<date>`. Strip a trailing 8-hex
+// digest so a digest-suffixed log still matches the bare expected key (scjz.37).
+function stripDailyBatchDigest(referenceId: string): string {
+  return referenceId.replace(/-[0-9a-f]{8}$/, '')
+}
+
+const DAILY_BATCH_LOG_TYPES = new Set([
+  'DAILY_BATCH_REVENUE_DEFERRAL',
+  'DAILY_BATCH_INVENTORY_ALLOC',
+  'DAILY_BATCH_GROUP_B',
+])
+
 function buildLiveSyncLogIndex(syncLogs: AccountingSyncLogRow[]): Set<string> {
   const index = new Set<string>()
   for (const log of syncLogs) {
     if (!LIVE_SYNC_STATUSES.has(log.status)) continue
     index.add(liveSyncLogIndexKey(log.type, log.referenceId, log.referenceType))
+    // Also index the digest-stripped key so a digest-suffixed Xero daily-batch
+    // log matches the bare `<group>-<date>` the invariant expects.
+    if (DAILY_BATCH_LOG_TYPES.has(log.type)) {
+      const bare = stripDailyBatchDigest(log.referenceId)
+      if (bare !== log.referenceId) {
+        index.add(liveSyncLogIndexKey(log.type, bare, log.referenceType))
+      }
+    }
   }
   return index
 }
 
+// referenceType is required: an earlier version made it optional and, when
+// omitted, matched a sync log of the right type+referenceId under *any*
+// referenceType. That loose match could cross entity kinds (e.g. a DailyBatch
+// log satisfying a SalesOrderRefund lookup that shared a referenceId), so the
+// evidence check is now keyed on the full (type, referenceType, referenceId)
+// triple — every call site already supplies referenceType (scjz.75).
 function hasLiveSyncLog(
   syncLogIndex: Set<string>,
   type: string,
   referenceId: string,
-  referenceType?: string,
+  referenceType: string,
 ): boolean {
-  if (referenceType) return syncLogIndex.has(liveSyncLogIndexKey(type, referenceId, referenceType))
-  for (const key of syncLogIndex) {
-    if (key.startsWith(`${type}\u0000`) && key.endsWith(`\u0000${referenceId}`)) return true
-  }
-  return false
+  return syncLogIndex.has(liveSyncLogIndexKey(type, referenceId, referenceType))
 }
 
 function expectedDailyBatchReference(prefix: 'A1' | 'A2' | 'B', stagedAt: Date | string | null): string | null {
@@ -262,6 +324,30 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       })
     }
 
+    // A posted (or to-be-posted) journal must balance: total debits == total
+    // credits. The suite previously only checked that evidence existed, never the
+    // amounts, so an unbalanced journal could reach the GL undetected (scjz.38).
+    if (LIVE_SYNC_STATUSES.has(log.status)) {
+      const totals = journalLineTotals(log.payload)
+      if (totals && Math.abs(totals.debit - totals.credit) > 0.005) {
+        findings.push({
+          severity: 'critical',
+          code: 'accounting_sync_journal_unbalanced',
+          syncLogId: log.id,
+          message: `Accounting sync log ${log.id} journal is unbalanced (debit ${totals.debit.toFixed(2)} != credit ${totals.credit.toFixed(2)})`,
+          details: {
+            connector: log.connector,
+            type: log.type,
+            referenceType: log.referenceType,
+            referenceId: log.referenceId,
+            debit: Math.round(totals.debit * 100) / 100,
+            credit: Math.round(totals.credit * 100) / 100,
+            lineCount: totals.lineCount,
+          },
+        })
+      }
+    }
+
     if (
       IDEMPOTENCY_REQUIRED_STATUSES.has(log.status) &&
       !DAILY_BATCH_TYPES.has(log.type) &&
@@ -321,6 +407,77 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     const hasA1 = order.revenueDeferredDate != null
     const hasA2 = order.inventoryAllocatedDate != null
     const postedShipments = order.shipments.filter((shipment) => shipment.shipmentJournalDate != null)
+
+    // Lifecycle tie-out (scjz.75): once an order has fully shipped and every
+    // recognizable (SHIPPED) shipment has posted its Group-B revenue, the sum of
+    // the shipments' recognized revenue must equal the A1 deferred amount — the
+    // terminal-status true-up exists precisely to absorb rounding so it lands
+    // exactly. A divergence beyond rounding means revenue is stranded in
+    // deferral or over-recognized. Refunded orders are skipped: their
+    // UNEARNED_REV_REVERSAL adjusts the deferred base outside this sum, which a
+    // refund-reversal-aware tie-out (scjz.68) must account for separately. The
+    // `every` guard skips orders mid-recognition (a SHIPPED shipment still
+    // awaiting its next daily batch), where recognized < deferred is expected.
+    if (
+      hasA1 &&
+      isFullyShippedTerminalStatus(order.status) &&
+      order.refunds.length === 0 &&
+      postedShipments.length > 0 &&
+      order.shipments.every((shipment) => shipment.shipmentJournalDate != null || shipment.status !== 'SHIPPED')
+    ) {
+      const deferred = decimalToNumber(order.unearnedRevenueAmount)
+      const recognized = postedShipments.reduce(
+        (sum, shipment) => sum + decimalToNumber(shipment.revenueRecognizedAmount),
+        0,
+      )
+      if (deferred > 0 && Math.abs(recognized - deferred) > 0.01) {
+        findings.push({
+          severity: 'warning',
+          code: 'sales_order_recognized_revenue_deferral_mismatch',
+          orderId: order.id,
+          message: `Sales order ${label} is fully shipped but recognized Group-B revenue (${recognized.toFixed(2)}) does not tie out to A1 deferred revenue (${deferred.toFixed(2)})`,
+          details: {
+            status: order.status,
+            unearnedRevenueAmount: deferred,
+            recognizedRevenueTotal: Math.round(recognized * 100) / 100,
+            postedShipmentCount: postedShipments.length,
+            difference: Math.round((recognized - deferred) * 100) / 100,
+          },
+        })
+      }
+    }
+
+    // A1 revenue deferral is only ever staged for a paid order (the daily batch
+    // selects paidAt != null), so a posted order whose paidAt is now null had its
+    // payment reversed (chargeback) without a compensating credit note — recognized
+    // revenue with no cash, otherwise invisible to reconciliation (scjz.42/.72).
+    // Require durable accounting evidence (the external credit-note id), not the
+    // locally-generated creditNoteNumber which is assigned at refund creation
+    // before the credit-note sync queues — otherwise a never-synced/failed refund
+    // would falsely suppress exactly the missing-accounting case this surfaces.
+    const creditNotes = order.refunds.filter((refund) => refund.accountingCreditNoteId != null)
+    const postedRevenue = decimalToNumber(order.unearnedRevenueAmount)
+    const creditedTotal = creditNotes.reduce((sum, refund) => sum + decimalToNumber(refund.totalBase), 0)
+    // A credit note only compensates the reversed payment if it covers the posted
+    // revenue. A prior PARTIAL refund must NOT suppress the finding. When the posted
+    // amount is unknown (<= 0) fall back to presence to avoid false positives.
+    const fullyCompensated = creditNotes.length > 0
+      && (postedRevenue <= 0 || creditedTotal + 0.01 >= postedRevenue)
+    if ((hasA1 || hasA2 || postedShipments.length > 0) && order.paidAt === null && !fullyCompensated) {
+      findings.push({
+        severity: 'critical',
+        code: 'revenue_posted_without_payment',
+        orderId: order.id,
+        message: `Sales order ${label} has posted revenue/allocation but paidAt is cleared and no compensating credit note exists — a reversed payment left recognized revenue without cash`,
+        details: {
+          status: order.status,
+          revenueDeferredDate: order.revenueDeferredDate,
+          inventoryAllocatedDate: order.inventoryAllocatedDate,
+          postedShipmentCount: postedShipments.length,
+          unearnedRevenueAmount: decimalToNumber(order.unearnedRevenueAmount),
+        },
+      })
+    }
 
     if (hasA1) {
       const expectedReferenceId = expectedDailyBatchReference('A1', order.revenueDeferredDate)
@@ -438,6 +595,12 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
 
     for (const refund of order.refunds) {
       const refundRetryTypes = retrySyncTypes(refund.accountingRetrySyncs)
+      // scjz.70/.71: a chargeback is exempt from the reversal-evidence requirement
+      // ONLY when it staged no COGS/unearned reversal (fully-shipped, credit-note-only).
+      // A partial/deferred chargeback that staged an UNEARNED_REV_REVERSAL must still
+      // have that evidence. `reversalStaged` is a DURABLE per-refund flag set at staging
+      // time (accountingRetrySyncs is cleared once syncs queue, so it can't carry this).
+      const chargebackExemptReversal = Boolean(refund.chargeback) && !refund.reversalStaged
       const hasPostedShipment = postedShipments.length > 0
       if (!hasPostedShipment) continue
 
@@ -467,7 +630,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         refundRetryTypes.size > 0 &&
         (
           !hasCreditNoteEvidence ||
-          (decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence)
+          (decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !chargebackExemptReversal)
         )
       ) {
         findings.push({
@@ -500,7 +663,10 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         })
       }
 
-      if (!hasReversalEvidence && !refund.accountingRetryRequired && decimalToNumber(refund.totalBase) > 0) {
+      // scjz.70: a fully-shipped chargeback stages no COGS/unearned reversal (credit
+      // note only), so don't flag it; but a partial/deferred chargeback that staged
+      // an UNEARNED_REV_REVERSAL is still required to have that evidence.
+      if (!hasReversalEvidence && !refund.accountingRetryRequired && !chargebackExemptReversal && decimalToNumber(refund.totalBase) > 0) {
         findings.push({
           severity: 'warning',
           code: 'refund_missing_reversal_sync',
@@ -572,19 +738,29 @@ export async function collectAccountingInvariantRows(
   const [salesOrders, postedShipments, syncLogs] = await Promise.all([
     client.salesOrder.findMany({
       where: {
-        status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] },
+        status: { not: 'CANCELLED' },
+        refundStatus: { not: 'FULL' },
         OR: [
           { revenueDeferredDate: retainedDateFilter },
           { inventoryAllocatedDate: retainedDateFilter },
           { shipments: { some: { shipmentJournalDate: retainedDateFilter } } },
           { refunds: { some: retentionCutoff ? { refundedAt: { gte: retentionCutoff } } : {} } },
         ],
+        // NB: the revenue_posted_without_payment invariant (scjz.72) only evaluates
+        // orders collected by the retention window above — i.e. recent reversed
+        // payments (the common case). A chargeback on an order posted outside the
+        // window is not caught here; we deliberately do NOT pull those unwindowed,
+        // because the sync-log query is also windowed, so evaluating an old order
+        // would emit false *_without_sync_evidence warnings for its (unloaded) old
+        // batch logs. The full chargeback handling (scjz.42) creates a credit note
+        // / moves the order terminal, which is the durable fix.
       },
       select: {
         id: true,
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
+        paidAt: true,
         revenueDeferredDate: true,
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
@@ -607,6 +783,8 @@ export async function collectAccountingInvariantRows(
             accountingRetryRequired: true,
             accountingWarning: true,
             accountingRetrySyncs: true,
+            chargeback: true,
+            reversalStaged: true,
           },
         },
       },
@@ -614,7 +792,7 @@ export async function collectAccountingInvariantRows(
     client.shipment.findMany({
       where: {
         shipmentJournalDate: retainedDateFilter,
-        order: { status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] } },
+        order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
       },
       select: {
         id: true,
@@ -663,6 +841,48 @@ export async function runAccountingInvariantReport(options: {
     options.client ?? (db as unknown as AccountingInvariantClient),
   )
   const findings = evaluateAccountingInvariantRows(rows)
+
+  // scjz.74/.60c: reconcile the GL inventory balance to the 6dp cost-layer
+  // subledger. Only a gap beyond the rounding-scale sweep limit is a real
+  // discrepancy worth a finding; rounding-scale residue is left for the
+  // rounding-difference sweep (scjz.60c-2). Degrades silently when the inventory
+  // account is unmapped or no trial-balance snapshot exists yet.
+  const inventoryReconciliation = await loadInventoryGlReconciliation()
+  if (inventoryReconciliation.available && inventoryReconciliation.action === 'flag') {
+    findings.push({
+      severity: 'critical',
+      code: 'inventory_gl_subledger_mismatch',
+      message: `GL inventory balance (${inventoryReconciliation.glBalance.toFixed(2)}) does not reconcile to the cost-layer subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
+      details: {
+        balanceDate: inventoryReconciliation.balanceDate,
+        glBalance: inventoryReconciliation.glBalance,
+        subledgerValue: inventoryReconciliation.subledgerValue,
+        delta: inventoryReconciliation.delta,
+        sweepLimit: inventoryReconciliation.sweepLimit,
+      },
+    })
+  }
+
+  // khdw: reconcile the GL COGS account to its IMS subledger period movement
+  // (Σ dispatch cogsBatchAmount − Σ refund cogsReversalBase). Only a gap beyond the
+  // rounding-scale sweep limit is a real discrepancy; rounding residue is left for
+  // the COGS rounding-difference sweep. Degrades silently when the COGS account is
+  // unmapped or no usable balance snapshots exist yet.
+  const cogsReconciliation = await loadCogsGlReconciliation()
+  if (cogsReconciliation.available && cogsReconciliation.action === 'flag') {
+    findings.push({
+      severity: 'critical',
+      code: 'cogs_gl_subledger_mismatch',
+      message: `GL COGS movement (${cogsReconciliation.glBalance.toFixed(2)}) does not reconcile to the COGS subledger movement (${cogsReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
+      details: {
+        balanceDate: cogsReconciliation.balanceDate,
+        glBalance: cogsReconciliation.glBalance,
+        subledgerValue: cogsReconciliation.subledgerValue,
+        delta: cogsReconciliation.delta,
+        sweepLimit: cogsReconciliation.sweepLimit,
+      },
+    })
+  }
 
   return {
     checkedAt: new Date().toISOString(),

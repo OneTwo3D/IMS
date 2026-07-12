@@ -14,6 +14,8 @@ type EmailData = {
   bodyLines: string[]
   ctaLabel?: string
   ctaUrl?: string
+  /** Set when the email has no PDF attachment (e.g. dispatch notifications). */
+  hideAttachmentNote?: boolean
 }
 
 const SAMPLE_DATA: Record<EmailTemplateType, EmailData> = {
@@ -123,12 +125,16 @@ export async function renderEmailHtml(
   const publicAppUrl = (await getPublicAppUrl())?.replace(/\/$/, '') ?? ''
 
   const logoHtml = branding.documentLogoUrl
-    ? `<img src="${publicAppUrl}${branding.documentLogoUrl}" alt="${branding.companyName}" style="max-height:50px;max-width:200px;margin-bottom:16px;" />`
+    ? `<img src="${publicAppUrl}${branding.documentLogoUrl}" alt="${escapeHtml(branding.companyName)}" style="max-height:50px;max-width:200px;margin-bottom:16px;" />`
     : branding.logoUrl
-      ? `<img src="${publicAppUrl}${branding.logoUrl}" alt="${branding.companyName}" style="max-height:40px;max-width:40px;margin-bottom:16px;" />`
+      ? `<img src="${publicAppUrl}${branding.logoUrl}" alt="${escapeHtml(branding.companyName)}" style="max-height:40px;max-width:40px;margin-bottom:16px;" />`
       : ''
 
   const bodyHtml = data.bodyLines.map((l) => `<p style="margin:0 0 12px;color:#333;font-size:15px;line-height:1.5;">${escapeHtml(l)}</p>`).join('\n')
+
+  const ctaHtml = data.ctaLabel && data.ctaUrl
+    ? `<p style="margin:20px 0 12px;"><a href="${escapeHtml(data.ctaUrl)}" style="display:inline-block;background:${branding.primaryColor};color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:10px 24px;border-radius:6px;">${escapeHtml(data.ctaLabel)}</a></p>`
+    : ''
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -150,7 +156,8 @@ export async function renderEmailHtml(
   <p style="margin:0 0 16px;color:#333;font-size:15px;">Dear ${escapeHtml(data.recipientName)},</p>
   ${tpl?.headerNote ? `<div style="background:#f8f9fa;border-left:3px solid ${branding.accentColor};padding:12px 16px;margin:0 0 20px;border-radius:0 4px 4px 0;"><p style="margin:0;color:#555;font-size:14px;">${escapeHtml(tpl.headerNote)}</p></div>` : ''}
   ${bodyHtml}
-  <p style="margin:0 0 12px;color:#333;font-size:15px;">The document is attached to this email as a PDF.</p>
+  ${ctaHtml}
+  ${data.hideAttachmentNote ? '' : '<p style="margin:0 0 12px;color:#333;font-size:15px;">The document is attached to this email as a PDF.</p>'}
   ${tpl?.footerNote ? `<div style="border-top:1px solid #eee;padding-top:16px;margin-top:20px;"><p style="margin:0;color:#888;font-size:13px;">${escapeHtml(tpl.footerNote)}</p></div>` : ''}
   <p style="margin:24px 0 0;color:#333;font-size:15px;">Kind regards,<br/><strong>${escapeHtml(fromName)}</strong></p>
 </td></tr>
@@ -172,6 +179,6 @@ export async function renderEmailHtml(
 </html>`
 }
 
-function escapeHtml(s: string): string {
+export function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
 }

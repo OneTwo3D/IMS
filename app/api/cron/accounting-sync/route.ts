@@ -4,6 +4,7 @@ import { CRON_RATE_LIMIT_FIVE_MINUTE_MAX, enforceCronRateLimit } from '@/lib/cro
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { isAccountingConnectorConnected } from '@/lib/accounting'
 
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
@@ -19,8 +20,7 @@ export async function GET(request: Request) {
     if (enabled?.value !== 'true') {
       return NextResponse.json({ skipped: true, reason: 'Xero sync disabled' })
     }
-    const token = await db.accountingToken.findFirst({ where: { connector: 'xero' }, select: { id: true } })
-    if (!token) {
+    if (!(await isAccountingConnectorConnected('xero'))) {
       return NextResponse.json({ skipped: true, reason: 'Xero not connected' })
     }
     // audit-grob: drain the landed-cost adjustment-journal backstop FIRST so any
@@ -53,8 +53,7 @@ export async function GET(request: Request) {
     if (enabled?.value !== 'true') {
       return NextResponse.json({ skipped: true, reason: 'QuickBooks sync disabled' })
     }
-    const token = await db.accountingToken.findFirst({ where: { connector: 'quickbooks' }, select: { id: true } })
-    if (!token) {
+    if (!(await isAccountingConnectorConnected('quickbooks'))) {
       return NextResponse.json({ skipped: true, reason: 'QuickBooks not connected' })
     }
     // audit-grob: same backstop drain — the landed-cost journals are

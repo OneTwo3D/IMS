@@ -88,6 +88,12 @@ type ShipmentRow = {
   shipmentJournalDate: Date | null
 }
 
+type RefundLineRow = {
+  orderId: string
+  salesOrderLineId: string | null
+  qty: number
+}
+
 type MemoryState = {
   order: OrderRow
   products: ProductRow[]
@@ -95,6 +101,7 @@ type MemoryState = {
   stockLevels: StockLevelRow[]
   allocations?: AllocationRow[]
   shipments?: ShipmentRow[]
+  refundLines?: RefundLineRow[]
 }
 
 function decimalLikeToNumber(value: number | { toNumber(): number } | undefined): number {
@@ -104,6 +111,7 @@ function decimalLikeToNumber(value: number | { toNumber(): number } | undefined)
 function createClient(state: MemoryState): AllocationServiceClient {
   const allocations = state.allocations ?? []
   const shipments = state.shipments ?? []
+  const refundLines = state.refundLines ?? []
   const client = {
     $queryRaw: async () => [],
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(client),
@@ -189,8 +197,16 @@ function createClient(state: MemoryState): AllocationServiceClient {
       updateMany: async () => ({ count: 0 }),
     },
     shipment: {
-      findFirst: async ({ where }: { where: { orderId: string; shipmentJournalDate?: { not: null } } }) => {
+      findFirst: async ({ where }: { where: { orderId: string; shipmentJournalDate?: { not: null }; status?: string; OR?: Array<{ shipmentJournalDate?: { not: null }; status?: string }> } }) => {
         const rows = shipments.filter((shipment) => shipment.orderId === where.orderId)
+        const matchesClause = (clause: { shipmentJournalDate?: { not: null }; status?: string }, shipment: ShipmentRow) => {
+          if (clause.shipmentJournalDate?.not === null) return shipment.shipmentJournalDate != null
+          if (clause.status !== undefined) return shipment.status === clause.status
+          return false
+        }
+        if (where.OR) {
+          return rows.find((shipment) => where.OR!.some((clause) => matchesClause(clause, shipment))) ?? null
+        }
         if (where.shipmentJournalDate?.not === null) {
           return rows.find((shipment) => shipment.shipmentJournalDate != null) ?? null
         }
@@ -209,6 +225,11 @@ function createClient(state: MemoryState): AllocationServiceClient {
     },
     shipmentLine: {
       findMany: async () => [],
+    },
+    salesOrderRefundLine: {
+      findMany: async ({ where }: { where: { refund: { orderId: string } } }) => refundLines
+        .filter((refundLine) => refundLine.orderId === where.refund.orderId)
+        .map((refundLine) => ({ salesOrderLineId: refundLine.salesOrderLineId, qty: refundLine.qty })),
     },
   }
 
@@ -241,9 +262,31 @@ function baseState(overrides: Partial<MemoryState> = {}): MemoryState {
     stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 }],
     allocations: [],
     shipments: [],
+    refundLines: [],
     ...overrides,
   }
 }
+
+test('allocateSalesOrder excludes refunded quantity from demand', async () => {
+  // Line qty 3, 2 already refunded → only 1 unit remains to allocate.
+  const state = baseState({ refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', qty: 2 }] })
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.success, true)
+  assert.equal(result.allocationCount, 1)
+  assert.deepEqual(state.allocations, [{
+    orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 1,
+  }])
+  assert.equal(state.stockLevels[0].reservedQty, 1)
+})
+
+test('allocateSalesOrder creates no allocation when the whole line is refunded', async () => {
+  const state = baseState({ refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', qty: 3 }] })
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.allocationCount, 0)
+  assert.deepEqual(state.allocations, [])
+})
 
 test('allocateSalesOrder allocates available stock and advances order status', async () => {
   const state = baseState()
@@ -740,6 +783,22 @@ test('cancelSalesOrderFulfillmentState aggregates multi-scope reservation releas
     ['product-b', 'warehouse-1', 0],
     ['product-a', 'warehouse-2', 0],
   ])
+})
+
+test('cancelSalesOrderFulfillmentState refuses a partially-shipped order with a journaled shipment', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    // A2 never ran (no inventoryAllocatedDate) but a partial shipment was
+    // dispatched and posted to accounting — cancelling would orphan its COGS.
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-06-01T00:00:00.000Z') }],
+  })
+  const client = createClient(state)
+
+  await assert.rejects(
+    () => cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }),
+    /Cannot cancel an order with a dispatched shipment/,
+  )
+  assert.equal(state.order.status, 'ALLOCATED')
 })
 
 test('updateSalesOrderStatusUnderLock refuses PICKING when allocations disappeared before locked update', async () => {

@@ -4,8 +4,12 @@ import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   applyReturnInboundStockTx,
+  buildChargebackRefundLines,
   createSalesOrderRefund,
+  recordRefundCogsReversalFromSync,
+  resolveRefundCogsReversalBase,
   retrySalesOrderRefundAccounting,
+  type RefundAccountingSyncRequest,
   type RefundServiceClient,
 } from '@/lib/domain/sales/refund-service'
 import type { AccountingSettings } from '@/lib/accounting'
@@ -15,6 +19,7 @@ type Order = {
   externalOrderNumber: string | null
   orderNumber: string | null
   status: string
+  refundStatus?: string
   fxRateToBase: number
   totalBase: number
   revenueDeferredDate: Date | null
@@ -57,6 +62,8 @@ type Refund = {
   totalForeign: number
   totalBase: number
   returnWarehouseId: string | null
+  chargeback?: boolean
+  reversalStaged?: boolean
   accountingRetryRequired?: boolean
   accountingWarning?: string | null
   accountingRetrySyncs?: unknown
@@ -88,7 +95,7 @@ type State = {
     shipmentJournalDate: Date | null
     revenueRecognizedAmount: number | null
     cogsBatchAmount: number | null
-    lines: Array<{ id: string; lineId: string; qty: number; costLayerSnapshot: unknown }>
+    lines: Array<{ id: string; lineId: string; productId?: string; qty: number; costLayerSnapshot: unknown }>
   }>
   allocations: Array<{ id: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number; costLayerSnapshot: unknown }>
   costLayers: Array<{ id: string; productId: string; poLineId: string | null; receivedQty: number; unitCostBase: number }>
@@ -109,7 +116,14 @@ type State = {
     createdAt: Date
   }>
   stockLevels: Array<{ productId: string; warehouseId: string; quantity: number; reservedQty: number }>
+  // scjz.20: kit product graph so loadFulfillmentProductGraph can expand KIT lines to
+  // components. Keyed by productId; absent ids default to SIMPLE with no components.
+  productGraph?: Record<string, {
+    type: string
+    productComponents: Array<{ componentId: string; qty: number; component: { sku: string; type: string; oversellAllowed: boolean } }>
+  }>
   activityLogs: unknown[]
+  cogsSubledgerMovements: unknown[]
   settings: Record<string, string>
   executeRawCalls: number
   nextRefundId: number
@@ -192,6 +206,7 @@ function baseState(overrides: Partial<State> = {}): State {
     cogsEntries: [],
     stockLevels: [],
     activityLogs: [],
+    cogsSubledgerMovements: [],
     settings: {},
     executeRawCalls: 0,
     nextRefundId: 1,
@@ -264,7 +279,9 @@ function createClient(state: State): RefundServiceClient {
               ...shipment,
               lines: shipment.lines.map((line) => ({
                 ...line,
-                productId: state.lines.find((salesLine) => salesLine.id === line.lineId)?.productId,
+                // KIT shipment lines carry the COMPONENT productId; fall back to the
+                // sales line's product for SIMPLE fixtures that don't set it (scjz.20).
+                productId: line.productId ?? state.lines.find((salesLine) => salesLine.id === line.lineId)?.productId,
               })),
             })),
             refunds: state.refunds
@@ -360,6 +377,13 @@ function createClient(state: State): RefundServiceClient {
     accountingSyncLog: {
       findMany: async () => [],
     },
+    cogsSubledgerMovement: {
+      // khdw: refund staging records the COGS reversal into the subledger ledger.
+      upsert: async ({ create }: { create: Record<string, unknown> }) => {
+        state.cogsSubledgerMovements.push(create)
+        return create
+      },
+    },
     activityLog: {
       create: async ({ data }: { data: unknown }) => {
         state.activityLogs.push(data)
@@ -421,7 +445,17 @@ function createClient(state: State): RefundServiceClient {
       },
     },
     product: {
-      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => ({ id, sku: id.toUpperCase() })),
+      // Includes type + productComponents so loadFulfillmentProductGraph (scjz.20
+      // kit-unit COGS conversion) can build its graph. These fixtures are all SIMPLE
+      // products (1 component unit per sales-line unit); kit-unit conversion is
+      // exercised end-to-end against a real DB in scripts/repro-scjz20.ts.
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
+        where.id.in.map((id) => ({
+          id,
+          sku: id.toUpperCase(),
+          type: state.productGraph?.[id]?.type ?? 'SIMPLE',
+          productComponents: state.productGraph?.[id]?.productComponents ?? [],
+        })),
     },
   }
   return client as unknown as RefundServiceClient
@@ -460,11 +494,26 @@ test('createSalesOrderRefund creates a partial refund record', async () => {
   })
 
   assert.equal(result.success, true)
-  assert.equal(state.orders[0].status, 'PARTIALLY_REFUNDED')
+  assert.equal(state.orders[0].status, 'SHIPPED') // lifecycle status is left untouched
+  assert.equal(state.orders[0].refundStatus, 'PARTIAL')
   assert.equal(state.refunds[0].creditNoteNumber, 'CN-2026-00001')
   assert.equal(state.refundLines[0].qty, 1)
   assert.equal(state.refundLines[0].unitPriceBase, 50)
   assert.equal(state.refundLines[0].salesOrderLineId, 'line-1')
+})
+
+test('createSalesOrderRefund dual-writes refundStatus=FULL on a full refund', async () => {
+  const state = baseState()
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Full return',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].status, 'SHIPPED') // lifecycle status is left untouched
+  assert.equal(state.orders[0].refundStatus, 'FULL')
 })
 
 test('createSalesOrderRefund converts refund totals from base to foreign currency', async () => {
@@ -729,6 +778,141 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-returns')
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
+  assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+})
+
+test('createSalesOrderRefund chargeback mode suppresses COGS reversal AND restock (scjz.70)', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Payment reversed (chargeback)',
+    // A warehouse is supplied to prove the chargeback suppresses restock regardless.
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    chargeback: true,
+  })
+
+  assert.equal(result.success, true)
+  // No COGS reversal — cost is kept as a loss.
+  assert.equal(
+    result.success && result.accountingSyncs.some((s) => s.type === 'COGS_REVERSAL'),
+    false,
+  )
+  // No inventory restock — the customer keeps the goods.
+  assert.equal(result.success && result.returnedRows.length, 0)
+  assert.equal(state.movements.length, 0)
+  // The refund is recorded as a chargeback that staged NO reversal (fully shipped →
+  // credit-note-only), so the accounting evidence checks exempt it durably (scjz.71).
+  assert.equal(state.refunds[0]?.chargeback, true)
+  assert.equal(state.refunds[0]?.reversalStaged, false)
+})
+
+test('createSalesOrderRefund reverses kit COGS in component units, not kit units', async () => {
+  // scjz.20: refund qty is in KIT units but cost-layer snapshots are in COMPONENT
+  // units. A 1:2 kit refunded for 3 kits must reverse 3 * 2 = 6 component units of
+  // basis (£60), not 3 (£30). Refund only the fully-shipped portion to isolate the
+  // shipment-cost conversion.
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 150,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 150,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 60,
+    }],
+    lines: [{
+      id: 'line-1',
+      orderId: 'order-1',
+      productId: 'kit-1',
+      description: 'Kit',
+      qty: 3,
+      totalBase: 150,
+    }],
+    productGraph: {
+      'kit-1': {
+        type: 'KIT',
+        productComponents: [{
+          componentId: 'comp-1',
+          qty: 2,
+          component: { sku: 'COMP-1', type: 'SIMPLE', oversellAllowed: false },
+        }],
+      },
+    },
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 150,
+      cogsBatchAmount: 60,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        productId: 'comp-1',
+        qty: 6,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 6, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', poLineId: 'po-line-1', receivedQty: 6, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'kit-1', description: 'Kit', qty: 3, totalBase: 150 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  // 3 kits * 2 components = 6 component units of basis at £10 = £60 reversed.
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
+    costLayerId: 'layer-1',
+    qty: '6.000000',
+    unitCostBase: '10.000000',
+    shipmentLineId: 'shipment-line-1',
+    source: 'shipment',
+  }])
+  // Returned stock is restocked in component units against the component product.
+  assert.equal(state.movements[0].productId, 'comp-1')
+  assert.equal(state.movements[0].qty, 6)
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
 })
 
@@ -1066,10 +1250,83 @@ test('createSalesOrderRefund clears accounting deferral dates for full refunds',
   })
 
   assert.equal(result.success, true)
-  assert.equal(state.orders[0].status, 'REFUNDED')
+  assert.equal(state.orders[0].refundStatus, 'FULL')
   assert.equal(state.orders[0].revenueDeferredDate, null)
   assert.equal(state.orders[0].inventoryAllocatedDate, null)
   assert.deepEqual(state.refunds[0].accountingRetrySyncs, result.success ? result.accountingSyncs : [])
+})
+
+test('createSalesOrderRefund reverses the FULL deferral on a full refund of a shipped-but-unjournaled order (qn8a)', async () => {
+  // qn8a: a deferred order ships, but Group B has NOT yet journaled its revenue
+  // recognition (shipmentJournalDate: null, revenueRecognizedAmount: 0), then a
+  // FULL refund is issued. A concern was raised that the unearnedReversal cap
+  // (unshippedQtyRevenue + nonQtyRevenue) would drop the shipped portion's
+  // deferral, stranding it in the unearned account once the order flips to
+  // REFUNDED (which Group B then excludes forever).
+  //
+  // It does NOT strand: the refund's shipment query filters to journaled
+  // shipments only (refund-service.ts shipments where shipmentJournalDate not
+  // null), so an unjournaled-but-shipped qty is classified as UNSHIPPED in the
+  // revenue split and lands inside the cap. The full remaining deferral is
+  // reversed; the credit-note ACCRECCREDIT document reverses Sales↔AR, netting
+  // to Dr Unearned / Cr AR — a correct full unwind. This test locks that so the
+  // journaled-only filter cannot silently regress.
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      // Unjournaled: Group B has not run for this shipment yet.
+      shipmentJournalDate: null,
+      revenueRecognizedAmount: 0,
+      cogsBatchAmount: 0,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    allocations: [{
+      id: 'alloc-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Full return',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  const unearnedSync = result.success && result.accountingSyncs.find((s) => s.type === 'UNEARNED_REV_REVERSAL')
+  assert.ok(unearnedSync, 'expected an UNEARNED_REV_REVERSAL sync')
+  const debitLine = (unearnedSync.payload as { lines?: Array<{ accountCode?: string; debit?: number }> })
+    .lines?.find((l) => l.accountCode === accountingSettings.unearnedRevenueAccount && l.debit)
+  // The entire £100 deferral is reversed out of the unearned account — nothing stranded.
+  assert.equal(debitLine?.debit, 100)
 })
 
 test('createSalesOrderRefund fallback stock return excludes the current refund from prior returns', async () => {
@@ -1819,4 +2076,201 @@ test('retrySalesOrderRefundAccounting uses persisted sales line identity and ref
   assert.equal(state.movements.length, 2)
   assert.equal(state.movements[1].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[1].referenceId, 'refund-2')
+})
+
+// scjz.70 / .42a: full-order chargeback refund-line selection (pure).
+test('buildChargebackRefundLines: full order with no prior refunds keeps qty + value exact', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [
+      { lineId: 'l1', productId: 'p1', description: 'Widget', qty: 3, totalBase: 30 },
+      { lineId: 'l2', productId: 'p2', description: 'Gadget', qty: 1, totalBase: 12.5 },
+    ],
+  })
+  assert.deepEqual(
+    lines.map((l) => ({ lineId: l.lineId, qty: l.qty, totalBase: l.totalBase, lineKind: l.lineKind })),
+    [
+      { lineId: 'l1', qty: 3, totalBase: 30, lineKind: 'sale' },
+      { lineId: 'l2', qty: 1, totalBase: 12.5, lineKind: 'sale' },
+    ],
+  )
+})
+
+test('buildChargebackRefundLines: preserves 4dp totals (no cent-rounding) — Codex P2', () => {
+  // Decimal(18,4) totals must survive intact; rounding to 2dp would understate.
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Frac', qty: 1, totalBase: 12.3456 }],
+  })
+  assert.equal(lines[0]!.totalBase, 12.3456)
+})
+
+test('buildChargebackRefundLines: includes remaining shipping as a shipping-kind line — Codex P2', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 10 }],
+    shipping: { totalBase: 5.5, priorRefundedBase: 1.5 },
+  })
+  const ship = lines.find((l) => l.lineKind === 'shipping')
+  assert.ok(ship)
+  assert.equal(ship.productId, null)
+  assert.equal(ship.qty, 0)
+  assert.equal(ship.totalBase, 4) // 5.5 − 1.5 remaining
+})
+
+test('buildChargebackRefundLines: order discount mirrored as a negative discount line, goods at full value — scjz.71', () => {
+  // Goods 100 + shipping 10, a £10 order discount: the invoice posted full goods +
+  // a separate −10 discount line, so the chargeback mirrors it (no goods scaling).
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 100 }],
+    shipping: { totalBase: 10 },
+    discount: { totalBase: 10 },
+  })
+  const sale = lines.find((l) => l.lineKind === 'sale')!
+  const ship = lines.find((l) => l.lineKind === 'shipping')!
+  const disc = lines.find((l) => l.lineKind === 'discount')!
+  assert.equal(sale.totalBase, 100) // goods at FULL value — not scaled
+  assert.equal(ship.totalBase, 10)
+  assert.equal(disc.totalBase, -10) // negative discount line, mirrors the invoice
+  assert.equal(disc.productId, null)
+  assert.equal(disc.qty, 0)
+  // Net reversed = goods + shipping − discount = the order's net total.
+  assert.equal(sale.totalBase + ship.totalBase + disc.totalBase, 100)
+})
+
+test('buildChargebackRefundLines: no discount line emitted when no order discount — scjz.71', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 2, totalBase: 50 }],
+    shipping: { totalBase: 5 },
+  })
+  assert.equal(lines.find((l) => l.lineKind === 'sale')!.totalBase, 50)
+  assert.equal(lines.find((l) => l.lineKind === 'shipping')!.totalBase, 5)
+  assert.equal(lines.some((l) => l.lineKind === 'discount'), false)
+})
+
+test('buildChargebackRefundLines: fully-refunded shipping is dropped', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 1, totalBase: 10 }],
+    shipping: { totalBase: 5, priorRefundedBase: 5 },
+  })
+  assert.equal(lines.some((l) => l.lineKind === 'shipping'), false)
+})
+
+test('buildChargebackRefundLines: prior refunds reduce remaining qty AND remaining value', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 4, totalBase: 100 }],
+    priorRefundedQtyByLineId: { l1: 1 },
+    priorRefundedBaseByLineId: { l1: 25 },
+  })
+  assert.deepEqual(
+    lines.map((l) => ({ qty: l.qty, totalBase: l.totalBase })),
+    [{ qty: 3, totalBase: 75 }],
+  )
+})
+
+test('buildChargebackRefundLines: non-proportional prior refund (price-only) reduces value not qty — Codex P2', () => {
+  // A £10 price-only adjustment with no quantity: remaining qty unchanged, value − 10.
+  const lines = buildChargebackRefundLines({
+    lines: [{ lineId: 'l1', productId: 'p1', description: 'Widget', qty: 4, totalBase: 100 }],
+    priorRefundedBaseByLineId: { l1: 10 },
+  })
+  assert.deepEqual(
+    lines.map((l) => ({ qty: l.qty, totalBase: l.totalBase })),
+    [{ qty: 4, totalBase: 90 }],
+  )
+})
+
+test('buildChargebackRefundLines: fully-refunded (qty + value) and zero lines are dropped', () => {
+  const lines = buildChargebackRefundLines({
+    lines: [
+      { lineId: 'l1', productId: 'p1', description: 'Done', qty: 2, totalBase: 20 },
+      { lineId: 'l2', productId: 'p2', description: 'Zero', qty: 0, totalBase: 0 },
+      { lineId: 'l3', productId: 'p3', description: 'Keep', qty: 1, totalBase: 10 },
+    ],
+    priorRefundedQtyByLineId: { l1: 2 },
+    priorRefundedBaseByLineId: { l1: 20 },
+  })
+  assert.deepEqual(lines.map((l) => l.lineId), ['l3'])
+})
+
+// ---------------------------------------------------------------------------
+// bcz9.4: COGS-reversal subledger recording at queue time
+// ---------------------------------------------------------------------------
+
+test('resolveRefundCogsReversalBase prefers the 6dp structured base over 2dp credit lines', () => {
+  const base = resolveRefundCogsReversalBase({
+    date: '2026-01-02',
+    _cogsReversalBase: 10.123456,
+    lines: [
+      { accountCode: '630', debit: 10.12 },
+      { accountCode: '500', credit: 10.12 },
+    ],
+  })
+  assert.equal(base, 10.123456)
+})
+
+test('resolveRefundCogsReversalBase falls back to summed credit lines without a structured base', () => {
+  const base = resolveRefundCogsReversalBase({
+    date: '2026-01-02',
+    lines: [
+      { accountCode: '630', debit: 7.5 },
+      { accountCode: '500', credit: 7.5 },
+    ],
+  })
+  assert.equal(base, 7.5)
+})
+
+test('resolveRefundCogsReversalBase returns null when no positive base is present', () => {
+  assert.equal(resolveRefundCogsReversalBase({ date: '2026-01-02', lines: [{ credit: 0 }] }), null)
+  assert.equal(resolveRefundCogsReversalBase({ date: '2026-01-02' }), null)
+  assert.equal(resolveRefundCogsReversalBase(null), null)
+})
+
+function cogsLedgerProbe(): { rows: Array<Record<string, unknown>>; client: RefundServiceClient } {
+  const rows: Array<Record<string, unknown>> = []
+  const client = {
+    cogsSubledgerMovement: {
+      upsert: async ({ create }: { create: Record<string, unknown> }) => {
+        rows.push(create)
+        return create
+      },
+    },
+  } as unknown as RefundServiceClient
+  return { rows, client }
+}
+
+const cogsReversalSync: RefundAccountingSyncRequest = {
+  type: 'COGS_REVERSAL',
+  referenceType: 'SalesOrderRefund',
+  referenceId: 'refund-9',
+  idempotencyKey: 'sales-order-refund:refund-9:cogs-reversal',
+  payload: {
+    date: '2026-01-02',
+    reference: 'COGS reversal',
+    _cogsReversalBase: 10.123456,
+    lines: [
+      { accountCode: '630', description: 'COGS reversal', debit: 10.12 },
+      { accountCode: '500', description: 'COGS reversal', credit: 10.12 },
+    ],
+  },
+}
+
+test('recordRefundCogsReversalFromSync writes the negative 6dp row when the reversal will post', async () => {
+  const { rows, client } = cogsLedgerProbe()
+  await recordRefundCogsReversalFromSync(client, cogsReversalSync, true)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].sourceType, 'REFUND_REVERSAL')
+  assert.equal(rows[0].sourceRef, 'refund-9')
+  assert.equal(rows[0].idempotencyKey, 'sales-order-refund:refund-9:cogs-reversal')
+  assert.equal(Number(rows[0].baseDelta), -10.123456)
+})
+
+test('recordRefundCogsReversalFromSync is a no-op when the reversal will not post', async () => {
+  const { rows, client } = cogsLedgerProbe()
+  await recordRefundCogsReversalFromSync(client, cogsReversalSync, false)
+  assert.equal(rows.length, 0)
+})
+
+test('recordRefundCogsReversalFromSync ignores non-COGS_REVERSAL syncs', async () => {
+  const { rows, client } = cogsLedgerProbe()
+  const unearned: RefundAccountingSyncRequest = { ...cogsReversalSync, type: 'UNEARNED_REV_REVERSAL' }
+  await recordRefundCogsReversalFromSync(client, unearned, true)
+  assert.equal(rows.length, 0)
 })

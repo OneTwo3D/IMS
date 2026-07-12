@@ -230,6 +230,7 @@ enum WmsDiscrepancyCategory {
   BUNDLE_DERIVATION_CONFLICT
   BARCODE_CONFLICT
   BARCODE_BACKFILLED_FROM_WMS
+  INVALID_HS_CODE
 }
 
 enum WmsDiscrepancyStatus {

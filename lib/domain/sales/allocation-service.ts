@@ -42,7 +42,7 @@ export type AllocateSalesOrderResult = {
   unallocatedQty: number
   backorderLineCount: number
   orderRef?: string
-  isWcOrder?: boolean
+  isShoppingOrder?: boolean
   shipFromWarehouseId?: string | null
   logAttempt?: boolean
 }
@@ -284,10 +284,33 @@ export async function applyAllocationReservationDelta(
       continue
     }
 
-    await tx.stockLevel.updateMany({
-      where: { productId: row.productId, warehouseId: row.warehouseId },
+    // l4jq: guard the release decrement so it can never drive reservedQty
+    // negative (the reserve branch above already checks updated.count).
+    // reservedQty is a per-(product,warehouse) AGGREGATE: in the normal case
+    // (reservedQty >= qty) the guarded decrement below releases exactly this
+    // allocation's qty and PRESERVES any co-existing reservations from other
+    // orders (reservedQty - qty stays positive). The floor branch only runs on
+    // genuine upstream drift — a release exceeding the WHOLE aggregate
+    // (reservedQty < qty) — where max(0, reserved - qty) is 0 anyway; we floor to
+    // 0 rather than rely on the DB non-negative CHECK to abort the transaction.
+    const released = await tx.stockLevel.updateMany({
+      where: { productId: row.productId, warehouseId: row.warehouseId, reservedQty: { gte: qty } },
       data: { reservedQty: { decrement: qty } },
     })
+    if (released.count === 0) {
+      const floored = await tx.stockLevel.updateMany({
+        where: { productId: row.productId, warehouseId: row.warehouseId },
+        data: { reservedQty: 0 },
+      })
+      if (floored.count > 0) {
+        // Loud: releasing more than the entire reserved aggregate means the
+        // reservation ledger drifted upstream and needs reconciliation.
+        console.error(
+          `[allocation] reservedQty drift on release for product ${row.productId} @ ${row.warehouseId}: ` +
+          `tried to release ${qty.toString()} but reserved was lower; floored to 0.`,
+        )
+      }
+    }
   }
 }
 
@@ -367,6 +390,24 @@ export async function cancelSalesOrderFulfillmentState(
   if (!lockedOrder) throw new Error('Order not found')
   if (lockedOrder.status === 'SHIPPED') {
     throw new Error('Cannot cancel a shipped order — process a refund instead')
+  }
+
+  // A partially-shipped order stays ALLOCATED (it only flips to SHIPPED when ALL
+  // shipments ship), so the order-status guard above is not enough. If any
+  // shipment has already been dispatched/journaled, cancelling would release
+  // reservations and delete pending shipments while the dispatched shipment's
+  // COGS + revenue stay recognised in the ledger with no reversal. The
+  // resetAllocationAccountingIfStaged check below is gated on inventoryAllocatedDate
+  // (it early-returns when A2 hasn't run), so guard here unconditionally.
+  const dispatchedShipment = await tx.shipment.findFirst({
+    where: {
+      orderId: input.orderId,
+      OR: [{ shipmentJournalDate: { not: null } }, { status: 'SHIPPED' }],
+    },
+    select: { id: true },
+  })
+  if (dispatchedShipment) {
+    throw new Error('Cannot cancel an order with a dispatched shipment — process a refund instead')
   }
 
   const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, 'CANCELLED', {
@@ -608,7 +649,9 @@ export async function allocateSalesOrder(
       id: true,
       orderNumber: true,
       externalOrderNumber: true,
-      shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
+      // b8i6.1: any shopping connector (not just WooCommerce) — a storefront order
+      // allocates only from storefront-synced warehouses regardless of connector.
+      shoppingLinks: { select: { id: true }, take: 1 },
       status: true,
       shipFromWarehouseId: true,
       lines: {
@@ -633,22 +676,22 @@ export async function allocateSalesOrder(
   })
   if (!so) return noAllocationResult('Order not found')
 
-  const isWcOrder = so.shoppingLinks.length > 0
+  const isShoppingOrder = so.shoppingLinks.length > 0
   const orderRef = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
   const allWarehouses = await client.warehouse.findMany({
     where: {
       active: true,
       availableForSale: true,
-      ...(isWcOrder ? { syncToStore: true } : {}),
+      ...(isShoppingOrder ? { syncToStore: true } : {}),
     },
     select: { id: true, code: true, name: true, isDefault: true, syncToStore: true },
     orderBy: { isDefault: 'desc' },
   })
   if (!allWarehouses.length) {
     return {
-      ...noAllocationResult(isWcOrder ? 'No WooCommerce-synced warehouses available for sale' : 'No warehouses available for sale'),
+      ...noAllocationResult(isShoppingOrder ? 'No storefront-synced warehouses available for sale' : 'No warehouses available for sale'),
       orderRef,
-      isWcOrder,
+      isShoppingOrder,
       shipFromWarehouseId: so.shipFromWarehouseId,
     }
   }
@@ -714,13 +757,30 @@ export async function allocateSalesOrder(
       activeShipmentLines,
     )
 
+    // Refunded quantities are no longer outstanding demand — a refund on a not-yet-
+    // shipped order removes those units from what needs allocating. Only ever reduces
+    // demand, so it is safe for every status (already-shipped lines clamp to 0).
+    const refundLines = await tx.salesOrderRefundLine.findMany({
+      where: { refund: { orderId } },
+      select: { salesOrderLineId: true, qty: true },
+    })
+    const refundedByLine = new Map<string, Prisma.Decimal>()
+    for (const refundLine of refundLines) {
+      if (!refundLine.salesOrderLineId) continue
+      refundedByLine.set(
+        refundLine.salesOrderLineId,
+        (refundedByLine.get(refundLine.salesOrderLineId) ?? new Prisma.Decimal(0)).add(toDecimal(refundLine.qty)),
+      )
+    }
+
     const lines = so.lines.filter((line) => line.productId).map((line) => {
       const committed = committedByLine.get(line.id) ?? new Prisma.Decimal(0)
+      const refunded = refundedByLine.get(line.id) ?? new Prisma.Decimal(0)
       return {
         id: line.id,
         productId: line.productId!,
         sku: line.sku ?? line.productId!,
-        qty: Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(committed)),
+        qty: Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(committed).sub(refunded)),
       }
     }).filter((line) => line.qty.gt(0))
 
@@ -826,13 +886,18 @@ export async function allocateSalesOrder(
     }
 
     const report = buildBackorderReport({
+      // Demand is net of refunds here too, so refunded units aren't reported as
+      // unallocated/backordered (which would otherwise mark the result unsuccessful).
       lines: so.lines.map((line) => ({
         id: line.id,
         orderId: line.orderId,
         productId: line.productId,
         sku: line.sku,
         description: line.description,
-        qty: line.qty,
+        qty: Prisma.Decimal.max(
+          new Prisma.Decimal(0),
+          toDecimal(line.qty).sub(refundedByLine.get(line.id) ?? new Prisma.Decimal(0)),
+        ).toNumber(),
         product: line.product,
       })),
       allocations: nextAllocations.map((allocation) => ({
@@ -896,7 +961,7 @@ export async function allocateSalesOrder(
       unallocatedQty: 0,
       backorderLineCount: 0,
       orderRef,
-      isWcOrder,
+      isShoppingOrder,
       shipFromWarehouseId: so.shipFromWarehouseId,
     }
   }
@@ -917,7 +982,7 @@ export async function allocateSalesOrder(
     unallocatedQty: allocationResult.unallocatedQty,
     backorderLineCount: allocationResult.backorderLineCount,
     orderRef,
-    isWcOrder,
+    isShoppingOrder,
     shipFromWarehouseId: so.shipFromWarehouseId,
     logAttempt: true,
   }

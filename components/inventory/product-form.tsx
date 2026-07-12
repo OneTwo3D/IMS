@@ -1,6 +1,7 @@
 'use client'
 
-import { useActionState, useState } from 'react'
+import { useActionState, useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -39,6 +40,7 @@ type Props = {
     mpn?: string
     hsCode?: string
     countryOfOrigin?: string
+    customsDescription?: string
     weight?: string
     imageUrl?: string | null
     widthCm?: string | null
@@ -88,6 +90,14 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
   const baseCurrency = useBaseCurrency()
   const [state, formAction, isPending] = useActionState(action, {})
 
+  // Inline mode (the product detail page) renders Save in the page header, on the
+  // same row as the product name, via a portal into a slot the page provides.
+  const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- resolving an externally-rendered portal target requires a post-mount DOM read
+    if (inline) setHeaderSlot(document.getElementById('product-detail-actions'))
+  }, [inline])
+
   // All fields are controlled so values survive a failed server-action submission
   const [fields, setFields] = useState({
     sku:                  defaultValues?.sku                  ?? '',
@@ -102,6 +112,7 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
     mpn:                  defaultValues?.mpn                  ?? '',
     hsCode:               defaultValues?.hsCode               ?? '',
     countryOfOrigin:      defaultValues?.countryOfOrigin      ?? '',
+    customsDescription:   defaultValues?.customsDescription   ?? '',
     weight:               defaultValues?.weight               ?? '',
     salesPriceBase:        defaultValues?.salesPriceBase        ?? '',
     salePriceBase:         defaultValues?.salePriceBase         ?? '',
@@ -133,7 +144,13 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
   const willCreateCategory = cleanedCategoryPath.length > 0 && !categoryMatchesExisting
 
   const formContent = (
-    <form action={formAction} className="space-y-6">
+    <form id="product-detail-form" action={formAction} className="space-y-6">
+      {inline && headerSlot && createPortal(
+        <Button type="submit" form="product-detail-form" disabled={isPending}>
+          {isPending ? 'Saving…' : 'Save Product'}
+        </Button>,
+        headerSlot,
+      )}
       {state.message && (
         <p className="text-sm text-destructive">{state.message}</p>
       )}
@@ -363,6 +380,17 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
         </div>
       </div>
 
+      <div className="space-y-1.5">
+        <Label htmlFor="customsDescription">Customs Description</Label>
+        <Input
+          id="customsDescription"
+          name="customsDescription"
+          value={fields.customsDescription}
+          onChange={(ev) => set('customsDescription', ev.target.value)}
+          placeholder="Goods description for customs paperwork"
+        />
+      </div>
+
       {/* Pricing — hidden for VARIABLE products (price comes from variants) */}
       {fields.type === 'VARIABLE' ? (
         <p className="text-sm text-muted-foreground">Prices are set on individual variants.</p>
@@ -522,14 +550,8 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
         </p>
       </div>
 
-      {/* Actions */}
-      {inline ? (
-        <div className="sticky bottom-0 z-10 -mx-6 -mb-6 px-6 py-3 bg-background/95 backdrop-blur-sm border-t border-border flex justify-end">
-          <Button type="submit" disabled={isPending}>
-            {isPending ? 'Saving…' : 'Save Product'}
-          </Button>
-        </div>
-      ) : (
+      {/* Actions — inline mode portals Save into the page header; dialog mode keeps a footer */}
+      {!inline && (
         <DialogFooter>
           {onClose && (
             <Button type="button" variant="outline" onClick={onClose}>

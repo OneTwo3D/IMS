@@ -1,7 +1,11 @@
 import { createHash } from 'crypto'
 import { Prisma, ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
+import type { WmsDiscrepancyCategory } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
+import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
+import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 
@@ -22,10 +26,10 @@ const PRODUCT_SYNC_CANDIDATE_SELECT = {
   id: true,
   sku: true,
   name: true,
-  description: true,
   barcode: true,
   hsCode: true,
   countryOfOrigin: true,
+  customsDescription: true,
   weight: true,
   widthCm: true,
   heightCm: true,
@@ -56,10 +60,10 @@ type ProductSyncCandidate = {
   id: string
   sku: string
   name: string
-  description: string | null
   barcode: string | null
   hsCode: string | null
   countryOfOrigin: string | null
+  customsDescription: string | null
   weight: Prisma.Decimal | null
   widthCm: Prisma.Decimal | null
   heightCm: Prisma.Decimal | null
@@ -165,16 +169,36 @@ export function buildMintsoftProductDto(product: ProductSyncCandidate): WmsProdu
   return {
     sku: product.sku,
     name: product.name,
-    customsDescription: trimToNull(product.description),
+    customsDescription: trimToNull(product.customsDescription),
     barcode: trimToNull(product.barcode),
     commodityCode: trimToNull(product.hsCode),
-    countryOfManufacture: trimToNull(product.countryOfOrigin),
+    countryOfManufacture: trimToNull(product.countryOfOrigin) ?? DEFAULT_COUNTRY_OF_ORIGIN,
     weightKg: toNullableNumber(product.weight),
     heightCm: toNullableNumber(product.heightCm),
     widthCm: toNullableNumber(product.widthCm),
     depthCm: toNullableNumber(product.depthCm),
     imageUrl: trimToNull(product.imageUrl),
   }
+}
+
+/**
+ * Gate a commodity (HS/CN) code before it is declared to the WMS. A code that is not a
+ * declarable 2026 CN8 (see isDeclarableCn8) is omitted — commodityCode is nulled and the
+ * offending value returned as invalidCnCode so the caller can raise a discrepancy. A valid
+ * code is normalised to its canonical 8 digits (punctuation/spacing stripped) so the WMS
+ * always receives e.g. "01012100", never "0101.2100". An absent code passes through as null.
+ */
+export function resolveMintsoftCommodityCode(commodityCode: string | null): {
+  commodityCode: string | null
+  invalidCnCode: string | null
+} {
+  if (!commodityCode) {
+    return { commodityCode: null, invalidCnCode: null }
+  }
+  if (!isDeclarableCn8(commodityCode)) {
+    return { commodityCode: null, invalidCnCode: commodityCode }
+  }
+  return { commodityCode: normalizeCn8(commodityCode), invalidCnCode: null }
 }
 
 export function hashMintsoftProductDto(product: WmsProductDto): string {
@@ -319,10 +343,11 @@ async function recordMintsoftProductLinkError(productId: string, error: string) 
   })
 }
 
-async function upsertBarcodeConflict(params: {
+async function upsertProductDiscrepancy(params: {
   scopes: MintsoftProductSyncScope[]
   productId: string
   sku: string
+  category: WmsDiscrepancyCategory
   imsValue: string | null
   wmsValue: string | null
   message: string
@@ -334,7 +359,7 @@ async function upsertBarcodeConflict(params: {
         connector: 'mintsoft',
         warehouseId: scope.warehouseId,
         productId: params.productId,
-        category: 'BARCODE_CONFLICT',
+        category: params.category,
         status: 'OPEN',
       },
       data: {
@@ -361,7 +386,7 @@ async function upsertBarcodeConflict(params: {
           warehouseId: scope.warehouseId,
           productId: params.productId,
           sku: params.sku,
-          category: 'BARCODE_CONFLICT',
+          category: params.category,
           status: 'OPEN',
           imsValue: params.imsValue,
           wmsValue: params.wmsValue,
@@ -382,7 +407,7 @@ async function upsertBarcodeConflict(params: {
         connector: 'mintsoft',
         warehouseId: scope.warehouseId,
         productId: params.productId,
-        category: 'BARCODE_CONFLICT',
+        category: params.category,
         status: 'OPEN',
       },
       data: {
@@ -402,7 +427,11 @@ async function upsertBarcodeConflict(params: {
   }
 }
 
-async function resolveBarcodeConflict(scopes: MintsoftProductSyncScope[], productId: string) {
+async function resolveProductDiscrepancy(
+  scopes: MintsoftProductSyncScope[],
+  productId: string,
+  category: WmsDiscrepancyCategory,
+) {
   const warehouseIds = scopes.map((scope) => scope.warehouseId)
   if (warehouseIds.length === 0) return
 
@@ -411,7 +440,7 @@ async function resolveBarcodeConflict(scopes: MintsoftProductSyncScope[], produc
       connector: 'mintsoft',
       warehouseId: { in: warehouseIds },
       productId,
-      category: 'BARCODE_CONFLICT',
+      category,
       status: 'OPEN',
     },
     data: {
@@ -504,7 +533,7 @@ async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode:
       sku: context.product.sku,
       barcode,
     })
-    await resolveBarcodeConflict(context.scopes, context.product.id)
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'BARCODE_CONFLICT')
 
     return { ok: true }
   } catch (error) {
@@ -517,10 +546,11 @@ async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode:
   const ownerSummary = owner ? `${owner.sku} (${owner.id})` : 'another IMS product'
   const message = `Cannot backfill from WMS — barcode already owned by IMS product ${ownerSummary}.`
 
-  await upsertBarcodeConflict({
+  await upsertProductDiscrepancy({
     scopes: context.scopes,
     productId: context.product.id,
     sku: context.product.sku,
+    category: 'BARCODE_CONFLICT',
     imsValue: null,
     wmsValue: barcode,
     message,
@@ -547,6 +577,13 @@ async function syncOneMintsoftProduct(
   const authoritativeLookup = await fetchAuthoritativeMintsoftProduct(context)
   const authoritative = authoritativeLookup.product
   let dto = buildMintsoftProductDto(context.product)
+  // CN validation (bhdm.3): never declare a malformed / non-2026 CN8 to the WMS. A valid code is
+  // normalised to canonical 8 digits; a bad code is omitted (the rest of the product still syncs)
+  // and recorded as a discrepancy below.
+  const { commodityCode: validatedCommodityCode, invalidCnCode } = resolveMintsoftCommodityCode(dto.commodityCode)
+  if (validatedCommodityCode !== dto.commodityCode) {
+    dto = { ...dto, commodityCode: validatedCommodityCode }
+  }
   let payloadHash = hashMintsoftProductDto(dto)
   const wmsBarcode = trimToNull(authoritative?.barcode)
   const barcodePlan = resolveMintsoftBarcodePlan(dto.barcode, wmsBarcode)
@@ -584,16 +621,32 @@ async function syncOneMintsoftProduct(
   }
 
   if (barcodePlan.kind === 'conflict') {
-    await upsertBarcodeConflict({
+    await upsertProductDiscrepancy({
       scopes: context.scopes,
       productId: context.product.id,
       sku: context.product.sku,
+      category: 'BARCODE_CONFLICT',
       imsValue: dto.barcode,
       wmsValue: wmsBarcode,
       message: `IMS barcode ${dto.barcode} differs from Mintsoft barcode ${wmsBarcode}. Barcode was not overwritten.`,
     })
   } else {
-    await resolveBarcodeConflict(context.scopes, context.product.id)
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'BARCODE_CONFLICT')
+  }
+
+  // Invalid HS/CN code (bhdm.3): flag the omitted code as a discrepancy, or clear a prior one.
+  if (invalidCnCode) {
+    await upsertProductDiscrepancy({
+      scopes: context.scopes,
+      productId: context.product.id,
+      sku: context.product.sku,
+      category: 'INVALID_HS_CODE',
+      imsValue: invalidCnCode,
+      wmsValue: null,
+      message: `IMS HS/CN code "${invalidCnCode}" is not a declarable 2026 CN8 (must be exactly 8 digits and present in the EU CN list). Code was omitted from the Mintsoft push.`,
+    })
+  } else {
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'INVALID_HS_CODE')
   }
 
   const externalProductId = resolveMintsoftExternalProductId({
@@ -660,20 +713,57 @@ async function syncOneMintsoftProduct(
     }
   }
 
-  const synced = await context.connector.upsertProduct(dto, {
-    externalProductId,
-    omitBarcode: barcodePlan.omitBarcode,
-  })
+  let synced: Awaited<ReturnType<typeof context.connector.upsertProduct>>
+  try {
+    synced = await context.connector.upsertProduct(dto, {
+      externalProductId,
+      omitBarcode: barcodePlan.omitBarcode,
+    })
+  } catch (error) {
+    await recordWmsMutationEvent({
+      connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'FAILED',
+      entityType: 'PRODUCT', entityId: context.product.id, externalId: externalProductId ?? null,
+      summary: `Mintsoft product upsert failed for ${context.product.sku}`,
+      before: { externalProductId: externalProductId ?? null },
+      error: error instanceof Error ? error.message : 'Mintsoft product upsert failed',
+    })
+    throw error
+  }
+  const upsertEvent = {
+    connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'SUCCEEDED',
+    entityType: 'PRODUCT', entityId: context.product.id, externalId: synced.externalId,
+    summary: synced.externalId === externalProductId
+      ? `Mintsoft product updated for ${context.product.sku}`
+      : `Mintsoft product created for ${context.product.sku}`,
+    before: { externalProductId: externalProductId ?? null, payloadHash: existingLink?.payloadHash ?? null },
+    after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, payloadHash },
+  } as const
 
-  await upsertMintsoftProductLink({
-    productId: context.product.id,
-    externalProductId: synced.externalId,
-    payloadHash,
-    lastKnownBarcode: trimToNull(synced.barcode) ?? dto.barcode,
-    metadata: toJsonPayload(synced.raw),
-    lastError: null,
-    touchLastSyncedAt: true,
-  })
+  // The event records only AFTER the local link persisted (Codex r2) — a link
+  // failure after a remote success is flagged, not silently reported clean.
+  // The catch covers ONLY the link upsert (Codex r3: a failure of the
+  // follow-up error-flag cleanup must not forge a false linkPersistFailed —
+  // the link itself is already durably written by then).
+  try {
+    await upsertMintsoftProductLink({
+      productId: context.product.id,
+      externalProductId: synced.externalId,
+      payloadHash,
+      lastKnownBarcode: trimToNull(synced.barcode) ?? dto.barcode,
+      metadata: toJsonPayload(synced.raw),
+      lastError: null,
+      touchLastSyncedAt: true,
+    })
+  } catch (persistError) {
+    await recordWmsMutationEvent({
+      ...upsertEvent,
+      summary: `${upsertEvent.summary}, but recording the product link failed`,
+      after: { ...upsertEvent.after, linkPersistFailed: true },
+      error: persistError instanceof Error ? persistError.message : 'Mintsoft product link persist failed',
+    })
+    throw persistError
+  }
+  await recordWmsMutationEvent(upsertEvent)
   await clearMintsoftProductLinkError(context.product.id)
 
   return {

@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
+  reduceSnapshotByQty,
   serializeCostLayerSnapshot,
   sumCostLayerSnapshot,
   takeFromSnapshotEntries,
@@ -139,4 +140,27 @@ test('transfer cost-layer snapshots serialize unit costs as six-decimal strings'
 
   const parsed = parseCostLayerSnapshot(serialized)
   assert.equal(parsed[0]?.unitCostBase, '1.123457')
+})
+
+test('reduceSnapshotByQty consumes FIFO across entries regardless of costLayerId (scjz.21)', () => {
+  const base = [
+    { costLayerId: 'alloc-layer-1', qty: '2.000000', unitCostBase: '5.000000' },
+    { costLayerId: 'alloc-layer-2', qty: '3.000000', unitCostBase: '6.000000' },
+  ]
+  // Relieve 4 units by qty — fully consumes layer-1 (2) then 2 of layer-2 — even
+  // though the deduction names no costLayerId (dispatch consumed different layers).
+  const remaining = reduceSnapshotByQty(base, 4)
+  assert.deepEqual(remaining, [
+    { costLayerId: 'alloc-layer-2', qty: '1.000000', unitCostBase: '6.000000' },
+  ])
+})
+
+test('reduceSnapshotByQty clamps at zero when over-reducing', () => {
+  const base = [{ costLayerId: 'alloc-layer-1', qty: '2.000000', unitCostBase: '5.000000' }]
+  assert.deepEqual(reduceSnapshotByQty(base, 10), [])
+})
+
+test('reduceSnapshotByQty leaves entries untouched for a non-positive qty', () => {
+  const base = [{ costLayerId: 'alloc-layer-1', qty: '2.000000', unitCostBase: '5.000000' }]
+  assert.deepEqual(reduceSnapshotByQty(base, 0), base)
 })

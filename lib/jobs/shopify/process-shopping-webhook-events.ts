@@ -1,7 +1,7 @@
 import {
   createShoppingWebhookEventRepository,
   type ShoppingWebhookEventRepository,
-} from '@/lib/connectors/woocommerce/webhook-inbox'
+} from '@/lib/connectors/shopping-webhook-inbox'
 import { processShopifyWebhookPayload } from '@/lib/connectors/shopify'
 import {
   processPendingShoppingWebhookEvents,

@@ -9,6 +9,7 @@ import {
   calculateInventoryTurnover,
   classifyVelocityQuartiles,
   normalizeVelocityWindow,
+  saleMovementCogsBase,
   type DailyVelocityRow,
 } from '@/lib/domain/inventory/velocity'
 
@@ -364,3 +365,19 @@ function velocityRowBase(productId: string, sku: string, cogsBase: string): Dail
     lastSaleAt: null,
   }
 }
+
+test('saleMovementCogsBase sums revaluation-aware CogsEntry totals over the point-in-time movement value', () => {
+  // After a landed-cost revaluation, CogsEntry.totalCostBase is updated but the
+  // movement's totalValueBase is not; the report must use the CogsEntry sum.
+  const cogs = saleMovementCogsBase({
+    totalValueBase: '10.000000',
+    cogsEntries: [{ totalCostBase: '6.500000' }, { totalCostBase: '5.250000' }],
+  })
+  assert.equal(cogs.toFixed(6), '11.750000')
+})
+
+test('saleMovementCogsBase falls back to the movement value when there is no COGS evidence', () => {
+  assert.equal(saleMovementCogsBase({ totalValueBase: '7.250000', cogsEntries: [] }).toFixed(6), '7.250000')
+  assert.equal(saleMovementCogsBase({ totalValueBase: '7.250000' }).toFixed(6), '7.250000')
+  assert.equal(saleMovementCogsBase({ totalValueBase: null }).toFixed(6), '0.000000')
+})

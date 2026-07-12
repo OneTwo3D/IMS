@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
 import { DEFAULT_BASE_CURRENCY, getFallbackCurrencyMeta, isBaseCurrencyLocked } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
@@ -197,8 +198,15 @@ const CORE_LEGACY_KEYS: Record<CoreNumberingKey, string[]> = {
   cn_prefix: ['numbering_cn_prefix'],
 }
 
-export async function getNumberingFormats(): Promise<NumberingFormats> {
-  await requireAuth()
+export async function getNumberingFormats(
+  options?: { internalBypassToken?: symbol },
+): Promise<NumberingFormats> {
+  // scjz.71: internal/cron callers (e.g. the payment-poller chargeback) have no user
+  // session, so requireAuth would redirect (NEXT_REDIRECT). The numbering formats are
+  // non-sensitive settings; bypass the session check for trusted internal callers.
+  if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+    await requireAuth()
+  }
 
   const connectorKeys = SHOPPING_CONNECTORS.flatMap((c) => [
     c.orderKey, c.invKey,

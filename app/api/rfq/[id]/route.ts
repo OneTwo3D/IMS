@@ -224,7 +224,7 @@ async function renderRfqPdf(po: RfqPurchaseOrder, tpl: RfqDocumentTemplate | nul
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Product', width: 125 },
+    { label: 'Product', width: 125, wrap: true },
     { label: 'Barcode / EAN', width: 75 },
     { label: 'MPN', width: 90 },
     { label: 'Quantity', width: 60, align: 'right' },

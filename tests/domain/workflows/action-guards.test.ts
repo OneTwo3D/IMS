@@ -19,8 +19,6 @@ test('sales order action guard allows current aggregate ship flow and blocks dir
   assert.deepEqual(validateSalesOrderStatusTransition('PENDING_PAYMENT', 'ALLOCATED'), { success: true })
   assert.deepEqual(validateSalesOrderStatusTransition('ALLOCATED', 'SHIPPED'), { success: true })
   assert.deepEqual(validateSalesOrderStatusTransition('SHIPPED', 'DELIVERED'), { success: true })
-  assert.deepEqual(validateSalesOrderStatusTransition('SHIPPED', 'PARTIALLY_REFUNDED'), { success: true })
-  assert.deepEqual(validateSalesOrderStatusTransition('PARTIALLY_REFUNDED', 'REFUNDED'), { success: true })
   assert.deepEqual(validateSalesOrderStatusTransition('DRAFT', 'SHIPPED'), {
     success: false,
     error: 'Cannot transition sales order from DRAFT to SHIPPED',
@@ -40,13 +38,11 @@ test('manual sales order status guard routes refund states through refund workfl
   })
 })
 
-test('refund sales order status guard permits repeated partial refunds without partial commits', () => {
-  assert.deepEqual(validateRefundSalesOrderStatusUpdate('SHIPPED', 'PARTIALLY_REFUNDED'), { success: true })
-  assert.deepEqual(validateRefundSalesOrderStatusUpdate('PARTIALLY_REFUNDED', 'PARTIALLY_REFUNDED'), { success: true })
-  assert.deepEqual(validateRefundSalesOrderStatusUpdate('REFUNDED', 'PARTIALLY_REFUNDED'), {
-    success: false,
-    error: 'Cannot transition sales order from REFUNDED to PARTIALLY_REFUNDED',
-  })
+test('refund sales order status guard short-circuits same-status updates; refund states are retired', () => {
+  // Refund state is the orthogonal refundStatus now; the lifecycle no longer has
+  // REFUNDED/PARTIALLY_REFUNDED, so they are not valid transition targets.
+  assert.deepEqual(validateRefundSalesOrderStatusUpdate('SHIPPED', 'SHIPPED'), { success: true })
+  assert.equal(validateRefundSalesOrderStatusUpdate('SHIPPED', 'PARTIALLY_REFUNDED').success, false)
 })
 
 test('shipment action guard blocks skipping pick and pack states', () => {

@@ -94,6 +94,40 @@ test('allocates landed cost by total line weight', () => {
   })
 })
 
+test('flags BY_WEIGHT lines that receive zero freight because their weight is zero/blank', () => {
+  // line-a weight 0 (positive qty), line-b weight 1: BY_WEIGHT puts all freight on
+  // line-b and none on line-a, which must raise a per-line diagnostic.
+  const zeroWeightLines: string[][] = []
+  const gross = Object.fromEntries(computeGrossUnitCostBaseByLine({
+    lines: [{ id: 'line-a', qty: 2, unitCostBase: 10, totalBase: 20, weight: 0 }, baseLines[1]],
+    directCostLines: [{ amountBase: 30, distributionMethod: 'BY_WEIGHT' }],
+    onWeightZeroLines: (lineIds) => zeroWeightLines.push(lineIds),
+  }))
+
+  assert.deepEqual(zeroWeightLines, [['line-a']])
+  // All freight landed on the weighted line.
+  assert.equal(gross['line-a'], 10)
+  assert.equal(gross['line-b'], 50)
+})
+
+test('does not flag zero-weight lines when every weight is zero (equal-split fallback) or method is not BY_WEIGHT', () => {
+  const allZero: string[][] = []
+  computeGrossUnitCostBaseByLine({
+    lines: [{ id: 'line-a', qty: 2, unitCostBase: 10, totalBase: 20, weight: 0 }, { id: 'line-b', qty: 1, unitCostBase: 20, totalBase: 20, weight: 0 }],
+    directCostLines: [{ amountBase: 30, distributionMethod: 'BY_WEIGHT' }],
+    onWeightZeroLines: (lineIds) => allZero.push(lineIds),
+  })
+  assert.deepEqual(allZero, [])
+
+  const nonWeight: string[][] = []
+  computeGrossUnitCostBaseByLine({
+    lines: [{ id: 'line-a', qty: 2, unitCostBase: 10, totalBase: 20, weight: 0 }, baseLines[1]],
+    directCostLines: [{ amountBase: 30, distributionMethod: 'BY_QUANTITY' }],
+    onWeightZeroLines: (lineIds) => nonWeight.push(lineIds),
+  })
+  assert.deepEqual(nonWeight, [])
+})
+
 test('allocates landed cost equally by eligible line', () => {
   assert.deepEqual(grossFor(30, 'EQUAL_SPLIT'), {
     'line-a': 17.5,
@@ -115,6 +149,10 @@ test('combines direct and linked landed-cost sources', () => {
 })
 
 test('retrospective layer adjustment splits inventory and consumed COGS deltas', () => {
+  // 10 received, 4 on hand, 6 consumed. Of the 6: 1 customer-returned (handled via
+  // refund snapshot, excluded) leaves 5 in the COGS delta — supplier-returned units
+  // are NOW included (scjz.10): they ride the same self-contained P&L pair as sold
+  // goods rather than being dropped.
   assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
     oldUnitCost: 10,
     newUnitCost: 12,
@@ -123,6 +161,48 @@ test('retrospective layer adjustment splits inventory and consumed COGS deltas',
     returnedQty: 1,
     supplierReturnedQty: 2,
     manufacturingConsumedQty: 0,
+  })), {
+    costDelta: 2,
+    consumedQty: 6,
+    netConsumedQty: 5,
+    cogsDelta: 10,
+    inventoryDelta: 8,
+  })
+})
+
+test('retrospective layer adjustment includes supplier-returned units in COGS (scjz.10)', () => {
+  // 10 received, 0 on hand, all 10 consumed: 4 supplier-returned + 6 sold. The
+  // supplier-returned units' late-cost delta must NOT be dropped — netConsumed = 10.
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 11,
+    receivedQty: 10,
+    remainingQty: 0,
+    returnedQty: 0,
+    supplierReturnedQty: 4,
+    manufacturingConsumedQty: 0,
+  })), {
+    costDelta: 1,
+    consumedQty: 10,
+    netConsumedQty: 10,
+    cogsDelta: 10,
+    inventoryDelta: 0,
+  })
+})
+
+test('retrospective layer adjustment excludes PURCHASE_REVERSAL-consumed units from COGS (scjz.14)', () => {
+  // 10 received, 4 on hand, 6 consumed = 4 sold + 2 supplier-returned + ... but 3
+  // of the consumed were PO-cancellation reversals (PURCHASE_REVERSAL), which are
+  // NOT customer COGS. netConsumed = 6 − 0 − 0 − 0 − 3 = 3, so COGS delta covers 3.
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 12,
+    receivedQty: 10,
+    remainingQty: 4,
+    returnedQty: 0,
+    supplierReturnedQty: 0,
+    manufacturingConsumedQty: 0,
+    reversalConsumedQty: 3,
   })), {
     costDelta: 2,
     consumedQty: 6,
@@ -150,7 +230,9 @@ test('retrospective layer adjustment handles landed-cost decreases', () => {
   })
 })
 
-test('retrospective layer adjustment excludes customer and supplier returns from COGS', () => {
+test('retrospective layer adjustment excludes customer returns but includes supplier returns in COGS (scjz.10)', () => {
+  // 6 consumed = 4 customer-returned (excluded — handled via refund snapshots) +
+  // 2 supplier-returned (now INCLUDED, scjz.10) → netConsumed = 2.
   const deltas = calculateLayerAdjustmentDeltas({
     oldUnitCost: 10,
     newUnitCost: 12,
@@ -161,8 +243,8 @@ test('retrospective layer adjustment excludes customer and supplier returns from
     manufacturingConsumedQty: 0,
   })
 
-  assert.equal(deltas.netConsumedQty.toNumber(), 0)
-  assert.equal(deltas.cogsDelta.toNumber(), 0)
+  assert.equal(deltas.netConsumedQty.toNumber(), 2)
+  assert.equal(deltas.cogsDelta.toNumber(), 4)
   assert.equal(deltas.inventoryDelta.toNumber(), 8)
 })
 
@@ -216,7 +298,7 @@ test('propagateLandedCostToOutputs cascades a component cost change through nest
   await propagateLandedCostToOutputs(
     tx as never, deps, 'comp-1', toDecimal(2),
     (c, i) => { cogs = cogs.add(c); inv = inv.add(i) },
-    new Set(), 1,
+    new Set(), 1, 'test-recalc-run', new Date('2026-06-20T00:00:00.000Z'),
   )
   // out-1 unit cost up 2×4/10 = 0.8 → 5.8; out-2 up 0.8×2/5 = 0.32 → 7.32.
   assert.equal(updates['out-1'], '5.8')
@@ -261,7 +343,7 @@ test('propagateLandedCostToOutputs accumulates BOTH paths of a diamond BOM (audi
   })
   await propagateLandedCostToOutputs(
     tx as never, deps, 'comp-1', toDecimal(1),
-    () => {}, new Set(), 1,
+    () => {}, new Set(), 1, 'test-recalc-run', new Date('2026-06-20T00:00:00.000Z'),
   )
   assert.equal(state['out-1'].unitCostBase, '4')
   assert.equal(state['out-2'].unitCostBase, '4')
@@ -306,6 +388,30 @@ test('returned quantity helpers return Decimal without fractional drift', async 
 
   assert.equal(customerReturned.toString(), '0.3')
   assert.equal(supplierReturned.toString(), '0.3')
+})
+
+test('snapshot updates lock matching rows FOR UPDATE before rewriting the JSON array', async () => {
+  const selectSqls: string[] = []
+  const tx = {
+    $queryRawUnsafe: async (sql: string) => {
+      selectSqls.push(sql)
+      return sql.includes('"shipment_lines"')
+        ? [{ id: 'row-a', costLayerSnapshot: [{ costLayerId: 'layer-a', qty: 1, unitCostBase: 10 }] }]
+        : []
+    },
+    $executeRawUnsafe: async () => 1,
+    activityLog: { create: async () => ({ id: 'activity-1' }) },
+  }
+
+  await updateSnapshotsForCostLayerChange(tx as never, 'layer-a', new Prisma.Decimal('12'))
+
+  // Every snapshot-row scan must take a row lock so a concurrent revaluation of
+  // another layer sharing the row cannot clobber the JSON array (scjz.7).
+  assert.ok(selectSqls.length > 0)
+  for (const sql of selectSqls) {
+    assert.match(sql, /SELECT id, "costLayerSnapshot"/)
+    assert.match(sql, /FOR UPDATE\s*$/)
+  }
 })
 
 test('snapshot updates accept Decimal input and serialize JSON unit costs as strings', async () => {
@@ -525,11 +631,14 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     getReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getSupplierReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getManufacturingConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
+    getReversalConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getDependentOutputSourceLines: async () => [],
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 0, cogsRevaluationDelta: new Prisma.Decimal(0) }),
     refreshSalesOrderLineCogsForCostLayerChange: async () => 0,
+    recordCostLayerRevaluation: async () => false,
     warnWeightFallback: () => {},
+    warnWeightZeroLines: () => {},
     ...overrides,
   }
 }
@@ -764,6 +873,46 @@ test('recalculateDirectLandedCosts falls back to equal split when every BY_WEIGH
   )
 })
 
+test('recalculateDirectLandedCosts records a cost-layer revaluation for each revalued layer (blq0)', async () => {
+  const { tx } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [
+      {
+        id: 'line-a',
+        qty: 2,
+        unitCostBase: 10,
+        totalBase: 20,
+        product: { weight: 0 },
+        costLayers: [{ id: 'layer-a', unitCostBase: 10, receivedQty: 2, remainingQty: 2 }],
+      },
+    ],
+    freightCostLines: [{ amountBase: 4, distributionMethod: 'BY_VALUE' }],
+    landedCostLinks: [],
+  })
+  const revaluations: Array<{ costLayerId: string; oldUnitCostBase: string; newUnitCostBase: string; reason: string }> = []
+  await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    recordCostLayerRevaluation: async (_tx, input) => {
+      revaluations.push({
+        costLayerId: input.costLayerId,
+        oldUnitCostBase: String(input.oldUnitCostBase),
+        newUnitCostBase: String(input.newUnitCostBase),
+        reason: input.reason,
+      })
+      return true
+    },
+  }), TEST_AUDIT_OPTIONS)
+
+  // Freight 4 spread over 2 units = +2/unit, so layer-a 10 → 12.
+  assert.deepEqual(revaluations, [{
+    costLayerId: 'layer-a',
+    oldUnitCostBase: '10',
+    newUnitCostBase: '12',
+    reason: 'landed_cost_recalc',
+  }])
+})
+
 test('recalculateDirectLandedCosts combines direct and linked landed-cost lines', async () => {
   const { tx, purchaseOrderLineUpdates } = createDirectTx({
     id: 'po-1',
@@ -842,6 +991,88 @@ test('recalculateDirectLandedCosts records direct and linked weight fallback war
     auditRun.data.warningsJson.map((warning) => warning.context),
     ['recalculateDirectLandedCosts:PO-1', 'recalculateDirectLandedCosts:PO-1:linked'],
   )
+})
+
+test('recalculateDirectLandedCosts warns when BY_WEIGHT gives a positive-qty zero-weight line no freight', async () => {
+  const zeroLineCalls: Array<{ context: string; lineIds: string[] }> = []
+  const { tx } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [
+      {
+        id: 'line-a',
+        qty: 1,
+        unitCostBase: 10,
+        landedUnitCostBase: 10,
+        totalBase: 10,
+        product: { weight: 0 },
+        costLayers: [{ id: 'layer-a', unitCostBase: 10, receivedQty: 1, remainingQty: 1 }],
+      },
+      {
+        id: 'line-b',
+        qty: 1,
+        unitCostBase: 20,
+        landedUnitCostBase: 20,
+        totalBase: 20,
+        product: { weight: 1 },
+        costLayers: [{ id: 'layer-b', unitCostBase: 20, receivedQty: 1, remainingQty: 1 }],
+      },
+    ],
+    freightCostLines: [{ amountBase: 5, distributionMethod: 'BY_WEIGHT' }],
+    landedCostLinks: [],
+  })
+
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    warnWeightZeroLines: (context, lineIds) => {
+      zeroLineCalls.push({ context, lineIds })
+      return { code: 'weight_zero_line', context, message: 'zero weight' }
+    },
+  }), TEST_AUDIT_OPTIONS)
+
+  assert.deepEqual(result.warnings.map((warning) => warning.code), ['weight_zero_line'])
+  assert.deepEqual(zeroLineCalls, [{ context: 'recalculateDirectLandedCosts:PO-1', lineIds: ['line-a'] }])
+})
+
+test('recalculateDirectLandedCosts does not warn on zero-weight lines for a zero/credit BY_WEIGHT cost line', async () => {
+  const zeroLineCalls: string[] = []
+  const { tx } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [
+      {
+        id: 'line-a',
+        qty: 1,
+        unitCostBase: 10,
+        landedUnitCostBase: 10,
+        totalBase: 10,
+        product: { weight: 0 },
+        costLayers: [{ id: 'layer-a', unitCostBase: 10, receivedQty: 1, remainingQty: 1 }],
+      },
+      {
+        id: 'line-b',
+        qty: 1,
+        unitCostBase: 20,
+        landedUnitCostBase: 20,
+        totalBase: 20,
+        product: { weight: 1 },
+        costLayers: [{ id: 'layer-b', unitCostBase: 20, receivedQty: 1, remainingQty: 1 }],
+      },
+    ],
+    freightCostLines: [{ amountBase: 0, distributionMethod: 'BY_WEIGHT' }],
+    landedCostLinks: [],
+  })
+
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    warnWeightZeroLines: (_context, lineIds) => {
+      zeroLineCalls.push(...lineIds)
+      return undefined
+    },
+  }), TEST_AUDIT_OPTIONS)
+
+  assert.deepEqual(result.warnings, [])
+  assert.deepEqual(zeroLineCalls, [])
 })
 
 test('recalculateDirectLandedCosts skips snapshot refresh when cost delta is negligible', async () => {
@@ -945,7 +1176,9 @@ test('recalculateDirectLandedCosts keeps fractional returns and snapshot cost as
   }), TEST_AUDIT_OPTIONS)
 
   assert.equal(snapshotUnitCost, '1.1')
-  assert.deepEqual(result.cogsAdjustments.map((adj) => adj.totalDelta), [0.02])
+  // scjz.10: supplier-returned (0.2) now counts toward COGS → netConsumed 0.4 ×
+  // costDelta 0.1 = 0.04 (was 0.02 when supplier returns were wrongly dropped).
+  assert.deepEqual(result.cogsAdjustments.map((adj) => adj.totalDelta), [0.04])
   assert.deepEqual(result.cogsAdjustments.map((adj) => adj.freightPoId), [null])
   assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.totalDelta), [0.05])
   assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.freightPoId), [null])

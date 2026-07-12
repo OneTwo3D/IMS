@@ -24,10 +24,13 @@ test.describe('workflow coverage', () => {
     const dialog = page.getByRole('dialog', { name: 'New Stock Adjustment' })
     await dialog.getByRole('heading', { name: 'New Stock Adjustment' }).waitFor()
     await dialog.getByPlaceholder(/search by sku or name/i).fill(product.sku)
-    await dialog.getByRole('button', { name: new RegExp(product.sku) }).first().click()
+    // vzlk-2c: search results are combobox options now, not plain buttons.
+    await dialog.getByRole('option', { name: new RegExp(product.sku) }).first().click()
 
-    const qtyInput = dialog.locator('input[type="number"]').last()
-    await qtyInput.fill('5')
+    // vzlk-2b: target the labelled qty field (no longer the last number input — that
+    // is the unit-cost field) and supply a unit cost for the positive new line.
+    await dialog.getByRole('spinbutton', { name: /quantity to add or remove/i }).last().fill('5')
+    await dialog.locator('input[title^="Unit cost"]').last().fill('10')
     await dialog.getByRole('button', { name: /save adjustments/i }).click()
 
     await expect(dialog.getByText(/1 adjustment saved\./i)).toBeVisible()

@@ -62,10 +62,10 @@ async function quarantinePriorFixtures() {
   await db.salesOrder.updateMany({
     where: {
       orderNumber: { startsWith: 'SO-E2E-XERO-' },
-      status: { not: 'REFUNDED' },
+      refundStatus: { not: 'FULL' },
     },
     data: {
-      status: 'REFUNDED',
+      refundStatus: 'FULL',
     },
   })
 }

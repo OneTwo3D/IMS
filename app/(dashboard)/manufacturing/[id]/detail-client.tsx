@@ -396,7 +396,7 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
               onChange={(e) => setCompletionQty(e.target.value)}
             />
             <p className="text-xs text-muted-foreground">
-              Planned {order.qtyPlanned}. Components are consumed at the planned BOM regardless, so a lower yield raises the per-unit cost of the good units.
+              Planned {order.qtyPlanned}. Completing always consumes the full planned BOM, so a lower figure is treated as <strong>yield loss</strong> (defective/scrapped output) and raises the per-unit cost of the remaining good units. If production was <strong>stopped early</strong> and components were not used, cancel the order or leave it In Progress instead — do not complete with a reduced quantity here.
             </p>
             {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
           </div>

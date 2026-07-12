@@ -94,7 +94,7 @@ const DETAIL_FIELDS: FieldDef[] = [
   { key: 'mpn', label: 'MPN', type: 'text' },
   { key: 'customerName', label: 'Customer', type: 'text' },
   { key: 'salesRep', label: 'Sales Rep', type: 'text' },
-  { key: 'status', label: 'Status', type: 'select', options: ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED', 'REFUNDED', 'CANCELLED'] },
+  { key: 'status', label: 'Status', type: 'select', options: ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] },
   { key: 'qty', label: 'Qty', type: 'number' },
   { key: 'totalBase', label: 'Total', type: 'number' },
   { key: 'createdAt', label: 'Created', type: 'text' },

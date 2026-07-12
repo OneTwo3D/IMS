@@ -3,8 +3,11 @@ import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 
-const HEADERS = ['sku', 'warehouseCode', 'qty', 'note']
-const TEMPLATE_HEADERS = ['sku', 'warehouseCode', 'qty', 'note']
+// unitCost (base currency) is optional but REQUIRED for a positive adjustment of a
+// product with no existing cost basis (cogs-audit scjz.2); blank uses the derived
+// average. Kept after qty so existing 4-column files still import.
+const HEADERS = ['sku', 'warehouseCode', 'qty', 'unitCost', 'note']
+const TEMPLATE_HEADERS = ['sku', 'warehouseCode', 'qty', 'unitCost', 'note']
 const REQUIRED_HEADERS = ['sku', 'warehouseCode', 'qty']
 
 export async function GET(req: Request) {
@@ -39,6 +42,7 @@ export async function GET(req: Request) {
       sku: m.product.sku,
       warehouseCode: warehouse?.code ?? '',
       qty: String(isAddition ? Number(m.qty) : -Number(m.qty)),
+      unitCost: isAddition && m.unitCostBase != null ? String(Number(m.unitCostBase)) : '',
       note: m.note ?? '',
     }
   })

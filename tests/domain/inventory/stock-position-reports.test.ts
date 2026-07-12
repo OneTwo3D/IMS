@@ -60,6 +60,9 @@ test('stock-on-hand report enriches as-of rows, totals the full filtered set, an
     orphanWarehouseMovementCount: 0,
     missingValueMovementSample: [],
     valueReplayReliable: true,
+    currentValueDriftCount: 0,
+    postAsOfRevaluationCount: 0,
+    staleSnapshotCount: 0,
   })
   const client = makeClient({
     product: {
@@ -116,6 +119,9 @@ test('stock-on-hand current report keeps live reservation scope', async () => {
     orphanWarehouseMovementCount: 0,
     missingValueMovementSample: [],
     valueReplayReliable: true,
+    currentValueDriftCount: 0,
+    postAsOfRevaluationCount: 0,
+    staleSnapshotCount: 0,
   })
   const client = makeClient({
     product: { findMany: async () => [product] },
@@ -153,6 +159,9 @@ test('stock-on-hand as-of report uses reservation snapshots when available', asy
     orphanWarehouseMovementCount: 0,
     missingValueMovementSample: [],
     valueReplayReliable: true,
+    currentValueDriftCount: 0,
+    postAsOfRevaluationCount: 0,
+    staleSnapshotCount: 0,
   })
   const client = makeClient({
     product: { findMany: async () => [product] },
@@ -202,6 +211,9 @@ test('stock-on-hand as-of report surfaces missing reservation snapshots and mark
     orphanWarehouseMovementCount: 0,
     missingValueMovementSample: [],
     valueReplayReliable: true,
+    currentValueDriftCount: 0,
+    postAsOfRevaluationCount: 0,
+    staleSnapshotCount: 0,
   })
   const client = makeClient({
     product: { findMany: async () => [product] },
@@ -242,6 +254,9 @@ test('stock-on-hand as-of report treats sparse missing rows as zero reserved whe
     orphanWarehouseMovementCount: 0,
     missingValueMovementSample: [],
     valueReplayReliable: true,
+    currentValueDriftCount: 0,
+    postAsOfRevaluationCount: 0,
+    staleSnapshotCount: 0,
   })
   const client = makeClient({
     product: { findMany: async () => [product] },
@@ -289,6 +304,9 @@ test('stock-on-hand as-of report marks mixed snapshot and current fallback rows 
     orphanWarehouseMovementCount: 0,
     missingValueMovementSample: [],
     valueReplayReliable: true,
+    currentValueDriftCount: 0,
+    postAsOfRevaluationCount: 0,
+    staleSnapshotCount: 0,
   })
   const client = makeClient({
     product: {
@@ -344,6 +362,9 @@ test('stock-on-hand current reverse replay uses current reservations instead of 
     orphanWarehouseMovementCount: 0,
     missingValueMovementSample: [],
     valueReplayReliable: true,
+    currentValueDriftCount: 0,
+    postAsOfRevaluationCount: 0,
+    staleSnapshotCount: 0,
   })
   const client = makeClient({
     product: { findMany: async () => [product] },
@@ -385,6 +406,9 @@ test('stock-on-hand reservation snapshot lookup filters cross-pair noise', async
     orphanWarehouseMovementCount: 0,
     missingValueMovementSample: [],
     valueReplayReliable: true,
+    currentValueDriftCount: 0,
+    postAsOfRevaluationCount: 0,
+    staleSnapshotCount: 0,
   })
   const warehouse2 = { id: 'warehouse-2', code: 'WH2', name: 'Second warehouse' }
   const client = makeClient({
@@ -472,6 +496,9 @@ test('negative stock report replays movements from an as-of opening balance and 
     orphanWarehouseMovementCount: 0,
     missingValueMovementSample: [],
     valueReplayReliable: true,
+    currentValueDriftCount: 0,
+    postAsOfRevaluationCount: 0,
+    staleSnapshotCount: 0,
   })
   const client = makeClient({
     stockMovement: {

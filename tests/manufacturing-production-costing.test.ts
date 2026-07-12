@@ -3,6 +3,7 @@ import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   buildOverheadAccountDeltas,
+  disassemblyProvenanceShare,
   recomputeManufacturingUnitCosts,
   stableHash,
 } from '../lib/domain/manufacturing/production-costing.ts'
@@ -228,4 +229,66 @@ test('overhead account deltas drop sub-half-penny rounded changes', () => {
 test('stableHash is key-sorted and uses full sha256 digest', () => {
   assert.equal(stableHash({ b: 1, a: 2 }), stableHash({ a: 2, b: 1 }))
   assert.equal(stableHash({ a: 2 }).length, 64)
+})
+
+// scjz.27: disassembly recovered layers must always get cost-layer source-line
+// provenance so a later landed-cost change on the output layer can propagate in.
+test('disassembly provenance: proportional share = baseAllocated / totalRecovered', () => {
+  const share = disassemblyProvenanceShare({
+    baseAllocatedCostBase: 6,
+    totalRecoveredCostBase: 10,
+    useEqualSplitOverhead: false,
+    componentCount: 2,
+  })
+  assert.equal(share?.toNumber(), 0.6)
+})
+
+test('disassembly provenance: proportional shares sum to 1 across components', () => {
+  // Two components allocated 6 and 4 of a 10 total recovered cost.
+  const shares = [6, 4].map((base) => disassemblyProvenanceShare({
+    baseAllocatedCostBase: base,
+    totalRecoveredCostBase: 10,
+    useEqualSplitOverhead: false,
+    componentCount: 2,
+  })!)
+  const total = shares.reduce((sum, s) => sum.add(s), new Prisma.Decimal(0))
+  assert.equal(total.toNumber(), 1)
+})
+
+test('disassembly provenance: equal-split path (zero-cost output) attributes 1/N', () => {
+  // totalRecoveredCostBase === 0 → value share is 0/0; fall back to an equal
+  // per-component share so the recovered layers still record provenance.
+  const share = disassemblyProvenanceShare({
+    baseAllocatedCostBase: 0,
+    totalRecoveredCostBase: 0,
+    useEqualSplitOverhead: true,
+    componentCount: 4,
+  })
+  assert.equal(share?.toNumber(), 0.25)
+})
+
+test('disassembly provenance: equal-split shares sum to 1 across components', () => {
+  const n = 3
+  const shares = Array.from({ length: n }, () => disassemblyProvenanceShare({
+    baseAllocatedCostBase: 0,
+    totalRecoveredCostBase: 0,
+    useEqualSplitOverhead: true,
+    componentCount: n,
+  })!)
+  const total = shares.reduce((sum, s) => sum.add(s), new Prisma.Decimal(0))
+  assert.equal(total.toNumber(), 1)
+})
+
+test('disassembly provenance: returns null when zero-cost output has no equal-split basis', () => {
+  // No recovered cost and not the equal-split path (e.g. zero components) → no
+  // provenance to write, so the caller skips the source-line insert.
+  assert.equal(
+    disassemblyProvenanceShare({
+      baseAllocatedCostBase: 0,
+      totalRecoveredCostBase: 0,
+      useEqualSplitOverhead: false,
+      componentCount: 0,
+    }),
+    null,
+  )
 })

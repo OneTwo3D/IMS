@@ -113,6 +113,16 @@ export function roundQuantity(value: DecimalInput, precision: number): Decimal {
   return toDecimal(value).toDecimalPlaces(precision, Prisma.Decimal.ROUND_HALF_UP)
 }
 
+/**
+ * Floor a quantity to `precision` decimal places (ROUND_DOWN). Use when a value
+ * must never exceed the input — e.g. capping a received quantity to a column's
+ * precision so a sub-granularity request can't round UP and over-book.
+ */
+export function floorQuantity(value: DecimalInput, precision: number): Decimal {
+  assertValidPrecision(precision)
+  return toDecimal(value).toDecimalPlaces(precision, Prisma.Decimal.ROUND_DOWN)
+}
+
 export function compareDecimal(a: DecimalInput, b: DecimalInput): -1 | 0 | 1 {
   const comparison = toDecimal(a).cmp(toDecimal(b))
   if (comparison < 0) return -1

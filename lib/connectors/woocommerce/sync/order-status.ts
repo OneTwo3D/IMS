@@ -5,7 +5,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
-import { wcPut } from '../api'
+import { wcFetch, wcPut } from '../api'
 import type { WcFullOrder } from './types'
 
 type SalesOrderStatus = string
@@ -107,6 +107,16 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
     const wcLink = order?.shoppingLinks[0]
     if (!order) return
     if (!wcLink?.externalOrderId) return // not a WC order
+
+    // Idempotent: skip the PUT when WooCommerce is already at the target status.
+    // Re-PUTting the same status risks re-firing storefront transition hooks (e.g. the
+    // AST despatch email) when another integration already moved the order — split-order
+    // completion via the companion plugin, or a WMS bridge pushing the status directly
+    // during the cutover period.
+    const currentWc = await wcFetch(`/orders/${wcLink.externalOrderId}`)
+    if (!currentWc.error && (currentWc.data as { status?: string } | null)?.status === externalStatus) {
+      return
+    }
 
     const { error } = await wcPut(`/orders/${wcLink.externalOrderId}`, { status: externalStatus })
 

@@ -6,7 +6,8 @@ import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { freshAuthFailureResult, getSession, requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
+import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
   fetchMintsoftAsns,
@@ -16,7 +17,7 @@ import {
   validateMintsoftBaseUrl,
   type MintsoftSettings,
 } from '@/lib/connectors/mintsoft'
-import { inferMintsoftOrderLookupConnector } from '@/lib/connectors/mintsoft/order-lookup'
+import { inferShoppingOrderLookupConnector } from '@/lib/fulfillment/shopping-order-lookup'
 import {
   clearMintsoftAlignmentCreditsForBinding,
   createMintsoftBindingHandover,
@@ -25,6 +26,7 @@ import {
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { runMintsoftBundleVerify } from '@/lib/connectors/mintsoft/sync/bundle-sync'
 import { parseMintsoftThresholds, sanitizeMintsoftThresholds } from '@/lib/connectors/mintsoft/sync/stock-sync-helpers'
+import { parseDefaultCourierId } from '@/lib/connectors/mintsoft/api/order-push'
 import {
   mapMintsoftReturnsInboxRow,
   runMintsoftReturnsSync,
@@ -47,6 +49,12 @@ import {
 } from '@/lib/integration-connection-test-gate'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsAsnPackagingType } from '@/lib/connectors/wms/types'
+import type {
+  WmsAsnRow,
+  WmsPurchaseOrderAsnStateCore,
+  WmsTransferAsnStateCore,
+  WmsCreateAsnInput,
+} from '@/lib/connectors/wms/asn-types'
 
 type MintsoftOrderLookupConnector = ShoppingConnectorId | ''
 
@@ -63,6 +71,12 @@ type MintsoftBindingSelect = {
   discrepancyThresholds: true
   reportRecipients: true
   alignmentConfirmedAt: true
+  alignDownReasonId: true
+  alignDownReason: {
+    select: {
+      name: true
+    }
+  }
   lastStockSyncAt: true
   lastStockSyncStatus: true
   warehouse: {
@@ -88,6 +102,12 @@ const mintsoftBindingSelect = {
   discrepancyThresholds: true,
   reportRecipients: true,
   alignmentConfirmedAt: true,
+  alignDownReasonId: true,
+  alignDownReason: {
+    select: {
+      name: true,
+    },
+  },
   lastStockSyncAt: true,
   lastStockSyncStatus: true,
   warehouse: {
@@ -155,6 +175,8 @@ export type MintsoftBindingRow = {
   reportRecipients: string[]
   alignmentConfirmedAt: string | null
   alignmentDryRunReady: boolean
+  alignDownReasonId: string | null
+  alignDownReasonName: string | null
   lastStockSyncAt: string | null
   lastStockSyncStatus: string | null
 }
@@ -212,46 +234,16 @@ type MintsoftReturnRestockActivityMetadata = {
   orderId: string | null
 }
 
-export type MintsoftPurchaseOrderAsnRow = {
-  id: string
-  externalAsnId: string
-  status: string
-  createdAt: string
-  lastCallbackAt: string | null
-  closedAt: string | null
-  lineCount: number
-  totalExpectedQty: string
-  totalReceivedQty: string
-}
+// ASN view-models conform to the connector-agnostic WMS contract
+// (lib/connectors/wms/asn-types.ts); core flows consume the generic types via
+// the app/actions/wms-asn.ts facade.
+export type MintsoftPurchaseOrderAsnRow = WmsAsnRow
 
-export type MintsoftPurchaseOrderAsnState = {
-  pluginEnabled: boolean
-  canCreate: boolean
-  canManage: boolean
-  blockedReason: string | null
-  destinationWarehouseCode: string | null
-  bindingExternalWarehouseId: string | null
-  existingAsns: MintsoftPurchaseOrderAsnRow[]
-}
+export type MintsoftPurchaseOrderAsnState = WmsPurchaseOrderAsnStateCore
 
-export type MintsoftTransferAsnState = {
-  pluginEnabled: boolean
-  canCreate: boolean
-  canManage: boolean
-  blockedReason: string | null
-  destinationWarehouseCode: string | null
-  bindingExternalWarehouseId: string | null
-  existingAsns: MintsoftPurchaseOrderAsnRow[]
-}
+export type MintsoftTransferAsnState = WmsTransferAsnStateCore
 
-export type MintsoftCreatePurchaseOrderAsnInput = {
-  packagingType?: WmsAsnPackagingType | null
-  packageCount?: number | null
-  eta?: string | null
-  supplierReference?: string | null
-  carrier?: string | null
-  autoCallback?: boolean
-}
+export type MintsoftCreatePurchaseOrderAsnInput = WmsCreateAsnInput
 
 export type MintsoftBundleLinkRow = {
   id: string
@@ -288,6 +280,14 @@ export type MintsoftDashboardData = {
   receiptReviewEventCount: number
   availableOrderLookupConnectors: ShoppingConnectorId[]
   orderLookupConnectorRequired: boolean
+  /** Active adjustment reasons for the align-down reason picker (6oyu.1). */
+  adjustmentReasons: MintsoftAdjustmentReasonOption[]
+}
+
+export type MintsoftAdjustmentReasonOption = {
+  id: string
+  name: string
+  hasAccountCode: boolean
 }
 
 export type MintsoftOnboardingConnectionData = {
@@ -320,6 +320,7 @@ export type MintsoftBindingInput = {
     percentDelta?: number | null
   }
   reportRecipients?: string[]
+  alignDownReasonId?: string | null
 }
 
 const MintsoftConnectionInputSchema = z.object({
@@ -347,6 +348,7 @@ const MintsoftBindingInputSchema = z.object({
     percentDelta: z.number().nonnegative().nullable().optional(),
   }).optional(),
   reportRecipients: z.array(z.string().email('Report recipients must be valid email addresses.')).optional(),
+  alignDownReasonId: z.string().min(1).nullable().optional(),
 })
 
 const MintsoftBindingDeleteSchema = z.string().min(1, 'Binding ID is required.')
@@ -414,6 +416,8 @@ function mapMintsoftBinding(row: {
   discrepancyThresholds: Prisma.JsonValue | null
   reportRecipients: string[]
   alignmentConfirmedAt: Date | null
+  alignDownReasonId: string | null
+  alignDownReason: { name: string } | null
   lastStockSyncAt: Date | null
   lastStockSyncStatus: string | null
   warehouse: {
@@ -442,6 +446,8 @@ function mapMintsoftBinding(row: {
     reportRecipients: row.reportRecipients,
     alignmentConfirmedAt: row.alignmentConfirmedAt?.toISOString() ?? null,
     alignmentDryRunReady: options?.alignmentDryRunReady ?? false,
+    alignDownReasonId: row.alignDownReasonId,
+    alignDownReasonName: row.alignDownReason?.name ?? null,
     lastStockSyncAt: row.lastStockSyncAt?.toISOString() ?? null,
     lastStockSyncStatus: row.lastStockSyncStatus,
   }
@@ -624,6 +630,96 @@ async function requireMintsoftReturnsWriteAccess() {
   return requirePermission('stock_control.adjust')
 }
 
+/** Carrier mapping: IMS shipping-service name → Mintsoft CourierServiceId (Phase 8). */
+export async function getMintsoftCourierServiceMap(): Promise<string> {
+  await requireMintsoftReadAccess()
+  return (await getMintsoftSettings()).mintsoft_courier_service_map
+}
+
+export async function saveMintsoftCourierServiceMap(rawJson: unknown): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftWriteAccess()
+  const json = typeof rawJson === 'string' ? rawJson.trim() : ''
+  if (json) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(json)
+    } catch {
+      return { success: false, error: 'Invalid JSON.' }
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { success: false, error: 'Provide a JSON object of shipping-service name → courier service id.' }
+    }
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const id = typeof value === 'number' ? value : Number(String(value).trim())
+      if (!Number.isInteger(id) || id <= 0) {
+        return { success: false, error: `Value for "${key}" must be a positive integer courier service id.` }
+      }
+    }
+  }
+  await db.setting.upsert({
+    where: { key: 'mintsoft_courier_service_map' },
+    create: { key: 'mintsoft_courier_service_map', value: serializeSettingValue('mintsoft_courier_service_map', json) },
+    update: { value: serializeSettingValue('mintsoft_courier_service_map', json) },
+  })
+  revalidatePath('/sync')
+  return { success: true }
+}
+
+/**
+ * Order dispatch deep-link template + courier fallback (Phase 8). Both feed the
+ * outbound order-push / order-status flow and previously had no UI — settable
+ * only via raw DB. A blank template falls back to the proven default; a blank
+ * courier id means "no fallback".
+ */
+export async function getMintsoftOrderDispatchSettings(): Promise<{
+  adminOrderUrlTemplate: string
+  defaultCourierServiceId: string
+}> {
+  await requireMintsoftReadAccess()
+  const settings = await getMintsoftSettings()
+  return {
+    adminOrderUrlTemplate: settings.mintsoft_admin_order_url_template,
+    defaultCourierServiceId: settings.mintsoft_default_courier_service_id,
+  }
+}
+
+export async function saveMintsoftOrderDispatchSettings(input: {
+  adminOrderUrlTemplate?: unknown
+  defaultCourierServiceId?: unknown
+}): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftWriteAccess()
+
+  const template = typeof input?.adminOrderUrlTemplate === 'string' ? input.adminOrderUrlTemplate.trim() : ''
+  if (template && !template.includes('{id}')) {
+    return { success: false, error: 'The order URL template must contain the {id} placeholder.' }
+  }
+
+  const courierRaw =
+    typeof input?.defaultCourierServiceId === 'number'
+      ? String(input.defaultCourierServiceId)
+      : typeof input?.defaultCourierServiceId === 'string'
+        ? input.defaultCourierServiceId.trim()
+        : ''
+  if (courierRaw && parseDefaultCourierId(courierRaw) == null) {
+    return { success: false, error: 'Default courier service id must be a whole positive number, or blank for no fallback.' }
+  }
+
+  await db.$transaction([
+    db.setting.upsert({
+      where: { key: 'mintsoft_admin_order_url_template' },
+      create: { key: 'mintsoft_admin_order_url_template', value: serializeSettingValue('mintsoft_admin_order_url_template', template) },
+      update: { value: serializeSettingValue('mintsoft_admin_order_url_template', template) },
+    }),
+    db.setting.upsert({
+      where: { key: 'mintsoft_default_courier_service_id' },
+      create: { key: 'mintsoft_default_courier_service_id', value: serializeSettingValue('mintsoft_default_courier_service_id', courierRaw) },
+      update: { value: serializeSettingValue('mintsoft_default_courier_service_id', courierRaw) },
+    }),
+  ])
+  revalidatePath('/sync')
+  return { success: true }
+}
+
 function getAvailableOrderLookupConnectors(pluginState: {
   woocommerce: boolean
   shopify: boolean
@@ -649,7 +745,7 @@ function buildMintsoftConnectionFingerprint(input: {
 }
 
 async function ensureMintsoftConnectionId(): Promise<string> {
-  const inferredOrderLookupConnector = await inferMintsoftOrderLookupConnector()
+  const inferredOrderLookupConnector = await inferShoppingOrderLookupConnector()
   const existingConnection = await db.wmsConnection.findFirst({
     where: { connector: 'mintsoft' },
     orderBy: [{ createdAt: 'asc' }],
@@ -941,6 +1037,11 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     }),
     getIntegrationPluginState(),
   ])
+  const adjustmentReasons = await db.adjustmentReason.findMany({
+    where: { active: true },
+    orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+    select: { id: true, name: true, accountCode: true },
+  })
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
   const alignmentDryRunReadyWarehouseIds = new Set(
     dryRunReadyJobs
@@ -1008,6 +1109,11 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     receiptReviewEventCount,
     availableOrderLookupConnectors,
     orderLookupConnectorRequired: availableOrderLookupConnectors.length > 1,
+    adjustmentReasons: adjustmentReasons.map((reason) => ({
+      id: reason.id,
+      name: reason.name,
+      hasAccountCode: Boolean(reason.accountCode),
+    })),
   }
 }
 
@@ -1064,8 +1170,8 @@ export async function getMintsoftOnboardingConnectionData(): Promise<MintsoftOnb
 export async function getMintsoftPurchaseOrderAsnState(
   poId: string,
 ): Promise<MintsoftPurchaseOrderAsnState> {
-  const [session, pluginEnabled, po, existingAsns] = await Promise.all([
-    getSession(),
+  const session = await requireMintsoftReadAccess()
+  const [pluginEnabled, po, existingAsns] = await Promise.all([
     isIntegrationPluginEnabled('mintsoft'),
     db.purchaseOrder.findUnique({
       where: { id: poId },
@@ -1121,7 +1227,7 @@ export async function getMintsoftPurchaseOrderAsnState(
     }),
   ])
 
-  const canManage = session?.user ? hasPermission(session.user.role, 'purchasing.receive') : false
+  const canManage = hasPermission(session.user.role, 'purchasing.receive')
 
   if (!po) {
     return {
@@ -1567,6 +1673,23 @@ export async function saveMintsoftBinding(
     }
   }
 
+  // 6oyu.1: the align-down reason must be an active reason WITH a GL account —
+  // align-down books a write-off, and without an account code the inventory GL
+  // would silently diverge from the stock it removes.
+  const alignDownReasonId = data.alignDownReasonId ?? null
+  if (alignDownReasonId) {
+    const reason = await db.adjustmentReason.findUnique({
+      where: { id: alignDownReasonId },
+      select: { active: true, accountCode: true },
+    })
+    if (!reason || !reason.active) {
+      return { success: false, error: 'The align-down adjustment reason no longer exists or is inactive.' }
+    }
+    if (!reason.accountCode) {
+      return { success: false, error: 'The align-down adjustment reason needs a GL account code so write-offs post to the ledger.' }
+    }
+  }
+
   const connectionId = await ensureMintsoftConnectionId()
   const reportRecipients = Array.from(new Set((data.reportRecipients ?? []).map((recipient) => recipient.trim().toLowerCase()).filter(Boolean)))
   const discrepancyThresholds = sanitizeMintsoftThresholds(data.discrepancyThresholds)
@@ -1582,6 +1705,7 @@ export async function saveMintsoftBinding(
     returnsMode: data.returnsMode ?? 'DISABLED',
     syncFrequencyMinutes: Math.max(1, Math.trunc(data.syncFrequencyMinutes ?? 60)),
     reportRecipients,
+    alignDownReasonId: nextStockSyncMode === 'ALIGN_TO_WMS' ? alignDownReasonId : null,
     ...(discrepancyThresholds
       ? { discrepancyThresholds }
       : { discrepancyThresholds: Prisma.JsonNull }),
@@ -2260,6 +2384,13 @@ export async function createMintsoftPurchaseOrderAsn(
           throw new Error('This purchase order has no outstanding quantity left to place on an ASN.')
         }
 
+        // q66in.4.6: a retry may carry a NEW ETA — keep the watchdog anchored to
+        // the value actually sent to the WMS, not the first attempt's.
+        await tx.wmsAsnMap.update({
+          where: { id: pendingAsn.id },
+          data: { eta: etaIso ? new Date(etaIso) : null },
+        })
+
         const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
         const pendingLineBySourceLineId = new Map(pendingAsn.lines.map((line) => [line.sourceLineId, line]))
         const activeSourceLineIds = outstandingLines.map((line) => line.sourceLineId)
@@ -2371,6 +2502,8 @@ export async function createMintsoftPurchaseOrderAsn(
           sourceId: po.id,
           warehouseId: po.destinationWarehouseId,
           status: 'CREATE_PENDING',
+          // q66in.4.6: the watchdog's overdue-ASN SLO anchors on the ETA.
+          eta: etaIso ? new Date(etaIso) : null,
           lines: {
             create: outstandingLines.map((line) => ({
               externalAsnLineId: `pending:${line.sourceLineId}`,
@@ -2720,6 +2853,24 @@ export async function createMintsoftPurchaseOrderAsn(
           lineCount: outcome.lineCount,
           callbackUrl,
           autoCallback,
+        },
+      })
+      await recordWmsMutationEvent({
+        connector: 'mintsoft', direction: 'OUTBOUND', action: 'asn_create', outcome: 'SUCCEEDED',
+        entityType: 'ASN', entityId: outcome.asnMapId, externalId: outcome.externalAsnId, jobId: job.id,
+        summary: `${outcome.kind === 'recovered' ? 'Recovered' : 'Created'} Mintsoft ASN ${outcome.externalAsnId} for purchase order ${parsedId.data}`,
+        after: {
+          warehouseCode: outcome.warehouseCode,
+          kind: outcome.kind,
+          lineCount: outcome.lineCount,
+          ...('lines' in reservation
+            ? {
+                reference: reservation.reference,
+                eta: reservation.eta ?? null,
+                carrier: reservation.carrier ?? null,
+                lines: reservation.lines.map((line) => ({ sku: line.sku, quantity: line.expectedQty })),
+              }
+            : {}),
         },
       })
 
@@ -3161,6 +3312,13 @@ export async function createMintsoftTransferAsn(
           throw new Error('This transfer has no outstanding quantity left to place on an ASN.')
         }
 
+        // q66in.4.6: a retry may carry a NEW ETA — keep the watchdog anchored to
+        // the value actually sent to the WMS, not the first attempt's.
+        await tx.wmsAsnMap.update({
+          where: { id: pendingAsn.id },
+          data: { eta: etaIso ? new Date(etaIso) : null },
+        })
+
         const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
         const pendingLineBySourceLineId = new Map(pendingAsn.lines.map((line) => [line.sourceLineId, line]))
         const activeSourceLineIds = outstandingLines.map((line) => line.sourceLineId)
@@ -3272,6 +3430,8 @@ export async function createMintsoftTransferAsn(
           sourceId: transfer.id,
           warehouseId: transfer.toWarehouseId,
           status: 'CREATE_PENDING',
+          // q66in.4.6: the watchdog's overdue-ASN SLO anchors on the ETA.
+          eta: etaIso ? new Date(etaIso) : null,
           lines: {
             create: outstandingLines.map((line) => ({
               externalAsnLineId: `pending:${line.sourceLineId}`,
@@ -3621,6 +3781,24 @@ export async function createMintsoftTransferAsn(
           lineCount: outcome.lineCount,
           callbackUrl,
           autoCallback,
+        },
+      })
+      await recordWmsMutationEvent({
+        connector: 'mintsoft', direction: 'OUTBOUND', action: 'asn_create', outcome: 'SUCCEEDED',
+        entityType: 'ASN', entityId: outcome.asnMapId, externalId: outcome.externalAsnId, jobId: job.id,
+        summary: `${outcome.kind === 'recovered' ? 'Recovered' : 'Created'} Mintsoft ASN ${outcome.externalAsnId} for transfer ${parsedId.data}`,
+        after: {
+          warehouseCode: outcome.warehouseCode,
+          kind: outcome.kind,
+          lineCount: outcome.lineCount,
+          ...('lines' in reservation
+            ? {
+                reference: reservation.reference,
+                eta: reservation.eta ?? null,
+                carrier: reservation.carrier ?? null,
+                lines: reservation.lines.map((line) => ({ sku: line.sku, quantity: line.expectedQty })),
+              }
+            : {}),
         },
       })
 

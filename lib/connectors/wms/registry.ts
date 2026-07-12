@@ -1,5 +1,6 @@
 import type { WmsConnector, WmsConnectorId } from './types'
 import { MintsoftConnector } from '@/lib/connectors/mintsoft'
+import { ShipheroConnector } from '@/lib/connectors/shiphero'
 
 export type WmsConnectorDef = {
   id: WmsConnectorId
@@ -11,6 +12,11 @@ export const WMS_CONNECTORS: readonly WmsConnectorDef[] = [
   {
     id: 'mintsoft',
     label: 'Mintsoft',
+    available: true,
+  },
+  {
+    id: 'shiphero',
+    label: 'ShipHero',
     available: true,
   },
 ] as const
@@ -25,6 +31,8 @@ export function getWmsConnector(id: WmsConnectorId): WmsConnector {
   switch (id) {
     case 'mintsoft':
       return new MintsoftConnector()
+    case 'shiphero':
+      return new ShipheroConnector()
     default:
       throw new Error(`Unknown WMS connector: ${id}`)
   }

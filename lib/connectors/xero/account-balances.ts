@@ -137,7 +137,11 @@ export function parseXeroTrialBalanceRows(report: XeroTrialBalanceReport): Parse
 }
 
 function configuredAccountCodes(settings: Awaited<ReturnType<typeof getXeroSettings>>): string[] {
-  return [settings.xero_inventory_account, settings.xero_cogs_account]
+  // Allocated Inventory is synced alongside Inventory + COGS so the inventory
+  // GL <-> cost-layer reconciliation (scjz.60c/.74) has both on-hand legs (value
+  // sits in the Allocated-Inventory contra between A2 and dispatch) on a common
+  // balance date; without it the reconciliation stays permanently unavailable.
+  return [settings.xero_inventory_account, settings.xero_allocated_inventory_account, settings.xero_cogs_account]
     .map((code) => code.trim())
     .filter((code): code is string => code.length > 0)
 }
@@ -170,7 +174,13 @@ export function buildXeroAccountBalanceSnapshotInputs(
   const errors: string[] = []
   for (const account of input.accounts) {
     const parsed = matchParsedBalance(account, input.parsedRows)
-    if (!parsed) {
+    // Xero omits zero-balance accounts from the Trial Balance, so a configured
+    // (and therefore real) chart account with no matching row simply has a zero
+    // balance — synthesize a zero snapshot rather than failing the whole sync.
+    // Guard on a non-empty report: if NOTHING parsed, the fetch/parse itself
+    // failed, so a missing row is a real error, not a genuine zero balance.
+    const amount = parsed ? parsed.amount : 0
+    if (!parsed && input.parsedRows.length === 0) {
       errors.push(`No Trial Balance row matched configured account ${account.code ?? account.externalAccountId} (${account.name}).`)
       continue
     }
@@ -181,8 +191,8 @@ export function buildXeroAccountBalanceSnapshotInputs(
       accountName: account.name,
       balanceDate: input.balanceDate,
       currency: input.baseCurrency,
-      amountForeign: parsed.amount,
-      amountBase: parsed.amount,
+      amountForeign: amount,
+      amountBase: amount,
       sourcePayloadRef: `xero:trial-balance:${input.balanceDate}`,
       syncRunId: input.syncRunId ?? null,
     })

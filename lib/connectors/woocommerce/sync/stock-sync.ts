@@ -38,6 +38,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import type { Prisma } from '@/app/generated/prisma/client'
+import { toDecimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
@@ -247,7 +248,7 @@ async function invalidateMappingIfVersionMatches(
   }
 }
 
-type PushEntry = {
+export type PushEntry = {
   productId: string
   sku: string
   externalId: number
@@ -259,7 +260,7 @@ type PushEntry = {
   }
 }
 
-type VariantPushEntry = PushEntry & {
+export type VariantPushEntry = PushEntry & {
   parentWcId: number
 }
 
@@ -268,7 +269,7 @@ type EffectiveTarget = {
   parentWcId?: number
 }
 
-type CandidateProduct = {
+export type CandidateProduct = {
   id: string
   sku: string
   type: 'SIMPLE' | 'VARIANT' | 'KIT' | 'BOM'
@@ -447,18 +448,24 @@ async function pushBatchWithFence(
   })
 }
 
-function emptyResult(message: string): StockSyncResult {
+// A gate-refusal result: the run was refused before any work started. Marked
+// `aborted` so a manual push surfaces it as an error and the job queue
+// retains the job for retry (see shouldRetainJob) instead of treating it as
+// a benign "nothing to push" no-op. Not for benign empty outcomes — those are
+// built inline with aborted unset.
+function gateRefusalResult(message: string): StockSyncResult {
   return {
     synced: 0, skipped: 0, errors: [],
     candidates: 0, matched: 0, unmatched: 0,
     pushed: false, message, unmatchedSkuSample: [],
+    aborted: true,
   }
 }
 
 export async function pushStockToWc(options?: PushStockOptions): Promise<StockSyncResult> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (enabled?.value !== 'true') {
-    return emptyResult('Stock sync is disabled in settings')
+    return gateRefusalResult('Stock sync is disabled in settings')
   }
   const scopedProductIds = options?.productIds ? [...new Set(options.productIds)] : null
   const forceProductIds = new Set(options?.forceProductIds ?? [])
@@ -495,7 +502,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // run — see the concurrency-safety note at the top of this file.
   const { creds, syncVersion } = await snapshotSyncContext()
   if (!creds) {
-    return emptyResult('WooCommerce credentials are not configured')
+    return gateRefusalResult('WooCommerce credentials are not configured')
   }
 
   const warehouses = await db.warehouse.findMany({
@@ -503,24 +510,65 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     select: { id: true },
   })
   if (!warehouses.length) {
-    return emptyResult('No warehouses flagged syncToStore')
+    return gateRefusalResult('No warehouses flagged syncToStore')
   }
 
   const whIds = warehouses.map((w) => w.id)
-  const scopedComponentIds = scopedProductIds
+  // d2jd: a scoped VARIABLE parent must expand to ALL its child products. The
+  // stockable units are the children, not the non-stockable VARIABLE parent, and
+  // this sync treats ANY product with a parent as a Woo variation candidate — so a
+  // child may be a VARIANT, KIT or BOM (the candidate filter later drops only
+  // VARIABLE/NON_INVENTORY). Without this, scoping just the parent id (e.g. a
+  // parent-product edit enqueues only the parent) pushed ZERO child stock until the
+  // daily forceAll reconcile. Expanding to the children makes a parent-scoped sync
+  // behave as if every child id had been scoped directly.
+  const scopedChildRows = scopedProductIds
+    ? await db.product.findMany({
+        where: { parentId: { in: scopedProductIds } },
+        select: { id: true, parentId: true },
+      })
+    : []
+  const scopedChildIds = scopedChildRows.map((row) => row.id)
+  // d2jd (force parity): if a VARIABLE parent is FORCED, force its children too.
+  // The children are candidates via the expansion above, but the no-change dedupe
+  // below would skip an unchanged child — leaving a forced/webhook job at synced=0
+  // that shouldRetainJob re-queues until it dead-letters at MAX_ATTEMPTS. On a
+  // parent-scoped run no child has its own force entry, so propagate it here.
+  for (const row of scopedChildRows) {
+    if (row.parentId && forceProductIds.has(row.parentId)) {
+      forceProductIds.add(row.id)
+    }
+  }
+  // The scoped set "as if each child were scoped directly": parents + their children.
+  // Used for the candidate-product id match.
+  const scopedProductAndVariantIds = scopedProductIds
+    ? [...new Set([...scopedProductIds, ...scopedChildIds])]
+    : null
+  // KIT components of the expanded set (parents + children) so a scoped/child KIT has
+  // its component stock loaded for availability.
+  //
+  // NOTE (codex P1): we deliberately do NOT widen the dependent-KIT match (the OR
+  // clause below) to the expanded children. Adding a KIT that uses an expanded child
+  // as a component would make it a candidate WITHOUT loading that kit's OTHER
+  // components' stock, so computeKitAvailability would read them as 0 and could push
+  // the kit's Woo stock to 0 on an unrelated parent edit. The dependent-KIT match
+  // therefore stays on the originally-scoped ids (unchanged pre-existing behaviour);
+  // a kit that only references an expanded child is corrected by the daily forceAll
+  // reconcile — the same safety net the rest of this scoped path relies on.
+  const scopedComponentIds = scopedProductAndVariantIds
     ? [
         ...new Set(
           (
             await db.productComponent.findMany({
-              where: { productId: { in: scopedProductIds } },
+              where: { productId: { in: scopedProductAndVariantIds } },
               select: { componentId: true },
             })
           ).map((row) => row.componentId),
         ),
       ]
     : []
-  const scopedStockProductIds = scopedProductIds
-    ? [...new Set([...scopedProductIds, ...scopedComponentIds])]
+  const scopedStockProductIds = scopedProductAndVariantIds
+    ? [...new Set([...scopedProductAndVariantIds, ...scopedComponentIds])]
     : null
 
   const stockLevels = await db.stockLevel.findMany({
@@ -530,16 +578,6 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     },
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
-
-  const stockByProduct = new Map<string, number>()
-  const stockByProductWarehouse = new Map<string, Map<string, number>>()
-  for (const sl of stockLevels) {
-    const available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
-    stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
-    const byWarehouse = stockByProductWarehouse.get(sl.productId) ?? new Map<string, number>()
-    byWarehouse.set(sl.warehouseId, available)
-    stockByProductWarehouse.set(sl.productId, byWarehouse)
-  }
 
   const cogsSetting = await db.setting.findUnique({ where: { key: 'wc_cogs_sync_enabled' } })
   const cogsSyncEnabled = cogsSetting?.value === 'true'
@@ -552,7 +590,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       ...(scopedProductIds
         ? {
             OR: [
-              { id: { in: scopedProductIds } },
+              { id: { in: scopedProductAndVariantIds ?? scopedProductIds } },
               {
                 type: 'KIT',
                 productComponents: { some: { componentId: { in: scopedProductIds } } },
@@ -585,30 +623,108 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   const products = rawProducts.filter(
     (p): p is CandidateProduct => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY',
   )
+
+  // yi4m: a KIT candidate's component may ITSELF be a KIT (nested). computeKitAvailability
+  // recurses only when that nested KIT is present in productById; a scoped sync that
+  // didn't independently select the nested KIT would otherwise read its availability as
+  // 0 and understate the parent. Resolve nested KITs (and deeper nesting) here, for the
+  // availability graph ONLY — they are added to productById below but NOT to `products`,
+  // so they are not themselves pushed. Unscoped runs already select every KIT.
+  const candidateIds = new Set(products.map((p) => p.id))
+  const nestedKitById = new Map<string, CandidateProduct>()
+  if (scopedProductIds) {
+    const kitComponentFrontier = (kits: CandidateProduct[]): string[] =>
+      [
+        ...new Set(
+          kits.flatMap((p) =>
+            p.type === 'KIT'
+              ? p.productComponents.filter((c) => c.component.type === 'KIT').map((c) => c.componentId)
+              : [],
+          ),
+        ),
+      ].filter((id) => !candidateIds.has(id) && !nestedKitById.has(id))
+    let frontier = kitComponentFrontier(products)
+    while (frontier.length > 0) {
+      const fetched = await db.product.findMany({
+        where: { id: { in: frontier } },
+        select: {
+          id: true,
+          sku: true,
+          type: true,
+          lifecycleStatus: true,
+          externalProductId: true,
+          parent: { select: { sku: true, externalProductId: true } },
+          productComponents: {
+            select: {
+              componentId: true,
+              qty: true,
+              component: { select: { type: true, lifecycleStatus: true } },
+            },
+          },
+        },
+      })
+      const fetchedKits = fetched.filter(
+        (p): p is CandidateProduct => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY',
+      )
+      for (const kit of fetchedKits) nestedKitById.set(kit.id, kit)
+      // Deeper nesting; the candidateIds/nestedKitById filter guarantees termination,
+      // even on a KIT cycle (computeKitAvailability separately flags the cycle itself).
+      frontier = kitComponentFrontier(fetchedKits)
+    }
+  }
+  // All KITs whose component stock must be loaded for the availability calc: the push
+  // candidates plus the nested KITs resolved above.
+  const kitsNeedingComponentStock = [...products, ...nestedKitById.values()]
+
+  // bghy: a KIT can be selected because it CONTAINS a scoped product as a component,
+  // but the stock fetch above only loaded the scoped ids (+ components of scoped KITs)
+  // — NOT that KIT's OTHER components. computeAvailableByProduct reads missing
+  // component stock as 0 and would understate (often zero out) the KIT. Load the
+  // sibling-component stock for all KIT candidates that wasn't already fetched, so the
+  // availability calc has a full basis. Unscoped runs already load everything.
+  let stockLevelsForMaps = stockLevels
+  // The complete scoped stock id set INCLUDING KIT siblings — passed to the fresh
+  // re-fetch (oversell-window clamp) below so it has the same basis; otherwise the
+  // min(snapshot, fresh) clamp would re-introduce the under-push (bghy).
+  let scopedStockIdsWithSiblings = scopedStockProductIds
+  if (scopedStockProductIds) {
+    const alreadyFetched = new Set(scopedStockProductIds)
+    const missingComponentIds = [
+      ...new Set(
+        kitsNeedingComponentStock.flatMap((p) =>
+          p.type === 'KIT' ? p.productComponents.map((c) => c.componentId) : [],
+        ),
+      ),
+    ].filter((componentId) => !alreadyFetched.has(componentId))
+    if (missingComponentIds.length > 0) {
+      const siblingStockLevels = await db.stockLevel.findMany({
+        where: { warehouseId: { in: whIds }, productId: { in: missingComponentIds } },
+        select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
+      })
+      stockLevelsForMaps = [...stockLevels, ...siblingStockLevels]
+      scopedStockIdsWithSiblings = [...scopedStockProductIds, ...missingComponentIds]
+    }
+  }
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevelsForMaps)
+
   const result: StockSyncResult = {
     synced: 0, skipped: 0, errors: [],
     candidates: products.length, matched: 0, unmatched: 0,
     pushed: false, message: '', unmatchedSkuSample: [],
   }
-  const productById = new Map(products.map((product) => [product.id, product]))
-  const availableByProduct = new Map<string, number>()
-  const kitAvailabilityMemo = new Map<string, number>()
-  const kitAvailabilityErrors = new Set<string>()
-  for (const product of products) {
-    const available = product.type === 'KIT'
-      ? computeKitAvailability(
-          product,
-          whIds,
-          stockByProductWarehouse,
-          productById,
-          kitAvailabilityMemo,
-          new Set<string>(),
-          result.errors,
-          kitAvailabilityErrors,
-        )
-      : (stockByProduct.get(product.id) ?? 0)
-    availableByProduct.set(product.id, available)
-  }
+  // yi4m: include nested KITs so computeKitAvailability can recurse into them; they are
+  // lookup-only here (not in `products`, so not pushed).
+  const productById = new Map(
+    [...products, ...nestedKitById.values()].map((product) => [product.id, product]),
+  )
+  const availableByProduct = computeAvailableByProduct(
+    products,
+    whIds,
+    stockByProduct,
+    stockByProductWarehouse,
+    productById,
+    result.errors,
+  )
 
   const previousStates = await db.stockSyncState.findMany({
     where: {
@@ -898,18 +1014,48 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // -------- COGS gathering --------
   const cogsByProduct = new Map<string, number>()
   if (cogsSyncEnabled) {
-    for (const product of products) {
-      if (!effectiveTargets.has(product.id)) continue
-      const oldestLayer = await db.costLayer.findFirst({
-        where: { productId: product.id, remainingQty: { gt: 0 } },
-        orderBy: { receivedAt: 'asc' },
-        select: { unitCostBase: true },
+    // rryh: push the WEIGHTED-AVERAGE remaining unit cost across ALL open FIFO
+    // layers, not just the oldest layer's cost. The oldest-only value made the
+    // store COGS jump each time the oldest layer was exhausted and ignored newer
+    // layers' cost. Accumulate in Decimal to avoid sub-penny float drift.
+    const cogsProductIds = products.filter((p) => effectiveTargets.has(p.id)).map((p) => p.id)
+    if (cogsProductIds.length > 0) {
+      const layers = await db.costLayer.findMany({
+        where: { productId: { in: cogsProductIds }, remainingQty: { gt: 0 } },
+        select: { productId: true, remainingQty: true, unitCostBase: true },
       })
-      if (oldestLayer) {
-        cogsByProduct.set(product.id, Number(oldestLayer.unitCostBase))
+      const agg = new Map<string, { qty: Prisma.Decimal; cost: Prisma.Decimal }>()
+      for (const l of layers) {
+        const cur = agg.get(l.productId) ?? { qty: toDecimal(0), cost: toDecimal(0) }
+        const q = toDecimal(l.remainingQty)
+        cur.qty = cur.qty.add(q)
+        cur.cost = cur.cost.add(q.mul(toDecimal(l.unitCostBase)))
+        agg.set(l.productId, cur)
+      }
+      for (const [pid, { qty, cost }] of agg) {
+        if (qty.gt(0)) cogsByProduct.set(pid, cost.div(qty).toNumber())
       }
     }
   }
+
+  // 1qsb stale-snapshot oversell guard. The availability snapshot above was taken
+  // before SKU resolution and the WooCommerce preflight network round-trips, so a
+  // shipment/allocation may have dropped stock since. Re-read current stock now and
+  // drive the push qty from min(snapshot, fresh) — i.e. CLAMP DOWN ONLY, the per-run
+  // qty can only fall, never rise above what the snapshot saw. This MUST feed the
+  // build loop (not a post-filter pass): the unchanged-product dedupe below compares
+  // the payload qty against lastPushedQty, so a product whose stock dropped has to be
+  // re-valued BEFORE that comparison or it would be skipped and left stale-high at
+  // WooCommerce (the exact oversell scenario this guards). A stale-LOW value is
+  // harmless and self-corrects on the next per-event push / daily forceAll reconcile.
+  const freshAvailableByProduct = await computeFreshAvailableByProduct(
+    products,
+    productById,
+    whIds,
+    // bghy: include KIT siblings so the fresh re-fetch has the same basis as the
+    // snapshot — otherwise the min(snapshot, fresh) clamp re-zeros the KIT.
+    scopedStockIdsWithSiblings,
+  )
 
   // -------- Build push entries --------
   const pushEntries: PushEntry[] = []
@@ -920,12 +1066,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       if (!result.errors.some((m) => m.includes(product.id))) result.skipped++
       continue
     }
-    const available = shouldForceWooZeroStock(product.lifecycleStatus)
-      ? 0
-      : (availableByProduct.get(product.id) ?? 0)
+    const stockQuantity = resolvePushStockQuantity(
+      availableByProduct.get(product.id) ?? 0,
+      freshAvailableByProduct.get(product.id) ?? 0,
+      shouldForceWooZeroStock(product.lifecycleStatus),
+    )
     const payload: PushEntry['payload'] = {
       id: target.externalId,
-      stock_quantity: Math.floor(available),
+      stock_quantity: stockQuantity,
       manage_stock: true,
     }
     const cogs = cogsByProduct.get(product.id)
@@ -1327,6 +1475,130 @@ async function recordAttempt() {
   })
 }
 
+export type StockLevelSnapshotRow = {
+  productId: string
+  warehouseId: string
+  quantity: Prisma.Decimal | number
+  reservedQty: Prisma.Decimal | number
+}
+
+/**
+ * Build the per-product and per-(product,warehouse) available-stock maps from a
+ * stockLevel snapshot. `available = max(0, quantity - reservedQty)`. Extracted so
+ * the exact same availability basis can be recomputed against a fresh re-read
+ * immediately before pushing (the 1qsb stale-snapshot oversell guard).
+ */
+export function buildStockMaps(stockLevels: StockLevelSnapshotRow[]): {
+  stockByProduct: Map<string, number>
+  stockByProductWarehouse: Map<string, Map<string, number>>
+} {
+  const stockByProduct = new Map<string, number>()
+  const stockByProductWarehouse = new Map<string, Map<string, number>>()
+  for (const sl of stockLevels) {
+    const available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
+    stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
+    const byWarehouse = stockByProductWarehouse.get(sl.productId) ?? new Map<string, number>()
+    byWarehouse.set(sl.warehouseId, available)
+    stockByProductWarehouse.set(sl.productId, byWarehouse)
+  }
+  return { stockByProduct, stockByProductWarehouse }
+}
+
+/**
+ * Resolve the available quantity per candidate product: KITs are valued via the
+ * recursive component-availability walk; everything else reads its summed
+ * across-warehouse available stock. Pure over the supplied stock maps so it can
+ * run on both the initial snapshot and a fresh re-read.
+ */
+export function computeAvailableByProduct(
+  products: CandidateProduct[],
+  warehouseIds: string[],
+  stockByProduct: Map<string, number>,
+  stockByProductWarehouse: Map<string, Map<string, number>>,
+  productById: Map<string, CandidateProduct>,
+  errors: string[],
+): Map<string, number> {
+  const availableByProduct = new Map<string, number>()
+  const kitAvailabilityMemo = new Map<string, number>()
+  const kitAvailabilityErrors = new Set<string>()
+  for (const product of products) {
+    const available = product.type === 'KIT'
+      ? computeKitAvailability(
+          product,
+          warehouseIds,
+          stockByProductWarehouse,
+          productById,
+          kitAvailabilityMemo,
+          new Set<string>(),
+          errors,
+          kitAvailabilityErrors,
+        )
+      : (stockByProduct.get(product.id) ?? 0)
+    availableByProduct.set(product.id, available)
+  }
+  return availableByProduct
+}
+
+/**
+ * 1qsb stale-snapshot oversell guard. Re-reads current stock (the same scope as the
+ * run snapshot) and returns a fresh per-product available map, re-using buildStockMaps
+ * + computeAvailableByProduct so the basis (floor, multi-warehouse summation, recursive
+ * kit-BOM) matches the snapshot. The caller drives each push qty from
+ * min(snapshot, fresh) BEFORE the unchanged-product dedupe, so a product whose stock
+ * dropped after the snapshot is re-valued in time to still be pushed (not skipped as
+ * "unchanged" and left stale-high at WooCommerce).
+ */
+/**
+ * Resolve the integer `stock_quantity` to push to WooCommerce for one product.
+ *
+ * - `forcedZero` (lifecycle EOL/archived etc.) → 0.
+ * - Otherwise: `min(snapshotAvailable, freshAvailable)` then floored.
+ *
+ * The `min` is the 1qsb oversell guard (CLAMP DOWN ONLY): the per-run qty can fall
+ * to the freshly re-read value but never rise above what the run snapshot saw, so a
+ * stale-high quantity is never pushed.
+ *
+ * The floor is 1qsb Part-1 (by design, do NOT "fix"): the inputs are summed across
+ * all syncToStore warehouses (see buildStockMaps) and WooCommerce `stock_quantity` is
+ * integer-only — it cannot represent 2.6. IMS keeps the true fractional figure
+ * internally; flooring DOWN is the oversell-safe direction (WC under-reports, never
+ * over-reports). Pushing a ceil/fractional value would risk overselling the partial unit.
+ */
+export function resolvePushStockQuantity(
+  snapshotAvailable: number,
+  freshAvailable: number,
+  forcedZero: boolean,
+): number {
+  if (forcedZero) return 0
+  return Math.floor(Math.min(snapshotAvailable, freshAvailable))
+}
+
+async function computeFreshAvailableByProduct(
+  products: CandidateProduct[],
+  productById: Map<string, CandidateProduct>,
+  whIds: string[],
+  scopedStockProductIds: string[] | null,
+): Promise<Map<string, number>> {
+  const freshStockLevels = await db.stockLevel.findMany({
+    where: {
+      warehouseId: { in: whIds },
+      ...(scopedStockProductIds ? { productId: { in: scopedStockProductIds } } : {}),
+    },
+    select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
+  })
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(freshStockLevels)
+  // Throwaway error sink: any kit-cycle diagnostics were already surfaced from the
+  // snapshot pass; recomputing here must not double-report them.
+  return computeAvailableByProduct(
+    products,
+    whIds,
+    stockByProduct,
+    stockByProductWarehouse,
+    productById,
+    [],
+  )
+}
+
 function computeKitAvailability(
   product: CandidateProduct,
   warehouseIds: string[],
@@ -1337,9 +1609,15 @@ function computeKitAvailability(
   errors: string[],
   seenCycleErrors: Set<string>,
 ): number {
-  if (memo.has(product.id)) return memo.get(product.id) ?? 0
+  // yi4m: the result depends on the warehouse set passed in — a nested KIT is evaluated
+  // per single warehouse (computeKitAvailability(nested, [warehouseId], …)) while a
+  // top-level KIT gets the full list. Key the memo by (product, warehouse set) so warehouse
+  // A's nested result is not reused for warehouse B (which would over/under-state the
+  // KIT-of-KIT). Cycle detection (`stack`) stays keyed by product id — it's path-based.
+  const memoKey = `${product.id}|${warehouseIds.join(',')}`
+  if (memo.has(memoKey)) return memo.get(memoKey) ?? 0
   if (product.productComponents.length === 0) {
-    memo.set(product.id, 0)
+    memo.set(memoKey, 0)
     return 0
   }
   if (stack.has(product.id)) {
@@ -1348,7 +1626,7 @@ function computeKitAvailability(
       errors.push(`KIT cycle detected: ${cycleKey}`)
       seenCycleErrors.add(cycleKey)
     }
-    memo.set(product.id, 0)
+    memo.set(memoKey, 0)
     return 0
   }
 
@@ -1380,7 +1658,7 @@ function computeKitAvailability(
   }
 
   stack.delete(product.id)
-  memo.set(product.id, total)
+  memo.set(memoKey, total)
   return total
 }
 
@@ -1852,17 +2130,22 @@ async function runManualWcStockPush(progress: ManualStockSyncProgress): Promise<
     },
   })
 
-  progress.status = result.errors.length > 0 ? 'error' : 'done'
+  // A gate abort (sync disabled, no credentials, no syncToStore warehouses)
+  // carries no errors[] but must not read as success: the operator explicitly
+  // asked for a push and nothing was pushed.
+  progress.status = result.errors.length > 0 || result.aborted === true ? 'error' : 'done'
   progress.synced = result.synced
   progress.total = Math.max(progress.total, result.synced)
   progress.errors = result.errors.slice(0, 20)
-  progress.message = result.message?.trim()
-    ? result.message.trim()
-    : result.errors.length > 0
-      ? `Stock push finished with ${result.errors.length} error(s) — ${result.synced} synced`
-      : result.synced > 0
-        ? `Stock push complete — ${result.synced} product(s) synced to WooCommerce`
-        : 'Stock push complete — all products already in sync'
+  progress.message = result.aborted === true
+    ? `${result.message?.trim() || 'Stock push refused'} — nothing was pushed`
+    : result.message?.trim()
+      ? result.message.trim()
+      : result.errors.length > 0
+        ? `Stock push finished with ${result.errors.length} error(s) — ${result.synced} synced`
+        : result.synced > 0
+          ? `Stock push complete — ${result.synced} product(s) synced to WooCommerce`
+          : 'Stock push complete — all products already in sync'
   progress.updatedAt = new Date().toISOString()
   await saveManualStockSyncProgress(progress)
 }

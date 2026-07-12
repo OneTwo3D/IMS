@@ -17,45 +17,17 @@ rules.
 
 | Status | Allowed next statuses | Notes |
 |---|---|---|
-| `ALLOCATED` | `PICKING`, `PROCESSING`, `SHIPPED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
+| `ALLOCATED` | `PICKING`, `PROCESSING`, `SHIPPED`, `CANCELLED`, `ON_HOLD` | - |
 | `CANCELLED` | None | Terminal. |
-| `COMPLETED` | `DELIVERED`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `DELIVERED` | `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `DRAFT` | `PROCESSING`, `PENDING_PAYMENT`, `ALLOCATED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `ON_HOLD` | `DRAFT`, `PENDING_PAYMENT`, `PROCESSING`, `ALLOCATED`, `PICKING`, `PACKING`, `CANCELLED`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `PACKING` | `SHIPPED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `PARTIALLY_REFUNDED` | `REFUNDED` | Can move only to `REFUNDED`. |
-| `PENDING_PAYMENT` | `PROCESSING`, `DRAFT`, `ALLOCATED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `PICKING` | `PACKING`, `SHIPPED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `PROCESSING` | `ALLOCATED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `REFUNDED` | None | Terminal. |
-| `SHIPPED` | `COMPLETED`, `DELIVERED`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-
-The `DELIVERED` transition can be driven automatically by delivery-tracking
-polling (TrackShip or the active shopping connector, via `/api/cron/delivery-status`).
-That cron path runs the **same** transition guard and side effects as a manual
-delivery — it does not write the status directly. Because the cron has no user
-session it skips only the permission check (not the state-machine guard, unlike
-the WooCommerce status-sync path), so if an order has moved out of a deliverable
-state (e.g. cancelled or refunded after dispatch) between the poll's SHIPPED
-query and the under-lock write, the guard rejects the change and the cron logs a
-`delivery_status_skipped` warning instead of forcing it.
-
-**`COMPLETED` vs `DELIVERED`.** Both are manual, operator-set terminal-ish
-statuses reached from `SHIPPED` (and `COMPLETED → DELIVERED`). `DELIVERED` means
-the carrier confirmed delivery and can be set automatically by the delivery-status
-cron; `COMPLETED` is a manual "this order is done from our side" marker for
-businesses that don't track delivery (no automatic trigger sets it). Neither is
-forced by any sync; both still allow `PARTIALLY_REFUNDED`/`REFUNDED` afterwards.
-Use `DELIVERED` when delivery tracking is in play, `COMPLETED` otherwise.
-
-Manual status edits are rejected on **archived** orders (unarchive first);
-automated pushes (WooCommerce force-sync, the delivery-status cron) still apply.
-Deleting a payment that takes an already-paid order in an advanced status
-(`SHIPPED`/`COMPLETED`/`DELIVERED`/`PARTIALLY_REFUNDED`) back below fully-paid
-does not auto-revert the status but raises a `payment_status_mismatch` warning
-activity log so the operator can decide (it fires only on a genuine paid→unpaid
-transition, not for orders that were never fully paid, e.g. credit terms).
+| `COMPLETED` | `DELIVERED` | - |
+| `DELIVERED` | None | - |
+| `DRAFT` | `PROCESSING`, `PENDING_PAYMENT`, `ALLOCATED`, `CANCELLED`, `ON_HOLD` | - |
+| `ON_HOLD` | `DRAFT`, `PENDING_PAYMENT`, `PROCESSING`, `ALLOCATED`, `PICKING`, `PACKING`, `CANCELLED` | - |
+| `PACKING` | `SHIPPED`, `CANCELLED`, `ON_HOLD` | - |
+| `PENDING_PAYMENT` | `PROCESSING`, `DRAFT`, `ALLOCATED`, `CANCELLED`, `ON_HOLD` | - |
+| `PICKING` | `PACKING`, `SHIPPED`, `CANCELLED`, `ON_HOLD` | - |
+| `PROCESSING` | `ALLOCATED`, `CANCELLED`, `ON_HOLD` | - |
+| `SHIPPED` | `COMPLETED`, `DELIVERED` | - |
 
 ### Shipments
 

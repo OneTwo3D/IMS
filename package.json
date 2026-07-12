@@ -14,8 +14,9 @@
     "test:unit": "NODE_OPTIONS='--import tsx' node --test \"tests/**/*.test.ts\"",
     "check:decimal-boundaries": "node scripts/check-domain-decimal-boundaries.mjs",
     "check:connector-fetch-boundaries": "node scripts/check-connector-fetch-boundaries.mjs",
+    "check:wms-connector-boundary": "node scripts/check-wms-connector-boundary.mjs",
     "check:migration-conventions": "node scripts/check-migration-conventions.mjs",
-    "check:all": "npm run check:decimal-boundaries && npm run check:connector-fetch-boundaries && npm run check:migration-conventions",
+    "check:all": "npm run check:decimal-boundaries && npm run check:connector-fetch-boundaries && npm run check:wms-connector-boundary && npm run check:migration-conventions",
     "test:concurrency": "RUN_DB_CONCURRENCY_TESTS=1 NODE_OPTIONS='--import tsx' node --test \"tests/concurrency/**/*.test.ts\"",
     "docs:workflows": "tsx scripts/generate-workflow-docs.ts",
     "docs:workflows:check": "tsx scripts/generate-workflow-docs.ts --check",
@@ -45,6 +46,7 @@
     "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
     "@aws-sdk/client-s3": "^3.1030.0",
     "@base-ui/react": "^1.4.0",
     "@prisma/adapter-pg": "^7.7.0",
@@ -58,10 +60,10 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "~1.7.0",
-    "next": "16.2.3",
-    "next-auth": "^5.0.0-beta.30",
+    "next": "16.2.10",
+    "next-auth": "5.0.0-beta.30",
     "next-themes": "^0.4.6",
-    "nodemailer": "^8.0.5",
+    "nodemailer": "^9.0.3",
     "otplib": "^13.4.0",
     "pdfkit": "^0.18.0",
     "pg": "^8.20.0",
@@ -71,7 +73,6 @@
     "react-markdown": "^10.1.0",
     "recharts": "^3.8.1",
     "remark-gfm": "^4.0.1",
-    "shadcn": "^4.2.0",
     "sharp": "^0.34.5",
     "ssh2-sftp-client": "^12.1.1",
     "tailwind-merge": "^3.5.0",
@@ -90,10 +91,14 @@
     "@types/react-dom": "^19",
     "dotenv": "^17.4.2",
     "eslint": "^9",
-    "eslint-config-next": "16.2.3",
+    "eslint-config-next": "16.2.10",
     "prisma": "^7.7.0",
+    "shadcn": "^4.2.0",
     "tailwindcss": "^4",
     "tsx": "^4.21.0",
     "typescript": "^5"
+  },
+  "overrides": {
+    "@hono/node-server": ">=1.19.13 <2"
   }
 }

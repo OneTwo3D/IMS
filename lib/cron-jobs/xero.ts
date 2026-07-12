@@ -41,4 +41,14 @@ registerCronJobs([
     defaultSchedule: '*/15 * * * *',
     defaultEnabled: true,
   },
+  {
+    slug: 'xero-tax-rate-drift',
+    settingKey: 'xero_tax_rate_drift',
+    module: 'accounting',
+    moduleLabel: 'Accounting',
+    label: 'Xero Tax Rate Drift Detection',
+    description: 'Compares active IMS tax rates against the live Xero rates and logs a warning when a rate was edited directly in Xero (alert-only).',
+    defaultSchedule: '0 * * * *',
+    defaultEnabled: true,
+  },
 ])

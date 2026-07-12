@@ -13,7 +13,7 @@
  * sync is safe.
  */
 
-import { xeroPost } from './api'
+import { xeroGet, xeroPost } from './api'
 
 export type XeroTaxComponent = {
   Name: string
@@ -82,4 +82,18 @@ export async function putXeroTaxRate(
     return { success: false, error: res.error ?? 'Failed to push tax rate' }
   }
   return { success: true, taxType: res.data.TaxRates[0].TaxType }
+}
+
+/**
+ * Fetch the live Xero TaxRates (with their TaxComponents) for drift detection.
+ * Excludes DELETED/ARCHIVED rates so a deleted Xero rate reads as missing-on-xero
+ * rather than a phantom match. Throws on an API failure so the sweeper can record
+ * the run as errored rather than silently report "no drift".
+ */
+export async function fetchXeroTaxRates(): Promise<XeroTaxRate[]> {
+  const res = await xeroGet<{ TaxRates?: XeroTaxRate[] }>('TaxRates')
+  if (!res.ok || !res.data) {
+    throw new Error(res.error ?? `Failed to fetch Xero tax rates (status ${res.status})`)
+  }
+  return (res.data.TaxRates ?? []).filter((rate) => rate.Status !== 'DELETED' && rate.Status !== 'ARCHIVED')
 }

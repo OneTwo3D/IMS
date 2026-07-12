@@ -58,7 +58,7 @@ Configure outbound email so the system can send invoices, sales order confirmati
 Configure currencies, tax rates, and your financial year.
 
 - **Financial year start** — pick the date (e.g. `01-04` for the UK fiscal year). Used in analytics period filters.
-- **Tax rates** — define at least one VAT rate (e.g. "UK Standard 20%"). Each rate has a country code and a Xero tax type code for accounting sync.
+- **Tax rates** — define at least one VAT rate (e.g. "UK Standard 20%"). Each rate has a country code and a Xero tax type code for accounting sync. Once your accounting connector is linked, the **Tax rate mapping** card maps your IMS rates to existing connector tax codes (**Auto-apply**); for rates the connector is missing, use **Generate missing rates** on **Settings > Accounting > Tax** to create and map them (Xero only) — see `settings.md`.
 - **Additional currencies** — if you sell to multiple currencies, add them here. The system fetches daily exchange rates from the European Central Bank automatically; you can also pin manual rates per currency.
 
 > **Beginner tip:** if you only sell in your base currency, you can leave the additional-currencies list empty.

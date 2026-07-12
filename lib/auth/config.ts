@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
 import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
-import { getClientIp } from '@/lib/request-ip'
+import { getClientIp, isTrustedProxyConfigured } from '@/lib/request-ip'
 import { isTurnstileEnabled, verifyTurnstileToken } from '@/lib/turnstile'
 import {
   evaluateSessionState,
@@ -177,9 +177,21 @@ export const authConfig: NextAuthConfig = {
           if (!turnstileVerified) return null
         }
 
+        // Fail closed so a rate-limit backend outage cannot silently disable
+        // brute-force protection. Keyed on email+IP for targeted-guess throttling.
         const rlKey = `login:${parsed.data.email.toLowerCase()}:${clientIp}`
-        const rl = await checkRateLimit(rlKey, 10, 15 * 60_000)
+        const rl = await checkRateLimit(rlKey, 10, 15 * 60_000, { failClosed: true })
         if (!rl.allowed) return null
+
+        // Broader per-IP cap throttles password-spraying (one password across
+        // many accounts from one source). Only enabled when trusted-proxy
+        // resolution is configured: without it every client collapses onto the
+        // fronting proxy's IP and this cap would lock out an entire office.
+        if (isTrustedProxyConfigured() && clientIp !== 'unknown') {
+          const ipRlKey = `login-ip:${clientIp}`
+          const ipRl = await checkRateLimit(ipRlKey, 50, 15 * 60_000, { failClosed: true })
+          if (!ipRl.allowed) return null
+        }
 
         const user = await db.user.findUnique({
           where: { email: parsed.data.email },

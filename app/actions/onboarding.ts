@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAdmin } from '@/lib/auth/server'
 import { getSettingValue } from '@/lib/settings-store'
-import { getIntegrationPluginState, type IntegrationPluginState } from '@/lib/integration-plugins'
+import { getIntegrationPluginState, INTEGRATION_PLUGIN_SETTING_KEYS, type IntegrationPluginState } from '@/lib/integration-plugins'
 import { isBaseCurrencyLocked } from '@/lib/base-currency'
 import { syncCrontab } from '@/app/actions/cron'
 
@@ -271,8 +271,8 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
       update: { value: String(state.quickbooks) },
     }),
     db.setting.upsert({
-      where: { key: 'plugin_mintsoft_enabled' },
-      create: { key: 'plugin_mintsoft_enabled', value: String(state.mintsoft) },
+      where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft },
+      create: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft, value: String(state.mintsoft) },
       update: { value: String(state.mintsoft) },
     }),
   ])

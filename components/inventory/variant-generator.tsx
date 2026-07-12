@@ -7,6 +7,7 @@ import { Plus, Trash2, Sparkles, Package } from 'lucide-react'
 import { StockFlowButton } from '@/components/inventory/stock-flow-dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import {
   Table, TableHeader, TableBody, TableRow, TableHead, TableCell,
@@ -48,6 +49,7 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
   )
   const [saveMsg, setSaveMsg] = useState<string | null>(null)
   const [genMsg, setGenMsg] = useState<string | null>(null)
+  const [variantType, setVariantType] = useState<'VARIANT' | 'KIT' | 'BOM'>('VARIANT')
   const [isPending, startTransition] = useTransition()
 
   function addOption() {
@@ -97,7 +99,7 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
       // Always save current options first so the server reads the latest set
       const valid = options.filter((o) => o.name.trim() && o.values.trim())
       await saveProductOptions(productId, valid)
-      const result = await generateVariantsFromOptions(productId)
+      const result = await generateVariantsFromOptions(productId, variantType)
       if (result.error) {
         setGenMsg(`Error: ${result.error}`)
       } else {
@@ -184,13 +186,31 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
               </Badge>
             ))}
           </div>
-          <div className="flex items-center gap-3 pt-1">
+          <div className="flex flex-wrap items-center gap-3 pt-1">
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              Generate as
+              <Select
+                value={variantType}
+                onChange={(ev) => setVariantType(ev.target.value as 'VARIANT' | 'KIT' | 'BOM')}
+                disabled={isPending}
+                className="h-8 w-44"
+              >
+                <option value="VARIANT">Variant (simple child)</option>
+                <option value="KIT">Kit / Bundle (virtual)</option>
+                <option value="BOM">BOM (manufactured)</option>
+              </Select>
+            </label>
             <Button type="button" size="sm" onClick={handleGenerate} disabled={isPending}>
               <Sparkles className="h-3.5 w-3.5 mr-1" />
               {isPending ? 'Generating…' : 'Generate Variants'}
             </Button>
             {genMsg && <span className="text-xs text-muted-foreground">{genMsg}</span>}
           </div>
+          {variantType !== 'VARIANT' && (
+            <p className="text-xs text-muted-foreground">
+              {variantType === 'KIT' ? 'Kit' : 'BOM'} variants are created without components — add each one&apos;s components afterwards from its product page.
+            </p>
+          )}
         </div>
       )}
 

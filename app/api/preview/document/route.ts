@@ -50,7 +50,7 @@ async function generateInvoicePreview(branding: Branding, today: string) {
 
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'Description', width: 230 },
+    { label: 'Description', width: 230, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: 'Price (£)', width: 65, align: 'right' },
     { label: 'Tax (£)', width: 55, align: 'right' },
@@ -95,7 +95,7 @@ async function generateSalesOrderPreview(branding: Branding, today: string) {
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Description', width: 195 },
+    { label: 'Description', width: 195, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: 'Price (£)', width: 65, align: 'right' },
     { label: 'Discount', width: 50, align: 'right' },
@@ -141,7 +141,7 @@ async function generatePurchaseOrderPreview(branding: Branding, today: string) {
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 65 },
-    { label: 'Product', width: 120 },
+    { label: 'Product', width: 120, wrap: true },
     { label: 'Barcode / EAN', width: 75 },
     { label: 'MPN', width: 85 },
     { label: 'Qty', width: 45, align: 'right' },
@@ -175,7 +175,7 @@ async function generateRfqPreview(branding: Branding, today: string) {
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Product', width: 125 },
+    { label: 'Product', width: 125, wrap: true },
     { label: 'Barcode / EAN', width: 75 },
     { label: 'MPN', width: 90 },
     { label: 'Quantity', width: 60, align: 'right' },
@@ -205,7 +205,7 @@ async function generatePackingSlipPreview(branding: Branding, today: string) {
   const columns: PdfTableColumn[] = [
     { label: '#', width: 30, align: 'right' },
     { label: 'SKU', width: 90 },
-    { label: 'Product', width: 280 },
+    { label: 'Product', width: 280, wrap: true },
     { label: 'Qty', width: 60, align: 'right' },
     { label: 'Packed', width: 50, align: 'center' },
   ]
@@ -232,7 +232,7 @@ async function generateCreditNotePreview(branding: Branding, today: string) {
 
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'Description', width: 260 },
+    { label: 'Description', width: 260, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: 'Price (£)', width: 65, align: 'right' },
     { label: 'Credit (£)', width: 75, align: 'right' },
@@ -278,7 +278,7 @@ async function generateManufacturingOrderPreview(branding: Branding, today: stri
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Component', width: 130 },
+    { label: 'Component', width: 130, wrap: true },
     { label: 'Barcode / EAN', width: 75 },
     { label: 'MPN', width: 90 },
     { label: 'Per Unit', width: 50, align: 'right' },

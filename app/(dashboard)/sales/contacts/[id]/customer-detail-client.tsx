@@ -237,6 +237,11 @@ export function CustomerDetailClient({ customer }: Props) {
                     <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[o.status] ?? ''}`}>
                       {STATUS_LABELS[o.status] ?? o.status}
                     </span>
+                    {o.refundStatus !== 'NONE' && (
+                      <span className={`ml-1 inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${o.refundStatus === 'FULL' ? STATUS_CLASS.REFUNDED : STATUS_CLASS.PARTIALLY_REFUNDED}`}>
+                        {o.refundStatus === 'FULL' ? 'Refunded' : 'Part. Refunded'}
+                      </span>
+                    )}
                   </TableCell>
                   <TableCell className="px-4 text-right text-xs tabular-nums">{o.lineCount}</TableCell>
                   <TableCell className="px-4 text-right text-xs tabular-nums">

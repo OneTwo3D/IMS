@@ -114,6 +114,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/xero-tax-rate-drift': {
+    access: 'cron-secret',
+    reason: 'IMS↔Xero TaxRate drift detection (alert-only); guarded by verifyCron.',
+  },
   '/api/cron/activity-cleanup': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
@@ -131,6 +135,10 @@ export const apiRouteAuthPolicy = {
     reason: 'Cron endpoint guarded by verifyCron.',
   },
   '/api/cron/fx-rates': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
+  '/api/cron/hs-classify': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
@@ -154,6 +162,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/mintsoft-dispatch-sync': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
   '/api/cron/mintsoft-product-verify': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
@@ -170,7 +182,35 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/shiphero-webhook-sweeper': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
+  '/api/cron/shiphero-reconcile': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
+  '/api/cron/shiphero-stock-sync': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
   '/api/cron/shopping-webhook-inbox': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
+  '/api/cron/wms-order-status': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
+  '/api/cron/wms-order-push': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
+  '/api/cron/wms-order-reconcile': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
+  '/api/cron/wms-watchdog': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
@@ -349,6 +389,10 @@ export const apiRouteAuthPolicy = {
   '/api/webhooks/mintsoft/asn-booked-in': {
     access: 'public-webhook',
     reason: 'Public Mintsoft webhook endpoint; verifies plugin enablement, shared signature, and fresh signed timestamp.',
+  },
+  '/api/webhooks/shiphero/[event]': {
+    access: 'public-webhook',
+    reason: 'Public ShipHero webhook endpoint; verifies plugin enablement, event type, and shared HMAC before idempotent staging.',
   },
   '/api/webhooks/shopping/[connector]/[resource]': {
     access: 'public-webhook',

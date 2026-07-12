@@ -1,5 +1,5 @@
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
-import { roundQuantity } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export type PurchaseInvoiceEditHeader = {
   invoiceNumber: string | null
@@ -125,7 +125,7 @@ export function optionalText(value: string | null | undefined): string | null {
   return trimmed ? trimmed : null
 }
 
-function rounded4(value: number): number {
+function rounded4(value: DecimalInput): number {
   return roundQuantity(value, 4).toNumber()
 }
 
@@ -155,9 +155,12 @@ export function calculatePurchaseInvoice(params: {
 }): PurchaseInvoiceCalculation {
   assertPositiveFxRate(params.fxRateToBase)
 
-  let subtotalForeign = 0
-  let subtotalBase = 0
-  let taxBaseForeign = 0
+  // Accumulate AP base/foreign totals in Decimal so the invoice header reconciles
+  // to the sum of its stored line bases (cogs-audit scjz.59). Float division and
+  // `+=` accumulation could drift the header a penny from its lines.
+  let subtotalForeign = toDecimal(0)
+  let subtotalBase = toDecimal(0)
+  let taxBaseForeign = toDecimal(0)
   const lineData: PurchaseInvoiceLineDraft[] = []
   const accountingLines: PurchaseInvoiceAccountingLine[] = []
 
@@ -172,11 +175,11 @@ export function calculatePurchaseInvoice(params: {
         throw new Error(`Invalid unit cost for ${poLine.product.sku}`)
       }
 
-      const totalForeign = rounded4(line.qtyBilled * line.unitCostForeign)
-      const totalBase = rounded4(totalForeign / params.fxRateToBase)
-      subtotalForeign += totalForeign
-      subtotalBase += totalBase
-      taxBaseForeign += totalForeign
+      const totalForeign = rounded4(multiplyMoney(line.qtyBilled, line.unitCostForeign))
+      const totalBase = rounded4(toDecimal(totalForeign).div(params.fxRateToBase))
+      subtotalForeign = addMoney(subtotalForeign, totalForeign)
+      subtotalBase = addMoney(subtotalBase, totalBase)
+      taxBaseForeign = addMoney(taxBaseForeign, totalForeign)
 
       lineData.push({
         id: line.id,
@@ -210,10 +213,10 @@ export function calculatePurchaseInvoice(params: {
 
     const description = optionalText(line.description ?? costLine.description) ?? costLine.description
     const totalForeign = rounded4(line.amountForeign)
-    const totalBase = rounded4(totalForeign / params.fxRateToBase)
-    subtotalForeign += totalForeign
-    subtotalBase += totalBase
-    if (costLine.vatable) taxBaseForeign += totalForeign
+    const totalBase = rounded4(toDecimal(totalForeign).div(params.fxRateToBase))
+    subtotalForeign = addMoney(subtotalForeign, totalForeign)
+    subtotalBase = addMoney(subtotalBase, totalBase)
+    if (costLine.vatable) taxBaseForeign = addMoney(taxBaseForeign, totalForeign)
 
     lineData.push({
       id: line.id,
@@ -234,9 +237,11 @@ export function calculatePurchaseInvoice(params: {
     })
   }
 
-  const taxRate = params.poSubtotalForeign > 0 ? params.poTaxForeign / params.poSubtotalForeign : 0
-  const taxForeign = rounded4(taxBaseForeign * taxRate)
-  const taxBase = rounded4(taxForeign / params.fxRateToBase)
+  const taxRate = params.poSubtotalForeign > 0
+    ? toDecimal(params.poTaxForeign).div(params.poSubtotalForeign)
+    : toDecimal(0)
+  const taxForeign = rounded4(multiplyMoney(taxBaseForeign, taxRate))
+  const taxBase = rounded4(toDecimal(taxForeign).div(params.fxRateToBase))
 
   return {
     lineData,
@@ -245,8 +250,8 @@ export function calculatePurchaseInvoice(params: {
     subtotalBase: rounded4(subtotalBase),
     taxForeign,
     taxBase,
-    totalForeign: rounded4(subtotalForeign + taxForeign),
-    totalBase: rounded4(subtotalBase + taxBase),
+    totalForeign: rounded4(addMoney(subtotalForeign, taxForeign)),
+    totalBase: rounded4(addMoney(subtotalBase, taxBase)),
   }
 }
 

@@ -11,6 +11,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, isAccountingSyncTypeEnabled, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
+import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import {
   addMoney,
   multiplyMoney,
@@ -42,6 +43,16 @@ type ShipmentCogsRevaluationSyncOptions = {
    * (audit-gbzh).
    */
   isDailyBatchPostingEnabled?: () => Promise<boolean>
+  /**
+   * Per-recalc-run nonce (audit-g4la style). The revaluation idempotency key
+   * otherwise encodes only (shipment, layer, oldCogs, newCogs), so correcting a
+   * landed cost A→B→A→B regenerates the first key and the later identical
+   * correction is silently deduped against the earlier one (or a post-failure
+   * retry whose cogsBatchAmount advanced re-posts). Stamping the run nonce into
+   * the key makes each recalc run post a distinct COGS_REVERSAL while a retry
+   * WITHIN a run (same nonce) still dedups correctly (cogs-audit scjz.33).
+   */
+  recalcRunId?: string
 }
 
 export function buildShipmentCogsRevaluationSyncPayload(input: {
@@ -56,18 +67,32 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
   const newCogs = roundQuantity(input.newCogsBase, 2)
   if (oldCogs.sub(newCogs).abs().lt(0.01)) return null
 
+  // Use a 4-line reverse + repost journal rather than a 2-line delta so the
+  // accounting audit trail shows both the old and recomputed shipment COGS.
+  // When one side rounds to 0 (e.g. a 0.00 shipment revalued up, or a shipment
+  // revalued down to 0.00) its reverse/post legs would be zero-amount, which the
+  // accounting-event normalizer rejects (a line must carry exactly one positive
+  // debit or credit). Drop the zero side's legs so we emit a balanced 2-line
+  // delta instead of a journal that throws (cogs-audit scjz.35).
+  const lines: Array<Record<string, unknown>> = []
+  if (oldCogs.gt(0)) {
+    lines.push(
+      { accountCode: input.inventoryAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, debit: oldCogs.toNumber() },
+      { accountCode: input.cogsAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, credit: oldCogs.toNumber() },
+    )
+  }
+  if (newCogs.gt(0)) {
+    lines.push(
+      { accountCode: input.cogsAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, debit: newCogs.toNumber() },
+      { accountCode: input.inventoryAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, credit: newCogs.toNumber() },
+    )
+  }
+
   return {
     date: new Date().toISOString().slice(0, 10),
     reference: `Shipment COGS revaluation: ${input.shipmentId}`,
     narration: `Reverse and repost shipment COGS after cost-layer revaluation for shipment ${input.shipmentId}`,
-    // Use a 4-line reverse + repost journal rather than a 2-line delta so the
-    // accounting audit trail shows both the old and recomputed shipment COGS.
-    lines: [
-      { accountCode: input.inventoryAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, debit: oldCogs.toNumber() },
-      { accountCode: input.cogsAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, credit: oldCogs.toNumber() },
-      { accountCode: input.cogsAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, debit: newCogs.toNumber() },
-      { accountCode: input.inventoryAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, credit: newCogs.toNumber() },
-    ],
+    lines,
     sourceCostLayerId: input.costLayerId,
     oldCogsBase: oldCogs.toNumber(),
     newCogsBase: newCogs.toNumber(),
@@ -98,14 +123,64 @@ async function queueShipmentCogsRevaluationSync(
   const isEnabled = options.isReversalPostingEnabled ?? (() => isAccountingSyncTypeEnabled('COGS_REVERSAL'))
   if (!(await isEnabled())) return false
 
+  const revaluationIdempotencyKey = `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}${options.recalcRunId ? `:${options.recalcRunId}` : ''}`
   await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
     type: 'COGS_REVERSAL',
     referenceType: 'Shipment',
     referenceId: input.shipmentId,
-    idempotencyKey: `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}`,
+    idempotencyKey: revaluationIdempotencyKey,
     payload,
   })
+  // khdw: record the net COGS-account movement of this revaluation (reverse old +
+  // repost new → net debit = newCogs − oldCogs, both 2dp) in the COGS subledger
+  // ledger, keyed identically to the sync so it dedupes across retries.
+  await recordCogsSubledgerMovement(tx, {
+    sourceType: 'SHIPMENT_REVALUATION',
+    sourceRef: input.shipmentId,
+    idempotencyKey: revaluationIdempotencyKey,
+    baseDelta: toDecimal(payload.newCogsBase as number).sub(payload.oldCogsBase as number),
+    journalDate: payload.date as string,
+  })
   return true
+}
+
+/**
+ * Ensure the (product, warehouse) stock_levels row exists and take a FOR UPDATE
+ * row lock on it. This serializes concurrent stock-quantity/cost-layer mutations
+ * for the same product+warehouse: a caller must hold this lock before reading
+ * average cost or candidate layers so a concurrent consume between the read and
+ * the layer write cannot leave the new layer costed against stale state
+ * (cogs-audit scjz.3). Mirrors the lock applyStockAdjustment already takes.
+ *
+ * Uses $queryRaw (not $executeRaw) because Prisma's executeRaw path does not
+ * reliably hold SELECT ... FOR UPDATE locks (enforced by row-lock-queryraw test).
+ */
+export async function lockStockLevelRow(
+  tx: TxClient,
+  productId: string,
+  warehouseId: string,
+): Promise<{ quantity: Decimal; reservedQty: Decimal }> {
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: { productId, warehouseId, quantity: 0 },
+    update: {},
+  })
+  // Return the locked on-hand and reserved quantities so callers can run a
+  // pre-flight availability check against the live, locked row (scjz.3 / ig58)
+  // instead of relying on the DB non-negative CHECK to abort with an opaque
+  // constraint error.
+  const rows = await tx.$queryRaw<Array<{ quantity: unknown; reservedQty: unknown }>>`
+    SELECT "quantity", "reservedQty"
+    FROM stock_levels
+    WHERE "productId" = ${productId}
+      AND "warehouseId" = ${warehouseId}
+    FOR UPDATE
+  `
+  const row = rows[0]
+  return {
+    quantity: toDecimal((row?.quantity ?? 0) as DecimalInput),
+    reservedQty: toDecimal((row?.reservedQty ?? 0) as DecimalInput),
+  }
 }
 
 function minDecimal(a: Decimal, b: Decimal): Decimal {
@@ -229,6 +304,13 @@ export async function consumeFifoLayers(
 }
 
 /**
+ * Largest FIFO shortfall tolerated before treating the consume as insufficient.
+ * Set to the engine scale (6dp) so only float→Decimal conversion noise on the
+ * requested qty is absorbed, not a materially under-covered consumption.
+ */
+const FIFO_SHORTFALL_TOLERANCE = toDecimal('0.000001')
+
+/**
  * Consume FIFO layers and throw if layers are exhausted before qty is met.
  * Use this for dispatches and manufacturing where a shortfall is a hard error.
  */
@@ -246,13 +328,27 @@ export async function consumeFifoLayersStrict(
     if (message) throw new Error(message)
     throw error
   }
-  if (result.remainingQty.gt(0.0001)) {
+  // Tolerance is the engine scale (6dp), not 1e-4: the old 0.0001 band silently
+  // absorbed a real shortfall up to a ten-thousandth of a unit — large for
+  // fractional-unit products — and buildStockMovementValueFieldsFromConsumed then
+  // divides the consumed value by the FULL rowQty, understating unit cost while
+  // claiming the qty fully moved. Only sub-µ float→Decimal noise is tolerated now.
+  if (result.remainingQty.gt(FIFO_SHORTFALL_TOLERANCE)) {
     throw new Error(
       `Insufficient FIFO layers for product ${productId} in warehouse ${warehouseId}: ` +
       `needed ${qty}, only ${subtractMoney(qty, result.remainingQty).toString()} available in cost layers`,
     )
   }
-  // audit-snxr: the sub-0.0001 tolerance above lets a tiny positive consume slip
+  // Surface a non-zero shortfall that was absorbed within tolerance as a
+  // reconciliation exception — it indicates the consumed value was spread over a
+  // marginally larger rowQty than the layers covered.
+  if (result.remainingQty.gt(0)) {
+    console.warn(
+      `consumeFifoLayersStrict absorbed a sub-tolerance FIFO shortfall for product ${productId} ` +
+      `in warehouse ${warehouseId}: requested ${qty}, ${result.remainingQty.toString()} uncovered by cost layers.`,
+    )
+  }
+  // audit-snxr: the sub-µ tolerance above lets a tiny positive consume slip
   // through with NOTHING consumed when there are no cost layers at all (stock /
   // cost-layer desync). Callers build cogs_entries only when consumed is
   // non-empty, so a zero-evidence outbound movement would be written and then
@@ -350,6 +446,106 @@ export async function createCostLayer(
   return layer.id
 }
 
+/**
+ * Reason codes for a cost-layer unitCostBase revaluation, recorded in the
+ * cost_layer_revaluations event log (cogs-audit scjz.43/.48).
+ */
+export type CostLayerRevaluationReason =
+  | 'landed_cost_recalc'
+  | 'landed_cost_output_propagation'
+  | 'manufacturing_recompute'
+  | 'fx_rebase'
+  | 'adjustment_edit'
+
+/**
+ * Append a cost-layer revaluation event (the basis valid before/after the change,
+ * with its effective timestamp) so as-of/historical valuation can reconstruct the
+ * cost basis at a point in time. No-op deltas (old == new at 6dp) are skipped so
+ * the log only carries real basis changes. Pass the recalc/edit timestamp as
+ * effectiveAt so events order correctly against an as-of date.
+ */
+export async function recordCostLayerRevaluation(
+  tx: TxClient,
+  input: {
+    costLayerId: string
+    oldUnitCostBase: DecimalInput
+    newUnitCostBase: DecimalInput
+    effectiveAt: Date
+    reason: CostLayerRevaluationReason
+  },
+): Promise<boolean> {
+  const oldUnit = roundQuantity(input.oldUnitCostBase, 6)
+  const newUnit = roundQuantity(input.newUnitCostBase, 6)
+  if (oldUnit.eq(newUnit)) return false
+  // Coalesce repeated revaluations of the same layer within one run (identical
+  // effectiveAt) — e.g. a diamond BOM cascade reaching an output layer twice, or
+  // two revalued components feeding the same output — into a single net
+  // old→final event. This keeps the original "old" cost and advances "new", so
+  // as-of replay can order events by effectiveAt alone, with no ambiguous
+  // intra-run sequence (blq0). Safe without locking: all events in a run share
+  // one transaction, which is serial.
+  const existing = await tx.costLayerRevaluation.findFirst({
+    where: { costLayerId: input.costLayerId, effectiveAt: input.effectiveAt },
+    select: { id: true, oldUnitCostBase: true },
+  })
+  if (existing) {
+    // Net change across the run = original old → latest new. If they now match
+    // (e.g. 5→6→5), the run was a no-op for this layer; drop the event.
+    if (roundQuantity(existing.oldUnitCostBase, 6).eq(newUnit)) {
+      await tx.costLayerRevaluation.delete({ where: { id: existing.id } })
+    } else {
+      await tx.costLayerRevaluation.update({
+        where: { id: existing.id },
+        data: { newUnitCostBase: newUnit.toFixed(6) },
+      })
+    }
+    return true
+  }
+  await tx.costLayerRevaluation.create({
+    data: {
+      costLayerId: input.costLayerId,
+      oldUnitCostBase: oldUnit.toFixed(6),
+      newUnitCostBase: newUnit.toFixed(6),
+      effectiveAt: input.effectiveAt,
+      reason: input.reason,
+    },
+  })
+  return true
+}
+
+/**
+ * Set a cost layer's unitCostBase to an absolute value AND log the revaluation in
+ * one step, so the cost_layer_revaluations event log stays complete. Reads the
+ * prior cost first. Returns the old unit cost (as a Decimal) for callers that need
+ * the delta. Use this instead of a bare costLayer.update whenever a layer is
+ * REVALUED (its cost changes after creation) — not for qty-only changes.
+ */
+export async function updateCostLayerUnitCost(
+  tx: TxClient,
+  costLayerId: string,
+  newUnitCostBase: DecimalInput,
+  options: { effectiveAt: Date; reason: CostLayerRevaluationReason },
+): Promise<Decimal> {
+  const existing = await tx.costLayer.findUnique({
+    where: { id: costLayerId },
+    select: { unitCostBase: true },
+  })
+  const oldUnit = toDecimal(existing?.unitCostBase ?? 0)
+  const newUnit = roundQuantity(newUnitCostBase, 6)
+  await tx.costLayer.update({
+    where: { id: costLayerId },
+    data: { unitCostBase: newUnit.toFixed(6) },
+  })
+  await recordCostLayerRevaluation(tx, {
+    costLayerId,
+    oldUnitCostBase: oldUnit,
+    newUnitCostBase: newUnit,
+    effectiveAt: options.effectiveAt,
+    reason: options.reason,
+  })
+  return oldUnit
+}
+
 export async function addCostLayerSourceLines(
   tx: TxClient,
   costLayerId: string,
@@ -408,14 +604,20 @@ export async function copyCostLayerSourceLinesProportionally(
   if (sourceReceivedQty.lte(0)) return 0
 
   const rawRatio = copiedQtyDecimal.div(sourceReceivedQty)
-  const ratio = rawRatio.gt(1) ? toDecimal(1) : rawRatio
-  if (ratio.lte(0)) return 0
+  // Every caller copies a SLICE drawn from the source layer (a refund/transfer/
+  // sync portion of what was consumed from it), so copiedQty must never exceed
+  // the source receivedQty. Capping the ratio at 1 silently understated the
+  // copied source cost (cost-value leak); throw instead so the upstream anomaly
+  // surfaces. A sub-µ band above 1 is rounding slack — clamp it to 1.
   if (rawRatio.gt('1.000001')) {
-    console.warn(
-      `copyCostLayerSourceLinesProportionally capped ratio at 1 for ${fromCostLayerId} -> ${toCostLayerId} ` +
-      `(copiedQty=${copiedQtyDecimal.toString()}, sourceReceivedQty=${sourceReceivedQty.toString()})`,
+    throw new Error(
+      `copyCostLayerSourceLinesProportionally: copiedQty exceeds source receivedQty for ${fromCostLayerId} -> ${toCostLayerId} ` +
+      `(copiedQty=${copiedQtyDecimal.toString()}, sourceReceivedQty=${sourceReceivedQty.toString()}); ` +
+      `this would leak source cost into the target layer.`,
     )
   }
+  const ratio = rawRatio.gt(1) ? toDecimal(1) : rawRatio
+  if (ratio.lte(0)) return 0
 
   return addCostLayerSourceLines(
     tx,
@@ -470,9 +672,15 @@ export async function updateSnapshotsForCostLayerChange(
   const containsCostLayer = JSON.stringify([{ costLayerId }])
 
   for (const table of tables) {
-    // Find rows whose snapshot JSON mentions this cost layer id
+    // Find rows whose snapshot JSON mentions this cost layer id. FOR UPDATE locks
+    // each matching row for the rest of the transaction so a concurrent
+    // revaluation of another layer that shares the same snapshot row cannot
+    // read-modify-write the JSON array in parallel and clobber this change — the
+    // second locker blocks, then re-reads the committed array (cogs-audit scjz.7).
+    // Stays on $queryRawUnsafe (a row-returning query) so the lock is held;
+    // $executeRaw would not (enforced by the row-lock-queryraw gate).
     const rows = await tx.$queryRawUnsafe<Array<{ id: string; costLayerSnapshot: unknown }>>(
-      `SELECT id, "costLayerSnapshot" FROM "${table.model}" WHERE "costLayerSnapshot" @> $1::jsonb`,
+      `SELECT id, "costLayerSnapshot" FROM "${table.model}" WHERE "costLayerSnapshot" @> $1::jsonb FOR UPDATE`,
       containsCostLayer,
     )
 
@@ -674,6 +882,29 @@ export async function getManufacturingConsumedQtyForCostLayer(
   return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0))
 }
 
+/**
+ * Sum stock consumed by PO cancellation reversals (PURCHASE_REVERSAL) for a cost
+ * layer. Cancellation reversals consume FIFO layers and write cogs_entries to
+ * satisfy the outbound-evidence guard, but they are NOT customer COGS — the stock
+ * was reversed out, not sold. Landed-cost recalculation must exclude these units
+ * from the retrospective COGS delta, otherwise a later revaluation of a
+ * partly-cancelled layer would post spurious COGS for reversed stock (cogs-audit
+ * scjz.14; mirrors the audit-jz9i manufacturing exclusion).
+ */
+export async function getReversalConsumedQtyForCostLayer(
+  tx: TxClient,
+  costLayerId: string,
+): Promise<Decimal> {
+  const rows = await tx.cogsEntry.findMany({
+    where: {
+      costLayerId,
+      movement: { type: 'PURCHASE_REVERSAL' },
+    },
+    select: { qty: true },
+  })
+  return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0))
+}
+
 export type DependentOutputSourceLine = {
   sourceLineId: string
   outputCostLayerId: string
@@ -797,13 +1028,17 @@ export async function refreshSalesOrderLineCogs(
   const uniqueLineIds = [...new Set(lineIds)]
   if (uniqueLineIds.length === 0) return 0
 
+  // Only SHIPPED shipment lines carry a COGS snapshot (it is written at dispatch).
+  // Excluding PENDING/PICKING/PACKED lines keeps the mixed-snapshot detection below
+  // from treating a not-yet-dispatched partial as a desync — those legitimately
+  // have no snapshot yet (scjz.24).
   const shipmentLines = await tx.shipmentLine.findMany({
-    where: { lineId: { in: uniqueLineIds } },
+    where: { lineId: { in: uniqueLineIds }, shipment: { status: 'SHIPPED' } },
     select: { lineId: true, costLayerSnapshot: true },
   })
 
   const cogsByLineId = new Map<string, Decimal>()
-  const hasSnapshotByLineId = new Map<string, boolean>()
+  const snapshotCountByLineId = new Map<string, number>()
   const shipmentLineCountByLineId = new Map<string, number>()
   for (const shipmentLine of shipmentLines) {
     const snapshot = parseCostLayerSnapshot(shipmentLine.costLayerSnapshot)
@@ -819,26 +1054,41 @@ export async function refreshSalesOrderLineCogs(
       ),
     )
     if (snapshot.length > 0) {
-      hasSnapshotByLineId.set(shipmentLine.lineId, true)
+      snapshotCountByLineId.set(
+        shipmentLine.lineId,
+        (snapshotCountByLineId.get(shipmentLine.lineId) ?? 0) + 1,
+      )
     }
   }
 
   let updated = 0
   for (const lineId of uniqueLineIds) {
     const cogs = cogsByLineId.get(lineId)
-    const hasShipmentLines = (shipmentLineCountByLineId.get(lineId) ?? 0) > 0
-    if (hasShipmentLines && !hasSnapshotByLineId.get(lineId)) {
+    const totalShipmentLines = shipmentLineCountByLineId.get(lineId) ?? 0
+    const snapshottedShipmentLines = snapshotCountByLineId.get(lineId) ?? 0
+    if (totalShipmentLines > 0 && snapshottedShipmentLines === 0) {
       // Legacy shipped lines may pre-date shipment FIFO snapshots. Preserve
       // their existing COGS instead of nulling historical margin during a
       // retrospective landed-cost refresh.
       continue
     }
+    if (totalShipmentLines > 0 && snapshottedShipmentLines < totalShipmentLines) {
+      // Mixed snapshot presence: some shipment lines for this sales line carry a
+      // FIFO snapshot and others don't (e.g. a partial's snapshot was cleared
+      // between batch runs). Summing only the snapshotted subset would understate
+      // COGS / overstate margin, so preserve the prior cogsBase and flag for
+      // reconciliation rather than writing a partial total.
+      console.warn(
+        `refreshSalesOrderLineCogs: sales line ${lineId} has mixed shipment-snapshot presence ` +
+        `(${snapshottedShipmentLines}/${totalShipmentLines} shipment lines snapshotted); ` +
+        `preserving prior cogsBase instead of summing a partial set.`,
+      )
+      continue
+    }
     await tx.salesOrderLine.update({
       where: { id: lineId },
       data: {
-        cogsBase: cogs == null || !hasSnapshotByLineId.get(lineId)
-          ? null
-          : roundQuantity(cogs, 4).toNumber(),
+        cogsBase: cogs == null ? null : roundQuantity(cogs, 4).toNumber(),
       },
     })
     updated++

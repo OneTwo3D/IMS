@@ -16,6 +16,29 @@ export type VelocityWindow = {
   dateTo: string | Date
 }
 
+export type SaleMovementCogsSource = {
+  totalValueBase: DecimalInput | null
+  cogsEntries?: Array<{ totalCostBase: DecimalInput }>
+}
+
+/**
+ * Revaluation-aware sale COGS for a SALE_DISPATCH movement.
+ *
+ * Landed-cost revaluation updates `CogsEntry.totalCostBase` (via
+ * `refreshShipmentCogsForCostLayerChange`) but NOT `StockMovement.totalValueBase`.
+ * Turnover/margin reports already read the `CogsEntry` sum, so dead-stock and
+ * replenishment velocity must use the same canonical source or the same units
+ * carry two different COGS figures after a revaluation (scjz.52). Legacy
+ * movements with no COGS evidence fall back to the point-in-time movement value.
+ */
+export function saleMovementCogsBase(movement: SaleMovementCogsSource): Decimal {
+  const entries = movement.cogsEntries ?? []
+  if (entries.length > 0) {
+    return entries.reduce((sum, entry) => sum.add(toDecimal(entry.totalCostBase)), toDecimal(0))
+  }
+  return toDecimal(movement.totalValueBase ?? 0)
+}
+
 export type VelocitySaleInput = {
   key?: string
   productId: string

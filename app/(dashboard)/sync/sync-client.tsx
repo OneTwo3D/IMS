@@ -35,13 +35,16 @@ type Props = {
   logs: ShoppingSyncLogRow[]
   taxRates: { id: string; name: string }[]
   shoppingCredentials: ShoppingConnectorCredentials
-  /** audit-wrwr: whether Xero is the connected accounting connector (for the unified tax mapper). */
-  xeroConnected: boolean
+  /** audit-wrwr: whether the active accounting connector is connected (for the unified tax mapper). */
+  accountingConnected: boolean
 }
 
+// Refund state is the orthogonal refundStatus now, not a lifecycle status — a WC
+// 'refunded' order maps to a lifecycle status and its refund flows through the refund
+// records. So REFUNDED/PARTIALLY_REFUNDED are not offered as mapping targets.
 const IMS_STATUSES = [
   'DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING',
-  'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED', 'REFUNDED', 'PARTIALLY_REFUNDED',
+  'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED',
 ]
 
 const WC_STATUSES = ['pending', 'failed', 'on-hold', 'processing', 'completed', 'cancelled', 'refunded']
@@ -321,7 +324,9 @@ function WebhookSecretField({
   const [setupingWebhooks, setSetupingWebhooks] = useState(false)
   const [webhookResult, setWebhookResult] = useState<string | null>(null)
   const [webhookError, setWebhookError] = useState(false)
-  const hasSecret = !!value
+  // A configured secret is never sent to the client, so presence comes from the
+  // load-time flag; `value` is only non-empty when freshly generated this session.
+  const hasSecret = !!value || hadSecretOnLoad
 
   async function handleGenerate() {
     const secret = generateSecret()
@@ -455,7 +460,7 @@ function WebhookSecretField({
   )
 }
 
-export function SyncClient({ settings: init, statusMappings, logs, shoppingCredentials, xeroConnected }: Props) {
+export function SyncClient({ settings: init, statusMappings, logs, shoppingCredentials, accountingConnected }: Props) {
   const router = useRouter()
   const formatDateTime = useFormatDateTime()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
@@ -472,6 +477,21 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
   const [saved, setSaved] = useState(false)
+  // The server-side value of the stock-push toggle. Ticking the checkbox only
+  // mutates local state (`s`), but the manual push runs against the SAVED
+  // setting — pushing with an unsaved toggle is guaranteed to no-op on the
+  // server gate, so the button blocks until Save Settings has persisted it.
+  // Resynced from the prop during render (React's derived-state adjustment
+  // pattern) so an out-of-band save (another tab/session) followed by
+  // router.refresh() doesn't leave the button falsely blocked.
+  const serverStockSyncEnabled = init.wc_stock_sync_enabled === 'true'
+  const [savedStockSyncEnabled, setSavedStockSyncEnabled] = useState(serverStockSyncEnabled)
+  const [lastServerStockSyncEnabled, setLastServerStockSyncEnabled] = useState(serverStockSyncEnabled)
+  if (lastServerStockSyncEnabled !== serverStockSyncEnabled) {
+    setLastServerStockSyncEnabled(serverStockSyncEnabled)
+    setSavedStockSyncEnabled(serverStockSyncEnabled)
+  }
+  const isStockPushUnsaved = s.wc_stock_sync_enabled === 'true' && !savedStockSyncEnabled
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null)
   const [connectionError, setConnectionError] = useState(false)
   const [testingConnection, setTestingConnection] = useState(false)
@@ -483,12 +503,12 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   const wcConfigured = !!wcUrl && !!wcKey && !!wcSecret
   const initialImportDone = s.wc_initial_import_completed === 'true'
   const orderWebhookActive = (() => {
-    if (!s.wc_webhook_secret || !s.wc_order_webhook_last_received_at) return false
+    if (s.wc_webhook_secret_set !== 'true' || !s.wc_order_webhook_last_received_at) return false
     const receivedAt = Date.parse(s.wc_order_webhook_last_received_at)
     return Number.isFinite(receivedAt) && (Date.now() - receivedAt) <= 24 * 60 * 60 * 1000
   })()
   const productWebhookActive = (() => {
-    if (!s.wc_webhook_secret || !s.wc_product_webhook_last_received_at) return false
+    if (s.wc_webhook_secret_set !== 'true' || !s.wc_product_webhook_last_received_at) return false
     const receivedAt = Date.parse(s.wc_product_webhook_last_received_at)
     return Number.isFinite(receivedAt) && (Date.now() - receivedAt) <= 24 * 60 * 60 * 1000
   })()
@@ -720,6 +740,15 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   }
 
   async function handleStockSync() {
+    // Belt-and-braces behind the disabled button: the server gate reads the
+    // SAVED setting, so a push with an unsaved toggle can only no-op.
+    if (isStockPushUnsaved) {
+      setSyncResult({
+        text: 'Stock push is still disabled on the server — click "Save Settings" first, then push.',
+        isError: true,
+      })
+      return
+    }
     setSyncResult(null)
     setStockSyncStarting(true)
     stockSyncStartedByUserRef.current = true
@@ -805,6 +834,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
         setSyncResult({ text: `Error: ${settingsResult.error ?? 'Failed to save sync settings.'}`, isError: true })
         return
       }
+      setSavedStockSyncEnabled(s.wc_stock_sync_enabled === 'true')
       router.refresh()
       setSyncResult(null)
       setSaved(true)
@@ -945,7 +975,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
 
         {wcConfigured && (
           <HelperPluginCard
-            webhookSecret={s.wc_webhook_secret}
+            webhookSecret={s.wc_webhook_secret_set === 'true' ? 'configured' : ''}
             fxPushEnabled={s.wc_fx_push_enabled === 'true'}
             lastFxPushAt={s.last_wc_fx_push_at}
             onFxPushToggle={async (enabled) => {
@@ -997,6 +1027,10 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   <span className="text-sm">Import completed</span>
                 </div>
                 <p className="text-xs text-muted-foreground">{importProgress.message}</p>
+                <Button size="sm" variant="outline" onClick={handleStartInitialImport} disabled={importStarting}>
+                  {importStarting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+                  Re-import active orders
+                </Button>
               </div>
             ) : importProgress?.status === 'error' ? (
               <div className="space-y-2">
@@ -1056,7 +1090,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 {orderWebhookActive && (
                   <p className="text-xs text-muted-foreground">Primary order polling is disabled — orders are received in real-time via webhook (last received: {formatDateTime(s.wc_order_webhook_last_received_at)}). Cron now acts only as backup reconciliation, roughly daily.</p>
                 )}
-                {s.wc_webhook_secret && !orderWebhookActive && (
+                {s.wc_webhook_secret_set === 'true' && !orderWebhookActive && (
                   <p className="text-xs text-amber-600">Webhook secret is set but no recent order webhook has been received — polling reconciliation is still active.</p>
                 )}
               </div>
@@ -1065,7 +1099,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
             <WebhookSecretField
               value={s.wc_webhook_secret}
               onChange={(v) => setS({ ...s, wc_webhook_secret: v })}
-              hadSecretOnLoad={!!init.wc_webhook_secret}
+              hadSecretOnLoad={init.wc_webhook_secret_set === 'true'}
               onSave={async (secret) => {
                 await withStepUp(() => saveShoppingSyncSettings({ wc_webhook_secret: secret }))
               }}
@@ -1179,8 +1213,13 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                     <p className="text-xs text-muted-foreground">Pushes the next FIFO unit cost to WooCommerce&apos;s native Cost of Goods Sold field</p>
                   </div>
                 </label>
+                {isStockPushUnsaved && (
+                  <p className="text-xs text-amber-600">
+                    Stock push is not enabled on the server yet — click Save Settings below before pushing.
+                  </p>
+                )}
                 <div className="flex items-center gap-2 flex-wrap">
-                  <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending || stockSyncBusy}>
+                  <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending || stockSyncBusy || isStockPushUnsaved}>
                     {stockSyncBusy ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
                     Push Stock Now
                   </Button>
@@ -1227,9 +1266,9 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
         </div>
       )}
 
-      {/* Tax Rates tab — audit-wrwr: unified WC/Xero/IMS mapper */}
+      {/* Tax Rates tab — audit-wrwr: unified WC/accounting/IMS mapper */}
       {tab === 'tax' && (
-        <UnifiedTaxRateMapper context="settings" wcConnected={wcConfigured} xeroConnected={xeroConnected} />
+        <UnifiedTaxRateMapper context="settings" wcConnected={wcConfigured} accountingConnected={accountingConnected} />
       )}
 
       {/* Status Mapping tab */}

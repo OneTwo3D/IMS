@@ -101,8 +101,15 @@ enum SalesOrderStatus {
   COMPLETED
   DELIVERED
   CANCELLED
-  REFUNDED
-  PARTIALLY_REFUNDED
+  // REFUNDED / PARTIALLY_REFUNDED retired — refund state is now the orthogonal
+  // RefundDisposition (SalesOrder.refundStatus); an order can be e.g. DELIVERED + FULL.
+}
+
+// Refund disposition for a sales order, orthogonal to the fulfilment lifecycle status.
+enum RefundDisposition {
+  NONE
+  PARTIAL
+  FULL
 }
 
 enum ShipmentStatus {
@@ -162,6 +169,13 @@ enum AccountingSyncType {
   DAILY_BATCH_REVENUE_DEFERRAL
   DAILY_BATCH_INVENTORY_ALLOC
   DAILY_BATCH_GROUP_B
+  // cogs-audit scjz.60.4: end-of-daily-batch sweep of the inventory subledger-vs-GL
+  // rounding residue to the configured rounding-difference account (guarded; only
+  // when the gap is within the sweep tolerance — material gaps are flagged, never swept).
+  DAILY_BATCH_INVENTORY_RECONCILIATION
+  // khdw: end-of-daily-batch sweep of the COGS subledger-vs-GL rounding residue
+  // (same guard as inventory — sub-penny sweep, material gaps flagged never swept).
+  DAILY_BATCH_COGS_RECONCILIATION
   UNEARNED_REV_REVERSAL
   BILL_PAYMENT
   REALISED_FX_JOURNAL
@@ -405,6 +419,8 @@ model AdjustmentReason {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
+  alignDownBindings ExternalWmsBinding[] @relation("ExternalWmsBindingAlignDownReason")
+
   @@map("adjustment_reasons")
 }
 
@@ -587,6 +603,7 @@ model Product {
   mpn             String?
   hsCode          String?
   countryOfOrigin String?     // 2-letter ISO code
+  customsDescription String?  // free-text goods description for customs paperwork
   weight          Decimal?    @db.Decimal(10, 4) // kg, for landed cost by weight
   active          Boolean     @default(true)
 
@@ -675,6 +692,7 @@ model Product {
   wmsSyncLogs      WmsSyncLog[]          @relation("WmsSyncLogProduct")
   wmsStockSnapshots WmsStockSnapshot[]   @relation("WmsStockSnapshotProduct")
   wmsStockDiscrepancies WmsStockDiscrepancy[] @relation("WmsStockDiscrepancyProduct")
+  hsCodeProposals  HsCodeProposal[]
   wmsReturnsInbox  WmsReturnsInbox[]     @relation("WmsReturnsInboxProduct")
 
   @@index([parentId])
@@ -742,8 +760,8 @@ model StockLevel {
   id              String    @id @default(cuid())
   productId       String
   warehouseId     String
-  quantity        Decimal   @db.Decimal(12, 4) @default(0) // enforced non-negative in DB
-  reservedQty     Decimal   @db.Decimal(12, 4) @default(0) // enforced non-negative in DB; in transit / allocated
+  quantity        Decimal   @db.Decimal(14, 6) @default(0) // enforced non-negative in DB; 6dp matches cost_layers/FIFO engine
+  reservedQty     Decimal   @db.Decimal(14, 6) @default(0) // enforced non-negative in DB; in transit / allocated; 6dp matches cost_layers
   updatedAt       DateTime  @updatedAt
 
   product         Product   @relation(fields: [productId], references: [id])
@@ -758,8 +776,8 @@ model CostLayer {
   id              String    @id @default(cuid())
   productId       String
   warehouseId     String
-  receivedQty     Decimal   @db.Decimal(12, 4) // enforced non-negative in DB
-  remainingQty    Decimal   @db.Decimal(12, 4) // enforced non-negative in DB and <= receivedQty
+  receivedQty     Decimal   @db.Decimal(14, 6) // enforced non-negative in DB; 6dp matches the FIFO engine + cogs_entries
+  remainingQty    Decimal   @db.Decimal(14, 6) // enforced non-negative in DB and <= receivedQty; 6dp matches the FIFO engine
   unitCostBase     Decimal   @db.Decimal(18, 6) // landed cost per unit in GBP
   receivedAt      DateTime  @default(now())
   poLineId        String?   // link back to the PO line that created this layer
@@ -775,11 +793,31 @@ model CostLayer {
 
   cogsEntries     CogsEntry[]
   sourceLines     CostLayerSourceLine[]
+  revaluations    CostLayerRevaluation[]
 
   @@index([productId, warehouseId, receivedAt])
   @@index([adjustmentMovementId])
   @@index([productionOrderId])
   @@map("cost_layers")
+}
+
+// Event log of every change to a cost layer's unitCostBase (landed-cost recalc,
+// manufacturing recompute, FX rebase, adjustment edit), so as-of/historical
+// valuation can reconstruct the cost basis valid at a point in time instead of
+// using the current (post-revaluation) cost (cogs-audit scjz.43/.48).
+model CostLayerRevaluation {
+  id              String    @id @default(cuid())
+  costLayerId     String
+  oldUnitCostBase Decimal   @db.Decimal(18, 6)
+  newUnitCostBase Decimal   @db.Decimal(18, 6)
+  effectiveAt     DateTime
+  reason          String?
+  createdAt       DateTime  @default(now())
+
+  costLayer       CostLayer @relation(fields: [costLayerId], references: [id], onDelete: Cascade)
+
+  @@index([costLayerId, effectiveAt])
+  @@map("cost_layer_revaluations")
 }
 
 model CostLayerSourceLine {
@@ -817,6 +855,32 @@ model CogsEntry {
   @@map("cogs_entries")
 }
 
+/// khdw: independent subledger of GL COGS-account movements, used by the daily-batch
+/// COGS subledger-vs-GL rounding reconciliation. One signed row per COGS-account
+/// posting that does NOT have a native structured home: refund COGS reversals,
+/// shipment COGS revaluations, and landed-cost COGS adjustments. (Dispatch COGS is
+/// reconciled from its native field Shipment.cogsBatchAmount, so it is not recorded
+/// here.) `baseDelta` is the signed base-currency COGS movement — positive = COGS
+/// debited (increased), negative = credited (decreased) — at the highest precision
+/// the source carries (6dp refund cost-layer total; 2dp-exact reval/landed-cost).
+/// `journalDate` is the GL date the movement posts on, so the reconciliation windows
+/// it the same way it windows Shipment.shipmentJournalDate on the dispatch side.
+model CogsSubledgerMovement {
+  id             String   @id @default(cuid())
+  // 'REFUND_REVERSAL' | 'SHIPMENT_REVALUATION' | 'LANDED_COST_ADJUSTMENT'
+  sourceType     String   @map("source_type")
+  // originating entity (refundId / shipmentId / purchaseOrderId) for traceability
+  sourceRef      String   @map("source_ref")
+  // dedupes re-staged/retried postings; mirrors the COGS journal's idempotency key
+  idempotencyKey String   @unique @map("idempotency_key")
+  baseDelta      Decimal  @db.Decimal(18, 6) @map("base_delta")
+  journalDate    DateTime @map("journal_date")
+  createdAt      DateTime @default(now())
+
+  @@index([journalDate])
+  @@map("cogs_subledger_movements")
+}
+
 /// Governed by additional db-native reporting guarantees from migration
 /// 20260602103000_stock_movement_reporting_guarantees:
 /// - value fields must both be null or both populated, and totalValueBase must
@@ -830,7 +894,7 @@ model StockMovement {
   productId       String
   fromWarehouseId String?
   toWarehouseId   String?
-  qty             Decimal           @db.Decimal(12, 4) // always positive; enforced non-negative in DB
+  qty             Decimal           @db.Decimal(14, 6) // always positive; enforced non-negative in DB; 6dp matches cost_layers/FIFO engine
   note            String?
   referenceType   String?           // e.g. "PurchaseOrder", "SalesOrder"
   referenceId     String?           // ID of the related entity
@@ -844,11 +908,20 @@ model StockMovement {
   /// Reporting denormalization: total movement value in base currency.
   /// Expected to match qty * unitCostBase within inventory invariant tolerance.
   totalValueBase  Decimal?          @db.Decimal(18, 6)
+  /// Durable line-granularity link from a sale-dispatch movement to the
+  /// originating ShipmentLine (and thus the SalesOrderLine). Populated for
+  /// SALE_DISPATCH movements created from a real shipment; null for other
+  /// movement types and for zero-cost historical-import demand rows.
+  /// Promotes the latent `SALE_DISPATCH:shipmentLine:<id>` idempotency-key
+  /// linkage into a first-class column so revenue↔COGS reporting can join at
+  /// shipment-line granularity (cogs-audit scjz.51/.67, epic 4pz6).
+  shipmentLineId  String?
   createdAt       DateTime          @default(now())
 
   product         Product           @relation(fields: [productId], references: [id])
   fromWarehouse   Warehouse?        @relation("MovementFromWarehouse", fields: [fromWarehouseId], references: [id])
   toWarehouse     Warehouse?        @relation("MovementToWarehouse", fields: [toWarehouseId], references: [id])
+  shipmentLine    ShipmentLine?     @relation(fields: [shipmentLineId], references: [id], onDelete: SetNull)
 
   adjustmentLayers CostLayer[]      @relation("AdjustmentMovementLayer")
   cogsEntries     CogsEntry[]
@@ -857,6 +930,7 @@ model StockMovement {
   @@index([createdAt])
   @@index([productId, createdAt])
   @@index([type, createdAt])
+  @@index([shipmentLineId])
   @@index([referenceType, referenceId])
   @@index([referenceType(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_movements_reference_type_trgm_idx")
   @@index([referenceId(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_movements_reference_id_trgm_idx")
@@ -890,9 +964,13 @@ model InventorySnapshot {
   snapshotDate DateTime @db.Date
   productId    String
   warehouseId  String
-  qty          Decimal  @db.Decimal(12, 4)
+  qty          Decimal  @db.Decimal(14, 6) // 6dp matches live stock_levels/cost_layers
   valueBase    Decimal  @db.Decimal(18, 6)
   unitCostBase Decimal? @db.Decimal(18, 6)
+  // False when this snapshot's value is not point-in-time accurate — e.g. a
+  // backfilled row seeded from current cost layers that were revalued after this
+  // date, so its valueBase reflects a later cost basis (cogs-audit scjz.43/.48).
+  valueReplayReliable Boolean @default(true)
   createdAt    DateTime @default(now())
 
   product      Product   @relation(fields: [productId], references: [id])
@@ -903,6 +981,26 @@ model InventorySnapshot {
   @@index([productId, snapshotDate])
   @@index([warehouseId, snapshotDate])
   @@map("inventory_snapshots")
+}
+
+/// Daily coverage marker for sparse InventorySnapshot rows. If a run exists for a
+/// snapshotDate, absent product/warehouse rows represent a genuine zero on-hand
+/// position for that day, so an empty inventory_snapshots result for the date is a
+/// real zero subledger value (used by the inventory GL reconciliation, scjz.60.5)
+/// rather than an uncovered date. If no run exists, callers must treat empty rows
+/// as missing evidence, not zero. Mirrors InventoryReservationSnapshotRun.
+model InventorySnapshotRun {
+  id              String    @id @default(cuid())
+  snapshotDate    DateTime  @unique @db.Date
+  stockLevelCount Int
+  snapshotCount   Int
+  source          String    @default("cron")
+  checkMethod     String    @default("daily_current_state_v1")
+  cutoffAt        DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("inventory_snapshot_runs")
 }
 
 /// Daily product/warehouse reservation position for true as-of availability
@@ -917,8 +1015,8 @@ model InventoryReservationSnapshot {
   snapshotDate           DateTime @db.Date
   productId              String
   warehouseId            String
-  reservedQty            Decimal  @db.Decimal(12, 4)
-  availableQty           Decimal  @db.Decimal(12, 4)
+  reservedQty            Decimal  @db.Decimal(14, 6) // 6dp matches live stock_levels/cost_layers
+  availableQty           Decimal  @db.Decimal(14, 6) // 6dp matches live stock_levels/cost_layers
   reservationSourceCount Int      @default(0)
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
@@ -1392,6 +1490,11 @@ model SalesOrder {
   id                String           @id @default(cuid())
   externalOrderNumber String?         // Storefront order number/reference
   status            SalesOrderStatus @default(DRAFT)
+  // Refund disposition, orthogonal to the fulfilment `status` lifecycle (an order can
+  // be e.g. Processing + Partially refunded, or Delivered + Fully refunded). Maintained
+  // by the refund service; the legacy PARTIALLY_REFUNDED/REFUNDED `status` values are
+  // being retired in favour of this field (epic: orthogonal refund status).
+  refundStatus      RefundDisposition @default(NONE)
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 
@@ -1399,6 +1502,7 @@ model SalesOrder {
   customerId        String?
   customerName      String?
   customerEmail     String?
+  customerVatNumber String?          // customer-entered VAT/IOSS number from the storefront, sent to the WMS for customs
   billingAddress    Json?
   shippingAddress   Json?
 
@@ -1460,6 +1564,9 @@ model SalesOrder {
   shipments         Shipment[]
   shoppingLinks     ShoppingOrderLink[]
   wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
+  wmsOrderStatus    WmsOrderStatusSnapshot?
+  wmsOrderPush      WmsOrderPushLink?
+  wmsOrderDiscrepancies WmsOrderDiscrepancy[]
 
   @@index([status])
   @@index([status, updatedAt(sort: Desc)], map: "sales_orders_status_updatedAt_idx")
@@ -1511,6 +1618,17 @@ model SalesOrderRefund {
   accountingRetryRequired Boolean @default(false) @map("accounting_retry_required")
   accountingWarning String?   @map("accounting_warning")
   accountingRetrySyncs Json?  @map("accounting_retry_syncs")
+  // scjz.70: revenue-only chargeback — credit note reverses recognised revenue
+  // against AR, but COGS reversal + inventory restock are suppressed (cost kept as
+  // a loss, goods not returned). Persisted so an accounting retry that re-stages
+  // reproduces the treatment.
+  chargeback      Boolean    @default(false)
+  // scjz.71: whether this refund STAGED a COGS/unearned reversal (durable, set at
+  // staging time). Distinguishes a fully-shipped chargeback (no reversal staged —
+  // credit-note-only, exempt from reversal-evidence checks) from a partial/deferred
+  // chargeback that staged an UNEARNED_REV_REVERSAL and must still have that evidence.
+  // accountingRetrySyncs is cleared once syncs queue, so it can't carry this.
+  reversalStaged  Boolean    @default(false)
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
 
@@ -2156,6 +2274,90 @@ model ShoppingOrderLink {
   @@map("shopping_order_links")
 }
 
+// Cached live WMS order status for a sales order, populated by the WMS
+// order-status sweep cron and read by the sales LIST chips (the detail view
+// fetches live). Connector-agnostic — `connector` records which WMS produced it.
+model WmsOrderStatusSnapshot {
+  id                  String   @id @default(cuid())
+  orderId             String   @unique
+  connector           String
+  connectorLabel      String
+  externalOrderId     String
+  externalOrderNumber String
+  status              String
+  statusLabel         String
+  isSplit             Boolean  @default(false)
+  partCount           Int?
+  isMerged            Boolean  @default(false)
+  mergedOrderNumbers  String[] @default([])
+  deepLinkUrl         String?
+  trackingNumber      String?
+  carrier             String?
+  fetchedAt           DateTime @default(now())
+  lastError           String?
+  // Last WMS status successfully pushed to the storefront (G4). Decoupled from `status`
+  // so a failed storefront push isn't masked by the cached-status change gate — it retries.
+  wcPushedStatus      String?
+
+  order               SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([connector])
+  @@index([fetchedAt])
+  @@map("wms_order_status_snapshots")
+}
+
+// Outbound push state for an IMS sales order sent to a WMS for fulfilment
+// (Phase 8). The push sweep is the writer; `externalOrderId` is the stable join
+// to the WMS order after a successful create. Connector-agnostic.
+enum WmsOrderPushState {
+  PENDING_CREATE
+  SYNCED
+  PENDING_CANCEL
+  CANCELLED
+  DEAD_LETTER
+  HELD
+  MERGED
+}
+
+model WmsOrderPushLink {
+  id                  String            @id @default(cuid())
+  orderId             String            @unique
+  connector           String
+  externalOrderId     String?
+  externalOrderNumber String?
+  state               WmsOrderPushState @default(PENDING_CREATE)
+  attempts            Int               @default(0)
+  lastError           String?
+  lastAttemptAt       DateTime?
+  pushedAt            DateTime?
+  cancelledAt         DateTime?
+  // G6 review flags (non-blocking; the order is still pushed). courierPending: the order's
+  // shipping service didn't map to a WMS courier and we fell back to a configured default id,
+  // so an operator should confirm/pick the courier in the WMS; auto-cleared when the WMS
+  // order-status sweep reports a resolved courier name. totalMismatchPence: the order's own
+  // totals did not reconcile to within a penny at push time (surfaced for review).
+  courierPending      Boolean           @default(false)
+  totalMismatchPence  Int?
+  /// 6oyu.2: dispatch-reconciliation dead-letter. The dispatch sweep counts
+  /// CONSECUTIVE per-order reconcile errors here (reset on success/pending);
+  /// at the cap the link is dead-lettered (dispatchDeadLetteredAt set), leaves
+  /// the sweep's candidate set, and surfaces in the sync exception inbox.
+  dispatchFailureCount   Int            @default(0)
+  dispatchLastError      String?
+  dispatchDeadLetteredAt DateTime?
+  /// q66in.4.4: when the order reconcile last verified this link against the
+  /// WMS — the capped daily sweep rotates least-recently-checked first.
+  reconcileCheckedAt     DateTime?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  order               SalesOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([connector, state])
+  @@index([dispatchDeadLetteredAt])
+  @@map("wms_order_push_links")
+}
+
 // ---------------------------------------------------------------------------
 // WMS / WAREHOUSE CONNECTOR
 // ---------------------------------------------------------------------------
@@ -2191,6 +2393,8 @@ enum WmsSyncJobType {
   ASN_CALLBACK
   RETURNS_SYNC
   PRODUCT_VERIFY
+  DISPATCH_SYNC
+  ORDER_RECONCILE
 }
 
 enum WmsSyncJobStatus {
@@ -2210,6 +2414,7 @@ enum WmsDiscrepancyCategory {
   BUNDLE_DERIVATION_CONFLICT
   BARCODE_CONFLICT
   BARCODE_BACKFILLED_FROM_WMS
+  INVALID_HS_CODE
 }
 
 enum WmsDiscrepancyStatus {
@@ -2217,6 +2422,12 @@ enum WmsDiscrepancyStatus {
   ACKNOWLEDGED
   RESOLVED
   IGNORED
+}
+
+enum HsCodeProposalStatus {
+  PENDING
+  APPROVED
+  REJECTED
 }
 
 enum WmsReturnsInboxStatus {
@@ -2294,13 +2505,25 @@ model ExternalWmsBinding {
   discrepancyThresholds Json?
   reportRecipients     String[]               @default([])
   alignmentConfirmedAt DateTime?
+  /// q66in.4.6: when the watchdog last alerted that this binding's stock sync
+  /// is stale (dedupe); cleared by the next successful sync.
+  staleSyncAlertedAt   DateTime?
+  /// Adjustment reason used to book ALIGN_TO_WMS downward corrections (6oyu.1).
+  /// Align-down only auto-applies while this is set; deleting the reason nulls it
+  /// and align-down falls back to manual discrepancies.
+  alignDownReasonId    String?
   lastStockSyncAt      DateTime?
   lastStockSyncStatus  WmsSyncJobStatus?
+  /// q66in.4.6: last sync that completed its checks (SUCCEEDED/PARTIAL) — the
+  /// watchdog's staleness anchor. lastStockSyncAt advances on FAILED attempts
+  /// too, which would keep a permanently failing binding "fresh" forever.
+  lastStockSyncSuccessAt DateTime?
   createdAt            DateTime               @default(now())
   updatedAt            DateTime               @updatedAt
 
   connection           WmsConnection          @relation(fields: [connectionId], references: [id], onDelete: Cascade)
   warehouse            Warehouse              @relation(fields: [warehouseId], references: [id])
+  alignDownReason      AdjustmentReason?      @relation("ExternalWmsBindingAlignDownReason", fields: [alignDownReasonId], references: [id], onDelete: SetNull)
 
   @@unique([connector, warehouseId])
   @@unique([connector, externalWarehouseId])
@@ -2327,6 +2550,40 @@ model WmsProductLink {
   @@unique([connector, productId])
   @@index([productId])
   @@map("wms_product_links")
+}
+
+/// AI HS-code classification proposal awaiting human review (6igm.3). A proposal is only
+/// authoritative once APPROVED, at which point its code is written to the product. Carries both
+/// the classifier's self-report (modelConfidence, source) and the deterministic validator output
+/// (confidence, band, flags, declarable) so the review queue needs no recomputation to display.
+model HsCodeProposal {
+  id                         String               @id @default(cuid())
+  productId                  String
+  proposedHsCode             String?
+  proposedCustomsDescription String?
+  source                     String               @default("pending")
+  modelConfidence            Int                  @default(0)
+  confidence                 Int                  @default(0)
+  band                       String               @default("low")
+  flags                      String               @default("")
+  /// Hash of the classification-relevant fields (name/description/category) at classify time,
+  /// so a product edit that changes them can invalidate this proposal for re-classification (6igm.5).
+  classificationFieldsHash   String?
+  writeBlocking              Boolean              @default(false)
+  declarable                 Boolean              @default(false)
+  reasoning                  String               @default("")
+  status                     HsCodeProposalStatus @default(PENDING)
+  reviewedBy                 String?
+  reviewedAt                 DateTime?
+  reviewNote                 String?
+  createdAt                  DateTime             @default(now())
+  updatedAt                  DateTime             @updatedAt
+
+  product                    Product              @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([productId])
+  @@map("hs_code_proposals")
 }
 
 model WmsBundleLink {
@@ -2357,6 +2614,12 @@ model WmsAsnMap {
   status         WmsAsnStatus
   lastCallbackAt DateTime?
   closedAt       DateTime?
+  /// q66in.4.6: expected arrival (from the ASN create dialog) — the watchdog's
+  /// 'open ASN with no callback after ETA' SLO anchor.
+  eta            DateTime?
+  /// q66in.4.6: when the watchdog last alerted on this ASN (dedupe); cleared by
+  /// a fresh callback or close so a RENEWED breach re-alerts.
+  sloAlertedAt   DateTime?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -2440,6 +2703,55 @@ model WmsSyncLog {
   @@map("wms_sync_logs")
 }
 
+enum WmsMutationDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum WmsMutationOutcome {
+  SUCCEEDED
+  FAILED
+}
+
+/// q66in.4.6: audit-grade timeline of connector mutations — one row per
+/// IMS↔WMS state change, with operational before/after images. Payloads are
+/// built at the call sites from operational fields only (states, ids, SKUs,
+/// quantities, totals) and pass through a PII scrub as defense-in-depth —
+/// never full order/customer dumps. Purged by the activity-cleanup cron after
+/// the configured retention.
+model WmsMutationEvent {
+  id          String               @id @default(cuid())
+  connector   String
+  direction   WmsMutationDirection
+  /// e.g. order_create, order_update, order_hold, order_cancel, order_release,
+  /// order_comment, asn_create, product_upsert, bundle_upsert, align_up,
+  /// align_down, booked_in_receipt, dispatch_applied, return_inbox
+  action      String
+  outcome     WmsMutationOutcome
+  /// IMS entity the mutation is about: SALES_ORDER, PRODUCT, ASN, STOCK_LEVEL,
+  /// SHIPMENT, RETURN — free string, matches the timeline UI filter.
+  entityType  String
+  entityId    String?
+  /// WMS-side identifier (external order/ASN/product id) when known.
+  externalId  String?
+  summary     String
+  before      Json?
+  after       Json?
+  error       String?
+  /// Correlates to a WmsSyncJob run when the mutation happened inside one.
+  jobId       String?
+  triggeredBy String?
+  createdAt   DateTime             @default(now())
+
+  @@index([createdAt])
+  @@index([connector, createdAt])
+  @@index([entityType, entityId])
+  @@index([entityId])
+  @@index([externalId])
+  @@index([action, createdAt])
+  @@map("wms_mutation_events")
+}
+
 model WmsStockSnapshot {
   id           String   @id @default(cuid())
   connector    String
@@ -2456,6 +2768,30 @@ model WmsStockSnapshot {
   @@unique([connector, warehouseId, productId])
   @@index([warehouseId, productId])
   @@map("wms_stock_snapshots")
+}
+
+/// q66in.4.4: durable ORDER-level reconcile finding. The capped daily sweep can
+/// never produce a complete snapshot, so findings persist as OPEN rows —
+/// upserted when detected, resolved only when THAT order re-verifies clean (or
+/// the drift predicate no longer holds). One OPEN row per (order, category),
+/// enforced by a partial unique index in SQL.
+model WmsOrderDiscrepancy {
+  id                  String    @id @default(cuid())
+  connector           String
+  orderId             String
+  category            String
+  status              String    @default("OPEN")
+  detail              String?
+  externalOrderNumber String?
+  firstSeenAt         DateTime  @default(now())
+  lastSeenAt          DateTime  @default(now())
+  resolvedAt          DateTime?
+
+  order               SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([status, category])
+  @@index([orderId])
+  @@map("wms_order_discrepancies")
 }
 
 model WmsStockDiscrepancy {
@@ -2516,6 +2852,39 @@ model WmsInboundReceiptEvent {
   @@index([processingStatus, nextRetryAt])
   @@index([deadLetteredAt])
   @@map("wms_inbound_receipt_events")
+}
+
+/// Generic inbound webhook event staging for push-primary WMS connectors (ShipHero).
+/// Distinct from WmsInboundReceiptEvent (Mintsoft's ASN-specific poll model): ShipHero
+/// pushes order/shipment/inventory webhooks, staged here by event type with idempotent
+/// dedupe on (connector, externalEventId), retry/dead-letter state, and a monotonic
+/// status rank guarding the writeback against out-of-order delivery.
+model WmsWebhookEvent {
+  id                 String    @id @default(cuid())
+  connector          String
+  eventType          String
+  externalEventId    String
+  /// Order ref (order_id / legacy_id) for status events; null for inventory events.
+  externalOrderId    String?
+  /// Rank of the event's fulfillment_status at receipt; the monotonic guard refuses
+  /// to apply an event whose rank is below an already-applied one for the same order.
+  statusRank         Int?
+  payload            Json
+  processedAt        DateTime?
+  /// Set when the event applied but was a no-op because a higher-ranked status already won.
+  supersededAt       DateTime?
+  processingStatus   String    @default("PENDING")
+  processingAttempts Int       @default(0)
+  nextRetryAt        DateTime?
+  deadLetteredAt     DateTime?
+  lastError          String?
+  receivedAt         DateTime  @default(now())
+
+  @@unique([connector, externalEventId])
+  @@index([processingStatus, nextRetryAt])
+  @@index([connector, externalOrderId])
+  @@index([deadLetteredAt])
+  @@map("wms_webhook_events")
 }
 
 model WmsReturnsInbox {
@@ -2601,7 +2970,10 @@ model Notification {
   createdAt DateTime @default(now())
   readAt    DateTime?
 
-  user         User?                    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  /// Cascade, NOT SetNull (Codex r7): userId=null means "broadcast to all
+  /// users", so nulling on recipient deletion converted targeted (often
+  /// admin-only, operationally sensitive) notifications into broadcasts.
+  user         User?                    @relation(fields: [userId], references: [id], onDelete: Cascade)
   readReceipts NotificationReadReceipt[]
 
   @@index([userId, read, createdAt])
@@ -2739,6 +3111,7 @@ model ShipmentLine {
   shipment    Shipment       @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
   line        SalesOrderLine @relation(fields: [lineId], references: [id])
   product     Product        @relation(fields: [productId], references: [id])
+  stockMovements StockMovement[]
 
   @@index([costLayerSnapshot(ops: JsonbOps)], type: Gin, map: "shipment_lines_costLayerSnapshot_gin_idx")
   @@map("shipment_lines")

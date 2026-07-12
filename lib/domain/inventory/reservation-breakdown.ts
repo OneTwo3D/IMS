@@ -41,6 +41,7 @@ type AllocationRow = {
     externalOrderNumber: string | null
     expectedDelivery: Date | null
     status: string
+    refundStatus: string
   }
   line: {
     sku: string | null
@@ -99,7 +100,6 @@ export type ReservationSourceLoadOptions = {
 
 const ZERO = new Prisma.Decimal(0)
 const RESERVATION_EPSILON = new Prisma.Decimal('0.0001')
-const TERMINAL_ORDER_STATUSES = ['CANCELLED', 'REFUNDED'] as const
 
 function stockKey(productId: string, warehouseId: string): string {
   return `${productId}:${warehouseId}`
@@ -133,14 +133,14 @@ export async function loadReservationSourceRows(
     ...(options.productId ? { productId: options.productId } : {}),
     ...(options.warehouseId ? { warehouseId: options.warehouseId } : {}),
     qty: { gt: 0 },
-    order: { status: { notIn: [...TERMINAL_ORDER_STATUSES] } },
+    order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
   }
   const activeShipmentWhere = {
     ...(options.productId ? { productId: options.productId } : {}),
     shipment: {
       status: { not: 'PENDING' },
       ...(options.warehouseId ? { warehouseId: options.warehouseId } : {}),
-      order: { status: { notIn: [...TERMINAL_ORDER_STATUSES] } },
+      order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
     },
   }
   const productionWhere = {
@@ -182,6 +182,7 @@ export async function loadReservationSourceRows(
             externalOrderNumber: true,
             expectedDelivery: true,
             status: true,
+            refundStatus: true,
           },
         },
         line: {
@@ -250,7 +251,7 @@ export async function loadReservationSourceRows(
   for (const allocation of allocations) {
     if (options.productId && allocation.productId !== options.productId) continue
     if (options.warehouseId && allocation.warehouseId !== options.warehouseId) continue
-    if (TERMINAL_ORDER_STATUSES.includes(allocation.order.status as typeof TERMINAL_ORDER_STATUSES[number])) continue
+    if (allocation.order.status === 'CANCELLED' || allocation.order.refundStatus === 'FULL') continue
 
     const committed = committedByAllocation.get(
       allocationKey(allocation.lineId, allocation.productId, allocation.warehouseId),

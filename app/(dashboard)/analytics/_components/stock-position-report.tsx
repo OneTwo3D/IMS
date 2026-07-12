@@ -20,6 +20,17 @@ export type StockPositionColumn<Row> = {
   footer?: React.ReactNode
 }
 
+/**
+ * Optional leading selection column. The page supplies the header and per-row
+ * cell content (e.g. checkboxes) — this component renders the `<th>`/`<td>`
+ * shells and keeps colSpans aligned. Defaults to undefined so every other
+ * report renders unchanged.
+ */
+export type StockPositionSelectionColumn<Row> = {
+  header: React.ReactNode
+  cell: (row: Row, index: number) => React.ReactNode
+}
+
 export type StockPositionFilterValues = {
   asOf?: string
   dateFrom?: string
@@ -62,6 +73,8 @@ type StockPositionReportPageProps<Row> = {
   // ABC class / urgency / text search.
   extraFilters?: React.ReactNode
   headerActions?: React.ReactNode
+  /** Optional leading checkbox/selection column (reorder report only today). */
+  selectionColumn?: StockPositionSelectionColumn<Row>
 }
 
 function today(): string {
@@ -88,6 +101,7 @@ export function StockPositionReportPage<Row>({
   showDemandWindowDays = false,
   extraFilters,
   headerActions,
+  selectionColumn,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
   const csvHref = `${exportBasePath}?${appendParams(params, { type: reportKey })}`
@@ -245,6 +259,9 @@ export function StockPositionReportPage<Row>({
         <Table containerClassName="max-h-[calc(100vh-22rem)]">
           <TableHeader className="bg-muted/50">
             <TableRow>
+              {selectionColumn && (
+                <TableHead className="w-10 text-center">{selectionColumn.header}</TableHead>
+              )}
               {columns.map((column) => (
                 <TableHead key={column.key} className={column.align === 'right' ? 'text-right' : ''}>{column.label}</TableHead>
               ))}
@@ -253,6 +270,9 @@ export function StockPositionReportPage<Row>({
           <TableBody>
             {rows.map((row, index) => (
               <TableRow key={rowKey(row, index)}>
+                {selectionColumn && (
+                  <TableCell className="text-center">{selectionColumn.cell(row, index)}</TableCell>
+                )}
                 {columns.map((column) => (
                   <TableCell key={column.key} className={column.align === 'right' ? 'text-right tabular-nums' : ''}>
                     {column.render(row)}
@@ -262,13 +282,14 @@ export function StockPositionReportPage<Row>({
             ))}
             {rows.length === 0 && (
               <TableRow>
-                <TableCell colSpan={columns.length} className="py-10 text-center text-sm text-muted-foreground">No rows match the current filters.</TableCell>
+                <TableCell colSpan={columns.length + (selectionColumn ? 1 : 0)} className="py-10 text-center text-sm text-muted-foreground">No rows match the current filters.</TableCell>
               </TableRow>
             )}
           </TableBody>
           {columns.some((column) => column.footer != null) && (
             <tfoot className="border-t bg-muted/30 font-medium">
               <tr>
+                {selectionColumn && <td className="px-3 py-2" />}
                 {columns.map((column) => (
                   <td key={column.key} className={`px-3 py-2 text-sm ${column.align === 'right' ? 'text-right tabular-nums' : ''}`}>
                     {column.footer ?? null}

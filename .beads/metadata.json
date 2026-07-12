@@ -1,7 +1,7 @@
 {
   "database": "dolt",
   "backend": "dolt",
-  "dolt_mode": "embedded",
+  "dolt_mode": "server",
   "dolt_database": "onetwo3d_ims",
   "project_id": "0d77a373-b2a9-461b-8d1e-d45d594ead57"
 }

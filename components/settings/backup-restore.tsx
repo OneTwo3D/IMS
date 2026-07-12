@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { listBackups, deleteBackup, type BackupEntry } from '@/app/actions/backup'
+import { useStepUpReauth, isFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 function fmtSize(bytes: number) {
@@ -41,6 +42,20 @@ export function BackupRestore() {
   const [uploadManifestFile, setUploadManifestFile] = useState<File | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const manifestFileRef = useRef<HTMLInputElement>(null)
+
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
+
+  // The /api/backup/restore endpoint requires a fresh admin session; on staleness
+  // it returns 403 {code:'fresh_auth_required'}. Prompt step-up re-auth and retry once.
+  async function restoreFetch(init?: RequestInit): Promise<{ ok: boolean; status: number; data: { email?: string; error?: string; code?: string } }> {
+    let res = await fetch('/api/backup/restore', init)
+    let data = await res.json().catch(() => ({}))
+    if (!res.ok && res.status === 403 && data?.code === 'fresh_auth_required' && (await promptReauth())) {
+      res = await fetch('/api/backup/restore', init)
+      data = await res.json().catch(() => ({}))
+    }
+    return { ok: res.ok, status: res.status, data }
+  }
 
   const refreshList = () => listBackups().then(setBackups)
 
@@ -77,9 +92,8 @@ export function BackupRestore() {
     setSendingRestoreToken(true)
     setRestoreTokenStatus(null)
     try {
-      const res = await fetch('/api/backup/restore')
-      const data = await res.json()
-      if (res.ok) {
+      const { ok, data } = await restoreFetch()
+      if (ok) {
         setRestoreTokenStatus(`Confirmation code emailed to ${data.email}.`)
       } else {
         setRestoreTokenStatus(data.error ?? 'Failed to send confirmation email.')
@@ -100,9 +114,8 @@ export function BackupRestore() {
       formData.append('filename', filename)
       formData.append('confirmationPhrase', restoreConfirm)
       formData.append('restoreToken', restoreToken.trim().toUpperCase())
-      const res = await fetch('/api/backup/restore', { method: 'POST', body: formData })
-      const data = await res.json()
-      if (res.ok) {
+      const { ok, data } = await restoreFetch({ method: 'POST', body: formData })
+      if (ok) {
         setMsg({ text: 'Database restored successfully. Please refresh.', isError: false })
         setShowRestore(null)
         setRestoreConfirm('')
@@ -130,9 +143,8 @@ export function BackupRestore() {
       formData.append('manifestFile', uploadManifestFile)
       formData.append('confirmationPhrase', restoreConfirm)
       formData.append('restoreToken', restoreToken.trim().toUpperCase())
-      const res = await fetch('/api/backup/restore', { method: 'POST', body: formData })
-      const data = await res.json()
-      if (res.ok) {
+      const { ok, data } = await restoreFetch({ method: 'POST', body: formData })
+      if (ok) {
         setMsg({ text: 'Database restored from uploaded file. Please refresh.', isError: false })
         setShowUploadRestore(false)
         setRestoreConfirm('')
@@ -155,7 +167,15 @@ export function BackupRestore() {
 
   async function handleDelete(filename: string) {
     startTransition(async () => {
-      await deleteBackup(filename)
+      setMsg(null)
+      let result = await deleteBackup(filename)
+      if (isFreshAuthFailure(result) && (await promptReauth())) {
+        result = await deleteBackup(filename)
+      }
+      if (!result.success) {
+        setMsg({ text: result.error ?? 'Failed to delete backup.', isError: true })
+        return
+      }
       await refreshList()
     })
   }
@@ -184,6 +204,7 @@ export function BackupRestore() {
 
   return (
     <div className="space-y-4">
+      {stepUpDialog}
       <div className="flex items-center gap-2">
         <Button size="sm" onClick={handleCreate} disabled={creating}>
           {creating ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Download className="h-4 w-4 mr-1" />}

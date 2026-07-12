@@ -36,7 +36,7 @@ export function FxRatesTable({ baseCurrency, rates, pushLog, health }: Props) {
       <div>
         <p className="text-sm text-muted-foreground mb-3">
           Latest rate per currency — direction <code className="text-xs bg-muted px-1 rounded">1 {baseCurrency} = X</code>.
-          The rate stamped on each PO/SO and forwarded to Xero / WooCommerce comes from this table.
+          The rate stamped on each PO/SO and forwarded to your accounting and shopping connectors comes from this table.
           Pin a manual override when the daily ECB rate is wrong for a particular currency; the override stays in effect
           until you clear it.
         </p>
@@ -179,7 +179,7 @@ function ManualOverrideDialog({
         <div className="space-y-4 text-sm">
           <p className="text-xs text-muted-foreground">
             Pin a rate for <code className="bg-muted px-1 rounded">1 {baseCurrency} = X {row.toCurrency}</code>.
-            While set, the daily fetch will skip this currency and every read site (PO/SO, Xero, WooCommerce push) will
+            While set, the daily fetch will skip this currency and every read site (PO/SO, accounting and shopping pushes) will
             use this value.
           </p>
           <div className="space-y-1.5">
