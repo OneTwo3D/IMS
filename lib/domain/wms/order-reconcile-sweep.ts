@@ -382,57 +382,56 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
       ))
     },
     async listCancelledLinksToVerify(limit) {
-      // Recent window only: a long-cancelled order that once verified clean
-      // doesn't need re-checking forever. Windowed on cancelledAt — a STABLE
-      // timestamp (both the cancel and hold passes set it; our own
-      // reconcileCheckedAt stamp churns updatedAt, which would never age out).
-      const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
-      const links = await db.wmsOrderPushLink.findMany({
-        where: {
-          connector: connectorId,
-          externalOrderNumber: { not: null },
-          OR: [
-            // Propagated cancellations/holds within the window — or carrying an
-            // OPEN finding, which stays verifiable forever (a WMS-side fix after
-            // the window must still be able to re-verify clean).
-            {
-              state: { in: ['CANCELLED', 'HELD'] },
-              OR: [
-                { cancelledAt: { gte: since } },
-                // Never reconciled at all — e.g. the cron enabled >30 days
-                // after cancellations accumulated (Codex r26): age alone must
-                // not exempt a link that has never been verified once.
-                { reconcileCheckedAt: null },
-                { order: { wmsOrderDiscrepancies: { some: { category: 'ACTIVE_AFTER_CANCEL', status: 'OPEN' } } } },
-              ],
-            },
-            // UNPROPAGATED (Codex r23 P1): the IMS order is cancelled/on-hold/
-            // fully-refunded but the link is still SYNCED/MERGED — the push
-            // cron hasn't cancelled the WMS order (dead cron, or a cancel that
-            // keeps throwing), and the warehouse may still ship it. Mirrors the
-            // push sweep's holdable/cancellable intent sets.
-            {
-              state: { in: ['SYNCED', 'MERGED'] },
-              order: {
-                OR: [
-                  { status: { in: ['CANCELLED', 'ON_HOLD'] } },
-                  { status: { notIn: ['SHIPPED', 'COMPLETED', 'DELIVERED'] }, refundStatus: 'FULL' },
-                ],
-              },
-            },
-          ],
-        },
-        select: { orderId: true, state: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
-        take: limit,
-        // Rotate like check B: least-recently-verified first, so a window with
-        // more cancellations than the cap still gets full coverage over days.
-        orderBy: [{ reconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { cancelledAt: 'desc' }],
-      })
-      return links.flatMap((link) => (
+      const toRow = (link: { orderId: string; state: string; externalOrderNumber: string | null; order: { orderNumber: string | null } }) => (
         link.externalOrderNumber
           ? [{ orderId: link.orderId, orderNumber: link.order.orderNumber, externalOrderNumber: link.externalOrderNumber, linkState: link.state }]
           : []
-      ))
+      )
+
+      // Tier 1 — UNPROPAGATED cancellations FIRST (Codex r27 P1): the IMS order
+      // is cancelled/on-hold/fully-refunded but the link is still SYNCED/MERGED
+      // (dead push cron, or a WMS cancel that keeps throwing). These are the
+      // most dangerous and inherently RECENT transitions, and the link often
+      // carries a fresh reconcileCheckedAt from its SYNCED life — recency must
+      // not push them behind old propagated cancellations.
+      const unpropagated = await db.wmsOrderPushLink.findMany({
+        where: {
+          connector: connectorId,
+          externalOrderNumber: { not: null },
+          state: { in: ['SYNCED', 'MERGED'] },
+          order: {
+            OR: [
+              { status: { in: ['CANCELLED', 'ON_HOLD'] } },
+              { status: { notIn: ['SHIPPED', 'COMPLETED', 'DELIVERED'] }, refundStatus: 'FULL' },
+            ],
+          },
+        },
+        select: { orderId: true, state: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
+        take: limit,
+        orderBy: [{ reconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { updatedAt: 'desc' }],
+      })
+
+      // Tier 2 — propagated CANCELLED/HELD links within the window, never
+      // checked at all, or carrying an OPEN finding (verifiable forever).
+      const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      const remaining = Math.max(0, limit - unpropagated.length)
+      const propagated = remaining === 0 ? [] : await db.wmsOrderPushLink.findMany({
+        where: {
+          connector: connectorId,
+          externalOrderNumber: { not: null },
+          state: { in: ['CANCELLED', 'HELD'] },
+          OR: [
+            { cancelledAt: { gte: since } },
+            { reconcileCheckedAt: null },
+            { order: { wmsOrderDiscrepancies: { some: { category: 'ACTIVE_AFTER_CANCEL', status: 'OPEN' } } } },
+          ],
+        },
+        select: { orderId: true, state: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
+        take: remaining,
+        orderBy: [{ reconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { cancelledAt: 'desc' }],
+      })
+
+      return [...unpropagated.flatMap(toRow), ...propagated.flatMap(toRow)]
     },
     fetchOrderStatus(orderNumber) {
       return connector.fetchOrderStatus ? connector.fetchOrderStatus(orderNumber) : Promise.resolve(null)
@@ -463,7 +462,16 @@ export async function runWmsOrderReconcileSweep(
 
   const state = await getIntegrationPluginState()
   const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])
-  if (!connectorId) return { jobId: null, status: 'SKIPPED', counters: emptyCounters, skippedReason: 'No WMS connector enabled' }
+  if (!connectorId) {
+    // No connector: every open finding is unactionable and can never re-verify
+    // (Codex r27 P2 — the connector-retirement pass below would otherwise be
+    // unreachable, and the re-push refusal promises the next run retires them).
+    await db.wmsOrderDiscrepancy.updateMany({
+      where: { status: 'OPEN' },
+      data: { status: 'RESOLVED', resolvedAt: new Date() },
+    })
+    return { jobId: null, status: 'SKIPPED', counters: emptyCounters, skippedReason: 'No WMS connector enabled' }
+  }
   const connector = getWmsConnector(connectorId)
   if (!connector.fetchOrderStatus) {
     return { jobId: null, status: 'SKIPPED', counters: emptyCounters, skippedReason: 'Active WMS connector has no order-status support' }
