@@ -3,7 +3,7 @@
 import { useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, CheckCircle2, Inbox, Loader2, RotateCcw, XCircle } from 'lucide-react'
+import { ArrowLeft, CheckCircle2, Inbox, Loader2, RotateCcw } from 'lucide-react'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -19,7 +19,6 @@ import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from 
 import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
-  permanentFailOutboxException,
   replayDeadReceiptEvent,
   replayOutboxException,
   retryRefundSyncPark,
@@ -147,8 +146,8 @@ export function ExceptionsClient({ data }: Props) {
       {data.outboxFailures.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`Integration outbox — failed rows (${data.outboxFailures.length})`}
-            detail="Accounting posts, WooCommerce stock pushes, booked-in events and landed-cost journals that exhausted their retries. Replay resets the row with its original payload; mark permanently failed to acknowledge a row that must not run."
+            title={`Integration outbox — permanently failed rows (${data.outboxFailures.length})`}
+            detail="Accounting posts, WooCommerce stock pushes, booked-in events and landed-cost journals that exhausted their retries. Replay resets the row with its original payload and restarts its retry ladder."
           />
           <Table containerClassName="rounded-lg border" className="min-w-[900px]">
             <TableHeader className="bg-muted/40">
@@ -165,33 +164,20 @@ export function ExceptionsClient({ data }: Props) {
               {data.outboxFailures.map((row) => (
                 <TableRow key={row.id}>
                   <TableCell className="text-xs font-mono">{row.connector}/{row.operation}</TableCell>
-                  <TableCell className="text-xs">{row.status === 'PERMANENT_FAILED' ? 'Permanent' : 'Retryable'}</TableCell>
+                  <TableCell className="text-xs">Permanent</TableCell>
                   <TableCell className="text-xs">{row.attempts}</TableCell>
                   <TableCell className="text-xs text-muted-foreground max-w-[300px] truncate" title={row.lastError ?? ''}>{row.lastError ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.updatedAt)}</TableCell>
                   <TableCell className="text-right">
-                    <div className="flex justify-end gap-1">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        disabled={isPending}
-                        onClick={() => runAction(() => replayOutboxException(row.id), 'Outbox row re-queued.')}
-                      >
-                        <RotateCcw className="h-3 w-3 mr-1" />Replay
-                      </Button>
-                      {row.status !== 'PERMANENT_FAILED' ? (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          disabled={isPending}
-                          onClick={() => runAction(() => permanentFailOutboxException(row.id), 'Outbox row marked permanently failed.')}
-                        >
-                          <XCircle className="h-3 w-3 mr-1" />Fail
-                        </Button>
-                      ) : null}
-                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isPending}
+                      onClick={() => runAction(() => replayOutboxException(row.id), 'Outbox row re-queued.')}
+                    >
+                      <RotateCcw className="h-3 w-3 mr-1" />Replay
+                    </Button>
                   </TableCell>
                 </TableRow>
               ))}

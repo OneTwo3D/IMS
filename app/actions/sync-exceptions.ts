@@ -8,7 +8,6 @@ import { freshAuthFailureResult, requireFreshPermission, requirePermission } fro
 import {
   IntegrationOutboxAdminError,
   listIntegrationOutboxAdminRows,
-  permanentlyFailIntegrationOutboxAdminRow,
   replayIntegrationOutboxAdminRow,
 } from '@/lib/domain/integrations/outbox-admin'
 import { INTEGRATION_OUTBOX_STATUS } from '@/lib/domain/integrations/outbox'
@@ -106,8 +105,12 @@ export type ExceptionInboxData = {
   pennyMismatches: PennyMismatchRow[]
 }
 
+// Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
+// RETRYABLE_FAILED row is still on the processor's automatic retry ladder and
+// either recovers or lands here as PERMANENT_FAILED. Listing mid-backoff rows
+// would surface self-resolving noise, and "acknowledging" them (flipping to
+// PERMANENT_FAILED) would not have removed them from this same list.
 const OUTBOX_FAILURE_STATUSES = [
-  INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
   INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
 ]
 
@@ -367,29 +370,6 @@ export async function replayOutboxException(id: string): Promise<MutationResult>
       action: 'integration_outbox_replay',
       description: `Re-queued integration outbox row (${result.row.connector}/${result.row.operation}) from ${result.priorStatus} via the exception inbox`,
       metadata: { outboxId: id, priorStatus: result.priorStatus, priorLastError: result.priorLastError, userId: session.user.id },
-    })
-    revalidatePath('/sync/exceptions')
-    return { success: true }
-  } catch (error) {
-    const freshAuthFailure = freshAuthFailureResult(error)
-    if (freshAuthFailure) return freshAuthFailure
-    if (error instanceof IntegrationOutboxAdminError) return { success: false, error: error.message }
-    throw error
-  }
-}
-
-/** Acknowledge a failed outbox row as permanently failed (stops it counting as actionable). */
-export async function permanentFailOutboxException(id: string): Promise<MutationResult> {
-  try {
-    const session = await requireFreshPermission('sync')
-    const result = await permanentlyFailIntegrationOutboxAdminRow({ id })
-    await logActivity({
-      entityType: 'SYNC',
-      entityId: id,
-      tag: 'sync',
-      action: 'integration_outbox_permanent_fail',
-      description: `Marked integration outbox row (${result.row.connector}/${result.row.operation}) permanently failed via the exception inbox`,
-      metadata: { outboxId: id, priorStatus: result.priorStatus, userId: session.user.id },
     })
     revalidatePath('/sync/exceptions')
     return { success: true }
