@@ -82,7 +82,13 @@ export type WmsOrderReconcileDeps = {
 export async function runWmsOrderReconcileCore(
   deps: WmsOrderReconcileDeps,
   options?: { lookupLimit?: number },
-): Promise<{ counters: WmsReconcileCounters; findings: WmsReconcileFinding[]; verifiedOrderIds: string[] }> {
+): Promise<{
+  counters: WmsReconcileCounters
+  findings: WmsReconcileFinding[]
+  verifiedOrderIds: string[]
+  verifiedSyncedOrderIds: string[]
+  verifiedCancelledOrderIds: string[]
+}> {
   const lookupLimit = options?.lookupLimit ?? RECONCILE_DEFAULT_LOOKUP_LIMIT
   const counters: WmsReconcileCounters = { intentChecked: 0, linksVerified: 0, cancelledVerified: 0, findings: 0, errors: 0 }
   const findings: WmsReconcileFinding[] = []
@@ -105,13 +111,14 @@ export async function runWmsOrderReconcileCore(
   // B and C share ONE lookup budget (each fetchOrderStatus is a WMS API call),
   // and C — the ship-goods-nobody-expects direction — is fetched FIRST so a
   // large live-link backlog can never starve the safety-critical check (Codex).
-  const verifiedOrderIds: string[] = []
+  const verifiedSyncedOrderIds: string[] = []
+  const verifiedCancelledOrderIds: string[] = []
   const cancelledLinks = await deps.listCancelledLinksToVerify(lookupLimit)
   for (const link of cancelledLinks) {
     counters.cancelledVerified += 1
     try {
       const status = await deps.fetchOrderStatus(link.externalOrderNumber)
-      verifiedOrderIds.push(link.orderId)
+      verifiedCancelledOrderIds.push(link.orderId)
       if (status && !status.dispatched && !isLikelyCancelledWmsStatus(status)) {
         findings.push({
           category: 'ACTIVE_AFTER_CANCEL',
@@ -134,7 +141,7 @@ export async function runWmsOrderReconcileCore(
     counters.linksVerified += 1
     try {
       const status = await deps.fetchOrderStatus(link.externalOrderNumber)
-      verifiedOrderIds.push(link.orderId)
+      verifiedSyncedOrderIds.push(link.orderId)
       if (!status) {
         findings.push({
           category: 'MISSING_IN_WMS',
@@ -151,7 +158,13 @@ export async function runWmsOrderReconcileCore(
   }
 
   counters.findings = findings.length
-  return { counters, findings, verifiedOrderIds }
+  return {
+    counters,
+    findings,
+    verifiedOrderIds: [...verifiedCancelledOrderIds, ...verifiedSyncedOrderIds],
+    verifiedSyncedOrderIds,
+    verifiedCancelledOrderIds,
+  }
 }
 
 /**
@@ -365,14 +378,22 @@ export async function runWmsOrderReconcileSweep(
       }
     }
 
-    // Resolve B/C rows for orders this run verified CLEAN (verified, no finding).
+    // Resolve B/C rows PER CATEGORY (Codex r8): each check only speaks for its
+    // own category — an order found ACTIVE_AFTER_CANCEL this run still resolves
+    // its old MISSING_IN_WMS row if check B verified it, and vice versa.
     const foundKey = new Set(core.findings.map((finding) => `${finding.orderId}:${finding.category}`))
-    const cleanOrderIds = core.verifiedOrderIds.filter((orderId) => (
-      !foundKey.has(`${orderId}:MISSING_IN_WMS`) && !foundKey.has(`${orderId}:ACTIVE_AFTER_CANCEL`)
-    ))
-    if (cleanOrderIds.length > 0) {
+    const cleanFor = (verifiedIds: string[], category: string) => verifiedIds.filter((orderId) => !foundKey.has(`${orderId}:${category}`))
+    const cleanSynced = cleanFor(core.verifiedSyncedOrderIds, 'MISSING_IN_WMS')
+    if (cleanSynced.length > 0) {
       await db.wmsOrderDiscrepancy.updateMany({
-        where: { orderId: { in: cleanOrderIds }, category: { in: ['MISSING_IN_WMS', 'ACTIVE_AFTER_CANCEL'] }, status: 'OPEN' },
+        where: { orderId: { in: cleanSynced }, category: 'MISSING_IN_WMS', status: 'OPEN' },
+        data: { status: 'RESOLVED', resolvedAt: now },
+      })
+    }
+    const cleanCancelled = cleanFor(core.verifiedCancelledOrderIds, 'ACTIVE_AFTER_CANCEL')
+    if (cleanCancelled.length > 0) {
+      await db.wmsOrderDiscrepancy.updateMany({
+        where: { orderId: { in: cleanCancelled }, category: 'ACTIVE_AFTER_CANCEL', status: 'OPEN' },
         data: { status: 'RESOLVED', resolvedAt: now },
       })
     }
@@ -420,7 +441,7 @@ export async function runWmsOrderReconcileSweep(
         status,
         finishedAt: new Date(),
         totalChecked: counters.intentChecked + counters.linksVerified + counters.cancelledVerified,
-        matched: Math.max(0, counters.intentChecked + counters.linksVerified + counters.cancelledVerified - counters.findings),
+        matched: Math.max(0, counters.intentChecked + counters.linksVerified + counters.cancelledVerified - counters.findings - counters.errors),
         mismatched: counters.findings,
         errors: counters.errors,
       },
