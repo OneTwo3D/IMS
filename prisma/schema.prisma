@@ -2390,6 +2390,7 @@ enum WmsSyncJobType {
   RETURNS_SYNC
   PRODUCT_VERIFY
   DISPATCH_SYNC
+  ORDER_RECONCILE
 }
 
 enum WmsSyncJobStatus {

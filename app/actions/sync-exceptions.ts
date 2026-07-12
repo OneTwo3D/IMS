@@ -89,6 +89,15 @@ export type StuckDispatchRow = {
   deadLetteredAt: string | null
 }
 
+export type OrderReconcileDriftRow = {
+  orderId: string
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  category: string
+  detail: string | null
+  foundAt: string | null
+}
+
 export type ExceptionInboxSummary = {
   wmsPushDeadLetters: number
   outboxFailures: number
@@ -96,6 +105,7 @@ export type ExceptionInboxSummary = {
   refundSyncParks: number
   stuckDispatches: number
   pennyMismatches: number
+  orderReconcileDrift: number
   total: number
 }
 
@@ -107,6 +117,7 @@ export type ExceptionInboxData = {
   refundSyncParks: RefundSyncParkRow[]
   stuckDispatches: StuckDispatchRow[]
   pennyMismatches: PennyMismatchRow[]
+  orderReconcileDrift: OrderReconcileDriftRow[]
 }
 
 // Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
@@ -185,9 +196,52 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
   }))
 }
 
+/**
+ * q66in.4.4: drift findings from the LATEST finished ORDER_RECONCILE sweep.
+ * Each run rewrites the truth, so only the newest job's findings are live.
+ */
+async function findLatestOrderReconcileJob(): Promise<{ id: string; finishedAt: Date | null } | null> {
+  return db.wmsSyncJob.findFirst({
+    where: { type: 'ORDER_RECONCILE', finishedAt: { not: null } },
+    orderBy: { startedAt: 'desc' },
+    select: { id: true, finishedAt: true },
+  })
+}
+
+async function countOrderReconcileDrift(): Promise<number> {
+  const latestJob = await findLatestOrderReconcileJob()
+  if (!latestJob) return 0
+  return db.wmsSyncLog.count({ where: { jobId: latestJob.id, action: 'discrepancy' } })
+}
+
+async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
+  const latestJob = await findLatestOrderReconcileJob()
+  if (!latestJob) return []
+
+  const logs = await db.wmsSyncLog.findMany({
+    where: { jobId: latestJob.id, action: 'discrepancy' },
+    take: SECTION_LIMIT,
+    select: { reason: true, payload: true },
+  })
+
+  return logs.map((log) => {
+    const payload = (log.payload && typeof log.payload === 'object' && !Array.isArray(log.payload))
+      ? log.payload as Record<string, unknown>
+      : {}
+    return {
+      orderId: typeof payload.orderId === 'string' ? payload.orderId : '',
+      orderNumber: typeof payload.orderNumber === 'string' ? payload.orderNumber : null,
+      externalOrderNumber: typeof payload.externalOrderNumber === 'string' ? payload.externalOrderNumber : null,
+      category: typeof payload.category === 'string' ? payload.category : 'UNKNOWN',
+      detail: log.reason,
+      foundAt: latestJob.finishedAt?.toISOString() ?? null,
+    }
+  }).filter((row) => row.orderId)
+}
+
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
 async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift] = await Promise.all([
     db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
@@ -195,6 +249,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     db.shoppingSyncLog.count({ where: REFUND_PARK_WHERE }),
     db.wmsOrderPushLink.count({ where: { totalMismatchPence: { not: null } } }),
     countStuckDispatches(),
+    countOrderReconcileDrift(),
   ])
 
   const deadReceiptEvents = deadReceipts + deadWebhooks
@@ -205,7 +260,8 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     refundSyncParks,
     stuckDispatches,
     pennyMismatches,
-    total: wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks + stuckDispatches + pennyMismatches,
+    orderReconcileDrift,
+    total: wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks + stuckDispatches + pennyMismatches + orderReconcileDrift,
   }
 }
 
@@ -221,7 +277,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   await requirePermission('sync')
 
   const counts = await loadExceptionCounts()
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: 'DEAD_LETTER' },
       orderBy: { lastAttemptAt: 'desc' },
@@ -299,6 +355,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         order: { select: { orderNumber: true } },
       },
     }),
+    loadOrderReconcileDrift(),
   ])
 
   const refundOrderIds = refundLogs.map((log) => log.entityId).filter((id): id is string => Boolean(id))
@@ -369,6 +426,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       totalMismatchPence: link.totalMismatchPence ?? 0,
       externalOrderNumber: link.externalOrderNumber,
     })),
+    orderReconcileDrift,
   }
 
   return {
@@ -574,6 +632,48 @@ export async function replayStuckDispatch(orderId: string): Promise<MutationResu
       tag: 'sync',
       action: 'wms_dispatch_replay',
       description: 'Re-queued a dead-lettered dispatch reconciliation via the exception inbox',
+      metadata: { orderId, userId: session.user.id },
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * Re-create a WMS order the WMS no longer knows (MISSING_IN_WMS reconcile
+ * finding): compare-and-set the SYNCED/MERGED link back to PENDING_CREATE so
+ * the next push sweep re-pushes it. The sweep's own eligibility still applies,
+ * so a no-longer-eligible order simply won't re-push.
+ */
+export async function repushMissingWmsOrder(orderId: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const updated = await db.wmsOrderPushLink.updateMany({
+      where: { orderId, state: { in: ['SYNCED', 'MERGED'] } },
+      data: {
+        state: 'PENDING_CREATE',
+        externalOrderId: null,
+        externalOrderNumber: null,
+        attempts: 0,
+        lastError: null,
+        dispatchFailureCount: 0,
+        dispatchLastError: null,
+        dispatchDeadLetteredAt: null,
+      },
+    })
+    if (updated.count === 0) {
+      return { success: false, error: 'The push link is no longer in a re-pushable state.' }
+    }
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      tag: 'sync',
+      action: 'wms_order_repush',
+      description: 'Re-queued a WMS-missing order for re-push via the exception inbox',
       metadata: { orderId, userId: session.user.id },
     })
     revalidatePath('/sync/exceptions')
