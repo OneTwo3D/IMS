@@ -298,6 +298,11 @@ export function buildNotPushedDriftWhere(input: {
       // stamp, which would make a stale HELD finding self-resolve mid-run
       // (Codex r7). cancelledAt only moves when the hold state itself does.
       { wmsOrderPush: { state: 'HELD' as const, cancelledAt: { lt: input.cutoff } } },
+      // A ready+paid order parked on a CANCELLED link is unreachable by the
+      // push sweep entirely (its release pass only covers HELD) — e.g. an order
+      // restored to PROCESSING through a storefront status sync after its WMS
+      // order was cancelled (Codex r22). Same stable-timestamp freshness.
+      { wmsOrderPush: { state: 'CANCELLED' as const, cancelledAt: { lt: input.cutoff } } },
     ],
   }
 }

@@ -245,3 +245,11 @@ test('reconcile core: a split order on a parts-less connector is judged by its w
   assert.equal(findings.length, 1)
   assert.equal(findings[0].category, 'ACTIVE_AFTER_CANCEL')
 })
+
+test('isLikelyCancelledWmsStatus: both US and UK spellings count (Codex r22 false-positive pin)', () => {
+  // /cancel/i is a substring test — "cancel" prefixes "canceled", so the US
+  // single-l spelling matches without special-casing.
+  assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'canceled', statusLabel: '' }), true)
+  assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: 'Canceled', statusLabel: '' }), true)
+  assert.equal(reconcile.isLikelyCancelledWmsStatus({ status: '', statusLabel: 'canceled' }), true)
+})
