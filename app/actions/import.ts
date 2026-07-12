@@ -916,7 +916,7 @@ export async function importOpeningStockCsv(formData: FormData): Promise<CsvImpo
   }
 
   const touchedProductIds = new Set<string>()
-  const { applyOpeningStock } = await import('./stock')
+  const { applyOpeningStock } = await import('@/lib/domain/inventory/opening-stock')
 
   for (const row of stagedRows) {
     const pairKey = `${row.productId}:${row.warehouseId}`

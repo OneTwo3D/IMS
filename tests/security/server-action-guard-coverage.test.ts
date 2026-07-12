@@ -48,11 +48,6 @@ const ALLOWLIST: Record<string, string> = {
   'wms-sync.ts:*': 'connector facade → guarded mintsoft/shiphero actions',
   'wms-asn.ts:*': 'connector facade → guarded mintsoft/shiphero ASN actions',
   'wms-onboarding.ts:*': 'connector facade → guarded mintsoft/shiphero onboarding actions',
-
-  // Internal transaction-scoped helper leaking as an action: requires a Prisma
-  // `tx` arg (not meaningfully RPC-callable) and is only invoked by the guarded
-  // openingstock CSV importer. Relocation out of 'use server' tracked as follow-up.
-  'stock.ts:applyOpeningStock': 'internal tx-scoped helper; relocation tracked in follow-up',
 }
 
 /**
