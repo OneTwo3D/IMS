@@ -2,6 +2,7 @@ import { createHash } from 'crypto'
 import { Prisma, ProductLifecycleStatus, ProductType, WmsBundleSyncDirection } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import type { WmsBundleComponent, WmsBundleDto, WmsBundleRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 
@@ -674,6 +675,12 @@ async function syncBundleInternal(
     created = await connector.createBundle(dto)
   } catch (error) {
     await releaseBundleCreateSlot(claim.linkId)
+    await recordWmsMutationEvent({
+      connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: 'FAILED',
+      entityType: 'PRODUCT', entityId: productId,
+      summary: `Mintsoft bundle create failed for ${candidate.sku}`,
+      error: error instanceof Error ? error.message : 'Mintsoft bundle create failed',
+    })
     return {
       status: 'ERROR',
       action: 'conflict',
@@ -683,6 +690,13 @@ async function syncBundleInternal(
       checksum,
     }
   }
+
+  await recordWmsMutationEvent({
+    connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: 'SUCCEEDED',
+    entityType: 'PRODUCT', entityId: productId, externalId: created.externalBundleId,
+    summary: `Mintsoft bundle created for ${candidate.sku}`,
+    after: { externalBundleId: created.externalBundleId, sku: candidate.sku, checksum },
+  })
 
   const finalize = await finalizeBundleLink(claim.linkId, {
     externalBundleId: created.externalBundleId,

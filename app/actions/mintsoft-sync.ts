@@ -6,6 +6,7 @@ import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
@@ -2854,6 +2855,24 @@ export async function createMintsoftPurchaseOrderAsn(
           autoCallback,
         },
       })
+      await recordWmsMutationEvent({
+        connector: 'mintsoft', direction: 'OUTBOUND', action: 'asn_create', outcome: 'SUCCEEDED',
+        entityType: 'ASN', entityId: outcome.asnMapId, externalId: outcome.externalAsnId, jobId: job.id,
+        summary: `${outcome.kind === 'recovered' ? 'Recovered' : 'Created'} Mintsoft ASN ${outcome.externalAsnId} for purchase order ${parsedId.data}`,
+        after: {
+          warehouseCode: outcome.warehouseCode,
+          kind: outcome.kind,
+          lineCount: outcome.lineCount,
+          ...('lines' in reservation
+            ? {
+                reference: reservation.reference,
+                eta: reservation.eta ?? null,
+                carrier: reservation.carrier ?? null,
+                lines: reservation.lines.map((line) => ({ sku: line.sku, quantity: line.expectedQty })),
+              }
+            : {}),
+        },
+      })
 
       try {
         await replayMintsoftBookedInEventsForAsn(outcome.externalAsnId)
@@ -3762,6 +3781,24 @@ export async function createMintsoftTransferAsn(
           lineCount: outcome.lineCount,
           callbackUrl,
           autoCallback,
+        },
+      })
+      await recordWmsMutationEvent({
+        connector: 'mintsoft', direction: 'OUTBOUND', action: 'asn_create', outcome: 'SUCCEEDED',
+        entityType: 'ASN', entityId: outcome.asnMapId, externalId: outcome.externalAsnId, jobId: job.id,
+        summary: `${outcome.kind === 'recovered' ? 'Recovered' : 'Created'} Mintsoft ASN ${outcome.externalAsnId} for transfer ${parsedId.data}`,
+        after: {
+          warehouseCode: outcome.warehouseCode,
+          kind: outcome.kind,
+          lineCount: outcome.lineCount,
+          ...('lines' in reservation
+            ? {
+                reference: reservation.reference,
+                eta: reservation.eta ?? null,
+                carrier: reservation.carrier ?? null,
+                lines: reservation.lines.map((line) => ({ sku: line.sku, quantity: line.expectedQty })),
+              }
+            : {}),
         },
       })
 

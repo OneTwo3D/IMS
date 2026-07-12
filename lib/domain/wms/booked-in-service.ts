@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import { copyCostLayerSourceLinesProportionally, createCostLayer } from '@/lib/cost-layers'
 import {
@@ -336,6 +337,7 @@ export async function processBookedInEvent(
           id: true,
           externalAsnId: true,
           warehouseId: true,
+          status: true,
         },
       })
 
@@ -543,6 +545,7 @@ export async function processBookedInEvent(
         asnLineMapId: string
         poLineId: string
         productId: string
+        sku: string
         expectedQty: number
         qtyAccountedViaSnapshot: number
         qtyAccountedViaReceipt: number
@@ -553,6 +556,7 @@ export async function processBookedInEvent(
         asnLineMapId: string
         transferLineId: string
         productId: string
+        sku: string
         expectedQty: number
         qtyAccountedViaSnapshot: number
         qtyAccountedViaReceipt: number
@@ -572,6 +576,7 @@ export async function processBookedInEvent(
             asnLineMapId: line.id,
             poLineId: poLine.id,
             productId: poLine.productId,
+            sku: line.sku,
             expectedQty: Number(line.expectedQty),
             qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
             qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
@@ -592,6 +597,7 @@ export async function processBookedInEvent(
           asnLineMapId: line.id,
           transferLineId: transferLine.id,
           productId: transferLine.productId,
+          sku: line.sku,
           expectedQty: Number(line.expectedQty),
           qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
           qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
@@ -602,6 +608,9 @@ export async function processBookedInEvent(
       }
 
       const touchedProductIds = new Set<string>()
+      // q66in.4.6 audit timeline: per-line before/after images of what this
+      // webhook actually changed, emitted as ONE mutation event after commit.
+      const auditReceiptLines: Array<Record<string, unknown>> = []
 
       for (const [poId, receiptLines] of receiptLinesByPoId) {
         await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
@@ -782,6 +791,17 @@ export async function processBookedInEvent(
             })
 
             touchedProductIds.add(poLine.productId)
+            auditReceiptLines.push({
+              target: 'PURCHASE_ORDER',
+              reference: po.reference,
+              sku: receiptLine.sku,
+              productId: poLine.productId,
+              warehouseId: asnMap.warehouseId,
+              qtyReceivedBefore: Number(poLine.qtyReceived),
+              qtyReceivedAfter: Number(poLine.qtyReceived) + receiptLine.qtyReceived,
+              stockQtyAdded: receiptLine.stockQtyToAdd,
+              coveredBySnapshotQty: receiptLine.coveredBySnapshotQty,
+            })
           }
 
           await tx.wmsAsnLineMap.update({
@@ -966,6 +986,17 @@ export async function processBookedInEvent(
             })
 
             touchedProductIds.add(transferLine.productId)
+            auditReceiptLines.push({
+              target: 'STOCK_TRANSFER',
+              reference: transfer.reference,
+              sku: receiptLine.sku,
+              productId: transferLine.productId,
+              warehouseId: transfer.toWarehouseId,
+              qtyReceivedBefore: Number(transferLine.qtyReceived),
+              qtyReceivedAfter: Number(transferLine.qtyReceived) + receiptLine.qtyReceived,
+              stockQtyAdded: receiptLine.stockQtyToAdd,
+              coveredBySnapshotQty: receiptLine.coveredBySnapshotQty,
+            })
           }
 
           await tx.wmsAsnLineMap.update({
@@ -1005,6 +1036,7 @@ export async function processBookedInEvent(
         },
       })
       const asnClosed = refreshedLines.every((line) => Number(line.lastProcessedReceivedQty) >= Number(line.expectedQty))
+      const asnStatusAfter = asnClosed ? 'BOOKED_IN' : 'PARTIALLY_BOOKED_IN'
 
       await tx.wmsAsnMap.update({
         where: { id: asnMap.id },
@@ -1038,6 +1070,9 @@ export async function processBookedInEvent(
         duplicate: false,
         pending: false,
         productIds: Array.from(touchedProductIds),
+        auditLines: auditReceiptLines,
+        asnStatusBefore: asnMap.status as string,
+        asnStatusAfter,
       }
     }, STOCK_TX_OPTIONS)
 
@@ -1103,6 +1138,16 @@ export async function processBookedInEvent(
       },
       resolveUser: false,
     })
+    if ('auditLines' in processed && processed.auditLines) {
+      await recordWmsMutationEvent({
+        connector: 'mintsoft', direction: 'INBOUND', action: 'booked_in_receipt', outcome: 'SUCCEEDED',
+        entityType: 'ASN', entityId: event.id, externalId: event.externalAsnId,
+        summary: `Booked-in webhook applied for ASN ${event.externalAsnId} — ${processed.auditLines.length} line(s) received`,
+        before: { asnStatus: processed.asnStatusBefore },
+        after: { asnStatus: processed.asnStatusAfter, lines: processed.auditLines },
+        triggeredBy: 'webhook',
+      })
+    }
 
     return {
       status: 'processed',
@@ -1124,6 +1169,13 @@ export async function processBookedInEvent(
         externalAsnId: event.externalAsnId,
       },
       resolveUser: false,
+    })
+    await recordWmsMutationEvent({
+      connector: 'mintsoft', direction: 'INBOUND', action: 'booked_in_receipt', outcome: 'FAILED',
+      entityType: 'ASN', entityId: event.id, externalId: event.externalAsnId,
+      summary: `Booked-in webhook processing failed for ASN ${event.externalAsnId}`,
+      error: message,
+      triggeredBy: 'webhook',
     })
     return {
       status: 'failed',

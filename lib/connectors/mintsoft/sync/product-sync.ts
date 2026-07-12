@@ -3,6 +3,7 @@ import { Prisma, ProductLifecycleStatus, ProductType } from '@/app/generated/pri
 import type { WmsDiscrepancyCategory } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
 import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
@@ -712,9 +713,30 @@ async function syncOneMintsoftProduct(
     }
   }
 
-  const synced = await context.connector.upsertProduct(dto, {
-    externalProductId,
-    omitBarcode: barcodePlan.omitBarcode,
+  let synced: Awaited<ReturnType<typeof context.connector.upsertProduct>>
+  try {
+    synced = await context.connector.upsertProduct(dto, {
+      externalProductId,
+      omitBarcode: barcodePlan.omitBarcode,
+    })
+  } catch (error) {
+    await recordWmsMutationEvent({
+      connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'FAILED',
+      entityType: 'PRODUCT', entityId: context.product.id, externalId: externalProductId ?? null,
+      summary: `Mintsoft product upsert failed for ${context.product.sku}`,
+      before: { externalProductId: externalProductId ?? null },
+      error: error instanceof Error ? error.message : 'Mintsoft product upsert failed',
+    })
+    throw error
+  }
+  await recordWmsMutationEvent({
+    connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'SUCCEEDED',
+    entityType: 'PRODUCT', entityId: context.product.id, externalId: synced.externalId,
+    summary: synced.externalId === externalProductId
+      ? `Mintsoft product updated for ${context.product.sku}`
+      : `Mintsoft product created for ${context.product.sku}`,
+    before: { externalProductId: externalProductId ?? null, payloadHash: existingLink?.payloadHash ?? null },
+    after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, payloadHash },
   })
 
   await upsertMintsoftProductLink({

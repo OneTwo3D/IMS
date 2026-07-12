@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { createCostLayer, copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import { notify } from '@/lib/notifications'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
@@ -876,6 +877,14 @@ async function applyMintsoftAlignmentForProduct(params: {
       level: reservedExceedsAvailable ? 'WARNING' : undefined,
       resolveUser: false,
     })
+    await recordWmsMutationEvent({
+      connector: 'mintsoft', direction: 'INBOUND', action: 'align_up', outcome: 'SUCCEEDED',
+      entityType: 'STOCK_LEVEL', entityId: params.productId,
+      summary: `Align-up: ${params.sku} in ${params.binding.warehouse.code} raised to match Mintsoft (+${params.delta})`,
+      before: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: outcome.quantityBefore, reservedQty: outcome.reservedQty },
+      after: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: outcome.quantityAfter, delta: params.delta, allocations: outcome.allocations },
+      triggeredBy: 'stock-sync',
+    })
     await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
   }
 
@@ -1051,6 +1060,14 @@ async function applyMintsoftAlignDownForProduct(params: {
       },
       level: 'WARNING',
       resolveUser: false,
+    })
+    await recordWmsMutationEvent({
+      connector: 'mintsoft', direction: 'INBOUND', action: 'align_down', outcome: 'SUCCEEDED',
+      entityType: 'STOCK_LEVEL', entityId: params.productId, jobId: params.jobId,
+      summary: `Align-down: ${params.sku} in ${params.binding.warehouse.code} lowered to match Mintsoft (${params.imsQty} → ${params.wmsQty})`,
+      before: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: params.imsQty, reservedQty: outcome.reservedQty },
+      after: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: params.wmsQty, delta: params.delta, movementId: outcome.movementId, adjustmentReasonId: params.binding.alignDownReasonId },
+      triggeredBy: 'stock-sync',
     })
     await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
   }

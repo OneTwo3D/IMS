@@ -8,6 +8,7 @@ import type { WmsConnector, WmsConnectorId, WmsOrderTracking } from '@/lib/conne
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
 import { scrubWmsError } from './error-scrub'
+import { recordWmsMutationEvent } from './mutation-audit'
 
 /**
  * Connector-agnostic WMS dispatch sweep (q66in.1.1/1.5 + G2, hoisted to the generic
@@ -318,13 +319,27 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
     fetchOrderStatus(orderNumber) {
       return connector.fetchOrderStatus ? connector.fetchOrderStatus(orderNumber) : Promise.resolve(null)
     },
-    applyDispatch(orderId, tracking) {
-      return applyExternalFulfillmentUpdate({
+    async applyDispatch(orderId, tracking) {
+      // q66in.4.6 audit timeline: capture the order status pre-image so the
+      // dispatch event carries a real before/after, not just the target state.
+      const orderBefore = await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true, orderNumber: true } }).catch(() => null)
+      const result = await applyExternalFulfillmentUpdate({
         source: connectorId,
         lookup: { orderId },
         targetShipmentStatus: 'SHIPPED',
         tracking,
       })
+      if (result.success) {
+        await recordWmsMutationEvent({
+          connector: connectorId, direction: 'INBOUND', action: 'dispatch_applied', outcome: 'SUCCEEDED',
+          entityType: 'SALES_ORDER', entityId: orderId,
+          summary: `WMS despatch applied to order ${orderBefore?.orderNumber ?? orderId} — shipment marked SHIPPED`,
+          before: { orderStatus: orderBefore?.status ?? null },
+          after: { shipmentStatus: 'SHIPPED', tracking: tracking.map((entry) => ({ trackingNumber: entry.trackingNumber, shippingService: entry.shippingService ?? null })) },
+          triggeredBy: 'dispatch-sweep',
+        })
+      }
+      return result
     },
     partsSupported: Boolean(connector.fetchOrderParts),
     fetchOrderParts(orderNumber) {
