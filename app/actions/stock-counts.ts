@@ -9,6 +9,8 @@ import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { classifyStockCountWmsPolicy, computeStockCountPostings, makeStockCountReference, type StockCountLineForPost } from '@/lib/domain/inventory/stock-count'
+import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 30000 }
@@ -275,8 +277,17 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
       // 6oyu.3: a WMS-mirrored warehouse's book is a reflection of WMS stock —
       // block counts under ALIGN_TO_WMS (the sync would fight them) and require
       // explicit acknowledgement under NOTIFICATION_ONLY.
-      const binding = await tx.externalWmsBinding.findFirst({
-        where: { warehouseId: count.warehouseId, active: true, connection: { active: true } },
+      // Only ENABLED connectors' bindings apply (Codex r30): a stale binding of
+      // a disabled/replaced WMS plugin must not block or warn on counts.
+      const pluginState = await getIntegrationPluginState()
+      const enabledWmsConnectors = WMS_CONNECTOR_IDS.filter((id) => pluginState[id])
+      const binding = enabledWmsConnectors.length === 0 ? null : await tx.externalWmsBinding.findFirst({
+        where: {
+          warehouseId: count.warehouseId,
+          active: true,
+          connection: { active: true },
+          connector: { in: enabledWmsConnectors },
+        },
         select: { connector: true, stockSyncMode: true },
       })
       const wmsPolicy = classifyStockCountWmsPolicy(binding)
