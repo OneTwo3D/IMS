@@ -317,6 +317,16 @@ export async function runWmsOrderReconcileSweep(
   }
 
   const deps = options?.deps ?? createPrismaReconcileDeps(connectorId, connector)
+
+  // Connector-switch retirement (Codex r13): findings created for a PREVIOUS
+  // connector reference links this sweep never scans again — they could neither
+  // re-verify clean nor be acted on. The active connector re-detects its own
+  // drift fresh.
+  await db.wmsOrderDiscrepancy.updateMany({
+    where: { status: 'OPEN', connector: { not: connectorId } },
+    data: { status: 'RESOLVED', resolvedAt: new Date() },
+  })
+
   const job = await db.wmsSyncJob.create({
     data: { connector: connectorId, type: 'ORDER_RECONCILE', status: 'RUNNING', startedAt: new Date(), triggeredBy },
     select: { id: true },
