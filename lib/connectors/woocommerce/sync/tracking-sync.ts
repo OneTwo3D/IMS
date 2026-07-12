@@ -24,7 +24,7 @@ function normalizeTrackingRow(row: TrackingSourceRow): TrackingSourceRow {
   }
 }
 
-export function dedupeTrackingRows(rows: TrackingSourceRow[]): TrackingSourceRow[] {
+function dedupeTrackingRows(rows: TrackingSourceRow[]): TrackingSourceRow[] {
   const seen = new Set<string>()
   const out: TrackingSourceRow[] = []
 
@@ -40,7 +40,7 @@ export function dedupeTrackingRows(rows: TrackingSourceRow[]): TrackingSourceRow
   return out
 }
 
-export function toWcTrackingItem(row: TrackingSourceRow): WcTrackingItem {
+function toWcTrackingItem(row: TrackingSourceRow): WcTrackingItem {
   const provider = row.carrier || 'Custom'
   return {
     tracking_provider: provider,

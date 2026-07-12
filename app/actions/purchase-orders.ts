@@ -1,7 +1,6 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
@@ -11,7 +10,7 @@ import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-war
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
-import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer } from '@/lib/cost-layers'
+import { cogsEntryDataFromConsumed, consumeFifoLayersStrict } from '@/lib/cost-layers'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
@@ -49,7 +48,6 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
-import { sumReceiptQtyByPoLine } from '@/lib/domain/purchasing/receipt-quantities'
 import { computePurchaseOrderOverBilling, type PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
 import { computeReturnCreditNoteDraft } from '@/lib/domain/purchasing/return-credit-note'
 import { findDivergentReceiptLines } from '@/lib/domain/purchasing/receipt-warehouse-divergence'
@@ -281,18 +279,6 @@ export type ReceiptLineInput = {
   warehouseId: string
 }
 
-// rf0l: validate every receipt line before it can drive a cost layer / stock
-// level. qtyReceived must be a finite, positive number (no NaN/Infinity, no
-// negatives); the write path additionally rounds it to the 6dp engine scale.
-const ReceiptLineInputSchema = z.object({
-  poLineId: z.string().min(1, 'poLineId is required'),
-  warehouseId: z.string().min(1, 'Warehouse is required for each line'),
-  qtyReceived: z
-    .number()
-    .refine(Number.isFinite, 'qtyReceived must be a finite number')
-    .gt(0, 'qtyReceived must be greater than 0'),
-})
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -312,16 +298,9 @@ function safeFxRate(rate: number): number {
 
 function calcLineTotals(unitCostForeign: number, qty: number, fxRate: number) {
   const rate = safeFxRate(fxRate)
-  // Use the shared Decimal (HALF_UP) helpers rather than Math.round on floats.
-  // unitCostBase here becomes the cost-layer unitCostBase at receipt — the seed
-  // of all downstream COGS — so it must round on the same engine as receipts,
-  // FIFO consumption and COGS (cogs-audit scjz.58). Math.round((x/rate)*1eN)/1eN
-  // operated on a float-contaminated mantissa and rounds .5 of negatives
-  // asymmetrically, so PO line base costs could disagree with the cost layer
-  // derived from them at the 6th dp / the penny.
-  const totalForeign = roundQuantity(multiplyMoney(unitCostForeign, qty), 4).toNumber()
-  const unitCostBase = roundQuantity(toDecimal(unitCostForeign).div(rate), 6).toNumber()
-  const totalBase = roundQuantity(toDecimal(totalForeign).div(rate), 4).toNumber()
+  const totalForeign = Math.round(unitCostForeign * qty * 10000) / 10000
+  const unitCostBase = Math.round((unitCostForeign / rate) * 1000000) / 1000000
+  const totalBase = Math.round((totalForeign / rate) * 10000) / 10000
   return { unitCostBase, totalForeign, totalBase }
 }
 
@@ -1621,7 +1600,7 @@ export async function receivePurchaseOrder(
   id: string,
   receiptLines: ReceiptLineInput[],
   notes?: string,
-  options?: { confirmWarehouseDivergence?: boolean; idempotencyToken?: string },
+  options?: { confirmWarehouseDivergence?: boolean },
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('purchasing.receive')
@@ -1666,14 +1645,7 @@ export async function receivePurchaseOrder(
       return { success: false, error: 'PO cannot be received in its current status' }
     }
 
-    // rf0l: reject malformed receipt input (NaN/Infinity/negative qty, missing
-    // ids) before it reaches the cost-layer/stock-level write path.
-    const parsed = z.array(ReceiptLineInputSchema).safeParse(receiptLines)
-    if (!parsed.success) {
-      return { success: false, error: parsed.error.issues[0]?.message ?? 'Invalid receipt line' }
-    }
-
-    const linesWithQty = parsed.data.filter((rl) => rl.qtyReceived > 0)
+    const linesWithQty = receiptLines.filter((rl) => rl.qtyReceived > 0)
     if (!linesWithQty.length) return { success: false, error: 'No quantities to receive' }
     const [accountingSettings, receiptWarehouseNames] = await Promise.all([
       getAccountingSettings(),
@@ -1685,21 +1657,14 @@ export async function receivePurchaseOrder(
     const whNameMap = Object.fromEntries(receiptWarehouseNames.map((w) => [w.id, w.name]))
     const warehouseNamesList = [...new Set(linesWithQty.map((rl) => whNameMap[rl.warehouseId] ?? rl.warehouseId))].join(', ')
 
-    // Per-row sanity: warehouse present, PO line exists.
+    // Validate: can't receive more than outstanding qty
     for (const rl of linesWithQty) {
       if (!rl.warehouseId) return { success: false, error: 'Warehouse is required for each line' }
-      if (!po.lines.find((l) => l.id === rl.poLineId)) return { success: false, error: 'Invalid PO line' }
-    }
-    // mgyk: validate SUMMED qty per PO line against outstanding, not per row. A single
-    // receipt may legitimately split one line across warehouses, but the TOTAL must not
-    // over-receive it — the old per-row check let two rows for the same line each pass
-    // (each ≤ outstanding) while their sum exceeded it.
-    const receiveByPoLine = sumReceiptQtyByPoLine(linesWithQty)
-    for (const [poLineId, totalQty] of receiveByPoLine) {
-      const poLine = po.lines.find((l) => l.id === poLineId)!
-      const outstanding = toDecimal(poLine.qty).minus(toDecimal(poLine.qtyReceived))
-      if (roundQuantity(totalQty, 6).greaterThan(roundQuantity(outstanding, 6))) {
-        return { success: false, error: `Cannot receive more than outstanding qty (${roundQuantity(outstanding, 6).toNumber()})` }
+      const poLine = po.lines.find((l) => l.id === rl.poLineId)
+      if (!poLine) return { success: false, error: 'Invalid PO line' }
+      const outstanding = Number(poLine.qty) - Number(poLine.qtyReceived)
+      if (rl.qtyReceived > outstanding) {
+        return { success: false, error: `Cannot receive more than outstanding qty (${outstanding})` }
       }
     }
 
@@ -1719,24 +1684,9 @@ export async function receivePurchaseOrder(
     }
 
     const receiptRef = `RCP-${po.reference}-${Date.now().toString(36).toUpperCase()}`
-    const idempotencyToken = options?.idempotencyToken
     const receiptResult = await db.$transaction(async (tx) => {
       // Lock the PO row to prevent concurrent receipts from over-receiving
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
-
-      // opys: idempotent receipt. The receiptRef carries Date.now() (unique per
-      // submit), so a network retry / double-click would otherwise double-book a
-      // partial receipt under the outstanding-qty ceiling. With the PO row locked,
-      // detect a prior submission that already FULLY committed its PURCHASE_RECEIPT
-      // movements under the same client token and skip — the receipt tx is atomic, so
-      // those movements exist only if a prior submission committed in full.
-      if (idempotencyToken) {
-        const priorReceipt = await tx.stockMovement.findFirst({
-          where: { idempotencyKey: { startsWith: `purchase-receipt:${idempotencyToken}:` } },
-          select: { id: true },
-        })
-        if (priorReceipt) return { alreadyApplied: true as const }
-      }
 
       const currentPo = await tx.purchaseOrder.findUnique({
         where: { id },
@@ -1800,15 +1750,14 @@ export async function receivePurchaseOrder(
       })
 
       // Re-validate outstanding qty under lock — the pre-tx check used a
-      // stale snapshot that concurrent receipts could have advanced past. mgyk:
-      // validate the SUMMED qty per PO line (a line may be split across warehouses).
+      // stale snapshot that concurrent receipts could have advanced past.
       const lockedLineMap = new Map(currentPo.lines.map((line) => [line.id, line]))
-      for (const [poLineId, totalQty] of sumReceiptQtyByPoLine(linesWithQty)) {
-        const poLine = lockedLineMap.get(poLineId)
+      for (const rl of linesWithQty) {
+        const poLine = lockedLineMap.get(rl.poLineId)
         if (!poLine) throw new Error('Invalid PO line')
-        const outstanding = toDecimal(poLine.qty).minus(toDecimal(poLine.qtyReceived))
-        if (roundQuantity(totalQty, 6).greaterThan(roundQuantity(outstanding, 6))) {
-          throw new Error(`Cannot receive more than outstanding qty (${roundQuantity(outstanding, 6).toNumber()}) for line ${poLineId}`)
+        const outstanding = Number(poLine.qty) - Number(poLine.qtyReceived)
+        if (rl.qtyReceived > outstanding) {
+          throw new Error(`Cannot receive more than outstanding qty (${outstanding}) for line ${rl.poLineId}`)
         }
       }
 
@@ -1827,11 +1776,8 @@ export async function receivePurchaseOrder(
         },
       })
 
-      // Accumulate the receipt value in Decimal so the STOCK_RECEIPT journal
-      // debit equals the sum of the cost-layer values (qty * Decimal unitCostBase)
-      // rather than a float running total (cogs-audit scjz.11).
-      let totalReceiptValue = toDecimal(0)
-      for (const [receiptLineIndex, rl] of linesWithQty.entries()) {
+      let totalReceiptValue = 0
+      for (const rl of linesWithQty) {
         const poLine = currentPo.lines.find((l) => l.id === rl.poLineId)
         if (!poLine) continue
 
@@ -1841,45 +1787,31 @@ export async function receivePurchaseOrder(
           poRef: currentPo.reference,
         })
         const unitCostBase = toDecimal(unitCostBaseInput)
-        // rf0l: round the received qty to the 6dp engine scale ONCE and reuse it
-        // everywhere (movement, cost layer, stock level, PO line) so the cost
-        // layer never drifts from the stock level. The shared createCostLayer
-        // helper applies the same rounding; the direct writes here mirror it.
-        const qtyReceived = roundQuantity(rl.qtyReceived, 6)
-        // rf0l (Codex): a sub-µ positive qty (e.g. 1e-7) passes the >0 filter but
-        // rounds to 0 at the 6dp scale — skip it rather than write a zero-qty
-        // movement/layer/stock row.
-        if (qtyReceived.lte(0)) continue
-        const qtyReceivedStr = qtyReceived.toFixed(6)
-        totalReceiptValue = addMoney(totalReceiptValue, multiplyMoney(qtyReceived, unitCostBase))
+        totalReceiptValue += rl.qtyReceived * unitCostBase.toNumber()
 
         await tx.stockMovement.create({
           data: {
             type: 'PURCHASE_RECEIPT',
             productId: poLine.productId,
             toWarehouseId: rl.warehouseId,
-            qty: qtyReceivedStr,
-            ...buildStockMovementValueFields({ qty: qtyReceived, unitCostBase }),
+            qty: rl.qtyReceived,
+            ...buildStockMovementValueFields({ qty: rl.qtyReceived, unitCostBase }),
             note: `Received against ${currentPo.reference}`,
             referenceType: 'PurchaseOrder',
             referenceId: id,
-            // opys: dedup anchor for double-submit. Deterministic per (token, line
-            // index): the same submission retried with the same lines collides on the
-            // unique idempotencyKey and is caught by the pre-check above. Stable across
-            // retries because the parsed line order is stable for the same input.
-            idempotencyKey: idempotencyToken
-              ? `purchase-receipt:${idempotencyToken}:${receiptLineIndex}`
-              : null,
           },
         })
 
-        await createCostLayer(tx, {
-          productId: poLine.productId,
-          warehouseId: rl.warehouseId,
-          qty: qtyReceived,
-          unitCostBase,
-          poLineId: poLine.id,
-          isOpeningStock: false,
+        await tx.costLayer.create({
+          data: {
+            productId: poLine.productId,
+            warehouseId: rl.warehouseId,
+            receivedQty: rl.qtyReceived,
+            remainingQty: rl.qtyReceived,
+            unitCostBase,
+            poLineId: poLine.id,
+            isOpeningStock: false,
+          },
         })
 
         await tx.stockLevel.upsert({
@@ -1892,17 +1824,17 @@ export async function receivePurchaseOrder(
           create: {
             productId: poLine.productId,
             warehouseId: rl.warehouseId,
-            quantity: qtyReceivedStr,
+            quantity: rl.qtyReceived,
             reservedQty: 0,
           },
           update: {
-            quantity: { increment: qtyReceivedStr },
+            quantity: { increment: rl.qtyReceived },
           },
         })
 
         await tx.purchaseOrderLine.update({
           where: { id: rl.poLineId },
-          data: { qtyReceived: { increment: qtyReceivedStr } },
+          data: { qtyReceived: { increment: rl.qtyReceived } },
         })
       }
 
@@ -1961,8 +1893,8 @@ export async function receivePurchaseOrder(
         }
       }
 
-      if (accountingSettings.syncEnabled && totalReceiptValue.gt(0)) {
-        const amount = roundQuantity(totalReceiptValue, 2).toNumber()
+      if (accountingSettings.syncEnabled && totalReceiptValue > 0) {
+        const amount = Math.round(totalReceiptValue * 100) / 100
         const payload = {
           date: new Date().toISOString().slice(0, 10),
           reference: `Receipt: ${po.reference}`,
@@ -1981,40 +1913,8 @@ export async function receivePurchaseOrder(
         })
       }
 
-      return { allReceived, newStatus, freightPoIds, totalReceiptValue: totalReceiptValue.toNumber() }
+      return { allReceived, newStatus, freightPoIds, totalReceiptValue }
     }, STOCK_TX_OPTIONS)
-
-    // opys: duplicate submission detected under the lock — the receipt was already
-    // booked by the first submission. Skip the DB write and the (duplicate) activity
-    // log, but still run the best-effort, idempotent catch-up effects: if the first
-    // submission crashed AFTER commit but before these ran, the retry self-heals them
-    // (they're also covered by the daily reconcile, so a miss is transient either way).
-    if ('alreadyApplied' in receiptResult) {
-      revalidatePath('/purchase-orders')
-      revalidatePath(`/purchase-orders/${id}`)
-      const replayProductIds = [
-        ...new Set(
-          linesWithQty
-            .map((rl) => po.lines.find((line) => line.id === rl.poLineId)?.productId)
-            .filter((value): value is string => !!value),
-        ),
-      ]
-      try {
-        await allocateBackordersForProducts(replayProductIds, {
-          source: 'purchase_receipt',
-          referenceId: id,
-          referenceLabel: `PO receipt ${po.reference}`,
-        })
-      } catch (allocError) {
-        console.error(allocError)
-      }
-      try {
-        await enqueueStockSync(replayProductIds, 'IMS_CHANGE')
-      } catch (syncError) {
-        console.error(syncError)
-      }
-      return { success: true }
-    }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
@@ -3305,7 +3205,6 @@ export async function markBillPaid(
         poId: true,
         invoiceNumber: true,
         totalForeign: true,
-        totalBase: true,
         fxRateToBase: true,
         paidAt: true,
         accountingInvoiceId: true,
@@ -3410,12 +3309,6 @@ export async function markBillPaid(
           amountForeign: paymentAmount,
           bookedRateToBase: Number(invoice.fxRateToBase),
           settlementRateToBase,
-          // Booked base for the settled portion = stored totalBase prorated by the
-          // settled foreign share, so realised FX measures against the real AP
-          // carrying value rather than a re-derived figure (cogs-audit scjz.55).
-          bookedBase: Number(invoice.totalForeign) > 0
-            ? multiplyMoney(invoice.totalBase, paymentAmount).div(toDecimal(invoice.totalForeign)).toNumber()
-            : undefined,
         })
         const lines = buildRealisedFxJournal({
           side: 'payable',
@@ -3730,47 +3623,39 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
     const totalBase = subtotalBase + taxBase
 
     const freightReference = await makeReference()
-    // Create the freight PO + landed-cost links AND run the initial recalc in ONE
-    // transaction: if the recalc fails (e.g. a linked primary is CLOSED ->
-    // throws, or a lock timeout), the freight PO and its LandedCostLinks roll back
-    // too, so we never leave 'linked but unapplied' freight with no retry path
-    // (scjz.15). The cancellation path already recalcs in-tx; this matches it.
-    const { po, landedResult } = await db.$transaction(
-      async (tx) => {
-        const po = await tx.purchaseOrder.create({
-          data: {
-            reference: freightReference,
-            type: 'FREIGHT',
-            supplierId: input.supplierId,
-            currency: input.currency,
-            fxRateToBase: fxRate,
-            subtotalForeign,
-            subtotalBase,
-            taxForeign,
-            taxBase,
-            totalForeign,
-            totalBase,
-            directFreightForeign: subtotalForeign,
-            directFreightBase: subtotalBase,
-            supplierRef: input.supplierRef || null,
-            notes: input.notes || null,
-            freightCostLines: { create: costLineData },
-            asFreightFor: {
-              create: input.primaryPoIds.map((pid) => ({
-                primaryPoId: pid,
-                method: costLineData[0]?.distributionMethod ?? 'BY_VALUE',
-              })),
-            },
-          },
-          select: PO_SELECT,
-        })
-        const landedResult = await recalculateLandedCosts(tx, po.id, undefined, {
-          triggeredById: session.user.id,
-          reason: 'freight_purchase_order_created',
-          scheduleAdjustmentJournals: true, // audit-grob durable backstop
-        })
-        return { po, landedResult }
+    const po = await db.purchaseOrder.create({
+      data: {
+        reference: freightReference,
+        type: 'FREIGHT',
+        supplierId: input.supplierId,
+        currency: input.currency,
+        fxRateToBase: fxRate,
+        subtotalForeign,
+        subtotalBase,
+        taxForeign,
+        taxBase,
+        totalForeign,
+        totalBase,
+        directFreightForeign: subtotalForeign,
+        directFreightBase: subtotalBase,
+        supplierRef: input.supplierRef || null,
+        notes: input.notes || null,
+        freightCostLines: { create: costLineData },
+        asFreightFor: {
+          create: input.primaryPoIds.map((pid) => ({
+            primaryPoId: pid,
+            method: costLineData[0]?.distributionMethod ?? 'BY_VALUE',
+          })),
+        },
       },
+      select: PO_SELECT,
+    })
+    const landedResult = await db.$transaction(
+      async (tx) => recalculateLandedCosts(tx, po.id, undefined, {
+        triggeredById: session.user.id,
+        reason: 'freight_purchase_order_created',
+        scheduleAdjustmentJournals: true, // audit-grob durable backstop
+      }),
       STOCK_TX_OPTIONS,
     )
 

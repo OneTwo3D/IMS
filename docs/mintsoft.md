@@ -1,6 +1,6 @@
 # Mintsoft Connector
 
-Mintsoft is the first WMS connector behind the connector-agnostic WMS boundary (see [`wms-connector-boundary.md`](./wms-connector-boundary.md)). It covers stock alignment, ASN creation, product verification, bundle sync, returns polling, signed ASN booked-in webhooks, outbound order-dispatch push (Phase 8), inbound dispatch ingestion (despatch → IMS shipment, with per-part partial shipments to the storefront for split orders and survivor reconciliation for merged orders), and order-status tracking on sales orders.
+Mintsoft is the WMS connector for stock alignment, ASN creation, product verification, bundle sync, returns polling, and signed ASN booked-in webhooks.
 
 ## Authentication And Bindings
 
@@ -19,22 +19,6 @@ Mintsoft connector settings cannot be marked active until a **Test Connection** 
 - Open discrepancies are stored in `wms_stock_discrepancies`; partial unique indexes prevent duplicate open discrepancy rows for the same connector, warehouse, category, and product/SKU.
 - Alignment should only change IMS stock after the binding permits it and discrepancy thresholds are satisfied.
 
-### Align up (Mintsoft holds more)
-
-Upward deltas are absorbed into open ASN lines as provisional goods-in receipts (cost layers from the source PO/transfer line), tracked as alignment snapshot credits that the booked-in webhook later reconciles. A delta no open ASN line can explain stays a manual discrepancy.
-
-### Align down (Mintsoft holds less — shrinkage / already-shipped)
-
-Downward deltas are auto-corrected by posting a negative stock adjustment (FIFO consumption + inventory GL journal via `applyStockAdjustment`), but only when EVERY gate passes; otherwise the discrepancy stays open carrying the hold reason:
-
-1. **Write-off reason configured** — the binding's *Align-Down Write-Off Reason* (an active `AdjustmentReason` **with a GL account code**) must be set; the write-off posts `DR reason-account / CR Inventory`. No reason → align-down never runs.
-2. **Thresholds configured and not breached** — the binding's discrepancy thresholds double as the auto-fix ceiling; unconfigured thresholds or a breaching delta stay manual (a WMS API glitch must not write off a warehouse).
-3. **No pending inbound** — open ASN lines with outstanding expected receipts or unreconciled alignment credits hold the correction (the lower Mintsoft balance may be receipt timing, not shrinkage).
-4. **Persistence across two runs** — the same delta must have been recorded by a *previous* sync run, so in-flight dispatch webhooks/sweeps get a full cycle to land before stock is written off.
-5. **Reservations** — on-hand is never driven below `reservedQty`; the oversell aftermath (orders reserving stock that doesn't exist) must be resolved by an operator.
-
-Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/after quantities and the movement id, and are idempotent per sync job. Dry-run mode (before alignment confirmation) previews align-down the same way it previews align-up.
-
 ## ASN Flow
 
 - IMS creates outbound ASN payloads for purchase orders and transfer lines.
@@ -48,7 +32,7 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
 
 ### Receipt Review
 
-Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings. Events that instead exhaust their retries go `DEAD` and surface in the cross-connector [sync exception inbox](./sync-exceptions.md) (`/sync/exceptions`), which can safely re-queue them.
+Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings.
 
 - Structural warnings block approval until the underlying IMS or Mintsoft data is fixed: remote quantity regression, missing IMS source line, unsupported source type, or missing transfer cost-layer snapshot.
 - `received_over_expected` is a variance warning. It always requires admin review, but approval accepts the over-receipt and lets processing continue.
@@ -97,60 +81,6 @@ The `timestamp` string must be the exact header value IMS uses for freshness val
 - Returns are first collected into `wms_returns_inbox`.
 - Operators review unmatched returns and choose restock/refund handling.
 - Restocking preserves the selected destination warehouse on subsequent polling updates.
-
-## Stocktakes and Mirrored Warehouses
-
-An IMS-side stock count against a WMS-bound warehouse is coordinated with the stock sync (6oyu.3): under **Align To WMS** posting is **blocked** — the WMS is the stock master, so perform the stocktake there and let the sync import the corrections; under **notification-only** posting **warns and requires acknowledgement**, since any remaining divergence against the WMS is re-flagged as a discrepancy on the next sync. Unbound (or sync-disabled) warehouses are unaffected.
-
-## Silent-Failure Watchdog (scheduled)
-
-The `wms-watchdog` cron (hourly, ships disabled — enable in System Settings → Scheduler) alerts once per breach (WARNING activity + admin bell, deduped until the condition heals): **open ASNs past their ETA** (persisted from the ASN dialog) **with no booked-in callback** — naming any unreconciled alignment credits, which silently suppress real PO receipts until the callback arrives — and **bindings without a successful stock sync** for 3× their own cadence (dead cron — or one whose every attempt fails; FAILED attempts don't count as freshness). A fresh callback / ASN close, or the next successful sync, re-arms the alert. If a breach alert cannot be delivered (notification insert fails, or no active admin exists) the breach stays unclaimed for retry and the run returns HTTP 500 so scheduler monitoring goes red.
-
-## Mutation Audit Timeline (q66in.4.6)
-
-Every connector mutation — outbound (order create/update/hold/cancel/release, warehouse comments, ASN create, product/bundle upsert) and inbound (booked-in receipts, align-up/align-down corrections, dispatch application, returns-inbox staging) — records a `WmsMutationEvent` row with operational **before/after images** (states, SKUs, quantities, totals; PII keys are masked at write time by `scrubWmsMutationPayload`). Browse it at **Integrations → Event Timeline** (`/sync/events`): filter by connector/direction/action/outcome or exact entity/external id, and expand a row for the before/after JSON. Recording is best-effort (an audit failure never fails the mutation); rows are purged by the activity-cleanup cron after 365 days.
-
-## Order Reconciliation (scheduled)
-
-The `wms-order-reconcile` cron (default daily, ships disabled — enable in System Settings → Scheduler) runs a connector-agnostic order-level reconcile of IMS intent vs WMS truth (`lib/domain/wms/order-reconcile-sweep.ts`). Because the WMS API cannot enumerate orders, it verifies IMS-known truth per order: eligible orders with no live push link (`NOT_PUSHED`), live links whose WMS order vanished (`MISSING_IN_WMS`), and cancelled/held orders still active in the WMS (`ACTIVE_AFTER_CANCEL` — admins are belled; the warehouse may ship them). Findings land on an `ORDER_RECONCILE` sync job and surface in the [sync exception inbox](./sync-exceptions.md).
-
-## Order Dispatch Push (Phase 8)
-
-IMS pushes sales orders outbound to the WMS so the 3PL can fulfil them. The work is done by a connector-agnostic sweep (`lib/domain/wms/order-push-sweep.ts`) driven by the `wms-order-push` cron (`/api/cron/wms-order-push`, default every 10 minutes). **The cron ships disabled** — enable it in System Settings → Scheduler once a warehouse is bound.
-
-- **Eligibility.** An order is pushed when it is paid, in a ready status (`PROCESSING` or `ALLOCATED`), and its ship-from warehouse is bound to the active WMS. Orders in unbound warehouses are skipped.
-- **Idempotency.** Each order tracks one `WmsOrderPushLink` (unique per order). Create uses the order's external reference so a re-run never double-creates. State machine: `PENDING_CREATE → SYNCED`, then `HELD` (order put on hold), `CANCELLED` (order cancelled), or `DEAD_LETTER` (repeated failures or an unresolvable conflict).
-- **Create / update / cancel.** New eligible orders are created in the WMS; subsequent edits while the WMS order is still `NEW` are amended; orders put on hold are cancelled in the WMS and parked `HELD` (and re-created if released); IMS-cancelled orders propagate a cancel.
-- **Retries.** A failed push increments an attempt counter and retries on the next sweep; after 5 attempts it dead-letters for manual review rather than looping forever. A line with no SKU fails the whole order (never a silent partial push).
-- **Couriers.** The order's shipping service is mapped to a Mintsoft `CourierServiceId` via the courier map; unmapped services fall back to the default courier id, or pass the name through for Mintsoft to resolve.
-
-## Dispatch Ingestion & Reconciliation (Phase 8)
-
-The reverse direction — WMS despatch → IMS shipment — is driven by the **connector-agnostic** dispatch sweep (`lib/domain/wms/dispatch-sweep.ts`, hoisted from the Mintsoft module in `q66in.1.3`), triggered by the `mintsoft-dispatch-sync` cron (`/api/cron/mintsoft-dispatch-sync`, every 15 min — the poll is Mintsoft's path; ShipHero ingests despatch via webhooks). It polls pushed-but-not-shipped links (`WmsOrderPushLink.state` in `SYNCED`/`MERGED`) and feeds despatches into `applyExternalFulfillmentUpdate`, which progresses the IMS shipment to `SHIPPED` and carries the tracking number/courier through (and, for storefront orders, onward to WooCommerce so the customer is emailed — see [`woo-mintsoft-plugin-parity-gap.md`](./todo/woo-mintsoft-plugin-parity-gap.md)). The per-order step `reconcileOneOrder` is exported so a webhook-primary WMS can reconcile a single order on a shipment event.
-
-- **Despatch detection.** Each connector normalises a `dispatched` flag onto `WmsOrderStatus`/`WmsOrderPart` (Mintsoft: status `DESPATCHED`/`INVOICED` or a tracking despatch date; ShipHero: `fulfilled`), so the sweep stays connector-agnostic.
-- **Split orders.** Mintsoft can split an order into N parts that despatch independently. Each despatched part is pushed to the storefront as a **partial shipment** (the onetwoInventory Helper plugin records it into the storefront's partial-shipment UI + customer email; idempotent per part). The IMS order is marked `SHIPPED` only once **every** part has despatched, using `NumberOfParts` as the authoritative total. Tracking from all parts is aggregated onto the single IMS shipment.
-- **Merged orders.** When Mintsoft merges an order into a survivor (combined `a+b` OrderNumber), the original WMS order is destroyed. The link is **repointed** to the survivor and parked `MERGED` so the outbound push sweep's `SYNCED`-only update/cancel/hold passes skip it (no dual-sync amending the survivor). A merged **and** split survivor is reconciled **atomically** (no per-part partial shipments — its parts mix several original orders), completing the IMS order when the survivor is fully despatched.
-- **Idempotency.** A dispatched order reconciles to `SHIPPED` and drops out of the poll set; partial-shipment pushes are de-duplicated per `(order, part)` on the storefront side.
-- **Tool-agnostic.** The whole reconcile (`lib/domain/wms/dispatch-sweep.ts`) is behind the generic `WmsConnector` contract — the connector supplies `fetchOrderStatus` (with `dispatched`/`isMerged`/`isSplit`), `fetchOrderParts`, and `fetchOrderPartItems`; the storefront write goes via the shopping facade. A second WMS inherits dispatch/split/merge by implementing the contract.
-
-## Order Status Chip
-
-In-flight orders show a WMS status chip on the sales list and detail pages. The cached value is refreshed by the `wms-order-status` cron (`/api/cron/wms-order-status`, default every 15 minutes) and the detail page also fetches live on load. The chip deep-links to the order in the WMS admin using the admin order URL template.
-
-The connector builds that deep link and stores it on the cached snapshot (core flows never reference a connector-specific URL format — see the connector boundary). So a change to the admin URL template reaches the **list** chips on the next status sweep, while the **detail** page — which queries the connector live — reflects it immediately.
-
-## Connector Settings
-
-Beyond credentials, these connector settings drive dispatch and status. All are editable under Integrations → Mintsoft (no DB access required).
-
-| Setting | Purpose | Default |
-|---|---|---|
-| `mintsoft_admin_order_url_template` | Deep-link target for the order-status chip; `{id}` is replaced with the Mintsoft order id | `https://app.fulfillable.co.uk/Order/Details/{id}` |
-| `mintsoft_default_courier_service_id` | Fallback `CourierServiceId` when a shipping service isn't in the map; blank means no fallback | _(blank)_ |
-| `mintsoft_courier_service_map` | JSON map of IMS shipping-service name → Mintsoft `CourierServiceId`, e.g. `{ "Royal Mail Tracked 24": 12 }` | _(blank)_ |
-
-The courier id map is strict: values must resolve to positive integers (numeric strings like `"12"` are accepted; decimals, negatives, and trailing junk are rejected).
 
 ## Operational Notes
 

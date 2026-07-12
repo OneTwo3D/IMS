@@ -103,10 +103,6 @@ Set the **invoice generation trigger** to control when invoices are created auto
 - **On ship** — invoice created when the order is shipped
 - **On paid** — invoice created when the order is fully paid
 
-### Dispatch Email
-
-Toggle the dispatch email for direct (non-storefront) orders (off by default). When enabled, customers of direct orders receive a branded dispatch notification with the dispatched items, carrier, tracking number(s), and a tracking link when their order ships — queued at most once per order. Storefront orders are always excluded so the storefront's own dispatch email is not duplicated.
-
 ### Delivery Tracking
 
 Toggle the delivery tracking module on or off. When enabled:
@@ -175,33 +171,6 @@ Setting `TaxRate.reverseCharge` to true changes how IMS posts the line to the ac
 - The reporting category should be set to `REVERSE_CHARGE` so the VAT analytics report groups it separately from domestic sales.
 
 If the reverse-charge tax type settings are empty, IMS falls back to the parent `TaxRate.accountingTaxType` — the line still posts but is not flagged as reverse-charge on the accounting side.
-
-### Generate missing accounting tax rates
-
-**Where:** the VAT rates screen itself — **Settings > Accounting > Tax** (the same page where you add and enable/disable rates). When an accounting connector is connected, a **Generate missing rates** button appears next to **Add VAT Rate**. This complements the **Xero drift** chips on each rate ("no matching rate in Xero").
-
-For every **active, unmapped** IMS rate (`accountingTaxType` blank) that has **no name-match** among the connector's existing rates, IMS can create the rate in the connector and write the returned tax type back onto the IMS rate. Rates that already name-match an existing connector rate are **skipped** (map those with the WooCommerce-connector tax-rate mapper's **Auto-apply** — no duplicates are created). Clicking the button first shows a **confirmation dialog** listing each rate to be created with its rate and report type; the **report type is a per-rate dropdown pre-filled with the default below** — change any of them before confirming. Nothing is written until you confirm.
-
-- **Xero** — fully supported. Creates each rate via `POST /TaxRates` (mirroring any tax components) and sets `ReportTaxType` from the IMS `Reporting category` + `Used for`:
-
-  | Reporting category | Used for | Xero ReportTaxType |
-  |---|---|---|
-  | `DOMESTIC` | SALES / BOTH | `OUTPUT` |
-  | `DOMESTIC` | PURCHASE | `INPUT` |
-  | `REVERSE_CHARGE` | any | `REVERSECHARGES` |
-  | `EC_SALES` | SALES / BOTH | `ECOUTPUTSERVICES` |
-  | `EC_SALES` | PURCHASE | `ECACQUISITIONS` |
-  | `OSS` (non-EU / non-VOEC) **at 0%** | SALES / BOTH → `EXEMPTOUTPUT`, PURCHASE → `EXEMPTINPUT` | |
-  | `OSS` (non-EU / non-VOEC) **charging VAT** | SALES / BOTH → `OUTPUT`, PURCHASE → `INPUT` | |
-  | (unset) | SALES / BOTH → `OUTPUT`, PURCHASE → `INPUT` | |
-
-  > Xero rejects the `NONE` report type when creating a rate ("not valid for this organisation"), so it is never used or offered.
-
-  **EU / VOEC distance-selling override:** a **sales** rate whose **name starts with an EU member-state ISO code** (e.g. `DE Standard`, `FR 20%`; Greece as `GR` or `EL`) or a **VOEC** code (Norway `NO`) is an OSS/IOSS/VOEC distance sale and defaults to **`MOSSSALES`** ("MOSS Sales" in Xero). This overrides the category default above — except an explicit `REVERSE_CHARGE` (which still files to `REVERSECHARGES`) and purchase-only rates. OSS rates **outside** those schemes (e.g. Channel Islands `CI`, Isle of Man `IM`, Monaco `MC`) are treated as **exempt** (`EXEMPTOUTPUT` / `EXEMPTINPUT`) when they're 0% — Xero forbids a non-zero exempt rate, so any that still charge VAT fall back to `OUTPUT` / `INPUT`. The match is on a leading 2-letter token only, so `Deutschland` does not count as `DE`. Any of these can be changed per-rate in the confirmation dialog.
-
-  The creation is idempotent — Xero keys by `Name`, so a rate that already exists is matched rather than duplicated. Each generate run is recorded in the Activity log (`xero_tax_rates_generated`); partial failures are reported per rate and don't roll back rates already created.
-
-- **QuickBooks** — not supported (QBO has no programmatic tax-code creation on the public API). The action degrades gracefully: create the tax codes in QuickBooks, then use **Auto-apply** to map them.
 
 ## Backup & Restore
 
@@ -298,12 +267,6 @@ The system relies on scheduled jobs to keep external systems in sync and to main
 | `/api/cron/backup` | Database backup | Daily |
 | `/api/cron/product-lifecycle-archive` | Auto-archive exhausted EOL products | Daily |
 | `/api/cron/mintsoft-webhook-sweeper` | Drain Mintsoft webhook events | Every 5 min |
-| `/api/cron/wms-order-push` | Push paid, ready-to-fulfil orders for WMS-bound warehouses to the WMS, and propagate cancellations (Phase 8 dispatch). **Off by default** | Every 10 min |
-| `/api/cron/wms-order-status` | Refresh cached WMS order statuses that power the sales-list status chips | Every 15 min |
-| `/api/cron/mintsoft-stock-sync` | Poll Mintsoft warehouse stock and queue discrepancy handling for bound warehouses | Hourly |
-| `/api/cron/mintsoft-returns-sync` | Poll the Mintsoft returns feed and stage items for review | Hourly |
-| `/api/cron/mintsoft-product-verify` | Check Mintsoft product/barcode mappings against IMS products | Daily |
-| `/api/cron/mintsoft-bundle-verify` | Check KIT composition against the linked Mintsoft bundle | Daily |
 | `/api/cron/email-outbox` | Send queued emails | Hourly |
 | `/api/cron/activity-cleanup` | Trim old activity log entries | Daily |
 

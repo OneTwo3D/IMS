@@ -241,11 +241,4 @@ export type StockSyncResult = SyncResult & {
   message: string
   /** Up to 10 SKUs that could not be matched in WC — shown to operators. */
   unmatchedSkuSample: string[]
-  /**
-   * The run was refused before any work started (stock sync disabled in
-   * settings, missing credentials, or no syncToStore warehouses). Distinct
-   * from a benign "nothing to push" no-op: an operator-requested push that
-   * aborts must surface as a failure, and a queued job must be retained.
-   */
-  aborted?: boolean
 }

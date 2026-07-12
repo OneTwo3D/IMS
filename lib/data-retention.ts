@@ -101,11 +101,7 @@ export async function purgeExpiredData(): Promise<{
     const { count } = await db.salesOrder.updateMany({
       where: {
         createdAt: { lt: cutoff },
-        // Terminal lifecycle, or any refunded order (refund state is now orthogonal).
-        OR: [
-          { status: { in: ['COMPLETED', 'DELIVERED', 'CANCELLED'] } },
-          { refundStatus: { not: 'NONE' } },
-        ],
+        status: { in: ['COMPLETED', 'DELIVERED', 'CANCELLED', 'REFUNDED', 'PARTIALLY_REFUNDED'] },
         archived: false,
       },
       data: { archived: true },

@@ -10,6 +10,8 @@ export const SALES_ORDER_STATUSES = [
   'COMPLETED',
   'DELIVERED',
   'CANCELLED',
+  'REFUNDED',
+  'PARTIALLY_REFUNDED',
 ] as const
 
 export type SalesOrderStatus = typeof SALES_ORDER_STATUSES[number]

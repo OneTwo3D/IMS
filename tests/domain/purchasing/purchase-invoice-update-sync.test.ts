@@ -70,7 +70,6 @@ test('maybeQueuePurchaseInvoiceUpdate queues Xero PURCHASE_INVOICE_UPDATE when e
     isAccountingSyncTypeEnabled: async () => true,
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
-      return true
     },
   }
 
@@ -104,7 +103,6 @@ test('maybeQueuePurchaseInvoiceUpdate logs unsupported connector without queuein
     isAccountingSyncTypeEnabled: async () => true,
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
-      return true
     },
   }
 
@@ -138,7 +136,6 @@ test('maybeQueuePurchaseInvoiceUpdate skips disabled sync type without warning l
     isAccountingSyncTypeEnabled: async () => false,
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
-      return true
     },
   }
 
@@ -166,7 +163,6 @@ test('maybeQueuePurchaseInvoiceUpdate skips bills without external accounting id
     isAccountingSyncTypeEnabled: async () => true,
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
-      return true
     },
   }
 

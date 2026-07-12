@@ -3,21 +3,10 @@ import { logActivity } from '@/lib/activity-log'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 
-/**
- * Resolve the redirect origin from the trusted, server-configured app URL only.
- * The Host / X-Forwarded-Host headers are attacker-controlled, so building the
- * redirect target from them is an open redirect (CWE-601). Fall back to the
- * request's own origin only when no app URL is configured.
- */
-async function resolveAppOrigin(request: Request): Promise<string> {
-  const publicAppUrl = await getPublicAppUrl()
-  if (publicAppUrl) {
-    try {
-      return new URL(publicAppUrl).origin
-    } catch {
-      // fall through to request origin
-    }
-  }
+function getExternalOrigin(request: Request): string {
+  const fwdProto = (request.headers.get('x-forwarded-proto') ?? 'https').split(',')[0].trim()
+  const fwdHost = (request.headers.get('x-forwarded-host') ?? request.headers.get('host') ?? '').split(',')[0].trim()
+  if (fwdHost) return `${fwdProto}://${fwdHost}`
   return new URL(request.url).origin
 }
 
@@ -32,7 +21,7 @@ async function redirectWithStatus(origin: string, connector: string, params: Rec
 
 export async function GET(request: Request) {
   const url = new URL(request.url)
-  const origin = await resolveAppOrigin(request)
+  const origin = getExternalOrigin(request)
   const code = url.searchParams.get('code')
   const state = url.searchParams.get('state')
   const error = url.searchParams.get('error')

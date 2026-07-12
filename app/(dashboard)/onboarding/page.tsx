@@ -8,7 +8,7 @@ import { getCurrencies } from '@/app/actions/currencies'
 import { getTaxRates, getWarehousesForSettings } from '@/app/actions/settings'
 import { getShoppingConnectorCredentials, getShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import { getAccountingSettingsMasked, getAccountingConnectionStatus } from '@/app/actions/accounting-sync'
-import { getWmsOnboardingConnectionData } from '@/app/actions/wms-onboarding'
+import { getMintsoftOnboardingConnectionData } from '@/app/actions/mintsoft-sync'
 import { detectPublicAppUrlFromHeaders, getPublicAppUrlInfo } from '@/lib/public-app-url'
 import { getSettingValue } from '@/lib/settings-store'
 import { OnboardingClient } from './onboarding-client'
@@ -36,7 +36,7 @@ export default async function OnboardingPage() {
     shopifyCredentials,
     accountingSettings,
     accountingStatus,
-    wmsConnection,
+    mintsoftConnection,
     emailSettings,
     publicAppUrlInfo,
   ] = await Promise.all([
@@ -51,7 +51,7 @@ export default async function OnboardingPage() {
     getShopifyConnectorCredentials(),
     getAccountingSettingsMasked(),
     getAccountingConnectionStatus(),
-    getWmsOnboardingConnectionData(),
+    getMintsoftOnboardingConnectionData(),
     getEmailSettings(),
     getPublicAppUrlInfo(),
   ])
@@ -77,7 +77,7 @@ export default async function OnboardingPage() {
       shopifyCredentials={shopifyCredentials}
       accountingSettings={accountingSettings}
       accountingStatus={accountingStatus}
-      wmsConnection={wmsConnection}
+      mintsoftConnection={mintsoftConnection}
       emailSettings={emailSettings}
       publicAppUrlInfo={publicAppUrlInfo}
       suggestedPublicAppUrl={suggestedPublicAppUrl}

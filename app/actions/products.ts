@@ -2,16 +2,17 @@
 
 import { revalidatePath } from 'next/cache'
 import { redirect } from 'next/navigation'
+import { after } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
-import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
-import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
-import { scheduleWmsProductSync, isAnyWmsConnectorEnabled } from '@/lib/domain/wms/product-sync-dispatch'
+import { runMintsoftProductSyncForProduct } from '@/lib/connectors/mintsoft/sync/product-sync'
+import { runBundleSyncForProduct } from '@/lib/connectors/mintsoft/sync/bundle-sync'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import {
   COMPONENT_PRODUCT_STATUSES,
   deriveLegacyActiveFromLifecycleStatus,
@@ -81,7 +82,6 @@ export type ProductDetail = ProductRow & {
   depthCm: string | null
   hsCode: string | null
   countryOfOrigin: string | null
-  customsDescription: string | null
   variants: ProductRow[]
   stockByWarehouse: {
     warehouseId: string
@@ -466,7 +466,6 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     mpn: p.mpn,
     hsCode: p.hsCode ?? null,
     countryOfOrigin: p.countryOfOrigin ?? null,
-    customsDescription: p.customsDescription ?? null,
     leadTimeDays: p.leadTimeDays ?? null,
     observedLeadTimeDays: p.observedLeadTimeDays ?? null,
     weight: p.weight?.toString() ?? null,
@@ -633,7 +632,6 @@ const productSchema = z.object({
   mpn: z.string().max(100).optional().nullable(),
   hsCode: z.string().optional().nullable(),
   countryOfOrigin: z.string().max(2).optional().nullable(),
-  customsDescription: z.string().optional().nullable(),
   weight: z.string().optional().nullable(),
   salesPriceBase: z.string().optional().nullable(),
   salePriceBase: z.string().optional().nullable(),
@@ -662,6 +660,56 @@ export type ProductFormState = {
   message?: string
 }
 
+async function syncMintsoftProductBestEffort(productId: string): Promise<void> {
+  try {
+    if (!await isIntegrationPluginEnabled('mintsoft')) {
+      return
+    }
+    await runMintsoftProductSyncForProduct(productId, 'product_mutation')
+  } catch (syncError) {
+    console.error(syncError)
+  }
+}
+
+async function syncMintsoftBundleBestEffort(productId: string): Promise<void> {
+  try {
+    if (!await isIntegrationPluginEnabled('mintsoft')) {
+      return
+    }
+    await runBundleSyncForProduct(productId, 'product_mutation')
+  } catch (syncError) {
+    console.error(syncError)
+  }
+}
+
+async function syncMintsoftParentBundlesBestEffort(productId: string): Promise<void> {
+  try {
+    if (!await isIntegrationPluginEnabled('mintsoft')) {
+      return
+    }
+    const parents = await db.productComponent.findMany({
+      where: { componentId: productId },
+      select: { productId: true },
+    })
+    const unique = Array.from(new Set(parents.map((parent) => parent.productId)))
+    for (const parentId of unique) {
+      try {
+        await runBundleSyncForProduct(parentId, 'product_mutation')
+      } catch (error) {
+        console.error('[mintsoft bundle sync] parent KIT sync failed', parentId, error)
+      }
+    }
+  } catch (syncError) {
+    console.error(syncError)
+  }
+}
+
+function scheduleMintsoftProductSync(productId: string) {
+  after(() => syncMintsoftProductBestEffort(productId))
+  after(() => syncMintsoftBundleBestEffort(productId))
+  after(() => syncMintsoftParentBundlesBestEffort(productId))
+}
+
 export async function createProduct(
   _prev: ProductFormState,
   formData: FormData
@@ -680,7 +728,6 @@ export async function createProduct(
     mpn: ((formData.get('mpn') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
-    customsDescription: formData.get('customsDescription') as string || null,
     weight: formData.get('weight') as string || null,
     salesPriceBase: formData.get('salesPriceBase') as string || null,
     salePriceBase: formData.get('salePriceBase') as string || null,
@@ -741,10 +788,7 @@ export async function createProduct(
         barcode: data.barcode || null,
         mpn: data.mpn || null,
         hsCode: data.hsCode || null,
-        // New products with no origin default to China for customs parity with hs-code-woo
-        // (bhdm.5). Only on create — see updateProduct for why update must not default.
-        countryOfOrigin: data.countryOfOrigin || DEFAULT_COUNTRY_OF_ORIGIN,
-        customsDescription: data.customsDescription || null,
+        countryOfOrigin: data.countryOfOrigin || null,
         weight: data.weight ? data.weight : null,
         salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
         salePriceBase: data.salePriceBase ? data.salePriceBase : null,
@@ -793,8 +837,8 @@ export async function createProduct(
   } catch (syncError) {
     console.error(syncError)
   }
-  if (hasPermission(session.user.role, 'sync') && await isAnyWmsConnectorEnabled()) {
-    scheduleWmsProductSync(created.id)
+  if (hasPermission(session.user.role, 'sync') && await isIntegrationPluginEnabled('mintsoft')) {
+    scheduleMintsoftProductSync(created.id)
   }
 
   revalidatePath('/inventory')
@@ -820,7 +864,6 @@ export async function updateProduct(
     mpn: ((formData.get('mpn') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
-    customsDescription: formData.get('customsDescription') as string || null,
     weight: formData.get('weight') as string || null,
     salesPriceBase: formData.get('salesPriceBase') as string || null,
     salePriceBase: formData.get('salePriceBase') as string || null,
@@ -895,11 +938,7 @@ export async function updateProduct(
         barcode: data.barcode || null,
         mpn: data.mpn || null,
         hsCode: data.hsCode || null,
-        // Do NOT default origin on update: a deliberate clear must not silently overwrite a
-        // real country with CN (customs misdeclaration). New products default at create; the
-        // WMS product push still declares CN for any null origin, so customs stays covered (bhdm.5).
         countryOfOrigin: data.countryOfOrigin || null,
-        customsDescription: data.customsDescription || null,
         weight: data.weight ? data.weight : null,
         salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
         salePriceBase: data.salePriceBase ? data.salePriceBase : null,
@@ -961,15 +1000,8 @@ export async function updateProduct(
   } catch (syncError) {
     console.error(syncError)
   }
-  if (hasPermission(session.user.role, 'sync') && await isAnyWmsConnectorEnabled()) {
-    scheduleWmsProductSync(id)
-  }
-  // If the classification-relevant fields changed, drop the stale HS-code proposal so the
-  // sweep re-classifies (6igm.5/.7). Best-effort — never block the product save.
-  try {
-    await invalidateStaleHsProposal(id)
-  } catch (hsError) {
-    console.error(hsError)
+  if (hasPermission(session.user.role, 'sync') && await isIntegrationPluginEnabled('mintsoft')) {
+    scheduleMintsoftProductSync(id)
   }
 
   revalidatePath('/inventory')
@@ -1408,17 +1440,13 @@ export async function saveProductOptions(
 }
 
 export async function generateVariantsFromOptions(
-  productId: string,
-  variantType: 'VARIANT' | 'KIT' | 'BOM' = 'VARIANT'
+  productId: string
 ): Promise<{ created: number; skipped: number; error?: string }> {
   await requirePermission('inventory.edit')
-  if (variantType !== 'VARIANT' && variantType !== 'KIT' && variantType !== 'BOM') {
-    return { created: 0, skipped: 0, error: 'Invalid variant type' }
-  }
   const [product, options] = await Promise.all([
     db.product.findUnique({
       where: { id: productId },
-      select: { sku: true, name: true, type: true, weight: true, widthCm: true, heightCm: true, depthCm: true, hsCode: true, countryOfOrigin: true, customsDescription: true },
+      select: { sku: true, name: true, type: true, weight: true, widthCm: true, heightCm: true, depthCm: true },
     }),
     db.productOption.findMany({ where: { productId }, orderBy: { sortOrder: 'asc' } }),
   ])
@@ -1489,7 +1517,7 @@ export async function generateVariantsFromOptions(
       data: {
         sku,
         name,
-        type: variantType,
+        type: 'VARIANT',
         parentId: productId,
         active: true,
         lifecycleStatus: 'ACTIVE',
@@ -1497,10 +1525,6 @@ export async function generateVariantsFromOptions(
         widthCm:  product.widthCm  ?? undefined,
         heightCm: product.heightCm ?? undefined,
         depthCm:  product.depthCm  ?? undefined,
-        // Variants inherit the parent's customs data; can be overridden per variant afterwards.
-        hsCode:             product.hsCode             ?? undefined,
-        countryOfOrigin:    product.countryOfOrigin    ?? undefined,
-        customsDescription: product.customsDescription ?? undefined,
       },
     })
     createdVariantIds.push(createdVariant.id)

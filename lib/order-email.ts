@@ -12,10 +12,8 @@ import {
   type PdfTableColumn,
 } from '@/lib/pdf'
 import { formatMoney, type SymbolPos } from '@/lib/utils'
-import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { formatDateTime } from '@/lib/format-datetime'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
-import { getTrackingUrl } from '@/lib/tracking'
 
 type EmailAttachment = { filename: string; content: Buffer; contentType?: string }
 type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[] }
@@ -38,7 +36,6 @@ type SoForPdf = {
   taxRatePercent: unknown
   totalForeign: unknown
   totalBase: unknown
-  taxBase: unknown
   discountAmount: unknown
   invoiceNumber: string | null
   invoicedAt: Date | null
@@ -124,7 +121,7 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
-    { label: 'Description', width: 195, wrap: true },
+    { label: 'Description', width: 195 },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price (${sym})`, width: 65, align: 'right' },
     { label: 'Discount', width: 50, align: 'right' },
@@ -177,7 +174,6 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   await drawHeader(doc, branding, {
     title: 'Invoice',
     reference: invNum,
-    ...(so.orderNumber ? { secondaryReference: { label: 'Order', value: so.orderNumber } } : {}),
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
@@ -196,7 +192,7 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   const { sym, symPos } = await getCurrencyFormat(so.currency)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'Description', width: 230, wrap: true },
+    { label: 'Description', width: 230 },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price (${sym})`, width: 65, align: 'right' },
     { label: `Tax (${sym})`, width: 55, align: 'right' },
@@ -211,25 +207,14 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
     Number(l.totalForeign).toFixed(2),
   ])
   drawTable(doc, columns, rows, branding)
-  // A wrapped description column can leave the table ending near the page bottom;
-  // keep the totals block together rather than splitting it across the page break.
-  if (doc.y + 90 > 780) doc.addPage()
   drawTotals(doc, so, sym, symPos, columns)
 
-  const base = await getBaseCurrencyDisplay()
-  if (so.currency !== base.code) {
+  if (so.currency !== 'GBP') {
     const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
     const vW = columns[columns.length - 1].width
     const lW = 80
-    const baseMoney = (n: number) => formatMoney(n, base.symbol, base.symbolPosition)
-    // Total + VAT in the base currency on one line, e.g. "(GBP equivalent £80.73, 20% VAT £13.46)".
-    const equivParts = [`${base.code} equivalent ${baseMoney(Number(so.totalBase))}`]
-    if (Number(so.taxForeign) > 0) {
-      const vatPct = so.taxRatePercent != null ? `${(Number(so.taxRatePercent) * 100).toFixed(0)}% ` : ''
-      equivParts.push(`${vatPct}VAT ${baseMoney(Number(so.taxBase))}`)
-    }
     doc.font('Helvetica').fontSize(8).fillColor('#888')
-      .text(`(${equivParts.join(', ')})`, tableRight - vW - lW, doc.y + 3, { width: lW + vW, align: 'right' })
+      .text(`(GBP equivalent: ${formatMoney(Number(so.totalBase), '£', 'PREFIX')})`, tableRight - vW - lW, doc.y + 3, { width: lW + vW, align: 'right' })
   }
 
   if (tpl?.footerNote) {
@@ -347,82 +332,6 @@ async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: bo
   }
 }
 
-async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
-  const so = await db.salesOrder.findUnique({
-    where: { id: orderId },
-    select: {
-      id: true,
-      orderNumber: true,
-      externalOrderNumber: true,
-      customerName: true,
-      customerEmail: true,
-      shippedAt: true,
-      trackingNumber: true,
-      shippingService: true,
-      createdAt: true,
-      lines: { select: { description: true, sku: true, qty: true } },
-      shipments: {
-        where: { status: 'SHIPPED' },
-        select: { trackingNumber: true, shippingService: true },
-      },
-      _count: { select: { shoppingLinks: true } },
-    },
-  })
-  if (!so) throw new Error('Order not found')
-  if (!so.customerEmail) throw new Error('No customer email address')
-  // Re-check at send time: if the order gained a storefront link after the
-  // email was queued, the storefront sends its own dispatch email — bail out
-  // rather than double-emailing the customer.
-  if (so._count.shoppingLinks > 0) throw new Error('Order is storefront-linked; dispatch email suppressed')
-
-  const branding = await getBranding()
-  const ref = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
-  const tz = await getDisplayTimeZone()
-  const date = formatDateTime(so.shippedAt ?? new Date(), { day: 'numeric', month: 'long', year: 'numeric' }, tz)
-
-  // Shipment-level tracking first; fall back to the order-level fields set by
-  // reconcileOrderAfterShipment for legacy/manual flows.
-  const trackingEntries = so.shipments
-    .filter((s) => s.trackingNumber)
-    .map((s) => ({ trackingNumber: s.trackingNumber!, carrier: s.shippingService ?? so.shippingService }))
-  if (trackingEntries.length === 0 && so.trackingNumber) {
-    trackingEntries.push({ trackingNumber: so.trackingNumber, carrier: so.shippingService })
-  }
-
-  const itemLines = so.lines.map((l) => `${Number(l.qty)} × ${l.description}${l.sku ? ` (${l.sku})` : ''}`)
-  const trackingLines = trackingEntries.map((t) =>
-    t.carrier ? `${t.carrier} — tracking number ${t.trackingNumber}` : `Tracking number ${t.trackingNumber}`)
-
-  // getTrackingUrl returns null when the carrier is blank; a tracking number
-  // is still useful, so fall back to the same universal tracker it uses for
-  // unknown carriers.
-  const firstTracked = trackingEntries[0]
-  const trackingUrl = firstTracked
-    ? getTrackingUrl(firstTracked.carrier, firstTracked.trackingNumber)
-      ?? `https://t.17track.net/en#nums=${encodeURIComponent(firstTracked.trackingNumber)}`
-    : null
-
-  const subject = `Your order ${ref} has been dispatched`
-  const html = await renderEmailHtml(branding, {
-    recipientName: so.customerName ?? 'Customer',
-    recipientEmail: so.customerEmail,
-    reference: ref,
-    date,
-    subject,
-    bodyLines: [
-      `Good news — your order ${ref} has been dispatched.`,
-      ...(itemLines.length > 0 ? ['Items in this order:', ...itemLines] : []),
-      ...trackingLines,
-      ...(trackingUrl ? ['You can follow your delivery using the tracking link below.'] : []),
-      'If you have any questions about your delivery, please don\'t hesitate to contact us.',
-    ],
-    ...(trackingUrl ? { ctaLabel: 'Track your delivery', ctaUrl: trackingUrl } : {}),
-    hideAttachmentNote: true,
-  })
-
-  return { to: so.customerEmail, subject, html }
-}
-
 export async function getSalesOrderConfirmationQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
@@ -462,6 +371,5 @@ export async function prepareQueuedEmail(kind: string, referenceType: string | n
   if (kind === 'SALES_ORDER_CONFIRMATION') return buildSalesOrderConfirmationEmail(referenceId)
   if (kind === 'INVOICE') return buildInvoiceEmail(referenceId)
   if (kind === 'ACCOUNTING_INVOICE') return buildInvoiceEmail(referenceId, { accountingPdf: true })
-  if (kind === 'SHIPMENT_DISPATCHED') return buildDispatchEmail(referenceId)
   return null
 }

@@ -106,16 +106,6 @@ function isTrustedProxy(ip: string): boolean {
   ))
 }
 
-/**
- * True when trusted-proxy resolution is configured (TRUSTED_PROXY_IPS or
- * TRUSTED_PROXY_CIDRS is set). When false, `getClientIp` cannot distinguish real
- * clients from the fronting proxy, so per-IP throttling would collapse every
- * client onto one key — callers should skip per-IP caps in that case.
- */
-export function isTrustedProxyConfigured(): boolean {
-  return trustedProxyIps.size > 0 || trustedProxyRanges.length > 0
-}
-
 function getForwardedChain(headers: HeaderSource): string[] {
   return (headers.get('x-forwarded-for') ?? '')
     .split(',')

@@ -24,7 +24,6 @@ function cleanRows(): AccountingReconciliationRows {
       orderNumber: 'SO-1',
       externalOrderNumber: null,
       status: 'SHIPPED',
-      refundStatus: 'NONE',
       revenueDeferredDate: A1_DATE,
       inventoryAllocatedDate: A2_DATE,
     }],
@@ -582,7 +581,6 @@ test('refunded terminal order with posted shipment reports missing credit-note a
   rows.salesOrders = [{
     ...rows.salesOrders[0],
     status: 'REFUNDED',
-    refundStatus: 'FULL',
   }]
   rows.refunds = [{
     ...rows.refunds[0],
@@ -603,7 +601,6 @@ test('zero-value refund on a posted-shipment order does not require reversal evi
   rows.salesOrders = [{
     ...rows.salesOrders[0],
     status: 'REFUNDED',
-    refundStatus: 'FULL',
   }]
   rows.refunds = [{
     ...rows.refunds[0],
@@ -621,7 +618,7 @@ test('zero-value refund on a posted-shipment order does not require reversal evi
 test('live sync status membership gates terminal credit-note evidence', () => {
   for (const status of ['PENDING', 'PROCESSING', 'SYNCED']) {
     const rows = cleanRows()
-    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED', refundStatus: 'FULL' }]
+    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED' }]
     rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null }]
     rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
     rows.accountingEvents = rows.accountingEvents.filter((event) => event.sourceEntityType !== 'SalesOrderRefund' || event.type !== 'CREDIT_NOTE')
@@ -643,7 +640,7 @@ test('live sync status membership gates terminal credit-note evidence', () => {
 
   for (const status of ['FAILED', 'REJECTED']) {
     const rows = cleanRows()
-    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED', refundStatus: 'FULL' }]
+    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED' }]
     rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null }]
     rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
     rows.accountingEvents = rows.accountingEvents.filter((event) => event.sourceEntityType !== 'SalesOrderRefund' || event.type !== 'CREDIT_NOTE')
@@ -809,7 +806,6 @@ test('accounting reconciliation row collection selects required datasets', async
         revenueDeferredDate?: { gte?: unknown }
         inventoryAllocatedDate?: { gte?: unknown }
         status?: { in?: string[] }
-        refundStatus?: { not?: string }
         updatedAt?: { gte?: unknown }
       }>
     }
@@ -819,12 +815,9 @@ test('accounting reconciliation row collection selects required datasets', async
   assert.ok(salesOrderWhere.OR[0].revenueDeferredDate?.gte instanceof Date)
   assert.ok(salesOrderWhere.OR[1].inventoryAllocatedDate?.gte instanceof Date)
   assert.deepEqual(salesOrderWhere.OR[2].status, {
-    in: ['CANCELLED', 'COMPLETED', 'DELIVERED'],
+    in: ['REFUNDED', 'PARTIALLY_REFUNDED', 'CANCELLED', 'COMPLETED', 'DELIVERED'],
   })
   assert.ok(salesOrderWhere.OR[2].updatedAt?.gte instanceof Date)
-  // Refunded orders may sit in a non-terminal lifecycle status now — scanned via refundStatus.
-  assert.deepEqual(salesOrderWhere.OR[3].refundStatus, { not: 'NONE' })
-  assert.ok(salesOrderWhere.OR[3].updatedAt?.gte instanceof Date)
   assert.equal(salesOrderCall.take, 10000)
   const shipmentWhere = (calls.shipment as { where: { shipmentJournalDate: { gte?: unknown } } }).where
   assert.ok(shipmentWhere.shipmentJournalDate.gte instanceof Date)

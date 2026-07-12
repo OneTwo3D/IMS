@@ -1,22 +1,18 @@
 import { randomUUID } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
-import { getAccountingSettings, queueAccountingSync, queueAccountingSyncTx, type AccountingSettings } from '@/lib/accounting'
+import { getAccountingSettings, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { logActivity } from '@/lib/activity-log'
 import {
   getDependentOutputSourceLines,
   getManufacturingConsumedQtyForCostLayer,
   getReturnedQtyForCostLayer,
-  getReversalConsumedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
-  recordCostLayerRevaluation,
   refreshSalesOrderLineCogsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
-import { db } from '@/lib/db'
 import { toJsonInputValue } from '@/lib/db/json-input'
-import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
 
 export const LANDED_COST_DISTRIBUTION_METHODS = [
@@ -65,7 +61,7 @@ export type LandedCostRecalcResult = {
 }
 
 export type LandedCostRevaluationWarning = {
-  code: 'weight_fallback' | 'weight_zero_line'
+  code: 'weight_fallback'
   context: string
   message: string
 }
@@ -106,7 +102,6 @@ type CostLayerAdjustmentInput = {
   returnedQty: Prisma.Decimal | number | string
   supplierReturnedQty: Prisma.Decimal | number | string
   manufacturingConsumedQty: Prisma.Decimal | number | string
-  reversalConsumedQty?: Prisma.Decimal | number | string
 }
 
 type PropagatedOutputLayerAudit = {
@@ -135,28 +130,22 @@ export type LandedCostServiceDeps = {
   getReturnedQtyForCostLayer: typeof getReturnedQtyForCostLayer
   getSupplierReturnedQtyForCostLayer: typeof getSupplierReturnedQtyForCostLayer
   getManufacturingConsumedQtyForCostLayer: typeof getManufacturingConsumedQtyForCostLayer
-  getReversalConsumedQtyForCostLayer: typeof getReversalConsumedQtyForCostLayer
   getDependentOutputSourceLines: typeof getDependentOutputSourceLines
   updateSnapshotsForCostLayerChange: typeof updateSnapshotsForCostLayerChange
   refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
   refreshSalesOrderLineCogsForCostLayerChange: typeof refreshSalesOrderLineCogsForCostLayerChange
-  recordCostLayerRevaluation: typeof recordCostLayerRevaluation
   warnWeightFallback: (context: string) => LandedCostRevaluationWarning | void
-  warnWeightZeroLines: (context: string, lineIds: string[]) => LandedCostRevaluationWarning | void
 }
 
 const defaultDeps: LandedCostServiceDeps = {
   getReturnedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
   getManufacturingConsumedQtyForCostLayer,
-  getReversalConsumedQtyForCostLayer,
   getDependentOutputSourceLines,
   updateSnapshotsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
   refreshSalesOrderLineCogsForCostLayerChange,
-  recordCostLayerRevaluation,
   warnWeightFallback,
-  warnWeightZeroLines,
 }
 
 const LANDED_COST_DELTA_EPSILON = new Prisma.Decimal('0.000001')
@@ -192,12 +181,8 @@ export function computeDistributionBase(
     case 'BY_WEIGHT':
       return decimal(line.product.weight).mul(line.qty)
     case 'BY_QUANTITY':
-      // Per-unit distribution: a 1000-unit line absorbs 1000× a 1-unit line.
       return decimal(line.qty)
     case 'EQUAL_SPLIT':
-      // nmim: EQUAL_SPLIT weights each LINE equally (base 1/line) REGARDLESS of
-      // quantity — this is intentional, the distinct "split freight evenly across
-      // line items" option. Callers wanting per-unit distribution use BY_QUANTITY.
       return new Prisma.Decimal(1)
     case 'BY_VALUE':
     default:
@@ -220,26 +205,16 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
 } {
   const costDelta = decimal(input.newUnitCost).sub(decimal(input.oldUnitCost))
   const consumedQty = decimal(input.receivedQty).sub(decimal(input.remainingQty))
-  // What this delta journals as COGS, and why each class is excluded:
-  // - audit-jz9i: manufacturing-consumed units are not customer COGS — their cost
-  //   was capitalised into the produced output's layer, so the delta is propagated
-  //   into that output by propagateLandedCostToOutputs (audit-e7h8), not here.
-  // - scjz.14: PURCHASE_REVERSAL units (PO cancellation) were reversed out, not
-  //   sold; they wrote cogs_entries only for the outbound-evidence guard.
-  // - returnedQty (customer returns): handled by updateSnapshotsForCostLayerChange
-  //   rewriting the refund-line snapshots, so the refund reversal already carries
-  //   the revalued cost — excluded here to avoid double-counting.
-  // - scjz.10: supplier-returned units ARE included. The late-cost delta on goods
-  //   returned to the supplier was previously dropped (excluded here, handled
-  //   nowhere). They ride the SAME consumed-qty COGS-adjustment journal as sold
-  //   goods — the retrospective COGS-adjustment journal (DR cogsAccount / CR
-  //   transitAccount on a cost increase; scjz.34).
+  // audit-jz9i: exclude manufacturing-consumed units. They are not customer COGS —
+  // their cost was capitalised into the produced output's cost layer — so the
+  // retrospective landed-cost delta for those units is propagated into that output
+  // layer by propagateLandedCostToOutputs (audit-e7h8), not journalled as COGS here.
   const netConsumedQty = Prisma.Decimal.max(
     new Prisma.Decimal(0),
     consumedQty
       .sub(decimal(input.returnedQty))
-      .sub(decimal(input.manufacturingConsumedQty))
-      .sub(decimal(input.reversalConsumedQty ?? 0)),
+      .sub(decimal(input.supplierReturnedQty))
+      .sub(decimal(input.manufacturingConsumedQty)),
   )
   return {
     costDelta,
@@ -288,8 +263,6 @@ export async function propagateLandedCostToOutputs(
   ) => void,
   ancestors: Set<string>,
   depth: number,
-  recalcRunId: string,
-  revaluedAt: Date,
 ): Promise<void> {
   if (costDeltaPerUnit.abs().lte(LANDED_COST_DELTA_EPSILON)) return
   if (depth > MAX_LANDED_COST_PROPAGATION_DEPTH) return
@@ -337,18 +310,10 @@ export async function propagateLandedCostToOutputs(
     const newOutputUnitCost = oldOutputUnitCost.add(outputUnitDelta).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
 
     await tx.costLayer.update({ where: { id: outputCostLayerId }, data: { unitCostBase: newOutputUnitCost } })
-    await deps.recordCostLayerRevaluation(tx, {
-      costLayerId: outputCostLayerId,
-      oldUnitCostBase: oldOutputUnitCost,
-      newUnitCostBase: newOutputUnitCost,
-      effectiveAt: revaluedAt,
-      reason: 'landed_cost_output_propagation',
-    })
 
     const returnedQty = decimal(await deps.getReturnedQtyForCostLayer(tx, outputCostLayerId))
     const supplierReturnedQty = decimal(await deps.getSupplierReturnedQtyForCostLayer(tx, outputCostLayerId))
     const manufacturingConsumedQty = decimal(await deps.getManufacturingConsumedQtyForCostLayer(tx, outputCostLayerId))
-    const reversalConsumedQty = decimal(await deps.getReversalConsumedQtyForCostLayer(tx, outputCostLayerId))
     const outDeltas = calculateLayerAdjustmentDeltas({
       oldUnitCost: oldOutputUnitCost,
       newUnitCost: newOutputUnitCost,
@@ -357,7 +322,6 @@ export async function propagateLandedCostToOutputs(
       returnedQty,
       supplierReturnedQty,
       manufacturingConsumedQty,
-      reversalConsumedQty,
     })
     // Reflect the new output cost in finished goods already sold from this layer,
     // FIRST, so its COGS revaluation can be removed from the cascade's COGS
@@ -366,7 +330,7 @@ export async function propagateLandedCostToOutputs(
     let outputShipmentRevalDelta = new Prisma.Decimal(0)
     if (outDeltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
       await deps.updateSnapshotsForCostLayerChange(tx, outputCostLayerId, newOutputUnitCost)
-      const shipmentRefresh = await deps.refreshShipmentCogsForCostLayerChange(tx, outputCostLayerId, { recalcRunId })
+      const shipmentRefresh = await deps.refreshShipmentCogsForCostLayerChange(tx, outputCostLayerId)
       outputShipmentRevalDelta = shipmentRefresh.cogsRevaluationDelta
       await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, outputCostLayerId)
     }
@@ -379,7 +343,7 @@ export async function propagateLandedCostToOutputs(
     })
 
     // Cascade into outputs that consumed THIS output (nested BOM levels).
-    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId, revaluedAt)
+    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1)
   }
 }
 
@@ -414,54 +378,6 @@ function captureWeightFallback(
   const warning = deps.warnWeightFallback(context) ?? makeWeightFallbackWarning(context)
   result.warnings.push(warning)
   runWarnings.push(warning)
-}
-
-function makeWeightZeroLineWarning(context: string, lineIds: string[]): LandedCostRevaluationWarning {
-  const description = `${context}: BY_WEIGHT landed-cost allocation assigned zero freight to ${lineIds.length} positive-quantity line(s) with zero/blank weight; that freight was distributed onto the weighted lines instead`
-  return { code: 'weight_zero_line', context, message: description }
-}
-
-function warnWeightZeroLines(context: string, lineIds: string[]): LandedCostRevaluationWarning {
-  const warning = makeWeightZeroLineWarning(context, lineIds)
-  console.warn(warning.message)
-  void logActivity({
-    entityType: 'PURCHASE_ORDER',
-    entityId: null,
-    action: 'landed_cost_weight_zero_line',
-    tag: 'purchase',
-    level: 'WARNING',
-    description: warning.message,
-    metadata: { context, lineIds },
-    resolveUser: false,
-  }).catch((error) => console.error(error))
-  return warning
-}
-
-function captureWeightZeroLines(
-  result: LandedCostRecalcResult,
-  runWarnings: LandedCostRevaluationWarning[],
-  deps: LandedCostServiceDeps,
-  context: string,
-  lineIds: string[],
-): void {
-  if (lineIds.length === 0) return
-  const warning = deps.warnWeightZeroLines(context, lineIds) ?? makeWeightZeroLineWarning(context, lineIds)
-  result.warnings.push(warning)
-  runWarnings.push(warning)
-}
-
-/**
- * Positive-quantity lines that contributed zero weight to a BY_WEIGHT split
- * (weight 0/null) and therefore received no freight while other lines absorbed
- * it. Only meaningful on the non-fallback path (basisTotal > 0); the all-zero
- * case is already reported by the weight-fallback warning (scjz.17).
- */
-function zeroWeightEligibleLineIds(
-  method: LandedCostDistributionMethod,
-  bases: Array<{ lineId: string; base: Prisma.Decimal }>,
-): string[] {
-  if (method !== 'BY_WEIGHT') return []
-  return bases.filter((entry) => entry.base.lte(0)).map((entry) => entry.lineId)
 }
 
 function decimalText(value: Prisma.Decimal | number | string | null | undefined): string {
@@ -592,7 +508,6 @@ export function computeGrossUnitCostBaseByLine(params: {
   lines: PendingGrossCostLine[]
   directCostLines?: PendingGrossCostLineSource[]
   linkedCostLines?: PendingGrossCostLineSource[]
-  onWeightZeroLines?: (lineIds: string[]) => void
 }): Map<string, number> {
   const eligibleLines = params.lines.filter((line) => decimal(line.qty).gt(0))
   const landedByLine = new Map<string, Prisma.Decimal>()
@@ -625,12 +540,6 @@ export function computeGrossUnitCostBaseByLine(params: {
       if (method === 'BY_WEIGHT') warnWeightFallback('computeGrossUnitCostBaseByLine')
       basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
       for (const entry of bases) entry.base = new Prisma.Decimal(1)
-    } else if (params.onWeightZeroLines) {
-      // Opt-in only: this helper also runs on read-only cost previews
-      // (getPurchaseOrder, receipt validation), so it must not persist a warning
-      // by default. The recalc paths surface the diagnostic via result.warnings.
-      const zeroWeightLineIds = zeroWeightEligibleLineIds(method, bases)
-      if (zeroWeightLineIds.length > 0) params.onWeightZeroLines(zeroWeightLineIds)
     }
     for (const entry of bases) {
       const share = amountBase.mul(entry.base).div(basisTotal)
@@ -657,19 +566,15 @@ export function computeGrossUnitCostBaseByLine(params: {
 }
 
 /**
- * scjz.34: the account that offsets a CONSUMED-qty retrospective COGS correction
- * (goods already sold). The freight bill debits the transit/clearing account for
- * ALL received units; the landed-cost recalc then drains transit in full — the
- * ON-HAND portion via DR inventory / CR transit, and the CONSUMED portion via this
- * COGS adjustment (DR COGS / CR transit on an increase). Routing the consumed
- * portion to transit (rather than the inventory-revaluation P&L account, the prior
- * audit-o3yb behaviour) is what fully clears the freight bill's transit debit;
- * otherwise the sold units' freight share stayed permanently in transit.
+ * audit-o3yb: the account that offsets a CONSUMED-qty retrospective COGS
+ * correction (goods already sold). Uses the inventory-revaluation P&L account
+ * when configured; otherwise falls back to the transit/clearing account (the
+ * prior behaviour) so deployments that haven't set the new account keep working.
  */
 export function resolveConsumedCogsOffsetAccount(
-  settings: Pick<AccountingSettings, 'transitAccount'>,
+  settings: Pick<AccountingSettings, 'inventoryRevaluationAccount' | 'transitAccount'>,
 ): string {
-  return settings.transitAccount
+  return settings.inventoryRevaluationAccount || settings.transitAccount
 }
 
 export async function queueLandedCostAdjustmentJournals(
@@ -707,10 +612,11 @@ export async function queueLandedCostAdjustmentJournals(
     })
   }
 
-  // scjz.34: the CONSUMED-qty correction (goods already sold) offsets COGS to the
-  // transit/clearing account so the freight bill's transit debit drains in full.
-  // The ON-HAND portion is handled by the inventoryTransitAdjustments loop above and
-  // also clears through transit; together they fully reconcile the freight liability.
+  // audit-o3yb: the CONSUMED-qty correction (goods already sold) offsets COGS to
+  // the inventory-revaluation P&L account, not the transit/clearing account — the
+  // goods have left stock, so a clearing entry there would never reconcile. The
+  // ON-HAND portion is handled by the inventoryTransitAdjustments loop above and
+  // stays on inventory/transit. Falls back to transit until the account is set.
   const consumedCogsOffsetAccount = resolveConsumedCogsOffsetAccount(settings)
   for (const adj of adjustments.cogsAdjustments) {
     const absDelta = Math.abs(adj.totalDelta)
@@ -733,31 +639,12 @@ export async function queueLandedCostAdjustmentJournals(
         },
       ],
     }
-    const cogsIdempotencyKey = landedCostAdjustmentIdempotencyKey('cogs', adj)
-    // bcz9.2: commit the COGS journal queue + its subledger ledger row atomically in
-    // one transaction so a crash (or a posting-setting change) between them can't leave
-    // a queued journal with no ledger row, or a ledger row with no journal — either of
-    // which would make the daily-batch COGS reconciliation perpetually flag. The ledger
-    // row is recorded based on the queue's OWN decision (queueAccountingSyncTx's return)
-    // per adjustment, not a separate settings recheck, so a connector/setting flip
-    // mid-loop can't desync queue vs ledger (Codex bcz9.4).
-    await db.$transaction(async (tx) => {
-      const queued = await queueAccountingSyncTx(tx, {
-        type: 'COGS_JOURNAL',
-        referenceType: 'PurchaseOrder',
-        referenceId: adj.primaryPoId,
-        payload,
-        idempotencyKey: cogsIdempotencyKey,
-      })
-      if (queued) {
-        await recordCogsSubledgerMovement(tx, {
-          sourceType: 'LANDED_COST_ADJUSTMENT',
-          sourceRef: adj.primaryPoId,
-          idempotencyKey: cogsIdempotencyKey,
-          baseDelta: isIncrease ? absDelta : -absDelta,
-          journalDate: payload.date,
-        })
-      }
+    await queueAccountingSync({
+      type: 'COGS_JOURNAL',
+      referenceType: 'PurchaseOrder',
+      referenceId: adj.primaryPoId,
+      payload,
+      idempotencyKey: landedCostAdjustmentIdempotencyKey('cogs', adj),
     })
   }
 }
@@ -780,8 +667,6 @@ export async function recalculateLandedCosts(
   const result = emptyRecalcResult()
   // audit-g4la: one nonce per recalc run, stamped onto every adjustment's eventKey.
   const recalcRunId = randomUUID()
-  // One effective timestamp per recalc run for the revaluation event log (blq0).
-  const revaluedAt = new Date()
 
   for (const link of links) {
     const primaryPoId = link.primaryPoId
@@ -862,16 +747,6 @@ export async function recalculateLandedCosts(
         const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
         basisTotal = equalBase
         for (const entry of bases) entry.base = new Prisma.Decimal(1)
-      } else if (decimal(freightCostLine.amountBase).gt(0)) {
-        // Only warn when positive freight was actually distributed away from the
-        // zero-weight line; a zero/credit cost line assigns nothing (scjz.17).
-        captureWeightZeroLines(
-          result,
-          runWarnings,
-          serviceDeps,
-          `recalculateLandedCosts:${primaryPo.reference}`,
-          zeroWeightEligibleLineIds(method, bases),
-        )
       }
 
       const amountBase = decimal(freightCostLine.amountBase)
@@ -900,14 +775,6 @@ export async function recalculateLandedCosts(
           const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
           basisTotal = equalBase
           for (const entry of bases) entry.base = new Prisma.Decimal(1)
-        } else if (decimal(freightCostLine.amountBase).gt(0)) {
-          captureWeightZeroLines(
-            result,
-            runWarnings,
-            serviceDeps,
-            `recalculateLandedCosts:${primaryPo.reference}:linked`,
-            zeroWeightEligibleLineIds(method, bases),
-          )
         }
 
         const amountBase = decimal(freightCostLine.amountBase)
@@ -993,9 +860,6 @@ export async function recalculateLandedCosts(
         const manufacturingConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
           ? decimal(await serviceDeps.getManufacturingConsumedQtyForCostLayer(tx, cl.id))
           : new Prisma.Decimal(0)
-        const reversalConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-          ? decimal(await serviceDeps.getReversalConsumedQtyForCostLayer(tx, cl.id))
-          : new Prisma.Decimal(0)
         const deltas = calculateLayerAdjustmentDeltas({
           oldUnitCost,
           newUnitCost,
@@ -1004,7 +868,6 @@ export async function recalculateLandedCosts(
           returnedQty,
           supplierReturnedQty,
           manufacturingConsumedQty,
-          reversalConsumedQty,
         })
         totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
         totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
@@ -1024,13 +887,6 @@ export async function recalculateLandedCosts(
           where: { id: cl.id },
           data: { unitCostBase: grossUnitCostBase },
         })
-        await serviceDeps.recordCostLayerRevaluation(tx, {
-          costLayerId: cl.id,
-          oldUnitCostBase: oldUnitCost,
-          newUnitCostBase: newUnitCost,
-          effectiveAt: revaluedAt,
-          reason: 'landed_cost_recalc',
-        })
 
         // audit-e7h8: cascade the delta into produced output layers (the
         // manufacturing-consumed portion was excluded from this layer's COGS).
@@ -1041,7 +897,7 @@ export async function recalculateLandedCosts(
             totalInventoryDelta = totalInventoryDelta.add(invD)
             propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
           },
-          new Set(), 1, recalcRunId, revaluedAt,
+          new Set(), 1,
         )
 
         let affectedRefundSnapshots = 0
@@ -1049,7 +905,7 @@ export async function recalculateLandedCosts(
         let affectedSalesOrderLines = 0
         if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
           affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-          const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId })
+          const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
           affectedShipments = shipmentRefresh.shipmentsUpdated
           // audit-3aph: the shipment path now owns the COGS revaluation for sold
           // goods (COGS_REVERSAL now / daily batch later), so remove it from the
@@ -1164,8 +1020,6 @@ export async function recalculateDirectLandedCosts(
   const result = emptyRecalcResult()
   // audit-g4la: one nonce per recalc run, stamped onto every adjustment's eventKey.
   const recalcRunId = randomUUID()
-  // One effective timestamp per recalc run for the revaluation event log (blq0).
-  const revaluedAt = new Date()
   const po = await tx.purchaseOrder.findUnique({
     where: { id: poId },
     select: {
@@ -1249,8 +1103,6 @@ export async function recalculateDirectLandedCosts(
       )
       basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
       for (const entry of bases) entry.base = new Prisma.Decimal(1)
-    } else if (decimal(freightCostLine.amountBase).gt(0)) {
-      captureWeightZeroLines(result, runWarnings, serviceDeps, warningContext, zeroWeightEligibleLineIds(method, bases))
     }
     const amountBase = decimal(freightCostLine.amountBase)
     for (const entry of bases) {
@@ -1334,9 +1186,6 @@ export async function recalculateDirectLandedCosts(
       const manufacturingConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
         ? decimal(await serviceDeps.getManufacturingConsumedQtyForCostLayer(tx, cl.id))
         : new Prisma.Decimal(0)
-      const reversalConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-        ? decimal(await serviceDeps.getReversalConsumedQtyForCostLayer(tx, cl.id))
-        : new Prisma.Decimal(0)
       const deltas = calculateLayerAdjustmentDeltas({
         oldUnitCost,
         newUnitCost,
@@ -1345,7 +1194,6 @@ export async function recalculateDirectLandedCosts(
         returnedQty,
         supplierReturnedQty,
         manufacturingConsumedQty,
-        reversalConsumedQty,
       })
       totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
       totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
@@ -1365,13 +1213,6 @@ export async function recalculateDirectLandedCosts(
         where: { id: cl.id },
         data: { unitCostBase: grossUnitCostBase },
       })
-      await serviceDeps.recordCostLayerRevaluation(tx, {
-        costLayerId: cl.id,
-        oldUnitCostBase: oldUnitCost,
-        newUnitCostBase: newUnitCost,
-        effectiveAt: revaluedAt,
-        reason: 'landed_cost_recalc',
-      })
 
       // audit-e7h8: cascade the delta into produced output layers (the
       // manufacturing-consumed portion was excluded from this layer's COGS).
@@ -1382,7 +1223,7 @@ export async function recalculateDirectLandedCosts(
           totalInventoryDelta = totalInventoryDelta.add(invD)
           propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
         },
-        new Set(), 1, recalcRunId, revaluedAt,
+        new Set(), 1,
       )
 
       let affectedRefundSnapshots = 0
@@ -1390,7 +1231,7 @@ export async function recalculateDirectLandedCosts(
       let affectedSalesOrderLines = 0
       if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
         affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-        const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId })
+        const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
         affectedShipments = shipmentRefresh.shipmentsUpdated
         // audit-3aph: shipment path owns the sold-goods COGS revaluation — remove
         // it from the COGS_JOURNAL to avoid double-posting COGS for sold units.

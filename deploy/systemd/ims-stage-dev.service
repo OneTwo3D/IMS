@@ -1,9 +1,5 @@
-# DEPRECATED — do NOT run on any internet-facing host.
-# Runs `next dev` as root on 0.0.0.0 (leaks source/stack traces, unsandboxed,
-# root privileges). Replaced by ims-stage.service; see deploy/README.md and
-# onetwo3d-ims-k0ei / dg42. Kept only as a local-development reference.
 [Unit]
-Description=IMS Stage Development Server (DEPRECATED — local dev only)
+Description=IMS Stage Development Server
 After=network.target
 
 [Service]

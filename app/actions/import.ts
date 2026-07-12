@@ -685,7 +685,7 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
 
   const warehouses = await db.warehouse.findMany({ select: { id: true, code: true } })
   const codeToWarehouseId = new Map(warehouses.map((w) => [w.code.toUpperCase(), w.id]))
-  const { applyStockAdjustment } = await import('@/lib/domain/inventory/stock-adjustment-apply')
+  const { applyStockAdjustment } = await import('./stock')
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
@@ -695,10 +695,6 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
     const warehouseCode = row['warehouseCode']?.trim().toUpperCase()
     const qtyStr = row['qty']?.trim()
     const note = row['note']?.trim() || null
-    // Optional unit-cost column: required for a positive adjustment of a product
-    // with no existing cost basis (cogs-audit scjz.2); otherwise the row errors
-    // rather than booking £0 stock. Blank uses the derived average.
-    const unitCostStr = row['unitCost']?.trim()
 
     if (!sku) { result.errors.push(`Row ${lineNum}: missing sku`); result.skipped++; continue }
     if (!warehouseCode) { result.errors.push(`Row ${lineNum}: missing warehouseCode`); result.skipped++; continue }
@@ -715,12 +711,6 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
     if (!warehouseId) { result.errors.push(`Row ${lineNum}: warehouse "${warehouseCode}" not found`); result.skipped++; continue }
 
     const qty = Number(qtyStr)
-    if (unitCostStr != null && unitCostStr !== '' && (isNaN(Number(unitCostStr)) || Number(unitCostStr) < 0)) {
-      result.errors.push(`Row ${lineNum}: invalid unitCost`)
-      result.skipped++
-      continue
-    }
-    const unitCostBase = unitCostStr != null && unitCostStr !== '' ? Number(unitCostStr) : undefined
 
     try {
       if (!preview) {
@@ -731,7 +721,6 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
             warehouseId,
             qty,
             note,
-            unitCostBase,
           })
         })
       }
@@ -916,7 +905,7 @@ export async function importOpeningStockCsv(formData: FormData): Promise<CsvImpo
   }
 
   const touchedProductIds = new Set<string>()
-  const { applyOpeningStock } = await import('@/lib/domain/inventory/opening-stock')
+  const { applyOpeningStock } = await import('./stock')
 
   for (const row of stagedRows) {
     const pairKey = `${row.productId}:${row.warehouseId}`

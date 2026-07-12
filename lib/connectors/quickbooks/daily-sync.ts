@@ -26,21 +26,12 @@ import {
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
-  reduceSnapshotByQty,
   sumCostLayerSnapshot,
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
-import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
-import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
-import {
-  sumPostedUnearnedReversal,
-  isFullyShippedNetOfRefunds,
-  batchContainsFinalUnjournaledShipment,
-} from '@/lib/domain/accounting/deferred-trueup'
-import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 type MutableLayer = {
@@ -57,7 +48,7 @@ type JournalLinePayload = {
   debit?: number
   credit?: number
 }
-type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | 'activityLog'>
+type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog'>
 
 const QBO_DAILY_BATCH_LOCK_KEY = 4_112_208_032
 const QBO_CONNECTOR = 'quickbooks'
@@ -67,14 +58,12 @@ const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_GROUP_B',
 ] as const
 
-// GL postings round to the canonical GL precision (cogs-audit scjz.60); these
-// thin aliases keep call sites terse while the precision lives in one place.
 function round2(value: number): number {
-  return roundToGlPrecisionNumber(value)
+  return Math.round(value * 100) / 100
 }
 
 function round2Decimal(value: Decimal): number {
-  return roundQuantity(value, GL_BASE_PRECISION).toNumber()
+  return roundQuantity(value, 2).toNumber()
 }
 
 function normalizeDeferredDiscountBase(order: {
@@ -213,9 +202,6 @@ async function createPendingSyncLog(
       payload: params.payload as never,
     },
   })
-  // Mirror failure must not abort the whole daily batch: the sync log is already
-  // created (and will post), so swallow + warn here exactly as queueAccountingSyncTx
-  // does, instead of rolling back every order in the group (cogs-audit scjz.40).
   await mirrorAccountingSyncLogToEvent(tx, {
     syncLogId: log.id,
     connector: QBO_CONNECTOR,
@@ -225,15 +211,7 @@ async function createPendingSyncLog(
     payload: params.payload,
     currency: params.currency,
     status: 'PENDING',
-  }).catch((mirrorError: unknown) => tx.activityLog.create({
-    data: {
-      entityType: 'SYSTEM',
-      action: 'accounting_event_mirror_error',
-      tag: 'sync',
-      level: 'WARNING',
-      description: `Daily-batch sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
-    },
-  }).then(() => undefined))
+  })
 }
 
 async function lockCostLayers(
@@ -295,20 +273,16 @@ async function hasLiveDailyBatchLog(type: DailyBatchLogType, referenceId: string
 }
 
 async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getQuickBooksSettings>>, baseCurrency: string): Promise<void> {
-  // scjz.36: only recreate within the sync-log retention window — beyond it, SYNCED
-  // daily-batch logs are pruned by data-retention, so a "missing" log can't be told
-  // apart from one that already posted, and rebuilding would double-post the journal.
-  const journaledDateFilter = await recreateJournaledDateFilter()
   const orphanA1Orders = await db.salesOrder.findMany({
-    where: { revenueDeferredDate: journaledDateFilter },
+    where: { revenueDeferredDate: { not: null } },
     select: { revenueDeferredDate: true, unearnedRevenueAmount: true },
   })
   const orphanA2Orders = await db.salesOrder.findMany({
-    where: { inventoryAllocatedDate: journaledDateFilter },
+    where: { inventoryAllocatedDate: { not: null } },
     select: { inventoryAllocatedDate: true, allocationBatchAmount: true },
   })
   const orphanBShipments = await db.shipment.findMany({
-    where: { shipmentJournalDate: journaledDateFilter },
+    where: { shipmentJournalDate: { not: null } },
     select: { shipmentJournalDate: true, revenueRecognizedAmount: true, cogsBatchAmount: true },
   })
 
@@ -460,8 +434,7 @@ export async function runDailyBatchSync(): Promise<{
         paidAt: { not: null },
         revenueDeferredDate: null,
         accountingInvoiceId: { not: null },
-        status: { notIn: ['CANCELLED', 'DRAFT'] },
-        refundStatus: { not: 'FULL' },
+        status: { notIn: ['CANCELLED', 'REFUNDED', 'DRAFT'] },
       },
       select: {
         id: true,
@@ -552,8 +525,7 @@ export async function runDailyBatchSync(): Promise<{
       where: {
         revenueDeferredDate: { not: null },
         inventoryAllocatedDate: null,
-        status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'] },
-        refundStatus: { not: 'FULL' },
+        status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'] },
       },
       orderBy: { revenueDeferredDate: 'asc' },
       select: {
@@ -677,7 +649,7 @@ export async function runDailyBatchSync(): Promise<{
           status: 'SHIPPED',
           shipmentJournalDate: null,
           order: {
-            refundStatus: { not: 'FULL' },
+            status: { not: 'REFUNDED' },
             revenueDeferredDate: { not: null },
             inventoryAllocatedDate: { not: null },
           },
@@ -705,14 +677,12 @@ export async function runDailyBatchSync(): Promise<{
               orderNumber: true,
               externalOrderNumber: true,
               status: true,
-              refundStatus: true,
               totalBase: true,
               unearnedRevenueAmount: true,
               lines: { select: { id: true, productId: true, qty: true, totalBase: true } },
               shipments: {
                 select: {
                   id: true,
-                  status: true,
                   shipmentJournalDate: true,
                   revenueRecognizedAmount: true,
                 },
@@ -785,71 +755,6 @@ export async function runDailyBatchSync(): Promise<{
         )),
       )
 
-      // --- scjz.68: refund-reversal-aware deferred-revenue true-up inputs ---
-      // (1) posted UNEARNED_REV_REVERSAL per order — deferred revenue a refund credit
-      //     note already took out of the unearned account, which the true-up must not
-      //     recognize again; (2) for PARTIALLY_REFUNDED orders, the per-line coverage
-      //     used to decide whether the order is fully shipped net of refunds.
-      const allocationById = new Map(orderAllocations.map((allocation) => [allocation.id, allocation]))
-      const partialOrderIds = new Set(
-        shipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
-      )
-
-      const refunds = await tx.salesOrderRefund.findMany({
-        where: { orderId: { in: orderIds } },
-        select: { id: true, orderId: true },
-      })
-      const refundIdToOrderId = new Map(refunds.map((refund) => [refund.id, refund.orderId]))
-      const reversalSyncs = await tx.accountingSyncLog.findMany({
-        where: {
-          connector: QBO_CONNECTOR,
-          type: 'UNEARNED_REV_REVERSAL',
-          status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-          OR: [
-            { referenceType: 'SalesOrder', referenceId: { in: orderIds } },
-            { referenceType: 'SalesOrderRefund', referenceId: { in: refunds.map((refund) => refund.id) } },
-          ],
-        },
-        select: { referenceType: true, referenceId: true, payload: true },
-      })
-      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
-      for (const sync of reversalSyncs) {
-        const targetOrderId = sync.referenceType === 'SalesOrder'
-          ? sync.referenceId
-          : refundIdToOrderId.get(sync.referenceId)
-        if (!targetOrderId) continue
-        const list = reversalSyncsByOrder.get(targetOrderId) ?? []
-        list.push({ payload: sync.payload })
-        reversalSyncsByOrder.set(targetOrderId, list)
-      }
-
-      const shippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
-      const refundedUnshippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
-      if (partialOrderIds.size > 0) {
-        const dispatchedShipmentLines = await tx.shipmentLine.findMany({
-          where: { shipment: { orderId: { in: [...partialOrderIds] }, status: 'SHIPPED' } },
-          select: { lineId: true, productId: true, qty: true, shipment: { select: { orderId: true } } },
-        })
-        for (const line of dispatchedShipmentLines) {
-          if (!line.productId) continue
-          const rows = shippedRowsByOrder.get(line.shipment.orderId) ?? []
-          rows.push({ lineId: line.lineId, productId: line.productId, qty: Number(line.qty) })
-          shippedRowsByOrder.set(line.shipment.orderId, rows)
-        }
-        // Returns of shipped units (shipment-source) do not reduce the ship
-        // obligation, so only allocation-source (unshipped) refund qty counts.
-        for (const refundLine of priorRefundLines) {
-          for (const entry of parseCostLayerSnapshot(refundLine.costLayerSnapshot)) {
-            if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
-            const allocation = allocationById.get(entry.orderAllocationId)
-            if (!allocation?.productId || !partialOrderIds.has(allocation.orderId)) continue
-            const rows = refundedUnshippedRowsByOrder.get(allocation.orderId) ?? []
-            rows.push({ lineId: allocation.lineId, productId: allocation.productId, qty: toDecimal(entry.qty).toNumber() })
-            refundedUnshippedRowsByOrder.set(allocation.orderId, rows)
-          }
-        }
-      }
-
       const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
       for (const allocation of orderAllocations) {
         allocationAvailability.set(
@@ -862,12 +767,9 @@ export async function runDailyBatchSync(): Promise<{
         for (const entry of parseCostLayerSnapshot(priorShipmentLine.costLayerSnapshot)) {
           if (!entry.orderAllocationId) continue
           const available = allocationAvailability.get(entry.orderAllocationId) ?? []
-          // Relieve the allocation contra by QTY, not by exact costLayerId: dispatch
-          // consumes FIFO-oldest layers that can differ from the allocation's pinned
-          // ones, so a costLayerId match would strand the contra (cogs-audit scjz.21).
           allocationAvailability.set(
             entry.orderAllocationId,
-            reduceSnapshotByQty(available, entry.qty),
+            reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
           )
         }
       }
@@ -876,11 +778,9 @@ export async function runDailyBatchSync(): Promise<{
         for (const entry of parseCostLayerSnapshot(priorRefundLine.costLayerSnapshot)) {
           if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
           const available = allocationAvailability.get(entry.orderAllocationId) ?? []
-          // Qty-based, matching the shipment relief above, so allocation availability
-          // tracking is consistent and order-independent in total relieved qty (scjz.21).
           allocationAvailability.set(
             entry.orderAllocationId,
-            reduceSnapshotByQty(available, entry.qty),
+            reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
           )
         }
       }
@@ -909,41 +809,8 @@ export async function runDailyBatchSync(): Promise<{
         const recognizedPreviously = firstShipment.order.shipments.reduce((sum, shipment) => (
           shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
         ), 0)
-        // scjz.68: subtract deferred revenue a refund credit note already reversed
-        // out of the unearned account so the true-up never re-recognizes it.
-        const postedUnearnedReversal = sumPostedUnearnedReversal(
-          reversalSyncsByOrder.get(orderId) ?? [],
-          settings.quickbooks_unearned_revenue_account,
-        )
-        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
+        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously))
         let runningRevenue = 0
-
-        // scjz.68: a fully-shipped terminal order trues up the remainder; a
-        // PARTIALLY_REFUNDED order may too, but only once every shippable line is
-        // shipped net of refunds. Either way hold the true-up until this batch holds
-        // the order's final dispatched-but-unjournaled shipment, so a batch-window
-        // split cannot recognize a later shipment's revenue early.
-        let isTrueUpEligible = isFullyShippedTerminalStatus(firstShipment.order.status) && firstShipment.order.refundStatus !== 'PARTIAL'
-        if (!isTrueUpEligible && firstShipment.order.refundStatus === 'PARTIAL') {
-          const combinedCoverageByLine = calculateCoverageByLine(requirementsByLine, [
-            ...(shippedRowsByOrder.get(orderId) ?? []),
-            ...(refundedUnshippedRowsByOrder.get(orderId) ?? []),
-          ])
-          isTrueUpEligible = isFullyShippedNetOfRefunds(
-            firstShipment.order.lines
-              .filter((line) => !!line.productId)
-              .map((line) => ({
-                orderedQty: Number(line.qty),
-                coveredQty: combinedCoverageByLine.get(line.id) ?? 0,
-              })),
-          )
-        }
-        if (isTrueUpEligible) {
-          isTrueUpEligible = batchContainsFinalUnjournaledShipment(
-            firstShipment.order.shipments.filter((shipment) => shipment.status === 'SHIPPED'),
-            new Set(orderShipments.map((shipment) => shipment.id)),
-          )
-        }
 
         for (let index = 0; index < orderShipments.length; index++) {
           const shipment = orderShipments[index]
@@ -962,16 +829,18 @@ export async function runDailyBatchSync(): Promise<{
             return sum + (Number(line.totalBase) * Math.min(coveredQty, lineQty)) / lineQty
           }, 0)
 
-          const proportionalRevenue = orderLineTotal > 0
+          let revenueProportion = orderLineTotal > 0
             ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
             : 0
-          const revenueProportion = recognizeShipmentRevenue({
-            proportionalRevenue,
-            remainingDeferred,
-            runningRevenue,
-            isFinalShipmentOfFullyShippedTerminalOrder:
-              isTrueUpEligible && index === orderShipments.length - 1,
-          })
+
+          if (firstShipment.order.status === 'SHIPPED' && index === orderShipments.length - 1) {
+            revenueProportion = round2(Math.max(0, remainingDeferred - runningRevenue))
+          } else {
+            revenueProportion = Math.min(
+              revenueProportion,
+              round2(Math.max(0, remainingDeferred - runningRevenue)),
+            )
+          }
 
           const shipmentSnapshotsForLines = shipment.lines.map((line) => (
             parseCostLayerSnapshot(line.costLayerSnapshot)

@@ -63,14 +63,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   const hasDateFilter = Object.keys(dateFilter).length > 0
 
   const orders = await db.salesOrder.findMany({
-    where: {
-      // Shipped/completed sales plus any refunded order (refund state is orthogonal now).
-      OR: [
-        { status: { in: ['SHIPPED', 'COMPLETED'] } },
-        { refundStatus: { not: 'NONE' } },
-      ],
-      ...(hasDateFilter ? { createdAt: dateFilter } : {}),
-    },
+    where: { status: { in: ['SHIPPED', 'COMPLETED', 'PARTIALLY_REFUNDED', 'REFUNDED'] }, ...(hasDateFilter ? { createdAt: dateFilter } : {}) },
     select: {
       id: true, totalBase: true, discountAmount: true, fxRateToBase: true, pricesIncludeVat: true, taxRatePercent: true, customerName: true, salesRep: true,
       shoppingLinks: { select: { connector: true } },

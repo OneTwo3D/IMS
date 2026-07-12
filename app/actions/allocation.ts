@@ -310,7 +310,7 @@ export async function autoAllocateOrder(
         description,
         metadata: {
           orderNumber: allocationResult.orderRef,
-          isShoppingOrder: allocationResult.isShoppingOrder,
+          isWcOrder: allocationResult.isWcOrder,
           shipFromWarehouseId: allocationResult.shipFromWarehouseId,
           allocations: allocationResult.allocationCount,
           unallocatedQty: allocationResult.unallocatedQty,
@@ -718,13 +718,6 @@ export async function updateShipmentStatus(
         const { generateInvoiceNumber } = await import('./sales')
         await generateInvoiceNumber(reconciliation.orderId)
       }
-      // Direct (non-storefront) orders: courtesy dispatch email, opt-in and
-      // queued at most once per order. Called on every SHIPPED transition —
-      // not just when the order flipped — so a retry after a crashed enqueue
-      // still heals; the helper self-guards (order must be SHIPPED, dedup
-      // under the order row lock) and never throws.
-      const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
-      await queueDispatchEmailIfEligible(reconciliation.orderId)
     }
     if (!result.transitioned) return { success: true }
 

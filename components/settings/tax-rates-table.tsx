@@ -2,61 +2,21 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plus, Pencil, X, Check, Loader2, AlertTriangle, Wand2 } from 'lucide-react'
+import { Plus, Pencil, X, Check, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import type { TaxRateDriftStatus } from '@/lib/domain/accounting/tax-rate-drift-status'
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createTaxRate, updateTaxRate, type TaxRateRow, type TaxCategoryValue } from '@/app/actions/settings'
-import { previewMissingAccountingTaxRates, generateMissingAccountingTaxRates } from '@/app/actions/accounting-sync'
-import type { MissingTaxRatePreviewResult } from '@/lib/tax/generate-missing-tax-rates'
 
-type Props = {
-  taxRates: TaxRateRow[]
-  onChanged?: () => void
-  /** Current IMS↔Xero drift keyed by taxRateId (Phase 3, 0jls5). */
-  drift?: Record<string, TaxRateDriftStatus>
-  /** Whether IMS→Xero tax-rate sync is enabled (drives the tooltip guidance). */
-  driftSyncEnabled?: boolean
-  /** Whether an accounting connector is connected — gates the "Generate missing
-   *  rates" action (onetwo3d-ims-nzkk). */
-  accountingConnected?: boolean
-}
-
-function TaxRateDriftChip({ drift, syncEnabled }: { drift: TaxRateDriftStatus; syncEnabled?: boolean }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300">
-        <AlertTriangle className="h-3 w-3" /> Xero drift
-      </TooltipTrigger>
-      <TooltipContent className="max-w-xs text-left whitespace-normal">
-        <p className="font-medium">
-          {drift.status === 'missing-on-xero' ? 'No matching rate in Xero' : 'Differs from the live Xero rate'}
-        </p>
-        {drift.lines.length > 0 && (
-          <ul className="mt-1 list-disc pl-4 text-xs">
-            {drift.lines.map((line, i) => <li key={i}>{line}</li>)}
-          </ul>
-        )}
-        <p className="mt-1 text-xs text-muted-foreground">
-          {syncEnabled
-            ? 'Edit the IMS rate to match Xero, or re-push from IMS.'
-            : 'Tax-rate sync is off — fix the IMS rate, then enable tax-rate sync to push.'}
-        </p>
-      </TooltipContent>
-    </Tooltip>
-  )
-}
+type Props = { taxRates: TaxRateRow[]; onChanged?: () => void }
 
 const USED_FOR_LABELS: Record<string, string> = {
   SALES: 'Sales',
@@ -372,16 +332,10 @@ function TaxRateFormDialog({
   )
 }
 
-export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, accountingConnected }: Props) {
+export function TaxRatesTable({ taxRates, onChanged }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [editing, setEditing] = useState<TaxRateRow | null | undefined>(undefined)
-  const [genBusy, setGenBusy] = useState<'preview' | 'run' | null>(null)
-  const [genPreview, setGenPreview] = useState<MissingTaxRatePreviewResult | null>(null)
-  const [genMessage, setGenMessage] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
-  // Per-rate report type chosen in the confirmation dialog, keyed by taxRateId.
-  // Seeded from the computed default when the preview opens; user-editable.
-  const [reportTypeEdits, setReportTypeEdits] = useState<Record<string, string>>({})
 
   function handleToggle(rate: TaxRateRow) {
     startTransition(async () => {
@@ -389,46 +343,6 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
       onChanged?.()
       router.refresh()
     })
-  }
-
-  async function handleGeneratePreview() {
-    setGenBusy('preview'); setGenMessage(null)
-    try {
-      const res = await previewMissingAccountingTaxRates()
-      if (!res.success) { setGenMessage({ kind: 'error', text: res.error ?? 'Failed to preview missing tax rates.' }); return }
-      if (!res.supported) { setGenMessage({ kind: 'error', text: res.error ?? 'Generating tax rates is not supported for this connector.' }); return }
-      if (res.toCreate.length === 0) {
-        setGenMessage({ kind: 'ok', text: 'No missing tax rates to create — every active rate is already mapped or matches an existing accounting rate.' })
-        return
-      }
-      setReportTypeEdits(Object.fromEntries(res.toCreate.map((rate) => [rate.taxRateId, rate.reportType ?? ''])))
-      setGenPreview(res)
-    } catch (e) {
-      setGenMessage({ kind: 'error', text: e instanceof Error ? e.message : 'Failed to preview missing tax rates.' })
-    } finally { setGenBusy(null) }
-  }
-
-  async function handleGenerateConfirm() {
-    if (!genPreview) return
-    const ids = genPreview.toCreate.map((rate) => rate.taxRateId)
-    // Only send overrides that differ from the computed default.
-    const overrides: Record<string, string> = {}
-    for (const rate of genPreview.toCreate) {
-      const chosen = reportTypeEdits[rate.taxRateId]
-      if (chosen && chosen !== (rate.reportType ?? '')) overrides[rate.taxRateId] = chosen
-    }
-    setGenBusy('run'); setGenMessage(null)
-    try {
-      const res = await generateMissingAccountingTaxRates(ids, overrides)
-      if (!res.success) { setGenMessage({ kind: 'error', text: res.error ?? 'Failed to generate tax rates.' }); return }
-      setGenPreview(null)
-      const failedNote = res.failed.length > 0 ? ` ${res.failed.length} failed (${res.failed.map((f) => f.name).join(', ')}).` : ''
-      setGenMessage({ kind: res.failed.length > 0 ? 'error' : 'ok', text: `Created and mapped ${res.created} tax rate(s).${failedNote}` })
-      onChanged?.()
-      router.refresh()
-    } catch (e) {
-      setGenMessage({ kind: 'error', text: e instanceof Error ? e.message : 'Failed to generate tax rates.' })
-    } finally { setGenBusy(null) }
   }
 
   const salesRates = taxRates.filter((r) => r.usedFor === 'SALES' || r.usedFor === 'BOTH')
@@ -460,12 +374,7 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
         <TableBody>
           {rates.map((r) => (
             <TableRow key={r.id} className={!r.active ? 'opacity-50' : ''}>
-              <TableCell className="font-medium">
-                <span className="inline-flex flex-wrap items-center gap-1.5">
-                  {r.name}
-                  {drift?.[r.id] && <TaxRateDriftChip drift={drift[r.id]} syncEnabled={driftSyncEnabled} />}
-                </span>
-              </TableCell>
+              <TableCell className="font-medium">{r.name}</TableCell>
               <TableCell className="text-xs">
                 <span className="inline-flex items-center rounded-full px-2 py-0.5 font-medium border bg-muted/50">
                   {TAX_CATEGORY_LABELS[r.taxCategory] ?? r.taxCategory}
@@ -509,83 +418,10 @@ export function TaxRatesTable({ taxRates, onChanged, drift, driftSyncEnabled, ac
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-end gap-2 flex-wrap">
-        {accountingConnected && (
-          <Button size="sm" variant="outline" onClick={handleGeneratePreview} disabled={genBusy != null || isPending}>
-            {genBusy === 'preview' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Wand2 className="h-3 w-3 mr-1" />}
-            Generate missing rates
-          </Button>
-        )}
         <Button size="sm" onClick={() => setEditing(null)}>
           <Plus className="h-3 w-3 mr-1" />Add VAT Rate
         </Button>
       </div>
-
-      {genMessage && (
-        <p className={`text-xs ${genMessage.kind === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>{genMessage.text}</p>
-      )}
-
-      <Dialog open={genPreview != null} onOpenChange={(open) => { if (!open) setGenPreview(null) }}>
-        <DialogContent className="max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Generate missing tax rates</DialogTitle>
-            <DialogDescription>
-              These active tax rates aren&apos;t mapped and have no matching rate in your accounting
-              connector. The report type is pre-filled with a sensible default — adjust any of them
-              before confirming. Confirm to create each rate in the accounting system and map it back automatically.
-            </DialogDescription>
-          </DialogHeader>
-          {genPreview && (
-            <div className="max-h-72 overflow-y-auto rounded-md border">
-              <Table>
-                <TableHeader className="bg-muted/50">
-                  <TableRow>
-                    <TableHead className="text-xs">Tax rate</TableHead>
-                    <TableHead className="text-xs text-right">Rate</TableHead>
-                    <TableHead className="text-xs">Report type</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {genPreview.toCreate.map((rate) => {
-                    const options = genPreview.reportTypeOptions ?? []
-                    const value = reportTypeEdits[rate.taxRateId] ?? rate.reportType ?? ''
-                    return (
-                      <TableRow key={rate.taxRateId}>
-                        <TableCell className="font-medium">{rate.name}</TableCell>
-                        <TableCell className="text-right font-mono text-xs text-muted-foreground">{rate.ratePct.toFixed(2)}%</TableCell>
-                        <TableCell>
-                          {options.length > 0 ? (
-                            <select
-                              className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                              value={value}
-                              onChange={(e) => setReportTypeEdits((prev) => ({ ...prev, [rate.taxRateId]: e.target.value }))}
-                              disabled={genBusy === 'run'}
-                            >
-                              {/* Include the current value even if it isn't in the options list. */}
-                              {value && !options.includes(value) && <option value={value}>{value}</option>}
-                              {options.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
-                            </select>
-                          ) : (
-                            <span className="text-xs text-muted-foreground">{value || '—'}</span>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                    )
-                  })}
-                </TableBody>
-              </Table>
-            </div>
-          )}
-          <DialogFooter>
-            <Button type="button" variant="outline" size="sm" onClick={() => setGenPreview(null)} disabled={genBusy === 'run'}>
-              Cancel
-            </Button>
-            <Button type="button" size="sm" onClick={handleGenerateConfirm} disabled={genBusy === 'run'}>
-              {genBusy === 'run' ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Wand2 className="h-3.5 w-3.5 mr-1" />}
-              Create {genPreview?.toCreate.length ?? 0} rate(s)
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       {allBoth ? (
         renderTable(taxRates)

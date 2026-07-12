@@ -57,7 +57,6 @@ export type InventorySnapshotRowInput = {
   qty: Decimal
   valueBase: Decimal
   unitCostBase: Decimal | null
-  valueReplayReliable: boolean
 }
 
 export type InventoryReservationSnapshotRowInput = {
@@ -77,15 +76,6 @@ export type InventoryReservationSnapshotRunInput = {
   checkMethod: string
   cutoffAt: Date | null
   reservationSourceCount: number | null
-}
-
-export type InventorySnapshotRunInput = {
-  snapshotDate: Date
-  stockLevelCount: number
-  snapshotCount: number
-  source: 'cron' | 'backfill'
-  checkMethod: string
-  cutoffAt: Date | null
 }
 
 export type InventorySnapshotDrift = {
@@ -118,11 +108,6 @@ export type InventorySnapshotBackfillResult = {
   daysWritten: number
   snapshotsWritten: number
   missingValueMovementCount: number
-  // Cost-layer revaluations that took effect after fromDate. Backfilled snapshots
-  // seed value from CURRENT cost layers, which already reflect later landed-cost /
-  // manufacturing revaluations, so any such revaluation means at least some
-  // backfilled date's value is not the basis valid then (scjz.48). >0 ⇒ unreliable.
-  postBackfillRevaluationCount: number
   dryRun: boolean
   valueReplayReliable: boolean
   reservationBackfill: InventoryReservationSnapshotBackfillResult
@@ -157,10 +142,8 @@ export type InventorySnapshotClient = Pick<
   | 'salesOrder'
   | 'stockLevel'
   | 'costLayer'
-  | 'costLayerRevaluation'
   | 'stockMovement'
   | 'inventorySnapshot'
-  | 'inventorySnapshotRun'
   | 'inventoryReservationSnapshot'
   | 'inventoryReservationSnapshotRun'
   | 'orderAllocation'
@@ -181,18 +164,11 @@ export type InventorySnapshotTestClient = {
   costLayer: {
     findMany(args: unknown): Promise<InventorySnapshotCostLayerRow[]>
   }
-  costLayerRevaluation: {
-    count(args: unknown): Promise<number>
-    findMany(args: unknown): Promise<Array<{ effectiveAt: Date; costLayer: { productId: string; warehouseId: string } | null }>>
-  }
   stockMovement: {
     findMany(args: unknown): Promise<InventorySnapshotMovementRow[]>
   }
   inventorySnapshot: {
     findMany(args: unknown): Promise<Array<{ snapshotDate: Date; valueBase: DecimalInput }>>
-    upsert(args: unknown): Promise<unknown>
-  }
-  inventorySnapshotRun: {
     upsert(args: unknown): Promise<unknown>
   }
   inventoryReservationSnapshot: {
@@ -256,7 +232,6 @@ const EMPTY_RESERVATION_BACKFILL_RESULT: InventoryReservationSnapshotBackfillRes
   knownLimitations: [],
 }
 
-const INVENTORY_SNAPSHOT_BACKFILL_CHECK_METHOD = 'aggregated_movement_replay_v1'
 const RESERVATION_BACKFILL_CHECK_METHOD = 'current_sources_updated_at_gate_v2'
 const RESERVATION_BACKFILL_LIMITATIONS = [
   'The mutation check assumes reservation-source writes use Prisma paths that maintain updatedAt values.',
@@ -331,10 +306,7 @@ function calendarDayCount(fromDate: Date, toDate: Date): number {
 }
 
 function roundQty(value: DecimalInput): Decimal {
-  // Persist snapshot quantities at 6dp to match the live stock_levels / cost_layers
-  // precision (cogs-audit scjz.1); rounding to 4dp here would make daily snapshots
-  // and as-of reports disagree with the 6dp live quantities.
-  return roundQuantity(value, 6)
+  return roundQuantity(value, 4)
 }
 
 function roundValue(value: DecimalInput): Decimal {
@@ -388,7 +360,7 @@ function stateFromCurrentRows(
   return { state, costLayerQtyByKey }
 }
 
-function rowFromStateEntry(snapshotDate: Date, entry: SnapshotStateEntry, valueReplayReliable: boolean): InventorySnapshotRowInput {
+function rowFromStateEntry(snapshotDate: Date, entry: SnapshotStateEntry): InventorySnapshotRowInput {
   const qty = roundQty(entry.qty)
   const valueBase = roundValue(entry.valueBase)
   return {
@@ -398,17 +370,12 @@ function rowFromStateEntry(snapshotDate: Date, entry: SnapshotStateEntry, valueR
     qty,
     valueBase,
     unitCostBase: qty.gt(0) ? roundValue(valueBase.div(qty)) : null,
-    valueReplayReliable,
   }
 }
 
-function rowsFromState(
-  snapshotDate: Date,
-  state: SnapshotState,
-  isValueReplayReliable: (productId: string, warehouseId: string) => boolean,
-): InventorySnapshotRowInput[] {
+function rowsFromState(snapshotDate: Date, state: SnapshotState): InventorySnapshotRowInput[] {
   return [...state.values()]
-    .map((entry) => rowFromStateEntry(snapshotDate, entry, isValueReplayReliable(entry.productId, entry.warehouseId)))
+    .map((entry) => rowFromStateEntry(snapshotDate, entry))
     .sort((a, b) => (
       a.productId.localeCompare(b.productId) ||
       a.warehouseId.localeCompare(b.warehouseId)
@@ -455,8 +422,7 @@ export function buildInventorySnapshotRows(input: {
 
   return {
     snapshotDate,
-    // Built from current state at capture time → point-in-time reliable.
-    rows: rowsFromState(snapshotDate, state, () => true),
+    rows: rowsFromState(snapshotDate, state),
     drift: findDrift(state, costLayerQtyByKey, input.tolerance),
   }
 }
@@ -622,7 +588,7 @@ async function loadReservationBackfillSupportSnapshot(
       where: {
         shipment: {
           status: { not: 'PENDING' },
-          order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
+          order: { status: { notIn: ['CANCELLED', 'REFUNDED'] } },
         },
       },
       select: { id: true },
@@ -823,13 +789,11 @@ async function writeSnapshotRows(
           qty: row.qty,
           valueBase: row.valueBase,
           unitCostBase: row.unitCostBase,
-          valueReplayReliable: row.valueReplayReliable,
         },
         update: {
           qty: row.qty,
           valueBase: row.valueBase,
           unitCostBase: row.unitCostBase,
-          valueReplayReliable: row.valueReplayReliable,
         },
       } as never) as Promise<unknown>
     ))
@@ -917,32 +881,6 @@ async function writeReservationSnapshotRun(
   } as never)
 }
 
-async function writeInventorySnapshotRun(
-  client: SnapshotClient,
-  row: InventorySnapshotRunInput,
-): Promise<void> {
-  const updatedAt = new Date()
-  await client.inventorySnapshotRun.upsert({
-    where: { snapshotDate: row.snapshotDate },
-    create: {
-      snapshotDate: row.snapshotDate,
-      stockLevelCount: row.stockLevelCount,
-      snapshotCount: row.snapshotCount,
-      source: row.source,
-      checkMethod: row.checkMethod,
-      cutoffAt: row.cutoffAt,
-    },
-    update: {
-      stockLevelCount: row.stockLevelCount,
-      snapshotCount: row.snapshotCount,
-      source: row.source,
-      checkMethod: row.checkMethod,
-      cutoffAt: row.cutoffAt,
-      updatedAt,
-    },
-  } as never)
-}
-
 export async function writeDailyInventorySnapshot(options: {
   client?: SnapshotClient
   snapshotDate?: SnapshotDateInput
@@ -953,20 +891,9 @@ export async function writeDailyInventorySnapshot(options: {
   const { state, costLayerQtyByKey } = await loadAggregatedCurrentSnapshotState(client)
   const reservationSnapshot = await loadCurrentReservationSnapshotRows(client, snapshotDate)
   const drift = findDrift(state, costLayerQtyByKey, options.tolerance)
-  // Captured from current state today → point-in-time reliable.
-  const rows = rowsFromState(snapshotDate, state, () => true)
+  const rows = rowsFromState(snapshotDate, state)
 
   const snapshotsWritten = await writeSnapshotRows(client, rows)
-  // Coverage marker so a future empty inventory_snapshots result for this date is
-  // read as a genuine zero on-hand position rather than an uncovered date (scjz.60.5).
-  await writeInventorySnapshotRun(client, {
-    snapshotDate,
-    stockLevelCount: reservationSnapshot.stockLevelCount,
-    snapshotCount: snapshotsWritten,
-    source: 'cron',
-    checkMethod: 'daily_current_state_v1',
-    cutoffAt: startOfNextUtcDay(snapshotDate),
-  })
   const reservationSnapshotsWritten = await writeReservationSnapshotRows(client, reservationSnapshot.rows)
   await writeReservationSnapshotRun(client, {
     snapshotDate,
@@ -1060,9 +987,6 @@ export async function backfillInventorySnapshots(options: {
   const { state } = await loadAggregatedCurrentSnapshotState(client)
 
   let missingValueMovementCount = 0
-  // (product, warehouse) keys whose value had a null-totalValueBase movement
-  // reversed into it during the walk — unreliable from that day backward (scjz.43/.48).
-  const nullValueAffectedPairs = new Set<string>()
   let snapshotsWritten = 0
   let daysWritten = 0
   let movementCursor: { id: string } | undefined
@@ -1133,60 +1057,16 @@ export async function backfillInventorySnapshots(options: {
       }
       if (!reverseMovementIntoState(state, movement)) {
         missingValueMovementCount += 1
-        // The (product, warehouse) value just had a null-totalValueBase movement
-        // baked in; flag only those pairs so unrelated SKUs stay reliable (scjz.43/.48).
-        for (const warehouseId of [movement.fromWarehouseId, movement.toWarehouseId]) {
-          if (warehouseId) nullValueAffectedPairs.add(stockKey(movement.productId, warehouseId))
-        }
       }
     }
   }
 
   await reverseMovementsOnOrAfter(startOfNextUtcDay(toDate))
 
-  // scjz.43/.48: backfilled values seed from CURRENT cost layers. A snapshot for
-  // pair (p,w) on day D is point-in-time accurate only if no cost layer for that
-  // pair was revalued after D. Build the latest revaluation per pair so each row
-  // is flagged precisely (an unrelated SKU's row stays reliable).
-  const latestRevalByPair = new Map<string, Date>()
-  // Only revaluations on/after next-day-midnight(fromDate) can make any row in
-  // [fromDate, toDate] stale (an earlier one is already reflected for every day
-  // in range), so bound the scan instead of loading the whole log.
-  const revaluationRows = await client.costLayerRevaluation.findMany({
-    where: { effectiveAt: { gte: startOfNextUtcDay(fromDate) } },
-    select: { effectiveAt: true, costLayer: { select: { productId: true, warehouseId: true } } },
-  }) as Array<{ effectiveAt: Date; costLayer: { productId: string; warehouseId: string } | null }>
-  for (const row of revaluationRows) {
-    if (!row.costLayer) continue
-    const key = stockKey(row.costLayer.productId, row.costLayer.warehouseId)
-    const prev = latestRevalByPair.get(key)
-    if (!prev || row.effectiveAt > prev) latestRevalByPair.set(key, row.effectiveAt)
-  }
-  const pairValueReplayReliable = (day: Date) => (productId: string, warehouseId: string): boolean => {
-    const key = stockKey(productId, warehouseId)
-    // A reversed null-value movement is baked into this and every earlier day.
-    if (nullValueAffectedPairs.has(key)) return false
-    const latest = latestRevalByPair.get(key)
-    return latest == null || startOfNextUtcDay(day) > latest
-  }
-
   for (let day = toDate; day >= fromDate; day = addUtcDays(day, -1)) {
-    const rows = rowsFromState(day, state, pairValueReplayReliable(day))
+    const rows = rowsFromState(day, state)
     snapshotsWritten += options.dryRun ? rows.length : await writeSnapshotRows(client, rows)
     daysWritten += 1
-
-    // Coverage marker per backfilled day so empty inventory_snapshots for a genuinely
-    // zero-stock historical date reconciles instead of reading as uncovered (scjz.60.5).
-    if (!options.dryRun) {
-      await writeInventorySnapshotRun(client, {
-        snapshotDate: day,
-        stockLevelCount: rows.length,
-        snapshotCount: rows.length,
-        source: 'backfill',
-        checkMethod: INVENTORY_SNAPSHOT_BACKFILL_CHECK_METHOD,
-        cutoffAt: startOfNextUtcDay(day),
-      })
-    }
 
     if (options.includeReservationSnapshots) {
       const cutoff = startOfNextUtcDay(day)
@@ -1237,25 +1117,14 @@ export async function backfillInventorySnapshots(options: {
     await reverseMovementsOnOrAfter(day)
   }
 
-  // scjz.48: backfilled values seed from CURRENT cost layers, so any revaluation
-  // after a backfilled day no longer reflects the basis valid then. Backfilled
-  // snapshots are end-of-day, so a revaluation DURING fromDate is already captured
-  // in fromDate's snapshot — only revaluations from next-day midnight onward make
-  // a backfilled date unreliable. Surface the count and downgrade reliability
-  // rather than silently writing post-revaluation values onto historical dates.
-  const postBackfillRevaluationCount = await client.costLayerRevaluation.count({
-    where: { effectiveAt: { gte: startOfNextUtcDay(fromDate) } },
-  })
-
   return {
     fromDate: formatSnapshotDate(fromDate),
     toDate: formatSnapshotDate(toDate),
     daysWritten,
     snapshotsWritten,
     missingValueMovementCount,
-    postBackfillRevaluationCount,
     dryRun: options.dryRun === true,
-    valueReplayReliable: missingValueMovementCount === 0 && postBackfillRevaluationCount === 0,
+    valueReplayReliable: missingValueMovementCount === 0,
     reservationBackfill,
   }
 }
@@ -1295,13 +1164,7 @@ export async function getAverageInventoryValueBase(options: {
   if (totalByDate.size === 0) return '0.000000'
 
   const total = [...totalByDate.values()].reduce((sum, value) => sum.add(value), toDecimal(0))
-  // Divide by the number of days that actually have snapshots, not every calendar
-  // day in the range (cogs-audit scjz.47). Calendar-day division understated the
-  // average when snapshots are missing for some days (cron gap / partial backfill)
-  // — the numerator only covers observed days — which then inflated any turnover
-  // ratio built on this denominator. Consistent with the turnover report, which
-  // also divides by observed snapshot days.
-  return roundValue(total.div(totalByDate.size)).toFixed(6)
+  return roundValue(total.div(calendarDayCount(fromDate, toDate))).toFixed(6)
 }
 
 export function inventorySnapshotCounts(result: InventorySnapshotWriteResult): Record<string, number> {

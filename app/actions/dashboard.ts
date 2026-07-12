@@ -140,9 +140,7 @@ function getComparisonRange(from: Date, to: Date, mode: CompareMode, fyMonth: nu
   }
 }
 
-// "Completed" sales for dashboard metrics: shipped/completed orders, plus any
-// refunded order (refund state is orthogonal to the lifecycle status now).
-const COMPLETED_LIFECYCLE_STATUSES: ('SHIPPED' | 'COMPLETED')[] = ['SHIPPED', 'COMPLETED']
+const COMPLETED_STATUSES: ('SHIPPED' | 'COMPLETED' | 'PARTIALLY_REFUNDED' | 'REFUNDED')[] = ['SHIPPED', 'COMPLETED', 'PARTIALLY_REFUNDED', 'REFUNDED']
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 // ---------------------------------------------------------------------------
@@ -177,13 +175,7 @@ export async function getDashboardData(
 
   const [orders, products, openPOs, pendingSales, , costLayers, incomingPOData, allRecent] = await Promise.all([
     db.salesOrder.findMany({
-      where: {
-        createdAt: { gte: fetchFrom },
-        OR: [
-          { status: { in: COMPLETED_LIFECYCLE_STATUSES } },
-          { refundStatus: { not: 'NONE' } },
-        ],
-      },
+      where: { status: { in: COMPLETED_STATUSES }, createdAt: { gte: fetchFrom } },
       select: {
         id: true, externalOrderNumber: true, customerName: true, status: true, createdAt: true,
         totalBase: true, subtotalBase: true, shippingBase: true, discountAmount: true, fxRateToBase: true, pricesIncludeVat: true, taxRatePercent: true,

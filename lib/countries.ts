@@ -1,10 +1,3 @@
-/**
- * Default country of origin applied when a product has none, for customs parity with the
- * hs-code-woo plugin (which defaults origin to China). Used at product persistence and before
- * declaring an origin to a WMS so customs paperwork always carries a country (bhdm.5).
- */
-export const DEFAULT_COUNTRY_OF_ORIGIN = 'CN'
-
 /** ISO 3166-1 alpha-2 country codes → English names (common trading countries first). */
 const COUNTRIES: Record<string, string> = {
   GB: 'United Kingdom', US: 'United States', CN: 'China', DE: 'Germany', FR: 'France',

@@ -51,10 +51,7 @@ export type WcSyncSettings = {
   wc_sync_product_direction: string
   wc_stock_sync_enabled: string
   wc_cogs_sync_enabled: string
-  // The webhook secret itself is never sent to the client (masked to ''); the
-  // UI only needs to know whether one is configured.
   wc_webhook_secret: string
-  wc_webhook_secret_set: string
   wc_webhook_last_received_at: string
   wc_order_webhook_last_received_at: string
   wc_product_webhook_last_received_at: string
@@ -78,23 +75,6 @@ const SYNC_SETTING_KEYS = [
   'wc_fx_push_enabled', 'last_wc_fx_push_at',
 ]
 
-// Machine-managed sync state — written by the import / sync / webhook jobs, never
-// by the settings form. Excluded from saveSyncSettings so a settings save can't
-// silently wipe the initial-import-completed flag or the sync cursors (which would
-// turn live order sync back off).
-const MACHINE_MANAGED_SYNC_KEYS = new Set<string>([
-  'wc_initial_import_completed',
-  'wc_webhook_last_received_at',
-  'wc_order_webhook_last_received_at',
-  'wc_product_webhook_last_received_at',
-  'last_wc_order_sync_at',
-  'last_wc_order_reconcile_at',
-  'last_wc_product_sync_at',
-  'last_wc_product_reconcile_at',
-  'last_wc_stock_sync_at',
-  'last_wc_fx_push_at',
-])
-
 const SYNC_DEFAULTS: WcSyncSettings = {
   wc_sync_enabled: 'false',
   wc_sync_order_statuses: '["processing"]',
@@ -104,7 +84,6 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   wc_stock_sync_enabled: 'false',
   wc_cogs_sync_enabled: 'false',
   wc_webhook_secret: '',
-  wc_webhook_secret_set: 'false',
   wc_webhook_last_received_at: '',
   wc_order_webhook_last_received_at: '',
   wc_product_webhook_last_received_at: '',
@@ -129,15 +108,6 @@ export async function getWcSyncSettings(): Promise<WcSyncSettings> {
     if (v) result[k] = v
   }
   result.envOverrides = getActiveSettingEnvOverrides(SYNC_SETTING_KEYS)
-
-  // Never expose the webhook secret to the client. Report only whether one is
-  // configured (from DB value or an env override); the UI masks it on display
-  // and re-generation produces a fresh client-side value.
-  const secretFromEnv = !!result.envOverrides.wc_webhook_secret
-  result.wc_webhook_secret_set = result.wc_webhook_secret || secretFromEnv ? 'true' : 'false'
-  result.wc_webhook_secret = ''
-  if (secretFromEnv) result.envOverrides.wc_webhook_secret = '(set via environment)'
-
   return result
 }
 
@@ -240,7 +210,7 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
   })
   if (!gate.ok) return { success: false, error: gate.error }
   const ops = Object.entries(data)
-    .filter((entry): entry is [string, string] => SYNC_SETTING_KEYS.includes(entry[0]) && !MACHINE_MANAGED_SYNC_KEYS.has(entry[0]) && typeof entry[1] === 'string')
+    .filter((entry): entry is [string, string] => SYNC_SETTING_KEYS.includes(entry[0]) && typeof entry[1] === 'string')
     .map(([k, v]) =>
       db.setting.upsert({
         where: { key: k },
@@ -707,13 +677,10 @@ export async function getShoppingSyncLogs(limit = 50): Promise<SyncLogRow[]> {
 // Auto-create WooCommerce webhooks
 // ---------------------------------------------------------------------------
 
-// WooCommerce only supports webhook topics for the coupon/customer/order/product
-// resources — there is no `refund` resource, so a `refund.created` topic is rejected
-// with woocommerce_rest_shop_webhook_invalid_topic. Refunds are covered by the
-// `order.updated` webhook, whose handler calls syncRefundsForOrder().
 const WC_WEBHOOK_DEFS = [
   { name: 'OTI – Order created',   topic: 'order.created',   path: '/api/webhooks/shopping/woocommerce/orders' },
   { name: 'OTI – Order updated',   topic: 'order.updated',   path: '/api/webhooks/shopping/woocommerce/orders' },
+  { name: 'OTI – Refund created',  topic: 'refund.created',  path: '/api/webhooks/shopping/woocommerce/orders' },
   { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/shopping/woocommerce/products' },
 ] as const
 

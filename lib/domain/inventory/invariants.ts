@@ -937,7 +937,7 @@ export async function collectInventoryInvariantRows(
         shipment: {
           status: 'SHIPPED',
           order: {
-            refundStatus: { not: 'FULL' },
+            status: { not: 'REFUNDED' },
           },
         },
       },
@@ -1152,8 +1152,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       INNER JOIN "shipments" s ON s.id = sl."shipmentId"
       INNER JOIN "sales_orders" so ON so.id = s."orderId"
       WHERE s.status <> 'PENDING'
-        AND so.status <> 'CANCELLED'
-        AND so."refundStatus" <> 'FULL'
+        AND so.status NOT IN ('CANCELLED', 'REFUNDED')
         ${activeShipmentProductFilter}
         ${activeShipmentWarehouseFilter}
       GROUP BY sl."lineId", sl."productId", s."warehouseId"
@@ -1170,8 +1169,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
        AND asl."productId" = oa."productId"
        AND asl."warehouseId" = oa."warehouseId"
       WHERE oa.qty > 0
-        AND so.status <> 'CANCELLED'
-        AND so."refundStatus" <> 'FULL'
+        AND so.status NOT IN ('CANCELLED', 'REFUNDED')
         ${allocationProductFilter}
         ${allocationWarehouseFilter}
       GROUP BY oa."productId", oa."warehouseId"
@@ -1669,7 +1667,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       INNER JOIN "sales_orders" so ON so.id = s."orderId"
       INNER JOIN "products" p ON p.id = sl."productId"
       WHERE s.status = 'SHIPPED'
-        AND so."refundStatus" <> 'FULL'
+        AND so.status <> 'REFUNDED'
         AND p.type::text IN (${sqlFifoProductTypes()})
         AND sl.qty > ${toleranceSql}
         AND CASE
@@ -1712,7 +1710,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
           'fromWarehouseId', st."fromWarehouseId",
           'dispatchedAt', st."dispatchedAt",
           'qty', stl.qty::float8,
-          'thresholdDays', ${STRANDED_TRANSFER_DAYS}::int
+          'thresholdDays', ${STRANDED_TRANSFER_DAYS}
         ) AS details
       FROM "stock_transfers" st
       INNER JOIN "stock_transfer_lines" stl ON stl."transferId" = st.id

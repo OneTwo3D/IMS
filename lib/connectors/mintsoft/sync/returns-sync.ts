@@ -1,7 +1,6 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { recordWmsMutationEvents, type WmsMutationEventInput } from '@/lib/domain/wms/mutation-audit'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsReturnRecord } from '@/lib/connectors/wms/types'
 import { resolveOrderForExternalFulfillment } from '@/lib/fulfillment/external-fulfillment'
@@ -320,7 +319,6 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
     errors: 0,
   }
   const logRows: Prisma.WmsSyncLogCreateManyInput[] = []
-  const auditEvents: WmsMutationEventInput[] = []
   let createdCount = 0
   let updatedCount = 0
   let maxReceivedAtSeen: Date | null = null
@@ -418,21 +416,6 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
           createdCount += 1
           counters.corrected += 1
         }
-        auditEvents.push({
-          connector: 'mintsoft', direction: 'INBOUND', action: 'return_inbox', outcome: 'SUCCEEDED',
-          entityType: 'RETURN', entityId: saved.id, externalId: record.externalReturnId, jobId: job.id,
-          summary: existing
-            ? `Mintsoft return ${record.externalReturnId} updated in the returns inbox`
-            : `Mintsoft return ${record.externalReturnId} staged in the returns inbox`,
-          before: existing ? { status: existing.status, warehouseId: existing.warehouseId } : null,
-          after: { sku: saved.sku, qty, reason, reference, orderMatched: Boolean(order), productMatched: Boolean(product) },
-          triggeredBy: 'returns-sync',
-        })
-        // Bound memory on a large backlog: flush a full batch as we go
-        // (Codex r2); the final flush after the loop catches the remainder.
-        if (auditEvents.length >= 200) {
-          await recordWmsMutationEvents(auditEvents.splice(0))
-        }
 
         const fullyMatched = isMintsoftReturnFullyMatched({
           orderId: order?.id ?? null,
@@ -476,7 +459,6 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
       }
     }
 
-    await recordWmsMutationEvents(auditEvents)
     if (logRows.length > 0) {
       await db.wmsSyncLog.createMany({ data: logRows })
     }

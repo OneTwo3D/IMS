@@ -2,7 +2,6 @@ import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { createCostLayer, copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import { notify } from '@/lib/notifications'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
@@ -10,46 +9,15 @@ import {
   collectMissingInWmsCandidates,
   consolidateMintsoftStockLines,
   hasMintsoftThresholdBreach,
-  planMintsoftAlignDown,
   planMintsoftAlignmentAllocations,
   parseMintsoftThresholds,
 } from './stock-sync-helpers'
-import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
-import { enqueueStockSync } from '@/lib/shopping'
-
-/**
- * Codex P2 (6oyu.1): an applied alignment changes IMS on-hand, so the storefront
- * sync must be enqueued like every other stock mutation — otherwise WooCommerce
- * keeps advertising the pre-alignment quantity until an unrelated event syncs it
- * (for align-down that re-opens the oversell window the correction just closed).
- * Best-effort post-commit: a failure is surfaced as a WARNING, never thrown.
- */
-async function enqueueAlignmentStockSync(binding: SyncBinding, productId: string, sku: string): Promise<void> {
-  try {
-    await enqueueStockSync([productId], 'IMS_CHANGE')
-  } catch (error) {
-    console.error(error)
-    try {
-      await logActivity({
-        entityType: 'SYNC',
-        entityId: binding.id,
-        tag: 'sync',
-        action: 'mintsoft_alignment_stock_sync_enqueue_failed',
-        description: `Storefront stock sync enqueue failed after Mintsoft alignment for ${sku}; store stock may be stale until the next sync: ${error instanceof Error ? error.message : String(error)}`,
-        level: 'WARNING',
-        resolveUser: false,
-      })
-    } catch (logError) {
-      console.error(logError)
-    }
-  }
-}
 
 type SyncBinding = {
   id: string
@@ -61,7 +29,6 @@ type SyncBinding = {
   discrepancyThresholds: Prisma.JsonValue | null
   reportRecipients: string[]
   alignmentConfirmedAt: Date | null
-  alignDownReasonId: string | null
   warehouseId: string
   lastStockSyncAt: Date | null
   connection: {
@@ -146,7 +113,6 @@ async function getSyncBinding(bindingId: string): Promise<SyncBinding | null> {
       discrepancyThresholds: true,
       reportRecipients: true,
       alignmentConfirmedAt: true,
-      alignDownReasonId: true,
       warehouseId: true,
       lastStockSyncAt: true,
       connection: {
@@ -241,7 +207,6 @@ async function reserveStockSyncJob(
         discrepancyThresholds: true,
         reportRecipients: true,
         alignmentConfirmedAt: true,
-        alignDownReasonId: true,
         warehouseId: true,
         lastStockSyncAt: true,
         connection: {
@@ -648,7 +613,6 @@ async function lockStockLevelForAlignment(
 
 async function applyMintsoftAlignmentForProduct(params: {
   binding: SyncBinding
-  jobId: string
   productId: string
   sku: string
   delta: number
@@ -878,15 +842,6 @@ async function applyMintsoftAlignmentForProduct(params: {
       level: reservedExceedsAvailable ? 'WARNING' : undefined,
       resolveUser: false,
     })
-    await recordWmsMutationEvent({
-      connector: 'mintsoft', direction: 'INBOUND', action: 'align_up', outcome: 'SUCCEEDED',
-      entityType: 'STOCK_LEVEL', entityId: params.productId, jobId: params.jobId,
-      summary: `Align-up: ${params.sku} in ${params.binding.warehouse.code} raised to match Mintsoft (+${params.delta})`,
-      before: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: outcome.quantityBefore, reservedQty: outcome.reservedQty },
-      after: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: outcome.quantityAfter, delta: params.delta, allocations: outcome.allocations },
-      triggeredBy: 'stock-sync',
-    })
-    await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
   }
 
   return {
@@ -895,185 +850,6 @@ async function applyMintsoftAlignmentForProduct(params: {
     correctedQty: outcome.correctedQty,
     reason: outcome.reason,
   }
-}
-
-/**
- * 6oyu.1: outstanding inbound quantity for a product across OPEN Mintsoft ASNs.
- * Covers both receipts still expected (Mintsoft has not booked them in) and
- * unreconciled alignment snapshot credits (booked-in webhook not yet processed).
- * Either being positive means a lower Mintsoft balance can be receipt timing,
- * so align-down must hold.
- */
-async function getOpenAsnPendingQty(binding: SyncBinding, productId: string): Promise<number> {
-  const lines = await db.wmsAsnLineMap.findMany({
-    where: {
-      productId,
-      asn: {
-        connector: 'mintsoft',
-        warehouseId: binding.warehouseId,
-        closedAt: null,
-      },
-    },
-    select: {
-      expectedQty: true,
-      qtyAccountedViaSnapshot: true,
-      lastProcessedReceivedQty: true,
-    },
-  })
-
-  return lines.reduce((sum, line) => {
-    const expected = Number(line.expectedQty)
-    const snapshot = Number(line.qtyAccountedViaSnapshot)
-    const received = Number(line.lastProcessedReceivedQty)
-    const pendingReceipt = Math.max(0, expected - Math.max(snapshot, received))
-    const unreconciledCredit = Math.max(0, snapshot - received)
-    return sum + pendingReceipt + unreconciledCredit
-  }, 0)
-}
-
-/**
- * 6oyu.1: auto-correct a NEGATIVE Mintsoft delta (IMS holds more than the WMS)
- * by posting a downward stock adjustment against the binding's align-down
- * adjustment reason. All safety gates live in planMintsoftAlignDown; the write
- * path is the same applyStockAdjustment the manual adjustment/stocktake flows
- * use (FIFO consumption, movement value fields, inventory GL journal).
- */
-async function applyMintsoftAlignDownForProduct(params: {
-  binding: SyncBinding
-  jobId: string
-  productId: string
-  sku: string
-  delta: number
-  imsQty: number
-  wmsQty: number
-  dryRun: boolean
-  runStartedAt: Date
-}): Promise<{
-  applied: boolean
-  dryRun: boolean
-  reason: string
-}> {
-  const [priorDiscrepancy, openAsnPendingQty, stockLevel, alignDownReason] = await Promise.all([
-    db.wmsStockDiscrepancy.findFirst({
-      where: buildDiscrepancyWhere(params.binding, 'QTY_MISMATCH', params.productId, params.sku),
-      select: { delta: true, lastSeenAt: true },
-    }),
-    getOpenAsnPendingQty(params.binding, params.productId),
-    db.stockLevel.findUnique({
-      where: {
-        productId_warehouseId: {
-          productId: params.productId,
-          warehouseId: params.binding.warehouseId,
-        },
-      },
-      select: { reservedQty: true },
-    }),
-    // Codex P2: the save-time active + GL-account validation can go stale (the
-    // reason deactivated or its account removed after binding save). Without a
-    // live account code applyStockAdjustment would silently skip the inventory
-    // journal, so revalidate here — a stale reason degrades to a manual hold.
-    params.binding.alignDownReasonId
-      ? db.adjustmentReason.findUnique({
-          where: { id: params.binding.alignDownReasonId },
-          select: { active: true, accountCode: true },
-        })
-      : Promise.resolve(null),
-  ])
-
-  const decision = planMintsoftAlignDown({
-    delta: params.delta,
-    imsQty: params.imsQty,
-    wmsQty: params.wmsQty,
-    reservedQty: Number(stockLevel?.reservedQty ?? 0),
-    reasonConfigured: Boolean(alignDownReason?.active && alignDownReason?.accountCode),
-    thresholds: parseMintsoftThresholds(params.binding.discrepancyThresholds),
-    openAsnPendingQty,
-    priorDiscrepancy: priorDiscrepancy
-      ? {
-          delta: priorDiscrepancy.delta == null ? null : Number(priorDiscrepancy.delta),
-          lastSeenAt: priorDiscrepancy.lastSeenAt,
-        }
-      : null,
-    runStartedAt: params.runStartedAt,
-  })
-
-  if (decision.action === 'hold') {
-    return { applied: false, dryRun: false, reason: decision.reason }
-  }
-
-  if (params.dryRun) {
-    return {
-      applied: false,
-      dryRun: true,
-      reason: `Dry run: would align ${params.sku} down ${formatQuantity(Math.abs(decision.qty))} (${formatQuantity(params.imsQty)} → ${formatQuantity(params.wmsQty)}).`,
-    }
-  }
-
-  const outcome = await db.$transaction(async (tx) => {
-    // Re-check the on-hand quantity UNDER the lock: the delta was computed from a
-    // fetch made earlier in the sweep, and a dispatch/receipt landing in between
-    // would make it stale — applying it anyway would overshoot the correction.
-    const locked = await lockStockLevelForAlignment(tx, params.productId, params.binding.warehouseId)
-    if (locked.quantity !== params.imsQty) {
-      return {
-        applied: false as const,
-        reason: `IMS stock moved during the sync run (${formatQuantity(params.imsQty)} → ${formatQuantity(locked.quantity)}); align-down skipped this run.`,
-      }
-    }
-
-    const applied = await applyStockAdjustment({
-      tx,
-      productId: params.productId,
-      warehouseId: params.binding.warehouseId,
-      qty: decision.qty,
-      reasonId: params.binding.alignDownReasonId ?? undefined,
-      note: `Mintsoft Align To WMS: aligned down from ${formatQuantity(params.imsQty)} to ${formatQuantity(params.wmsQty)}`,
-      referenceType: 'WmsSyncJob',
-      referenceId: params.jobId,
-      idempotencyToken: `mintsoft-align-down:${params.jobId}:${params.productId}`,
-    })
-
-    return {
-      applied: true as const,
-      reason: `Aligned ${params.sku} down ${formatQuantity(Math.abs(decision.qty))} to match Mintsoft (${formatQuantity(params.imsQty)} → ${formatQuantity(params.wmsQty)}).`,
-      movementId: applied.movementId,
-      reservedQty: locked.reservedQty,
-    }
-  }, { maxWait: 5000, timeout: 30000 })
-
-  if (outcome.applied) {
-    await logActivity({
-      entityType: 'SYNC',
-      entityId: params.binding.id,
-      tag: 'sync',
-      action: 'mintsoft_align_down_applied',
-      description: `Applied Mintsoft align-down for ${params.sku} in ${params.binding.warehouse.code} (${formatQuantity(params.imsQty)} → ${formatQuantity(params.wmsQty)})`,
-      metadata: {
-        warehouseId: params.binding.warehouseId,
-        productId: params.productId,
-        sku: params.sku,
-        delta: params.delta,
-        quantityBefore: params.imsQty,
-        quantityAfter: params.wmsQty,
-        reservedQty: outcome.reservedQty,
-        movementId: outcome.movementId,
-        adjustmentReasonId: params.binding.alignDownReasonId,
-      },
-      level: 'WARNING',
-      resolveUser: false,
-    })
-    await recordWmsMutationEvent({
-      connector: 'mintsoft', direction: 'INBOUND', action: 'align_down', outcome: 'SUCCEEDED',
-      entityType: 'STOCK_LEVEL', entityId: params.productId, jobId: params.jobId,
-      summary: `Align-down: ${params.sku} in ${params.binding.warehouse.code} lowered to match Mintsoft (${params.imsQty} → ${params.wmsQty})`,
-      before: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: params.imsQty, reservedQty: outcome.reservedQty },
-      after: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: params.wmsQty, delta: params.delta, movementId: outcome.movementId, adjustmentReasonId: params.binding.alignDownReasonId },
-      triggeredBy: 'stock-sync',
-    })
-    await enqueueAlignmentStockSync(params.binding, params.productId, params.sku)
-  }
-
-  return { applied: outcome.applied, dryRun: false, reason: outcome.reason }
 }
 
 async function notifyThresholdBreaches(binding: SyncBinding, breachCount: number): Promise<number> {
@@ -1114,11 +890,6 @@ async function updateBindingSyncState(bindingId: string, status: 'SUCCEEDED' | '
     data: {
       lastStockSyncAt: new Date(),
       lastStockSyncStatus: status,
-      // Only a run that actually completed its checks heals the watchdog's
-      // stale-sync alert and advances its staleness anchor (Codex r4/r5: a
-      // FAILED run advancing the anchor kept a permanently failing binding
-      // "fresh", so the first stale alert would never fire).
-      ...(status === 'FAILED' ? {} : { staleSyncAlertedAt: null, lastStockSyncSuccessAt: new Date() }),
     },
   })
 }
@@ -1244,10 +1015,6 @@ export async function runStockSyncForBinding(
 
   let thresholdBreaches = 0
   const alignmentDryRun = binding.stockSyncMode === 'ALIGN_TO_WMS' && !binding.alignmentConfirmedAt
-  // 6oyu.1: align-down's persistence gate compares the prior discrepancy's
-  // lastSeenAt against this run's start — a row written by THIS run must not
-  // count as prior evidence.
-  const runStartedAt = new Date()
   let lastHeartbeatAt = Date.now()
 
   try {
@@ -1435,7 +1202,6 @@ export async function runStockSyncForBinding(
         if (binding.stockSyncMode === 'ALIGN_TO_WMS' && delta > 0) {
           const alignment = await applyMintsoftAlignmentForProduct({
             binding,
-            jobId: job.id,
             productId: product.id,
             sku: product.sku,
             delta,
@@ -1465,56 +1231,12 @@ export async function runStockSyncForBinding(
           }
         }
 
-        // 6oyu.1: align-down. A held decision falls through to the normal
-        // discrepancy upsert below carrying the hold reason, which both surfaces
-        // WHY it stayed manual and arms the persistence gate for the next run
-        // (the gate reads the discrepancy this run writes).
-        let alignDownHoldReason: string | null = null
-        if (binding.stockSyncMode === 'ALIGN_TO_WMS' && delta < 0) {
-          const alignDown = await applyMintsoftAlignDownForProduct({
-            binding,
-            jobId: job.id,
-            productId: product.id,
-            sku: product.sku,
-            delta,
-            imsQty,
-            wmsQty,
-            dryRun: alignmentDryRun,
-            runStartedAt,
-          })
-
-          if (alignDown.applied) {
-            counters.corrected += 1
-            await resolveOpenDiscrepancies(binding, product.id, product.sku)
-            logRows.push({
-              jobId: job.id,
-              sku: product.sku,
-              productId: product.id,
-              action: 'corrected',
-              imsQtyBefore: imsQty,
-              imsQtyAfter: wmsQty,
-              wmsQty,
-              delta,
-              reason: alignDown.reason,
-              payload: (line.raw ?? {}) as Prisma.InputJsonValue,
-            })
-            continue
-          }
-
-          if (alignDown.dryRun) {
-            counters.alignmentPreviews += 1
-            alignDownHoldReason = `DRY_RUN_PREVIEW: ${alignDown.reason}`
-          } else {
-            alignDownHoldReason = alignDown.reason
-          }
-        }
-
         const timingConflict = await detectReceiptTimingConflict(binding, product.id, delta)
         const category = timingConflict ? 'RECEIPT_TIMING_CONFLICT' : 'QTY_MISMATCH'
         const message = timingConflict
           ?? (
-            alignDownHoldReason
-              ? `IMS has ${formatQuantity(imsQty)} and Mintsoft has ${formatQuantity(wmsQty)} for ${product.sku}. ${alignDownHoldReason}`
+            binding.stockSyncMode === 'ALIGN_TO_WMS' && delta < 0
+              ? `IMS has ${formatQuantity(imsQty)} and Mintsoft has ${formatQuantity(wmsQty)} for ${product.sku}. Align To WMS currently auto-corrects upward deltas only; lower Mintsoft balances remain manual.`
               : `IMS has ${formatQuantity(imsQty)} and Mintsoft has ${formatQuantity(wmsQty)} for ${product.sku}.`
           )
 
@@ -1757,13 +1479,7 @@ export async function createMintsoftBindingHandover(
     where: { id: binding.id },
     data: {
       lastStockSyncAt: new Date(),
-      // A handover records a successful STOCK_SYNC, so it is watchdog
-      // freshness too (Codex r6): without these, leaving alignment mode kept
-      // the old/null success anchor (immediate false stale alert) or carried
-      // a stale stamp that suppressed later genuine breaches.
-      lastStockSyncSuccessAt: new Date(),
       lastStockSyncStatus: 'SUCCEEDED',
-      staleSyncAlertedAt: null,
     },
   })
 

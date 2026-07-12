@@ -3,11 +3,11 @@
 import { useEffect, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { ChevronDown, ChevronUp, Pencil, X, Truck, PackageCheck, Ban, Loader2, Upload } from 'lucide-react'
-import { createWmsTransferAsn } from '@/app/actions/wms-asn'
-import type {
-  WmsCreateAsnInput,
-  WmsTransferAsnState,
-} from '@/lib/connectors/wms/asn-types'
+import {
+  createMintsoftTransferAsn,
+  type MintsoftCreatePurchaseOrderAsnInput,
+  type MintsoftTransferAsnState,
+} from '@/app/actions/mintsoft-sync'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
@@ -19,7 +19,6 @@ import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableL
 import {
   dispatchTransfer,
   receiveTransfer,
-  receiveTransferPartial,
   cancelTransfer,
   cancelDispatchedTransfer,
   updateTransferDraft,
@@ -224,23 +223,23 @@ function EditDraftForm({
 }
 
 // ---------------------------------------------------------------------------
-// WMS ASN dialog
+// Mintsoft ASN dialog
 // ---------------------------------------------------------------------------
 
-function WmsTransferAsnDialog({
+function MintsoftTransferAsnDialog({
   transfer,
-  wmsAsnState,
+  mintsoftAsnState,
   onClose,
 }: {
   transfer: TransferRow
-  wmsAsnState: WmsTransferAsnState
+  mintsoftAsnState: MintsoftTransferAsnState
   onClose: () => void
 }) {
   const router = useRouter()
   const formatDateTime = useFormatDateTime()
   const formatDate = (iso: string) => formatDateTime(iso, DATE_TIME_OPTS)
   const [isPending, startTransition] = useTransition()
-  const [packagingType, setPackagingType] = useState<NonNullable<WmsCreateAsnInput['packagingType']>>('PARCEL')
+  const [packagingType, setPackagingType] = useState<NonNullable<MintsoftCreatePurchaseOrderAsnInput['packagingType']>>('PARCEL')
   const [packageCount, setPackageCount] = useState('1')
   const [eta, setEta] = useState('')
   const [supplierReference, setSupplierReference] = useState(transfer.reference)
@@ -249,7 +248,7 @@ function WmsTransferAsnDialog({
   const [error, setError] = useState('')
 
   const outstandingLines = transfer.lines.filter((line) => line.qty > line.qtyReceived)
-  const hasOpenAsn = wmsAsnState.existingAsns.some((asn) => asn.closedAt == null)
+  const hasOpenAsn = mintsoftAsnState.existingAsns.some((asn) => asn.closedAt == null)
 
   function handleConfirm() {
     setError('')
@@ -261,14 +260,14 @@ function WmsTransferAsnDialog({
     }
 
     startTransition(async () => {
-      const result = await createWmsTransferAsn(transfer.id, {
+      const result = await createMintsoftTransferAsn(transfer.id, {
         packagingType,
         packageCount: parsedPackageCount,
         eta: eta || null,
         supplierReference: supplierReference || null,
         carrier: carrier || null,
         autoCallback,
-      } satisfies WmsCreateAsnInput)
+      } satisfies MintsoftCreatePurchaseOrderAsnInput)
 
       if (result.success) {
         router.refresh()
@@ -276,7 +275,7 @@ function WmsTransferAsnDialog({
         return
       }
 
-      setError(result.error ?? `Failed to create ${wmsAsnState.connectorLabel} ASN`)
+      setError(result.error ?? 'Failed to create Mintsoft ASN')
     })
   }
 
@@ -286,17 +285,17 @@ function WmsTransferAsnDialog({
     }}>
       <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
         <DialogHeader>
-          <DialogTitle>{wmsAsnState.connectorLabel} ASN</DialogTitle>
+          <DialogTitle>Mintsoft ASN</DialogTitle>
           <DialogDescription>
-            Create or review the {wmsAsnState.connectorLabel} ASN for this in-transit warehouse transfer. {wmsAsnState.connectorLabel} receives the remaining quantities in base stock units.
+            Create or review the Mintsoft ASN for this in-transit warehouse transfer. Mintsoft receives the remaining quantities in base stock units.
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4">
-          {wmsAsnState.existingAsns.length > 0 && (
+          {mintsoftAsnState.existingAsns.length > 0 && (
             <div className="space-y-2 rounded-md border p-3">
               <div className="flex items-center justify-between gap-3">
-                <h3 className="text-sm font-medium">Existing {wmsAsnState.connectorLabel} ASNs</h3>
+                <h3 className="text-sm font-medium">Existing Mintsoft ASNs</h3>
                 {hasOpenAsn && (
                   <span className="text-xs text-amber-700 dark:text-amber-400">
                     An open ASN already exists for this transfer.
@@ -314,7 +313,7 @@ function WmsTransferAsnDialog({
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {wmsAsnState.existingAsns.map((asn) => (
+                  {mintsoftAsnState.existingAsns.map((asn) => (
                     <TableRow key={asn.id}>
                       <TableCell className="font-mono text-xs">{asn.externalAsnId}</TableCell>
                       <TableCell className="text-xs">{formatAsnStatus(asn.status)}</TableCell>
@@ -349,9 +348,9 @@ function WmsTransferAsnDialog({
 
           <div className="grid gap-3 md:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor="wmsTransferPackagingType">Packaging Type</Label>
+              <Label htmlFor="mintsoftTransferPackagingType">Packaging Type</Label>
               <select
-                id="wmsTransferPackagingType"
+                id="mintsoftTransferPackagingType"
                 value={packagingType}
                 onChange={(event) => setPackagingType(event.target.value as typeof packagingType)}
                 className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
@@ -362,9 +361,9 @@ function WmsTransferAsnDialog({
               </select>
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="wmsTransferPackageCount">Package Count</Label>
+              <Label htmlFor="mintsoftTransferPackageCount">Package Count</Label>
               <Input
-                id="wmsTransferPackageCount"
+                id="mintsoftTransferPackageCount"
                 type="number"
                 min={1}
                 step={1}
@@ -373,27 +372,27 @@ function WmsTransferAsnDialog({
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="wmsTransferEta">ETA</Label>
+              <Label htmlFor="mintsoftTransferEta">ETA</Label>
               <Input
-                id="wmsTransferEta"
+                id="mintsoftTransferEta"
                 type="date"
                 value={eta}
                 onChange={(event) => setEta(event.target.value)}
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="wmsTransferCarrier">Carrier</Label>
+              <Label htmlFor="mintsoftTransferCarrier">Carrier</Label>
               <Input
-                id="wmsTransferCarrier"
+                id="mintsoftTransferCarrier"
                 value={carrier}
                 onChange={(event) => setCarrier(event.target.value)}
                 placeholder="e.g. DPD, DHL Freight"
               />
             </div>
             <div className="space-y-1.5 md:col-span-2">
-              <Label htmlFor="wmsTransferReference">Shipment Reference</Label>
+              <Label htmlFor="mintsoftTransferReference">Shipment Reference</Label>
               <Input
-                id="wmsTransferReference"
+                id="mintsoftTransferReference"
                 value={supplierReference}
                 onChange={(event) => setSupplierReference(event.target.value)}
                 placeholder="Optional shipment or transfer reference"
@@ -411,128 +410,22 @@ function WmsTransferAsnDialog({
             <span>
               <span className="font-medium">Enable booked-in callback</span>
               <span className="block text-muted-foreground">
-                When enabled, {wmsAsnState.connectorLabel} will call back into IMS when the ASN is booked in so the transfer receipt can be reconciled automatically.
+                When enabled, Mintsoft will call back into IMS when the ASN is booked in so the transfer receipt can be reconciled automatically.
               </span>
             </span>
           </label>
 
-          {wmsAsnState.blockedReason && (
-            <p className="text-sm text-muted-foreground">{wmsAsnState.blockedReason}</p>
+          {mintsoftAsnState.blockedReason && (
+            <p className="text-sm text-muted-foreground">{mintsoftAsnState.blockedReason}</p>
           )}
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Close</Button>
-          <Button onClick={handleConfirm} disabled={isPending || !wmsAsnState.canCreate}>
+          <Button onClick={handleConfirm} disabled={isPending || !mintsoftAsnState.canCreate}>
             {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            Create {wmsAsnState.connectorLabel} ASN
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Partial receive dialog
-// ---------------------------------------------------------------------------
-
-function PartialReceiveDialog({
-  transfer,
-  onClose,
-  onReceived,
-}: {
-  transfer: TransferRow
-  onClose: () => void
-  onReceived: () => void
-}) {
-  const outstanding = transfer.lines.filter((line) => Number(line.qty) > Number(line.qtyReceived))
-  const [qtys, setQtys] = useState<Record<string, string>>(() =>
-    Object.fromEntries(outstanding.map((line) => [line.id, String(Number(line.qty) - Number(line.qtyReceived))])),
-  )
-  const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  async function submit() {
-    setError(null)
-    for (const line of outstanding) {
-      const remaining = Number(line.qty) - Number(line.qtyReceived)
-      const entered = Number(qtys[line.id])
-      if (Number.isFinite(entered) && entered > remaining) {
-        setError(`${line.sku}: cannot receive more than the ${remaining} remaining.`)
-        return
-      }
-    }
-    const lineDeltas = outstanding
-      .map((line) => ({ lineId: line.id, qty: Number(qtys[line.id]) }))
-      .filter((delta) => Number.isFinite(delta.qty) && delta.qty > 0)
-    if (lineDeltas.length === 0) {
-      setError('Enter a quantity for at least one line.')
-      return
-    }
-    setSubmitting(true)
-    // One token per submit makes a network retry of this exact call idempotent.
-    const res = await receiveTransferPartial(transfer.id, lineDeltas, crypto.randomUUID())
-    setSubmitting(false)
-    if (res.success) {
-      onReceived()
-      onClose()
-    } else {
-      setError(res.message ?? 'Failed to receive.')
-    }
-  }
-
-  return (
-    <Dialog open onOpenChange={(open) => { if (!open) onClose() }}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>Receive part of {transfer.reference}</DialogTitle>
-          <DialogDescription>
-            Enter how many of each line have physically arrived. The transfer stays in transit until every line is fully received.
-          </DialogDescription>
-        </DialogHeader>
-        {outstanding.length === 0 ? (
-          <p className="text-sm text-muted-foreground">All lines are already received.</p>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="text-xs">Product</TableHead>
-                <TableHead className="text-xs text-right">Remaining</TableHead>
-                <TableHead className="text-xs text-right w-32">Receive now</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {outstanding.map((line) => {
-                const remaining = Number(line.qty) - Number(line.qtyReceived)
-                return (
-                  <TableRow key={line.id}>
-                    <TableCell className="text-xs">{line.sku} — {line.productName}</TableCell>
-                    <TableCell className="text-xs text-right tabular-nums">{remaining}</TableCell>
-                    <TableCell className="text-right">
-                      <Input
-                        type="number"
-                        min={0}
-                        max={remaining}
-                        step="any"
-                        value={qtys[line.id] ?? ''}
-                        onChange={(e) => setQtys((prev) => ({ ...prev, [line.id]: e.target.value }))}
-                        className="h-8 text-right"
-                      />
-                    </TableCell>
-                  </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
-        )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
-        <DialogFooter>
-          <Button variant="outline" size="sm" onClick={onClose} disabled={submitting}>Cancel</Button>
-          <Button size="sm" onClick={submit} disabled={submitting || outstanding.length === 0}>
-            {submitting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <PackageCheck className="h-3 w-3 mr-1" />}
-            Receive selected
+            Create Mintsoft ASN
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -548,14 +441,14 @@ function TransferCard({
   transfer: initial,
   warehouses,
   products,
-  wmsAsnState,
+  mintsoftAsnState,
   stockLevels,
   onUpdated,
 }: {
   transfer: TransferRow
   warehouses: Warehouse[]
   products: ProductRow[]
-  wmsAsnState: WmsTransferAsnState | null
+  mintsoftAsnState: MintsoftTransferAsnState | null
   stockLevels: StockLevels
   onUpdated: (t: TransferRow) => void
 }) {
@@ -566,8 +459,7 @@ function TransferCard({
   const [transfer, setTransfer] = useState(initial)
   const [expanded, setExpanded] = useState(false)
   const [editing, setEditing] = useState(false)
-  const [showWmsDialog, setShowWmsDialog] = useState(false)
-  const [showPartialDialog, setShowPartialDialog] = useState(false)
+  const [showMintsoftDialog, setShowMintsoftDialog] = useState(false)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -576,9 +468,6 @@ function TransferCard({
   }, [initial])
 
   async function handleDispatch() {
-    // bgoq: dispatch irreversibly books stock OUT of the source warehouse and
-    // consumes FIFO cost layers — confirm before this destructive action.
-    if (!confirm('Dispatch this transfer? This books stock out of the source warehouse and consumes FIFO cost layers. It can only be undone with a separate "cancel dispatch".')) return
     setActioning(true); setActionError(null)
     const res = await dispatchTransfer(transfer.id)
     setActioning(false)
@@ -605,9 +494,6 @@ function TransferCard({
   }
 
   async function handleCancel() {
-    // bgoq: confirm before cancelling a draft (a hover-revealed Ban icon is easy
-    // to misclick).
-    if (!confirm('Cancel this draft transfer?')) return
     setActioning(true); setActionError(null)
     const res = await cancelTransfer(transfer.id)
     setActioning(false)
@@ -671,13 +557,9 @@ function TransferCard({
             {transfer.status === 'IN_TRANSIT' && (
               <>
                 <Button size="sm" variant="outline" className="h-7 text-xs gap-1"
-                  onClick={() => setShowWmsDialog(true)}
-                  disabled={!wmsAsnState}>
-                  <Upload className="h-3 w-3" /> {wmsAsnState?.connectorLabel ?? 'WMS'} ASN
-                </Button>
-                <Button size="sm" variant="outline" className="h-7 text-xs gap-1"
-                  onClick={() => setShowPartialDialog(true)} disabled={actioning}>
-                  <PackageCheck className="h-3 w-3" /> Receive Partial
+                  onClick={() => setShowMintsoftDialog(true)}
+                  disabled={!mintsoftAsnState}>
+                  <Upload className="h-3 w-3" /> Mintsoft ASN
                 </Button>
                 <Button size="sm" variant="outline" className="h-7 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950"
                   onClick={handleReceive} disabled={actioning}>
@@ -757,19 +639,11 @@ function TransferCard({
         </TableRow>
       )}
 
-      {showWmsDialog && wmsAsnState && transfer.status === 'IN_TRANSIT' && (
-        <WmsTransferAsnDialog
+      {showMintsoftDialog && mintsoftAsnState && transfer.status === 'IN_TRANSIT' && (
+        <MintsoftTransferAsnDialog
           transfer={transfer}
-          wmsAsnState={wmsAsnState}
-          onClose={() => setShowWmsDialog(false)}
-        />
-      )}
-
-      {showPartialDialog && transfer.status === 'IN_TRANSIT' && (
-        <PartialReceiveDialog
-          transfer={transfer}
-          onClose={() => setShowPartialDialog(false)}
-          onReceived={() => router.refresh()}
+          mintsoftAsnState={mintsoftAsnState}
+          onClose={() => setShowMintsoftDialog(false)}
         />
       )}
     </>
@@ -784,7 +658,7 @@ type ListProps = {
   transfers: TransferRow[]
   warehouses: Warehouse[]
   products: ProductRow[]
-  wmsAsnStates: Record<string, WmsTransferAsnState>
+  mintsoftAsnStates: Record<string, MintsoftTransferAsnState>
   stockLevels: StockLevels
   onTransferUpdated: (t: TransferRow) => void
 }
@@ -793,7 +667,7 @@ export function TransferList({
   transfers,
   warehouses,
   products,
-  wmsAsnStates,
+  mintsoftAsnStates,
   stockLevels,
   onTransferUpdated,
 }: ListProps) {
@@ -833,7 +707,7 @@ export function TransferList({
                 transfer={transfer}
                 warehouses={warehouses}
                 products={products}
-                wmsAsnState={wmsAsnStates[transfer.id] ?? null}
+                mintsoftAsnState={mintsoftAsnStates[transfer.id] ?? null}
                 stockLevels={stockLevels}
                 onUpdated={onTransferUpdated}
               />
@@ -859,7 +733,7 @@ export function TransferList({
                   transfer={t}
                   warehouses={warehouses}
                   products={products}
-                  wmsAsnState={wmsAsnStates[t.id] ?? null}
+                  mintsoftAsnState={mintsoftAsnStates[t.id] ?? null}
                   stockLevels={stockLevels}
                   onUpdated={onTransferUpdated}
                 />
@@ -885,14 +759,14 @@ function MobileTransferCard({
   transfer: initial,
   warehouses,
   products,
-  wmsAsnState,
+  mintsoftAsnState,
   stockLevels,
   onUpdated,
 }: {
   transfer: TransferRow
   warehouses: Warehouse[]
   products: ProductRow[]
-  wmsAsnState: WmsTransferAsnState | null
+  mintsoftAsnState: MintsoftTransferAsnState | null
   stockLevels: StockLevels
   onUpdated: (t: TransferRow) => void
 }) {
@@ -903,8 +777,7 @@ function MobileTransferCard({
   const [transfer, setTransfer] = useState(initial)
   const [expanded, setExpanded] = useState(false)
   const [editing, setEditing] = useState(false)
-  const [showWmsDialog, setShowWmsDialog] = useState(false)
-  const [showPartialDialog, setShowPartialDialog] = useState(false)
+  const [showMintsoftDialog, setShowMintsoftDialog] = useState(false)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -913,9 +786,6 @@ function MobileTransferCard({
   }, [initial])
 
   async function handleDispatch() {
-    // bgoq: dispatch irreversibly books stock OUT of the source warehouse and
-    // consumes FIFO cost layers — confirm before this destructive action.
-    if (!confirm('Dispatch this transfer? This books stock out of the source warehouse and consumes FIFO cost layers. It can only be undone with a separate "cancel dispatch".')) return
     setActioning(true); setActionError(null)
     const res = await dispatchTransfer(transfer.id)
     setActioning(false)
@@ -940,9 +810,6 @@ function MobileTransferCard({
   }
 
   async function handleCancel() {
-    // bgoq: confirm before cancelling a draft (a hover-revealed Ban icon is easy
-    // to misclick).
-    if (!confirm('Cancel this draft transfer?')) return
     setActioning(true); setActionError(null)
     const res = await cancelTransfer(transfer.id)
     setActioning(false)
@@ -989,11 +856,8 @@ function MobileTransferCard({
         )}
         {transfer.status === 'IN_TRANSIT' && (
           <>
-            <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={() => setShowWmsDialog(true)} disabled={!wmsAsnState}>
-              <Upload className="h-3 w-3" /> {wmsAsnState?.connectorLabel ?? 'WMS'} ASN
-            </Button>
-            <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={() => setShowPartialDialog(true)} disabled={actioning}>
-              <PackageCheck className="h-3 w-3" /> Receive Partial
+            <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={() => setShowMintsoftDialog(true)} disabled={!mintsoftAsnState}>
+              <Upload className="h-3 w-3" /> Mintsoft ASN
             </Button>
             <Button size="sm" variant="outline" className="h-8 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950" onClick={handleReceive} disabled={actioning}>
               <PackageCheck className="h-3 w-3" /> Mark Received
@@ -1039,19 +903,11 @@ function MobileTransferCard({
         </div>
       )}
 
-      {showWmsDialog && wmsAsnState && transfer.status === 'IN_TRANSIT' && (
-        <WmsTransferAsnDialog
+      {showMintsoftDialog && mintsoftAsnState && transfer.status === 'IN_TRANSIT' && (
+        <MintsoftTransferAsnDialog
           transfer={transfer}
-          wmsAsnState={wmsAsnState}
-          onClose={() => setShowWmsDialog(false)}
-        />
-      )}
-
-      {showPartialDialog && transfer.status === 'IN_TRANSIT' && (
-        <PartialReceiveDialog
-          transfer={transfer}
-          onClose={() => setShowPartialDialog(false)}
-          onReceived={() => router.refresh()}
+          mintsoftAsnState={mintsoftAsnState}
+          onClose={() => setShowMintsoftDialog(false)}
         />
       )}
     </MobileRecordCard>

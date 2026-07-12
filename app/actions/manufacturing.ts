@@ -1,6 +1,5 @@
 'use server'
 
-import { randomUUID } from 'crypto'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -13,7 +12,6 @@ import {
   consumeFifoLayersStrict,
   createCostLayer,
   getReturnedQtyForCostLayer,
-  recordCostLayerRevaluation,
   refreshShipmentCogsForCostLayerChange,
   refreshSalesOrderLineCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
@@ -21,7 +19,6 @@ import {
 import {
   buildOverheadAccountDeltas,
   compareAccountCodes,
-  disassemblyProvenanceShare,
   recomputeManufacturingUnitCosts,
   stableHash,
 } from '@/lib/domain/manufacturing/production-costing'
@@ -587,32 +584,10 @@ export async function updateManufacturingOrderStatus(
         const qtyPlanned = Number(order.qtyPlanned)
         // audit-H6: use the snapshot frozen at IN_PROGRESS, not the live BOM, so
         // a mid-production component edit can't change what is consumed/recovered
-        // or strand the reservation. Completion now requires IN_PROGRESS
-        // (DRAFT->complete is blocked, scjz.32), so the live-BOM fallback only
-        // covers legacy orders started before audit-H6 added componentSnapshot.
-        // 8fo0: honour the frozen snapshot strictly (audit-H6). Three cases:
-        //  - DB NULL: legacy order (pre-audit-H6) — fall back to the live BOM.
-        //  - empty array []: a REAL frozen snapshot of ZERO components (an empty BOM
-        //    snapshots [] at IN_PROGRESS start). Use it as-is (consume/recover
-        //    nothing). Do NOT fall back to the live BOM — a BOM edited after the
-        //    order started would otherwise be silently consumed/recovered with no
-        //    reservation backing it (the disassembly path has no per-component
-        //    reservation gate, so the live-BOM fallback was the sharpest leak).
-        //  - present but not a clean array of {componentId, qty>0}: CORRUPT. Hard-
-        //    error rather than silently consuming the wrong components.
-        const rawSnapshot = order.componentSnapshot
-        let components: ProductionOrderComponentSnapshot | typeof order.outputProduct.productComponents
-        if (rawSnapshot == null) {
-          components = order.outputProduct.productComponents
-        } else if (Array.isArray(rawSnapshot)) {
-          const parsedSnapshot = parseProductionOrderComponentSnapshot(rawSnapshot)
-          if (parsedSnapshot == null && rawSnapshot.length > 0) {
-            throw new Error('This production order has a frozen component snapshot that is present but malformed; refusing to fall back to the live BOM. Resolve the snapshot data before completing this order.')
-          }
-          components = parsedSnapshot ?? []
-        } else {
-          throw new Error('This production order has a frozen component snapshot that is present but malformed; refusing to fall back to the live BOM. Resolve the snapshot data before completing this order.')
-        }
+        // or strand the reservation. Fall back to the live BOM only for orders
+        // that were never started (no snapshot).
+        const components: ProductionOrderComponentSnapshot | typeof order.outputProduct.productComponents =
+          parseProductionOrderComponentSnapshot(order.componentSnapshot) ?? order.outputProduct.productComponents
         completedComponents = components
         const wasInProgress = order.status === 'IN_PROGRESS'
         const costLayerReceivedAt = manufacturingCostLayerReceivedAt({
@@ -630,13 +605,6 @@ export async function updateManufacturingOrderStatus(
           // audit-wght: book the ACTUAL produced quantity (yield loss) into stock +
           // the output cost layer; component consumption below stays at the planned
           // BOM, so the full run cost capitalises into the fewer good units.
-          // 6077: this is a deliberate YIELD-LOSS model, NOT partial completion.
-          // actualQtyProduced < qtyPlanned means "made fewer good units from the
-          // full materials" (scrap/defects), so the full planned BOM is consumed by
-          // design. Stopping early without consuming materials is not expressible
-          // here — the operator cancels or keeps the order In Progress instead (the
-          // completion dialog documents this). Do NOT scale component consumption to
-          // actual without adding an explicit partial-completion workflow + scrap field.
           const outputResolution = resolveAssemblyOutputQty({ qtyPlanned, actualQtyProduced })
           if ('error' in outputResolution) throw new Error(outputResolution.error)
           const outputQty = outputResolution.qty
@@ -651,13 +619,6 @@ export async function updateManufacturingOrderStatus(
           }> = []
           for (const comp of components) {
             const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
-            // 8fo0: two COMPLEMENTARY gates, not redundant — keep both. This one
-            // validates aggregate reserved-qty (requireReserved, by product+warehouse
-            // — not scoped to this order) + stock_levels availability;
-            // consumeFifoLayersStrict below is the cost-layer consumption authority.
-            // They guard distinct invariants and fail CLOSED if stock_levels and
-            // cost_layers ever disagree (better than consuming against a single
-            // source that the other contradicts).
             await assertStockAvailable(tx, comp.componentId, order.warehouseId, totalQty, {
               includeReserved: wasInProgress,
               requireReserved: wasInProgress,
@@ -717,12 +678,6 @@ export async function updateManufacturingOrderStatus(
           // costs. Spread the FULL run cost across the ACTUAL produced units, so
           // yield loss raises the per-unit cost rather than vanishing.
           const outputTotalCostBase = totalAssemblyCostBase.add(totalManufacturingCostBase)
-          // 8fo0 (split to lxv6, deferred): the PRODUCTION_IN movement below stores
-          // the EXACT outputTotalCostBase, but the layer can only hold a 6dp per-unit
-          // cost, so qty*round6(unitCost) may differ from the exact total by a
-          // sub-penny residual. This is the inherent 6dp cost-layer storage limit
-          // (same class as scjz.12); fixing it needs an engine-level exact-value
-          // change across ALL layers, not a manufacturing-local tweak.
           const outputLayerId = await createCostLayer(tx, {
             productId: order.outputProductId,
             warehouseId: order.warehouseId,
@@ -849,26 +804,14 @@ export async function updateManufacturingOrderStatus(
               productionOrderId: id,
               receivedAt: costLayerReceivedAt,
             })
-            // Cost-layer source-line provenance so a later landed-cost change on the
-            // disassembled OUTPUT layer propagates into this recovered component layer
-            // (scjz.27). The equal-split-overhead path (zero-cost output) previously
-            // wrote no source lines, leaving the recovered layers invisible to
-            // propagateLandedCostToOutputs and permanently understated; it now writes
-            // equal-share lines carrying zero value, which propagation fills in when
-            // the output is later revalued.
-            const provenanceShare = disassemblyProvenanceShare({
-              baseAllocatedCostBase: baseAllocatedCost,
-              totalRecoveredCostBase,
-              useEqualSplitOverhead,
-              componentCount: components.length,
-            })
-            if (provenanceShare) {
+            if (baseAllocatedCost.gt(0) && totalRecoveredCostBase.gt(0)) {
+              const componentShare = baseAllocatedCost.div(totalRecoveredCostBase)
               await addCostLayerSourceLines(tx, componentLayerId, recoveredCost.consumed.map((entry) => ({
                 sourceProductId: order.outputProductId,
                 sourceCostLayerId: entry.costLayerId,
-                qty: entry.qty.mul(provenanceShare),
+                qty: entry.qty.mul(componentShare),
                 unitCostBase: entry.unitCostBase,
-                totalCostBase: entry.qty.mul(entry.unitCostBase).mul(provenanceShare),
+                totalCostBase: entry.qty.mul(entry.unitCostBase).mul(componentShare),
               })))
             }
 
@@ -1198,12 +1141,10 @@ export async function updateManufacturingOrderStatus(
     revalidatePath('/inventory')
     revalidatePath('/stock-control')
     try {
-      // audit-H6 / 8fo0: on completion, sync exactly the components actually
-      // consumed/recovered (the frozen snapshot set — which may legitimately be
-      // empty for a zero-component frozen order; honour that rather than re-reading
-      // the live BOM). For other transitions no component stock changed, so fall
+      // audit-H6: on completion, sync the components actually consumed/recovered
+      // (snapshot set); for other transitions no component stock changed, so fall
       // back to the live BOM list (unchanged behaviour).
-      const syncComponentIds = status === 'COMPLETED'
+      const syncComponentIds = completedComponents.length > 0
         ? completedComponents.map((comp) => comp.componentId)
         : orderPreview.outputProduct.productComponents.map((comp) => comp.componentId)
       await enqueueStockSync(
@@ -1487,10 +1428,6 @@ export async function getManufacturingCostLines(productionOrderId: string): Prom
 async function recalculateManufacturingCostLayers(
   tx: Prisma.TransactionClient,
   productionOrderId: string,
-  // Per-edit-run nonce, generated by the caller so the shipment COGS_REVERSAL here
-  // and the companion MANUFACTURING_RECLASS journal share ONE nonce — an A→B→A
-  // cost edit must post (or dedup) both together, never just one (cogs-audit scjz.33).
-  recalcRunId: string,
 ): Promise<{ cogsDeltaBase: number; inventoryDeltaBase: number }> {
   const po = await tx.productionOrder.findUnique({
     where: { id: productionOrderId },
@@ -1531,8 +1468,6 @@ async function recalculateManufacturingCostLayers(
     currentMfgCost,
   )
   const oldByLayer = new Map(layerInfos.map((l) => [l.id, l]))
-  // One effective timestamp per recompute run for the revaluation event log (blq0).
-  const revaluedAt = new Date()
 
   let netCogsDeltaBase = toDecimal(0)
   let netInventoryDeltaBase = toDecimal(0)
@@ -1545,13 +1480,6 @@ async function recalculateManufacturingCostLayers(
     await tx.costLayer.update({
       where: { id: li.id },
       data: { unitCostBase: r.newUnitCostBase },
-    })
-    await recordCostLayerRevaluation(tx, {
-      costLayerId: li.id,
-      oldUnitCostBase: li.oldUnitCostBase,
-      newUnitCostBase: r.newUnitCostBase,
-      effectiveAt: revaluedAt,
-      reason: 'manufacturing_recompute',
     })
 
     const returnedQty = await getReturnedQtyForCostLayer(tx, li.id)
@@ -1567,7 +1495,7 @@ async function recalculateManufacturingCostLayers(
     }
 
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
-    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, { recalcRunId })
+    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id)
     // audit-3aph: the shipment path owns the sold-finished-goods COGS revaluation
     // (COGS_REVERSAL now / daily batch later), so subtract it from the reclass
     // journal's COGS leg to avoid double-posting COGS for sold units.
@@ -1663,11 +1591,7 @@ export async function updateManufacturingCostLines(
       // then queue the reclass journal IN-TX so the cost-layer change and
       // the GL post are durable atomically.
       if (po.status === 'COMPLETED') {
-        // One nonce per cost-edit run, shared by the shipment COGS_REVERSAL (inside
-        // the recalc) and the MANUFACTURING_RECLASS key below, so an A→B→A edit
-        // posts/dedups both together (cogs-audit scjz.33).
-        const recalcRunId = randomUUID()
-        const deltas = await recalculateManufacturingCostLayers(tx, productionOrderId, recalcRunId)
+        const deltas = await recalculateManufacturingCostLayers(tx, productionOrderId)
         cogsDeltaBase = deltas.cogsDeltaBase
         inventoryDeltaBase = deltas.inventoryDeltaBase
 
@@ -1720,7 +1644,6 @@ export async function updateManufacturingCostLines(
               })),
               cogsDeltaBase,
               inventoryDeltaBase,
-              recalcRunId,
             })}`
             await queueAccountingSyncTx(tx, {
               type: 'MANUFACTURING_RECLASS',

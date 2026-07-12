@@ -4,7 +4,6 @@ import { useState, useTransition, useEffect } from 'react'
 import Link from 'next/link'
 import type { SoRow, SoStatus } from '@/app/actions/sales'
 import { getSalesOrders } from '@/app/actions/sales'
-import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
@@ -29,6 +28,8 @@ const STATUS_LABELS: Record<SoStatus, string> = {
   COMPLETED: 'Completed',
   DELIVERED: 'Delivered',
   CANCELLED: 'Cancelled',
+  REFUNDED: 'Refunded',
+  PARTIALLY_REFUNDED: 'Part. Refunded',
 }
 
 const STATUS_CLASS: Record<SoStatus, string> = {
@@ -43,6 +44,8 @@ const STATUS_CLASS: Record<SoStatus, string> = {
   COMPLETED: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200',
   DELIVERED: 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-900 dark:text-emerald-200',
   CANCELLED: 'text-destructive border-destructive/30',
+  REFUNDED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
+  PARTIALLY_REFUNDED: 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900 dark:text-orange-200',
 }
 
 const FILTER_STATUSES: SoStatus[] = ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED']
@@ -63,7 +66,7 @@ function timeAgo(iso: string): string {
 
 type ColKey = 'order' | 'customer' | 'status' | 'total' | 'warehouse' | 'created' | 'items'
   | 'source' | 'country' | 'payment' | 'shipping' | 'orderDate' | 'shippedDate'
-  | 'deliveredDate' | 'invoiceStatus' | 'stockStatus' | 'cogs' | 'profit' | 'wms' | 'wmsPush'
+  | 'deliveredDate' | 'invoiceStatus' | 'stockStatus' | 'cogs' | 'profit'
 
 type ColDef = { key: ColKey; label: string; align?: 'right' }
 
@@ -86,20 +89,7 @@ const ALL_COLUMNS: ColDef[] = [
   { key: 'stockStatus', label: 'Stock Status' },
   { key: 'cogs', label: 'COGS', align: 'right' },
   { key: 'profit', label: 'Profit %', align: 'right' },
-  { key: 'wms', label: 'WMS Status' },
-  { key: 'wmsPush', label: 'WMS Dispatch' },
 ]
-
-const WMS_PUSH_TONE: Record<string, string> = {
-  SYNCED: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
-  PENDING_CREATE: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200',
-  HELD: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200',
-  CANCELLED: 'bg-muted text-muted-foreground',
-  DEAD_LETTER: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
-}
-const WMS_PUSH_LABEL: Record<string, string> = {
-  SYNCED: 'Pushed', PENDING_CREATE: 'Queued', PENDING_CANCEL: 'Cancelling', HELD: 'Held', CANCELLED: 'Cancelled', DEAD_LETTER: 'Failed',
-}
 
 const DEFAULT_VISIBLE: ColKey[] = ['order', 'customer', 'status', 'total', 'warehouse', 'created', 'items']
 const FIXED_COLS: ColKey[] = ['order']
@@ -124,9 +114,8 @@ function loadCols(): ColKey[] {
 // ---------------------------------------------------------------------------
 
 function invoiceStatus(so: SoRow): { label: string; cls: string } {
-  // Refund state is orthogonal to the lifecycle status now — read refundStatus.
-  if (so.refundStatus === 'FULL') return { label: 'Refunded', cls: 'bg-red-100 text-red-800' }
-  if (so.refundStatus === 'PARTIAL') return { label: 'Part. Refunded', cls: 'bg-orange-100 text-orange-800' }
+  if (so.status === 'REFUNDED') return { label: 'Refunded', cls: 'bg-red-100 text-red-800' }
+  if (so.status === 'PARTIALLY_REFUNDED') return { label: 'Part. Refunded', cls: 'bg-orange-100 text-orange-800' }
   if (so.paidAt) return { label: 'Paid', cls: 'bg-green-100 text-green-800' }
   if (so.invoiceNumber) return { label: 'Invoiced', cls: 'bg-purple-100 text-purple-800' }
   return { label: 'Pending', cls: 'bg-gray-100 text-gray-800' }
@@ -339,27 +328,6 @@ export function SoListClient({ initialOrders, currencySymbols = {}, currencyPosi
           </TableCell>
         )
       }
-      case 'wms':
-        return (
-          <TableCell key={key}>
-            {so.wmsStatus ? <WmsOrderStatusChip status={so.wmsStatus} /> : <span className="text-muted-foreground text-xs">—</span>}
-          </TableCell>
-        )
-      case 'wmsPush':
-        return (
-          <TableCell key={key}>
-            {so.wmsPush ? (
-              <span
-                className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${WMS_PUSH_TONE[so.wmsPush.state] ?? 'bg-muted text-muted-foreground'}`}
-                title={so.wmsPush.lastError ?? undefined}
-              >
-                {WMS_PUSH_LABEL[so.wmsPush.state] ?? so.wmsPush.state}
-              </span>
-            ) : (
-              <span className="text-muted-foreground text-xs">—</span>
-            )}
-          </TableCell>
-        )
     }
   }
 

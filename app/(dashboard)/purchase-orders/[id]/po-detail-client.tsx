@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useEffect, useMemo, useRef } from 'react'
+import { useState, useTransition, useEffect, useMemo } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink, CreditCard, CheckCircle2, AlertTriangle } from 'lucide-react'
@@ -34,10 +34,10 @@ import {
   type InvoiceRow,
 } from '@/app/actions/purchase-orders'
 import type {
-  WmsCreateAsnInput,
-  WmsPurchaseOrderAsnState,
-} from '@/lib/connectors/wms/asn-types'
-import { createWmsPurchaseOrderAsn } from '@/app/actions/wms-asn'
+  MintsoftCreatePurchaseOrderAsnInput,
+  MintsoftPurchaseOrderAsnState,
+} from '@/app/actions/mintsoft-sync'
+import { createMintsoftPurchaseOrderAsn } from '@/app/actions/mintsoft-sync'
 import { getTrackingUrl } from '@/lib/tracking'
 import type { AccountingBankAccount } from '@/lib/accounting'
 import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accounting/rejected-sync-warnings'
@@ -70,7 +70,7 @@ type Props = {
   companyHomeCountry?: string | null
   accountingAvailable: boolean
   accountingBillUrlTemplate: string
-  wmsAsnState: WmsPurchaseOrderAsnState
+  mintsoftAsnState: MintsoftPurchaseOrderAsnState
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
   overBilling: PurchaseOrderOverBillingSummary
   prepaidReconciliation: PrepaidReconciliationSummary
@@ -142,10 +142,6 @@ function ReceiveDialog({
   const [error, setError] = useState('')
   // audit-H7: require explicit confirmation when receiving into a non-destination warehouse.
   const [confirmDivergence, setConfirmDivergence] = useState(false)
-  // opys: stable idempotency token for this receive submission. Created lazily on
-  // first submit and reused across double-clicks / retries so the server dedups a
-  // double-booked receipt; reset only after a confirmed success.
-  const idempotencyTokenRef = useRef<string | null>(null)
 
   const defaultWarehouseId = po.destinationWarehouseId ?? warehouses[0]?.id ?? ''
   const destinationWarehouseName = po.destinationWarehouseId
@@ -196,9 +192,6 @@ function ReceiveDialog({
       return
     }
 
-    if (!idempotencyTokenRef.current) {
-      idempotencyTokenRef.current = crypto.randomUUID()
-    }
     startTransition(async () => {
       const result = await receivePurchaseOrder(
         po.id,
@@ -208,13 +201,9 @@ function ReceiveDialog({
           warehouseId: l.warehouseId,
         })),
         receiptNotes || undefined,
-        {
-          confirmWarehouseDivergence: confirmDivergence,
-          idempotencyToken: idempotencyTokenRef.current ?? undefined,
-        },
+        { confirmWarehouseDivergence: confirmDivergence },
       )
       if (result.success) {
-        idempotencyTokenRef.current = null
         router.refresh()
         onClose()
       } else {
@@ -559,18 +548,16 @@ function ReturnDialog({
   )
 }
 
-function WmsAsnDialog({
+function MintsoftAsnDialog({
   po,
-  connectorLabel,
   onClose,
 }: {
   po: PoDetail
-  connectorLabel: string
   onClose: () => void
 }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
-  const [packagingType, setPackagingType] = useState<NonNullable<WmsCreateAsnInput['packagingType']>>('PARCEL')
+  const [packagingType, setPackagingType] = useState<NonNullable<MintsoftCreatePurchaseOrderAsnInput['packagingType']>>('PARCEL')
   const [packageCount, setPackageCount] = useState('1')
   const [eta, setEta] = useState(po.expectedDelivery?.slice(0, 10) ?? '')
   const [supplierReference, setSupplierReference] = useState(po.supplierRef ?? '')
@@ -590,14 +577,14 @@ function WmsAsnDialog({
     }
 
     startTransition(async () => {
-      const result = await createWmsPurchaseOrderAsn(po.id, {
+      const result = await createMintsoftPurchaseOrderAsn(po.id, {
         packagingType,
         packageCount: parsedPackageCount,
         eta: eta || null,
         supplierReference: supplierReference || null,
         carrier: carrier || null,
         autoCallback,
-      } satisfies WmsCreateAsnInput)
+      } satisfies MintsoftCreatePurchaseOrderAsnInput)
 
       if (result.success) {
         router.refresh()
@@ -605,7 +592,7 @@ function WmsAsnDialog({
         return
       }
 
-      setError(result.error ?? `Failed to create ${connectorLabel} ASN`)
+      setError(result.error ?? 'Failed to create Mintsoft ASN')
     })
   }
 
@@ -615,9 +602,9 @@ function WmsAsnDialog({
     }}>
       <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
         <DialogHeader>
-          <DialogTitle>Create {connectorLabel} ASN</DialogTitle>
+          <DialogTitle>Create Mintsoft ASN</DialogTitle>
           <DialogDescription>
-            {connectorLabel} will receive the PO&apos;s outstanding quantities in base stock units. The callback can be disabled if this warehouse is not ready to process booked-in webhooks yet.
+            Mintsoft will receive the PO&apos;s outstanding quantities in base stock units. The callback can be disabled if this warehouse is not ready to process booked-in webhooks yet.
           </DialogDescription>
         </DialogHeader>
 
@@ -643,9 +630,9 @@ function WmsAsnDialog({
 
           <div className="grid gap-3 md:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor="wmsPackagingType">Packaging Type</Label>
+              <Label htmlFor="mintsoftPackagingType">Packaging Type</Label>
               <Select
-                id="wmsPackagingType"
+                id="mintsoftPackagingType"
                 value={packagingType}
                 onChange={(event) => setPackagingType(event.target.value as typeof packagingType)}
                 className="h-9 rounded-md px-3"
@@ -656,9 +643,9 @@ function WmsAsnDialog({
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="wmsPackageCount">Package Count</Label>
+              <Label htmlFor="mintsoftPackageCount">Package Count</Label>
               <Input
-                id="wmsPackageCount"
+                id="mintsoftPackageCount"
                 type="number"
                 min={1}
                 step={1}
@@ -667,27 +654,27 @@ function WmsAsnDialog({
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="wmsEta">ETA</Label>
+              <Label htmlFor="mintsoftEta">ETA</Label>
               <Input
-                id="wmsEta"
+                id="mintsoftEta"
                 type="date"
                 value={eta}
                 onChange={(event) => setEta(event.target.value)}
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="wmsCarrier">Carrier</Label>
+              <Label htmlFor="mintsoftCarrier">Carrier</Label>
               <Input
-                id="wmsCarrier"
+                id="mintsoftCarrier"
                 value={carrier}
                 onChange={(event) => setCarrier(event.target.value)}
                 placeholder="e.g. DPD, DHL Freight"
               />
             </div>
             <div className="space-y-1.5 md:col-span-2">
-              <Label htmlFor="wmsSupplierReference">Supplier Reference</Label>
+              <Label htmlFor="mintsoftSupplierReference">Supplier Reference</Label>
               <Input
-                id="wmsSupplierReference"
+                id="mintsoftSupplierReference"
                 value={supplierReference}
                 onChange={(event) => setSupplierReference(event.target.value)}
                 placeholder="Optional supplier or shipment reference"
@@ -705,7 +692,7 @@ function WmsAsnDialog({
             <span>
               <span className="font-medium">Enable booked-in callback</span>
               <span className="block text-muted-foreground">
-                When enabled, {connectorLabel} will call back into IMS when the ASN is booked in so the PO receipt can be reconciled automatically.
+                When enabled, Mintsoft will call back into IMS when the ASN is booked in so the PO receipt can be reconciled automatically.
               </span>
             </span>
           </label>
@@ -717,7 +704,7 @@ function WmsAsnDialog({
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
           <Button onClick={handleConfirm} disabled={isPending}>
             {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            Create {connectorLabel} ASN
+            Create Mintsoft ASN
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1873,7 +1860,7 @@ function ShipDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1897,7 +1884,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const [showReturn, setShowReturn] = useState(false)
   const [showBill, setShowBill] = useState(false)
   const [showShip, setShowShip] = useState(false)
-  const [showWmsAsn, setShowWmsAsn] = useState(false)
+  const [showMintsoftAsn, setShowMintsoftAsn] = useState(false)
   const [showEditTracking, setShowEditTracking] = useState(false)
   const [showEditFreight, setShowEditFreight] = useState(false)
   const [showReceipts, setShowReceipts] = useState(false)
@@ -2064,15 +2051,15 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               <PackageCheck className="h-4 w-4 mr-1" />Receive Goods
             </Button>
           )}
-          {wmsAsnState.pluginEnabled && wmsAsnState.canManage && (
+          {mintsoftAsnState.pluginEnabled && mintsoftAsnState.canManage && (
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setShowWmsAsn(true)}
-              disabled={isPending || !wmsAsnState.canCreate}
-              title={wmsAsnState.canCreate ? undefined : (wmsAsnState.blockedReason ?? undefined)}
+              onClick={() => setShowMintsoftAsn(true)}
+              disabled={isPending || !mintsoftAsnState.canCreate}
+              title={mintsoftAsnState.canCreate ? undefined : (mintsoftAsnState.blockedReason ?? undefined)}
             >
-              <Upload className="h-4 w-4 mr-1" />Create {wmsAsnState.connectorLabel} ASN
+              <Upload className="h-4 w-4 mr-1" />Create Mintsoft ASN
             </Button>
           )}
           {canReturn && hasReturnable && (
@@ -2301,23 +2288,23 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
         />
       )}
 
-      {(wmsAsnState.pluginEnabled || wmsAsnState.existingAsns.length > 0) && (
+      {(mintsoftAsnState.pluginEnabled || mintsoftAsnState.existingAsns.length > 0) && (
         <div className="rounded-md border p-4 space-y-3">
           <div>
             <div>
-              <h2 className="text-sm font-medium">{wmsAsnState.connectorLabel} ASN</h2>
+              <h2 className="text-sm font-medium">Mintsoft ASN</h2>
               <p className="text-sm text-muted-foreground">
-                Destination warehouse: {wmsAsnState.destinationWarehouseCode ?? '—'}
-                {wmsAsnState.bindingExternalWarehouseId ? ` · ${wmsAsnState.connectorLabel} warehouse ${wmsAsnState.bindingExternalWarehouseId}` : ''}
+                Destination warehouse: {mintsoftAsnState.destinationWarehouseCode ?? '—'}
+                {mintsoftAsnState.bindingExternalWarehouseId ? ` · Mintsoft warehouse ${mintsoftAsnState.bindingExternalWarehouseId}` : ''}
               </p>
             </div>
           </div>
 
-          {!wmsAsnState.canCreate && wmsAsnState.blockedReason && (
-            <p className="text-sm text-muted-foreground">{wmsAsnState.blockedReason}</p>
+          {!mintsoftAsnState.canCreate && mintsoftAsnState.blockedReason && (
+            <p className="text-sm text-muted-foreground">{mintsoftAsnState.blockedReason}</p>
           )}
 
-          {wmsAsnState.existingAsns.length > 0 ? (
+          {mintsoftAsnState.existingAsns.length > 0 ? (
             <Table className="min-w-[640px]">
               <TableHeader>
                 <TableRow>
@@ -2330,7 +2317,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {wmsAsnState.existingAsns.map((asn) => (
+                {mintsoftAsnState.existingAsns.map((asn) => (
                   <TableRow key={asn.id}>
                     <TableCell className="font-mono text-xs font-medium">{asn.externalAsnId}</TableCell>
                     <TableCell className="text-xs">
@@ -2350,7 +2337,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               </TableBody>
             </Table>
           ) : (
-            <p className="text-sm text-muted-foreground">No {wmsAsnState.connectorLabel} ASN has been created for this purchase order yet.</p>
+            <p className="text-sm text-muted-foreground">No Mintsoft ASN has been created for this purchase order yet.</p>
           )}
         </div>
       )}
@@ -2656,9 +2643,9 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
         <ReceiveDialog po={po} warehouses={warehouses} onClose={() => setShowReceive(false)} />
       )}
 
-      {/* WMS ASN dialog */}
-      {showWmsAsn && (
-        <WmsAsnDialog po={po} connectorLabel={wmsAsnState.connectorLabel} onClose={() => setShowWmsAsn(false)} />
+      {/* Mintsoft ASN dialog */}
+      {showMintsoftAsn && (
+        <MintsoftAsnDialog po={po} onClose={() => setShowMintsoftAsn(false)} />
       )}
 
       {/* Return dialog */}

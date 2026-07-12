@@ -1,5 +1,4 @@
 import type { WmsAsnLineRef, WmsAsnRef, WmsBundleComponent, WmsBundleRef, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
-import { clampCustomsDescription } from '@/lib/trade/customs-description'
 
 const ARRAY_PAYLOAD_KEYS = ['data', 'Data', 'items', 'Items', 'results', 'Results', 'warehouses', 'Warehouses', 'stockLevels', 'StockLevels', 'returns', 'Returns'] as const
 const ASN_ARRAY_PAYLOAD_KEYS = [...ARRAY_PAYLOAD_KEYS, 'lines', 'Lines', 'asnLines', 'AsnLines', 'orderItems', 'OrderItems'] as const
@@ -186,7 +185,7 @@ export function normalizeMintsoftProductPayload(value: unknown): Record<string, 
   const sku = getFirstString(record, STOCK_SKU_KEYS)
   const name = getFirstString(record, PRODUCT_NAME_KEYS)
   const barcode = getFirstString(record, PRODUCT_BARCODE_KEYS)
-  const customsDescription = clampCustomsDescription(getFirstString(record, ['customsDescription', 'CustomsDescription']))
+  const customsDescription = getFirstString(record, ['customsDescription', 'CustomsDescription'])
   const commodityCode = getFirstString(record, ['commodityCode', 'CommodityCode', 'code', 'Code'])
 
   if (sku) payload.SKU = sku

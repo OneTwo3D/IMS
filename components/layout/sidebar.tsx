@@ -16,7 +16,6 @@ import {
   HelpCircle,
   ChevronLeft,
   ChevronRight,
-  BadgeCheck,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { NavItem } from './nav-item'
@@ -29,7 +28,6 @@ import { getSidebarAnalyticsChildren } from '@/lib/sidebar/analytics-access'
 const STOCK_CONTROL_CHILDREN = [
   { href: '/stock-control/stock-adjustments', label: 'Stock Adjustments' },
   { href: '/stock-control/transfers',  label: 'Warehouse Transfers' },
-  { href: '/stock-control/stock-counts', label: 'Stock Counts' },
 ]
 
 const PURCHASES_CHILDREN = [
@@ -153,7 +151,6 @@ export function Sidebar({
       <nav className="flex flex-1 flex-col gap-1 overflow-y-auto p-2">
         {can('dashboard') && <NavItem href="/dashboard" label="Dashboard" icon={LayoutDashboard} collapsed={collapsed} onNavigate={onNavigate} />}
         {can('inventory') && <NavItem href="/inventory" label="Inventory" icon={Package} collapsed={collapsed} onNavigate={onNavigate} />}
-        {can('inventory.edit') && <NavItem href="/trade/hs-code-review" label="HS Code Review" icon={BadgeCheck} collapsed={collapsed} onNavigate={onNavigate} />}
         {can('stock_control') && (
           <NavGroup label="Stock Control" icon={Warehouse} items={STOCK_CONTROL_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}

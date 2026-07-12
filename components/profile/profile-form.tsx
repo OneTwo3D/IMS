@@ -1,7 +1,6 @@
 'use client'
 
-import { useState, useTransition, useRef, useEffect } from 'react'
-import { createPortal } from 'react-dom'
+import { useState, useTransition, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { Camera, Loader2, Check, X, KeyRound, User, Shield } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -48,12 +47,6 @@ export function ProfileForm({ user }: { user: UserData }) {
   const [pictureUrl, setPictureUrl] = useState(user.pictureUrl)
   const [uploading, setUploading] = useState(false)
   const [uploadMsg, setUploadMsg] = useState<{ text: string; isError: boolean } | null>(null)
-
-  // Save lives in the page header (top-right), portaled into a slot the page provides
-  const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
-  useEffect(() => {
-    setHeaderSlot(document.getElementById('profile-actions'))
-  }, [])
 
   const initials = name
     .split(' ')
@@ -133,21 +126,6 @@ export function ProfileForm({ user }: { user: UserData }) {
 
   return (
     <div className="space-y-6">
-      {headerSlot && createPortal(
-        <>
-          {profileMsg && (
-            <p className={`text-sm flex items-center gap-1 ${profileMsg.isError ? 'text-destructive' : 'text-green-600'}`}>
-              {profileMsg.isError ? <X className="h-3 w-3" /> : <Check className="h-3 w-3" />}
-              {profileMsg.text}
-            </p>
-          )}
-          <Button size="sm" onClick={handleSaveProfile} disabled={isPending}>
-            {isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
-            Save Changes
-          </Button>
-        </>,
-        headerSlot,
-      )}
       {/* Avatar section */}
       <Card className="p-6">
         <div className="flex items-center gap-6">
@@ -207,6 +185,18 @@ export function ProfileForm({ user }: { user: UserData }) {
             <Label>Role</Label>
             <Input value={ROLE_LABELS[user.role] ?? user.role} disabled className="h-9 bg-muted" />
           </div>
+        </div>
+        <div className="flex items-center gap-3 mt-4">
+          <Button size="sm" onClick={handleSaveProfile} disabled={isPending}>
+            {isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
+            Save Changes
+          </Button>
+          {profileMsg && (
+            <p className={`text-sm flex items-center gap-1 ${profileMsg.isError ? 'text-destructive' : 'text-green-600'}`}>
+              {profileMsg.isError ? <X className="h-3 w-3" /> : <Check className="h-3 w-3" />}
+              {profileMsg.text}
+            </p>
+          )}
         </div>
       </Card>
 

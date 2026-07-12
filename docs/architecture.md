@@ -54,9 +54,8 @@
 | `app/api/` | API Route Handlers — PDF generation, CSV export, cron endpoints, file uploads, webhooks |
 | `components/` | React components organised by module (auth, inventory, layout, profile, settings, ui) |
 | `lib/` | Shared utilities — database client, PDF generation, email templates, CSV handling, activity logging |
-| `lib/connectors/` | External system connectors behind connector-agnostic boundaries — shopping (WooCommerce, Shopify), accounting (Xero, QuickBooks), and WMS/3PL (Mintsoft). The WMS boundary is contract-enforced; see [`wms-connector-boundary.md`](./wms-connector-boundary.md) |
+| `lib/connectors/` | External system connectors (WooCommerce, with interfaces for Shopify, Xero, QuickBooks) |
 | `lib/connectors/woocommerce/` | WooCommerce connector module — order import, status sync, refund sync, product sync, stock sync |
-| `lib/connectors/wms/` | Connector-agnostic WMS contract + registry; `lib/connectors/mintsoft/` is the first implementation (stock sync, ASN, returns, order dispatch push) |
 | `prisma/` | Database schema, migrations, and seed data |
 | `help-docs/` | User-facing help articles rendered in the app |
 | `docs/` | Internal/admin/reference documentation kept in git only, plus repo copies of the user help docs |
@@ -435,12 +434,6 @@ WooCommerce integration is implemented as a modular connector in `lib/connectors
 - **Completion flow** — WC completed status triggers auto-allocation, shipment creation with tracking
 - **Webhook security** — HMAC verification using timing-safe comparison (`timingSafeEqual`)
 - **Customer invoice PDFs** — WooCommerce My Account buttons are rendered by the helper plugin after Woo verifies order ownership. The plugin signs a short-lived server-to-server request to IMS with `WC_INVOICE_PDF_SECRET`, which is intentionally separate from `WC_WEBHOOK_SECRET`. The plugin uses an admin-pinned IMS base URL and never follows per-order meta as a fetch URL; IMS order meta only signals `_ims_invoice_pdf_available=yes`.
-
-### Trade & customs classification
-
-HS/CN codes, customs descriptions, and country of origin flow through the product record and are declared to the WMS (`commodityCode`/`customsDescription`/`countryOfManufacture`) and forwarded to WooCommerce attributes. IMS already enforces the customs-critical invariants natively: fail-closed 2026 EU CN8 validation before a WMS push (`lib/trade/cn-validate.ts` — omit non-declarable codes + raise an `INVALID_HS_CODE` discrepancy), WC-authoritative trade-field propagation on import, and a China default for empty origin (`bhdm.1/.2/.3/.5`).
-
-**Decision (2026-07-03, bhdm.6): the AI HS-code classifier + human approval gate will be ported into IMS** rather than delegated to the hs-code-woo WordPress plugin. Rationale: IMS should own trade classification independent of WooCommerce so non-WC sales channels can obtain HS codes, and so the classifier/approval workflow lives beside the authoritative product record. This is a deliberate reversal of the earlier "hs-code-woo is the upstream brain" framing. **Interim state:** hs-code-woo remains the authoritative classifier and IMS consumes its approved codes via WC import until the IMS-native classifier ships; the fail-closed CN validation core (bhdm.3) is already reusable by it. The build is tracked as its own epic (AI classification, confidence bands/flags, human approval queue UI, background sweep).
 
 ### Integrations Dashboard
 

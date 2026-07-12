@@ -39,7 +39,6 @@ type SourceOrderRow = {
   orderNumber: string | null
   externalOrderNumber: string | null
   status: string
-  refundStatus: string
   revenueDeferredDate: Date | string | null
   inventoryAllocatedDate: Date | string | null
 }
@@ -57,11 +56,6 @@ type SourceRefundRow = {
   accountingCreditNoteId: string | null
   totalBase: DecimalLike
   accountingRetrySyncs: unknown
-  // scjz.70: revenue-only chargeback — credit note only, no COGS/unearned reversal.
-  // Optional: the Prisma select always provides it; absent is a normal refund.
-  chargeback?: boolean
-  // scjz.71: durable — whether a COGS/unearned reversal was staged for this refund.
-  reversalStaged?: boolean
 }
 
 type AccountingSyncLogRow = {
@@ -160,9 +154,8 @@ export const MAX_RECONCILIATION_FINDINGS_PER_RUN = 500
 
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
-// Refunded orders are picked up by the refundStatus OR-branch in the source query;
-// this set is now purely terminal lifecycle statuses.
-const TERMINAL_SALES_ORDER_STATUSES = ['CANCELLED', 'COMPLETED', 'DELIVERED'] as const
+const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'PARTIALLY_REFUNDED', 'CANCELLED', 'COMPLETED', 'DELIVERED'] as const
+const REFUNDED_SALES_ORDER_STATUSES = new Set(['REFUNDED', 'PARTIALLY_REFUNDED'])
 // PENDING/PROCESSING are intentional evidence: reconciliation distinguishes
 // "queued but not mirrored" from "no accounting path was ever scheduled".
 const LIVE_SYNC_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED'])
@@ -449,7 +442,7 @@ export function evaluateAccountingReconciliationRows(
       }
     }
 
-    if (order.refundStatus !== 'NONE') {
+    if (REFUNDED_SALES_ORDER_STATUSES.has(order.status)) {
       for (const refund of orderRefunds) {
         const hasCreditNoteEvidence = hasRefundCreditNoteEvidence(rows, refund)
         const hasReversalEvidence = hasRefundReversalEvidence(rows, refund)
@@ -470,13 +463,8 @@ export function evaluateAccountingReconciliationRows(
         }
 
         // Zero-total refunds post no COGS/unearned-revenue reversal; only
-        // positive-value refunds require reversal evidence. scjz.70/.71: a fully-shipped
-        // chargeback stages none (credit note only) so it is exempt; a partial/deferred
-        // chargeback that staged an UNEARNED_REV_REVERSAL still owes that evidence.
-        // reversalStaged is a DURABLE per-refund flag set at staging time
-        // (accountingRetrySyncs is cleared once syncs queue, so it can't carry this).
-        const chargebackExemptReversal = Boolean(refund.chargeback) && !refund.reversalStaged
-        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence && !chargebackExemptReversal) {
+        // positive-value refunds require reversal evidence.
+        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence) {
           findings.push({
             severity: 'critical',
             code: 'terminal_refunded_order_missing_reversal_evidence',
@@ -656,10 +644,6 @@ export async function collectAccountingReconciliationRows(
           { revenueDeferredDate: { gte: fromDate } },
           { inventoryAllocatedDate: { gte: fromDate } },
           { status: { in: [...TERMINAL_SALES_ORDER_STATUSES] }, updatedAt: { gte: fromDate } },
-          // Refund state is orthogonal to the lifecycle status now, so a recently
-          // refunded order may sit in a non-terminal status (e.g. PROCESSING). Always
-          // scan refunded orders so their credit-note/reversal evidence is checked.
-          { refundStatus: { not: 'NONE' }, updatedAt: { gte: fromDate } },
         ],
       },
       orderBy: { updatedAt: 'desc' },
@@ -669,7 +653,6 @@ export async function collectAccountingReconciliationRows(
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
-        refundStatus: true,
         revenueDeferredDate: true,
         inventoryAllocatedDate: true,
       },
@@ -697,8 +680,6 @@ export async function collectAccountingReconciliationRows(
         accountingCreditNoteId: true,
         totalBase: true,
         accountingRetrySyncs: true,
-        chargeback: true,
-        reversalStaged: true,
       },
     }),
     client.accountingSyncLog.findMany({

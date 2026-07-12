@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import {
-  BookOpen, Calculator, CalendarClock, Check, ExternalLink,
+  Boxes, BookOpen, Calculator, CalendarClock, Check, ExternalLink,
   Loader2, ShoppingCart, Store,
 } from 'lucide-react'
 import Link from 'next/link'
@@ -15,13 +15,12 @@ import { Switch } from '@/components/ui/switch'
 import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { saveShoppingConnectorCredentials, saveShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import { connectAccountingConnector, saveAccountingConnectionSettings } from '@/app/actions/accounting-sync'
+import { saveMintsoftConnectionSettings } from '@/app/actions/mintsoft-sync'
 import { saveOnboardingPluginState } from '@/app/actions/onboarding'
-import { WmsOnboardingConnection } from '@/components/onboarding/wms-onboarding-connection'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import type { ShoppingConnectorCredentials, ShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import type { AccountingConnectionStatus, AccountingConnectorId, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
-import type { WmsOnboardingConnectionData } from '@/app/actions/wms-onboarding'
+import type { MintsoftOnboardingConnectionData } from '@/app/actions/mintsoft-sync'
 import type { PublicAppUrlInfo } from '@/lib/public-app-url'
 
 type Props = {
@@ -30,14 +29,14 @@ type Props = {
   shopifyCredentials: ShopifyConnectorCredentials
   accountingSettings: AccountingConnectorSettingsMasked
   accountingStatus: AccountingConnectionStatus
-  wmsConnection: WmsOnboardingConnectionData
+  mintsoftConnection: MintsoftOnboardingConnectionData
   publicAppUrlInfo: PublicAppUrlInfo
   onPluginStateChange: (state: IntegrationPluginState) => void
   onConnectionStateChange: (state: {
     wc?: boolean
     shopify?: boolean
     accounting?: boolean
-    wms?: boolean
+    mintsoft?: boolean
   }) => void
   onReadyChange: (ready: boolean) => void
 }
@@ -48,7 +47,7 @@ export function IntegrationsStep({
   shopifyCredentials: initialShopifyCreds,
   accountingSettings: initialAccountingSettings,
   accountingStatus: initialAccountingStatus,
-  wmsConnection,
+  mintsoftConnection: initialMintsoftConnection,
   publicAppUrlInfo,
   onPluginStateChange,
   onConnectionStateChange,
@@ -73,8 +72,7 @@ export function IntegrationsStep({
   const [savingPlugins, setSavingPlugins] = useState(false)
   const [savingWc, setSavingWc] = useState(false)
   const [savingShopify, setSavingShopify] = useState(false)
-  const [wmsBusy, setWmsBusy] = useState(false)
-  const [wmsConnected, setWmsConnected] = useState(wmsConnection.configured)
+  const [savingMintsoft, setSavingMintsoft] = useState(false)
   const [savingAccountingConnection, setSavingAccountingConnection] = useState(false)
   const [connectingAccounting, setConnectingAccounting] = useState(false)
 
@@ -91,6 +89,15 @@ export function IntegrationsStep({
   const [shopifyWebhookSecret, setShopifyWebhookSecret] = useState(initialShopifyCreds.webhookSecretMasked ? '' : initialShopifyCreds.webhookSecret)
   const [shopifySaved, setShopifySaved] = useState(false)
   const [shopifyMessage, setShopifyMessage] = useState('')
+
+  // Mintsoft credentials
+  const [mintsoftBaseUrl, setMintsoftBaseUrl] = useState(initialMintsoftConnection.connection.baseUrl)
+  const [mintsoftUsername, setMintsoftUsername] = useState(initialMintsoftConnection.connection.username)
+  const [mintsoftPassword, setMintsoftPassword] = useState(initialMintsoftConnection.connection.passwordMasked ? '' : initialMintsoftConnection.connection.password)
+  const [mintsoftWebhookSecret, setMintsoftWebhookSecret] = useState(initialMintsoftConnection.connection.webhookSecretMasked ? '' : initialMintsoftConnection.connection.webhookSecret)
+  const [mintsoftOrderLookupConnector, setMintsoftOrderLookupConnector] = useState(initialMintsoftConnection.connection.orderLookupConnector)
+  const [mintsoftSaved, setMintsoftSaved] = useState(false)
+  const [mintsoftMessage, setMintsoftMessage] = useState('')
 
   // Accounting credentials
   const [acClientId, setAcClientId] = useState(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? initialAccountingSettings.quickbooks_client_id ?? '')
@@ -120,8 +127,12 @@ export function IntegrationsStep({
   }, [initialShopifyCreds])
 
   useEffect(() => {
-    setWmsConnected(wmsConnection.configured)
-  }, [wmsConnection.configured])
+    setMintsoftBaseUrl(initialMintsoftConnection.connection.baseUrl)
+    setMintsoftUsername(initialMintsoftConnection.connection.username)
+    setMintsoftPassword(initialMintsoftConnection.connection.passwordMasked ? '' : initialMintsoftConnection.connection.password)
+    setMintsoftWebhookSecret(initialMintsoftConnection.connection.webhookSecretMasked ? '' : initialMintsoftConnection.connection.webhookSecret)
+    setMintsoftOrderLookupConnector(initialMintsoftConnection.connection.orderLookupConnector)
+  }, [initialMintsoftConnection])
 
   useEffect(() => {
     setAcClientId(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? initialAccountingSettings.quickbooks_client_id ?? '')
@@ -168,7 +179,7 @@ export function IntegrationsStep({
       setSavingPlugins(false)
       setSavingWc(false)
       setSavingShopify(false)
-      setWmsBusy(false)
+      setSavingMintsoft(false)
     }
 
     window.addEventListener('pageshow', resetTransientBusyState)
@@ -196,7 +207,7 @@ export function IntegrationsStep({
   }
 
   function togglePlugin(key: keyof IntegrationPluginState, value: boolean) {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
+    if (savingPlugins || savingWc || savingShopify || savingMintsoft || savingAccountingConnection || connectingAccounting) return
     const previousPlugins = plugins
     const nextPlugins = buildNextPlugins(previousPlugins, key, value)
     setError('')
@@ -215,7 +226,7 @@ export function IntegrationsStep({
   }
 
   function handleSaveWcCredentials() {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
+    if (savingPlugins || savingWc || savingShopify || savingMintsoft || savingAccountingConnection || connectingAccounting) return
     setError('')
     setWcSaved(false)
     setWcMessage('')
@@ -241,7 +252,7 @@ export function IntegrationsStep({
   }
 
   function handleSaveShopifyCredentials() {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
+    if (savingPlugins || savingWc || savingShopify || savingMintsoft || savingAccountingConnection || connectingAccounting) return
     setError('')
     setShopifySaved(false)
     setShopifyMessage('')
@@ -266,8 +277,41 @@ export function IntegrationsStep({
     })()
   }
 
+  function handleSaveMintsoftConnection() {
+    if (savingPlugins || savingWc || savingShopify || savingMintsoft || savingAccountingConnection || connectingAccounting) return
+    setError('')
+    setMintsoftSaved(false)
+    setMintsoftMessage('')
+    setSavingMintsoft(true)
+    void (async () => {
+      try {
+        const result = await withStepUp(() => saveMintsoftConnectionSettings({
+          baseUrl: mintsoftBaseUrl,
+          username: mintsoftUsername,
+          password: mintsoftPassword,
+          webhookSecret: mintsoftWebhookSecret,
+          orderLookupConnector: mintsoftOrderLookupConnector,
+          active: true,
+        }))
+        if (!result.success) {
+          setError(result.error ?? 'Failed to save Mintsoft connection')
+          return
+        }
+        setMintsoftSaved(true)
+        setMintsoftMessage(result.message ?? 'Connection verified and saved.')
+        onConnectionStateChange({ mintsoft: true })
+        router.refresh()
+        setTimeout(() => setMintsoftSaved(false), 2000)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to save Mintsoft connection')
+      } finally {
+        setSavingMintsoft(false)
+      }
+    })()
+  }
+
   function handleSaveAccountingConnection() {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
+    if (savingPlugins || savingWc || savingShopify || savingMintsoft || savingAccountingConnection || connectingAccounting) return
     const selectedAccountingConnector: AccountingConnectorId = plugins.quickbooks ? 'quickbooks' : 'xero'
     const selectedAccountingLabel = selectedAccountingConnector === 'quickbooks' ? 'QuickBooks' : 'Xero'
     setError('')
@@ -294,7 +338,7 @@ export function IntegrationsStep({
   }
 
   function handleConnectAccounting() {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
+    if (savingPlugins || savingWc || savingShopify || savingMintsoft || savingAccountingConnection || connectingAccounting) return
     const selectedAccountingConnector: AccountingConnectorId = plugins.quickbooks ? 'quickbooks' : 'xero'
     const selectedAccountingLabel = selectedAccountingConnector === 'quickbooks' ? 'QuickBooks' : 'Xero'
     setError('')
@@ -326,35 +370,37 @@ export function IntegrationsStep({
 
   const hasShoppingConnector = plugins.woocommerce || plugins.shopify
   const hasAccountingConnector = plugins.xero || plugins.quickbooks
-  const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => plugins[id])
+  const hasWmsConnector = plugins.mintsoft
   const accountingLabel = plugins.quickbooks ? 'QuickBooks' : 'Xero'
   const hasPublicAppUrl = Boolean(publicAppUrlInfo.value)
   const hasSavedAccountingSecret = initialAccountingSettings.secretMasked
   const hasAccountingSecret = Boolean(acClientSecret.trim()) || hasSavedAccountingSecret
-  const busy = savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting
-  const availableWmsOrderLookupConnectors = [
+  const busy = savingPlugins || savingWc || savingShopify || savingMintsoft || savingAccountingConnection || connectingAccounting
+  const availableMintsoftOrderLookupConnectors = [
     plugins.woocommerce ? 'woocommerce' : null,
     plugins.shopify ? 'shopify' : null,
   ].filter((value): value is 'woocommerce' | 'shopify' => value !== null)
+  const mintsoftOrderLookupRequired = availableMintsoftOrderLookupConnectors.length > 1
   const wcConnected = wcSaved || (!!initialWcCreds.url && !!initialWcCreds.key && initialWcCreds.secretMasked)
   const shopifyConnected = shopifySaved || (!!initialShopifyCreds.storeDomain && initialShopifyCreds.accessTokenMasked)
   const accountingConnected = accountingConnectedLocal || initialAccountingStatus.connected
+  const mintsoftConnected = mintsoftSaved || initialMintsoftConnection.status.configured
   const wcConnectedLabel = wcUrl.trim() || initialWcCreds.url || 'WooCommerce store'
   const shopifyConnectedLabel = shopifyDomain.trim() || initialShopifyCreds.storeDomain || 'Shopify store'
   const accountingConnectedLabel = initialAccountingStatus.tenantName || accountingLabel
+  const mintsoftConnectedLabel = mintsoftUsername.trim() || mintsoftBaseUrl.trim() || 'Mintsoft account'
 
   useEffect(() => {
     const ready =
       (plugins.woocommerce ? wcConnected : true)
       && (plugins.shopify ? shopifyConnected : true)
       && ((plugins.xero || plugins.quickbooks) ? accountingConnected : true)
-      && (wmsEnabled ? wmsConnected : true)
-      && (plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || wmsEnabled)
+      && (plugins.mintsoft ? mintsoftConnected : true)
+      && (plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || plugins.mintsoft)
     onReadyChange(ready)
   }, [
     accountingConnected,
-    wmsConnected,
-    wmsEnabled,
+    mintsoftConnected,
     onReadyChange,
     plugins,
     shopifyConnected,
@@ -630,20 +676,107 @@ export function IntegrationsStep({
           </Card>
         )}
 
-        <WmsOnboardingConnection
-          data={wmsConnection}
-          enabled={plugins[wmsConnection.connectorId]}
-          busy={busy}
-          availableOrderLookupConnectors={availableWmsOrderLookupConnectors}
-          withStepUp={withStepUp}
-          onToggle={(value) => togglePlugin(wmsConnection.connectorId, value)}
-          onBusyChange={setWmsBusy}
-          onConnected={() => {
-            setWmsConnected(true)
-            onConnectionStateChange({ wms: true })
-          }}
-          onError={setError}
-        />
+        <label className="flex items-start gap-3 cursor-pointer rounded-lg border p-3 hover:bg-muted/50 transition-colors">
+          <Switch checked={plugins.mintsoft} onCheckedChange={(v) => togglePlugin('mintsoft', v)} className="mt-0.5" disabled={busy} />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <Boxes className="h-4 w-4 text-amber-600" />
+              <span className="text-sm font-medium">Mintsoft</span>
+            </div>
+            <p className="text-xs text-muted-foreground mt-0.5">Enable the Mintsoft WMS connector and warehouse binding tools</p>
+          </div>
+        </label>
+        {plugins.mintsoft && (
+          <Card className="p-4 space-y-4">
+            {mintsoftConnected ? (
+              <div className="flex items-center gap-2 rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-800">
+                <Check className="h-4 w-4" />
+                Connected to <strong>{mintsoftConnectedLabel}</strong>
+              </div>
+            ) : null}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5 sm:col-span-2">
+                <Label className="text-xs">Base URL</Label>
+                <Input
+                  value={mintsoftBaseUrl}
+                  onChange={(e) => setMintsoftBaseUrl(e.target.value)}
+                  placeholder="https://api.mintsoft.co.uk/"
+                  className="h-9"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Username</Label>
+                <Input
+                  value={mintsoftUsername}
+                  onChange={(e) => setMintsoftUsername(e.target.value)}
+                  placeholder="Mintsoft username"
+                  className="h-9"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Password</Label>
+                <Input
+                  type="password"
+                  value={mintsoftPassword}
+                  onChange={(e) => setMintsoftPassword(e.target.value)}
+                  placeholder={initialMintsoftConnection.connection.passwordMasked ? '••••••••' : 'Mintsoft password'}
+                  className="h-9"
+                />
+              </div>
+              <div className="space-y-1.5 sm:col-span-2">
+                <Label className="text-xs">Webhook Secret</Label>
+                <Input
+                  type="password"
+                  value={mintsoftWebhookSecret}
+                  onChange={(e) => setMintsoftWebhookSecret(e.target.value)}
+                  placeholder={initialMintsoftConnection.connection.webhookSecretMasked ? '••••••••' : 'Shared secret'}
+                  className="h-9"
+                />
+              </div>
+              <div className="space-y-1.5 sm:col-span-2">
+                <Label className="text-xs">Order Lookup Connector</Label>
+                <select
+                  value={mintsoftOrderLookupConnector}
+                  onChange={(e) => setMintsoftOrderLookupConnector(e.target.value as '' | 'woocommerce' | 'shopify')}
+                  className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                >
+                  <option value="">None</option>
+                  {availableMintsoftOrderLookupConnectors.includes('woocommerce') ? <option value="woocommerce">WooCommerce</option> : null}
+                  {availableMintsoftOrderLookupConnectors.includes('shopify') ? <option value="shopify">Shopify</option> : null}
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  {mintsoftOrderLookupRequired
+                    ? 'Required because more than one shopping connector is enabled.'
+                    : availableMintsoftOrderLookupConnectors.length === 0
+                      ? 'Optional. You can set this later after enabling a shopping connector.'
+                      : 'Used to resolve storefront order numbers on Mintsoft callbacks.'}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                type="button"
+                onClick={handleSaveMintsoftConnection}
+                disabled={busy || (mintsoftOrderLookupRequired && !mintsoftOrderLookupConnector)}
+                size="sm"
+              >
+                {savingMintsoft ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+                {mintsoftSaved ? <><Check className="h-4 w-4 mr-1" />Verified</> : 'Save & Test Connection'}
+              </Button>
+              {mintsoftMessage ? <span className="text-xs text-muted-foreground">{mintsoftMessage}</span> : null}
+              {initialMintsoftConnection.status.configured ? (
+                <span className="text-xs text-muted-foreground">Mintsoft connection is already configured.</span>
+              ) : null}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Warehouse bindings and stock-sync rules are configured after onboarding in{' '}
+              <Link href="/sync?connector=mintsoft" className="text-primary hover:underline inline-flex items-center gap-0.5">
+                Integrations <ExternalLink className="h-3 w-3" />
+              </Link>
+              .
+            </p>
+          </Card>
+        )}
 
       </div>
 
@@ -672,7 +805,7 @@ export function IntegrationsStep({
 
       {error && <p className="text-sm text-destructive">{error}</p>}
 
-      {!hasShoppingConnector && !hasAccountingConnector && !wmsEnabled && (
+      {!hasShoppingConnector && !hasAccountingConnector && !hasWmsConnector && (
         <p className="text-sm text-muted-foreground italic">
           No integrations selected. You can enable them at any time from Settings.
         </p>

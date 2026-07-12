@@ -5,9 +5,7 @@ import { db } from '@/lib/db'
 import { getProduct, getVariableProducts, listProductCategories, listProductSupplierOptions, updateProduct, getProductOptions, getProductSuppliers, getProductComponents, getKitStock } from '@/app/actions/products'
 import { getWarehouses, getActiveAdjustmentReasons } from '@/app/actions/stock'
 import { getStockUnitOptions } from '@/app/actions/settings'
-import { getPendingHsProposalForProduct } from '@/app/actions/hs-proposals'
 import { ProductForm } from '@/components/inventory/product-form'
-import { HsProposalPanel } from '@/components/inventory/hs-proposal-panel'
 import { StockAdjustmentForm } from '@/components/inventory/stock-adjustment-form'
 import { VariantGenerator } from '@/components/inventory/variant-generator'
 import { KitConfigurator } from '@/components/inventory/kit-configurator'
@@ -77,12 +75,11 @@ export default async function ProductDetailPage({
 
   const isKitOrBom = product.type === 'KIT' || product.type === 'BOM'
 
-  const [productOptions, suppliers, productComponents, kitStock, hsProposal] = await Promise.all([
+  const [productOptions, suppliers, productComponents, kitStock] = await Promise.all([
     product.type === 'VARIABLE' ? getProductOptions(id) : Promise.resolve([]),
     getProductSuppliers(id),
     isKitOrBom ? getProductComponents(id) : Promise.resolve([]),
     product.type === 'KIT' ? getKitStock(id) : Promise.resolve([]),
-    getPendingHsProposalForProduct(id),
   ])
 
   const hasStoreLink = await hasExternalProductLink(id)
@@ -100,8 +97,8 @@ export default async function ProductDetailPage({
 
   return (
     <div className="space-y-6">
-      {/* Breadcrumb + title — sticky so the Save action stays visible while scrolling */}
-      <div className="sticky top-0 z-10 -mx-3 sm:-mx-4 md:-mx-6 border-b bg-background/95 px-3 sm:px-4 md:px-6 py-3 backdrop-blur">
+      {/* Breadcrumb */}
+      <div>
         <nav className="flex items-center gap-1 text-sm text-muted-foreground mb-2">
           <Link href="/inventory" className="hover:text-foreground">Inventory</Link>
           {product.parentId && product.parentSku && (
@@ -133,8 +130,6 @@ export default async function ProductDetailPage({
               parentId={product.parentId}
             />
           )}
-          {/* Save (portaled here from the inline ProductForm) sits top-right on the name row */}
-          <div id="product-detail-actions" className="ml-auto flex items-center" />
         </div>
       </div>
 
@@ -158,7 +153,6 @@ export default async function ProductDetailPage({
                 barcode: product.barcode ?? undefined,
                 mpn: product.mpn ?? undefined,
                 hsCode: product.hsCode ?? undefined,
-                customsDescription: product.customsDescription ?? undefined,
                 countryOfOrigin: product.countryOfOrigin ?? undefined,
                 weight: product.weight ?? undefined,
                 imageUrl: product.imageUrl,
@@ -182,20 +176,6 @@ export default async function ProductDetailPage({
               inline
             />
           </Card>
-
-          {/* HS-code classification proposal (6igm.6) — classifiable product types only */}
-          {product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && (
-            <Card className="p-6">
-              <h2 className="text-base font-semibold mb-4">HS Code Classification</h2>
-              {/* key on the proposal identity + code so the editable input re-seeds after a
-                  Classify/Re-classify refresh (App Router preserves client state otherwise). */}
-              <HsProposalPanel
-                key={`${hsProposal?.id ?? 'none'}:${hsProposal?.proposedHsCode ?? ''}`}
-                productId={id}
-                proposal={hsProposal}
-              />
-            </Card>
-          )}
 
           {/* Variants + generator (for VARIABLE products) */}
           {product.type === 'VARIABLE' && (

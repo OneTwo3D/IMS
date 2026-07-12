@@ -172,7 +172,7 @@ test('all stock movement enum values are covered by the reporting value contract
 test('active stock movement writer files route reporting values through the helper', () => {
   const writerFilesByType: Partial<Record<StockMovementType, string[]>> = {
     ADJUSTMENT: ['app/actions/stock.ts', 'app/actions/purchase-orders.ts'],
-    OPENING_STOCK: ['lib/domain/inventory/opening-stock.ts'],
+    OPENING_STOCK: ['app/actions/stock.ts'],
     PRODUCTION_IN: ['app/actions/manufacturing.ts'],
     PRODUCTION_OUT: ['app/actions/manufacturing.ts'],
     PURCHASE_RECEIPT: ['app/actions/purchase-orders.ts', 'lib/domain/wms/booked-in-service.ts'],

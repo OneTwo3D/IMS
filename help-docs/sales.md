@@ -9,7 +9,6 @@ The sales order list provides a searchable, sortable overview of all orders.
 - **Search** by order reference, customer name, or other fields
 - **Filter by status** to focus on orders at a specific stage
 - **Export to CSV** for reporting or use in external tools
-- **WMS status** — when an order ships from a warehouse bound to a WMS (e.g. Mintsoft), a chip shows the WMS's fulfilment state (e.g. new, picking, dispatched, cancelled). The order detail page refreshes it live and deep-links to the order in the WMS admin; the list shows the most recent cached value. An order only pushes to the WMS once it is paid and ready to fulfil and dispatch push is enabled (see Settings → System → Scheduler).
 
 ## Creating a Sales Order
 
@@ -125,12 +124,6 @@ When the delivery tracking module is enabled (in **Settings > Sales**), the syst
 - **DELIVERED status** becomes available as the final order status
 
 See [Settings > Sales](#delivery-tracking-settings) for configuration details.
-
-## Dispatch Email (direct orders)
-
-Direct (non-storefront) orders can optionally email the customer a branded dispatch notification when the order transitions to SHIPPED. It includes the dispatched items, carrier and tracking number(s), and a tracking link, and is queued at most once per order. Storefront orders are excluded — the storefront sends its own dispatch email once IMS pushes tracking back.
-
-Off by default; enable in **Settings > Sales > Dispatch Email**. See [Documents & Email](documents-email.md) for details.
 
 ## Refunds
 

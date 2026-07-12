@@ -2,25 +2,18 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
-import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
-import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { WMS_CONNECTOR_IDS, isWmsConnectorId } from '@/lib/connectors/wms/types'
-import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
-import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
   queueAccountingSync,
-  queueAccountingSyncTx,
   getAccountingSettings,
-  getActiveAccountingConnectorInfo,
   type AccountingSettings,
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { enqueueStockSync, pushOrderDeliveryMetadata, pushSalesOrderStatus } from '@/lib/shopping'
+import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import {
   resolveLineTaxRateBatch,
@@ -32,7 +25,7 @@ import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { decimalToNumber } from '@/lib/decimal'
-import { multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -42,9 +35,7 @@ import {
 } from '@/lib/accounting-fx'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
-  buildChargebackRefundLines,
   createSalesOrderRefund,
-  recordRefundCogsReversalFromSync,
   retrySalesOrderRefundAccounting,
   type CreatedRefundLine,
   type RefundAccountingSyncRequest,
@@ -82,7 +73,7 @@ export type SoStatus =
   | 'DRAFT' | 'PENDING_PAYMENT' | 'ON_HOLD'
   | 'PROCESSING' | 'ALLOCATED' | 'PICKING' | 'PACKING'
   | 'SHIPPED' | 'COMPLETED' | 'DELIVERED'
-  | 'CANCELLED'
+  | 'CANCELLED' | 'REFUNDED' | 'PARTIALLY_REFUNDED'
 
 export type SoLineRow = {
   id: string
@@ -120,7 +111,6 @@ export type SoRow = {
   hasExternalSource: boolean
   externalOrderDate: string | null
   status: SoStatus
-  refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
   currency: string
   fxRateToBase: number
   customerName: string | null
@@ -155,10 +145,6 @@ export type SoRow = {
   lineCount: number
   cogsBase: number | null
   profitMarginPercent: number | null
-  /** Cached live WMS order status (sales-list chip); null when none/disabled. */
-  wmsStatus: WmsOrderStatusView | null
-  /** Outbound WMS dispatch-push state (sales-list chip); null when never pushed. */
-  wmsPush: { state: string; lastError: string | null } | null
 }
 
 export type SoDetail = SoRow & {
@@ -176,12 +162,9 @@ export type SoDetail = SoRow & {
     payments: PaymentRow[]
     lines: {
       id: string
-      salesOrderLineId: string | null
       productId: string | null
       description: string
       qty: number
-      unitPriceForeign: number
-      totalForeign: number
       totalBase: number
     }[]
   }[]
@@ -386,7 +369,6 @@ const SO_SELECT = {
   },
   orderNumber: true,
   status: true,
-  refundStatus: true,
   currency: true,
   fxRateToBase: true,
   customerName: true,
@@ -418,24 +400,6 @@ const SO_SELECT = {
   paymentMethodTitle: true,
   externalCreatedAt: true,
   createdAt: true,
-  wmsOrderStatus: {
-    select: {
-      connector: true,
-      connectorLabel: true,
-      externalOrderId: true,
-      externalOrderNumber: true,
-      status: true,
-      statusLabel: true,
-      isSplit: true,
-      partCount: true,
-      isMerged: true,
-      mergedOrderNumbers: true,
-      deepLinkUrl: true,
-      trackingNumber: true,
-      carrier: true,
-    },
-  },
-  wmsOrderPush: { select: { state: true, lastError: true } },
   _count: { select: { lines: true } },
   lines: { select: { cogsBase: true } },
 } as const
@@ -446,7 +410,6 @@ function mapSoRow(so: {
   shoppingLinks: { connector: string; externalOrderId: string }[]
   orderNumber: string | null
   status: string
-  refundStatus: string
   currency: string
   fxRateToBase: unknown
   customerName: string | null
@@ -480,22 +443,6 @@ function mapSoRow(so: {
   createdAt: Date
   _count: { lines: number }
   lines: { cogsBase: unknown }[]
-  wmsOrderStatus: {
-    connector: string
-    connectorLabel: string
-    externalOrderId: string
-    externalOrderNumber: string
-    status: string
-    statusLabel: string
-    isSplit: boolean
-    partCount: number | null
-    isMerged: boolean
-    mergedOrderNumbers: string[]
-    deepLinkUrl: string | null
-    trackingNumber: string | null
-    carrier: string | null
-  } | null
-  wmsOrderPush: { state: string; lastError: string | null } | null
 }): SoRow {
   const totalBase = Number(so.totalBase)
   const lineCogs = so.lines.map((l) => l.cogsBase != null ? Number(l.cogsBase) : null)
@@ -506,27 +453,8 @@ function mapSoRow(so: {
     : null
   const externalLink = so.shoppingLinks[0] ?? null
   const hasExternalSource = !!externalLink
-  const wms = so.wmsOrderStatus
   return {
     id: so.id,
-    wmsPush: so.wmsOrderPush ? { state: so.wmsOrderPush.state, lastError: so.wmsOrderPush.lastError } : null,
-    wmsStatus: wms
-      ? {
-          connectorLabel: wms.connectorLabel,
-          externalOrderId: wms.externalOrderId,
-          externalOrderNumber: wms.externalOrderNumber,
-          status: wms.status,
-          statusLabel: wms.statusLabel,
-          isSplit: wms.isSplit,
-          partCount: wms.partCount,
-          isMerged: wms.isMerged,
-          mergedOrderNumbers: wms.mergedOrderNumbers,
-          deepLinkUrl: wms.deepLinkUrl,
-          tracking: wms.trackingNumber || wms.carrier
-            ? [{ trackingNumber: wms.trackingNumber, carrier: wms.carrier, despatchedAt: null }]
-            : [],
-        }
-      : null,
     externalOrderId: externalLink?.externalOrderId ?? null,
     externalOrderNumber: so.externalOrderNumber,
     orderNumber: so.orderNumber,
@@ -535,7 +463,6 @@ function mapSoRow(so: {
     hasExternalSource,
     externalOrderDate: so.externalCreatedAt?.toISOString() ?? null,
     status: so.status as SoStatus,
-    refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
     currency: so.currency,
     fxRateToBase: Number(so.fxRateToBase),
     customerName: so.customerName,
@@ -629,26 +556,13 @@ export async function getSalesOrders(
   if (!opts?.includeCompleted) {
     where.status = { notIn: ['COMPLETED', 'DELIVERED'] }
   }
-  const [orders, pluginState] = await Promise.all([
-    db.salesOrder.findMany({
-      where,
-      select: SO_SELECT,
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-    }),
-    getIntegrationPluginState(),
-  ])
-  const activeWmsConnector = WMS_CONNECTOR_IDS.find((id) => pluginState[id]) ?? null
-  return orders.map((order) => {
-    const row = mapSoRow(order)
-    // Only surface a cached chip from the currently-active WMS connector, so
-    // disabling/switching the connector clears stale chips (matching the live
-    // detail view, which returns null when no WMS connector is enabled).
-    if (row.wmsStatus && order.wmsOrderStatus?.connector !== activeWmsConnector) {
-      row.wmsStatus = null
-    }
-    return row
+  const orders = await db.salesOrder.findMany({
+    where,
+    select: SO_SELECT,
+    orderBy: { createdAt: 'desc' },
+    take: limit,
   })
+  return orders.map(mapSoRow)
 }
 
 export async function getSalesOrder(id: string): Promise<SoDetail | null> {
@@ -675,7 +589,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,
           lines: {
-            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true },
+            select: { id: true, productId: true, description: true, qty: true, totalBase: true },
           },
           payments: {
             select: { id: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
@@ -711,12 +625,9 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       })),
       lines: r.lines.map((rl) => ({
         id: rl.id,
-        salesOrderLineId: rl.salesOrderLineId,
         productId: rl.productId,
         description: rl.description,
         qty: Number(rl.qty),
-        unitPriceForeign: Number(rl.unitPriceForeign),
-        totalForeign: Number(rl.totalForeign),
         totalBase: Number(rl.totalBase),
       })),
     })),
@@ -1341,9 +1252,7 @@ export async function applySalesOrderStatusTransition(
         paidAt: true,
         invoiceNumber: true,
         currency: true,
-        // b8i6.1: detect a shopping order via ANY connector (not just WooCommerce)
-        // so a Shopify-linked order also gets its IMS status pushed back.
-        shoppingLinks: { select: { id: true }, take: 1 },
+        shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
         lines: { select: { id: true, productId: true, sku: true, qty: true } },
       },
     })
@@ -1513,11 +1422,6 @@ export async function applySalesOrderStatusTransition(
       if (trigger?.value === 'on_shipped') {
         await generateInvoiceNumber(id, { skipLog: true })
       }
-      // Direct (non-storefront) orders: courtesy dispatch email, opt-in and
-      // queued at most once per order. Self-guarded (order must be SHIPPED,
-      // dedup under the order row lock) and never throws.
-      const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
-      await queueDispatchEmailIfEligible(id)
     }
 
     revalidatePath('/sales')
@@ -1533,22 +1437,18 @@ export async function applySalesOrderStatusTransition(
       metadata: { orderNumber: statusOrderRef, previousStatus: previousStatusForLog, newStatus: targetStatus },
     })
 
-    // Push status back to the order's shopping connector(s) (fire-and-forget).
-    // b8i6.1: routed through the facade so it dispatches to the order's actual
-    // connector (WooCommerce pushes; Shopify is skipped until it gains a push).
+    // Push status to WooCommerce (fire-and-forget)
     if ((options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0) {
-      pushSalesOrderStatus(id, targetStatus)
-        .then((res) => {
-          if (!res.success) throw new Error(res.error ?? 'unknown error')
-        })
+      import('@/lib/connectors/woocommerce/sync/order-status')
+        .then((m) => m.pushImsStatusToWc(id, targetStatus as never))
         .catch(async (syncError) => {
           await logActivity({
             entityType: 'SALES_ORDER',
             entityId: id,
-            action: 'shopping_status_push_failed',
+            action: 'wc_status_push_failed',
             tag: 'sync',
             level: 'WARNING',
-            description: `Failed to push status ${targetStatus} for order ${getSalesOrderReference(so)} to shopping connector: ${syncError instanceof Error ? syncError.message : String(syncError)}`,
+            description: `Failed to push status ${targetStatus} for order ${getSalesOrderReference(so)} to WooCommerce: ${syncError instanceof Error ? syncError.message : String(syncError)}`,
             metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: String(syncError) },
           })
         })
@@ -1685,9 +1585,7 @@ async function queueRefundAccountingActions(input: {
           : (line.qty > 0 ? line.unitPriceForeign : line.totalForeign),
         accountCode: line.lineKind === 'shipping'
           ? (settings.shippingAccount || settings.salesAccount)
-          : line.lineKind === 'discount'
-            ? (settings.discountAccount || settings.salesAccount)
-            : settings.salesAccount,
+          : settings.salesAccount,
         taxType: (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined) ?? fallbackCnTaxType,
       })),
       lineAmountsIncludeTax: false,
@@ -1696,22 +1594,7 @@ async function queueRefundAccountingActions(input: {
   })
 
   for (const sync of input.accountingSyncs) {
-    if (sync.type === 'COGS_REVERSAL') {
-      // bcz9.4: queue the COGS_REVERSAL journal and record its COGS subledger row in
-      // ONE transaction. Recording at queue time (not at refund staging) guarantees the
-      // negative ledger row exists only once the GL reversal is durably queued, so the
-      // daily-batch COGS reconciliation can't sweep a not-yet-queued reversal as rounding
-      // and then double-count it when a retry posts the real journal (Codex PR #353 F5).
-      // Idempotent on the sync key, so initial + retry record exactly once.
-      await db.$transaction(async (tx) => {
-        // Record based on the queue's OWN decision (not a separate settings recheck) so
-        // a connector/setting flip between the two can't desync queue vs ledger (Codex).
-        const queued = await queueAccountingSyncTx(tx, sync)
-        await recordRefundCogsReversalFromSync(tx, sync, queued)
-      })
-    } else {
-      await queueAccountingSync(sync)
-    }
+    await queueAccountingSync(sync)
   }
 }
 
@@ -1764,13 +1647,7 @@ async function loadRefundAccountingQueueInput(
       unitPriceBase: decimalToNumber(line.unitPriceBase),
       totalForeign: decimalToNumber(line.totalForeign),
       totalBase: decimalToNumber(line.totalBase),
-      // lineKind isn't persisted: a null-product line is shipping, UNLESS its total is
-      // negative — that's the mirrored order-discount line, which must reload as
-      // 'discount' so an accounting RETRY re-posts it to the discount account (not
-      // shipping). Matches the replay reconstruction in refund-service.
-      lineKind: line.productId
-        ? 'sale'
-        : (decimalToNumber(line.totalBase) < 0 ? 'discount' : 'shipping'),
+      lineKind: line.productId ? 'sale' : 'shipping',
     })),
     accountingSyncs,
   }
@@ -1804,7 +1681,7 @@ export async function createRefund(
   lines: RefundRequestLine[],
   reason: string,
   returnWarehouseId?: string,
-  options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
+  options?: { internalBypassToken?: symbol; externalRefundId?: number },
 ): Promise<{ success: boolean; error?: string; warning?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
@@ -1813,9 +1690,7 @@ export async function createRefund(
 
     const { getNumberingFormats } = await import('./company')
     const [numbering, accountingSettings] = await Promise.all([
-      // scjz.71: internal callers (the payment-poller chargeback) have no session, so
-      // pass the bypass through to skip getNumberingFormats' requireAuth (NEXT_REDIRECT).
-      getNumberingFormats(options?.internalBypassToken ? { internalBypassToken: options.internalBypassToken } : undefined),
+      getNumberingFormats(),
       getAccountingSettings().catch(() => null),
     ])
 
@@ -1827,10 +1702,6 @@ export async function createRefund(
       externalRefundId: options?.externalRefundId,
       creditNotePrefix: numbering.cn_prefix,
       accountingSettings,
-      // scjz.70: revenue-only chargeback (credit note reverses recognised revenue,
-      // COGS + restock suppressed). Used by the payment-poller on a payment reversal.
-      chargeback: options?.chargeback,
-      activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
     })
     if (!refundResult.success) return refundResult
 
@@ -1901,95 +1772,6 @@ export async function createRefund(
       await clearRefundAccountingRetryState(refundResult.createdRefund.id)
     }
 
-    // A refund reduces outstanding demand. For an already-allocated, not-yet-shipped order,
-    // re-run allocation so the refunded units' stock reservation is released — the allocator
-    // nets refunded qty (kit/BOM aware) and re-reserves only the remaining demand. Best-effort,
-    // and refuseIfShipmentsExist makes it a no-op once any shipment exists (the shipment build
-    // caps shippable qty net of refunds for those). Limited to PROCESSING/ALLOCATED so a refund
-    // can't promote a DRAFT/PENDING_PAYMENT order to ALLOCATED.
-    if (refundResult.so.status === 'PROCESSING' || refundResult.so.status === 'ALLOCATED') {
-      try {
-        const { autoAllocateOrder } = await import('./allocation')
-        await autoAllocateOrder(orderId, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true })
-      } catch (reallocationError) {
-        console.error(reallocationError)
-      }
-    }
-
-    // Propagate the refund to a WMS the order was already pushed to. The push sweep drives
-    // the automatic side: a full refund cancels the WMS order while it is still NEW; a
-    // partial refund's reduced line quantities are reconciled while NEW. Past NEW the WMS
-    // can no longer be cancelled/amended via API, so here we (a) drop an operator-facing
-    // comment on the WMS order itself so the warehouse sees the refund, and (b) keep the IMS
-    // activity-log breadcrumb for partial refunds. Only for newly-created refunds (not
-    // idempotent replays), best-effort so a transient failure can't fail a committed refund.
-    if (!refundResult.replayed) {
-      try {
-        const wmsLink = await db.wmsOrderPushLink.findUnique({
-          where: { orderId },
-          select: { state: true, connector: true, externalOrderId: true },
-        })
-        if (wmsLink?.state === 'SYNCED') {
-          const isFull = refundResult.newStatus === 'REFUNDED'
-          // A partial refund only affects WMS fulfilment when it reduces a sale line's
-          // quantity; amount-only partials (shipping / discount / goodwill) leave demand
-          // unchanged, so they need no WMS amendment, note, or operator query.
-          const reducesFulfilment = refundResult.createdRefundLines.some(
-            (line) => line.lineKind === 'sale' && line.qty > 0,
-          )
-          if (isFull || reducesFulfilment) {
-            const orderRef = refundResult.so.orderNumber ?? orderId
-            const creditNote = refundResult.creditNoteNumber
-
-            if (!isFull) {
-              await logActivity({
-                entityType: 'SALES_ORDER',
-                entityId: orderId,
-                action: 'wms_amendment_query_required',
-                tag: 'sync',
-                level: 'WARNING',
-                description: `Partial refund on order ${orderRef} already sent to ${wmsLink.connector} — line quantities are auto-amended in the WMS while the order is still NEW; if it has progressed past NEW, raise a line-item cancellation query in the WMS for the refunded items.`,
-                metadata: { connector: wmsLink.connector, creditNoteNumber: creditNote },
-              })
-            }
-
-            if (wmsLink.externalOrderId && isWmsConnectorId(wmsLink.connector)) {
-              const connector = getWmsConnector(wmsLink.connector)
-              if (connector.addOrderComment) {
-                const comment = isFull
-                  ? `IMS: Order fully refunded (credit note ${creditNote}). If not yet dispatched it will be cancelled automatically; if already in progress please treat this as a cancellation request / raise a cancellation query.`
-                  : `IMS: Partial refund (credit note ${creditNote}). Line quantities have been reduced — if the order is still amendable the items are updated automatically; otherwise please raise a line-item cancellation query for the refunded items.`
-                // q66in.4.6 audit timeline (Codex r1): the refund note is a WMS
-                // mutation outside the order-push sweep, so it records here.
-                try {
-                  await connector.addOrderComment(wmsLink.externalOrderId, comment)
-                  await recordWmsMutationEvent({
-                    connector: wmsLink.connector, direction: 'OUTBOUND', action: 'order_comment', outcome: 'SUCCEEDED',
-                    entityType: 'SALES_ORDER', entityId: orderId, externalId: wmsLink.externalOrderId,
-                    summary: `Refund note (credit note ${creditNote}) posted on WMS order ${orderRef}`,
-                    after: { comment },
-                    triggeredBy: 'refund',
-                  })
-                } catch (commentError) {
-                  await recordWmsMutationEvent({
-                    connector: wmsLink.connector, direction: 'OUTBOUND', action: 'order_comment', outcome: 'FAILED',
-                    entityType: 'SALES_ORDER', entityId: orderId, externalId: wmsLink.externalOrderId,
-                    summary: `Failed to post refund note (credit note ${creditNote}) on WMS order ${orderRef}`,
-                    after: { comment },
-                    error: commentError instanceof Error ? commentError.message : 'WMS comment failed',
-                    triggeredBy: 'refund',
-                  })
-                  throw commentError
-                }
-              }
-            }
-          }
-        }
-      } catch (wmsNotifyError) {
-        console.error(wmsNotifyError)
-      }
-    }
-
     if (returnWarehouseId && refundResult.returnedRows.length > 0) {
       for (const row of refundResult.returnedRows) {
         await logActivity({
@@ -2049,167 +1831,6 @@ export async function createRefund(
   }
 }
 
-/**
- * scjz.71: raise a revenue-only chargeback for an order whose payment was reversed
- * (detected by the payment-poller). Idempotent — at most one chargeback per order;
- * a second call (e.g. a later poll) is a no-op. Builds the full remaining-order
- * refund lines + shipping and runs the chargeback path (credit note reverses
- * recognised revenue against AR; COGS kept as a loss; no restock). Internal/cron
- * context, so it bypasses the interactive permission check.
- */
-export async function raiseChargebackForReversedOrder(
-  orderId: string,
-  options?: { internalBypassToken?: symbol },
-): Promise<{ raised: boolean; reason?: string; error?: string }> {
-  // SECURITY: this is a privileged path — it calls createRefund with
-  // INTERNAL_ACTION_BYPASS, skipping the sales.refund permission. As an export of a
-  // 'use server' module it is reachable as a Server Function via direct POST, so it
-  // must gate itself exactly like createRefund: the in-process payment-poller passes
-  // the unforgeable symbol token; any network caller (which cannot transmit a JS
-  // symbol over the RPC boundary) falls through to the sales.refund permission check.
-  if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
-    await requirePermission('sales.refund')
-  }
-  // Idempotency: one chargeback per order. A prior chargeback means the refund row
-  // already exists (avoids duplicate credit notes). BUT if that chargeback's
-  // accounting (credit-note / reversal staging) hasn't completed yet
-  // (accountingRetryRequired), the financial reversal is NOT done — surface an error
-  // so the payment poller holds paidAt and re-surfaces the failure instead of
-  // clearing payment state on an incomplete reversal. The refund-accounting retry
-  // sweep re-queues the credit note; once it succeeds the flag clears and a later
-  // poll returns the benign "already exists".
-  const existingChargeback = await db.salesOrderRefund.findFirst({
-    where: { orderId, chargeback: true },
-    select: { id: true, accountingRetryRequired: true },
-  })
-  if (existingChargeback) {
-    if (existingChargeback.accountingRetryRequired) {
-      return { raised: false, error: 'chargeback exists but its accounting reversal is still pending retry' }
-    }
-    return { raised: false, reason: 'chargeback already exists' }
-  }
-
-  const order = await db.salesOrder.findUnique({
-    where: { id: orderId },
-    select: {
-      shippingBase: true,
-      totalBase: true,
-      taxBase: true,
-      discountAmount: true,
-      fxRateToBase: true,
-      pricesIncludeVat: true,
-      taxRatePercent: true,
-      orderNumber: true,
-      externalOrderNumber: true,
-      lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
-      shipments: { select: { status: true, shipmentJournalDate: true } },
-      refunds: { select: { id: true } },
-    },
-  })
-  if (!order) return { raised: false, error: 'Order not found' }
-
-  // Codex P2: a chargeback marks the order REFUNDED and keeps the dispatched-stock
-  // COGS as a loss (no reversal). That is only correct once the dispatch has been
-  // journaled by the Group B daily batch — Group B EXCLUDES REFUNDED orders, so
-  // charging back a shipped-but-unjournaled order would mean its COGS never posts at
-  // all (and the allocation could be unwound as if the stock were still on hand).
-  // Defer until every shipped shipment is journaled: surface an error so the poller
-  // holds paidAt and re-attempts after the next Group B run posts the COGS.
-  if (order.shipments.some((s) => s.status === 'SHIPPED' && s.shipmentJournalDate == null)) {
-    return { raised: false, error: 'shipped quantity not yet journaled by the daily batch — deferring chargeback until COGS is posted' }
-  }
-
-  // A chargeback unwinds the WHOLE remaining order. Prior partial refunds make the
-  // remaining balance ambiguous — amount-only/ad-hoc refunds aren't tied to a line, a
-  // prior refund may have already reversed part of the discount/shipping, etc. — so the
-  // auto-mirror can over- or under-credit. Safe-skip any previously-refunded order to
-  // manual handling; the common chargeback case (payment reversal, no prior refund) is
-  // fully covered.
-  if (order.refunds.length > 0) {
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: 'chargeback_requires_manual_handling',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} that already has prior refunds — auto-chargeback skipped (remaining balance is ambiguous); raise the credit note manually.`,
-      resolveUser: false,
-    })
-    return { raised: false, reason: 'order has prior refunds — manual chargeback required' }
-  }
-
-  // scjz.71: chargeback lines are NET (ex-tax) — they match the credit note's net
-  // unitAmounts, and the credit note carries the order's per-line taxType
-  // (lineAmountsIncludeTax: false) so Xero grosses them back up to reverse the full
-  // tax-inclusive AR. createSalesOrderRefund compares the net refund total against the
-  // net order total for chargebacks so a full taxable unwind reads as REFUNDED.
-  // Taxable + non-taxable are both handled; non-taxable simply has taxBase 0.
-  // An order-level discount is mirrored as a separate negative discount line below
-  // (exactly as the invoice posted it), not spread across the goods.
-
-  // scjz.71: order-level discount handling mirrors the invoice. The invoice posts the
-  // discount as a SEPARATE negative line to settings.discountAccount only when that
-  // account is configured (otherwise it posted no discount line — full goods). And a
-  // discount combined with prior partial refunds makes the remaining discount basis
-  // ambiguous. Safe-skip both edge cases to manual; otherwise pass the discount through
-  // as its own mirrored line (in BASE currency = discountAmount / fxRateToBase).
-  let discountInput: { totalBase: number } | undefined
-  if (decimalToNumber(order.discountAmount) > 0) {
-    const cbSettings = await getAccountingSettings().catch(() => null)
-    // The invoice only posts a separate discount line when a discount account is
-    // configured (otherwise it posted full goods, no discount line). Without one we
-    // can't mirror it — safe-skip to manual. (Prior-refund orders were already skipped.)
-    if (!cbSettings?.discountAccount) {
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: orderId,
-        action: 'chargeback_requires_manual_handling',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} carrying an order-level discount but no discount account is configured — auto-chargeback skipped; raise the credit note manually.`,
-        resolveUser: false,
-      })
-      return { raised: false, reason: 'order-level discount but no discount account — manual chargeback required' }
-    }
-    // Convert to the NET (ex-VAT) basis the credit note posts on (lineAmountsIncludeTax
-    // is false). discountAmount is stored in the order's inclusive/exclusive convention,
-    // so strip VAT when the order is tax-inclusive, then to base currency.
-    const fxRate = decimalToNumber(order.fxRateToBase) || 1
-    const vatPct = decimalToNumber(order.taxRatePercent)
-    const discountForeignNet = order.pricesIncludeVat && vatPct > 0
-      ? decimalToNumber(order.discountAmount) / (1 + vatPct)
-      : decimalToNumber(order.discountAmount)
-    discountInput = { totalBase: discountForeignNet / fxRate }
-  }
-
-  const lines = buildChargebackRefundLines({
-    lines: order.lines.map((line) => ({
-      lineId: line.id,
-      productId: line.productId,
-      description: line.description,
-      qty: decimalToNumber(line.qty),
-      totalBase: decimalToNumber(line.totalBase),
-    })),
-    shipping: { totalBase: decimalToNumber(order.shippingBase) },
-    discount: discountInput,
-  })
-  if (lines.length === 0) return { raised: false, reason: 'nothing left to charge back' }
-
-  const result = await createRefund(orderId, lines, 'Payment reversed (chargeback)', undefined, {
-    internalBypassToken: INTERNAL_ACTION_BYPASS,
-    chargeback: true,
-  })
-  // A surfaced accounting warning means the refund row was created but its
-  // credit-note / reversal staging did not fully complete. Treat it as an error so
-  // the payment poller logs the failure and leaves paidAt set, rather than silently
-  // advancing as if the chargeback fully posted — the existing-chargeback pre-check
-  // would otherwise block any further automatic attempt. The refund's
-  // accountingRetryRequired flag still drives the refund-accounting retry sweep that
-  // re-queues the failed credit note.
-  if (result.warning) return { raised: false, error: result.warning }
-  return { raised: result.success, error: result.error }
-}
-
 export async function retryRefundAccounting(
   refundId: string,
 ): Promise<{ success: boolean; error?: string }> {
@@ -2220,7 +1841,6 @@ export async function retryRefundAccounting(
     const result = await retrySalesOrderRefundAccounting(db, {
       refundId,
       accountingSettings,
-      activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
     })
     if (!result.success) {
       const auditContext = await loadRefundAuditContext(refundId)
@@ -2650,18 +2270,16 @@ export async function addPayment(input: {
           orderNumber: true,
           externalOrderNumber: true,
           status: true,
-          refundStatus: true,
           currency: true,
           totalForeign: true,
-          totalBase: true,
           fxRateToBase: true,
           paidAt: true,
           invoiceNumber: true,
         },
       })
       if (!so) return { error: 'Order not found' }
-      if (so.status === 'CANCELLED' || so.refundStatus === 'FULL') {
-        return { error: `Cannot add payments to ${so.refundStatus === 'FULL' ? 'fully refunded' : so.status.toLowerCase()} orders` }
+      if (so.status === 'CANCELLED' || so.status === 'REFUNDED') {
+        return { error: `Cannot add payments to ${so.status.toLowerCase()} orders` }
       }
       if (input.currency !== so.currency) {
         return { error: `Payment currency must match order currency (${so.currency})` }
@@ -2766,12 +2384,6 @@ export async function addPayment(input: {
             amountForeign: input.amount,
             bookedRateToBase: Number(txResult.so.fxRateToBase),
             settlementRateToBase: txResult.settlementRateToBase,
-            // Booked base for this payment = the order's stored base prorated by the
-            // settled foreign share, so realised FX measures against the real AR
-            // carrying value rather than a re-derived figure (cogs-audit scjz.55).
-            bookedBase: Number(txResult.so.totalForeign) > 0
-              ? multiplyMoney(txResult.so.totalBase, input.amount).div(toDecimal(txResult.so.totalForeign)).toNumber()
-              : undefined,
           })
           const lines = buildRealisedFxJournal({
             side: 'receivable',

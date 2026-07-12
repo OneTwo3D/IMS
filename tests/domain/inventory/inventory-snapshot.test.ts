@@ -40,8 +40,6 @@ function createSnapshotClient(input: {
   productionUpdatedAt?: Date | null
   hasCommittedShipmentLine?: boolean
   hasAssemblyProductionOrder?: boolean
-  postBackfillRevaluationCount?: number
-  revaluations?: Array<{ effectiveAt: Date; costLayer: { productId: string; warehouseId: string } | null }>
   allocations?: Array<{
     id: string
     orderId: string
@@ -49,22 +47,15 @@ function createSnapshotClient(input: {
     productId: string
     warehouseId: string
     qty: Prisma.Decimal
-    order: { orderNumber: string | null; externalOrderNumber: string | null; expectedDelivery: Date | null; status: string; refundStatus: string }
+    order: { orderNumber: string | null; externalOrderNumber: string | null; expectedDelivery: Date | null; status: string }
     line: { sku: string | null; description: string }
   }>
-} = {}): InventorySnapshotTestClient & {
-  upserts: unknown[]
-  runUpserts: unknown[]
-  reservationUpserts: unknown[]
-  reservationRunUpserts: unknown[]
-} {
+} = {}): InventorySnapshotTestClient & { upserts: unknown[]; reservationUpserts: unknown[]; reservationRunUpserts: unknown[] } {
   const upserts: unknown[] = []
-  const runUpserts: unknown[] = []
   const reservationUpserts: unknown[] = []
   const reservationRunUpserts: unknown[] = []
   return {
     upserts,
-    runUpserts,
     reservationUpserts,
     reservationRunUpserts,
     salesOrder: {
@@ -79,10 +70,6 @@ function createSnapshotClient(input: {
     },
     costLayer: {
       findMany: async () => input.costLayers ?? [],
-    },
-    costLayerRevaluation: {
-      count: async () => input.postBackfillRevaluationCount ?? 0,
-      findMany: async () => input.revaluations ?? [],
     },
     stockMovement: {
       findMany: async (args) => {
@@ -112,12 +99,6 @@ function createSnapshotClient(input: {
       findMany: async () => input.averageRows ?? [],
       upsert: async (args) => {
         upserts.push(args)
-        return {}
-      },
-    },
-    inventorySnapshotRun: {
-      upsert: async (args) => {
-        runUpserts.push(args)
         return {}
       },
     },
@@ -212,7 +193,7 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('0.5'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'CONFIRMED', refundStatus: 'NONE' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'CONFIRMED' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -268,37 +249,6 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
       reservedQty: '0.5000',
       availableQty: '1.5000',
       reservationSourceCount: 1,
-    },
-  )
-  assert.equal(client.runUpserts.length, 1)
-  const runUpsert = client.runUpserts[0] as {
-    where: { snapshotDate: Date }
-    create: {
-      snapshotDate: Date
-      stockLevelCount: number
-      snapshotCount: number
-      source: string
-      checkMethod: string
-      cutoffAt: Date
-    }
-  }
-  assert.deepEqual(runUpsert.where, { snapshotDate: new Date('2026-05-28T00:00:00.000Z') })
-  assert.deepEqual(
-    {
-      snapshotDate: runUpsert.create.snapshotDate,
-      stockLevelCount: runUpsert.create.stockLevelCount,
-      snapshotCount: runUpsert.create.snapshotCount,
-      source: runUpsert.create.source,
-      checkMethod: runUpsert.create.checkMethod,
-      cutoffAt: runUpsert.create.cutoffAt,
-    },
-    {
-      snapshotDate: new Date('2026-05-28T00:00:00.000Z'),
-      stockLevelCount: 1,
-      snapshotCount: 1,
-      source: 'cron',
-      checkMethod: 'daily_current_state_v1',
-      cutoffAt: new Date('2026-05-29T00:00:00.000Z'),
     },
   )
   assert.equal(client.reservationRunUpserts.length, 1)
@@ -411,7 +361,6 @@ test('historical backfill replays later movements backwards from current state',
     daysWritten: 2,
     snapshotsWritten: 2,
     missingValueMovementCount: 0,
-    postBackfillRevaluationCount: 0,
     dryRun: false,
     valueReplayReliable: true,
     reservationBackfill: {
@@ -438,50 +387,6 @@ test('historical backfill replays later movements backwards from current state',
       { snapshotDate: '2026-05-27T00:00:00.000Z', qty: '12.0000', valueBase: '24.000000' },
     ],
   )
-  // A coverage marker is written per backfilled day so a future zero-stock date
-  // reconciles instead of reading as uncovered (scjz.60.5).
-  assert.deepEqual(
-    client.runUpserts.map((upsert) => {
-      const create = (upsert as {
-        create: { snapshotDate: Date; stockLevelCount: number; snapshotCount: number; source: string; checkMethod: string; cutoffAt: Date }
-      }).create
-      return {
-        snapshotDate: create.snapshotDate.toISOString(),
-        stockLevelCount: create.stockLevelCount,
-        snapshotCount: create.snapshotCount,
-        source: create.source,
-        checkMethod: create.checkMethod,
-        cutoffAt: create.cutoffAt.toISOString(),
-      }
-    }),
-    [
-      { snapshotDate: '2026-05-28T00:00:00.000Z', stockLevelCount: 1, snapshotCount: 1, source: 'backfill', checkMethod: 'aggregated_movement_replay_v1', cutoffAt: '2026-05-29T00:00:00.000Z' },
-      { snapshotDate: '2026-05-27T00:00:00.000Z', stockLevelCount: 1, snapshotCount: 1, source: 'backfill', checkMethod: 'aggregated_movement_replay_v1', cutoffAt: '2026-05-28T00:00:00.000Z' },
-    ],
-  )
-})
-
-test('backfill flags valueReplayReliable false when a layer was revalued after fromDate (scjz.48)', async () => {
-  const client = createSnapshotClient({
-    stockLevels: [
-      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') },
-    ],
-    costLayers: [
-      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('2') },
-    ],
-    // A cost-layer revaluation took effect after the backfill fromDate, so the
-    // current-layer-seeded historical values are not the basis valid then.
-    postBackfillRevaluationCount: 1,
-  })
-
-  const result = await backfillInventorySnapshots({
-    client,
-    fromDate: '2026-05-27',
-    toDate: '2026-05-28',
-  })
-
-  assert.equal(result.postBackfillRevaluationCount, 1)
-  assert.equal(result.valueReplayReliable, false)
 })
 
 test('reservation backfill writes sparse rows and run markers for reliable days', async () => {
@@ -501,7 +406,7 @@ test('reservation backfill writes sparse rows and run markers for reliable days'
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1.25'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -587,7 +492,7 @@ test('reservation backfill warns and skips run marker when source state changed 
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -634,7 +539,7 @@ test('reservation backfill checks each mutable reservation source path', async (
         productId: 'product-1',
         warehouseId: 'warehouse-1',
         qty: decimal('1'),
-        order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
+        order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
         line: { sku: 'SKU-1', description: 'Widget' },
       }],
     })
@@ -669,7 +574,7 @@ test('reservation backfill skips days when shipment-line history is not provable
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -702,7 +607,7 @@ test('reservation backfill skips days when assembly BOM component history is not
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -734,7 +639,7 @@ test('reservation backfill writes negative availability as evidence with a warni
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('2'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -773,7 +678,7 @@ test('reservation backfill handles mixed supported and unsupported days', async 
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -816,7 +721,7 @@ test('reservation backfill reruns are idempotent by snapshot date and stock pair
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -1038,7 +943,6 @@ test('historical backfill dry-run does not write and reports null-value movement
   })
 
   assert.equal(client.upserts.length, 0)
-  assert.equal(client.runUpserts.length, 0)
   assert.equal(result.dryRun, true)
   assert.equal(result.missingValueMovementCount, 1)
   assert.equal(result.valueReplayReliable, false)
@@ -1055,64 +959,6 @@ test('historical backfill dry-run does not write and reports null-value movement
   })
 })
 
-test('backfill marks days at/before a reversed null-value movement as not point-in-time reliable (scjz.43/.48)', async () => {
-  const client = createSnapshotClient({
-    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') }],
-    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('2') }],
-    movements: [
-      {
-        id: 'movement-null',
-        type: StockMovementType.SALE_DISPATCH,
-        productId: 'product-1',
-        fromWarehouseId: 'warehouse-1',
-        toWarehouseId: null,
-        qty: decimal('2'),
-        totalValueBase: null,
-        createdAt: new Date('2026-05-28T12:00:00.000Z'),
-      },
-    ],
-  })
-
-  await backfillInventorySnapshots({ client, fromDate: '2026-05-27', toDate: '2026-05-28' })
-
-  const byDate = new Map(
-    client.upserts.map((u) => {
-      const create = (u as { create: { snapshotDate: Date; valueReplayReliable: boolean } }).create
-      return [create.snapshotDate.toISOString().slice(0, 10), create.valueReplayReliable]
-    }),
-  )
-  // 05-28 written before the null movement is reversed → reliable; 05-27 written
-  // after it is reversed (baked into state) → unreliable.
-  assert.equal(byDate.get('2026-05-28'), true)
-  assert.equal(byDate.get('2026-05-27'), false)
-})
-
-test('backfill flags only the revalued product per (product,warehouse), not unrelated SKUs (scjz.43/.48)', async () => {
-  const client = createSnapshotClient({
-    stockLevels: [
-      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10') },
-      { productId: 'product-2', warehouseId: 'warehouse-1', quantity: decimal('5') },
-    ],
-    costLayers: [
-      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('10'), unitCostBase: decimal('2') },
-      { productId: 'product-2', warehouseId: 'warehouse-1', remainingQty: decimal('5'), unitCostBase: decimal('3') },
-    ],
-    // Only product-1 was revalued (after the backfill range).
-    revaluations: [{ effectiveAt: new Date('2026-05-29T00:00:00.000Z'), costLayer: { productId: 'product-1', warehouseId: 'warehouse-1' } }],
-  })
-
-  await backfillInventorySnapshots({ client, fromDate: '2026-05-27', toDate: '2026-05-28' })
-
-  const reliableByProduct = new Map(
-    client.upserts.map((u) => {
-      const create = (u as { create: { productId: string; valueReplayReliable: boolean } }).create
-      return [create.productId, create.valueReplayReliable]
-    }),
-  )
-  assert.equal(reliableByProduct.get('product-1'), false)
-  assert.equal(reliableByProduct.get('product-2'), true)
-})
-
 test('reservation backfill dry-run reports supported reservation work without writing rows or run markers', async () => {
   const client = createSnapshotClient({
     stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],
@@ -1124,7 +970,7 @@ test('reservation backfill dry-run reports supported reservation work without wr
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: decimal('1'),
-      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED', refundStatus: 'NONE' },
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
       line: { sku: 'SKU-1', description: 'Widget' },
     }],
   })
@@ -1164,32 +1010,17 @@ test('historical backfill rejects inverted and future date ranges', async () => 
   )
 })
 
-test('average inventory value divides by observed snapshot days, not calendar days (scjz.47)', async () => {
+test('average inventory value divides by calendar days and handles empty ranges', async () => {
   const client = createSnapshotClient({
     averageRows: [
       { snapshotDate: new Date('2026-05-27T00:00:00.000Z'), valueBase: decimal('100') },
     ],
   })
 
-  // One snapshot day in a 2-calendar-day range → average is 100/1, not 100/2.
-  // Calendar-day division understated the average when days lack snapshots.
   assert.equal(
     await getAverageInventoryValueBase({ client, fromDate: '2026-05-27', toDate: '2026-05-28' }),
-    '100.000000',
+    '50.000000',
   )
-
-  // Two distinct snapshot days → divide by 2.
-  const twoDayClient = createSnapshotClient({
-    averageRows: [
-      { snapshotDate: new Date('2026-05-27T00:00:00.000Z'), valueBase: decimal('100') },
-      { snapshotDate: new Date('2026-05-28T00:00:00.000Z'), valueBase: decimal('300') },
-    ],
-  })
-  assert.equal(
-    await getAverageInventoryValueBase({ client: twoDayClient, fromDate: '2026-05-27', toDate: '2026-05-31' }),
-    '200.000000',
-  )
-
   assert.equal(
     await getAverageInventoryValueBase({ client: createSnapshotClient(), fromDate: '2026-05-27', toDate: '2026-05-28' }),
     '0.000000',

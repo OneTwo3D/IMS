@@ -1,10 +1,9 @@
 import type { Metadata } from 'next'
-import { AlertTriangle, FileText, Mail, ShieldAlert, Truck } from 'lucide-react'
+import { AlertTriangle, FileText, ShieldAlert, Truck } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { getSetting } from '@/app/actions/settings'
 import { getRecentInvoicePdfTokenSecurityEvents, getRecentTaxRateFallbackEvents } from '@/app/actions/activity-log'
 import { InvoiceTriggerSetting } from '@/components/settings/invoice-trigger'
-import { DispatchEmailSetting } from '@/components/settings/dispatch-email'
 import { DeliveryTrackingSettings } from '@/components/settings/delivery-tracking'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { formatDateTime } from '@/lib/format-datetime'
@@ -15,7 +14,6 @@ export const metadata: Metadata = { title: 'Sales Settings' }
 export default async function SalesSettingsPage() {
   const [
     invoiceTrigger,
-    dispatchEmailEnabled,
     trackingEnabled,
     trackingSource,
     trackshipKey,
@@ -25,7 +23,6 @@ export default async function SalesSettingsPage() {
     recentInvoicePdfTokenSecurityEvents,
   ] = await Promise.all([
     getSetting('invoice_trigger'),
-    getSetting('dispatch_email_enabled'),
     getSetting('delivery_tracking_enabled'),
     getSetting('delivery_tracking_source'),
     getSetting('trackship_api_key'),
@@ -55,17 +52,6 @@ export default async function SalesSettingsPage() {
           Configure when sales order invoices are automatically generated.
         </p>
         <InvoiceTriggerSetting currentValue={invoiceTrigger ?? 'manual'} />
-      </Card>
-
-      <Card className="p-6">
-        <div className="flex items-center gap-2 mb-4">
-          <Mail className="h-4 w-4 text-muted-foreground" />
-          <h2 className="text-base font-semibold">Dispatch Email</h2>
-        </div>
-        <p className="text-sm text-muted-foreground mb-4">
-          Send direct (non-storefront) customers a dispatch notification with tracking when their order ships.
-        </p>
-        <DispatchEmailSetting currentValue={dispatchEmailEnabled ?? 'false'} />
       </Card>
 
       {woocommerceEnabled && (

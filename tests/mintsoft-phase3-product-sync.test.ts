@@ -158,10 +158,10 @@ test('buildMintsoftProductDto and hashMintsoftProductDto are stable for equivale
     id: 'prod-1',
     sku: 'SKU-1',
     name: 'Mintsoft Widget',
+    description: 'Warehouse safe description',
     barcode: '5012345678900',
     hsCode: '902000',
     countryOfOrigin: 'GB',
-    customsDescription: 'Cotton widget for customs',
     weight: { toString: () => '1.25', valueOf: () => 1.25 } as never,
     widthCm: { toString: () => '10', valueOf: () => 10 } as never,
     heightCm: { toString: () => '11', valueOf: () => 11 } as never,
@@ -175,7 +175,7 @@ test('buildMintsoftProductDto and hashMintsoftProductDto are stable for equivale
   assert.deepEqual(dto, {
     sku: 'SKU-1',
     name: 'Mintsoft Widget',
-    customsDescription: 'Cotton widget for customs',
+    customsDescription: 'Warehouse safe description',
     barcode: '5012345678900',
     commodityCode: '902000',
     countryOfManufacture: 'GB',
@@ -190,97 +190,6 @@ test('buildMintsoftProductDto and hashMintsoftProductDto are stable for equivale
     productSync.hashMintsoftProductDto(dto),
     productSync.hashMintsoftProductDto({ ...dto }),
   )
-})
-
-test('buildMintsoftProductDto never sends marketing copy as the customs description', () => {
-  const base = {
-    id: 'prod-2',
-    sku: 'SKU-2',
-    name: 'Customs Widget',
-    barcode: null,
-    hsCode: null,
-    countryOfOrigin: null,
-    weight: null,
-    widthCm: null,
-    heightCm: null,
-    depthCm: null,
-    imageUrl: null,
-    type: ProductType.SIMPLE,
-    lifecycleStatus: ProductLifecycleStatus.ACTIVE,
-    wmsProductLinks: [],
-  }
-
-  // Strict policy: only the dedicated customsDescription is sent; missing/blank -> null.
-  assert.equal(
-    productSync.buildMintsoftProductDto({ ...base, customsDescription: 'Real customs text' }).customsDescription,
-    'Real customs text',
-  )
-  assert.equal(
-    productSync.buildMintsoftProductDto({ ...base, customsDescription: null }).customsDescription,
-    null,
-  )
-  assert.equal(
-    productSync.buildMintsoftProductDto({ ...base, customsDescription: '   ' }).customsDescription,
-    null,
-  )
-})
-
-test('buildMintsoftProductDto defaults country of manufacture to CN when origin is empty', () => {
-  const base = {
-    id: 'prod-3',
-    sku: 'SKU-3',
-    name: 'Origin Widget',
-    barcode: null,
-    hsCode: null,
-    customsDescription: null,
-    weight: null,
-    widthCm: null,
-    heightCm: null,
-    depthCm: null,
-    imageUrl: null,
-    type: ProductType.SIMPLE,
-    lifecycleStatus: ProductLifecycleStatus.ACTIVE,
-    wmsProductLinks: [],
-  }
-
-  // No origin -> defaults to China (customs parity with hs-code-woo).
-  assert.equal(
-    productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: null }).countryOfManufacture,
-    'CN',
-  )
-  // A real origin is preserved untouched.
-  assert.equal(
-    productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: 'GB' }).countryOfManufacture,
-    'GB',
-  )
-})
-
-test('resolveMintsoftCommodityCode omits a non-declarable CN code and reports it', () => {
-  // Valid 2026 CN8 passes through untouched.
-  assert.deepEqual(productSync.resolveMintsoftCommodityCode('01012100'), {
-    commodityCode: '01012100',
-    invalidCnCode: null,
-  })
-  // Valid but punctuated code is normalised to canonical 8 digits, not omitted.
-  assert.deepEqual(productSync.resolveMintsoftCommodityCode('0101.2100'), {
-    commodityCode: '01012100',
-    invalidCnCode: null,
-  })
-  // Absent-from-2026 code is omitted and surfaced.
-  assert.deepEqual(productSync.resolveMintsoftCommodityCode('99999999'), {
-    commodityCode: null,
-    invalidCnCode: '99999999',
-  })
-  // Malformed (too short) code is omitted and surfaced.
-  assert.deepEqual(productSync.resolveMintsoftCommodityCode('9020'), {
-    commodityCode: null,
-    invalidCnCode: '9020',
-  })
-  // No code is a no-op (not a discrepancy).
-  assert.deepEqual(productSync.resolveMintsoftCommodityCode(null), {
-    commodityCode: null,
-    invalidCnCode: null,
-  })
 })
 
 test('isMintsoftProductEligible excludes parent and archived products', () => {

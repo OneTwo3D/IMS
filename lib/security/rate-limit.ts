@@ -61,29 +61,16 @@ export async function getRateLimitBackend(): Promise<RateLimitBackend> {
   return backendPromise
 }
 
-export type CheckRateLimitOptions = {
-  /**
-   * When true, a backend failure denies the request instead of allowing it.
-   * Use for auth-critical buckets (login, TOTP, step-up, password reset) so a
-   * rate-limit backend outage cannot silently disable brute-force protection.
-   */
-  failClosed?: boolean
-}
-
 export async function checkRateLimit(
   key: string,
   max = 5,
   windowMs = 5 * 60_000,
-  options: CheckRateLimitOptions = {},
 ): Promise<RateLimitResult> {
   try {
     const backend = await getRateLimitBackend()
     return await backend.check(key, max, windowMs)
   } catch (error) {
     await logRateLimitBackendFailure('check', error)
-    if (options.failClosed) {
-      return { allowed: false, retryAfterSec: Math.ceil(windowMs / 1000), remaining: 0 }
-    }
     return { allowed: true, retryAfterSec: 0, remaining: max }
   }
 }

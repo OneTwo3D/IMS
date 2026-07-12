@@ -13,7 +13,9 @@ import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domai
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
-import { getAccountingSettings, getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
+import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
+import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { cache } from 'react'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -97,9 +99,6 @@ export type InventoryValuationReport = {
   valueReplayReliable: boolean
   missingValueMovementCount: number
   orphanWarehouseMovementCount: number
-  currentValueDriftCount: number
-  postAsOfRevaluationCount: number
-  staleSnapshotCount: number
   rows: InventoryValuationReportRow[]
   pageInfo: PageInfo
   totals: {
@@ -269,7 +268,6 @@ type CogsEntryRow = {
     product: ProductMeta
     fromWarehouse: WarehouseMeta | null
     toWarehouse: WarehouseMeta | null
-    shipmentLine?: { lineId: string; line: { id: string; productId: string | null; totalBase: DecimalInput } } | null
   }
 }
 
@@ -469,13 +467,13 @@ function supplierMetas(product: ProductMeta): Array<{ id: string; name: string }
     .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
 }
 
-const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | 'quickbooks' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
-  const [baseCurrency, settings, connectorInfo] = await Promise.all([getBaseCurrencyCode(), getAccountingSettings(), getActiveAccountingConnectorInfo()])
+const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
+  const [baseCurrency, settings, plugins] = await Promise.all([getBaseCurrencyCode(), getXeroSettings(), getIntegrationPluginState()])
   return {
-    connector: connectorInfo?.id ?? null,
+    connector: plugins.xero ? 'xero' : null,
     baseCurrency,
-    inventoryAccountCode: settings.inventoryAccount.trim() || null,
-    cogsAccountCode: settings.cogsAccount.trim() || null,
+    inventoryAccountCode: settings.xero_inventory_account.trim() || null,
+    cogsAccountCode: settings.xero_cogs_account.trim() || null,
   }
 })
 
@@ -507,14 +505,14 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: ['No accounting connector is enabled, so GL inventory variance is blank.'],
+      notices: ['Xero is not enabled, so GL inventory variance is blank.'],
     }
   }
   if (!context.inventoryAccountCode) {
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: ['No inventory asset account is configured on the active accounting connector, so GL variance is blank.'],
+      notices: ['No Xero inventory asset account is configured, so GL variance is blank.'],
     }
   }
   const snapshot = await findLatestAccountBalanceSnapshot({
@@ -550,14 +548,14 @@ async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBas
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: ['No accounting connector is enabled, so GL COGS variance is blank.'],
+      notices: ['Xero is not enabled, so GL COGS variance is blank.'],
     }
   }
   if (!context.cogsAccountCode) {
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: ['No COGS account is configured on the active accounting connector, so GL COGS variance is blank.'],
+      notices: ['No Xero COGS account is configured, so GL COGS variance is blank.'],
     }
   }
   const movement = await loadCogsGlMovementWithOnDemandSnapshotSync({
@@ -590,11 +588,9 @@ async function loadCogsGlMovementWithOnDemandSnapshotSync(lookup: CogsGlMovement
     return { ok: true, movementBase: movement.movementBase }
   } catch (error) {
     if (!(error instanceof MissingAccountBalanceSnapshotError)) throw error
+    if (lookup.connector !== 'xero') return { ok: false }
 
-    // Connector-agnostic on-demand snapshot sync: dispatches to the active accounting
-    // connector. Returns ok:false (with a notice) when the active connector can't
-    // produce the snapshot — including QuickBooks, whose ingestion isn't implemented yet.
-    const syncResult = await syncAccountingAccountBalanceSnapshots({
+    const syncResult = await syncXeroAccountBalanceSnapshots({
       balanceDate: error.requiredBalanceDate,
       accountCodes: lookup.accountCode ? [lookup.accountCode] : undefined,
       syncRunId: `report-demand:${error.requiredBalanceDate}:${error.reason}`,
@@ -602,7 +598,7 @@ async function loadCogsGlMovementWithOnDemandSnapshotSync(lookup: CogsGlMovement
     if (syncResult.errors.length > 0 || syncResult.persisted === 0) {
       return {
         ok: false,
-        notice: `On-demand GL Trial Balance sync for ${error.requiredBalanceDate} did not create the required GL balance snapshot.`,
+        notice: `On-demand Xero Trial Balance sync for ${error.requiredBalanceDate} did not create the required GL balance snapshot.`,
       }
     }
 
@@ -729,30 +725,13 @@ export function inventoryCostingFiltersForUi(filters: InventoryCostingFilters): 
 }
 
 export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsGroupBy): CogsReportRow[] {
-  // A sales-order line (revenueKey = orderId:productId) can be fulfilled from
-  // more than one group (e.g. split-warehouse dispatch produces two COGS
-  // movements with the same revenueKey in different warehouse groups). Counting
-  // the full line revenue in each group double-counts the report total
-  // (cogs-audit scjz.50). Build per-line totals first, then allocate each line's
-  // revenue across its groups in proportion to the qty fulfilled by that group.
-  const lineRevenueByKey = new Map<string, { revenue: Decimal; totalQty: Decimal }>()
-  for (const input of inputs) {
-    if (!input.revenueKey || input.revenueBase == null) continue
-    const existing = lineRevenueByKey.get(input.revenueKey)
-    if (existing) {
-      existing.totalQty = existing.totalQty.add(toDecimal(input.qty))
-    } else {
-      lineRevenueByKey.set(input.revenueKey, { revenue: toDecimal(input.revenueBase), totalQty: toDecimal(input.qty) })
-    }
-  }
-
   const groups = new Map<string, {
     first: CogsAggregationInput
     qty: Decimal
     cogsBase: Decimal
+    revenueBase: Decimal
     revenueCaptured: boolean
-    unkeyedRevenue: Decimal
-    qtyByRevenueKey: Map<string, Decimal>
+    revenueKeys: Set<string>
     movementIds: Set<string>
   }>()
 
@@ -762,21 +741,18 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
       first: input,
       qty: decimalZero(),
       cogsBase: decimalZero(),
+      revenueBase: decimalZero(),
       revenueCaptured: true,
-      unkeyedRevenue: decimalZero(),
-      qtyByRevenueKey: new Map<string, Decimal>(),
+      revenueKeys: new Set<string>(),
       movementIds: new Set<string>(),
     }
     existing.qty = existing.qty.add(toDecimal(input.qty))
     existing.cogsBase = existing.cogsBase.add(toDecimal(input.cogsBase))
     if (input.revenueBase == null) {
       existing.revenueCaptured = false
-    } else if (input.revenueKey) {
-      existing.qtyByRevenueKey.set(input.revenueKey, (existing.qtyByRevenueKey.get(input.revenueKey) ?? decimalZero()).add(toDecimal(input.qty)))
-    } else {
-      // Unkeyed revenue cannot be cross-group-deduped or qty-allocated; preserve
-      // the prior per-row behaviour of summing it directly into the group.
-      existing.unkeyedRevenue = existing.unkeyedRevenue.add(toDecimal(input.revenueBase))
+    } else if (!input.revenueKey || !existing.revenueKeys.has(input.revenueKey)) {
+      existing.revenueBase = existing.revenueBase.add(toDecimal(input.revenueBase))
+      if (input.revenueKey) existing.revenueKeys.add(input.revenueKey)
     }
     existing.movementIds.add(input.id)
     groups.set(key, existing)
@@ -784,16 +760,7 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
 
   return [...groups.entries()]
     .map(([key, group]) => {
-      // Sum this group's qty-proportional share of each line's revenue. When a
-      // line's total fulfilled qty is zero (degenerate, e.g. fully reversed),
-      // fall back to the full line revenue rather than dropping it.
-      const groupRevenue = [...group.qtyByRevenueKey.entries()].reduce((sum, [revKey, groupQty]) => {
-        const line = lineRevenueByKey.get(revKey)
-        if (!line) return sum
-        const share = line.totalQty.gt(0) ? line.revenue.mul(groupQty).div(line.totalQty) : line.revenue
-        return sum.add(share)
-      }, group.unkeyedRevenue)
-      const revenueBase = group.revenueCaptured ? groupRevenue : null
+      const revenueBase = group.revenueCaptured ? group.revenueBase : null
       const grossMarginBase = revenueBase ? revenueBase.sub(group.cogsBase) : null
       const grossMarginPct = revenueBase && !revenueBase.isZero()
         ? grossMarginBase!.div(revenueBase).mul(100)
@@ -975,34 +942,6 @@ export function aggregateInventoryTurnoverRows(
     })
 }
 
-/**
- * Window-wide average inventory value for the turnover report total row.
- *
- * The per-group rows each divide their snapshot value total by that group's own
- * distinct-day count, so summing the per-group averages (different denominators)
- * yields a wrong portfolio daily average and turnover ratio (cogs-audit scjz.46).
- * Instead, build a single window-wide day→value map (summing every group's share
- * onto the same day) and divide by the distinct snapshot days across the window —
- * mirroring getAverageInventoryValueBase in inventory-snapshot.ts.
- */
-export function aggregateInventoryTurnoverTotalAverage(
-  snapshotInputs: InventoryTurnoverSnapshotAggregationInput[],
-  groupBy: InventoryTurnoverGroupBy,
-): { averageInventoryValueBase: Decimal; snapshotDayCount: number } {
-  const valueByDay = new Map<string, Decimal>()
-  for (const input of snapshotInputs) {
-    const day = dateOnly(input.snapshotDate)
-    for (const meta of turnoverGroupMetas(input, groupBy)) {
-      valueByDay.set(day, (valueByDay.get(day) ?? decimalZero()).add(toDecimal(input.inventoryValueBase).mul(meta.share)))
-    }
-  }
-  if (valueByDay.size === 0) {
-    return { averageInventoryValueBase: decimalZero(), snapshotDayCount: 0 }
-  }
-  const total = [...valueByDay.values()].reduce((sum, value) => sum.add(value), decimalZero())
-  return { averageInventoryValueBase: total.div(valueByDay.size), snapshotDayCount: valueByDay.size }
-}
-
 export function aggregateLandedCostMethods(inputs: LandedCostAggregationInput[]): LandedCostReport['methodSummary'] {
   const groups = new Map<LandedCostMethod, { count: number; goodsValueBase: Decimal; landedValueBase: Decimal }>()
   for (const input of inputs) {
@@ -1110,9 +1049,6 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     valueReplayReliable: snapshot.valueReplayReliable,
     missingValueMovementCount: snapshot.missingValueMovementCount,
     orphanWarehouseMovementCount: snapshot.orphanWarehouseMovementCount,
-    currentValueDriftCount: snapshot.currentValueDriftCount,
-    postAsOfRevaluationCount: snapshot.postAsOfRevaluationCount,
-    staleSnapshotCount: snapshot.staleSnapshotCount,
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
@@ -1121,22 +1057,9 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
       glBalanceBase: gl.glBalanceBase ? moneyString(gl.glBalanceBase) : null,
       glVarianceBase: gl.glVarianceBase ? moneyString(gl.glVarianceBase) : null,
     },
-    // Reason-specific reliability notices so a revaluation/drift cause is not
-    // misreported as missing value evidence (scjz.43/.44).
     notices: [
       ...gl.notices,
-      (snapshot.missingValueMovementCount > 0 || snapshot.orphanWarehouseMovementCount > 0)
-        ? 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.'
-        : '',
-      snapshot.postAsOfRevaluationCount > 0
-        ? 'This as-of valuation draws on a cost basis affected by a later cost-layer revaluation that the as-of replay did not apply, so it is not point-in-time accurate.'
-        : '',
-      snapshot.staleSnapshotCount > 0
-        ? 'This as-of valuation uses snapshot rows flagged not point-in-time accurate when written (backfilled from a later cost basis or with a missing-value movement baked in).'
-        : '',
-      snapshot.currentValueDriftCount > 0
-        ? 'This valuation has cost-layer quantities that diverge from stock levels (orphan layers or stock/cost-layer desync).'
-        : '',
+      snapshot.valueReplayReliable ? '' : 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.',
     ].filter(Boolean),
   }
 }
@@ -1179,51 +1102,6 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
   return { revenueByOrderProduct, orderMetaById }
 }
 
-export type CogsRevenueRowInput = {
-  orderId: string | null
-  /** movement.productId (the consumed product — component for kit dispatch) */
-  productId: string
-  shipmentLine: { lineId: string; lineProductId: string | null; lineTotalBase: DecimalInput } | null
-}
-
-/**
- * Resolve the revenue key + base for each COGS row, attributing revenue at
- * sales-LINE granularity where the shipment-line link makes it unambiguous, so
- * an order with two same-product lines at different prices/warehouses reports
- * each line's actual revenue instead of one qty-blended figure (scjz.67).
- *
- * Switch is all-or-nothing per (order, product): line-level keys are used only
- * when EVERY COGS row of that pair links to a sales line of the same product —
- * otherwise the blended order:product fallback is kept for the whole pair. This
- * avoids mixing the two keying schemes (which would double-count) and preserves
- * today's behaviour for kit-component dispatch (line product = kit ≠ component)
- * and legacy unlinked rows. Returned array is aligned to `rows`.
- */
-export function resolveCogsRevenueKeys(
-  rows: CogsRevenueRowInput[],
-  revenueByOrderProduct: Map<string, Decimal>,
-): Array<{ revenueKey: string | null; revenueBase: Decimal | null }> {
-  const lineLevelByOrderProduct = new Map<string, boolean>()
-  for (const row of rows) {
-    if (!row.orderId) continue
-    const opk = revenueKey({ orderId: row.orderId, productId: row.productId })
-    const lineLinked = row.shipmentLine != null && row.shipmentLine.lineProductId === row.productId
-    lineLevelByOrderProduct.set(opk, (lineLevelByOrderProduct.get(opk) ?? true) && lineLinked)
-  }
-
-  return rows.map((row) => {
-    if (!row.orderId) return { revenueKey: null, revenueBase: null }
-    const opk = revenueKey({ orderId: row.orderId, productId: row.productId })
-    if (lineLevelByOrderProduct.get(opk) && row.shipmentLine) {
-      return {
-        revenueKey: `L:${row.shipmentLine.lineId}`,
-        revenueBase: toDecimal(row.shipmentLine.lineTotalBase),
-      }
-    }
-    return { revenueKey: opk, revenueBase: revenueByOrderProduct.get(opk) ?? null }
-  })
-}
-
 export async function getCogsReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<CogsReport> {
   const dateFrom = filters.dateFrom ?? daysAgo(30)
   const dateTo = filters.dateTo ?? today()
@@ -1238,14 +1116,13 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       // movements leave stock through fromWarehouseId; extend this if a future
       // COGS-producing movement records the warehouse on another side.
       ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
-      // COGS/margin must be SALES cost only. cogs_entries are also written for
-      // PRODUCTION_OUT (capitalised into the output layer, not expensed),
-      // negative ADJUSTMENT write-offs, supplier returns (ADJUSTMENT) and
-      // PURCHASE_REVERSAL — none of which are customer COGS and none of which
-      // carry sales revenue. Restricting to SALE_DISPATCH (consistent with the
-      // turnover and margin-analytics reports) avoids understating gross margin
-      // by netting revenue-less consumption cost against sales.
-      type: StockMovementType.SALE_DISPATCH,
+      // Exclude PRODUCTION_OUT: manufacturing consumes components whose cost is
+      // CAPITALISED into the output product's cost layer, not expensed. Those
+      // cogs_entries exist only to satisfy the outbound-evidence guard; counting
+      // them here would show revenue-less cost and double-count the component
+      // cost again when the finished good is sold (whose SALE_DISPATCH COGS
+      // already includes it).
+      type: { not: StockMovementType.PRODUCTION_OUT },
       product: productWhere(filters),
     },
   }
@@ -1278,10 +1155,6 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
             },
             fromWarehouse: { select: { id: true, code: true, name: true } },
             toWarehouse: { select: { id: true, code: true, name: true } },
-            // Line-granularity revenue link (4pz6.1): when present, attribute each
-            // sales line's actual revenue instead of the blended order:product
-            // figure (scjz.67).
-            shipmentLine: { select: { lineId: true, line: { select: { id: true, productId: true, totalBase: true } } } },
           },
         },
       },
@@ -1297,26 +1170,13 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     .map((row) => row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
   const { revenueByOrderProduct, orderMetaById } = await loadRevenueByOrderProduct(sourceOrderIds)
-  const resolvedRevenue = resolveCogsRevenueKeys(
-    rows.map((row) => ({
-      orderId: row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null,
-      productId: row.movement.product.id,
-      shipmentLine: row.movement.shipmentLine
-        ? {
-            lineId: row.movement.shipmentLine.lineId,
-            lineProductId: row.movement.shipmentLine.line.productId,
-            lineTotalBase: row.movement.shipmentLine.line.totalBase,
-          }
-        : null,
-    })),
-    revenueByOrderProduct,
-  )
-  const inputs: CogsAggregationInput[] = rows.map((row, index) => {
+  const inputs: CogsAggregationInput[] = rows.map((row) => {
     const product = row.movement.product
     const warehouse = row.movement.fromWarehouse ?? row.movement.toWarehouse
     const orderId = row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null
     const meta = orderId ? orderMetaById.get(orderId) : undefined
-    const { revenueKey: key, revenueBase } = resolvedRevenue[index]!
+    const key = orderId ? revenueKey({ orderId, productId: product.id }) : null
+    const revenueBase = key ? revenueByOrderProduct.get(key) ?? null : null
     return {
       id: row.movement.id,
       qty: row.qty,
@@ -1531,14 +1391,13 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
   const missingSupplierSnapshotRowCount = groupBy === 'supplier'
     ? snapshotInputs.filter((row) => row.suppliers.length === 0).length
     : 0
-  // Total average inventory value must use a window-wide daily total / distinct
-  // snapshot days, not the sum of per-group averages (those divide by different
-  // per-group day counts) (cogs-audit scjz.46).
-  const totalAverage = aggregateInventoryTurnoverTotalAverage(snapshotInputs, groupBy)
-  const totals = {
-    cogsBase: allRows.reduce((sum, row) => sum.add(toDecimal(row.cogsBase)), decimalZero()),
-    averageInventoryValueBase: totalAverage.averageInventoryValueBase,
-  }
+  const totals = allRows.reduce(
+    (sum, row) => ({
+      cogsBase: sum.cogsBase.add(toDecimal(row.cogsBase)),
+      averageInventoryValueBase: sum.averageInventoryValueBase.add(toDecimal(row.averageInventoryValueBase)),
+    }),
+    { cogsBase: decimalZero(), averageInventoryValueBase: decimalZero() },
+  )
   const turnover = calculateInventoryTurnover({
     cogsBase: totals.cogsBase,
     averageInventoryValueBase: totals.averageInventoryValueBase,
@@ -1562,7 +1421,7 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
       turnoverRatio: turnover.turnoverRatio,
       daysInventoryOutstanding: turnover.daysInventoryOutstanding,
       cogsEntryCount: mappedSupplierCogsEntryCount,
-      snapshotDayCount: totalAverage.snapshotDayCount,
+      snapshotDayCount: Math.max(0, ...allRows.map((row) => row.snapshotDayCount)),
     },
     notices: [
       cogsRows.length === 0

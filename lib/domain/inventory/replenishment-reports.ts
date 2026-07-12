@@ -2,7 +2,7 @@ import { Prisma, ProductType, PurchaseOrderStatus, SalesOrderStatus, StockMoveme
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
-import { calculateDailyVelocity, saleMovementCogsBase, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
+import { calculateDailyVelocity, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
@@ -50,6 +50,7 @@ const ACTIVE_SALES_ORDER_STATUSES: SalesOrderStatus[] = [
   SalesOrderStatus.PACKING,
   SalesOrderStatus.SHIPPED,
   SalesOrderStatus.DELIVERED,
+  SalesOrderStatus.PARTIALLY_REFUNDED,
 ]
 
 type FindManyDelegate = {
@@ -111,7 +112,6 @@ type SaleMovementRow = {
   productId: string
   qty: DecimalInput
   totalValueBase: DecimalInput | null
-  cogsEntries: Array<{ totalCostBase: DecimalInput }>
   createdAt: Date
   product: {
     sku: string
@@ -615,7 +615,6 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
       productId: true,
       qty: true,
       totalValueBase: true,
-      cogsEntries: { select: { totalCostBase: true } },
       createdAt: true,
       product: {
         select: {
@@ -640,7 +639,7 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
     categoryName: movement.product.category?.name ?? null,
     supplierNames: supplierNames(movement.product),
     qty: movement.qty,
-    cogsBase: saleMovementCogsBase(movement),
+    cogsBase: movement.totalValueBase ?? 0,
     occurredAt: movement.createdAt,
   }))
 }
@@ -1133,7 +1132,7 @@ export async function getBackorderDemandReport(
     client.salesOrderLine.findMany({
       where: {
         productId: { not: null },
-        order: { status: { in: ACTIVE_SALES_ORDER_STATUSES }, refundStatus: { not: 'FULL' } },
+        order: { status: { in: ACTIVE_SALES_ORDER_STATUSES } },
         product: productWhere(filters),
       },
       select: {

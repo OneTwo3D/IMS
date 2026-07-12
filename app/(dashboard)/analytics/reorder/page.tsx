@@ -17,9 +17,6 @@ import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { hasPermission } from '@/lib/permissions'
 import { getForecastSettings } from '@/app/actions/forecasting'
 import { HistoricalImportTrigger } from './historical-import-trigger'
-import { ReorderSelectionProvider } from '@/lib/analytics/reorder-selection-context'
-import { parseSelectedParam } from '@/lib/analytics/reorder-selection'
-import { ReorderSelectAllCheckbox, ReorderRowCheckbox } from './reorder-selection-checkboxes'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
@@ -129,11 +126,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     { key: 'urgency', label: 'Status', render: (row) => urgencyLabel(row.urgency) },
   ]
 
-  const toolbarRows = report.rows.map((row) => ({
-    productId: row.productId,
-    productType: row.productType,
-    suggestedReorderQty: Number(row.suggestedReorderQty) || 0,
-  }))
+  const toolbarRows = report.rows.map((row) => ({ productId: row.productId, productType: row.productType }))
   // audit-pcc0: pass the same filters that produced the visible report so the PO/MO
   // buttons compute draft quantities from identical getReorderReport semantics.
   const actionFilters: ReorderActionFilters = {
@@ -147,14 +140,8 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     urgency: filters.urgency,
     search: filters.search,
   }
-  const visibleProductIds = report.rows.map((row) => row.productId)
-  // Hydrate selection from the URL, but only for ids still on the current page
-  // (single-page selection model — off-page ids are dropped on navigation).
-  const visibleProductIdSet = new Set(visibleProductIds)
-  const initialSelected = parseSelectedParam(one(resolvedSearchParams.selected)).filter((id) => visibleProductIdSet.has(id))
   return (
     <div className="space-y-3">
-      <ReorderSelectionProvider visibleIds={visibleProductIds} initialSelected={initialSelected}>
       <ReorderActionsToolbar rows={toolbarRows} filters={actionFilters} />
     <StockPositionReportPage
       title="Reorder Planning"
@@ -216,12 +203,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
           </div>
         </>
       }
-      selectionColumn={{
-        header: <ReorderSelectAllCheckbox />,
-        cell: (row) => <ReorderRowCheckbox productId={row.productId} label={row.sku} />,
-      }}
     />
-      </ReorderSelectionProvider>
     </div>
   )
 }

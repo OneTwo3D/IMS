@@ -174,8 +174,8 @@ export function KitConfigurator({ productId, productType, initialComponents, all
               />
               <Input
                 type="number"
-                min="0"
-                step="1"
+                min="0.0001"
+                step="0.0001"
                 value={line.qty}
                 onChange={(e) => updateLine(line.key, 'qty', e.target.value)}
                 className="h-8 text-sm w-24"

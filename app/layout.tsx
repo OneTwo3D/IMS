@@ -1,5 +1,4 @@
 import type { Metadata } from 'next'
-import { headers } from 'next/headers'
 import { Inter } from 'next/font/google'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { AuthSessionProvider } from '@/components/providers/session-provider'
@@ -15,10 +14,7 @@ export async function generateMetadata(): Promise<Metadata> {
   }
 }
 
-export default async function RootLayout({ children }: { children: React.ReactNode }) {
-  // CSP nonce set per-request by proxy.ts; applied to the inline theme script
-  // below so it is allowed under the strict-dynamic script-src policy.
-  const nonce = (await headers()).get('x-nonce') ?? undefined
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={inter.variable} suppressHydrationWarning>
       <head>
@@ -28,7 +24,6 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             correct palette before React hydrates. Must stay synchronous
             and inline; an external script or useEffect would flash. */}
         <script
-          nonce={nonce}
           dangerouslySetInnerHTML={{
             __html: `(function(){try{var t=localStorage.getItem('theme');var d=t==='dark'||(t!=='light'&&matchMedia('(prefers-color-scheme:dark)').matches);document.documentElement.classList.toggle('dark',d);document.documentElement.style.colorScheme=d?'dark':'light'}catch(e){}})()`,
           }}

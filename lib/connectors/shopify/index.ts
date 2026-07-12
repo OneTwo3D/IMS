@@ -3,13 +3,12 @@ import type { ShoppingProductLinkResult, ShoppingWebhookResource } from '@/lib/s
 import { notImplementedResult } from '@/lib/connectors/not-implemented'
 import { db } from '@/lib/db'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
-import { scheduleInboxDrain } from '@/lib/jobs/shopping/drain-inbox'
 import {
   createShoppingWebhookEventRepository,
   persistShopifyWebhookEvent,
   type PersistShoppingWebhookEventResult,
   type ShoppingWebhookEventRepository,
-} from '@/lib/connectors/shopping-webhook-inbox'
+} from '@/lib/connectors/woocommerce/webhook-inbox'
 import { getShopifyDeliveryStatusForSalesOrder } from './delivery'
 import { extractShopifyLegacyResourceId, getShopifyCredentials, shopifyGraphql, verifyShopifyWebhookSignature } from './api'
 import { getShopifyProductExternalLink, getShopifySalesOrderAdminLink } from './links'
@@ -817,13 +816,6 @@ export async function handleWebhook(options: ShopifyWebhookOptions = {}) {
       payload,
     },
   )
-
-  // Near-realtime: kick a debounced, single-flight inbox drain for newly-received
-  // events instead of waiting for the 5-min cron. Non-blocking — the cron remains
-  // the durability backstop.
-  if (result.status === 'created') {
-    scheduleInboxDrain('shopify')
-  }
 
   return Response.json({
     accepted: true,

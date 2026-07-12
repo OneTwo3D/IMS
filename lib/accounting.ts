@@ -123,20 +123,6 @@ export async function getActiveAccountingConnectorInfo(): Promise<AccountingConn
   }
 }
 
-/**
- * Generic selector for whether an accounting connector has stored OAuth
- * credentials (i.e. is connected). Wraps the AccountingToken store so
- * non-connector ingress code (e.g. the sync cron) does not read connector
- * persistence directly — if token storage changes, only this helper changes.
- */
-export async function isAccountingConnectorConnected(
-  connector: AccountingConnectorInfo['id'],
-): Promise<boolean> {
-  const { db } = await import('@/lib/db')
-  const token = await db.accountingToken.findFirst({ where: { connector }, select: { id: true } })
-  return token !== null
-}
-
 export async function queueAccountingSync(params: {
   type: AccountingSyncType
   referenceType: string
@@ -219,14 +205,9 @@ export async function queueAccountingSyncTx(
     payload: Record<string, unknown>
     idempotencyKey?: string
   },
-): Promise<boolean> {
-  // Returns whether a GL counterpart for this posting exists or will post: false when
-  // the type won't post (no active/enabled connector), true when it was queued or is
-  // already queued. Callers that must stay consistent with the queue decision (e.g. the
-  // COGS subledger ledger writes, bcz9.2/bcz9.4) should record based on THIS result, not
-  // a separate settings recheck — avoiding a TOCTOU if the connector/setting flips.
+): Promise<void> {
   const context = await getAccountingPostingContext(params.type)
-  if (!context) return false
+  if (!context) return
 
   const payload = {
     ...params.payload,
@@ -246,7 +227,7 @@ export async function queueAccountingSyncTx(
       },
       select: { id: true },
     })
-    if (existing) return true
+    if (existing) return
   }
 
   try {
@@ -289,11 +270,8 @@ export async function queueAccountingSyncTx(
         description: `Accounting sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
       },
     }).then(() => undefined))
-    return true
   } catch (error) {
-    // A unique-key collision means a concurrent insert already queued this posting,
-    // so the GL counterpart exists — treat as queued.
-    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return true
+    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
     throw error
   }
 }
@@ -457,38 +435,5 @@ export async function listAccountingBankAccounts(): Promise<AccountingBankAccoun
       const { listStoredBankAccounts } = await import('@/lib/connectors/quickbooks/accounts')
       return listStoredBankAccounts()
     }
-  }
-}
-
-export type AccountBalanceSnapshotSyncResult = { fetched: number; persisted: number; skipped: number; errors: string[] }
-
-/**
- * Sync GL account-balance snapshots from the active accounting connector (used by the
- * account-balance-snapshot cron and the on-demand GL reconciliation refresh). Connector
- * -agnostic: dispatches to the active connector's implementation. QuickBooks has no
- * trial-balance/account-balance ingestion yet (needs the QBO trial-balance API + a QBO
- * sandbox — see onetwo3d-ims-khdw.1), so under QBO it returns a clear unsupported result
- * rather than silently succeeding; the GL reconciliations then degrade to unavailable.
- */
-export async function syncAccountingAccountBalanceSnapshots(options?: {
-  balanceDate?: Date | string
-  accountCodes?: string[]
-  syncRunId?: string
-}): Promise<AccountBalanceSnapshotSyncResult> {
-  const connector = await getActiveAccountingConnectorId()
-  if (!connector) return { fetched: 0, persisted: 0, skipped: 0, errors: ['No active accounting connector'] }
-
-  switch (connector) {
-    case 'xero': {
-      const { syncXeroAccountBalanceSnapshots } = await import('@/lib/connectors/xero/account-balances')
-      return syncXeroAccountBalanceSnapshots(options)
-    }
-    case 'quickbooks':
-      return {
-        fetched: 0,
-        persisted: 0,
-        skipped: 0,
-        errors: ['QuickBooks account-balance snapshot ingestion is not implemented (onetwo3d-ims-khdw.1)'],
-      }
   }
 }

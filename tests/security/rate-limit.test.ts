@@ -70,34 +70,6 @@ test('shared rate-limit wrapper uses memory backend by default', async () => {
   }
 })
 
-test('checkRateLimit fails open by default but denies when failClosed is set', async () => {
-  const previousBackend = process.env.RATE_LIMIT_BACKEND
-  const previousRedisUrl = process.env.REDIS_URL
-  // redis backend without REDIS_URL makes backend creation throw, exercising
-  // the catch path in checkRateLimit.
-  process.env.RATE_LIMIT_BACKEND = 'redis'
-  delete process.env.REDIS_URL
-  resetRateLimitBackendForTests()
-
-  try {
-    const key = `test:${Date.now()}:fail-mode`
-
-    const open = await checkRateLimit(key, 5, 60_000)
-    assert.equal(open.allowed, true)
-
-    const closed = await checkRateLimit(key, 5, 60_000, { failClosed: true })
-    assert.equal(closed.allowed, false)
-    assert.equal(closed.remaining, 0)
-    assert.ok(closed.retryAfterSec > 0)
-  } finally {
-    if (previousBackend === undefined) delete process.env.RATE_LIMIT_BACKEND
-    else process.env.RATE_LIMIT_BACKEND = previousBackend
-    if (previousRedisUrl === undefined) delete process.env.REDIS_URL
-    else process.env.REDIS_URL = previousRedisUrl
-    resetRateLimitBackendForTests()
-  }
-})
-
 function makeFakeAtomicRedisRunner() {
   const buckets = new Map<string, Array<{ score: number; member: string }>>()
   const evalCommands: string[][] = []

@@ -7,12 +7,12 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
-import { getAccountingSettings } from '@/lib/accounting'
+import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost, lockStockLevelRow } from '@/lib/cost-layers'
+import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
 import { decimalToNumber } from '@/lib/decimal'
 import {
   buildStockLevelMap,
@@ -28,29 +28,91 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromConsumed,
 } from '@/lib/domain/inventory/stock-movement-value'
-import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
-// cv67: post-commit side effects (backorder allocation, over-allocation release,
-// WooCommerce stock-sync enqueue) run best-effort AFTER the adjustment commits, so
-// a failure can't roll the adjustment back. Previously these were swallowed with
-// console.error only — invisible to operators, so a failed enqueue silently drifted
-// store stock. Surface them to the activity log (WARNING) so they're auditable and
-// the operator can re-sync. Never throws (the adjustment already committed).
-async function logStockSideEffectFailure(action: string, error: unknown): Promise<void> {
-  console.error(error)
-  try {
-    await logActivity({
-      entityType: 'STOCK_ADJUSTMENT',
-      action,
-      tag: 'sync',
-      level: 'WARNING',
-      description: `Post-commit ${action} failed; stock/orders may need re-sync: ${error instanceof Error ? error.message : String(error)}`,
-    })
-  } catch (logError) {
-    console.error(logError)
+// ---------------------------------------------------------------------------
+// Helpers for inventory adjustment accounting journal
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute a unit cost (GBP) for a product from its FIFO cost layers.
+ * Used to value manual stock adjustments (write-offs, shrinkage, stock found)
+ * when queuing the accounting journal. Returns the weighted average of
+ * remaining layers; falls back to 0 if no layers exist.
+ */
+async function getProductUnitCost(
+  tx: Prisma.TransactionClient,
+  productId: string,
+): Promise<number> {
+  const layers = await tx.costLayer.findMany({
+    where: { productId, remainingQty: { gt: 0 } },
+    select: { remainingQty: true, unitCostBase: true },
+  })
+  let totalQty = 0
+  let totalCost = 0
+  for (const l of layers) {
+    const q = Number(l.remainingQty)
+    totalQty += q
+    totalCost += q * Number(l.unitCostBase)
   }
+  return totalQty > 0 ? totalCost / totalQty : 0
+}
+
+/**
+ * Build the journal payload for an inventory adjustment.
+ *
+ *   qty > 0 (stock added, e.g. "stock found"):
+ *     DR Inventory / CR reason.accountCode   — the reason account is a gain
+ *
+ *   qty < 0 (stock removed, e.g. "write-off", "shrinkage"):
+ *     DR reason.accountCode / CR Inventory   — the reason account is an expense
+ *
+ * Returns null when there is nothing to post (no cost, no reason account,
+ * or zero quantity).
+ */
+function buildInventoryAdjustmentJournal(params: {
+  reasonAccountCode: string
+  inventoryAccountCode: string
+  productSku: string
+  productName: string
+  warehouseCode: string
+  warehouseName: string
+  qty: number
+  unitCost: number
+  note: string | null
+}): {
+  date: string
+  reference: string
+  narration: string
+  lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }>
+} | null {
+  const { reasonAccountCode, inventoryAccountCode, productSku, productName, warehouseCode, warehouseName, qty, unitCost, note } = params
+  if (qty === 0 || unitCost === 0 || !reasonAccountCode || !inventoryAccountCode) return null
+
+  const totalValue = Math.round(Math.abs(qty) * unitCost * 100) / 100
+  if (totalValue === 0) return null
+
+  const date = new Date().toISOString().slice(0, 10)
+  const directionLabel = qty > 0 ? 'increase' : 'decrease'
+  const reference = `Adj: ${productSku} ${qty > 0 ? '+' : ''}${qty} @ ${warehouseCode}`
+  const narration = [
+    `Stock ${directionLabel} — ${productName} @ ${warehouseName}`,
+    note,
+  ].filter(Boolean).join(' — ')
+  const description = `${productSku} ${qty > 0 ? '+' : ''}${qty} @ ${warehouseCode}`
+
+  const lines = qty > 0
+    ? [
+        { accountCode: inventoryAccountCode, description, debit: totalValue },
+        { accountCode: reasonAccountCode, description, credit: totalValue },
+      ]
+    : [
+        { accountCode: reasonAccountCode, description, debit: totalValue },
+        { accountCode: inventoryAccountCode, description, credit: totalValue },
+      ]
+
+  return { date, reference, narration, lines }
 }
 
 // ---------------------------------------------------------------------------
@@ -63,8 +125,233 @@ export type AdjustmentFormState = {
   success?: boolean
 }
 
-// applyOpeningStock (an internal transaction-scoped helper) was relocated to
-// lib/domain/inventory/opening-stock.ts so it is not exposed as a server action.
+export type ApplyStockAdjustmentInput = {
+  tx: Prisma.TransactionClient
+  productId: string
+  warehouseId: string
+  qty: number
+  reasonId?: string
+  note?: string | null
+}
+
+export type AppliedStockAdjustment = {
+  movementId: string
+  productSku: string
+  warehouseName: string
+}
+
+export type ApplyOpeningStockInput = {
+  tx: Prisma.TransactionClient
+  productId: string
+  warehouseId: string
+  qty: number
+  unitCostBase: number
+  note?: string | null
+}
+
+export async function applyStockAdjustment({
+  tx,
+  productId,
+  warehouseId,
+  qty,
+  reasonId,
+  note,
+}: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
+  const isAddition = qty > 0
+  const absQty = Math.abs(qty).toString()
+
+  let reasonName: string | null = note || null
+  let accountCode: string | null = null
+
+  if (reasonId) {
+    const reason = await tx.adjustmentReason.findUnique({
+      where: { id: reasonId },
+      select: { name: true, accountCode: true },
+    })
+    if (reason) {
+      reasonName = note ? `${reason.name}: ${note}` : reason.name
+      accountCode = reason.accountCode
+    }
+  }
+
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: { productId, warehouseId, quantity: 0 },
+    update: {},
+  })
+  await tx.$queryRaw`
+    SELECT "productId", "warehouseId"
+    FROM stock_levels
+    WHERE "productId" = ${productId}
+      AND "warehouseId" = ${warehouseId}
+    FOR UPDATE
+  `
+
+  let additionUnitCost: number | null = null
+  if (isAddition) {
+    const warehouseAvgCost = await getAverageUnitCost(tx, productId, warehouseId)
+    additionUnitCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, productId)
+  }
+
+  const movement = await tx.stockMovement.create({
+    data: {
+      type: 'ADJUSTMENT',
+      productId,
+      fromWarehouseId: isAddition ? null : warehouseId,
+      toWarehouseId: isAddition ? warehouseId : null,
+      qty: absQty,
+      note: reasonName,
+      ...(isAddition ? buildStockMovementValueFields({ qty: absQty, unitCostBase: additionUnitCost ?? 0 }) : {}),
+    },
+  })
+
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: {
+      productId,
+      warehouseId,
+      quantity: isAddition ? absQty : `-${absQty}`,
+    },
+    update: {
+      quantity: {
+        increment: qty,
+      },
+    },
+  })
+
+  if (isAddition) {
+    await createCostLayer(tx, {
+      productId,
+      warehouseId,
+      qty: Math.abs(qty),
+      unitCostBase: additionUnitCost ?? 0,
+      receivedAt: movement.createdAt,
+      isOpeningStock: false,
+      adjustmentMovementId: movement.id,
+    })
+  } else {
+    const { consumed } = await consumeFifoLayersStrict(tx, productId, warehouseId, Math.abs(qty))
+    await tx.stockMovement.update({
+      where: { id: movement.id },
+      data: buildStockMovementValueFieldsFromConsumed(consumed, absQty),
+    })
+    if (consumed.length > 0) {
+      await tx.cogsEntry.createMany({
+        data: consumed.map((entry) => cogsEntryDataFromConsumed(movement.id, entry)),
+      })
+    }
+  }
+
+  const [product, warehouse] = await Promise.all([
+    tx.product.findUnique({ where: { id: productId }, select: { sku: true, name: true } }),
+    tx.warehouse.findUnique({ where: { id: warehouseId }, select: { code: true, name: true } }),
+  ])
+
+  if (accountCode) {
+    const settings = await getAccountingSettings()
+    const unitCost = await getProductUnitCost(tx, productId)
+    const journal = buildInventoryAdjustmentJournal({
+      reasonAccountCode: accountCode,
+      inventoryAccountCode: settings.inventoryAccount,
+      productSku: product?.sku ?? productId,
+      productName: product?.name ?? '',
+      warehouseCode: warehouse?.code ?? '',
+      warehouseName: warehouse?.name ?? '',
+      qty,
+      unitCost,
+      note: reasonName,
+    })
+    if (journal) {
+      await queueAccountingSync({
+        type: 'INVENTORY_ADJUSTMENT',
+        referenceType: 'StockMovement',
+        referenceId: movement.id,
+        payload: journal as unknown as Record<string, unknown>,
+      })
+    }
+  }
+
+  return {
+    movementId: movement.id,
+    productSku: product?.sku ?? productId,
+    warehouseName: warehouse?.name ?? warehouseId,
+  }
+}
+
+export async function applyOpeningStock({
+  tx,
+  productId,
+  warehouseId,
+  qty,
+  unitCostBase,
+  note,
+}: ApplyOpeningStockInput): Promise<AppliedStockAdjustment> {
+  if (!Number.isFinite(qty) || qty <= 0) {
+    throw new Error('Opening stock quantity must be greater than zero')
+  }
+  if (!Number.isFinite(unitCostBase) || unitCostBase < 0) {
+    throw new Error('Opening stock unit cost must be zero or greater')
+  }
+
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: { productId, warehouseId, quantity: 0 },
+    update: {},
+  })
+  await tx.$queryRaw`
+    SELECT "productId", "warehouseId"
+    FROM stock_levels
+    WHERE "productId" = ${productId}
+      AND "warehouseId" = ${warehouseId}
+    FOR UPDATE
+  `
+  const existingOpeningLayer = await tx.costLayer.findFirst({
+    where: { productId, warehouseId, isOpeningStock: true },
+    select: { id: true },
+  })
+  if (existingOpeningLayer) {
+    throw new Error('Opening stock has already been applied for this product and warehouse')
+  }
+
+  const movement = await tx.stockMovement.create({
+    data: {
+      type: 'OPENING_STOCK',
+      productId,
+      toWarehouseId: warehouseId,
+      qty,
+      ...buildStockMovementValueFields({ qty, unitCostBase }),
+      note: note || null,
+    },
+  })
+
+  await tx.stockLevel.update({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    data: {
+      quantity: { increment: qty },
+    },
+  })
+
+  await createCostLayer(tx, {
+    productId,
+    warehouseId,
+    qty,
+    unitCostBase,
+    receivedAt: movement.createdAt,
+    isOpeningStock: true,
+    adjustmentMovementId: movement.id,
+  })
+
+  const [product, warehouse] = await Promise.all([
+    tx.product.findUnique({ where: { id: productId }, select: { sku: true } }),
+    tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } }),
+  ])
+
+  return {
+    movementId: movement.id,
+    productSku: product?.sku ?? productId,
+    warehouseName: warehouse?.name ?? warehouseId,
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Single product adjustment
@@ -78,10 +365,6 @@ const adjustSchema = z.object({
   }),
   reasonId: z.string().optional(),
   note: z.string().optional(),
-  unitCostBase: z.string().optional().refine(
-    (v) => v == null || v === '' || (!isNaN(Number(v)) && Number(v) >= 0),
-    { message: 'Unit cost must be zero or greater' },
-  ),
 })
 
 export async function adjustStock(
@@ -95,20 +378,14 @@ export async function adjustStock(
     qty: formData.get('qty'),
     reasonId: formData.get('reasonId') || undefined,
     note: formData.get('note') || undefined,
-    unitCostBase: formData.get('unitCostBase') || undefined,
   })
 
   if (!parsed.success) {
     return { errors: parsed.error.flatten().fieldErrors }
   }
 
-  const { productId, warehouseId, qty, reasonId, note, unitCostBase } = parsed.data
-  const unitCostBaseNum = unitCostBase != null && unitCostBase !== '' ? Number(unitCostBase) : undefined
+  const { productId, warehouseId, qty, reasonId, note } = parsed.data
   const qtyNum = Number(qty)
-  // 0tr0: per-submission idempotency token from the form (hidden field). Dedups a
-  // double-submit of this single adjustment; the movement key is derived from it +
-  // the payload inside applyStockAdjustment.
-  const idempotencyToken = (formData.get('idempotencyToken') || '').toString().trim() || undefined
 
   let logSku = ''
   let logWarehouseName = ''
@@ -122,12 +399,10 @@ export async function adjustStock(
         qty: qtyNum,
         reasonId,
         note,
-        unitCostBase: unitCostBaseNum,
-        idempotencyToken,
       })
       logSku = applied.productSku
       logWarehouseName = applied.warehouseName
-    }, STOCK_TX_OPTIONS)
+    })
 
     revalidatePath(`/inventory/${productId}`)
     revalidatePath('/stock-control')
@@ -140,7 +415,7 @@ export async function adjustStock(
           referenceLabel: `stock adjustment (+${qtyNum}) at ${logWarehouseName}`,
         })
       } catch (allocError) {
-        await logStockSideEffectFailure('backorder_allocation', allocError)
+        console.error(allocError)
       }
     } else if (qtyNum < 0) {
       try {
@@ -149,14 +424,14 @@ export async function adjustStock(
           { source: 'stock_adjustment', referenceId: productId, referenceLabel: `stock adjustment (${qtyNum}) at ${logWarehouseName}` },
         )
       } catch (rebalanceError) {
-        await logStockSideEffectFailure('overallocation_release', rebalanceError)
+        console.error(rebalanceError)
       }
     }
 
     try {
       await enqueueStockSync([productId], 'IMS_CHANGE')
     } catch (syncError) {
-      await logStockSideEffectFailure('stock_sync_enqueue', syncError)
+      console.error(syncError)
     }
 
     await logActivity({
@@ -194,19 +469,6 @@ export type BulkAdjustLine = {
   warehouseId: string
   reasonId: string   // '' = no reason selected
   qty: number
-  // Optional explicit base-currency unit cost for a positive line. Required (per
-  // cogs-audit scjz.2) when the product has no derivable cost basis, otherwise the
-  // line throws rather than booking £0 stock. Omit to use the derived average.
-  unitCostBase?: number | null
-  // tllm: a stable per-line identity from the client (a dialog-session key that
-  // survives retries of the same submission, unlike array position). Combined with
-  // the submission token it gives each line a distinct, retry-stable idempotency key
-  // — so two lines with identical content don't collapse to a single movement, and
-  // removing/reordering a line on retry can't shift another line's key.
-  lineId: string
-  // vzlk-2a: optional per-line free-text note (combined with the reason name on the
-  // movement, mirroring the single adjustment form).
-  note?: string | null
 }
 
 export type BulkAdjustFormState = {
@@ -215,73 +477,40 @@ export type BulkAdjustFormState = {
   count?: number
 }
 
-// rfdl: schema for a bulk-adjust line. qty must be finite (0 lines are filtered
-// out, not rejected, to match the prior lenient behaviour); unitCostBase, when
-// present, must be a finite number >= 0 (or null for the derived average).
-const bulkAdjustLineSchema = z.object({
-  productId: z.string().min(1, 'productId is required'),
-  warehouseId: z.string().min(1, 'warehouseId is required'),
-  reasonId: z.string(),
-  // tllm: stable per-line id, restricted to idempotency-key-safe characters so it
-  // can be composed into the per-line submission token without escaping.
-  lineId: z.string().min(1, 'lineId is required').regex(/^[A-Za-z0-9._-]+$/, 'lineId has invalid characters'),
-  note: z.string().max(500, 'Note must be 500 characters or fewer').nullable().optional(),
-  qty: z.number().refine(Number.isFinite, 'qty must be a finite number'),
-  unitCostBase: z
-    .number()
-    .refine(Number.isFinite, 'unitCostBase must be a finite number')
-    .nonnegative('unitCostBase must be zero or greater')
-    .nullable()
-    .optional(),
-})
-
 export async function bulkAdjustStock(
-  lines: BulkAdjustLine[],
-  idempotencyToken?: string,
+  lines: BulkAdjustLine[]
 ): Promise<BulkAdjustFormState> {
   await requirePermission('stock_control.adjust')
-
-  // rfdl: validate every line (parity with single adjustStock). Reject non-finite
-  // qty, negative unitCostBase, and missing/non-string ids before any write.
-  const parsed = z.array(bulkAdjustLineSchema).safeParse(lines)
-  if (!parsed.success) {
-    return { message: parsed.error.issues[0]?.message ?? 'Invalid bulk adjustment line.' }
-  }
-  const valid = parsed.data.filter((l) => l.qty !== 0 && l.productId && l.warehouseId)
+  const valid = lines.filter((l) => l.qty !== 0 && l.productId && l.warehouseId)
 
   if (valid.length === 0) {
     return { message: 'No adjustments to save.' }
   }
 
-  // Pre-fetch accounting settings ONCE for the whole batch (8biu: avoid a per-line
-  // getAccountingSettings() inside the transaction loop). The reason name is resolved
-  // per line inside applyStockAdjustment.
-  const accountingSettings = await getAccountingSettings()
+  // Pre-fetch all unique reasons
+  const reasonIds = [...new Set(valid.map((l) => l.reasonId).filter(Boolean))]
+  const reasons = reasonIds.length
+    ? await db.adjustmentReason.findMany({
+        where: { id: { in: reasonIds } },
+        select: { id: true, name: true, accountCode: true },
+      })
+    : []
+  const reasonMap = new Map(reasons.map((r) => [r.id, r]))
 
   try {
     await db.$transaction(async (tx) => {
       for (const line of valid) {
+        const reason = line.reasonId ? reasonMap.get(line.reasonId) : null
         await applyStockAdjustment({
           tx,
           productId: line.productId,
           warehouseId: line.warehouseId,
           qty: line.qty,
           reasonId: line.reasonId,
-          // vzlk-2a: pass the per-line free-text note (not the reason name — that was
-          // double-counted, since applyStockAdjustment already prefixes the reason
-          // name, producing "Damaged: Damaged"). Now: reason name [+ ": <note>"].
-          note: line.note ?? null,
-          unitCostBase: line.unitCostBase,
-          settings: accountingSettings,
-          // 0tr0/tllm: per-line token = submission token + the line's STABLE client
-          // id (not its array position). applyStockAdjustment then keys the movement
-          // by a content fingerprint of that token + payload, so: a re-submitted batch
-          // dedups line-for-line; two lines with identical content stay distinct; and
-          // removing/reordering a line on retry can't shift a key onto another line.
-          idempotencyToken: idempotencyToken ? `${idempotencyToken}.${line.lineId}` : undefined,
+          note: reason?.name ?? null,
         })
       }
-    }, STOCK_TX_OPTIONS)
+    })
 
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
@@ -303,7 +532,7 @@ export async function bulkAdjustStock(
           referenceLabel: `bulk stock adjustment (${valid.length} lines)`,
         })
       } catch (rebalanceError) {
-        await logStockSideEffectFailure('overallocation_release', rebalanceError)
+        console.error(rebalanceError)
       }
     }
     if (positiveProductIds.length > 0) {
@@ -313,7 +542,7 @@ export async function bulkAdjustStock(
           referenceLabel: `bulk stock adjustment (${valid.length} lines)`,
         })
       } catch (allocError) {
-        await logStockSideEffectFailure('backorder_allocation', allocError)
+        console.error(allocError)
       }
     }
 
@@ -323,7 +552,7 @@ export async function bulkAdjustStock(
         'IMS_CHANGE',
       )
     } catch (syncError) {
-      await logStockSideEffectFailure('stock_sync_enqueue', syncError)
+      console.error(syncError)
     }
 
     await logActivity({
@@ -331,12 +560,6 @@ export async function bulkAdjustStock(
       action: 'bulk_adjusted',
       tag: 'stock',
       description: `Bulk adjusted stock for ${valid.length} products`,
-      // 27f9: record per-line detail so a bulk adjustment is auditable line-by-line
-      // (which product/warehouse/qty), not just an opaque "N products" summary.
-      metadata: {
-        lineCount: valid.length,
-        lines: valid.map((l) => ({ productId: l.productId, warehouseId: l.warehouseId, qty: l.qty, reasonId: l.reasonId || null })),
-      },
     })
 
     return { success: true, count: valid.length }
@@ -445,7 +668,7 @@ export async function updateAdjustmentMovement(
             select: { id: true, costLayerId: true, qty: true },
           },
           adjustmentLayers: {
-            select: { id: true, receivedQty: true, remainingQty: true, unitCostBase: true },
+            select: { id: true, receivedQty: true, remainingQty: true },
           },
         },
       })
@@ -485,37 +708,7 @@ export async function updateAdjustmentMovement(
         )
       }
 
-      // ycnj: an in-place edit re-books qty/cost layers/COGS but cannot revise an
-      // accounting journal that was already posted for this movement — that would
-      // silently drift the GL sub-ledger from inventory. Block the edit once a
-      // journal exists; the operator posts a reversing adjustment (which carries
-      // its own compensating journal) instead.
-      // Ignore CANCELLED rows (deliberately abandoned — never re-queued, so they
-      // never reach the ledger). PENDING/PROCESSING/SYNCED block (posted or will
-      // post); FAILED also blocks because it can be re-queued by reconciliation
-      // and would then post the OLD value, drifting from the edited inventory.
-      const postedJournal = await tx.accountingSyncLog.findFirst({
-        where: {
-          referenceType: 'StockMovement',
-          referenceId: id,
-          type: 'INVENTORY_ADJUSTMENT',
-          status: { not: 'CANCELLED' },
-        },
-        select: { id: true },
-      })
-      if (postedJournal) {
-        throw new Error(
-          'This adjustment has been posted to accounting. Create a reversing adjustment ' +
-          'instead of editing it in place, so the ledger stays consistent.',
-        )
-      }
-
       const newWarehouseId = oldWarehouseId // warehouse can't be changed via edit
-      // Take the FOR UPDATE lock before any cost-sensitive read (stock level,
-      // candidate layers, average cost) so a concurrent consume between the read
-      // and the new layer's creation cannot cost it against stale state. The
-      // addition branch previously read getAverageUnitCost unlocked (scjz.3).
-      await lockStockLevelRow(tx, movement.productId, newWarehouseId)
       const currentLevel = await tx.stockLevel.findUnique({
         where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
         select: { quantity: true, reservedQty: true },
@@ -608,25 +801,14 @@ export async function updateAdjustmentMovement(
 
       let nextMovementValueFields: ReturnType<typeof buildStockMovementValueFields> | ReturnType<typeof buildStockMovementValueFieldsFromConsumed>
       if (newIsAddition) {
-        // ycnj: preserve the ORIGINAL addition layer's unit cost on a qty edit, so
-        // a re-booked addition isn't silently revalued at the current average
-        // (e.g. a £0 sample, or +10 @ £2 → +12, must keep £2 not become average).
-        // Only a removal→addition edit (no original addition layer to inherit a
-        // cost from) falls back to the derived warehouse/historical average.
-        const originalUnitCost = oldIsAddition ? Number(movement.adjustmentLayers[0]?.unitCostBase) : NaN
-        let unitCostBase: number
-        if (Number.isFinite(originalUnitCost) && originalUnitCost >= 0) {
-          unitCostBase = originalUnitCost
-        } else {
-          const warehouseAvgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
-          unitCostBase = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, movement.productId)
-        }
-        nextMovementValueFields = buildStockMovementValueFields({ qty: Math.abs(newSignedQty), unitCostBase })
+        const warehouseAvgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
+        const avgCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, movement.productId)
+        nextMovementValueFields = buildStockMovementValueFields({ qty: Math.abs(newSignedQty), unitCostBase: avgCost })
         await createCostLayer(tx, {
           productId: movement.productId,
           warehouseId: newWarehouseId,
           qty: Math.abs(newSignedQty),
-          unitCostBase,
+          unitCostBase: avgCost,
           receivedAt: movement.createdAt,
           isOpeningStock: false,
           adjustmentMovementId: id,
@@ -684,7 +866,7 @@ export async function updateAdjustmentMovement(
             referenceLabel: `adjustment edit (net +${netDelta})`,
           })
         } catch (allocError) {
-          await logStockSideEffectFailure('backorder_allocation', allocError)
+          console.error(allocError)
         }
       } else if (netDelta < 0 && warehouseId) {
         try {
@@ -693,13 +875,13 @@ export async function updateAdjustmentMovement(
             { source: 'stock_adjustment', referenceId: id, referenceLabel: `adjustment edit (net ${netDelta})` },
           )
         } catch (rebalanceError) {
-          await logStockSideEffectFailure('overallocation_release', rebalanceError)
+          console.error(rebalanceError)
         }
       }
       try {
         await enqueueStockSync([movement.productId], 'IMS_CHANGE')
       } catch (syncError) {
-        await logStockSideEffectFailure('stock_sync_enqueue', syncError)
+        console.error(syncError)
       }
     }
 
@@ -808,14 +990,6 @@ export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Pr
 }
 
 /** Avg COGS per product from FIFO cost layers (weighted avg of remaining stock) */
-/**
- * Weighted-average remaining cost per product, for the sales-order form's
- * indicative COGS/margin estimate ONLY (the single caller renders it client-side;
- * it is never persisted, posted to a GL journal, or used to cost a movement). The
- * JS-float accumulation below is therefore acceptable — this is NOT a GL path, so
- * it is intentionally left as Number() math (4ve5: verified display-only, no drift
- * risk). Anything that posts to accounting must use the Decimal engine instead.
- */
 export async function getAvgCogsMap(): Promise<Record<string, number>> {
   await requireAuth()
   const layers = await db.costLayer.findMany({

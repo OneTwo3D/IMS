@@ -66,7 +66,6 @@ export async function savePaymentAccountMap(
 export async function getPaymentMethodCombos(): Promise<
   Array<{ paymentMethod: string; currency: string }>
 > {
-  await requirePermission('settings.company')
   const rows = await db.salesOrder.findMany({
     where: { paymentMethod: { not: null } },
     select: { paymentMethod: true, currency: true },

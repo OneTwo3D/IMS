@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { CsvBar } from '@/components/ui/csv-bar'
 import { importTransfersCsv } from '@/app/actions/import'
-import type { WmsTransferAsnState } from '@/lib/connectors/wms/asn-types'
+import type { MintsoftTransferAsnState } from '@/app/actions/mintsoft-sync'
 import { TransferFormDialog } from './transfer-form'
 import { TransferList } from './transfer-list'
 import type { TransferRow } from '@/app/actions/transfers'
@@ -20,11 +20,11 @@ type Props = {
   warehouses: Warehouse[]
   products: ProductRow[]
   initialTransfers: TransferRow[]
-  wmsAsnStates: Record<string, WmsTransferAsnState>
+  mintsoftAsnStates: Record<string, MintsoftTransferAsnState>
   stockLevels: Record<string, Record<string, StockLevelEntry>>
 }
 
-export function TransfersClient({ warehouses, products, initialTransfers, wmsAsnStates, stockLevels }: Props) {
+export function TransfersClient({ warehouses, products, initialTransfers, mintsoftAsnStates, stockLevels }: Props) {
   const [transfers, setTransfers] = useState(initialTransfers)
   const [showCreate, setShowCreate] = useState(false)
   const warehouseCount = warehouses.length
@@ -75,7 +75,7 @@ export function TransfersClient({ warehouses, products, initialTransfers, wmsAsn
         transfers={transfers}
         warehouses={warehouses}
         products={products}
-        wmsAsnStates={wmsAsnStates}
+        mintsoftAsnStates={mintsoftAsnStates}
         stockLevels={stockLevels}
         onTransferUpdated={handleUpdated}
       />
