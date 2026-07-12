@@ -128,8 +128,21 @@ export async function runWmsOrderReconcileCore(
     counters.cancelledVerified += 1
     try {
       const status = await deps.fetchOrderStatus(link.externalOrderNumber)
+      if (!status) {
+        // Null conflates "gone" with "ambiguous merged match" (Codex r15 P1):
+        // counting it as verified-clean could resolve a live ACTIVE_AFTER_CANCEL
+        // finding. Only the tri-state probe's MISSING verdict verifies absence.
+        const presence = deps.probeOrderPresence ? await deps.probeOrderPresence(link.externalOrderNumber) : null
+        if (presence === 'MISSING') {
+          verifiedCancelledOrderIds.push(link.orderId)
+        } else {
+          counters.errors += 1
+          console.error(`[wms-order-reconcile] unresolvable cancelled-order lookup for ${link.externalOrderNumber} (${presence ?? 'no probe'}); skipping`)
+        }
+        continue
+      }
       verifiedCancelledOrderIds.push(link.orderId)
-      if (status && !status.dispatched && !isLikelyCancelledWmsStatus(status)) {
+      if (!status.dispatched && !isLikelyCancelledWmsStatus(status)) {
         findings.push({
           category: 'ACTIVE_AFTER_CANCEL',
           orderId: link.orderId,

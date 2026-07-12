@@ -83,12 +83,13 @@ test('reconcile core: check B is skipped entirely without a tri-state probe', as
 })
 
 test('reconcile core: a cancelled link still active in the WMS is ACTIVE_AFTER_CANCEL', async () => {
-  const { findings } = await reconcile.runWmsOrderReconcileCore(deps({
+  const { findings, counters, verifiedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
     listCancelledLinksToVerify: async () => [
       { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },   // still active → finding
       { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },   // cancelled in WMS → clean
-      { orderId: 'o3', orderNumber: 'SO-3', externalOrderNumber: 'WC-3' },   // gone from WMS → clean
+      { orderId: 'o3', orderNumber: 'SO-3', externalOrderNumber: 'WC-3' },   // verifiably gone from WMS → clean
       { orderId: 'o4', orderNumber: 'SO-4', externalOrderNumber: 'WC-4' },   // dispatched → goods gone, not a cancel question
+      { orderId: 'o5', orderNumber: 'SO-5', externalOrderNumber: 'WC-5' },   // null status + AMBIGUOUS probe → fail closed
     ],
     fetchOrderStatus: async (orderNumber) => {
       if (orderNumber === 'WC-1') return status({ status: 'PROCESSING', statusLabel: 'Processing' })
@@ -96,10 +97,16 @@ test('reconcile core: a cancelled link still active in the WMS is ACTIVE_AFTER_C
       if (orderNumber === 'WC-4') return status({ status: 'DESPATCHED', statusLabel: 'Despatched', dispatched: true })
       return null
     },
+    probeOrderPresence: async (orderNumber) => (orderNumber === 'WC-3' ? 'MISSING' : 'AMBIGUOUS'),
   }))
   assert.equal(findings.length, 1)
   assert.equal(findings[0].category, 'ACTIVE_AFTER_CANCEL')
   assert.match(findings[0].detail, /Processing/)
+  // WC-5's ambiguous null is an error — it must NOT count as verified-clean
+  // (that would resolve a live ACTIVE_AFTER_CANCEL finding).
+  assert.equal(counters.errors, 1)
+  assert.equal(verifiedOrderIds.includes('o5'), false)
+  assert.equal(verifiedOrderIds.includes('o3'), true)
 })
 
 test('reconcile core: lookup failures count as errors and never abort the run', async () => {
