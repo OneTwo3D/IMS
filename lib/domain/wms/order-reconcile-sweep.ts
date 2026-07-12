@@ -139,8 +139,12 @@ export async function runWmsOrderReconcileCore(
   // the starvation existed in both directions). Each check's rotation covers
   // its own backlog across runs.
   const cancelledLinks = await deps.listCancelledLinksToVerify(Math.ceil(lookupLimit / 2))
+  // C's CALL spend is capped at half the budget too (Codex r20 P1): each row
+  // can cost up to two calls (status + fallback probe) or more (parts), so a
+  // row cap alone still let C consume the entire call budget.
+  const cancelledCallBudget = Math.ceil(lookupLimit / 2)
   for (const link of cancelledLinks) {
-    if (lookupsUsed >= lookupLimit) break
+    if (lookupsUsed >= cancelledCallBudget) break
     counters.cancelledVerified += 1
     attemptedCancelledOrderIds.push(link.orderId)
     try {

@@ -698,7 +698,11 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
         return { ok: false as const, error: 'No open missing-in-WMS finding for this order (already resolved or re-verified).' }
       }
       const updated = await tx.wmsOrderPushLink.updateMany({
-        where: { orderId, state: { in: ['SYNCED', 'MERGED'] } },
+        // CAS on the exact WMS reference that was probed absent (Codex r20): a
+        // concurrent merge repoint changes externalOrderNumber, and clearing
+        // the NEW survivor reference off a stale probe would let the push
+        // sweep duplicate it.
+        where: { orderId, state: { in: ['SYNCED', 'MERGED'] }, externalOrderNumber: link?.externalOrderNumber ?? null },
         data: {
           state: 'PENDING_CREATE',
           externalOrderId: null,
