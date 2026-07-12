@@ -105,8 +105,8 @@ export async function runWmsOrderReconcileCore(
   counters: WmsReconcileCounters
   findings: WmsReconcileFinding[]
   verifiedOrderIds: string[]
-  verifiedSyncedOrderIds: string[]
-  verifiedCancelledOrderIds: string[]
+  verifiedSynced: Array<{ orderId: string; externalOrderNumber: string }>
+  verifiedCancelled: Array<{ orderId: string; externalOrderNumber: string }>
   attemptedSynced: Array<{ orderId: string; linkState: string; externalOrderNumber: string }>
   attemptedCancelled: Array<{ orderId: string; linkState: string; externalOrderNumber: string }>
 }> {
@@ -132,8 +132,8 @@ export async function runWmsOrderReconcileCore(
   // B and C share ONE lookup budget (each fetchOrderStatus is a WMS API call),
   // and C — the ship-goods-nobody-expects direction — is fetched FIRST so a
   // large live-link backlog can never starve the safety-critical check (Codex).
-  const verifiedSyncedOrderIds: string[] = []
-  const verifiedCancelledOrderIds: string[] = []
+  const verifiedSynced: Array<{ orderId: string; externalOrderNumber: string }> = []
+  const verifiedCancelled: Array<{ orderId: string; externalOrderNumber: string }> = []
   // ATTEMPTED ids drive the rotation stamp; VERIFIED ids drive resolution
   // (Codex r19 P1): an errored/ambiguous lookup is never verified, but it must
   // still rotate to the back of the queue — otherwise persistently-failing
@@ -163,11 +163,18 @@ export async function runWmsOrderReconcileCore(
         // Null conflates "gone" with "ambiguous merged match" (Codex r15 P1):
         // counting it as verified-clean could resolve a live ACTIVE_AFTER_CANCEL
         // finding. Only the tri-state probe's MISSING verdict verifies absence.
+        // Reserve budget BEFORE the fallback call (Codex r25): the status
+        // lookup may have consumed the last slot.
+        if (deps.probeOrderPresence && lookupsUsed >= cancelledCallBudget) {
+          counters.errors += 1
+          console.error(`[wms-order-reconcile] budget exhausted before the fallback probe for ${link.externalOrderNumber}; skipping`)
+          continue
+        }
         const presence = deps.probeOrderPresence
           ? (lookupsUsed += 1, await deps.probeOrderPresence(link.externalOrderNumber))
           : null
         if (presence === 'MISSING') {
-          verifiedCancelledOrderIds.push(link.orderId)
+          verifiedCancelled.push({ orderId: link.orderId, externalOrderNumber: link.externalOrderNumber })
         } else {
           counters.errors += 1
           console.error(`[wms-order-reconcile] unresolvable cancelled-order lookup for ${link.externalOrderNumber} (${presence ?? 'no probe'}); skipping`)
@@ -181,6 +188,11 @@ export async function runWmsOrderReconcileCore(
       // its top-level status is computed for the whole order, not collapsed)
       // falls through to the top-level classification below.
       if (deps.partsSupported && (status.isSplit || (status.partCount ?? 1) > 1)) {
+        if (lookupsUsed >= cancelledCallBudget) {
+          counters.errors += 1
+          console.error(`[wms-order-reconcile] budget exhausted before the parts lookup for ${link.externalOrderNumber}; skipping`)
+          continue
+        }
         lookupsUsed += 1
         const parts = await deps.fetchOrderParts(status.externalOrderNumber || link.externalOrderNumber)
         if (parts.length === 0) {
@@ -189,7 +201,7 @@ export async function runWmsOrderReconcileCore(
           console.error(`[wms-order-reconcile] split order ${link.externalOrderNumber} has no inspectable parts; skipping`)
           continue
         }
-        verifiedCancelledOrderIds.push(link.orderId)
+        verifiedCancelled.push({ orderId: link.orderId, externalOrderNumber: link.externalOrderNumber })
         const activeParts = parts.filter((part) => (
           !part.dispatched && !isLikelyCancelledWmsStatus({ status: part.status, statusLabel: part.status })
         ))
@@ -205,7 +217,7 @@ export async function runWmsOrderReconcileCore(
         continue
       }
 
-      verifiedCancelledOrderIds.push(link.orderId)
+      verifiedCancelled.push({ orderId: link.orderId, externalOrderNumber: link.externalOrderNumber })
       if (!status.dispatched && !isLikelyCancelledWmsStatus(status)) {
         findings.push({
           category: 'ACTIVE_AFTER_CANCEL',
@@ -242,7 +254,7 @@ export async function runWmsOrderReconcileCore(
           console.error(`[wms-order-reconcile] ambiguous WMS match for ${link.externalOrderNumber}; skipping`)
           continue
         }
-        verifiedSyncedOrderIds.push(link.orderId)
+        verifiedSynced.push({ orderId: link.orderId, externalOrderNumber: link.externalOrderNumber })
         if (presence === 'MISSING') {
           findings.push({
             category: 'MISSING_IN_WMS',
@@ -263,9 +275,9 @@ export async function runWmsOrderReconcileCore(
   return {
     counters,
     findings,
-    verifiedOrderIds: [...verifiedCancelledOrderIds, ...verifiedSyncedOrderIds],
-    verifiedSyncedOrderIds,
-    verifiedCancelledOrderIds,
+    verifiedOrderIds: [...verifiedCancelled, ...verifiedSynced].map((entry) => entry.orderId),
+    verifiedSynced,
+    verifiedCancelled,
     attemptedSynced,
     attemptedCancelled,
   }
@@ -586,21 +598,24 @@ export async function runWmsOrderReconcileSweep(
     // Keyed on validFindings (Codex r11): a finding dropped by the state
     // revalidation must not block resolving the order's existing open row.
     const foundKey = new Set(validFindings.map((finding) => `${finding.orderId}:${finding.category}`))
-    const cleanFor = (verifiedIds: string[], category: string) => verifiedIds.filter((orderId) => !foundKey.has(`${orderId}:${category}`))
-    const cleanSynced = cleanFor(core.verifiedSyncedOrderIds, 'MISSING_IN_WMS')
-    if (cleanSynced.length > 0) {
-      await db.wmsOrderDiscrepancy.updateMany({
-        where: { orderId: { in: cleanSynced }, category: 'MISSING_IN_WMS', status: 'OPEN' },
-        data: { status: 'RESOLVED', resolvedAt: now },
-      })
+    // Resolutions are pinned to the reference THIS run verified clean (Codex
+    // r25): an overlapping run may have re-opened the finding for a repointed
+    // reference the clean lookup never saw — that row must survive. Bounded by
+    // the run's lookup cap, so per-entry updates are fine for a daily cron.
+    const resolveVerifiedClean = async (
+      entries: Array<{ orderId: string; externalOrderNumber: string }>,
+      category: string,
+    ) => {
+      for (const entry of entries) {
+        if (foundKey.has(`${entry.orderId}:${category}`)) continue
+        await db.wmsOrderDiscrepancy.updateMany({
+          where: { orderId: entry.orderId, category, status: 'OPEN', externalOrderNumber: entry.externalOrderNumber },
+          data: { status: 'RESOLVED', resolvedAt: now },
+        })
+      }
     }
-    const cleanCancelled = cleanFor(core.verifiedCancelledOrderIds, 'ACTIVE_AFTER_CANCEL')
-    if (cleanCancelled.length > 0) {
-      await db.wmsOrderDiscrepancy.updateMany({
-        where: { orderId: { in: cleanCancelled }, category: 'ACTIVE_AFTER_CANCEL', status: 'OPEN' },
-        data: { status: 'RESOLVED', resolvedAt: now },
-      })
-    }
+    await resolveVerifiedClean(core.verifiedSynced, 'MISSING_IN_WMS')
+    await resolveVerifiedClean(core.verifiedCancelled, 'ACTIVE_AFTER_CANCEL')
 
     // State-scope cleanup (Codex r11): an open B/C row whose link has LEFT the
     // category's state can never be rescanned by its check (B only walks

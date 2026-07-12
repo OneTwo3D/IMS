@@ -168,7 +168,7 @@ test('reconcile core: returns the ids it actually verified for rotation stamping
 })
 
 test('reconcile core: errored lookups still count as ATTEMPTED so they rotate to the back', async () => {
-  const { attemptedSynced, verifiedSyncedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
+  const { attemptedSynced, verifiedSynced } = await reconcile.runWmsOrderReconcileCore(deps({
     listSyncedLinksToVerify: async () => [
       { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', linkState: 'SYNCED' },
       { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2', linkState: 'SYNCED' },
@@ -186,13 +186,16 @@ test('reconcile core: errored lookups still count as ATTEMPTED so they rotate to
     { orderId: 'o1', linkState: 'SYNCED', externalOrderNumber: 'WC-1' },
     { orderId: 'o2', linkState: 'SYNCED', externalOrderNumber: 'WC-2' },
   ])
-  assert.deepEqual(verifiedSyncedOrderIds, ['o2'])
+  assert.deepEqual(verifiedSynced, [{ orderId: 'o2', externalOrderNumber: 'WC-2' }])
 })
 
-test('reconcile core: fallback probes are charged against the WMS call budget', async () => {
+test('reconcile core: fallback probes are charged against — and reserved from — the call budget', async () => {
   let syncedLimitSeen = -1
-  await reconcile.runWmsOrderReconcileCore(deps({
-    // 3 cancelled links, each null status + probe = 2 calls each = 6 calls.
+  const { counters } = await reconcile.runWmsOrderReconcileCore(deps({
+    // 3 cancelled links, each wanting null status + probe = 2 calls each; C's
+    // call budget is ceil(10/2)=5, so row 3's fallback probe is REFUSED at the
+    // cap (Codex r25: the status lookup may consume the last slot) and counts
+    // as an error instead of overshooting.
     listCancelledLinksToVerify: async () => Array.from({ length: 3 }, (_, index) => ({
       orderId: `c${index}`, orderNumber: `SO-C${index}`, externalOrderNumber: `WCC-${index}`, linkState: 'CANCELLED',
     })),
@@ -203,8 +206,9 @@ test('reconcile core: fallback probes are charged against the WMS call budget', 
       return []
     },
   }), { lookupLimit: 10 })
-  // B's budget reflects the 6 CALLS spent, not the 3 links listed.
-  assert.equal(syncedLimitSeen, 4)
+  // 5 calls spent in C (status,probe,status,probe,status) — B gets the rest.
+  assert.equal(syncedLimitSeen, 5)
+  assert.equal(counters.errors, 1)
 })
 
 test('reconcile core: a split cancelled order is judged by ALL its parts, not the collapsed Part 1', async () => {
