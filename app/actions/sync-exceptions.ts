@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
@@ -114,19 +115,19 @@ const OUTBOX_FAILURE_STATUSES = [
 // imports have NO entityId; the missing-FX queue rows have NO entityId and a
 // payload.reason marker). Refund-sync rows always carry entityId = the IMS
 // order id, so require it — and exclude the FX-queue marker defensively so a
-// future entityId-carrying FX row can never be "retried" as a refund.
+// future entityId-carrying FX row can never be "retried" as a refund. The
+// exclusion must explicitly admit SQL-NULL payloads (refund-sync's FAILED rows
+// carry none): a JSON-path NOT predicate silently drops NULL rows.
 const REFUND_PARK_WHERE = {
   connector: 'woocommerce',
   direction: 'FROM_CONNECTOR' as const,
   entityType: 'SalesOrder',
   status: { in: ['PENDING' as const, 'FAILED' as const] },
   entityId: { not: null },
-  NOT: {
-    payload: {
-      path: ['reason'],
-      equals: 'missing_fx_rate',
-    },
-  },
+  OR: [
+    { payload: { equals: Prisma.DbNull } },
+    { NOT: { payload: { path: ['reason'], equals: 'missing_fx_rate' } } },
+  ],
 }
 
 /**
@@ -461,6 +462,20 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
         where: { id: row.id },
         data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },
       })
+    } else if (row.externalId) {
+      // Codex P2: a still-failing retry re-parks the SAME refund as a fresh row
+      // (refund-sync always creates). Keep only the newest park per refund —
+      // delete the older duplicates so the inbox shows one actionable row with
+      // the current error instead of accumulating copies on every retry.
+      const parks = await db.shoppingSyncLog.findMany({
+        where: { ...REFUND_PARK_WHERE, externalId: row.externalId },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true },
+      })
+      const staleIds = parks.slice(1).map((park) => park.id)
+      if (staleIds.length > 0) {
+        await db.shoppingSyncLog.deleteMany({ where: { id: { in: staleIds } } })
+      }
     }
 
     await logActivity({
