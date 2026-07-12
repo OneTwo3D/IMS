@@ -52,6 +52,8 @@ function deps(overrides: Partial<WmsDispatchSweepDeps>): WmsDispatchSweepDeps {
     fetchPartItems: async () => [],
     pushPartialShipment: async () => ({ ok: true }),
     repointLink: async () => {},
+    recordDispatchError: async () => ({ deadLettered: false }),
+    clearDispatchFailures: async () => {},
     ...overrides,
   }
 }
@@ -322,4 +324,94 @@ test('runWmsDispatchSweepCore isolates a thrown fetch as a per-order error', asy
   assert.equal(counters.totalChecked, 2)
   assert.equal(counters.errors, 1)
   assert.equal(counters.dispatched, 1)
+})
+
+// --- 6oyu.2: dispatch dead-letter (consecutive-failure tracking) ---
+
+test('shouldDeadLetterDispatch: dead-letters at the cap, never below it or twice', () => {
+  const { shouldDeadLetterDispatch, DISPATCH_MAX_CONSECUTIVE_FAILURES } = sweep
+  assert.equal(shouldDeadLetterDispatch(DISPATCH_MAX_CONSECUTIVE_FAILURES - 1, null), false)
+  assert.equal(shouldDeadLetterDispatch(DISPATCH_MAX_CONSECUTIVE_FAILURES, null), true)
+  assert.equal(shouldDeadLetterDispatch(DISPATCH_MAX_CONSECUTIVE_FAILURES + 3, null), true)
+  // Already dead-lettered → never again (compare-and-set semantics).
+  assert.equal(shouldDeadLetterDispatch(DISPATCH_MAX_CONSECUTIVE_FAILURES, new Date()), false)
+})
+
+test('sweep core: an error outcome records a dispatch failure for the candidate', async () => {
+  const recorded: Array<{ linkId: string; reason: string }> = []
+  const result = await sweep.runWmsDispatchSweepCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1' }],
+    fetchOrderStatus: async () => status({ externalOrderNumber: 'WC-1', status: 'DESPATCHED', dispatched: true }),
+    applyDispatch: async () => ({ success: false, error: 'no stock to consume' }),
+    recordDispatchError: async (candidate, reason) => {
+      recorded.push({ linkId: candidate.linkId, reason })
+      return { deadLettered: false }
+    },
+  }))
+  assert.equal(result.counters.errors, 1)
+  assert.deepEqual(recorded, [{ linkId: 'l1', reason: 'no stock to consume' }])
+  assert.equal(result.logs[0].reason, 'no stock to consume')
+})
+
+test('sweep core: the dead-letter marker is appended to the log reason', async () => {
+  const result = await sweep.runWmsDispatchSweepCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1' }],
+    fetchOrderStatus: async () => status({ externalOrderNumber: 'WC-1', status: 'DESPATCHED', dispatched: true }),
+    applyDispatch: async () => ({ success: false, error: 'no stock to consume' }),
+    recordDispatchError: async () => ({ deadLettered: true }),
+  }))
+  assert.match(result.logs[0].reason, /dead-lettered after \d+ consecutive failures/)
+})
+
+test('sweep core: a thrown reconcile error also records a dispatch failure', async () => {
+  const recorded: string[] = []
+  const result = await sweep.runWmsDispatchSweepCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1' }],
+    fetchOrderStatus: async () => { throw new Error('connector exploded') },
+    recordDispatchError: async (candidate) => {
+      recorded.push(candidate.linkId)
+      return { deadLettered: false }
+    },
+  }))
+  assert.equal(result.counters.errors, 1)
+  assert.deepEqual(recorded, ['l1'])
+})
+
+test('sweep core: success and pending outcomes clear the failure streak', async () => {
+  const cleared: string[] = []
+  await sweep.runWmsDispatchSweepCore(deps({
+    listCandidates: async () => [
+      { linkId: 'l-ok', orderId: 'o1', externalOrderNumber: 'WC-1' },
+      { linkId: 'l-pending', orderId: 'o2', externalOrderNumber: 'WC-2' },
+    ],
+    fetchOrderStatus: async (orderNumber) => (
+      orderNumber === 'WC-1'
+        ? status({ externalOrderNumber: 'WC-1', status: 'DESPATCHED', dispatched: true })
+        : status({ externalOrderNumber: 'WC-2', status: 'PROCESSING', dispatched: false })
+    ),
+    clearDispatchFailures: async (linkId) => { cleared.push(linkId) },
+  }))
+  assert.deepEqual(cleared.sort(), ['l-ok', 'l-pending'])
+})
+
+test('sweep core: a bookkeeping failure never aborts the batch or recurses into the counter', async () => {
+  let recordCalls = 0
+  const result = await sweep.runWmsDispatchSweepCore(deps({
+    listCandidates: async () => [
+      { linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1' },
+      { linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-2' },
+    ],
+    fetchOrderStatus: async () => status({ status: 'DESPATCHED', dispatched: true }),
+    applyDispatch: async () => ({ success: false, error: 'no stock' }),
+    recordDispatchError: async () => {
+      recordCalls += 1
+      throw new Error('activity log down')
+    },
+  }))
+  // Both candidates still processed; exactly ONE recordDispatchError call per
+  // candidate (no recursion), and the reconcile errors still counted.
+  assert.equal(result.counters.totalChecked, 2)
+  assert.equal(result.counters.errors, 2)
+  assert.equal(recordCalls, 2)
+  assert.equal(result.logs.length, 2)
 })

@@ -6,6 +6,7 @@ import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsConnectorId, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
+import { notify } from '@/lib/notifications'
 import { scrubWmsError } from './error-scrub'
 
 /**
@@ -26,6 +27,20 @@ const DISPATCH_SWEEP_DEFAULT_BATCH_SIZE = 50
 
 /** Lifecycle statuses where the IMS order has already left the dispatch-poll set. */
 const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] as const
+
+/**
+ * 6oyu.2: consecutive per-order reconcile failures before the link is
+ * dead-lettered out of the sweep. Five failures ≈ five sweep cycles — enough
+ * for transient WMS/API wobbles to clear, short enough that a genuinely stuck
+ * order (typically dispatched-but-no-IMS-stock) stops re-erroring forever and
+ * surfaces in the exception inbox instead.
+ */
+export const DISPATCH_MAX_CONSECUTIVE_FAILURES = 5
+
+/** Pure dead-letter decision so the threshold semantics are unit-testable. */
+export function shouldDeadLetterDispatch(failureCount: number, deadLetteredAt: Date | null): boolean {
+  return failureCount >= DISPATCH_MAX_CONSECUTIVE_FAILURES && !deadLetteredAt
+}
 
 /** Map WMS tracking entries to the shape applyExternalFulfillmentUpdate expects. */
 export function toFulfillmentTracking(
@@ -86,6 +101,12 @@ export type WmsDispatchSweepDeps = {
   // Merge handling: repoint the push link to the surviving WMS order when this order was
   // merged into another (its own WMS order is destroyed).
   repointLink(linkId: string, to: { externalOrderId: string; externalOrderNumber: string }): Promise<void>
+  // 6oyu.2: consecutive-failure tracking. recordDispatchError increments the link's
+  // failure count (dead-lettering at DISPATCH_MAX_CONSECUTIVE_FAILURES — the link then
+  // leaves listCandidates); clearDispatchFailures resets it on a success/pending outcome
+  // so only CONSECUTIVE failures accumulate.
+  recordDispatchError(candidate: WmsDispatchCandidate, reason: string): Promise<{ deadLettered: boolean }>
+  clearDispatchFailures(linkId: string): Promise<void>
 }
 
 /**
@@ -220,24 +241,39 @@ export async function runWmsDispatchSweepCore(
   const candidates = await deps.listCandidates(batchSize)
   for (const candidate of candidates) {
     counters.totalChecked += 1
+
+    // Reconcile first; the failure-tracking bookkeeping below runs OUTSIDE this
+    // try/catch so a bookkeeping error can never count as another reconcile
+    // failure (Codex: recordDispatchError throwing inside the catch would have
+    // recursed into itself) nor abort the rest of the batch.
+    let outcome: { action: 'dispatched' | 'pending' | 'error'; reason: string }
     try {
-      const outcome = await reconcileOneOrder(deps, candidate)
-      counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
-      logs.push({
-        orderId: candidate.orderId,
-        externalOrderNumber: candidate.externalOrderNumber,
-        action: outcome.action,
-        reason: outcome.reason,
-      })
+      outcome = await reconcileOneOrder(deps, candidate)
     } catch (error) {
-      counters.errors += 1
-      logs.push({
-        orderId: candidate.orderId,
-        externalOrderNumber: candidate.externalOrderNumber,
-        action: 'error',
-        reason: scrubWmsError(error, 'WMS dispatch sweep error'),
-      })
+      outcome = { action: 'error', reason: scrubWmsError(error, 'WMS dispatch sweep error') }
     }
+    counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
+
+    // 6oyu.2: only CONSECUTIVE errors dead-letter — any non-error outcome resets.
+    let reason = outcome.reason
+    try {
+      if (outcome.action === 'error') {
+        const { deadLettered } = await deps.recordDispatchError(candidate, outcome.reason)
+        if (deadLettered) reason = `${outcome.reason} — dead-lettered after ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures`
+      } else {
+        await deps.clearDispatchFailures(candidate.linkId)
+      }
+    } catch (bookkeepingError) {
+      // Best-effort: the streak just doesn't move this run.
+      console.error('[wms-dispatch-sweep] failure-tracking bookkeeping failed:', bookkeepingError)
+    }
+
+    logs.push({
+      orderId: candidate.orderId,
+      externalOrderNumber: candidate.externalOrderNumber,
+      action: outcome.action,
+      reason,
+    })
   }
 
   return { counters, logs }
@@ -264,6 +300,9 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           // tracking; the push-sweep skips them (SYNCED-only) so they aren't re-pushed.
           state: { in: ['SYNCED', 'MERGED'] },
           externalOrderNumber: { not: null },
+          // 6oyu.2: dead-lettered links stop re-erroring every sweep; an operator
+          // replays them from the exception inbox once the cause is fixed.
+          dispatchDeadLetteredAt: null,
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },
         select: { id: true, orderId: true, externalOrderNumber: true },
@@ -307,9 +346,95 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
     async repointLink(linkId, to) {
       // Park as MERGED so the push-sweep's SYNCED-filtered passes skip it (no dual-sync
       // amending the survivor with this order's lines); the dispatch sweep still polls it.
+      // The failure streak belonged to the OLD WMS order — the survivor starts clean.
       await db.wmsOrderPushLink.update({
         where: { id: linkId },
-        data: { externalOrderId: to.externalOrderId, externalOrderNumber: to.externalOrderNumber, state: 'MERGED' },
+        data: {
+          externalOrderId: to.externalOrderId,
+          externalOrderNumber: to.externalOrderNumber,
+          state: 'MERGED',
+          dispatchFailureCount: 0,
+          dispatchLastError: null,
+          dispatchDeadLetteredAt: null,
+        },
+      })
+    },
+    async recordDispatchError(candidate, reason) {
+      const link = await db.wmsOrderPushLink.update({
+        where: { id: candidate.linkId },
+        data: {
+          dispatchFailureCount: { increment: 1 },
+          dispatchLastError: reason,
+        },
+        select: { dispatchFailureCount: true, dispatchDeadLetteredAt: true },
+      })
+
+      if (!shouldDeadLetterDispatch(link.dispatchFailureCount, link.dispatchDeadLetteredAt)) {
+        return { deadLettered: false }
+      }
+
+      // Compare-and-set so a concurrent run (or replay) can't double dead-letter,
+      // AND (Codex) so an overlapping sweep's successful reconcile — which resets
+      // the count between our increment/read and this write — vetoes the
+      // dead-letter: the count must STILL be at the threshold when we commit.
+      const updated = await db.wmsOrderPushLink.updateMany({
+        where: {
+          id: candidate.linkId,
+          dispatchDeadLetteredAt: null,
+          dispatchFailureCount: { gte: DISPATCH_MAX_CONSECUTIVE_FAILURES },
+        },
+        data: { dispatchDeadLetteredAt: new Date() },
+      })
+      if (updated.count === 0) return { deadLettered: false }
+
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: candidate.orderId,
+        tag: 'sync',
+        action: 'wms_dispatch_dead_lettered',
+        description: `Dispatch reconciliation dead-lettered after ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures (WMS order ${candidate.externalOrderNumber}): ${reason}`,
+        metadata: {
+          orderId: candidate.orderId,
+          externalOrderNumber: candidate.externalOrderNumber,
+          connector: connectorId,
+          failureCount: link.dispatchFailureCount,
+          lastError: reason,
+        },
+        level: 'WARNING',
+        resolveUser: false,
+      })
+
+      // Bell the admins individually — a broadcast (userId null) would expose
+      // order details to READONLY/SUPPLIER users.
+      const admins = await db.user.findMany({
+        where: { role: 'ADMIN', active: true },
+        select: { id: true },
+      })
+      await Promise.all(admins.map((admin) => notify({
+        userId: admin.id,
+        type: 'error',
+        title: 'WMS dispatch stuck',
+        message: `Order ${candidate.externalOrderNumber} despatched in the WMS but cannot reconcile into IMS (${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures). It needs attention in the sync exception inbox.`,
+        actionUrl: '/sync/exceptions',
+      })))
+
+      return { deadLettered: true }
+    },
+    async clearDispatchFailures(linkId) {
+      // Only touch rows with failure state — keeps the happy path write-free.
+      // A success also clears dispatchDeadLetteredAt (Codex): an overlapping
+      // sweep can dead-letter while THIS run successfully reconciles, and a
+      // reconciled order must not linger as a false exception.
+      await db.wmsOrderPushLink.updateMany({
+        where: {
+          id: linkId,
+          OR: [
+            { dispatchFailureCount: { gt: 0 } },
+            { dispatchLastError: { not: null } },
+            { dispatchDeadLetteredAt: { not: null } },
+          ],
+        },
+        data: { dispatchFailureCount: 0, dispatchLastError: null, dispatchDeadLetteredAt: null },
       })
     },
   }
@@ -320,8 +445,11 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
  * record (consistent with the other WMS sync jobs).
  *
  * Known limitations (Phase 11 / q66in.4): candidates aren't row-locked (overlapping runs
- * could both process an order, but applyExternalFulfillmentUpdate is idempotent), and a
- * despatched order that can't reconcile (no IMS stock) re-errors each run until resolved.
+ * could both process an order, but applyExternalFulfillmentUpdate is idempotent). A
+ * despatched order that can't reconcile (no IMS stock) dead-letters after
+ * DISPATCH_MAX_CONSECUTIVE_FAILURES consecutive errors (6oyu.2): the link leaves the
+ * candidate set, admins are notified, and the order surfaces in /sync/exceptions for
+ * replay once the stock position is fixed.
  */
 export async function runWmsDispatchSweep(
   triggeredBy: string,

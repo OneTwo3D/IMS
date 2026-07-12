@@ -243,7 +243,22 @@ type LinkWrite = {
   cancelledAt?: Date | null
   courierPending?: boolean
   totalMismatchPence?: number | null
+  dispatchFailureCount?: number
+  dispatchLastError?: string | null
+  dispatchDeadLetteredAt?: Date | null
 }
+
+/**
+ * 6oyu.2 (Codex): whenever the link starts pointing at a NEW WMS order (release
+ * re-create, create-pass success), the previous order's dispatch dead-letter
+ * state must not carry over — a stale dispatchDeadLetteredAt would permanently
+ * suppress dispatch polling for the fresh order.
+ */
+const RESET_DISPATCH_FAILURES = {
+  dispatchFailureCount: 0,
+  dispatchLastError: null,
+  dispatchDeadLetteredAt: null,
+} satisfies LinkWrite
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
 export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
@@ -302,7 +317,7 @@ export async function runWmsOrderPushSweepCore(
   // --- Release pass: a HELD order back in a ready+paid state re-enters the
   // create queue (its WMS order was cancelled when held, so it re-creates). ---
   for (const link of await port.releasableHeldOrders(connectorId, batchSize)) {
-    await port.updateLink(link.id, { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null }).catch(() => {})
+    await port.updateLink(link.id, { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null, ...RESET_DISPATCH_FAILURES }).catch(() => {})
     result.released += 1
   }
 
@@ -327,7 +342,7 @@ export async function runWmsOrderPushSweepCore(
         await port.upsertByOrder(
           order.id,
           { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, totalMismatchPence },
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
         result.created += 1
         // Courier-pending (G6c): the shipping service didn't resolve and the WMS used a

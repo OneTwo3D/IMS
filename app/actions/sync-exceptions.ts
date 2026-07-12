@@ -15,7 +15,6 @@ import {
   DEAD_RECEIPT_EVENT_STATUS,
   buildDeadReceiptEventReplayData,
   buildDeadReceiptEventReplayWhere,
-  parseDispatchErrorPayload,
 } from '@/lib/domain/wms/exception-inbox'
 import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
@@ -81,11 +80,13 @@ export type RefundSyncParkRow = {
 }
 
 export type StuckDispatchRow = {
-  orderId: string | null
+  orderId: string
   orderNumber: string | null
   externalOrderNumber: string | null
+  connector: string
+  failureCount: number
   reason: string | null
-  jobFinishedAt: string | null
+  deadLetteredAt: string | null
 }
 
 export type ExceptionInboxSummary = {
@@ -142,52 +143,39 @@ const REFUND_PARK_WHERE = {
  * finished DISPATCH_SYNC sweep. Anything listed here failed on the latest run
  * and will keep failing until an operator intervenes.
  */
-async function findLatestDispatchSweepJob(): Promise<{ id: string; finishedAt: Date | null } | null> {
-  return db.wmsSyncJob.findFirst({
-    where: { type: 'DISPATCH_SYNC', finishedAt: { not: null } },
-    orderBy: { startedAt: 'desc' },
-    select: { id: true, finishedAt: true },
-  })
-}
+// 6oyu.2: stuck dispatches are now first-class — the dispatch sweep dead-letters
+// a link after DISPATCH_MAX_CONSECUTIVE_FAILURES consecutive reconcile errors
+// (dispatchDeadLetteredAt set, link leaves the sweep's candidate set).
+const STUCK_DISPATCH_WHERE = { dispatchDeadLetteredAt: { not: null } }
 
-/** Codex P2: the banner count must not inherit the 50-row display limit. */
-async function countStuckDispatches(): Promise<number> {
-  const latestJob = await findLatestDispatchSweepJob()
-  if (!latestJob) return 0
-  return db.wmsSyncLog.count({ where: { jobId: latestJob.id, action: 'error' } })
+function countStuckDispatches(): Promise<number> {
+  return db.wmsOrderPushLink.count({ where: STUCK_DISPATCH_WHERE })
 }
 
 async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
-  const latestJob = await findLatestDispatchSweepJob()
-  if (!latestJob) return []
-
-  const errorLogs = await db.wmsSyncLog.findMany({
-    where: { jobId: latestJob.id, action: 'error' },
+  const links = await db.wmsOrderPushLink.findMany({
+    where: STUCK_DISPATCH_WHERE,
+    orderBy: { dispatchDeadLetteredAt: 'desc' },
     take: SECTION_LIMIT,
-    select: { reason: true, payload: true },
+    select: {
+      orderId: true,
+      connector: true,
+      externalOrderNumber: true,
+      dispatchFailureCount: true,
+      dispatchLastError: true,
+      dispatchDeadLetteredAt: true,
+      order: { select: { orderNumber: true } },
+    },
   })
-  if (errorLogs.length === 0) return []
 
-  const parsed = errorLogs.map((log) => ({
-    ...parseDispatchErrorPayload(log.payload),
-    reason: log.reason,
-  }))
-
-  const orderIds = parsed.map((row) => row.orderId).filter((id): id is string => Boolean(id))
-  const orders = orderIds.length > 0
-    ? await db.salesOrder.findMany({
-        where: { id: { in: orderIds } },
-        select: { id: true, orderNumber: true },
-      })
-    : []
-  const orderNumberById = new Map(orders.map((order) => [order.id, order.orderNumber]))
-
-  return parsed.map((row) => ({
-    orderId: row.orderId,
-    orderNumber: row.orderId ? orderNumberById.get(row.orderId) ?? null : null,
-    externalOrderNumber: row.externalOrderNumber,
-    reason: row.reason,
-    jobFinishedAt: latestJob.finishedAt?.toISOString() ?? null,
+  return links.map((link) => ({
+    orderId: link.orderId,
+    orderNumber: link.order.orderNumber,
+    externalOrderNumber: link.externalOrderNumber,
+    connector: link.connector,
+    failureCount: link.dispatchFailureCount,
+    reason: link.dispatchLastError,
+    deadLetteredAt: link.dispatchDeadLetteredAt?.toISOString() ?? null,
   }))
 }
 
@@ -552,6 +540,38 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     })
     revalidatePath('/sync/exceptions')
     return { success: true, synced: Boolean(refundLanded) }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * Replay a dead-lettered dispatch reconciliation: clear the dead-letter marker
+ * and failure streak so the next dispatch sweep retries the order. Use after
+ * fixing the underlying cause (typically the order's IMS stock position).
+ */
+export async function replayStuckDispatch(orderId: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const updated = await db.wmsOrderPushLink.updateMany({
+      where: { orderId, dispatchDeadLetteredAt: { not: null } },
+      data: { dispatchDeadLetteredAt: null, dispatchFailureCount: 0, dispatchLastError: null },
+    })
+    if (updated.count === 0) {
+      return { success: false, error: 'The dispatch is no longer dead-lettered (already replayed).' }
+    }
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      tag: 'sync',
+      action: 'wms_dispatch_replay',
+      description: 'Re-queued a dead-lettered dispatch reconciliation via the exception inbox',
+      metadata: { orderId, userId: session.user.id },
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure

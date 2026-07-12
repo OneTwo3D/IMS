@@ -2337,12 +2337,20 @@ model WmsOrderPushLink {
   // totals did not reconcile to within a penny at push time (surfaced for review).
   courierPending      Boolean           @default(false)
   totalMismatchPence  Int?
+  /// 6oyu.2: dispatch-reconciliation dead-letter. The dispatch sweep counts
+  /// CONSECUTIVE per-order reconcile errors here (reset on success/pending);
+  /// at the cap the link is dead-lettered (dispatchDeadLetteredAt set), leaves
+  /// the sweep's candidate set, and surfaces in the sync exception inbox.
+  dispatchFailureCount   Int            @default(0)
+  dispatchLastError      String?
+  dispatchDeadLetteredAt DateTime?
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
   order               SalesOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([connector, state])
+  @@index([dispatchDeadLetteredAt])
   @@map("wms_order_push_links")
 }
 

@@ -40,24 +40,3 @@ export function buildDeadReceiptEventReplayData() {
     lastError: null,
   }
 }
-
-export type DispatchErrorPayloadRef = {
-  orderId: string | null
-  externalOrderNumber: string | null
-}
-
-/**
- * Dispatch-sweep error logs carry `{ orderId, externalOrderNumber }` in their
- * JSON payload (dispatch-sweep.ts writes them per errored order). Parse
- * defensively — the payload column is untyped JSON.
- */
-export function parseDispatchErrorPayload(payload: unknown): DispatchErrorPayloadRef {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    return { orderId: null, externalOrderNumber: null }
-  }
-  const record = payload as Record<string, unknown>
-  return {
-    orderId: typeof record.orderId === 'string' ? record.orderId : null,
-    externalOrderNumber: typeof record.externalOrderNumber === 'string' ? record.externalOrderNumber : null,
-  }
-}

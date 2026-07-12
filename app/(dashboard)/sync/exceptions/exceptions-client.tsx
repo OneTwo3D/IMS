@@ -22,6 +22,7 @@ import {
   replayDeadReceiptEvent,
   replayDeadWebhookEvent,
   replayOutboxException,
+  replayStuckDispatch,
   retryRefundSyncPark,
   type ExceptionInboxData,
 } from '@/app/actions/sync-exceptions'
@@ -299,31 +300,43 @@ export function ExceptionsClient({ data }: Props) {
       {data.stuckDispatches.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`Dispatch reconciliation — stuck orders (${data.summary.stuckDispatches})`}
-            detail="The WMS despatched these orders but IMS could not reconcile them (typically no IMS stock to consume). They re-error on every sweep until the stock position is fixed on the order."
+            title={`Dispatch reconciliation — dead-lettered orders (${data.summary.stuckDispatches})`}
+            detail="The WMS despatched these orders but IMS could not reconcile them (typically no IMS stock to consume). After repeated failures the sweep stops retrying; fix the order's stock position, then replay."
             shown={data.stuckDispatches.length}
             total={data.summary.stuckDispatches}
           />
-          <Table containerClassName="rounded-lg border" className="min-w-[700px]">
+          <Table containerClassName="rounded-lg border" className="min-w-[820px]">
             <TableHeader className="bg-muted/40">
               <TableRow>
                 <TableHead>Order</TableHead>
                 <TableHead>WMS order</TableHead>
+                <TableHead>Failures</TableHead>
                 <TableHead>Error</TableHead>
-                <TableHead>Last sweep</TableHead>
+                <TableHead>Dead-lettered</TableHead>
+                <TableHead className="text-right">Action</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {data.stuckDispatches.map((row, index) => (
-                <TableRow key={row.orderId ?? index}>
+              {data.stuckDispatches.map((row) => (
+                <TableRow key={row.orderId}>
                   <TableCell>
-                    {row.orderId
-                      ? <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
-                      : '—'}
+                    <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
                   </TableCell>
                   <TableCell className="text-xs font-mono">{row.externalOrderNumber ?? '—'}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground max-w-[380px] truncate" title={row.reason ?? ''}>{row.reason ?? '—'}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{row.jobFinishedAt ? formatDateTime(row.jobFinishedAt) : '—'}</TableCell>
+                  <TableCell className="text-xs">{row.failureCount}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.reason ?? ''}>{row.reason ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.deadLetteredAt ? formatDateTime(row.deadLetteredAt) : '—'}</TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isPending}
+                      onClick={() => runAction(() => replayStuckDispatch(row.orderId), 'Dispatch reconciliation re-queued for the next sweep.')}
+                    >
+                      <RotateCcw className="h-3 w-3 mr-1" />Replay
+                    </Button>
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>
