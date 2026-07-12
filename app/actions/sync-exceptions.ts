@@ -197,73 +197,38 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
 }
 
 /**
- * q66in.4.4: drift findings from the ORDER_RECONCILE sweeps. Truth model
- * (Codex P1s): a FAILED run never counts; the latest SUCCEEDED run is the
- * authoritative baseline (a complete pass really did re-verify everything);
- * any PARTIAL runs since then only ADD findings (their lookup errors mean
- * absence-of-finding proves nothing, so they must not clear earlier truth).
+ * q66in.4.4: drift findings are DURABLE wms_order_discrepancies rows — the
+ * capped sweep upserts them and resolves a row only when that specific order
+ * re-verifies clean, so a newer (necessarily partial) run never clears truth.
  */
-async function findOrderReconcileTruthJobs(): Promise<Array<{ id: string; finishedAt: Date | null }>> {
-  const latestComplete = await db.wmsSyncJob.findFirst({
-    where: { type: 'ORDER_RECONCILE', finishedAt: { not: null }, status: 'SUCCEEDED' },
-    orderBy: { startedAt: 'desc' },
-    select: { id: true, startedAt: true, finishedAt: true },
-  })
-  const partialsSince = await db.wmsSyncJob.findMany({
-    where: {
-      type: 'ORDER_RECONCILE',
-      finishedAt: { not: null },
-      status: 'PARTIAL',
-      ...(latestComplete ? { startedAt: { gt: latestComplete.startedAt } } : {}),
-    },
-    orderBy: { startedAt: 'desc' },
-    select: { id: true, finishedAt: true },
-  })
-  return [...(latestComplete ? [latestComplete] : []), ...partialsSince]
-}
+const ORDER_DRIFT_WHERE = { status: 'OPEN' }
 
-type ReconcileLogRow = { reason: string | null; payload: Prisma.JsonValue | null; foundAt: Date | null }
-
-function toDriftRow(log: ReconcileLogRow): OrderReconcileDriftRow {
-  const payload = (log.payload && typeof log.payload === 'object' && !Array.isArray(log.payload))
-    ? log.payload as Record<string, unknown>
-    : {}
-  return {
-    orderId: typeof payload.orderId === 'string' ? payload.orderId : '',
-    orderNumber: typeof payload.orderNumber === 'string' ? payload.orderNumber : null,
-    externalOrderNumber: typeof payload.externalOrderNumber === 'string' ? payload.externalOrderNumber : null,
-    category: typeof payload.category === 'string' ? payload.category : 'UNKNOWN',
-    detail: log.reason,
-    foundAt: log.foundAt?.toISOString() ?? null,
-  }
-}
-
-async function loadOrderReconcileDriftRows(): Promise<OrderReconcileDriftRow[]> {
-  const jobs = await findOrderReconcileTruthJobs()
-  if (jobs.length === 0) return []
-  const finishedAtByJob = new Map(jobs.map((job) => [job.id, job.finishedAt]))
-
-  const logs = await db.wmsSyncLog.findMany({
-    where: { jobId: { in: jobs.map((job) => job.id) }, action: 'discrepancy' },
-    select: { jobId: true, reason: true, payload: true },
-  })
-
-  // Dedupe across the baseline + partial runs by (order, category).
-  const byKey = new Map<string, OrderReconcileDriftRow>()
-  for (const log of logs) {
-    const row = toDriftRow({ reason: log.reason, payload: log.payload, foundAt: log.jobId ? finishedAtByJob.get(log.jobId) ?? null : null })
-    if (!row.orderId) continue
-    byKey.set(`${row.orderId}:${row.category}`, row)
-  }
-  return Array.from(byKey.values())
-}
-
-async function countOrderReconcileDrift(): Promise<number> {
-  return (await loadOrderReconcileDriftRows()).length
+function countOrderReconcileDrift(): Promise<number> {
+  return db.wmsOrderDiscrepancy.count({ where: ORDER_DRIFT_WHERE })
 }
 
 async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
-  return (await loadOrderReconcileDriftRows()).slice(0, SECTION_LIMIT)
+  const rows = await db.wmsOrderDiscrepancy.findMany({
+    where: ORDER_DRIFT_WHERE,
+    orderBy: [{ category: 'asc' }, { firstSeenAt: 'asc' }],
+    take: SECTION_LIMIT,
+    select: {
+      orderId: true,
+      category: true,
+      detail: true,
+      externalOrderNumber: true,
+      lastSeenAt: true,
+      order: { select: { orderNumber: true } },
+    },
+  })
+  return rows.map((row) => ({
+    orderId: row.orderId,
+    orderNumber: row.order.orderNumber,
+    externalOrderNumber: row.externalOrderNumber,
+    category: row.category,
+    detail: row.detail,
+    foundAt: row.lastSeenAt.toISOString(),
+  }))
 }
 
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
@@ -695,6 +660,10 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     if (updated.count === 0) {
       return { success: false, error: 'The push link is no longer in a re-pushable state.' }
     }
+    await db.wmsOrderDiscrepancy.updateMany({
+      where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
+      data: { status: 'RESOLVED', resolvedAt: new Date() },
+    })
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,

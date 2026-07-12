@@ -87,8 +87,10 @@ export async function runWmsOrderReconcileCore(
   const counters: WmsReconcileCounters = { intentChecked: 0, linksVerified: 0, cancelledVerified: 0, findings: 0, errors: 0 }
   const findings: WmsReconcileFinding[] = []
 
-  // A — pure IMS SQL, no WMS calls.
-  const unpushed = await deps.listUnpushedIntentOrders(lookupLimit)
+  // A — pure IMS SQL, no WMS calls, so it is NOT bound by the lookup budget:
+  // scan far wider than the API cap (Codex: the same-oldest-200 would hide
+  // newer unpushed orders behind a large backlog).
+  const unpushed = await deps.listUnpushedIntentOrders(lookupLimit * 5)
   counters.intentChecked = unpushed.length
   for (const order of unpushed) {
     findings.push({
@@ -223,7 +225,9 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
         },
         select: { orderId: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
         take: limit,
-        orderBy: { updatedAt: 'desc' },
+        // Rotate like check B: least-recently-verified first, so a window with
+        // more cancellations than the cap still gets full coverage over days.
+        orderBy: [{ reconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { updatedAt: 'desc' }],
       })
       return links.flatMap((link) => (
         link.externalOrderNumber
@@ -277,6 +281,7 @@ export async function runWmsOrderReconcileSweep(
       })
     }
 
+    // Run ledger (per-run history stays on the job).
     if (core.findings.length > 0) {
       await db.wmsSyncLog.createMany({
         data: core.findings.map((finding) => ({
@@ -293,6 +298,76 @@ export async function runWmsOrderReconcileSweep(
           } as Prisma.InputJsonValue,
         })),
       })
+    }
+
+    // Durable findings (Codex): a capped run is never a complete snapshot, so
+    // OPEN rows persist until the SPECIFIC order re-verifies clean — they are
+    // never cleared wholesale by a newer run.
+    const now = new Date()
+    const newlyOpened: WmsReconcileFinding[] = []
+    for (const finding of core.findings) {
+      const updated = await db.wmsOrderDiscrepancy.updateMany({
+        where: { orderId: finding.orderId, category: finding.category, status: 'OPEN' },
+        data: { detail: finding.detail, externalOrderNumber: finding.externalOrderNumber, lastSeenAt: now },
+      })
+      if (updated.count === 0) {
+        try {
+          await db.wmsOrderDiscrepancy.create({
+            data: {
+              connector: connectorId,
+              orderId: finding.orderId,
+              category: finding.category,
+              detail: finding.detail,
+              externalOrderNumber: finding.externalOrderNumber,
+            },
+          })
+          newlyOpened.push(finding)
+        } catch (error) {
+          // Partial-unique race with a concurrent run: the row exists now — fine.
+          if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002')) throw error
+        }
+      }
+    }
+
+    // Resolve B/C rows for orders this run verified CLEAN (verified, no finding).
+    const foundKey = new Set(core.findings.map((finding) => `${finding.orderId}:${finding.category}`))
+    const cleanOrderIds = core.verifiedOrderIds.filter((orderId) => (
+      !foundKey.has(`${orderId}:MISSING_IN_WMS`) && !foundKey.has(`${orderId}:ACTIVE_AFTER_CANCEL`)
+    ))
+    if (cleanOrderIds.length > 0) {
+      await db.wmsOrderDiscrepancy.updateMany({
+        where: { orderId: { in: cleanOrderIds }, category: { in: ['MISSING_IN_WMS', 'ACTIVE_AFTER_CANCEL'] }, status: 'OPEN' },
+        data: { status: 'RESOLVED', resolvedAt: now },
+      })
+    }
+
+    // Resolve NOT_PUSHED rows whose drift predicate no longer holds — the order
+    // gained a live link, or stopped being eligible. Re-evaluated per open row
+    // (bounded set), never by absence from a capped scan.
+    const openNotPushed = await db.wmsOrderDiscrepancy.findMany({
+      where: { category: 'NOT_PUSHED', status: 'OPEN' },
+      select: { id: true, orderId: true },
+    })
+    if (openNotPushed.length > 0) {
+      const stillDrifting = new Set(
+        (await db.salesOrder.findMany({
+          where: {
+            id: { in: openNotPushed.map((row) => row.orderId) },
+            status: { in: ['PROCESSING', 'ALLOCATED'] },
+            paidAt: { not: null },
+            refundStatus: { not: 'FULL' },
+            OR: [{ wmsOrderPush: null }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
+          },
+          select: { id: true },
+        })).map((order) => order.id),
+      )
+      const resolvableIds = openNotPushed.filter((row) => !stillDrifting.has(row.orderId)).map((row) => row.id)
+      if (resolvableIds.length > 0) {
+        await db.wmsOrderDiscrepancy.updateMany({
+          where: { id: { in: resolvableIds } },
+          data: { status: 'RESOLVED', resolvedAt: now },
+        })
+      }
     }
 
     const status: 'SUCCEEDED' | 'PARTIAL' = counters.errors > 0 ? 'PARTIAL' : 'SUCCEEDED'
@@ -320,8 +395,9 @@ export async function runWmsOrderReconcileSweep(
       })
     }
 
-    // Check C is the ship-goods-nobody-expects direction — bell the admins.
-    const activeAfterCancel = core.findings.filter((finding) => finding.category === 'ACTIVE_AFTER_CANCEL')
+    // Check C is the ship-goods-nobody-expects direction — bell the admins, but
+    // only for NEWLY-opened findings (a known open finding must not re-bell daily).
+    const activeAfterCancel = newlyOpened.filter((finding) => finding.category === 'ACTIVE_AFTER_CANCEL')
     if (activeAfterCancel.length > 0) {
       const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
       await Promise.all(admins.map((admin) => notify({
