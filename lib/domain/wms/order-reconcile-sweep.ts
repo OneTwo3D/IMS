@@ -637,7 +637,16 @@ export async function runWmsOrderReconcileSweep(
       where: {
         category: 'MISSING_IN_WMS',
         status: 'OPEN',
-        order: { wmsOrderPush: { isNot: { state: { in: ['SYNCED', 'MERGED'] } } } },
+        // Mirror check B's FULL verification scope (Codex r28): a finding whose
+        // order can never be rescanned — link left SYNCED/MERGED, dispatch
+        // dead-lettered, order terminal/cancelled/on-hold/fully-refunded — is
+        // moot; those states surface through their own flows.
+        OR: [
+          { order: { wmsOrderPush: { isNot: { state: { in: ['SYNCED', 'MERGED'] } } } } },
+          { order: { wmsOrderPush: { is: { dispatchDeadLetteredAt: { not: null } } } } },
+          { order: { status: { in: ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED', 'ON_HOLD'] } } },
+          { order: { refundStatus: 'FULL' } },
+        ],
       },
       data: { status: 'RESOLVED', resolvedAt: now },
     })
@@ -665,6 +674,36 @@ export async function runWmsOrderReconcileSweep(
     // Resolve NOT_PUSHED rows whose drift predicate no longer holds — the order
     // gained a live link, or stopped being eligible. Re-evaluated per open row
     // (bounded set), never by absence from a capped scan.
+    // Superseded references (Codex r28): resolutions pin the exact reference,
+    // so an OPEN B/C row whose link now points at a DIFFERENT WMS order can
+    // never re-verify — retire it; the new reference re-detects fresh if drift
+    // persists. Chunked to stay under bind-parameter limits.
+    for (let lastId = ''; ;) {
+      const openRows = await db.wmsOrderDiscrepancy.findMany({
+        where: {
+          category: { in: ['MISSING_IN_WMS', 'ACTIVE_AFTER_CANCEL'] },
+          status: 'OPEN',
+          externalOrderNumber: { not: null },
+          ...(lastId ? { id: { gt: lastId } } : {}),
+        },
+        orderBy: { id: 'asc' },
+        take: 500,
+        select: { id: true, externalOrderNumber: true, order: { select: { wmsOrderPush: { select: { externalOrderNumber: true } } } } },
+      })
+      if (openRows.length === 0) break
+      lastId = openRows[openRows.length - 1].id
+      const supersededIds = openRows
+        .filter((row) => row.order.wmsOrderPush && row.order.wmsOrderPush.externalOrderNumber !== row.externalOrderNumber)
+        .map((row) => row.id)
+      if (supersededIds.length > 0) {
+        await db.wmsOrderDiscrepancy.updateMany({
+          where: { id: { in: supersededIds } },
+          data: { status: 'RESOLVED', resolvedAt: now },
+        })
+      }
+      if (openRows.length < 500) break
+    }
+
     // Chunked (Codex r18): the OPEN set is unbounded and detection can add up
     // to lookupLimit*5 rows per run — one giant `in` query would eventually
     // exceed Postgres's bind-parameter limit and permanently fail the cron.
