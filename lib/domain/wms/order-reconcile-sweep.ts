@@ -185,6 +185,10 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
             // by the push sweep's release pass — if it lingers, that cron is dead.
             { wmsOrderPush: { state: 'HELD', updatedAt: { lt: cutoff } } },
           ],
+          // Rotation (Codex): findings are durable, so already-flagged orders
+          // need no re-scan — every run's slots go to UNDISCOVERED drift, and a
+          // backlog larger than the cap is fully reported across runs.
+          NOT: { wmsOrderDiscrepancies: { some: { category: 'NOT_PUSHED', status: 'OPEN' } } },
         },
         select: { id: true, orderNumber: true },
         take: limit,
@@ -228,7 +232,14 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
           connector: connectorId,
           state: { in: ['CANCELLED', 'HELD'] },
           externalOrderNumber: { not: null },
-          cancelledAt: { gte: since },
+          // Window on the stable cancellation time — but a link with an OPEN
+          // finding stays verifiable forever (Codex: otherwise a fix applied in
+          // the WMS after the window could never re-verify clean and the
+          // durable finding would be permanent).
+          OR: [
+            { cancelledAt: { gte: since } },
+            { order: { wmsOrderDiscrepancies: { some: { category: 'ACTIVE_AFTER_CANCEL', status: 'OPEN' } } } },
+          ],
         },
         select: { orderId: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
         take: limit,

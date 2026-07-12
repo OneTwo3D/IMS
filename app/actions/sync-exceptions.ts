@@ -644,31 +644,43 @@ export async function replayStuckDispatch(orderId: string): Promise<MutationResu
 export async function repushMissingWmsOrder(orderId: string): Promise<MutationResult> {
   try {
     const session = await requireFreshPermission('sync')
-    // Codex: an OPEN finding is the AUTHORIZATION for this reset — resolving it
-    // first (compare-and-set) means a stale page or direct invocation cannot
-    // wipe a healthy order's external identifiers.
-    const finding = await db.wmsOrderDiscrepancy.updateMany({
-      where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
-      data: { status: 'RESOLVED', resolvedAt: new Date() },
+    // Codex: an OPEN finding is the AUTHORIZATION for this reset, and the two
+    // writes are one transaction — if the link reset doesn't apply, the finding
+    // stays OPEN (it must not vanish from the inbox with the order unfixed).
+    const outcome = await db.$transaction(async (tx) => {
+      const finding = await tx.wmsOrderDiscrepancy.updateMany({
+        where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
+        data: { status: 'RESOLVED', resolvedAt: new Date() },
+      })
+      if (finding.count === 0) {
+        return { ok: false as const, error: 'No open missing-in-WMS finding for this order (already resolved or re-verified).' }
+      }
+      const updated = await tx.wmsOrderPushLink.updateMany({
+        where: { orderId, state: { in: ['SYNCED', 'MERGED'] } },
+        data: {
+          state: 'PENDING_CREATE',
+          externalOrderId: null,
+          externalOrderNumber: null,
+          attempts: 0,
+          lastError: null,
+          dispatchFailureCount: 0,
+          dispatchLastError: null,
+          dispatchDeadLetteredAt: null,
+        },
+      })
+      if (updated.count === 0) {
+        // Rolls back the finding resolution.
+        throw new Error('REPUSH_LINK_NOT_RESETTABLE')
+      }
+      return { ok: true as const }
+    }).catch((error) => {
+      if (error instanceof Error && error.message === 'REPUSH_LINK_NOT_RESETTABLE') {
+        return { ok: false as const, error: 'The push link is no longer in a re-pushable state.' }
+      }
+      throw error
     })
-    if (finding.count === 0) {
-      return { success: false, error: 'No open missing-in-WMS finding for this order (already resolved or re-verified).' }
-    }
-    const updated = await db.wmsOrderPushLink.updateMany({
-      where: { orderId, state: { in: ['SYNCED', 'MERGED'] } },
-      data: {
-        state: 'PENDING_CREATE',
-        externalOrderId: null,
-        externalOrderNumber: null,
-        attempts: 0,
-        lastError: null,
-        dispatchFailureCount: 0,
-        dispatchLastError: null,
-        dispatchDeadLetteredAt: null,
-      },
-    })
-    if (updated.count === 0) {
-      return { success: false, error: 'The push link is no longer in a re-pushable state.' }
+    if (!outcome.ok) {
+      return { success: false, error: outcome.error }
     }
     await logActivity({
       entityType: 'SALES_ORDER',
