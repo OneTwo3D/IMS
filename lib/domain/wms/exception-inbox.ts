@@ -4,6 +4,13 @@ import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-s
 // so the compare-and-set semantics are unit-testable without a database.
 
 /**
+ * Connector-agnostic alias for the dead-lettered receipt-event status so core
+ * app flows can query it without referencing a connector-named constant
+ * (wms-connector boundary). The status values themselves are generic.
+ */
+export const DEAD_RECEIPT_EVENT_STATUS = MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead
+
+/**
  * Where-clause for replaying a dead-lettered inbound receipt event: only a row
  * still DEAD and never processed may be replayed — a concurrent sweep or a
  * second operator click makes updateMany match zero rows instead of clobbering.

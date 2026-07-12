@@ -12,8 +12,8 @@ import {
   replayIntegrationOutboxAdminRow,
 } from '@/lib/domain/integrations/outbox-admin'
 import { INTEGRATION_OUTBOX_STATUS } from '@/lib/domain/integrations/outbox'
-import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
 import {
+  DEAD_RECEIPT_EVENT_STATUS,
   buildDeadReceiptEventReplayData,
   buildDeadReceiptEventReplayWhere,
   parseDispatchErrorPayload,
@@ -183,7 +183,7 @@ export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary>
   const [wmsPushDeadLetters, outboxFailures, deadReceiptEvents, refundSyncParks, pennyMismatches, stuckDispatches] = await Promise.all([
     db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
-    db.wmsInboundReceiptEvent.count({ where: { processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead } }),
+    db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.shoppingSyncLog.count({ where: REFUND_PARK_WHERE }),
     db.wmsOrderPushLink.count({ where: { totalMismatchPence: { not: null } } }),
     loadStuckDispatches().then((rows) => rows.length),
@@ -226,7 +226,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         .sort((left, right) => new Date(right.updatedAt as never).getTime() - new Date(left.updatedAt as never).getTime())
         .slice(0, SECTION_LIMIT)),
     db.wmsInboundReceiptEvent.findMany({
-      where: { processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead },
+      where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS },
       orderBy: { deadLetteredAt: 'desc' },
       take: SECTION_LIMIT,
       select: {
