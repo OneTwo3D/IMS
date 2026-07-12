@@ -373,9 +373,16 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         return { deadLettered: false }
       }
 
-      // Compare-and-set so a concurrent run (or replay) can't double dead-letter.
+      // Compare-and-set so a concurrent run (or replay) can't double dead-letter,
+      // AND (Codex) so an overlapping sweep's successful reconcile — which resets
+      // the count between our increment/read and this write — vetoes the
+      // dead-letter: the count must STILL be at the threshold when we commit.
       const updated = await db.wmsOrderPushLink.updateMany({
-        where: { id: candidate.linkId, dispatchDeadLetteredAt: null },
+        where: {
+          id: candidate.linkId,
+          dispatchDeadLetteredAt: null,
+          dispatchFailureCount: { gte: DISPATCH_MAX_CONSECUTIVE_FAILURES },
+        },
         data: { dispatchDeadLetteredAt: new Date() },
       })
       if (updated.count === 0) return { deadLettered: false }
