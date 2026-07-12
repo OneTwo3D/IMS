@@ -324,7 +324,9 @@ function WebhookSecretField({
   const [setupingWebhooks, setSetupingWebhooks] = useState(false)
   const [webhookResult, setWebhookResult] = useState<string | null>(null)
   const [webhookError, setWebhookError] = useState(false)
-  const hasSecret = !!value
+  // A configured secret is never sent to the client, so presence comes from the
+  // load-time flag; `value` is only non-empty when freshly generated this session.
+  const hasSecret = !!value || hadSecretOnLoad
 
   async function handleGenerate() {
     const secret = generateSecret()
@@ -501,12 +503,12 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   const wcConfigured = !!wcUrl && !!wcKey && !!wcSecret
   const initialImportDone = s.wc_initial_import_completed === 'true'
   const orderWebhookActive = (() => {
-    if (!s.wc_webhook_secret || !s.wc_order_webhook_last_received_at) return false
+    if (s.wc_webhook_secret_set !== 'true' || !s.wc_order_webhook_last_received_at) return false
     const receivedAt = Date.parse(s.wc_order_webhook_last_received_at)
     return Number.isFinite(receivedAt) && (Date.now() - receivedAt) <= 24 * 60 * 60 * 1000
   })()
   const productWebhookActive = (() => {
-    if (!s.wc_webhook_secret || !s.wc_product_webhook_last_received_at) return false
+    if (s.wc_webhook_secret_set !== 'true' || !s.wc_product_webhook_last_received_at) return false
     const receivedAt = Date.parse(s.wc_product_webhook_last_received_at)
     return Number.isFinite(receivedAt) && (Date.now() - receivedAt) <= 24 * 60 * 60 * 1000
   })()
@@ -973,7 +975,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
 
         {wcConfigured && (
           <HelperPluginCard
-            webhookSecret={s.wc_webhook_secret}
+            webhookSecret={s.wc_webhook_secret_set === 'true' ? 'configured' : ''}
             fxPushEnabled={s.wc_fx_push_enabled === 'true'}
             lastFxPushAt={s.last_wc_fx_push_at}
             onFxPushToggle={async (enabled) => {
@@ -1088,7 +1090,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 {orderWebhookActive && (
                   <p className="text-xs text-muted-foreground">Primary order polling is disabled — orders are received in real-time via webhook (last received: {formatDateTime(s.wc_order_webhook_last_received_at)}). Cron now acts only as backup reconciliation, roughly daily.</p>
                 )}
-                {s.wc_webhook_secret && !orderWebhookActive && (
+                {s.wc_webhook_secret_set === 'true' && !orderWebhookActive && (
                   <p className="text-xs text-amber-600">Webhook secret is set but no recent order webhook has been received — polling reconciliation is still active.</p>
                 )}
               </div>
@@ -1097,7 +1099,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
             <WebhookSecretField
               value={s.wc_webhook_secret}
               onChange={(v) => setS({ ...s, wc_webhook_secret: v })}
-              hadSecretOnLoad={!!init.wc_webhook_secret}
+              hadSecretOnLoad={init.wc_webhook_secret_set === 'true'}
               onSave={async (secret) => {
                 await withStepUp(() => saveShoppingSyncSettings({ wc_webhook_secret: secret }))
               }}
