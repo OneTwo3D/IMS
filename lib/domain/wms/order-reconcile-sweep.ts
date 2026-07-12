@@ -394,6 +394,9 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
       // most dangerous and inherently RECENT transitions, and the link often
       // carries a fresh reconcileCheckedAt from its SYNCED life — recency must
       // not push them behind old propagated cancellations.
+      // Tier 1 is capped at HALF the C row budget (Codex r29): a saturated
+      // unpropagated backlog (push cron down) must not starve tier 2, whose
+      // OPEN findings could then never re-verify clean.
       const unpropagated = await db.wmsOrderPushLink.findMany({
         where: {
           connector: connectorId,
@@ -407,7 +410,7 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
           },
         },
         select: { orderId: true, state: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
-        take: limit,
+        take: Math.ceil(limit / 2),
         orderBy: [{ reconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { updatedAt: 'desc' }],
       })
 
@@ -540,8 +543,22 @@ export async function runWmsOrderReconcileSweep(
     const findingLinks = new Map(
       (await db.wmsOrderPushLink.findMany({
         where: { orderId: { in: core.findings.map((finding) => finding.orderId) } },
-        select: { orderId: true, state: true, externalOrderNumber: true },
-      })).map((link) => [link.orderId, { state: link.state as string, externalOrderNumber: link.externalOrderNumber }]),
+        select: {
+          orderId: true,
+          state: true,
+          externalOrderNumber: true,
+          order: { select: { status: true, refundStatus: true } },
+        },
+      })).map((link) => [link.orderId, {
+        state: link.state as string,
+        externalOrderNumber: link.externalOrderNumber,
+        orderStatus: link.order.status as string,
+        refundStatus: link.order.refundStatus as string,
+      }]),
+    )
+    const stillOughtToCancel = (link: { orderStatus: string; refundStatus: string }) => (
+      ['CANCELLED', 'ON_HOLD'].includes(link.orderStatus)
+      || (link.refundStatus === 'FULL' && !['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(link.orderStatus))
     )
     const validFindings = core.findings.filter((finding) => {
       const expected = EXPECTED_LINK_STATES[finding.category]
@@ -550,7 +567,17 @@ export async function runWmsOrderReconcileSweep(
       if (!link || !expected.includes(link.state)) return false
       // The finding speaks about the reference that was LOOKED UP — a repoint
       // to a different WMS order (even same-state, Codex r24) invalidates it.
-      return finding.externalOrderNumber == null || finding.externalOrderNumber === link.externalOrderNumber
+      if (finding.externalOrderNumber != null && finding.externalOrderNumber !== link.externalOrderNumber) return false
+      // An unpropagated-shape ACTIVE_AFTER_CANCEL also requires the ORDER to
+      // still want cancelling (Codex r29): a restore from CANCELLED/ON_HOLD (or
+      // a refund reversal) mid-lookup would otherwise bell the admins for a
+      // transient state the cleanup resolves moments later.
+      if (
+        finding.category === 'ACTIVE_AFTER_CANCEL'
+        && ['SYNCED', 'MERGED'].includes(link.state)
+        && !stillOughtToCancel(link)
+      ) return false
+      return true
     })
 
     // Run ledger (per-run history stays on the job) — valid findings only
