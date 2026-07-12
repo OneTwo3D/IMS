@@ -105,7 +105,10 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       connector: connectorId,
       closedAt: null,
       sloAlertedAt: null,
-      status: { not: 'CREATE_PENDING' },
+      // Reservations not yet (verifiably) created in the WMS — pending AND
+      // in-flight (Codex r3: a crashed claim sits CREATE_IN_FLIGHT with a
+      // synthetic external id) — are not overdue SHIPMENTS.
+      status: { notIn: ['CREATE_PENDING', 'CREATE_IN_FLIGHT'] },
       OR: [
         { eta: { lt: new Date(now.getTime() - ASN_OVERDUE_GRACE_MS) } },
         { eta: null, lastCallbackAt: null, createdAt: { lt: new Date(now.getTime() - ASN_NO_ETA_FALLBACK_AGE_MS) } },
@@ -142,6 +145,13 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       ? ` ${creditLines.length} line(s) carry unreconciled alignment credits (e.g. ${creditLines[0].sku}) — until the booked-in callback arrives, REAL receipts for those lines are silently suppressed.`
       : ''
     const anchor = asn.eta ? `its ETA (${asn.eta.toISOString().slice(0, 10)})` : `${Math.round((now.getTime() - asn.createdAt.getTime()) / 86_400_000)} days with no callback`
+    // Deliver the THROWING notification FIRST (Codex r3): logActivity swallows
+    // insert failures, so the stamp's keep/revert decision must ride on the
+    // notification insert. The activity line is best-effort colour.
+    await notifyAdminsDurably(
+      'WMS ASN overdue',
+      `ASN ${asn.externalAsnId} (${asn.warehouse.code}) is past ${anchor} with no booked-in callback.${creditNote} Chase the shipment / callback in the WMS.`,
+    )
     await logActivity({
       entityType: 'SYNC',
       entityId: asn.id,
@@ -159,10 +169,6 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       level: 'WARNING',
       resolveUser: false,
     })
-    await notifyAdminsDurably(
-      'WMS ASN overdue',
-      `ASN ${asn.externalAsnId} (${asn.warehouse.code}) is past ${anchor} with no booked-in callback.${creditNote} Chase the shipment / callback in the WMS.`,
-    )
     overdueAsnAlerts += 1
     } catch (deliveryError) {
       // Delivery failed — un-stamp so the next sweep retries the alert
@@ -206,6 +212,10 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     try {
 
     const last = binding.lastStockSyncAt ? binding.lastStockSyncAt.toISOString() : 'never'
+    await notifyAdminsDurably(
+      'WMS stock sync stale',
+      `Stock sync for ${binding.warehouse.code} has not completed since ${last} — check the scheduler and the WMS connection.`,
+    )
     await logActivity({
       entityType: 'SYNC',
       entityId: binding.id,
@@ -221,10 +231,6 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       level: 'WARNING',
       resolveUser: false,
     })
-    await notifyAdminsDurably(
-      'WMS stock sync stale',
-      `Stock sync for ${binding.warehouse.code} has not completed since ${last} — check the scheduler and the WMS connection.`,
-    )
     staleBindingAlerts += 1
     } catch (deliveryError) {
       await db.externalWmsBinding.updateMany({
