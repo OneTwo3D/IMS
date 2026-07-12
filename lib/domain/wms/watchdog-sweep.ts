@@ -80,15 +80,30 @@ export type WmsWatchdogResult = {
   reason?: string
 }
 
-/** Notification rows for every active admin — deliberately NOT lib/notifications.notify(), which swallows insert failures. */
-function adminNotificationRows(admins: { id: string }[], title: string, message: string) {
-  return admins.map((admin) => ({
-    userId: admin.id,
-    type: 'warning',
-    title,
-    message,
-    actionUrl: '/sync',
-  }))
+/**
+ * Insert a warning notification for every CURRENTLY active admin, inside the
+ * caller's claim transaction — deliberately NOT lib/notifications.notify(),
+ * which swallows insert failures. Recipients are queried at delivery time
+ * (Codex r7: a run-start snapshot kept notifying admins demoted or
+ * deactivated mid-sweep) and zero recipients THROWS so the transaction rolls
+ * the claim back for retry.
+ */
+async function notifyActiveAdmins(
+  tx: Pick<typeof db, 'user' | 'notification'>,
+  title: string,
+  message: string,
+): Promise<void> {
+  const admins = await tx.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+  if (admins.length === 0) throw new Error('no active ADMIN users to notify')
+  await tx.notification.createMany({
+    data: admins.map((admin) => ({
+      userId: admin.id,
+      type: 'warning',
+      title,
+      message,
+      actionUrl: '/sync',
+    })),
+  })
 }
 
 export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
@@ -99,9 +114,10 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   // Zero active admins is NOT delivery (Codex r5/r6): claiming breaches with
   // nowhere to send them would either lose alerts or (rolled back per entity)
   // re-claim up to 200 ASNs every run in a write/log storm. Fail the whole run
-  // instead — the cron goes red until an admin exists.
-  const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-  if (admins.length === 0) {
+  // up front — the cron goes red until an admin exists. (Delivery re-checks
+  // recipients per transaction; this is only the storm guard.)
+  const admins = await db.user.count({ where: { role: 'ADMIN', active: true } })
+  if (admins === 0) {
     console.error('[wms-watchdog] no active ADMIN users — breach alerts are undeliverable')
     return { status: 'FAILED', overdueAsnAlerts: 0, staleBindingAlerts: 0, reason: 'No active ADMIN users to notify' }
   }
@@ -178,13 +194,11 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
           data: { sloAlertedAt: now },
         })
         if (stamped.count === 0) return false
-        await tx.notification.createMany({
-          data: adminNotificationRows(
-            admins,
-            'WMS ASN overdue',
-            `ASN ${asn.externalAsnId} (${asn.warehouse.code}) ${breach}.${creditNote} Chase the shipment / callback in the WMS.`,
-          ),
-        })
+        await notifyActiveAdmins(
+          tx,
+          'WMS ASN overdue',
+          `ASN ${asn.externalAsnId} (${asn.warehouse.code}) ${breach}.${creditNote} Chase the shipment / callback in the WMS.`,
+        )
         return true
       })
     } catch (deliveryError) {
@@ -261,13 +275,11 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
           data: { staleSyncAlertedAt: now },
         })
         if (stamped.count === 0) return false
-        await tx.notification.createMany({
-          data: adminNotificationRows(
-            admins,
-            'WMS stock sync stale',
-            `Stock sync for ${binding.warehouse.code} has not completed successfully since ${last}.${failing} Check the scheduler and the WMS connection.`,
-          ),
-        })
+        await notifyActiveAdmins(
+          tx,
+          'WMS stock sync stale',
+          `Stock sync for ${binding.warehouse.code} has not completed successfully since ${last}.${failing} Check the scheduler and the WMS connection.`,
+        )
         return true
       })
     } catch (deliveryError) {

@@ -2921,7 +2921,10 @@ model Notification {
   createdAt DateTime @default(now())
   readAt    DateTime?
 
-  user         User?                    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  /// Cascade, NOT SetNull (Codex r7): userId=null means "broadcast to all
+  /// users", so nulling on recipient deletion converted targeted (often
+  /// admin-only, operationally sensitive) notifications into broadcasts.
+  user         User?                    @relation(fields: [userId], references: [id], onDelete: Cascade)
   readReceipts NotificationReadReceipt[]
 
   @@index([userId, read, createdAt])
