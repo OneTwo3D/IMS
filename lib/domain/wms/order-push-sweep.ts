@@ -4,6 +4,7 @@ import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsOrderAddress, WmsOrderPushInput, WmsOrderPushLine } from '@/lib/connectors/wms/types'
 import { scrubWmsError } from './error-scrub'
+import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
 
 /**
  * Connector-agnostic outbound order-push sweep (Phase 8). Pushes IMS sales
@@ -266,12 +267,12 @@ const RESET_DISPATCH_FAILURES = {
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
 export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
-export type WmsPushLinkRef = { id: string; externalOrderId: string | null }
+export type WmsPushLinkRef = { id: string; orderId: string; externalOrderId: string | null }
 
 export interface WmsOrderPushPort {
   activeBindings(connector: string): Promise<Array<{ warehouseId: string; externalWarehouseId: string }>>
   /** HELD links whose order is back in a ready+paid state. */
-  releasableHeldOrders(connector: string, limit: number): Promise<Array<{ id: string }>>
+  releasableHeldOrders(connector: string, limit: number): Promise<WmsPushLinkRef[]>
   /** Ready+paid orders for bound warehouses with no link or a PENDING_CREATE link. */
   createCandidates(connector: string, boundWarehouseIds: string[], limit: number): Promise<WmsPushCandidate[]>
   /** SYNCED links for ready orders changed since the last push (updatedAt > pushedAt). */
@@ -282,6 +283,24 @@ export interface WmsOrderPushPort {
   cancellableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
   upsertByOrder(orderId: string, create: LinkWrite & { connector: string }, update: LinkWrite): Promise<void>
   updateLink(id: string, data: LinkWrite): Promise<void>
+  /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
+  recordEvent(event: WmsMutationEventInput): Promise<void>
+}
+
+/** PII-free projection of a push input for the audit timeline: what IMS asked the WMS to hold. */
+function pushIntentSummary(input: WmsOrderPushInput) {
+  return {
+    orderNumber: input.orderNumber,
+    externalWarehouseId: input.externalWarehouseId,
+    currency: input.currency,
+    courierService: input.courierService,
+    totalVat: input.totalVat,
+    shippingExVat: input.shippingExVat,
+    shippingVat: input.shippingVat,
+    discountExVat: input.discountExVat,
+    discountVat: input.discountVat,
+    lines: input.lines.map((line) => ({ sku: line.sku, quantity: line.quantity, unitPriceExVat: line.unitPriceExVat, unitPriceVat: line.unitPriceVat })),
+  }
 }
 
 type PushConnector = Pick<WmsConnector, 'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment'>
@@ -303,15 +322,33 @@ export async function runWmsOrderPushSweepCore(
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE
   const now = options?.now ?? (() => new Date())
 
+  // q66in.4.6 audit timeline: one event per remote mutation (attempted or
+  // succeeded), best-effort — an audit failure must never fail the sweep.
+  const audit = async (event: Omit<WmsMutationEventInput, 'connector' | 'direction' | 'triggeredBy'>) => {
+    try {
+      await port.recordEvent({ connector: connectorId, direction: 'OUTBOUND', triggeredBy: 'order-push-sweep', ...event })
+    } catch (error) {
+      console.error('[wms-order-push] failed to record audit event', error)
+    }
+  }
+
   // Best-effort warehouse-visible note when IMS can't propagate a hold/cancel
   // because the WMS order is already past NEW. Mirrors the refund-conflict comment
   // (onetwo3d-ims-ql59); never fail the sweep on a comment error.
-  const postConflictComment = async (externalOrderId: string, comment: string) => {
+  const postConflictComment = async (externalOrderId: string, comment: string, orderId?: string) => {
     if (!connector.addOrderComment) return
     try {
       await connector.addOrderComment(externalOrderId, comment)
+      await audit({
+        action: 'order_comment', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: orderId ?? null, externalId: externalOrderId,
+        summary: 'Warehouse-visible note posted on WMS order', after: { comment },
+      })
     } catch (error) {
       console.error('[wms-order-push] failed to post conflict comment', error)
+      await audit({
+        action: 'order_comment', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: orderId ?? null, externalId: externalOrderId,
+        summary: 'Failed to post warehouse-visible note on WMS order', after: { comment }, error: scrubWmsError(error, 'WMS comment failed'),
+      })
     }
   }
 
@@ -321,8 +358,21 @@ export async function runWmsOrderPushSweepCore(
   // --- Release pass: a HELD order back in a ready+paid state re-enters the
   // create queue (its WMS order was cancelled when held, so it re-creates). ---
   for (const link of await port.releasableHeldOrders(connectorId, batchSize)) {
-    await port.updateLink(link.id, { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null, ...RESET_DISPATCH_FAILURES }).catch(() => {})
+    // Only a release that actually PERSISTED counts and is audited (Codex r1:
+    // swallowing the write error while recording SUCCEEDED forged the timeline).
+    try {
+      await port.updateLink(link.id, { state: 'PENDING_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 0, lastError: null, cancelledAt: null, ...RESET_DISPATCH_FAILURES })
+    } catch (error) {
+      console.error('[wms-order-push] release link update failed', link.id, error)
+      continue
+    }
     result.released += 1
+    await audit({
+      action: 'order_release', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+      summary: 'Held order back in a ready+paid state — re-queued for WMS create',
+      before: { state: 'HELD', externalOrderId: link.externalOrderId },
+      after: { state: 'PENDING_CREATE', externalOrderId: null },
+    })
   }
 
   // --- Create pass ---
@@ -333,8 +383,15 @@ export async function runWmsOrderPushSweepCore(
       if (!externalWarehouseId) continue
 
       const ts = now()
+      const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
+      // Hoisted so the catch can tell "remote create failed" from "remote
+      // create SUCCEEDED but recording the link failed" (Codex r1) — the audit
+      // outcome must mirror the remote mutation, not the local bookkeeping.
+      let input: WmsOrderPushInput | null = null
+      let push: Awaited<ReturnType<NonNullable<PushConnector['pushOrder']>>> | null = null
       try {
-        const push = await connector.pushOrder!(buildPushInput(order, externalWarehouseId))
+        input = buildPushInput(order, externalWarehouseId)
+        push = await connector.pushOrder!(input)
         const courierPending = push.courierFallback ?? false
         // Penny-precision guard (G6): record (never block) when the order's own totals
         // don't reconcile to the penny, so an operator can investigate a mis-totalled order.
@@ -349,12 +406,19 @@ export async function runWmsOrderPushSweepCore(
           { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
         result.created += 1
+        await audit({
+          action: 'order_create', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
+          summary: `Order ${order.orderNumber ?? order.id} created in WMS as ${push.externalOrderNumber ?? push.externalOrderId}`,
+          before: beforeCreate,
+          after: { state: 'SYNCED', externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, courierPending, totalMismatchPence, intent: pushIntentSummary(input) },
+        })
         // Courier-pending (G6c): the shipping service didn't resolve and the WMS used a
         // default courier — flag it on the WMS order so the warehouse verifies before despatch.
         if (courierPending) {
           await postConflictComment(
             push.externalOrderId,
             `IMS: shipping method '${order.shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`,
+            order.id,
           )
         }
       } catch (error) {
@@ -367,6 +431,17 @@ export async function runWmsOrderPushSweepCore(
         await port
           .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: ts }, { state, attempts, lastError: message, lastAttemptAt: ts })
           .catch(() => {})
+        await audit({
+          action: 'order_create', outcome: push ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push?.externalOrderId ?? null,
+          summary: push
+            ? `Order ${order.orderNumber ?? order.id} created in WMS as ${push.externalOrderNumber ?? push.externalOrderId}, but recording the link failed`
+            : `WMS create failed for order ${order.orderNumber ?? order.id}${dead ? ' — dead-lettered' : ''}`,
+          before: beforeCreate,
+          after: push
+            ? { state: 'SYNCED', externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, linkPersistFailed: true, ...(input ? { intent: pushIntentSummary(input) } : {}) }
+            : { state, attempts },
+          error: message,
+        })
       }
     }
   }
@@ -378,15 +453,36 @@ export async function runWmsOrderPushSweepCore(
       if (!externalWarehouseId || !link.externalOrderId) continue
 
       const ts = now()
+      let update: Awaited<ReturnType<NonNullable<PushConnector['updateOrder']>>> | null = null
       try {
-        const update = await connector.updateOrder(link.externalOrderId, buildPushInput(link.order, externalWarehouseId))
+        const input = buildPushInput(link.order, externalWarehouseId)
+        update = await connector.updateOrder(link.externalOrderId, input)
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
         await port.updateLink(link.id, { pushedAt: ts, lastAttemptAt: ts, lastError: update.updated ? null : `Amendment not propagated (WMS status ${update.status})` })
         if (update.updated) result.updated += 1
+        await audit({
+          action: 'order_update', outcome: update.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
+          summary: update.updated
+            ? `Order ${link.order.orderNumber ?? link.order.id} amendment propagated to WMS`
+            : `Order ${link.order.orderNumber ?? link.order.id} amendment NOT propagated — WMS order past NEW (status ${update.status})`,
+          before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
+          after: { propagated: update.updated, wmsStatus: update.status, intent: pushIntentSummary(input) },
+          error: update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
+        })
       } catch (error) {
+        const message = scrubWmsError(error, 'WMS order update failed')
         result.failed += 1
-        await port.updateLink(link.id, { lastError: scrubWmsError(error, 'WMS order update failed'), lastAttemptAt: ts }).catch(() => {})
+        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
+        await audit({
+          action: 'order_update', outcome: update?.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
+          summary: update
+            ? `Order ${link.order.orderNumber ?? link.order.id} amendment ${update.updated ? 'propagated to WMS' : `not propagated (WMS status ${update.status})`}, but recording the link failed`
+            : `WMS update failed for order ${link.order.orderNumber ?? link.order.id}`,
+          before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
+          after: update ? { propagated: update.updated, wmsStatus: update.status, linkPersistFailed: true } : undefined,
+          error: message,
+        })
       }
     }
   }
@@ -397,22 +493,45 @@ export async function runWmsOrderPushSweepCore(
     for (const link of await port.holdableLinks(connectorId, batchSize)) {
       if (!link.externalOrderId) continue
       const ts = now()
+      let cancel: Awaited<ReturnType<NonNullable<PushConnector['cancelOrder']>>> | null = null
       try {
-        const cancel = await connector.cancelOrder(link.externalOrderId)
+        cancel = await connector.cancelOrder(link.externalOrderId)
         if (cancel.cancelled || cancel.status === 'NOT_FOUND') {
           // reconcileCheckedAt reset (q66in.4.4): a freshly held/cancelled link
           // must rotate to the FRONT of the reconcile's safety check, not
           // inherit its pre-transition verification recency.
           await port.updateLink(link.id, { state: 'HELD', cancelledAt: ts, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null })
           result.held += 1
+          await audit({
+            action: 'order_hold', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+            summary: 'IMS-held order pulled back from the WMS (cancelled remotely, parked HELD)',
+            before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
+            after: { state: 'HELD', wmsCancelStatus: cancel.status },
+          })
         } else {
           result.deadLettered += 1
           await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `Held in IMS but WMS order past NEW (status ${cancel.status}) — raise a cancellation query in the WMS`, lastAttemptAt: ts })
-          await postConflictComment(link.externalOrderId, `IMS: This order has been placed ON HOLD in IMS but is already being fulfilled here (status ${cancel.status}) and could not be auto-cancelled. Please pause it if possible, or raise a cancellation query.`)
+          await audit({
+            action: 'order_hold', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+            summary: 'IMS hold could not cancel the WMS order (past NEW) — dead-lettered for operator action',
+            before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
+            after: { state: 'DEAD_LETTER', wmsStatus: cancel.status },
+            error: `WMS order past NEW (status ${cancel.status})`,
+          })
+          await postConflictComment(link.externalOrderId, `IMS: This order has been placed ON HOLD in IMS but is already being fulfilled here (status ${cancel.status}) and could not be auto-cancelled. Please pause it if possible, or raise a cancellation query.`, link.orderId)
         }
       } catch (error) {
+        const message = scrubWmsError(error, 'WMS hold/cancel failed')
         result.failed += 1
-        await port.updateLink(link.id, { lastError: scrubWmsError(error, 'WMS hold/cancel failed'), lastAttemptAt: ts }).catch(() => {})
+        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
+        const remoteCancelled = cancel ? cancel.cancelled || cancel.status === 'NOT_FOUND' : false
+        await audit({
+          action: 'order_hold', outcome: remoteCancelled ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+          summary: remoteCancelled ? 'WMS order cancelled for hold, but recording the link failed' : 'WMS hold/cancel call failed',
+          before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
+          after: cancel ? { wmsCancelStatus: cancel.status, linkPersistFailed: true } : undefined,
+          error: message,
+        })
       }
     }
   }
@@ -422,22 +541,45 @@ export async function runWmsOrderPushSweepCore(
     for (const link of await port.cancellableLinks(connectorId, batchSize)) {
       if (!link.externalOrderId) continue
       const ts = now()
+      let cancel: Awaited<ReturnType<NonNullable<PushConnector['cancelOrder']>>> | null = null
       try {
-        const cancel = await connector.cancelOrder(link.externalOrderId)
+        cancel = await connector.cancelOrder(link.externalOrderId)
         if (cancel.cancelled || cancel.status === 'NOT_FOUND') {
           await port.updateLink(link.id, { state: 'CANCELLED', cancelledAt: ts, lastError: null, lastAttemptAt: ts , reconcileCheckedAt: null })
           result.cancelled += 1
+          await audit({
+            action: 'order_cancel', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+            summary: 'IMS-cancelled/fully-refunded order cancelled in the WMS',
+            before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
+            after: { state: 'CANCELLED', wmsCancelStatus: cancel.status },
+          })
         } else {
           // Past NEW in the WMS — already being fulfilled despite the IMS cancel/full
           // refund. Only NEW orders auto-cancel; surface a dead-letter conflict so an
           // operator raises a cancellation query in the WMS rather than retrying forever.
           result.deadLettered += 1
           await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: `WMS order past NEW (status ${cancel.status}) — raise a cancellation query in the WMS`, lastAttemptAt: ts })
-          await postConflictComment(link.externalOrderId, `IMS: This order has been cancelled / fully refunded in IMS but is already being fulfilled here (status ${cancel.status}) and could not be auto-cancelled. Please raise a cancellation query.`)
+          await audit({
+            action: 'order_cancel', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+            summary: 'IMS cancel could not cancel the WMS order (past NEW) — dead-lettered for operator action',
+            before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
+            after: { state: 'DEAD_LETTER', wmsStatus: cancel.status },
+            error: `WMS order past NEW (status ${cancel.status})`,
+          })
+          await postConflictComment(link.externalOrderId, `IMS: This order has been cancelled / fully refunded in IMS but is already being fulfilled here (status ${cancel.status}) and could not be auto-cancelled. Please raise a cancellation query.`, link.orderId)
         }
       } catch (error) {
+        const message = scrubWmsError(error, 'WMS cancel failed')
         result.failed += 1
-        await port.updateLink(link.id, { lastError: scrubWmsError(error, 'WMS cancel failed'), lastAttemptAt: ts }).catch(() => {})
+        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
+        const remoteCancelled = cancel ? cancel.cancelled || cancel.status === 'NOT_FOUND' : false
+        await audit({
+          action: 'order_cancel', outcome: remoteCancelled ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+          summary: remoteCancelled ? 'WMS order cancelled, but recording the link failed' : 'WMS cancel call failed',
+          before: { state: 'SYNCED', externalOrderId: link.externalOrderId },
+          after: cancel ? { wmsCancelStatus: cancel.status, linkPersistFailed: true } : undefined,
+          error: message,
+        })
       }
     }
   }
@@ -456,7 +598,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     releasableHeldOrders: (connector, limit) =>
       db.wmsOrderPushLink.findMany({
         where: { connector, state: 'HELD', order: { status: { in: [...READY_STATUSES] }, paidAt: { not: null }, refundStatus: { not: 'FULL' } } },
-        select: { id: true },
+        select: { id: true, orderId: true, externalOrderId: true },
         take: limit,
       }),
     async createCandidates(connector, boundWarehouseIds, limit) {
@@ -499,7 +641,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     holdableLinks: (connector, limit) =>
       db.wmsOrderPushLink.findMany({
         where: { connector, state: 'SYNCED', externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
-        select: { id: true, externalOrderId: true },
+        select: { id: true, orderId: true, externalOrderId: true },
         take: limit,
       }),
     cancellableLinks: (connector, limit) =>
@@ -518,7 +660,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
             ],
           },
         },
-        select: { id: true, externalOrderId: true },
+        select: { id: true, orderId: true, externalOrderId: true },
         take: limit,
       }),
     async upsertByOrder(orderId, create, update) {
@@ -527,6 +669,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     async updateLink(id, data) {
       await db.wmsOrderPushLink.update({ where: { id }, data })
     },
+    recordEvent: (event) => recordWmsMutationEvent(event),
   }
 }
 

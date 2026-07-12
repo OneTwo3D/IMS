@@ -2703,6 +2703,55 @@ model WmsSyncLog {
   @@map("wms_sync_logs")
 }
 
+enum WmsMutationDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum WmsMutationOutcome {
+  SUCCEEDED
+  FAILED
+}
+
+/// q66in.4.6: audit-grade timeline of connector mutations — one row per
+/// IMS↔WMS state change, with operational before/after images. Payloads are
+/// built at the call sites from operational fields only (states, ids, SKUs,
+/// quantities, totals) and pass through a PII scrub as defense-in-depth —
+/// never full order/customer dumps. Purged by the activity-cleanup cron after
+/// the configured retention.
+model WmsMutationEvent {
+  id          String               @id @default(cuid())
+  connector   String
+  direction   WmsMutationDirection
+  /// e.g. order_create, order_update, order_hold, order_cancel, order_release,
+  /// order_comment, asn_create, product_upsert, bundle_upsert, align_up,
+  /// align_down, booked_in_receipt, dispatch_applied, return_inbox
+  action      String
+  outcome     WmsMutationOutcome
+  /// IMS entity the mutation is about: SALES_ORDER, PRODUCT, ASN, STOCK_LEVEL,
+  /// SHIPMENT, RETURN — free string, matches the timeline UI filter.
+  entityType  String
+  entityId    String?
+  /// WMS-side identifier (external order/ASN/product id) when known.
+  externalId  String?
+  summary     String
+  before      Json?
+  after       Json?
+  error       String?
+  /// Correlates to a WmsSyncJob run when the mutation happened inside one.
+  jobId       String?
+  triggeredBy String?
+  createdAt   DateTime             @default(now())
+
+  @@index([createdAt])
+  @@index([connector, createdAt])
+  @@index([entityType, entityId])
+  @@index([entityId])
+  @@index([externalId])
+  @@index([action, createdAt])
+  @@map("wms_mutation_events")
+}
+
 model WmsStockSnapshot {
   id           String   @id @default(cuid())
   connector    String

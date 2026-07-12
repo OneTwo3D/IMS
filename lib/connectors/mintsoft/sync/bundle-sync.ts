@@ -2,6 +2,7 @@ import { createHash } from 'crypto'
 import { Prisma, ProductLifecycleStatus, ProductType, WmsBundleSyncDirection } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import type { WmsBundleComponent, WmsBundleDto, WmsBundleRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 
@@ -674,6 +675,12 @@ async function syncBundleInternal(
     created = await connector.createBundle(dto)
   } catch (error) {
     await releaseBundleCreateSlot(claim.linkId)
+    await recordWmsMutationEvent({
+      connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: 'FAILED',
+      entityType: 'PRODUCT', entityId: productId,
+      summary: `Mintsoft bundle create failed for ${candidate.sku}`,
+      error: error instanceof Error ? error.message : 'Mintsoft bundle create failed',
+    })
     return {
       status: 'ERROR',
       action: 'conflict',
@@ -687,6 +694,17 @@ async function syncBundleInternal(
   const finalize = await finalizeBundleLink(claim.linkId, {
     externalBundleId: created.externalBundleId,
     checksum,
+  })
+  // Emitted after the finalize boundary (Codex r2): a remote create whose
+  // local link failed is flagged, not reported as an unqualified success.
+  await recordWmsMutationEvent({
+    connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: 'SUCCEEDED',
+    entityType: 'PRODUCT', entityId: productId, externalId: created.externalBundleId,
+    summary: finalize.success
+      ? `Mintsoft bundle created for ${candidate.sku}`
+      : `Mintsoft bundle created for ${candidate.sku}, but the local link finalize failed — manual recovery required`,
+    after: { externalBundleId: created.externalBundleId, sku: candidate.sku, checksum, ...(finalize.success ? {} : { linkPersistFailed: true }) },
+    error: finalize.success ? null : (finalize.lastError?.message ?? 'bundle link finalize failed'),
   })
   if (!finalize.success) {
     await logActivity({

@@ -1,4 +1,7 @@
 import type { Metadata } from 'next'
+import Link from 'next/link'
+import { History } from 'lucide-react'
+import { buttonVariants } from '@/components/ui/button'
 import { redirect } from 'next/navigation'
 import {
   getShoppingConnectorCredentials,
@@ -102,11 +105,17 @@ export default async function SyncPage() {
 
   return (
     <div className="space-y-6 max-w-5xl">
-      <div>
-        <h1 className="text-2xl font-semibold">Integrations</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Connect One Two Inventory with external platforms.
-        </p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold">Integrations</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Connect One Two Inventory with external platforms.
+          </p>
+        </div>
+        {/* q66in.4.6: audit-grade before/after timeline of WMS connector mutations. */}
+        <Link href="/sync/events" className={buttonVariants({ variant: 'outline', size: 'sm' })}>
+          <History className="h-4 w-4 mr-1" />Event Timeline
+        </Link>
       </div>
       {exceptionSummary && <ExceptionsBanner summary={exceptionSummary} />}
       {orphanSummary && <ConnectorOrphanBanner summary={orphanSummary} />}

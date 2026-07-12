@@ -3,6 +3,7 @@ import { Prisma, ProductLifecycleStatus, ProductType } from '@/app/generated/pri
 import type { WmsDiscrepancyCategory } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
 import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
@@ -712,20 +713,57 @@ async function syncOneMintsoftProduct(
     }
   }
 
-  const synced = await context.connector.upsertProduct(dto, {
-    externalProductId,
-    omitBarcode: barcodePlan.omitBarcode,
-  })
+  let synced: Awaited<ReturnType<typeof context.connector.upsertProduct>>
+  try {
+    synced = await context.connector.upsertProduct(dto, {
+      externalProductId,
+      omitBarcode: barcodePlan.omitBarcode,
+    })
+  } catch (error) {
+    await recordWmsMutationEvent({
+      connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'FAILED',
+      entityType: 'PRODUCT', entityId: context.product.id, externalId: externalProductId ?? null,
+      summary: `Mintsoft product upsert failed for ${context.product.sku}`,
+      before: { externalProductId: externalProductId ?? null },
+      error: error instanceof Error ? error.message : 'Mintsoft product upsert failed',
+    })
+    throw error
+  }
+  const upsertEvent = {
+    connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'SUCCEEDED',
+    entityType: 'PRODUCT', entityId: context.product.id, externalId: synced.externalId,
+    summary: synced.externalId === externalProductId
+      ? `Mintsoft product updated for ${context.product.sku}`
+      : `Mintsoft product created for ${context.product.sku}`,
+    before: { externalProductId: externalProductId ?? null, payloadHash: existingLink?.payloadHash ?? null },
+    after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, payloadHash },
+  } as const
 
-  await upsertMintsoftProductLink({
-    productId: context.product.id,
-    externalProductId: synced.externalId,
-    payloadHash,
-    lastKnownBarcode: trimToNull(synced.barcode) ?? dto.barcode,
-    metadata: toJsonPayload(synced.raw),
-    lastError: null,
-    touchLastSyncedAt: true,
-  })
+  // The event records only AFTER the local link persisted (Codex r2) — a link
+  // failure after a remote success is flagged, not silently reported clean.
+  // The catch covers ONLY the link upsert (Codex r3: a failure of the
+  // follow-up error-flag cleanup must not forge a false linkPersistFailed —
+  // the link itself is already durably written by then).
+  try {
+    await upsertMintsoftProductLink({
+      productId: context.product.id,
+      externalProductId: synced.externalId,
+      payloadHash,
+      lastKnownBarcode: trimToNull(synced.barcode) ?? dto.barcode,
+      metadata: toJsonPayload(synced.raw),
+      lastError: null,
+      touchLastSyncedAt: true,
+    })
+  } catch (persistError) {
+    await recordWmsMutationEvent({
+      ...upsertEvent,
+      summary: `${upsertEvent.summary}, but recording the product link failed`,
+      after: { ...upsertEvent.after, linkPersistFailed: true },
+      error: persistError instanceof Error ? persistError.message : 'Mintsoft product link persist failed',
+    })
+    throw persistError
+  }
+  await recordWmsMutationEvent(upsertEvent)
   await clearMintsoftProductLinkError(context.product.id)
 
   return {
