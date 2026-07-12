@@ -17,6 +17,9 @@ import {
   buildDeadReceiptEventReplayWhere,
 } from '@/lib/domain/wms/exception-inbox'
 import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 
 // q66in.4.2: the dead-letter / exception inbox. One aggregated read model over
@@ -644,6 +647,45 @@ export async function replayStuckDispatch(orderId: string): Promise<MutationResu
 export async function repushMissingWmsOrder(orderId: string): Promise<MutationResult> {
   try {
     const session = await requireFreshPermission('sync')
+
+    // Codex r17: the durable row may be STALE (order restored/recreated in the
+    // WMS since the sweep ran) — a reset would then make the push sweep create
+    // a DUPLICATE. Revalidate absence live, and only for the active connector.
+    const pluginState = await getIntegrationPluginState()
+    const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+    const openFinding = await db.wmsOrderDiscrepancy.findFirst({
+      where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
+      select: { connector: true },
+    })
+    if (!openFinding) {
+      return { success: false, error: 'No open missing-in-WMS finding for this order (already resolved or re-verified).' }
+    }
+    if (!activeConnectorId || openFinding.connector !== activeConnectorId) {
+      return { success: false, error: 'This finding belongs to a connector that is no longer active — the next reconcile run retires it.' }
+    }
+    const connector = getWmsConnector(activeConnectorId)
+    if (!connector.probeOrderPresence) {
+      return { success: false, error: 'The active WMS connector cannot verify order absence, so a safe re-push is not possible.' }
+    }
+    const link = await db.wmsOrderPushLink.findUnique({
+      where: { orderId },
+      select: { externalOrderNumber: true },
+    })
+    const presence = link?.externalOrderNumber
+      ? await connector.probeOrderPresence(link.externalOrderNumber)
+      : 'MISSING'
+    if (presence === 'FOUND') {
+      // The WMS knows the order again — the finding is stale; resolve it instead.
+      await db.wmsOrderDiscrepancy.updateMany({
+        where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
+        data: { status: 'RESOLVED', resolvedAt: new Date() },
+      })
+      return { success: false, error: 'The WMS knows this order again — the finding was stale and has been resolved. No re-push needed.' }
+    }
+    if (presence === 'AMBIGUOUS') {
+      return { success: false, error: 'The WMS returned an ambiguous match for this order — re-pushing could create a duplicate. Resolve the ambiguity in the WMS first.' }
+    }
+
     // Codex: an OPEN finding is the AUTHORIZATION for this reset, and the two
     // writes are one transaction — if the link reset doesn't apply, the finding
     // stays OPEN (it must not vanish from the inbox with the order unfixed).

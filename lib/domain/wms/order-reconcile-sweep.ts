@@ -249,7 +249,12 @@ export function buildNotPushedDriftWhere(input: {
     ...(input.orderIds ? { id: { in: input.orderIds } } : {}),
     status: { in: ['PROCESSING' as const, 'ALLOCATED' as const] },
     paidAt: { not: null, lt: input.cutoff },
-    updatedAt: { lt: input.cutoff },
+    // Deliberately NO order.updatedAt condition (Codex r17 P1): storefront
+    // refreshes touch busy orders far more often than the grace window, which
+    // would permanently mask a dead push cron. The residual false positive — an
+    // old-paid order that became ready moments before the sweep — is narrow
+    // (the push cron handles ready orders within minutes when alive) and the
+    // durable-finding resolution pass clears it on the next run.
     refundStatus: { not: 'FULL' as const },
     shipFromWarehouseId: { in: input.boundWarehouseIds },
     OR: [
