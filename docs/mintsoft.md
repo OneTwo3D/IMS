@@ -102,6 +102,10 @@ The `timestamp` string must be the exact header value IMS uses for freshness val
 
 An IMS-side stock count against a WMS-bound warehouse is coordinated with the stock sync (6oyu.3): under **Align To WMS** posting is **blocked** — the WMS is the stock master, so perform the stocktake there and let the sync import the corrections; under **notification-only** posting **warns and requires acknowledgement**, since any remaining divergence against the WMS is re-flagged as a discrepancy on the next sync. Unbound (or sync-disabled) warehouses are unaffected.
 
+## Silent-Failure Watchdog (scheduled)
+
+The `wms-watchdog` cron (hourly, ships disabled — enable in System Settings → Scheduler) alerts once per breach (WARNING activity + admin bell, deduped until the condition heals): **open ASNs past their ETA** (persisted from the ASN dialog) **with no booked-in callback** — naming any unreconciled alignment credits, which silently suppress real PO receipts until the callback arrives — and **bindings without a successful stock sync** for 3× their own cadence (dead cron — or one whose every attempt fails; FAILED attempts don't count as freshness). A fresh callback / ASN close, or the next successful sync, re-arms the alert. If a breach alert cannot be delivered (notification insert fails, or no active admin exists) the breach stays unclaimed for retry and the run returns HTTP 500 so scheduler monitoring goes red.
+
 ## Order Reconciliation (scheduled)
 
 The `wms-order-reconcile` cron (default daily, ships disabled — enable in System Settings → Scheduler) runs a connector-agnostic order-level reconcile of IMS intent vs WMS truth (`lib/domain/wms/order-reconcile-sweep.ts`). Because the WMS API cannot enumerate orders, it verifies IMS-known truth per order: eligible orders with no live push link (`NOT_PUSHED`), live links whose WMS order vanished (`MISSING_IN_WMS`), and cancelled/held orders still active in the WMS (`ACTIVE_AFTER_CANCEL` — admins are belled; the warehouse may ship them). Findings land on an `ORDER_RECONCILE` sync job and surface in the [sync exception inbox](./sync-exceptions.md).

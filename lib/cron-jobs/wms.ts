@@ -9,6 +9,7 @@
 // imports must be static — keep one line per WMS cron module.
 import './wms-order-status' // connector-agnostic (module 'wms')
 import './wms-order-push'
-import './wms-order-reconcile' // connector-agnostic (module 'wms')
+import './wms-order-reconcile'
+import './wms-watchdog' // connector-agnostic (module 'wms')
 import './wms-mintsoft' // Mintsoft connector jobs
 import './wms-shiphero' // ShipHero connector jobs

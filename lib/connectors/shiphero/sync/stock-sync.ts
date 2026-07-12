@@ -129,7 +129,9 @@ export async function runShipheroStockSyncForBinding(bindingId: string): Promise
     const keepSkus = [...new Set(findings.filter((f) => !f.productId).map((f) => f.sku))]
     const resolved = await resolveClearedWmsStockDiscrepancies({ connector: CONNECTOR, warehouseId: binding.warehouseId, keepProductIds, keepSkus }, now)
 
-    await db.externalWmsBinding.update({ where: { id: binding.id }, data: { lastStockSyncAt: now, lastStockSyncStatus: 'SUCCEEDED' } })
+    // staleSyncAlertedAt re-arms the watchdog's stale-sync alert; only a
+    // completed run advances its lastStockSyncSuccessAt anchor (q66in.4.6).
+    await db.externalWmsBinding.update({ where: { id: binding.id }, data: { lastStockSyncAt: now, lastStockSyncSuccessAt: now, lastStockSyncStatus: 'SUCCEEDED', staleSyncAlertedAt: null } })
     return { bindingId, status: 'SUCCEEDED', checked: stockLines.length, discrepancies: findings.length, resolved, thresholdBreaches }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'ShipHero stock sync failed'

@@ -1096,6 +1096,11 @@ async function updateBindingSyncState(bindingId: string, status: 'SUCCEEDED' | '
     data: {
       lastStockSyncAt: new Date(),
       lastStockSyncStatus: status,
+      // Only a run that actually completed its checks heals the watchdog's
+      // stale-sync alert and advances its staleness anchor (Codex r4/r5: a
+      // FAILED run advancing the anchor kept a permanently failing binding
+      // "fresh", so the first stale alert would never fire).
+      ...(status === 'FAILED' ? {} : { staleSyncAlertedAt: null, lastStockSyncSuccessAt: new Date() }),
     },
   })
 }
@@ -1733,7 +1738,13 @@ export async function createMintsoftBindingHandover(
     where: { id: binding.id },
     data: {
       lastStockSyncAt: new Date(),
+      // A handover records a successful STOCK_SYNC, so it is watchdog
+      // freshness too (Codex r6): without these, leaving alignment mode kept
+      // the old/null success anchor (immediate false stale alert) or carried
+      // a stale stamp that suppressed later genuine breaches.
+      lastStockSyncSuccessAt: new Date(),
       lastStockSyncStatus: 'SUCCEEDED',
+      staleSyncAlertedAt: null,
     },
   })
 

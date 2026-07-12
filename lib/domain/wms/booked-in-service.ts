@@ -1011,6 +1011,7 @@ export async function processBookedInEvent(
         data: {
           status: asnClosed ? 'BOOKED_IN' : 'PARTIALLY_BOOKED_IN',
           lastCallbackAt: now,
+          sloAlertedAt: null,
           ...(asnClosed ? { closedAt: now } : {}),
         },
       })

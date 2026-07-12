@@ -2383,6 +2383,13 @@ export async function createMintsoftPurchaseOrderAsn(
           throw new Error('This purchase order has no outstanding quantity left to place on an ASN.')
         }
 
+        // q66in.4.6: a retry may carry a NEW ETA — keep the watchdog anchored to
+        // the value actually sent to the WMS, not the first attempt's.
+        await tx.wmsAsnMap.update({
+          where: { id: pendingAsn.id },
+          data: { eta: etaIso ? new Date(etaIso) : null },
+        })
+
         const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
         const pendingLineBySourceLineId = new Map(pendingAsn.lines.map((line) => [line.sourceLineId, line]))
         const activeSourceLineIds = outstandingLines.map((line) => line.sourceLineId)
@@ -2494,6 +2501,8 @@ export async function createMintsoftPurchaseOrderAsn(
           sourceId: po.id,
           warehouseId: po.destinationWarehouseId,
           status: 'CREATE_PENDING',
+          // q66in.4.6: the watchdog's overdue-ASN SLO anchors on the ETA.
+          eta: etaIso ? new Date(etaIso) : null,
           lines: {
             create: outstandingLines.map((line) => ({
               externalAsnLineId: `pending:${line.sourceLineId}`,
@@ -3284,6 +3293,13 @@ export async function createMintsoftTransferAsn(
           throw new Error('This transfer has no outstanding quantity left to place on an ASN.')
         }
 
+        // q66in.4.6: a retry may carry a NEW ETA — keep the watchdog anchored to
+        // the value actually sent to the WMS, not the first attempt's.
+        await tx.wmsAsnMap.update({
+          where: { id: pendingAsn.id },
+          data: { eta: etaIso ? new Date(etaIso) : null },
+        })
+
         const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
         const pendingLineBySourceLineId = new Map(pendingAsn.lines.map((line) => [line.sourceLineId, line]))
         const activeSourceLineIds = outstandingLines.map((line) => line.sourceLineId)
@@ -3395,6 +3411,8 @@ export async function createMintsoftTransferAsn(
           sourceId: transfer.id,
           warehouseId: transfer.toWarehouseId,
           status: 'CREATE_PENDING',
+          // q66in.4.6: the watchdog's overdue-ASN SLO anchors on the ETA.
+          eta: etaIso ? new Date(etaIso) : null,
           lines: {
             create: outstandingLines.map((line) => ({
               externalAsnLineId: `pending:${line.sourceLineId}`,
