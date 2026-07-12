@@ -399,6 +399,10 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
               state: { in: ['CANCELLED', 'HELD'] },
               OR: [
                 { cancelledAt: { gte: since } },
+                // Never reconciled at all — e.g. the cron enabled >30 days
+                // after cancellations accumulated (Codex r26): age alone must
+                // not exempt a link that has never been verified once.
+                { reconcileCheckedAt: null },
                 { order: { wmsOrderDiscrepancies: { some: { category: 'ACTIVE_AFTER_CANCEL', status: 'OPEN' } } } },
               ],
             },

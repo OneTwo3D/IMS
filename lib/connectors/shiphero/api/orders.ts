@@ -125,10 +125,11 @@ export function pickShipheroOrderNode(nodes: unknown[], reference: string): unkn
 }
 
 /**
- * Tri-state presence probe (q66in.4.4). Unlike Mintsoft, ShipHero's picker
- * never fails closed on ambiguity (exact order_number match, else the first
- * hit), so zero nodes is a VERIFIABLE absence — AMBIGUOUS is not a state this
- * lookup can produce.
+ * Tri-state presence probe (q66in.4.4). Zero nodes is a VERIFIABLE absence;
+ * an EXACT order_number hit is presence. Candidates WITHOUT an exact match are
+ * AMBIGUOUS (Codex r26): the search matched something related, so absence is
+ * not proven — and reconciliation must fail closed rather than re-create a
+ * possibly-live order or mistake unrelated hits for health.
  */
 export async function probeShipheroOrderPresence(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
   const reference = orderNumber.trim()
@@ -136,7 +137,9 @@ export async function probeShipheroOrderPresence(orderNumber: string): Promise<'
   const result = await shipheroGraphql<ShipheroOrdersData>(ORDER_STATUS_QUERY, { orderNumber: reference })
   if (result.error) throw new Error(result.error)
   const nodes = extractShipheroConnectionNodes((result.data?.orders as { data?: unknown })?.data ?? result.data?.orders)
-  return nodes.length === 0 ? 'MISSING' : 'FOUND'
+  if (nodes.length === 0) return 'MISSING'
+  const exact = nodes.some((node) => str(asRecord(node)?.order_number) === reference)
+  return exact ? 'FOUND' : 'AMBIGUOUS'
 }
 
 export async function fetchShipheroOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
