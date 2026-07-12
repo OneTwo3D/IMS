@@ -2505,6 +2505,9 @@ model ExternalWmsBinding {
   discrepancyThresholds Json?
   reportRecipients     String[]               @default([])
   alignmentConfirmedAt DateTime?
+  /// q66in.4.6: when the watchdog last alerted that this binding's stock sync
+  /// is stale (dedupe); cleared by the next successful sync.
+  staleSyncAlertedAt   DateTime?
   /// Adjustment reason used to book ALIGN_TO_WMS downward corrections (6oyu.1).
   /// Align-down only auto-applies while this is set; deleting the reason nulls it
   /// and align-down falls back to manual discrepancies.
@@ -2607,6 +2610,12 @@ model WmsAsnMap {
   status         WmsAsnStatus
   lastCallbackAt DateTime?
   closedAt       DateTime?
+  /// q66in.4.6: expected arrival (from the ASN create dialog) — the watchdog's
+  /// 'open ASN with no callback after ETA' SLO anchor.
+  eta            DateTime?
+  /// q66in.4.6: when the watchdog last alerted on this ASN (dedupe); cleared by
+  /// a fresh callback or close so a RENEWED breach re-alerts.
+  sloAlertedAt   DateTime?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 

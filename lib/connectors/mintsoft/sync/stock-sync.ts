@@ -1095,6 +1095,7 @@ async function updateBindingSyncState(bindingId: string, status: 'SUCCEEDED' | '
     where: { id: bindingId },
     data: {
       lastStockSyncAt: new Date(),
+      staleSyncAlertedAt: null,
       lastStockSyncStatus: status,
     },
   })

@@ -2494,6 +2494,8 @@ export async function createMintsoftPurchaseOrderAsn(
           sourceId: po.id,
           warehouseId: po.destinationWarehouseId,
           status: 'CREATE_PENDING',
+          // q66in.4.6: the watchdog's overdue-ASN SLO anchors on the ETA.
+          eta: etaIso ? new Date(etaIso) : null,
           lines: {
             create: outstandingLines.map((line) => ({
               externalAsnLineId: `pending:${line.sourceLineId}`,
@@ -3395,6 +3397,8 @@ export async function createMintsoftTransferAsn(
           sourceId: transfer.id,
           warehouseId: transfer.toWarehouseId,
           status: 'CREATE_PENDING',
+          // q66in.4.6: the watchdog's overdue-ASN SLO anchors on the ETA.
+          eta: etaIso ? new Date(etaIso) : null,
           lines: {
             create: outstandingLines.map((line) => ({
               externalAsnLineId: `pending:${line.sourceLineId}`,
