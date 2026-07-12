@@ -666,6 +666,9 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
           dispatchFailureCount: 0,
           dispatchLastError: null,
           dispatchDeadLetteredAt: null,
+          // The recency belonged to the MISSING order — the replacement must
+          // rotate to the front of verification, not inherit it (Codex r9).
+          reconcileCheckedAt: null,
         },
       })
       if (updated.count === 0) {

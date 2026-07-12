@@ -259,6 +259,9 @@ const RESET_DISPATCH_FAILURES = {
   dispatchFailureCount: 0,
   dispatchLastError: null,
   dispatchDeadLetteredAt: null,
+  // Same rationale for the reconcile stamp: the recency belonged to the OLD
+  // WMS order; the fresh one must rotate to the front of verification.
+  reconcileCheckedAt: null,
 } satisfies LinkWrite
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
