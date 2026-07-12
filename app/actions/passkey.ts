@@ -19,6 +19,20 @@ import { getPublicAppUrl } from '@/lib/public-app-url'
 
 const RP_NAME = 'onetwoInventory'
 
+/**
+ * Returns the current session only if it is *fully* authenticated. A
+ * password-only session that has not yet cleared the TOTP challenge
+ * (`totpEnabled && !totpVerified`) is rejected: allowing it to enroll or manage
+ * passkeys would let a password-holding attacker register their own
+ * authenticator and sign in with it, bypassing the second factor entirely.
+ */
+async function getVerifiedSession() {
+  const session = await getSession()
+  if (!session?.user?.id) return null
+  if (session.user.totpEnabled && !session.user.totpVerified) return null
+  return session
+}
+
 async function getPasskeyOriginConfig(): Promise<{ rpId: string; origin: string } | { error: string }> {
   const publicAppUrl = await getPublicAppUrl()
   if (!publicAppUrl) return { error: 'Public app URL is not configured.' }
@@ -42,7 +56,7 @@ async function getChallenge(key: string): Promise<string | null> {
 // --- Registration ---
 
 export async function getPasskeyRegistrationOptions() {
-  const session = await getSession()
+  const session = await getVerifiedSession()
   if (!session?.user?.id) return { error: 'Unauthorized' }
   const originConfig = await getPasskeyOriginConfig()
   if ('error' in originConfig) return { error: originConfig.error }
@@ -78,7 +92,7 @@ export async function verifyPasskeyRegistration(
   response: RegistrationResponseJSON,
   name?: string,
 ) {
-  const session = await getSession()
+  const session = await getVerifiedSession()
   if (!session?.user?.id) return { error: 'Unauthorized' }
   const originConfig = await getPasskeyOriginConfig()
   if ('error' in originConfig) return { error: originConfig.error }
@@ -210,7 +224,7 @@ export async function verifyPasskeyAuthentication(
 // --- Management ---
 
 export async function listPasskeys() {
-  const session = await getSession()
+  const session = await getVerifiedSession()
   if (!session?.user?.id) return []
 
   return db.passkey.findMany({
@@ -221,7 +235,7 @@ export async function listPasskeys() {
 }
 
 export async function renamePasskey(id: string, name: string) {
-  const session = await getSession()
+  const session = await getVerifiedSession()
   if (!session?.user?.id) return { error: 'Unauthorized' }
 
   await db.passkey.updateMany({
@@ -233,7 +247,7 @@ export async function renamePasskey(id: string, name: string) {
 }
 
 export async function deletePasskey(id: string) {
-  const session = await getSession()
+  const session = await getVerifiedSession()
   if (!session?.user?.id) return { error: 'Unauthorized' }
 
   await db.$transaction([

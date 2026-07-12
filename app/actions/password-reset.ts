@@ -38,8 +38,8 @@ export async function requestPasswordReset(email: string): Promise<PasswordReset
   const ip = getClientIp(await headers()) ?? 'unknown'
   // Per-IP cap guards against email-bombing across many target addresses; the
   // per-email+IP cap guards a single target. Either tripping → silent ack.
-  const ipLimit = await checkRateLimit(`pwreset-ip:${ip}`, 20, 15 * 60_000)
-  const emailLimit = await checkRateLimit(`pwreset:${normalizedEmail}:${ip}`, 5, 15 * 60_000)
+  const ipLimit = await checkRateLimit(`pwreset-ip:${ip}`, 20, 15 * 60_000, { failClosed: true })
+  const emailLimit = await checkRateLimit(`pwreset:${normalizedEmail}:${ip}`, 5, 15 * 60_000, { failClosed: true })
   if (!ipLimit.allowed || !emailLimit.allowed) return REQUEST_ACK
 
   const user = await db.user.findFirst({
@@ -108,7 +108,7 @@ export async function resetPassword(token: string, newPassword: string): Promise
   if (policyError) return { success: false, error: policyError }
 
   const ip = getClientIp(await headers()) ?? 'unknown'
-  const limit = await checkRateLimit(`pwreset-confirm:${ip}`, 20, 15 * 60_000)
+  const limit = await checkRateLimit(`pwreset-confirm:${ip}`, 20, 15 * 60_000, { failClosed: true })
   if (!limit.allowed) return { success: false, error: 'Too many attempts. Please try again later.' }
 
   const userId = await consumeAuthToken(passwordResetTokenKey(token))

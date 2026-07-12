@@ -125,9 +125,9 @@ export async function renderEmailHtml(
   const publicAppUrl = (await getPublicAppUrl())?.replace(/\/$/, '') ?? ''
 
   const logoHtml = branding.documentLogoUrl
-    ? `<img src="${publicAppUrl}${branding.documentLogoUrl}" alt="${branding.companyName}" style="max-height:50px;max-width:200px;margin-bottom:16px;" />`
+    ? `<img src="${publicAppUrl}${branding.documentLogoUrl}" alt="${escapeHtml(branding.companyName)}" style="max-height:50px;max-width:200px;margin-bottom:16px;" />`
     : branding.logoUrl
-      ? `<img src="${publicAppUrl}${branding.logoUrl}" alt="${branding.companyName}" style="max-height:40px;max-width:40px;margin-bottom:16px;" />`
+      ? `<img src="${publicAppUrl}${branding.logoUrl}" alt="${escapeHtml(branding.companyName)}" style="max-height:40px;max-width:40px;margin-bottom:16px;" />`
       : ''
 
   const bodyHtml = data.bodyLines.map((l) => `<p style="margin:0 0 12px;color:#333;font-size:15px;line-height:1.5;">${escapeHtml(l)}</p>`).join('\n')

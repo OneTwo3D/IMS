@@ -177,8 +177,15 @@ export const authConfig: NextAuthConfig = {
           if (!turnstileVerified) return null
         }
 
+        // Fail closed so a rate-limit backend outage cannot silently disable
+        // brute-force protection. Keyed on email+IP for targeted-guess
+        // throttling. A broader per-IP cap is deliberately NOT added here: with
+        // an untrusted/unset proxy config (see TRUSTED_PROXY_IPS in
+        // lib/request-ip.ts) every client collapses to the proxy IP, so a
+        // per-IP login cap would lock out an entire office. Add one only once
+        // trusted-proxy resolution is enforced.
         const rlKey = `login:${parsed.data.email.toLowerCase()}:${clientIp}`
-        const rl = await checkRateLimit(rlKey, 10, 15 * 60_000)
+        const rl = await checkRateLimit(rlKey, 10, 15 * 60_000, { failClosed: true })
         if (!rl.allowed) return null
 
         const user = await db.user.findUnique({
