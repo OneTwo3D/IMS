@@ -82,7 +82,7 @@ export type WmsOrderReconcileDeps = {
 export async function runWmsOrderReconcileCore(
   deps: WmsOrderReconcileDeps,
   options?: { lookupLimit?: number },
-): Promise<{ counters: WmsReconcileCounters; findings: WmsReconcileFinding[] }> {
+): Promise<{ counters: WmsReconcileCounters; findings: WmsReconcileFinding[]; verifiedOrderIds: string[] }> {
   const lookupLimit = options?.lookupLimit ?? RECONCILE_DEFAULT_LOOKUP_LIMIT
   const counters: WmsReconcileCounters = { intentChecked: 0, linksVerified: 0, cancelledVerified: 0, findings: 0, errors: 0 }
   const findings: WmsReconcileFinding[] = []
@@ -100,36 +100,16 @@ export async function runWmsOrderReconcileCore(
     })
   }
 
-  // B — verify each live link still has a WMS order behind it. B and C share
-  // ONE lookup budget (Codex): each fetchOrderStatus is a WMS API call, and the
-  // advertised per-run cap must bound the total, not each check.
-  const syncedLinks = await deps.listSyncedLinksToVerify(lookupLimit)
-  for (const link of syncedLinks) {
-    counters.linksVerified += 1
-    try {
-      const status = await deps.fetchOrderStatus(link.externalOrderNumber)
-      if (!status) {
-        findings.push({
-          category: 'MISSING_IN_WMS',
-          orderId: link.orderId,
-          orderNumber: link.orderNumber,
-          externalOrderNumber: link.externalOrderNumber,
-          detail: 'The push link is live but the WMS no longer knows this order — it will never fulfil. Replay re-creates it.',
-        })
-      }
-    } catch (error) {
-      counters.errors += 1
-      console.error(`[wms-order-reconcile] status lookup failed for ${link.externalOrderNumber}:`, scrubWmsError(error, 'lookup failed'))
-    }
-  }
-
-  // C — verify cancelled/held orders are actually gone or cancelled in the WMS,
-  // within whatever lookup budget B left over.
-  const cancelledBudget = Math.max(0, lookupLimit - syncedLinks.length)
-  for (const link of await deps.listCancelledLinksToVerify(cancelledBudget)) {
+  // B and C share ONE lookup budget (each fetchOrderStatus is a WMS API call),
+  // and C — the ship-goods-nobody-expects direction — is fetched FIRST so a
+  // large live-link backlog can never starve the safety-critical check (Codex).
+  const verifiedOrderIds: string[] = []
+  const cancelledLinks = await deps.listCancelledLinksToVerify(lookupLimit)
+  for (const link of cancelledLinks) {
     counters.cancelledVerified += 1
     try {
       const status = await deps.fetchOrderStatus(link.externalOrderNumber)
+      verifiedOrderIds.push(link.orderId)
       if (status && !status.dispatched && !isLikelyCancelledWmsStatus(status)) {
         findings.push({
           category: 'ACTIVE_AFTER_CANCEL',
@@ -145,8 +125,31 @@ export async function runWmsOrderReconcileCore(
     }
   }
 
+  // B — verify each live link still has a WMS order behind it, within whatever
+  // budget C left over.
+  const syncedBudget = Math.max(0, lookupLimit - cancelledLinks.length)
+  for (const link of await deps.listSyncedLinksToVerify(syncedBudget)) {
+    counters.linksVerified += 1
+    try {
+      const status = await deps.fetchOrderStatus(link.externalOrderNumber)
+      verifiedOrderIds.push(link.orderId)
+      if (!status) {
+        findings.push({
+          category: 'MISSING_IN_WMS',
+          orderId: link.orderId,
+          orderNumber: link.orderNumber,
+          externalOrderNumber: link.externalOrderNumber,
+          detail: 'The push link is live but the WMS no longer knows this order — it will never fulfil. Replay re-creates it.',
+        })
+      }
+    } catch (error) {
+      counters.errors += 1
+      console.error(`[wms-order-reconcile] status lookup failed for ${link.externalOrderNumber}:`, scrubWmsError(error, 'lookup failed'))
+    }
+  }
+
   counters.findings = findings.length
-  return { counters, findings }
+  return { counters, findings, verifiedOrderIds }
 }
 
 /** Prisma + active-connector wiring, mirroring the other WMS sweeps. */
@@ -197,7 +200,9 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
         },
         select: { orderId: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
         take: limit,
-        orderBy: { pushedAt: 'asc' },
+        // Rotate: least-recently-verified first (never-checked links lead), so a
+        // corpus larger than the per-run cap still gets full coverage over days.
+        orderBy: [{ reconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { pushedAt: 'asc' }],
       })
       return links.flatMap((link) => (
         link.externalOrderNumber
@@ -264,6 +269,13 @@ export async function runWmsOrderReconcileSweep(
   try {
     const core = await runWmsOrderReconcileCore(deps, options)
     counters = core.counters
+
+    if (core.verifiedOrderIds.length > 0) {
+      await db.wmsOrderPushLink.updateMany({
+        where: { orderId: { in: core.verifiedOrderIds } },
+        data: { reconcileCheckedAt: new Date() },
+      })
+    }
 
     if (core.findings.length > 0) {
       await db.wmsSyncLog.createMany({

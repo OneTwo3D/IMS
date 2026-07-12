@@ -2344,6 +2344,9 @@ model WmsOrderPushLink {
   dispatchFailureCount   Int            @default(0)
   dispatchLastError      String?
   dispatchDeadLetteredAt DateTime?
+  /// q66in.4.4: when the order reconcile last verified this link against the
+  /// WMS — the capped daily sweep rotates least-recently-checked first.
+  reconcileCheckedAt     DateTime?
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 

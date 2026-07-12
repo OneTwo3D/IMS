@@ -101,17 +101,36 @@ test('reconcile core: lookup failures count as errors and never abort the run', 
   assert.equal(findings[0].externalOrderNumber, 'WC-2')
 })
 
-test('reconcile core: checks B and C share one lookup budget', async () => {
-  let cancelledLimitSeen = -1
-  await reconcile.runWmsOrderReconcileCore(deps({
-    listSyncedLinksToVerify: async () => Array.from({ length: 8 }, (_, index) => ({
-      orderId: `o${index}`, orderNumber: `SO-${index}`, externalOrderNumber: `WC-${index}`,
-    })),
+test('reconcile core: C is budgeted first so a live-link backlog cannot starve it', async () => {
+  let syncedLimitSeen = -1
+  const { counters } = await reconcile.runWmsOrderReconcileCore(deps({
     listCancelledLinksToVerify: async (limit) => {
-      cancelledLimitSeen = limit
+      assert.equal(limit, 10)
+      return Array.from({ length: 3 }, (_, index) => ({
+        orderId: `c${index}`, orderNumber: `SO-C${index}`, externalOrderNumber: `WCC-${index}`,
+      }))
+    },
+    listSyncedLinksToVerify: async (limit) => {
+      syncedLimitSeen = limit
       return []
     },
-    fetchOrderStatus: async () => status({}),
+    fetchOrderStatus: async () => status({ status: 'Cancelled', statusLabel: 'Cancelled' }),
   }), { lookupLimit: 10 })
-  assert.equal(cancelledLimitSeen, 2)
+  assert.equal(syncedLimitSeen, 7)
+  assert.equal(counters.cancelledVerified, 3)
+})
+
+test('reconcile core: returns the ids it actually verified for rotation stamping', async () => {
+  const { verifiedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
+    listSyncedLinksToVerify: async () => [
+      { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },
+      { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },
+    ],
+    fetchOrderStatus: async (orderNumber) => {
+      if (orderNumber === 'WC-1') throw new Error('down')
+      return status({})
+    },
+  }))
+  // The errored lookup must NOT be stamped as verified (it would dodge rotation).
+  assert.deepEqual(verifiedOrderIds, ['o2'])
 })
