@@ -421,11 +421,20 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       return { deadLettered: true }
     },
     async clearDispatchFailures(linkId) {
-      // Only touch rows that actually accumulated failures — keeps the happy
-      // path write-free.
+      // Only touch rows with failure state — keeps the happy path write-free.
+      // A success also clears dispatchDeadLetteredAt (Codex): an overlapping
+      // sweep can dead-letter while THIS run successfully reconciles, and a
+      // reconciled order must not linger as a false exception.
       await db.wmsOrderPushLink.updateMany({
-        where: { id: linkId, dispatchFailureCount: { gt: 0 }, dispatchDeadLetteredAt: null },
-        data: { dispatchFailureCount: 0, dispatchLastError: null },
+        where: {
+          id: linkId,
+          OR: [
+            { dispatchFailureCount: { gt: 0 } },
+            { dispatchLastError: { not: null } },
+            { dispatchDeadLetteredAt: { not: null } },
+          ],
+        },
+        data: { dispatchFailureCount: 0, dispatchLastError: null, dispatchDeadLetteredAt: null },
       })
     },
   }
