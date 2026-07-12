@@ -76,6 +76,8 @@ export type WmsOrderReconcileDeps = {
   /** Check C: recently cancelled/held links whose WMS order should be gone or cancelled. */
   listCancelledLinksToVerify(limit: number): Promise<Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>>
   fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null>
+  /** Whether the connector exposes per-part inspection (fetchOrderParts). */
+  partsSupported: boolean
   /** All parts of a (possibly split) order — [] when the connector has no part support. */
   fetchOrderParts(orderNumber: string): Promise<import('@/lib/connectors/wms/types').WmsOrderPart[]>
   /**
@@ -143,10 +145,13 @@ export async function runWmsOrderReconcileCore(
         }
         continue
       }
-      // Split orders: the collapsed top-level status speaks only for Part 1
-      // (Codex r16 P1) — a cancelled Part 1 must not mask an active Part 2 that
-      // can still ship. EVERY part must be dispatched or cancelled.
-      if (status.isSplit || (status.partCount ?? 1) > 1) {
+      // Split orders on a parts-capable connector: the collapsed top-level
+      // status speaks only for Part 1 (Codex r16 P1) — a cancelled Part 1 must
+      // not mask an active Part 2 that can still ship. EVERY part must be
+      // dispatched or cancelled. A connector WITHOUT part support (Codex r18:
+      // its top-level status is computed for the whole order, not collapsed)
+      // falls through to the top-level classification below.
+      if (deps.partsSupported && (status.isSplit || (status.partCount ?? 1) > 1)) {
         const parts = await deps.fetchOrderParts(status.externalOrderNumber || link.externalOrderNumber)
         if (parts.length === 0) {
           // Split but parts not inspectable — fail closed, never verified-clean.
@@ -356,6 +361,7 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
     fetchOrderStatus(orderNumber) {
       return connector.fetchOrderStatus ? connector.fetchOrderStatus(orderNumber) : Promise.resolve(null)
     },
+    partsSupported: Boolean(connector.fetchOrderParts),
     fetchOrderParts(orderNumber) {
       return connector.fetchOrderParts ? connector.fetchOrderParts(orderNumber) : Promise.resolve([])
     },
@@ -545,18 +551,34 @@ export async function runWmsOrderReconcileSweep(
     // Resolve NOT_PUSHED rows whose drift predicate no longer holds — the order
     // gained a live link, or stopped being eligible. Re-evaluated per open row
     // (bounded set), never by absence from a capped scan.
-    const openNotPushed = await db.wmsOrderDiscrepancy.findMany({
-      where: { category: 'NOT_PUSHED', status: 'OPEN' },
-      select: { id: true, orderId: true },
+    // Chunked (Codex r18): the OPEN set is unbounded and detection can add up
+    // to lookupLimit*5 rows per run — one giant `in` query would eventually
+    // exceed Postgres's bind-parameter limit and permanently fail the cron.
+    const RESOLUTION_CHUNK = 500
+    // Same predicate as detection — including the bound-warehouse condition
+    // (Codex: an order whose binding was disabled or that moved to an unbound
+    // warehouse is out of WMS scope and must resolve, not linger).
+    const resolutionBindings = await db.externalWmsBinding.findMany({
+      where: { connector: connectorId, active: true, connection: { active: true } },
+      select: { warehouseId: true },
     })
-    if (openNotPushed.length > 0) {
-      // Same predicate as detection — including the bound-warehouse condition
-      // (Codex: an order whose binding was disabled or that moved to an unbound
-      // warehouse is out of WMS scope and must resolve, not linger).
-      const bindings = await db.externalWmsBinding.findMany({
-        where: { connector: connectorId, active: true, connection: { active: true } },
-        select: { warehouseId: true },
+    // Plain id > lastId pagination (NOT Prisma cursor: resolving the cursor row
+    // mid-walk would break cursor positioning on the filtered set).
+    for (let lastId = ''; ;) {
+      const openNotPushed = await db.wmsOrderDiscrepancy.findMany({
+        where: { category: 'NOT_PUSHED', status: 'OPEN', ...(lastId ? { id: { gt: lastId } } : {}) },
+        orderBy: { id: 'asc' },
+        take: RESOLUTION_CHUNK,
+        select: { id: true, orderId: true },
       })
+      if (openNotPushed.length === 0) break
+      lastId = openNotPushed[openNotPushed.length - 1].id
+      await resolveNotPushedChunk(openNotPushed)
+      if (openNotPushed.length < RESOLUTION_CHUNK) break
+    }
+
+    async function resolveNotPushedChunk(openNotPushed: Array<{ id: string; orderId: string }>) {
+      const bindings = resolutionBindings
       const stillDrifting = new Set(
         bindings.length === 0
           ? []

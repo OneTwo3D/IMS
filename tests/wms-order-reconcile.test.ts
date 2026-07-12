@@ -31,6 +31,7 @@ function deps(overrides: Partial<reconcileNs.WmsOrderReconcileDeps>): reconcileN
     listSyncedLinksToVerify: async () => [],
     listCancelledLinksToVerify: async () => [],
     fetchOrderStatus: async () => null,
+    partsSupported: true,
     fetchOrderParts: async () => [],
     probeOrderPresence: async () => 'FOUND' as const,
     ...overrides,
@@ -196,4 +197,16 @@ test('reconcile core: a split cancelled order is judged by ALL its parts, not th
   assert.equal(opaqueCase.findings.length, 0)
   assert.equal(opaqueCase.counters.errors, 1)
   assert.equal(opaqueCase.verifiedOrderIds.includes('o1'), false)
+})
+
+test('reconcile core: a split order on a parts-less connector is judged by its whole-order status', async () => {
+  // A connector without part support computes its top-level status for the
+  // WHOLE order (no Part-1 collapse), so it remains authoritative.
+  const { findings } = await reconcile.runWmsOrderReconcileCore(deps({
+    partsSupported: false,
+    listCancelledLinksToVerify: async () => [{ orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' }],
+    fetchOrderStatus: async () => status({ isSplit: true, partCount: 2, status: 'PROCESSING', statusLabel: 'Processing' }),
+  }))
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].category, 'ACTIVE_AFTER_CANCEL')
 })
