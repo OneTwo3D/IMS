@@ -393,17 +393,20 @@ export function ProductClient({ product }: { product: Product }) {
 ```
 
 **Permissions & RBAC:**
-- Check permissions server-side in actions via `checkPermission(session, 'action', resource)`
-- Import from `@/lib/permissions.ts`
+- Enforce permissions server-side in actions via `requirePermission('permission')` (throws on failure) or check with `hasPermission(session.user.role, 'permission')`
+- `requireAuth`/`requirePermission` are in `@/lib/auth/server`; `hasPermission`/`getPermissions` are in `@/lib/permissions`
 - Prevent privilege escalation by validating user role on server
 
 ```typescript
-import { checkPermission } from '@/lib/permissions'
+import { requirePermission } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
 
 export async function updateProduct(id: string, input: unknown) {
-  const session = await requireAuth()
+  // Throws (403) if the current role lacks the permission:
+  const session = await requirePermission('products.edit')
 
-  if (!checkPermission(session, 'edit_products')) {
+  // ...or branch without throwing:
+  if (!hasPermission(session.user.role, 'products.edit')) {
     throw new Error('Unauthorized')
   }
 
@@ -582,7 +585,7 @@ See `@docs/deployment.md` for full deployment guide including backups, monitorin
 
 Every change must verify:
 - [ ] **Authentication:** Endpoints require valid session (use `requireAuth()`)
-- [ ] **Authorization:** Role checks in place (use `checkPermission()`)
+- [ ] **Authorization:** Role checks in place (use `requirePermission()` / `hasPermission()`)
 - [ ] **Input Validation:** Zod schema validates all server action inputs
 - [ ] **SQL Injection:** Prisma parameterized queries prevent injection
 - [ ] **XSS:** React auto-escapes, but avoid `dangerouslySetInnerHTML`
@@ -637,7 +640,7 @@ npx prisma db pull   # Sync schema from database
 **Debug Server Actions:**
 - Add console.log statements (visible in server logs)
 - Check NextAuth session: `const session = await requireAuth()`
-- Verify role permissions: `checkPermission(session, 'action')`
+- Verify role permissions: `hasPermission(session.user.role, 'permission')`
 - Check activity log for errors: `app/(dashboard)/activity/`
 
 **Debug Database Queries:**

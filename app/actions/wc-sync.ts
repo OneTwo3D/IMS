@@ -51,7 +51,10 @@ export type WcSyncSettings = {
   wc_sync_product_direction: string
   wc_stock_sync_enabled: string
   wc_cogs_sync_enabled: string
+  // The webhook secret itself is never sent to the client (masked to ''); the
+  // UI only needs to know whether one is configured.
   wc_webhook_secret: string
+  wc_webhook_secret_set: string
   wc_webhook_last_received_at: string
   wc_order_webhook_last_received_at: string
   wc_product_webhook_last_received_at: string
@@ -101,6 +104,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   wc_stock_sync_enabled: 'false',
   wc_cogs_sync_enabled: 'false',
   wc_webhook_secret: '',
+  wc_webhook_secret_set: 'false',
   wc_webhook_last_received_at: '',
   wc_order_webhook_last_received_at: '',
   wc_product_webhook_last_received_at: '',
@@ -125,6 +129,15 @@ export async function getWcSyncSettings(): Promise<WcSyncSettings> {
     if (v) result[k] = v
   }
   result.envOverrides = getActiveSettingEnvOverrides(SYNC_SETTING_KEYS)
+
+  // Never expose the webhook secret to the client. Report only whether one is
+  // configured (from DB value or an env override); the UI masks it on display
+  // and re-generation produces a fresh client-side value.
+  const secretFromEnv = !!result.envOverrides.wc_webhook_secret
+  result.wc_webhook_secret_set = result.wc_webhook_secret || secretFromEnv ? 'true' : 'false'
+  result.wc_webhook_secret = ''
+  if (secretFromEnv) result.envOverrides.wc_webhook_secret = '(set via environment)'
+
   return result
 }
 
