@@ -33,6 +33,8 @@ import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-s
 import { SyncDashboard } from './sync-dashboard'
 import { ConnectorOrphanBanner } from './connector-orphan-banner'
 import { FailedSyncBanner } from './failed-sync-banner'
+import { ExceptionsBanner } from './exceptions-banner'
+import { getExceptionInboxSummary } from '@/app/actions/sync-exceptions'
 import { TaxRateDriftBanner } from './tax-rate-drift-banner'
 
 export const metadata: Metadata = { title: 'Integrations' }
@@ -95,6 +97,8 @@ export default async function SyncPage() {
   const failedSyncSummary = await getFailedAccountingSyncSummary().catch(() => null)
   // 0jls5: surface IMS tax rates that have drifted from the live Xero definition.
   const taxRateDrift = pluginState.xero ? await getCurrentTaxRateDrift().catch(() => null) : null
+  // q66in.4.2: aggregate count of dead-lettered/parked sync work across connectors.
+  const exceptionSummary = await getExceptionInboxSummary().catch(() => null)
 
   return (
     <div className="space-y-6 max-w-5xl">
@@ -104,6 +108,7 @@ export default async function SyncPage() {
           Connect One Two Inventory with external platforms.
         </p>
       </div>
+      {exceptionSummary && <ExceptionsBanner summary={exceptionSummary} />}
       {orphanSummary && <ConnectorOrphanBanner summary={orphanSummary} />}
       {failedSyncSummary && <FailedSyncBanner summary={failedSyncSummary} />}
       {taxRateDrift && <TaxRateDriftBanner drift={taxRateDrift} />}
