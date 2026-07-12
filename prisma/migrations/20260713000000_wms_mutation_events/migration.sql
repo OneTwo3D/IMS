@@ -28,4 +28,8 @@ CREATE TABLE "wms_mutation_events" (
 CREATE INDEX "wms_mutation_events_createdAt_idx" ON "wms_mutation_events"("createdAt");
 CREATE INDEX "wms_mutation_events_connector_createdAt_idx" ON "wms_mutation_events"("connector", "createdAt");
 CREATE INDEX "wms_mutation_events_entityType_entityId_idx" ON "wms_mutation_events"("entityType", "entityId");
+-- Standalone id indexes: the timeline's entity search is `entityId = X OR
+-- externalId = X` with no entityType constraint (Codex r2).
+CREATE INDEX "wms_mutation_events_entityId_idx" ON "wms_mutation_events"("entityId");
+CREATE INDEX "wms_mutation_events_externalId_idx" ON "wms_mutation_events"("externalId");
 CREATE INDEX "wms_mutation_events_action_createdAt_idx" ON "wms_mutation_events"("action", "createdAt");

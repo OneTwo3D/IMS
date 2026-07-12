@@ -729,7 +729,7 @@ async function syncOneMintsoftProduct(
     })
     throw error
   }
-  await recordWmsMutationEvent({
+  const upsertEvent = {
     connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'SUCCEEDED',
     entityType: 'PRODUCT', entityId: context.product.id, externalId: synced.externalId,
     summary: synced.externalId === externalProductId
@@ -737,18 +737,31 @@ async function syncOneMintsoftProduct(
       : `Mintsoft product created for ${context.product.sku}`,
     before: { externalProductId: externalProductId ?? null, payloadHash: existingLink?.payloadHash ?? null },
     after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, payloadHash },
-  })
+  } as const
 
-  await upsertMintsoftProductLink({
-    productId: context.product.id,
-    externalProductId: synced.externalId,
-    payloadHash,
-    lastKnownBarcode: trimToNull(synced.barcode) ?? dto.barcode,
-    metadata: toJsonPayload(synced.raw),
-    lastError: null,
-    touchLastSyncedAt: true,
-  })
-  await clearMintsoftProductLinkError(context.product.id)
+  // The event records only AFTER the local link persisted (Codex r2) — a link
+  // failure after a remote success is flagged, not silently reported clean.
+  try {
+    await upsertMintsoftProductLink({
+      productId: context.product.id,
+      externalProductId: synced.externalId,
+      payloadHash,
+      lastKnownBarcode: trimToNull(synced.barcode) ?? dto.barcode,
+      metadata: toJsonPayload(synced.raw),
+      lastError: null,
+      touchLastSyncedAt: true,
+    })
+    await clearMintsoftProductLinkError(context.product.id)
+  } catch (persistError) {
+    await recordWmsMutationEvent({
+      ...upsertEvent,
+      summary: `${upsertEvent.summary}, but recording the product link failed`,
+      after: { ...upsertEvent.after, linkPersistFailed: true },
+      error: persistError instanceof Error ? persistError.message : 'Mintsoft product link persist failed',
+    })
+    throw persistError
+  }
+  await recordWmsMutationEvent(upsertEvent)
 
   return {
     sku: context.product.sku,

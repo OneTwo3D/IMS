@@ -118,16 +118,24 @@ export async function recordWmsMutationEvent(input: WmsMutationEventInput): Prom
   }
 }
 
+/** Batch insert size — bounds query size AND the blast radius of one failed insert. */
+export const WMS_MUTATION_EVENT_BATCH_SIZE = 200
+
 /**
  * Batch variant for high-volume loops (Codex r1: a returns backlog must not
- * pay one serial audit round trip per record). Same best-effort contract.
+ * pay one serial audit round trip per record). Chunked (Codex r2): one
+ * transient failure loses at most one chunk, never the whole run's audit
+ * trail, and a huge backlog can't exceed practical query limits. Same
+ * best-effort contract.
  */
 export async function recordWmsMutationEvents(inputs: WmsMutationEventInput[]): Promise<void> {
-  if (inputs.length === 0) return
-  try {
-    await db.wmsMutationEvent.createMany({ data: inputs.map(toRow) })
-  } catch (error) {
-    console.error(`[wms-mutation-audit] failed to record ${inputs.length} events:`, error)
+  for (let start = 0; start < inputs.length; start += WMS_MUTATION_EVENT_BATCH_SIZE) {
+    const chunk = inputs.slice(start, start + WMS_MUTATION_EVENT_BATCH_SIZE)
+    try {
+      await db.wmsMutationEvent.createMany({ data: chunk.map(toRow) })
+    } catch (error) {
+      console.error(`[wms-mutation-audit] failed to record ${chunk.length} events (chunk at ${start}):`, error)
+    }
   }
 }
 

@@ -691,16 +691,20 @@ async function syncBundleInternal(
     }
   }
 
-  await recordWmsMutationEvent({
-    connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: 'SUCCEEDED',
-    entityType: 'PRODUCT', entityId: productId, externalId: created.externalBundleId,
-    summary: `Mintsoft bundle created for ${candidate.sku}`,
-    after: { externalBundleId: created.externalBundleId, sku: candidate.sku, checksum },
-  })
-
   const finalize = await finalizeBundleLink(claim.linkId, {
     externalBundleId: created.externalBundleId,
     checksum,
+  })
+  // Emitted after the finalize boundary (Codex r2): a remote create whose
+  // local link failed is flagged, not reported as an unqualified success.
+  await recordWmsMutationEvent({
+    connector: 'mintsoft', direction: 'OUTBOUND', action: 'bundle_create', outcome: 'SUCCEEDED',
+    entityType: 'PRODUCT', entityId: productId, externalId: created.externalBundleId,
+    summary: finalize.success
+      ? `Mintsoft bundle created for ${candidate.sku}`
+      : `Mintsoft bundle created for ${candidate.sku}, but the local link finalize failed — manual recovery required`,
+    after: { externalBundleId: created.externalBundleId, sku: candidate.sku, checksum, ...(finalize.success ? {} : { linkPersistFailed: true }) },
+    error: finalize.success ? null : (finalize.lastError?.message ?? 'bundle link finalize failed'),
   })
   if (!finalize.success) {
     await logActivity({

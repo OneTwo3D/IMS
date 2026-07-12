@@ -428,6 +428,11 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
           after: { sku: saved.sku, qty, reason, reference, orderMatched: Boolean(order), productMatched: Boolean(product) },
           triggeredBy: 'returns-sync',
         })
+        // Bound memory on a large backlog: flush a full batch as we go
+        // (Codex r2); the final flush after the loop catches the remainder.
+        if (auditEvents.length >= 200) {
+          await recordWmsMutationEvents(auditEvents.splice(0))
+        }
 
         const fullyMatched = isMintsoftReturnFullyMatched({
           orderId: order?.id ?? null,

@@ -2746,6 +2746,8 @@ model WmsMutationEvent {
   @@index([createdAt])
   @@index([connector, createdAt])
   @@index([entityType, entityId])
+  @@index([entityId])
+  @@index([externalId])
   @@index([action, createdAt])
   @@map("wms_mutation_events")
 }

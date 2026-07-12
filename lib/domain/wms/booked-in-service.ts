@@ -1071,6 +1071,7 @@ export async function processBookedInEvent(
         pending: false,
         productIds: Array.from(touchedProductIds),
         auditLines: auditReceiptLines,
+        asnMapId: asnMap.id,
         asnStatusBefore: asnMap.status as string,
         asnStatusAfter,
       }
@@ -1141,10 +1142,12 @@ export async function processBookedInEvent(
     if ('auditLines' in processed && processed.auditLines) {
       await recordWmsMutationEvent({
         connector: 'mintsoft', direction: 'INBOUND', action: 'booked_in_receipt', outcome: 'SUCCEEDED',
-        entityType: 'ASN', entityId: event.id, externalId: event.externalAsnId,
+        // Keyed to the ASN map (Codex r2: the webhook event id under
+        // entityType ASN broke timeline lookups by ASN id).
+        entityType: 'ASN', entityId: processed.asnMapId, externalId: event.externalAsnId,
         summary: `Booked-in webhook applied for ASN ${event.externalAsnId} — ${processed.auditLines.length} line(s) received`,
         before: { asnStatus: processed.asnStatusBefore },
-        after: { asnStatus: processed.asnStatusAfter, lines: processed.auditLines },
+        after: { asnStatus: processed.asnStatusAfter, lines: processed.auditLines, webhookEventId: event.id },
         triggeredBy: 'webhook',
       })
     }
@@ -1172,8 +1175,11 @@ export async function processBookedInEvent(
     })
     await recordWmsMutationEvent({
       connector: 'mintsoft', direction: 'INBOUND', action: 'booked_in_receipt', outcome: 'FAILED',
-      entityType: 'ASN', entityId: event.id, externalId: event.externalAsnId,
+      // The ASN map may not be resolvable on failure — key by external ASN id
+      // only and carry the webhook event id in the payload (Codex r2).
+      entityType: 'ASN', entityId: null, externalId: event.externalAsnId,
       summary: `Booked-in webhook processing failed for ASN ${event.externalAsnId}`,
+      after: { webhookEventId: event.id },
       error: message,
       triggeredBy: 'webhook',
     })

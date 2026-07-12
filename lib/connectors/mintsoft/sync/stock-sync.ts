@@ -648,6 +648,7 @@ async function lockStockLevelForAlignment(
 
 async function applyMintsoftAlignmentForProduct(params: {
   binding: SyncBinding
+  jobId: string
   productId: string
   sku: string
   delta: number
@@ -879,7 +880,7 @@ async function applyMintsoftAlignmentForProduct(params: {
     })
     await recordWmsMutationEvent({
       connector: 'mintsoft', direction: 'INBOUND', action: 'align_up', outcome: 'SUCCEEDED',
-      entityType: 'STOCK_LEVEL', entityId: params.productId,
+      entityType: 'STOCK_LEVEL', entityId: params.productId, jobId: params.jobId,
       summary: `Align-up: ${params.sku} in ${params.binding.warehouse.code} raised to match Mintsoft (+${params.delta})`,
       before: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: outcome.quantityBefore, reservedQty: outcome.reservedQty },
       after: { sku: params.sku, warehouseId: params.binding.warehouseId, quantity: outcome.quantityAfter, delta: params.delta, allocations: outcome.allocations },
@@ -1434,6 +1435,7 @@ export async function runStockSyncForBinding(
         if (binding.stockSyncMode === 'ALIGN_TO_WMS' && delta > 0) {
           const alignment = await applyMintsoftAlignmentForProduct({
             binding,
+            jobId: job.id,
             productId: product.id,
             sku: product.sku,
             delta,
