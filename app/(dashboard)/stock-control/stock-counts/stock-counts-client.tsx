@@ -174,6 +174,21 @@ function StockCountRowView({
     })
   }
 
+  // 6oyu.3: posting against a WMS-synced (notification-only) warehouse returns
+  // requiresWmsAcknowledgement — surface the warning and re-submit confirmed.
+  function runPost(build: (acknowledgeWmsWarning: boolean) => Promise<{ success?: boolean; message?: string; requiresWmsAcknowledgement?: boolean }>, okMsg: string) {
+    setLocalError(null)
+    startTransition(async () => {
+      let res = await build(false)
+      if (res.requiresWmsAcknowledgement) {
+        if (!confirm(`${res.message}\n\nPost anyway?`)) return
+        res = await build(true)
+      }
+      if (res.success) onChanged(okMsg)
+      else setLocalError(res.message ?? 'Action failed.')
+    })
+  }
+
   function buildCounts() {
     return count.lines.map((l) => {
       const raw = countsByLine[l.id]
@@ -249,7 +264,7 @@ function StockCountRowView({
                   onClick={() => {
                     if (!confirm('Post this stock count? Variances will be booked as stock adjustments (creating/consuming FIFO layers). This cannot be undone.')) return
                     // Atomic: the counts are persisted inside the post transaction.
-                    run(() => postStockCount({ countId: count.id, reasonId: reasonId || undefined, counts: buildCounts() }), 'Stock count posted.')
+                    runPost((acknowledgeWmsWarning) => postStockCount({ countId: count.id, reasonId: reasonId || undefined, counts: buildCounts(), acknowledgeWmsWarning }), 'Stock count posted.')
                   }}
                 >
                   Post variances
