@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { freshAuthFailureResult, getSession, requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
   fetchMintsoftAsns,
@@ -1169,8 +1169,8 @@ export async function getMintsoftOnboardingConnectionData(): Promise<MintsoftOnb
 export async function getMintsoftPurchaseOrderAsnState(
   poId: string,
 ): Promise<MintsoftPurchaseOrderAsnState> {
-  const [session, pluginEnabled, po, existingAsns] = await Promise.all([
-    getSession(),
+  const session = await requireMintsoftReadAccess()
+  const [pluginEnabled, po, existingAsns] = await Promise.all([
     isIntegrationPluginEnabled('mintsoft'),
     db.purchaseOrder.findUnique({
       where: { id: poId },
@@ -1226,7 +1226,7 @@ export async function getMintsoftPurchaseOrderAsnState(
     }),
   ])
 
-  const canManage = session?.user ? hasPermission(session.user.role, 'purchasing.receive') : false
+  const canManage = hasPermission(session.user.role, 'purchasing.receive')
 
   if (!po) {
     return {

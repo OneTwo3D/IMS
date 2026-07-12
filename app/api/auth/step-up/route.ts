@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
   }
 
   const rlKey = `step_up:${session.user.id}`
-  const rl = await checkRateLimit(rlKey, 5, 5 * 60_000)
+  const rl = await checkRateLimit(rlKey, 5, 5 * 60_000, { failClosed: true })
   if (!rl.allowed) {
     return Response.json(
       { error: 'Too many attempts, try again later.' },

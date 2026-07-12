@@ -35,6 +35,11 @@ export type CronRateLimitOptions = {
  * - Sub-hourly jobs intentionally use headroom above exact cadence. Do not set
  *   a 5-minute cron to exactly 12/hour or a 15-minute cron to exactly 4/hour;
  *   jitter, retries, and boundary timing will deny legitimate scheduled runs.
+ * - Fail-open on backend error is DELIBERATE here (checkRateLimit is called
+ *   without `failClosed`): cron routes are already gated by CRON_SECRET, so a
+ *   rate-limit backend outage must not block legitimate scheduled jobs. This is
+ *   the opposite trade-off from the auth endpoints (login/reset/TOTP/step-up),
+ *   which fail closed because they are the primary brute-force barrier.
  */
 export function cronRateLimitKey(jobName: string, sourceIp?: string | null): string {
   if (sourceIp?.trim()) return `cron:${jobName}:${sourceIp.trim()}`

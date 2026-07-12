@@ -134,6 +134,23 @@ test('production preflight rejects common placeholder secret shapes', async () =
   })
 })
 
+test('production preflight rejects the shipped dev AUTH_SECRET placeholder (onetwo3d-ims-ey8j)', async () => {
+  await withStorageDirs(async (storage) => {
+    // This exact 50-char value was found live in .env; it is long enough to pass
+    // a naive length check and does not contain "change-me", so it must be caught
+    // by the placeholder-shape guard.
+    const result = await runProductionPreflight({
+      env: {
+        ...baseEnv(storage),
+        AUTH_SECRET: 'dev-secret-please-change-this-in-production-32chars',
+      },
+    })
+
+    assert.equal(result.ok, false)
+    assertFailed(result, 'auth-secret')
+  })
+})
+
 test('production preflight fails for settings encryption keys using fallback derivation shapes', async () => {
   await withStorageDirs(async (storage) => {
     const result = await runProductionPreflight({
