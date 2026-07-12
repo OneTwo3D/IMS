@@ -1097,9 +1097,10 @@ async function updateBindingSyncState(bindingId: string, status: 'SUCCEEDED' | '
       lastStockSyncAt: new Date(),
       lastStockSyncStatus: status,
       // Only a run that actually completed its checks heals the watchdog's
-      // stale-sync alert (Codex r4: a FAILED run advancing lastStockSyncAt
-      // while clearing the stamp turned one breach into repeated alert spam).
-      ...(status === 'FAILED' ? {} : { staleSyncAlertedAt: null }),
+      // stale-sync alert and advances its staleness anchor (Codex r4/r5: a
+      // FAILED run advancing the anchor kept a permanently failing binding
+      // "fresh", so the first stale alert would never fire).
+      ...(status === 'FAILED' ? {} : { staleSyncAlertedAt: null, lastStockSyncSuccessAt: new Date() }),
     },
   })
 }

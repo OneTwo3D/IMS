@@ -32,11 +32,13 @@ test('isAsnOverdue: without an ETA only a completely silent, old ASN is overdue'
 
 test('isBindingSyncStale: stale after 3× its own cadence, floored at an hour', () => {
   const mins = (n: number) => new Date(NOW.getTime() - n * 60_000)
-  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncAt: mins(200), syncFrequencyMinutes: 60, createdAt: days(30) }, NOW), true)
-  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncAt: mins(100), syncFrequencyMinutes: 60, createdAt: days(30) }, NOW), false)
+  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncSuccessAt: mins(200), syncFrequencyMinutes: 60, createdAt: days(30) }, NOW), true)
+  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncSuccessAt: mins(100), syncFrequencyMinutes: 60, createdAt: days(30) }, NOW), false)
   // Tight cadences use the one-hour floor, not 3×5m.
-  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncAt: mins(30), syncFrequencyMinutes: 5, createdAt: days(30) }, NOW), false)
-  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncAt: mins(70), syncFrequencyMinutes: 5, createdAt: days(30) }, NOW), true)
-  // Never-synced bindings anchor on creation.
-  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncAt: null, syncFrequencyMinutes: 60, createdAt: mins(200) }, NOW), true)
+  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncSuccessAt: mins(30), syncFrequencyMinutes: 5, createdAt: days(30) }, NOW), false)
+  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncSuccessAt: mins(70), syncFrequencyMinutes: 5, createdAt: days(30) }, NOW), true)
+  // Never-SUCCESSFULLY-synced bindings anchor on creation (Codex r5: the
+  // predicate deliberately never sees the attempt timestamp — FAILED attempts
+  // advancing lastStockSyncAt must not count as freshness).
+  assert.equal(watchdog.isBindingSyncStale({ lastStockSyncSuccessAt: null, syncFrequencyMinutes: 60, createdAt: mins(200) }, NOW), true)
 })

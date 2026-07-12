@@ -55,14 +55,19 @@ export function isAsnOverdue(
   return now.getTime() - asn.createdAt.getTime() >= ASN_NO_ETA_FALLBACK_AGE_MS
 }
 
-/** Pure: has this binding's stock sync been silent past its own cadence? */
+/**
+ * Pure: has this binding's stock sync been silent past its own cadence?
+ * Anchored on the last SUCCESSFUL sync (Codex r5): lastStockSyncAt advances on
+ * FAILED attempts too, so a binding failing every cadence would never go stale
+ * and the first alert would never fire.
+ */
 export function isBindingSyncStale(
-  binding: { lastStockSyncAt: Date | null; syncFrequencyMinutes: number; createdAt: Date },
+  binding: { lastStockSyncSuccessAt: Date | null; syncFrequencyMinutes: number; createdAt: Date },
   now: Date,
 ): boolean {
   const interval = Math.max(binding.syncFrequencyMinutes, 1) * 60_000
   const staleAfter = Math.max(interval * BINDING_STALE_INTERVALS, BINDING_STALE_FLOOR_MS)
-  const anchor = binding.lastStockSyncAt ?? binding.createdAt
+  const anchor = binding.lastStockSyncSuccessAt ?? binding.createdAt
   return now.getTime() - anchor.getTime() >= staleAfter
 }
 
@@ -81,7 +86,10 @@ export type WmsWatchdogResult = {
  */
 async function notifyAdminsDurably(title: string, message: string): Promise<void> {
   const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-  if (admins.length === 0) return
+  // Zero active admins is NOT delivery (Codex r5): returning normally would
+  // keep the dedupe stamp and the breach would never reach a later-created or
+  // reactivated admin. Throw so the caller reverts the stamp and retries.
+  if (admins.length === 0) throw new Error('no active ADMIN users to notify')
   await db.notification.createMany({
     data: admins.map((admin) => ({
       userId: admin.id,
@@ -154,20 +162,29 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     const creditNote = creditLines.length > 0
       ? ` ${creditLines.length} line(s) carry unreconciled alignment credits (e.g. ${creditLines[0].sku}) — until the booked-in callback arrives, REAL receipts for those lines are silently suppressed.`
       : ''
-    const anchor = asn.eta ? `its ETA (${asn.eta.toISOString().slice(0, 10)})` : `${Math.round((now.getTime() - asn.createdAt.getTime()) / 86_400_000)} days with no callback`
+    // Describe the ACTUAL breach (Codex r5): a renewed-silence breach is "no
+    // further callback since the last one" — anchoring its text on the ETA
+    // produced materially false incident context (even "past its ETA" while
+    // the ETA was still in the future).
+    const daysSince = (from: Date) => Math.round((now.getTime() - from.getTime()) / 86_400_000)
+    const breach = asn.lastCallbackAt
+      ? `is still open with no further booked-in callback for ${daysSince(asn.lastCallbackAt)} days (last callback ${asn.lastCallbackAt.toISOString().slice(0, 10)})`
+      : asn.eta
+        ? `is past its ETA (${asn.eta.toISOString().slice(0, 10)}) with no booked-in callback`
+        : `has been open for ${daysSince(asn.createdAt)} days with no booked-in callback`
     // Deliver the THROWING notification FIRST (Codex r3): logActivity swallows
     // insert failures, so the stamp's keep/revert decision must ride on the
     // notification insert. The activity line is best-effort colour.
     await notifyAdminsDurably(
       'WMS ASN overdue',
-      `ASN ${asn.externalAsnId} (${asn.warehouse.code}) is past ${anchor} with no booked-in callback.${creditNote} Chase the shipment / callback in the WMS.`,
+      `ASN ${asn.externalAsnId} (${asn.warehouse.code}) ${breach}.${creditNote} Chase the shipment / callback in the WMS.`,
     )
     await logActivity({
       entityType: 'SYNC',
       entityId: asn.id,
       tag: 'sync',
       action: 'wms_asn_overdue',
-      description: `ASN ${asn.externalAsnId} (${asn.warehouse.code}) is past ${anchor} with no booked-in callback.${creditNote}`,
+      description: `ASN ${asn.externalAsnId} (${asn.warehouse.code}) ${breach}.${creditNote}`,
       metadata: {
         asnMapId: asn.id,
         externalAsnId: asn.externalAsnId,
@@ -181,13 +198,23 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     })
     overdueAsnAlerts += 1
     } catch (deliveryError) {
-      // Delivery failed — un-stamp so the next sweep retries the alert
-      // (a stuck stamp would suppress it permanently; Codex).
-      await db.wmsAsnMap.updateMany({
-        where: { id: asn.id, sloAlertedAt: now },
-        data: { sloAlertedAt: null },
-      }).catch(() => {})
       console.error(`[wms-watchdog] overdue-ASN alert delivery failed for ${asn.externalAsnId}:`, deliveryError)
+      // Delivery failed — un-stamp so the next sweep retries the alert
+      // (a stuck stamp would suppress it permanently; Codex). If the revert
+      // ITSELF fails, the stamp is stuck with no alert delivered: fail the
+      // whole run loudly rather than report SUCCEEDED over a permanently
+      // suppressed breach (Codex r5).
+      try {
+        await db.wmsAsnMap.updateMany({
+          where: { id: asn.id, sloAlertedAt: now },
+          data: { sloAlertedAt: null },
+        })
+      } catch (rollbackError) {
+        throw new Error(
+          `wms-watchdog: failed to revert the alert stamp for ASN ${asn.externalAsnId} after failed delivery — breach would be permanently suppressed`,
+          { cause: rollbackError },
+        )
+      }
     }
   }
 
@@ -202,7 +229,8 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     },
     select: {
       id: true,
-      lastStockSyncAt: true,
+      lastStockSyncSuccessAt: true,
+      lastStockSyncStatus: true,
       syncFrequencyMinutes: true,
       createdAt: true,
       warehouse: { select: { code: true } },
@@ -211,31 +239,33 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   for (const binding of bindings) {
     if (!isBindingSyncStale(binding, now)) continue
     // Pin the snapshot freshness (Codex): a sync completing mid-sweep refreshes
-    // lastStockSyncAt and clears the stamp — alerting over it would be false
-    // and would re-suppress the recovered binding.
+    // lastStockSyncSuccessAt and clears the stamp — alerting over it would be
+    // false and would re-suppress the recovered binding.
     const stamped = await db.externalWmsBinding.updateMany({
-      where: { id: binding.id, staleSyncAlertedAt: null, lastStockSyncAt: binding.lastStockSyncAt },
+      where: { id: binding.id, staleSyncAlertedAt: null, lastStockSyncSuccessAt: binding.lastStockSyncSuccessAt },
       data: { staleSyncAlertedAt: now },
     })
     if (stamped.count === 0) continue
 
     try {
 
-    const last = binding.lastStockSyncAt ? binding.lastStockSyncAt.toISOString() : 'never'
+    const last = binding.lastStockSyncSuccessAt ? binding.lastStockSyncSuccessAt.toISOString() : 'never'
+    const failing = binding.lastStockSyncStatus === 'FAILED' ? ' Recent attempts are FAILING.' : ''
     await notifyAdminsDurably(
       'WMS stock sync stale',
-      `Stock sync for ${binding.warehouse.code} has not completed since ${last} — check the scheduler and the WMS connection.`,
+      `Stock sync for ${binding.warehouse.code} has not completed successfully since ${last}.${failing} Check the scheduler and the WMS connection.`,
     )
     await logActivity({
       entityType: 'SYNC',
       entityId: binding.id,
       tag: 'sync',
       action: 'wms_stock_sync_stale',
-      description: `Stock sync for ${binding.warehouse.code} has not completed since ${last} (cadence ${binding.syncFrequencyMinutes}m) — the sync cron may be dead; stock drift accumulates undetected.`,
+      description: `Stock sync for ${binding.warehouse.code} has not completed successfully since ${last} (cadence ${binding.syncFrequencyMinutes}m).${failing} The sync cron may be dead or failing; stock drift accumulates undetected.`,
       metadata: {
         bindingId: binding.id,
         connector: connectorId,
-        lastStockSyncAt: binding.lastStockSyncAt?.toISOString() ?? null,
+        lastStockSyncSuccessAt: binding.lastStockSyncSuccessAt?.toISOString() ?? null,
+        lastStockSyncStatus: binding.lastStockSyncStatus,
         syncFrequencyMinutes: binding.syncFrequencyMinutes,
       },
       level: 'WARNING',
@@ -243,11 +273,20 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     })
     staleBindingAlerts += 1
     } catch (deliveryError) {
-      await db.externalWmsBinding.updateMany({
-        where: { id: binding.id, staleSyncAlertedAt: now },
-        data: { staleSyncAlertedAt: null },
-      }).catch(() => {})
       console.error(`[wms-watchdog] stale-sync alert delivery failed for ${binding.warehouse.code}:`, deliveryError)
+      // Same revert-or-fail contract as the ASN path (Codex r5): a swallowed
+      // rollback failure leaves the stamp stuck while the run reports success.
+      try {
+        await db.externalWmsBinding.updateMany({
+          where: { id: binding.id, staleSyncAlertedAt: now },
+          data: { staleSyncAlertedAt: null },
+        })
+      } catch (rollbackError) {
+        throw new Error(
+          `wms-watchdog: failed to revert the stale-sync stamp for ${binding.warehouse.code} after failed delivery — breach would be permanently suppressed`,
+          { cause: rollbackError },
+        )
+      }
     }
   }
 

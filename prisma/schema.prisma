@@ -2514,6 +2514,10 @@ model ExternalWmsBinding {
   alignDownReasonId    String?
   lastStockSyncAt      DateTime?
   lastStockSyncStatus  WmsSyncJobStatus?
+  /// q66in.4.6: last sync that completed its checks (SUCCEEDED/PARTIAL) — the
+  /// watchdog's staleness anchor. lastStockSyncAt advances on FAILED attempts
+  /// too, which would keep a permanently failing binding "fresh" forever.
+  lastStockSyncSuccessAt DateTime?
   createdAt            DateTime               @default(now())
   updatedAt            DateTime               @updatedAt
 
