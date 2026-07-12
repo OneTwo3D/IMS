@@ -60,8 +60,11 @@ export type OutboxFailureRow = {
 export type DeadReceiptEventRow = {
   id: string
   connector: string
+  /** booked-in = wms_inbound_receipt_events (ASN goods-in); webhook = wms_webhook_events (order/inventory). */
+  kind: 'booked-in' | 'webhook'
   externalEventId: string
-  externalAsnId: string | null
+  /** ASN id for booked-in rows; the event type for webhook rows. */
+  reference: string | null
   processingAttempts: number
   lastError: string | null
   deadLetteredAt: string | null
@@ -188,21 +191,19 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
   }))
 }
 
-export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary> {
-  // Codex P1: failure rows carry order ids, connector errors and refund ids —
-  // gate reads on the sync permission (READONLY/SUPPLIER must not see them).
-  // The /sync banner loader .catch()es, so the banner just hides for them.
-  await requirePermission('sync')
-
-  const [wmsPushDeadLetters, outboxFailures, deadReceiptEvents, refundSyncParks, pennyMismatches, stuckDispatches] = await Promise.all([
+/** True per-source totals — never capped by the display limit (Codex r3/r5). */
+async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches] = await Promise.all([
     db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
+    db.wmsWebhookEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.shoppingSyncLog.count({ where: REFUND_PARK_WHERE }),
     db.wmsOrderPushLink.count({ where: { totalMismatchPence: { not: null } } }),
     countStuckDispatches(),
   ])
 
+  const deadReceiptEvents = deadReceipts + deadWebhooks
   return {
     wmsPushDeadLetters,
     outboxFailures,
@@ -214,10 +215,19 @@ export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary>
   }
 }
 
+export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary> {
+  // Codex P1: failure rows carry order ids, connector errors and refund ids —
+  // gate reads on the sync permission (READONLY/SUPPLIER must not see them).
+  // The /sync banner loader .catch()es, so the banner just hides for them.
+  await requirePermission('sync')
+  return loadExceptionCounts()
+}
+
 export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   await requirePermission('sync')
 
-  const [pushLinks, outbox, deadEvents, refundLogs, stuckDispatches, mismatchLinks] = await Promise.all([
+  const counts = await loadExceptionCounts()
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: 'DEAD_LETTER' },
       orderBy: { lastAttemptAt: 'desc' },
@@ -248,6 +258,22 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         connector: true,
         externalEventId: true,
         externalAsnId: true,
+        processingAttempts: true,
+        lastError: true,
+        deadLetteredAt: true,
+      },
+    }),
+    // Codex r5: order/inventory webhooks dead-letter in their own table
+    // (wms_webhook_events) with the same retry machinery — include them.
+    db.wmsWebhookEvent.findMany({
+      where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS },
+      orderBy: { deadLetteredAt: 'desc' },
+      take: SECTION_LIMIT,
+      select: {
+        id: true,
+        connector: true,
+        eventType: true,
+        externalEventId: true,
         processingAttempts: true,
         lastError: true,
         deadLetteredAt: true,
@@ -308,15 +334,30 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       lastError: row.lastError,
       updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : String(row.updatedAt),
     })),
-    deadReceiptEvents: deadEvents.map((event) => ({
-      id: event.id,
-      connector: event.connector,
-      externalEventId: event.externalEventId,
-      externalAsnId: event.externalAsnId,
-      processingAttempts: event.processingAttempts,
-      lastError: event.lastError,
-      deadLetteredAt: event.deadLetteredAt?.toISOString() ?? null,
-    })),
+    deadReceiptEvents: [
+      ...deadReceiptRows.map((event) => ({
+        id: event.id,
+        connector: event.connector,
+        kind: 'booked-in' as const,
+        externalEventId: event.externalEventId,
+        reference: event.externalAsnId,
+        processingAttempts: event.processingAttempts,
+        lastError: event.lastError,
+        deadLetteredAt: event.deadLetteredAt?.toISOString() ?? null,
+      })),
+      ...deadWebhookRows.map((event) => ({
+        id: event.id,
+        connector: event.connector,
+        kind: 'webhook' as const,
+        externalEventId: event.externalEventId,
+        reference: event.eventType,
+        processingAttempts: event.processingAttempts,
+        lastError: event.lastError,
+        deadLetteredAt: event.deadLetteredAt?.toISOString() ?? null,
+      })),
+    ]
+      .sort((left, right) => (right.deadLetteredAt ?? '').localeCompare(left.deadLetteredAt ?? ''))
+      .slice(0, SECTION_LIMIT),
     refundSyncParks: refundLogs.map((log) => ({
       id: log.id,
       status: log.status,
@@ -338,16 +379,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
 
   return {
     ...data,
-    summary: {
-      wmsPushDeadLetters: data.wmsPushDeadLetters.length,
-      outboxFailures: data.outboxFailures.length,
-      deadReceiptEvents: data.deadReceiptEvents.length,
-      refundSyncParks: data.refundSyncParks.length,
-      stuckDispatches: data.stuckDispatches.length,
-      pennyMismatches: data.pennyMismatches.length,
-      total: data.wmsPushDeadLetters.length + data.outboxFailures.length + data.deadReceiptEvents.length
-        + data.refundSyncParks.length + data.stuckDispatches.length + data.pennyMismatches.length,
-    },
+    // Codex r5: real totals, not the capped list lengths — the client renders
+    // "showing N of M" when a section is capped at SECTION_LIMIT.
+    summary: counts,
   }
 }
 
@@ -403,6 +437,39 @@ export async function replayDeadReceiptEvent(id: string): Promise<MutationResult
       action: 'wms_receipt_event_replay',
       description: 'Re-queued a dead-lettered WMS receipt event via the exception inbox',
       metadata: { receiptEventId: id, userId: session.user.id },
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * Replay a DEAD order/inventory webhook event (wms_webhook_events): same
+ * compare-and-set reset as the booked-in replay; the webhook sweeper
+ * re-processes the ORIGINAL payload under its externalEventId idempotency, and
+ * the monotonic status-rank guard makes a stale replay a no-op.
+ */
+export async function replayDeadWebhookEvent(id: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const updated = await db.wmsWebhookEvent.updateMany({
+      where: buildDeadReceiptEventReplayWhere(id),
+      data: buildDeadReceiptEventReplayData(),
+    })
+    if (updated.count === 0) {
+      return { success: false, error: 'The webhook event is no longer dead-lettered (already replayed or processed).' }
+    }
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: id,
+      tag: 'sync',
+      action: 'wms_webhook_event_replay',
+      description: 'Re-queued a dead-lettered WMS webhook event via the exception inbox',
+      metadata: { webhookEventId: id, userId: session.user.id },
     })
     revalidatePath('/sync/exceptions')
     return { success: true }

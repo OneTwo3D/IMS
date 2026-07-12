@@ -20,6 +20,7 @@ import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
   replayDeadReceiptEvent,
+  replayDeadWebhookEvent,
   replayOutboxException,
   retryRefundSyncPark,
   type ExceptionInboxData,
@@ -101,8 +102,10 @@ export function ExceptionsClient({ data }: Props) {
       {data.wmsPushDeadLetters.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`WMS order pushes — dead-lettered (${data.wmsPushDeadLetters.length})`}
+            title={`WMS order pushes — dead-lettered (${data.summary.wmsPushDeadLetters})`}
             detail="These orders never reached the warehouse (or a hold/cancel conflicted). They will not fulfil until replayed or resolved."
+            shown={data.wmsPushDeadLetters.length}
+            total={data.summary.wmsPushDeadLetters}
           />
           <Table containerClassName="rounded-lg border" className="min-w-[820px]">
             <TableHeader className="bg-muted/40">
@@ -146,8 +149,10 @@ export function ExceptionsClient({ data }: Props) {
       {data.outboxFailures.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`Integration outbox — permanently failed rows (${data.outboxFailures.length})`}
+            title={`Integration outbox — permanently failed rows (${data.summary.outboxFailures})`}
             detail="Accounting posts, WooCommerce stock pushes, booked-in events and landed-cost journals that exhausted their retries. Replay resets the row with its original payload and restarts its retry ladder."
+            shown={data.outboxFailures.length}
+            total={data.summary.outboxFailures}
           />
           <Table containerClassName="rounded-lg border" className="min-w-[900px]">
             <TableHeader className="bg-muted/40">
@@ -189,14 +194,17 @@ export function ExceptionsClient({ data }: Props) {
       {data.deadReceiptEvents.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`WMS receipt events — dead-lettered (${data.deadReceiptEvents.length})`}
-            detail="Booked-in webhooks that exhausted their retries. Their goods-in has NOT been applied; replay re-queues the original event for the webhook sweeper."
+            title={`WMS inbound events — dead-lettered (${data.summary.deadReceiptEvents})`}
+            detail="Booked-in and order/inventory webhooks that exhausted their retries. Their effect has NOT been applied; replay re-queues the original event for the webhook sweeper."
+            shown={data.deadReceiptEvents.length}
+            total={data.summary.deadReceiptEvents}
           />
           <Table containerClassName="rounded-lg border" className="min-w-[820px]">
             <TableHeader className="bg-muted/40">
               <TableRow>
                 <TableHead>Event</TableHead>
-                <TableHead>ASN</TableHead>
+                <TableHead>Kind</TableHead>
+                <TableHead>ASN / type</TableHead>
                 <TableHead>Attempts</TableHead>
                 <TableHead>Last error</TableHead>
                 <TableHead>Dead-lettered</TableHead>
@@ -205,9 +213,10 @@ export function ExceptionsClient({ data }: Props) {
             </TableHeader>
             <TableBody>
               {data.deadReceiptEvents.map((row) => (
-                <TableRow key={row.id}>
+                <TableRow key={`${row.kind}-${row.id}`}>
                   <TableCell className="text-xs font-mono">{row.connector} · {row.externalEventId}</TableCell>
-                  <TableCell className="text-xs">{row.externalAsnId ?? '—'}</TableCell>
+                  <TableCell className="text-xs">{row.kind}</TableCell>
+                  <TableCell className="text-xs">{row.reference ?? '—'}</TableCell>
                   <TableCell className="text-xs">{row.processingAttempts}</TableCell>
                   <TableCell className="text-xs text-muted-foreground max-w-[300px] truncate" title={row.lastError ?? ''}>{row.lastError ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.deadLetteredAt ? formatDateTime(row.deadLetteredAt) : '—'}</TableCell>
@@ -217,7 +226,10 @@ export function ExceptionsClient({ data }: Props) {
                       variant="outline"
                       size="sm"
                       disabled={isPending}
-                      onClick={() => runAction(() => replayDeadReceiptEvent(row.id), 'Receipt event re-queued for the sweeper.')}
+                      onClick={() => runAction(
+                        () => (row.kind === 'booked-in' ? replayDeadReceiptEvent(row.id) : replayDeadWebhookEvent(row.id)),
+                        'Event re-queued for the sweeper.',
+                      )}
                     >
                       <RotateCcw className="h-3 w-3 mr-1" />Replay
                     </Button>
@@ -232,8 +244,10 @@ export function ExceptionsClient({ data }: Props) {
       {data.refundSyncParks.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`WooCommerce refunds — parked (${data.refundSyncParks.length})`}
+            title={`WooCommerce refunds — parked (${data.summary.refundSyncParks})`}
             detail="Refunds that could not be applied (usually an amount mismatch). The refund/restock/credit-note has NOT posted. Retry re-fetches the order's refunds fresh from WooCommerce."
+            shown={data.refundSyncParks.length}
+            total={data.summary.refundSyncParks}
           />
           <Table containerClassName="rounded-lg border" className="min-w-[820px]">
             <TableHeader className="bg-muted/40">
@@ -285,8 +299,10 @@ export function ExceptionsClient({ data }: Props) {
       {data.stuckDispatches.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`Dispatch reconciliation — stuck orders (${data.stuckDispatches.length})`}
+            title={`Dispatch reconciliation — stuck orders (${data.summary.stuckDispatches})`}
             detail="The WMS despatched these orders but IMS could not reconcile them (typically no IMS stock to consume). They re-error on every sweep until the stock position is fixed on the order."
+            shown={data.stuckDispatches.length}
+            total={data.summary.stuckDispatches}
           />
           <Table containerClassName="rounded-lg border" className="min-w-[700px]">
             <TableHeader className="bg-muted/40">
@@ -318,8 +334,10 @@ export function ExceptionsClient({ data }: Props) {
       {data.pennyMismatches.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`WMS pushes — order-total mismatches (${data.pennyMismatches.length})`}
+            title={`WMS pushes — order-total mismatches (${data.summary.pennyMismatches})`}
             detail="Advisory: these orders pushed successfully but the IMS and WMS totals drifted by more than a penny. Review the order, then clear the flag."
+            shown={data.pennyMismatches.length}
+            total={data.summary.pennyMismatches}
           />
           <Table containerClassName="rounded-lg border" className="min-w-[640px]">
             <TableHeader className="bg-muted/40">
@@ -361,11 +379,15 @@ export function ExceptionsClient({ data }: Props) {
   )
 }
 
-function SectionHeading({ title, detail }: { title: string; detail: string }) {
+function SectionHeading({ title, detail, shown, total }: { title: string; detail: string; shown?: number; total?: number }) {
+  const capped = shown != null && total != null && total > shown
   return (
     <div>
       <h2 className="text-sm font-semibold">{title}</h2>
-      <p className="text-xs text-muted-foreground">{detail}</p>
+      <p className="text-xs text-muted-foreground">
+        {detail}
+        {capped ? ` Showing the ${shown} most recent of ${total}.` : ''}
+      </p>
     </div>
   )
 }

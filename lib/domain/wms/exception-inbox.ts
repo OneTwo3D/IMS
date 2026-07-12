@@ -11,9 +11,12 @@ import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-s
 export const DEAD_RECEIPT_EVENT_STATUS = MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead
 
 /**
- * Where-clause for replaying a dead-lettered inbound receipt event: only a row
- * still DEAD and never processed may be replayed — a concurrent sweep or a
- * second operator click makes updateMany match zero rows instead of clobbering.
+ * Where-clause for replaying a dead-lettered inbound event: only a row still
+ * DEAD and never processed may be replayed — a concurrent sweep or a second
+ * operator click makes updateMany match zero rows instead of clobbering.
+ * Shared by BOTH inbound-event tables (wms_inbound_receipt_events booked-in
+ * rows and wms_webhook_events order/inventory rows) — they use the same
+ * processingStatus machinery and retry-ladder columns.
  */
 export function buildDeadReceiptEventReplayWhere(id: string) {
   return {
