@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
-import { notify } from '@/lib/notifications'
+
 
 /**
  * Connector-agnostic WMS watchdog (q66in.4.6): alerts on SILENT failure modes
@@ -64,15 +64,24 @@ export type WmsWatchdogResult = {
   skippedReason?: string
 }
 
-async function notifyAdmins(title: string, message: string): Promise<void> {
+/**
+ * Durable admin notification — deliberately NOT lib/notifications.notify(),
+ * which swallows insert failures: the watchdog's dedupe stamp must only stick
+ * when the alert verifiably persisted (Codex), so this THROWS on failure and
+ * the caller reverts the stamp.
+ */
+async function notifyAdminsDurably(title: string, message: string): Promise<void> {
   const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-  await Promise.all(admins.map((admin) => notify({
-    userId: admin.id,
-    type: 'warning',
-    title,
-    message,
-    actionUrl: '/sync',
-  })))
+  if (admins.length === 0) return
+  await db.notification.createMany({
+    data: admins.map((admin) => ({
+      userId: admin.id,
+      type: 'warning',
+      title,
+      message,
+      actionUrl: '/sync',
+    })),
+  })
 }
 
 export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
@@ -116,13 +125,17 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   })
   for (const asn of openAsns) {
     if (!isAsnOverdue(asn, now)) continue
-    // CAS the dedupe stamp: a concurrent run (or a healing callback that just
-    // cleared it) must not double-alert.
+    // CAS the dedupe stamp: a concurrent run must not double-alert, and the
+    // callback state is pinned to the snapshot (Codex) — a booked-in callback
+    // landing mid-sweep heals the ASN, and stamping over it would alert from
+    // stale data AND re-suppress the healed entity.
     const stamped = await db.wmsAsnMap.updateMany({
-      where: { id: asn.id, sloAlertedAt: null, closedAt: null },
+      where: { id: asn.id, sloAlertedAt: null, closedAt: null, lastCallbackAt: asn.lastCallbackAt },
       data: { sloAlertedAt: now },
     })
     if (stamped.count === 0) continue
+
+    try {
 
     const creditLines = asn.lines.filter((line) => Number(line.qtyAccountedViaSnapshot) > Number(line.lastProcessedReceivedQty))
     const creditNote = creditLines.length > 0
@@ -146,11 +159,20 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       level: 'WARNING',
       resolveUser: false,
     })
-    await notifyAdmins(
+    await notifyAdminsDurably(
       'WMS ASN overdue',
       `ASN ${asn.externalAsnId} (${asn.warehouse.code}) is past ${anchor} with no booked-in callback.${creditNote} Chase the shipment / callback in the WMS.`,
     )
     overdueAsnAlerts += 1
+    } catch (deliveryError) {
+      // Delivery failed — un-stamp so the next sweep retries the alert
+      // (a stuck stamp would suppress it permanently; Codex).
+      await db.wmsAsnMap.updateMany({
+        where: { id: asn.id, sloAlertedAt: now },
+        data: { sloAlertedAt: null },
+      }).catch(() => {})
+      console.error(`[wms-watchdog] overdue-ASN alert delivery failed for ${asn.externalAsnId}:`, deliveryError)
+    }
   }
 
   // 2 — stale binding stock sync.
@@ -172,11 +194,16 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
   })
   for (const binding of bindings) {
     if (!isBindingSyncStale(binding, now)) continue
+    // Pin the snapshot freshness (Codex): a sync completing mid-sweep refreshes
+    // lastStockSyncAt and clears the stamp — alerting over it would be false
+    // and would re-suppress the recovered binding.
     const stamped = await db.externalWmsBinding.updateMany({
-      where: { id: binding.id, staleSyncAlertedAt: null },
+      where: { id: binding.id, staleSyncAlertedAt: null, lastStockSyncAt: binding.lastStockSyncAt },
       data: { staleSyncAlertedAt: now },
     })
     if (stamped.count === 0) continue
+
+    try {
 
     const last = binding.lastStockSyncAt ? binding.lastStockSyncAt.toISOString() : 'never'
     await logActivity({
@@ -194,11 +221,18 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       level: 'WARNING',
       resolveUser: false,
     })
-    await notifyAdmins(
+    await notifyAdminsDurably(
       'WMS stock sync stale',
       `Stock sync for ${binding.warehouse.code} has not completed since ${last} — check the scheduler and the WMS connection.`,
     )
     staleBindingAlerts += 1
+    } catch (deliveryError) {
+      await db.externalWmsBinding.updateMany({
+        where: { id: binding.id, staleSyncAlertedAt: now },
+        data: { staleSyncAlertedAt: null },
+      }).catch(() => {})
+      console.error(`[wms-watchdog] stale-sync alert delivery failed for ${binding.warehouse.code}:`, deliveryError)
+    }
   }
 
   return { status: 'SUCCEEDED', overdueAsnAlerts, staleBindingAlerts }
