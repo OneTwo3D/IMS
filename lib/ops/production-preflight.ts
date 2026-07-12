@@ -27,7 +27,7 @@ type PreflightOptions = {
   dbConnect?: (databaseUrl: string) => Promise<void>
 }
 
-const PLACEHOLDER_SUBSTRING_PATTERN = /(change[-_ ]?me|replace[-_ ]?me|example|yourdomain\.com|your[-_ ]?(secret|password|token)|<[^>]+>|\[[^\]]+\]|__[^_]+__)/i
+const PLACEHOLDER_SUBSTRING_PATTERN = /(change[-_ ]?(me|this|it|in[-_ ]?production)|please[-_ ]?change|(^|[-_ ])(dev|test|sample|placeholder|dummy|changeme)[-_ ]?secret|replace[-_ ]?me|example|yourdomain\.com|your[-_ ]?(secret|password|token)|<[^>]+>|\[[^\]]+\]|__[^_]+__)/i
 const PLACEHOLDER_EXACT_VALUES = new Set(['secret', 'password', 'password123', 'admin', 'test', 'todo'])
 
 function isTruthy(value: string | undefined): boolean {
