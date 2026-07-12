@@ -92,6 +92,21 @@ export function pickOrderRow(orders: RawOrder[], orderNumber: string): RawOrder 
   return merged.length === 1 ? merged[0] : null
 }
 
+/**
+ * Tri-state presence probe (q66in.4.4): unlike fetchMintsoftOrderStatus, this
+ * distinguishes a search with NO trace of the order (MISSING) from one whose
+ * candidates exist but cannot be disambiguated (AMBIGUOUS — pickOrderRow fails
+ * closed on multiple merged matches). Reconciliation only treats MISSING as
+ * safe grounds for re-creating the order.
+ */
+export async function probeMintsoftOrderPresence(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
+  const reference = orderNumber.trim()
+  if (!reference) return 'MISSING'
+  const matches = await searchMintsoftOrdersByNumber(reference)
+  if (matches.length === 0) return 'MISSING'
+  return pickOrderRow(matches, reference) ? 'FOUND' : 'AMBIGUOUS'
+}
+
 export function readTracking(order: RawOrder): WmsOrderTracking[] {
   const trackingNumber = toStr(order.TrackingNumber)
   const carrier = toStr(order.CourierServiceName)

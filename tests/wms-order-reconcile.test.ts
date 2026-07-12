@@ -31,6 +31,7 @@ function deps(overrides: Partial<reconcileNs.WmsOrderReconcileDeps>): reconcileN
     listSyncedLinksToVerify: async () => [],
     listCancelledLinksToVerify: async () => [],
     fetchOrderStatus: async () => null,
+    probeOrderPresence: async () => 'FOUND' as const,
     ...overrides,
   }
 }
@@ -51,17 +52,34 @@ test('reconcile core: eligible-but-unpushed orders become NOT_PUSHED findings', 
   assert.equal(findings[0].orderId, 'o1')
 })
 
-test('reconcile core: a live link whose WMS order vanished is MISSING_IN_WMS; found orders are clean', async () => {
-  const { findings } = await reconcile.runWmsOrderReconcileCore(deps({
+test('reconcile core: a verifiably missing WMS order is MISSING_IN_WMS; found and AMBIGUOUS are not', async () => {
+  const { findings, counters, verifiedOrderIds } = await reconcile.runWmsOrderReconcileCore(deps({
     listSyncedLinksToVerify: async () => [
       { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },
       { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },
+      { orderId: 'o3', orderNumber: 'SO-3', externalOrderNumber: 'WC-3' },
     ],
-    fetchOrderStatus: async (orderNumber) => (orderNumber === 'WC-1' ? null : status({ externalOrderNumber: 'WC-2' })),
+    probeOrderPresence: async (orderNumber) => (
+      orderNumber === 'WC-1' ? 'MISSING' : orderNumber === 'WC-3' ? 'AMBIGUOUS' : 'FOUND'
+    ),
   }))
   assert.equal(findings.length, 1)
   assert.equal(findings[0].category, 'MISSING_IN_WMS')
   assert.equal(findings[0].externalOrderNumber, 'WC-1')
+  // AMBIGUOUS fails closed: an error, neither a finding nor a clean verification
+  // (a re-push of an ambiguous-but-live order would DUPLICATE it in the WMS).
+  assert.equal(counters.errors, 1)
+  assert.equal(verifiedOrderIds.includes('o3'), false)
+})
+
+test('reconcile core: check B is skipped entirely without a tri-state probe', async () => {
+  let listed = false
+  const { counters } = await reconcile.runWmsOrderReconcileCore(deps({
+    probeOrderPresence: null,
+    listSyncedLinksToVerify: async () => { listed = true; return [] },
+  }))
+  assert.equal(listed, false)
+  assert.equal(counters.linksVerified, 0)
 })
 
 test('reconcile core: a cancelled link still active in the WMS is ACTIVE_AFTER_CANCEL', async () => {
@@ -90,9 +108,9 @@ test('reconcile core: lookup failures count as errors and never abort the run', 
       { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },
       { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },
     ],
-    fetchOrderStatus: async (orderNumber) => {
+    probeOrderPresence: async (orderNumber) => {
       if (orderNumber === 'WC-1') throw new Error('WMS API down')
-      return null
+      return 'MISSING'
     },
   }))
   assert.equal(counters.errors, 1)
@@ -128,9 +146,9 @@ test('reconcile core: returns the ids it actually verified for rotation stamping
       { orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1' },
       { orderId: 'o2', orderNumber: 'SO-2', externalOrderNumber: 'WC-2' },
     ],
-    fetchOrderStatus: async (orderNumber) => {
+    probeOrderPresence: async (orderNumber) => {
       if (orderNumber === 'WC-1') throw new Error('down')
-      return status({})
+      return 'FOUND'
     },
   }))
   // The errored lookup must NOT be stamped as verified (it would dodge rotation).

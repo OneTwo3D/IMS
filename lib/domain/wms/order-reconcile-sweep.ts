@@ -76,6 +76,12 @@ export type WmsOrderReconcileDeps = {
   /** Check C: recently cancelled/held links whose WMS order should be gone or cancelled. */
   listCancelledLinksToVerify(limit: number): Promise<Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>>
   fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null>
+  /**
+   * Tri-state presence probe; null when the connector cannot distinguish
+   * MISSING from AMBIGUOUS — check B is then skipped entirely (a re-push based
+   * on a conflated null could DUPLICATE a live WMS order).
+   */
+  probeOrderPresence: ((orderNumber: string) => Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'>) | null
 }
 
 /** Testable core — pure orchestration over injected deps. */
@@ -139,25 +145,37 @@ export async function runWmsOrderReconcileCore(
   }
 
   // B — verify each live link still has a WMS order behind it, within whatever
-  // budget C left over.
-  const syncedBudget = Math.max(0, lookupLimit - cancelledLinks.length)
-  for (const link of await deps.listSyncedLinksToVerify(syncedBudget)) {
-    counters.linksVerified += 1
-    try {
-      const status = await deps.fetchOrderStatus(link.externalOrderNumber)
-      verifiedSyncedOrderIds.push(link.orderId)
-      if (!status) {
-        findings.push({
-          category: 'MISSING_IN_WMS',
-          orderId: link.orderId,
-          orderNumber: link.orderNumber,
-          externalOrderNumber: link.externalOrderNumber,
-          detail: 'The push link is live but the WMS no longer knows this order — it will never fulfil. Replay re-creates it.',
-        })
+  // budget C left over. Runs ONLY with a tri-state probe (Codex r14 P1):
+  // fetchOrderStatus's null conflates "absent" with "ambiguous merged match",
+  // and re-pushing an ambiguous-but-live order would duplicate it in the WMS.
+  if (deps.probeOrderPresence) {
+    const probe = deps.probeOrderPresence
+    const syncedBudget = Math.max(0, lookupLimit - cancelledLinks.length)
+    for (const link of await deps.listSyncedLinksToVerify(syncedBudget)) {
+      counters.linksVerified += 1
+      try {
+        const presence = await probe(link.externalOrderNumber)
+        if (presence === 'AMBIGUOUS') {
+          // Exists but not resolvable — fail closed: neither a finding nor a
+          // clean verification.
+          counters.errors += 1
+          console.error(`[wms-order-reconcile] ambiguous WMS match for ${link.externalOrderNumber}; skipping`)
+          continue
+        }
+        verifiedSyncedOrderIds.push(link.orderId)
+        if (presence === 'MISSING') {
+          findings.push({
+            category: 'MISSING_IN_WMS',
+            orderId: link.orderId,
+            orderNumber: link.orderNumber,
+            externalOrderNumber: link.externalOrderNumber,
+            detail: 'The push link is live but the WMS verifiably has no trace of this order — it will never fulfil. Replay re-creates it.',
+          })
+        }
+      } catch (error) {
+        counters.errors += 1
+        console.error(`[wms-order-reconcile] presence probe failed for ${link.externalOrderNumber}:`, scrubWmsError(error, 'lookup failed'))
       }
-    } catch (error) {
-      counters.errors += 1
-      console.error(`[wms-order-reconcile] status lookup failed for ${link.externalOrderNumber}:`, scrubWmsError(error, 'lookup failed'))
     }
   }
 
@@ -291,6 +309,9 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
     fetchOrderStatus(orderNumber) {
       return connector.fetchOrderStatus ? connector.fetchOrderStatus(orderNumber) : Promise.resolve(null)
     },
+    probeOrderPresence: connector.probeOrderPresence
+      ? (orderNumber) => connector.probeOrderPresence!(orderNumber)
+      : null,
   }
 }
 
