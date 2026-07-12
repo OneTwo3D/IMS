@@ -9,21 +9,25 @@ const watchdog = 'default' in watchdogNs
 const NOW = new Date('2026-07-12T12:00:00Z')
 const days = (n: number) => new Date(NOW.getTime() - n * 86_400_000)
 
-test('isAsnOverdue: past-ETA with no callback (or a pre-ETA callback) is overdue after the grace', () => {
+test('isAsnOverdue: never-called-back ASNs anchor on the ETA (with grace)', () => {
   assert.equal(watchdog.isAsnOverdue({ eta: days(2), lastCallbackAt: null, createdAt: days(10) }, NOW), true)
-  // The last callback predates the ETA — the shipment stalled after it.
-  assert.equal(watchdog.isAsnOverdue({ eta: days(2), lastCallbackAt: days(5), createdAt: days(10) }, NOW), true)
-  // A callback AFTER the ETA means the warehouse is booking it in.
-  assert.equal(watchdog.isAsnOverdue({ eta: days(2), lastCallbackAt: days(1), createdAt: days(10) }, NOW), false)
   // Within the 24h grace after the ETA: not yet overdue.
   assert.equal(watchdog.isAsnOverdue({ eta: new Date(NOW.getTime() - 3_600_000), lastCallbackAt: null, createdAt: days(10) }, NOW), false)
+})
+
+test('isAsnOverdue: after a (partial) callback, RENEWED silence is a fresh breach (Codex r4)', () => {
+  // Recent callback: the warehouse is booking it in.
+  assert.equal(watchdog.isAsnOverdue({ eta: days(2), lastCallbackAt: days(1), createdAt: days(10) }, NOW), false)
+  // Partial callback then a week of silence with the ASN still open: breach —
+  // a partial receipt must not make the ASN unwatchable forever.
+  assert.equal(watchdog.isAsnOverdue({ eta: days(20), lastCallbackAt: days(8), createdAt: days(30) }, NOW), true)
+  assert.equal(watchdog.isAsnOverdue({ eta: null, lastCallbackAt: days(8), createdAt: days(30) }, NOW), true)
+  assert.equal(watchdog.isAsnOverdue({ eta: null, lastCallbackAt: days(3), createdAt: days(30) }, NOW), false)
 })
 
 test('isAsnOverdue: without an ETA only a completely silent, old ASN is overdue', () => {
   assert.equal(watchdog.isAsnOverdue({ eta: null, lastCallbackAt: null, createdAt: days(8) }, NOW), true)
   assert.equal(watchdog.isAsnOverdue({ eta: null, lastCallbackAt: null, createdAt: days(3) }, NOW), false)
-  // Any callback at all: the pipe works — age alone is not a breach.
-  assert.equal(watchdog.isAsnOverdue({ eta: null, lastCallbackAt: days(9), createdAt: days(30) }, NOW), false)
 })
 
 test('isBindingSyncStale: stale after 3× its own cadence, floored at an hour', () => {

@@ -32,18 +32,27 @@ export const BINDING_STALE_INTERVALS = 3
 /** ...but never sooner than this floor. */
 export const BINDING_STALE_FLOOR_MS = 60 * 60 * 1000
 
-/** Pure: is an open ASN overdue for its booked-in callback? */
+/**
+ * Pure: is an open ASN overdue for its booked-in callback?
+ * Silence is measured from the LAST sign of life:
+ *  - had a (partial) callback → renewed silence for the fallback window while
+ *    still open is a fresh breach (Codex r4: a partial receipt must not make
+ *    the ASN unwatchable forever);
+ *  - never called back, with an ETA → past the ETA + grace;
+ *  - never called back, no ETA → completely silent since creation for the
+ *    fallback window.
+ */
 export function isAsnOverdue(
   asn: { eta: Date | null; lastCallbackAt: Date | null; createdAt: Date },
   now: Date,
 ): boolean {
-  if (asn.eta) {
-    if (now.getTime() - asn.eta.getTime() < ASN_OVERDUE_GRACE_MS) return false
-    // A callback after the ETA means the warehouse IS booking it in.
-    return !asn.lastCallbackAt || asn.lastCallbackAt.getTime() < asn.eta.getTime()
+  if (asn.lastCallbackAt) {
+    return now.getTime() - asn.lastCallbackAt.getTime() >= ASN_NO_ETA_FALLBACK_AGE_MS
   }
-  // No ETA recorded: only flag a completely silent ASN, and only when old.
-  return !asn.lastCallbackAt && now.getTime() - asn.createdAt.getTime() >= ASN_NO_ETA_FALLBACK_AGE_MS
+  if (asn.eta) {
+    return now.getTime() - asn.eta.getTime() >= ASN_OVERDUE_GRACE_MS
+  }
+  return now.getTime() - asn.createdAt.getTime() >= ASN_NO_ETA_FALLBACK_AGE_MS
 }
 
 /** Pure: has this binding's stock sync been silent past its own cadence? */
@@ -110,8 +119,9 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       // synthetic external id) — are not overdue SHIPMENTS.
       status: { notIn: ['CREATE_PENDING', 'CREATE_IN_FLIGHT'] },
       OR: [
-        { eta: { lt: new Date(now.getTime() - ASN_OVERDUE_GRACE_MS) } },
-        { eta: null, lastCallbackAt: null, createdAt: { lt: new Date(now.getTime() - ASN_NO_ETA_FALLBACK_AGE_MS) } },
+        { lastCallbackAt: { lt: new Date(now.getTime() - ASN_NO_ETA_FALLBACK_AGE_MS) } },
+        { lastCallbackAt: null, eta: { lt: new Date(now.getTime() - ASN_OVERDUE_GRACE_MS) } },
+        { lastCallbackAt: null, eta: null, createdAt: { lt: new Date(now.getTime() - ASN_NO_ETA_FALLBACK_AGE_MS) } },
       ],
     },
     take: 200,

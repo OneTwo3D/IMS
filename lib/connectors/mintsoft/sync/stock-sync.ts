@@ -1095,8 +1095,11 @@ async function updateBindingSyncState(bindingId: string, status: 'SUCCEEDED' | '
     where: { id: bindingId },
     data: {
       lastStockSyncAt: new Date(),
-      staleSyncAlertedAt: null,
       lastStockSyncStatus: status,
+      // Only a run that actually completed its checks heals the watchdog's
+      // stale-sync alert (Codex r4: a FAILED run advancing lastStockSyncAt
+      // while clearing the stamp turned one breach into repeated alert spam).
+      ...(status === 'FAILED' ? {} : { staleSyncAlertedAt: null }),
     },
   })
 }
