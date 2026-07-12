@@ -1,0 +1,6 @@
+# Suppress reviewed false positives (narrow, per-finding fingerprints only).
+# These are deterministic idempotency-key test values in accounting-event tests,
+# confirmed not to be credentials. Do NOT broaden to a path/rule exclusion — new
+# or different secrets produce different fingerprints and must still fail the gate.
+a9b95f858ff43001af527147f8812bbe70612ab7:tests/domain/accounting/accounting-event.test.ts:generic-api-key:62
+7a5e92d878a80bcd0e7f49e529d0342c9fd2ef76:tests/domain/accounting/accounting-event.test.ts:generic-api-key:41
