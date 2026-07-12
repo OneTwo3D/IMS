@@ -516,8 +516,11 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
       : null
 
     if (refundLanded) {
-      await db.shoppingSyncLog.update({
-        where: { id: row.id },
+      // Codex r6: repeated webhook deliveries can have parked the SAME refund
+      // several times — resolve every park row for this refund, not just the
+      // clicked one, so stale duplicates don't linger as actionable exceptions.
+      await db.shoppingSyncLog.updateMany({
+        where: row.externalId ? { ...REFUND_PARK_WHERE, externalId: row.externalId } : { id: row.id },
         data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },
       })
     } else if (row.externalId) {
