@@ -27,8 +27,13 @@ export const API_PATH_PREFIX = '/api/'
  * This is the OUTER bypass surface (muid / the Next advisories): a protected
  * page reached via an alternate App-Router transport (`.rsc`,
  * `.segments/*.segment.rsc`, root transport) must still be matched so the auth
- * gate runs; only true static assets are excluded. Exported so proxy.ts's
- * `config.matcher` and the regression test share one source of truth.
+ * gate runs. The exclusions are framework static prefixes (`_next/static`,
+ * `_next/image`, `favicon.ico`) and any path ENDING in a public image
+ * extension — the latter is path-shape based, so a (pathological) protected
+ * route ending in such an extension would also skip the proxy; that residual
+ * is backstopped by app/(dashboard)/layout.tsx requireAuth() (see the
+ * KNOWN-LIMITATION test). Exported so proxy.ts's `config.matcher` and the
+ * regression test share one source of truth.
  */
 export const PROXY_MATCHER = '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)'
 

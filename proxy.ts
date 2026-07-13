@@ -3,9 +3,21 @@ import type { NextRequest } from 'next/server'
 import { auth } from '@/lib/auth'
 import { sessionInvalidLoginReason, type SessionInvalidReason } from '@/lib/auth/session-state'
 import { buildCsp, cspHeaderName, generateNonce, getCspMode } from '@/lib/security/csp'
-import { API_PATH_PREFIX, evaluateProxyAuthz, isPublicProxyPath } from '@/lib/security/proxy-authz'
+import { API_PATH_PREFIX, evaluateProxyAuthz, isPublicProxyPath, type ProxySession } from '@/lib/security/proxy-authz'
 
-export async function proxy(request: NextRequest) {
+/** The session resolver — injectable so handleProxy can be driven end-to-end in tests (muid). */
+export type ProxyAuthenticate = () => Promise<ProxySession>
+
+/**
+ * Middleware core, parameterized on the session resolver so the full
+ * request→response wiring (matcher already gates entry; then public/redirect/
+ * allow + CSP) is unit-testable without next-auth (onetwo3d-ims-muid). The
+ * exported `proxy` wires in the real auth().
+ */
+export async function handleProxy(
+  request: NextRequest,
+  authenticate: ProxyAuthenticate,
+): Promise<NextResponse> {
   const { pathname } = request.nextUrl
 
   // Per-request nonce + CSP for HTML responses. API routes return JSON and get
@@ -44,11 +56,11 @@ export async function proxy(request: NextRequest) {
   // Public routes — skip the auth check but still emit CSP on HTML.
   if (isPublicProxyPath(pathname)) return passThrough()
 
-  // Wrap auth() in try/catch — if the JWT is corrupt/expired, redirect to login
-  // instead of showing a generic error page.
-  let session
+  // Wrap the session resolve in try/catch — if the JWT is corrupt/expired,
+  // redirect to login instead of showing a generic error page.
+  let session: ProxySession
   try {
-    session = await auth()
+    session = await authenticate()
   } catch {
     return redirectToLogin(null)
   }
@@ -65,6 +77,11 @@ export async function proxy(request: NextRequest) {
     case 'allow':
       return passThrough()
   }
+}
+
+/** Next.js middleware entry — wires the real next-auth session resolver into the core. */
+export function proxy(request: NextRequest): Promise<NextResponse> {
+  return handleProxy(request, auth)
 }
 
 export const config = {
