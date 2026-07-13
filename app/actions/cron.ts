@@ -12,6 +12,8 @@ import { getAllCronJobs } from '@/lib/cron-jobs'
 import { getCronSecret } from '@/lib/cron-secret'
 import {
   buildOtiCrontabBlock,
+  emulateRuntimeSecretExtraction,
+  isCronSafePath,
   parseOtiCrontabStatus,
   spliceOtiBlock,
   type CrontabSecretRef,
@@ -31,13 +33,20 @@ function readOwnCrontab(): Promise<string> {
 /**
  * Prefer cron lines that read CRON_SECRET from the app's .env at RUNTIME
  * (ryxy: an embedded literal silently 401'd every managed job after a secret
- * rotation). Fall back to embedding only when there is no readable .env with
- * a CRON_SECRET line (e.g. env supplied purely by the service manager).
+ * rotation) — but ONLY when the Node-side emulation of the exact shell
+ * pipeline proves the .env yields the ACTIVE process secret byte-for-byte
+ * (Codex: line presence alone chose runtime mode even when the .env value was
+ * stale, exotic, or shadowed by a service-manager override). Everything else
+ * embeds the current literal, which is always correct at sync time.
  */
 function resolveSecretRef(secret: string): CrontabSecretRef {
   const envFilePath = path.join(process.cwd(), '.env')
   try {
-    if (existsSync(envFilePath) && /^CRON_SECRET=/m.test(readFileSync(envFilePath, 'utf8'))) {
+    if (
+      isCronSafePath(envFilePath)
+      && existsSync(envFilePath)
+      && emulateRuntimeSecretExtraction(readFileSync(envFilePath, 'utf8')) === secret
+    ) {
       return { kind: 'env-file', envFilePath }
     }
   } catch {
@@ -123,6 +132,8 @@ export async function syncCrontab(): Promise<{ success: boolean; error?: string 
 export type CrontabDriftStatus = OtiCrontabStatus & {
   /** OS user whose crontab the app manages (the service user). */
   osUser: string
+  /** Runtime-env mode only: does the .env pipeline still yield the ACTIVE secret? null otherwise. */
+  runtimeSecretMatches: boolean | null
 }
 
 /**
@@ -134,8 +145,26 @@ export type CrontabDriftStatus = OtiCrontabStatus & {
 export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
   await requirePermission('settings.company')
   const [crontabText, secret] = await Promise.all([readOwnCrontab(), getCronSecret()])
+  const status = parseOtiCrontabStatus(crontabText, secret)
+
+  // Runtime-env blocks can drift too (Codex): an edited-but-not-restarted .env
+  // or a service-manager override makes the pipeline yield a value the app no
+  // longer accepts. Re-run the emulation against the current .env.
+  let runtimeSecretMatches: boolean | null = null
+  if (status.secretMode === 'runtime-env' && secret) {
+    const envFilePath = path.join(process.cwd(), '.env')
+    try {
+      runtimeSecretMatches = existsSync(envFilePath)
+        ? emulateRuntimeSecretExtraction(readFileSync(envFilePath, 'utf8')) === secret
+        : false
+    } catch {
+      runtimeSecretMatches = false
+    }
+  }
+
   return {
-    ...parseOtiCrontabStatus(crontabText, secret),
+    ...status,
     osUser: os.userInfo().username,
+    runtimeSecretMatches,
   }
 }

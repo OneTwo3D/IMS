@@ -49,7 +49,6 @@ export async function verifyCron(request: Request): Promise<NextResponse | null>
 }
 
 const CRON_AUTH_REJECT_LOG_INTERVAL_MS = 60 * 60_000
-const lastRejectLogAt = new Map<string, number>()
 
 async function logCronAuthRejected(request: Request): Promise<void> {
   let pathname = 'unknown'
@@ -58,9 +57,17 @@ async function logCronAuthRejected(request: Request): Promise<void> {
   } catch {
     // keep 'unknown'
   }
-  const now = Date.now()
-  if (now - (lastRejectLogAt.get(pathname) ?? 0) < CRON_AUTH_REJECT_LOG_INTERVAL_MS) return
-  lastRejectLogAt.set(pathname, now)
+  // Throttle through the shared rate-limit backend (cluster-wide when Redis is
+  // configured, per-process memory otherwise — Codex: a module-level Map was
+  // one warning per replica per route). A failed logActivity write still
+  // consumes the slot; acceptable for an advisory WARNING.
+  try {
+    const { checkRateLimit } = await import('@/lib/rate-limit')
+    const gate = await checkRateLimit(`cron-auth-reject-log:${pathname}`, 1, CRON_AUTH_REJECT_LOG_INTERVAL_MS)
+    if (!gate.allowed) return
+  } catch {
+    return
+  }
   await logActivity({
     entityType: 'SYSTEM',
     tag: 'system',

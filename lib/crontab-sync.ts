@@ -7,9 +7,10 @@
  * crontab, so an env rotation silently 401'd every managed job until the next
  * manual sync. The installer never had this class of failure because its cron
  * lines read the secret from .env AT RUNTIME (scripts/install.sh) — the block
- * builder now emits that pattern whenever the app has a readable .env, and
- * falls back to the embedded literal only when it doesn't (e.g. env supplied
- * purely by the service manager).
+ * builder now emits that pattern, but ONLY when a Node-side emulation of the
+ * exact shell pipeline proves the .env yields the ACTIVE process secret
+ * byte-for-byte; every other case (no .env, exotic formats, service-manager
+ * override) falls back to embedding the current literal.
  */
 
 export const OTI_CRON_START_MARKER = '# --- OTI CRON START ---'
@@ -36,14 +37,46 @@ export type BuildOtiCrontabBlockResult =
   | { ok: false; error: string }
 
 /**
+ * Node-side emulation of the EXACT shell pipeline the cron lines run
+ * (`grep -m1 '^CRON_SECRET=' file | cut -d= -f2- | tr -d '"'`). Runtime mode
+ * is only chosen when this emulation yields a value byte-equal to the ACTIVE
+ * process secret (Codex: line-presence alone selected runtime mode even when
+ * the .env value was stale, single-quoted, commented, CRLF, or shadowed by a
+ * service-manager override — every managed job would then send a wrong or
+ * corrupted bearer). Returns null when no line matches.
+ */
+export function emulateRuntimeSecretExtraction(envFileContent: string): string | null {
+  // grep '^CRON_SECRET=' matches per \n-separated line; a CRLF file keeps its \r
+  // (so equality with the clean process value fails → literal fallback).
+  const line = envFileContent.split('\n').find((entry) => entry.startsWith('CRON_SECRET='))
+  if (line === undefined) return null
+  // cut -d= -f2- : everything after the first '='; tr -d '"' : drop ALL double quotes.
+  // $(...) strips trailing newlines only — split already consumed them.
+  return line.slice('CRON_SECRET='.length).replaceAll('"', '')
+}
+
+/**
+ * Characters cron or the crontab format treat specially in command text:
+ * % (cron splits the line and feeds the rest to stdin, even inside quotes),
+ * CR/LF and other control characters (structurally corrupt the crontab), and
+ * the single quote our shell quoting relies on.
+ */
+export function isCronSafePath(filePath: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return !/['%\u0000-\u001f\u007f]/.test(filePath)
+}
+
+/**
  * Runtime secret read for a cron job line: greps the CRON_SECRET line out of
  * the app's .env when the job FIRES, so a secret rotation (env edit + service
  * restart) needs no crontab re-sync. tr strips optional double quotes — the
  * installer writes the value unquoted but hand-maintained .env files often
- * quote it.
+ * quote it. The [ -n ] guard stops the job when extraction yields nothing
+ * (Codex: the pipeline exits 0 even when the file or line is missing, so an
+ * empty bearer would otherwise still be sent).
  */
 function runtimeSecretPrefix(envFilePath: string): string {
-  return `CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '${envFilePath}' | cut -d= -f2- | tr -d '"') && `
+  return `CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '${envFilePath}' | cut -d= -f2- | tr -d '"') && [ -n "$CRON_SECRET" ] && `
 }
 
 export function buildOtiCrontabBlock(params: {
@@ -54,8 +87,8 @@ export function buildOtiCrontabBlock(params: {
 }): BuildOtiCrontabBlockResult {
   const { jobs, settings, secretRef, baseUrl } = params
 
-  if (secretRef.kind === 'env-file' && secretRef.envFilePath.includes("'")) {
-    return { ok: false, error: 'App .env path contains a single quote; cannot build safe cron lines.' }
+  if (secretRef.kind === 'env-file' && !isCronSafePath(secretRef.envFilePath)) {
+    return { ok: false, error: 'App .env path contains characters cron cannot carry safely (quote, %, or control characters).' }
   }
 
   const lines: string[] = [
@@ -141,7 +174,7 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
     ? crontabText.slice(0, startIdx) + crontabText.slice(endIdx + OTI_CRON_END_MARKER.length)
     : crontabText
 
-  const isJobLine = (line: string) => /\/api\/cron\//.test(line) && !line.trim().startsWith('#')
+  const isJobLine = (line: string) => (/\/api\/cron\//.test(line) || /\$BASE_URL\//.test(line)) && !line.trim().startsWith('#')
   const managedJobCount = block.split('\n').filter(isJobLine).length
   const unmanagedCronApiLines = outside.split('\n').filter(isJobLine).length
 
