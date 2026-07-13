@@ -23,11 +23,24 @@ const START_MARKER_RE = /^# --- OTI CRON START ---[ \t\r]*$/
 const END_MARKER_RE = /^# --- OTI CRON END ---[ \t\r]*$/
 
 /**
- * Strip EVERY complete OTI block (START…END pair) and any stray unpaired marker
- * line from a crontab, preserving all other lines verbatim (Codex r5). Handles
- * multiple blocks, END-before-START, and an unclosed START (which drops only
- * the stray marker, never the lines after it — no data loss). Shared shape with
- * the installer's awk reconciliation so both are consistent.
+ * The unmistakable signature of a job line THIS builder generates — a curl that
+ * sends `Authorization: Bearer $CRON_SECRET` to `$BASE_URL/<slug>`. Used to
+ * sweep up ORPHANED managed job lines left by an unclosed/mangled block (Codex
+ * r6), which the block-range removal alone can't reach. It references our own
+ * shell variables, so an operator's own crontab line can't plausibly match.
+ */
+const MANAGED_JOB_LINE_RE = /-H "Authorization: Bearer \$CRON_SECRET" "\$BASE_URL\//
+
+/** The runtime-mode header comment the builder emits, capturing the .env path. */
+const RUNTIME_HEADER_RE = /^# CRON_SECRET is read from (.+?) at runtime/m
+
+/**
+ * Strip EVERY complete OTI block (START…END pair), any stray unpaired marker,
+ * AND any orphaned managed job line from a crontab, preserving all other lines
+ * verbatim (Codex r5/r6). Handles multiple blocks, END-before-START, and an
+ * unclosed START — whose own generated job lines are removed by signature so
+ * they don't survive as duplicates, while genuine operator lines are kept.
+ * Shared shape with the installer's awk reconciliation so both are consistent.
  */
 export function stripOtiBlocks(crontabText: string): string {
   const lines = crontabText.split('\n')
@@ -47,6 +60,7 @@ export function stripOtiBlocks(crontabText: string): string {
   for (let i = 0; i < lines.length; i += 1) {
     if (drop[i]) continue
     if (START_MARKER_RE.test(lines[i]) || END_MARKER_RE.test(lines[i])) continue
+    if (MANAGED_JOB_LINE_RE.test(lines[i])) continue   // orphaned managed job line
     kept.push(lines[i])
   }
   return kept.join('\n')
@@ -273,14 +287,20 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
     }
 
     const embedded = block.match(/^CRON_SECRET="(.*)"$/m)
+    const runtimeHeader = block.match(RUNTIME_HEADER_RE)
     if (blockJobLines.length === 0) {
-      // No jobs to run or drift (all disabled) — benign (Codex r5: this valid
-      // state was mis-flagged 'unknown'). Reflect whichever secret line exists.
+      // No jobs to run or drift (all disabled) — benign ONLY when it's a real
+      // managed block (Codex r5/r6: an embedded literal, or the runtime header
+      // whose .env path we can still verify). A marker-only or arbitrary block
+      // is malformed → 'unknown', so the banner surfaces it.
       if (embedded) {
         secretMode = 'embedded'
         embeddedSecretMatches = currentSecret !== null && embedded[1] === currentSecret
-      } else {
+      } else if (runtimeHeader) {
         secretMode = 'runtime-env'
+        runtimeEnvPath = runtimeHeader[1]
+      } else {
+        secretMode = 'unknown'
       }
     } else if (allRuntime && runtimePaths.size === 1) {
       // Every job line reads the same .env at runtime (an embedded literal, if

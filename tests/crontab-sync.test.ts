@@ -442,8 +442,36 @@ test('status: an all-disabled (zero-job) embedded block is embedded, and runtime
   assert.equal(e.embeddedSecretMatches, true)
   assert.equal(e.managedJobCount, 0)
 
-  const emptyRuntime = [OTI_CRON_START_MARKER, '# CRON_SECRET read at runtime', 'BASE_URL="x"', OTI_CRON_END_MARKER, ''].join('\n')
+  const emptyRuntime = [OTI_CRON_START_MARKER, '# CRON_SECRET is read from /opt/app/.env at runtime — rotating it needs no crontab re-sync.', 'BASE_URL="x"', OTI_CRON_END_MARKER, ''].join('\n')
   const r = parseOtiCrontabStatus(emptyRuntime, 'cur')
   assert.equal(r.secretMode, 'runtime-env')
+  assert.equal(r.runtimeEnvPath, '/opt/app/.env')
   assert.equal(r.managedJobCount, 0)
+})
+
+// --- Codex r6: orphaned managed lines + malformed zero-job block ----------
+
+test('splice/strip: an unclosed block\'s own generated job lines do NOT survive as duplicates (Codex r6)', () => {
+  const orphan = "15 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/a/.env' | cut -d= -f2- | tr -d '\"') && [ -n \"$CRON_SECRET\" ] && curl -sf -o /dev/null -H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/wms-watchdog\" >> '/var/log/x' 2>&1"
+  const existing = ['0 9 * * * /opt/operator.sh', OTI_CRON_START_MARKER, 'BASE_URL="x"', orphan].join('\n')  // unclosed: no END
+  const stripped = stripOtiBlocks(existing)
+  assert.match(stripped, /\/opt\/operator\.sh/)            // operator line kept
+  assert.doesNotMatch(stripped, /wms-watchdog/)             // orphaned managed job removed
+  // and a full splice yields exactly one live watchdog job
+  const out = spliceOtiBlock(existing, [OTI_CRON_START_MARKER, orphan.replace('wms-watchdog', 'wms-watchdog'), OTI_CRON_END_MARKER])
+  assert.equal((out.match(/wms-watchdog/g) || []).length, 1)
+})
+
+test('status: a marker-only / arbitrary zero-job block (no literal, no runtime header) is unknown (Codex r6)', () => {
+  const markerOnly = [OTI_CRON_START_MARKER, OTI_CRON_END_MARKER, ''].join('\n')
+  assert.equal(parseOtiCrontabStatus(markerOnly, 'cur').secretMode, 'unknown')
+  const arbitrary = [OTI_CRON_START_MARKER, '# hand-edited junk', 'FOO="bar"', OTI_CRON_END_MARKER, ''].join('\n')
+  assert.equal(parseOtiCrontabStatus(arbitrary, 'cur').secretMode, 'unknown')
+})
+
+test('strip: an operator line that merely mentions Bearer is not our managed signature (kept)', () => {
+  // Our signature is specifically `Bearer $CRON_SECRET" "$BASE_URL/` — a plain
+  // operator curl with a different auth is preserved.
+  const existing = '0 3 * * * curl -H "Authorization: Bearer mytoken" https://ops.example.com/health'
+  assert.equal(stripOtiBlocks(existing), existing)
 })

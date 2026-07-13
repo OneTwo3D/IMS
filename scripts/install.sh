@@ -1004,11 +1004,13 @@ PRESERVED_CRON="$(printf '%s\n' "${EXISTING_CRON}" | awk -v port="${APP_PORT}" '
         }
       }
     }
-    ours = "localhost:" port "/api/cron/"
+    legacy = "localhost:" port "/api/cron/"           # old pre-r4 literal-URL format
+    managed = "Bearer $CRON_SECRET\" \"$BASE_URL/"    # our current managed job signature (matches lib/crontab-sync.ts)
     for (i = 1; i <= NR; i++) {
       if (drop[i]) continue
       if (isStart(line[i]) || isEnd(line[i])) continue   # stray unpaired marker
-      if (index(line[i], ours) > 0) continue             # our own legacy bootstrap line
+      if (index(line[i], legacy) > 0) continue           # our own legacy bootstrap line
+      if (index(line[i], managed) > 0) continue           # orphaned managed job line (unclosed block)
       print line[i]
     }
   }
