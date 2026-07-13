@@ -961,23 +961,46 @@ success "Log rotation configured."
 # ---------------------------------------------------------------------------
 header "Setting up cron jobs"
 
+# The bootstrap jobs are written INSIDE the OTI markers, in the SAME managed
+# format the in-app scheduler sync (Settings -> System -> Scheduler) emits, so
+# the first in-app save splices/replaces this block in place instead of leaving
+# duplicate unmanaged lines that drift on secret rotation (onetwo3d-ims-ryxy).
+# Runtime-read secret + [ -n ] guard + managed LOG_DIR log path.
 CRON_ENV_FILE="${APP_DIR}/.env"
-CRON_CURL_PREFIX="CRON_SECRET=\$(grep -m 1 '^CRON_SECRET=' '${CRON_ENV_FILE}' | cut -d= -f2-) && curl -fsS -H \"Authorization: Bearer \${CRON_SECRET}\""
-CRON_LINES=(
-  "0 1 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/account-balance-snapshot > /dev/null 2>&1"
-  "0 6 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/fx-rates > /dev/null 2>&1"
-  "0 3 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/activity-cleanup > /dev/null 2>&1"
-  "0 2 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/backup > /dev/null 2>&1"
-  "0 4 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/wc-reconcile > /dev/null 2>&1"
-  "*/15 * * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/delivery-status > /dev/null 2>&1"
+CRON_LOG_FILE="${LOG_DIR}/cron.log"
+CRON_CURL_PREFIX="CRON_SECRET=\$(grep -m1 '^CRON_SECRET=' '${CRON_ENV_FILE}' | cut -d= -f2- | tr -d '\"') && [ -n \"\$CRON_SECRET\" ] && curl -sf -o /dev/null -H \"Authorization: Bearer \$CRON_SECRET\""
+CRON_BASE="http://localhost:${APP_PORT}/api/cron"
+
+# schedule|slug|label pairs for the bootstrap set
+CRON_JOBS=(
+  "0 1 * * *|account-balance-snapshot|Account Balance Snapshot"
+  "0 6 * * *|fx-rates|FX Rate Update"
+  "0 3 * * *|activity-cleanup|Activity Log Cleanup"
+  "0 2 * * *|backup|Database Backup"
+  "0 4 * * *|wc-reconcile|WooCommerce Reconciliation"
+  "*/15 * * * *|delivery-status|Delivery Status Check"
 )
 
+# Preserve any crontab lines the operator has OUTSIDE the OTI markers; replace
+# only the managed block (same splice contract as app/actions/cron.ts).
+EXISTING_CRON="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
+PRESERVED_CRON="$(printf '%s\n' "${EXISTING_CRON}" | sed '/# --- OTI CRON START ---/,/# --- OTI CRON END ---/d')"
+
 {
-  crontab -u "${APP_USER}" -l 2>/dev/null || true
-  for line in "${CRON_LINES[@]}"; do
-    echo "$line"
+  printf '%s\n' "${PRESERVED_CRON}"
+  echo "# --- OTI CRON START ---"
+  echo "# Managed by One Two Inventory — do not edit manually"
+  echo "# CRON_SECRET is read from ${CRON_ENV_FILE} at runtime — rotating it needs no crontab re-sync."
+  echo "BASE_URL=\"${CRON_BASE}\""
+  echo ""
+  for job in "${CRON_JOBS[@]}"; do
+    IFS='|' read -r sched slug label <<< "$job"
+    echo "# ${label}"
+    echo "${sched}  ${CRON_CURL_PREFIX} \"\$BASE_URL/${slug}\" >> '${CRON_LOG_FILE}' 2>&1"
+    echo ""
   done
-} | sort -u | crontab -u "${APP_USER}" -
+  echo "# --- OTI CRON END ---"
+} | crontab -u "${APP_USER}" -
 
 success "Cron jobs configured:"
 echo "  - 02:00 Daily scheduled backup (if enabled in settings)"

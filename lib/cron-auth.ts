@@ -1,5 +1,5 @@
 import { timingSafeEqual } from 'crypto'
-import { NextResponse } from 'next/server'
+import { NextResponse, after } from 'next/server'
 import { logActivity } from '@/lib/activity-log'
 import { getCronSecret } from '@/lib/cron-secret'
 
@@ -23,9 +23,10 @@ export async function verifyCron(request: Request): Promise<NextResponse | null>
     // ryxy: rejected cron auth was COMPLETELY silent (curl -sf on the caller
     // side, nothing app-side) — a stale rotated secret 401'd every scheduled
     // job for months unnoticed. Surface it in the activity log, throttled per
-    // route so a misconfigured scheduler can't flood the log. Fire-and-forget
-    // (Codex r2): the 401 must never wait on — or stall behind — logging.
-    void logCronAuthRejected(request)
+    // route so a misconfigured scheduler can't flood the log. Deferred via
+    // after() (Codex r2/r3): the 401 never waits on logging, but the write is
+    // still tied to the request lifecycle so it completes under serverless.
+    scheduleCronAuthRejectedLog(request)
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
@@ -54,11 +55,17 @@ const CRON_AUTH_REJECT_LOG_INTERVAL_MS = 60 * 60_000
 // backend — that put a Redis round trip on the hot 401-reject path (latency
 // under a black-holed Redis) and its fail-open defeated the throttle during an
 // outage. Per-replica 1/route/hour is the right bound for an advisory WARNING;
-// the static cron route set keeps the Map bounded. The timestamp is committed
-// only AFTER a confirmed write, so a failed insert doesn't suppress the hour.
+// the static cron route set keeps the Map bounded.
 const lastRejectLogAt = new Map<string, number>()
 
-async function logCronAuthRejected(request: Request): Promise<void> {
+/**
+ * Schedule the throttled reject-log write on the request's after() hook so it
+ * completes under serverless without blocking the 401 (Codex r3). The slot is
+ * RESERVED synchronously here — before any await — so concurrent rejects in the
+ * same window don't all pass the check (Codex r3); the write itself is
+ * best-effort (logActivity swallows failures).
+ */
+function scheduleCronAuthRejectedLog(request: Request): void {
   let pathname = 'unknown'
   try {
     pathname = new URL(request.url).pathname
@@ -67,8 +74,9 @@ async function logCronAuthRejected(request: Request): Promise<void> {
   }
   const now = Date.now()
   if (now - (lastRejectLogAt.get(pathname) ?? 0) < CRON_AUTH_REJECT_LOG_INTERVAL_MS) return
-  try {
-    await logActivity({
+  lastRejectLogAt.set(pathname, now)
+  const run = () =>
+    logActivity({
       entityType: 'SYSTEM',
       tag: 'system',
       action: 'cron_auth_rejected',
@@ -77,9 +85,11 @@ async function logCronAuthRejected(request: Request): Promise<void> {
       metadata: { pathname },
       resolveUser: false,
     })
-    lastRejectLogAt.set(pathname, now)
-  } catch (error) {
-    console.error('[cron-auth] failed to log rejected cron request', error)
+  try {
+    after(run)
+  } catch {
+    // Outside a request scope (after() unavailable) — fall back to detached.
+    void run()
   }
 }
 

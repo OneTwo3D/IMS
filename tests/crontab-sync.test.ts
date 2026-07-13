@@ -197,7 +197,7 @@ test('build: the cron log path defaults to the installer-owned LOG_DIR and is ov
     baseUrl: BASE,
   })
   assert.ok(def.ok)
-  assert.ok(def.lines.join('\n').includes(`>> ${DEFAULT_CRON_LOG_PATH} 2>&1`))
+  assert.ok(def.lines.join('\n').includes(`>> '${DEFAULT_CRON_LOG_PATH}' 2>&1`))
   assert.doesNotMatch(def.lines.join('\n'), /\/var\/log\/oti-cron\.log/)
 
   const custom = buildOtiCrontabBlock({
@@ -208,7 +208,7 @@ test('build: the cron log path defaults to the installer-owned LOG_DIR and is ov
     logPath: '/srv/logs/cron.log',
   })
   assert.ok(custom.ok)
-  assert.match(custom.lines.join('\n'), />> \/srv\/logs\/cron\.log 2>&1/)
+  assert.match(custom.lines.join('\n'), />> '\/srv\/logs\/cron\.log' 2>&1/)
 
   // an unsafe log path is rejected, not written
   const bad = buildOtiCrontabBlock({
@@ -241,4 +241,60 @@ test('status: a block with neither embedded literal nor runtime command is unkno
   assert.equal(status.secretMode, 'unknown')
   assert.equal(status.runtimeEnvPath, null)
   assert.equal(status.embeddedSecretMatches, null)
+})
+
+
+// --- Codex r3: log-path quoting + precise runtime classification --------
+
+test('build: the log path is single-quoted in the redirect (no injection via spaces/operators) (Codex r3)', () => {
+  const result = buildOtiCrontabBlock({
+    jobs: [JOB],
+    settings: new Map([['cron_wms_watchdog_enabled', 'true']]),
+    secretRef: { kind: 'literal', secret: 's' },
+    baseUrl: BASE,
+    logPath: '/var/log/one-two-inventory/cron.log',
+  })
+  assert.ok(result.ok)
+  assert.match(result.lines.join('\n'), />> '\/var\/log\/one-two-inventory\/cron\.log' 2>&1/)
+})
+
+test('status: a block whose job lines read DIFFERENT env paths is unknown, not runtime-env (Codex r3)', () => {
+  const mixed = [
+    OTI_CRON_START_MARKER,
+    'BASE_URL="x"',
+    "15 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/a/.env' | cut -d= -f2- | tr -d '\"') && [ -n \"$CRON_SECRET\" ] && curl \"$BASE_URL/api/cron/a\"",
+    "30 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/b/.env' | cut -d= -f2- | tr -d '\"') && [ -n \"$CRON_SECRET\" ] && curl \"$BASE_URL/api/cron/b\"",
+    OTI_CRON_END_MARKER,
+    '',
+  ].join('\n')
+  const status = parseOtiCrontabStatus(mixed, 'current')
+  assert.equal(status.secretMode, 'unknown')
+  assert.equal(status.runtimeEnvPath, null)
+})
+
+test('status: a block where only SOME job lines carry the runtime command is unknown (Codex r3)', () => {
+  const partial = [
+    OTI_CRON_START_MARKER,
+    'BASE_URL="x"',
+    "15 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/a/.env' | cut -d= -f2- | tr -d '\"') && [ -n \"$CRON_SECRET\" ] && curl \"$BASE_URL/api/cron/a\"",
+    '30 * * * *  curl "$BASE_URL/api/cron/b"',
+    OTI_CRON_END_MARKER,
+    '',
+  ].join('\n')
+  const status = parseOtiCrontabStatus(partial, 'current')
+  assert.equal(status.secretMode, 'unknown')
+})
+
+test('status: a commented-out runtime command does not classify a block as runtime-env (Codex r3)', () => {
+  const commented = [
+    OTI_CRON_START_MARKER,
+    'BASE_URL="x"',
+    "# 15 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/a/.env' | cut -d= -f2- | tr -d '\"') && curl \"$BASE_URL/api/cron/a\"",
+    OTI_CRON_END_MARKER,
+    '',
+  ].join('\n')
+  const status = parseOtiCrontabStatus(commented, 'current')
+  // no live job lines, no embedded literal, commented command ignored
+  assert.equal(status.secretMode, 'unknown')
+  assert.equal(status.managedJobCount, 0)
 })
