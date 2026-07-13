@@ -6,6 +6,7 @@ import {
   evaluateProxyAuthz,
   isPublicProxyPath,
   proxyRunsForPath,
+  PROXY_MATCHER,
   PUBLIC_PAGE_PATHS,
   type ProxySession,
 } from '../../lib/security/proxy-authz.ts'
@@ -92,37 +93,55 @@ test('public paths are never gated even without a session', () => {
 // protected page — in ANY transport form — still causes the proxy to run, and
 // that proxy.ts ships exactly this matcher.
 
-test('proxy.ts ships the shared PROXY_MATCHER (one source of truth), not an inline copy', () => {
-  // Read as text to avoid importing proxy.ts's heavy runtime deps (next/server,
-  // auth) into a unit test; the point is that proxy.ts references the shared
-  // constant so this suite's matcher assertions govern what actually ships.
+test('proxy.ts ships the SAME matcher string as PROXY_MATCHER (drift guard)', () => {
+  // config.matcher MUST be a static literal (Next rejects a variable at build
+  // time), so proxy.ts inlines the string. Extract that literal from source and
+  // assert it equals the shared constant, so this suite's matcher assertions
+  // govern what actually ships and the two can't drift. Text-read avoids
+  // importing proxy.ts's heavy runtime deps (next/server, auth) into a unit test.
   const src = readFileSync(new URL('../../proxy.ts', import.meta.url), 'utf8')
-  assert.match(src, /matcher:\s*\[PROXY_MATCHER\]/)
+  const m = src.match(/matcher:\s*\[\s*'([^']*)'\s*\]/)
+  assert.ok(m, 'proxy.ts must declare a single-quoted literal matcher')
+  // The source literal escapes each backslash as `\\`; the shared constant's
+  // literal is written the same way, so re-escape PROXY_MATCHER's runtime value
+  // to the source form and compare. Guards against the two drifting apart.
+  assert.equal(m![1], PROXY_MATCHER.replace(/\\/g, '\\\\'))
 })
 
-test('MATCHER: protected pages and their .rsc / segment / root transports all run the proxy', () => {
+test('MATCHER: protected pages and their real App-Router transports all run the proxy', () => {
   for (const path of [
     '/', '/dashboard', '/settings/system', '/inventory', '/sync',
+    // RSC + segment-prefetch transports (Next's actual generated forms) + data route
     '/dashboard.rsc', '/settings.rsc', '/index.rsc',
-    '/dashboard/.segments/x.segment.rsc',
+    '/dashboard.segments/__PAGE__.segment.rsc',
+    '/_next/data/BUILD_ID/dashboard.json',
+    // adversarial shapes that must still be gated (not excluded, not case-folded)
+    '/dashboard%2e%2e/secret', '/dashboard//x', '/_NEXT/static/x.js',
     '/login', '/api/cron/wms-watchdog',   // proxy runs on these too (then passes through)
   ]) {
     assert.equal(proxyRunsForPath(path), true, `${path} must run the proxy`)
   }
 })
 
-test('MATCHER: only true static assets are excluded from the proxy', () => {
+test('MATCHER: framework static-asset prefixes and public image files are excluded', () => {
   for (const path of [
     '/_next/static/chunk-abc.js', '/_next/image', '/favicon.ico',
     '/logo.svg', '/photo.png', '/pic.jpeg', '/anim.gif', '/img.webp',
   ]) {
-    assert.equal(proxyRunsForPath(path), false, `${path} should be excluded (static asset)`)
+    assert.equal(proxyRunsForPath(path), false, `${path} should be excluded`)
   }
 })
 
-test('BYPASS: a protected page with an image-like suffix but not a static asset still runs', () => {
-  // Only paths ENDING in a real image extension are excluded; a protected
-  // route that merely contains ".png" mid-path is NOT a static asset.
+test('MATCHER: a mid-path image extension is NOT excluded (only a trailing one is)', () => {
   assert.equal(proxyRunsForPath('/settings/report.png.data'), true)
   assert.equal(proxyRunsForPath('/dashboard/pngreport'), true)
+})
+
+test('KNOWN LIMITATION: a protected path ENDING in an image extension skips the proxy — backstopped by the dashboard layout auth', () => {
+  // The suffix exclusion is path-shape based, so a (pathological) protected
+  // route like /inventory/<id>.png would skip the proxy. This is not a real
+  // auth hole: every dashboard page renders under app/(dashboard)/layout.tsx,
+  // which calls requireAuth() and redirects unauthenticated/2FA-pending users.
+  // Documented here so the exclusion's real behavior is asserted, not assumed.
+  assert.equal(proxyRunsForPath('/inventory/example.png'), false)
 })
