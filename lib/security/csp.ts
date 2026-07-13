@@ -41,12 +41,33 @@ export function cspHeaderName(mode: Exclude<CspMode, 'off'>): string {
  * Dev builds additionally allow `'unsafe-eval'` (Turbopack / React Fast Refresh
  * evaluate code) and websocket connect (HMR). Production omits both.
  */
-export function buildCsp(nonce: string, isDev: boolean): string {
+
+/** Static flag-image CDN used for country flags on sales pages (img-src). */
+export const FLAG_CDN_ORIGIN = 'https://flagcdn.com'
+/** Cloudflare Turnstile origin — its challenge iframe (frame-src) and telemetry (connect-src) when the widget is enabled. */
+export const TURNSTILE_ORIGIN = 'https://challenges.cloudflare.com'
+
+export type BuildCspOptions = {
+  /** Cloudflare Turnstile is configured (login widget) — allow its iframe + telemetry origin. */
+  turnstileEnabled?: boolean
+}
+
+export function buildCsp(nonce: string, isDev: boolean, options: BuildCspOptions = {}): string {
+  const { turnstileEnabled = false } = options
+
+  // script-src uses nonce + strict-dynamic: a CSP3 browser IGNORES host
+  // allowlists here, so the nonce'd next/script loader (e.g. Turnstile api.js)
+  // and anything IT loads are trusted — no external script host is listed.
   const scriptSrc = ["'self'", `'nonce-${nonce}'`, "'strict-dynamic'"]
   if (isDev) scriptSrc.push("'unsafe-eval'")
 
   const connectSrc = ["'self'"]
   if (isDev) connectSrc.push('ws:', 'wss:')
+  if (turnstileEnabled) connectSrc.push(TURNSTILE_ORIGIN)
+
+  // Turnstile renders its challenge in an iframe from its origin; otherwise no
+  // framing is allowed.
+  const frameSrc = turnstileEnabled ? [TURNSTILE_ORIGIN] : ["'none'"]
 
   const directives = [
     `default-src 'self'`,
@@ -55,14 +76,14 @@ export function buildCsp(nonce: string, isDev: boolean): string {
     // all injected styles, so styles use 'unsafe-inline' (styles are a far
     // weaker XSS vector than scripts).
     `style-src 'self' 'unsafe-inline'`,
-    `img-src 'self' data: blob:`,
+    `img-src 'self' data: blob: ${FLAG_CDN_ORIGIN}`,
     `font-src 'self' data:`,
     `connect-src ${connectSrc.join(' ')}`,
     `object-src 'none'`,
     `base-uri 'self'`,
     `form-action 'self'`,
     `frame-ancestors 'none'`,
-    `frame-src 'none'`,
+    `frame-src ${frameSrc.join(' ')}`,
     `worker-src 'self' blob:`,
     `manifest-src 'self'`,
     `upgrade-insecure-requests`,

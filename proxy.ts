@@ -26,9 +26,13 @@ export async function handleProxy(
   const isApiRoute = pathname.startsWith(API_PATH_PREFIX)
   const cspMode = getCspMode()
   const nonce = generateNonce()
+  // Turnstile-enabled check inlined (not imported from lib/turnstile) so the
+  // middleware doesn't pull in its node:net-dependent transitive deps; the
+  // env pair is the canonical signal (see lib/turnstile.isTurnstileEnabled).
+  const turnstileEnabled = Boolean(process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY?.trim() && process.env.TURNSTILE_SECRET_KEY?.trim())
   const csp = cspMode === 'off' || isApiRoute
     ? null
-    : buildCsp(nonce, process.env.NODE_ENV !== 'production')
+    : buildCsp(nonce, process.env.NODE_ENV !== 'production', { turnstileEnabled })
 
   // Attach the CSP response header (report-only or enforce) to any response.
   const withCsp = <T extends NextResponse>(response: T): T => {

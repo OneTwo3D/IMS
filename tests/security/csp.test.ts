@@ -43,3 +43,22 @@ test('buildCsp allows eval and websockets only in development', () => {
   assert.match(dev, /script-src [^;]*'unsafe-eval'/)
   assert.match(dev, /connect-src [^;]*ws:/)
 })
+
+test('buildCsp allows the flag CDN for country-flag images (4jl5 enforce-ready)', () => {
+  const csp = buildCsp('n', false)
+  assert.match(csp, /img-src [^;]*https:\/\/flagcdn\.com/)
+})
+
+test('buildCsp gates Turnstile origin behind the enabled flag (frame-src + connect-src)', () => {
+  const off = buildCsp('n', false)
+  // Default: no framing, Turnstile origin absent
+  assert.match(off, /frame-src 'none'/)
+  assert.doesNotMatch(off, /challenges\.cloudflare\.com/)
+
+  const on = buildCsp('n', false, { turnstileEnabled: true })
+  assert.match(on, /frame-src [^;]*https:\/\/challenges\.cloudflare\.com/)
+  assert.match(on, /connect-src [^;]*https:\/\/challenges\.cloudflare\.com/)
+  // still nonce-based scripts (strict-dynamic), no external script host
+  assert.match(on, /script-src [^;]*'strict-dynamic'/)
+  assert.doesNotMatch(on, /script-src [^;]*challenges\.cloudflare\.com/)
+})
