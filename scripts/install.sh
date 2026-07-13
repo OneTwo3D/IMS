@@ -961,23 +961,100 @@ success "Log rotation configured."
 # ---------------------------------------------------------------------------
 header "Setting up cron jobs"
 
+# The bootstrap jobs are written INSIDE the OTI markers, in the SAME managed
+# format the in-app scheduler sync (Settings -> System -> Scheduler) emits, so
+# the first in-app save splices/replaces this block in place instead of leaving
+# duplicate unmanaged lines that drift on secret rotation (onetwo3d-ims-ryxy).
+# Runtime-read secret + [ -n ] guard + managed LOG_DIR log path.
 CRON_ENV_FILE="${APP_DIR}/.env"
-CRON_CURL_PREFIX="CRON_SECRET=\$(grep -m 1 '^CRON_SECRET=' '${CRON_ENV_FILE}' | cut -d= -f2-) && curl -fsS -H \"Authorization: Bearer \${CRON_SECRET}\""
-CRON_LINES=(
-  "0 1 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/account-balance-snapshot > /dev/null 2>&1"
-  "0 6 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/fx-rates > /dev/null 2>&1"
-  "0 3 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/activity-cleanup > /dev/null 2>&1"
-  "0 2 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/backup > /dev/null 2>&1"
-  "0 4 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/wc-reconcile > /dev/null 2>&1"
-  "*/15 * * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/delivery-status > /dev/null 2>&1"
+CRON_LOG_FILE="${LOG_DIR}/cron.log"
+CRON_CURL_PREFIX="CRON_SECRET=\$(grep -m1 '^CRON_SECRET=' '${CRON_ENV_FILE}' | cut -d= -f2- | tr -d '\"') && [ -n \"\$CRON_SECRET\" ] && curl -sf -o /dev/null -H \"Authorization: Bearer \$CRON_SECRET\""
+CRON_BASE="http://localhost:${APP_PORT}/api/cron"
+
+# schedule|slug|label pairs for the bootstrap set
+CRON_JOBS=(
+  "0 1 * * *|account-balance-snapshot|Account Balance Snapshot"
+  "0 6 * * *|fx-rates|FX Rate Update"
+  "0 3 * * *|activity-cleanup|Activity Log Cleanup"
+  "0 2 * * *|backup|Database Backup"
+  "0 4 * * *|wc-reconcile|WooCommerce Reconciliation"
+  "*/15 * * * *|delivery-status|Delivery Status Check"
 )
 
+# Build the fresh managed block into a temp file (cleaned up on ANY exit —
+# Codex r9: the temp file must not leak if the pipeline below fails).
+CRON_BLOCK_FILE="$(mktemp -t oti-cron.XXXXXX)"
+trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 {
-  crontab -u "${APP_USER}" -l 2>/dev/null || true
-  for line in "${CRON_LINES[@]}"; do
-    echo "$line"
+  echo "# --- OTI CRON START ---"
+  echo "# Managed by One Two Inventory — do not edit manually"
+  echo "# CRON_SECRET is read from ${CRON_ENV_FILE} at runtime — rotating it needs no crontab re-sync."
+  echo "BASE_URL=\"${CRON_BASE}\""
+  echo ""
+  for job in "${CRON_JOBS[@]}"; do
+    IFS='|' read -r sched slug label <<< "$job"
+    echo "# ${label}"
+    echo "${sched}  ${CRON_CURL_PREFIX} \"\$BASE_URL/${slug}\" >> '${CRON_LOG_FILE}' 2>&1"
+    echo ""
   done
-} | sort -u | crontab -u "${APP_USER}" -
+  echo "# --- OTI CRON END ---"
+} > "${CRON_BLOCK_FILE}"
+
+# Replace the managed block IN PLACE, preserving the operator's own lines AND
+# the block's original position among them (onetwo3d-ims-ryxy / Codex r4-r8).
+# Mirrors the app-side computeOtiDrops/spliceOtiBlock (lib/crontab-sync.ts):
+#   - drops EVERY complete START..END block (markers tolerant of trailing
+#     whitespace/CR); a START..next-START without an END is a malformed tail,
+#   - never deletes past an UNCLOSED start marker; within a malformed tail it
+#     drops ONLY our own remnants (job/header/BASE_URL), keeping operator lines,
+#   - a managed job line is our EXACT generated signature (byte-identical to the
+#     TS constant), so an operator line using a different Authorization form is
+#     preserved; legacy pre-marker localhost:APP_PORT/api/cron/ lines are cleared,
+#   - the fresh block is re-inserted where the first managed marker was (NOT at
+#     EOF), so it never jumps past an operator PATH/SHELL/CRON_TZ assignment.
+# `|| true` so a fresh box with NO existing crontab (crontab -l exits nonzero)
+# doesn't trip `set -euo pipefail` and abort the install (Codex r9).
+{ crontab -u "${APP_USER}" -l 2>/dev/null || true; } | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" '
+  function isStart(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
+  function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
+  function isRemnant(x) {
+    managed = "-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/"   # exact generated job signature (== TS)
+    return (index(x, managed) > 0 \
+      || x ~ /^# CRON_SECRET is read from .* at runtime/ \
+      || x ~ /^# Managed by One Two Inventory/ \
+      || x ~ /^BASE_URL="/)
+  }
+  function emitBlock(  bl) { while ((getline bl < blockfile) > 0) print bl; close(blockfile) }
+  { line[NR] = $0 }
+  END {
+    i = 1; firstMarker = 0
+    while (i <= NR) {
+      if (isStart(line[i])) {
+        if (firstMarker == 0) firstMarker = i
+        j = i + 1
+        while (j <= NR && !isEnd(line[j]) && !isStart(line[j])) j++
+        if (j <= NR && isEnd(line[j])) { for (k = i; k <= j; k++) drop[k] = 1; i = j + 1; continue }
+        drop[i] = 1   # unclosed START: marker + our tail remnants, keep operator lines
+        for (k = i + 1; k < j; k++) if (isEnd(line[k]) || isRemnant(line[k])) drop[k] = 1
+        i = j
+        continue
+      }
+      if (isEnd(line[i])) { if (firstMarker == 0) firstMarker = i; drop[i] = 1 }   # stray END
+      i++
+    }
+    legacy = "localhost:" port "/api/cron/"   # pre-r4 bootstrap lines predate the markers
+    emitted = 0
+    for (i = 1; i <= NR; i++) {
+      if (i == firstMarker) { emitBlock(); emitted = 1 }
+      if (drop[i]) continue
+      if (index(line[i], legacy) > 0) continue
+      print line[i]
+    }
+    if (!emitted) emitBlock()   # no prior block → append at end
+  }
+' | crontab -u "${APP_USER}" -
+rm -f "${CRON_BLOCK_FILE}"
+trap - EXIT   # risky window over; drop the cleanup trap
 
 success "Cron jobs configured:"
 echo "  - 02:00 Daily scheduled backup (if enabled in settings)"

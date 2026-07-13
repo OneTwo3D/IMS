@@ -1,21 +1,64 @@
 'use server'
 
 import { execFile } from 'child_process'
+import { existsSync, readFileSync } from 'fs'
+import os from 'os'
+import path from 'path'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import { getCronSecret } from '@/lib/cron-secret'
+import {
+  buildOtiCrontabBlock,
+  emulateRuntimeSecretExtraction,
+  isCronSafePath,
+  parseOtiCrontabStatus,
+  spliceOtiBlock,
+  type CrontabSecretRef,
+  type OtiCrontabStatus,
+} from '@/lib/crontab-sync'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 
-// Strict cron expression validation: 5 fields, only digits / * / , / - / /
-const CRON_RE = /^(\*|(\*\/)?[0-9]+([,-][0-9]+)*)( (\*|(\*\/)?[0-9]+([,-][0-9]+)*)){4}$/
+function readOwnCrontab(): Promise<string> {
+  return new Promise<string>((resolve) => {
+    execFile('crontab', ['-l'], { timeout: 5000 }, (err, stdout) => {
+      resolve(err ? '' : stdout)
+    })
+  })
+}
+
+/**
+ * Prefer cron lines that read CRON_SECRET from the app's .env at RUNTIME
+ * (ryxy: an embedded literal silently 401'd every managed job after a secret
+ * rotation) — but ONLY when the Node-side emulation of the exact shell
+ * pipeline proves the .env yields the ACTIVE process secret byte-for-byte
+ * (Codex: line presence alone chose runtime mode even when the .env value was
+ * stale, exotic, or shadowed by a service-manager override). Everything else
+ * embeds the current literal, which is always correct at sync time.
+ */
+function resolveSecretRef(secret: string): CrontabSecretRef {
+  const envFilePath = path.join(process.cwd(), '.env')
+  try {
+    if (
+      isCronSafePath(envFilePath)
+      && existsSync(envFilePath)
+      && emulateRuntimeSecretExtraction(readFileSync(envFilePath, 'utf8')) === secret
+    ) {
+      return { kind: 'env-file', envFilePath }
+    }
+  } catch {
+    // unreadable .env → embedded fallback below
+  }
+  return { kind: 'literal', secret }
+}
 
 /**
  * Reads all cron_* settings from the DB, generates the crontab block between
  * OTI markers, and writes it via `crontab -` (safe, no shell injection).
+ * Writes the CALLING OS user's crontab — i.e. the user the app runs as.
  */
 export async function syncCrontab(): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
@@ -46,65 +89,12 @@ export async function syncCrontab(): Promise<{ success: boolean; error?: string 
   })
   const settings = new Map(rows.map((r) => [r.key, r.value]))
 
-  // Build crontab lines
-  const lines: string[] = [
-    '# --- OTI CRON START ---',
-    '# Managed by One Two Inventory — do not edit manually',
-    `CRON_SECRET="${secret}"`,
-    `BASE_URL="${baseUrl}/api/cron"`,
-    '',
-  ]
+  const logPath = process.env.OTI_CRON_LOG_PATH?.trim() || undefined
+  const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl, logPath })
+  if (!block.ok) return { success: false, error: block.error }
 
-  for (const job of jobs) {
-    const cronEnabled = settings.get(`cron_${job.settingKey}_enabled`)
-    let enabled: boolean
-    if (cronEnabled !== undefined) {
-      enabled = cronEnabled === 'true'
-    } else if (job.legacyEnabledKey) {
-      enabled = settings.get(job.legacyEnabledKey) === 'true'
-    } else {
-      enabled = job.defaultEnabled
-    }
-    if (!enabled) continue
-
-    const schedule = settings.get(`cron_${job.settingKey}_schedule`) ?? job.defaultSchedule
-    if (!CRON_RE.test(schedule)) {
-      return { success: false, error: `Invalid cron schedule for ${job.label}: "${schedule}"` }
-    }
-
-    lines.push(
-      `# ${job.label}`,
-      `${schedule}  curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/${job.slug}" >> /var/log/oti-cron.log 2>&1`,
-      '',
-    )
-  }
-
-  lines.push('# --- OTI CRON END ---')
-
-  // Read existing crontab, preserve lines outside our markers
-  const existingCrontab = await new Promise<string>((resolve) => {
-    execFile('crontab', ['-l'], { timeout: 5000 }, (err, stdout) => {
-      resolve(err ? '' : stdout)
-    })
-  })
-
-  const START_MARKER = '# --- OTI CRON START ---'
-  const END_MARKER = '# --- OTI CRON END ---'
-  const startIdx = existingCrontab.indexOf(START_MARKER)
-  const endIdx = existingCrontab.indexOf(END_MARKER)
-
-  let before = ''
-  let after = ''
-
-  if (startIdx !== -1 && endIdx !== -1) {
-    before = existingCrontab.slice(0, startIdx)
-    after = existingCrontab.slice(endIdx + END_MARKER.length)
-  } else {
-    before = existingCrontab
-    if (before && !before.endsWith('\n')) before += '\n'
-  }
-
-  const newCrontab = before + lines.join('\n') + '\n' + after.replace(/^\n+/, '')
+  const existingCrontab = await readOwnCrontab()
+  const newCrontab = spliceOtiBlock(existingCrontab, block.lines)
 
   // Write via `crontab -` (stdin pipe, no shell injection)
   const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
@@ -124,7 +114,7 @@ export async function syncCrontab(): Promise<{ success: boolean; error?: string 
       entityType: 'SYSTEM',
       tag: 'system',
       action: 'crontab_sync',
-      description: 'Crontab synced from scheduled jobs settings',
+      description: `Crontab synced from scheduled jobs settings (user ${os.userInfo().username})`,
     })
   } else {
     await logActivity({
@@ -138,4 +128,46 @@ export async function syncCrontab(): Promise<{ success: boolean; error?: string 
 
   revalidatePath('/settings/system')
   return result
+}
+
+export type CrontabDriftStatus = OtiCrontabStatus & {
+  /** OS user whose crontab the app manages (the service user). */
+  osUser: string
+  /** Runtime-env mode only: does the .env pipeline still yield the ACTIVE secret? null otherwise. */
+  runtimeSecretMatches: boolean | null
+}
+
+/**
+ * Drift inspection for the scheduler settings page (ryxy): reports whether
+ * the app user's crontab has a managed block, how it sources its secret, and
+ * whether an embedded secret is STALE (the silent-401 failure mode), plus any
+ * unmanaged /api/cron/ lines that will drift outside the app's control.
+ */
+export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
+  await requirePermission('settings.company')
+  const [crontabText, secret] = await Promise.all([readOwnCrontab(), getCronSecret()])
+  const status = parseOtiCrontabStatus(crontabText, secret)
+
+  // Runtime-env blocks can drift too (Codex): an edited-but-not-restarted .env
+  // or a service-manager override makes the pipeline yield a value the app no
+  // longer accepts. Re-run the emulation against the .env path the cron line
+  // ACTUALLY reads (Codex r2: checking process.cwd()/.env could report a block
+  // pointing at a stale/other path as healthy).
+  let runtimeSecretMatches: boolean | null = null
+  if (status.secretMode === 'runtime-env' && status.runtimeEnvPath && secret) {
+    const envFilePath = status.runtimeEnvPath
+    try {
+      runtimeSecretMatches = existsSync(envFilePath)
+        ? emulateRuntimeSecretExtraction(readFileSync(envFilePath, 'utf8')) === secret
+        : false
+    } catch {
+      runtimeSecretMatches = false
+    }
+  }
+
+  return {
+    ...status,
+    osUser: os.userInfo().username,
+    runtimeSecretMatches,
+  }
 }
