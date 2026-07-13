@@ -5,6 +5,7 @@ import { ActivitySquare, Archive, Plug, RotateCcw, ScrollText, Timer } from 'luc
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
 import { getSetting } from '@/app/actions/settings'
+import { getCrontabStatus } from '@/app/actions/cron'
 import { ActivityLogRetentionSetting } from '@/components/settings/activity-log-retention'
 import { DataRetentionSetting } from '@/components/settings/data-retention'
 import { DatabaseReset } from '@/components/settings/database-reset'
@@ -47,12 +48,28 @@ export default async function SystemSettingsPage({
     : null
 
   // Only fetch data needed for the active tab
-  const [pluginState, publicAppUrl, cronJobs, retentionData] = await Promise.all([
+  const [pluginState, publicAppUrl, cronJobs, retentionData, crontabStatus] = await Promise.all([
     activeTab === 'plugins' || activeTab === 'scheduler' ? getIntegrationPluginState() : null,
     activeTab === 'scheduler' ? getPublicAppUrlInfo() : null,
     activeTab === 'scheduler' ? loadCronJobs() : null,
     activeTab === 'retention' ? loadRetentionData() : null,
+    activeTab === 'scheduler' ? getCrontabStatus().catch(() => null) : null,
   ])
+
+  // ryxy drift conditions: no managed block for the app user, a STALE embedded
+  // secret (every managed job silently 401s), or unmanaged /api/cron/ lines
+  // that will drift outside the app's control.
+  const crontabWarnings: string[] = []
+  if (crontabStatus) {
+    if (!crontabStatus.blockPresent) {
+      crontabWarnings.push(`No managed crontab block exists for the app user (${crontabStatus.osUser}) — scheduled jobs are NOT running from these settings. Save the scheduler settings to write it.`)
+    } else if (crontabStatus.secretMode === 'embedded' && crontabStatus.embeddedSecretMatches === false) {
+      crontabWarnings.push('The crontab has a STALE embedded CRON_SECRET — every managed job is failing auth with silent 401s. Save the scheduler settings to re-sync it.')
+    }
+    if (crontabStatus.unmanagedCronApiLines > 0) {
+      crontabWarnings.push(`${crontabStatus.unmanagedCronApiLines} cron line(s) outside the managed block call /api/cron/ endpoints — they duplicate managed jobs and drift on secret rotation. Consolidate them into the managed block.`)
+    }
+  }
 
   return (
     <div className="space-y-6 max-w-4xl">
@@ -160,6 +177,14 @@ export default async function SystemSettingsPage({
 
       {activeTab === 'scheduler' && cronJobs && (
         <div className="space-y-6">
+          {crontabWarnings.length > 0 && (
+            <div className="rounded-lg border border-red-300 bg-red-50 p-4 dark:border-red-900 dark:bg-red-950/40" role="alert">
+              <p className="text-sm font-semibold text-red-800 dark:text-red-200">Scheduler crontab needs attention</p>
+              <ul className="mt-1 list-disc pl-5 text-sm text-red-700 dark:text-red-300 space-y-1">
+                {crontabWarnings.map((warning) => <li key={warning}>{warning}</li>)}
+              </ul>
+            </div>
+          )}
           <Card className="p-6">
             <div className="flex items-center gap-2 mb-4">
               <Timer className="h-4 w-4 text-muted-foreground" />

@@ -1,5 +1,6 @@
 import { timingSafeEqual } from 'crypto'
 import { NextResponse } from 'next/server'
+import { logActivity } from '@/lib/activity-log'
 import { getCronSecret } from '@/lib/cron-secret'
 
 export { MIN_CRON_SECRET_LENGTH, assertProductionCronSecretConfigured } from '@/lib/cron-secret-validation'
@@ -19,6 +20,11 @@ export async function verifyCron(request: Request): Promise<NextResponse | null>
     const auth = request.headers.get('authorization')
     if (auth && bearerMatches(auth, `Bearer ${secret}`)) return null
 
+    // ryxy: rejected cron auth was COMPLETELY silent (curl -sf on the caller
+    // side, nothing app-side) — a stale rotated secret 401'd every scheduled
+    // job for months unnoticed. Surface it in the activity log, throttled per
+    // route so a misconfigured scheduler can't flood the log.
+    await logCronAuthRejected(request)
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
@@ -40,6 +46,30 @@ export async function verifyCron(request: Request): Promise<NextResponse | null>
   }
 
   return null
+}
+
+const CRON_AUTH_REJECT_LOG_INTERVAL_MS = 60 * 60_000
+const lastRejectLogAt = new Map<string, number>()
+
+async function logCronAuthRejected(request: Request): Promise<void> {
+  let pathname = 'unknown'
+  try {
+    pathname = new URL(request.url).pathname
+  } catch {
+    // keep 'unknown'
+  }
+  const now = Date.now()
+  if (now - (lastRejectLogAt.get(pathname) ?? 0) < CRON_AUTH_REJECT_LOG_INTERVAL_MS) return
+  lastRejectLogAt.set(pathname, now)
+  await logActivity({
+    entityType: 'SYSTEM',
+    tag: 'system',
+    action: 'cron_auth_rejected',
+    level: 'WARNING',
+    description: `Cron request to ${pathname} rejected — bad or missing bearer secret. If this repeats hourly, the crontab's CRON_SECRET is stale (rotate drift): re-sync the scheduler in Settings → System → Scheduler.`,
+    metadata: { pathname },
+    resolveUser: false,
+  })
 }
 
 function bearerMatches(provided: string, expected: string): boolean {
