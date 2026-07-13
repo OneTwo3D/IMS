@@ -7,6 +7,7 @@ import {
   isCrontabEmbeddableSecret,
   parseOtiCrontabStatus,
   spliceOtiBlock,
+  stripOtiBlocks,
   DEFAULT_CRON_LOG_PATH,
   OTI_CRON_START_MARKER,
   OTI_CRON_END_MARKER,
@@ -295,9 +296,10 @@ test('status: a commented-out runtime command does not classify a block as runti
     '',
   ].join('\n')
   const status = parseOtiCrontabStatus(commented, 'current')
-  // no live job lines, no embedded literal, commented command ignored
-  assert.equal(status.secretMode, 'unknown')
+  // The commented command is NOT counted as a live runtime job — no job lines,
+  // no literal → the benign all-disabled block, not a false runtime path.
   assert.equal(status.managedJobCount, 0)
+  assert.equal(status.runtimeEnvPath, null)
 })
 
 
@@ -372,4 +374,76 @@ test('status: a clean embedded block (literal + $CRON_SECRET job lines) is still
   const status = parseOtiCrontabStatus(embedded, 'current')
   assert.equal(status.secretMode, 'embedded')
   assert.equal(status.embeddedSecretMatches, true)
+})
+
+
+// --- Codex r5: robust splice + anchored runtime + benign zero-job ---
+
+test('splice: strips ALL existing blocks (multiple, whitespace/CRLF markers) and preserves operator lines (Codex r5)', () => {
+  const existing = [
+    '0 9 * * * /opt/op.sh',
+    OTI_CRON_START_MARKER, 'A', OTI_CRON_END_MARKER,
+    '5 * * * * /opt/other.sh',
+    OTI_CRON_START_MARKER + '  ',  // trailing whitespace
+    'B',
+    OTI_CRON_END_MARKER + '\t',
+    '@reboot /opt/init.sh',
+  ].join('\n')
+  const out = spliceOtiBlock(existing, [OTI_CRON_START_MARKER, 'FRESH', OTI_CRON_END_MARKER])
+  assert.match(out, /\/opt\/op\.sh/)
+  assert.match(out, /\/opt\/other\.sh/)
+  assert.match(out, /@reboot \/opt\/init\.sh/)
+  assert.doesNotMatch(out, /^A$/m)
+  assert.doesNotMatch(out, /^B$/m)
+  // exactly one managed block remains
+  assert.equal(out.split(OTI_CRON_START_MARKER).length - 1, 1)
+  assert.match(out, /FRESH/)
+})
+
+test('splice: an unclosed START marker does not delete the operator lines after it (Codex r5)', () => {
+  const existing = ['0 8 * * * /opt/keep.sh', OTI_CRON_START_MARKER, '0 9 * * * /opt/keep2.sh'].join('\n')
+  const out = spliceOtiBlock(existing, [OTI_CRON_START_MARKER, 'FRESH', OTI_CRON_END_MARKER])
+  assert.match(out, /\/opt\/keep\.sh/)
+  assert.match(out, /\/opt\/keep2\.sh/)
+})
+
+test('splice: is idempotent across repeated saves (Codex r5)', () => {
+  const block = [OTI_CRON_START_MARKER, 'X', OTI_CRON_END_MARKER]
+  const once = spliceOtiBlock('0 9 * * * /opt/op.sh\n', block)
+  const twice = spliceOtiBlock(once, block)
+  assert.equal(once, twice)
+  assert.equal(twice.split(OTI_CRON_START_MARKER).length - 1, 1)
+})
+
+test('stripOtiBlocks: END-before-START does not corrupt surrounding lines (Codex r5)', () => {
+  const text = [OTI_CRON_END_MARKER, '0 8 * * * /opt/a.sh', OTI_CRON_START_MARKER, '0 9 * * * /opt/b.sh'].join('\n')
+  const out = stripOtiBlocks(text)
+  assert.match(out, /\/opt\/a\.sh/)
+  assert.match(out, /\/opt\/b\.sh/)
+  assert.doesNotMatch(out, /OTI CRON/)
+})
+
+test('status: a full-pipeline extraction buried inside echo (never assigned) is NOT runtime-env (Codex r5)', () => {
+  const decoy = [
+    OTI_CRON_START_MARKER,
+    'BASE_URL="x"',
+    "15 * * * *  echo \"CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/a/.env' | cut -d= -f2- | tr -d '\"')\" && curl \"$BASE_URL/api/cron/a\"",
+    OTI_CRON_END_MARKER,
+    '',
+  ].join('\n')
+  const status = parseOtiCrontabStatus(decoy, 'current')
+  assert.equal(status.secretMode, 'unknown')
+})
+
+test('status: an all-disabled (zero-job) embedded block is embedded, and runtime is runtime-env — not unknown (Codex r5)', () => {
+  const emptyEmbedded = [OTI_CRON_START_MARKER, 'CRON_SECRET="cur"', 'BASE_URL="x"', OTI_CRON_END_MARKER, ''].join('\n')
+  const e = parseOtiCrontabStatus(emptyEmbedded, 'cur')
+  assert.equal(e.secretMode, 'embedded')
+  assert.equal(e.embeddedSecretMatches, true)
+  assert.equal(e.managedJobCount, 0)
+
+  const emptyRuntime = [OTI_CRON_START_MARKER, '# CRON_SECRET read at runtime', 'BASE_URL="x"', OTI_CRON_END_MARKER, ''].join('\n')
+  const r = parseOtiCrontabStatus(emptyRuntime, 'cur')
+  assert.equal(r.secretMode, 'runtime-env')
+  assert.equal(r.managedJobCount, 0)
 })

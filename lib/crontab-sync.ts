@@ -16,6 +16,42 @@
 export const OTI_CRON_START_MARKER = '# --- OTI CRON START ---'
 export const OTI_CRON_END_MARKER = '# --- OTI CRON END ---'
 
+// Marker detection tolerant of trailing whitespace / CR (Codex r5: exact
+// equality left whitespace- or CRLF-suffixed markers unmatched, so old blocks
+// survived as live duplicates).
+const START_MARKER_RE = /^# --- OTI CRON START ---[ \t\r]*$/
+const END_MARKER_RE = /^# --- OTI CRON END ---[ \t\r]*$/
+
+/**
+ * Strip EVERY complete OTI block (START…END pair) and any stray unpaired marker
+ * line from a crontab, preserving all other lines verbatim (Codex r5). Handles
+ * multiple blocks, END-before-START, and an unclosed START (which drops only
+ * the stray marker, never the lines after it — no data loss). Shared shape with
+ * the installer's awk reconciliation so both are consistent.
+ */
+export function stripOtiBlocks(crontabText: string): string {
+  const lines = crontabText.split('\n')
+  const drop = new Array<boolean>(lines.length).fill(false)
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!START_MARKER_RE.test(lines[i])) continue
+    // find the next END after this START
+    let j = i + 1
+    while (j < lines.length && !END_MARKER_RE.test(lines[j])) j += 1
+    if (j < lines.length) {
+      for (let k = i; k <= j; k += 1) drop[k] = true
+      i = j
+    }
+    // unclosed START: leave the range; the stray marker is dropped below
+  }
+  const kept: string[] = []
+  for (let i = 0; i < lines.length; i += 1) {
+    if (drop[i]) continue
+    if (START_MARKER_RE.test(lines[i]) || END_MARKER_RE.test(lines[i])) continue
+    kept.push(lines[i])
+  }
+  return kept.join('\n')
+}
+
 // Strict cron expression validation: 5 fields, only digits / * / , / - / /
 const CRON_RE = /^(\*|(\*\/)?[0-9]+([,-][0-9]+)*)( (\*|(\*\/)?[0-9]+([,-][0-9]+)*)){4}$/
 
@@ -167,23 +203,17 @@ export function buildOtiCrontabBlock(params: {
   return { ok: true, lines }
 }
 
-/** Replace (or append) the OTI block, preserving everything outside the markers. */
+/**
+ * Replace the OTI block, preserving every non-OTI line. Strips ALL existing
+ * complete blocks + stray markers first (Codex r5: the old indexOf approach
+ * mishandled END-before-START, multiple blocks, and whitespace/CRLF markers —
+ * duplicating or corrupting operator lines across repeated saves), then appends
+ * the fresh block. Idempotent.
+ */
 export function spliceOtiBlock(existingCrontab: string, blockLines: string[]): string {
-  const startIdx = existingCrontab.indexOf(OTI_CRON_START_MARKER)
-  const endIdx = existingCrontab.indexOf(OTI_CRON_END_MARKER)
-
-  let before = ''
-  let after = ''
-
-  if (startIdx !== -1 && endIdx !== -1) {
-    before = existingCrontab.slice(0, startIdx)
-    after = existingCrontab.slice(endIdx + OTI_CRON_END_MARKER.length)
-  } else {
-    before = existingCrontab
-    if (before && !before.endsWith('\n')) before += '\n'
-  }
-
-  return before + blockLines.join('\n') + '\n' + after.replace(/^\n+/, '')
+  const preserved = stripOtiBlocks(existingCrontab).replace(/\n+$/, '')
+  const prefix = preserved.length > 0 ? preserved + '\n' : ''
+  return prefix + blockLines.join('\n') + '\n'
 }
 
 export type OtiCrontabStatus = {
@@ -216,10 +246,12 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
     : crontabText
 
   const isJobLine = (line: string) => (/\/api\/cron\//.test(line) || /\$BASE_URL\//.test(line)) && !line.trim().startsWith('#')
-  // The FULL extraction pipeline with a NON-EMPTY path (Codex r3/r4): matching
-  // only the leading `grep` fragment misclassified a decoy like
-  // `echo "CRON_SECRET=$(grep …)"` and an empty '' path as healthy runtime.
-  const RUNTIME_CMD = /CRON_SECRET=\$\(grep -m1 '\^CRON_SECRET=' '([^']+)' \| cut -d= -f2- \| tr -d '"'\)/
+  // The FULL extraction pipeline, ANCHORED as the command's first token —
+  // right after the 5-field cron schedule (Codex r3/r4/r5): matching only the
+  // grep fragment, an empty '' path, or the pipeline buried inside an
+  // `echo "…"` all misclassified as healthy runtime. \S+ and \s+ don't overlap
+  // so the {5} quantifier can't backtrack catastrophically.
+  const RUNTIME_CMD = /^\s*\S+(?:\s+\S+){4}\s+CRON_SECRET=\$\(grep -m1 '\^CRON_SECRET=' '([^']+)' \| cut -d= -f2- \| tr -d '"'\)/
   const blockJobLines = block.split('\n').filter(isJobLine)
   const managedJobCount = blockJobLines.length
   const unmanagedCronApiLines = outside.split('\n').filter(isJobLine).length
@@ -241,17 +273,26 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
     }
 
     const embedded = block.match(/^CRON_SECRET="(.*)"$/m)
-    if (allRuntime && runtimePaths.size === 1) {
+    if (blockJobLines.length === 0) {
+      // No jobs to run or drift (all disabled) — benign (Codex r5: this valid
+      // state was mis-flagged 'unknown'). Reflect whichever secret line exists.
+      if (embedded) {
+        secretMode = 'embedded'
+        embeddedSecretMatches = currentSecret !== null && embedded[1] === currentSecret
+      } else {
+        secretMode = 'runtime-env'
+      }
+    } else if (allRuntime && runtimePaths.size === 1) {
       // Every job line reads the same .env at runtime (an embedded literal, if
       // any, is stale leftover and ignored).
       secretMode = 'runtime-env'
       runtimeEnvPath = [...runtimePaths][0]
-    } else if (embedded && !anyRuntime && blockJobLines.length > 0) {
+    } else if (embedded && !anyRuntime) {
       // Top-level literal AND every job line uses $CRON_SECRET from it.
       secretMode = 'embedded'
       embeddedSecretMatches = currentSecret !== null && embedded[1] === currentSecret
     } else {
-      // Mixed, partial, empty, or otherwise unrecognizable — malformed.
+      // Mixed, partial, or otherwise unrecognizable — malformed.
       secretMode = 'unknown'
     }
   }

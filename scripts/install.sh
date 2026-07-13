@@ -982,24 +982,33 @@ CRON_JOBS=(
 )
 
 # Preserve the operator's own crontab lines while replacing the managed block
-# and clearing any legacy One Two Inventory cron entries, so an upgrade doesn't
-# leave duplicates (onetwo3d-ims-ryxy / Codex r4). awk (not a sed range) so a
-# START marker with no matching END can NOT delete operator lines to EOF:
-#   - drop a COMPLETE START..END block (requires the END),
-#   - drop stray marker lines and any line that curls our /api/cron/ endpoints,
-#   - keep everything else verbatim.
+# and clearing legacy One Two Inventory bootstrap lines, so an upgrade doesn't
+# leave duplicates (onetwo3d-ims-ryxy / Codex r4/r5). Mirrors the app-side
+# stripOtiBlocks (lib/crontab-sync.ts):
+#   - drops EVERY complete START..END block (markers tolerant of trailing
+#     whitespace/CR), so multiple/whitespace/CRLF blocks don't survive,
+#   - never deletes past an UNCLOSED start marker (no operator data loss),
+#   - strips ONLY our own legacy lines — those curling localhost:APP_PORT/api/
+#     cron/ (an operator's unrelated /api/cron/ on another host/port is kept).
 EXISTING_CRON="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
-PRESERVED_CRON="$(printf '%s\n' "${EXISTING_CRON}" | awk '
-  { line[NR] = $0
-    if ($0 == "# --- OTI CRON START ---" && startln == 0) startln = NR
-    if ($0 == "# --- OTI CRON END ---" && startln > 0 && NR > startln && endln == 0) endln = NR
-  }
+PRESERVED_CRON="$(printf '%s\n' "${EXISTING_CRON}" | awk -v port="${APP_PORT}" '
+  function isStart(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
+  function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
+  { line[NR] = $0 }
   END {
-    complete = (startln > 0 && endln > 0)   # only drop a COMPLETE range
+    # Pair each START with the next END after it; mark those ranges to drop.
     for (i = 1; i <= NR; i++) {
-      if (complete && i >= startln && i <= endln) continue
-      if (line[i] == "# --- OTI CRON START ---" || line[i] == "# --- OTI CRON END ---") continue
-      if (line[i] ~ /\/api\/cron\//) continue   # legacy unmarked One Two Inventory job line
+      if (isStart(line[i])) {
+        for (j = i + 1; j <= NR; j++) {
+          if (isEnd(line[j])) { for (k = i; k <= j; k++) drop[k] = 1; i = j; break }
+        }
+      }
+    }
+    ours = "localhost:" port "/api/cron/"
+    for (i = 1; i <= NR; i++) {
+      if (drop[i]) continue
+      if (isStart(line[i]) || isEnd(line[i])) continue   # stray unpaired marker
+      if (index(line[i], ours) > 0) continue             # our own legacy bootstrap line
       print line[i]
     }
   }
