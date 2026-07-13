@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
   evaluateProxyAuthz,
   isPublicProxyPath,
+  proxyRunsForPath,
   PUBLIC_PAGE_PATHS,
   type ProxySession,
 } from '../../lib/security/proxy-authz.ts'
@@ -81,4 +83,46 @@ test('a TOTP-verified session passes through', () => {
 test('public paths are never gated even without a session', () => {
   assert.equal(evaluateProxyAuthz('/login', null).action, 'public')
   assert.equal(evaluateProxyAuthz('/api/cron/backup', null).action, 'public')
+})
+
+
+// --- muid: the proxy MATCHER boundary (the outer bypass surface) ---------
+// The Next.js advisories concern alternate App-Router transports (.rsc,
+// .segment.rsc, root transport) escaping middleware matching. These assert a
+// protected page — in ANY transport form — still causes the proxy to run, and
+// that proxy.ts ships exactly this matcher.
+
+test('proxy.ts ships the shared PROXY_MATCHER (one source of truth), not an inline copy', () => {
+  // Read as text to avoid importing proxy.ts's heavy runtime deps (next/server,
+  // auth) into a unit test; the point is that proxy.ts references the shared
+  // constant so this suite's matcher assertions govern what actually ships.
+  const src = readFileSync(new URL('../../proxy.ts', import.meta.url), 'utf8')
+  assert.match(src, /matcher:\s*\[PROXY_MATCHER\]/)
+})
+
+test('MATCHER: protected pages and their .rsc / segment / root transports all run the proxy', () => {
+  for (const path of [
+    '/', '/dashboard', '/settings/system', '/inventory', '/sync',
+    '/dashboard.rsc', '/settings.rsc', '/index.rsc',
+    '/dashboard/.segments/x.segment.rsc',
+    '/login', '/api/cron/wms-watchdog',   // proxy runs on these too (then passes through)
+  ]) {
+    assert.equal(proxyRunsForPath(path), true, `${path} must run the proxy`)
+  }
+})
+
+test('MATCHER: only true static assets are excluded from the proxy', () => {
+  for (const path of [
+    '/_next/static/chunk-abc.js', '/_next/image', '/favicon.ico',
+    '/logo.svg', '/photo.png', '/pic.jpeg', '/anim.gif', '/img.webp',
+  ]) {
+    assert.equal(proxyRunsForPath(path), false, `${path} should be excluded (static asset)`)
+  }
+})
+
+test('BYPASS: a protected page with an image-like suffix but not a static asset still runs', () => {
+  // Only paths ENDING in a real image extension are excluded; a protected
+  // route that merely contains ".png" mid-path is NOT a static asset.
+  assert.equal(proxyRunsForPath('/settings/report.png.data'), true)
+  assert.equal(proxyRunsForPath('/dashboard/pngreport'), true)
 })

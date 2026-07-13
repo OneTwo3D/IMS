@@ -3,7 +3,7 @@ import type { NextRequest } from 'next/server'
 import { auth } from '@/lib/auth'
 import { sessionInvalidLoginReason, type SessionInvalidReason } from '@/lib/auth/session-state'
 import { buildCsp, cspHeaderName, generateNonce, getCspMode } from '@/lib/security/csp'
-import { API_PATH_PREFIX, evaluateProxyAuthz, isPublicProxyPath } from '@/lib/security/proxy-authz'
+import { API_PATH_PREFIX, evaluateProxyAuthz, isPublicProxyPath, PROXY_MATCHER } from '@/lib/security/proxy-authz'
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl
@@ -68,5 +68,5 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)'],
+  matcher: [PROXY_MATCHER],
 }

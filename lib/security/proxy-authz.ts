@@ -22,6 +22,21 @@ export const PUBLIC_PAGE_PATHS = ['/login', '/2fa', '/forgot-password', '/reset-
 /** The API prefix — API routes authenticate themselves (cron secret, session, HMAC), so the page gate skips them. */
 export const API_PATH_PREFIX = '/api/'
 
+/**
+ * The proxy's Next.js matcher — which requests the middleware even RUNS on.
+ * This is the OUTER bypass surface (muid / the Next advisories): a protected
+ * page reached via an alternate App-Router transport (`.rsc`,
+ * `.segments/*.segment.rsc`, root transport) must still be matched so the auth
+ * gate runs; only true static assets are excluded. Exported so proxy.ts's
+ * `config.matcher` and the regression test share one source of truth.
+ */
+export const PROXY_MATCHER = '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)'
+
+/** True when the proxy middleware runs for this path (mirrors Next's matcher compilation). */
+export function proxyRunsForPath(pathname: string): boolean {
+  return new RegExp(`^${PROXY_MATCHER}$`).test(pathname)
+}
+
 /** True when the path is a public auth page (exact or sub-path) or an API route. */
 export function isPublicProxyPath(pathname: string): boolean {
   if (pathname.startsWith(API_PATH_PREFIX)) return true
