@@ -527,3 +527,46 @@ test('status: a zero-job runtime header with a non-cron-safe path is unknown, no
   ].join('\n')
   assert.equal(parseOtiCrontabStatus(bad, 'cur').secretMode, 'unknown')
 })
+
+
+// --- Codex r8: in-place replacement + identical signature + %-path -------
+
+test('splice: the managed block keeps its POSITION (before an operator env assignment) (Codex r8)', () => {
+  // Block originally sits between PATH and SHELL. A restrictive SHELL below it
+  // must stay below it — moving the block past SHELL would break every job.
+  const existing = ['PATH=/custom/bin', OTI_CRON_START_MARKER, 'OLD', OTI_CRON_END_MARKER, 'SHELL=/bin/bash', '0 9 * * * below'].join('\n')
+  const out = spliceOtiBlock(existing, [OTI_CRON_START_MARKER, 'NEW', OTI_CRON_END_MARKER]).split('\n')
+  const startAt = out.indexOf(OTI_CRON_START_MARKER)
+  const pathAt = out.indexOf('PATH=/custom/bin')
+  const shellAt = out.indexOf('SHELL=/bin/bash')
+  assert.ok(pathAt < startAt && startAt < shellAt, 'block must stay between PATH and SHELL')
+  assert.match(out.join('\n'), /NEW/)
+  assert.doesNotMatch(out.join('\n'), /OLD/)
+})
+
+test('splice: with no prior block the fresh block is appended after operator lines (Codex r8)', () => {
+  const out = spliceOtiBlock('PATH=/custom/bin\n0 9 * * * op\n', [OTI_CRON_START_MARKER, 'X', OTI_CRON_END_MARKER]).split('\n')
+  assert.ok(out.indexOf('0 9 * * * op') < out.indexOf(OTI_CRON_START_MARKER))
+})
+
+test('splice: repeated saves keep the block position stable and are idempotent (Codex r8)', () => {
+  const block = [OTI_CRON_START_MARKER, 'X', OTI_CRON_END_MARKER]
+  const once = spliceOtiBlock('PATH=/p\n' + block.join('\n') + '\nSHELL=/s\n', block)
+  const twice = spliceOtiBlock(once, block)
+  assert.equal(once, twice)
+})
+
+test('strip: an operator line using --header long form (not -H) is preserved in a malformed tail (Codex r8)', () => {
+  const existing = [
+    OTI_CRON_START_MARKER,
+    '30 * * * * curl --header "Authorization: Bearer $CRON_SECRET" "$BASE_URL/operator-owned"',
+  ].join('\n')  // unclosed
+  const out = stripOtiBlocks(existing)
+  assert.match(out, /operator-owned/)   // --header form is NOT our -H signature
+})
+
+test('status: multi-job runtime block whose path is not cron-safe is unknown (Codex r8)', () => {
+  const cmd = (p: string) => `15 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '${p}' | cut -d= -f2- | tr -d '"') && curl -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/a"`
+  const bad = [OTI_CRON_START_MARKER, 'BASE_URL="x"', cmd('/opt/50%off/.env'), OTI_CRON_END_MARKER, ''].join('\n')
+  assert.equal(parseOtiCrontabStatus(bad, 'cur').secretMode, 'unknown')
+})

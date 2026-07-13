@@ -52,12 +52,21 @@ function isManagedRemnant(line: string): boolean {
  * OUTSIDE any block is always preserved. Shared shape + identical job signature
  * with the installer's awk so both are consistent.
  */
-export function stripOtiBlocks(crontabText: string): string {
-  const lines = crontabText.split('\n')
+/**
+ * Compute which lines to drop when removing OTI content, plus the index of the
+ * FIRST managed marker (where a replacement block should be re-inserted so it
+ * keeps its original position — Codex r8: crontab env assignments like PATH /
+ * SHELL / CRON_TZ apply to the jobs BELOW them, so relocating the block to EOF
+ * could move it past a restrictive operator assignment and silently break every
+ * managed job).
+ */
+function computeOtiDrops(lines: string[]): { drop: boolean[]; firstMarkerLine: number } {
   const drop = new Array<boolean>(lines.length).fill(false)
+  let firstMarkerLine = -1
   let i = 0
   while (i < lines.length) {
     if (START_MARKER_RE.test(lines[i])) {
+      if (firstMarkerLine === -1) firstMarkerLine = i
       // Scan for this block's END, stopping at the next START (which opens a
       // new block). END found → complete block, drop the whole range.
       let j = i + 1
@@ -76,9 +85,28 @@ export function stripOtiBlocks(crontabText: string): string {
       i = j
       continue
     }
-    if (END_MARKER_RE.test(lines[i])) { drop[i] = true } // stray END outside a block
+    if (END_MARKER_RE.test(lines[i])) {
+      if (firstMarkerLine === -1) firstMarkerLine = i
+      drop[i] = true // stray END outside a block
+    }
     i += 1
   }
+  return { drop, firstMarkerLine }
+}
+
+/**
+ * Strip EVERY complete OTI block (START…END pair) and any stray marker,
+ * preserving all other lines verbatim (Codex r5/r6/r7). Handles multiple
+ * blocks, END-before-START, and an unclosed START: its OWN generated remnants
+ * (job lines / header / BASE_URL) are swept so they don't survive as
+ * duplicates, but the sweep is BOUNDED to the malformed region [START ..
+ * next START / EOF) — a genuine operator line, even one matching our signature,
+ * OUTSIDE any block is always preserved. Shared shape + identical job signature
+ * with the installer's awk so both are consistent.
+ */
+export function stripOtiBlocks(crontabText: string): string {
+  const lines = crontabText.split('\n')
+  const { drop } = computeOtiDrops(lines)
   return lines.filter((_, idx) => !drop[idx]).join('\n')
 }
 
@@ -234,16 +262,31 @@ export function buildOtiCrontabBlock(params: {
 }
 
 /**
- * Replace the OTI block, preserving every non-OTI line. Strips ALL existing
- * complete blocks + stray markers first (Codex r5: the old indexOf approach
- * mishandled END-before-START, multiple blocks, and whitespace/CRLF markers —
- * duplicating or corrupting operator lines across repeated saves), then appends
- * the fresh block. Idempotent.
+ * Replace the OTI block, preserving every non-OTI line AND the block's original
+ * POSITION among them (Codex r5/r8): all existing blocks + stray markers are
+ * stripped (handles END-before-START, multiple blocks, whitespace/CRLF markers,
+ * and orphaned remnants), and the fresh block is inserted where the first
+ * managed marker was — so it doesn't jump past an operator PATH/SHELL/CRON_TZ
+ * assignment. If there was no prior block, it's appended at the end. Idempotent.
  */
 export function spliceOtiBlock(existingCrontab: string, blockLines: string[]): string {
-  const preserved = stripOtiBlocks(existingCrontab).replace(/\n+$/, '')
-  const prefix = preserved.length > 0 ? preserved + '\n' : ''
-  return prefix + blockLines.join('\n') + '\n'
+  const lines = existingCrontab.split('\n')
+  const { drop, firstMarkerLine } = computeOtiDrops(lines)
+  const out: string[] = []
+  let inserted = false
+  for (let i = 0; i < lines.length; i += 1) {
+    if (i === firstMarkerLine) { out.push(...blockLines); inserted = true }
+    if (drop[i]) continue
+    out.push(lines[i])
+  }
+  if (!inserted) {
+    // No prior block — append after the operator lines, with a clean separator.
+    while (out.length > 0 && out[out.length - 1] === '') out.pop()
+    out.push(...blockLines)
+  }
+  // Collapse any trailing blank lines the removal left, end with a single \n.
+  while (out.length > 0 && out[out.length - 1] === '') out.pop()
+  return out.join('\n') + '\n'
 }
 
 export type OtiCrontabStatus = {
@@ -320,9 +363,10 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
       } else {
         secretMode = 'unknown'
       }
-    } else if (allRuntime && runtimePaths.size === 1) {
+    } else if (allRuntime && runtimePaths.size === 1 && isCronSafePath([...runtimePaths][0])) {
       // Every job line reads the same .env at runtime (an embedded literal, if
-      // any, is stale leftover and ignored).
+      // any, is stale leftover and ignored). The path must be cron-safe (Codex
+      // r8: a %-path would be split by cron), consistent with the zero-job case.
       secretMode = 'runtime-env'
       runtimeEnvPath = [...runtimePaths][0]
     } else if (embedded && !anyRuntime) {
