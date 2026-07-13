@@ -23,47 +23,63 @@ const START_MARKER_RE = /^# --- OTI CRON START ---[ \t\r]*$/
 const END_MARKER_RE = /^# --- OTI CRON END ---[ \t\r]*$/
 
 /**
- * The unmistakable signature of a job line THIS builder generates — a curl that
- * sends `Authorization: Bearer $CRON_SECRET` to `$BASE_URL/<slug>`. Used to
- * sweep up ORPHANED managed job lines left by an unclosed/mangled block (Codex
- * r6), which the block-range removal alone can't reach. It references our own
- * shell variables, so an operator's own crontab line can't plausibly match.
+ * The exact substring EVERY job line this builder generates contains — a curl
+ * sending `Authorization: Bearer $CRON_SECRET` to `$BASE_URL/<slug>` (both
+ * runtime and embedded modes; the runtime prefix differs but this tail is
+ * identical). The installer's awk uses the IDENTICAL literal via index(), so
+ * the two agree exactly (Codex r7). It references our own shell variables, so
+ * a coincidental operator match is implausible — but the sweep below is still
+ * BOUNDED to a malformed block's region, never global (Codex r7).
  */
-const MANAGED_JOB_LINE_RE = /-H "Authorization: Bearer \$CRON_SECRET" "\$BASE_URL\//
+export const MANAGED_JOB_LINE_SIGNATURE = '-H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/'
+/** Lines the builder emits inside a block besides job lines (header/BASE_URL) — swept in a malformed tail. */
+const MANAGED_META_RE = /^(?:# CRON_SECRET is read from .* at runtime|# Managed by One Two Inventory|BASE_URL=")/
 
 /** The runtime-mode header comment the builder emits, capturing the .env path. */
 const RUNTIME_HEADER_RE = /^# CRON_SECRET is read from (.+?) at runtime/m
 
+function isManagedRemnant(line: string): boolean {
+  return line.includes(MANAGED_JOB_LINE_SIGNATURE) || MANAGED_META_RE.test(line)
+}
+
 /**
- * Strip EVERY complete OTI block (START…END pair), any stray unpaired marker,
- * AND any orphaned managed job line from a crontab, preserving all other lines
- * verbatim (Codex r5/r6). Handles multiple blocks, END-before-START, and an
- * unclosed START — whose own generated job lines are removed by signature so
- * they don't survive as duplicates, while genuine operator lines are kept.
- * Shared shape with the installer's awk reconciliation so both are consistent.
+ * Strip EVERY complete OTI block (START…END pair) and any stray marker,
+ * preserving all other lines verbatim (Codex r5/r6/r7). Handles multiple
+ * blocks, END-before-START, and an unclosed START: its OWN generated remnants
+ * (job lines / header / BASE_URL) are swept so they don't survive as
+ * duplicates, but the sweep is BOUNDED to the malformed region [START ..
+ * next START / EOF) — a genuine operator line, even one matching our signature,
+ * OUTSIDE any block is always preserved. Shared shape + identical job signature
+ * with the installer's awk so both are consistent.
  */
 export function stripOtiBlocks(crontabText: string): string {
   const lines = crontabText.split('\n')
   const drop = new Array<boolean>(lines.length).fill(false)
-  for (let i = 0; i < lines.length; i += 1) {
-    if (!START_MARKER_RE.test(lines[i])) continue
-    // find the next END after this START
-    let j = i + 1
-    while (j < lines.length && !END_MARKER_RE.test(lines[j])) j += 1
-    if (j < lines.length) {
-      for (let k = i; k <= j; k += 1) drop[k] = true
+  let i = 0
+  while (i < lines.length) {
+    if (START_MARKER_RE.test(lines[i])) {
+      // Scan for this block's END, stopping at the next START (which opens a
+      // new block). END found → complete block, drop the whole range.
+      let j = i + 1
+      while (j < lines.length && !END_MARKER_RE.test(lines[j]) && !START_MARKER_RE.test(lines[j])) j += 1
+      if (j < lines.length && END_MARKER_RE.test(lines[j])) {
+        for (let k = i; k <= j; k += 1) drop[k] = true
+        i = j + 1
+        continue
+      }
+      // Unclosed START: drop the marker and, within the malformed tail up to
+      // the next START (or EOF), drop only OUR remnants — keep operator lines.
+      drop[i] = true
+      for (let k = i + 1; k < j; k += 1) {
+        if (END_MARKER_RE.test(lines[k]) || isManagedRemnant(lines[k])) drop[k] = true
+      }
       i = j
+      continue
     }
-    // unclosed START: leave the range; the stray marker is dropped below
+    if (END_MARKER_RE.test(lines[i])) { drop[i] = true } // stray END outside a block
+    i += 1
   }
-  const kept: string[] = []
-  for (let i = 0; i < lines.length; i += 1) {
-    if (drop[i]) continue
-    if (START_MARKER_RE.test(lines[i]) || END_MARKER_RE.test(lines[i])) continue
-    if (MANAGED_JOB_LINE_RE.test(lines[i])) continue   // orphaned managed job line
-    kept.push(lines[i])
-  }
-  return kept.join('\n')
+  return lines.filter((_, idx) => !drop[idx]).join('\n')
 }
 
 // Strict cron expression validation: 5 fields, only digits / * / , / - / /
@@ -296,7 +312,9 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
       if (embedded) {
         secretMode = 'embedded'
         embeddedSecretMatches = currentSecret !== null && embedded[1] === currentSecret
-      } else if (runtimeHeader) {
+      } else if (runtimeHeader && isCronSafePath(runtimeHeader[1])) {
+        // Require a cron-SAFE path (Codex r7): the builder only ever emits one,
+        // so a header whose path isn't cron-safe is hand-mangled → unknown.
         secretMode = 'runtime-env'
         runtimeEnvPath = runtimeHeader[1]
       } else {

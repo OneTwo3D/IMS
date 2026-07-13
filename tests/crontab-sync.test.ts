@@ -475,3 +475,55 @@ test('strip: an operator line that merely mentions Bearer is not our managed sig
   const existing = '0 3 * * * curl -H "Authorization: Bearer mytoken" https://ops.example.com/health'
   assert.equal(stripOtiBlocks(existing), existing)
 })
+
+
+// --- Codex r7: bounded orphan sweep + strict header path ----------------
+
+test('strip: an operator line matching our signature OUTSIDE any block is preserved (Codex r7)', () => {
+  // No block at all — a coincidental operator match must never be stripped.
+  const op = '0 3 * * * curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/operator-owned"'
+  assert.equal(stripOtiBlocks(op), op)
+  // And after a complete block elsewhere, the outside operator line still survives.
+  const withBlock = [op, OTI_CRON_START_MARKER, 'X', OTI_CRON_END_MARKER].join('\n')
+  assert.match(stripOtiBlocks(withBlock), /operator-owned/)
+})
+
+test('strip: an unclosed block sweeps our remnants but keeps an operator line in the tail (Codex r7)', () => {
+  const orphan = '15 * * * *  x && curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/wms-watchdog" >> (log)'
+  const existing = [
+    OTI_CRON_START_MARKER,
+    '# Managed by One Two Inventory — do not edit manually',
+    'BASE_URL="x"',
+    orphan,
+    '0 2 * * * /opt/operator-in-tail.sh',   // operator line inside the malformed tail
+  ].join('\n')
+  const out = stripOtiBlocks(existing)
+  assert.doesNotMatch(out, /wms-watchdog/)          // our orphan removed
+  assert.doesNotMatch(out, /BASE_URL="x"/)          // our remnant removed
+  assert.match(out, /\/opt\/operator-in-tail\.sh/)  // operator line kept
+})
+
+test('strip: a second START after an unclosed one bounds the tail (Codex r7)', () => {
+  const orphan = '15 * * * *  -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/a"'
+  const existing = [
+    OTI_CRON_START_MARKER, orphan,                 // unclosed
+    OTI_CRON_START_MARKER, 'Y', OTI_CRON_END_MARKER, // complete
+    '0 9 * * * /opt/keep.sh',
+  ].join('\n')
+  const out = stripOtiBlocks(existing)
+  assert.doesNotMatch(out, /"\$BASE_URL\/a"/)
+  assert.doesNotMatch(out, /^Y$/m)
+  assert.match(out, /\/opt\/keep\.sh/)
+  assert.doesNotMatch(out, /OTI CRON/)
+})
+
+test('status: a zero-job runtime header with a non-cron-safe path is unknown, not runtime-env (Codex r7)', () => {
+  const bad = [
+    OTI_CRON_START_MARKER,
+    "# CRON_SECRET is read from /opt/o'brien/.env at runtime — rotating it needs no crontab re-sync.",
+    'BASE_URL="x"',
+    OTI_CRON_END_MARKER,
+    '',
+  ].join('\n')
+  assert.equal(parseOtiCrontabStatus(bad, 'cur').secretMode, 'unknown')
+})

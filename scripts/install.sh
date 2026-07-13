@@ -983,34 +983,55 @@ CRON_JOBS=(
 
 # Preserve the operator's own crontab lines while replacing the managed block
 # and clearing legacy One Two Inventory bootstrap lines, so an upgrade doesn't
-# leave duplicates (onetwo3d-ims-ryxy / Codex r4/r5). Mirrors the app-side
-# stripOtiBlocks (lib/crontab-sync.ts):
+# leave duplicates (onetwo3d-ims-ryxy / Codex r4-r7). Mirrors the app-side
+# stripOtiBlocks (lib/crontab-sync.ts) EXACTLY:
 #   - drops EVERY complete START..END block (markers tolerant of trailing
-#     whitespace/CR), so multiple/whitespace/CRLF blocks don't survive,
-#   - never deletes past an UNCLOSED start marker (no operator data loss),
-#   - strips ONLY our own legacy lines — those curling localhost:APP_PORT/api/
-#     cron/ (an operator's unrelated /api/cron/ on another host/port is kept).
+#     whitespace/CR); a START..next-START without an END is a malformed tail,
+#   - never deletes past an UNCLOSED start marker; within a malformed tail it
+#     drops ONLY our own remnants (job/header/BASE_URL), keeping operator lines,
+#   - a managed job line is our exact generated signature; a legacy line is the
+#     old localhost:APP_PORT/api/cron/ literal — an operator's unrelated line,
+#     even one matching the signature OUTSIDE a block, is always preserved.
 EXISTING_CRON="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
 PRESERVED_CRON="$(printf '%s\n' "${EXISTING_CRON}" | awk -v port="${APP_PORT}" '
   function isStart(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
   function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
+  function isRemnant(x) {
+    managed = "Bearer $CRON_SECRET\" \"$BASE_URL/"   # exact generated job signature
+    legacy = "localhost:" port "/api/cron/"          # old pre-r4 literal-URL format
+    return (index(x, managed) > 0 || index(x, legacy) > 0 \
+      || x ~ /^# CRON_SECRET is read from .* at runtime/ \
+      || x ~ /^# Managed by One Two Inventory/ \
+      || x ~ /^BASE_URL="/)
+  }
   { line[NR] = $0 }
   END {
-    # Pair each START with the next END after it; mark those ranges to drop.
-    for (i = 1; i <= NR; i++) {
+    i = 1
+    while (i <= NR) {
       if (isStart(line[i])) {
-        for (j = i + 1; j <= NR; j++) {
-          if (isEnd(line[j])) { for (k = i; k <= j; k++) drop[k] = 1; i = j; break }
+        # scan for END, stopping at the next START
+        j = i + 1
+        while (j <= NR && !isEnd(line[j]) && !isStart(line[j])) j++
+        if (j <= NR && isEnd(line[j])) {
+          for (k = i; k <= j; k++) drop[k] = 1   # complete block
+          i = j + 1
+          continue
         }
+        # unclosed START: drop marker + our remnants in the tail, keep operator lines
+        drop[i] = 1
+        for (k = i + 1; k < j; k++) if (isEnd(line[k]) || isRemnant(line[k])) drop[k] = 1
+        i = j
+        continue
       }
+      if (isEnd(line[i])) drop[i] = 1   # stray END
+      i++
     }
-    legacy = "localhost:" port "/api/cron/"           # old pre-r4 literal-URL format
-    managed = "Bearer $CRON_SECRET\" \"$BASE_URL/"    # our current managed job signature (matches lib/crontab-sync.ts)
+    # Legacy pre-r4 bootstrap lines predate the markers entirely — strip those
+    # (our own endpoint on our own port) wherever they sit.
+    legacy = "localhost:" port "/api/cron/"
     for (i = 1; i <= NR; i++) {
       if (drop[i]) continue
-      if (isStart(line[i]) || isEnd(line[i])) continue   # stray unpaired marker
-      if (index(line[i], legacy) > 0) continue           # our own legacy bootstrap line
-      if (index(line[i], managed) > 0) continue           # orphaned managed job line (unclosed block)
+      if (index(line[i], legacy) > 0) continue
       print line[i]
     }
   }
