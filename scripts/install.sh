@@ -981,13 +981,33 @@ CRON_JOBS=(
   "*/15 * * * *|delivery-status|Delivery Status Check"
 )
 
-# Preserve any crontab lines the operator has OUTSIDE the OTI markers; replace
-# only the managed block (same splice contract as app/actions/cron.ts).
+# Preserve the operator's own crontab lines while replacing the managed block
+# and clearing any legacy One Two Inventory cron entries, so an upgrade doesn't
+# leave duplicates (onetwo3d-ims-ryxy / Codex r4). awk (not a sed range) so a
+# START marker with no matching END can NOT delete operator lines to EOF:
+#   - drop a COMPLETE START..END block (requires the END),
+#   - drop stray marker lines and any line that curls our /api/cron/ endpoints,
+#   - keep everything else verbatim.
 EXISTING_CRON="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
-PRESERVED_CRON="$(printf '%s\n' "${EXISTING_CRON}" | sed '/# --- OTI CRON START ---/,/# --- OTI CRON END ---/d')"
+PRESERVED_CRON="$(printf '%s\n' "${EXISTING_CRON}" | awk '
+  { line[NR] = $0
+    if ($0 == "# --- OTI CRON START ---" && startln == 0) startln = NR
+    if ($0 == "# --- OTI CRON END ---" && startln > 0 && NR > startln && endln == 0) endln = NR
+  }
+  END {
+    complete = (startln > 0 && endln > 0)   # only drop a COMPLETE range
+    for (i = 1; i <= NR; i++) {
+      if (complete && i >= startln && i <= endln) continue
+      if (line[i] == "# --- OTI CRON START ---" || line[i] == "# --- OTI CRON END ---") continue
+      if (line[i] ~ /\/api\/cron\//) continue   # legacy unmarked One Two Inventory job line
+      print line[i]
+    }
+  }
+')"
 
 {
-  printf '%s\n' "${PRESERVED_CRON}"
+  # Emit preserved operator lines only when non-empty (avoid a leading blank).
+  [[ -n "${PRESERVED_CRON//[$'\n']/}" ]] && printf '%s\n' "${PRESERVED_CRON}"
   echo "# --- OTI CRON START ---"
   echo "# Managed by One Two Inventory — do not edit manually"
   echo "# CRON_SECRET is read from ${CRON_ENV_FILE} at runtime — rotating it needs no crontab re-sync."

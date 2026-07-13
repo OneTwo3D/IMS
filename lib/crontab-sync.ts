@@ -80,6 +80,17 @@ export function isCronSafePath(filePath: string): boolean {
 }
 
 /**
+ * A secret is safe to embed as `CRON_SECRET="…"` only if it can't break out of
+ * that double-quoted crontab env-assignment (Codex r4): a `"` closes the quote,
+ * a backslash/backtick/`$` can inject, and CR/LF splits the crontab into new
+ * lines. Installer secrets are hex (openssl rand) so this never trips in
+ * practice; it guards a hand-set secret from corrupting the whole crontab.
+ */
+export function isCrontabEmbeddableSecret(secret: string): boolean {
+  return !/["\\`$\r\n]/.test(secret)
+}
+
+/**
  * Runtime secret read for a cron job line: greps the CRON_SECRET line out of
  * the app's .env when the job FIRES, so a secret rotation (env edit + service
  * restart) needs no crontab re-sync. tr strips optional double quotes — the
@@ -107,6 +118,9 @@ export function buildOtiCrontabBlock(params: {
   }
   if (!isCronSafePath(logPath)) {
     return { ok: false, error: 'Cron log path contains characters cron cannot carry safely (quote, %, or control characters).' }
+  }
+  if (secretRef.kind === 'literal' && !isCrontabEmbeddableSecret(secretRef.secret)) {
+    return { ok: false, error: 'Cron secret contains characters that cannot be safely embedded in the crontab (quote, backslash, backtick, $, or newline); rotate to a hex/base64 secret.' }
   }
 
   const lines: string[] = [
@@ -202,10 +216,10 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
     : crontabText
 
   const isJobLine = (line: string) => (/\/api\/cron\//.test(line) || /\$BASE_URL\//.test(line)) && !line.trim().startsWith('#')
-  // The runtime extraction command, anchored to the START of a job line so a
-  // commented-out or truncated occurrence can't be mistaken for a live one
-  // (Codex r3).
-  const RUNTIME_CMD = /CRON_SECRET=\$\(grep -m1 '\^CRON_SECRET=' '([^']*)'/
+  // The FULL extraction pipeline with a NON-EMPTY path (Codex r3/r4): matching
+  // only the leading `grep` fragment misclassified a decoy like
+  // `echo "CRON_SECRET=$(grep …)"` and an empty '' path as healthy runtime.
+  const RUNTIME_CMD = /CRON_SECRET=\$\(grep -m1 '\^CRON_SECRET=' '([^']+)' \| cut -d= -f2- \| tr -d '"'\)/
   const blockJobLines = block.split('\n').filter(isJobLine)
   const managedJobCount = blockJobLines.length
   const unmanagedCronApiLines = outside.split('\n').filter(isJobLine).length
@@ -214,29 +228,30 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
   let embeddedSecretMatches: boolean | null = null
   let runtimeEnvPath: string | null = null
   if (blockPresent) {
+    // Classify the JOB LINES' secret source first, so a hybrid block (a
+    // top-level embedded literal AND job lines that read the .env at runtime)
+    // is 'unknown', not falsely healthy (Codex r4).
+    const runtimePaths = new Set<string>()
+    let allRuntime = blockJobLines.length > 0
+    let anyRuntime = false
+    for (const line of blockJobLines) {
+      const m = line.match(RUNTIME_CMD)
+      if (m) { runtimePaths.add(m[1]); anyRuntime = true }
+      else allRuntime = false
+    }
+
     const embedded = block.match(/^CRON_SECRET="(.*)"$/m)
-    if (embedded) {
+    if (allRuntime && runtimePaths.size === 1) {
+      // Every job line reads the same .env at runtime (an embedded literal, if
+      // any, is stale leftover and ignored).
+      secretMode = 'runtime-env'
+      runtimeEnvPath = [...runtimePaths][0]
+    } else if (embedded && !anyRuntime && blockJobLines.length > 0) {
+      // Top-level literal AND every job line uses $CRON_SECRET from it.
       secretMode = 'embedded'
       embeddedSecretMatches = currentSecret !== null && embedded[1] === currentSecret
-    } else if (blockJobLines.length > 0) {
-      // Runtime-env ONLY when EVERY job line carries the extraction command and
-      // they all read the SAME .env path (Codex r3: an unanchored single-match
-      // regex accepted mixed / partial / commented blocks as healthy runtime).
-      const paths = new Set<string>()
-      let allRuntime = true
-      for (const line of blockJobLines) {
-        const m = line.match(RUNTIME_CMD)
-        if (m) paths.add(m[1])
-        else allRuntime = false
-      }
-      if (allRuntime && paths.size === 1) {
-        secretMode = 'runtime-env'
-        runtimeEnvPath = [...paths][0]
-      } else {
-        secretMode = 'unknown'
-      }
     } else {
-      // Block present but no job lines and no embedded literal — malformed.
+      // Mixed, partial, empty, or otherwise unrecognizable — malformed.
       secretMode = 'unknown'
     }
   }

@@ -4,6 +4,7 @@ import {
   buildOtiCrontabBlock,
   emulateRuntimeSecretExtraction,
   isCronSafePath,
+  isCrontabEmbeddableSecret,
   parseOtiCrontabStatus,
   spliceOtiBlock,
   DEFAULT_CRON_LOG_PATH,
@@ -297,4 +298,78 @@ test('status: a commented-out runtime command does not classify a block as runti
   // no live job lines, no embedded literal, commented command ignored
   assert.equal(status.secretMode, 'unknown')
   assert.equal(status.managedJobCount, 0)
+})
+
+
+// --- Codex r4: literal-secret safety + tighter runtime classification ---
+
+test('build: a literal secret that could break out of the crontab quote is rejected (Codex r4)', () => {
+  for (const bad of ['abc"def', 'abc\\def', 'abc`id`', 'abc$x', 'abc\nrm -rf /']) {
+    const result = buildOtiCrontabBlock({
+      jobs: [JOB],
+      settings: new Map([['cron_wms_watchdog_enabled', 'true']]),
+      secretRef: { kind: 'literal', secret: bad },
+      baseUrl: BASE,
+    })
+    assert.equal(result.ok, false, `secret ${JSON.stringify(bad)} should be rejected`)
+  }
+  assert.equal(isCrontabEmbeddableSecret('a1b2c3d4e5f6'), true)
+  assert.equal(isCrontabEmbeddableSecret('has"quote'), false)
+})
+
+test('status: a decoy echo of the grep fragment is NOT classified runtime-env (Codex r4)', () => {
+  const decoy = [
+    OTI_CRON_START_MARKER,
+    'BASE_URL="x"',
+    // contains the leading grep fragment but not the full extraction pipeline
+    "15 * * * *  echo \"CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/a/.env')\" && curl \"$BASE_URL/api/cron/a\"",
+    OTI_CRON_END_MARKER,
+    '',
+  ].join('\n')
+  const status = parseOtiCrontabStatus(decoy, 'current')
+  assert.equal(status.secretMode, 'unknown')
+})
+
+test('status: an embedded literal does NOT short-circuit — all-runtime job lines classify runtime-env and get path-verified (Codex r4)', () => {
+  const hybrid = [
+    OTI_CRON_START_MARKER,
+    'CRON_SECRET="stale-leftover"',
+    'BASE_URL="x"',
+    "15 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/a/.env' | cut -d= -f2- | tr -d '\"') && curl \"$BASE_URL/api/cron/a\"",
+    OTI_CRON_END_MARKER,
+    '',
+  ].join('\n')
+  const status = parseOtiCrontabStatus(hybrid, 'current')
+  // NOT falsely 'embedded/healthy' off the stale literal — the job line reads
+  // the .env at runtime, so we classify runtime-env and verify that path.
+  assert.equal(status.secretMode, 'runtime-env')
+  assert.equal(status.runtimeEnvPath, '/a/.env')
+})
+
+test('status: a truly mixed block (embedded literal + DIFFERING runtime paths) is unknown (Codex r4)', () => {
+  const mixed = [
+    OTI_CRON_START_MARKER,
+    'CRON_SECRET="current"',
+    'BASE_URL="x"',
+    "15 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/a/.env' | cut -d= -f2- | tr -d '\"') && curl \"$BASE_URL/api/cron/a\"",
+    "30 * * * *  CRON_SECRET=$(grep -m1 '^CRON_SECRET=' '/b/.env' | cut -d= -f2- | tr -d '\"') && curl \"$BASE_URL/api/cron/b\"",
+    OTI_CRON_END_MARKER,
+    '',
+  ].join('\n')
+  const status = parseOtiCrontabStatus(mixed, 'current')
+  assert.equal(status.secretMode, 'unknown')
+})
+
+test('status: a clean embedded block (literal + $CRON_SECRET job lines) is still classified embedded (Codex r4)', () => {
+  const embedded = [
+    OTI_CRON_START_MARKER,
+    'CRON_SECRET="current"',
+    'BASE_URL="x"',
+    '15 * * * *  curl -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/api/cron/a"',
+    OTI_CRON_END_MARKER,
+    '',
+  ].join('\n')
+  const status = parseOtiCrontabStatus(embedded, 'current')
+  assert.equal(status.secretMode, 'embedded')
+  assert.equal(status.embeddedSecretMatches, true)
 })
