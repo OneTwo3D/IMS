@@ -44,9 +44,11 @@ test('buildCsp allows eval and websockets only in development', () => {
   assert.match(dev, /connect-src [^;]*ws:/)
 })
 
-test('buildCsp allows the flag CDN for country-flag images (4jl5 enforce-ready)', () => {
+test('buildCsp allows any HTTPS image so external product/logo/avatar URLs render under enforce (4jl5)', () => {
   const csp = buildCsp('n', false)
-  assert.match(csp, /img-src [^;]*https:\/\/flagcdn\.com/)
+  assert.match(csp, /img-src 'self' data: blob: https:/)
+  // still excludes plain http (upgrade-insecure-requests handles legacy urls)
+  assert.doesNotMatch(csp, /img-src [^;]*\bhttp:/)
 })
 
 test('buildCsp gates Turnstile origin behind the enabled flag (frame-src + connect-src)', () => {

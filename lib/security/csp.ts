@@ -42,8 +42,6 @@ export function cspHeaderName(mode: Exclude<CspMode, 'off'>): string {
  * evaluate code) and websocket connect (HMR). Production omits both.
  */
 
-/** Static flag-image CDN used for country flags on sales pages (img-src). */
-export const FLAG_CDN_ORIGIN = 'https://flagcdn.com'
 /** Cloudflare Turnstile origin — its challenge iframe (frame-src) and telemetry (connect-src) when the widget is enabled. */
 export const TURNSTILE_ORIGIN = 'https://challenges.cloudflare.com'
 
@@ -76,7 +74,12 @@ export function buildCsp(nonce: string, isDev: boolean, options: BuildCspOptions
     // all injected styles, so styles use 'unsafe-inline' (styles are a far
     // weaker XSS vector than scripts).
     `style-src 'self' 'unsafe-inline'`,
-    `img-src 'self' data: blob: ${FLAG_CDN_ORIGIN}`,
+    // Images are a weak XSS vector (they can't execute script), and IMS renders
+    // arbitrary image URLs by design — WooCommerce product-image URLs, and
+    // operator-entered product/logo/avatar URLs — so any HTTPS image is allowed
+    // (Codex: 'self'-only would break product imagery everywhere under enforce).
+    // upgrade-insecure-requests upgrades any legacy http: image URL to https.
+    `img-src 'self' data: blob: https:`,
     `font-src 'self' data:`,
     `connect-src ${connectSrc.join(' ')}`,
     `object-src 'none'`,
