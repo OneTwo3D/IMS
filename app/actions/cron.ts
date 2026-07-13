@@ -89,7 +89,8 @@ export async function syncCrontab(): Promise<{ success: boolean; error?: string 
   })
   const settings = new Map(rows.map((r) => [r.key, r.value]))
 
-  const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl })
+  const logPath = process.env.OTI_CRON_LOG_PATH?.trim() || undefined
+  const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl, logPath })
   if (!block.ok) return { success: false, error: block.error }
 
   const existingCrontab = await readOwnCrontab()
@@ -149,10 +150,12 @@ export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
 
   // Runtime-env blocks can drift too (Codex): an edited-but-not-restarted .env
   // or a service-manager override makes the pipeline yield a value the app no
-  // longer accepts. Re-run the emulation against the current .env.
+  // longer accepts. Re-run the emulation against the .env path the cron line
+  // ACTUALLY reads (Codex r2: checking process.cwd()/.env could report a block
+  // pointing at a stale/other path as healthy).
   let runtimeSecretMatches: boolean | null = null
-  if (status.secretMode === 'runtime-env' && secret) {
-    const envFilePath = path.join(process.cwd(), '.env')
+  if (status.secretMode === 'runtime-env' && status.runtimeEnvPath && secret) {
+    const envFilePath = status.runtimeEnvPath
     try {
       runtimeSecretMatches = existsSync(envFilePath)
         ? emulateRuntimeSecretExtraction(readFileSync(envFilePath, 'utf8')) === secret

@@ -2,8 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   buildOtiCrontabBlock,
+  emulateRuntimeSecretExtraction,
+  isCronSafePath,
   parseOtiCrontabStatus,
   spliceOtiBlock,
+  DEFAULT_CRON_LOG_PATH,
   OTI_CRON_START_MARKER,
   OTI_CRON_END_MARKER,
   type CrontabJobDef,
@@ -119,7 +122,6 @@ test('status: missing block reports absent with no secret mode', () => {
 // --- Codex r1: runtime-mode safety --------------------------------------
 
 test('emulate: mirrors the shell pipeline for the formats it must handle', () => {
-  const { emulateRuntimeSecretExtraction } = require('../lib/crontab-sync.ts') as typeof import('../lib/crontab-sync.ts')
   // plain and double-quoted values yield the clean secret
   assert.equal(emulateRuntimeSecretExtraction('CRON_SECRET=abc123\nOTHER=x\n'), 'abc123')
   assert.equal(emulateRuntimeSecretExtraction('CRON_SECRET="abc123"\n'), 'abc123')
@@ -149,7 +151,6 @@ test('build: runtime job lines guard against empty extraction ([ -n ]) so no emp
 })
 
 test('build: env paths with cron-special characters are rejected', () => {
-  const { isCronSafePath } = require('../lib/crontab-sync.ts') as typeof import('../lib/crontab-sync.ts')
   assert.equal(isCronSafePath('/opt/app/.env'), true)
   assert.equal(isCronSafePath('/opt/50%off/.env'), false)
   assert.equal(isCronSafePath("/opt/o'brien/.env"), false)
@@ -176,4 +177,68 @@ test('status: parser counts the builder\'s own job lines (round-trip)', () => {
   assert.equal(status.secretMode, 'runtime-env')
   assert.equal(status.managedJobCount, 1)
   assert.equal(status.unmanagedCronApiLines, 0)
+})
+
+
+// --- Codex r2: pipeline equivalence, status precision, log path ----------
+
+test('emulate: binary (NUL-containing) .env is refused so runtime mode is never chosen (Codex r2)', () => {
+  // GNU grep prints "Binary file … matches" for NUL content — the pipeline
+  // then diverges from process.env, so the emulation must return null.
+  assert.equal(emulateRuntimeSecretExtraction('CRON_SECRET=abc\n\0junk\n'), null)
+  assert.equal(emulateRuntimeSecretExtraction('\0\nCRON_SECRET=abc\n'), null)
+})
+
+test('build: the cron log path defaults to the installer-owned LOG_DIR and is overridable (Codex r2)', () => {
+  const def = buildOtiCrontabBlock({
+    jobs: [JOB],
+    settings: new Map([['cron_wms_watchdog_enabled', 'true']]),
+    secretRef: { kind: 'literal', secret: 's' },
+    baseUrl: BASE,
+  })
+  assert.ok(def.ok)
+  assert.ok(def.lines.join('\n').includes(`>> ${DEFAULT_CRON_LOG_PATH} 2>&1`))
+  assert.doesNotMatch(def.lines.join('\n'), /\/var\/log\/oti-cron\.log/)
+
+  const custom = buildOtiCrontabBlock({
+    jobs: [JOB],
+    settings: new Map([['cron_wms_watchdog_enabled', 'true']]),
+    secretRef: { kind: 'literal', secret: 's' },
+    baseUrl: BASE,
+    logPath: '/srv/logs/cron.log',
+  })
+  assert.ok(custom.ok)
+  assert.match(custom.lines.join('\n'), />> \/srv\/logs\/cron\.log 2>&1/)
+
+  // an unsafe log path is rejected, not written
+  const bad = buildOtiCrontabBlock({
+    jobs: [JOB],
+    settings: new Map([['cron_wms_watchdog_enabled', 'true']]),
+    secretRef: { kind: 'literal', secret: 's' },
+    baseUrl: BASE,
+    logPath: '/srv/50%/cron.log',
+  })
+  assert.equal(bad.ok, false)
+})
+
+test('status: runtime-env exposes the ACTUAL .env path the cron line reads (Codex r2)', () => {
+  const built = buildOtiCrontabBlock({
+    jobs: [JOB],
+    settings: new Map([['cron_wms_watchdog_enabled', 'true']]),
+    secretRef: { kind: 'env-file', envFilePath: '/etc/ims/.env' },
+    baseUrl: BASE,
+  })
+  assert.ok(built.ok)
+  const status = parseOtiCrontabStatus(built.lines.join('\n') + '\n', 's')
+  assert.equal(status.secretMode, 'runtime-env')
+  assert.equal(status.runtimeEnvPath, '/etc/ims/.env')
+})
+
+test('status: a block with neither embedded literal nor runtime command is unknown/malformed (Codex r2)', () => {
+  const malformed = `${OTI_CRON_START_MARKER}\nBASE_URL="x"\n15 * * * * curl "$BASE_URL/api/cron/x"\n${OTI_CRON_END_MARKER}\n`
+  const status = parseOtiCrontabStatus(malformed, 'current')
+  assert.equal(status.blockPresent, true)
+  assert.equal(status.secretMode, 'unknown')
+  assert.equal(status.runtimeEnvPath, null)
+  assert.equal(status.embeddedSecretMatches, null)
 })

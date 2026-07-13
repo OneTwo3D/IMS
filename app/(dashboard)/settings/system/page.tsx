@@ -67,6 +67,8 @@ export default async function SystemSettingsPage({
       crontabWarnings.push('The crontab has a STALE embedded CRON_SECRET — every managed job is failing auth with silent 401s. Save the scheduler settings to re-sync it.')
     } else if (crontabStatus.secretMode === 'runtime-env' && crontabStatus.runtimeSecretMatches === false) {
       crontabWarnings.push('The .env CRON_SECRET no longer matches the running service — scheduled jobs are failing auth. Restart the service after rotating the secret (or fix the .env), then re-save the scheduler settings.')
+    } else if (crontabStatus.secretMode === 'unknown') {
+      crontabWarnings.push('The managed crontab block is malformed (no recognizable CRON_SECRET source) — it was likely hand-edited. Save the scheduler settings to rewrite it.')
     }
     if (crontabStatus.unmanagedCronApiLines > 0) {
       crontabWarnings.push(`${crontabStatus.unmanagedCronApiLines} cron line(s) outside the managed block call /api/cron/ endpoints — they duplicate managed jobs and drift on secret rotation. Consolidate them into the managed block.`)

@@ -23,8 +23,9 @@ export async function verifyCron(request: Request): Promise<NextResponse | null>
     // ryxy: rejected cron auth was COMPLETELY silent (curl -sf on the caller
     // side, nothing app-side) — a stale rotated secret 401'd every scheduled
     // job for months unnoticed. Surface it in the activity log, throttled per
-    // route so a misconfigured scheduler can't flood the log.
-    await logCronAuthRejected(request)
+    // route so a misconfigured scheduler can't flood the log. Fire-and-forget
+    // (Codex r2): the 401 must never wait on — or stall behind — logging.
+    void logCronAuthRejected(request)
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
@@ -49,6 +50,13 @@ export async function verifyCron(request: Request): Promise<NextResponse | null>
 }
 
 const CRON_AUTH_REJECT_LOG_INTERVAL_MS = 60 * 60_000
+// Process-local throttle (Codex r2): deliberately NOT the shared rate-limit
+// backend — that put a Redis round trip on the hot 401-reject path (latency
+// under a black-holed Redis) and its fail-open defeated the throttle during an
+// outage. Per-replica 1/route/hour is the right bound for an advisory WARNING;
+// the static cron route set keeps the Map bounded. The timestamp is committed
+// only AFTER a confirmed write, so a failed insert doesn't suppress the hour.
+const lastRejectLogAt = new Map<string, number>()
 
 async function logCronAuthRejected(request: Request): Promise<void> {
   let pathname = 'unknown'
@@ -57,26 +65,22 @@ async function logCronAuthRejected(request: Request): Promise<void> {
   } catch {
     // keep 'unknown'
   }
-  // Throttle through the shared rate-limit backend (cluster-wide when Redis is
-  // configured, per-process memory otherwise — Codex: a module-level Map was
-  // one warning per replica per route). A failed logActivity write still
-  // consumes the slot; acceptable for an advisory WARNING.
+  const now = Date.now()
+  if (now - (lastRejectLogAt.get(pathname) ?? 0) < CRON_AUTH_REJECT_LOG_INTERVAL_MS) return
   try {
-    const { checkRateLimit } = await import('@/lib/rate-limit')
-    const gate = await checkRateLimit(`cron-auth-reject-log:${pathname}`, 1, CRON_AUTH_REJECT_LOG_INTERVAL_MS)
-    if (!gate.allowed) return
-  } catch {
-    return
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'system',
+      action: 'cron_auth_rejected',
+      level: 'WARNING',
+      description: `Cron request to ${pathname} rejected — bad or missing bearer secret. If this repeats hourly, the crontab's CRON_SECRET is stale (rotate drift): re-sync the scheduler in Settings → System → Scheduler.`,
+      metadata: { pathname },
+      resolveUser: false,
+    })
+    lastRejectLogAt.set(pathname, now)
+  } catch (error) {
+    console.error('[cron-auth] failed to log rejected cron request', error)
   }
-  await logActivity({
-    entityType: 'SYSTEM',
-    tag: 'system',
-    action: 'cron_auth_rejected',
-    level: 'WARNING',
-    description: `Cron request to ${pathname} rejected — bad or missing bearer secret. If this repeats hourly, the crontab's CRON_SECRET is stale (rotate drift): re-sync the scheduler in Settings → System → Scheduler.`,
-    metadata: { pathname },
-    resolveUser: false,
-  })
 }
 
 function bearerMatches(provided: string, expected: string): boolean {

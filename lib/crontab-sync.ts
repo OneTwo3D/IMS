@@ -32,6 +32,15 @@ export type CrontabSecretRef =
   | { kind: 'env-file'; envFilePath: string }
   | { kind: 'literal'; secret: string }
 
+/**
+ * Default cron log path — the installer creates and chowns `/var/log/
+ * one-two-inventory` to the app user and logrotates `*.log` there (Codex r2:
+ * the old `/var/log/oti-cron.log` sat in root-owned /var/log, so the append
+ * redirect failed BEFORE curl ran on a clean install). Overridable via
+ * OTI_CRON_LOG_PATH for non-standard deployments.
+ */
+export const DEFAULT_CRON_LOG_PATH = '/var/log/one-two-inventory/cron.log'
+
 export type BuildOtiCrontabBlockResult =
   | { ok: true; lines: string[] }
   | { ok: false; error: string }
@@ -46,6 +55,11 @@ export type BuildOtiCrontabBlockResult =
  * corrupted bearer). Returns null when no line matches.
  */
 export function emulateRuntimeSecretExtraction(envFileContent: string): string | null {
+  // GNU grep treats input containing a NUL as binary and prints only "Binary
+  // file … matches" instead of the line — the pipeline then yields the wrong
+  // value (Codex r2). Refuse to match binary content so runtime mode is never
+  // chosen when the real shell pipeline would diverge; literal mode is used.
+  if (envFileContent.includes('\u0000')) return null
   // grep '^CRON_SECRET=' matches per \n-separated line; a CRLF file keeps its \r
   // (so equality with the clean process value fails → literal fallback).
   const line = envFileContent.split('\n').find((entry) => entry.startsWith('CRON_SECRET='))
@@ -62,7 +76,6 @@ export function emulateRuntimeSecretExtraction(envFileContent: string): string |
  * the single quote our shell quoting relies on.
  */
 export function isCronSafePath(filePath: string): boolean {
-  // eslint-disable-next-line no-control-regex
   return !/['%\u0000-\u001f\u007f]/.test(filePath)
 }
 
@@ -84,11 +97,16 @@ export function buildOtiCrontabBlock(params: {
   settings: Map<string, string>
   secretRef: CrontabSecretRef
   baseUrl: string
+  logPath?: string
 }): BuildOtiCrontabBlockResult {
   const { jobs, settings, secretRef, baseUrl } = params
+  const logPath = params.logPath ?? DEFAULT_CRON_LOG_PATH
 
   if (secretRef.kind === 'env-file' && !isCronSafePath(secretRef.envFilePath)) {
     return { ok: false, error: 'App .env path contains characters cron cannot carry safely (quote, %, or control characters).' }
+  }
+  if (!isCronSafePath(logPath)) {
+    return { ok: false, error: 'Cron log path contains characters cron cannot carry safely (quote, %, or control characters).' }
   }
 
   const lines: string[] = [
@@ -123,7 +141,7 @@ export function buildOtiCrontabBlock(params: {
 
     lines.push(
       `# ${job.label}`,
-      `${schedule}  ${commandPrefix}curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/${job.slug}" >> /var/log/oti-cron.log 2>&1`,
+      `${schedule}  ${commandPrefix}curl -sf -o /dev/null -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/${job.slug}" >> ${logPath} 2>&1`,
       '',
     )
   }
@@ -153,10 +171,16 @@ export function spliceOtiBlock(existingCrontab: string, blockLines: string[]): s
 
 export type OtiCrontabStatus = {
   blockPresent: boolean
-  /** How the block sources its secret; 'none' when no block exists. */
-  secretMode: 'runtime-env' | 'embedded' | 'none'
+  /**
+   * How the block sources its secret. 'none' = no block; 'unknown' = a block
+   * exists but has neither an embedded literal nor a runtime extraction
+   * command (malformed/hand-edited — Codex r2).
+   */
+  secretMode: 'runtime-env' | 'embedded' | 'unknown' | 'none'
   /** Embedded mode only: does the literal match the CURRENT env secret? null otherwise. */
   embeddedSecretMatches: boolean | null
+  /** Runtime-env mode only: the .env path the cron command actually reads (so the caller checks the RIGHT file, not an assumed cwd). null otherwise. */
+  runtimeEnvPath: string | null
   /** Managed job lines inside the block. */
   managedJobCount: number
   /** Cron-API job lines OUTSIDE the markers — a legacy/hand-written block that will drift (ryxy). */
@@ -180,15 +204,24 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
 
   let secretMode: OtiCrontabStatus['secretMode'] = 'none'
   let embeddedSecretMatches: boolean | null = null
+  let runtimeEnvPath: string | null = null
   if (blockPresent) {
     const embedded = block.match(/^CRON_SECRET="(.*)"$/m)
+    // Only classify runtime-env when the block ACTUALLY contains the runtime
+    // extraction command (Codex r2): an empty or hand-mangled block must not
+    // masquerade as a healthy runtime block. Capture the exact .env path the
+    // command reads so the caller re-checks the RIGHT file.
+    const runtimeMatch = block.match(/CRON_SECRET=\$\(grep -m1 '\^CRON_SECRET=' '([^']*)'/)
     if (embedded) {
       secretMode = 'embedded'
       embeddedSecretMatches = currentSecret !== null && embedded[1] === currentSecret
-    } else {
+    } else if (runtimeMatch) {
       secretMode = 'runtime-env'
+      runtimeEnvPath = runtimeMatch[1]
+    } else {
+      secretMode = 'unknown'
     }
   }
 
-  return { blockPresent, secretMode, embeddedSecretMatches, managedJobCount, unmanagedCronApiLines }
+  return { blockPresent, secretMode, embeddedSecretMatches, runtimeEnvPath, managedJobCount, unmanagedCronApiLines }
 }
