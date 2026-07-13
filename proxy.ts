@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { auth } from '@/lib/auth'
-import { sessionInvalidLoginReason } from '@/lib/auth/session-state'
+import { sessionInvalidLoginReason, type SessionInvalidReason } from '@/lib/auth/session-state'
 import { buildCsp, cspHeaderName, generateNonce, getCspMode } from '@/lib/security/csp'
+import { API_PATH_PREFIX, evaluateProxyAuthz, isPublicProxyPath } from '@/lib/security/proxy-authz'
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl
@@ -10,7 +11,7 @@ export async function proxy(request: NextRequest) {
   // Per-request nonce + CSP for HTML responses. API routes return JSON and get
   // the static headers from next.config.ts instead; static assets are excluded
   // by the matcher below.
-  const isApiRoute = pathname.startsWith('/api/')
+  const isApiRoute = pathname.startsWith(API_PATH_PREFIX)
   const cspMode = getCspMode()
   const nonce = generateNonce()
   const csp = cspMode === 'off' || isApiRoute
@@ -33,41 +34,37 @@ export async function proxy(request: NextRequest) {
     return withCsp(NextResponse.next({ request: { headers: requestHeaders } }))
   }
 
+  const redirectToLogin = (invalidReason: SessionInvalidReason | null): NextResponse => {
+    const loginUrl = new URL('/login', request.url)
+    loginUrl.searchParams.set('callbackUrl', pathname)
+    if (invalidReason) loginUrl.searchParams.set('reason', sessionInvalidLoginReason(invalidReason))
+    return withCsp(NextResponse.redirect(loginUrl))
+  }
+
   // Public routes — skip the auth check but still emit CSP on HTML.
-  const isAuthPage =
-    pathname.startsWith('/login') ||
-    pathname.startsWith('/2fa') ||
-    pathname.startsWith('/forgot-password') ||
-    pathname.startsWith('/reset-password')
+  if (isPublicProxyPath(pathname)) return passThrough()
 
-  if (isAuthPage || isApiRoute) return passThrough()
-
-  // Wrap auth() in try/catch — if JWT is corrupt/expired, redirect to login
-  // instead of showing a generic error page
+  // Wrap auth() in try/catch — if the JWT is corrupt/expired, redirect to login
+  // instead of showing a generic error page.
   let session
   try {
     session = await auth()
   } catch {
-    const loginUrl = new URL('/login', request.url)
-    loginUrl.searchParams.set('callbackUrl', pathname)
-    return withCsp(NextResponse.redirect(loginUrl))
+    return redirectToLogin(null)
   }
 
-  if (!session?.user || session.user.sessionInvalidReason) {
-    const loginUrl = new URL('/login', request.url)
-    loginUrl.searchParams.set('callbackUrl', pathname)
-    if (session?.user?.sessionInvalidReason) {
-      loginUrl.searchParams.set('reason', sessionInvalidLoginReason(session.user.sessionInvalidReason))
-    }
-    return withCsp(NextResponse.redirect(loginUrl))
+  // Authorization decision (lib/security/proxy-authz.ts — unit-tested against
+  // proxy-bypass request shapes, onetwo3d-ims-muid).
+  const decision = evaluateProxyAuthz(pathname, session)
+  switch (decision.action) {
+    case 'redirect-login':
+      return redirectToLogin(decision.invalidReason)
+    case 'redirect-2fa':
+      return withCsp(NextResponse.redirect(new URL('/2fa', request.url)))
+    case 'public':
+    case 'allow':
+      return passThrough()
   }
-
-  // 2FA gate: if TOTP is enabled but not yet verified in this session, send to /2fa
-  if (session.user.totpEnabled && !session.user.totpVerified && pathname !== '/2fa') {
-    return withCsp(NextResponse.redirect(new URL('/2fa', request.url)))
-  }
-
-  return passThrough()
 }
 
 export const config = {
