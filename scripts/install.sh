@@ -981,8 +981,10 @@ CRON_JOBS=(
   "*/15 * * * *|delivery-status|Delivery Status Check"
 )
 
-# Build the fresh managed block into a temp file.
-CRON_BLOCK_FILE="$(mktemp)"
+# Build the fresh managed block into a temp file (cleaned up on ANY exit —
+# Codex r9: the temp file must not leak if the pipeline below fails).
+CRON_BLOCK_FILE="$(mktemp -t oti-cron.XXXXXX)"
+trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 {
   echo "# --- OTI CRON START ---"
   echo "# Managed by One Two Inventory — do not edit manually"
@@ -1010,7 +1012,9 @@ CRON_BLOCK_FILE="$(mktemp)"
 #     preserved; legacy pre-marker localhost:APP_PORT/api/cron/ lines are cleared,
 #   - the fresh block is re-inserted where the first managed marker was (NOT at
 #     EOF), so it never jumps past an operator PATH/SHELL/CRON_TZ assignment.
-crontab -u "${APP_USER}" -l 2>/dev/null | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" '
+# `|| true` so a fresh box with NO existing crontab (crontab -l exits nonzero)
+# doesn't trip `set -euo pipefail` and abort the install (Codex r9).
+{ crontab -u "${APP_USER}" -l 2>/dev/null || true; } | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" '
   function isStart(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
   function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
   function isRemnant(x) {
@@ -1050,6 +1054,7 @@ crontab -u "${APP_USER}" -l 2>/dev/null | awk -v port="${APP_PORT}" -v blockfile
   }
 ' | crontab -u "${APP_USER}" -
 rm -f "${CRON_BLOCK_FILE}"
+trap - EXIT   # risky window over; drop the cleanup trap
 
 success "Cron jobs configured:"
 echo "  - 02:00 Daily scheduled backup (if enabled in settings)"
