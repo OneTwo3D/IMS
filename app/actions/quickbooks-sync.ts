@@ -193,7 +193,10 @@ export async function connectQuickBooks(
     if (!publicAppUrl) {
       return { success: false, error: 'Public app URL is not configured.' }
     }
-    const redirectUri = `${publicAppUrl}/api/accounting/callback`
+    // Normalized so the redirect_uri EXACTLY matches the one the callback sends
+    // at token exchange (qye3/Codex: raw concat vs the callback's origin-based
+    // form diverged for uppercase hosts, explicit :443, etc., breaking OAuth).
+    const redirectUri = new URL('/api/accounting/callback', publicAppUrl).toString()
     const authUrl = await getAuthorizationUrl(clientId, redirectUri, session.user.id, returnPath)
 
     return { success: true, redirectUrl: authUrl }

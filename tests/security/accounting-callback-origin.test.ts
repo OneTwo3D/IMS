@@ -126,6 +126,20 @@ test('resolveAppOrigin returns the NORMALIZED origin for WHATWG-parseable junk (
   assert.equal(resolveAppOrigin('https://ims.example.com/base/path'), CONFIGURED)
 })
 
+test('the callback and authorize redirect_uri agree exactly for tricky-but-valid configs (Codex r5: exact-match)', () => {
+  // Authorize (app/actions/xero-sync.ts, quickbooks-sync.ts) and the callback
+  // token exchange must send the IDENTICAL redirect_uri. Both now normalize via
+  // `new URL('/api/accounting/callback', <configured URL / its origin>)`.
+  for (const cfg of ['https://IMS.EXAMPLE.COM', 'https://ims.example.com:443', 'https://ims.example.com/base', 'https://ims.example.com/']) {
+    const authorizeUri = new URL('/api/accounting/callback', cfg).toString()   // authorize side
+    const origin = resolveAppOrigin(cfg)
+    assert.ok(origin)
+    const callbackUri = new URL('/api/accounting/callback', origin).toString()  // callback side
+    assert.equal(callbackUri, authorizeUri, `redirect_uri mismatch for ${cfg}`)
+    assert.equal(callbackUri, `${CONFIGURED}/api/accounting/callback`)
+  }
+})
+
 test('resolveAppOrigin rejects non-web schemes that parse but have origin "null" (F5)', () => {
   for (const bad of ['data:text/html,x', 'file:///etc/passwd', 'mailto:a@b.c', 'javascript:alert(1)']) {
     assert.equal(resolveAppOrigin(bad), null, `${bad} must not be a usable origin`)
