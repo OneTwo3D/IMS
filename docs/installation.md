@@ -142,11 +142,12 @@ or filesystem paths.
 
 Use the ClamAV **daemon** client `clamdscan`, not the standalone `clamscan`.
 `clamscan` reloads the full (~110 MB+) signature database on every invocation
-(several seconds per scan), which exceeds the 5-second scanner health-check
-budget and makes the preflight fail; `clamdscan` reaches the resident `clamd`
-over its socket and scans in milliseconds. Pass `--fdpass` so `clamd` (running
-as the `clamav` user) can read a quarantine file owned by the IMS service user
-via the passed file descriptor instead of by path. A full deployment and
+(typically several seconds per scan), which can exceed the 5-second scanner
+health-check budget and fail the preflight; `clamdscan` reuses the resident
+`clamd` over its socket, so scans are effectively immediate. Pass `--fdpass` so
+the IMS-spawned `clamdscan` opens the quarantine file (owned `0600` by the IMS
+service user) and hands the descriptor to `clamd`, which otherwise runs as the
+`clamav` user and could not read it by path. A full deployment and
 operational-response runbook — install, signature updates, verification, and the
 handling of infected / timeout / scanner-unavailable outcomes — is in
 [docs/ops/invoice-pdf-malware-scanning.md](ops/invoice-pdf-malware-scanning.md).

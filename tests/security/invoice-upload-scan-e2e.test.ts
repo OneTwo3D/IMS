@@ -56,8 +56,32 @@ async function withUploadSandbox(run: (scannerDir: string) => Promise<void>): Pr
 async function countFiles(dir: string): Promise<number> {
   try {
     return (await readdir(dir)).length
-  } catch {
-    return 0
+  } catch (error) {
+    // Only a non-existent directory counts as "empty". Any other error
+    // (EACCES, EIO, a leftover unreadable dir) must fail the assertion loudly
+    // rather than masquerade as a clean fail-closed result.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0
+    throw error
+  }
+}
+
+/**
+ * A fully explicit, hermetic scanner env. Every FILE_SCAN_* variable is set —
+ * including the ones we don't want — so an ambient value on the host (e.g. a
+ * CI runner with a real ClamAV command configured) can never leak in and cause
+ * the suite to invoke a system scanner instead of its controlled fixture.
+ * FILE_SCAN_COMMAND_ARGV takes priority over FILE_SCAN_COMMAND in file-scan.ts,
+ * so we drive everything through ARGV and blank the legacy string form.
+ */
+function scanEnv(argv: string[], extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
+  return {
+    FILE_SCAN_MODE: 'command',
+    FILE_SCAN_COMMAND_ARGV: JSON.stringify(argv),
+    FILE_SCAN_COMMAND: undefined,
+    FILE_SCAN_NAME: undefined,
+    FILE_SCAN_ENV_ALLOWLIST: undefined,
+    FILE_SCAN_TIMEOUT_MS: undefined,
+    ...extra,
   }
 }
 
@@ -65,7 +89,7 @@ test('E2E: a malicious (EICAR) invoice PDF is quarantined, rejected 400, and del
   await withUploadSandbox(async (dir) => {
     const scanner = await writeEicarScanner(dir)
     const result = await storeInvoicePdfUpload('evil-invoice.pdf', maliciousPdf(), {
-      scan: { env: { FILE_SCAN_MODE: 'command', FILE_SCAN_COMMAND: `${process.execPath} ${scanner} {file}` } },
+      scan: { env: scanEnv([process.execPath, scanner, '{file}']) },
     })
 
     assert.equal(result.ok, false)
@@ -83,7 +107,7 @@ test('E2E: a clean invoice PDF passes the same real scanner and is promoted to t
   await withUploadSandbox(async (dir) => {
     const scanner = await writeEicarScanner(dir)
     const result = await storeInvoicePdfUpload('good-invoice.pdf', cleanPdf(), {
-      scan: { env: { FILE_SCAN_MODE: 'command', FILE_SCAN_COMMAND: `${process.execPath} ${scanner} {file}` } },
+      scan: { env: scanEnv([process.execPath, scanner, '{file}']) },
     })
 
     assert.equal(result.ok, true)
@@ -97,7 +121,7 @@ test('E2E: a clean invoice PDF passes the same real scanner and is promoted to t
 test('E2E: an unavailable scanner fails CLOSED (503) and leaves nothing in the served dir', async () => {
   await withUploadSandbox(async () => {
     const result = await storeInvoicePdfUpload('good-invoice.pdf', cleanPdf(), {
-      scan: { env: { FILE_SCAN_MODE: 'command', FILE_SCAN_COMMAND: '/nonexistent/scanner {file}' } },
+      scan: { env: scanEnv(['/nonexistent/scanner', '{file}']) },
     })
 
     assert.equal(result.ok, false)
@@ -116,7 +140,7 @@ test('E2E: a scanner that times out fails CLOSED (503) and leaves nothing in the
     await writeFile(slow, 'setTimeout(() => process.exit(0), 60_000)\n')
     const result = await storeInvoicePdfUpload('good-invoice.pdf', cleanPdf(), {
       scan: {
-        env: { FILE_SCAN_MODE: 'command', FILE_SCAN_COMMAND: `${process.execPath} ${slow} {file}` },
+        env: scanEnv([process.execPath, slow, '{file}']),
         timeoutMs: 150,
       },
     })
