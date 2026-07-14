@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
@@ -100,17 +99,9 @@ test('END-TO-END: a disabled plugin redirects with the disabled error, still on 
   assert.match(new URL(location(res)).searchParams.get('accounting_error') ?? '', /disabled/)
 })
 
-// --- Codex r2: real-GET wiring guard + null-config exchange + bad scheme ---
-
-test('the exported GET delegates to handleAccountingCallback with the REAL deps (wiring guard, F2)', () => {
-  const src = readFileSync(new URL('../../app/api/accounting/callback/route.ts', import.meta.url), 'utf8')
-  // GET must call handleAccountingCallback with the production getPublicAppUrl +
-  // isIntegrationPluginEnabled, so a revert to inline header-derived logic (that
-  // bypasses the tested handler) is caught here.
-  assert.match(src, /return handleAccountingCallback\(request,\s*\{/)
-  assert.match(src, /getPublicAppUrl,/)
-  assert.match(src, /isPluginEnabled:\s*isIntegrationPluginEnabled/)
-})
+// (The real-GET wiring test lives in accounting-callback-get.test.ts, which
+// mocks the DB-backed deps BEFORE importing the route — impossible here where
+// the route is statically imported for the handler tests above.)
 
 test('END-TO-END: a real exchange (code+state) with NO configured URL errors BEFORE consuming state (F4)', async () => {
   // No token-exchange import should run; the guard fires first and emits a safe

@@ -92,12 +92,13 @@ export async function handleAccountingCallback(request: Request, deps: Accountin
   }
 
   // The token exchange needs an ABSOLUTE redirect_uri that exactly matches the
-  // one used at authorization (built from the configured app URL). Without a
-  // configured URL we cannot reconstruct it, so reject BEFORE consuming the
-  // single-use OAuth state (Codex r2/F4) — the state stays valid for a retry
-  // once the app URL is configured, rather than being burned on a doomed
-  // exchange with a relative redirect_uri.
-  if (!publicAppUrl) {
+  // one used at authorization (built from the configured app URL). We can only
+  // reconstruct it when the configured URL resolved to a valid web origin —
+  // gate on `origin` (null for missing/malformed/non-http URLs), not raw
+  // truthiness (Codex r2+r3/F4: a malformed-but-truthy URL must not slip
+  // through). Reject BEFORE consuming the single-use OAuth state so it stays
+  // valid for a retry once the app URL is fixed.
+  if (!origin || !publicAppUrl) {
     return redirectWithStatus(origin, connector, { accounting_error: 'Server application URL is not configured; cannot complete the connection' })
   }
 
