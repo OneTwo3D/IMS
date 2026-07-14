@@ -119,9 +119,12 @@ test('E2E: a clean invoice PDF passes the same real scanner and is promoted to t
 })
 
 test('E2E: an unavailable scanner fails CLOSED (503) and leaves nothing in the served dir', async () => {
-  await withUploadSandbox(async () => {
+  await withUploadSandbox(async (dir) => {
+    // A path inside the fresh sandbox that is never created — guaranteed absent
+    // regardless of what the host has at any fixed system path.
+    const missing = path.join(dir, 'no-such-scanner')
     const result = await storeInvoicePdfUpload('good-invoice.pdf', cleanPdf(), {
-      scan: { env: scanEnv(['/nonexistent/scanner', '{file}']) },
+      scan: { env: scanEnv([missing, '{file}']) },
     })
 
     assert.equal(result.ok, false)
