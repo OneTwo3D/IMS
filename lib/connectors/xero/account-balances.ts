@@ -141,7 +141,16 @@ function configuredAccountCodes(settings: Awaited<ReturnType<typeof getXeroSetti
   // GL <-> cost-layer reconciliation (scjz.60c/.74) has both on-hand legs (value
   // sits in the Allocated-Inventory contra between A2 and dispatch) on a common
   // balance date; without it the reconciliation stays permanently unavailable.
-  return [settings.xero_inventory_account, settings.xero_allocated_inventory_account, settings.xero_cogs_account]
+  // 6oyu.4 (khdw): STOCK_IN_TRANSIT is snapshotted alongside the others so the
+  // transit subledger-vs-GL reconciliation has a daily GL balance to compare its
+  // period movement against (without it the reconciliation stays permanently
+  // unavailable).
+  return [
+    settings.xero_inventory_account,
+    settings.xero_allocated_inventory_account,
+    settings.xero_cogs_account,
+    settings.xero_transit_account,
+  ]
     .map((code) => code.trim())
     .filter((code): code is string => code.length > 0)
 }

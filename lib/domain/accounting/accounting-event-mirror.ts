@@ -40,6 +40,8 @@ export const MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES = [
   'DAILY_BATCH_INVENTORY_RECONCILIATION',
   // khdw: mirror the COGS rounding-difference sweep on the same basis.
   'DAILY_BATCH_COGS_RECONCILIATION',
+  // 6oyu.4 (khdw): mirror the STOCK_IN_TRANSIT rounding-difference sweep likewise.
+  'DAILY_BATCH_TRANSIT_RECONCILIATION',
   'COGS_REVERSAL',
   'UNEARNED_REV_REVERSAL',
 ] as const

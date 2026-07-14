@@ -23,7 +23,8 @@ import {
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType } from '@/lib/domain/purchasing/supplier-credit-note'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
+import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
@@ -1972,13 +1973,27 @@ export async function receivePurchaseOrder(
             { accountCode: accountingSettings.transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
           ],
         }
-        await queueAccountingSyncTx(tx, {
+        const receiptIdempotencyKey = accountingPayloadKey(`purchase-receipt:${id}:${receiptRef}`, payload)
+        const queued = await queueAccountingSyncTx(tx, {
           type: 'STOCK_RECEIPT',
           referenceType: 'PurchaseOrder',
           referenceId: id,
           payload,
-          idempotencyKey: accountingPayloadKey(`purchase-receipt:${id}:${receiptRef}`, payload),
+          idempotencyKey: receiptIdempotencyKey,
         })
+        // 6oyu.4 (khdw): receipt DR inventory / CR transit → CREDITS the transit
+        // clearing account (drains goods-in-transit into inventory). Record the transit
+        // subledger row (−amount) atomically with the queued journal, keyed the same —
+        // only when actually queued (record on the queue's OWN decision, bcz9.4).
+        if (queued) {
+          await recordTransitSubledgerMovement(tx, {
+            sourceType: 'STOCK_RECEIPT',
+            sourceRef: id,
+            idempotencyKey: receiptIdempotencyKey,
+            baseDelta: -amount,
+            journalDate: payload.date,
+          })
+        }
       }
 
       return { allReceived, newStatus, freightPoIds, totalReceiptValue: totalReceiptValue.toNumber() }
@@ -2438,13 +2453,27 @@ export async function returnPurchaseOrder(
             },
           ],
         }
-        await queueAccountingSyncTx(tx, {
+        const returnIdempotencyKey = accountingPayloadKey(`purchase-return:${purchaseReturn.id}`, payload)
+        const queued = await queueAccountingSyncTx(tx, {
           type: 'INVENTORY_ADJUSTMENT',
           referenceType: 'PurchaseReturn',
           referenceId: purchaseReturn.id,
           payload,
-          idempotencyKey: accountingPayloadKey(`purchase-return:${purchaseReturn.id}`, payload),
+          idempotencyKey: returnIdempotencyKey,
         })
+        // 6oyu.4 (khdw): a supplier return reverses received stock DR transit / CR
+        // inventory → DEBITS the transit clearing account (+amount). Record the transit
+        // subledger row atomically with the queued journal, keyed the same — only when
+        // actually queued (record on the queue's OWN decision, bcz9.4).
+        if (queued) {
+          await recordTransitSubledgerMovement(tx, {
+            sourceType: 'SUPPLIER_RETURN',
+            sourceRef: purchaseReturn.id,
+            idempotencyKey: returnIdempotencyKey,
+            baseDelta: amount,
+            journalDate: payload.date,
+          })
+        }
       }
       return { overBilling: overBillingComputed, creditNote: createdCreditNote, suppressedReturnCredit: suppressedReturnCreditForeign }
     }, STOCK_TX_OPTIONS)
@@ -2843,13 +2872,29 @@ export async function createInvoice(
       })
 
       if (accountingSettings.syncEnabled) {
-        await queueAccountingSyncTx(tx, {
+        const billIdempotencyKey = accountingPayloadKey(`purchase-invoice:${poId}`, accountingPayload)
+        const queued = await queueAccountingSyncTx(tx, {
           type: 'PURCHASE_INVOICE',
           referenceType: 'PurchaseOrder',
           referenceId: poId,
           payload: accountingPayload,
-          idempotencyKey: accountingPayloadKey(`purchase-invoice:${poId}`, accountingPayload),
+          idempotencyKey: billIdempotencyKey,
         })
+        // 6oyu.4 (khdw): the bill DEBITS the transit clearing account by its NET
+        // subtotal (the ACCPAY bill posts EXCLUSIVE — all product + cost lines are
+        // coded to transit, tax goes to the VAT account). Record the transit subledger
+        // row (+subtotalBase) atomically with the queued bill, keyed the same — but
+        // ONLY when the journal actually queued (bcz9.4: record on the queue's OWN
+        // decision, so a disabled type / flipped connector can't write a row with no GL).
+        if (queued) {
+          await recordTransitSubledgerMovement(tx, {
+            sourceType: 'PURCHASE_BILL',
+            sourceRef: poId,
+            idempotencyKey: billIdempotencyKey,
+            baseDelta: invoiceCalculation.subtotalBase,
+            journalDate: input.invoiceDate,
+          })
+        }
       }
     }, STOCK_TX_OPTIONS)
 
@@ -3127,6 +3172,8 @@ export async function updateInvoice(
         where: { id: invoice.id },
         select: {
           paidAt: true,
+          // 6oyu.4 (khdw): the pre-edit NET subtotal, to record the transit delta.
+          subtotalBase: true,
           lines: { select: { poLineId: true, qtyBilled: true } },
         },
       })
@@ -3221,10 +3268,13 @@ export async function updateInvoice(
         accountingInvoiceId: invoice.accountingInvoiceId,
         accountingPayload,
         idempotencyKey,
+        previousSubtotalBase: Number(lockedInvoice.subtotalBase),
+        newSubtotalBase: Number(invoiceCalculation.subtotalBase),
         deps: {
           getActiveAccountingConnectorInfo,
           isAccountingSyncTypeEnabled,
           queueAccountingSyncTx,
+          recordTransitSubledgerMovement,
         },
       })
     }, STOCK_TX_OPTIONS)
@@ -3587,7 +3637,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true,
         // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
         // audit-v08m: + the bill's external (Xero) id, to allocate the credit to it.
-        purchaseInvoice: { select: { taxForeign: true, accountingInvoiceId: true } },
+        purchaseInvoice: { select: { subtotalForeign: true, taxForeign: true, accountingInvoiceId: true } },
         po: {
           select: {
             reference: true, type: true,
@@ -3650,7 +3700,10 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       })
       if (claimed.count === 0) return false
       if (shouldQueueXero) {
-        await queueAccountingSyncTx(tx, {
+        // Single date for both the journal and its subledger row (they must share the
+        // GL date dimension the reconciliation windows on).
+        const creditNoteDate = new Date().toISOString().slice(0, 10)
+        const queued = await queueAccountingSyncTx(tx, {
           type: 'PURCHASE_CREDIT_NOTE',
           referenceType: 'SupplierCreditNote',
           referenceId: cn.id,
@@ -3670,7 +3723,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
             // adds the notional VAT (mirroring the net/exclusive RC bill); all
             // others carry a GROSS amount → INCLUSIVE.
             lineAmountsIncludeTax: !isReverseCharge,
-            date: new Date().toISOString().slice(0, 10),
+            date: creditNoteDate,
             // audit-v08m: allocate the credit to the bill once both have posted to
             // Xero. Skipped when the bill has no external id yet (allocation needs it).
             allocateToInvoiceId: cn.purchaseInvoice?.accountingInvoiceId ?? null,
@@ -3678,6 +3731,25 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
           }),
           idempotencyKey: `supplier-credit-note:${cn.id}`,
         })
+        // 6oyu.4 (khdw): the ACCPAYCREDIT CREDITS the transit clearing account by its
+        // NET (the credit posts INCLUSIVE, so Xero splits net→transit + VAT→tax) —
+        // record the transit subledger row (−net) atomically with the queued journal,
+        // keyed the same, only when actually queued (record on the queue's OWN
+        // decision, bcz9.4). Net is derived from the offset bill's VAT ratio.
+        if (queued) {
+          const transitNetBase = resolveSupplierCreditNoteTransitBase({
+            grossBase: Number(cn.amountForeign) * Number(cn.fxRateToBase),
+            billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
+            billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
+          })
+          await recordTransitSubledgerMovement(tx, {
+            sourceType: 'SUPPLIER_CREDIT_NOTE',
+            sourceRef: cn.id,
+            idempotencyKey: `supplier-credit-note:${cn.id}`,
+            baseDelta: -transitNetBase,
+            journalDate: creditNoteDate,
+          })
+        }
       }
       return true
     }, STOCK_TX_OPTIONS)

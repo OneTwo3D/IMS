@@ -176,6 +176,9 @@ enum AccountingSyncType {
   // khdw: end-of-daily-batch sweep of the COGS subledger-vs-GL rounding residue
   // (same guard as inventory — sub-penny sweep, material gaps flagged never swept).
   DAILY_BATCH_COGS_RECONCILIATION
+  // 6oyu.4 (khdw): end-of-daily-batch sweep of the STOCK_IN_TRANSIT subledger-vs-GL
+  // rounding residue (same guard — sub-penny swept, material gaps flagged never swept).
+  DAILY_BATCH_TRANSIT_RECONCILIATION
   UNEARNED_REV_REVERSAL
   BILL_PAYMENT
   REALISED_FX_JOURNAL
@@ -879,6 +882,30 @@ model CogsSubledgerMovement {
 
   @@index([journalDate])
   @@map("cogs_subledger_movements")
+}
+
+/// 6oyu.4 (epic khdw): append-only subledger of every GL STOCK_IN_TRANSIT-account
+/// movement, used by the daily-batch transit GL reconciliation. Mirrors
+/// CogsSubledgerMovement exactly. Transit is a clearing account: bills DEBIT it
+/// (+ baseDelta), and receipt / reclass / credit notes / cancellations CREDIT it
+/// (− baseDelta). `journalDate` is the GL date the movement posts on, so the
+/// reconciliation windows it the same way it windows the transit balance snapshots.
+model TransitSubledgerMovement {
+  id             String   @id @default(cuid())
+  // 'PURCHASE_BILL' | 'PURCHASE_BILL_UPDATE' | 'SUPPLIER_CREDIT_NOTE' | 'STOCK_RECEIPT'
+  // | 'LANDED_COST_RECLASS' | 'LANDED_COST_CONSUMED_OFFSET' | 'PURCHASE_ORDER_CANCEL'
+  // | 'SUPPLIER_RETURN'
+  sourceType     String   @map("source_type")
+  // originating entity (purchaseOrderId / creditNoteId) for traceability
+  sourceRef      String   @map("source_ref")
+  // dedupes re-staged/retried postings; mirrors the transit journal's idempotency key
+  idempotencyKey String   @unique @map("idempotency_key")
+  baseDelta      Decimal  @db.Decimal(18, 6) @map("base_delta")
+  journalDate    DateTime @map("journal_date")
+  createdAt      DateTime @default(now())
+
+  @@index([journalDate])
+  @@map("transit_subledger_movements")
 }
 
 /// Governed by additional db-native reporting guarantees from migration

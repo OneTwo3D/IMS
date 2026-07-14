@@ -34,10 +34,21 @@ type QueueAccountingSyncTxParams = {
   idempotencyKey: string
 }
 
+// 6oyu.4 (khdw): a bill edit reposts to Xero, changing the NET (transit) leg from the
+// old subtotal to the new one — the transit subledger must record the signed delta.
+type TransitSubledgerUpdateInput = {
+  sourceType: 'PURCHASE_BILL_UPDATE'
+  sourceRef: string
+  idempotencyKey: string
+  baseDelta: number
+  journalDate: string
+}
+
 export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx> = {
   getActiveAccountingConnectorInfo: () => Promise<AccountingConnectorInfo>
   isAccountingSyncTypeEnabled: (type: 'PURCHASE_INVOICE_UPDATE') => Promise<boolean>
   queueAccountingSyncTx: (tx: Tx, params: QueueAccountingSyncTxParams) => Promise<boolean>
+  recordTransitSubledgerMovement: (tx: Tx, input: TransitSubledgerUpdateInput) => Promise<void>
 }
 
 export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoiceUpdateSyncTx>(params: {
@@ -49,6 +60,10 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   accountingInvoiceId: string | null
   accountingPayload: PurchaseInvoiceAccountingPayload
   idempotencyKey: string | null
+  // 6oyu.4 (khdw): the bill's NET (transit) subtotal before and after this edit, in
+  // base currency, so the transit subledger records the signed movement (new − old).
+  previousSubtotalBase: number
+  newSubtotalBase: number
   deps: PurchaseInvoiceUpdateSyncDeps<Tx>
 }): Promise<'queued' | 'skipped-disabled' | 'skipped-no-external-id' | 'skipped-unsupported-connector'> {
   if (!params.accountingInvoiceId || !params.idempotencyKey) return 'skipped-no-external-id'
@@ -81,12 +96,28 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
     return 'skipped-disabled'
   }
 
-  await params.deps.queueAccountingSyncTx(params.tx, {
+  const queued = await params.deps.queueAccountingSyncTx(params.tx, {
     type: 'PURCHASE_INVOICE_UPDATE',
     referenceType: 'PurchaseOrder',
     referenceId: params.poId,
     payload: params.accountingPayload,
     idempotencyKey: params.idempotencyKey,
   })
+  // 6oyu.4 (khdw): the Xero update REPLACES the bill, so the transit GL debit moves
+  // from the old net subtotal to the new one — record the signed delta (new − old).
+  // Keyed by the update's own idempotency key (a content hash, unique per edit), so a
+  // retried identical edit records once; a zero-delta edit (e.g. only the invoice
+  // number changed) is skipped by the recorder. The journal posts on the bill date.
+  // Record on the queue's OWN decision (bcz9.4): only when it actually queued, so a
+  // disabled type can't write a subledger row with no GL counterpart.
+  if (queued) {
+    await params.deps.recordTransitSubledgerMovement(params.tx, {
+      sourceType: 'PURCHASE_BILL_UPDATE',
+      sourceRef: params.poId,
+      idempotencyKey: params.idempotencyKey,
+      baseDelta: params.newSubtotalBase - params.previousSubtotalBase,
+      journalDate: String(params.accountingPayload.date),
+    })
+  }
   return 'queued'
 }
