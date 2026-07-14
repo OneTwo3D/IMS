@@ -1,14 +1,21 @@
 /**
  * Poll Xero for paid invoices (sales) and bills (purchases).
- * - Sales: manual orders only (WC orders arrive with paidAt already set)
+ * - Sales forward pass (unpaid→paid): manual orders only. WC orders take payment
+ *   status from their channel and arrive with paidAt already set, so there is
+ *   nothing for the forward pass to detect (see the shoppingLinks:{none:{}} filter).
+ * - Sales reversal pass (paid→reversed): ALL sales orders incl. WC-linked (6oyu.6).
+ *   A reversed payment / chargeback must clear paidAt + unwind revenue regardless of
+ *   channel; the WC refund webhook stays authoritative via a per-order dedup guard.
  * - Purchases: all POs — detects when a bill is paid via Xero bank feed
  */
 
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
 import { logActivity } from '@/lib/activity-log'
+import { notify } from '@/lib/notifications'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { detectPaymentReversals } from '@/lib/domain/accounting/payment-reversal'
+import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
 
 type XeroInvoice = {
   InvoiceID: string
@@ -44,6 +51,30 @@ async function fetchReversedInvoiceIds(type: 'ACCREC' | 'ACCPAY', lastPoll: stri
     }
   }
   return { all, voided }
+}
+
+// A detected payment reversal / chargeback needs a human to reconcile (dispute the
+// chargeback, revert fulfilment, chase re-payment). Broadcast a warning to active
+// admins — status is never auto-reverted, so the alert is the only prompt to review a
+// shipped-but-reversed order. Fires even when a recent WC refund covered the revenue
+// side (wcHandled), since that refund may only partially explain a full payment removal.
+async function notifyReversalAdmins(order: DetectedReversalOrder, wcHandled: boolean): Promise<void> {
+  const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
+  const message = wcHandled
+    ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). A WooCommerce refund in this window already reversed revenue (no duplicate credit note raised) and paidAt was cleared — verify the refund fully covers the reversal and whether the order status should revert.`
+    : `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). paidAt was cleared and revenue unwound where applicable — review whether the order status should revert.`
+  const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+  await Promise.all(
+    admins.map((admin) =>
+      notify({
+        userId: admin.id,
+        type: 'warning',
+        title: 'Payment reversal detected',
+        message,
+        actionUrl: `/sales/${order.id}`,
+      }),
+    ),
+  )
 }
 
 export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[] }> {
@@ -114,65 +145,86 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     result.errors.push(`Sales polling error: ${String(e)}`)
   }
 
-  // --- Sales payment reversals (audit-M-acct #3) ---
+  // --- Sales payment reversals (audit-M-acct #3, WC-inclusion 6oyu.6) ---
   // The forward poll only marks unpaid→paid. If an invoice IMS thinks is paid is
   // no longer PAID in Xero — payment reversed/deleted (back to AUTHORISED), an
   // amendment that voided the payment (AUTHORISED), or the invoice VOIDED — clear
   // paidAt so IMS stops showing it paid. Status is NOT auto-reverted (an order may
-  // already be picking/shipped); a WARNING carrying the current status flags it.
+  // already be picking/shipped); a WARNING + admin notification carrying the current
+  // status flags it.
+  // 6oyu.6: WooCommerce-linked orders (the bulk of volume) are now INCLUDED — a
+  // reversed payment / chargeback on a WC order must clear paidAt and unwind revenue
+  // too. The WC refund webhook stays authoritative: handleDetectedReversal's
+  // hasWooCommerceRefund dedup guard defers to any existing WC-side refund so the
+  // poller never double-reverses an order the refund path already handled.
   // NOTE: must run AFTER the forward pass above so a pay-then-reverse within one
   // window nets to the correct (unpaid) final state.
   try {
-    const paidManualOrders = await db.salesOrder.findMany({
+    const paidOrders = await db.salesOrder.findMany({
       where: {
         accountingInvoiceId: { not: null },
         paidAt: { not: null },
-        shoppingLinks: { none: {} },
       },
       select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true },
     })
-    if (paidManualOrders.length > 0) {
+    if (paidOrders.length > 0) {
       const reversedIds = await fetchReversedInvoiceIds('ACCREC', lastPoll)
-      for (const order of detectPaymentReversals(paidManualOrders, reversedIds.all)) {
-        // scjz.71: a reversed payment on a revenue-POSTED order (revenue recognised +
-        // invoiced) is a chargeback — raise a revenue-only credit note that reverses
-        // recognised revenue against AR (COGS kept as a loss, no restock). Idempotent
-        // (one chargeback per order). Dynamic import breaks the lib→action cycle.
-        // CRITICAL: clear paidAt ONLY after the chargeback is recorded — otherwise a
-        // failed chargeback would drop the order out of the next poll's paidManualOrders
-        // (paidAt: not null) and the recognised revenue would never be reversed (Codex P1).
+      const windowStart = new Date(lastPoll)
+      for (const order of detectPaymentReversals(paidOrders, reversedIds.all)) {
         // A VOIDED invoice has already had its AR/revenue reversed by Xero, so a
         // separate credit note would double-reverse — only auto-chargeback an
         // AUTHORISED payment removal where the invoice is still live (Codex P2).
         const invoiceVoided = order.accountingInvoiceId != null && reversedIds.voided.has(order.accountingInvoiceId)
-        let chargebackFailed = false
-        if (order.revenueDeferredDate && !invoiceVoided) {
-          try {
+        const { outcome, error } = await handleDetectedReversal(order, { invoiceVoided }, {
+          // Dedup (window-scoped): a WC-side refund (SalesOrderRefund carrying the WC
+          // externalRefundId) recorded within THIS poll window means the WC refund
+          // webhook already owns the revenue reversal — skip the redundant chargeback
+          // and log quietly. Window-scoped so a HISTORIC partial refund never
+          // permanently suppresses a genuine later reversal, and a no-op for manual
+          // orders (which never have an externalRefundId), leaving that path unchanged.
+          wasHandledByRecentWcRefund: async (orderId) => {
+            const wcRefund = await db.salesOrderRefund.findFirst({
+              where: { orderId, externalRefundId: { not: null }, createdAt: { gte: windowStart } },
+              select: { id: true },
+            })
+            return wcRefund != null
+          },
+          // scjz.71: a reversed payment on a revenue-POSTED order is a chargeback —
+          // raise a revenue-only credit note that reverses recognised revenue against
+          // AR (COGS kept as a loss, no restock). raiseChargebackForReversedOrder is
+          // idempotent (one chargeback per order) and refuses orders with any prior
+          // refund — the authoritative guard against a double credit note even if the
+          // window check races a WC refund. Dynamic import breaks the lib→action cycle.
+          raiseChargeback: async (orderId) => {
             const { raiseChargebackForReversedOrder } = await import('@/app/actions/sales')
-            const chargeback = await raiseChargebackForReversedOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
-            if (chargeback.error) {
-              chargebackFailed = true
-              result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${chargeback.error}`)
-            }
-          } catch (chargebackError) {
-            chargebackFailed = true
-            result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${String(chargebackError)}`)
-          }
-        }
-        // Leave paidAt set on a failed chargeback so the reversal is re-attempted and
-        // the order is not silently shown unpaid-and-unreversed.
-        if (chargebackFailed) continue
-        await db.salesOrder.update({ where: { id: order.id }, data: { paidAt: null } })
-        result.salesReversed++
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: order.id,
-          action: 'payment_reversal_detected',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `Payment no longer present in Xero for order ${order.orderNumber ?? order.externalOrderNumber} (status: ${order.status}) — cleared paidAt. Review whether the order status should revert.`,
-          resolveUser: false,
+            return raiseChargebackForReversedOrder(orderId, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+          },
+          // paidAt is reconciled unconditionally on a genuine regression (payment is
+          // gone in Xero; the WC refund path does NOT clear paidAt), but ONLY after any
+          // required chargeback succeeded — a failed chargeback holds paidAt so the
+          // order stays in the next poll's paidOrders window and the reversal is
+          // re-attempted (Codex P1) rather than left unpaid-and-unreversed.
+          clearPaidAt: async (orderId) => {
+            await db.salesOrder.update({ where: { id: orderId }, data: { paidAt: null } })
+          },
+          notifyNeedsAttention: (o, { wcHandled }) => notifyReversalAdmins(o, wcHandled),
+          logReversalDetected: (o, { wcHandled }) => logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: o.id,
+            action: 'payment_reversal_detected',
+            tag: 'sync',
+            level: 'WARNING',
+            description: wcHandled
+              ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); cleared paidAt. Verify the WC refund fully covers the reversal and whether the order status should revert.`
+              : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — cleared paidAt. Review whether the order status should revert.`,
+            resolveUser: false,
+          }),
         })
+        if (outcome === 'reversed') {
+          result.salesReversed++
+        } else if (outcome === 'chargeback-failed') {
+          result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${error}`)
+        }
       }
     }
   } catch (e) {
