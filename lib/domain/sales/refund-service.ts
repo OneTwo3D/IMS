@@ -11,7 +11,7 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
-import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
@@ -367,6 +367,80 @@ async function nextCreditNoteNumber(
     update: { value: String(next) },
   })
   return `${params.prefix}${year}-${String(next).padStart(5, '0')}`
+}
+
+/**
+ * 6oyu.5: composite key for the ORIGINALLY-POSTED per-layer COGS of a shipment
+ * line. Keyed by shipment line AND cost layer because the same cost layer can be
+ * consumed by more than one shipment line and each carries its own dispatch-time
+ * posted cost.
+ */
+export function postedShipmentUnitCostKey(shipmentLineId: string, costLayerId: string): string {
+  return `${shipmentLineId}::${costLayerId}`
+}
+
+/**
+ * 6oyu.5: value shipment-source refund snapshot entries at the ORIGINALLY-POSTED
+ * COGS unit cost (from the immutable CogsEntry dispatch rows) instead of the
+ * current cost-layer cost. Entries with no posted basis (legacy dispatches that
+ * pre-date FIFO snapshots / CogsEntry rows) keep their existing unitCostBase so
+ * the reversal degrades to the prior carrying-value behaviour rather than
+ * dropping to zero. Pure so the reversal basis is unit-testable in isolation.
+ */
+export function applyPostedShipmentUnitCosts(
+  entries: CostLayerSnapshotEntry[],
+  postedUnitCostByKey: ReadonlyMap<string, number>,
+): CostLayerSnapshotEntry[] {
+  return entries.map((entry) => {
+    if (!entry.shipmentLineId) return entry
+    const posted = postedUnitCostByKey.get(postedShipmentUnitCostKey(entry.shipmentLineId, entry.costLayerId))
+    return posted == null ? entry : { ...entry, unitCostBase: posted }
+  })
+}
+
+/**
+ * 6oyu.5: load the ORIGINALLY-POSTED per-layer COGS unit cost for each shipment
+ * line, keyed by {@link postedShipmentUnitCostKey}. The source of truth is the
+ * immutable CogsEntry rows written at dispatch (shipment-service.ts) — NOT the
+ * shipment cost-layer snapshot NOR Shipment.cogsBatchAmount, both of which
+ * landed-cost revaluation MUTATES in place to the CURRENT layer cost
+ * (cost-layers.ts refreshShipmentCogsForCostLayerChange +
+ * updateSnapshotsForCostLayerChange). Reversing a refund at this posted basis
+ * leaves any post-dispatch revaluation delta in COGS for the refunded units, per
+ * the 2026-07-12 finance decision (bd onetwo3d-ims-6oyu.5); the returned stock's
+ * new inventory layer is valued on the same posted basis so the GL inventory leg
+ * of the single-amount COGS_REVERSAL journal stays equal to the cost-layer
+ * subledger (inventory GL/subledger reconciliation, invariants.ts).
+ */
+async function loadPostedShipmentUnitCosts(
+  tx: Prisma.TransactionClient,
+  shipmentLineIds: string[],
+): Promise<Map<string, number>> {
+  const totalsByKey = new Map<string, { qtyTotal: ReturnType<typeof toDecimal>; costTotal: ReturnType<typeof toDecimal> }>()
+  for (const shipmentLineId of shipmentLineIds) {
+    const movement = await tx.stockMovement.findUnique({
+      where: { idempotencyKey: saleDispatchMovementKey(shipmentLineId) },
+      select: {
+        cogsEntries: {
+          select: { costLayerId: true, qty: true, unitCostBase: true },
+        },
+      },
+    })
+    for (const entry of movement?.cogsEntries ?? []) {
+      const key = postedShipmentUnitCostKey(shipmentLineId, entry.costLayerId)
+      const totals = totalsByKey.get(key) ?? { qtyTotal: toDecimal(0), costTotal: toDecimal(0) }
+      const qty = toDecimal(entry.qty)
+      totals.qtyTotal = addMoney(totals.qtyTotal, qty)
+      totals.costTotal = addMoney(totals.costTotal, multiplyMoney(qty, toDecimal(entry.unitCostBase)))
+      totalsByKey.set(key, totals)
+    }
+  }
+  const postedUnitCostByKey = new Map<string, number>()
+  for (const [key, { qtyTotal, costTotal }] of totalsByKey) {
+    // Qty-weighted mean posted unit cost; robust to a layer split across rows.
+    if (qtyTotal.gt(0)) postedUnitCostByKey.set(key, refundBoundaryNumber(costTotal.div(qtyTotal)))
+  }
+  return postedUnitCostByKey
 }
 
 async function getShipmentLineCostSnapshot(
@@ -931,6 +1005,14 @@ async function stageRefundAccountingReversals(
       }
     }
 
+    // 6oyu.5: the ORIGINALLY-POSTED per-layer COGS for every shipment line, used to
+    // reverse the refund at the cost that was actually posted at dispatch rather than
+    // the current (possibly revalued) layer cost. See loadPostedShipmentUnitCosts.
+    const postedShipmentUnitCostByKey = await loadPostedShipmentUnitCosts(
+      tx,
+      (orderAccounting?.shipments ?? []).flatMap((shipment) => shipment.lines.map((line) => line.id)),
+    )
+
     const referencedCostLayerIds = Array.from(new Set([
       ...(orderAccounting?.allocations ?? []).flatMap((allocation) => (
         parseCostLayerSnapshot(allocation.costLayerSnapshot).map((entry) => entry.costLayerId)
@@ -956,15 +1038,15 @@ async function stageRefundAccountingReversals(
     const productIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.productId]))
     const poLineIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.poLineId]))
     const currentUnitCostByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, refundBoundaryNumber(layer.unitCostBase)]))
-    const refreshSnapshotCosts = (entries: CostLayerSnapshotEntry[]): CostLayerSnapshotEntry[] => (
+    // 6oyu.5: ALLOCATION-only valuation. Unshipped/allocated units never posted
+    // dispatch COGS, so their allocated-inventory contra reversal is valued at the
+    // current carrying cost (matching the allocation's live layer). The SHIPMENT
+    // path no longer uses this — it reverses at the originally-posted COGS
+    // (applyPostedShipmentUnitCosts) so a post-dispatch landed-cost revaluation
+    // delta stays in COGS for the refunded units.
+    const refreshAllocationSnapshotCosts = (entries: CostLayerSnapshotEntry[]): CostLayerSnapshotEntry[] => (
       entries.map((entry) => ({
         ...entry,
-        // Shipment/allocation snapshots prove which layer and quantity were
-        // consumed. Refund valuation refreshes to the current layer cost so
-        // returned stock matches its carrying value. Trade-off: if landed-cost
-        // revaluation ran after shipment, reversed COGS differs from the
-        // originally posted COGS by the revaluation delta; revisit if finance
-        // requires per-shipment posted COGS reversal instead.
         unitCostBase: currentUnitCostByCostLayerId.get(entry.costLayerId) ?? entry.unitCostBase,
       }))
     )
@@ -1143,7 +1225,9 @@ async function stageRefundAccountingReversals(
               shipmentLineId: shipmentLine.id,
               source: 'shipment',
             })
-            consumed.push(...refreshSnapshotCosts(taken.taken))
+            // 6oyu.5: value the reversed shipment units at the ORIGINALLY-POSTED
+            // COGS, not the current (possibly revalued) layer cost.
+            consumed.push(...applyPostedShipmentUnitCosts(taken.taken, postedShipmentUnitCostByKey))
             remainingQty = taken.remainingQty
             shipmentLineAvailability.set(
               shipmentLine.id,
@@ -1192,7 +1276,7 @@ async function stageRefundAccountingReversals(
             orderAllocationId: allocation.id,
             source: 'allocation',
           })
-          consumed.push(...refreshSnapshotCosts(taken.taken))
+          consumed.push(...refreshAllocationSnapshotCosts(taken.taken))
           remainingQty = taken.remainingQty
           allocationAvailability.set(
             allocation.id,
@@ -1288,6 +1372,11 @@ async function stageRefundAccountingReversals(
       0,
       refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized - priorUnearnedReversed,
     ) * 100) / 100
+    // 6oyu.5: shipment-source entries are valued at the ORIGINALLY-POSTED COGS
+    // (applyPostedShipmentUnitCosts), so both the COGS reversal below and the
+    // returned-stock new inventory layer (snapshotReturnRows, shipment-source only)
+    // reverse/re-enter on the posted basis. Any post-dispatch landed-cost
+    // revaluation delta therefore stays in COGS for the refunded units.
     const shipmentRefundSnapshot = params.refundLines.flatMap((line) => (
       (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'shipment')
     ))
