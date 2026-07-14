@@ -14,7 +14,12 @@ import { getPublicAppUrl } from '@/lib/public-app-url'
 export function resolveAppOrigin(publicAppUrl: string | null): string | null {
   if (!publicAppUrl) return null
   try {
-    return new URL(publicAppUrl).origin
+    const parsed = new URL(publicAppUrl)
+    // Only http(s) yields a usable origin; data:/file:/mailto: parse but their
+    // origin is the string "null", which would throw when used as a base
+    // (Codex r2/F5). Reject anything that isn't a real web origin.
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null
+    return parsed.origin
   } catch {
     return null
   }
@@ -86,8 +91,18 @@ export async function handleAccountingCallback(request: Request, deps: Accountin
     return await redirectWithStatus(origin, connector, { accounting_error: 'Missing OAuth state' })
   }
 
+  // The token exchange needs an ABSOLUTE redirect_uri that exactly matches the
+  // one used at authorization (built from the configured app URL). Without a
+  // configured URL we cannot reconstruct it, so reject BEFORE consuming the
+  // single-use OAuth state (Codex r2/F4) — the state stays valid for a retry
+  // once the app URL is configured, rather than being burned on a doomed
+  // exchange with a relative redirect_uri.
+  if (!publicAppUrl) {
+    return redirectWithStatus(origin, connector, { accounting_error: 'Server application URL is not configured; cannot complete the connection' })
+  }
+
   try {
-    const redirectUri = `${(publicAppUrl ?? '').replace(/\/+$/, '')}/api/accounting/callback`
+    const redirectUri = `${publicAppUrl.replace(/\/+$/, '')}/api/accounting/callback`
 
     if (connector === 'quickbooks') {
       const { consumeQuickBooksOAuthState, exchangeCodeForTokens } = await import('@/lib/connectors/quickbooks/auth')

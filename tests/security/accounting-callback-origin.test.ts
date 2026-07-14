@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
@@ -97,4 +98,41 @@ test('END-TO-END: a disabled plugin redirects with the disabled error, still on 
   )
   assert.equal(new URL(location(res)).origin, CONFIGURED)
   assert.match(new URL(location(res)).searchParams.get('accounting_error') ?? '', /disabled/)
+})
+
+// --- Codex r2: real-GET wiring guard + null-config exchange + bad scheme ---
+
+test('the exported GET delegates to handleAccountingCallback with the REAL deps (wiring guard, F2)', () => {
+  const src = readFileSync(new URL('../../app/api/accounting/callback/route.ts', import.meta.url), 'utf8')
+  // GET must call handleAccountingCallback with the production getPublicAppUrl +
+  // isIntegrationPluginEnabled, so a revert to inline header-derived logic (that
+  // bypasses the tested handler) is caught here.
+  assert.match(src, /return handleAccountingCallback\(request,\s*\{/)
+  assert.match(src, /getPublicAppUrl,/)
+  assert.match(src, /isPluginEnabled:\s*isIntegrationPluginEnabled/)
+})
+
+test('END-TO-END: a real exchange (code+state) with NO configured URL errors BEFORE consuming state (F4)', async () => {
+  // No token-exchange import should run; the guard fires first and emits a safe
+  // relative error redirect, leaving the single-use OAuth state intact for retry.
+  const res = await handleAccountingCallback(
+    hostileRequest('code=abc&state=xyz'),
+    deps({ appUrl: null, enabled: () => true }),
+  )
+  assert.equal(res.status, 307)
+  assert.match(location(res), /^\/sync/)
+  assert.doesNotMatch(location(res), /attacker|^https?:\/\//)
+  assert.match(new URL(location(res), 'http://x.invalid').searchParams.get('accounting_error') ?? '', /not configured/i)
+})
+
+test('resolveAppOrigin rejects non-web schemes that parse but have origin "null" (F5)', () => {
+  for (const bad of ['data:text/html,x', 'file:///etc/passwd', 'mailto:a@b.c', 'javascript:alert(1)']) {
+    assert.equal(resolveAppOrigin(bad), null, `${bad} must not be a usable origin`)
+  }
+  // and such a value degrades to a safe relative redirect, never a throw
+  const res = handleAccountingCallback(hostileRequest('error=cancelled'), deps({ appUrl: 'data:text/html,x' }))
+  return res.then((r) => {
+    assert.equal(r.status, 307)
+    assert.match(location(r), /^\/sync/)
+  })
 })
