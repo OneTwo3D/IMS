@@ -664,19 +664,6 @@ npm run type-check    # Full TypeScript check across entire project
 npm run lint          # ESLint style and quality checks
 ```
 
-## Recent Features (Latest Commits)
-
-- **Partial Fulfillment:** Ship available items now, allocate and ship the rest later. Allocation panel reappears for unfulfilled lines after partial shipment.
-- **PICKING Guard:** Blocks transition to Picking status when no allocations exist, preventing empty picks.
-- **Packing Slip Legacy Support:** Packing slip PDF works for orders without shipments (legacy flow) using order lines directly.
-- **Xero Sub-Ledger Batch Sync:** Daily batch sync of journal entries to Xero GL (replaces real-time sync for performance)
-- **WooCommerce Tax Rate Mapping:** Automatic tax type mapping from WC to Xero during order sync
-- **Payment Account Mapping:** UI for configuring payment method → bank account mapping for reconciliation
-- **Notifications System:** Email notifications for orders, shipments, and sync events with preference management
-- **Invoice Delegation:** Support for delegated invoice generation workflows (finance team can approve before sending)
-- **Passkey/WebAuthn Support:** FIDO2 passwordless authentication alongside TOTP 2FA
-- **Supplier Portal:** Separate RBAC role for suppliers to view orders and delivery status
-
 ## Contact & Support
 
 - **Product Owner:** One Two Enterprises Ltd
@@ -716,17 +703,9 @@ When working on tasks involving these technologies, invoke the corresponding ski
 | tuning-landing-journeys | Improving landing page flow, hierarchy, and conversion paths |
 | inspecting-search-coverage | Auditing technical and on-page search coverage |
 | adding-structured-signals | Adding structured data for rich results |
-
-
-## Skill Usage Guide
-
-When working on tasks involving these technologies, invoke the corresponding skill:
-
-| Skill | Invoke When |
-|-------|-------------|
-| pdfkit | Generates branded PDF documents with PDFKit for invoices and reports |
-| crafting-page-messaging | Writes conversion-focused messaging for pages and key CTAs |
-| instrumenting-product-metrics | Defines product events, funnels, and activation metrics |
+| pdfkit | Generating branded PDF documents with PDFKit for invoices and reports |
+| crafting-page-messaging | Writing conversion-focused messaging for pages and key CTAs |
+| instrumenting-product-metrics | Defining product events, funnels, and activation metrics |
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
