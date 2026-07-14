@@ -4,6 +4,7 @@ import { auth } from '@/lib/auth'
 import { sessionInvalidLoginReason, type SessionInvalidReason } from '@/lib/auth/session-state'
 import { buildCsp, cspHeaderName, generateNonce, getCspMode } from '@/lib/security/csp'
 import { API_PATH_PREFIX, evaluateProxyAuthz, isPublicProxyPath, type ProxySession } from '@/lib/security/proxy-authz'
+import { isTurnstileEnabled } from '@/lib/turnstile'
 
 /** The session resolver — injectable so handleProxy can be driven end-to-end in tests (muid). */
 export type ProxyAuthenticate = () => Promise<ProxySession>
@@ -28,7 +29,7 @@ export async function handleProxy(
   const nonce = generateNonce()
   const csp = cspMode === 'off' || isApiRoute
     ? null
-    : buildCsp(nonce, process.env.NODE_ENV !== 'production')
+    : buildCsp(nonce, process.env.NODE_ENV !== 'production', { turnstileEnabled: isTurnstileEnabled() })
 
   // Attach the CSP response header (report-only or enforce) to any response.
   const withCsp = <T extends NextResponse>(response: T): T => {
