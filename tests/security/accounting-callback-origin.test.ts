@@ -6,6 +6,7 @@ import {
   resolveAppOrigin,
   type AccountingCallbackDeps,
 } from '@/app/api/accounting/callback/route'
+import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import type { IntegrationPluginId } from '@/lib/integration-plugins'
 
 // onetwo3d-ims-qye3 (CWE-601): the accounting OAuth callback must build its
@@ -126,18 +127,28 @@ test('resolveAppOrigin returns the NORMALIZED origin for WHATWG-parseable junk (
   assert.equal(resolveAppOrigin('https://ims.example.com/base/path'), CONFIGURED)
 })
 
-test('the callback and authorize redirect_uri agree exactly for tricky-but-valid configs (Codex r5: exact-match)', () => {
-  // Authorize (app/actions/xero-sync.ts, quickbooks-sync.ts) and the callback
-  // token exchange must send the IDENTICAL redirect_uri. Both now normalize via
-  // `new URL('/api/accounting/callback', <configured URL / its origin>)`.
-  for (const cfg of ['https://IMS.EXAMPLE.COM', 'https://ims.example.com:443', 'https://ims.example.com/base', 'https://ims.example.com/']) {
-    const authorizeUri = new URL('/api/accounting/callback', cfg).toString()   // authorize side
-    const origin = resolveAppOrigin(cfg)
-    assert.ok(origin)
-    const callbackUri = new URL('/api/accounting/callback', origin).toString()  // callback side
-    assert.equal(callbackUri, authorizeUri, `redirect_uri mismatch for ${cfg}`)
-    assert.equal(callbackUri, `${CONFIGURED}/api/accounting/callback`)
+test('buildAccountingCallbackUri normalizes every settings-accepted config to the same redirect_uri (Codex r5/r6: exact-match on BOTH sides)', () => {
+  // Authorize (xero-sync/quickbooks-sync) and the callback token exchange both
+  // call this ONE builder, so the redirect_uri is identical for every valid
+  // config — including user-info, which the origin form strips consistently
+  // (Codex r6: the previous mismatch was user-info preserved on one side only).
+  const EXPECTED = `${CONFIGURED}/api/accounting/callback`
+  for (const cfg of [
+    'https://ims.example.com',
+    'https://IMS.EXAMPLE.COM',
+    'https://ims.example.com:443',
+    'https://ims.example.com/base',
+    'https://ims.example.com/',
+    'https://user:pass@ims.example.com',
+    'https://user:pass@ims.example.com/base?q=1#f',
+    'https:\\\\ims.example.com',
+  ]) {
+    assert.equal(buildAccountingCallbackUri(cfg), EXPECTED, `redirect_uri mismatch for ${cfg}`)
   }
+  // No valid origin → null, so callers reject before consuming OAuth state.
+  assert.equal(buildAccountingCallbackUri(null), null)
+  assert.equal(buildAccountingCallbackUri('not a url'), null)
+  assert.equal(buildAccountingCallbackUri('data:text/html,x'), null)
 })
 
 test('resolveAppOrigin rejects non-web schemes that parse but have origin "null" (F5)', () => {

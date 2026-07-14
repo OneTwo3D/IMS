@@ -1,29 +1,13 @@
 import { NextResponse } from 'next/server'
+import { buildAccountingCallbackUri, resolveAppOrigin } from '@/lib/accounting/callback-url'
 import { logActivity } from '@/lib/activity-log'
 import { isIntegrationPluginEnabled, type IntegrationPluginId } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 
-/**
- * The redirect origin is the trusted, server-configured app URL ONLY
- * (qye3/CWE-601). Returns null when no valid app URL is configured — and the
- * request URL / Host / X-Forwarded-Host headers are NEVER consulted, so an
- * attacker-controlled origin can never appear in the emitted redirect
- * regardless of Next's host-trust topology. When null, redirects go out as
- * RELATIVE Locations, which the browser resolves against the real request URL.
- */
-export function resolveAppOrigin(publicAppUrl: string | null): string | null {
-  if (!publicAppUrl) return null
-  try {
-    const parsed = new URL(publicAppUrl)
-    // Only http(s) yields a usable origin; data:/file:/mailto: parse but their
-    // origin is the string "null", which would throw when used as a base
-    // (Codex r2/F5). Reject anything that isn't a real web origin.
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null
-    return parsed.origin
-  } catch {
-    return null
-  }
-}
+// resolveAppOrigin + buildAccountingCallbackUri live in lib/accounting/
+// callback-url.ts (shared with the authorize flows so the redirect_uri matches
+// exactly). Re-exported for the existing tests.
+export { resolveAppOrigin }
 
 /**
  * Build the accounting-status redirect. An absolute URL on the trusted origin
@@ -103,12 +87,10 @@ export async function handleAccountingCallback(request: Request, deps: Accountin
   }
 
   try {
-    // Built from the VALIDATED, normalized origin — NEVER the raw publicAppUrl
-    // string (Codex r4/F4: a WHATWG-parseable-but-malformed raw value like
-    // `https:\\host` or `https://host?junk` would otherwise yield a broken
-    // redirect_uri). new URL() with the origin base matches the authorize-side
-    // construction (app/actions/xero-sync.ts).
-    const redirectUri = new URL('/api/accounting/callback', origin).toString()
+    // Same builder the authorize flows use, so the redirect_uri is byte-
+    // identical for exact OAuth matching (Codex). Non-null here since `origin`
+    // (derived from the same publicAppUrl) is non-null past the guard above.
+    const redirectUri = buildAccountingCallbackUri(publicAppUrl) as string
 
     if (connector === 'quickbooks') {
       const { consumeQuickBooksOAuthState, exchangeCodeForTokens } = await import('@/lib/connectors/quickbooks/auth')

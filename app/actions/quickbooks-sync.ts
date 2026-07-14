@@ -13,6 +13,7 @@ import {
   processPendingQuickBooksSync,
 } from '@/lib/connectors/quickbooks'
 import { getQuickBooksSettings, QUICKBOOKS_SETTING_KEYS, type QuickBooksSettings } from '@/lib/connectors/quickbooks/settings'
+import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
@@ -119,7 +120,7 @@ export async function saveQuickBooksConnectionSettings(
       return { success: false, error: 'Public app URL is not configured.' }
     }
 
-    const redirectUri = new URL('/api/accounting/callback', publicAppUrl).toString()
+    const redirectUri = buildAccountingCallbackUri(publicAppUrl)
     if (!redirectUri) {
       return { success: false, error: 'QuickBooks redirect URL is invalid.' }
     }
@@ -193,10 +194,14 @@ export async function connectQuickBooks(
     if (!publicAppUrl) {
       return { success: false, error: 'Public app URL is not configured.' }
     }
-    // Normalized so the redirect_uri EXACTLY matches the one the callback sends
-    // at token exchange (qye3/Codex: raw concat vs the callback's origin-based
-    // form diverged for uppercase hosts, explicit :443, etc., breaking OAuth).
-    const redirectUri = new URL('/api/accounting/callback', publicAppUrl).toString()
+    // Shared builder so the redirect_uri is byte-identical to the one the
+    // callback sends at token exchange (qye3/Codex: OAuth requires exact match;
+    // origin normalization strips case/port/path/query/fragment/user-info
+    // consistently on both sides).
+    const redirectUri = buildAccountingCallbackUri(publicAppUrl)
+    if (!redirectUri) {
+      return { success: false, error: 'Public app URL is not a valid http(s) URL.' }
+    }
     const authUrl = await getAuthorizationUrl(clientId, redirectUri, session.user.id, returnPath)
 
     return { success: true, redirectUrl: authUrl }

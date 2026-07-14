@@ -10,6 +10,7 @@ import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
 import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
 import { processPendingXeroSync } from '@/lib/connectors/xero'
 import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
+import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -197,7 +198,7 @@ export async function saveXeroConnectionSettings(
       return { success: false, error: 'Public app URL is not configured.' }
     }
 
-    const redirectUri = new URL('/api/accounting/callback', publicAppUrl).toString()
+    const redirectUri = buildAccountingCallbackUri(publicAppUrl)
     if (!redirectUri) {
       return { success: false, error: 'Xero redirect URL is invalid.' }
     }
@@ -278,10 +279,14 @@ export async function connectXero(
     if (!publicAppUrl) {
       return { success: false, error: 'Public app URL is not configured.' }
     }
-    // Normalized so the redirect_uri EXACTLY matches the one the callback sends
-    // at token exchange (qye3/Codex: raw concat vs the callback's origin-based
-    // form diverged for uppercase hosts, explicit :443, etc., breaking OAuth).
-    const redirectUri = new URL('/api/accounting/callback', publicAppUrl).toString()
+    // Shared builder so the redirect_uri is byte-identical to the one the
+    // callback sends at token exchange (qye3/Codex: OAuth requires exact match;
+    // origin normalization strips case/port/path/query/fragment/user-info
+    // consistently on both sides).
+    const redirectUri = buildAccountingCallbackUri(publicAppUrl)
+    if (!redirectUri) {
+      return { success: false, error: 'Public app URL is not a valid http(s) URL.' }
+    }
     const authUrl = await getAuthorizationUrl(clientId, redirectUri, session.user.id, returnPath)
 
     return { success: true, redirectUrl: authUrl }
