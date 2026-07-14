@@ -3,9 +3,11 @@ import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import {
+  applyPostedShipmentUnitCosts,
   applyReturnInboundStockTx,
   buildChargebackRefundLines,
   createSalesOrderRefund,
+  postedShipmentUnitCostKey,
   recordRefundCogsReversalFromSync,
   resolveRefundCogsReversalBase,
   retrySalesOrderRefundAccounting,
@@ -1048,7 +1050,12 @@ test('createSalesOrderRefund reconstructs legacy shipment snapshots from COGS en
   assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
 })
 
-test('createSalesOrderRefund uses current cost layer cost after landed cost revaluation', async () => {
+// 6oyu.5: after a post-dispatch landed-cost revaluation, updateSnapshotsForCost-
+// LayerChange rewrites the shipment snapshot AND cogsBatchAmount to the CURRENT
+// layer cost (£12), so the snapshot can NOT be the posted basis (scjz.19). The
+// immutable CogsEntry dispatch rows (£10) are. The refund must reverse £10 (posted)
+// and re-enter the returned stock at £10 — the +£2 revaluation delta stays in COGS.
+test('createSalesOrderRefund reverses originally-posted COGS after an UPWARD landed-cost revaluation (6oyu.5)', async () => {
   const state = baseState({
     orders: [{
       id: 'order-1',
@@ -1068,13 +1075,30 @@ test('createSalesOrderRefund uses current cost layer cost after landed cost reva
       status: 'SHIPPED',
       shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
       revenueRecognizedAmount: 100,
-      cogsBatchAmount: 20,
+      // Revaluation mutated the snapshot AND cogsBatchAmount to the current £12.
+      cogsBatchAmount: 24,
       lines: [{
         id: 'shipment-line-1',
         lineId: 'line-1',
         qty: 2,
-        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 12 }],
       }],
+    }],
+    // Immutable dispatch COGS: posted at £10/unit.
+    movements: [{
+      id: 'dispatch-movement-1',
+      productId: 'product-1',
+      qty: 2,
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      idempotencyKey: 'SALE_DISPATCH:shipmentLine:shipment-line-1',
+    }],
+    cogsEntries: [{
+      movementId: 'dispatch-movement-1',
+      costLayerId: 'layer-1',
+      qty: 2,
+      unitCostBase: 10,
+      createdAt: new Date('2026-01-02T00:00:00.000Z'),
     }],
     costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 12 }],
   })
@@ -1092,19 +1116,21 @@ test('createSalesOrderRefund uses current cost layer cost after landed cost reva
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
     costLayerId: 'layer-1',
     qty: '1.000000',
-    unitCostBase: '12.000000',
+    unitCostBase: '10.000000',
     shipmentLineId: 'shipment-line-1',
     source: 'shipment',
   }])
   assert.equal(
     findReturnCostLayer(state).unitCostBase,
-    '12.000000',
-    'return layer should be valued at the refreshed cost, not the shipment snapshot',
+    '10.000000',
+    'return layer should re-enter at the originally-posted cost, not the revalued layer cost',
   )
-  assert.equal(findCogsReversalInventoryLine(result).debit, 12)
+  assert.equal(findCogsReversalInventoryLine(result).debit, 10)
+  const sync = findCogsReversalSync(result)
+  assert.equal((sync.payload as { _cogsReversalBase?: number })._cogsReversalBase, 10)
 })
 
-test('createSalesOrderRefund uses decreased current cost layer cost after landed cost revaluation', async () => {
+test('createSalesOrderRefund reverses originally-posted COGS after a DOWNWARD landed-cost revaluation (6oyu.5)', async () => {
   const state = baseState({
     orders: [{
       id: 'order-1',
@@ -1124,13 +1150,28 @@ test('createSalesOrderRefund uses decreased current cost layer cost after landed
       status: 'SHIPPED',
       shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
       revenueRecognizedAmount: 100,
-      cogsBatchAmount: 20,
+      cogsBatchAmount: 16,
       lines: [{
         id: 'shipment-line-1',
         lineId: 'line-1',
         qty: 2,
-        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 8 }],
       }],
+    }],
+    movements: [{
+      id: 'dispatch-movement-1',
+      productId: 'product-1',
+      qty: 2,
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      idempotencyKey: 'SALE_DISPATCH:shipmentLine:shipment-line-1',
+    }],
+    cogsEntries: [{
+      movementId: 'dispatch-movement-1',
+      costLayerId: 'layer-1',
+      qty: 2,
+      unitCostBase: 10,
+      createdAt: new Date('2026-01-02T00:00:00.000Z'),
     }],
     costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 8 }],
   })
@@ -1148,16 +1189,108 @@ test('createSalesOrderRefund uses decreased current cost layer cost after landed
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
     costLayerId: 'layer-1',
     qty: '1.000000',
-    unitCostBase: '8.000000',
+    unitCostBase: '10.000000',
     shipmentLineId: 'shipment-line-1',
     source: 'shipment',
   }])
   assert.equal(
     findReturnCostLayer(state).unitCostBase,
-    '8.000000',
-    'return layer should follow downward landed-cost revaluation',
+    '10.000000',
+    'return layer should re-enter at the originally-posted cost after a downward revaluation',
   )
-  assert.equal(findCogsReversalInventoryLine(result).debit, 8)
+  assert.equal(findCogsReversalInventoryLine(result).debit, 10)
+})
+
+test('createSalesOrderRefund draws posted COGS proportionally on a PARTIAL refund after revaluation (6oyu.5)', async () => {
+  // Shipped 2 units across two FIFO layers with DIFFERENT posted costs (£10, £20),
+  // both revalued up to £15 after dispatch. A 1-unit partial refund must reverse
+  // the FIFO-oldest layer's POSTED £10 (proportional draw), not the current £15.
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 30,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 30,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [
+          { costLayerId: 'layer-1', qty: 1, unitCostBase: 15 },
+          { costLayerId: 'layer-2', qty: 1, unitCostBase: 15 },
+        ],
+      }],
+    }],
+    movements: [{
+      id: 'dispatch-movement-1',
+      productId: 'product-1',
+      qty: 2,
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      idempotencyKey: 'SALE_DISPATCH:shipmentLine:shipment-line-1',
+    }],
+    cogsEntries: [
+      { movementId: 'dispatch-movement-1', costLayerId: 'layer-1', qty: 1, unitCostBase: 10, createdAt: new Date('2026-01-02T00:00:00.000Z') },
+      { movementId: 'dispatch-movement-1', costLayerId: 'layer-2', qty: 1, unitCostBase: 20, createdAt: new Date('2026-01-02T00:00:01.000Z') },
+    ],
+    costLayers: [
+      { id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 1, unitCostBase: 15 },
+      { id: 'layer-2', productId: 'product-1', poLineId: 'po-line-2', receivedQty: 1, unitCostBase: 15 },
+    ],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Partial return after revaluation',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
+    costLayerId: 'layer-1',
+    qty: '1.000000',
+    unitCostBase: '10.000000',
+    shipmentLineId: 'shipment-line-1',
+    source: 'shipment',
+  }])
+  assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
+  assert.equal(findCogsReversalInventoryLine(result).debit, 10)
+})
+
+test('applyPostedShipmentUnitCosts overrides shipment entries with the posted basis, keeps others (6oyu.5)', () => {
+  const posted = new Map<string, number>([
+    [postedShipmentUnitCostKey('shipment-line-1', 'layer-1'), 10],
+  ])
+  const entries = [
+    // Shipment entry with a posted basis → overridden to £10.
+    { costLayerId: 'layer-1', qty: 1, unitCostBase: 12, shipmentLineId: 'shipment-line-1', source: 'shipment' as const },
+    // Shipment entry with NO posted basis (legacy) → keeps its carrying cost.
+    { costLayerId: 'layer-9', qty: 1, unitCostBase: 7, shipmentLineId: 'shipment-line-1', source: 'shipment' as const },
+    // Allocation entry (no shipmentLineId) → untouched.
+    { costLayerId: 'layer-1', qty: 1, unitCostBase: 5, orderAllocationId: 'alloc-1', source: 'allocation' as const },
+  ]
+  assert.deepEqual(applyPostedShipmentUnitCosts(entries, posted), [
+    { costLayerId: 'layer-1', qty: 1, unitCostBase: 10, shipmentLineId: 'shipment-line-1', source: 'shipment' },
+    { costLayerId: 'layer-9', qty: 1, unitCostBase: 7, shipmentLineId: 'shipment-line-1', source: 'shipment' },
+    { costLayerId: 'layer-1', qty: 1, unitCostBase: 5, orderAllocationId: 'alloc-1', source: 'allocation' },
+  ])
 })
 
 test('createSalesOrderRefund falls back to shipment snapshot cost when cost layer no longer exists', async () => {
