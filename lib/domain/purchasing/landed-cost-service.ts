@@ -17,6 +17,7 @@ import {
 import { db } from '@/lib/db'
 import { toJsonInputValue } from '@/lib/db/json-input'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
+import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
 
 export const LANDED_COST_DISTRIBUTION_METHODS = [
@@ -698,12 +699,29 @@ export async function queueLandedCostAdjustmentJournals(
         },
       ],
     }
-    await queueAccountingSync({
-      type: 'STOCK_IN_TRANSIT',
-      referenceType: 'PurchaseOrder',
-      referenceId: adj.primaryPoId,
-      payload,
-      idempotencyKey: landedCostAdjustmentIdempotencyKey('inventory', adj),
+    // 6oyu.4 (khdw): commit the STOCK_IN_TRANSIT reclass queue + its transit subledger
+    // row atomically (mirrors the COGS bcz9.2 pattern below) so a crash between them
+    // can't desync the ledger from the GL. Record only when actually queued; the
+    // signed delta follows the transit LEG: increase → CR transit (−), decrease → DR
+    // transit (+). Keyed by the journal's OWN idempotency key.
+    const reclassIdempotencyKey = landedCostAdjustmentIdempotencyKey('inventory', adj)
+    await db.$transaction(async (tx) => {
+      const queued = await queueAccountingSyncTx(tx, {
+        type: 'STOCK_IN_TRANSIT',
+        referenceType: 'PurchaseOrder',
+        referenceId: adj.primaryPoId,
+        payload,
+        idempotencyKey: reclassIdempotencyKey,
+      })
+      if (queued) {
+        await recordTransitSubledgerMovement(tx, {
+          sourceType: 'LANDED_COST_RECLASS',
+          sourceRef: adj.primaryPoId,
+          idempotencyKey: reclassIdempotencyKey,
+          baseDelta: isIncrease ? -absDelta : absDelta,
+          journalDate: payload.date,
+        })
+      }
     })
   }
 
@@ -755,6 +773,18 @@ export async function queueLandedCostAdjustmentJournals(
           sourceRef: adj.primaryPoId,
           idempotencyKey: cogsIdempotencyKey,
           baseDelta: isIncrease ? absDelta : -absDelta,
+          journalDate: payload.date,
+        })
+        // 6oyu.4 (khdw): the consumed-qty COGS adjustment offsets the TRANSIT account
+        // (resolveConsumedCogsOffsetAccount → transitAccount), so the SAME journal also
+        // moves transit — record its transit leg. On an increase: DR COGS / CR transit
+        // (transit −); on a decrease: DR transit / CR COGS (transit +). Same key as the
+        // COGS row but a separate ledger table, so no collision.
+        await recordTransitSubledgerMovement(tx, {
+          sourceType: 'LANDED_COST_CONSUMED_OFFSET',
+          sourceRef: adj.primaryPoId,
+          idempotencyKey: cogsIdempotencyKey,
+          baseDelta: isIncrease ? -absDelta : absDelta,
           journalDate: payload.date,
         })
       }

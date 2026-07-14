@@ -38,6 +38,7 @@ import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from 
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { buildInventoryReconciliationSweepJournal, loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
+import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
@@ -75,6 +76,7 @@ const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_GROUP_B',
   'DAILY_BATCH_INVENTORY_RECONCILIATION',
   'DAILY_BATCH_COGS_RECONCILIATION',
+  'DAILY_BATCH_TRANSIT_RECONCILIATION',
 ] as const
 
 // GL postings round to the canonical GL precision (cogs-audit scjz.60); these
@@ -220,7 +222,7 @@ function consumeSnapshotLayers(
 async function createPendingSyncLog(
   tx: AccountingMirrorClient,
   params: {
-    type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION'
+    type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION' | 'DAILY_BATCH_TRANSIT_RECONCILIATION'
     referenceId: string
     payload: Record<string, unknown>
     currency: string
@@ -323,6 +325,8 @@ export type XeroDailyBatchResult = {
   inventoryReconciliationSwept?: number | null
   // khdw: same, for the COGS subledger-vs-GL rounding sweep.
   cogsReconciliationSwept?: number | null
+  // 6oyu.4 (khdw): same, for the STOCK_IN_TRANSIT subledger-vs-GL rounding sweep.
+  transitReconciliationSwept?: number | null
 }
 
 export function resolveXeroDailyBatchLimit(value = process.env.XERO_DAILY_BATCH_LIMIT): number {
@@ -1391,6 +1395,47 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       }
     } catch (e) {
       result.errors.push(`COGS reconciliation sweep error: ${String(e)}`)
+    }
+
+    // 6oyu.4 (khdw): STOCK_IN_TRANSIT subledger-vs-GL rounding sweep — same
+    // guard/idempotency/safety as the inventory + COGS sweeps above, on the transit
+    // clearing account. Reconciles the PERIOD MOVEMENT (Σ signed transit subledger
+    // rows over the GL window) vs the transit account GL movement; sub-penny → swept,
+    // material → flagged (never swept — an uninstrumented transit flow or a genuine
+    // misstatement must surface, not be masked). Independent of inventory/COGS; a
+    // failure must never abort the batch (the core postings already committed).
+    result.transitReconciliationSwept = null
+    try {
+      const reconciliation = await loadTransitGlReconciliation()
+      const journal = buildTransitReconciliationSweepJournal(reconciliation, {
+        transitAccount: settings.xero_transit_account ?? '',
+        roundingAccount: settings.xero_rounding_difference_account ?? '',
+        currency: baseCurrency,
+      })
+      if (journal) {
+        const referenceId = `TRANSITRECON-${journal.date}`
+        if (!(await hasLiveDailyBatchLog('DAILY_BATCH_TRANSIT_RECONCILIATION', referenceId))) {
+          await db.$transaction((tx) => createPendingSyncLog(tx, {
+            type: 'DAILY_BATCH_TRANSIT_RECONCILIATION',
+            referenceId,
+            currency: baseCurrency,
+            payload: {
+              date: journal.date,
+              reference: `Transit reconciliation ${journal.date}`,
+              narration: journal.narration,
+              lines: journal.lines,
+              batchReferenceId: referenceId,
+              batchDate: journal.date,
+              batchGroup: 'TRANSIT_RECONCILIATION',
+              _postingMode: 'submitted',
+            },
+          }))
+          // delta is signed (subledger - GL); records both magnitude and direction.
+          result.transitReconciliationSwept = journal.subledgerHigher ? journal.amount : -journal.amount
+        }
+      }
+    } catch (e) {
+      result.errors.push(`Transit reconciliation sweep error: ${String(e)}`)
     }
 
     // Log summary

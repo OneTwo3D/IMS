@@ -2,6 +2,7 @@ import { Prisma, type PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getAccountingSettings, queueAccountingSyncTx } from '@/lib/accounting'
+import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { enqueueStockSync } from '@/lib/shopping'
 import { roundQuantity } from '@/lib/domain/math/decimal'
@@ -52,6 +53,7 @@ export type CancelPurchaseOrderServiceDeps = {
   enqueueStockSync: typeof enqueueStockSync
   getAccountingSettings: typeof getAccountingSettings
   queueAccountingSyncTx: typeof queueAccountingSyncTx
+  recordTransitSubledgerMovement: typeof recordTransitSubledgerMovement
   reversePurchaseOrderCostLayersForCancellation: typeof reversePurchaseOrderCostLayersForCancellation
   readPurchaseOrderConsumedCostForCancellation: typeof readPurchaseOrderConsumedCostForCancellation
   recalculateLandedCosts: typeof recalculateLandedCosts
@@ -70,6 +72,7 @@ const defaultCancelPurchaseOrderServiceDeps: CancelPurchaseOrderServiceDeps = {
   enqueueStockSync,
   getAccountingSettings,
   queueAccountingSyncTx,
+  recordTransitSubledgerMovement,
   reversePurchaseOrderCostLayersForCancellation,
   readPurchaseOrderConsumedCostForCancellation,
   recalculateLandedCosts,
@@ -200,13 +203,26 @@ export async function cancelPurchaseOrderService(
               },
             ],
           }
-          await deps.queueAccountingSyncTx(tx, {
+          const cancelIdempotencyKey = accountingPayloadKey(`purchase-order-cancel:${id}:cost-layer-reversal`, payload)
+          const queued = await deps.queueAccountingSyncTx(tx, {
             type: 'INVENTORY_ADJUSTMENT',
             referenceType: 'PurchaseOrder',
             referenceId: id,
             payload,
-            idempotencyKey: accountingPayloadKey(`purchase-order-cancel:${id}:cost-layer-reversal`, payload),
+            idempotencyKey: cancelIdempotencyKey,
           })
+          // 6oyu.4 (khdw): this reversal DR transit / CR inventory, so it DEBITS the
+          // transit clearing account (+amount). Record the transit subledger row
+          // atomically with the queued journal, keyed the same, only when queued.
+          if (queued) {
+            await deps.recordTransitSubledgerMovement(tx, {
+              sourceType: 'PURCHASE_ORDER_CANCEL',
+              sourceRef: id,
+              idempotencyKey: cancelIdempotencyKey,
+              baseDelta: amount,
+              journalDate: cancellationDate,
+            })
+          }
         }
       }
 

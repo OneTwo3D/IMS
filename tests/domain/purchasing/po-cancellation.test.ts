@@ -297,6 +297,7 @@ test('cancelPurchaseOrderService is idempotent when called twice', async () => {
       accountingSyncs.push(input)
       return { id: `sync-${accountingSyncs.length}` } as never
     },
+    recordTransitSubledgerMovement: async () => {},
     reversePurchaseOrderCostLayersForCancellation: async () => {
       reversalCalls += 1
       return {
@@ -398,6 +399,7 @@ test('cancelPurchaseOrderService flags already-consumed COGS with a WARNING and 
       consumedReadBeforeReversal = !reversalRan
       return { consumedQty: '70', consumedValueBase: '350', layers: [{ costLayerId: 'l1', poLineId: 'po-line-1', productId: 'p1', consumedQty: '70', unitCostBase: '5', consumedValueBase: '350' }] }
     },
+    recordTransitSubledgerMovement: async () => {},
     reversePurchaseOrderCostLayersForCancellation: async () => {
       reversalRan = true
       return { reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }
@@ -454,6 +456,7 @@ test('audit-C3: cancelling a FREIGHT PO recalculates landed costs and surfaces t
     getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
     queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
     readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
+    recordTransitSubledgerMovement: async () => {},
     reversePurchaseOrderCostLayersForCancellation: async () => ({ reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }),
     recalculateLandedCosts: (async (_tx: unknown, freightPoId: string) => {
       recalcCalledWithFreightPoId = freightPoId
@@ -502,6 +505,7 @@ test('audit-C3: cancelling a GOODS PO does NOT trigger a landed-cost recalc', as
     getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
     queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
     readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
+    recordTransitSubledgerMovement: async () => {},
     reversePurchaseOrderCostLayersForCancellation: async () => ({ reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }),
     recalculateLandedCosts: (async () => { recalcCalled = true; return {} as never }) as never,
     queueLandedCostAdjustmentJournals: async () => {},
@@ -537,6 +541,7 @@ test('audit-g5u2.4: an invoiced FREIGHT PO fully offset by POSTED credit notes c
       getAccountingSettings: async () => ({ syncEnabled: false, transitAccount: '140', inventoryAccount: '120' }) as never,
       queueAccountingSyncTx: async () => ({ id: 'sync-1' }) as never,
       readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
+      recordTransitSubledgerMovement: async () => {},
       reversePurchaseOrderCostLayersForCancellation: async () => ({ reversedLayers: [], productIds: [], totalReversalValueBase: new Prisma.Decimal('0') }),
       recalculateLandedCosts: (async () => ({ revalidatePoIds: [], auditRunIds: [], cogsAdjustments: [], inventoryTransitAdjustments: [], warnings: [] })) as never,
       queueLandedCostAdjustmentJournals: async () => {},
@@ -556,4 +561,46 @@ test('audit-g5u2.4: an invoiced FREIGHT PO fully offset by POSTED credit notes c
   assert.equal(blocked.success, false)
   assert.match(blocked.error ?? '', /not fully offset by posted credit notes/)
   assert.equal(uncredited.po.status, 'PARTIALLY_RECEIVED') // unchanged
+})
+
+test('cancelPurchaseOrderService records a +transit subledger row (DR transit / CR inventory reversal) — 6oyu.4', async () => {
+  const po: { status: PurchaseOrderStatus; reference: string } = { status: 'PARTIALLY_RECEIVED', reference: 'PO-T' }
+  const transitRows: Array<{ sourceType: string; sourceRef: string; idempotencyKey: string; baseDelta: number }> = []
+  const tx = {
+    $queryRaw: async () => [],
+    purchaseOrder: {
+      findUnique: async () => ({
+        status: po.status, reference: po.reference,
+        lines: [{ id: 'po-line-1' }], invoices: [], supplierCreditNotes: [],
+      }),
+      update: async ({ data }: { data: { status: typeof po.status } }) => { po.status = data.status; return { id: 'po-1' } },
+    },
+  }
+  const deps: CancelPurchaseOrderServiceDeps = {
+    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
+    transaction: async (fn) => fn(tx as never),
+    logActivity: async () => {},
+    enqueueStockSync: async () => {},
+    getAccountingSettings: async () => ({ syncEnabled: true, transitAccount: '140', inventoryAccount: '120' }) as never,
+    queueAccountingSyncTx: async () => true as never,
+    recordTransitSubledgerMovement: async (_tx, input) => {
+      transitRows.push({ sourceType: input.sourceType, sourceRef: input.sourceRef, idempotencyKey: input.idempotencyKey, baseDelta: Number(input.baseDelta) })
+    },
+    reversePurchaseOrderCostLayersForCancellation: async () => ({
+      reversedLayers: [{ costLayerId: 'layer-1', poLineId: 'po-line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: '2.000000', unitCostBase: '5.000000', totalValueBase: '10.000000' }],
+      productIds: ['product-1'],
+      totalReversalValueBase: new Prisma.Decimal('10'),
+    }),
+    readPurchaseOrderConsumedCostForCancellation: async () => ({ consumedQty: '0', consumedValueBase: '0', layers: [] }),
+    recalculateLandedCosts: async () => ({} as never),
+    queueLandedCostAdjustmentJournals: async () => {},
+  }
+
+  await cancelPurchaseOrderService('po-1', deps)
+
+  assert.equal(transitRows.length, 1)
+  assert.equal(transitRows[0]!.sourceType, 'PURCHASE_ORDER_CANCEL')
+  assert.equal(transitRows[0]!.sourceRef, 'po-1')
+  // DR transit → positive (reversing received inventory back into transit); magnitude = reversal value.
+  assert.equal(transitRows[0]!.baseDelta, 10)
 })

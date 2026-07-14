@@ -7,6 +7,34 @@
 // ---------------------------------------------------------------------------
 
 /**
+ * 6oyu.4 (khdw): the NET base amount a supplier credit note posts to the transit
+ * clearing account, for the transit subledger row.
+ *
+ * A STANDARD credit posts to Xero tax-INCLUSIVE with a GROSS amount, so Xero splits
+ * it into net (→ transit) + VAT (→ tax account) — transit receives the NET, not the
+ * gross. A REVERSE-CHARGE credit posts EXCLUSIVE with a net amount (its offset bill
+ * carries no actual VAT, so `billTaxForeign` is 0) — transit already receives the
+ * full amount. We derive the net from the OFFSET BILL's own VAT ratio (currency-
+ * invariant, so foreign figures are fine): net = gross × subtotal/(subtotal+tax).
+ * When the credit isn't tied to a bill (`billTaxForeign` 0/undefined) the amount is
+ * treated as already-net — the reconciliation's material-gap FLAG is the backstop
+ * for the rare untied-inclusive-standard-credit edge case.
+ */
+export function resolveSupplierCreditNoteTransitBase(params: {
+  /** The credit's GROSS base-currency amount (amountForeign × fxRateToBase). */
+  grossBase: number
+  /** The offset bill's net subtotal (foreign or base — only the ratio is used). */
+  billSubtotalForeign: number
+  /** The offset bill's tax total (same currency basis as subtotal). */
+  billTaxForeign: number
+}): number {
+  const tax = params.billTaxForeign
+  const subtotal = params.billSubtotalForeign
+  if (!(tax > 0) || !(subtotal > 0)) return params.grossBase
+  return params.grossBase * (subtotal / (subtotal + tax))
+}
+
+/**
  * Validate a record request. Returns an error string, or null when valid.
  * A credit note can only be recorded against a PO that already has a supplier
  * invoice (you credit a bill, not an unbilled order), and a selected invoice

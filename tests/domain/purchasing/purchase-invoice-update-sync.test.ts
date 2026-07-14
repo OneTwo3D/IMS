@@ -51,6 +51,8 @@ function baseParams<Tx extends { activityLog: { create: (input: ActivityLogCreat
     accountingInvoiceId: 'xero-bill-1',
     accountingPayload: basePayload(),
     idempotencyKey: 'purchase-invoice-update:hash',
+    previousSubtotalBase: 0,
+    newSubtotalBase: 0,
     deps,
   }
 }
@@ -66,6 +68,7 @@ test('maybeQueuePurchaseInvoiceUpdate queues Xero PURCHASE_INVOICE_UPDATE when e
     },
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    recordTransitSubledgerMovement: async () => {},
     getActiveAccountingConnectorInfo: async () => ({ id: 'xero', name: 'Xero' }),
     isAccountingSyncTypeEnabled: async () => true,
     queueAccountingSyncTx: async (_tx, input) => {
@@ -100,6 +103,7 @@ test('maybeQueuePurchaseInvoiceUpdate logs unsupported connector without queuein
     },
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    recordTransitSubledgerMovement: async () => {},
     getActiveAccountingConnectorInfo: async () => ({ id: 'quickbooks', name: 'QuickBooks' }),
     isAccountingSyncTypeEnabled: async () => true,
     queueAccountingSyncTx: async (_tx, input) => {
@@ -134,6 +138,7 @@ test('maybeQueuePurchaseInvoiceUpdate skips disabled sync type without warning l
     },
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    recordTransitSubledgerMovement: async () => {},
     getActiveAccountingConnectorInfo: async () => ({ id: 'xero', name: 'Xero' }),
     isAccountingSyncTypeEnabled: async () => false,
     queueAccountingSyncTx: async (_tx, input) => {
@@ -160,6 +165,7 @@ test('maybeQueuePurchaseInvoiceUpdate skips bills without external accounting id
     },
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    recordTransitSubledgerMovement: async () => {},
     getActiveAccountingConnectorInfo: async () => {
       throw new Error('connector should not be loaded')
     },
@@ -179,4 +185,73 @@ test('maybeQueuePurchaseInvoiceUpdate skips bills without external accounting id
   assert.equal(result, 'skipped-no-external-id')
   assert.equal(queueCalls.length, 0)
   assert.equal(activityLogCalls.length, 0)
+})
+
+test('maybeQueuePurchaseInvoiceUpdate records the signed transit delta (new − old net subtotal) — 6oyu.4', async () => {
+  const transitRows: Array<{ sourceType: string; sourceRef: string; idempotencyKey: string; baseDelta: number; journalDate: string }> = []
+  const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
+  const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    getActiveAccountingConnectorInfo: async () => ({ id: 'xero', name: 'Xero' }),
+    isAccountingSyncTypeEnabled: async () => true,
+    queueAccountingSyncTx: async () => true,
+    recordTransitSubledgerMovement: async (_tx, input) => {
+      transitRows.push({ ...input, baseDelta: Number(input.baseDelta) })
+    },
+  }
+
+  const result = await maybeQueuePurchaseInvoiceUpdate({
+    ...baseParams(tx, deps),
+    previousSubtotalBase: 100,
+    newSubtotalBase: 130.5,
+  })
+
+  assert.equal(result, 'queued')
+  assert.equal(transitRows.length, 1)
+  assert.equal(transitRows[0]!.sourceType, 'PURCHASE_BILL_UPDATE')
+  assert.equal(transitRows[0]!.sourceRef, 'po-1')
+  assert.equal(transitRows[0]!.idempotencyKey, 'purchase-invoice-update:hash')
+  // The bill's net (transit) leg rose by 30.50 → transit DEBIT delta of +30.50.
+  assert.equal(transitRows[0]!.baseDelta, 30.5)
+  assert.equal(transitRows[0]!.journalDate, '2026-06-12')
+})
+
+test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the update is not queued — 6oyu.4', async () => {
+  const transitRows: unknown[] = []
+  const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
+  const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    getActiveAccountingConnectorInfo: async () => ({ id: 'quickbooks', name: 'QuickBooks' }),
+    isAccountingSyncTypeEnabled: async () => true,
+    queueAccountingSyncTx: async () => true,
+    recordTransitSubledgerMovement: async (_tx, input) => { transitRows.push(input) },
+  }
+
+  const result = await maybeQueuePurchaseInvoiceUpdate({
+    ...baseParams(tx, deps),
+    previousSubtotalBase: 100,
+    newSubtotalBase: 130.5,
+  })
+
+  assert.equal(result, 'skipped-unsupported-connector')
+  assert.equal(transitRows.length, 0)
+})
+
+test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the queue declines (type disabled) — 6oyu.4', async () => {
+  const transitRows: unknown[] = []
+  const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
+  const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    getActiveAccountingConnectorInfo: async () => ({ id: 'xero', name: 'Xero' }),
+    isAccountingSyncTypeEnabled: async () => true,
+    // queue declines (e.g. no active posting context) — no GL counterpart exists.
+    queueAccountingSyncTx: async () => false,
+    recordTransitSubledgerMovement: async (_tx, input) => { transitRows.push(input) },
+  }
+
+  const result = await maybeQueuePurchaseInvoiceUpdate({
+    ...baseParams(tx, deps),
+    previousSubtotalBase: 100,
+    newSubtotalBase: 130.5,
+  })
+
+  assert.equal(result, 'queued')
+  assert.equal(transitRows.length, 0)
 })

@@ -4,6 +4,7 @@ import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
 import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
+import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -880,6 +881,28 @@ export async function runAccountingInvariantReport(options: {
         subledgerValue: cogsReconciliation.subledgerValue,
         delta: cogsReconciliation.delta,
         sweepLimit: cogsReconciliation.sweepLimit,
+      },
+    })
+  }
+
+  // 6oyu.4 (khdw): reconcile the GL STOCK_IN_TRANSIT clearing account to its IMS
+  // subledger period movement (Σ signed transit_subledger_movements over the GL
+  // window). Only a gap beyond the rounding-scale sweep limit is a real discrepancy —
+  // a missing/double transit posting, or a new transit flow not recording a subledger
+  // row; rounding residue is left for the transit rounding-difference sweep. Degrades
+  // silently when the transit account is unmapped or no usable balance snapshots exist.
+  const transitReconciliation = await loadTransitGlReconciliation()
+  if (transitReconciliation.available && transitReconciliation.action === 'flag') {
+    findings.push({
+      severity: 'critical',
+      code: 'transit_gl_subledger_mismatch',
+      message: `GL transit movement (${transitReconciliation.glBalance.toFixed(2)}) does not reconcile to the transit subledger movement (${transitReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
+      details: {
+        balanceDate: transitReconciliation.balanceDate,
+        glBalance: transitReconciliation.glBalance,
+        subledgerValue: transitReconciliation.subledgerValue,
+        delta: transitReconciliation.delta,
+        sweepLimit: transitReconciliation.sweepLimit,
       },
     })
   }

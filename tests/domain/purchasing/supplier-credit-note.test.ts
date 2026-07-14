@@ -5,7 +5,25 @@ import {
   validateRecordSupplierCreditNote,
   buildSupplierCreditNoteSyncPayload,
   resolveSupplierCreditNoteTaxType,
+  resolveSupplierCreditNoteTransitBase,
 } from '@/lib/domain/purchasing/supplier-credit-note'
+
+// 6oyu.4 (khdw): the NET base amount a credit note posts to the transit account (for
+// the transit subledger). A standard credit posts INCLUSIVE (gross) → transit gets the
+// net after Xero's VAT split; a reverse-charge/NONE credit is already net.
+test('resolveSupplierCreditNoteTransitBase: standard credit nets out the bill VAT ratio', () => {
+  // £120 gross credit against a 20%-VAT bill (subtotal 100, tax 20) → £100 net to transit.
+  assert.equal(
+    resolveSupplierCreditNoteTransitBase({ grossBase: 120, billSubtotalForeign: 100, billTaxForeign: 20 }),
+    100,
+  )
+})
+
+test('resolveSupplierCreditNoteTransitBase: no-VAT / reverse-charge / untied credit passes through as net', () => {
+  // billTaxForeign 0 (NONE, reverse-charge, or untied): the amount is already net.
+  assert.equal(resolveSupplierCreditNoteTransitBase({ grossBase: 80, billSubtotalForeign: 80, billTaxForeign: 0 }), 80)
+  assert.equal(resolveSupplierCreditNoteTransitBase({ grossBase: 80, billSubtotalForeign: 0, billTaxForeign: 0 }), 80)
+})
 
 // audit-g5u2.3: a supplier credit note can only be recorded against a billed PO,
 // and its Xero payload reverses the freight bill on the transit/clearing account.
