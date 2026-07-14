@@ -3,7 +3,7 @@
   "version": "2.0.0",
   "private": true,
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.11.0"
   },
   "scripts": {
     "dev": "next dev",
@@ -11,7 +11,7 @@
     "start": "next start",
     "lint": "eslint",
     "type-check": "tsc --noEmit",
-    "test:unit": "NODE_OPTIONS='--import tsx' node --test \"tests/**/*.test.ts\"",
+    "test:unit": "NODE_OPTIONS='--import tsx' node --experimental-test-module-mocks --test \"tests/**/*.test.ts\"",
     "check:decimal-boundaries": "node scripts/check-domain-decimal-boundaries.mjs",
     "check:connector-fetch-boundaries": "node scripts/check-connector-fetch-boundaries.mjs",
     "check:wms-connector-boundary": "node scripts/check-wms-connector-boundary.mjs",
