@@ -1,39 +1,60 @@
 import { NextResponse } from 'next/server'
 import { logActivity } from '@/lib/activity-log'
-import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { isIntegrationPluginEnabled, type IntegrationPluginId } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 
 /**
- * Resolve the redirect origin from the trusted, server-configured app URL only
- * (qye3/CWE-601). The Host / X-Forwarded-Host headers are attacker-controlled,
- * so they are NEVER read; the redirect target is the configured public app URL,
- * falling back to the request's own URL origin only when no app URL is set.
- * Pure over (request, publicAppUrl) so the no-forwarded-host guarantee is
- * unit-tested (tests/security/accounting-callback-origin.test.ts).
+ * The redirect origin is the trusted, server-configured app URL ONLY
+ * (qye3/CWE-601). Returns null when no valid app URL is configured — and the
+ * request URL / Host / X-Forwarded-Host headers are NEVER consulted, so an
+ * attacker-controlled origin can never appear in the emitted redirect
+ * regardless of Next's host-trust topology. When null, redirects go out as
+ * RELATIVE Locations, which the browser resolves against the real request URL.
  */
-export function resolveAppOrigin(request: Request, publicAppUrl: string | null): string {
-  if (publicAppUrl) {
-    try {
-      return new URL(publicAppUrl).origin
-    } catch {
-      // malformed configured URL — fall through to the request origin
-    }
+export function resolveAppOrigin(publicAppUrl: string | null): string | null {
+  if (!publicAppUrl) return null
+  try {
+    return new URL(publicAppUrl).origin
+  } catch {
+    return null
   }
-  return new URL(request.url).origin
 }
 
-async function redirectWithStatus(origin: string, connector: string, params: Record<string, string>, returnPath?: string | null) {
+/**
+ * Build the accounting-status redirect. An absolute URL on the trusted origin
+ * when one is configured; otherwise a RELATIVE Location (path + query) that
+ * can't be pointed at an attacker host by a forwarded-host header.
+ */
+function redirectWithStatus(origin: string | null, connector: string, params: Record<string, string>, returnPath?: string | null): NextResponse {
   const safeReturnPath = returnPath && returnPath.startsWith('/') ? returnPath : `/sync?connector=${connector}`
-  const url = new URL(safeReturnPath, origin)
+  // Parse against a throwaway base to merge the status params into the query.
+  const url = new URL(safeReturnPath, 'http://redirect.invalid')
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, value)
   }
-  return NextResponse.redirect(url)
+  if (origin) {
+    return NextResponse.redirect(new URL(url.pathname + url.search, origin))
+  }
+  return new NextResponse(null, { status: 307, headers: { Location: url.pathname + url.search } })
+}
+
+/** Injectable dependencies so the handler is unit-testable end-to-end (qye3). */
+export type AccountingCallbackDeps = {
+  getPublicAppUrl: () => Promise<string | null>
+  isPluginEnabled: (plugin: IntegrationPluginId) => Promise<boolean>
 }
 
 export async function GET(request: Request) {
+  return handleAccountingCallback(request, {
+    getPublicAppUrl,
+    isPluginEnabled: isIntegrationPluginEnabled,
+  })
+}
+
+export async function handleAccountingCallback(request: Request, deps: AccountingCallbackDeps): Promise<NextResponse> {
   const url = new URL(request.url)
-  const origin = resolveAppOrigin(request, await getPublicAppUrl())
+  const publicAppUrl = await deps.getPublicAppUrl()
+  const origin = resolveAppOrigin(publicAppUrl)
   const code = url.searchParams.get('code')
   const state = url.searchParams.get('state')
   const error = url.searchParams.get('error')
@@ -43,13 +64,13 @@ export async function GET(request: Request) {
   // Determine which connector initiated this OAuth flow.
   // QBO callbacks always include realmId; Xero callbacks never do.
   // Also check which plugin is enabled as a fallback.
-  const isQuickBooks = !!realmId || (await isIntegrationPluginEnabled('quickbooks'))
+  const isQuickBooks = !!realmId || (await deps.isPluginEnabled('quickbooks'))
   const connector = isQuickBooks ? 'quickbooks' : 'xero'
 
-  if (connector === 'xero' && !(await isIntegrationPluginEnabled('xero'))) {
+  if (connector === 'xero' && !(await deps.isPluginEnabled('xero'))) {
     return await redirectWithStatus(origin, connector, { accounting_error: 'Accounting plugin is disabled' })
   }
-  if (connector === 'quickbooks' && !(await isIntegrationPluginEnabled('quickbooks'))) {
+  if (connector === 'quickbooks' && !(await deps.isPluginEnabled('quickbooks'))) {
     return await redirectWithStatus(origin, connector, { accounting_error: 'Accounting plugin is disabled' })
   }
 
@@ -66,8 +87,7 @@ export async function GET(request: Request) {
   }
 
   try {
-    const publicAppUrl = await getPublicAppUrl()
-    const redirectUri = `${(publicAppUrl ?? origin).replace(/\/+$/, '')}/api/accounting/callback`
+    const redirectUri = `${(publicAppUrl ?? '').replace(/\/+$/, '')}/api/accounting/callback`
 
     if (connector === 'quickbooks') {
       const { consumeQuickBooksOAuthState, exchangeCodeForTokens } = await import('@/lib/connectors/quickbooks/auth')
