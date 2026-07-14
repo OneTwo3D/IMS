@@ -116,6 +116,16 @@ test('END-TO-END: a real exchange (code+state) with NO configured URL errors BEF
   assert.match(new URL(location(res), 'http://x.invalid').searchParams.get('accounting_error') ?? '', /not configured/i)
 })
 
+test('resolveAppOrigin returns the NORMALIZED origin for WHATWG-parseable junk (F4 — redirect_uri is built from this, never the raw string)', () => {
+  // These parse to a valid origin, so the exchange proceeds — but redirectUri
+  // is built from this normalized origin, so backslashes/query/fragment in the
+  // configured value can never produce a malformed redirect_uri.
+  assert.equal(resolveAppOrigin('https:\\\\ims.example.com'), CONFIGURED)
+  assert.equal(resolveAppOrigin('https://ims.example.com?junk=1'), CONFIGURED)
+  assert.equal(resolveAppOrigin('https://ims.example.com#junk'), CONFIGURED)
+  assert.equal(resolveAppOrigin('https://ims.example.com/base/path'), CONFIGURED)
+})
+
 test('resolveAppOrigin rejects non-web schemes that parse but have origin "null" (F5)', () => {
   for (const bad of ['data:text/html,x', 'file:///etc/passwd', 'mailto:a@b.c', 'javascript:alert(1)']) {
     assert.equal(resolveAppOrigin(bad), null, `${bad} must not be a usable origin`)

@@ -98,12 +98,17 @@ export async function handleAccountingCallback(request: Request, deps: Accountin
   // truthiness (Codex r2+r3/F4: a malformed-but-truthy URL must not slip
   // through). Reject BEFORE consuming the single-use OAuth state so it stays
   // valid for a retry once the app URL is fixed.
-  if (!origin || !publicAppUrl) {
+  if (!origin) {
     return redirectWithStatus(origin, connector, { accounting_error: 'Server application URL is not configured; cannot complete the connection' })
   }
 
   try {
-    const redirectUri = `${publicAppUrl.replace(/\/+$/, '')}/api/accounting/callback`
+    // Built from the VALIDATED, normalized origin — NEVER the raw publicAppUrl
+    // string (Codex r4/F4: a WHATWG-parseable-but-malformed raw value like
+    // `https:\\host` or `https://host?junk` would otherwise yield a broken
+    // redirect_uri). new URL() with the origin base matches the authorize-side
+    // construction (app/actions/xero-sync.ts).
+    const redirectUri = new URL('/api/accounting/callback', origin).toString()
 
     if (connector === 'quickbooks') {
       const { consumeQuickBooksOAuthState, exchangeCodeForTokens } = await import('@/lib/connectors/quickbooks/auth')
