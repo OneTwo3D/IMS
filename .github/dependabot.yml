@@ -1,0 +1,27 @@
+# Controlled update process for the SHA-pinned GitHub Actions (onetwo3d-ims-kwmp).
+# All third-party actions in .github/workflows/*.yml are pinned to full commit
+# SHAs with a `# vX.Y.Z` version comment. Dependabot updates those SHAs (and the
+# comment) when upstream ships a new release, so pinning stays maintainable
+# without hand-resolving SHAs — each bump arrives as a reviewable PR.
+#
+# ACTIVATION NOTE: GitHub reads dependabot.yml ONLY from the repository's DEFAULT
+# branch. This repo develops on `development` while the default branch is `main`,
+# so `target-branch` below points update PRs at `development` (where the pinned
+# workflows live and merge). For Dependabot to run at all, this file must also be
+# present on the default branch — either land it on `main`, or set `development`
+# as the default branch. Tracked as a repo-admin follow-up (see onetwo3d-ims kwmp
+# follow-up bd).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: development
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
