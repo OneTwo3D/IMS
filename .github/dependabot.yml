@@ -1,0 +1,18 @@
+# Controlled update process for the SHA-pinned GitHub Actions (onetwo3d-ims-kwmp).
+# All third-party actions in .github/workflows/*.yml are pinned to full commit
+# SHAs with a `# vX.Y.Z` version comment. Dependabot updates those SHAs (and the
+# comment) when upstream ships a new release, so pinning stays maintainable
+# without hand-resolving SHAs — each bump arrives as a reviewable PR.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
