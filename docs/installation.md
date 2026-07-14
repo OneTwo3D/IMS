@@ -129,16 +129,28 @@ string on upload; configure any CDN in front of avatar assets to include query
 strings in its cache key.
 
 Invoice PDF scanning is disabled by default. Set `FILE_SCAN_MODE=command` and
-`FILE_SCAN_COMMAND_ARGV='["clamscan","--no-summary","{file}"]'` or
-`FILE_SCAN_COMMAND='clamscan --no-summary {file}'` to enable fail-closed
-scanning. IMS writes uploaded PDFs to
+`FILE_SCAN_COMMAND_ARGV='["clamdscan","--no-summary","--fdpass","{file}"]'` to
+enable fail-closed scanning. IMS writes uploaded PDFs to
 `$UPLOAD_STORAGE_DIR/quarantine/invoices`, runs the command against the
 quarantined path, and moves the file to `$UPLOAD_STORAGE_DIR/invoices` only when
-the scanner exits `0`. Non-zero scanner exits reject the upload as unsafe;
-spawn errors and timeouts also reject the upload. Rejected quarantine files are
+the scanner exits `0`. Exit `1` (signature match) rejects the upload as infected
+(`400`); any other outcome — exit `2+`, spawn error, or timeout — fails closed
+and rejects the upload as a scan failure (`503`). Rejected quarantine files are
 deleted by default for disk hygiene; the activity log records scanner mode,
 status, reason, exit code, signal, and scanner identifier without scanner output
 or filesystem paths.
+
+Use the ClamAV **daemon** client `clamdscan`, not the standalone `clamscan`.
+`clamscan` reloads the full (~110 MB+) signature database on every invocation
+(typically several seconds per scan), which can exceed the 5-second scanner
+health-check budget and fail the preflight; `clamdscan` reuses the resident
+`clamd` over its socket, so scans are effectively immediate. Pass `--fdpass` so
+the IMS-spawned `clamdscan` opens the quarantine file (owned `0600` by the IMS
+service user) and hands the descriptor to `clamd`, which otherwise runs as the
+`clamav` user and could not read it by path. A full deployment and
+operational-response runbook — install, signature updates, verification, and the
+handling of infected / timeout / scanner-unavailable outcomes — is in
+[docs/ops/invoice-pdf-malware-scanning.md](ops/invoice-pdf-malware-scanning.md).
 
 Scanner commands run without a shell. Prefer `FILE_SCAN_COMMAND_ARGV` when an
 argument contains spaces or empty values. The scanner process receives only the
