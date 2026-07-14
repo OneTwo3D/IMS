@@ -129,16 +129,27 @@ string on upload; configure any CDN in front of avatar assets to include query
 strings in its cache key.
 
 Invoice PDF scanning is disabled by default. Set `FILE_SCAN_MODE=command` and
-`FILE_SCAN_COMMAND_ARGV='["clamscan","--no-summary","{file}"]'` or
-`FILE_SCAN_COMMAND='clamscan --no-summary {file}'` to enable fail-closed
-scanning. IMS writes uploaded PDFs to
+`FILE_SCAN_COMMAND_ARGV='["clamdscan","--no-summary","--fdpass","{file}"]'` to
+enable fail-closed scanning. IMS writes uploaded PDFs to
 `$UPLOAD_STORAGE_DIR/quarantine/invoices`, runs the command against the
 quarantined path, and moves the file to `$UPLOAD_STORAGE_DIR/invoices` only when
-the scanner exits `0`. Non-zero scanner exits reject the upload as unsafe;
-spawn errors and timeouts also reject the upload. Rejected quarantine files are
+the scanner exits `0`. Exit `1` (signature match) rejects the upload as infected
+(`400`); any other outcome — exit `2+`, spawn error, or timeout — fails closed
+and rejects the upload as a scan failure (`503`). Rejected quarantine files are
 deleted by default for disk hygiene; the activity log records scanner mode,
 status, reason, exit code, signal, and scanner identifier without scanner output
 or filesystem paths.
+
+Use the ClamAV **daemon** client `clamdscan`, not the standalone `clamscan`.
+`clamscan` reloads the full (~110 MB+) signature database on every invocation
+(several seconds per scan), which exceeds the 5-second scanner health-check
+budget and makes the preflight fail; `clamdscan` reaches the resident `clamd`
+over its socket and scans in milliseconds. Pass `--fdpass` so `clamd` (running
+as the `clamav` user) can read a quarantine file owned by the IMS service user
+via the passed file descriptor instead of by path. A full deployment and
+operational-response runbook — install, signature updates, verification, and the
+handling of infected / timeout / scanner-unavailable outcomes — is in
+[docs/ops/invoice-pdf-malware-scanning.md](ops/invoice-pdf-malware-scanning.md).
 
 Scanner commands run without a shell. Prefer `FILE_SCAN_COMMAND_ARGV` when an
 argument contains spaces or empty values. The scanner process receives only the
