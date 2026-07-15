@@ -61,10 +61,26 @@ export const REQUIRED_WEBHOOKS: WebhookSpec[] = [
   { topic: 'order.updated', resource: 'orders' },
 ]
 
+/**
+ * Settings that must be TRUE on THIS instance for the run, and are restored after.
+ *
+ * The rig deliberately starts disarmed so it can never post to the shared Demo ledger
+ * by accident. But wc_sync_enabled is not only an outbound switch: the inbound webhook
+ * route gates on it too (getWebhookProcessingGate, webhooks.ts:316). With it false the
+ * IMS answers Woo **202 {skipped: true}** — a SUCCESS code — and silently discards the
+ * order. Woo therefore never retries and marks delivery complete, so the loss is
+ * invisible from both ends. Arming it here for the run window is what makes inbound
+ * webhooks work at all.
+ *
+ * Xero posting stays disarmed: tests arm that explicitly via ims.setPostingMode.
+ */
+const E2E_SETTINGS_TO_ENABLE = ['wc_sync_enabled'] as const
+
 type LockRecord = {
   takenAt: string
   runId: string
   stageSettings: Record<string, string | null>
+  e2eSettings: Record<string, string | null>
   createdWebhookIds: number[]
 }
 
@@ -165,13 +181,24 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
       const r = await stage.query<{ value: string }>(`select value from settings where key = $1`, [key])
       prior[key] = r.rows.length ? r.rows[0].value : null
     }
+    const priorE2e: Record<string, string | null> = {}
+    for (const key of E2E_SETTINGS_TO_ENABLE) {
+      const r = await e2e.query<{ value: string }>(`select value from settings where key = $1`, [key])
+      priorE2e[key] = r.rows.length ? r.rows[0].value : null
+    }
 
     const creds = await wcCreds(e2e)
     const base = `${appUrl.replace(/\/$/, '')}/api/webhooks/shopping/woocommerce`
 
     // Write the lock BEFORE mutating anything, so a crash mid-acquire is still
     // recoverable. Recording `prior` first is what makes release() truthful.
-    const lock: LockRecord = { takenAt: new Date().toISOString(), runId, stageSettings: prior, createdWebhookIds: [] }
+    const lock: LockRecord = {
+      takenAt: new Date().toISOString(),
+      runId,
+      stageSettings: prior,
+      e2eSettings: priorE2e,
+      createdWebhookIds: [],
+    }
     await writeLock(e2e, lock)
 
     for (const key of STAGE_SETTINGS_TO_DISABLE) {
@@ -182,6 +209,15 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
       )
     }
     console.log(`[quiesce] stage disabled: ${STAGE_SETTINGS_TO_DISABLE.join(', ')}`)
+
+    for (const key of E2E_SETTINGS_TO_ENABLE) {
+      await e2e.query(
+        `insert into settings (key, value, "updatedAt") values ($1, 'true', now())
+           on conflict (key) do update set value = 'true', "updatedAt" = now()`,
+        [key],
+      )
+    }
+    console.log(`[quiesce] e2e armed for inbound webhooks: ${E2E_SETTINGS_TO_ENABLE.join(', ')}`)
 
     for (const w of REQUIRED_WEBHOOKS) {
       const created = await wcRequest<{ id: number }>(creds, '/webhooks', {
@@ -232,6 +268,23 @@ async function releaseInternal(e2e: Client, stage: Client, lock: LockRecord): Pr
         [key, value],
       )
       console.log(`[quiesce] stage ${key} restored to ${value}`)
+    }
+  }
+
+  // Put this instance back to disarmed, so nothing imports or posts between runs.
+  // `?? {}` because a lock written before e2eSettings existed would otherwise throw
+  // here and strand stage — recovery must never be brittler than what it recovers.
+  for (const [key, value] of Object.entries(lock.e2eSettings ?? {})) {
+    if (value === null) {
+      await e2e.query(`delete from settings where key = $1`, [key])
+      console.log(`[quiesce] e2e ${key} restored to (absent)`)
+    } else {
+      await e2e.query(
+        `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+           on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+        [key, value],
+      )
+      console.log(`[quiesce] e2e ${key} restored to ${value}`)
     }
   }
 

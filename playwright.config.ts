@@ -26,7 +26,15 @@ const ISOLATED_SPECS = /(?:stock-sync-drift|woocommerce(?:-[\w-]+)?|mintsoft-wor
 // specs out of the main parallel pool so fixture scripts and the dev
 // server are not contending across workers.
 const CSV_SERIAL_SPECS = /(?:csv-import-workflows|csv-roundtrip-exports)\.spec\.ts/
-const CHROMIUM_PARALLEL_IGNORE = new RegExp(`${ISOLATED_SPECS.source}|${CSV_SERIAL_SPECS.source}`)
+// Full-chain specs (o3d-lgo): a real Woo order -> the real IMS UI -> the real Xero
+// Demo ledger, asserted by reading the document back out of Xero. They must NEVER
+// join the parallel pool: processPendingXeroSync() drains the WHOLE pending queue, so
+// two concurrent specs would post each other's documents and assert on them. They also
+// take a lock that disables stage's connectors for the run window.
+const FULL_CHAIN_SPECS = /full-chain\/.*\.spec\.ts/
+const CHROMIUM_PARALLEL_IGNORE = new RegExp(
+  `${ISOLATED_SPECS.source}|${CSV_SERIAL_SPECS.source}|${FULL_CHAIN_SPECS.source}`,
+)
 
 export default defineConfig({
   testDir: './e2e',
@@ -89,6 +97,29 @@ export default defineConfig({
       fullyParallel: false,
       workers: 1,
       testMatch: CSV_SERIAL_SPECS,
+    },
+    {
+      // Full-chain: a real Woo order -> the real IMS UI -> the real Xero Demo ledger,
+      // asserted by reading the document back out of Xero (o3d-lgo).
+      //
+      // workers:1 + fullyParallel:false is a CORRECTNESS requirement, not tuning:
+      // processPendingXeroSync() drains the WHOLE pending queue, so concurrent specs
+      // would post one another's documents and then assert on them.
+      //
+      // NOT in `dependencies`: this project runs against the dedicated e2e instance
+      // (ims-e2e-dev.service, its own DB and Xero app), so it must not be chained
+      // behind the local chromium suite. It is opt-in via `npm run e2e:full-chain`,
+      // which uses playwright.no-webserver.config.ts — the base webServer here loads
+      // .env and would otherwise start a server against the wrong database.
+      name: 'full-chain',
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: 'e2e/.auth/admin.json',
+      },
+      dependencies: ['setup'],
+      fullyParallel: false,
+      workers: 1,
+      testMatch: FULL_CHAIN_SPECS,
     },
   ],
   webServer: {
