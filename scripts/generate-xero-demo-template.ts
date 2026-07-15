@@ -23,7 +23,18 @@ type Template = {
   currencies: Array<{ code: string; name: string }>
   accounts: Array<{ code: string; name: string; type: string }>
   bankAccounts: Array<{ name: string; currencyCode: string }>
-  taxRates: Array<{ name: string; components: Array<{ name: string; rate: number; isCompound: boolean }> }>
+  taxRates: Array<{
+    name: string
+    // Inputs to xeroReportTaxType() — Xero REQUIRES a ReportTaxType when creating a
+    // custom rate ("A validation exception occurred: The report tax type is
+    // required"). We snapshot the inputs rather than the computed value so the
+    // provisioner runs the same operator-confirmed mapper the app uses, and any
+    // later correction to that mapper flows through without regenerating.
+    reportingCategory: string | null
+    usedFor: string | null
+    rate: number
+    components: Array<{ name: string; rate: number; isCompound: boolean }>
+  }>
   settingAccountMap: Record<string, string>
 }
 
@@ -164,8 +175,14 @@ async function main() {
   // Only ACTIVE, non-residue rates. accounting_tax_type is deliberately NOT
   // captured: Xero mints those ids itself on creation, so a snapshot of them is
   // meaningless after a reset — the provisioner records what Xero returns.
-  const rateRows = (await db.query<{ id: string; name: string; rate: string }>(
-    `select id, name, rate from tax_rates where active order by name`,
+  const rateRows = (await db.query<{
+    id: string
+    name: string
+    rate: string
+    reporting_category: string | null
+    usedFor: string | null
+  }>(
+    `select id, name, rate, reporting_category, "usedFor" from tax_rates where active order by name`,
   )).rows
   const taxRates: Template['taxRates'] = []
   for (const r of rateRows) {
@@ -180,6 +197,9 @@ async function main() {
     )).rows
     taxRates.push({
       name: r.name,
+      reportingCategory: r.reporting_category,
+      usedFor: r.usedFor,
+      rate: Number(r.rate),
       // Fall back to a single component from the header rate: some rates carry no
       // component rows, and Xero requires at least one TaxComponent per TaxRate.
       components: comps.length

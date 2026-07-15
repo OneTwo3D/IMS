@@ -22,11 +22,27 @@
  * IDEMPOTENT: every step reads Xero first and creates only what is missing, so it
  * is safe to re-run after each reset (and safe to re-run when nothing changed).
  *
+ * THE ~4-WEEKLY RESET CYCLE. When the Demo company resets it is re-created with a
+ * NEW tenantId, and every custom account, bank account, currency and tax rate is
+ * gone. Recovery:
+ *
+ *   1. NODE_OPTIONS='--import tsx' node --env-file=.env \
+ *        scripts/provision-xero-demo.ts --clear-tenant-pin
+ *      The pin is ENFORCED on connect (selectTenantConnection() matches on
+ *      tenantId), so a pin left over from the previous Demo makes the reconnect
+ *      find no tenant. Clearing it first is not optional.
+ *   2. A human re-consents at <public_app_url>/sync?connector=xero and picks
+ *      "Demo Company (UK)". OAuth is interactive; it cannot be scripted.
+ *   3. Re-run this script normally. It rebuilds the org and RE-PINS the new
+ *      tenantId automatically.
+ *
  * SAFETY: refuses to run unless the connected tenant is literally
- * 'Demo Company (UK)'. The tenant is resolved BY NAME, never by a stored id —
- * xero_expected_tenant_id was observed changing (e7fb4378… -> 5c949ed5…) when the
- * Demo was reconnected, so a hardcoded id silently targets nothing after a reset.
- * It also refuses to run against the stage database: this writes settings.
+ * 'Demo Company (UK)', re-read live from GET /Organisation — a stale token row is
+ * not enough. The tenant is resolved BY NAME, never by a stored id
+ * (xero_expected_tenant_id was observed changing e7fb4378… -> 5c949ed5… within a
+ * single day). The pin is still kept and refreshed: it is what stops this rig ever
+ * connecting to a PRODUCTION Xero org, and it is only ever written after the live
+ * name check passes. It also refuses to run against the stage database.
  *
  * TAX RATES ARE THE SUBTLE PART. The TAX001…TAXnnn values in
  * tax_rates.accounting_tax_type are ids Xero ASSIGNS to custom rates in creation
@@ -37,17 +53,30 @@
  */
 import { Client } from 'pg'
 import { readFileSync } from 'node:fs'
-import { xeroGet, xeroPost } from '../lib/connectors/xero/api.ts'
+import { xeroGet, xeroPost, xeroPut } from '../lib/connectors/xero/api.ts'
+import { xeroReportTaxType } from '../lib/connectors/xero/tax-rate-report-type.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
 const TEMPLATE_PATH = new URL('./xero-demo-template.json', import.meta.url).pathname
 const DRY_RUN = process.argv.includes('--dry-run')
+const CLEAR_TENANT_PIN = process.argv.includes('--clear-tenant-pin')
+// Remap-only: re-point tax_rates.accounting_tax_type at the ids the LIVE org
+// actually uses, matching by name. Creates nothing, writes no settings, moves no
+// tenant pin — so unlike a full provision it is safe against ANY instance that
+// shares the Demo org, including stage (o3d-b3n).
+const REMAP_ONLY = process.argv.includes('--remap-only')
 
 type Template = {
   currencies: Array<{ code: string; name: string }>
   accounts: Array<{ code: string; name: string; type: string }>
   bankAccounts: Array<{ name: string; currencyCode: string }>
-  taxRates: Array<{ name: string; components: Array<{ name: string; rate: number; isCompound: boolean }> }>
+  taxRates: Array<{
+    name: string
+    reportingCategory: string | null
+    usedFor: string | null
+    rate: number
+    components: Array<{ name: string; rate: number; isCompound: boolean }>
+  }>
   settingAccountMap: Record<string, string>
 }
 
@@ -64,10 +93,12 @@ function log(msg: string) {
 
 async function guardTenant(db: Client) {
   const url = process.env.DATABASE_URL ?? ''
-  if (url.includes('onetwo3d_ims_dev')) {
+  if (url.includes('onetwo3d_ims_dev') && !REMAP_ONLY) {
     throw new Error(
-      'ABORT: DATABASE_URL points at the STAGE database (onetwo3d_ims_dev). This script writes ' +
-        'settings and remaps tax types — run it from the e2e instance only.',
+      'ABORT: DATABASE_URL points at the STAGE database (onetwo3d_ims_dev). A full provision ' +
+        'creates accounts and rewrites settings — run it from the e2e instance only. ' +
+        'If you meant to repair stale tax-type ids after a Demo reset, use --remap-only, ' +
+        'which creates nothing and touches only tax_rates.accounting_tax_type.',
     )
   }
 
@@ -91,7 +122,111 @@ async function guardTenant(db: Client) {
     throw new Error(`ABORT: live Xero org is "${live.Name}", not "${REQUIRED_TENANT}".`)
   }
   log(`tenant OK: ${live.Name} (${tenantId}), base currency ${live.BaseCurrency}`)
+
+  // Re-pin from the LIVE connection every run. The Demo company resets ~4-weekly
+  // and is re-created with a NEW tenantId, so a pin captured on a previous run goes
+  // stale by design. That matters because the pin is ENFORCED on connect:
+  // selectTenantConnection() (lib/connectors/xero/auth.ts:134) does
+  // `find(c => c.tenantId === expected) ?? null`, so a stale pin makes the next
+  // reconnect fail to find any tenant — the safety feature locks you out of the very
+  // org it is protecting. Re-pinning here keeps it correct without weakening it: we
+  // only reach this line after asserting the LIVE org name is REQUIRED_TENANT, so
+  // the pin can never be moved onto a production org.
+  // Never move another instance's pin: --remap-only may target stage.
+  if (!DRY_RUN && !REMAP_ONLY) {
+    await db.query(
+      `insert into settings (key, value, "updatedAt") values ('xero_expected_tenant_id', $1, now())
+         on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      [tenantId],
+    )
+    log(`tenant pin refreshed -> ${tenantId}`)
+  }
+
   return live.BaseCurrency
+}
+
+/**
+ * Re-point this instance's tax_rates.accounting_tax_type at the ids the LIVE org
+ * uses, matching on NAME. Creates nothing.
+ *
+ * Needed because Xero mints TAX001..TAXnnn for custom rates in CREATION ORDER: a
+ * ~4-weekly Demo reset destroys them, and re-creating them in a different order
+ * leaves stored ids resolving to a VALID BUT WRONG rate — i.e. invoices post with
+ * the wrong VAT, silently (o3d-b3n: 30/35 of stage's mappings were wrong).
+ */
+async function remapOnly(db: Client) {
+  const live = await xeroGet<{ TaxRates: Array<{ Name: string; TaxType: string; Status: string }> }>('TaxRates')
+  if (!live.ok) throw new Error(`Could not read TaxRates: ${live.error}`)
+  const byName = new Map(
+    (live.data?.TaxRates ?? []).filter((r) => r.Status === 'ACTIVE').map((r) => [r.Name, r.TaxType]),
+  )
+
+  const rows = (await db.query<{ name: string; accounting_tax_type: string | null }>(
+    `select name, accounting_tax_type from tax_rates where active order by name`,
+  )).rows
+
+  // Only CUSTOM ids rot. Xero mints TAX001..TAXnnn per-org in creation order, so a
+  // reset invalidates them. Its BUILT-IN types (OUTPUT2, RRINPUT, ZERORATEDOUTPUT,
+  // EXEMPTOUTPUT, NONE…) are stable across orgs and resets, so a mapping onto one is
+  // correct and must be left alone — matching those by NAME would drag them onto a
+  // same-named CUSTOM rate this template creates (e.g. IMS "UK VAT" is deliberately
+  // mapped to the built-in OUTPUT2, whose Xero name is "20% (VAT on Income)"), which
+  // would silently change posting behaviour rather than repair it.
+  // Three cases, and conflating them is a real bug: an UNSET mapping needs one
+  // (a freshly copied rate has none), a TAX0nn may have rotted, and a built-in is
+  // already right.
+  const isCustomId = (t: string | null) => !!t && /^TAX\d+$/.test(t)
+  const isUnset = (t: string | null) => !t || t.trim() === ''
+
+  let fixed = 0, already = 0, unmatched = 0, builtin = 0
+  for (const r of rows) {
+    if (!isUnset(r.accounting_tax_type) && !isCustomId(r.accounting_tax_type)) {
+      builtin++
+      continue
+    }
+    const liveType = byName.get(r.name)
+    if (!liveType) {
+      unmatched++
+      console.warn(`  ! "${r.name}" has no ACTIVE rate of that name in Xero — left as ${r.accounting_tax_type ?? '(unset)'}`)
+      continue
+    }
+    if (liveType === r.accounting_tax_type) { already++; continue }
+    log(`  ${r.name}: ${r.accounting_tax_type ?? '(unset)'} -> ${liveType}`)
+    if (!DRY_RUN) {
+      await db.query(
+        `update tax_rates set accounting_tax_type = $1, "updatedAt" = now() where name = $2`,
+        [liveType, r.name],
+      )
+    }
+    fixed++
+  }
+  console.log(`\n--- remap summary ---`)
+  console.log(`  corrected          : ${fixed}`)
+  console.log(`  already correct    : ${already}`)
+  console.log(`  built-in, untouched: ${builtin}  (stable across resets — not remapped by design)`)
+  console.log(`  unmatched          : ${unmatched}${unmatched ? '  <-- these cannot post until the rate exists in Xero' : ''}`)
+  if (DRY_RUN) console.log('\nDRY RUN — nothing was written.')
+}
+
+/**
+ * Clear the tenant pin so a human can re-consent after a Demo reset.
+ * Needed because the pin is enforced on connect against a tenantId that no longer
+ * exists; without clearing it the reconnect silently finds no tenant.
+ */
+async function clearTenantPin(db: Client) {
+  const before = await db.query<{ value: string }>(
+    `select value from settings where key = 'xero_expected_tenant_id'`,
+  )
+  if (!before.rows.length) {
+    console.log('tenant pin already absent — nothing to clear.')
+  } else {
+    await db.query(`delete from settings where key = 'xero_expected_tenant_id'`)
+    console.log(`cleared stale tenant pin (was ${before.rows[0].value}).`)
+  }
+  console.log(
+    '\nNext: reconnect at <public_app_url>/sync?connector=xero, choose "Demo Company (UK)",\n' +
+      'then re-run this script WITHOUT --clear-tenant-pin to rebuild the org and re-pin.',
+  )
 }
 
 async function ensureCurrencies(t: Template, baseCurrency: string) {
@@ -104,7 +239,11 @@ async function ensureCurrencies(t: Template, baseCurrency: string) {
     if (c.code === baseCurrency) { skipped.push(`currency ${c.code} (base)`); continue }
     log(`creating currency ${c.code} (${c.name})`)
     if (DRY_RUN) { created.push(`currency ${c.code}`); continue }
-    const r = await xeroPost('Currencies', { Currencies: [{ Code: c.code }] })
+    // Currencies is GET/PUT only — POST 404s (not 405, which is why that failure
+    // reads as "Unknown error" rather than method-not-allowed). The body is a bare
+    // object: wrapping it as {Currencies:[...]} parses but yields
+    // "A validation exception occurred: A currency code must be provided."
+    const r = await xeroPut('Currencies', { Code: c.code })
     if (!r.ok) throw new Error(`Failed to create currency ${c.code}: ${r.error}`)
     created.push(`currency ${c.code}`)
   }
@@ -131,7 +270,8 @@ async function ensureAccounts(t: Template) {
     }
     log(`creating account ${a.code} ${a.name} (${a.type})`)
     if (DRY_RUN) { created.push(`account ${a.code}`); continue }
-    const r = await xeroPost('Accounts', { Code: a.code, Name: a.name, Type: a.type })
+    // PUT is Xero's create verb for Accounts (POST is update).
+    const r = await xeroPut('Accounts', { Code: a.code, Name: a.name, Type: a.type })
     if (!r.ok) throw new Error(`Failed to create account ${a.code}: ${r.error}`)
     created.push(`account ${a.code}`)
   }
@@ -148,7 +288,7 @@ async function ensureBankAccounts(t: Template) {
     if (DRY_RUN) { created.push(`bank ${b.name}`); continue }
     // Bank accounts carry no Code in this org (they are matched by name), and Xero
     // requires a BankAccountNumber — derive a stable, obviously-synthetic one.
-    const r = await xeroPost('Accounts', {
+    const r = await xeroPut('Accounts', {
       Name: b.name,
       Type: 'BANK',
       BankAccountNumber: `E2E${b.name.replace(/[^A-Za-z0-9]/g, '').toUpperCase()}`.slice(0, 30),
@@ -176,12 +316,28 @@ async function ensureTaxRates(t: Template): Promise<Map<string, string>> {
       skipped.push(`taxrate ${r.name}`)
       continue
     }
-    log(`creating tax rate ${r.name} (${r.components.map((c) => `${c.rate * 100}%`).join('+')})`)
+    log(`creating tax rate ${r.name} (${r.components.map((c) => `${c.rate * 100}%`).join('+')}) -> ${xeroReportTaxType({ reportingCategory: r.reportingCategory, usedFor: r.usedFor, name: r.name, rate: r.rate })}`)
+    // Count before the dry-run bail: a dry run that under-reports what it would
+    // create is worse than none — the first version said "created: 15" for a run
+    // that would in fact have created 50.
+    created.push(`taxrate ${r.name}`)
     if (DRY_RUN) continue
+    // Xero REQUIRES ReportTaxType on a custom rate ("The report tax type is
+    // required"). Derive it with the app's own operator-confirmed, unit-tested
+    // mapper rather than inventing a VAT-return box here — it encodes real
+    // decisions (EU/VOEC distance sales -> MOSSSALES, reverse charge wins, Xero
+    // rejects NONE and rejects EXEMPT with a non-zero component).
+    const reportTaxType = xeroReportTaxType({
+      reportingCategory: r.reportingCategory,
+      usedFor: r.usedFor,
+      name: r.name,
+      rate: r.rate,
+    })
     const payload = {
       TaxRates: [
         {
           Name: r.name,
+          ReportTaxType: reportTaxType,
           TaxComponents: r.components.map((c) => ({
             Name: c.name,
             Rate: Math.round(c.rate * 100 * 10000) / 10000,
@@ -196,7 +352,6 @@ async function ensureTaxRates(t: Template): Promise<Map<string, string>> {
       throw new Error(`Failed to create tax rate ${r.name}: ${post.error}`)
     }
     resolved.set(r.name, post.data.TaxRates[0].TaxType)
-    created.push(`taxrate ${r.name}`)
   }
   return resolved
 }
@@ -219,8 +374,8 @@ async function applySettings(db: Client, t: Template) {
   for (const [key, value] of Object.entries(t.settingAccountMap)) {
     if (DRY_RUN) { log(`would set ${key}=${value}`); continue }
     await db.query(
-      `insert into settings (key, value) values ($1, $2)
-         on conflict (key) do update set value = excluded.value`,
+      `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+         on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
       [key, value],
     )
     log(`set ${key}=${value}`)
@@ -232,7 +387,15 @@ async function main() {
   const db = new Client({ connectionString: process.env.DATABASE_URL })
   await db.connect()
   try {
+    if (CLEAR_TENANT_PIN) {
+      await clearTenantPin(db)
+      return
+    }
     const baseCurrency = await guardTenant(db)
+    if (REMAP_ONLY) {
+      await remapOnly(db)
+      return
+    }
     await ensureCurrencies(t, baseCurrency)
     await ensureAccounts(t)
     await ensureBankAccounts(t)

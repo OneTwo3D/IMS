@@ -134,6 +134,9 @@
   "taxRates": [
     {
       "name": "AT VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.2,
       "components": [
         {
           "name": "AT VAT",
@@ -144,6 +147,9 @@
     },
     {
       "name": "BE VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.21,
       "components": [
         {
           "name": "BE VAT",
@@ -154,6 +160,9 @@
     },
     {
       "name": "BG VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.2,
       "components": [
         {
           "name": "BG VAT",
@@ -164,6 +173,9 @@
     },
     {
       "name": "CI VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0,
       "components": [
         {
           "name": "CI VAT",
@@ -174,6 +186,9 @@
     },
     {
       "name": "CY VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.19,
       "components": [
         {
           "name": "CY VAT",
@@ -184,6 +199,9 @@
     },
     {
       "name": "CZ VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.21,
       "components": [
         {
           "name": "CZ VAT",
@@ -194,6 +212,9 @@
     },
     {
       "name": "DE VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.19,
       "components": [
         {
           "name": "DE VAT",
@@ -204,6 +225,9 @@
     },
     {
       "name": "DK VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.25,
       "components": [
         {
           "name": "DK VAT",
@@ -214,6 +238,9 @@
     },
     {
       "name": "EE VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.24,
       "components": [
         {
           "name": "EE VAT",
@@ -224,6 +251,9 @@
     },
     {
       "name": "ES VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.21,
       "components": [
         {
           "name": "ES VAT",
@@ -234,6 +264,9 @@
     },
     {
       "name": "FI VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.255,
       "components": [
         {
           "name": "FI VAT",
@@ -244,6 +277,9 @@
     },
     {
       "name": "FR VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.2,
       "components": [
         {
           "name": "FR VAT",
@@ -254,6 +290,9 @@
     },
     {
       "name": "GR VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.24,
       "components": [
         {
           "name": "GR VAT",
@@ -264,6 +303,9 @@
     },
     {
       "name": "HR VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.25,
       "components": [
         {
           "name": "HR VAT",
@@ -274,6 +316,9 @@
     },
     {
       "name": "HU VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.27,
       "components": [
         {
           "name": "HU VAT",
@@ -284,6 +329,9 @@
     },
     {
       "name": "IE VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.23,
       "components": [
         {
           "name": "IE VAT",
@@ -294,6 +342,9 @@
     },
     {
       "name": "IM VAT",
+      "reportingCategory": "DOMESTIC",
+      "usedFor": "BOTH",
+      "rate": 0.2,
       "components": [
         {
           "name": "IM VAT",
@@ -304,6 +355,9 @@
     },
     {
       "name": "IT VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.22,
       "components": [
         {
           "name": "IT VAT",
@@ -314,6 +368,9 @@
     },
     {
       "name": "LT VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.21,
       "components": [
         {
           "name": "LT VAT",
@@ -324,6 +381,9 @@
     },
     {
       "name": "LU VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.17,
       "components": [
         {
           "name": "LU VAT",
@@ -334,6 +394,9 @@
     },
     {
       "name": "LV VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.21,
       "components": [
         {
           "name": "LV VAT",
@@ -344,6 +407,9 @@
     },
     {
       "name": "MC VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.2,
       "components": [
         {
           "name": "MC VAT",
@@ -354,6 +420,9 @@
     },
     {
       "name": "MT VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.18,
       "components": [
         {
           "name": "MT VAT",
@@ -364,6 +433,9 @@
     },
     {
       "name": "NL VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.21,
       "components": [
         {
           "name": "NL VAT",
@@ -374,6 +446,9 @@
     },
     {
       "name": "NO VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.25,
       "components": [
         {
           "name": "NO VAT",
@@ -384,6 +459,9 @@
     },
     {
       "name": "PL VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.23,
       "components": [
         {
           "name": "PL VAT",
@@ -394,6 +472,9 @@
     },
     {
       "name": "PT VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.23,
       "components": [
         {
           "name": "PT VAT",
@@ -404,6 +485,9 @@
     },
     {
       "name": "PT-30 VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.22,
       "components": [
         {
           "name": "PT-30 VAT",
@@ -414,6 +498,9 @@
     },
     {
       "name": "RO VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.21,
       "components": [
         {
           "name": "RO VAT",
@@ -424,6 +511,9 @@
     },
     {
       "name": "SE VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.25,
       "components": [
         {
           "name": "SE VAT",
@@ -434,6 +524,9 @@
     },
     {
       "name": "SI VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.22,
       "components": [
         {
           "name": "SI VAT",
@@ -444,6 +537,9 @@
     },
     {
       "name": "SK VAT",
+      "reportingCategory": "OSS",
+      "usedFor": "BOTH",
+      "rate": 0.23,
       "components": [
         {
           "name": "SK VAT",
@@ -454,6 +550,9 @@
     },
     {
       "name": "UK Reduced Rate (5%)",
+      "reportingCategory": "DOMESTIC",
+      "usedFor": "BOTH",
+      "rate": 0.05,
       "components": [
         {
           "name": "UK Reduced Rate (5%)",
@@ -464,6 +563,9 @@
     },
     {
       "name": "UK VAT",
+      "reportingCategory": "DOMESTIC",
+      "usedFor": "BOTH",
+      "rate": 0.2,
       "components": [
         {
           "name": "UK VAT",
@@ -474,6 +576,9 @@
     },
     {
       "name": "Zero Rated (0%)",
+      "reportingCategory": "DOMESTIC",
+      "usedFor": "BOTH",
+      "rate": 0,
       "components": [
         {
           "name": "Zero Rated (0%)",
