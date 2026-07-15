@@ -874,6 +874,54 @@ export async function getReturnedQtyForCostLayer(
 }
 
 /**
+ * Sum stock consumed by warehouse transfers (TRANSFER_OUT) for a cost layer.
+ *
+ * Sourced from stock_transfer_lines.costLayerSnapshot rather than cogs_entries:
+ * transfer dispatch consumes source layers but writes NO cogs_entries (it freezes
+ * a costLayerSnapshot on the line instead), so the cogsEntry-based exclusions are
+ * structurally blind to it. That blindness is why 6oyu.19 went unnoticed while
+ * every other exclusion was found.
+ *
+ * Transferred units are not customer COGS — the stock moved warehouse, it was not
+ * sold — and their revaluation delta already reaches the destination layer via
+ * propagateLandedCostToOutputs (transfer receipt links the destination layer back
+ * to the source with a costLayerSourceLine). Counting them in netConsumedQty as
+ * well double-posted the delta and stranded a permanent balance in transit.
+ *
+ * Status filter: a snapshot is written at dispatch, and STOCK_TRANSFER_TRANSITIONS
+ * only allows IN_TRANSIT -> RECEIVED (CANCELLED is reachable from DRAFT alone, i.e.
+ * never dispatched). IN_TRANSIT + RECEIVED are therefore exactly the states whose
+ * snapshot represents real consumption. The filter is explicit rather than implied
+ * by "has a snapshot" so that adding a cancel-after-dispatch path — which would
+ * restore the layer and must NOT be subtracted — fails safe.
+ */
+export async function getTransferConsumedQtyForCostLayer(
+  tx: TxClient,
+  costLayerId: string,
+): Promise<Decimal> {
+  const containsCostLayer = JSON.stringify([{ costLayerId }])
+  const rows = await tx.$queryRawUnsafe<Array<{ costLayerSnapshot: unknown }>>(
+    `SELECT stl."costLayerSnapshot"
+       FROM "stock_transfer_lines" stl
+       INNER JOIN "stock_transfers" st ON st.id = stl."transferId"
+      WHERE st.status IN ('IN_TRANSIT', 'RECEIVED')
+        AND stl."costLayerSnapshot" @> $1::jsonb`,
+    containsCostLayer,
+  )
+
+  let transferredQty = toDecimal(0)
+  for (const row of rows) {
+    for (const entry of parseCostLayerSnapshot(row.costLayerSnapshot)) {
+      if (entry.costLayerId === costLayerId) {
+        transferredQty = addMoney(transferredQty, entry.qty)
+      }
+    }
+  }
+
+  return transferredQty
+}
+
+/**
  * Sum stock returned to suppliers for a cost layer. Supplier returns consume
  * FIFO layers but are not customer COGS, so landed-cost recalculation must
  * exclude them from retrospective COGS deltas.
@@ -895,9 +943,10 @@ export async function getSupplierReturnedQtyForCostLayer(
 /**
  * Movement types each revaluation-exclusion query below is responsible for.
  * These are kept as explicit per-query lists (rather than one merged query)
- * because the two exclusions mean different things downstream: manufacturing's
- * delta is REDIRECTED into the produced output layer, whereas a reversal's is
- * simply dropped.
+ * because the exclusions mean different things downstream (manufacturing's and
+ * transfers' deltas are REDIRECTED into the output/destination layer, whereas a
+ * reversal's is simply dropped) and, critically, they read from DIFFERENT
+ * sources — cogs_entries vs stock_transfer_lines.costLayerSnapshot.
  *
  * Their union is asserted against MOVEMENT_COGS_RELEVANCE's derived
  * REVALUATION_EXCLUDED_MOVEMENT_TYPES in movement-cogs-relevance.test.ts, so
@@ -906,11 +955,14 @@ export async function getSupplierReturnedQtyForCostLayer(
  */
 const MANUFACTURING_CONSUMPTION_MOVEMENT_TYPES: StockMovementType[] = ['PRODUCTION_OUT']
 const REVERSAL_CONSUMPTION_MOVEMENT_TYPES: StockMovementType[] = ['PURCHASE_REVERSAL']
+/** Sourced from the transfer-line snapshot, NOT cogs_entries — see 6oyu.19. */
+const TRANSFER_CONSUMPTION_MOVEMENT_TYPES: StockMovementType[] = ['TRANSFER_OUT']
 
 /** Every movement type actually subtracted by a revaluation-exclusion query. */
 export const REVALUATION_EXCLUSION_QUERY_MOVEMENT_TYPES: StockMovementType[] = [
   ...MANUFACTURING_CONSUMPTION_MOVEMENT_TYPES,
   ...REVERSAL_CONSUMPTION_MOVEMENT_TYPES,
+  ...TRANSFER_CONSUMPTION_MOVEMENT_TYPES,
 ]
 
 /**

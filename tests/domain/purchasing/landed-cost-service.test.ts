@@ -6,6 +6,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import {
   getReturnedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
+  getTransferConsumedQtyForCostLayer,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
 import { toDecimal } from '@/lib/domain/math/decimal'
@@ -212,6 +213,99 @@ test('retrospective layer adjustment excludes PURCHASE_REVERSAL-consumed units f
   })
 })
 
+test('retrospective layer adjustment excludes TRANSFER_OUT-consumed units from COGS (6oyu.19)', () => {
+  // 10 received, 4 on hand, 6 consumed — of which 3 were transferred to another
+  // warehouse. Transferred stock moved, it was not sold, and its delta is carried
+  // to the destination layer by propagateLandedCostToOutputs. netConsumed = 6 − 3 = 3.
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 12,
+    receivedQty: 10,
+    remainingQty: 4,
+    returnedQty: 0,
+    supplierReturnedQty: 0,
+    manufacturingConsumedQty: 0,
+    transferConsumedQty: 3,
+  })), {
+    costDelta: 2,
+    consumedQty: 6,
+    netConsumedQty: 3,
+    cogsDelta: 6,
+    inventoryDelta: 8,
+  })
+})
+
+test('a fully-transferred layer posts NO COGS on revaluation (6oyu.19 double-count)', () => {
+  // The reported case: 100 units received, all 100 transferred out and received at
+  // the destination, none sold. A +£1/unit freight bill previously posted £100 of
+  // spurious COGS here WHILE propagateLandedCostToOutputs also (correctly) posted
+  // £100 of inventory on the destination — draining £200 of transit against a £100
+  // debit and stranding a permanent balance. This side must now contribute nothing:
+  // the destination layer alone carries the delta.
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 11,
+    receivedQty: 100,
+    remainingQty: 0,
+    returnedQty: 0,
+    supplierReturnedQty: 0,
+    manufacturingConsumedQty: 0,
+    transferConsumedQty: 100,
+  })), {
+    costDelta: 1,
+    consumedQty: 100,
+    netConsumedQty: 0,
+    cogsDelta: 0,
+    inventoryDelta: 0,
+  })
+})
+
+test('transfer exclusion composes with the other exclusions (6oyu.19)', () => {
+  // All four exclusion classes at once on one layer: 20 received, 2 on hand, 18
+  // consumed = 3 customer-returned + 4 manufacturing + 2 reversal + 5 transferred
+  // + 4 sold. Only the 4 sold units belong in the COGS delta. Supplier returns stay
+  // INCLUDED (scjz.10), so the 2 here ride along: netConsumed = 18−3−4−2−5 = 4.
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 13,
+    receivedQty: 20,
+    remainingQty: 2,
+    returnedQty: 3,
+    supplierReturnedQty: 2,
+    manufacturingConsumedQty: 4,
+    reversalConsumedQty: 2,
+    transferConsumedQty: 5,
+  })), {
+    costDelta: 3,
+    consumedQty: 18,
+    netConsumedQty: 4,
+    cogsDelta: 12,
+    inventoryDelta: 6,
+  })
+})
+
+test('netConsumedQty floors at zero when exclusions exceed consumption (6oyu.19)', () => {
+  // Over-subtraction must not flip the COGS delta negative (a credit to COGS for
+  // stock nobody sold). The max(0, ...) floor is load-bearing now that a fourth
+  // exclusion feeds it from a different source.
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
+    oldUnitCost: 10,
+    newUnitCost: 12,
+    receivedQty: 10,
+    remainingQty: 5,
+    returnedQty: 0,
+    supplierReturnedQty: 0,
+    manufacturingConsumedQty: 0,
+    transferConsumedQty: 99,
+  })), {
+    costDelta: 2,
+    consumedQty: 5,
+    netConsumedQty: 0,
+    cogsDelta: 0,
+    inventoryDelta: 10,
+  })
+})
+
 test('retrospective layer adjustment handles landed-cost decreases', () => {
   assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
     oldUnitCost: 12,
@@ -388,6 +482,51 @@ test('returned quantity helpers return Decimal without fractional drift', async 
 
   assert.equal(customerReturned.toString(), '0.3')
   assert.equal(supplierReturned.toString(), '0.3')
+})
+
+test('getTransferConsumedQtyForCostLayer sums only the requested layer, from the transfer snapshot (6oyu.19)', async () => {
+  const tx = {
+    $queryRawUnsafe: async () => [
+      { costLayerSnapshot: [{ costLayerId: 'layer-a', qty: '0.1', unitCostBase: 1 }] },
+      // A line that drew from two layers: only layer-a's qty counts.
+      { costLayerSnapshot: [
+        { costLayerId: 'layer-a', qty: '0.2', unitCostBase: 1 },
+        { costLayerId: 'other-layer', qty: '9', unitCostBase: 1 },
+      ] },
+      { costLayerSnapshot: [{ costLayerId: 'other-layer', qty: '5', unitCostBase: 1 }] },
+    ],
+  }
+
+  const transferred = await getTransferConsumedQtyForCostLayer(tx as never, 'layer-a')
+  assert.equal(transferred.toString(), '0.3')
+})
+
+test('getTransferConsumedQtyForCostLayer only counts dispatched transfers, via the snapshot not cogs_entries (6oyu.19)', async () => {
+  // Pins the load-bearing details of the query, none of which a mock can infer:
+  //  - it reads stock_transfer_lines (transfers write NO cogs_entries at all)
+  //  - IN_TRANSIT + RECEIVED only: a DRAFT transfer has consumed nothing, and a
+  //    future cancel-after-dispatch path would restore the layer, so subtracting
+  //    its snapshot would under-post COGS.
+  //  - it filters by jsonb containment on the parameter, hitting the GIN index
+  //    rather than scanning every transfer line ever written.
+  let capturedSql = ''
+  let capturedParam: unknown = null
+  const tx = {
+    $queryRawUnsafe: async (sql: string, param: unknown) => {
+      capturedSql = sql
+      capturedParam = param
+      return []
+    },
+  }
+
+  const transferred = await getTransferConsumedQtyForCostLayer(tx as never, 'layer-a')
+
+  assert.equal(transferred.toString(), '0')
+  assert.match(capturedSql, /"stock_transfer_lines"/)
+  assert.doesNotMatch(capturedSql, /cogs_entries/)
+  assert.match(capturedSql, /st\.status IN \('IN_TRANSIT', 'RECEIVED'\)/)
+  assert.match(capturedSql, /"costLayerSnapshot" @> \$1::jsonb/)
+  assert.equal(capturedParam, JSON.stringify([{ costLayerId: 'layer-a' }]))
 })
 
 test('snapshot updates lock matching rows FOR UPDATE before rewriting the JSON array', async () => {
@@ -632,6 +771,7 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     getSupplierReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getManufacturingConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getReversalConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
+    getTransferConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getDependentOutputSourceLines: async () => [],
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 0, cogsRevaluationDelta: new Prisma.Decimal(0) }),
