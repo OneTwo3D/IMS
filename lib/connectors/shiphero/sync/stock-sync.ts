@@ -30,8 +30,10 @@ function num(value: Prisma.Decimal | number | null | undefined): number {
 
 function discrepancyMessage(finding: StockDiscrepancyFinding): string {
   switch (finding.category) {
+    case 'MISSING_IN_IMS':
+      return `ShipHero holds ${finding.wmsQty} of SKU ${finding.sku}, which has no matching IMS product. Create or import the product in IMS.`
     case 'UNMAPPED_SKU':
-      return `ShipHero reports SKU ${finding.sku} (qty ${finding.wmsQty}) with no matching IMS product.`
+      return `ShipHero returned a stock line (qty ${finding.wmsQty}) with no SKU, so it cannot be resolved to an IMS product. Fix the product record in ShipHero.`
     case 'QTY_MISMATCH':
       return `Quantity mismatch for ${finding.sku}: IMS ${finding.imsQty} vs ShipHero ${finding.wmsQty} (delta ${finding.delta}).`
     case 'MISSING_IN_WMS':

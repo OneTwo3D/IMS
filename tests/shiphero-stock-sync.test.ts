@@ -6,6 +6,7 @@ import {
   normalizeShipheroStockLine,
 } from '../lib/connectors/shiphero/api/normalizers.ts'
 import {
+  classifyUnresolvedWmsSku,
   computeStockDiscrepancies,
   consolidateStockLines,
   hasStockThresholdBreach,
@@ -44,12 +45,12 @@ test('consolidateStockLines sums by SKU and sorts', () => {
   assert.deepEqual(lines.map((l) => [l.sku, l.quantity]), [['A', 3], ['B', 7]])
 })
 
-test('computeStockDiscrepancies finds unmapped / mismatch / missing-in-WMS, skips matches', () => {
+test('computeStockDiscrepancies finds missing-in-IMS / mismatch / missing-in-WMS, skips matches', () => {
   const findings = computeStockDiscrepancies({
     wmsLines: [
       { sku: 'A', quantity: 10, raw: null }, // matches IMS → no finding
       { sku: 'B', quantity: 7, raw: null }, // IMS has 5 → QTY_MISMATCH
-      { sku: 'NEW', quantity: 4, raw: null }, // no IMS product → UNMAPPED_SKU
+      { sku: 'NEW', quantity: 4, raw: null }, // real SKU, no IMS product → MISSING_IN_IMS
     ],
     productBySku: new Map([['A', { id: 'pA' }], ['B', { id: 'pB' }]]),
     imsQtyByProductId: new Map([['pA', 10], ['pB', 5], ['pC', 9]]), // pC absent from WMS → MISSING_IN_WMS
@@ -58,9 +59,32 @@ test('computeStockDiscrepancies finds unmapped / mismatch / missing-in-WMS, skip
   const byCat = Object.fromEntries(findings.map((f) => [f.category, f]))
   assert.equal(findings.length, 3)
   assert.equal(byCat.QTY_MISMATCH.delta, 2)
-  assert.equal(byCat.UNMAPPED_SKU.sku, 'NEW')
+  assert.equal(byCat.MISSING_IN_IMS.sku, 'NEW')
+  assert.equal(byCat.MISSING_IN_IMS.wmsQty, 4)
   assert.equal(byCat.MISSING_IN_WMS.sku, 'C')
   assert.equal(byCat.MISSING_IN_WMS.imsQty, 9)
+})
+
+test('computeStockDiscrepancies keeps UNMAPPED_SKU for a line with no usable SKU (6oyu.17)', () => {
+  // A blank SKU carries no key to resolve against IMS, so it is unmappable rather
+  // than missing — the two need different operator actions (fix the WMS record vs
+  // create the IMS product), so they must not collapse into one category.
+  const findings = computeStockDiscrepancies({
+    wmsLines: [
+      { sku: '', quantity: 4, raw: null },
+      { sku: '   ', quantity: 2, raw: null },
+    ],
+    productBySku: new Map(),
+    imsQtyByProductId: new Map(),
+  })
+  assert.equal(findings.length, 2)
+  assert.deepEqual(findings.map((f) => f.category), ['UNMAPPED_SKU', 'UNMAPPED_SKU'])
+})
+
+test('classifyUnresolvedWmsSku splits absent-from-IMS from unmappable (6oyu.17)', () => {
+  assert.equal(classifyUnresolvedWmsSku('WIDGET-1'), 'MISSING_IN_IMS')
+  assert.equal(classifyUnresolvedWmsSku(''), 'UNMAPPED_SKU')
+  assert.equal(classifyUnresolvedWmsSku('  \t '), 'UNMAPPED_SKU')
 })
 
 test('hasStockThresholdBreach honours absolute and percent thresholds', () => {

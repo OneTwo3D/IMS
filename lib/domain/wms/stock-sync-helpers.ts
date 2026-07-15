@@ -90,7 +90,11 @@ export function hasStockThresholdBreach(
 
 // --- Pure stock diff (NOTIFICATION_ONLY detection) -------------------------
 
-export type StockDiscrepancyCategory = 'QTY_MISMATCH' | 'UNMAPPED_SKU' | 'MISSING_IN_WMS'
+export type StockDiscrepancyCategory =
+  | 'QTY_MISMATCH'
+  | 'UNMAPPED_SKU'
+  | 'MISSING_IN_IMS'
+  | 'MISSING_IN_WMS'
 
 export type StockDiscrepancyFinding = {
   category: StockDiscrepancyCategory
@@ -102,10 +106,26 @@ export type StockDiscrepancyFinding = {
 }
 
 /**
+ * Classify a WMS stock line that did not resolve to an IMS product.
+ *
+ * Both outcomes mean "no IMS product", but they need different operator actions,
+ * so they are distinct categories (6oyu.17 — MISSING_IN_IMS was previously
+ * defined but never emitted, collapsing the common case into UNMAPPED_SKU):
+ *  - blank/whitespace SKU → UNMAPPED_SKU. The line carries no key to look up, so
+ *    it is unmappable rather than missing. Fix the WMS product record.
+ *  - non-blank SKU → MISSING_IN_IMS. The WMS holds a real, identified product
+ *    that IMS does not know about at all. Create/import the product in IMS.
+ */
+export function classifyUnresolvedWmsSku(sku: string): 'UNMAPPED_SKU' | 'MISSING_IN_IMS' {
+  return sku.trim() === '' ? 'UNMAPPED_SKU' : 'MISSING_IN_IMS'
+}
+
+/**
  * Compare consolidated WMS stock lines against IMS products + stock for a warehouse.
  * Pure: callers supply the SKU→product map and product→IMS-qty map. Produces
  * NOTIFICATION_ONLY findings:
- *  - UNMAPPED_SKU: a WMS line whose SKU has no IMS product.
+ *  - MISSING_IN_IMS: a WMS line with a real SKU that has no IMS product.
+ *  - UNMAPPED_SKU: a WMS line with no usable SKU to resolve against.
  *  - QTY_MISMATCH: a mapped SKU whose WMS qty differs from IMS qty.
  *  - MISSING_IN_WMS: an IMS product (with non-zero stock) absent from the WMS feed.
  */
@@ -121,7 +141,14 @@ export function computeStockDiscrepancies(input: {
   for (const line of input.wmsLines) {
     const product = input.productBySku.get(line.sku)
     if (!product) {
-      findings.push({ category: 'UNMAPPED_SKU', sku: line.sku, productId: null, imsQty: null, wmsQty: line.quantity, delta: null })
+      findings.push({
+        category: classifyUnresolvedWmsSku(line.sku),
+        sku: line.sku,
+        productId: null,
+        imsQty: null,
+        wmsQty: line.quantity,
+        delta: null,
+      })
       continue
     }
     seenProductIds.add(product.id)
