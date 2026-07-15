@@ -440,6 +440,31 @@ test('consumeFifoLayersStrict throws on a tiny positive consume with NO cost lay
   )
 })
 
+test('consumeFifoLayersStrict does NOT raise an absorption flag on the no-cost-layers throw path (6oyu.8)', async () => {
+  // The no-layers case leaves a sub-tolerance remainingQty, so it also satisfies
+  // the absorption condition — but nothing was absorbed, it hard-errors. The
+  // audit-snxr guard must run FIRST: flagging here would both misdescribe the
+  // event and be rolled back by the throw anyway.
+  const activityLogCreates: unknown[] = []
+  const tx = {
+    $executeRaw: async () => 0,
+    $queryRaw: async () => [],
+    costLayer: { update: async () => {} },
+    activityLog: {
+      create: async (args: unknown) => {
+        activityLogCreates.push(args)
+        return {}
+      },
+    },
+  }
+
+  await assert.rejects(
+    () => consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 0.000001),
+    /No FIFO cost layers to consume/,
+  )
+  assert.equal(activityLogCreates.length, 0)
+})
+
 test('consumeFifoLayersStrict throws on a >1e-6 shortfall previously absorbed by the 1e-4 band (scjz.6)', async () => {
   // Layer covers 4.99999 of a requested 5 → shortfall 0.00001. The old 0.0001
   // tolerance absorbed this (understating unit cost over the full rowQty); the
@@ -465,10 +490,77 @@ test('consumeFifoLayersStrict absorbs a sub-µ shortfall and still returns the c
       { id: 'layer-1', remainingQty: new Prisma.Decimal('4.9999995'), unitCostBase: new Prisma.Decimal('2') },
     ],
     costLayer: { update: async () => {} },
+    activityLog: { create: async () => ({}) },
   }
   const result = await consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 5)
   assert.equal(result.consumed.length, 1)
   assert.equal(result.consumed[0].qty.toString(), '4.9999995')
+})
+
+test('consumeFifoLayersStrict raises a finance-visible activity-log WARNING when it absorbs a sub-tolerance FIFO shortfall (6oyu.8)', async () => {
+  // Same sub-µ absorption as above, but assert the absorption is ALSO surfaced to
+  // finance as a reconciliation flag (activity-log WARNING) — not just a
+  // console.warn that only lands in server logs and is invisible to finance.
+  const activityLogCreates: Array<{ data: Record<string, unknown> }> = []
+  const tx = {
+    $executeRaw: async () => 0,
+    $queryRaw: async () => [
+      { id: 'layer-1', remainingQty: new Prisma.Decimal('4.9999995'), unitCostBase: new Prisma.Decimal('2') },
+    ],
+    costLayer: { update: async () => {} },
+    activityLog: {
+      create: async (args: { data: Record<string, unknown> }) => {
+        activityLogCreates.push(args)
+        return {}
+      },
+    },
+  }
+
+  const result = await consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 5)
+
+  // Numeric behaviour is unchanged: the sub-µ shortfall is still absorbed.
+  assert.equal(result.consumed.length, 1)
+  assert.equal(result.consumed[0].qty.toString(), '4.9999995')
+
+  // The absorption is raised as exactly one finance-visible reconciliation flag,
+  // written in-transaction with the full context finance needs to investigate.
+  assert.equal(activityLogCreates.length, 1)
+  const { data } = activityLogCreates[0]
+  assert.equal(data.level, 'WARNING')
+  assert.equal(data.action, 'fifo_shortfall_absorbed')
+  assert.equal(data.entityType, 'PRODUCT')
+  assert.equal(data.entityId, 'product-1')
+  assert.equal(data.tag, 'accounting')
+  assert.match(String(data.description), /sub-tolerance FIFO shortfall/i)
+  const metadata = data.metadata as Record<string, unknown>
+  assert.equal(metadata.productId, 'product-1')
+  assert.equal(metadata.warehouseId, 'warehouse-1')
+  assert.equal(metadata.requestedQty, 5)
+  assert.equal(metadata.shortfallQty, '0.0000005')
+})
+
+test('consumeFifoLayersStrict does NOT raise an activity-log flag when the consume is fully covered (6oyu.8)', async () => {
+  // A layer that exactly covers the request leaves zero shortfall: no absorption,
+  // so no reconciliation flag — the WARNING must be specific to the shortfall path.
+  const activityLogCreates: unknown[] = []
+  const tx = {
+    $executeRaw: async () => 0,
+    $queryRaw: async () => [
+      { id: 'layer-1', remainingQty: new Prisma.Decimal('5'), unitCostBase: new Prisma.Decimal('2') },
+    ],
+    costLayer: { update: async () => {} },
+    activityLog: {
+      create: async (args: unknown) => {
+        activityLogCreates.push(args)
+        return {}
+      },
+    },
+  }
+
+  const result = await consumeFifoLayersStrict(tx as never, 'product-1', 'warehouse-1', 5)
+
+  assert.equal(result.consumed.length, 1)
+  assert.equal(activityLogCreates.length, 0)
 })
 
 test('consumeFifoLayers returns the full remaining quantity when no FIFO rows are available', async () => {
