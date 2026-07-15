@@ -339,15 +339,6 @@ export async function consumeFifoLayersStrict(
       `needed ${qty}, only ${subtractMoney(qty, result.remainingQty).toString()} available in cost layers`,
     )
   }
-  // Surface a non-zero shortfall that was absorbed within tolerance as a
-  // reconciliation exception — it indicates the consumed value was spread over a
-  // marginally larger rowQty than the layers covered.
-  if (result.remainingQty.gt(0)) {
-    console.warn(
-      `consumeFifoLayersStrict absorbed a sub-tolerance FIFO shortfall for product ${productId} ` +
-      `in warehouse ${warehouseId}: requested ${qty}, ${result.remainingQty.toString()} uncovered by cost layers.`,
-    )
-  }
   // audit-snxr: the sub-µ tolerance above lets a tiny positive consume slip
   // through with NOTHING consumed when there are no cost layers at all (stock /
   // cost-layer desync). Callers build cogs_entries only when consumed is
@@ -355,11 +346,50 @@ export async function consumeFifoLayersStrict(
   // rejected by the deferred reporting-evidence guard at COMMIT (a confusing
   // P2028). A positive consumption with no FIFO provenance is a hard error here —
   // fail clearly before the movement is written rather than booking uncosted stock.
+  // Ordered BEFORE the absorption flag below: this path absorbs nothing, so
+  // flagging it would both misdescribe the event and be rolled back by the throw.
   if (qty > 0 && result.consumed.length === 0) {
     throw new Error(
       `No FIFO cost layers to consume for product ${productId} in warehouse ${warehouseId}: ` +
       `cannot record a costed outbound movement of ${qty} (stock/cost-layer desync — repair the cost layers).`,
     )
+  }
+  // Surface a non-zero shortfall that was absorbed within tolerance as a
+  // reconciliation exception — it indicates the consumed value was spread over a
+  // marginally larger rowQty than the layers covered, understating unit cost.
+  // A console.warn alone lands only in server logs and is invisible to finance
+  // (6oyu.8): also raise a finance-visible activity-log WARNING in the SAME
+  // transaction as the movement (mirrors accounting-fx.ts's fx_rate_fallback_used
+  // reconciliation flag) so the absorption is an auditable reconciliation event,
+  // not just a log line. Numeric behaviour is unchanged — this is visibility only.
+  if (result.remainingQty.gt(0)) {
+    // toFixed(), not toString(): Decimal renders sub-µ values in exponential
+    // notation ("5e-7"), which reads as noise in a finance-facing audit record.
+    const shortfallQty = result.remainingQty.toFixed()
+    console.warn(
+      `consumeFifoLayersStrict absorbed a sub-tolerance FIFO shortfall for product ${productId} ` +
+      `in warehouse ${warehouseId}: requested ${qty}, ${shortfallQty} uncovered by cost layers.`,
+    )
+    await tx.activityLog.create({
+      data: {
+        entityType: 'PRODUCT',
+        entityId: productId,
+        action: 'fifo_shortfall_absorbed',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `Absorbed a sub-tolerance FIFO shortfall for product ${productId} in warehouse ${warehouseId}: ` +
+          `requested ${qty}, ${shortfallQty} uncovered by cost layers — the consumed value was spread over the ` +
+          `full quantity, understating unit cost. Review the product's cost layers for a stock/cost-layer desync.`,
+        metadata: {
+          productId,
+          warehouseId,
+          requestedQty: qty,
+          shortfallQty,
+          toleranceQty: FIFO_SHORTFALL_TOLERANCE.toFixed(),
+        },
+      },
+    })
   }
   return { consumed: result.consumed, totalCost: result.totalCost }
 }
