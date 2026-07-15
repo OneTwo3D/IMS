@@ -7,7 +7,7 @@
  * in the caller's transaction.
  */
 
-import type { Prisma } from '@/app/generated/prisma/client'
+import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { getAccountingSettings, isAccountingSyncTypeEnabled, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
@@ -893,6 +893,27 @@ export async function getSupplierReturnedQtyForCostLayer(
 }
 
 /**
+ * Movement types each revaluation-exclusion query below is responsible for.
+ * These are kept as explicit per-query lists (rather than one merged query)
+ * because the two exclusions mean different things downstream: manufacturing's
+ * delta is REDIRECTED into the produced output layer, whereas a reversal's is
+ * simply dropped.
+ *
+ * Their union is asserted against MOVEMENT_COGS_RELEVANCE's derived
+ * REVALUATION_EXCLUDED_MOVEMENT_TYPES in movement-cogs-relevance.test.ts, so
+ * classifying a new movement type as EXCLUDE without giving it a query here is
+ * a test failure rather than silent spurious COGS (6oyu.7).
+ */
+const MANUFACTURING_CONSUMPTION_MOVEMENT_TYPES: StockMovementType[] = ['PRODUCTION_OUT']
+const REVERSAL_CONSUMPTION_MOVEMENT_TYPES: StockMovementType[] = ['PURCHASE_REVERSAL']
+
+/** Every movement type actually subtracted by a revaluation-exclusion query. */
+export const REVALUATION_EXCLUSION_QUERY_MOVEMENT_TYPES: StockMovementType[] = [
+  ...MANUFACTURING_CONSUMPTION_MOVEMENT_TYPES,
+  ...REVERSAL_CONSUMPTION_MOVEMENT_TYPES,
+]
+
+/**
  * Sum stock consumed by manufacturing (PRODUCTION_OUT) for a cost layer.
  * Manufacturing consumption capitalises the component cost INTO the produced
  * output's cost layer — it is not customer COGS — so landed-cost recalculation
@@ -905,7 +926,7 @@ export async function getManufacturingConsumedQtyForCostLayer(
   const rows = await tx.cogsEntry.findMany({
     where: {
       costLayerId,
-      movement: { type: 'PRODUCTION_OUT' },
+      movement: { type: { in: MANUFACTURING_CONSUMPTION_MOVEMENT_TYPES } },
     },
     select: { qty: true },
   })
@@ -928,7 +949,7 @@ export async function getReversalConsumedQtyForCostLayer(
   const rows = await tx.cogsEntry.findMany({
     where: {
       costLayerId,
-      movement: { type: 'PURCHASE_REVERSAL' },
+      movement: { type: { in: REVERSAL_CONSUMPTION_MOVEMENT_TYPES } },
     },
     select: { qty: true },
   })
