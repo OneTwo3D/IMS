@@ -32,13 +32,25 @@ export type CogsRelevance = 'CUSTOMER_COGS' | 'NOT_CUSTOMER_COGS' | 'NEVER_CONSU
 
 /**
  * What retrospective landed-cost revaluation does with these units TODAY.
- *  - INCLUDE_IN_COGS: counted in netConsumedQty; delta posts to COGS.
+ *  - INCLUDE_IN_COGS: counted in netConsumedQty; delta posts to COGS. Only ever
+ *    valid for units that genuinely ARE a sale.
  *  - EXCLUDE: subtracted from netConsumedQty by a dedicated exclusion query.
  *  - NOT_APPLICABLE: never consumes layers, so revaluation never sees it.
- *  - KNOWN_GAP: SHOULD be excluded (or redirected) but currently is not. Each
- *    KNOWN_GAP MUST name the bd issue tracking the fix — the test enforces it.
+ *  - ACCEPTED_TRADEOFF: NOT customer COGS, but counted in COGS anyway by an
+ *    explicit decision — the delta has nowhere better to go and excluding it
+ *    would strand value. Deliberately distinct from INCLUDE_IN_COGS so the
+ *    divergence is visible rather than looking like a misclassification, and
+ *    distinct from KNOWN_GAP so it is not mistaken for unfinished work.
+ *  - KNOWN_GAP: SHOULD be excluded (or redirected) but currently is not.
+ *
+ * ACCEPTED_TRADEOFF and KNOWN_GAP MUST both name their bd issue — enforced.
  */
-export type RevaluationTreatment = 'INCLUDE_IN_COGS' | 'EXCLUDE' | 'NOT_APPLICABLE' | 'KNOWN_GAP'
+export type RevaluationTreatment =
+  | 'INCLUDE_IN_COGS'
+  | 'EXCLUDE'
+  | 'NOT_APPLICABLE'
+  | 'ACCEPTED_TRADEOFF'
+  | 'KNOWN_GAP'
 
 /**
  * Where an EXCLUDE'd quantity is actually read from. Explicit because assuming
@@ -89,9 +101,9 @@ export const MOVEMENT_COGS_RELEVANCE: Record<StockMovementType, MovementCogsClas
   },
   ADJUSTMENT: {
     relevance: 'NOT_CUSTOMER_COGS',
-    treatment: 'KNOWN_GAP',
+    treatment: 'ACCEPTED_TRADEOFF',
     writesCogsEntries: true,
-    note: 'onetwo3d-ims-6oyu.20 — generic reason-coded adjustments post DR reason.accountCode / CR inventory, never COGS, but their units still land in netConsumedQty so the revaluation delta is misclassified into COGS. Magnitude is right, account is wrong; awaiting a finance decision (exclude and route to the reason account, vs document as intentional per the scjz.10 precedent). NOTE: supplier returns are ALSO type=ADJUSTMENT (referenceType=PurchaseReturn) and are deliberately INCLUDED per scjz.10 — any fix must key on referenceType, not type alone.',
+    note: 'ACCEPTED TRADE-OFF (onetwo3d-ims-6oyu.20, decided 2026-07-15) — the ONLY entry where relevance and treatment disagree, deliberately. A reason-coded adjustment posts DR reason.accountCode / CR inventory, so its late landed-cost delta lands in COGS rather than the reason account: magnitude right, account imprecise. Accepted for two reasons. (1) Not implementable: StockMovement persists no reasonId/accountCode — applyStockAdjustment resolves the reason only to build the journal and stores note="<reason.name>[: <note>]" as free text — so the reason account is unrecoverable at revaluation time, and historical rows never stored it at all. (2) Excluding without routing would be WORSE: the delta would drain nothing from transit, stranding a permanent balance and understating expense, trading a reclass for a completeness error. Including keeps transit draining fully and the P&L total correct, consistent with the scjz.10 decision to let supplier returns ride the same COGS-adjustment journal. Revisit only if reason attribution is persisted on the movement. NOTE: supplier returns are ALSO type=ADJUSTMENT (referenceType=PurchaseReturn) and are likewise INCLUDED per scjz.10.',
   },
   TRANSFER_OUT: {
     relevance: 'NOT_CUSTOMER_COGS',
@@ -189,3 +201,11 @@ export const TRANSFER_SNAPSHOT_EXCLUDED_MOVEMENT_TYPES: StockMovementType[] =
 /** Movement types currently known to be mistreated by revaluation. */
 export const REVALUATION_KNOWN_GAP_MOVEMENT_TYPES: StockMovementType[] =
   movementTypesWhere((entry) => entry.treatment === 'KNOWN_GAP')
+
+/**
+ * Movement types knowingly counted in COGS despite not being customer COGS.
+ * Not bugs — decisions. Kept separate from KNOWN_GAP so nobody "fixes" one by
+ * mistake, and from INCLUDE_IN_COGS so the divergence stays legible.
+ */
+export const REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES: StockMovementType[] =
+  movementTypesWhere((entry) => entry.treatment === 'ACCEPTED_TRADEOFF')

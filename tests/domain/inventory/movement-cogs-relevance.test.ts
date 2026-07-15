@@ -5,6 +5,7 @@ import {
   COGS_ENTRY_EXCLUDED_MOVEMENT_TYPES,
   LAYER_CONSUMING_MOVEMENT_TYPES_WITHOUT_COGS_ENTRIES,
   MOVEMENT_COGS_RELEVANCE,
+  REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES,
   REVALUATION_EXCLUDED_MOVEMENT_TYPES,
   REVALUATION_KNOWN_GAP_MOVEMENT_TYPES,
   TRANSFER_SNAPSHOT_EXCLUDED_MOVEMENT_TYPES,
@@ -67,16 +68,24 @@ test('registry entries are internally consistent (6oyu.7)', () => {
     }
 
     // INCLUDE_IN_COGS is only defensible for units that really are a sale.
+    // Anything else counted in COGS must say so via ACCEPTED_TRADEOFF, so the
+    // divergence cannot hide behind a plain "include".
     if (entry.treatment === 'INCLUDE_IN_COGS') {
-      assert.equal(entry.relevance, 'CUSTOMER_COGS', `${type}: only customer-COGS units may be included`)
+      assert.equal(entry.relevance, 'CUSTOMER_COGS', `${type}: only customer-COGS units may be plainly included`)
     }
 
-    // A known gap without a tracking issue is just an undocumented bug.
-    if (entry.treatment === 'KNOWN_GAP') {
+    // The inverse: a trade-off is only a trade-off if it diverges from the truth.
+    if (entry.treatment === 'ACCEPTED_TRADEOFF') {
+      assert.equal(entry.relevance, 'NOT_CUSTOMER_COGS', `${type}: customer-COGS units in COGS is not a trade-off, it is just correct`)
+    }
+
+    // An undocumented gap is just a bug; an uncited trade-off is indistinguishable
+    // from one. Both must name the decision/issue they rest on.
+    if (entry.treatment === 'KNOWN_GAP' || entry.treatment === 'ACCEPTED_TRADEOFF') {
       assert.match(
         entry.note,
         /onetwo3d-ims-\w+|o3d-\w+/,
-        `${type}: a KNOWN_GAP must reference the bd issue tracking its fix`,
+        `${type}: a ${entry.treatment} must reference the bd issue it rests on`,
       )
     }
 
@@ -106,9 +115,24 @@ test('each exclusion source covers exactly the types it can actually see (6oyu.1
   assert.deepEqual(TRANSFER_SNAPSHOT_EXCLUDED_MOVEMENT_TYPES, ['TRANSFER_OUT'])
 })
 
-test('known revaluation gaps are exactly the ones currently tracked (6oyu.7)', () => {
-  // Fails when a gap is fixed (drop it here + flip its treatment) or a new one is
-  // classified — either way the change should be conscious. TRANSFER_OUT left this
-  // list when 6oyu.19 was fixed; ADJUSTMENT (6oyu.20) awaits a finance decision.
-  assert.deepEqual(REVALUATION_KNOWN_GAP_MOVEMENT_TYPES, ['ADJUSTMENT'])
+test('no revaluation gaps remain unresolved (6oyu.7)', () => {
+  // TRANSFER_OUT left this list when 6oyu.19 was fixed; ADJUSTMENT left it when
+  // 6oyu.20 was decided as an accepted trade-off. A new entry here means a newly
+  // discovered defect — which should be a conscious, tracked addition.
+  assert.deepEqual(REVALUATION_KNOWN_GAP_MOVEMENT_TYPES, [])
+})
+
+test('accepted trade-offs are exactly the ones decided (6oyu.20)', () => {
+  // ADJUSTMENT: its reason account is unrecoverable at revaluation time
+  // (StockMovement stores no reasonId — only a free-text note), and excluding it
+  // without routing would strand the delta in transit and understate expense.
+  // Counting it in COGS keeps transit draining and the P&L total right, matching
+  // the scjz.10 supplier-return decision. Deliberate, not a bug.
+  assert.deepEqual(REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES, ['ADJUSTMENT'])
+
+  // A trade-off must not also be excluded — that would be silently subtracting
+  // the very units the decision says to keep.
+  for (const type of REVALUATION_ACCEPTED_TRADEOFF_MOVEMENT_TYPES) {
+    assert.ok(!REVALUATION_EXCLUDED_MOVEMENT_TYPES.includes(type), `${type}: accepted into COGS, so it must not be excluded`)
+  }
 })
