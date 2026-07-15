@@ -18,17 +18,43 @@ import { xeroGet, xeroPost } from '../../../lib/connectors/xero/api.ts'
 export type XeroDocKind = 'Invoices' | 'CreditNotes' | 'ManualJournals' | 'PurchaseOrders'
 
 type Tracked = { kind: XeroDocKind; id: string; label: string }
-const tracked: Tracked[] = []
+
+/**
+ * The registry is a FILE, not a module-level array.
+ *
+ * Playwright runs globalTeardown in a DIFFERENT PROCESS from the workers, so an
+ * in-memory list is always empty by the time teardown reads it — the documents are
+ * silently never voided and pile up in the SHARED Demo ledger. That is exactly what
+ * happened: OC-01's first green run left a live AUTHORISED invoice behind while
+ * teardown reported success. Cross-process state has to be on disk.
+ */
+const REGISTRY = '.full-chain-xero-docs.json'
+
+function readRegistry(): Tracked[] {
+  try {
+    const { readFileSync } = require('node:fs') as typeof import('node:fs')
+    return JSON.parse(readFileSync(REGISTRY, 'utf8')) as Tracked[]
+  } catch {
+    return []
+  }
+}
+
+function writeRegistry(docs: Tracked[]): void {
+  const { writeFileSync } = require('node:fs') as typeof import('node:fs')
+  writeFileSync(REGISTRY, JSON.stringify(docs, null, 2))
+}
 
 /** Register a document for teardown. Call as soon as an id is known. */
 export function trackDocument(kind: XeroDocKind, id: string, label: string): void {
   if (!id) return
-  if (tracked.some((t) => t.kind === kind && t.id === id)) return
-  tracked.push({ kind, id, label })
+  const docs = readRegistry()
+  if (docs.some((t) => t.kind === kind && t.id === id)) return
+  docs.push({ kind, id, label })
+  writeRegistry(docs)
 }
 
 export function trackedDocuments(): ReadonlyArray<Tracked> {
-  return tracked
+  return readRegistry()
 }
 
 // --- read-back ---------------------------------------------------------------
@@ -179,6 +205,7 @@ export function expectJournalLine(
 export async function voidTrackedDocuments(): Promise<{ voided: number; failed: string[] }> {
   const failed: string[] = []
   let voided = 0
+  const tracked = readRegistry()
   // Reverse order: allocations/payments before the documents they attach to.
   for (const t of [...tracked].reverse()) {
     try {
@@ -193,7 +220,9 @@ export async function voidTrackedDocuments(): Promise<{ voided: number; failed: 
       failed.push(`${t.kind}/${t.id} (${t.label}): ${e instanceof Error ? e.message : e}`)
     }
   }
-  tracked.length = 0
+  // Keep anything we could NOT void, so a later attempt still knows about it; drop the
+  // rest. Forgetting a document we failed to void would strand it silently.
+  writeRegistry(tracked.filter((t) => failed.some((f) => f.includes(t.id))))
   if (failed.length) {
     console.warn(`[xero-teardown] ${failed.length} document(s) left in the ledger:\n  ${failed.join('\n  ')}`)
   }

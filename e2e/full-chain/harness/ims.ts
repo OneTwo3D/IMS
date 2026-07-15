@@ -30,10 +30,23 @@ export async function allocateAndShip(
   page: Page,
   opts: { carrier?: string; tracking?: string } = {},
 ): Promise<void> {
+  // Two different starting points, and assuming the first is why this originally hung:
+  //  - a MANUALLY created order arrives DRAFT and needs "Process";
+  //  - a WOO-IMPORTED order arrives PROCESSING, already carrying allocations from the
+  //    import's auto-allocation — but still PROCESSING, so there is no "Process" button.
+  // "Create Shipments" only renders when allocations.length > 0 AND status ===
+  // 'ALLOCATED' (so-detail-client.tsx:475), so an imported order sits there forever
+  // unless something promotes it. Clicking Auto-Allocate/Re-Allocate is what an
+  // operator does, and it runs allocateSalesOrder, which performs the
+  // PROCESSING -> ALLOCATED transition (allocation-service.ts:881).
   const processBtn = page.getByRole('button', { name: 'Process' })
   if (await processBtn.isVisible().catch(() => false)) {
     await processBtn.click()
-    await expect(page.getByText(/^Allocated$/)).toBeVisible({ timeout: 30_000 })
+  } else {
+    const allocateBtn = page.getByRole('button', { name: /^(Auto-Allocate|Re-Allocate)$/ })
+    if (await allocateBtn.isVisible().catch(() => false)) {
+      await allocateBtn.click()
+    }
   }
 
   // The shipment button appears only once allocation has settled; poll rather than
@@ -42,7 +55,7 @@ export async function allocateAndShip(
     .poll(async () => {
       await page.reload()
       return page.getByRole('button', { name: /create shipments/i }).isVisible()
-    }, { timeout: 60_000 })
+    }, { timeout: 90_000 })
     .toBe(true)
 
   await page.getByRole('button', { name: /create shipments/i }).click()
@@ -92,7 +105,11 @@ export async function processPendingXeroSyncViaUi(page: Page): Promise<void> {
  * unrelated documents to the ledger.
  */
 export async function processPendingXeroSync(): Promise<unknown> {
-  const { processPendingXeroSync: run } = await import('../../../lib/connectors/xero/index.ts')
+  // Import the module directly, NOT the ../xero/index.ts barrel: the barrel drags in a
+  // graph with a CJS/ESM mismatch and dies with "Cannot use import statement outside a
+  // module". The other two triggers below already import their module directly, which is
+  // why only this one broke.
+  const { processPendingXeroSync: run } = await import('../../../lib/connectors/xero/sync-processor.ts')
   return run()
 }
 

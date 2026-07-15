@@ -111,6 +111,25 @@ export async function preflight(): Promise<PreflightReport> {
       )
     }
 
+    // --- per-type posting settings
+    // queueAccountingSync is a NO-OP unless the per-TYPE setting (xero_sync_sales_invoice
+    // etc.) is set and not 'off' — getAccountingPostingContext (accounting.ts:173-175)
+    // returns null otherwise. Nothing is queued, nothing errors, and the test later fails
+    // hunting for a document that was never even requested.
+    const perType = await db.query<{ key: string }>(
+      `select key from settings where key like 'xero_sync_%'
+        and key not in ('xero_sync_enabled','xero_sync_attach_pdf') and value <> 'off' and value <> ''`,
+    )
+    const needTypes = ['xero_sync_sales_invoice', 'xero_sync_credit_note', 'xero_sync_cogs_journal']
+    const haveTypes = new Set(perType.rows.map((r) => r.key))
+    const missingTypes = needTypes.filter((k) => !haveTypes.has(k))
+    if (missingTypes.length) {
+      problems.push(
+        `Per-type posting settings missing/off: ${missingTypes.join(', ')}. queueAccountingSync ` +
+          `silently no-ops for those types, so nothing is ever queued to Xero.`,
+      )
+    }
+
     // --- tax rates resolvable
     const unmapped = await db.query<{ count: string }>(
       `select count(*)::text as count from tax_rates

@@ -19,14 +19,12 @@ const fullChainConfig = {
   ...baseConfig,
   webServer: undefined,
   retries: 0,
-  // Playwright's 30s default is too short here. The rig runs `next dev`, so the FIRST
-  // request to a route compiles it — /dashboard can take over 30s, and auth.setup then
-  // fails on waitForURL(**\/dashboard) with a bare timeout that reads like bad
-  // credentials. It is not; the page simply was not built yet. globalSetup warms what it
-  // can, but /dashboard is behind auth so an unauthenticated warm only reaches the 307
-  // redirect and never compiles the page itself — hence a real timeout, not a workaround.
-  // The full-chain spec overrides this with its own (much larger) budget.
-  timeout: 120_000,
+  // Modest headroom over Playwright's 30s default. The rig now runs a PRODUCTION build
+  // (`next start`), so pages are pre-compiled and serve in well under a second — the
+  // on-demand compilation that made `next dev` blow past 30s (and balloon to 5.5GB) is
+  // gone. Kept above the default only because this tier crosses two external systems.
+  // The full-chain specs override it with their own much larger budgets.
+  timeout: 60_000,
   globalSetup: './e2e/full-chain/harness/global-setup.ts',
   globalTeardown: './e2e/full-chain/harness/global-teardown.ts',
   // Spreading baseConfig inherits ALL its projects, which would drag the entire local
