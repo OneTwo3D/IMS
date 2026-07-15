@@ -346,8 +346,19 @@ const INVOICE_UPDATE_TO_CREATE_TYPE: Partial<Record<AccountingSyncType, Accounti
   PURCHASE_INVOICE_UPDATE: 'PURCHASE_INVOICE',
 }
 
+/**
+ * Composite Map key. NUL is the separator because it cannot occur in any of the
+ * three components, so the join is unambiguous.
+ *
+ * Write it as the \u0000 ESCAPE, never as a literal NUL byte in the source: a
+ * literal makes `file` classify this module as `data` rather than text, and grep
+ * then treats it as binary and silently reports NO matches for anything in the
+ * whole file — an audit of this module would come back empty and look clean.
+ * Greppability of a 1.7k-line module beats the two characters saved; the runtime
+ * string is identical either way.
+ */
 function invoiceCreateKey(createType: AccountingSyncType, referenceType: string, referenceId: string): string {
-  return `${createType} ${referenceType} ${referenceId}`
+  return `${createType}\u0000${referenceType}\u0000${referenceId}`
 }
 
 /**
