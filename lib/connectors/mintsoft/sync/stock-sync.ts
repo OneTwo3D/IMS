@@ -3,6 +3,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
+import { classifyUnresolvedWmsSku } from '@/lib/domain/wms/stock-sync-helpers'
 import { createCostLayer, copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import { notify } from '@/lib/notifications'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
@@ -373,7 +374,7 @@ async function reserveStockSyncJob(
 
 async function upsertDiscrepancy(params: {
   binding: SyncBinding
-  category: 'MISSING_IN_WMS' | 'UNMAPPED_SKU' | 'QTY_MISMATCH' | 'RECEIPT_TIMING_CONFLICT'
+  category: 'MISSING_IN_WMS' | 'MISSING_IN_IMS' | 'UNMAPPED_SKU' | 'QTY_MISMATCH' | 'RECEIPT_TIMING_CONFLICT'
   productId: string | null
   sku: string
   imsValue: string | null
@@ -459,7 +460,7 @@ async function resolveOpenDiscrepancies(binding: SyncBinding, productId: string,
         { sku },
       ],
       category: {
-        in: ['MISSING_IN_WMS', 'UNMAPPED_SKU', 'QTY_MISMATCH', 'RECEIPT_TIMING_CONFLICT'],
+        in: ['MISSING_IN_WMS', 'MISSING_IN_IMS', 'UNMAPPED_SKU', 'QTY_MISMATCH', 'RECEIPT_TIMING_CONFLICT'],
       },
     },
     data: {
@@ -1361,15 +1362,21 @@ export async function runStockSyncForBinding(
         const product = productBySku.get(line.sku)
         if (!product) {
           counters.mismatched += 1
+          // productBySku is built from an unfiltered Product-by-SKU lookup, so a miss
+          // on a real SKU means the product is absent from IMS entirely — distinct
+          // from a line that carries no SKU to resolve at all (6oyu.17).
+          const category = classifyUnresolvedWmsSku(line.sku)
           await upsertDiscrepancy({
             binding,
-            category: 'UNMAPPED_SKU',
+            category,
             productId: null,
             sku: line.sku,
             imsValue: null,
             wmsValue: formatQuantity(line.quantity),
             delta: null,
-            message: 'Mintsoft returned a SKU that is not mapped to an IMS product.',
+            message: category === 'MISSING_IN_IMS'
+              ? `Mintsoft holds stock for SKU ${line.sku}, which has no matching IMS product. Create or import the product in IMS.`
+              : 'Mintsoft returned a stock line with no SKU, so it cannot be resolved to an IMS product. Fix the product record in Mintsoft.',
           })
 
           logRows.push({
@@ -1379,7 +1386,7 @@ export async function runStockSyncForBinding(
             action: 'discrepancy',
             wmsQty: line.quantity,
             delta: null,
-            reason: 'UNMAPPED_SKU',
+            reason: category,
             payload: (line.raw ?? {}) as Prisma.InputJsonValue,
           })
           continue

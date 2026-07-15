@@ -810,7 +810,7 @@ Implement one shared function `runStockSyncForBinding(bindingId, triggeredBy)` t
 2. Creates a `WmsSyncJob` row with `type: 'STOCK_SYNC'`, `status: 'RUNNING'`.
 3. Calls `connector.fetchStockLevels(externalWarehouseId)`.
 4. For each returned `WmsStockLine`:
-   - resolve IMS product via `Product.findUnique({where: {sku}})` → if missing, record `UNMAPPED_SKU` discrepancy, continue.
+   - resolve IMS product via `Product.findUnique({where: {sku}})` → if missing, record a discrepancy and continue. The category depends on why it did not resolve (`classifyUnresolvedWmsSku`, 6oyu.17): a real SKU with no IMS product is `MISSING_IN_IMS` (create/import the product in IMS); a line with a blank SKU is `UNMAPPED_SKU` (no key to resolve against — fix the WMS product record).
    - load current IMS `StockLevel` for `(productId, warehouseId)`.
    - load `WmsStockSnapshot` (per `(connector, warehouseId, productId)`) — observational only, used for the diff report, not for the double-booking skip rule.
    - detect `RECEIPT_TIMING_CONFLICT` if the snapshot delta matches an open ASN's expected qty and PO line is still unreceived (join against `WmsAsnMap` + `PurchaseOrderLine.qtyReceived`).
