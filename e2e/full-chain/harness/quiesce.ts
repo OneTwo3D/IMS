@@ -28,6 +28,7 @@
  * hatch.
  */
 import { Client } from 'pg'
+import type { WcCreds } from './wc.ts'
 
 const LOCK_KEY = 'e2e_quiesce_lock'
 
@@ -40,26 +41,31 @@ const STAGE_SETTINGS_TO_DISABLE = [
   'xero_payment_polling_enabled',
 ] as const
 
-export type WebhookSpec = { topic: string; resource: 'orders' | 'refunds' }
-
 /**
- * Topics the suite needs delivered to this instance.
+ * Topics that must be registered on the store, pointing at this instance.
  *
- * THERE IS NO REFUND TOPIC IN WOOCOMMERCE CORE. Attempting one returns
- * `woocommerce_rest_shop_webhook_invalid_topic`. A refund fires `order.updated`:
- * class-wc-webhook.php maps 'order.updated' => ['woocommerce_update_order',
- * 'woocommerce_order_refunded']. The IMS then picks the refund up because
- * handleOrderWebhook calls syncRefundsForOrder() (webhooks.ts:190). So OC-05/OC-06
- * are covered by order.updated and need no extra hook.
+ * These are PERMANENT webhooks (ids 847/848), registered once — NOT created per run.
+ * Two reasons, and the first is a hard blocker:
  *
- * (webhooks.ts:131 does handle a 'refund.created' topic on the /refunds resource,
- * but core Woo cannot emit it — that path only fires if something registers a custom
- * topic.)
+ *  1. Woo would intermittently not SCHEDULE delivery for a just-created webhook: order
+ *     163327 got its deliveries, 163329 minutes later got none queued at all. Woo caches
+ *     the active-webhook set, so a hook created moments earlier can be missing from the
+ *     list the order-creation request consults. Long-lived hooks are always cached —
+ *     which is exactly why stage's own 818/819 never miss. (o3d-lgo.10)
+ *  2. It shrinks this lock: with nothing created per run, a crashed run cannot strand a
+ *     webhook, so the lock only has to restore stage's settings.
+ *
+ * TRADE-OFF, accepted deliberately: the e2e instance now receives every real stage order.
+ * Between runs it sits disarmed (wc_sync_enabled=false) so those are discarded; during a
+ * run the gate is open, so a real order placed in that window would import into the e2e
+ * database. That DB is disposable and the window is minutes, but it is not nothing.
+ *
+ * THERE IS NO REFUND TOPIC IN WOOCOMMERCE CORE — attempting one returns
+ * `woocommerce_rest_shop_webhook_invalid_topic`. A refund fires `order.updated`
+ * (class-wc-webhook.php maps it to woocommerce_order_refunded), and handleOrderWebhook
+ * calls syncRefundsForOrder() (webhooks.ts:190), so OC-05/OC-06 are covered.
  */
-export const REQUIRED_WEBHOOKS: WebhookSpec[] = [
-  { topic: 'order.created', resource: 'orders' },
-  { topic: 'order.updated', resource: 'orders' },
-]
+export const REQUIRED_WEBHOOK_TOPICS = ['order.created', 'order.updated'] as const
 
 /**
  * Settings that must be TRUE on THIS instance for the run, and are restored after.
@@ -154,6 +160,37 @@ async function wcRequest<T>(
   return JSON.parse(text) as T
 }
 
+/**
+ * Assert the permanent delivery webhooks exist, are ACTIVE, and point here.
+ *
+ * WooCommerce disables a webhook after repeated delivery failures, so one can go quietly
+ * `disabled` between runs — and a disabled hook fails the same way as a missing one:
+ * every test times out with nothing in the inbox. Checking costs one request.
+ */
+async function assertPermanentWebhooks(creds: WcCreds, appUrl: string): Promise<void> {
+  const host = new URL(appUrl).host
+  const hooks = await wcRequest<Array<{ id: number; topic: string; delivery_url: string; status: string }>>(
+    creds, '/webhooks?per_page=100',
+  )
+  const problems: string[] = []
+  for (const topic of REQUIRED_WEBHOOK_TOPICS) {
+    const hit = hooks.find((h) => h.topic === topic && h.delivery_url.includes(host))
+    if (!hit) {
+      problems.push(`no ${topic} webhook delivering to ${host}`)
+    } else if (hit.status !== 'active') {
+      problems.push(`${topic} webhook ${hit.id} is "${hit.status}", not active (Woo disables a hook after repeated delivery failures)`)
+    }
+  }
+  if (problems.length) {
+    throw new Error(
+      `Permanent delivery webhooks are not usable:\n  - ${problems.join('\n  - ')}\n` +
+        `Without them Woo delivers nothing here and every test times out with an empty inbox. ` +
+        `Re-register them (o3d-lgo.10) before running.`,
+    )
+  }
+  console.log(`[quiesce] permanent delivery webhooks OK (${REQUIRED_WEBHOOK_TOPICS.join(', ')} -> ${host})`)
+}
+
 // --- public API -------------------------------------------------------------
 
 export type QuiesceHandle = { runId: string; deliveryUrlBase: string }
@@ -188,7 +225,11 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
     }
 
     const creds = await wcCreds(e2e)
-    const base = `${appUrl.replace(/\/$/, '')}/api/webhooks/shopping/woocommerce`
+
+    // The permanent hooks are a precondition, not something to create here. Assert them
+    // rather than silently proceeding: without them nothing is delivered and every test
+    // fails 5 minutes later with a confusing timeout.
+    await assertPermanentWebhooks(creds, appUrl)
 
     // Write the lock BEFORE mutating anything, so a crash mid-acquire is still
     // recoverable. Recording `prior` first is what makes release() truthful.
@@ -219,37 +260,23 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
     }
     console.log(`[quiesce] e2e armed for inbound webhooks: ${E2E_SETTINGS_TO_ENABLE.join(', ')}`)
 
-    for (const w of REQUIRED_WEBHOOKS) {
-      const created = await wcRequest<{ id: number }>(creds, '/webhooks', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: `E2E full-chain ${runId} ${w.topic}`,
-          topic: w.topic,
-          delivery_url: `${base}/${w.resource}`,
-          status: 'active',
-          secret: creds.webhookSecret,
-        }),
-      })
-      lock.createdWebhookIds.push(created.id)
-      await writeLock(e2e, lock) // persist after EACH create, so none can be orphaned
-      console.log(`[quiesce] webhook ${created.id} ${w.topic} -> ${base}/${w.resource}`)
-    }
-
-    return { runId, deliveryUrlBase: base }
+    return { runId, deliveryUrlBase: `${appUrl.replace(/\/$/, '')}/api/webhooks/shopping/woocommerce` }
   } finally {
     await e2e.end(); await stage.end()
   }
 }
 
 async function releaseInternal(e2e: Client, stage: Client, lock: LockRecord): Promise<void> {
-  // Webhooks first: they are the thing pointing at us. force=true because Woo
-  // otherwise moves them to trash and a trashed hook still occupies its topic slot.
-  if (lock.createdWebhookIds.length) {
+  // Delivery webhooks are PERMANENT and deliberately not touched here (o3d-lgo.10).
+  // `createdWebhookIds` is only honoured for locks written by the older create-per-run
+  // design, so an in-flight lock from before that change still cleans up correctly
+  // rather than orphaning its hooks.
+  if (lock.createdWebhookIds?.length) {
     const creds = await wcCreds(e2e)
     for (const id of lock.createdWebhookIds) {
       try {
         await wcRequest(creds, `/webhooks/${id}?force=true`, { method: 'DELETE' })
-        console.log(`[quiesce] deleted webhook ${id}`)
+        console.log(`[quiesce] deleted legacy per-run webhook ${id}`)
       } catch (e) {
         // Keep going: one undeletable hook must not strand stage's settings.
         console.warn(`[quiesce] could not delete webhook ${id}: ${e instanceof Error ? e.message : e}`)
