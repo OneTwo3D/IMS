@@ -1,0 +1,501 @@
+{
+  "$comment": [
+    "Declarative spec of what the Xero Demo company must contain for the full-chain e2e suite.",
+    "Applied idempotently by scripts/provision-xero-demo.ts after each ~4-weekly Demo reset.",
+    "Regenerate with scripts/generate-xero-demo-template.ts --source-db <url>.",
+    "Tax-rate TaxType ids are intentionally absent: Xero assigns them on creation, so any",
+    "snapshot of them is stale the moment the Demo resets. The provisioner writes back whatever",
+    "Xero returns."
+  ],
+  "generatedFrom": "postgresql://imsdev:***@localhost:5432/onetwo3d_ims_dev",
+  "currencies": [
+    {
+      "code": "CAD",
+      "name": "Canadian Dollar"
+    },
+    {
+      "code": "EUR",
+      "name": "Euro"
+    },
+    {
+      "code": "GBP",
+      "name": "British Pound Sterling"
+    },
+    {
+      "code": "NOK",
+      "name": "Norwegian Krone"
+    },
+    {
+      "code": "SEK",
+      "name": "Swedish Krona"
+    },
+    {
+      "code": "USD",
+      "name": "US Dollar"
+    }
+  ],
+  "accounts": [
+    {
+      "code": "200",
+      "name": "Sales",
+      "type": "REVENUE"
+    },
+    {
+      "code": "210",
+      "name": "Sales Discounts",
+      "type": "REVENUE"
+    },
+    {
+      "code": "220",
+      "name": "Shipping",
+      "type": "SALES"
+    },
+    {
+      "code": "310",
+      "name": "Cost of Goods Sold",
+      "type": "DIRECTCOSTS"
+    },
+    {
+      "code": "498",
+      "name": "Unrealised Currency Gains",
+      "type": "EXPENSE"
+    },
+    {
+      "code": "499",
+      "name": "Realised Currency Gains",
+      "type": "EXPENSE"
+    },
+    {
+      "code": "610",
+      "name": "Accounts Receivable",
+      "type": "CURRENT"
+    },
+    {
+      "code": "631",
+      "name": "Stock",
+      "type": "CURRENT"
+    },
+    {
+      "code": "632",
+      "name": "Stock in Transit",
+      "type": "CURRENT"
+    },
+    {
+      "code": "633",
+      "name": "Allocated Stock",
+      "type": "CURRENT"
+    },
+    {
+      "code": "800",
+      "name": "Accounts Payable",
+      "type": "CURRLIAB"
+    },
+    {
+      "code": "810",
+      "name": "Income in Advance",
+      "type": "CURRLIAB"
+    },
+    {
+      "code": "860",
+      "name": "Rounding",
+      "type": "CURRLIAB"
+    }
+  ],
+  "bankAccounts": [
+    {
+      "name": "Paypal (EUR)",
+      "currencyCode": "EUR"
+    },
+    {
+      "name": "Paypal (GBP)",
+      "currencyCode": "GBP"
+    },
+    {
+      "name": "Paypal (USD)",
+      "currencyCode": "USD"
+    },
+    {
+      "name": "Revolut (EUR)",
+      "currencyCode": "EUR"
+    },
+    {
+      "name": "Revolut (GBP)",
+      "currencyCode": "GBP"
+    },
+    {
+      "name": "Revolut (USD)",
+      "currencyCode": "USD"
+    },
+    {
+      "name": "Stripe (EUR)",
+      "currencyCode": "EUR"
+    }
+  ],
+  "taxRates": [
+    {
+      "name": "AT VAT",
+      "components": [
+        {
+          "name": "AT VAT",
+          "rate": 0.2,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "BE VAT",
+      "components": [
+        {
+          "name": "BE VAT",
+          "rate": 0.21,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "BG VAT",
+      "components": [
+        {
+          "name": "BG VAT",
+          "rate": 0.2,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "CI VAT",
+      "components": [
+        {
+          "name": "CI VAT",
+          "rate": 0,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "CY VAT",
+      "components": [
+        {
+          "name": "CY VAT",
+          "rate": 0.19,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "CZ VAT",
+      "components": [
+        {
+          "name": "CZ VAT",
+          "rate": 0.21,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "DE VAT",
+      "components": [
+        {
+          "name": "DE VAT",
+          "rate": 0.19,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "DK VAT",
+      "components": [
+        {
+          "name": "DK VAT",
+          "rate": 0.25,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "EE VAT",
+      "components": [
+        {
+          "name": "EE VAT",
+          "rate": 0.24,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "ES VAT",
+      "components": [
+        {
+          "name": "ES VAT",
+          "rate": 0.21,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "FI VAT",
+      "components": [
+        {
+          "name": "FI VAT",
+          "rate": 0.255,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "FR VAT",
+      "components": [
+        {
+          "name": "FR VAT",
+          "rate": 0.2,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "GR VAT",
+      "components": [
+        {
+          "name": "GR VAT",
+          "rate": 0.24,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "HR VAT",
+      "components": [
+        {
+          "name": "HR VAT",
+          "rate": 0.25,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "HU VAT",
+      "components": [
+        {
+          "name": "HU VAT",
+          "rate": 0.27,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "IE VAT",
+      "components": [
+        {
+          "name": "IE VAT",
+          "rate": 0.23,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "IM VAT",
+      "components": [
+        {
+          "name": "IM VAT",
+          "rate": 0.2,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "IT VAT",
+      "components": [
+        {
+          "name": "IT VAT",
+          "rate": 0.22,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "LT VAT",
+      "components": [
+        {
+          "name": "LT VAT",
+          "rate": 0.21,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "LU VAT",
+      "components": [
+        {
+          "name": "LU VAT",
+          "rate": 0.17,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "LV VAT",
+      "components": [
+        {
+          "name": "LV VAT",
+          "rate": 0.21,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "MC VAT",
+      "components": [
+        {
+          "name": "MC VAT",
+          "rate": 0.2,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "MT VAT",
+      "components": [
+        {
+          "name": "MT VAT",
+          "rate": 0.18,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "NL VAT",
+      "components": [
+        {
+          "name": "NL VAT",
+          "rate": 0.21,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "NO VAT",
+      "components": [
+        {
+          "name": "NO VAT",
+          "rate": 0.25,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "PL VAT",
+      "components": [
+        {
+          "name": "PL VAT",
+          "rate": 0.23,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "PT VAT",
+      "components": [
+        {
+          "name": "PT VAT",
+          "rate": 0.23,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "PT-30 VAT",
+      "components": [
+        {
+          "name": "PT-30 VAT",
+          "rate": 0.22,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "RO VAT",
+      "components": [
+        {
+          "name": "RO VAT",
+          "rate": 0.21,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "SE VAT",
+      "components": [
+        {
+          "name": "SE VAT",
+          "rate": 0.25,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "SI VAT",
+      "components": [
+        {
+          "name": "SI VAT",
+          "rate": 0.22,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "SK VAT",
+      "components": [
+        {
+          "name": "SK VAT",
+          "rate": 0.23,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "UK Reduced Rate (5%)",
+      "components": [
+        {
+          "name": "UK Reduced Rate (5%)",
+          "rate": 0.05,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "UK VAT",
+      "components": [
+        {
+          "name": "UK VAT",
+          "rate": 0.2,
+          "isCompound": false
+        }
+      ]
+    },
+    {
+      "name": "Zero Rated (0%)",
+      "components": [
+        {
+          "name": "Zero Rated (0%)",
+          "rate": 0,
+          "isCompound": false
+        }
+      ]
+    }
+  ],
+  "settingAccountMap": {
+    "xero_sales_account": "200",
+    "xero_shipping_account": "220",
+    "xero_discount_account": "210",
+    "xero_cogs_account": "310",
+    "xero_inventory_account": "631",
+    "xero_allocated_inventory_account": "633",
+    "xero_unearned_revenue_account": "810",
+    "xero_transit_account": "632",
+    "xero_accounts_receivable_account": "610",
+    "xero_accounts_payable_account": "800",
+    "xero_realised_fx_gain_loss_account": "499",
+    "xero_unrealised_fx_gain_loss_account": "498",
+    "xero_rounding_difference_account": "860"
+  }
+}
