@@ -21,11 +21,18 @@ const nextConfig: NextConfig = {
   // Do not advertise the framework/version in responses.
   poweredByHeader: false,
   serverExternalPackages: ['pdfkit', 'sharp', 'ssh2-sftp-client'],
+  // Origins allowed to reach `next dev` resources. An origin missing from this
+  // list still renders SSR HTML, but its HMR socket is refused and the dev client
+  // runtime never starts — so the page never hydrates and every button silently
+  // does nothing (a form falls back to a native GET). The failure looks like a
+  // broken login rather than a config gap, so add any new proxied dev hostname here.
   allowedDevOrigins: [
     'localhost',
     '127.0.0.1',
     'ims.onetwo3d.co.uk',
     'ims-stage.onetwo3d.co.uk',
+    // Full-chain e2e rig (o3d-lgo): ims-e2e-dev.service on :3002, proxied by OLS.
+    'ims-e2e.onetwo3d.co.uk',
   ],
   outputFileTracingExcludes: {
     '/api/backup/restore': ['./next.config.ts'],
