@@ -169,9 +169,12 @@ export async function getWcOrder(c: WcCreds, orderId: number): Promise<WcOrderDe
  */
 async function nudgeWpCron(c: WcCreds): Promise<void> {
   try {
+    // Give it room to finish. WordPress holds a `doing_cron` lock for ~60s, so nudges
+    // are no-ops most of the time anyway; aborting the one request that DID win the
+    // lock would leave the queue undrained for another minute.
     await fetch(`${c.url}/wp-cron.php?doing_wp_cron=${Date.now() / 1000}`, {
       method: 'GET',
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(30_000),
     })
   } catch {
     // Ignored on purpose: see above.
@@ -191,8 +194,15 @@ export async function awaitWebhookDelivery(
   wcOrderId: number,
   opts: { timeoutMs?: number; pollMs?: number; creds?: WcCreds } = {},
 ): Promise<{ salesOrderId: string; orderNumber: string }> {
-  const timeoutMs = opts.timeoutMs ?? 180_000
-  const pollMs = opts.pollMs ?? 3_000
+  // Measured, not guessed: on this store a delivery scheduled at 18:34:51 ran at
+  // 18:37:56 — just over 3 MINUTES. Woo queues webhook delivery through Action
+  // Scheduler, which runs off WP-Cron, which holds a ~60s lock and is visitor-triggered
+  // on a store with no visitors. 180s timed out 5 seconds before the delivery landed.
+  // This is the real latency of the real chain; do not tune it down without re-measuring.
+  const timeoutMs = opts.timeoutMs ?? 300_000
+  // 15s, not 3s: nudging faster cannot help (the cron lock swallows it) and each nudge
+  // is a real HTTP request to the shared store.
+  const pollMs = opts.pollMs ?? 15_000
   const creds = opts.creds ?? (await wcCreds())
   const db = new Client({ connectionString: process.env.DATABASE_URL })
   await db.connect()

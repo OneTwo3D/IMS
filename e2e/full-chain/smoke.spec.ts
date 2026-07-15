@@ -29,7 +29,11 @@ test.describe.serial('@full-chain @wc harness smoke', () => {
   })
 
   test('a real WooCommerce order reaches the IMS via Woo\'s own webhook', async () => {
-    test.setTimeout(180_000)
+    // Comfortably longer than awaitWebhookDelivery's own 300s budget. If the two are
+    // equal Playwright kills the test first and you get a bare "Test timeout exceeded"
+    // instead of the harness's diagnosis of WHY nothing arrived — which is the only
+    // part worth reading. (That happened; hence the gap.)
+    test.setTimeout(420_000)
 
     const product = await createWcProduct(creds, runId, { label: 'SMOKE', price: '19.99' })
     expect(product.id).toBeGreaterThan(0)
