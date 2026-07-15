@@ -106,19 +106,12 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     expect(Number(invoice.Total)).toBeCloseTo(Number(order.total), 2)
   })
 
-  // BLOCKED by o3d-uxv, a real product bug this test found and proved end to end:
-  // handleOrderWebhook suppresses the refund's order.updated as a 'status_echo'
-  // (order-webhook-echo.ts:68) because a PARTIAL refund leaves the WC order status
-  // 'processing', which matches the status the IMS itself pushed when shipping — inside
-  // a TEN MINUTE window. importWcOrder/syncRefundsForOrder never run, the event is
-  // marked PROCESSED, and the refund is lost with no error on either side.
-  //
-  // Deliberately fixme rather than deleted or weakened: the test is CORRECT and the
-  // product is wrong. Un-fixme it when o3d-uxv is fixed — it is the regression proof.
-  // (o3d-idp, the refund-line _refunded_item_id mismatch, was a second independent bug
-  // on the same path and is already fixed; both had to be wrong for it to fail this
-  // silently.)
-  test.fixme('OC-05: partial refund in Woo -> ACCRECCREDIT credit note verified IN Xero', async ({ page }) => {
+  // Regression proof for o3d-uxv: the refund's order.updated carries the same WC status
+  // the IMS pushed at ship time, so the echo rule used to discard the whole webhook and
+  // the refund was lost silently. handleOrderWebhook now scopes that suppression to the
+  // STATUS sync only, so import and refund sync still run. If this goes red, that
+  // regressed.
+  test('OC-05: partial refund in Woo -> ACCRECCREDIT credit note verified IN Xero', async ({ page }) => {
     test.setTimeout(600_000)
 
     const sku = taggedSku(runId, 'OC05')
