@@ -63,7 +63,7 @@ const CLEAR_TENANT_PIN = process.argv.includes('--clear-tenant-pin')
 // Remap-only: re-point tax_rates.accounting_tax_type at the ids the LIVE org
 // actually uses, matching by name. Creates nothing, writes no settings, moves no
 // tenant pin — so unlike a full provision it is safe against ANY instance that
-// shares the Demo org, including stage (o3d-b3n).
+// shares the Demo org, including stage (o3d-g4r).
 const REMAP_ONLY = process.argv.includes('--remap-only')
 
 type Template = {
@@ -152,7 +152,7 @@ async function guardTenant(db: Client) {
  * Needed because Xero mints TAX001..TAXnnn for custom rates in CREATION ORDER: a
  * ~4-weekly Demo reset destroys them, and re-creating them in a different order
  * leaves stored ids resolving to a VALID BUT WRONG rate — i.e. invoices post with
- * the wrong VAT, silently (o3d-b3n: 30/35 of stage's mappings were wrong).
+ * the wrong VAT, silently (o3d-g4r: 30/35 of stage's mappings were wrong).
  */
 async function remapOnly(db: Client) {
   const live = await xeroGet<{ TaxRates: Array<{ Name: string; TaxType: string; Status: string }> }>('TaxRates')
