@@ -27,7 +27,12 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             class + colorScheme immediately so the browser renders the
             correct palette before React hydrates. Must stay synchronous
             and inline; an external script or useEffect would flash. */}
+        {/* suppressHydrationWarning: once a CSP is active the browser blanks the
+            `nonce` content attribute (stashing the value in an internal slot),
+            so hydration reads back "" and mismatches the real nonce. The
+            <html> tag's own suppressHydrationWarning only covers one level. */}
         <script
+          suppressHydrationWarning
           nonce={nonce}
           dangerouslySetInnerHTML={{
             __html: `(function(){try{var t=localStorage.getItem('theme');var d=t==='dark'||(t!=='light'&&matchMedia('(prefers-color-scheme:dark)').matches);document.documentElement.classList.toggle('dark',d);document.documentElement.style.colorScheme=d?'dark':'light'}catch(e){}})()`,

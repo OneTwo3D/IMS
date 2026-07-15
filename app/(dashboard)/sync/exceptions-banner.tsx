@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { AlertTriangle, ArrowRight } from 'lucide-react'
-import { buttonVariants } from '@/components/ui/button'
+import { buttonVariants } from '@/components/ui/button-variants'
 import type { ExceptionInboxSummary } from '@/app/actions/sync-exceptions'
 
 /**

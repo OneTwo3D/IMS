@@ -21,4 +21,8 @@ function Button({
   )
 }
 
-export { Button, buttonVariants }
+// buttonVariants is deliberately NOT re-exported here: this is a "use client"
+// module, so re-exporting it would mark it a client reference and make any
+// server component calling buttonVariants() fail at render. Import it from
+// "@/components/ui/button-variants" instead (stock shadcn re-exports it; we don't).
+export { Button }
