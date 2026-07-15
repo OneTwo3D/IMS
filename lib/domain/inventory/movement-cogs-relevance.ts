@@ -111,7 +111,7 @@ export const MOVEMENT_COGS_RELEVANCE: Record<StockMovementType, MovementCogsClas
     relevance: 'NEVER_CONSUMES',
     treatment: 'NOT_APPLICABLE',
     writesCogsEntries: false,
-    note: 'Inbound — always written against toWarehouseId (booked-in-service, mintsoft stock-sync alignment credits).',
+    note: 'Inbound — always written against toWarehouseId (booked-in-service; WMS stock-sync alignment credits).',
   },
   RETURN_INBOUND: {
     relevance: 'NEVER_CONSUMES',
