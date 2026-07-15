@@ -9,6 +9,7 @@ import {
   getReturnedQtyForCostLayer,
   getReversalConsumedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
+  getTransferConsumedQtyForCostLayer,
   recordCostLayerRevaluation,
   refreshSalesOrderLineCogsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
@@ -108,6 +109,7 @@ type CostLayerAdjustmentInput = {
   supplierReturnedQty: Prisma.Decimal | number | string
   manufacturingConsumedQty: Prisma.Decimal | number | string
   reversalConsumedQty?: Prisma.Decimal | number | string
+  transferConsumedQty?: Prisma.Decimal | number | string
 }
 
 type PropagatedOutputLayerAudit = {
@@ -137,6 +139,7 @@ export type LandedCostServiceDeps = {
   getSupplierReturnedQtyForCostLayer: typeof getSupplierReturnedQtyForCostLayer
   getManufacturingConsumedQtyForCostLayer: typeof getManufacturingConsumedQtyForCostLayer
   getReversalConsumedQtyForCostLayer: typeof getReversalConsumedQtyForCostLayer
+  getTransferConsumedQtyForCostLayer: typeof getTransferConsumedQtyForCostLayer
   getDependentOutputSourceLines: typeof getDependentOutputSourceLines
   updateSnapshotsForCostLayerChange: typeof updateSnapshotsForCostLayerChange
   refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
@@ -151,6 +154,7 @@ const defaultDeps: LandedCostServiceDeps = {
   getSupplierReturnedQtyForCostLayer,
   getManufacturingConsumedQtyForCostLayer,
   getReversalConsumedQtyForCostLayer,
+  getTransferConsumedQtyForCostLayer,
   getDependentOutputSourceLines,
   updateSnapshotsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
@@ -227,6 +231,11 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
   //   into that output by propagateLandedCostToOutputs (audit-e7h8), not here.
   // - scjz.14: PURCHASE_REVERSAL units (PO cancellation) were reversed out, not
   //   sold; they wrote cogs_entries only for the outbound-evidence guard.
+  // - 6oyu.19: TRANSFER_OUT units moved warehouse, they were not sold. The delta
+  //   is carried to the destination layer by propagateLandedCostToOutputs (the
+  //   transfer receipt links it back via costLayerSourceLine), so counting it
+  //   here too double-posted it and stranded a balance in transit. Sourced from
+  //   the transfer-line snapshot, since transfers write no cogs_entries at all.
   // - returnedQty (customer returns): handled by updateSnapshotsForCostLayerChange
   //   rewriting the refund-line snapshots, so the refund reversal already carries
   //   the revalued cost — excluded here to avoid double-counting.
@@ -240,7 +249,8 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
     consumedQty
       .sub(decimal(input.returnedQty))
       .sub(decimal(input.manufacturingConsumedQty))
-      .sub(decimal(input.reversalConsumedQty ?? 0)),
+      .sub(decimal(input.reversalConsumedQty ?? 0))
+      .sub(decimal(input.transferConsumedQty ?? 0)),
   )
   return {
     costDelta,
@@ -350,6 +360,7 @@ export async function propagateLandedCostToOutputs(
     const supplierReturnedQty = decimal(await deps.getSupplierReturnedQtyForCostLayer(tx, outputCostLayerId))
     const manufacturingConsumedQty = decimal(await deps.getManufacturingConsumedQtyForCostLayer(tx, outputCostLayerId))
     const reversalConsumedQty = decimal(await deps.getReversalConsumedQtyForCostLayer(tx, outputCostLayerId))
+    const transferConsumedQty = decimal(await deps.getTransferConsumedQtyForCostLayer(tx, outputCostLayerId))
     const outDeltas = calculateLayerAdjustmentDeltas({
       oldUnitCost: oldOutputUnitCost,
       newUnitCost: newOutputUnitCost,
@@ -359,6 +370,7 @@ export async function propagateLandedCostToOutputs(
       supplierReturnedQty,
       manufacturingConsumedQty,
       reversalConsumedQty,
+      transferConsumedQty,
     })
     // Reflect the new output cost in finished goods already sold from this layer,
     // FIRST, so its COGS revaluation can be removed from the cascade's COGS
@@ -1026,6 +1038,9 @@ export async function recalculateLandedCosts(
         const reversalConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
           ? decimal(await serviceDeps.getReversalConsumedQtyForCostLayer(tx, cl.id))
           : new Prisma.Decimal(0)
+        const transferConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
+          ? decimal(await serviceDeps.getTransferConsumedQtyForCostLayer(tx, cl.id))
+          : new Prisma.Decimal(0)
         const deltas = calculateLayerAdjustmentDeltas({
           oldUnitCost,
           newUnitCost,
@@ -1035,6 +1050,7 @@ export async function recalculateLandedCosts(
           supplierReturnedQty,
           manufacturingConsumedQty,
           reversalConsumedQty,
+          transferConsumedQty,
         })
         totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
         totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
@@ -1367,6 +1383,9 @@ export async function recalculateDirectLandedCosts(
       const reversalConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
         ? decimal(await serviceDeps.getReversalConsumedQtyForCostLayer(tx, cl.id))
         : new Prisma.Decimal(0)
+      const transferConsumedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
+        ? decimal(await serviceDeps.getTransferConsumedQtyForCostLayer(tx, cl.id))
+        : new Prisma.Decimal(0)
       const deltas = calculateLayerAdjustmentDeltas({
         oldUnitCost,
         newUnitCost,
@@ -1376,6 +1395,7 @@ export async function recalculateDirectLandedCosts(
         supplierReturnedQty,
         manufacturingConsumedQty,
         reversalConsumedQty,
+        transferConsumedQty,
       })
       totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
       totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
