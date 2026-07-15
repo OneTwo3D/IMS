@@ -118,7 +118,7 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
       return
     }
 
-    const { error } = await wcPut(`/orders/${wcLink.externalOrderId}`, { status: externalStatus })
+    const { data: pushedOrder, error } = await wcPut(`/orders/${wcLink.externalOrderId}`, { status: externalStatus })
 
     if (error) {
       await logActivity({
@@ -129,6 +129,15 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
       return
     }
 
+    // Record WHEN our write landed, straight from WooCommerce's own clock.
+    //
+    // This is what lets the echo check identify OUR write rather than guessing from the
+    // status string. WC stamps date_modified_gmt on every change, so the echo of this
+    // push carries exactly this timestamp, while any later change (a refund, an edit)
+    // carries a greater one. Comparing status alone cannot tell those apart, which is
+    // how refunds were being discarded (o3d-uxv).
+    const pushedDateModifiedGmt = (pushedOrder as { date_modified_gmt?: string } | null)?.date_modified_gmt
+
     await db.shoppingSyncLog.create({
       data: {
         direction: 'TO_CONNECTOR',
@@ -136,7 +145,7 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
         entityType: 'SalesOrder',
         entityId: orderId,
         externalId: wcLink.externalOrderId,
-        payload: JSON.parse(JSON.stringify({ status: externalStatus })),
+        payload: JSON.parse(JSON.stringify({ status: externalStatus, pushedDateModifiedGmt })),
         syncedAt: new Date(),
       },
     })
