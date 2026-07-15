@@ -8,7 +8,7 @@ import { wcFetch } from '../api'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
-import type { WcRefund } from './types'
+import type { WcRefund, WcRefundLineItem } from './types'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
 type CreateRefundAction = typeof createRefundAction
@@ -96,8 +96,17 @@ export async function syncWcRefund(
         const qty = Math.abs(rl.quantity)
         if (qty === 0) continue
 
-        // Match by externalLineItemId
-        const imsLine = so.lines.find((l) => l.externalLineItemId === rl.id)
+        // Match on the ORDER line the refund refers to — NOT rl.id.
+        //
+        // WooCommerce mints a NEW order-item id for every refund line, so rl.id is the
+        // refund line's own id and never equals externalLineItemId (set from the ORDER
+        // line's id on import, field-mapping.ts:209). Measured against a live store:
+        // order line 92771 -> refund line 92774, with meta _refunded_item_id = "92771".
+        // The previous `l.externalLineItemId === rl.id` could therefore never match, so
+        // every Woo-side refund lost its line link, createRefund rejected it for having
+        // no shipped stock source, and the refund vanished with no error recorded —
+        // syncRefundsForOrder only returns a count, so nothing surfaced the failure.
+        const imsLine = so.lines.find((l) => l.externalLineItemId === refundedOrderLineId(rl))
         const refundTotal = parseDecimalAbs(rl.total)
         const refundGbp = divideRoundedNumber(refundTotal, fxRate, 4)
         mappedGrossForeign = mappedGrossForeign.add(refundTotal).add(parseDecimalAbs(rl.total_tax))
@@ -256,6 +265,20 @@ export async function syncWcRefund(
 /**
  * Check for new refunds on synced orders and process them.
  */
+/**
+ * The ORDER line item a refund line refers to.
+ *
+ * WooCommerce records it as the `_refunded_item_id` meta on the refund line; the line's
+ * own `id` is a fresh order-item id and matches nothing on our side. Falls back to
+ * rl.id so a store (or a stub) that does not emit the meta still behaves as before
+ * rather than losing the link entirely.
+ */
+export function refundedOrderLineId(rl: WcRefundLineItem): number {
+  const meta = (rl.meta_data ?? []).find((m) => m.key === '_refunded_item_id')
+  const id = Number(meta?.value)
+  return Number.isFinite(id) && id > 0 ? id : rl.id
+}
+
 export async function syncRefundsForOrder(externalOrderId: number): Promise<number> {
   // Fetch refunds from WC
   const { data, error } = await wcFetch(`/orders/${externalOrderId}/refunds`)

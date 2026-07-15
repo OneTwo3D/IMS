@@ -18,11 +18,12 @@ import { expect, test } from '@playwright/test'
 import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import {
-  awaitWebhookDelivery, cleanupWc, createWcOrder, createWcProduct, wcCreds, type WcCreds,
+  awaitWebhookDelivery, cleanupWc, createWcOrder, createWcProduct, getWcOrder, refundWcOrder,
+  wcCreds, type WcCreds,
 } from './harness/wc.ts'
 import { allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, setPostingMode } from './harness/ims.ts'
 import { addStockAdjustment, createInventoryProduct } from '../helpers.ts'
-import { expectLine, externalIdFor, getInvoice, trackDocument } from './harness/xero.ts'
+import { expectLine, externalIdFor, getCreditNote, getInvoice, trackDocument } from './harness/xero.ts'
 
 const WAREHOUSE_CODE = 'CBG'
 const WAREHOUSE_LABEL = 'CBG — Cambridge'
@@ -104,7 +105,125 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     expect(Number(invoice.SubTotal)).toBeCloseTo(Number(unitPrice) * qty, 2)
     expect(Number(invoice.Total)).toBeCloseTo(Number(order.total), 2)
   })
+
+  // BLOCKED by o3d-uxv, a real product bug this test found and proved end to end:
+  // handleOrderWebhook suppresses the refund's order.updated as a 'status_echo'
+  // (order-webhook-echo.ts:68) because a PARTIAL refund leaves the WC order status
+  // 'processing', which matches the status the IMS itself pushed when shipping — inside
+  // a TEN MINUTE window. importWcOrder/syncRefundsForOrder never run, the event is
+  // marked PROCESSED, and the refund is lost with no error on either side.
+  //
+  // Deliberately fixme rather than deleted or weakened: the test is CORRECT and the
+  // product is wrong. Un-fixme it when o3d-uxv is fixed — it is the regression proof.
+  // (o3d-idp, the refund-line _refunded_item_id mismatch, was a second independent bug
+  // on the same path and is already fixed; both had to be wrong for it to fail this
+  // silently.)
+  test.fixme('OC-05: partial refund in Woo -> ACCRECCREDIT credit note verified IN Xero', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    const sku = taggedSku(runId, 'OC05')
+    const unitPrice = '30.00'
+    const qty = 3
+    const refundQty = 1
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC05`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC05', price: unitPrice })
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+    const imported = await awaitWebhookDelivery(order.id, { creds })
+
+    // Ship first: a refund on an allocated-but-never-shipped line is REJECTED ("no
+    // shipped stock source exists", docs/sales.md:135), so the refund must follow a
+    // dispatch to be meaningful.
+    await openSalesOrder(page, imported.salesOrderId)
+    await allocateAndShip(page, { tracking: `${runTag(runId)}-OC05` })
+    await processPendingXeroSyncViaUi(page)
+
+    const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+    trackDocument('Invoices', invoiceId, `OC-05 invoice ${runTag(runId)}`)
+
+    // Refund ONE unit in WooCommerce. There is no refund webhook topic in WC core — a
+    // refund fires order.updated, and the IMS picks it up via syncRefundsForOrder
+    // (webhooks.ts:190). So this exercises the real inbound refund path.
+    const wcOrder = await getWcOrder(creds, order.id)
+    const lineId = wcOrder.line_items?.[0]?.id
+    expect(lineId, 'the Woo order should have a line to refund').toBeTruthy()
+    const refundAmount = (Number(unitPrice) * refundQty).toFixed(2)
+    await refundWcOrder(creds, order.id, {
+      amount: refundAmount,
+      reason: `${runTag(runId)} OC-05 partial refund`,
+      lineItems: [{ id: lineId!, quantity: refundQty, refund_total: refundAmount }],
+    })
+
+    // The refund reaches the IMS as a SalesOrderRefund via order.updated.
+    const refundId = await awaitRefund(imported.salesOrderId)
+    await processPendingXeroSyncViaUi(page)
+
+    // Read the CREDIT NOTE back out of Xero — a different document type from OC-01, and
+    // the one a sync-log assertion is least able to vouch for.
+    const creditNoteId = await externalIdFor({ type: 'CREDIT_NOTE', referenceId: refundId })
+    trackDocument('CreditNotes', creditNoteId, `OC-05 credit note ${runTag(runId)}`)
+
+    const creditNote = await getCreditNote(creditNoteId)
+    expect(creditNote.Type).toBe('ACCRECCREDIT')
+    expect(creditNote.Status).not.toBe('DELETED')
+    expect(creditNote.CurrencyCode).toBe('GBP')
+
+    const salesAccount = await settingValue('xero_sales_account')
+    expectLine(creditNote.LineItems, { accountCode: salesAccount, lineAmount: Number(refundAmount) })
+
+    // PARTIAL: the credit note must cover only the refunded unit, not the whole order.
+    // Getting this wrong would credit the customer 3x — exactly the class of error the
+    // IMS's own sync log cannot see.
+    expect(Number(creditNote.Total)).toBeLessThan(Number(order.total))
+    expect(Number(creditNote.Total)).toBeGreaterThan(0)
+
+    // And the order's refund disposition is PARTIAL — note REFUNDED is a RETIRED status;
+    // refund state is the orthogonal refundStatus (prisma/schema.prisma:104).
+    expect(await orderRefundStatus(imported.salesOrderId)).toBe('PARTIAL')
+  })
 })
+
+/** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
+async function awaitRefund(salesOrderId: string, timeoutMs = 180_000): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const r = await db.query<{ id: string }>(
+        `select id from sales_order_refunds where "orderId" = $1 order by "createdAt" desc limit 1`,
+        [salesOrderId],
+      )
+      if (r.rows.length) return r.rows[0].id
+      await new Promise((res) => setTimeout(res, 3_000))
+    }
+    throw new Error(
+      `No SalesOrderRefund for order ${salesOrderId} within ${timeoutMs}ms. A Woo refund arrives via ` +
+        `the order.updated webhook (there is no refund topic in WC core) and is applied by ` +
+        `syncRefundsForOrder — check the inbox actually received an order.updated after the refund.`,
+    )
+  } finally {
+    await db.end()
+  }
+}
+
+async function orderRefundStatus(salesOrderId: string): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ refundStatus: string }>(
+      `select "refundStatus" from sales_orders where id = $1`, [salesOrderId],
+    )
+    return r.rows[0]?.refundStatus ?? '(none)'
+  } finally {
+    await db.end()
+  }
+}
 
 /** Read a setting from this instance (account codes are per-instance config). */
 async function settingValue(key: string): Promise<string> {

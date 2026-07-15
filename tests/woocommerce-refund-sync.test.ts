@@ -49,6 +49,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
   const refunds: Array<{ id: string; externalRefundId: number }> = []
   const syncLogs: unknown[] = []
   const activityLogs: unknown[] = []
+  const createRefundLines: Array<{ lineId?: string; productId: string | null }> = []
   let createRefundCalls = 0
 
   const dependencies: WcRefundSyncDependencies = {
@@ -91,8 +92,12 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
         },
       },
     } as unknown as WcRefundSyncDependencies['db'],
-    async createRefund(_orderId, _lines, _reason, _returnWarehouseId, createOptions) {
+    async createRefund(_orderId, lines, _reason, _returnWarehouseId, createOptions) {
       createRefundCalls += 1
+      // Capture the lines. Without this nothing could assert that a refund line was
+      // actually LINKED to its IMS order line, which is how the _refunded_item_id bug
+      // survived: createRefund was only ever checked for being called.
+      createRefundLines.push(...(lines as unknown as Array<{ lineId?: string; productId: string | null }>))
       refunds.push({ id: `refund-${refunds.length + 1}`, externalRefundId: createOptions?.externalRefundId ?? 0 })
       return { success: true }
     },
@@ -106,6 +111,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
     refunds,
     syncLogs,
     activityLogs,
+    createRefundLines,
     get createRefundCalls() {
       return createRefundCalls
     },
@@ -227,4 +233,60 @@ test('syncWcRefund treats external refund unique conflicts as idempotent races',
     metadata: { externalRefundId: 7001, parentOrderId: 1001 },
     resolveUser: false,
   })
+})
+
+test('syncWcRefund links a refund line to its IMS order line via _refunded_item_id, not the refund line id', async () => {
+  // REGRESSION (o3d-w2m). WooCommerce mints a NEW order-item id for every refund line,
+  // and records the ORDER line it refunds in the _refunded_item_id meta. Measured on a
+  // live store: order line 92771 -> refund line 92774, meta _refunded_item_id "92771".
+  //
+  // The old code matched `l.externalLineItemId === rl.id`, which can never be true for a
+  // real refund. The line link was silently lost, createRefund rejected the refund for
+  // having no shipped stock source, and the whole Woo refund path failed with no error
+  // recorded anywhere.
+  //
+  // The other fixtures in this file give the refund line id 501 — the SAME id as the
+  // order line — which no real store does. That is precisely why the bug survived: the
+  // fixture encoded the broken premise.
+  const harness = makeDependencies()
+  const refund = makeRefund({
+    line_items: [
+      {
+        id: 504, // the refund line's OWN id — deliberately different from the order line
+        name: 'Widget',
+        product_id: 10,
+        variation_id: 0,
+        quantity: -1,
+        tax_class: '',
+        subtotal: '-12.50',
+        subtotal_tax: '0',
+        total: '-12.50',
+        total_tax: '0',
+        sku: 'WIDGET',
+        meta_data: [{ id: 1, key: '_refunded_item_id', value: '501' }],
+        refund_total: 12.5,
+      },
+    ],
+  })
+
+  const result = await syncWcRefund(1001, refund, harness.dependencies)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(harness.createRefundLines.length, 1)
+  assert.equal(
+    harness.createRefundLines[0].lineId,
+    'line-1',
+    'the refund line must resolve to the IMS order line via _refunded_item_id; an unlinked line (undefined) is later rejected for having no shipped stock source',
+  )
+  assert.equal(harness.createRefundLines[0].productId, 'product-1')
+})
+
+test('syncWcRefund falls back to the refund line id when _refunded_item_id is absent', async () => {
+  // Defensive: a store or stub that does not emit the meta should behave as before
+  // rather than lose the link entirely.
+  const harness = makeDependencies()
+  const result = await syncWcRefund(1001, makeRefund(), harness.dependencies)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(harness.createRefundLines[0].lineId, 'line-1')
 })
