@@ -96,12 +96,36 @@ const SETTING_CORRECTIONS: Array<{
       '"Allocated Stock" already exists and is unused.',
     issue: 'o3d-f82',
   },
+  {
+    key: 'xero_inventory_revaluation_account',
+    wrong: '',
+    right: '311',
+    why:
+      'Unset on stage. The settings UI defines it as the "P&L offset for retrospective COGS ' +
+      'corrections on goods already sold (e.g. freight cancelled after dispatch)" and says blank ' +
+      'falls back to Stock in Transit — i.e. a P&L correction lands in a balance-sheet clearing ' +
+      'account, which also muddies the transit reconciliation. 311 sits next to 310 Cost of Goods ' +
+      'Sold, the account it offsets. DIRECTCOSTS, not 6xx: that range is current ASSETS (610-633).',
+    issue: 'o3d-lgo.9',
+  },
+  {
+    key: 'xero_manufacturing_overhead_account',
+    wrong: '',
+    right: '330',
+    why:
+      'Unset on stage, so MANUFACTURING_RECLASS cannot post: app/actions/manufacturing.ts:1634 ' +
+      'gates the reclass on `settings?.manufacturingOverheadAccount` being set, which makes ' +
+      'full-chain case X-05 untestable. 330 follows 325 Direct Expenses in the DIRECTCOSTS block.',
+    issue: 'o3d-lgo.9',
+  },
 ]
 
 // Accounts the template must contain even though no setting on the SOURCE points
 // at them — because a correction above now points at them.
 const CORRECTION_ACCOUNTS: Array<{ code: string; name: string; type: string }> = [
   { code: '633', name: 'Allocated Stock', type: 'CURRENT' },
+  { code: '311', name: 'Inventory Revaluation', type: 'DIRECTCOSTS' },
+  { code: '330', name: 'Manufacturing Overhead', type: 'DIRECTCOSTS' },
 ]
 
 function arg(flag: string): string | undefined {

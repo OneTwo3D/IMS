@@ -56,6 +56,16 @@
       "type": "DIRECTCOSTS"
     },
     {
+      "code": "311",
+      "name": "Inventory Revaluation",
+      "type": "DIRECTCOSTS"
+    },
+    {
+      "code": "330",
+      "name": "Manufacturing Overhead",
+      "type": "DIRECTCOSTS"
+    },
+    {
       "code": "498",
       "name": "Unrealised Currency Gains",
       "type": "EXPENSE"
@@ -594,6 +604,7 @@
     "xero_discount_account": "210",
     "xero_cogs_account": "310",
     "xero_inventory_account": "631",
+    "xero_inventory_revaluation_account": "311",
     "xero_allocated_inventory_account": "633",
     "xero_unearned_revenue_account": "810",
     "xero_transit_account": "632",
@@ -601,6 +612,7 @@
     "xero_accounts_payable_account": "800",
     "xero_realised_fx_gain_loss_account": "499",
     "xero_unrealised_fx_gain_loss_account": "498",
-    "xero_rounding_difference_account": "860"
+    "xero_rounding_difference_account": "860",
+    "xero_manufacturing_overhead_account": "330"
   }
 }
