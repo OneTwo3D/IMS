@@ -129,6 +129,53 @@ export async function preflight(): Promise<PreflightReport> {
     )
     if (wc.rows[0].count !== '3') problems.push('WooCommerce credentials are not fully configured on this instance.')
 
+    // --- the guard that silently ate every order webhook
+    // handleOrderWebhook (webhooks.ts:125) returns {ok:true, skipped:'initial_import_pending'}
+    // unless wc_initial_import_completed === 'true'. It ACKs, so the event is marked
+    // PROCESSED and never retried, and nothing is imported — the test then fails 5
+    // minutes later with "the order never arrived", pointing at webhooks that are in
+    // fact working perfectly. Cost hours; hence this check.
+    const initial = await db.query<{ value: string }>(
+      `select value from settings where key = 'wc_initial_import_completed'`,
+    )
+    if (initial.rows[0]?.value !== 'true') {
+      problems.push(
+        `wc_initial_import_completed is not 'true' on this instance, so handleOrderWebhook SILENTLY ` +
+          `SKIPS every order webhook (skipped: initial_import_pending) while still ACKing it. ` +
+          `Either run the real initial import, or set the flag: the rig only cares about orders it ` +
+          `creates itself, so the "baseline import exists" precondition is satisfied by declaring it.`,
+      )
+    }
+
+    // --- storefront-synced warehouse
+    // Without one, importWcOrder creates the order but auto-allocation fails with
+    // "No storefront-synced warehouses available for sale", which surfaces as an import
+    // error rather than anything about warehouses.
+    const wh = await db.query<{ count: string }>(
+      `select count(*)::text as count from warehouses where "syncToStore" = true and "availableForSale" = true and active = true`,
+    )
+    if (wh.rows[0].count === '0') {
+      problems.push(
+        'No warehouse has syncToStore=true + availableForSale=true, so auto-allocation fails with ' +
+          '"No storefront-synced warehouses available for sale" on every imported order.',
+      )
+    }
+
+    // --- order status filter
+    // wc_sync_order_statuses gates which WC statuses import at all; absent means the
+    // harness's `processing` orders match nothing and vanish without explanation.
+    const statuses = await db.query<{ value: string }>(
+      `select value from settings where key = 'wc_sync_order_statuses'`,
+    )
+    if (!statuses.rows.length) {
+      problems.push(`wc_sync_order_statuses is not set — imports have no status filter to match.`)
+    } else if (!statuses.rows[0].value.includes('processing')) {
+      problems.push(
+        `wc_sync_order_statuses is ${statuses.rows[0].value} and does not include "processing", which ` +
+          `is what the harness creates — orders would be silently skipped.`,
+      )
+    }
+
     if (!process.env.STAGE_DATABASE_URL) {
       problems.push('STAGE_DATABASE_URL is not set — the quiesce lock cannot disable stage, so stage would race this run.')
     }
