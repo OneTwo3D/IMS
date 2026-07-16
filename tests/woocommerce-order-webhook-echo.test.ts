@@ -90,3 +90,49 @@ test('parses WC GMT stamps that carry no zone suffix', async () => {
   const verdict = evaluateWcOrderWebhookEcho([statusPush(PUSHED_AT)], order({ date_modified_gmt: oneSecondLater }))
   assert.deepEqual(verdict, { suppress: false }, 'one second later must read as later, not as the same instant')
 })
+
+
+/**
+ * The TRACKING arm had the identical flaw, found by the Codex review of PR #488: matching
+ * tracking proves the TRACKING is unchanged since our push, not that nothing else changed.
+ * Tracking stays identical across a later genuine status change, so after a ship-time
+ * tracking push EVERY order.updated in the 10-minute window looked like our echo and had
+ * its status sync skipped.
+ */
+const TRACKING = [{ tracking_number: 'TRK1', tracking_provider: 'Custom', date_shipped: '1784154150' }]
+
+const trackingPush = (pushedDateModifiedGmt?: string): ShoppingSyncLogPayload => ({
+  meta_key: '_wc_shipment_tracking_items',
+  items: TRACKING,
+  pushedDateModifiedGmt,
+})
+
+function orderWithTracking(dateModifiedGmt: string): WcFullOrder {
+  return {
+    id: 1001,
+    number: '1001',
+    status: 'processing',
+    date_modified_gmt: dateModifiedGmt,
+    line_items: [],
+    meta_data: [{ id: 1, key: '_wc_shipment_tracking_items', value: TRACKING }],
+  } as unknown as WcFullOrder
+}
+
+test('suppresses the echo of our own tracking push', async () => {
+  const verdict = evaluateWcOrderWebhookEcho([trackingPush(PUSHED_AT)], orderWithTracking(PUSHED_AT))
+  assert.deepEqual(verdict, { suppress: true, reason: 'tracking_echo' })
+})
+
+test('does NOT suppress a change made after our tracking push, even though tracking is unchanged', async () => {
+  // The regression: an admin completes the order (or a refund lands) minutes after we
+  // pushed tracking. Tracking is byte-identical, so the old rule called it our echo and
+  // skipped the status sync.
+  const verdict = evaluateWcOrderWebhookEcho([trackingPush(PUSHED_AT)], orderWithTracking(LATER))
+  assert.deepEqual(verdict, { suppress: false }, 'unchanged tracking does not mean unchanged order')
+})
+
+test('tracking echo falls back to payload matching when the push recorded no timestamp', async () => {
+  // Rows written before pushedDateModifiedGmt existed; they age out of the window.
+  const verdict = evaluateWcOrderWebhookEcho([trackingPush(undefined)], orderWithTracking(LATER))
+  assert.deepEqual(verdict, { suppress: true, reason: 'tracking_echo' })
+})

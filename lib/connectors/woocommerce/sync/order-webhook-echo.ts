@@ -113,6 +113,12 @@ export function evaluateWcOrderWebhookEcho(
     if (payload.meta_key === '_wc_shipment_tracking_items') {
       const loggedTracking = comparableLoggedTracking(payload.items)
       if (loggedTracking.length > 0 && JSON.stringify(loggedTracking) === JSON.stringify(inboundTracking)) {
+        // Matching tracking is necessary but NOT sufficient — same trap as the status arm
+        // above. Tracking does not change when the order's status later changes, so after
+        // we push tracking at ship time EVERY order.updated in the window carries
+        // identical tracking, including genuine changes. Ask WC's clock which this is.
+        const ours = isOurWrite(payload, wcOrder)
+        if (ours === false) continue // modified after our push -> a genuine change
         return { suppress: true, reason: 'tracking_echo' }
       }
     }

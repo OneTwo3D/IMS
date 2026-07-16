@@ -9,7 +9,8 @@
 // React) makes the save-payload mapping unit-testable — this is a save-path bug
 // that previously hardcoded xero_* keys, silently dropping qbo_* mappings.
 
-export type AccountingConnectorId = 'xero' | 'quickbooks'
+export const ACCOUNTING_CONNECTOR_IDS = ['xero', 'quickbooks'] as const
+export type AccountingConnectorId = (typeof ACCOUNTING_CONNECTOR_IDS)[number]
 
 export type AccountFieldDef = {
   suffix: string
@@ -72,12 +73,6 @@ export function settingKeyFor(connectorId: AccountingConnectorId, suffix: string
 }
 
 /**
- * Build the connector-prefixed settings payload from the in-form state. Uses the
- * active connector's prefix for every sync/flag suffix plus every account field
- * available on that connector, so QuickBooks account mappings actually persist
- * (the old hardcoded xero_* payload was filtered out by saveQuickBooksSettings).
- */
-/**
  * Account mappings that MUST NOT share a code, with the reason the reconciliation breaks
  * if they do. Pure data so the rule is reviewable next to the fields it governs.
  */
@@ -95,35 +90,88 @@ const MUST_BE_DISTINCT: Array<{ a: string; b: string; why: string }> = [
   },
 ]
 
+/** Every setting key the collision rules could involve, across all connectors. */
+export function accountMappingRuleKeys(): string[] {
+  return ACCOUNTING_CONNECTOR_IDS.flatMap((c) =>
+    MUST_BE_DISTINCT.flatMap((r) => [settingKeyFor(c, r.a), settingKeyFor(c, r.b)]),
+  )
+}
+
+export type AccountMappingError = {
+  /** The setting keys involved, so a caller can tell whether THIS save touched them. */
+  keys: string[]
+  message: string
+}
+
 /**
  * Reject account mappings whose collision would silently corrupt a reconciliation.
  *
  * Pure, so it can be unit-tested and reused by both the save path and any readiness view.
- * Returns human-readable errors; empty means valid.
+ * Empty result means valid.
  *
  * This exists because stage ran with allocated_inventory_account == transit_account (both
  * 632) and NOTHING complained — not the save path, not a readiness check (o3d-f82). The
  * misconfiguration is invisible until a reconciliation sweep flags a gap that looks like a
  * data problem rather than a settings one.
+ *
+ * @param payload the settings about to be saved (connector-prefixed keys).
+ * @param current the settings as currently stored, when known. Supplying it makes the
+ *   check "you may not INTRODUCE a collision" rather than "you may not save anything while
+ *   one exists" — see the lockout note below. Omit to validate the payload alone.
  */
 export function validateAccountingAccountMapping(
-  connectorId: AccountingConnectorId,
   payload: Record<string, string>,
-): string[] {
+  current?: Record<string, string>,
+): AccountMappingError[] {
   const labelFor = (suffix: string) => ACCOUNT_FIELDS.find((f) => f.suffix === suffix)?.label ?? suffix
-  const errors: string[] = []
-  for (const rule of MUST_BE_DISTINCT) {
-    const aVal = (payload[settingKeyFor(connectorId, rule.a)] ?? '').trim()
-    const bVal = (payload[settingKeyFor(connectorId, rule.b)] ?? '').trim()
-    // Blank is "not configured", not a collision — several of these are legitimately unset.
-    if (!aVal || !bVal || aVal !== bVal) continue
-    errors.push(
-      `"${labelFor(rule.a)}" and "${labelFor(rule.b)}" are both set to account ${aVal}. They must be different accounts: ${rule.why}.`,
-    )
+  const errors: AccountMappingError[] = []
+  // Validate whatever prefixes are actually PRESENT in the payload rather than trusting a
+  // caller-supplied connector id.
+  //
+  // The first cut took the connector from saveAccountingSettings' getActiveAccountingConnector(),
+  // which is xero-first and independent of the ?connector= URL param the client builds its
+  // payload from (xero-client.tsx:157). So a QuickBooks save would be checked against
+  // xero_* keys, find nothing, and the guard would silently never fire — a guard that
+  // reports success is worse than no guard. Keys absent from the payload are skipped
+  // anyway, so checking both prefixes costs nothing and cannot mis-fire.
+  for (const connectorId of ACCOUNTING_CONNECTOR_IDS) {
+    for (const rule of MUST_BE_DISTINCT) {
+      const aKey = settingKeyFor(connectorId, rule.a)
+      const bKey = settingKeyFor(connectorId, rule.b)
+      const aVal = (payload[aKey] ?? '').trim()
+      const bVal = (payload[bKey] ?? '').trim()
+      // Blank is "not configured", not a collision — several of these are legitimately unset.
+      if (!aVal || !bVal || aVal !== bVal) continue
+
+      // Do not punish an admin for a collision that ALREADY exists and that this save does
+      // not touch. Otherwise: settings already collide, the account cache is empty or the
+      // connector is disconnected so the UI hides the account selectors entirely, the
+      // admin tries to turn sync OFF — and the save is refused over two fields they
+      // cannot even see. The guard would lock them out of repairing it. Rule is therefore
+      // "you may not INTRODUCE the collision", not "nothing works while one exists".
+      if (current) {
+        const unchanged =
+          (current[aKey] ?? '').trim() === aVal && (current[bKey] ?? '').trim() === bVal
+        if (unchanged) continue
+      }
+
+      errors.push({
+        keys: [aKey, bKey],
+        message:
+          `"${labelFor(rule.a)}" and "${labelFor(rule.b)}" are both set to account ${aVal}. ` +
+          `They must be different accounts: ${rule.why}.`,
+      })
+    }
   }
   return errors
 }
 
+/**
+ * Build the connector-prefixed settings payload from the in-form state. Uses the
+ * active connector's prefix for every sync/flag suffix plus every account field
+ * available on that connector, so QuickBooks account mappings actually persist
+ * (the old hardcoded xero_* payload was filtered out by saveQuickBooksSettings).
+ */
 export function buildAccountingSettingsPayload(
   connectorId: AccountingConnectorId,
   state: Record<string, string>,

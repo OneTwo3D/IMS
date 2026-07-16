@@ -227,6 +227,13 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
       return { success: false, error: update.error }
     }
 
+    // Record WHEN our write landed, from WooCommerce's own clock — same rationale as the
+    // status push (order-status.ts). Matching tracking proves the TRACKING is unchanged
+    // since our push; it does NOT prove nothing else changed. Tracking stays identical
+    // across a later genuine status change, so without this timestamp the echo rule
+    // suppresses that change's status sync for the whole window (o3d-uxv, tracking arm).
+    const pushedDateModifiedGmt = (update.data as { date_modified_gmt?: string } | null)?.date_modified_gmt
+
     await db.shoppingSyncLog.create({
       data: {
         direction: 'TO_CONNECTOR',
@@ -234,7 +241,11 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
         entityType: 'SalesOrder',
         entityId: orderId,
         externalId: String(outbound.externalOrderId),
-        payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
+        payload: JSON.parse(JSON.stringify({
+          meta_key: '_wc_shipment_tracking_items',
+          items: outbound.items,
+          pushedDateModifiedGmt,
+        })),
         syncedAt: new Date(),
       },
     })
