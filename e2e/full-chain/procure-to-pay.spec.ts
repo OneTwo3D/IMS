@@ -112,7 +112,6 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     const receivedQty = 2
     const unitCost = '12.50'
     const receivedNet = Number(unitCost) * receivedQty // 25.00
-    const orderedNet = Number(unitCost) * orderedQty // 50.00 — must NOT appear anywhere
 
     await setPostingMode({ sync: true, dailyBatch: false })
     await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP02`, price: '18.00' })
@@ -145,8 +144,11 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     const bill = await getInvoice(billId)
     expect(bill.Type).toBe('ACCPAY')
     expect(bill.Status).not.toBe('DELETED')
+    // Just the one assertion: a subtotal within 0.005 of 25.00 cannot also be within 0.005 of
+    // 50.00, so a companion `not.toBeCloseTo(orderedNet)` could never fail on its own. It read
+    // as a second safeguard while being dead weight — exactly the kind of assertion this suite
+    // exists to distrust.
     expect(Number(bill.SubTotal)).toBeCloseTo(receivedNet, 2)
-    expect(Number(bill.SubTotal)).not.toBeCloseTo(orderedNet, 2) // the over-accrual, named explicitly
 
     const transitAccount = await settingValue('xero_transit_account')
     const inventoryAccount = await settingValue('xero_inventory_account')
