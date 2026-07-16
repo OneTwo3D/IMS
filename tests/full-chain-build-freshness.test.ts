@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { evaluateBuildFreshness, type BuildFacts } from '@/e2e/full-chain/harness/build-freshness'
+import { checkBuildFreshness, evaluateBuildFreshness, type BuildFacts } from '@/e2e/full-chain/harness/build-freshness'
 
 /**
  * The full-chain rig serves a PRODUCTION build, so a run can test code that is not in the
@@ -67,11 +67,28 @@ test('build freshness: sub-second restart after a build is NOT flagged', () => {
   assert.deepEqual(r.problems, [], 'same-second restart is legitimate')
 })
 
-test('build freshness: undeterminable facts WARN rather than pass silently', () => {
-  // No systemd (or no git) means the check could not RUN. That is not the same as passing,
-  // and must not be reported as if it were.
+test('build freshness: undeterminable facts FAIL — the guard must not fail open', () => {
+  // Both blind spots are exactly the states in which a stale build sails through, so warning
+  // and carrying on would make this a guard that fails open (Codex review, #489). The caller
+  // has already established the server IS this box's unit, so unreadable facts are anomalous.
   const r = evaluateBuildFreshness(facts({ serverStartMs: null, newestSourceMs: null, newestSourcePath: null }))
-  assert.deepEqual(r.problems, [], 'inability to check is not proof of staleness — do not fail the run')
-  assert.equal(r.warnings.length, 2)
-  assert.ok(r.warnings.every((w) => /NOT checked/.test(w)), 'the warning must say the check did not run')
+  assert.equal(r.problems.length, 2, 'each blind spot must block on its own')
+  assert.ok(r.problems.every((p) => /could NOT be checked|NOT be checked/i.test(p)))
+  assert.ok(r.problems.some((p) => /FULL_CHAIN_SKIP_FRESHNESS/.test(p)), 'and must name the deliberate override')
+})
+
+
+test('build freshness: skips (loudly) when the tests point at a server this box does not run', async (t) => {
+  // Everything the check reads is local — the filesystem and the local systemd unit — while
+  // Playwright aims at E2E_BASE_URL. Pointed elsewhere it would vouch for a server it has
+  // never seen, so it must decline and SAY so rather than quietly pass (Codex review, #489).
+  const prev = process.env.E2E_BASE_URL
+  process.env.E2E_BASE_URL = 'https://someone-elses-box.example'
+  t.after(() => { if (prev === undefined) delete process.env.E2E_BASE_URL; else process.env.E2E_BASE_URL = prev })
+
+  const r = checkBuildFreshness('/nonexistent-tree')
+  assert.deepEqual(r.problems, [], 'must not block a run it cannot judge')
+  assert.equal(r.warnings.length, 1)
+  assert.match(r.warnings[0], /NOT run/, 'the warning must admit the check did not run')
+  assert.match(r.warnings[0], /someone-elses-box/, 'and name the server it declined to judge')
 })

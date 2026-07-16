@@ -27,29 +27,42 @@
  * and the service manager are better sources than an HTTP endpoint anyway.
  */
 import { execFileSync } from 'node:child_process'
-import { statSync } from 'node:fs'
+import { readdirSync, statSync, type Dirent } from 'node:fs'
 
 /**
- * Tracked paths that are NOT compiled into the Next build, so changing them cannot make the
- * served build stale.
+ * Directory names that never contribute to the served bundle, skipped during the walk.
  *
  * Deliberately an EXCLUDE list, not an include list. The failure directions are asymmetric:
  * a path wrongly excluded means a stale build slips through — the exact bug this guards
  * against — whereas a path wrongly included only asks for an unnecessary rebuild. So the
- * default is "this counts", and every entry below has to earn its place by being obviously
- * outside the bundle. `scripts/` is here because it is standalone tsx run by hand; the
- * first draft of this check flagged a scripts/ edit as a stale build, which is the kind of
- * false positive that teaches people to ignore the guard.
+ * default is "this counts", and every entry has to earn its place by being obviously outside
+ * the bundle. `scripts` is here because it is standalone tsx run by hand; the first draft
+ * flagged a scripts/ edit as a stale build, which is the kind of false positive that teaches
+ * people to ignore a guard.
+ *
+ * `node_modules` and `.next` are skipped for cost, not correctness: a dependency change
+ * arrives as a package.json/lockfile edit, which the walk sees.
  */
-const NON_BUILD_PATHS = [
-  ':(exclude)e2e',
-  ':(exclude)tests',
-  ':(exclude)docs',
-  ':(exclude)scripts',
-  ':(exclude)deploy',
-  ':(exclude).github',
-  ':(exclude)*.md',
-]
+const SKIP_DIRS = new Set([
+  'node_modules', '.next', '.git', '.cache', '.npm-cache', '.npm', '.local', '.config',
+  'e2e', 'tests', 'docs', 'scripts', 'deploy', '.github',
+  'test-results', 'playwright-report', 'blob-report', '.pwprobe',
+  // Written CONSTANTLY at runtime or by tooling. Without these the guard reports a stale
+  // build after every bd command or invoice PDF — noise that would get it ignored, and an
+  // ignored guard is worse than none.
+  '.beads', '.beads-hooks', '.remember', 'data',
+])
+
+/**
+ * Files that cannot affect the bundle.
+ * .tsbuildinfo is tsc's incremental cache — running `npx tsc --noEmit` rewrites it, so a
+ * type-check would otherwise "prove" the build stale.
+ */
+const SKIP_FILE = (name: string) =>
+  name.endsWith('.md') ||
+  name.endsWith('.tsbuildinfo') ||
+  name.startsWith('.full-chain-') ||
+  name.startsWith('.tmp-')
 
 export type BuildFacts = {
   /** mtime of the newest tracked file that is compiled into the build. */
@@ -85,8 +98,21 @@ export function evaluateBuildFreshness(facts: BuildFacts): FreshnessReport {
     return { problems, warnings }
   }
 
+  // "Could not check" FAILS, it does not warn (found in review of PR #489).
+  //
+  // The first cut warned and carried on, which is a guard that fails OPEN: the two ways the
+  // check goes blind — an unscannable tree, an unreadable service — are exactly the states in
+  // which a stale build sails through, and a warning nobody reads is indistinguishable from
+  // no check at all. checkBuildFreshness has already established that the server under test IS
+  // this box's systemd unit, so both facts are readable here as a matter of course; failing to
+  // read them is anomalous and worth stopping for. FULL_CHAIN_SKIP_FRESHNESS=true is the
+  // escape hatch for the genuinely odd case (a hand-started server), and it is explicit —
+  // someone chose it, rather than a silent degrade choosing for them.
   if (facts.newestSourceMs === null) {
-    warnings.push('Could not list tracked source files, so build staleness was NOT checked.')
+    problems.push(
+      'Could not scan the source tree, so build staleness could NOT be checked and this run ' +
+        'cannot be trusted. Set FULL_CHAIN_SKIP_FRESHNESS=true to override deliberately.',
+    )
   } else if (facts.newestSourceMs > facts.buildMs) {
     const drift = Math.round((facts.newestSourceMs - facts.buildMs) / 1000)
     problems.push(
@@ -98,9 +124,11 @@ export function evaluateBuildFreshness(facts: BuildFacts): FreshnessReport {
   }
 
   if (facts.serverStartMs === null) {
-    warnings.push(
-      'Could not read the service start time, so "rebuilt but not restarted" was NOT checked. ' +
-        'If the server is not managed by ims-e2e-dev.service, restart it yourself after a build.',
+    problems.push(
+      'Could not read the start time of ims-e2e-dev.service, so "rebuilt but not restarted" ' +
+        'could NOT be checked — the server may be serving a build older than the one on disk. ' +
+        'If it is not managed by that unit, set FULL_CHAIN_SERVICE, or ' +
+        'FULL_CHAIN_SKIP_FRESHNESS=true to override deliberately.',
     )
   } else if (sec(facts.serverStartMs) < sec(facts.buildMs)) {
     problems.push(
@@ -113,31 +141,74 @@ export function evaluateBuildFreshness(facts: BuildFacts): FreshnessReport {
   return { problems, warnings }
 }
 
-function newestTrackedSource(cwd: string): { ms: number | null; path: string | null } {
-  try {
-    const out = execFileSync('git', ['ls-files', '-z', '--', '.', ...NON_BUILD_PATHS], {
-      cwd,
-      encoding: 'buffer',
-      maxBuffer: 32 * 1024 * 1024,
-    })
-    let newest = 0
-    let newestPath: string | null = null
-    for (const file of out.toString('utf8').split('\0')) {
-      if (!file) continue
+/**
+ * Newest mtime among everything that feeds the bundle, by walking the FILESYSTEM.
+ *
+ * NOT `git ls-files`. The first cut used it and had three false negatives — all in the
+ * dangerous direction, where a stale build passes (found in review of PR #489):
+ *   - an UNTRACKED new file (add app/api/foo/route.ts after building) is not tracked, so it
+ *     was invisible and the stale build passed;
+ *   - a DELETED file made statSync throw into a swallowing catch, so the bundle kept serving
+ *     a route the tree no longer has;
+ *   - the GENERATED PRISMA CLIENT (app/generated/prisma) is gitignored yet imported by
+ *     lib/db and compiled in, so regenerating it changed the build invisibly.
+ * "Tracked" was simply the wrong universe: the build reads the filesystem, so the check must
+ * read the filesystem.
+ *
+ * DIRECTORY mtimes count too, which is what catches deletions: removing a file cannot be seen
+ * by looking at files, but it does bump its parent directory's mtime.
+ */
+function newestSource(cwd: string): { ms: number | null; path: string | null } {
+  let newest = 0
+  let newestPath: string | null = null
+
+  const walk = (dir: string, rel: string) => {
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    // A directory's own mtime changes when an entry is added or removed — the only signal a
+    // DELETION leaves behind, since the deleted file cannot be stat'd.
+    //
+    // The repo ROOT is excluded from that, though: it is a dumping ground for transient
+    // artifacts, and a skipped FILE still bumps its parent's mtime. The harness itself writes
+    // .full-chain-run-id there on every run, so counting the root would have made the guard
+    // report a stale build after every single run — self-inflicted noise, and noise is how a
+    // guard gets ignored. The cost is that deleting a TOP-LEVEL file goes unnoticed; deletions
+    // inside app/, lib/, components/ — where source actually lives — are still caught, and
+    // deleting next.config.ts breaks the build far too loudly to need this check.
+    if (rel) {
       try {
-        const ms = statSync(`${cwd}/${file}`).mtimeMs
-        if (ms > newest) {
-          newest = ms
-          newestPath = file
+        const dms = statSync(dir).mtimeMs
+        if (dms > newest) {
+          newest = dms
+          newestPath = rel
         }
-      } catch {
-        // Tracked but absent from the working tree (e.g. mid-checkout). Not our concern.
+      } catch { /* raced away mid-walk */ }
+    }
+
+    for (const e of entries) {
+      if (e.isSymbolicLink()) continue // do not follow; a symlink's target is someone else's tree
+      const childRel = rel ? `${rel}/${e.name}` : e.name
+      if (e.isDirectory()) {
+        if (SKIP_DIRS.has(e.name)) continue
+        walk(`${dir}/${e.name}`, childRel)
+      } else if (e.isFile() && !SKIP_FILE(e.name)) {
+        try {
+          const ms = statSync(`${dir}/${e.name}`).mtimeMs
+          if (ms > newest) {
+            newest = ms
+            newestPath = childRel
+          }
+        } catch { /* raced away mid-walk */ }
       }
     }
-    return newestPath ? { ms: newest, path: newestPath } : { ms: null, path: null }
-  } catch {
-    return { ms: null, path: null }
   }
+
+  walk(cwd, '')
+  return newestPath ? { ms: newest, path: newestPath } : { ms: null, path: null }
 }
 
 function serviceStartMs(unit: string): number | null {
@@ -154,10 +225,23 @@ function serviceStartMs(unit: string): number | null {
 }
 
 export function collectBuildFacts(cwd = process.cwd()): BuildFacts {
-  const source = newestTrackedSource(cwd)
+  const source = newestSource(cwd)
   let buildMs: number | null = null
   try {
-    // BUILD_ID is written when the build completes, so its mtime is the build's finish time.
+    // BUILD_ID is NOT written at the end of the build — verified against the installed Next
+    // 16.2.10, where it lands before static generation and trace finalisation (its mtime is a
+    // second behind .next/trace and the manifests). An earlier draft of this comment claimed
+    // otherwise and was simply wrong.
+    //
+    // Keeping BUILD_ID anyway, because being EARLY is the safe direction here: it understates
+    // when the build finished, so the "source newer than build" test is if anything too eager,
+    // and an over-eager rebuild prompt costs two minutes while a missed one costs a green run
+    // that proved nothing. Using the newest .next artefact instead would overstate the finish
+    // time and start hiding real staleness.
+    //
+    // The narrow gap this leaves: a file edited AFTER the compiler read it but BEFORE BUILD_ID
+    // is written reads as older than the build and is missed. That needs an edit landing
+    // inside a specific second of a running build — accepted rather than engineered around.
     buildMs = statSync(`${cwd}/.next/BUILD_ID`).mtimeMs
   } catch {
     buildMs = null
@@ -170,6 +254,34 @@ export function collectBuildFacts(cwd = process.cwd()): BuildFacts {
   }
 }
 
+/** The rig this check can actually reason about: the local tree + the local systemd unit. */
+const LOCAL_RIG_URL = 'https://ims-e2e.onetwo3d.co.uk'
+
 export function checkBuildFreshness(cwd = process.cwd()): FreshnessReport {
+  // Only meaningful when the server under test IS the one this box builds and runs.
+  //
+  // Everything here reads the local filesystem and the local systemd unit, while Playwright
+  // aims at E2E_BASE_URL — so pointed at any other server the check answers a question nobody
+  // asked, in both directions: a fresh local build would vouch for a stale remote one, and a
+  // legitimately fresh hand-started server would be blocked by an unrelated stale unit. Say
+  // that plainly instead of pretending to have checked (found in review of PR #489).
+  if (process.env.FULL_CHAIN_SKIP_FRESHNESS === 'true') {
+    return {
+      problems: [],
+      warnings: ['FULL_CHAIN_SKIP_FRESHNESS=true — build freshness was NOT checked. This run cannot prove which code it tested.'],
+    }
+  }
+
+  const baseUrl = process.env.E2E_BASE_URL ?? LOCAL_RIG_URL
+  if (baseUrl !== LOCAL_RIG_URL) {
+    return {
+      problems: [],
+      warnings: [
+        `E2E_BASE_URL is ${baseUrl}, not the local rig (${LOCAL_RIG_URL}), so the build-freshness ` +
+          'check was NOT run: it can only vouch for the server this box builds and starts. ' +
+          'Whatever is serving that URL may be running any code at all.',
+      ],
+    }
+  }
   return evaluateBuildFreshness(collectBuildFacts(cwd))
 }

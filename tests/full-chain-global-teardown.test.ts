@@ -69,6 +69,23 @@ test('teardown FAILS when voiding throws outright, and still releases', async ()
   assert.equal(released, true)
 })
 
+test('a REJECTING cancelPendingQueue still releases the lock', async () => {
+  // THE CATASTROPHE (caught by Codex review of PR #489, not by these tests — they only ever
+  // modelled a resolved problem array, so the gap was invisible). db.connect() sat outside
+  // cancelPendingQueue's try, so an unreachable Postgres threw straight past release() and
+  // left STAGE DISABLED indefinitely: the precise failure the ordering exists to prevent.
+  // Nothing before release() may abort runTeardown, whatever a dependency does.
+  let released = false
+  await assert.rejects(
+    runTeardown(deps({
+      cancelPendingQueue: async () => { throw new Error('ECONNREFUSED: postgres is down') },
+      release: async () => { released = true },
+    })),
+    /ECONNREFUSED/,
+  )
+  assert.equal(released, true, 'stage must NEVER be left disabled because the queue check blew up')
+})
+
 test('teardown FAILS when the sync queue could not be cleared', async () => {
   await assert.rejects(
     runTeardown(deps({ cancelPendingQueue: async () => ['could not clear the Xero sync queue: connection refused'] })),

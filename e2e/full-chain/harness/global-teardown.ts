@@ -20,8 +20,12 @@ async function cancelPendingQueue(): Promise<string[]> {
   const url = process.env.DATABASE_URL
   if (!url || url.includes('onetwo3d_ims_dev')) return problems // never touch stage's queue
   const db = new Client({ connectionString: url })
-  await db.connect()
+  // connect() INSIDE the try. It sat outside, so an unreachable Postgres threw straight out
+  // of this function, past runTeardown's release() call, and left STAGE DISABLED — the exact
+  // catastrophe the ordering was written to prevent (caught in review of PR #489). This
+  // function's contract is to REPORT problems, never to throw one.
   try {
+    await db.connect()
     // PREPEND the teardown note; never OVERWRITE errorMessage. A row can be left queued
     // because it FAILED and is awaiting retry (retryCount > 0), and its error is the only
     // record of why. Clobbering it destroyed the evidence for exactly the class of bug
@@ -53,7 +57,8 @@ async function cancelPendingQueue(): Promise<string[]> {
   } catch (e) {
     problems.push(`could not clear the Xero sync queue: ${e instanceof Error ? e.message : e}`)
   } finally {
-    await db.end()
+    // A rejecting end() would escape the finally and defeat the whole point of the try.
+    await db.end().catch(() => {})
   }
   return problems
 }
@@ -91,7 +96,14 @@ export async function runTeardown(deps: TeardownDeps): Promise<void> {
   // These rows are unambiguously ours — this database's queue is exclusive to the rig —
   // so CANCELLED is right (the schema's status for deliberately abandoned rows, kept
   // distinct from FAILED so retry sweeps and error dashboards ignore them).
-  problems.push(...(await deps.cancelPendingQueue()))
+  // Wrapped even though cancelPendingQueue is contracted not to throw: deps are injectable,
+  // and NOTHING before release() may be allowed to abort this function. Leaving stage
+  // disabled is the worst outcome available here, so it gets belt and braces.
+  try {
+    problems.push(...(await deps.cancelPendingQueue()))
+  } catch (e) {
+    problems.push(`could not clear the Xero sync queue: ${e instanceof Error ? e.message : e}`)
+  }
 
   // Xero next: the documents are the thing that pollutes the SHARED Demo ledger and
   // skews the next run's reconciliation assertions (X-02).

@@ -161,8 +161,21 @@ async function remapOnly(db: Client) {
     (live.data?.TaxRates ?? []).filter((r) => r.Status === 'ACTIVE').map((r) => [r.Name, r.TaxType]),
   )
 
+  // "active" is NOT the right test for "needs a Xero mapping" (o3d-6ec).
+  //
+  // A storefront mapping can point at an INACTIVE rate, and resolveWcTaxRateById
+  // (field-mapping.ts:315) returns whatever the mapping names WITHOUT filtering on active —
+  // so that rate is used to tax real orders. Scoping the remap to active rates therefore
+  // left every such rate with a null accounting_tax_type, and the invoice posts to Xero with
+  // no TaxType at all. Both instances map WC rate 112 to "UK Standard Rate (20%)", which is
+  // inactive: on the e2e rig that left 33 of 65 WC mappings resolving to no Xero type.
+  //
+  // A rate needs a mapping if it is active OR if a storefront mapping points at it.
   const rows = (await db.query<{ name: string; accounting_tax_type: string | null }>(
-    `select name, accounting_tax_type from tax_rates where active order by name`,
+    `select name, accounting_tax_type from tax_rates
+      where active
+         or id in (select "taxRateId" from shopping_tax_rate_mappings)
+      order by name`,
   )).rows
 
   // Only CUSTOM ids rot. Xero mints TAX001..TAXnnn per-org in creation order, so a
