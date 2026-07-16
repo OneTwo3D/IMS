@@ -6,6 +6,7 @@ import {
   buildAccountingSettingsPayload,
   isFieldAvailableForConnector,
   settingKeyFor,
+  validateAccountingAccountMapping,
 } from '@/app/(dashboard)/sync/accounting-settings-fields'
 
 // iwrm: the accounting settings form is shared by Xero and QuickBooks. The save
@@ -72,4 +73,63 @@ test('isFieldAvailableForConnector gates Xero-only fields', () => {
 test('settingKeyFor composes the connector prefix', () => {
   assert.equal(settingKeyFor('xero', 'sales_account'), 'xero_sales_account')
   assert.equal(settingKeyFor('quickbooks', 'sales_account'), 'quickbooks_sales_account')
+})
+
+
+/**
+ * Stage ran with allocated_inventory_account == transit_account (both 632) and NOTHING
+ * complained — not the save path, not a readiness view (o3d-f82). The harm only surfaces
+ * later, as a transit reconciliation gap that reads like a data problem rather than the
+ * settings mistake it is. These pin the guard that now refuses the collision at save time.
+ */
+test('accounting mapping rejects transit and allocated inventory sharing an account', () => {
+  const errors = validateAccountingAccountMapping('xero', {
+    xero_transit_account: '632',
+    xero_allocated_inventory_account: '632',
+  })
+  assert.equal(errors.length, 1)
+  assert.match(errors[0], /632/)
+  assert.match(errors[0], /Stock in Transit/i)
+  assert.match(errors[0], /Allocated Inventory/i)
+})
+
+test('accounting mapping accepts distinct transit and allocated inventory accounts', () => {
+  assert.deepEqual(
+    validateAccountingAccountMapping('xero', {
+      xero_transit_account: '632',
+      xero_allocated_inventory_account: '633',
+    }),
+    [],
+  )
+})
+
+test('accounting mapping treats blank accounts as unset, not as a collision', () => {
+  // Several of these are legitimately unconfigured; two blanks are not "the same account".
+  assert.deepEqual(
+    validateAccountingAccountMapping('xero', {
+      xero_transit_account: '',
+      xero_allocated_inventory_account: '',
+    }),
+    [],
+  )
+})
+
+test('accounting mapping ignores surrounding whitespace when comparing accounts', () => {
+  // ' 632' and '632' are the same account to Xero; a guard fooled by a stray space is
+  // worse than none, because it reports success.
+  const errors = validateAccountingAccountMapping('xero', {
+    xero_transit_account: '632 ',
+    xero_allocated_inventory_account: ' 632',
+  })
+  assert.equal(errors.length, 1, 'whitespace must not smuggle a collision past the guard')
+})
+
+test('accounting mapping validates the QuickBooks key prefix too', () => {
+  // The rule is connector-agnostic; the keys are prefixed. A guard that only ever looked
+  // at xero_* keys would pass QuickBooks straight through.
+  const errors = validateAccountingAccountMapping('quickbooks', {
+    quickbooks_transit_account: '632',
+    quickbooks_allocated_inventory_account: '632',
+  })
+  assert.equal(errors.length, 1)
 })

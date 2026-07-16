@@ -77,6 +77,53 @@ export function settingKeyFor(connectorId: AccountingConnectorId, suffix: string
  * available on that connector, so QuickBooks account mappings actually persist
  * (the old hardcoded xero_* payload was filtered out by saveQuickBooksSettings).
  */
+/**
+ * Account mappings that MUST NOT share a code, with the reason the reconciliation breaks
+ * if they do. Pure data so the rule is reviewable next to the fields it governs.
+ */
+const MUST_BE_DISTINCT: Array<{ a: string; b: string; why: string }> = [
+  {
+    a: 'transit_account',
+    b: 'allocated_inventory_account',
+    why:
+      'the transit GL reconciliation compares the period movement of the transit account against the ' +
+      'transit subledger, on the premise that ONLY the enumerated purchase streams move that account. ' +
+      'The daily batch codes allocated inventory (DR on allocation, CR on COGS) and those movements are ' +
+      'not in the transit subledger, so sharing a code makes the sweep flag every window with sales ' +
+      'activity — permanently, and never swept. Allocated stock would also be reported inside Stock in ' +
+      'Transit on the balance sheet',
+  },
+]
+
+/**
+ * Reject account mappings whose collision would silently corrupt a reconciliation.
+ *
+ * Pure, so it can be unit-tested and reused by both the save path and any readiness view.
+ * Returns human-readable errors; empty means valid.
+ *
+ * This exists because stage ran with allocated_inventory_account == transit_account (both
+ * 632) and NOTHING complained — not the save path, not a readiness check (o3d-f82). The
+ * misconfiguration is invisible until a reconciliation sweep flags a gap that looks like a
+ * data problem rather than a settings one.
+ */
+export function validateAccountingAccountMapping(
+  connectorId: AccountingConnectorId,
+  payload: Record<string, string>,
+): string[] {
+  const labelFor = (suffix: string) => ACCOUNT_FIELDS.find((f) => f.suffix === suffix)?.label ?? suffix
+  const errors: string[] = []
+  for (const rule of MUST_BE_DISTINCT) {
+    const aVal = (payload[settingKeyFor(connectorId, rule.a)] ?? '').trim()
+    const bVal = (payload[settingKeyFor(connectorId, rule.b)] ?? '').trim()
+    // Blank is "not configured", not a collision — several of these are legitimately unset.
+    if (!aVal || !bVal || aVal !== bVal) continue
+    errors.push(
+      `"${labelFor(rule.a)}" and "${labelFor(rule.b)}" are both set to account ${aVal}. They must be different accounts: ${rule.why}.`,
+    )
+  }
+  return errors
+}
+
 export function buildAccountingSettingsPayload(
   connectorId: AccountingConnectorId,
   state: Record<string, string>,

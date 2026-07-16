@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
+import { validateAccountingAccountMapping } from '@/app/(dashboard)/sync/accounting-settings-fields'
 import { db } from '@/lib/db'
 import { freshAuthFailureResult, requireAuth, requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
@@ -209,7 +210,16 @@ export async function getAccountingSettingsMasked(): Promise<AccountingConnector
 
 export async function saveAccountingSettings(data: Record<string, string>): Promise<{ success: boolean; error?: string }> {
   const connector = await getActiveAccountingConnector()
-  return (connector ?? getAccountingConnector('xero')).saveSettings(data)
+  const resolved = connector ?? getAccountingConnector('xero')
+
+  // Refuse a mapping whose collision would silently corrupt a reconciliation. Stage ran
+  // for months with allocated_inventory_account == transit_account and nothing complained
+  // (o3d-f82); the damage surfaces later as a reconciliation "gap" that reads like a data
+  // problem rather than the settings mistake it is. Fail here, where it is fixable.
+  const errors = validateAccountingAccountMapping(resolved.id, data)
+  if (errors.length) return { success: false, error: errors.join(' ') }
+
+  return resolved.saveSettings(data)
 }
 
 export async function saveAccountingConnectionSettings(
