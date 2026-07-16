@@ -100,6 +100,87 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     expectJournalLine(journal.JournalLines, { accountCode: inventoryAccount, debit: expectedNet })
     expectJournalLine(journal.JournalLines, { accountCode: transitAccount, credit: expectedNet })
   })
+
+  test('PP-02: PARTIAL receipt -> Partially Received -> bill the RECEIVED qty only, transit nets to zero', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // Order 4, receive 2. The whole point is that everything downstream follows the RECEIVED
+    // quantity, not the ordered one.
+    const sku = taggedSku(runId, 'PP02')
+    const reference = `${runTag(runId)}-PP02`
+    const orderedQty = 4
+    const receivedQty = 2
+    const unitCost = '12.50'
+    const receivedNet = Number(unitCost) * receivedQty // 25.00
+    const orderedNet = Number(unitCost) * orderedQty // 50.00 — must NOT appear anywhere
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP02`, price: '18.00' })
+
+    const { poId } = await createAndSendPo(page, { sku, qty: String(orderedQty), unitCost })
+
+    // A short receipt must land PARTIALLY_RECEIVED, not RECEIVED. receiveGoods asserts the
+    // status itself, so a partial that silently books as complete fails here rather than
+    // surfacing later as an inexplicable accounting gap.
+    await receiveGoods(page, { expectStatus: 'Partially Received', qty: String(receivedQty) })
+
+    await createBill(page, { reference })
+    await processPendingXeroSyncViaUi(page)
+
+    // --- the bill: RECEIVED value, never the ordered value.
+    //
+    // Billing the full order against a part receipt is the classic over-accrual: the supplier
+    // has not delivered 2 of the 4, so debiting transit for all 4 leaves 25.00 of goods the
+    // ledger believes are in transit and which no receipt will ever clear.
+    //
+    // TWO defences, and it is worth knowing which is which. The UI merely DEFAULTS the bill to
+    // the received qty (po-detail-client.tsx:790-798 — billableCap is bounded by qtyRemaining,
+    // which is NET RECEIVED despite the name, not the outstanding order). The real guarantee is
+    // SERVER-SIDE: I proved it by breaking the client to demand the ordered qty, and the action
+    // refused with "exceeds net received qty 2 — only received, un-returned goods can be billed".
+    // So this assertion pins the default; the server is what makes over-accrual impossible.
+    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: poId })
+    trackDocument('Invoices', billId, `PP-02 bill ${runTag(runId)}`)
+
+    const bill = await getInvoice(billId)
+    expect(bill.Type).toBe('ACCPAY')
+    expect(bill.Status).not.toBe('DELETED')
+    expect(Number(bill.SubTotal)).toBeCloseTo(receivedNet, 2)
+    expect(Number(bill.SubTotal)).not.toBeCloseTo(orderedNet, 2) // the over-accrual, named explicitly
+
+    const transitAccount = await settingValue('xero_transit_account')
+    const inventoryAccount = await settingValue('xero_inventory_account')
+    expectLine(bill.LineItems, { accountCode: transitAccount, lineAmount: receivedNet })
+
+    // --- the receipt journal: also the received value only.
+    const journalId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: poId })
+    trackDocument('ManualJournals', journalId, `PP-02 stock receipt ${runTag(runId)}`)
+
+    const journal = await getManualJournal(journalId)
+    expect(journal.Status).not.toBe('DELETED')
+    expectJournalLine(journal.JournalLines, { accountCode: inventoryAccount, debit: receivedNet })
+    expectJournalLine(journal.JournalLines, { accountCode: transitAccount, credit: receivedNet })
+
+    // --- THE POINT: transit nets to ZERO across the pair.
+    //
+    // The receipt CREDITS transit and the bill DEBITS it, so for goods both received and
+    // billed the account must drain completely. A non-zero residue here is exactly what the
+    // transit GL reconciliation sweep would later flag as a material gap — and asserting the
+    // two documents separately would not catch a sign error or an ordered/received mismatch
+    // that happens to balance each document on its own.
+    const journalTransitLines = journal.JournalLines.filter((l) => l.AccountCode === transitAccount)
+    const billTransitLines = bill.LineItems.filter((l) => l.AccountCode === transitAccount)
+
+    // Prove the filters MATCHED before trusting their sum. Two empty arrays reduce to 0 + 0 = 0
+    // and would sail through the balance assertion below — a wrong account code, or a renamed
+    // setting, would then read as perfect books. A test that cannot fail is worse than no test.
+    expect(journalTransitLines.length, 'the receipt journal must touch transit').toBeGreaterThan(0)
+    expect(billTransitLines.length, 'the bill must touch transit').toBeGreaterThan(0)
+
+    const transitFromJournal = journalTransitLines.reduce((sum, l) => sum + l.LineAmount, 0) // Xero signs credits negative
+    const transitFromBill = billTransitLines.reduce((sum, l) => sum + (l.LineAmount ?? 0), 0)
+    expect(transitFromJournal + transitFromBill).toBeCloseTo(0, 2)
+  })
 })
 
 /** Read a setting from this instance (account codes are per-instance config). */

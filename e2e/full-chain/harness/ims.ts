@@ -144,6 +144,18 @@ export async function receiveGoods(
   await dialog.getByRole('button', { name: /confirm receipt/i }).click()
   await expect(dialog).toBeHidden({ timeout: 30_000 })
   await expect(page.getByText(new RegExp(`^${opts.expectStatus}$`, 'i')).first()).toBeVisible({ timeout: 30_000 })
+
+  // RELOAD before returning, so the caller gets a page whose data reflects the receipt.
+  //
+  // The status badge going green does NOT mean the whole page has re-read the server. The bill
+  // dialog seeds billLines from `po.lines` in a useState INITIALISER (po-detail-client.tsx:792),
+  // which runs once at mount — so opening it against a not-yet-refreshed page reads
+  // qtyReceived=0, computes billableCap=0, filters every line out, and renders a dialog with no
+  // table at all. That is a race, not a wait: PP-01 passed for days and then failed here with
+  // the receipt sitting committed in the database the whole time. Waiting longer cannot fix it,
+  // because the empty list is already state.
+  await page.reload()
+  await expect(page.getByText(new RegExp(`^${opts.expectStatus}$`, 'i')).first()).toBeVisible({ timeout: 30_000 })
 }
 
 /** Enter the supplier bill against the PO. Returns the supplier invoice number used. */
