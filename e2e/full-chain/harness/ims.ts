@@ -87,6 +87,20 @@ export async function refundOrder(page: Page, opts: { quantity: number; reason?:
 // --- purchasing -------------------------------------------------------------
 
 /**
+ * Open a PO's detail page.
+ *
+ * Needed because processPendingXeroSyncViaUi navigates AWAY (page.goto('/sync?connector=xero')),
+ * so anything driving the PO afterwards is looking at the sync dashboard. Without this, a second
+ * receiveGoods hunts for a "Receive Goods" button that is not on the page and simply hangs until
+ * the test times out — 15 minutes of nothing, reported as an inscrutable locator.click timeout.
+ */
+export async function openPurchaseOrder(page: Page, poId: string): Promise<void> {
+  await page.goto(`/purchase-orders/${poId}`)
+  await expect(page.getByRole('button', { name: /receive goods|create bill|close po/i }).first())
+    .toBeVisible({ timeout: 30_000 })
+}
+
+/**
  * Raise a PO for a product and send it. Returns the PO id.
  * Mirrors e2e/xero.spec.ts:createReceivedPoWithBill, the established shape for this flow.
  */
@@ -186,8 +200,18 @@ async function expectPoStatus(page: Page, label: string): Promise<void> {
   await expect(badge.first()).toBeVisible({ timeout: 30_000 })
 }
 
-/** Enter the supplier bill against the PO. Returns the supplier invoice number used. */
-export async function createBill(page: Page, opts: { reference: string }): Promise<string> {
+/**
+ * Enter the supplier bill against the PO. Returns the supplier invoice number used.
+ *
+ * `expectBillCount` is how many bills the PO should carry AFTERWARDS, and defaults to the first.
+ * A PO received in instalments is billed in instalments, so the "Bills (n)" confirmation cannot
+ * be hardcoded to 1 — doing so would make the second bill of a two-delivery PO look like a
+ * failure while it had in fact been created perfectly.
+ */
+export async function createBill(
+  page: Page,
+  opts: { reference: string; expectBillCount?: number },
+): Promise<string> {
   await page.getByRole('button', { name: /create bill/i }).click()
   const dialog = page.getByRole('dialog', { name: /Create Bill/ })
   await expect(dialog).toBeVisible({ timeout: 30_000 })
@@ -213,7 +237,8 @@ export async function createBill(page: Page, opts: { reference: string }): Promi
   await dialog.getByPlaceholder(/supplier's invoice/i).fill(opts.reference)
   await dialog.getByRole('button', { name: /confirm bill/i }).click()
   await expect(dialog).toBeHidden({ timeout: 30_000 })
-  await expect(page.getByRole('button', { name: /Bills \(1\)/ })).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByRole('button', { name: new RegExp(`Bills \\(${opts.expectBillCount ?? 1}\\)`) }))
+    .toBeVisible({ timeout: 30_000 })
   return opts.reference
 }
 

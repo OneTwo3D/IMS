@@ -113,10 +113,64 @@ export const getCreditNote = (id: string) => getOne<XeroCreditNote>('CreditNotes
 export const getManualJournal = (id: string) => getOne<XeroManualJournal>('ManualJournals', id, 'ManualJournals')
 
 /**
+ * Every externalTransactionId of `type` for a reference, oldest first, once at least
+ * `expected` have SYNCED.
+ *
+ * Needed because one reference can legitimately produce SEVERAL documents: STOCK_RECEIPT keys
+ * on the PO id (purchase-orders.ts:1980), so a PO received in two deliveries has two receipt
+ * journals under the same referenceId. externalIdFor takes `limit 1` ordered by createdAt DESC,
+ * so asking it for "the" journal silently answers with the LAST one — a test checking transit
+ * across both receipts would read one journal, find it balanced, and pass while the other was
+ * missing entirely.
+ *
+ * Waits for `expected` rather than returning what exists: the sync is asynchronous, so a naive
+ * read races the queue and would see one journal simply because the second had not posted yet.
+ */
+export async function externalIdsFor(opts: {
+  type: string
+  referenceId: string
+  expected: number
+  timeoutMs?: number
+}): Promise<string[]> {
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + (opts.timeoutMs ?? 60_000)
+    let seen = 0
+    while (Date.now() < deadline) {
+      const r = await db.query<{ externalTransactionId: string | null; status: string; errorMessage: string | null }>(
+        `select "externalTransactionId", status, "errorMessage" from accounting_sync_logs
+          where connector = 'xero' and type = $1::"AccountingSyncType" and "referenceId" = $2
+          order by "createdAt" asc`,
+        [opts.type, opts.referenceId],
+      )
+      const failed = r.rows.find((row) => row.status === 'FAILED')
+      if (failed) {
+        throw new Error(`${opts.type} for ${opts.referenceId} FAILED in Xero sync: ${failed.errorMessage ?? 'no error recorded'}`)
+      }
+      const ids = r.rows
+        .filter((row) => row.status === 'SYNCED' && row.externalTransactionId)
+        .map((row) => row.externalTransactionId as string)
+      seen = ids.length
+      if (ids.length >= opts.expected) return ids
+      await new Promise((res) => setTimeout(res, 2_000))
+    }
+    throw new Error(
+      `Expected ${opts.expected} SYNCED ${opts.type}(s) for ${opts.referenceId} but saw ${seen} within the timeout.`,
+    )
+  } finally {
+    await db.end()
+  }
+}
+
+/**
  * The externalTransactionId the IMS recorded for a synced document — the handle that
  * makes read-back possible. Fails loudly rather than returning null: a missing id means
  * the sync did not actually complete, and a test asserting "no document" would be a
  * false pass.
+ *
+ * Returns the MOST RECENT when several exist for the reference; use externalIdsFor when more
+ * than one is expected.
  */
 export async function externalIdFor(opts: {
   type: string

@@ -14,10 +14,12 @@
 import { expect, test } from '@playwright/test'
 import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
-import { createAndSendPo, createBill, processPendingXeroSyncViaUi, receiveGoods, setPostingMode } from './harness/ims.ts'
+import {
+  createAndSendPo, createBill, openPurchaseOrder, processPendingXeroSyncViaUi, receiveGoods, setPostingMode,
+} from './harness/ims.ts'
 import { createInventoryProduct } from '../helpers.ts'
 import {
-  expectJournalLine, expectLine, externalIdFor, getInvoice, getManualJournal, trackDocument,
+  expectJournalLine, expectLine, externalIdFor, externalIdsFor, getInvoice, getManualJournal, trackDocument,
 } from './harness/xero.ts'
 
 test.describe.serial('@full-chain @xero procure to pay', () => {
@@ -182,6 +184,106 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     const transitFromJournal = journalTransitLines.reduce((sum, l) => sum + l.LineAmount, 0) // Xero signs credits negative
     const transitFromBill = billTransitLines.reduce((sum, l) => sum + (l.LineAmount ?? 0), 0)
     expect(transitFromJournal + transitFromBill).toBeCloseTo(0, 2)
+  })
+
+  // PARKED on o3d-6l3, a real P1 this test found: every bill raised against a PO is sent to Xero
+  // with InvoiceNumber = the PO's OWN reference, so a PO billed in instalments collides on the
+  // second bill and only ever gets ONE bill into the ledger. Payables are understated by every
+  // instalment after the first, and the visible symptom is a Prisma unique-constraint violation
+  // three layers from the cause.
+  //
+  // Deliberately fixme rather than deleted or weakened: it is CORRECT, and it goes green the day
+  // o3d-6l3 is fixed. Weakening it to "one bill is fine" would encode the bug as the spec.
+  test.fixme('PP-03: the REMAINDER arrives -> Received -> transit drains to zero across BOTH deliveries', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // Order 4, take delivery of 2 and bill it, then take the other 2 and bill that. The PO ends
+    // fully received and fully billed, so by the end transit must hold NOTHING for it: every
+    // pound that entered on a receipt has to leave on a bill.
+    //
+    // Self-contained rather than continuing PP-02's PO. These are describe.serial, so leaning on
+    // PP-02's leftovers would make PP-03 pass or fail for reasons in another test — and the
+    // couple of seconds saved are not worth a test that cannot be run or diagnosed on its own.
+    const sku = taggedSku(runId, 'PP03')
+    const orderedQty = 4
+    const firstDelivery = 2
+    const secondDelivery = 2
+    const unitCost = '12.50'
+    const perDeliveryNet = Number(unitCost) * firstDelivery // 25.00
+    const orderedNet = Number(unitCost) * orderedQty // 50.00
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP03`, price: '18.00' })
+
+    const { poId } = await createAndSendPo(page, { sku, qty: String(orderedQty), unitCost })
+
+    // --- delivery 1 of 2, posted before the second arrives.
+    //
+    // Syncing after EACH delivery rather than batching both at the end, because that is what
+    // actually happens: the deliveries are days apart and the 5-minute sync runs in between.
+    // Queueing both and draining once compresses into one pass what production never does.
+    await receiveGoods(page, { expectStatus: 'Partially Received', qty: String(firstDelivery) })
+    await createBill(page, { reference: `${runTag(runId)}-PP03-A`, expectBillCount: 1 })
+    await processPendingXeroSyncViaUi(page)
+
+    // --- delivery 2 of 2: the PO completes.
+    // Back to the PO first — the sync above navigated to the connector dashboard.
+    await openPurchaseOrder(page, poId)
+    await receiveGoods(page, { expectStatus: 'Received', qty: String(secondDelivery) })
+    await createBill(page, { reference: `${runTag(runId)}-PP03-B`, expectBillCount: 2 })
+    await processPendingXeroSyncViaUi(page)
+
+    const transitAccount = await settingValue('xero_transit_account')
+    const inventoryAccount = await settingValue('xero_inventory_account')
+
+    // BOTH receipt journals, not "the" one. STOCK_RECEIPT keys on the PO id, so both deliveries
+    // file under the same referenceId — externalIdFor would hand back only the later journal and
+    // this test would then verify half a story and call it balanced.
+    const journalIds = await externalIdsFor({ type: 'STOCK_RECEIPT', referenceId: poId, expected: 2 })
+    expect(journalIds.length, 'each delivery books its own receipt journal').toBe(2)
+    const journals = []
+    for (const [i, id] of journalIds.entries()) {
+      trackDocument('ManualJournals', id, `PP-03 receipt ${i + 1} ${runTag(runId)}`)
+      const j = await getManualJournal(id)
+      expect(j.Status).not.toBe('DELETED')
+      // Each journal carries ITS OWN delivery, not the running total: 25 and 25, never 25 and 50.
+      expectJournalLine(j.JournalLines, { accountCode: inventoryAccount, debit: perDeliveryNet })
+      expectJournalLine(j.JournalLines, { accountCode: transitAccount, credit: perDeliveryNet })
+      journals.push(j)
+    }
+
+    // Likewise both bills — PURCHASE_INVOICE also keys on the PO id.
+    const billIds = await externalIdsFor({ type: 'PURCHASE_INVOICE', referenceId: poId, expected: 2 })
+    expect(billIds.length, 'each delivery is billed separately').toBe(2)
+    const bills = []
+    for (const [i, id] of billIds.entries()) {
+      trackDocument('Invoices', id, `PP-03 bill ${i + 1} ${runTag(runId)}`)
+      const b = await getInvoice(id)
+      expect(b.Type).toBe('ACCPAY')
+      expect(b.Status).not.toBe('DELETED')
+      expect(Number(b.SubTotal)).toBeCloseTo(perDeliveryNet, 2)
+      bills.push(b)
+    }
+
+    // --- THE POINT: transit holds nothing once everything is received and billed.
+    //
+    // Four documents, two in each direction. A residue here is precisely what the transit GL
+    // reconciliation sweep reports as a material gap — and it is the sweep's whole premise that
+    // this account is transient. Summing all four catches what per-document assertions cannot:
+    // a second receipt that re-books the first delivery, or a bill that quietly covers the whole
+    // order, would leave each document internally balanced and the account wrong.
+    const transitLines = [
+      ...journals.flatMap((j) => j.JournalLines.filter((l) => l.AccountCode === transitAccount).map((l) => l.LineAmount)),
+      ...bills.flatMap((b) => b.LineItems.filter((l) => l.AccountCode === transitAccount).map((l) => l.LineAmount ?? 0)),
+    ]
+    expect(transitLines.length, 'all four documents must touch transit').toBe(4)
+    expect(transitLines.reduce((a, b) => a + b, 0)).toBeCloseTo(0, 2)
+
+    // And the goods really did all land in stock: two debits of 25 make the full order value.
+    const inventoryTotal = journals
+      .flatMap((j) => j.JournalLines.filter((l) => l.AccountCode === inventoryAccount).map((l) => l.LineAmount))
+      .reduce((a, b) => a + b, 0)
+    expect(inventoryTotal).toBeCloseTo(orderedNet, 2)
   })
 })
 
