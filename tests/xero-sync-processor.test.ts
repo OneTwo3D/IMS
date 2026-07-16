@@ -2,10 +2,53 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  buildXeroIdempotencyKey,
   findInvoicePaymentsBlockedByEarlierLiveLogs,
   findInvoiceUpdatesBlockedByPendingCreate,
   isXeroAccountingOutboxEnabled,
 } from '@/lib/connectors/xero/sync-processor'
+
+/**
+ * Xero 400s an Idempotency-Key over 128 chars and the document never reaches the ledger.
+ * The manual-journal branch passed a long composite as entryId (omitting `payload`, so the
+ * hash branch was skipped) and built a 156-char key, so STOCK_RECEIPT journals NEVER
+ * posted. The 400 body was being discarded, so it read as a bare "HTTP 400" and was
+ * written off as a demo-tenant quirk (e2e/xero.spec.ts:134 fixme).
+ */
+const XERO_MAX = 128
+
+test('Xero idempotency key stays within the length Xero accepts, even for a long entryId', () => {
+  // The exact shape that was failing in production: purchase-receipt:<cuid>:<ref>:<sha256>
+  const longEntryId =
+    'purchase-receipt:cmrmplxiw0002huigplkbkj1m:RCP-PO-20260715-PDGA-MRMPLY9U:' +
+    '90bcbacb89490dd370735fbbb0a01b6f7a70b08c0a029ba254b293721cc82182'
+  const key = buildXeroIdempotencyKey(longEntryId, 'manual-journal')
+  assert.ok(
+    key.length <= XERO_MAX,
+    `key must be <= ${XERO_MAX} chars or Xero 400s the journal; got ${key.length}`,
+  )
+})
+
+test('Xero idempotency key is deterministic when hashed, so idempotency survives', () => {
+  // The whole point of the key: the same source must always produce the same key, or a
+  // retry posts a DUPLICATE journal to the ledger.
+  const longEntryId = 'purchase-receipt:' + 'x'.repeat(200)
+  assert.equal(
+    buildXeroIdempotencyKey(longEntryId, 'manual-journal'),
+    buildXeroIdempotencyKey(longEntryId, 'manual-journal'),
+  )
+})
+
+test('Xero idempotency keys stay distinct for different long sources', () => {
+  const a = buildXeroIdempotencyKey('purchase-receipt:' + 'a'.repeat(200), 'manual-journal')
+  const b = buildXeroIdempotencyKey('purchase-receipt:' + 'b'.repeat(200), 'manual-journal')
+  assert.notEqual(a, b, 'two different receipts must not collide onto one key')
+})
+
+test('Xero idempotency key leaves short keys human-readable', () => {
+  // Only over-long keys change shape; the common case stays greppable in Xero's UI.
+  assert.equal(buildXeroIdempotencyKey('abc123', 'manual-journal'), 'ims-manual-journal-abc123')
+})
 
 test('Xero accounting outbox processor feature flag defaults on', () => {
   assert.equal(isXeroAccountingOutboxEnabled(undefined), true)

@@ -125,9 +125,13 @@ async function xeroFetch<T = unknown>(
   }
 
   if (!res.ok) {
+    // Read the body ONCE as text, then parse. res.json() followed by res.text() in the
+    // catch cannot work: json() has already consumed the stream, so text() throws and
+    // the .catch swallows it — the raw-body fallback ALWAYS degraded to 'Unknown error'.
+    const rawBody = await res.text().catch(() => '')
     let errorMessage = `HTTP ${res.status}`
     try {
-      const errBody = await res.json() as XeroApiError
+      const errBody = JSON.parse(rawBody) as XeroApiError
       if (errBody.Message) {
         errorMessage = errBody.Message
       }
@@ -141,8 +145,15 @@ async function xeroFetch<T = unknown>(
           errorMessage += ': ' + validationErrors.join('; ')
         }
       }
+      // Xero does not always answer in the shape above. When it doesn't, we were
+      // DISCARDING the body and recording a bare "HTTP 400" — which is how a genuine
+      // STOCK_RECEIPT rejection stayed indistinguishable from a demo-tenant quirk and got
+      // parked as a fixme (e2e/xero.spec.ts:134). Never throw the diagnostic away.
+      if (errorMessage === `HTTP ${res.status}` && rawBody) {
+        errorMessage += `: ${rawBody.slice(0, 1000)}`
+      }
     } catch {
-      errorMessage += ': ' + await res.text().catch(() => 'Unknown error')
+      errorMessage += ': ' + (rawBody.slice(0, 1000) || 'Unknown error (empty response body)')
     }
     return { ok: false, status: res.status, error: errorMessage }
   }

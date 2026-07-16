@@ -209,13 +209,28 @@ export async function voidTrackedDocuments(): Promise<{ voided: number; failed: 
   // Reverse order: allocations/payments before the documents they attach to.
   for (const t of [...tracked].reverse()) {
     try {
-      // Xero has no DELETE verb here — status transitions are the delete.
-      // Invoices/credit notes VOID; manual journals must be DELETED (VOIDED is invalid).
-      const status = t.kind === 'ManualJournals' ? 'DELETED' : 'VOIDED'
+      // Xero has no DELETE verb here — status transitions are the delete, and which
+      // transition is legal depends on the document's CURRENT state, not just its type.
+      // So READ the state rather than assume it:
+      //   - already VOIDED/DELETED -> nothing to do (re-voiding is an error, and a
+      //     document already out of the ledger is exactly the outcome we want; assuming
+      //     otherwise re-reported a cleaned-up journal as stranded on every later run);
+      //   - a POSTED manual journal -> VOIDED ("The status 'DELETED' cannot be applied");
+      //   - a DRAFT manual journal   -> DELETED.
+      // Hardcoding DELETED for journals was invisible while journals never posted; the
+      // moment PP-01 got one POSTED it stranded in the Demo ledger.
       const idField = t.kind === 'Invoices' ? 'InvoiceID' : t.kind === 'CreditNotes' ? 'CreditNoteID' : 'ManualJournalID'
-      const res = await xeroPost(`${t.kind}/${t.id}`, { [idField]: t.id, Status: status })
-      if (!res.ok) throw new Error(res.error ?? 'unknown error')
-      voided++
+      const current = await xeroGet<{ [k: string]: Array<{ Status?: string }> }>(`${t.kind}/${t.id}`)
+      const status = current.ok ? current.data?.[t.kind]?.[0]?.Status : undefined
+
+      if (status === 'VOIDED' || status === 'DELETED') {
+        voided++ // already gone from the ledger
+      } else {
+        const target = t.kind === 'ManualJournals' && status === 'DRAFT' ? 'DELETED' : 'VOIDED'
+        const res = await xeroPost(`${t.kind}/${t.id}`, { [idField]: t.id, Status: target })
+        if (!res.ok) throw new Error(`${res.error ?? 'unknown error'} (document status was ${status ?? 'unreadable'})`)
+        voided++
+      }
     } catch (e) {
       failed.push(`${t.kind}/${t.id} (${t.label}): ${e instanceof Error ? e.message : e}`)
     }

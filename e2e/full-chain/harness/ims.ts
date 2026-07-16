@@ -84,6 +84,99 @@ export async function refundOrder(page: Page, opts: { quantity: number; reason?:
   await expect(dialog).toBeHidden({ timeout: 30_000 })
 }
 
+// --- purchasing -------------------------------------------------------------
+
+/**
+ * Raise a PO for a product and send it. Returns the PO id.
+ * Mirrors e2e/xero.spec.ts:createReceivedPoWithBill, the established shape for this flow.
+ */
+export async function createAndSendPo(
+  page: Page,
+  opts: { sku: string; supplierLabel?: string; qty?: string; unitCost?: string },
+): Promise<{ poId: string }> {
+  await page.goto('/purchase-orders')
+  await page.getByRole('button', { name: /new po/i }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'New Purchase Order' })
+  await dialog.locator('select').first().selectOption({ label: opts.supplierLabel ?? 'E2E Supplier' })
+  await dialog.getByPlaceholder(/search product to add/i).fill(opts.sku)
+  await dialog.getByRole('button', { name: new RegExp(opts.sku) }).first().click()
+
+  // A PO line's cost is entered by the BUYER — products carry a sales price, never a
+  // purchase cost (there is no cost column on products). Leaving it unset raises the PO
+  // at ZERO, which then bills at zero and posts a £0 ACCPAY to Xero: everything
+  // "succeeds" and the numbers are meaningless. Set it explicitly.
+  // The line inputs are unlabelled cells, so select on what distinguishes them:
+  // qty is min=1/step=1, cost is min=0/step=0.01, discount has a placeholder, and the
+  // FX rate is step=0.0001.
+  if (opts.qty !== undefined) {
+    await dialog.locator('input[type="number"][min="1"][step="1"]').first().fill(opts.qty)
+  }
+  await dialog.locator('input[type="number"][min="0"][step="0.01"]').first().fill(opts.unitCost ?? '12.00')
+
+  await dialog.getByRole('button', { name: /create purchase order/i }).click()
+
+  await page.waitForURL(/\/purchase-orders\/.+/)
+  const poId = page.url().split('/').pop()!
+  await page.getByRole('button', { name: /confirm & send po/i }).click()
+  await expect(page.getByText(/^PO Sent$/)).toBeVisible({ timeout: 30_000 })
+  return { poId }
+}
+
+/**
+ * Receive goods against the open PO.
+ *
+ * `expectStatus` is the caller's claim about the outcome: a full receipt lands RECEIVED,
+ * a short one PARTIALLY_RECEIVED (resolved in receivePurchaseOrder,
+ * app/actions/purchase-orders.ts:1915). Asserting it here means a partial receipt that
+ * silently books as complete fails at the point of the mistake.
+ */
+export async function receiveGoods(
+  page: Page,
+  opts: { expectStatus: 'Received' | 'Partially Received'; qty?: string } = { expectStatus: 'Received' },
+): Promise<void> {
+  await page.getByRole('button', { name: /receive goods/i }).click()
+  const dialog = page.getByRole('dialog', { name: /Receive Goods/ })
+  await expect(dialog).toBeVisible()
+  if (opts.qty !== undefined) {
+    await dialog.locator('input[type="number"]').first().fill(opts.qty)
+  }
+  await dialog.getByRole('button', { name: /confirm receipt/i }).click()
+  await expect(dialog).toBeHidden({ timeout: 30_000 })
+  await expect(page.getByText(new RegExp(`^${opts.expectStatus}$`, 'i')).first()).toBeVisible({ timeout: 30_000 })
+}
+
+/** Enter the supplier bill against the PO. Returns the supplier invoice number used. */
+export async function createBill(page: Page, opts: { reference: string }): Promise<string> {
+  await page.getByRole('button', { name: /create bill/i }).click()
+  const dialog = page.getByRole('dialog', { name: /Create Bill/ })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+
+  // WAIT for the billable lines to load before clicking Next.
+  //
+  // Step 1 renders its table only once billLines is populated (po-detail-client.tsx:952),
+  // and the lines arrive asynchronously. The pattern this was lifted from
+  // (xero.spec.ts:createReceivedPoWithBill) clicks Next immediately, relying on the rows
+  // being there and pre-selected — so it is a race, not a wait. It won running alone and
+  // lost behind the slower order-to-cash tests: Next fired against an empty selection,
+  // the wizard stayed on step 1 showing "Select at least one line", and the failure
+  // surfaced 30s later as a confusing "Review & Confirm dialog not found".
+  await expect(dialog.locator('table')).toBeVisible({ timeout: 30_000 })
+  const firstLine = dialog.locator('tbody input[type="checkbox"]').first()
+  await expect(firstLine).toBeVisible({ timeout: 30_000 })
+  if (!(await firstLine.isChecked())) await firstLine.check()
+
+  await dialog.getByRole('button', { name: /^Next$/ }).click()
+  // Explicit timeout: this inherited Playwright's 5s default while every neighbour waits
+  // 30s. A load-sensitive default is a flake generator.
+  await expect(page.getByRole('dialog', { name: /Create Bill — Review & Confirm/ })).toBeVisible({ timeout: 30_000 })
+  await dialog.getByPlaceholder(/supplier's invoice/i).fill(opts.reference)
+  await dialog.getByRole('button', { name: /confirm bill/i }).click()
+  await expect(dialog).toBeHidden({ timeout: 30_000 })
+  await expect(page.getByRole('button', { name: /Bills \(1\)/ })).toBeVisible({ timeout: 30_000 })
+  return opts.reference
+}
+
 /** Drive the Xero connector page's "Process pending now". */
 export async function processPendingXeroSyncViaUi(page: Page): Promise<void> {
   await page.goto('/sync?connector=xero')
