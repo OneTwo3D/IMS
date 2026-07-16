@@ -143,7 +143,47 @@ export async function receiveGoods(
   }
   await dialog.getByRole('button', { name: /confirm receipt/i }).click()
   await expect(dialog).toBeHidden({ timeout: 30_000 })
-  await expect(page.getByText(new RegExp(`^${opts.expectStatus}$`, 'i')).first()).toBeVisible({ timeout: 30_000 })
+  await expectPoStatus(page, opts.expectStatus)
+
+  // Then RELOAD, which does a different job from the assertion above and is not redundant with
+  // it (I removed it once believing it was, and was wrong).
+  //
+  // The badge only proves the refresh landed when the status TRANSITIONS. It does not when the
+  // status stays put — a second short receipt on an already-PARTIALLY_RECEIVED PO leaves the
+  // badge already reading "Partially Received", so the assertion is satisfied by the OLD render
+  // and returns before the new line data arrives. The bill dialog then seeds billLines from
+  // stale `po.lines` (po-detail-client.tsx:792, a useState initialiser that runs once) and bills
+  // the previous received quantity.
+  //
+  // So: the assertion proves the receipt HAPPENED; the reload guarantees the caller SEES it.
+  // One second, and it holds for every receipt rather than only the ones that change status.
+  await page.reload()
+  await expectPoStatus(page, opts.expectStatus)
+}
+
+/**
+ * Wait for the PO's STATUS BADGE to read `label`.
+ *
+ * Scoped to a <span> on purpose. The obvious getByText(/^Received$/) matches a <th> COLUMN
+ * HEADER — "Received" heads the quantity column in four separate tables on this page — so it
+ * was satisfied the instant the page rendered, whatever the PO status. That assertion could
+ * not fail: a receipt that never happened would have sailed through it.
+ *
+ * The cost was not just a weak assertion. receivePurchaseOrder's handler fires router.refresh()
+ * WITHOUT awaiting it and closes the dialog immediately (po-detail-client.tsx:216-219), so
+ * returning early handed the caller a page still showing pre-receipt data. The bill dialog then
+ * seeds billLines from `po.lines` in a useState INITIALISER (:792) that runs once at mount —
+ * reading qtyReceived=0, computing billableCap=0, filtering every line out, and rendering a
+ * dialog with NO table. PP-01 passed for days and then spent 33.5s waiting for a table that
+ * could never appear, with the receipt long since committed in the database.
+ *
+ * The badge is rendered from the SERVER's po.status (:2004), so waiting for it proves the refresh
+ * landed WHEN THE STATUS CHANGES. It proves nothing when the status stays the same — see the
+ * reload in receiveGoods, which covers that case.
+ */
+async function expectPoStatus(page: Page, label: string): Promise<void> {
+  const badge = page.locator('span').filter({ hasText: new RegExp(`^${label}$`) })
+  await expect(badge.first()).toBeVisible({ timeout: 30_000 })
 }
 
 /** Enter the supplier bill against the PO. Returns the supplier invoice number used. */
