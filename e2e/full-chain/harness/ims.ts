@@ -212,6 +212,34 @@ async function expectPoStatus(page: Page, label: string): Promise<void> {
 }
 
 /**
+ * Cancel the PO, the way an operator does.
+ *
+ * Cancellation is gated to DRAFT or PARTIALLY_RECEIVED (po-detail-client.tsx:1924): a fully
+ * RECEIVED PO has no Cancel button at all.
+ *
+ * ACCEPTS THE NATIVE confirm(). handleCancel guards on window.confirm (:1980), and Playwright
+ * auto-DISMISSES native dialogs unless something handles them — so without this the click
+ * returns cleanly, NOTHING is cancelled, and the test fails minutes later hunting for a reversal
+ * journal that was never requested.
+ */
+export async function cancelPurchaseOrder(page: Page, opts: { expectStatus?: string } = {}): Promise<void> {
+  const expectStatus = opts.expectStatus ?? 'Cancelled'
+  const accept = (d: { accept: () => Promise<void> }) => { void d.accept() }
+  page.on('dialog', accept)
+  try {
+    await page.getByRole('button', { name: /^Cancel PO$/ }).click()
+    await expectPoStatus(page, expectStatus)
+  } finally {
+    page.off('dialog', accept)
+  }
+
+  // Same reason as receiveGoods: handleCancel fires router.refresh() WITHOUT awaiting it (:1991),
+  // so the caller needs a page that has actually re-read the server.
+  await page.reload()
+  await expectPoStatus(page, expectStatus)
+}
+
+/**
  * Enter the supplier bill against the PO. Returns the supplier invoice number used.
  *
  * `expectBillCount` is how many bills the PO should carry AFTERWARDS, and defaults to the first.

@@ -15,7 +15,8 @@ import { expect, test } from '@playwright/test'
 import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import {
-  createAndSendPo, createBill, openPurchaseOrder, processPendingXeroSyncViaUi, receiveGoods, setPostingMode,
+  cancelPurchaseOrder, createAndSendPo, createBill, openPurchaseOrder, processPendingXeroSyncViaUi,
+  receiveGoods, setPostingMode,
 } from './harness/ims.ts'
 import { createInventoryProduct } from '../helpers.ts'
 import {
@@ -355,6 +356,78 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
       ).toBe(expectedRefs[i])
     }
     expect(seenIds.size, 'two bills must not share one ledger document').toBe(2)
+  })
+
+  test('PP-04: cancelling a part-received PO reverses the stock — inventory AND transit unwind to zero', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // Cancellation is gated to DRAFT or PARTIALLY_RECEIVED (po-detail-client.tsx:1924), so the
+    // case with any accounting in it is the partial one: goods have arrived, and cancelling has
+    // to put the books back exactly as they were.
+    //
+    // NOTE ON NAMING — the plan calls this "PURCHASE_ORDER_CANCEL postings", which is not what
+    // the code does. PURCHASE_ORDER_CANCEL is the TRANSIT SUBLEDGER's sourceType
+    // (transit-subledger-movement.ts:33); the journal itself is queued as an
+    // INVENTORY_ADJUSTMENT (cancellation-service.ts:208). Asserting the plan's name would hunt a
+    // sync type that never gets written.
+    const sku = taggedSku(runId, 'PP04')
+    const orderedQty = 4
+    const receivedQty = 2
+    const unitCost = '12.50'
+    const receivedNet = Number(unitCost) * receivedQty // 25.00
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP04`, price: '18.00' })
+
+    const { poId } = await createAndSendPo(page, { sku, qty: String(orderedQty), unitCost })
+    await receiveGoods(page, { expectStatus: 'Partially Received', qty: String(receivedQty) })
+
+    // Post the receipt BEFORE cancelling, so the reversal has something real to reverse. Draining
+    // both at the end would still balance, but it would not prove the receipt was ever in the
+    // ledger — and "two journals that cancel out" is exactly as true when neither happened.
+    await processPendingXeroSyncViaUi(page)
+    await openPurchaseOrder(page, poId)
+
+    await cancelPurchaseOrder(page, { expectStatus: 'Cancelled' })
+    await processPendingXeroSyncViaUi(page)
+
+    const transitAccount = await settingValue('xero_transit_account')
+    const inventoryAccount = await settingValue('xero_inventory_account')
+
+    // The receipt: DR inventory / CR transit.
+    const receiptId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: poId })
+    trackDocument('ManualJournals', receiptId, `PP-04 receipt ${runTag(runId)}`)
+    const receipt = await getManualJournal(receiptId)
+    expectJournalLine(receipt.JournalLines, { accountCode: inventoryAccount, debit: receivedNet })
+    expectJournalLine(receipt.JournalLines, { accountCode: transitAccount, credit: receivedNet })
+
+    // The cancellation: the mirror image, DR transit / CR inventory.
+    const reversalId = await externalIdFor({ type: 'INVENTORY_ADJUSTMENT', referenceId: poId })
+    trackDocument('ManualJournals', reversalId, `PP-04 cancel reversal ${runTag(runId)}`)
+    const reversal = await getManualJournal(reversalId)
+    expect(reversal.Status).not.toBe('DELETED')
+    expect(reversalId).not.toBe(receiptId) // a distinct document, not the receipt re-read
+    expectJournalLine(reversal.JournalLines, { accountCode: transitAccount, debit: receivedNet })
+    expectJournalLine(reversal.JournalLines, { accountCode: inventoryAccount, credit: receivedNet })
+
+    // --- THE POINT: the cancelled PO leaves NOTHING behind in either account.
+    //
+    // Goods that arrived and then un-arrived must not linger as stock the IMS believes it owns,
+    // nor as value stranded in transit. Asserting each journal alone would miss a reversal that
+    // balances internally while hitting the wrong pair of accounts — it is the SUM across both
+    // documents, per account, that has to be zero.
+    const sumFor = (account: string) =>
+      [receipt, reversal]
+        .flatMap((j) => j.JournalLines.filter((l) => l.AccountCode === account))
+        .reduce((a, l) => a + l.LineAmount, 0)
+
+    const inventoryLines = [receipt, reversal].flatMap((j) => j.JournalLines.filter((l) => l.AccountCode === inventoryAccount))
+    const transitLines = [receipt, reversal].flatMap((j) => j.JournalLines.filter((l) => l.AccountCode === transitAccount))
+    expect(inventoryLines.length, 'both journals must touch inventory').toBe(2)
+    expect(transitLines.length, 'both journals must touch transit').toBe(2)
+
+    expect(sumFor(inventoryAccount)).toBeCloseTo(0, 2)
+    expect(sumFor(transitAccount)).toBeCloseTo(0, 2)
   })
 })
 
