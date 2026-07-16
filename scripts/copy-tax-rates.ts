@@ -91,7 +91,8 @@ async function main() {
            r.taxCategory, r.is_compound, r.reverse_charge, r.reporting_category],
         )
       }
-      isNew ? inserted++ : updated++
+      if (isNew) inserted++
+      else updated++
 
       const srcComps = (await src.query<Component>(
         `select name, rate, compound_on_previous, sort_order, active

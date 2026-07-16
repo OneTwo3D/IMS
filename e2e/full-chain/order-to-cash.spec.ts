@@ -26,7 +26,6 @@ import { addStockAdjustment, createInventoryProduct } from '../helpers.ts'
 import { expectLine, externalIdFor, getCreditNote, getInvoice, trackDocument } from './harness/xero.ts'
 
 const WAREHOUSE_CODE = 'CBG'
-const WAREHOUSE_LABEL = 'CBG — Cambridge'
 
 test.describe.serial('@full-chain @wc @xero order to cash', () => {
   let creds: WcCreds

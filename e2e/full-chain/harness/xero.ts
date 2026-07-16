@@ -12,6 +12,7 @@
  * Demo ledger is SHARED with stage, so residue is not merely untidy: it skews the
  * reconciliation sweeps (X-02) that compare GL movement against the IMS subledger.
  */
+import { readFileSync, writeFileSync } from 'node:fs'
 import { Client } from 'pg'
 import { xeroGet, xeroPost } from '../../../lib/connectors/xero/api.ts'
 
@@ -32,7 +33,6 @@ const REGISTRY = '.full-chain-xero-docs.json'
 
 function readRegistry(): Tracked[] {
   try {
-    const { readFileSync } = require('node:fs') as typeof import('node:fs')
     return JSON.parse(readFileSync(REGISTRY, 'utf8')) as Tracked[]
   } catch {
     return []
@@ -40,7 +40,6 @@ function readRegistry(): Tracked[] {
 }
 
 function writeRegistry(docs: Tracked[]): void {
-  const { writeFileSync } = require('node:fs') as typeof import('node:fs')
   writeFileSync(REGISTRY, JSON.stringify(docs, null, 2))
 }
 

@@ -7,6 +7,7 @@
  * (It cannot survive SIGKILL; that is what acquire()'s stale-lock recovery and
  * scripts/restore-stage-connectors.ts are for.)
  */
+import { readFileSync } from 'node:fs'
 import { assertPreflight } from './preflight.ts'
 import { acquire } from './quiesce.ts'
 import { newRunId, runTag } from './tag.ts'
@@ -59,6 +60,5 @@ export function currentRunId(): string {
   if (process.env.FULL_CHAIN_RUN_ID) return process.env.FULL_CHAIN_RUN_ID
   // Playwright workers are separate processes, so env set in globalSetup does not
   // reach them — fall back to the file globalSetup wrote.
-  const { readFileSync } = require('node:fs') as typeof import('node:fs')
   return readFileSync(RUN_ID_FILE, 'utf8').trim()
 }
