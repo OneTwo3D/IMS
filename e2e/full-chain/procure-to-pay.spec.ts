@@ -76,9 +76,12 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     const transitAccount = await settingValue('xero_transit_account')
     expectLine(bill.LineItems, { accountCode: transitAccount, lineAmount: expectedNet })
 
-    // The supplier reference must survive to Xero, or nobody can tie the bill back to
-    // the PO from the accounting side.
-    expect(bill.Reference ?? '').toContain(reference)
+    // Both of our numbers must survive, in the RIGHT fields (o3d-6l3). Xero's ACCPAY
+    // InvoiceNumber means the SUPPLIER's document — and it is the natural key Xero upserts on,
+    // so putting our PO reference there let a second instalment overwrite the first. The PO
+    // reference belongs in Reference, which is what ties the bill back to the PO from the ledger.
+    expect(bill.InvoiceNumber ?? '').toBe(reference)
+    expect(bill.Reference ?? '').toContain('PO-')
 
     // --- the STOCK_RECEIPT journal (closes the e2e/xero.spec.ts:134 fixme) -------------
     //
@@ -186,15 +189,10 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     expect(transitFromJournal + transitFromBill).toBeCloseTo(0, 2)
   })
 
-  // PARKED on o3d-6l3, a real P1 this test found: every bill raised against a PO is sent to Xero
-  // with InvoiceNumber = the PO's OWN reference, so a PO billed in instalments collides on the
-  // second bill and only ever gets ONE bill into the ledger. Payables are understated by every
-  // instalment after the first, and the visible symptom is a Prisma unique-constraint violation
-  // three layers from the cause.
-  //
-  // Deliberately fixme rather than deleted or weakened: it is CORRECT, and it goes green the day
-  // o3d-6l3 is fixed. Weakening it to "one bill is fine" would encode the bug as the spec.
-  test.fixme('PP-03: the REMAINDER arrives -> Received -> transit drains to zero across BOTH deliveries', async ({ page }) => {
+  // The test that found o3d-6l3, now green: every bill used to be sent with InvoiceNumber = the
+  // PO's OWN reference, and Xero UPSERTS on InvoiceNumber — so the second instalment overwrote
+  // the first and returned its id rather than creating a bill. This is the regression guard.
+  test('PP-03: the REMAINDER arrives -> Received -> transit drains to zero across BOTH deliveries', async ({ page }) => {
     test.setTimeout(900_000)
 
     // Order 4, take delivery of 2 and bill it, then take the other 2 and bill that. The PO ends

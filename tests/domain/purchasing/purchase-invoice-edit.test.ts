@@ -239,13 +239,16 @@ test('buildPurchaseInvoiceAccountingPayload normalizes optional connector fields
     ],
   }), {
     accountingInvoiceId: 'xero-bill-1',
-    invoiceNumber: 'PO-1',
+    // The supplier gave no invoice number here (reference: null above), so InvoiceNumber is
+    // OMITTED rather than falling back to the PO ref — which is what used to happen and is what
+    // let a second instalment upsert over the first in Xero (o3d-6l3). The PO ref is Reference.
+    invoiceNumber: undefined,
     contactName: 'Unknown Supplier',
     date: '2026-06-12',
     dueDate: undefined,
     currency: 'GBP',
     currencyRateToBase: 1,
-    reference: undefined,
+    reference: 'PO-1',
     lines: [
       {
         description: 'PO PO-1 line',
