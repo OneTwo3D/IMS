@@ -126,3 +126,40 @@ test('a lock-release failure is reported ALONGSIDE other faults, not instead of 
     },
   )
 })
+
+test('a HANGING Xero clean-up still releases the lock, on time', async () => {
+  // THE 42-MINUTE INCIDENT. Ordering alone was not enough: release ran LAST, so it waited on the
+  // void, and the void waits on Xero. When the Demo tenant rate-limited us its client slept on
+  // Retry-After (the daily 5,000-call cap can return hours) and stage sat DISABLED the whole
+  // time — the exact catastrophe the ordering exists to prevent, by a route the ordering does
+  // not cover.
+  //
+  // A document left in the ledger is a manual void at someone's leisure; a held lock is a
+  // production stoppage. So the clean-up gets a budget and the lock is freed regardless.
+  let released = false
+  const started = Date.now()
+  await assert.rejects(
+    runTeardown(deps({
+      voidTrackedDocuments: () => new Promise(() => {}), // never settles, like a long Retry-After
+      release: async () => { released = true },
+      budgets: { voidMs: 50 }, // the real budget is 90s; no need to sit through it here
+    })),
+    /ABANDONED so that stage could be released/,
+    'an abandoned clean-up must FAIL the run — it is still residue in a shared ledger',
+  )
+  assert.equal(released, true, 'stage must be freed even though Xero never answered')
+  assert.ok(Date.now() - started < 5_000, 'and freed on the budget, not on Xero\'s schedule')
+})
+
+test('a HANGING straggler scan does not delay the release either', async () => {
+  // Diagnostics are the least important thing here and must never hold the lock. Unlike the void,
+  // an abandoned straggler scan is NOT a failure: it reports other runs' mess, which this run
+  // does not answer for.
+  let released = false
+  await runTeardown(deps({
+    findStragglers: () => new Promise(() => {}),
+    release: async () => { released = true },
+    budgets: { stragglerMs: 50 },
+  }))
+  assert.equal(released, true)
+})
