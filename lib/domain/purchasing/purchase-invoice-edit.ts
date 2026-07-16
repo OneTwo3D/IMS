@@ -93,13 +93,19 @@ export type PurchaseInvoiceCalculation = {
 
 export type PurchaseInvoiceAccountingPayload = {
   accountingInvoiceId?: string
-  invoiceNumber: string
+  /**
+   * The SUPPLIER's invoice number — which is what Xero's ACCPAY InvoiceNumber means: their
+   * document, not ours. Optional, because the buyer is not obliged to enter it (the Create Bill
+   * form marks the date required and this field not).
+   */
+  invoiceNumber?: string
   contactName: string
   date: string
   dueDate?: string
   currency: string
   currencyRateToBase?: number
-  reference?: string
+  /** OUR purchase order reference — how a bill is traced back to its PO from the ledger side. */
+  reference: string
   lines: PurchaseInvoiceAccountingLine[]
   supplierInvoicePath?: string
 }
@@ -269,13 +275,33 @@ export function buildPurchaseInvoiceAccountingPayload(params: {
 }): PurchaseInvoiceAccountingPayload {
   return {
     accountingInvoiceId: params.accountingInvoiceId ?? undefined,
-    invoiceNumber: params.poReference,
+    // THE SUPPLIER'S NUMBER GOES IN InvoiceNumber; OUR PO REFERENCE GOES IN Reference (o3d-6l3).
+    //
+    // These were the wrong way round, and it destroyed data. Xero's POST /Invoices UPSERTS on
+    // InvoiceNumber, so sending our PO reference — identical for every bill raised against that
+    // PO — meant the second instalment did not create a bill: it OVERWROTE the first and returned
+    // its InvoiceID. Two GBP 25 bills became one GBP 25 bill carrying the later reference, with
+    // no error on either side, while the IMS recorded both as SYNCED. Payables understated by
+    // every instalment but the last. Proven against the live ledger: the invoice bill #1 claimed
+    // came back holding bill #2's reference.
+    //
+    // The supplier's invoice number is rarely reused, so this makes the collision rare — but NOT
+    // impossible, and the earlier claim that it is "unique by nature" was too strong: Xero
+    // documents ACCPAY InvoiceNumber as NON-unique, because suppliers number their own documents.
+    // A supplier reusing "123", or a buyer typing it twice, would collide identically. What
+    // actually removes the failure mode is pushPurchaseBill using PUT (create-only) rather than
+    // POST (update-or-create) — see bills.ts. This mapping fixes the semantics; PUT fixes the
+    // consequence of getting them wrong. When the supplier number is absent
+    // (the field is optional) InvoiceNumber is simply omitted, which is both honest and safe:
+    // Xero cannot upsert on a value that is not there. The PO reference stays on the bill as
+    // Reference, so the ledger-side trail back to the PO survives either way.
+    invoiceNumber: params.reference?.trim() || undefined,
     contactName: params.contactName ?? 'Unknown Supplier',
     date: params.date,
     dueDate: params.dueDate ?? undefined,
     currency: params.currency,
     currencyRateToBase: Number(params.fxRateToBase) || undefined,
-    reference: params.reference ?? undefined,
+    reference: params.poReference,
     lines: params.lines,
     supplierInvoicePath: params.supplierInvoicePath ?? undefined,
   }

@@ -2836,7 +2836,8 @@ export async function createInvoice(
         allowBillBeforeReceipt: lockedPo.supplier.prepaid,
       })
 
-      await tx.purchaseInvoice.create({
+      const createdInvoice = await tx.purchaseInvoice.create({
+        select: { id: true },
         data: {
           poId,
           invoiceNumber: input.invoiceNumber || null,
@@ -2872,11 +2873,30 @@ export async function createInvoice(
       })
 
       if (accountingSettings.syncEnabled) {
-        const billIdempotencyKey = accountingPayloadKey(`purchase-invoice:${poId}`, accountingPayload)
+        // KEYED ON THE BILL, NOT THE PO (o3d-9oq).
+        //
+        // This used to queue as PurchaseOrder/poId, which left the sync log unable to say WHICH
+        // bill it was for. applyBackReference then fell back to guessing — "the newest bill on
+        // this PO with no external id yet" (back-reference.ts:87) — and the guess is wrong the
+        // moment two bills are in flight together, which the 5-minute sweep makes ordinary:
+        //   bill A posts, Xero returns XA -> write-back picks the NEWEST null bill, which is B
+        //   bill B posts, Xero returns XB -> write-back picks A
+        // The ids end up SWAPPED, and since PURCHASE_INVOICE_UPDATE posts to
+        // /Invoices/{accountingInvoiceId}, every later correction to A silently rewrites B's
+        // document in Xero, and vice versa.
+        //
+        // back-reference already had the exact branch (PurchaseInvoice/invoiceId, :82 and :121);
+        // nothing was using it. Naming the bill removes the guess entirely rather than making it
+        // cleverer — no ordering heuristic can be correct while several bills share a PO.
+        //
+        // The idempotency key moves with it: two bills that happen to produce identical payloads
+        // (same amount, same typo'd supplier ref) used to hash to one key under the PO and the
+        // second would dedupe away. Per-bill, they cannot collide.
+        const billIdempotencyKey = accountingPayloadKey(`purchase-invoice:${createdInvoice.id}`, accountingPayload)
         const queued = await queueAccountingSyncTx(tx, {
           type: 'PURCHASE_INVOICE',
-          referenceType: 'PurchaseOrder',
-          referenceId: poId,
+          referenceType: 'PurchaseInvoice',
+          referenceId: createdInvoice.id,
           payload: accountingPayload,
           idempotencyKey: billIdempotencyKey,
         })

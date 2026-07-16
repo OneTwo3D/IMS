@@ -87,13 +87,27 @@ export async function refundOrder(page: Page, opts: { quantity: number; reason?:
 // --- purchasing -------------------------------------------------------------
 
 /**
+ * Open a PO's detail page.
+ *
+ * Needed because processPendingXeroSyncViaUi navigates AWAY (page.goto('/sync?connector=xero')),
+ * so anything driving the PO afterwards is looking at the sync dashboard. Without this, a second
+ * receiveGoods hunts for a "Receive Goods" button that is not on the page and simply hangs until
+ * the test times out — 15 minutes of nothing, reported as an inscrutable locator.click timeout.
+ */
+export async function openPurchaseOrder(page: Page, poId: string): Promise<void> {
+  await page.goto(`/purchase-orders/${poId}`)
+  await expect(page.getByRole('button', { name: /receive goods|create bill|close po/i }).first())
+    .toBeVisible({ timeout: 30_000 })
+}
+
+/**
  * Raise a PO for a product and send it. Returns the PO id.
  * Mirrors e2e/xero.spec.ts:createReceivedPoWithBill, the established shape for this flow.
  */
 export async function createAndSendPo(
   page: Page,
   opts: { sku: string; supplierLabel?: string; qty?: string; unitCost?: string },
-): Promise<{ poId: string }> {
+): Promise<{ poId: string; poReference: string }> {
   await page.goto('/purchase-orders')
   await page.getByRole('button', { name: /new po/i }).click()
 
@@ -120,7 +134,18 @@ export async function createAndSendPo(
   const poId = page.url().split('/').pop()!
   await page.getByRole('button', { name: /confirm & send po/i }).click()
   await expect(page.getByText(/^PO Sent$/)).toBeVisible({ timeout: 30_000 })
-  return { poId }
+
+  // Return the PO's human reference too, so callers can assert the EXACT value rather than a
+  // shape. "contains PO-" would accept another order's reference and pass while the ledger trail
+  // pointed at the wrong PO.
+  //
+  // Matched on the reference's own SHAPE, not `heading level 1` — that picks up the layout's
+  // top-bar title ("Purchase Orders") rather than the PO, which is how the first cut of this
+  // asserted the bill's Reference should equal "Purchase Orders".
+  const heading = page.getByRole('heading').filter({ hasText: /^PO-\d{8}-/ }).first()
+  await expect(heading).toBeVisible({ timeout: 30_000 })
+  const poReference = ((await heading.textContent()) ?? '').trim()
+  return { poId, poReference }
 }
 
 /**
@@ -186,8 +211,18 @@ async function expectPoStatus(page: Page, label: string): Promise<void> {
   await expect(badge.first()).toBeVisible({ timeout: 30_000 })
 }
 
-/** Enter the supplier bill against the PO. Returns the supplier invoice number used. */
-export async function createBill(page: Page, opts: { reference: string }): Promise<string> {
+/**
+ * Enter the supplier bill against the PO. Returns the supplier invoice number used.
+ *
+ * `expectBillCount` is how many bills the PO should carry AFTERWARDS, and defaults to the first.
+ * A PO received in instalments is billed in instalments, so the "Bills (n)" confirmation cannot
+ * be hardcoded to 1 — doing so would make the second bill of a two-delivery PO look like a
+ * failure while it had in fact been created perfectly.
+ */
+export async function createBill(
+  page: Page,
+  opts: { reference: string; expectBillCount?: number },
+): Promise<string> {
   await page.getByRole('button', { name: /create bill/i }).click()
   const dialog = page.getByRole('dialog', { name: /Create Bill/ })
   await expect(dialog).toBeVisible({ timeout: 30_000 })
@@ -213,7 +248,8 @@ export async function createBill(page: Page, opts: { reference: string }): Promi
   await dialog.getByPlaceholder(/supplier's invoice/i).fill(opts.reference)
   await dialog.getByRole('button', { name: /confirm bill/i }).click()
   await expect(dialog).toBeHidden({ timeout: 30_000 })
-  await expect(page.getByRole('button', { name: /Bills \(1\)/ })).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByRole('button', { name: new RegExp(`Bills \\(${opts.expectBillCount ?? 1}\\)`) }))
+    .toBeVisible({ timeout: 30_000 })
   return opts.reference
 }
 

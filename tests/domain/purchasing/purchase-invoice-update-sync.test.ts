@@ -22,7 +22,11 @@ type ActivityLogCreateCall = {
 function basePayload() {
   return {
     accountingInvoiceId: 'xero-bill-1',
-    invoiceNumber: 'PO-1',
+    // invoiceNumber is the SUPPLIER's number; reference is OUR PO ref (o3d-6l3). This fixture
+    // used to carry the PO ref as invoiceNumber, encoding the very mapping that let a second
+    // instalment upsert over the first in Xero.
+    invoiceNumber: 'SUPPLIER-INV-9001',
+    reference: 'PO-1',
     contactName: 'Supplier',
     date: '2026-06-12',
     currency: 'GBP',

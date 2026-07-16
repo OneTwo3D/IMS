@@ -14,10 +14,13 @@
 import { expect, test } from '@playwright/test'
 import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
-import { createAndSendPo, createBill, processPendingXeroSyncViaUi, receiveGoods, setPostingMode } from './harness/ims.ts'
+import {
+  createAndSendPo, createBill, openPurchaseOrder, processPendingXeroSyncViaUi, receiveGoods, setPostingMode,
+} from './harness/ims.ts'
 import { createInventoryProduct } from '../helpers.ts'
 import {
-  expectJournalLine, expectLine, externalIdFor, getInvoice, getManualJournal, trackDocument,
+  billIdsForPo, expectJournalLine, expectLine, externalIdFor, externalIdsFor, getInvoice,
+  getManualJournal, trackDocument,
 } from './harness/xero.ts'
 
 test.describe.serial('@full-chain @xero procure to pay', () => {
@@ -48,14 +51,17 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
 
     await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP01`, price: '18.00' })
 
-    const { poId } = await createAndSendPo(page, { sku, qty: String(qty), unitCost })
+    const { poId, poReference } = await createAndSendPo(page, { sku, qty: String(qty), unitCost })
     await receiveGoods(page, { expectStatus: 'Received' })
     await createBill(page, { reference })
 
     await processPendingXeroSyncViaUi(page)
 
     // THE POINT: the bill as Xero actually holds it.
-    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: poId })
+    // Resolve the BILL, then its document — PURCHASE_INVOICE is keyed on the bill, not the PO
+    // (o3d-9oq), because a sync log that only knows the PO cannot say which bill it is for.
+    const [billRecordId] = await billIdsForPo(poId)
+    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId })
     trackDocument('Invoices', billId, `PP-01 bill ${runTag(runId)}`)
 
     const bill = await getInvoice(billId)
@@ -74,9 +80,14 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     const transitAccount = await settingValue('xero_transit_account')
     expectLine(bill.LineItems, { accountCode: transitAccount, lineAmount: expectedNet })
 
-    // The supplier reference must survive to Xero, or nobody can tie the bill back to
-    // the PO from the accounting side.
-    expect(bill.Reference ?? '').toContain(reference)
+    // Both of our numbers must survive, in the RIGHT fields (o3d-6l3). Xero's ACCPAY
+    // InvoiceNumber means the SUPPLIER's document — and it is the natural key Xero upserts on,
+    // so putting our PO reference there let a second instalment overwrite the first. The PO
+    // reference belongs in Reference, which is what ties the bill back to the PO from the ledger.
+    expect(bill.InvoiceNumber ?? '').toBe(reference)
+    // THIS PO's reference, not merely something PO-shaped. `toContain('PO-')` would accept
+    // another order's reference and pass while the bill was cross-wired to the wrong PO.
+    expect(bill.Reference ?? '').toBe(poReference)
 
     // --- the STOCK_RECEIPT journal (closes the e2e/xero.spec.ts:134 fixme) -------------
     //
@@ -138,7 +149,8 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     // SERVER-SIDE: I proved it by breaking the client to demand the ordered qty, and the action
     // refused with "exceeds net received qty 2 — only received, un-returned goods can be billed".
     // So this assertion pins the default; the server is what makes over-accrual impossible.
-    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: poId })
+    const [billRecordId] = await billIdsForPo(poId)
+    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId })
     trackDocument('Invoices', billId, `PP-02 bill ${runTag(runId)}`)
 
     const bill = await getInvoice(billId)
@@ -182,6 +194,167 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     const transitFromJournal = journalTransitLines.reduce((sum, l) => sum + l.LineAmount, 0) // Xero signs credits negative
     const transitFromBill = billTransitLines.reduce((sum, l) => sum + (l.LineAmount ?? 0), 0)
     expect(transitFromJournal + transitFromBill).toBeCloseTo(0, 2)
+  })
+
+  // The test that found o3d-6l3, now green: every bill used to be sent with InvoiceNumber = the
+  // PO's OWN reference, and Xero UPSERTS on InvoiceNumber — so the second instalment overwrote
+  // the first and returned its id rather than creating a bill. This is the regression guard.
+  test('PP-03: the REMAINDER arrives -> Received -> transit drains to zero across BOTH deliveries', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // Order 4, take delivery of 2 and bill it, then take the other 2 and bill that. The PO ends
+    // fully received and fully billed, so by the end transit must hold NOTHING for it: every
+    // pound that entered on a receipt has to leave on a bill.
+    //
+    // Self-contained rather than continuing PP-02's PO. These are describe.serial, so leaning on
+    // PP-02's leftovers would make PP-03 pass or fail for reasons in another test — and the
+    // couple of seconds saved are not worth a test that cannot be run or diagnosed on its own.
+    const sku = taggedSku(runId, 'PP03')
+    const orderedQty = 4
+    const firstDelivery = 2
+    const secondDelivery = 2
+    const unitCost = '12.50'
+    const perDeliveryNet = Number(unitCost) * firstDelivery // 25.00
+    const orderedNet = Number(unitCost) * orderedQty // 50.00
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP03`, price: '18.00' })
+
+    const { poId } = await createAndSendPo(page, { sku, qty: String(orderedQty), unitCost })
+
+    // --- delivery 1 of 2, posted before the second arrives.
+    //
+    // Syncing after EACH delivery rather than batching both at the end, because that is what
+    // actually happens: the deliveries are days apart and the 5-minute sync runs in between.
+    // Queueing both and draining once compresses into one pass what production never does.
+    await receiveGoods(page, { expectStatus: 'Partially Received', qty: String(firstDelivery) })
+    await createBill(page, { reference: `${runTag(runId)}-PP03-A`, expectBillCount: 1 })
+    await processPendingXeroSyncViaUi(page)
+
+    // --- delivery 2 of 2: the PO completes.
+    // Back to the PO first — the sync above navigated to the connector dashboard.
+    await openPurchaseOrder(page, poId)
+    await receiveGoods(page, { expectStatus: 'Received', qty: String(secondDelivery) })
+    await createBill(page, { reference: `${runTag(runId)}-PP03-B`, expectBillCount: 2 })
+    await processPendingXeroSyncViaUi(page)
+
+    const transitAccount = await settingValue('xero_transit_account')
+    const inventoryAccount = await settingValue('xero_inventory_account')
+
+    // BOTH receipt journals, not "the" one. STOCK_RECEIPT keys on the PO id, so both deliveries
+    // file under the same referenceId — externalIdFor would hand back only the later journal and
+    // this test would then verify half a story and call it balanced.
+    const journalIds = await externalIdsFor({ type: 'STOCK_RECEIPT', referenceId: poId, expected: 2 })
+    expect(journalIds.length, 'each delivery books its own receipt journal').toBe(2)
+    const journals = []
+    for (const [i, id] of journalIds.entries()) {
+      trackDocument('ManualJournals', id, `PP-03 receipt ${i + 1} ${runTag(runId)}`)
+      const j = await getManualJournal(id)
+      expect(j.Status).not.toBe('DELETED')
+      // Each journal carries ITS OWN delivery, not the running total: 25 and 25, never 25 and 50.
+      expectJournalLine(j.JournalLines, { accountCode: inventoryAccount, debit: perDeliveryNet })
+      expectJournalLine(j.JournalLines, { accountCode: transitAccount, credit: perDeliveryNet })
+      journals.push(j)
+    }
+
+    // Each bill resolved through ITS OWN id (o3d-9oq), which is stronger than asking the PO for
+    // "its bills": it proves bill A's sync log points at bill A's document. Under the old
+    // PO-keyed write-back, A and B could be handed each other's Xero ids and a PO-level lookup
+    // would still have returned two ids and looked perfect.
+    const billRecordIds = await billIdsForPo(poId)
+    expect(billRecordIds.length, 'two deliveries, two bills in the IMS').toBe(2)
+    const billIds: string[] = []
+    for (const rec of billRecordIds) {
+      billIds.push(await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: rec }))
+    }
+    expect(new Set(billIds).size, 'each bill must own a DISTINCT Xero document').toBe(2)
+    const bills = []
+    for (const [i, id] of billIds.entries()) {
+      trackDocument('Invoices', id, `PP-03 bill ${i + 1} ${runTag(runId)}`)
+      const b = await getInvoice(id)
+      expect(b.Type).toBe('ACCPAY')
+      expect(b.Status).not.toBe('DELETED')
+      expect(Number(b.SubTotal)).toBeCloseTo(perDeliveryNet, 2)
+      bills.push(b)
+    }
+
+    // --- THE POINT: transit holds nothing once everything is received and billed.
+    //
+    // Four documents, two in each direction. A residue here is precisely what the transit GL
+    // reconciliation sweep reports as a material gap — and it is the sweep's whole premise that
+    // this account is transient. Summing all four catches what per-document assertions cannot:
+    // a second receipt that re-books the first delivery, or a bill that quietly covers the whole
+    // order, would leave each document internally balanced and the account wrong.
+    const transitLines = [
+      ...journals.flatMap((j) => j.JournalLines.filter((l) => l.AccountCode === transitAccount).map((l) => l.LineAmount)),
+      ...bills.flatMap((b) => b.LineItems.filter((l) => l.AccountCode === transitAccount).map((l) => l.LineAmount ?? 0)),
+    ]
+    expect(transitLines.length, 'all four documents must touch transit').toBe(4)
+    expect(transitLines.reduce((a, b) => a + b, 0)).toBeCloseTo(0, 2)
+
+    // And the goods really did all land in stock: two debits of 25 make the full order value.
+    const inventoryTotal = journals
+      .flatMap((j) => j.JournalLines.filter((l) => l.AccountCode === inventoryAccount).map((l) => l.LineAmount))
+      .reduce((a, b) => a + b, 0)
+    expect(inventoryTotal).toBeCloseTo(orderedNet, 2)
+  })
+
+  test('PP-03b: TWO bills drained in ONE sync pass each keep their OWN Xero document', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // The BATCHED case, and the one PP-03 structurally cannot reach: it syncs after each bill,
+    // so its two bills never share a sync pass. Production batches by default — the sweep runs
+    // every five minutes, so two bills raised in one window post together.
+    //
+    // That ordering is what o3d-9oq was about. Write-back used to guess "the newest bill on this
+    // PO with no external id yet", so with A and B in flight together:
+    //   A posts, Xero returns XA -> the guess picks B, and B gets XA
+    //   B posts, Xero returns XB -> the guess picks A, and A gets XB
+    // The ids end up SWAPPED, silently, and every later edit to A rewrites B's document.
+    //
+    // A PO-level lookup would still find two ids here and look perfect. Only asking each BILL for
+    // its own document catches it — which is why the assertion below is per-bill and compares the
+    // reference that identifies that bill.
+    const sku = taggedSku(runId, 'PP03B')
+    const unitCost = '12.50'
+    const refA = `${runTag(runId)}-PP03B-A`
+    const refB = `${runTag(runId)}-PP03B-B`
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP03B`, price: '18.00' })
+
+    const { poId } = await createAndSendPo(page, { sku, qty: '4', unitCost })
+
+    // Two deliveries, two bills, NO sync in between — both sit in the queue together.
+    await receiveGoods(page, { expectStatus: 'Partially Received', qty: '2' })
+    await createBill(page, { reference: refA, expectBillCount: 1 })
+    await receiveGoods(page, { expectStatus: 'Received', qty: '2' })
+    await createBill(page, { reference: refB, expectBillCount: 2 })
+
+    await processPendingXeroSyncViaUi(page) // one pass, both bills
+
+    const billRecordIds = await billIdsForPo(poId)
+    expect(billRecordIds.length).toBe(2)
+
+    // Each IMS bill must resolve to the document that IS that bill. Under the swap, bill A's
+    // record pointed at bill B's document — both bills exist, both are 25.00, and only the
+    // reference distinguishes them. So the reference is the assertion that matters.
+    const seenIds = new Set<string>()
+    const expectedRefs = [refA, refB]
+    for (const [i, rec] of billRecordIds.entries()) {
+      const xeroId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: rec })
+      trackDocument('Invoices', xeroId, `PP-03b bill ${i + 1} ${runTag(runId)}`)
+      seenIds.add(xeroId)
+
+      const bill = await getInvoice(xeroId)
+      expect(bill.Type).toBe('ACCPAY')
+      expect(Number(bill.SubTotal)).toBeCloseTo(Number(unitCost) * 2, 2)
+      expect(
+        bill.InvoiceNumber ?? '',
+        `IMS bill ${i + 1} must point at ITS OWN Xero document, not its sibling's`,
+      ).toBe(expectedRefs[i])
+    }
+    expect(seenIds.size, 'two bills must not share one ledger document').toBe(2)
   })
 })
 
