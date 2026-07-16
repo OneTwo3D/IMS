@@ -21,16 +21,18 @@
  */
 import { Client } from 'pg'
 import { xeroGet } from '../../../lib/connectors/xero/api.ts'
+import { checkBuildFreshness } from './build-freshness.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
 
-export type PreflightReport = { ok: true } | { ok: false; problems: string[] }
+export type PreflightReport = { ok: boolean; problems: string[]; warnings: string[] }
 
 export async function preflight(): Promise<PreflightReport> {
   const problems: string[] = []
+  const warnings: string[] = []
   const url = process.env.DATABASE_URL ?? ''
 
-  if (!url) return { ok: false, problems: ['DATABASE_URL is not set.'] }
+  if (!url) return { ok: false, problems: ['DATABASE_URL is not set.'], warnings }
   if (url.includes('onetwo3d_ims_dev')) {
     return {
       ok: false,
@@ -39,8 +41,16 @@ export async function preflight(): Promise<PreflightReport> {
           'creates orders, posts journals and rewrites settings — it must only ever run against ' +
           'the e2e instance.',
       ],
+      warnings,
     }
   }
+
+  // --- is the server even running this tree? (o3d-0qk)
+  // First, because everything below it is wasted if the answer is no: a suite that passes
+  // against a stale build has proved nothing, and does it convincingly.
+  const freshness = checkBuildFreshness()
+  problems.push(...freshness.problems)
+  warnings.push(...freshness.warnings)
 
   const db = new Client({ connectionString: url })
   await db.connect()
@@ -131,14 +141,42 @@ export async function preflight(): Promise<PreflightReport> {
     }
 
     // --- tax rates resolvable
-    const unmapped = await db.query<{ count: string }>(
-      `select count(*)::text as count from tax_rates
-        where active and (accounting_tax_type is null or accounting_tax_type = '')`,
+    // Scoped to active OR storefront-mapped, NOT just active (o3d-6ec). A WC mapping can
+    // point at an INACTIVE rate and resolveWcTaxRateById does not filter on active, so that
+    // rate taxes real orders. Checking only active rates let 33 of 65 mapped rates sit with
+    // no accounting_tax_type while preflight reported everything fine — the invoice then
+    // posts to Xero with no TaxType.
+    const unmapped = await db.query<{ name: string }>(
+      `select name from tax_rates
+        where (active or id in (select "taxRateId" from shopping_tax_rate_mappings))
+          and (accounting_tax_type is null or accounting_tax_type = '')
+        order by name`,
     )
-    if (unmapped.rows[0].count !== '0') {
+    if (unmapped.rows.length) {
+      // Name the rates rather than counting them. --remap-only fixes only those whose NAME
+      // matches a rate in the live Xero org; anything else needs a human to choose a tax
+      // type, and telling them to re-run a script that cannot help would waste their time.
       problems.push(
-        `${unmapped.rows[0].count} active tax rate(s) have no accounting_tax_type. ` +
-          `Run: provision-xero-demo.ts --remap-only.`,
+        `${unmapped.rows.length} tax rate(s) that are active or storefront-mapped have no ` +
+          `accounting_tax_type, so their invoice lines post to Xero with NO TaxType: ` +
+          `${unmapped.rows.map((r) => `"${r.name}"`).join(', ')}. ` +
+          `Try provision-xero-demo.ts --remap-only first; it resolves by NAME against the live ` +
+          `org, so any rate whose name Xero does not know needs a tax type chosen by hand.`,
+      )
+    }
+
+    // --- a usable default tax rate exists (o3d-6ec)
+    // fallbackDefaultTaxRate (field-mapping.ts:293) queries { isDefault: true, active: true }
+    // and, finding nothing, silently returns 0% VAT with a null tax type — indistinguishable
+    // from a line that genuinely has no tax. Both instances shipped in exactly that state:
+    // the isDefault flag sat on an INACTIVE rate.
+    const usableDefault = await db.query<{ count: string }>(
+      `select count(*)::text as count from tax_rates where "isDefault" and active`,
+    )
+    if (usableDefault.rows[0].count === '0') {
+      problems.push(
+        'No tax rate is both isDefault AND active, so fallbackDefaultTaxRate silently resolves ' +
+          'every unmapped WC rate to 0% VAT with no tax type. Set the default onto a live rate.',
       )
     }
 
@@ -202,12 +240,15 @@ export async function preflight(): Promise<PreflightReport> {
     await db.end()
   }
 
-  return problems.length ? { ok: false, problems } : { ok: true }
+  return { ok: problems.length === 0, problems, warnings }
 }
 
 /** Throw a single, readable error listing everything wrong. */
 export async function assertPreflight(): Promise<void> {
   const r = await preflight()
+  // Warnings are checks that could not RUN (no systemd, no git), not checks that passed.
+  // Say so out loud: silently degrading to "fine" is how a guard stops guarding.
+  for (const w of r.warnings) console.warn(`[preflight] WARNING: ${w}`)
   if (!r.ok) {
     throw new Error(`Full-chain preflight FAILED:\n  - ${r.problems.join('\n  - ')}`)
   }
