@@ -285,8 +285,13 @@ export function buildPurchaseInvoiceAccountingPayload(params: {
     // every instalment but the last. Proven against the live ledger: the invoice bill #1 claimed
     // came back holding bill #2's reference.
     //
-    // The supplier's invoice number is unique per bill by nature, so it cannot upsert over a
-    // sibling — which is precisely why Xero uses it as the ACCPAY natural key. When it is absent
+    // The supplier's invoice number is rarely reused, so this makes the collision rare — but NOT
+    // impossible, and the earlier claim that it is "unique by nature" was too strong: Xero
+    // documents ACCPAY InvoiceNumber as NON-unique, because suppliers number their own documents.
+    // A supplier reusing "123", or a buyer typing it twice, would collide identically. What
+    // actually removes the failure mode is pushPurchaseBill using PUT (create-only) rather than
+    // POST (update-or-create) — see bills.ts. This mapping fixes the semantics; PUT fixes the
+    // consequence of getting them wrong. When the supplier number is absent
     // (the field is optional) InvoiceNumber is simply omitted, which is both honest and safe:
     // Xero cannot upsert on a value that is not there. The PO reference stays on the bill as
     // Reference, so the ledger-side trail back to the PO survives either way.

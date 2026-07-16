@@ -50,7 +50,7 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
 
     await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP01`, price: '18.00' })
 
-    const { poId } = await createAndSendPo(page, { sku, qty: String(qty), unitCost })
+    const { poId, poReference } = await createAndSendPo(page, { sku, qty: String(qty), unitCost })
     await receiveGoods(page, { expectStatus: 'Received' })
     await createBill(page, { reference })
 
@@ -81,7 +81,9 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     // so putting our PO reference there let a second instalment overwrite the first. The PO
     // reference belongs in Reference, which is what ties the bill back to the PO from the ledger.
     expect(bill.InvoiceNumber ?? '').toBe(reference)
-    expect(bill.Reference ?? '').toContain('PO-')
+    // THIS PO's reference, not merely something PO-shaped. `toContain('PO-')` would accept
+    // another order's reference and pass while the bill was cross-wired to the wrong PO.
+    expect(bill.Reference ?? '').toBe(poReference)
 
     // --- the STOCK_RECEIPT journal (closes the e2e/xero.spec.ts:134 fixme) -------------
     //

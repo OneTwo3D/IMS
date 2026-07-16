@@ -107,7 +107,7 @@ export async function openPurchaseOrder(page: Page, poId: string): Promise<void>
 export async function createAndSendPo(
   page: Page,
   opts: { sku: string; supplierLabel?: string; qty?: string; unitCost?: string },
-): Promise<{ poId: string }> {
+): Promise<{ poId: string; poReference: string }> {
   await page.goto('/purchase-orders')
   await page.getByRole('button', { name: /new po/i }).click()
 
@@ -134,7 +134,18 @@ export async function createAndSendPo(
   const poId = page.url().split('/').pop()!
   await page.getByRole('button', { name: /confirm & send po/i }).click()
   await expect(page.getByText(/^PO Sent$/)).toBeVisible({ timeout: 30_000 })
-  return { poId }
+
+  // Return the PO's human reference too, so callers can assert the EXACT value rather than a
+  // shape. "contains PO-" would accept another order's reference and pass while the ledger trail
+  // pointed at the wrong PO.
+  //
+  // Matched on the reference's own SHAPE, not `heading level 1` — that picks up the layout's
+  // top-bar title ("Purchase Orders") rather than the PO, which is how the first cut of this
+  // asserted the bill's Reference should equal "Purchase Orders".
+  const heading = page.getByRole('heading').filter({ hasText: /^PO-\d{8}-/ }).first()
+  await expect(heading).toBeVisible({ timeout: 30_000 })
+  const poReference = ((await heading.textContent()) ?? '').trim()
+  return { poId, poReference }
 }
 
 /**

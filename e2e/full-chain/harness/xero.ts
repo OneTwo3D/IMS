@@ -148,15 +148,23 @@ export async function externalIdsFor(opts: {
       if (failed) {
         throw new Error(`${opts.type} for ${opts.referenceId} FAILED in Xero sync: ${failed.errorMessage ?? 'no error recorded'}`)
       }
-      const ids = r.rows
-        .filter((row) => row.status === 'SYNCED' && row.externalTransactionId)
-        .map((row) => row.externalTransactionId as string)
+      // DEDUPE. Two SYNCED rows can carry the SAME externalTransactionId — that is precisely the
+      // o3d-6l3 failure (a second bill upserting over the first and being handed its id back).
+      // Counting rows rather than distinct DOCUMENTS would let this test fetch one Xero bill
+      // twice, count it as two, and balance it against two receipts. It would pass while the
+      // ledger held half the payables.
+      const ids = [...new Set(
+        r.rows
+          .filter((row) => row.status === 'SYNCED' && row.externalTransactionId)
+          .map((row) => row.externalTransactionId as string),
+      )]
       seen = ids.length
       if (ids.length >= opts.expected) return ids
       await new Promise((res) => setTimeout(res, 2_000))
     }
     throw new Error(
-      `Expected ${opts.expected} SYNCED ${opts.type}(s) for ${opts.referenceId} but saw ${seen} within the timeout.`,
+      `Expected ${opts.expected} DISTINCT SYNCED ${opts.type} document(s) for ${opts.referenceId} but saw ${seen} ` +
+        `within the timeout. Fewer distinct ids than sync rows means two rows resolved to ONE ledger document.`,
     )
   } finally {
     await db.end()
