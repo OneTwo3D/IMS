@@ -21,16 +21,18 @@
  */
 import { Client } from 'pg'
 import { xeroGet } from '../../../lib/connectors/xero/api.ts'
+import { checkBuildFreshness } from './build-freshness.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
 
-export type PreflightReport = { ok: true } | { ok: false; problems: string[] }
+export type PreflightReport = { ok: boolean; problems: string[]; warnings: string[] }
 
 export async function preflight(): Promise<PreflightReport> {
   const problems: string[] = []
+  const warnings: string[] = []
   const url = process.env.DATABASE_URL ?? ''
 
-  if (!url) return { ok: false, problems: ['DATABASE_URL is not set.'] }
+  if (!url) return { ok: false, problems: ['DATABASE_URL is not set.'], warnings }
   if (url.includes('onetwo3d_ims_dev')) {
     return {
       ok: false,
@@ -39,8 +41,16 @@ export async function preflight(): Promise<PreflightReport> {
           'creates orders, posts journals and rewrites settings — it must only ever run against ' +
           'the e2e instance.',
       ],
+      warnings,
     }
   }
+
+  // --- is the server even running this tree? (o3d-0qk)
+  // First, because everything below it is wasted if the answer is no: a suite that passes
+  // against a stale build has proved nothing, and does it convincingly.
+  const freshness = checkBuildFreshness()
+  problems.push(...freshness.problems)
+  warnings.push(...freshness.warnings)
 
   const db = new Client({ connectionString: url })
   await db.connect()
@@ -202,12 +212,15 @@ export async function preflight(): Promise<PreflightReport> {
     await db.end()
   }
 
-  return problems.length ? { ok: false, problems } : { ok: true }
+  return { ok: problems.length === 0, problems, warnings }
 }
 
 /** Throw a single, readable error listing everything wrong. */
 export async function assertPreflight(): Promise<void> {
   const r = await preflight()
+  // Warnings are checks that could not RUN (no systemd, no git), not checks that passed.
+  // Say so out loud: silently degrading to "fine" is how a guard stops guarding.
+  for (const w of r.warnings) console.warn(`[preflight] WARNING: ${w}`)
   if (!r.ok) {
     throw new Error(`Full-chain preflight FAILED:\n  - ${r.problems.join('\n  - ')}`)
   }
