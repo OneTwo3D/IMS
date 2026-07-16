@@ -19,7 +19,8 @@ import {
 } from './harness/ims.ts'
 import { createInventoryProduct } from '../helpers.ts'
 import {
-  expectJournalLine, expectLine, externalIdFor, externalIdsFor, getInvoice, getManualJournal, trackDocument,
+  billIdsForPo, expectJournalLine, expectLine, externalIdFor, externalIdsFor, getInvoice,
+  getManualJournal, trackDocument,
 } from './harness/xero.ts'
 
 test.describe.serial('@full-chain @xero procure to pay', () => {
@@ -57,7 +58,10 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     await processPendingXeroSyncViaUi(page)
 
     // THE POINT: the bill as Xero actually holds it.
-    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: poId })
+    // Resolve the BILL, then its document — PURCHASE_INVOICE is keyed on the bill, not the PO
+    // (o3d-9oq), because a sync log that only knows the PO cannot say which bill it is for.
+    const [billRecordId] = await billIdsForPo(poId)
+    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId })
     trackDocument('Invoices', billId, `PP-01 bill ${runTag(runId)}`)
 
     const bill = await getInvoice(billId)
@@ -145,7 +149,8 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     // SERVER-SIDE: I proved it by breaking the client to demand the ordered qty, and the action
     // refused with "exceeds net received qty 2 — only received, un-returned goods can be billed".
     // So this assertion pins the default; the server is what makes over-accrual impossible.
-    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: poId })
+    const [billRecordId] = await billIdsForPo(poId)
+    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId })
     trackDocument('Invoices', billId, `PP-02 bill ${runTag(runId)}`)
 
     const bill = await getInvoice(billId)
@@ -252,9 +257,17 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
       journals.push(j)
     }
 
-    // Likewise both bills — PURCHASE_INVOICE also keys on the PO id.
-    const billIds = await externalIdsFor({ type: 'PURCHASE_INVOICE', referenceId: poId, expected: 2 })
-    expect(billIds.length, 'each delivery is billed separately').toBe(2)
+    // Each bill resolved through ITS OWN id (o3d-9oq), which is stronger than asking the PO for
+    // "its bills": it proves bill A's sync log points at bill A's document. Under the old
+    // PO-keyed write-back, A and B could be handed each other's Xero ids and a PO-level lookup
+    // would still have returned two ids and looked perfect.
+    const billRecordIds = await billIdsForPo(poId)
+    expect(billRecordIds.length, 'two deliveries, two bills in the IMS').toBe(2)
+    const billIds: string[] = []
+    for (const rec of billRecordIds) {
+      billIds.push(await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: rec }))
+    }
+    expect(new Set(billIds).size, 'each bill must own a DISTINCT Xero document').toBe(2)
     const bills = []
     for (const [i, id] of billIds.entries()) {
       trackDocument('Invoices', id, `PP-03 bill ${i + 1} ${runTag(runId)}`)
@@ -284,6 +297,64 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
       .flatMap((j) => j.JournalLines.filter((l) => l.AccountCode === inventoryAccount).map((l) => l.LineAmount))
       .reduce((a, b) => a + b, 0)
     expect(inventoryTotal).toBeCloseTo(orderedNet, 2)
+  })
+
+  test('PP-03b: TWO bills drained in ONE sync pass each keep their OWN Xero document', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // The BATCHED case, and the one PP-03 structurally cannot reach: it syncs after each bill,
+    // so its two bills never share a sync pass. Production batches by default — the sweep runs
+    // every five minutes, so two bills raised in one window post together.
+    //
+    // That ordering is what o3d-9oq was about. Write-back used to guess "the newest bill on this
+    // PO with no external id yet", so with A and B in flight together:
+    //   A posts, Xero returns XA -> the guess picks B, and B gets XA
+    //   B posts, Xero returns XB -> the guess picks A, and A gets XB
+    // The ids end up SWAPPED, silently, and every later edit to A rewrites B's document.
+    //
+    // A PO-level lookup would still find two ids here and look perfect. Only asking each BILL for
+    // its own document catches it — which is why the assertion below is per-bill and compares the
+    // reference that identifies that bill.
+    const sku = taggedSku(runId, 'PP03B')
+    const unitCost = '12.50'
+    const refA = `${runTag(runId)}-PP03B-A`
+    const refB = `${runTag(runId)}-PP03B-B`
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP03B`, price: '18.00' })
+
+    const { poId } = await createAndSendPo(page, { sku, qty: '4', unitCost })
+
+    // Two deliveries, two bills, NO sync in between — both sit in the queue together.
+    await receiveGoods(page, { expectStatus: 'Partially Received', qty: '2' })
+    await createBill(page, { reference: refA, expectBillCount: 1 })
+    await receiveGoods(page, { expectStatus: 'Received', qty: '2' })
+    await createBill(page, { reference: refB, expectBillCount: 2 })
+
+    await processPendingXeroSyncViaUi(page) // one pass, both bills
+
+    const billRecordIds = await billIdsForPo(poId)
+    expect(billRecordIds.length).toBe(2)
+
+    // Each IMS bill must resolve to the document that IS that bill. Under the swap, bill A's
+    // record pointed at bill B's document — both bills exist, both are 25.00, and only the
+    // reference distinguishes them. So the reference is the assertion that matters.
+    const seenIds = new Set<string>()
+    const expectedRefs = [refA, refB]
+    for (const [i, rec] of billRecordIds.entries()) {
+      const xeroId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: rec })
+      trackDocument('Invoices', xeroId, `PP-03b bill ${i + 1} ${runTag(runId)}`)
+      seenIds.add(xeroId)
+
+      const bill = await getInvoice(xeroId)
+      expect(bill.Type).toBe('ACCPAY')
+      expect(Number(bill.SubTotal)).toBeCloseTo(Number(unitCost) * 2, 2)
+      expect(
+        bill.InvoiceNumber ?? '',
+        `IMS bill ${i + 1} must point at ITS OWN Xero document, not its sibling's`,
+      ).toBe(expectedRefs[i])
+    }
+    expect(seenIds.size, 'two bills must not share one ledger document').toBe(2)
   })
 })
 

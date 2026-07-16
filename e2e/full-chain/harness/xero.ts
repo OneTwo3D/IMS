@@ -113,6 +113,28 @@ export const getCreditNote = (id: string) => getOne<XeroCreditNote>('CreditNotes
 export const getManualJournal = (id: string) => getOne<XeroManualJournal>('ManualJournals', id, 'ManualJournals')
 
 /**
+ * The IMS bill ids on a PO, oldest first.
+ *
+ * PURCHASE_INVOICE sync logs are keyed on the BILL, not the PO (o3d-9oq), so a test that wants
+ * "this PO's bills" has to resolve them itself. That indirection is the point: it means each
+ * assertion is about a NAMED bill's own ledger document rather than whichever one a heuristic
+ * happened to pick.
+ */
+export async function billIdsForPo(poId: string): Promise<string[]> {
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string }>(
+      `select id from purchase_invoices where "poId" = $1 order by "createdAt" asc`,
+      [poId],
+    )
+    return r.rows.map((row) => row.id)
+  } finally {
+    await db.end()
+  }
+}
+
+/**
  * Every externalTransactionId of `type` for a reference, oldest first, once at least
  * `expected` have SYNCED.
  *
