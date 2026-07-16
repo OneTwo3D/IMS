@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
+import { accountMappingRuleKeys, validateAccountingAccountMapping } from '@/app/(dashboard)/sync/accounting-settings-fields'
 import { db } from '@/lib/db'
 import { freshAuthFailureResult, requireAuth, requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
@@ -209,7 +210,25 @@ export async function getAccountingSettingsMasked(): Promise<AccountingConnector
 
 export async function saveAccountingSettings(data: Record<string, string>): Promise<{ success: boolean; error?: string }> {
   const connector = await getActiveAccountingConnector()
-  return (connector ?? getAccountingConnector('xero')).saveSettings(data)
+  const resolved = connector ?? getAccountingConnector('xero')
+
+  // Refuse to INTRODUCE a mapping collision that would silently corrupt a reconciliation.
+  // Stage ran for months with allocated_inventory_account == transit_account and nothing
+  // complained (o3d-f82); the damage surfaces later as a reconciliation "gap" that reads
+  // like a data problem rather than the settings mistake it is. Fail here, where it is
+  // fixable.
+  //
+  // Read the CURRENT values straight from the settings rows rather than via the connector,
+  // for the same reason the validator no longer takes a connector id: resolution is
+  // xero-first and ignores which connector the payload is actually for. Passing `current`
+  // is what keeps this from locking an admin out of an unrelated save when a collision
+  // already exists and the UI is not even showing the account selectors.
+  const currentRows = await db.setting.findMany({ where: { key: { in: accountMappingRuleKeys() } } })
+  const current = Object.fromEntries(currentRows.map((r) => [r.key, r.value ?? '']))
+  const errors = validateAccountingAccountMapping(data, current)
+  if (errors.length) return { success: false, error: errors.map((e) => e.message).join(' ') }
+
+  return resolved.saveSettings(data)
 }
 
 export async function saveAccountingConnectionSettings(

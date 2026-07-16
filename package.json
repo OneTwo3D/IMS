@@ -42,6 +42,9 @@
     "e2e:external": "NODE_OPTIONS='--import tsx' playwright test --grep @external",
     "e2e:wc": "NODE_OPTIONS='--import tsx' playwright test --grep @wc",
     "e2e:xero": "NODE_OPTIONS='--import tsx' playwright test --grep @xero",
+    "e2e:full-chain": "NODE_OPTIONS='--import tsx' playwright test --config playwright.full-chain.config.ts",
+    "e2e:full-chain:preflight": "NODE_OPTIONS='--import tsx' node --env-file=.env -e \"import('./e2e/full-chain/harness/preflight.ts').then(async m=>{const r=await m.preflight();console.log(r.ok?'PREFLIGHT: OK':'PREFLIGHT: BLOCKED\\n  - '+r.problems.join('\\n  - '));process.exit(r.ok?0:1)})\"",
+    "e2e:full-chain:restore": "NODE_OPTIONS='--import tsx' node --env-file=.env scripts/restore-stage-connectors.ts",
     "e2e:headed": "NODE_OPTIONS='--import tsx' playwright test --headed",
     "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui"
   },

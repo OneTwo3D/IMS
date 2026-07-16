@@ -164,14 +164,30 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     const importResult = await importWcOrder(wcOrder)
     if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
   } else if (topic === 'order.updated') {
+    // An echo makes the STATUS untrustworthy — nothing else (o3d-uxv).
+    //
+    // This used to `return` here, discarding the whole webhook. That silently lost real
+    // changes: a PARTIAL refund does not alter the WC order status, so the refund's
+    // order.updated carries the same status the IMS itself pushed at ship time, matches
+    // the echo rule (order-webhook-echo.ts:68) for a full TEN MINUTES, and was dropped —
+    // no SalesOrderRefund, no credit note, no COGS reversal, and `ok: true` back to Woo
+    // so it never retried. Proven end to end against a live store.
+    //
+    // Scope the suppression to what it actually protects. The echo hazard is that
+    // syncWcOrderStatus would re-apply a status we just pushed and could drag the IMS
+    // BACKWARDS (e.g. echoing 'completed' over a DELIVERED order). importWcOrder cannot:
+    // for an existing order it only refreshes addresses/notes/paidAt and never touches
+    // status (order-import.ts:324). syncRefundsForOrder is idempotent and keyed on the
+    // WC refund id. Neither writes back to WooCommerce, so skipping the status sync
+    // alone keeps the loop/clobber protection intact while letting genuine changes land.
     const suppressed = await shouldSuppressWcOrderWebhookEcho(wcOrder)
     if (suppressed.suppress) {
       await logActivity({
         entityType: 'SYNC',
-        action: 'wc_order_webhook_suppressed',
+        action: 'wc_order_webhook_status_echo_skipped',
         tag: 'sync',
         level: 'INFO',
-        description: `Suppressed WooCommerce order webhook echo for WC order #${wcOrder.number}`,
+        description: `Skipped the status sync for WC order #${wcOrder.number} (own echo); import and refunds still applied`,
         metadata: {
           externalOrderId: wcOrder.id,
           reason: suppressed.reason,
@@ -179,13 +195,14 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
           status: wcOrder.status,
         },
       })
-      return NextResponse.json({ ok: true, suppressed: suppressed.reason })
     }
 
     const importResult = await importWcOrder(wcOrder)
     if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
-    const statusResult = await syncWcOrderStatus(wcOrder)
-    if (!statusResult.success) failures.push(`syncWcOrderStatus: ${statusResult.error ?? 'unknown error'}`)
+    if (!suppressed.suppress) {
+      const statusResult = await syncWcOrderStatus(wcOrder)
+      if (!statusResult.success) failures.push(`syncWcOrderStatus: ${statusResult.error ?? 'unknown error'}`)
+    }
     try {
       await syncRefundsForOrder(wcOrder.id)
     } catch (e) {

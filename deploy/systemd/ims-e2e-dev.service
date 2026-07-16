@@ -1,0 +1,78 @@
+# IMS full-chain E2E server — PRODUCTION build (o3d-lgo.2).
+#
+# A second, isolated IMS instance whose ONLY job is to run the @full-chain e2e
+# suite (Woo stage -> IMS -> Xero Demo). Forked from ims-stage-dev.service; the
+# stage tree is served live and iterated on by humans, so the e2e suite must
+# never run against it.
+#
+# Deliberate differences from ims-stage-dev.service:
+#   - Own git worktree (/opt/ims/onetwo3d-ims-e2e, branch full-chain-e2e) so a
+#     checkout here can never disturb the live stage tree.
+#   - Own database (onetwo3d_ims_e2e) via its own .env, so the Xero sync queue is
+#     exclusively this suite's — processPendingXeroSync() drains the WHOLE queue.
+#   - Port 3002 (stage is 3000).
+#   - `next start`, NOT `next dev`. The rig does not want hot reload, and dev mode cost
+#     real time: routes compile on FIRST REQUEST, so /dashboard blew past Playwright's
+#     timeouts and auth.setup failed with errors that read like bad credentials; and the
+#     dev server ballooned to 5.5GB of cache on a handful of requests, at which point
+#     everything crawled. A production build is deterministic and fast, and it retires a
+#     whole class of problem: allowedDevOrigins is a DEV-ONLY check, so the trap that
+#     silently broke hydration here cannot apply at all.
+#     COST: code changes need `npm run build` before a restart. For a test rig that is a
+#     feature — you test a built artefact, not a just-in-time compile.
+#   - RATE_LIMIT_BACKEND=memory (set in .env): Redis is SHARED with stage at
+#     localhost:6379, so a Redis-backed limiter would collide with stage's counters.
+#
+# NEVER use this instance's Settings -> System -> Scheduler UI. syncCrontab()
+# (app/actions/cron.ts) writes the single shared `ims` crontab with one hardcoded
+# BASE_URL, so a second scheduler would fight stage's. The suite triggers
+# runDailyBatchSync()/processPendingXeroSync()/pollXeroPayments() directly, which
+# also avoids the per-route hourly cron quotas that would 429 a curl-driven run.
+
+[Unit]
+Description=IMS Full-Chain E2E Server (hardened dev; isolated DB)
+After=network.target
+
+[Service]
+Type=simple
+User=ims
+Group=ims
+
+WorkingDirectory=/opt/ims/onetwo3d-ims-e2e
+EnvironmentFile=-/opt/ims/onetwo3d-ims-e2e/.env
+Environment=NODE_ENV=production
+Environment=NEXT_PUBLIC_APP_URL=https://ims-e2e.onetwo3d.co.uk
+Environment=AUTH_URL=https://ims-e2e.onetwo3d.co.uk
+Environment=PORT=3002
+# Bind on all interfaces: the WooCommerce box (ols, 10.0.3.12) delivers webhooks
+# to this host over the LAN. Verified 2026-07-15: ols -> 10.0.3.99:3000 = HTTP 200.
+# Bind on all interfaces (not loopback like the production stage unit): the Woo box
+# delivers webhooks to this host over the LAN, and OLS proxies to 10.0.3.99:3002.
+Environment=HOSTNAME=0.0.0.0
+# npm/next need a writable HOME + cache; keep them inside the (writable) app dir.
+Environment=HOME=/opt/ims/onetwo3d-ims-e2e
+Environment=NPM_CONFIG_CACHE=/opt/ims/onetwo3d-ims-e2e/.npm-cache
+
+# Fail fast with a clear reason if nobody built it.
+ExecStartPre=/usr/bin/test -d /opt/ims/onetwo3d-ims-e2e/.next
+ExecStart=/usr/bin/npm run start -- --hostname 0.0.0.0 --port 3002
+Restart=always
+RestartSec=5
+
+# --- sandboxing (mirrors ims-stage-dev.service) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+# `full` leaves the app's /opt tree writable — `strict` would break a dev server
+# that compiles and writes .next continuously.
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# NOTE: no MemoryDenyWriteExecute (breaks the V8 JIT).
+
+[Install]
+WantedBy=multi-user.target

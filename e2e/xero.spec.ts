@@ -131,9 +131,11 @@ test.describe.serial('@external @xero Xero integration', () => {
     await expectXeroLogRow(page, 'PURCHASE INVOICE', poId.slice(0, 8))
   })
 
-  test.fixme('syncs stock receipt journals to Xero', async () => {
-    test.fail(true, 'The demo Xero tenant currently does not surface a successful STOCK RECEIPT log row for the new PO after manual processing.')
-  })
+  // Stock receipt journals are covered end to end by full-chain PP-01, which asserts the
+  // POSTED ManualJournal in the Xero ledger (DR inventory / CR transit) rather than a log
+  // row. This was parked as a fixme blaming the demo tenant; the real cause was a 156-char
+  // Idempotency-Key that Xero 400'd every time, so the journals never posted anywhere.
+  // Fixed in buildXeroIdempotencyKey (sync-processor.ts).
 
   test.fixme('syncs inventory adjustments to Xero', async () => {
     test.fail(true, 'The demo Xero tenant currently does not surface a successful INVENTORY ADJUSTMENT log row for a new stock adjustment after manual processing.')

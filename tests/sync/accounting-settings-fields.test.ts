@@ -6,6 +6,7 @@ import {
   buildAccountingSettingsPayload,
   isFieldAvailableForConnector,
   settingKeyFor,
+  validateAccountingAccountMapping,
 } from '@/app/(dashboard)/sync/accounting-settings-fields'
 
 // iwrm: the accounting settings form is shared by Xero and QuickBooks. The save
@@ -72,4 +73,96 @@ test('isFieldAvailableForConnector gates Xero-only fields', () => {
 test('settingKeyFor composes the connector prefix', () => {
   assert.equal(settingKeyFor('xero', 'sales_account'), 'xero_sales_account')
   assert.equal(settingKeyFor('quickbooks', 'sales_account'), 'quickbooks_sales_account')
+})
+
+
+/**
+ * Stage ran with allocated_inventory_account == transit_account (both 632) and NOTHING
+ * complained — not the save path, not a readiness view (o3d-f82). The harm only surfaces
+ * later, as a transit reconciliation gap that reads like a data problem rather than the
+ * settings mistake it is. These pin the guard that now refuses the collision at save time.
+ */
+test('accounting mapping rejects transit and allocated inventory sharing an account', () => {
+  const errors = validateAccountingAccountMapping({
+    xero_transit_account: '632',
+    xero_allocated_inventory_account: '632',
+  })
+  assert.equal(errors.length, 1)
+  assert.match(errors[0].message, /632/)
+  assert.match(errors[0].message, /Stock in Transit/i)
+  assert.match(errors[0].message, /Allocated Inventory/i)
+  assert.deepEqual(errors[0].keys, ['xero_transit_account', 'xero_allocated_inventory_account'])
+})
+
+test('accounting mapping accepts distinct transit and allocated inventory accounts', () => {
+  assert.deepEqual(
+    validateAccountingAccountMapping({
+      xero_transit_account: '632',
+      xero_allocated_inventory_account: '633',
+    }),
+    [],
+  )
+})
+
+test('accounting mapping treats blank accounts as unset, not as a collision', () => {
+  // Several of these are legitimately unconfigured; two blanks are not "the same account".
+  assert.deepEqual(
+    validateAccountingAccountMapping({
+      xero_transit_account: '',
+      xero_allocated_inventory_account: '',
+    }),
+    [],
+  )
+})
+
+test('accounting mapping ignores surrounding whitespace when comparing accounts', () => {
+  // ' 632' and '632' are the same account to Xero; a guard fooled by a stray space is
+  // worse than none, because it reports success.
+  const errors = validateAccountingAccountMapping({
+    xero_transit_account: '632 ',
+    xero_allocated_inventory_account: ' 632',
+  })
+  assert.equal(errors.length, 1, 'whitespace must not smuggle a collision past the guard')
+})
+
+test('accounting mapping validates the QuickBooks key prefix too', () => {
+  // REGRESSION (found by Codex review of PR #488): the first cut took the connector from
+  // saveAccountingSettings' getActiveAccountingConnector(), which is xero-first and
+  // ignores the ?connector= param the client builds its payload from. A QuickBooks save
+  // was therefore checked against xero_* keys, found nothing, and passed silently. The
+  // validator now checks whichever prefixes are present in the payload.
+  const errors = validateAccountingAccountMapping({
+    quickbooks_transit_account: '632',
+    quickbooks_allocated_inventory_account: '632',
+  })
+  assert.equal(errors.length, 1)
+})
+
+
+test('accounting mapping does NOT block a save when the collision already exists and is untouched', () => {
+  // REGRESSION (found by Codex review of PR #488): the guard refused the WHOLE save while
+  // any collision existed. If settings already collided and the account cache was empty or
+  // the connector disconnected — so the UI hides the account selectors entirely — an admin
+  // could not even turn sync off, and had no way to repair the very fields being rejected.
+  // The rule is "you may not INTRODUCE a collision", not "nothing works while one exists".
+  const colliding = { xero_transit_account: '632', xero_allocated_inventory_account: '632' }
+  assert.deepEqual(
+    validateAccountingAccountMapping(colliding, colliding),
+    [],
+    'a pre-existing, unchanged collision must not block an unrelated save',
+  )
+})
+
+test('accounting mapping still blocks a save that INTRODUCES a collision', () => {
+  const before = { xero_transit_account: '632', xero_allocated_inventory_account: '633' }
+  const after = { xero_transit_account: '632', xero_allocated_inventory_account: '632' }
+  assert.equal(validateAccountingAccountMapping(after, before).length, 1)
+})
+
+test('accounting mapping blocks a save that CHANGES a collision to a different shared account', () => {
+  // Still a collision, just a different one — moving 632/632 to 999/999 must not sneak past
+  // the "unchanged" escape hatch.
+  const before = { xero_transit_account: '632', xero_allocated_inventory_account: '632' }
+  const after = { xero_transit_account: '999', xero_allocated_inventory_account: '999' }
+  assert.equal(validateAccountingAccountMapping(after, before).length, 1)
 })

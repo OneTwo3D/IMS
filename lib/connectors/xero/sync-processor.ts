@@ -63,12 +63,32 @@ export function isXeroAccountingOutboxEnabled(value = process.env.XERO_ACCOUNTIN
   return !['false', '0', 'off'].includes(String(value ?? 'true').trim().toLowerCase())
 }
 
+/**
+ * Xero rejects an Idempotency-Key longer than this with HTTP 400 — the document never
+ * reaches the ledger.
+ */
+const XERO_IDEMPOTENCY_KEY_MAX_LENGTH = 128
+
 export function buildXeroIdempotencyKey(entryId: string, operation: string, payload?: SyncPayload): string {
   if (typeof payload?._idempotencyKey === 'string' && payload._idempotencyKey.trim()) {
     const digest = createHash('sha256').update(payload._idempotencyKey).digest('hex')
     return `ims-${operation}-${digest}`
   }
-  return `ims-${operation}-${entryId}`
+
+  // Bound the key HERE rather than trusting every caller to pass something short.
+  //
+  // Not hypothetical: the manual-journal branch passes a composite
+  // `purchase-receipt:<cuid>:<receipt-ref>:<sha256>` as entryId and omits `payload`, so it
+  // skipped the hash above and built a 156-char key. Xero 400'd every one, meaning
+  // STOCK_RECEIPT journals NEVER posted. Because the 400 body was discarded (api.ts), it
+  // surfaced only as "HTTP 400" and got written off as a demo-tenant quirk
+  // (e2e/xero.spec.ts:134 fixme).
+  //
+  // Hashing is deterministic — the same entryId still yields the same key, so idempotency
+  // is preserved; only over-long keys change shape.
+  const key = `ims-${operation}-${entryId}`
+  if (key.length <= XERO_IDEMPOTENCY_KEY_MAX_LENGTH) return key
+  return `ims-${operation}-${createHash('sha256').update(entryId).digest('hex')}`
 }
 
 function getRateLimitBackoffMs(retryCount: number, message: string): number {
