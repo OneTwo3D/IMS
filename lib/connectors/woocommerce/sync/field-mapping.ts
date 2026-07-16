@@ -290,12 +290,54 @@ type ResolvedTaxRate = {
   source: 'mapped' | 'default'
 }
 
-async function fallbackDefaultTaxRate(): Promise<ResolvedTaxRate> {
+/**
+ * The order's tax rate when the line does not name one we can resolve.
+ *
+ * TWO CALLERS, AND THEY MEAN OPPOSITE THINGS (o3d-6ec) — which is why this used to fail
+ * silently: it could not tell them apart, so the honest case and the dangerous one produced
+ * the same wordless answer.
+ *
+ *   - `unmappedWcRateId === null`: the order names NO tax rate. WooCommerce is the authority
+ *     on that, so there is no tax and 0% is simply CORRECT. Nothing to report.
+ *   - `unmappedWcRateId` set: WooCommerce charged tax at a rate we cannot map. We do not know
+ *     the tax. Whatever we return is a SUBSTITUTION, and it must say so out loud.
+ *
+ * Compare getFxRateToGbp below, which faces the identical question — "we cannot resolve a
+ * rate WooCommerce actually applied" — and answers it by logging ERROR and throwing, parking
+ * the order rather than guessing. Tax silently guessing 0% was never a considered decision;
+ * it was the absence of one.
+ *
+ * This still substitutes rather than throwing, deliberately: parking orders is a change to
+ * live intake, and o3d-6ec records that the choice between substituting and refusing needs a
+ * finance opinion (an order whose VAT we cannot account for may be worth rejecting outright).
+ * Making it LOUD is the part that needs no opinion — a wrong number nobody can see is strictly
+ * worse than a wrong number on the exceptions dashboard.
+ */
+async function fallbackDefaultTaxRate(unmappedWcRateId: number | null = null): Promise<ResolvedTaxRate> {
   const defaultRate = await db.taxRate.findFirst({
     where: { isDefault: true, active: true },
     select: { id: true, name: true, rate: true, accountingTaxType: true, reverseCharge: true },
   })
+
   if (defaultRate) {
+    if (unmappedWcRateId !== null) {
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_tax_rate_unmapped',
+        tag: 'sync',
+        level: 'WARNING',
+        description:
+          `WooCommerce tax rate ${unmappedWcRateId} is not mapped to an IMS tax rate; substituted the ` +
+          `default "${defaultRate.name}" (${Number(defaultRate.rate) * 100}%). If WooCommerce charged a ` +
+          `different rate, this order's VAT is wrong. Map it in the WooCommerce connector's tax settings.`,
+        metadata: {
+          externalTaxRateId: unmappedWcRateId,
+          substitutedTaxRate: defaultRate.name,
+          substitutedRate: Number(defaultRate.rate),
+        },
+        resolveUser: false,
+      })
+    }
     return {
       taxRateId: defaultRate.id,
       taxRateName: defaultRate.name,
@@ -305,6 +347,25 @@ async function fallbackDefaultTaxRate(): Promise<ResolvedTaxRate> {
       source: 'default',
     }
   }
+
+  // No usable default. Returning 0% here is the worst answer available — plausible, and wrong
+  // whenever WooCommerce actually charged tax. ERROR (not WARNING) when a real rate went
+  // unmapped, because the order carries VAT we have just recorded as zero.
+  if (unmappedWcRateId !== null) {
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_tax_rate_unresolvable',
+      tag: 'sync',
+      level: 'ERROR',
+      description:
+        `WooCommerce tax rate ${unmappedWcRateId} is not mapped AND no tax rate is both default and ` +
+        `active, so this line was recorded at 0% VAT with no tax type — it will post to the ledger ` +
+        `with no TaxType. Map the rate, and set a default onto a live rate.`,
+      metadata: { externalTaxRateId: unmappedWcRateId },
+      resolveUser: false,
+    })
+  }
+
   return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null, reverseCharge: false, source: 'default' }
 }
 
@@ -321,7 +382,9 @@ export async function resolveWcTaxRateById(wcRateId: number | null | undefined):
     },
     include: { taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true, reverseCharge: true } } },
   })
-  if (!mapping) return fallbackDefaultTaxRate()
+  // Pass the id: WooCommerce named a rate and we could not resolve it, which is the case that
+  // must be reported. Calling this bare — as it used to — is what made the substitution silent.
+  if (!mapping) return fallbackDefaultTaxRate(wcRateId)
   return {
     taxRateId: mapping.taxRate.id,
     taxRateName: mapping.taxRate.name,
