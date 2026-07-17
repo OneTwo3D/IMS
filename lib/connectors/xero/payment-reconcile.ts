@@ -29,6 +29,7 @@ import { db } from '@/lib/db'
 import { xeroGet } from './api'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 import type { XeroResponse } from './api'
 
 export type XeroReconcileInvoice = {
@@ -118,6 +119,8 @@ export type ReconcileReport = {
   suspectAdvances: Array<{ id: string; label: string; xeroStatus: string }>
   unknown: Array<{ id: string; label: string; accountingInvoiceId: string }>
   errors: string[]
+  /** apply was requested but the payment poll held the write lock, so this run only reported. */
+  applyDeferred?: boolean
 }
 
 export type ReconcileDeps = {
@@ -253,14 +256,28 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
       if (doc.kind === 'sales') {
         const order = await db.salesOrder.findUnique({ where: { id: doc.id }, select: { status: true } })
         const advancing = order?.status === 'PENDING_PAYMENT'
-        // Guarded: only flip a row that is STILL unpaid, so a concurrent poller write cannot be
-        // clobbered. count 0 = someone else got there first.
-        const res = await db.salesOrder.updateMany({
-          where: { id: doc.id, paidAt: null },
-          data: advancing ? { paidAt: settled, status: 'PROCESSING' } : { paidAt: settled },
-        })
-        if (res.count === 0) return { applied: false, reason: 'already marked paid concurrently (poller)' }
+        // The status test goes INTO the write predicate, not just the read. Reading status and then
+        // guarding only on paidAt would let a concurrent PENDING_PAYMENT→CANCELLED slip between the
+        // two: updateMany would still match (paidAt null) and overwrite CANCELLED with PROCESSING +
+        // allocate. Requiring status='PENDING_PAYMENT' in the predicate makes the advance an atomic
+        // conditional transition — if the order moved on, count is 0 and we allocate nothing (Codex
+        // review of #496). The paidAt:null clause still blocks a concurrent poller write.
+        const res = advancing
+          ? await db.salesOrder.updateMany({
+              where: { id: doc.id, paidAt: null, status: 'PENDING_PAYMENT' },
+              data: { paidAt: settled, status: 'PROCESSING' },
+            })
+          : await db.salesOrder.updateMany({
+              where: { id: doc.id, paidAt: null },
+              data: { paidAt: settled },
+            })
+        if (res.count === 0) {
+          return { applied: false, reason: advancing
+            ? 'order was no longer PENDING_PAYMENT/unpaid at write time (cancelled or paid concurrently)'
+            : 'already marked paid concurrently (poller)' }
+        }
         if (advancing) {
+          // Only when the guarded PENDING_PAYMENT→PROCESSING transition actually happened.
           try {
             const { autoAllocateOrder } = await import('@/app/actions/allocation')
             await autoAllocateOrder(doc.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
@@ -283,18 +300,36 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
 
   }
 
-  const report = await reconcileLinkedInvoices(deps, opts)
+  // Report mode writes nothing, so it needs no lock. Apply mode must serialize with the payment poll
+  // (both write paidAt): hold the payment-write lock across the whole run so a poll cannot interleave
+  // its own Xero-read→write with ours. If the poll already holds it, DON'T wait and DON'T apply —
+  // fall back to a report-only pass so the audit still runs, and try the writes on the next daily run.
+  let report: ReconcileReport
+  let applyDeferred = false
+  if (!opts.apply) {
+    report = await reconcileLinkedInvoices(deps, { apply: false })
+  } else {
+    const locked = await withPaymentWriteLockOrSkip(() => reconcileLinkedInvoices(deps, { apply: true }))
+    if (isLockSkipped(locked)) {
+      applyDeferred = true
+      report = await reconcileLinkedInvoices(deps, { apply: false })
+    } else {
+      report = locked
+    }
+  }
+  report.applyDeferred = applyDeferred
 
+  const applied = report.missedPayments.filter((m) => m.applied).length
   // A durable record: the whole point is visibility into what the poller could not see.
   await logActivity({
     entityType: 'SYSTEM',
-    action: opts.apply ? 'xero_payment_reconcile_applied' : 'xero_payment_reconcile_report',
+    action: opts.apply && !applyDeferred ? 'xero_payment_reconcile_applied' : 'xero_payment_reconcile_report',
     tag: 'sync',
     level: report.suspectAdvances.length > 0 || report.errors.length > 0 ? 'WARNING' : 'INFO',
     description:
-      `Xero payment reconcile (${opts.apply ? 'apply' : 'report'}): checked ${report.checked}, ` +
-      `${report.missedPayments.length} missed payment(s), ${report.suspectAdvances.length} suspect advance(s), ` +
-      `${report.unknown.length} not found in Xero, ${report.errors.length} error(s)`,
+      `Xero payment reconcile (${opts.apply ? (applyDeferred ? 'apply DEFERRED — poll held the lock' : 'apply') : 'report'}): ` +
+      `checked ${report.checked}, ${report.missedPayments.length} missed payment(s)${opts.apply ? ` (${applied} applied)` : ''}, ` +
+      `${report.suspectAdvances.length} suspect advance(s), ${report.unknown.length} not found in Xero, ${report.errors.length} error(s)`,
     metadata: report,
     resolveUser: false,
   })

@@ -29,6 +29,7 @@ import { notify } from '@/lib/notifications'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { detectPaymentReversals } from '@/lib/domain/accounting/payment-reversal'
 import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
+import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
 import {
   CURSOR_OVERLAP_MS,
@@ -61,7 +62,23 @@ async function notifyReversalAdmins(order: DetectedReversalOrder, wcHandled: boo
   )
 }
 
-export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[] }> {
+type PollResult = { salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[]; skipped?: string }
+
+/**
+ * Serialized with the daily backlog reconcile (o3d-2s8): both write paidAt from a Xero read, so they
+ * must not interleave, or one could act on a state the other has already invalidated. If the reconcile
+ * holds the write lock, this poll cycle skips and retries in 15 minutes — a skipped cycle is harmless
+ * (the next one catches up), whereas a concurrent write is not.
+ */
+export async function pollXeroPayments(): Promise<PollResult> {
+  const outcome = await withPaymentWriteLockOrSkip(() => pollXeroPaymentsLocked())
+  if (isLockSkipped(outcome)) {
+    return { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [], skipped: 'backlog reconcile held the payment-write lock' }
+  }
+  return outcome
+}
+
+async function pollXeroPaymentsLocked(): Promise<PollResult> {
   const result = { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [] as string[] }
 
   // Read last poll timestamp. Parsed defensively: the cursor is a free-text Setting, and an
