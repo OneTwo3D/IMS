@@ -555,14 +555,22 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     // PURCHASE_CREDIT_NOTE_ALLOCATION stores NO externalTransactionId by design (sync-processor.ts:1334)
     // — externalIdFor would throw on it. The bill's AmountDue is the observable that actually
     // matters to whoever pays the supplier.
+    // Pin the credit to the RETURNED half, absolutely — not merely > 0. A credit for the whole bill
+    // (or any wrong amount) would otherwise slip through: the AmountDue check below subtracts the
+    // SAME observed creditTotal, so it stays self-consistent whatever the credit is worth (Codex
+    // review of PR #495). SubTotal ties it to returnedNet; the gross is the matching half of the
+    // bill (2 of 4 units at one rate).
     const creditTotal = Number(creditNote.Total)
-    expect(creditTotal, 'the credit must be worth something').toBeGreaterThan(0)
+    expect(Number(creditNote.SubTotal), 'the credit is for the returned 2 units, not the whole order')
+      .toBeCloseTo(returnedNet, 2)
+    expect(creditTotal, 'gross credit is the returned half of the bill').toBeCloseTo(billTotal / 2, 2)
 
     const billAfter = await getInvoice(billId)
     expect(Number(billAfter.Total), 'allocating a credit must not alter the bill itself').toBeCloseTo(billTotal, 2)
+    // Absolute expected balance: full bill minus the (now-pinned) returned-half credit.
     expect(
       Number(billAfter.AmountDue),
-      'the credit is posted but NOT allocated: the supplier would still be paid in full',
+      'the allocation must reduce AmountDue by exactly the returned-half credit',
     ).toBeCloseTo(billTotal - creditTotal, 2)
   })
 })

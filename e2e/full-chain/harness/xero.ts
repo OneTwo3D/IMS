@@ -24,20 +24,34 @@ const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
  * because the app never deletes anything; teardown does — an allocation has to be removed with a
  * real DELETE before its credit note or bill can be voided. Kept here, in test-only cleanup code,
  * rather than widening the production client's verb surface for a need only the harness has.
+ *
+ * ALWAYS resolves — never rejects. A raw fetch throws on DNS/network/timeout, and this runs OUTSIDE
+ * the per-kind try/catch below, so a throw here would abort cleanup of every remaining document and
+ * strand it in the shared ledger. Timed out at 30s to match the production transport rather than
+ * hang teardown indefinitely.
  */
 async function xeroDelete(path: string): Promise<{ ok: boolean; status: number; error?: string }> {
   const auth = await getAccessToken()
   if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
-  const res = await fetch(`${XERO_BASE_URL}/${path}`, {
-    method: 'DELETE',
-    headers: {
-      Authorization: `Bearer ${auth.accessToken}`,
-      'Xero-Tenant-Id': auth.tenantId,
-      Accept: 'application/json',
-    },
-  })
-  if (res.ok) return { ok: true, status: res.status }
-  return { ok: false, status: res.status, error: (await res.text().catch(() => '')).slice(0, 300) }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 30_000)
+  try {
+    const res = await fetch(`${XERO_BASE_URL}/${path}`, {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${auth.accessToken}`,
+        'Xero-Tenant-Id': auth.tenantId,
+        Accept: 'application/json',
+      },
+      signal: controller.signal,
+    })
+    if (res.ok) return { ok: true, status: res.status }
+    return { ok: false, status: res.status, error: (await res.text().catch(() => '')).slice(0, 300) }
+  } catch (e) {
+    return { ok: false, status: 0, error: e instanceof Error ? e.message : String(e) }
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 export type XeroDocKind = 'Invoices' | 'CreditNotes' | 'ManualJournals' | 'PurchaseOrders'
@@ -111,10 +125,11 @@ export type XeroCreditNote = {
   Type: string
   Status: string
   Total: number
+  SubTotal: number
   CurrencyCode: string
   Reference?: string
   LineItems: XeroLine[]
-  Allocations?: Array<{ AllocationID?: string; Amount?: number }>
+  Allocations?: Array<{ AllocationID?: string; Amount?: number; Invoice?: { InvoiceID?: string } }>
 }
 export type XeroJournalLine = { AccountCode: string; Description?: string; LineAmount: number; TaxType?: string }
 export type XeroManualJournal = {
@@ -389,13 +404,39 @@ export async function voidTrackedDocuments(): Promise<{ voided: number; failed: 
   // ("VOIDED cannot be applied … it has payments or credit notes allocated"). PP-05 is the first
   // test to create one, so this is the first teardown that has to undo it. Deleting the allocation
   // from the credit-note side frees both, after which the normal void loop below succeeds.
+  //
+  // Deleting an allocation IRREVERSIBLY mutates a SHARED ledger (the Demo tenant is also stage's),
+  // so the finding was right that registry membership of the credit note alone is too weak — a
+  // stale/mis-mapped external id could name a real note. The guard is PAIR-OWNERSHIP: delete an
+  // allocation only when BOTH ends are ours — the credit note is one WE tracked (we are iterating
+  // the registry) AND the allocation's target invoice is ALSO a tracked test bill. A real note's
+  // allocations land on real bills, which are never in our tracked set, so they are left untouched
+  // (Codex review of PR #495).
+  //
+  // We deliberately do NOT gate on an "E2E-FC" tag in the credit note's Reference: the IMS-generated
+  // return credit note is referenced like "RTN-PO-…", carrying no such prefix, so that check
+  // false-rejected the test's own note. The tracked-target-invoice gate is the real, sufficient
+  // safety and never false-rejects.
+  const trackedInvoiceIds = new Set(
+    (byKind.get('Invoices') ?? []).map((t) => t.id.toLowerCase()),
+  )
   for (const cn of byKind.get('CreditNotes') ?? []) {
     const res = await xeroGet<{ CreditNotes?: XeroCreditNote[] }>(`CreditNotes/${cn.id}`)
-    const allocations = res.ok ? res.data?.CreditNotes?.[0]?.Allocations ?? [] : []
-    for (const a of allocations) {
+    const note = res.ok ? res.data?.CreditNotes?.[0] : undefined
+    if (!note) continue // gone already, or unreadable — the void loop below will report it
+
+    for (const a of note.Allocations ?? []) {
       if (!a.AllocationID) continue
+      // Only touch an allocation that lands on a bill we created and tracked.
+      const targetInvoiceId = a.Invoice?.InvoiceID?.toLowerCase()
+      if (!targetInvoiceId || !trackedInvoiceIds.has(targetInvoiceId)) {
+        failed.push(`CreditNotes/${cn.id} (${cn.label}): allocation ${a.AllocationID} targets untracked invoice ${a.Invoice?.InvoiceID ?? '(unknown)'} — refusing to delete (shared ledger)`)
+        continue
+      }
       const del = await xeroDelete(`CreditNotes/${cn.id}/Allocations/${a.AllocationID}`)
       if (!del.ok) {
+        // Isolated per allocation: one failed DELETE is recorded but must not abort cleanup of the
+        // remaining credit notes, bills, journals and POs below.
         failed.push(`CreditNotes/${cn.id} (${cn.label}): could not remove allocation ${a.AllocationID}: ${del.error ?? del.status}`)
       }
     }
