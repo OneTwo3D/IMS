@@ -7,8 +7,32 @@ import { connectorFetch } from '@/lib/security/connector-fetch'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
 const XERO_MAX_RETRIES = 3
-const XERO_MINUTE_LIMIT = 55
-const XERO_DAY_LIMIT = 4900
+const XERO_MINUTE_LIMIT = 55 // Xero's is 60/min, rolling
+
+/**
+ * Xero's daily cap, minus a small reserve.
+ *
+ * 1,000 calls per organisation per ROLLING 24h — NOT 5,000, and NOT midnight-reset. Xero cut the
+ * free/Starter tier from 5,000 to 1,000 on 2026-03-02; the 4,900 this used to hold was the old
+ * cap's reserve and meant the limiter below could never engage. Xero began 429ing at 1,000 while
+ * waitForBudget still believed 3,900 remained, so the budget was fiction and the first thing that
+ * noticed was a request sleeping on Retry-After (o3d-wgv, o3d-98q).
+ *
+ * Rolling, so this cannot be reasoned about as "today's" spend: calls fall out of the window 24h
+ * after they were made, individually.
+ */
+const XERO_DAY_LIMIT = 950
+
+/**
+ * Longest we will ever sleep on a Retry-After.
+ *
+ * A MINUTE-limit 429 hands back seconds and is worth waiting out. A DAILY-limit 429 hands back
+ * HOURS — parseRetryAfterMs would pass ~86,400,000ms to sleep() and the cron request would hang
+ * until something killed it. Rare at 5,000/day; routine at 1,000. Past this we give up and let
+ * the caller defer the work (the outbox already re-queues with backoff), because a job that
+ * returns is one an operator can see (o3d-2it).
+ */
+const XERO_MAX_RETRY_AFTER_MS = 90_000
 
 const minuteBuckets = new Map<string, number[]>()
 const dayBuckets = new Map<string, number[]>()
@@ -82,8 +106,21 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     if (res.status !== 429) return res
 
     lastRateLimitMs = Math.max(parseRetryAfterMs(res.headers.get('Retry-After')), 1000 * 2 ** attempt)
-    if (attempt === XERO_MAX_RETRIES) {
-      return { ok: false, status: 429, text: async () => `Rate limited after retries; retry after ${lastRateLimitMs}ms` } as Response
+
+    // Give up rather than sleep out a daily limit. Retry-After is measured in seconds for the
+    // minute limit and in HOURS for the daily one; waiting out the latter hangs this request
+    // (and its cron) with nothing to show for it. Hand the 429 back and let the caller defer.
+    if (lastRateLimitMs > XERO_MAX_RETRY_AFTER_MS || attempt === XERO_MAX_RETRIES) {
+      return {
+        ok: false,
+        status: 429,
+        text: async () =>
+          lastRateLimitMs > XERO_MAX_RETRY_AFTER_MS
+            ? `Rate limited; Xero asked for ${Math.round(lastRateLimitMs / 1000)}s which exceeds the ` +
+              `${XERO_MAX_RETRY_AFTER_MS / 1000}s we are willing to block for. This is what the DAILY ` +
+              `cap (1,000 calls/org/rolling-24h) looks like — the work must be deferred, not waited out.`
+            : `Rate limited after retries; retry after ${lastRateLimitMs}ms`,
+      } as Response
     }
 
     await sleep(lastRateLimitMs)
