@@ -208,11 +208,27 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
   return { ok: false, status: 429, text: async () => `Rate limited after retries; retry after ${lastRateLimitMs}ms` } as Response
 }
 
+/**
+ * Format a timestamp for Xero's `If-Modified-Since`.
+ *
+ * Xero documents `yyyy-mm-ddThh:mm:ss` and is fussy about it: the milliseconds and offset a bare
+ * toISOString() emits are the reported cause of the header being silently ignored (XeroAPI/Xero-Java
+ * #166, XeroAPI/xero-ruby #24 — both surface as "the filter does nothing, every record comes back").
+ * Truncating to whole seconds keeps us on the documented shape.
+ *
+ * Dropping the sub-second is deliberately the safe direction: an earlier floor re-returns a record
+ * we have already reconciled, which the callers are idempotent about. Rounding up could skip one.
+ */
+export function formatIfModifiedSince(value: Date | string): string {
+  const date = value instanceof Date ? value : new Date(value)
+  return date.toISOString().slice(0, 19)
+}
+
 async function xeroFetch<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
-  opts?: { idempotencyKey?: string },
+  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
 ): Promise<XeroResponse<T>> {
   const auth = await getAccessToken()
   if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
@@ -226,6 +242,12 @@ async function xeroFetch<T = unknown>(
   }
   if (opts?.idempotencyKey && method !== 'GET') {
     headers['Idempotency-Key'] = opts.idempotencyKey
+  }
+  // The Accounting API's modified-since filter is THIS HEADER. There is no `ModifiedAfter` query
+  // param — the poller passed one for months and Xero, which ignores unknown query params rather
+  // than rejecting them, dropped it on the floor (o3d-5gm). `?since=` is Payroll, not Accounting.
+  if (opts?.ifModifiedSince) {
+    headers['If-Modified-Since'] = formatIfModifiedSince(opts.ifModifiedSince)
   }
 
   const init: RequestInit = { method, headers }
@@ -278,8 +300,11 @@ async function xeroFetch<T = unknown>(
   return { ok: true, status: res.status, data }
 }
 
-export async function xeroGet<T = unknown>(path: string): Promise<XeroResponse<T>> {
-  return xeroFetch<T>('GET', path)
+export async function xeroGet<T = unknown>(
+  path: string,
+  opts?: { ifModifiedSince?: Date | string },
+): Promise<XeroResponse<T>> {
+  return xeroFetch<T>('GET', path, undefined, opts)
 }
 
 export async function xeroPost<T = unknown>(
