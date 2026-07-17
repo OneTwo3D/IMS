@@ -278,46 +278,157 @@ export function expectJournalLine(
 
 // --- teardown ----------------------------------------------------------------
 
+const ID_FIELD = {
+  Invoices: 'InvoiceID',
+  CreditNotes: 'CreditNoteID',
+  ManualJournals: 'ManualJournalID',
+  PurchaseOrders: 'PurchaseOrderID',
+} as const
+
+/**
+ * Kinds that support `GET /{kind}?IDs=a,b,c` — one call for the whole set.
+ *
+ * ManualJournals is deliberately ABSENT: Xero documents the IDs filter for Invoices and
+ * CreditNotes, not for ManualJournals. An unsupported filter is not an error there, it is
+ * IGNORED — the endpoint would cheerfully return page 1 of every journal in the org, and we
+ * would read a stranger's statuses and "void" nothing. Journals therefore keep one read each.
+ */
+const SUPPORTS_IDS_FILTER = new Set(['Invoices', 'CreditNotes'])
+
+/**
+ * Order kinds so a document is never voided before the things attached to it.
+ *
+ * This replaces the old blanket `[...tracked].reverse()`, which got the same effect by accident
+ * of insertion order. A credit note allocated to a bill must go first, or voiding the bill is
+ * rejected while the allocation still points at it. Journals stand alone and can go any time.
+ */
+const VOID_ORDER: ReadonlyArray<string> = ['ManualJournals', 'CreditNotes', 'Invoices', 'PurchaseOrders']
+
+/** Read the current status of every tracked document of one kind, in as few calls as possible. */
+async function statusesFor(kind: string, ids: string[]): Promise<Map<string, string | undefined>> {
+  const out = new Map<string, string | undefined>()
+
+  if (SUPPORTS_IDS_FILTER.has(kind)) {
+    const res = await xeroGet<{ [k: string]: Array<{ Status?: string; [f: string]: unknown }> }>(
+      `${kind}?IDs=${ids.join(',')}`,
+    )
+    if (res.ok) {
+      for (const doc of res.data?.[kind] ?? []) {
+        const id = String(doc[ID_FIELD[kind as keyof typeof ID_FIELD]] ?? '')
+        if (id) out.set(id.toLowerCase(), doc.Status)
+      }
+      // Anything Xero did not return simply has no status; the caller treats that as unreadable
+      // rather than as absent, which is the same conservative behaviour as before.
+      return out
+    }
+    // Fall through to per-document reads: a filter failure must not skip the clean-up entirely.
+  }
+
+  for (const id of ids) {
+    const res = await xeroGet<{ [k: string]: Array<{ Status?: string }> }>(`${kind}/${id}`)
+    out.set(id.toLowerCase(), res.ok ? res.data?.[kind]?.[0]?.Status : undefined)
+  }
+  return out
+}
+
 /**
  * Void/delete everything this run created in Xero.
  *
  * Best-effort per document: one undeletable journal must not strand the rest. Reports
  * what it could not remove instead of failing silently — residue in a SHARED Demo
  * ledger is exactly what breaks the next run's reconciliation assertions.
+ *
+ * BATCHED, because clean-up was the single biggest consumer of a very small budget. It used to
+ * cost TWO calls per document — a GET for the status then a POST to void — so a 15-document run
+ * spent ~30 calls tearing down. Xero's free tier allows 1,000 calls per org per ROLLING 24h
+ * (cut from 5,000 on 2026-03-02), so teardown alone was ~3% of a day's budget per run and the
+ * suite exhausted the org in a day's development (o3d-98q). Reads now go one call per kind where
+ * Xero supports an IDs filter, and every write is a single array POST per kind: ~30 calls becomes
+ * ~6. Xero accepts an array on these endpoints and reports per-document problems inline when
+ * asked not to summarise them.
  */
 export async function voidTrackedDocuments(): Promise<{ voided: number; failed: string[] }> {
   const failed: string[] = []
   let voided = 0
   const tracked = readRegistry()
-  // Reverse order: allocations/payments before the documents they attach to.
-  for (const t of [...tracked].reverse()) {
+
+  const byKind = new Map<string, typeof tracked>()
+  for (const t of tracked) {
+    const list = byKind.get(t.kind) ?? []
+    list.push(t)
+    byKind.set(t.kind, list)
+  }
+
+  const kinds = [...byKind.keys()].sort(
+    (a, b) => (VOID_ORDER.indexOf(a) + 1 || 99) - (VOID_ORDER.indexOf(b) + 1 || 99),
+  )
+
+  for (const kind of kinds) {
+    const docs = byKind.get(kind) ?? []
+    const idField = ID_FIELD[kind as keyof typeof ID_FIELD] ?? 'InvoiceID'
+
     try {
-      // Xero has no DELETE verb here — status transitions are the delete, and which
-      // transition is legal depends on the document's CURRENT state, not just its type.
-      // So READ the state rather than assume it:
-      //   - already VOIDED/DELETED -> nothing to do (re-voiding is an error, and a
-      //     document already out of the ledger is exactly the outcome we want; assuming
-      //     otherwise re-reported a cleaned-up journal as stranded on every later run);
+      const statuses = await statusesFor(kind, docs.map((d) => d.id))
+
+      // Xero has no DELETE verb here — status transitions are the delete, and which transition
+      // is legal depends on the document's CURRENT state, not just its type:
+      //   - already VOIDED/DELETED -> nothing to do (re-voiding is an error, and a document
+      //     already out of the ledger is exactly the outcome we want; assuming otherwise
+      //     re-reported a cleaned-up journal as stranded on every later run);
       //   - a POSTED manual journal -> VOIDED ("The status 'DELETED' cannot be applied");
       //   - a DRAFT manual journal   -> DELETED.
-      // Hardcoding DELETED for journals was invisible while journals never posted; the
-      // moment PP-01 got one POSTED it stranded in the Demo ledger.
-      const idField = t.kind === 'Invoices' ? 'InvoiceID' : t.kind === 'CreditNotes' ? 'CreditNoteID' : 'ManualJournalID'
-      const current = await xeroGet<{ [k: string]: Array<{ Status?: string }> }>(`${t.kind}/${t.id}`)
-      const status = current.ok ? current.data?.[t.kind]?.[0]?.Status : undefined
+      // Hardcoding DELETED for journals was invisible while journals never posted; the moment
+      // PP-01 got one POSTED it stranded in the Demo ledger.
+      const payload: Array<Record<string, string>> = []
+      for (const d of docs) {
+        const status = statuses.get(d.id.toLowerCase())
+        if (status === 'VOIDED' || status === 'DELETED') {
+          voided++ // already gone from the ledger
+          continue
+        }
+        payload.push({
+          [idField]: d.id,
+          Status: kind === 'ManualJournals' && status === 'DRAFT' ? 'DELETED' : 'VOIDED',
+        })
+      }
+      if (!payload.length) continue
 
-      if (status === 'VOIDED' || status === 'DELETED') {
-        voided++ // already gone from the ledger
-      } else {
-        const target = t.kind === 'ManualJournals' && status === 'DRAFT' ? 'DELETED' : 'VOIDED'
-        const res = await xeroPost(`${t.kind}/${t.id}`, { [idField]: t.id, Status: target })
-        if (!res.ok) throw new Error(`${res.error ?? 'unknown error'} (document status was ${status ?? 'unreadable'})`)
-        voided++
+      // summarizeErrors=false: report per-document problems instead of rejecting the whole
+      // array on the first bad one. Without it a single undeletable document would strand every
+      // other document in the batch — the exact failure the per-document loop existed to avoid.
+      const res = await xeroPost(`${kind}?summarizeErrors=false`, { [kind]: payload })
+      if (!res.ok) {
+        for (const p of payload) {
+          const d = docs.find((x) => x.id === p[idField])
+          failed.push(`${kind}/${p[idField]} (${d?.label ?? '?'}): ${res.error ?? 'unknown error'}`)
+        }
+        continue
+      }
+
+      // Trust the ledger, not the HTTP status: with summarizeErrors=false a 200 can still carry
+      // documents that were rejected, each with its own ValidationErrors.
+      const returned = (res.data as { [k: string]: Array<Record<string, unknown>> } | undefined)?.[kind] ?? []
+      for (const p of payload) {
+        const d = docs.find((x) => x.id === p[idField])
+        const back = returned.find((r) => String(r[idField] ?? '').toLowerCase() === p[idField].toLowerCase())
+        const errs = (back?.ValidationErrors as Array<{ Message?: string }> | undefined) ?? []
+        if (errs.length) {
+          failed.push(`${kind}/${p[idField]} (${d?.label ?? '?'}): ${errs.map((e) => e.Message).join('; ')}`)
+        } else if (back?.Status === p.Status || back?.Status === 'VOIDED' || back?.Status === 'DELETED') {
+          voided++
+        } else {
+          failed.push(
+            `${kind}/${p[idField]} (${d?.label ?? '?'}): asked for ${p.Status}, ledger says ${String(back?.Status ?? 'nothing')}`,
+          )
+        }
       }
     } catch (e) {
-      failed.push(`${t.kind}/${t.id} (${t.label}): ${e instanceof Error ? e.message : e}`)
+      for (const d of docs) {
+        failed.push(`${kind}/${d.id} (${d.label}): ${e instanceof Error ? e.message : e}`)
+      }
     }
   }
+
   // Keep anything we could NOT void, so a later attempt still knows about it; drop the
   // rest. Forgetting a document we failed to void would strand it silently.
   writeRegistry(tracked.filter((t) => failed.some((f) => f.includes(t.id))))
