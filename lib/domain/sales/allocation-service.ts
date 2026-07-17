@@ -717,10 +717,16 @@ export async function allocateSalesOrder(
     // and flipping it to ALLOCATED — would silently un-cancel it. This is the window the payment
     // reconcile/poller can hit: they advance PENDING_PAYMENT→PROCESSING under a guarded write, then
     // call allocation separately, and a human cancel in between must win (o3d-2s8, Codex review #496).
-    const locked = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+    const locked = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true, refundStatus: true } })
     const lockedStatus = locked?.status ?? so.status
     if (lockedStatus === 'CANCELLED') {
       return { nextAllocations: [], syncProductIds: [], refused: true as const, refusedReason: 'cancelled' as const }
+    }
+    // A fully-refunded order must not be allocated — the money has gone back. Re-read under the lock
+    // so a full refund committing after the payment path advanced the order (poller/reconcile) cannot
+    // slip a refunded order into fulfilment (Codex review #496 round 6).
+    if (locked?.refundStatus === 'FULL') {
+      return { nextAllocations: [], syncProductIds: [], refused: true as const, refusedReason: 'refunded' as const }
     }
     // ON_HOLD is deliberately NOT refused: the state machine permits ON_HOLD→ALLOCATED, so a held
     // order can be allocated by design. What must not happen is RESUMING a held order to ALLOCATED off
@@ -974,7 +980,9 @@ export async function allocateSalesOrder(
       success: false,
       error: allocationResult.refusedReason === 'cancelled'
         ? 'Order was cancelled; allocation refused'
-        : 'Order has existing shipments; reallocation refused',
+        : allocationResult.refusedReason === 'refunded'
+          ? 'Order was fully refunded; allocation refused'
+          : 'Order has existing shipments; reallocation refused',
       syncProductIds: [],
       allocationCount: 0,
       unallocatedLines: [],

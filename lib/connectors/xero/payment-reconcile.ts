@@ -265,10 +265,11 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
         if (paid.count === 0) {
           return { applied: false, reason: 'already paid concurrently, or fully refunded since selection' }
         }
-        // Advance ONLY if still PENDING_PAYMENT, atomically; allocate only when that transition took,
-        // so a concurrent cancel/hold is never overwritten.
+        // Advance ONLY if still PENDING_PAYMENT, atomically, re-checking the refund invariant here too
+        // (a full refund can commit between the two writes). Allocate only when that transition took,
+        // so a concurrent cancel/hold/refund is never overwritten.
         const advanced = await db.salesOrder.updateMany({
-          where: { id: doc.id, status: 'PENDING_PAYMENT' },
+          where: { id: doc.id, status: 'PENDING_PAYMENT', paidAt: { not: null }, refundStatus: { not: 'FULL' } },
           data: { status: 'PROCESSING' },
         })
         if (advanced.count === 1) {

@@ -162,10 +162,12 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       if (paid.count === 0) continue // already paid, or fully refunded since selection — nothing to do
 
       // 2) Advance the lifecycle ONLY if it is still waiting for payment, as an atomic conditional
-      //    transition. Allocation follows only when that transition actually happened, so a
-      //    concurrent cancel/hold/advance is never overwritten and a held/cancelled order is untouched.
+      //    transition. The refund invariant is re-checked HERE too, not just on the payment write: a
+      //    full refund can commit between the two writes (leaving status PENDING_PAYMENT), and
+      //    advancing + allocating a fully-refunded order violates the invariant. Allocation follows
+      //    only when the transition took, so a concurrent cancel/hold/refund is never overwritten.
       const advanced = await db.salesOrder.updateMany({
-        where: { id: order.id, status: 'PENDING_PAYMENT' },
+        where: { id: order.id, status: 'PENDING_PAYMENT', paidAt: { not: null }, refundStatus: { not: 'FULL' } },
         data: { status: 'PROCESSING' },
       })
       if (advanced.count === 1) {

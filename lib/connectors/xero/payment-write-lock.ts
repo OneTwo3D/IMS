@@ -54,18 +54,29 @@ export async function withPaymentWriteLockOrSkip<T>(fn: () => Promise<T>): Promi
     held = true
     return await fn()
   } finally {
+    // The connection MUST always go back — and if we cannot cleanly release the lock, it must be
+    // DESTROYED, not returned to the pool still holding a session-level advisory lock (that would
+    // wedge every future poll indefinitely). A thrown unlock must not skip the release either, so the
+    // release lives in its own path guarded by `destroyed` (Codex review #496 round 6).
+    let destroyed = false
     if (held) {
-      // Same connection that acquired it, so this genuinely releases. Verify, because a silent
-      // false here would mean a leaked lock that wedges every subsequent poll.
-      const released = await client.query<{ unlocked: boolean }>(
-        'SELECT pg_advisory_unlock($1) AS unlocked',
-        [PAYMENT_WRITE_LOCK_KEY],
-      )
-      if (!released.rows[0]?.unlocked) {
-        console.error('[payment-write-lock] advisory unlock returned false — the lock may be leaked')
+      try {
+        const released = await client.query<{ unlocked: boolean }>(
+          'SELECT pg_advisory_unlock($1) AS unlocked',
+          [PAYMENT_WRITE_LOCK_KEY],
+        )
+        if (!released.rows[0]?.unlocked) {
+          console.error('[payment-write-lock] advisory unlock returned false — destroying the connection to force release')
+          client.release(true)
+          destroyed = true
+        }
+      } catch (e) {
+        console.error('[payment-write-lock] advisory unlock threw — destroying the connection to force release', e)
+        client.release(true) // destroying the physical connection makes PostgreSQL drop its session locks
+        destroyed = true
       }
     }
-    client.release()
+    if (!destroyed) client.release()
   }
 }
 
