@@ -322,6 +322,32 @@ If a poll ever reports *"Refusing to truncate"* in the activity log, more than 2
 changed in one window (usually a bulk operation in Xero). Nothing is lost: the cursor is held and
 the poll retries. If it persists, the cursor is probably stuck far in the past.
 
+### Payment Reconciliation (backlog sweep)
+
+Payment polling only ever looks at invoices Xero reports as **changed since the last poll**. That
+leaves two things it structurally cannot catch: an invoice paid long ago and never touched since, and
+an invoice Xero marked paid *before* the IMS had recorded its link. A separate **daily** job closes
+both gaps by working from the other direction — it starts from every IMS document that carries a Xero
+invoice id and asks Xero each one's current status directly.
+
+By default it is **report-only**: it records what it found in the activity log without changing
+anything. Two things surface:
+
+- **Missed payments** — the invoice is PAID in Xero but the order/bill is still unpaid in the IMS.
+- **Suspect advances** — the IMS treats a document as paid (or has moved an order on as if it were),
+  but Xero says its invoice is not actually paid. These are flagged for a person to review and are
+  **never** changed automatically, because a genuine later reversal looks the same and only a human
+  can tell them apart.
+
+To have the sweep also **collect** the missed payments (mark them paid, advance and allocate the
+order exactly as the poll would), set **`xero_payment_reconcile_apply`** to `true`. Leave it off
+until you have reviewed a report or two. You can also run it on demand:
+
+```bash
+npx tsx --env-file=.env scripts/reconcile-xero-payments.ts           # report only
+npx tsx --env-file=.env scripts/reconcile-xero-payments.ts --apply   # collect missed payments too
+```
+
 ### Purchase Bill Edits
 
 Unpaid purchase bills can be edited from the purchase order detail page. IMS updates the local
@@ -440,6 +466,7 @@ Group B of the daily batch consumes FIFO (First In, First Out) cost layers when 
 | `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals) |
 | `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
+| `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |
 | `/api/cron/accounting-fx-revaluation` | Daily | Periodic unrealised FX revaluation of open AR/AP balances |
 | `/api/cron/account-balance-snapshot` | Daily | Snapshot Xero account balances for period reporting |
 

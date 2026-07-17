@@ -42,6 +42,16 @@ registerCronJobs([
     defaultEnabled: true,
   },
   {
+    slug: 'accounting-payment-reconcile',
+    settingKey: 'xero_payment_reconcile',
+    module: 'accounting',
+    moduleLabel: 'Accounting',
+    label: 'Accounting Payment Reconcile',
+    description: 'Slow-cadence backlog sweep: checks every locally-linked invoice/bill against its current Xero status by id, catching payments the modified-since payment poll structurally cannot see. Report-only until xero_payment_reconcile_apply is set to true.',
+    defaultSchedule: '0 3 * * *',
+    defaultEnabled: true,
+  },
+  {
     slug: 'xero-tax-rate-drift',
     settingKey: 'xero_tax_rate_drift',
     module: 'accounting',
