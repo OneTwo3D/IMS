@@ -29,6 +29,7 @@ import { notify } from '@/lib/notifications'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { detectPaymentReversals } from '@/lib/domain/accounting/payment-reversal'
 import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
+import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
 import {
   CURSOR_OVERLAP_MS,
@@ -61,7 +62,23 @@ async function notifyReversalAdmins(order: DetectedReversalOrder, wcHandled: boo
   )
 }
 
-export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[] }> {
+type PollResult = { salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[]; skipped?: string }
+
+/**
+ * Serialized with the daily backlog reconcile (o3d-2s8): both write paidAt from a Xero read, so they
+ * must not interleave, or one could act on a state the other has already invalidated. If the reconcile
+ * holds the write lock, this poll cycle skips and retries in 15 minutes — a skipped cycle is harmless
+ * (the next one catches up), whereas a concurrent write is not.
+ */
+export async function pollXeroPayments(): Promise<PollResult> {
+  const outcome = await withPaymentWriteLockOrSkip(() => pollXeroPaymentsLocked())
+  if (isLockSkipped(outcome)) {
+    return { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [], skipped: 'backlog reconcile held the payment-write lock' }
+  }
+  return outcome
+}
+
+async function pollXeroPaymentsLocked(): Promise<PollResult> {
   const result = { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [] as string[] }
 
   // Read last poll timestamp. Parsed defensively: the cursor is a free-text Setting, and an
@@ -131,16 +148,29 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
       const paidInvoice = order.accountingInvoiceId ? invoiceById.get(order.accountingInvoiceId) : undefined
       const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
 
-      // Update paidAt and advance status if still PENDING_PAYMENT
-      const updateData: Record<string, unknown> = { paidAt: paidDate }
-      if (order.status === 'PENDING_PAYMENT') {
-        updateData.status = 'PROCESSING'
-      }
+      // TWO independent guarded writes, not one, so a concurrent lifecycle move can neither drop the
+      // payment nor be overwritten (o3d-2s8, Codex review of #496).
+      //
+      // 1) Record the payment. Guarded on the SAME invariants the candidate query used (still unpaid,
+      //    not fully refunded), re-checked at WRITE time — a full refund committing after selection
+      //    must not be revived, and this captures the payment regardless of any status change, so a
+      //    concurrent PENDING_PAYMENT→ON_HOLD/PROCESSING cannot make us silently lose a real payment.
+      const paid = await db.salesOrder.updateMany({
+        where: { id: order.id, paidAt: null, refundStatus: { not: 'FULL' } },
+        data: { paidAt: paidDate },
+      })
+      if (paid.count === 0) continue // already paid, or fully refunded since selection — nothing to do
 
-      await db.salesOrder.update({ where: { id: order.id }, data: updateData })
-
-      // Auto-allocate if status was just advanced
-      if (order.status === 'PENDING_PAYMENT') {
+      // 2) Advance the lifecycle ONLY if it is still waiting for payment, as an atomic conditional
+      //    transition. The refund invariant is re-checked HERE too, not just on the payment write: a
+      //    full refund can commit between the two writes (leaving status PENDING_PAYMENT), and
+      //    advancing + allocating a fully-refunded order violates the invariant. Allocation follows
+      //    only when the transition took, so a concurrent cancel/hold/refund is never overwritten.
+      const advanced = await db.salesOrder.updateMany({
+        where: { id: order.id, status: 'PENDING_PAYMENT', paidAt: { not: null }, refundStatus: { not: 'FULL' } },
+        data: { status: 'PROCESSING' },
+      })
+      if (advanced.count === 1) {
         try {
           const { autoAllocateOrder } = await import('@/app/actions/allocation')
           await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })

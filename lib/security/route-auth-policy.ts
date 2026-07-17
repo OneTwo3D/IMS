@@ -110,6 +110,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/accounting-payment-reconcile': {
+    access: 'cron-secret',
+    reason: 'Cron endpoint guarded by verifyCron.',
+  },
   '/api/cron/accounting-sync': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',

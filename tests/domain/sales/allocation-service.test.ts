@@ -51,6 +51,7 @@ type OrderRow = {
   externalOrderNumber: string | null
   shoppingLinks: Array<{ id: string }>
   status: string
+  refundStatus?: string | null
   shipFromWarehouseId: string | null
   inventoryAllocatedDate?: Date | null
   lines: OrderLineRow[]
@@ -825,4 +826,90 @@ test('updateSalesOrderStatusUnderLock refuses PICKING when allocations disappear
     /Cannot start picking/,
   )
   assert.equal(state.order.status, 'ALLOCATED')
+})
+
+// --- concurrency: the payment path can advance an order that is then cancelled/held before the
+// allocation row lock. The under-lock status must decide, not the stale pre-lock read (o3d-2s8). ---
+
+/** Model a concurrent status change that committed between the pre-lock read and the row lock: the
+ *  order's REAL (stored) status is already the new value, but the pre-lock `so` read (many-field
+ *  select) still returns the stale value. The under-lock read (select: { status }) stays truthful. If
+ *  the fix works, decisions use the real status, not the stale one. */
+function withStalePreLockStatus(state: MemoryState, staleStatus: string): AllocationServiceClient {
+  const client = createClient(state) as unknown as {
+    salesOrder: { findUnique: (a: { select?: Record<string, unknown> }) => Promise<{ status: string } | null> }
+  }
+  const real = client.salesOrder.findUnique
+  client.salesOrder.findUnique = async (args) => {
+    const row = await real(args)
+    if (!row) return row
+    const sel = args?.select ?? {}
+    // Only the big pre-lock `so` read is stale. The under-lock read selects status (+refundStatus)
+    // and the reset read selects inventoryAllocatedDate; leave both truthful.
+    const isUnderLockRead = 'status' in sel && !('lines' in sel)
+    const isResetRead = 'inventoryAllocatedDate' in sel
+    if (!isUnderLockRead && !isResetRead) row.status = staleStatus
+    return row
+  }
+  return client as unknown as AllocationServiceClient
+}
+
+test('allocateSalesOrder on a CANCELLED order deallocates (releases, no reserve, stays CANCELLED)', async () => {
+  // A cancelled order must hold no reservations. Allocation becomes pure deallocation — NOT a refusal
+  // that would strand its existing allocations.
+  const state = baseState({
+    order: { ...baseState().order, status: 'CANCELLED' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+  })
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(state.allocations, [], 'existing allocations released and deleted')
+  assert.equal(state.stockLevels[0].reservedQty, 0, 'reservations released')
+  assert.equal(state.order.status, 'CANCELLED', 'not resumed to ALLOCATED')
+})
+
+test('allocateSalesOrder does NOT resume a held order (PROCESSING→ON_HOLD committed before the lock)', async () => {
+  // Real status is ON_HOLD; the stale pre-lock read still says PROCESSING. Off the stale value the
+  // code would promote to ALLOCATED — the fix uses the under-lock ON_HOLD and does not.
+  const state = baseState({ order: { ...baseState().order, status: 'ON_HOLD' } })
+  const client = withStalePreLockStatus(state, 'PROCESSING')
+
+  await allocateSalesOrder(client, { orderId: 'order-1' })
+
+  assert.equal(state.stockLevels[0].reservedQty, 3, 'stock still reserved for the held order')
+  assert.equal(state.order.status, 'ON_HOLD', 'a held order is NOT promoted to ALLOCATED off stale status')
+})
+
+test('allocateSalesOrder cancelled before the lock is a clean deallocation, not a stale resume', async () => {
+  // Real status is CANCELLED; the stale pre-lock read says PROCESSING.
+  const state = baseState({
+    order: { ...baseState().order, status: 'CANCELLED' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+  })
+  const client = withStalePreLockStatus(state, 'PROCESSING')
+
+  await allocateSalesOrder(client, { orderId: 'order-1' })
+
+  assert.deepEqual(state.allocations, [], 'released and deleted, not re-reserved')
+  assert.equal(state.stockLevels[0].reservedQty, 0)
+  assert.equal(state.order.status, 'CANCELLED', 'not resumed to ALLOCATED off the stale PROCESSING read')
+})
+
+test('allocateSalesOrder on a fully-refunded order (refundStatus=FULL) deallocates, even at full monetary refund with non-zero line qty', async () => {
+  // FULL is a MONETARY classification: a full-value refund can leave product quantities unrefunded
+  // (amount-only/shipping refund). Line demand would be non-zero, but the order must hold no
+  // reservations — so FULL is zero-demand under the lock, not a re-reservation.
+  const state = baseState({
+    order: { ...baseState().order, status: 'PROCESSING', refundStatus: 'FULL' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+    // No refundLines — models a full monetary refund that did NOT refund product quantity.
+  })
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(state.allocations, [], 'reservations released and allocations deleted')
+  assert.equal(state.stockLevels[0].reservedQty, 0, 'no stock reserved for a fully-refunded order')
+  assert.notEqual(state.order.status, 'ALLOCATED', 'a fully-refunded order is not promoted/fulfilled')
 })
