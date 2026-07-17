@@ -64,15 +64,28 @@ async function notifyReversalAdmins(order: DetectedReversalOrder, wcHandled: boo
 export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[] }> {
   const result = { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [] as string[] }
 
-  // Read last poll timestamp
+  // Read last poll timestamp. Parsed defensively: the cursor is a free-text Setting, and an
+  // unparseable one (hand-edited, truncated) would otherwise reach toISOString() and throw
+  // RangeError straight out of here — the cron route does not wrap this call, so that is a 500
+  // rather than a recorded error. Falling back to the same 24h default as a missing cursor keeps a
+  // corrupt value degrading instead of breaking.
   const lastPollSetting = await db.setting.findUnique({ where: { key: 'xero_last_payment_poll' } })
-  const lastPoll = lastPollSetting?.value || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+  const defaultLastPoll = new Date(Date.now() - 24 * 60 * 60 * 1000)
+  const parsedLastPoll = lastPollSetting?.value ? new Date(lastPollSetting.value) : defaultLastPoll
+  const lastPollDate = Number.isFinite(parsedLastPoll.getTime()) ? parsedLastPoll : defaultLastPoll
+  if (lastPollDate !== parsedLastPoll) {
+    console.warn(
+      `[xero] xero_last_payment_poll is not a readable date (${JSON.stringify(lastPollSetting?.value)}); ` +
+      `falling back to the last 24h.`,
+    )
+  }
+  const lastPoll = lastPollDate.toISOString()
 
   // Stamped BEFORE the fetch, not after the passes: anything modified while this poll is running
   // must fall inside the NEXT window, not be skipped by a cursor set to the time we happened to
   // finish. Paired with CURSOR_OVERLAP_MS below.
   const pollStartedAt = new Date()
-  const since = new Date(new Date(lastPoll).getTime() - CURSOR_OVERLAP_MS)
+  const since = new Date(lastPollDate.getTime() - CURSOR_OVERLAP_MS)
 
   // --- One delta fetch for all four passes ---
   const fetched = await fetchInvoicesModifiedSince(since, (path, opts) =>
