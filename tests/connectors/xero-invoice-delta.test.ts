@@ -79,7 +79,8 @@ test('an exactly-full page is followed — this is the truncation bug that misse
 test('paging stops at MAX_PAGES and FAILS rather than silently truncating', async () => {
   // Every page full forever. Returning ok:true here would advance the cursor past invoices we never
   // read — exactly the silent data loss this whole change exists to remove.
-  const get: InvoiceFetcher = async () => ({ ok: true, status: 200, data: { Invoices: fullPage('x') } })
+  let n = 0
+  const get: InvoiceFetcher = async () => ({ ok: true, status: 200, data: { Invoices: fullPage(`x${n++}`) } })
 
   const res = await fetchInvoicesModifiedSince(SINCE, get)
 
@@ -87,16 +88,59 @@ test('paging stops at MAX_PAGES and FAILS rather than silently truncating', asyn
   assert.match(res.ok === false ? res.error : '', /Refusing to truncate/)
 })
 
-test('MAX_PAGES is not exceeded', async () => {
+test('paging never runs away past the sentinel', async () => {
   let calls = 0
   const get: InvoiceFetcher = async () => {
     calls++
-    return { ok: true, status: 200, data: { Invoices: fullPage('x') } }
+    return { ok: true, status: 200, data: { Invoices: fullPage(`x${calls}`) } }
   }
 
   await fetchInvoicesModifiedSince(SINCE, get)
 
-  assert.equal(calls, MAX_PAGES)
+  assert.equal(calls, MAX_PAGES + 1)
+})
+
+test('EXACTLY MAX_PAGES*PAGE_SIZE records is a success, not an overflow', async () => {
+  // The boundary Codex caught: stopping at MAX_PAGES full pages cannot tell "precisely 2,000" from
+  // "more than 2,000". Calling the first an overflow stalls a poll that had actually just finished.
+  let calls = 0
+  const get: InvoiceFetcher = async () => {
+    calls++
+    return calls <= MAX_PAGES
+      ? { ok: true, status: 200, data: { Invoices: fullPage(`p${calls}`) } }
+      : { ok: true, status: 200, data: { Invoices: [] } } // sentinel: nothing beyond
+  }
+
+  const res = await fetchInvoicesModifiedSince(SINCE, get)
+
+  assert.equal(res.ok, true, 'exactly the cap is a complete answer')
+  assert.equal(res.ok && res.invoices.length, MAX_PAGES * PAGE_SIZE)
+  assert.equal(calls, MAX_PAGES + 1, 'one sentinel request settles it')
+})
+
+test('pages are requested newest-first', async () => {
+  // Not cosmetic: under Xero's default ASC an invoice edited mid-walk shifts an UNTOUCHED record
+  // into a page already read, and that record's UpdatedDateUTC is too old for the next window to
+  // catch it. DESC can only ever shift records toward pages not yet read.
+  const { get, calls } = pagedFetcher([[inv('a', 'ACCREC', 'PAID')]])
+
+  await fetchInvoicesModifiedSince(SINCE, get)
+
+  assert.match(calls[0], /order=UpdatedDateUTC(%20|\+)DESC/)
+})
+
+test('an invoice returned on two pages is not duplicated, and the freshest status wins', async () => {
+  // Paging a live set newest-first can re-hand a record that was edited mid-walk.
+  const page1 = [...fullPage('p1').slice(0, 99), inv('dup', 'ACCREC', 'PAID')]
+  const page2 = [inv('dup', 'ACCREC', 'VOIDED'), inv('other', 'ACCREC', 'PAID')]
+  const { get } = pagedFetcher([page1, page2])
+
+  const res = await fetchInvoicesModifiedSince(SINCE, get)
+
+  assert.equal(res.ok, true)
+  const dups = res.ok ? res.invoices.filter((i) => i.InvoiceID === 'dup') : []
+  assert.equal(dups.length, 1, 'the same invoice must appear once')
+  assert.equal(dups[0].Status, 'VOIDED', 'the later page is the fresher read')
 })
 
 test('an API error propagates and stops paging', async () => {

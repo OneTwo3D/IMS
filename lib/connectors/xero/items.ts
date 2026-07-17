@@ -41,16 +41,27 @@ async function getStoredItemId(code: string): Promise<string | null> {
 /**
  * Remember the item id for this SKU.
  *
- * updateMany, not update: a code that matches no product must be a silent no-op rather than a
- * throw (callers may pass a pseudo-item code that is not a catalogue product). The catch covers a
- * unique-index race — losing the cache entry only costs one lookup next time.
+ * updateMany, not update: a code that matches no product must be a silent no-op rather than a throw
+ * (callers may pass a pseudo-item code that is not a catalogue product).
+ *
+ * Never fatal — failing to CACHE an id must not fail an invoice that Xero already accepted — but not
+ * silent either. A caching layer that quietly stops caching looks exactly like one that works, right
+ * up until the daily call budget is gone; that invisibility is the whole reason this column exists.
+ * So swallow the failure and say so.
  */
 async function storeItemId(code: string, itemId: string): Promise<void> {
   if (!itemId) return
-  await db.product.updateMany({
-    where: { sku: code },
-    data: { accountingItemId: itemId },
-  }).catch(() => {})
+  try {
+    await db.product.updateMany({
+      where: { sku: code },
+      data: { accountingItemId: itemId },
+    })
+  } catch (e) {
+    console.warn(
+      `[xero] could not cache item id ${itemId} for SKU ${code}; the invoice is unaffected but this ` +
+      `SKU will cost a lookup on every future invoice until it succeeds: ${String(e)}`,
+    )
+  }
 }
 
 /**

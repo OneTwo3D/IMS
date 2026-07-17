@@ -43,15 +43,25 @@ async function getStoredItemId(code: string): Promise<string | null> {
  * Remember the item id for this code.
  *
  * updateMany, not update: 'Shipping' (invoices.ts) is a real caller and is not a catalogue product,
- * so a no-match must be a silent no-op. The catch covers the unique-index race — losing the entry
- * only costs one lookup next time.
+ * so a no-match must be a silent no-op.
+ *
+ * Never fatal — failing to CACHE an id must not fail an invoice QuickBooks already accepted — but
+ * not silent either: a caching layer that quietly stops caching is indistinguishable from a working
+ * one until the call budget is gone.
  */
 async function storeItemId(code: string, itemId: string): Promise<void> {
   if (!itemId) return
-  await db.product.updateMany({
-    where: { sku: code },
-    data: { accountingItemId: itemId },
-  }).catch(() => {})
+  try {
+    await db.product.updateMany({
+      where: { sku: code },
+      data: { accountingItemId: itemId },
+    })
+  } catch (e) {
+    console.warn(
+      `[quickbooks] could not cache item id ${itemId} for SKU ${code}; the invoice is unaffected but ` +
+      `this SKU will cost a lookup on every future invoice until it succeeds: ${String(e)}`,
+    )
+  }
 }
 
 /**
