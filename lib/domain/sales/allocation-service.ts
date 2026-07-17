@@ -717,10 +717,15 @@ export async function allocateSalesOrder(
     // and flipping it to ALLOCATED — would silently un-cancel it. This is the window the payment
     // reconcile/poller can hit: they advance PENDING_PAYMENT→PROCESSING under a guarded write, then
     // call allocation separately, and a human cancel in between must win (o3d-2s8, Codex review #496).
-    const lockedStatus = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
-    if (lockedStatus?.status === 'CANCELLED') {
+    const locked = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+    const lockedStatus = locked?.status ?? so.status
+    if (lockedStatus === 'CANCELLED') {
       return { nextAllocations: [], syncProductIds: [], refused: true as const, refusedReason: 'cancelled' as const }
     }
+    // ON_HOLD is deliberately NOT refused: the state machine permits ON_HOLD→ALLOCATED, so a held
+    // order can be allocated by design. What must not happen is RESUMING a held order to ALLOCATED off
+    // a STALE status — that is handled below by deciding the transition on `lockedStatus`, not the
+    // pre-lock `so.status` (Codex review #496).
 
     if (input.refuseIfShipmentsExist) {
       const shipmentExists = await tx.shipment.findFirst({
@@ -889,8 +894,11 @@ export async function allocateSalesOrder(
       'reserve',
     )
 
-    if (nextAllocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(so.status)) {
-      const transition = validateSalesOrderStatusTransition(so.status, 'ALLOCATED')
+    // Decide the ALLOCATED transition on the UNDER-LOCK status, not the stale pre-lock so.status: the
+    // order may have moved (e.g. →ON_HOLD) since it was read for warehouse selection, and writing
+    // ALLOCATED off the stale value would resume a paused order (Codex review #496).
+    if (nextAllocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(lockedStatus)) {
+      const transition = validateSalesOrderStatusTransition(lockedStatus, 'ALLOCATED')
       if (!transition.success) throw new Error(transition.error)
       await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
     }

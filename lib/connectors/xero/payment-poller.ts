@@ -148,25 +148,27 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       const paidInvoice = order.accountingInvoiceId ? invoiceById.get(order.accountingInvoiceId) : undefined
       const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
 
-      // The status test goes INTO the write predicate, not just the read: status was read in the
-      // findMany above, and a cancellation can commit before this write. An unconditional update
-      // would flip CANCELLED back to PROCESSING and then allocate — un-cancelling the order. Requiring
-      // status='PENDING_PAYMENT' makes the advance an atomic conditional transition; if the order
-      // moved on, count is 0 and we advance/allocate nothing (o3d-2s8, Codex review of #496).
-      const advancing = order.status === 'PENDING_PAYMENT'
-      const updated = advancing
-        ? await db.salesOrder.updateMany({
-            where: { id: order.id, paidAt: null, status: 'PENDING_PAYMENT' },
-            data: { paidAt: paidDate, status: 'PROCESSING' },
-          })
-        : await db.salesOrder.updateMany({
-            where: { id: order.id, paidAt: null },
-            data: { paidAt: paidDate },
-          })
-      if (updated.count === 0) continue // cancelled or already paid concurrently — nothing to do
+      // TWO independent guarded writes, not one, so a concurrent lifecycle move can neither drop the
+      // payment nor be overwritten (o3d-2s8, Codex review of #496).
+      //
+      // 1) Record the payment. Guarded on the SAME invariants the candidate query used (still unpaid,
+      //    not fully refunded), re-checked at WRITE time — a full refund committing after selection
+      //    must not be revived, and this captures the payment regardless of any status change, so a
+      //    concurrent PENDING_PAYMENT→ON_HOLD/PROCESSING cannot make us silently lose a real payment.
+      const paid = await db.salesOrder.updateMany({
+        where: { id: order.id, paidAt: null, refundStatus: { not: 'FULL' } },
+        data: { paidAt: paidDate },
+      })
+      if (paid.count === 0) continue // already paid, or fully refunded since selection — nothing to do
 
-      // Auto-allocate only when the guarded PENDING_PAYMENT→PROCESSING transition actually happened.
-      if (advancing) {
+      // 2) Advance the lifecycle ONLY if it is still waiting for payment, as an atomic conditional
+      //    transition. Allocation follows only when that transition actually happened, so a
+      //    concurrent cancel/hold/advance is never overwritten and a held/cancelled order is untouched.
+      const advanced = await db.salesOrder.updateMany({
+        where: { id: order.id, status: 'PENDING_PAYMENT' },
+        data: { status: 'PROCESSING' },
+      })
+      if (advanced.count === 1) {
         try {
           const { autoAllocateOrder } = await import('@/app/actions/allocation')
           await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
