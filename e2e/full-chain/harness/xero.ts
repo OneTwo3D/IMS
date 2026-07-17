@@ -15,6 +15,30 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { Client } from 'pg'
 import { xeroGet, xeroPost } from '../../../lib/connectors/xero/api.ts'
+import { getAccessToken } from '../../../lib/connectors/xero/auth.ts'
+
+const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
+
+/**
+ * Authenticated DELETE against Xero. The production client (api.ts) only speaks GET/POST/PUT
+ * because the app never deletes anything; teardown does — an allocation has to be removed with a
+ * real DELETE before its credit note or bill can be voided. Kept here, in test-only cleanup code,
+ * rather than widening the production client's verb surface for a need only the harness has.
+ */
+async function xeroDelete(path: string): Promise<{ ok: boolean; status: number; error?: string }> {
+  const auth = await getAccessToken()
+  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  const res = await fetch(`${XERO_BASE_URL}/${path}`, {
+    method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${auth.accessToken}`,
+      'Xero-Tenant-Id': auth.tenantId,
+      Accept: 'application/json',
+    },
+  })
+  if (res.ok) return { ok: true, status: res.status }
+  return { ok: false, status: res.status, error: (await res.text().catch(() => '')).slice(0, 300) }
+}
 
 export type XeroDocKind = 'Invoices' | 'CreditNotes' | 'ManualJournals' | 'PurchaseOrders'
 
@@ -90,6 +114,7 @@ export type XeroCreditNote = {
   CurrencyCode: string
   Reference?: string
   LineItems: XeroLine[]
+  Allocations?: Array<{ AllocationID?: string; Amount?: number }>
 }
 export type XeroJournalLine = { AccountCode: string; Description?: string; LineAmount: number; TaxType?: string }
 export type XeroManualJournal = {
@@ -357,6 +382,23 @@ export async function voidTrackedDocuments(): Promise<{ voided: number; failed: 
     const list = byKind.get(t.kind) ?? []
     list.push(t)
     byKind.set(t.kind, list)
+  }
+
+  // Un-allocate before voiding. An allocation locks BOTH ends: Xero refuses to void a credit note
+  // "as it has a payment or credit note allocated to it" and equally refuses the bill it lands on
+  // ("VOIDED cannot be applied … it has payments or credit notes allocated"). PP-05 is the first
+  // test to create one, so this is the first teardown that has to undo it. Deleting the allocation
+  // from the credit-note side frees both, after which the normal void loop below succeeds.
+  for (const cn of byKind.get('CreditNotes') ?? []) {
+    const res = await xeroGet<{ CreditNotes?: XeroCreditNote[] }>(`CreditNotes/${cn.id}`)
+    const allocations = res.ok ? res.data?.CreditNotes?.[0]?.Allocations ?? [] : []
+    for (const a of allocations) {
+      if (!a.AllocationID) continue
+      const del = await xeroDelete(`CreditNotes/${cn.id}/Allocations/${a.AllocationID}`)
+      if (!del.ok) {
+        failed.push(`CreditNotes/${cn.id} (${cn.label}): could not remove allocation ${a.AllocationID}: ${del.error ?? del.status}`)
+      }
+    }
   }
 
   const kinds = [...byKind.keys()].sort(

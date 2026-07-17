@@ -296,7 +296,10 @@ export async function returnItems(
  * assertion that the draft was created.
  */
 export async function postSupplierCreditNote(page: Page): Promise<void> {
-  const card = page.getByText(/Supplier credit notes/i)
+  // Match the card heading's "Supplier credit notes (N)" specifically. A bare /Supplier credit
+  // notes/i also matches the prose hint above the table ("…(Supplier credit notes, below)…",
+  // po-detail-client.tsx:2121), so it resolves to two elements and strict mode throws.
+  const card = page.getByText(/Supplier credit notes \(\d+\)/i)
   await expect(card).toBeVisible({ timeout: 30_000 })
 
   const post = page.getByRole('button', { name: /^Post$/ })

@@ -483,7 +483,11 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     // posted yields NO allocation at all — the credit note would post, this test would find it,
     // and the bill would quietly stay fully due. The bill must own a Xero id first.
     await processPendingXeroSyncViaUi(page)
-    const [billId] = await billIdsForPo(poId)
+    // billIdsForPo returns the IMS purchase_invoices.id; the Xero InvoiceID (a GUID) is resolved
+    // from it via externalIdFor, exactly as PP-01/PP-02 do. Tracking or GETting the IMS cuid
+    // straight from Xero 404s — which is how this first showed up.
+    const [billRecordId] = await billIdsForPo(poId)
+    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId })
     trackDocument('Invoices', billId, `PP-05 bill ${runTag(runId)}`)
     const billBefore = await getInvoice(billId)
     expect(billBefore.Status, 'the bill must be in the ledger BEFORE the credit is posted').toBe('AUTHORISED')
@@ -535,7 +539,11 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
 
     const creditNote = await getCreditNote(creditNoteId)
     expect(creditNote.Type).toBe('ACCPAYCREDIT') // payable credit — the mirror of OC-05's ACCRECCREDIT
-    expect(creditNote.Status).toBe('AUTHORISED') // see PP-01: "not DELETED" would accept a DRAFT
+    // PAID, not AUTHORISED: this credit (25.00) is fully consumed by its allocation to the larger
+    // bill (50.00), and Xero moves a fully-allocated credit note to PAID — which is itself proof the
+    // allocation landed, the whole point of PP-05. AUTHORISED would be the status of a credit that
+    // posted but never allocated, i.e. the bug this test guards against. (Still not DRAFT/DELETED.)
+    expect(creditNote.Status).toBe('PAID')
     expect(creditNote.CurrencyCode).toBe('GBP')
     // The credit lands on TRANSIT, not inventory (supplier-credit-note.ts:153): the stock left
     // via the adjustment above, and this is the money leg catching up with it.
