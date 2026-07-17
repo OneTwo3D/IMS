@@ -92,7 +92,10 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
 
     const invoice = await getInvoice(invoiceId)
     expect(invoice.Type).toBe('ACCREC')
-    expect(invoice.Status).not.toBe('DELETED')
+    // AUTHORISED, not merely "not DELETED" — that accepts DRAFT and VOIDED, neither of which is
+    // revenue anyone can collect. A regression that silently drafted every invoice would have
+    // satisfied every line and total assertion below while the ledger stayed empty.
+    expect(invoice.Status).toBe('AUTHORISED')
     expect(invoice.CurrencyCode).toBe('GBP')
 
     // The line must carry the configured sales account — the class of bug a sync-log
@@ -160,7 +163,7 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
 
     const creditNote = await getCreditNote(creditNoteId)
     expect(creditNote.Type).toBe('ACCRECCREDIT')
-    expect(creditNote.Status).not.toBe('DELETED')
+    expect(creditNote.Status).toBe('AUTHORISED') // see OC-01: "not DELETED" accepts a DRAFT
     expect(creditNote.CurrencyCode).toBe('GBP')
 
     const salesAccount = await settingValue('xero_sales_account')

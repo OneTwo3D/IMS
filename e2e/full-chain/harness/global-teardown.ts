@@ -68,6 +68,31 @@ export type TeardownDeps = {
   voidTrackedDocuments: () => Promise<{ voided: number; failed: string[] }>
   findStragglers: () => Promise<string[]>
   release: () => Promise<void>
+  /** Budgets, overridable so the hang tests do not have to actually wait 90 seconds. */
+  budgets?: { voidMs?: number; stragglerMs?: number }
+}
+
+/**
+ * How long the whole Xero clean-up may take before we stop waiting and free stage.
+ *
+ * Generous enough for a normal void of a dozen documents, and far short of what Xero can make
+ * us wait: its client sleeps for `Retry-After` on a 429, and the DAILY limit (5,000 calls) can
+ * hand back a delay measured in hours.
+ */
+const XERO_TEARDOWN_BUDGET_MS = 90_000
+
+/** Diagnostics get less rope than the clean-up: they are the least important thing here. */
+const STRAGGLER_BUDGET_MS = 30_000
+
+/** Resolve to `onTimeout` rather than waiting forever. The work is abandoned, not cancelled. */
+async function withBudget<T>(work: Promise<T>, ms: number, onTimeout: T): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const budget = new Promise<T>((resolve) => { timer = setTimeout(() => resolve(onTimeout), ms) })
+  try {
+    return await Promise.race([work, budget])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 /**
@@ -83,6 +108,17 @@ export type TeardownDeps = {
  * the failure modes are wildly asymmetric: a polluted ledger costs a manual void, whereas a
  * held lock leaves STAGE DISABLED — not importing Woo orders, not posting to Xero — for as
  * long as nobody notices. Failing the run must never cost more than the fault it reports.
+ *
+ * AND THE LOCK IS NOT HOSTAGE TO XERO. Ordering alone was not enough: releasing LAST meant the
+ * release waited on the void, and the void waits on Xero. When the Demo tenant rate-limited us,
+ * the client slept on its Retry-After and teardown sat there for 42 MINUTES with stage disabled
+ * the whole time — the exact catastrophe the ordering exists to prevent, arriving by a route the
+ * ordering does not cover. Xero's daily limit can hand back a delay measured in hours.
+ *
+ * So the Xero clean-up now runs on a BUDGET. If it overruns we abandon it, report the residue as
+ * a failure, and free stage on time. The trade is deliberate and one-directional: a document left
+ * in the Demo ledger is a manual void someone does at leisure, while a held lock is a production
+ * stoppage. Cleaning up must never cost more than the mess.
  *
  * Dependencies are injected so that ordering can be tested without a database, a Xero tenant
  * or a real lock — the same shape as createAdminHealthHandler({ authorize, collect }).
@@ -107,14 +143,26 @@ export async function runTeardown(deps: TeardownDeps): Promise<void> {
 
   // Xero next: the documents are the thing that pollutes the SHARED Demo ledger and
   // skews the next run's reconciliation assertions (X-02).
+  const TIMED_OUT = { voided: -1, failed: [] as string[] }
   try {
-    const { voided, failed } = await deps.voidTrackedDocuments()
-    if (voided) console.log(`[full-chain] voided ${voided} Xero document(s)`)
-    if (failed.length) {
+    const voidMs = deps.budgets?.voidMs ?? XERO_TEARDOWN_BUDGET_MS
+    const result = await withBudget(deps.voidTrackedDocuments(), voidMs, TIMED_OUT)
+    if (result === TIMED_OUT) {
       problems.push(
-        `${failed.length} Xero document(s) could NOT be voided and REMAIN in the shared Demo ledger:\n` +
-          failed.map((f) => `      ${f}`).join('\n'),
+        `Xero clean-up did not finish within ${voidMs / 1000}s and was ABANDONED so that stage ` +
+          `could be released on time. Documents from this run are probably still in the shared Demo ledger — ` +
+          `the next run's straggler scan will name them. The usual cause is a Xero rate limit: its client sleeps ` +
+          `for Retry-After, and the daily 5,000-call cap can hand back hours.`,
       )
+    } else {
+      const { voided, failed } = result
+      if (voided) console.log(`[full-chain] voided ${voided} Xero document(s)`)
+      if (failed.length) {
+        problems.push(
+          `${failed.length} Xero document(s) could NOT be voided and REMAIN in the shared Demo ledger:\n` +
+            failed.map((f) => `      ${f}`).join('\n'),
+        )
+      }
     }
   } catch (e) {
     problems.push(`Xero teardown failed outright: ${e instanceof Error ? e.message : e}`)
@@ -128,7 +176,8 @@ export async function runTeardown(deps: TeardownDeps): Promise<void> {
   // intervened — punishing the next person for a fault they did not cause, which is how a
   // signal gets routinely ignored. This run answers for this run.
   try {
-    const strays = await deps.findStragglers()
+    // Also budgeted: it is another Xero call, and diagnostics must never delay the release.
+    const strays = await withBudget(deps.findStragglers(), deps.budgets?.stragglerMs ?? STRAGGLER_BUDGET_MS, [] as string[])
     if (strays.length) {
       console.warn(`[full-chain] stragglers from earlier runs still in the ledger:\n  ${strays.join('\n  ')}`)
     }
