@@ -9,6 +9,7 @@
  * inventory item, which would double-book cost of goods sold.
  */
 
+import { db } from '@/lib/db'
 import { xeroGet, xeroPost } from './api'
 
 type XeroItemResponse = {
@@ -21,6 +22,35 @@ type XeroItemResponse = {
 
 function escapeXeroWhereValue(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+/**
+ * The Xero ItemID already resolved for this SKU, if any.
+ *
+ * Item codes ARE product SKUs, so the product row is the natural home for the mapping — the same
+ * shape as Customer/Supplier.accountingContactId and Product.externalProductId (o3d-3nc).
+ */
+async function getStoredItemId(code: string): Promise<string | null> {
+  const row = await db.product.findUnique({
+    where: { sku: code },
+    select: { accountingItemId: true },
+  })
+  return row?.accountingItemId ?? null
+}
+
+/**
+ * Remember the item id for this SKU.
+ *
+ * updateMany, not update: a code that matches no product must be a silent no-op rather than a
+ * throw (callers may pass a pseudo-item code that is not a catalogue product). The catch covers a
+ * unique-index race — losing the cache entry only costs one lookup next time.
+ */
+async function storeItemId(code: string, itemId: string): Promise<void> {
+  if (!itemId) return
+  await db.product.updateMany({
+    where: { sku: code },
+    data: { accountingItemId: itemId },
+  }).catch(() => {})
 }
 
 /**
@@ -38,12 +68,22 @@ export async function findOrCreateItem(
 ): Promise<{ success: boolean; itemId?: string; error?: string }> {
   if (!code) return { success: false, error: 'Item code is required' }
 
+  // Already resolved once — the item exists, so there is nothing to look up or create. This is the
+  // whole point of the column: item lookups were ~75% of the calls it takes to post an invoice
+  // (one GET per distinct SKU, per invoice, forever) against a 1,000/org/day cap (o3d-3nc).
+  const storedItemId = await getStoredItemId(code)
+  if (storedItemId) {
+    return { success: true, itemId: storedItemId }
+  }
+
   // Search by code
   const where = `Items?where=${encodeURIComponent(`Code=="${escapeXeroWhereValue(code)}"`)}`
   const res = await xeroGet<XeroItemResponse>(where)
 
   if (res.ok && res.data?.Items?.length) {
-    return { success: true, itemId: res.data.Items[0].ItemID }
+    const itemId = res.data.Items[0].ItemID
+    await storeItemId(code, itemId)
+    return { success: true, itemId }
   }
 
   // Create new UNTRACKED item. Do NOT add InventoryAssetAccountCode — its
@@ -61,12 +101,16 @@ export async function findOrCreateItem(
   if ((!createRes.ok || !createRes.data?.Items?.length) && /already exists|has already been used|code already exists/i.test(createRes.error ?? '')) {
     const retryRes = await xeroGet<XeroItemResponse>(where)
     if (retryRes.ok && retryRes.data?.Items?.length) {
-      return { success: true, itemId: retryRes.data.Items[0].ItemID }
+      const itemId = retryRes.data.Items[0].ItemID
+      await storeItemId(code, itemId)
+      return { success: true, itemId }
     }
   }
   if (!createRes.ok || !createRes.data?.Items?.length) {
     return { success: false, error: createRes.error ?? 'Failed to create item' }
   }
 
-  return { success: true, itemId: createRes.data.Items[0].ItemID }
+  const itemId = createRes.data.Items[0].ItemID
+  await storeItemId(code, itemId)
+  return { success: true, itemId }
 }

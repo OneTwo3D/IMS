@@ -32,6 +32,14 @@ Official guide: <https://developer.xero.com/documentation/getting-started-guide/
 
 Like other integrations, Xero sync is gated behind a successful connection test. The fingerprint includes the Client ID, expected tenant ID, and authenticated tenant ID/name. If you rotate the Client Secret or re-authorise to a different Xero tenant, re-test before activating sync.
 
+### Disconnecting
+
+Disconnecting removes the stored token **and forgets every Xero ID the IMS had cached** — the Xero
+contact ID on each customer/supplier and the Xero item ID on each product. This is deliberate: those
+IDs only mean anything to the organisation that issued them, so keeping them would hand stale IDs to
+the next connection. After reconnecting (to the same org or a different one, or when switching to
+QuickBooks) the IDs are simply resolved again on first use. Nothing needs to be re-entered.
+
 ## Account Mapping
 
 | IMS Account | Xero Account Type | Purpose |
@@ -303,6 +311,16 @@ When enabled, the IMS polls Xero every 15 minutes for:
 
 - **Paid sales invoices** (manual orders only — WC orders arrive pre-paid)
 - **Paid purchase bills** (all POs — detects when a bill is paid via bank feed)
+- **Reversed payments** on either (payment removed or invoice voided — clears `paidAt`)
+
+All four checks are answered by a **single** request that asks Xero only for invoices changed since
+the last successful poll, using the `If-Modified-Since` header. The poll advances its cursor only
+when it succeeds, and deliberately re-reads the last couple of minutes each time, so a payment can
+be seen twice but never skipped — acting on one twice is a no-op.
+
+If a poll ever reports *"Refusing to truncate"* in the activity log, more than 2,000 invoices
+changed in one window (usually a bulk operation in Xero). Nothing is lost: the cursor is held and
+the poll retries. If it persists, the cursor is probably stuck far in the past.
 
 ### Purchase Bill Edits
 
