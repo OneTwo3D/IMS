@@ -718,7 +718,7 @@ export async function allocateSalesOrder(
     // review of #496).
     const locked = await tx.salesOrder.findUnique({
       where: { id: orderId },
-      select: { status: true },
+      select: { status: true, refundStatus: true },
     })
     const lockedStatus = locked?.status ?? so.status
 
@@ -732,13 +732,15 @@ export async function allocateSalesOrder(
       }
     }
 
-    // A CANCELLED order has ZERO allocation demand — it must hold no reservations. We do NOT refuse
-    // (that would strand its existing allocations); instead demand is treated as zero so the
-    // release-and-delete below runs and reserves nothing, making allocation on a cancelled order a
-    // pure deallocation. This is the same shape a full refund already produces naturally (every line
-    // nets to zero), and it is the safe outcome for the payment-path race where an order is cancelled
-    // between its PENDING_PAYMENT→PROCESSING advance and this allocation.
-    const zeroDemand = lockedStatus === 'CANCELLED'
+    // A CANCELLED or fully-refunded order has ZERO allocation demand — it must hold no reservations.
+    // We do NOT refuse (that would strand its existing allocations); instead demand is treated as zero
+    // so the release-and-delete below runs and reserves nothing, making allocation a pure
+    // deallocation. FULL is included because it is a MONETARY classification (a full-value refund can
+    // occur with less than full product QUANTITY — an amount-only or shipping refund), so the
+    // per-line quantity demand can be non-zero even when the order is fully refunded; without this an
+    // order refunded in full could be re-reserved and promoted. Both are read UNDER the lock, so a
+    // refund committing between the payment advance and this allocation is honoured (Codex review #496).
+    const zeroDemand = lockedStatus === 'CANCELLED' || locked?.refundStatus === 'FULL'
 
     await resetAllocationAccountingIfStaged(tx, orderId)
     const graph = await loadFulfillmentProductGraph(tx, productIds)

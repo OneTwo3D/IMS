@@ -51,6 +51,7 @@ type OrderRow = {
   externalOrderNumber: string | null
   shoppingLinks: Array<{ id: string }>
   status: string
+  refundStatus?: string | null
   shipFromWarehouseId: string | null
   inventoryAllocatedDate?: Date | null
   lines: OrderLineRow[]
@@ -843,9 +844,11 @@ function withStalePreLockStatus(state: MemoryState, staleStatus: string): Alloca
     const row = await real(args)
     if (!row) return row
     const sel = args?.select ?? {}
-    const isUnderLockRead = Object.keys(sel).length === 1 && sel.status
+    // Only the big pre-lock `so` read is stale. The under-lock read selects status (+refundStatus)
+    // and the reset read selects inventoryAllocatedDate; leave both truthful.
+    const isUnderLockRead = 'status' in sel && !('lines' in sel)
     const isResetRead = 'inventoryAllocatedDate' in sel
-    if (!isUnderLockRead && !isResetRead) row.status = staleStatus // only the pre-lock `so` read is stale
+    if (!isUnderLockRead && !isResetRead) row.status = staleStatus
     return row
   }
   return client as unknown as AllocationServiceClient
@@ -892,4 +895,21 @@ test('allocateSalesOrder cancelled before the lock is a clean deallocation, not 
   assert.deepEqual(state.allocations, [], 'released and deleted, not re-reserved')
   assert.equal(state.stockLevels[0].reservedQty, 0)
   assert.equal(state.order.status, 'CANCELLED', 'not resumed to ALLOCATED off the stale PROCESSING read')
+})
+
+test('allocateSalesOrder on a fully-refunded order (refundStatus=FULL) deallocates, even at full monetary refund with non-zero line qty', async () => {
+  // FULL is a MONETARY classification: a full-value refund can leave product quantities unrefunded
+  // (amount-only/shipping refund). Line demand would be non-zero, but the order must hold no
+  // reservations — so FULL is zero-demand under the lock, not a re-reservation.
+  const state = baseState({
+    order: { ...baseState().order, status: 'PROCESSING', refundStatus: 'FULL' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+    // No refundLines — models a full monetary refund that did NOT refund product quantity.
+  })
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(state.allocations, [], 'reservations released and allocations deleted')
+  assert.equal(state.stockLevels[0].reservedQty, 0, 'no stock reserved for a fully-refunded order')
+  assert.notEqual(state.order.status, 'ALLOCATED', 'a fully-refunded order is not promoted/fulfilled')
 })
