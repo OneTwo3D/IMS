@@ -712,6 +712,16 @@ export async function allocateSalesOrder(
   const runAllocation = async (tx: Prisma.TransactionClient) => {
     await lockSalesOrder(tx, orderId)
 
+    // Re-read status UNDER the row lock. `so.status` above was read for warehouse selection BEFORE
+    // the lock, and the order may have moved since — a concurrent CANCELLED, ON_HOLD, or full refund.
+    // Every decision below that depends on status uses THIS value, not the stale one (o3d-2s8, Codex
+    // review of #496).
+    const locked = await tx.salesOrder.findUnique({
+      where: { id: orderId },
+      select: { status: true },
+    })
+    const lockedStatus = locked?.status ?? so.status
+
     if (input.refuseIfShipmentsExist) {
       const shipmentExists = await tx.shipment.findFirst({
         where: { orderId },
@@ -721,6 +731,14 @@ export async function allocateSalesOrder(
         return { nextAllocations: [], syncProductIds: [], refused: true as const }
       }
     }
+
+    // A CANCELLED order has ZERO allocation demand — it must hold no reservations. We do NOT refuse
+    // (that would strand its existing allocations); instead demand is treated as zero so the
+    // release-and-delete below runs and reserves nothing, making allocation on a cancelled order a
+    // pure deallocation. This is the same shape a full refund already produces naturally (every line
+    // nets to zero), and it is the safe outcome for the payment-path race where an order is cancelled
+    // between its PENDING_PAYMENT→PROCESSING advance and this allocation.
+    const zeroDemand = lockedStatus === 'CANCELLED'
 
     await resetAllocationAccountingIfStaged(tx, orderId)
     const graph = await loadFulfillmentProductGraph(tx, productIds)
@@ -773,7 +791,7 @@ export async function allocateSalesOrder(
       )
     }
 
-    const lines = so.lines.filter((line) => line.productId).map((line) => {
+    const lines = zeroDemand ? [] : so.lines.filter((line) => line.productId).map((line) => {
       const committed = committedByLine.get(line.id) ?? new Prisma.Decimal(0)
       const refunded = refundedByLine.get(line.id) ?? new Prisma.Decimal(0)
       return {
@@ -879,8 +897,12 @@ export async function allocateSalesOrder(
       'reserve',
     )
 
-    if (nextAllocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(so.status)) {
-      const transition = validateSalesOrderStatusTransition(so.status, 'ALLOCATED')
+    // Promote to ALLOCATED only off the UNDER-LOCK status. Deciding on the stale pre-lock so.status
+    // is how a concurrent PROCESSING→ON_HOLD (or →CANCELLED) got resumed to ALLOCATED off a value
+    // that was no longer true (o3d-2s8, Codex review of #496). ON_HOLD/CANCELLED are not in the set,
+    // so a held or cancelled order keeps its status; it is simply not un-paused by allocation.
+    if (nextAllocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(lockedStatus)) {
+      const transition = validateSalesOrderStatusTransition(lockedStatus, 'ALLOCATED')
       if (!transition.success) throw new Error(transition.error)
       await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
     }
