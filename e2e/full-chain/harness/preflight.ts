@@ -25,6 +25,33 @@ import { checkBuildFreshness } from './build-freshness.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
 
+/**
+ * How long the live-org probe may take before preflight stops waiting and fails.
+ *
+ * Generous for a healthy call (usually well under a second) and far short of what a rate-limited
+ * Xero can make us wait: the client sleeps for Retry-After, and the rolling 24h cap returns one
+ * measured in hours. The teardown got the same treatment in #492 for the same reason; preflight
+ * is where the wait actually bites now, since it makes the first Xero call of any run.
+ *
+ * NB the daily cap is 1,000 calls per org per rolling 24h (Xero cut it from 5,000 in March 2026),
+ * which is why this is a routine occurrence rather than an edge case.
+ */
+const XERO_PROBE_BUDGET_MS = 30_000
+
+/** Sentinel: compared by reference, so it can never collide with a real response. */
+const PROBE_TIMED_OUT = Symbol('xero-probe-timed-out')
+
+/** Resolve to `onTimeout` rather than waiting forever. The work is abandoned, not cancelled. */
+async function withBudget<T, S>(work: Promise<T>, ms: number, onTimeout: S): Promise<T | S> {
+  let timer: NodeJS.Timeout | undefined
+  const budget = new Promise<S>((resolve) => { timer = setTimeout(() => resolve(onTimeout), ms) })
+  try {
+    return await Promise.race([work, budget])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 export type PreflightReport = { ok: boolean; problems: string[]; warnings: string[] }
 
 export async function preflight(): Promise<PreflightReport> {
@@ -67,8 +94,27 @@ export async function preflight(): Promise<PreflightReport> {
         problems.push(`Connected tenant is "${tenantName}", not "${REQUIRED_TENANT}". Refusing to run.`)
       }
       // Re-read the LIVE org: a stale token row must not be enough to unlock posting.
-      const org = await xeroGet<{ Organisations: Array<{ Name: string; BaseCurrency: string }> }>('Organisation')
-      if (!org.ok || !org.data?.Organisations?.length) {
+      //
+      // ON A BUDGET, because this is the FIRST Xero call of any run and the one that discovers
+      // a rate limit. xeroFetch sleeps for Retry-After on a 429 (lib/connectors/xero/api.ts),
+      // and the cap is a ROLLING 24-HOUR window whose Retry-After is measured in hours.
+      // Unbudgeted, a rate-limited run prints two lines and then hangs silently —
+      // indistinguishable from a broken rig, and it cost most of a day twice (o3d-98q).
+      // Fail in seconds with the real reason instead.
+      const org = await withBudget(
+        xeroGet<{ Organisations: Array<{ Name: string; BaseCurrency: string }> }>('Organisation'),
+        XERO_PROBE_BUDGET_MS,
+        PROBE_TIMED_OUT,
+      )
+      if (org === PROBE_TIMED_OUT) {
+        problems.push(
+          `Xero did not answer within ${XERO_PROBE_BUDGET_MS / 1000}s. The usual cause is the rolling 24h ` +
+            `1,000-call limit on the shared Demo tenant (Xero cut it from 5,000 in March 2026): the client ` +
+            `sleeps for Retry-After, which the cap returns in HOURS, so the run would hang rather than fail. ` +
+            `Note stage's own crons spend this same org's budget continuously. Wait for the window to roll ` +
+            `off (~24h after the calls that spent it) or use a different tenant. See bd o3d-98q.`,
+        )
+      } else if (!org.ok || !org.data?.Organisations?.length) {
         problems.push(`Could not read the Xero organisation (token expired or revoked?): ${org.error ?? 'unknown error'}`)
       } else if (org.data.Organisations[0].Name !== REQUIRED_TENANT) {
         problems.push(`LIVE Xero org is "${org.data.Organisations[0].Name}", not "${REQUIRED_TENANT}".`)
