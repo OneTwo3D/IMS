@@ -148,3 +148,38 @@ test('buildDriftSnapshot keeps only non-equal items with the right shape', async
   assert.ok(drifted.lines.length > 0)
   assert.equal(snapshot.find((s) => s.taxRateId === 't3')!.status, 'missing-on-xero')
 })
+
+test('no IMS tax rates: does NOT call Xero at all, but still stamps the check', async () => {
+  // The sweep used to Promise.all the profile load and the Xero fetch, so the GET fired before
+  // the profile count was known — an instance with no IMS tax rates spent a call every hour to
+  // compare nothing against them. 24/day out of a 1,000/day cap, for nothing (o3d-e2j).
+  let xeroCalls = 0
+  const checkedAt: Date[] = []
+  const result = await sweepTaxRateDrift({
+    loadImsProfiles: async () => [],
+    fetchXeroTaxRates: async () => { xeroCalls++; return [] },
+    recordDrift: async () => { throw new Error('nothing to drift') },
+    recordCheckedAt: async (at) => { checkedAt.push(at) },
+  })
+
+  assert.equal(xeroCalls, 0, 'must not spend a Xero call with nothing to compare')
+  assert.deepEqual(result, { checked: 0, drifted: 0, items: [] })
+  // "we looked and there was nothing to compare" is a successful sweep: leaving the timestamp
+  // stale would make the UI report the sweeper as broken.
+  assert.equal(checkedAt.length, 1, 'an empty sweep is still a sweep')
+})
+
+test('with IMS tax rates: Xero is called exactly once', async () => {
+  let xeroCalls = 0
+  const result = await sweepTaxRateDrift({
+    loadImsProfiles: async () => [imsProfile('t1', 'VAT 20%', [{ name: 'VAT', rate: 20 }])],
+    fetchXeroTaxRates: async () => { xeroCalls++; return [xeroRate('VAT 20%', [{ name: 'VAT', rate: 20 }])] },
+    recordDrift: async () => {},
+    recordCheckedAt: async () => {},
+  })
+
+  // Only the call count and the fact it compared: whether these fixtures drift is the business
+  // of the drift tests above, not of the gate this test covers.
+  assert.equal(xeroCalls, 1)
+  assert.equal(result.checked, 1)
+})

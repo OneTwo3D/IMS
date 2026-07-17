@@ -97,10 +97,21 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     })
 
     if (unpaidManualOrders.length > 0) {
-      // Query Xero for recently paid sales invoices
+      // Query Xero for recently paid sales invoices.
+      //
+      // The `where` clause must be a SINGLE url-encoded param — see fetchReversedInvoiceIds.
+      // Left raw, the `&&` splits the query string: Xero receives only where=Type=="ACCREC",
+      // silently drops Status, and returns EVERY ACCREC invoice whatever its status. paidIds
+      // below is built from that response, so unpaid invoices land in it and the orders they
+      // belong to get stamped paid — with paidDate falling back to now(), because an unpaid
+      // invoice has no FullyPaidOnDate. That is money marked collected that never arrived.
+      //
+      // scjz.71 fixed exactly this in fetchReversedInvoiceIds and left both forward passes
+      // untouched; the comment there described the bug that was still live here.
       const modifiedAfter = new Date(lastPoll).toISOString()
+      const where = encodeURIComponent('Type=="ACCREC"&&Status=="PAID"')
       const res = await xeroGet<XeroInvoicesResponse>(
-        `Invoices?where=Type=="ACCREC"&&Status=="PAID"&ModifiedAfter=${modifiedAfter}`,
+        `Invoices?where=${where}&ModifiedAfter=${modifiedAfter}`,
       )
 
       if (res.ok && res.data?.Invoices) {
@@ -242,9 +253,12 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     })
 
     if (unpaidBills.length > 0) {
+      // Single url-encoded `where`, for the reason spelled out in the ACCREC pass above:
+      // a raw `&&` drops the Status filter and every unpaid bill gets marked paid.
       const modifiedAfter = new Date(lastPoll).toISOString()
+      const where = encodeURIComponent('Type=="ACCPAY"&&Status=="PAID"')
       const res = await xeroGet<XeroInvoicesResponse>(
-        `Invoices?where=Type=="ACCPAY"&&Status=="PAID"&ModifiedAfter=${modifiedAfter}`,
+        `Invoices?where=${where}&ModifiedAfter=${modifiedAfter}`,
       )
 
       if (res.ok && res.data?.Invoices) {

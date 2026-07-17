@@ -7,8 +7,32 @@ import { connectorFetch } from '@/lib/security/connector-fetch'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
 const XERO_MAX_RETRIES = 3
-const XERO_MINUTE_LIMIT = 55
-const XERO_DAY_LIMIT = 4900
+const XERO_MINUTE_LIMIT = 55 // Xero's is 60/min, rolling
+
+/**
+ * Xero's daily cap, minus a small reserve.
+ *
+ * 1,000 calls per organisation per ROLLING 24h — NOT 5,000, and NOT midnight-reset. Xero cut the
+ * free/Starter tier from 5,000 to 1,000 on 2026-03-02; the 4,900 this used to hold was the old
+ * cap's reserve and meant the limiter below could never engage. Xero began 429ing at 1,000 while
+ * waitForBudget still believed 3,900 remained, so the budget was fiction and the first thing that
+ * noticed was a request sleeping on Retry-After (o3d-wgv, o3d-98q).
+ *
+ * Rolling, so this cannot be reasoned about as "today's" spend: calls fall out of the window 24h
+ * after they were made, individually.
+ */
+const XERO_DAY_LIMIT = 950
+
+/**
+ * Longest we will ever sleep on a Retry-After.
+ *
+ * A MINUTE-limit 429 hands back seconds and is worth waiting out. A DAILY-limit 429 hands back
+ * HOURS — parseRetryAfterMs would pass ~86,400,000ms to sleep() and the cron request would hang
+ * until something killed it. Rare at 5,000/day; routine at 1,000. Past this we give up and let
+ * the caller defer the work (the outbox already re-queues with backoff), because a job that
+ * returns is one an operator can see (o3d-2it).
+ */
+const XERO_MAX_RETRY_AFTER_MS = 90_000
 
 const minuteBuckets = new Map<string, number[]>()
 const dayBuckets = new Map<string, number[]>()
@@ -41,7 +65,20 @@ function pushRequestTimestamp(bucket: Map<string, number[]>, key: string, now: n
   bucket.set(key, values)
 }
 
-async function waitForBudget(tenantId: string) {
+/**
+ * Block until this tenant has minute-budget, or report that the DAY budget is gone.
+ *
+ * The two limits need opposite treatment and used to get the same one. A minute-limit wait is
+ * at most 60s and worth sitting out. A day-limit wait is up to 24 HOURS — sleeping that out
+ * hangs the request and its cron for the rest of the day, which is the same failure we just
+ * removed from the Retry-After path (o3d-2it).
+ *
+ * This was unreachable while XERO_DAY_LIMIT was 4,900: Xero 429'd at its real 1,000 long before
+ * the local bucket ever filled, so the day branch was dead code. Correcting the limit to 950
+ * makes it live, so it has to report exhaustion instead of sleeping on it. Callers turn this
+ * into a 429 and let the outbox defer with backoff.
+ */
+async function waitForBudget(tenantId: string): Promise<{ ok: true } | { ok: false; waitMs: number }> {
   while (true) {
     const now = Date.now()
     const minute = (minuteBuckets.get(tenantId) ?? []).filter((ts) => ts >= now - 60_000)
@@ -49,11 +86,14 @@ async function waitForBudget(tenantId: string) {
     minuteBuckets.set(tenantId, minute)
     dayBuckets.set(tenantId, day)
 
+    // Day first: no amount of waiting inside this request will fix it.
+    if (day.length >= XERO_DAY_LIMIT) {
+      return { ok: false, waitMs: 86_400_000 - (now - day[0]) }
+    }
+
     const minuteWait = minute.length >= XERO_MINUTE_LIMIT ? 60_000 - (now - minute[0]) : 0
-    const dayWait = day.length >= XERO_DAY_LIMIT ? 86_400_000 - (now - day[0]) : 0
-    const waitMs = Math.max(minuteWait, dayWait)
-    if (waitMs <= 0) return
-    await sleep(waitMs)
+    if (minuteWait <= 0) return { ok: true }
+    await sleep(minuteWait)
   }
 }
 
@@ -61,6 +101,58 @@ function noteRequest(tenantId: string) {
   const now = Date.now()
   pushRequestTimestamp(minuteBuckets, tenantId, now, 60_000)
   pushRequestTimestamp(dayBuckets, tenantId, now, 86_400_000)
+}
+
+/** Xero's own view of what is left, per tenant. Ground truth, unlike the local buckets. */
+export type XeroLimitSnapshot = {
+  dayRemaining?: number
+  minuteRemaining?: number
+  appMinuteRemaining?: number
+  at: number
+}
+
+const limitSnapshots = new Map<string, XeroLimitSnapshot>()
+
+/**
+ * Record what Xero says is left. It tells us on EVERY response and we were not listening.
+ *
+ * The local buckets are a guess that is wrong in both directions: in-memory, so wiped on every
+ * deploy and not shared across workers, and blind to spend by anything else pointed at the same
+ * org (the e2e rig and stage share one Demo tenant — o3d-98q). These headers are free,
+ * authoritative and need no accounting of our own.
+ *
+ * Read-only for now: the buckets still drive throttling, because a header-driven limiter should
+ * land with its own tests. This makes real spend visible first — see xeroLimitSnapshot() (o3d-8p8).
+ */
+function noteLimitHeaders(tenantId: string, res: { headers?: { get(name: string): string | null } }) {
+  const num = (name: string): number | undefined => {
+    const raw = res.headers?.get(name)
+    if (raw == null) return undefined
+    const n = Number.parseInt(raw, 10)
+    return Number.isFinite(n) ? n : undefined
+  }
+
+  const snapshot: XeroLimitSnapshot = {
+    dayRemaining: num('X-DayLimit-Remaining'),
+    minuteRemaining: num('X-MinLimit-Remaining'),
+    appMinuteRemaining: num('X-AppMinLimit-Remaining'),
+    at: Date.now(),
+  }
+  if (snapshot.dayRemaining == null && snapshot.minuteRemaining == null) return // not a Xero API response
+  limitSnapshots.set(tenantId, snapshot)
+
+  // Loud once it is genuinely tight. Silence here is what let a day's budget vanish unnoticed
+  // twice in one week.
+  if (snapshot.dayRemaining != null && snapshot.dayRemaining <= 100) {
+    console.warn(
+      `[xero] tenant ${tenantId}: ${snapshot.dayRemaining} of the day's API calls left (rolling 24h).`,
+    )
+  }
+}
+
+/** What Xero last told us was left for this tenant, or undefined if it has not answered yet. */
+export function xeroLimitSnapshot(tenantId: string): XeroLimitSnapshot | undefined {
+  return limitSnapshots.get(tenantId)
 }
 
 function parseRetryAfterMs(value: string | null): number {
@@ -75,15 +167,39 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
   let lastRateLimitMs = 0
 
   for (let attempt = 0; attempt <= XERO_MAX_RETRIES; attempt++) {
-    await waitForBudget(auth.tenantId)
+    const budget = await waitForBudget(auth.tenantId)
+    if (!budget.ok) {
+      return {
+        ok: false,
+        status: 429,
+        text: async () =>
+          `Xero day budget exhausted for this tenant: ${XERO_DAY_LIMIT} calls used within the rolling ` +
+          `24h window, oldest falls out in ${Math.round(budget.waitMs / 60_000)} min. Not waiting — ` +
+          `the work must be deferred. (Xero's real cap is 1,000/org/rolling-24h since 2026-03-02.)`,
+      } as Response
+    }
     noteRequest(auth.tenantId)
 
     const res = await connectorFetch(url, init, { connectorName: 'Xero' })
+    noteLimitHeaders(auth.tenantId, res)
     if (res.status !== 429) return res
 
     lastRateLimitMs = Math.max(parseRetryAfterMs(res.headers.get('Retry-After')), 1000 * 2 ** attempt)
-    if (attempt === XERO_MAX_RETRIES) {
-      return { ok: false, status: 429, text: async () => `Rate limited after retries; retry after ${lastRateLimitMs}ms` } as Response
+
+    // Give up rather than sleep out a daily limit. Retry-After is measured in seconds for the
+    // minute limit and in HOURS for the daily one; waiting out the latter hangs this request
+    // (and its cron) with nothing to show for it. Hand the 429 back and let the caller defer.
+    if (lastRateLimitMs > XERO_MAX_RETRY_AFTER_MS || attempt === XERO_MAX_RETRIES) {
+      return {
+        ok: false,
+        status: 429,
+        text: async () =>
+          lastRateLimitMs > XERO_MAX_RETRY_AFTER_MS
+            ? `Rate limited; Xero asked for ${Math.round(lastRateLimitMs / 1000)}s which exceeds the ` +
+              `${XERO_MAX_RETRY_AFTER_MS / 1000}s we are willing to block for. This is what the DAILY ` +
+              `cap (1,000 calls/org/rolling-24h) looks like — the work must be deferred, not waited out.`
+            : `Rate limited after retries; retry after ${lastRateLimitMs}ms`,
+      } as Response
     }
 
     await sleep(lastRateLimitMs)

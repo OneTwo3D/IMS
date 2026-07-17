@@ -42,7 +42,24 @@ function nameKey(name: string): string {
 }
 
 export async function sweepTaxRateDrift(deps: TaxRateDriftSweepDeps): Promise<TaxRateDriftSweepResult> {
-  const [imsProfiles, xeroRates] = await Promise.all([deps.loadImsProfiles(), deps.fetchXeroTaxRates()])
+  // Profiles FIRST, and bail before touching Xero when there are none.
+  //
+  // This used to be Promise.all([loadImsProfiles(), fetchXeroTaxRates()]), which fires the Xero
+  // GET before the profile count is known — so an instance with no IMS tax rates still spent a
+  // call every hour to compare nothing against them. That is 24 calls/day out of a cap of 1,000
+  // per org per rolling 24h (Xero cut the free tier from 5,000 on 2026-03-02), bought with
+  // nothing but the ~100ms the concurrency saved. o3d-e2j.
+  const imsProfiles = await deps.loadImsProfiles()
+  if (imsProfiles.length === 0) {
+    // Still stamp the check: "we looked and there was nothing to compare" is a successful sweep,
+    // and leaving the timestamp stale would make the UI report the sweeper as broken.
+    if (deps.recordCheckedAt) {
+      await deps.recordCheckedAt(deps.now ? deps.now() : new Date())
+    }
+    return { checked: 0, drifted: 0, items: [] }
+  }
+
+  const xeroRates = await deps.fetchXeroTaxRates()
   const xeroByName = new Map<string, XeroTaxRate>()
   for (const rate of xeroRates) xeroByName.set(nameKey(rate.Name), rate)
 
