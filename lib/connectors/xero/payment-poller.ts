@@ -148,16 +148,25 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       const paidInvoice = order.accountingInvoiceId ? invoiceById.get(order.accountingInvoiceId) : undefined
       const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
 
-      // Update paidAt and advance status if still PENDING_PAYMENT
-      const updateData: Record<string, unknown> = { paidAt: paidDate }
-      if (order.status === 'PENDING_PAYMENT') {
-        updateData.status = 'PROCESSING'
-      }
+      // The status test goes INTO the write predicate, not just the read: status was read in the
+      // findMany above, and a cancellation can commit before this write. An unconditional update
+      // would flip CANCELLED back to PROCESSING and then allocate — un-cancelling the order. Requiring
+      // status='PENDING_PAYMENT' makes the advance an atomic conditional transition; if the order
+      // moved on, count is 0 and we advance/allocate nothing (o3d-2s8, Codex review of #496).
+      const advancing = order.status === 'PENDING_PAYMENT'
+      const updated = advancing
+        ? await db.salesOrder.updateMany({
+            where: { id: order.id, paidAt: null, status: 'PENDING_PAYMENT' },
+            data: { paidAt: paidDate, status: 'PROCESSING' },
+          })
+        : await db.salesOrder.updateMany({
+            where: { id: order.id, paidAt: null },
+            data: { paidAt: paidDate },
+          })
+      if (updated.count === 0) continue // cancelled or already paid concurrently — nothing to do
 
-      await db.salesOrder.update({ where: { id: order.id }, data: updateData })
-
-      // Auto-allocate if status was just advanced
-      if (order.status === 'PENDING_PAYMENT') {
+      // Auto-allocate only when the guarded PENDING_PAYMENT→PROCESSING transition actually happened.
+      if (advancing) {
         try {
           const { autoAllocateOrder } = await import('@/app/actions/allocation')
           await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
