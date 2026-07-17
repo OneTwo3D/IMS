@@ -7,6 +7,19 @@
  *   A reversed payment / chargeback must clear paidAt + unwind revenue regardless of
  *   channel; the WC refund webhook stays authoritative via a per-order dedup guard.
  * - Purchases: all POs — detects when a bill is paid via Xero bank feed
+ *
+ * All four passes read ONE delta GET (o3d-5gm). Two things forced that rewrite:
+ *
+ *  1. The delta was never real. Every pass sent `ModifiedAfter=<cursor>` as a query param, which
+ *     the Accounting API does not have — its modified-since filter is the If-Modified-Since HEADER.
+ *     Xero ignores unknown query params rather than rejecting them, so the cursor was computed,
+ *     threaded and thrown away, and every pass asked for the whole collection.
+ *  2. Which then hit the page cap. With no `page` param Xero stops at 100 rows, so "every ACCREC
+ *     invoice ever marked PAID" arrived as an arbitrary 100-row slice of history. On a tenant with
+ *     more than 100 paid invoices the forward pass could simply fail to see a payment.
+ *
+ * So this is a correctness fix that happens to be ~6x cheaper: 6 calls/run (~576/day against a
+ * 1,000/day cap) became 1 (~96/day).
  */
 
 import { db } from '@/lib/db'
@@ -17,41 +30,12 @@ import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { detectPaymentReversals } from '@/lib/domain/accounting/payment-reversal'
 import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
 
-type XeroInvoice = {
-  InvoiceID: string
-  Status: string
-  FullyPaidOnDate?: string
-}
-
-type XeroInvoicesResponse = {
-  Invoices: XeroInvoice[]
-}
-
-// audit-M-acct #3: an invoice IMS marked paid is "reversed" if it's no longer
-// PAID in Xero. After a payment is removed it returns to AUTHORISED; a voided
-// invoice becomes VOIDED. Both signal IMS should clear paidAt, so collect both.
-async function fetchReversedInvoiceIds(type: 'ACCREC' | 'ACCPAY', lastPoll: string): Promise<{ all: Set<string>; voided: Set<string> }> {
-  const modifiedAfter = new Date(lastPoll).toISOString()
-  const all = new Set<string>()
-  const voided = new Set<string>()
-  for (const status of ['AUTHORISED', 'VOIDED'] as const) {
-    // The `where` clause must be a SINGLE url-encoded param — leaving `&&` raw makes
-    // the `&` split it into separate query params, so Xero drops the Status filter and
-    // returns every ACCREC invoice (which made the VOIDED set match AUTHORISED invoices
-    // and wrongly suppressed chargebacks — scjz.71).
-    const where = encodeURIComponent(`Type=="${type}"&&Status=="${status}"`)
-    const res = await xeroGet<XeroInvoicesResponse>(
-      `Invoices?where=${where}&ModifiedAfter=${modifiedAfter}`,
-    )
-    if (res.ok && res.data?.Invoices) {
-      for (const invoice of res.data.Invoices) {
-        all.add(invoice.InvoiceID)
-        if (status === 'VOIDED') voided.add(invoice.InvoiceID)
-      }
-    }
-  }
-  return { all, voided }
-}
+import {
+  CURSOR_OVERLAP_MS,
+  fetchInvoicesModifiedSince,
+  idsWhere,
+  type XeroInvoicesResponse,
+} from './invoice-delta'
 
 // A detected payment reversal / chargeback needs a human to reconcile (dispute the
 // chargeback, revert fulfilment, chase re-payment). Broadcast a warning to active
@@ -80,15 +64,62 @@ async function notifyReversalAdmins(order: DetectedReversalOrder, wcHandled: boo
 export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[] }> {
   const result = { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [] as string[] }
 
-  // Read last poll timestamp
+  // Read last poll timestamp. Parsed defensively: the cursor is a free-text Setting, and an
+  // unparseable one (hand-edited, truncated) would otherwise reach toISOString() and throw
+  // RangeError straight out of here — the cron route does not wrap this call, so that is a 500
+  // rather than a recorded error. Falling back to the same 24h default as a missing cursor keeps a
+  // corrupt value degrading instead of breaking.
   const lastPollSetting = await db.setting.findUnique({ where: { key: 'xero_last_payment_poll' } })
-  const lastPoll = lastPollSetting?.value || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+  const defaultLastPoll = new Date(Date.now() - 24 * 60 * 60 * 1000)
+  const parsedLastPoll = lastPollSetting?.value ? new Date(lastPollSetting.value) : defaultLastPoll
+  const lastPollDate = Number.isFinite(parsedLastPoll.getTime()) ? parsedLastPoll : defaultLastPoll
+  if (lastPollDate !== parsedLastPoll) {
+    console.warn(
+      `[xero] xero_last_payment_poll is not a readable date (${JSON.stringify(lastPollSetting?.value)}); ` +
+      `falling back to the last 24h.`,
+    )
+  }
+  const lastPoll = lastPollDate.toISOString()
+
+  // Stamped BEFORE the fetch, not after the passes: anything modified while this poll is running
+  // must fall inside the NEXT window, not be skipped by a cursor set to the time we happened to
+  // finish. Paired with CURSOR_OVERLAP_MS below.
+  const pollStartedAt = new Date()
+  const since = new Date(lastPollDate.getTime() - CURSOR_OVERLAP_MS)
+
+  // --- One delta fetch for all four passes ---
+  const fetched = await fetchInvoicesModifiedSince(since, (path, opts) =>
+    xeroGet<XeroInvoicesResponse>(path, opts),
+  )
+  if (!fetched.ok) {
+    result.errors.push(`Xero invoice fetch failed: ${fetched.error}`)
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_payment_poll_cursor_held',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Xero payment poll fetched no invoices: ${fetched.error}`,
+      metadata: result,
+      resolveUser: false,
+    })
+    return result
+  }
+
+  const changed = fetched.invoices
+  const paidSalesIds = idsWhere(changed, 'ACCREC', ['PAID'])
+  const reversedSalesIds = idsWhere(changed, 'ACCREC', ['AUTHORISED', 'VOIDED'])
+  const voidedSalesIds = idsWhere(changed, 'ACCREC', ['VOIDED'])
+  const paidBillIds = idsWhere(changed, 'ACCPAY', ['PAID'])
+  const reversedBillIds = idsWhere(changed, 'ACCPAY', ['AUTHORISED', 'VOIDED'])
+  const invoiceById = new Map(changed.map((i) => [i.InvoiceID, i]))
 
   // --- Sales invoices (manual orders only — no shopping connector link) ---
   try {
-    const unpaidManualOrders = await db.salesOrder.findMany({
+    // Bounded by the delta rather than by history. This used to load EVERY unpaid order with an
+    // invoice id and intersect client-side; now Xero has already told us which invoices moved.
+    const unpaidManualOrders = paidSalesIds.size === 0 ? [] : await db.salesOrder.findMany({
       where: {
-        accountingInvoiceId: { not: null },
+        accountingInvoiceId: { in: [...paidSalesIds] },
         paidAt: null,
         refundStatus: { not: 'FULL' }, // a fully refunded order must not be revived as paid
         shoppingLinks: { none: {} }, // Shopping orders get payment status from their channel
@@ -96,61 +127,36 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
       select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true },
     })
 
-    if (unpaidManualOrders.length > 0) {
-      // Query Xero for recently paid sales invoices.
-      //
-      // The `where` clause must be a SINGLE url-encoded param — see fetchReversedInvoiceIds.
-      // Left raw, the `&&` splits the query string: Xero receives only where=Type=="ACCREC",
-      // silently drops Status, and returns EVERY ACCREC invoice whatever its status. paidIds
-      // below is built from that response, so unpaid invoices land in it and the orders they
-      // belong to get stamped paid — with paidDate falling back to now(), because an unpaid
-      // invoice has no FullyPaidOnDate. That is money marked collected that never arrived.
-      //
-      // scjz.71 fixed exactly this in fetchReversedInvoiceIds and left both forward passes
-      // untouched; the comment there described the bug that was still live here.
-      const modifiedAfter = new Date(lastPoll).toISOString()
-      const where = encodeURIComponent('Type=="ACCREC"&&Status=="PAID"')
-      const res = await xeroGet<XeroInvoicesResponse>(
-        `Invoices?where=${where}&ModifiedAfter=${modifiedAfter}`,
-      )
+    for (const order of unpaidManualOrders) {
+      const paidInvoice = order.accountingInvoiceId ? invoiceById.get(order.accountingInvoiceId) : undefined
+      const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
 
-      if (res.ok && res.data?.Invoices) {
-        const paidIds = new Set(res.data.Invoices.map(i => i.InvoiceID))
-
-        for (const order of unpaidManualOrders) {
-          if (order.accountingInvoiceId && paidIds.has(order.accountingInvoiceId)) {
-            const paidInvoice = res.data.Invoices.find(i => i.InvoiceID === order.accountingInvoiceId)
-            const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
-
-            // Update paidAt and advance status if still PENDING_PAYMENT
-            const updateData: Record<string, unknown> = { paidAt: paidDate }
-            if (order.status === 'PENDING_PAYMENT') {
-              updateData.status = 'PROCESSING'
-            }
-
-            await db.salesOrder.update({ where: { id: order.id }, data: updateData })
-
-            // Auto-allocate if status was just advanced
-            if (order.status === 'PENDING_PAYMENT') {
-              try {
-                const { autoAllocateOrder } = await import('@/app/actions/allocation')
-                await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
-              } catch { /* Non-critical */ }
-            }
-
-            result.salesPaid++
-            await logActivity({
-              entityType: 'SALES_ORDER',
-              entityId: order.id,
-              action: 'payment_detected',
-              tag: 'sync',
-              level: 'INFO',
-              description: `Payment detected via Xero for order ${order.orderNumber ?? order.externalOrderNumber}`,
-              resolveUser: false,
-            })
-          }
-        }
+      // Update paidAt and advance status if still PENDING_PAYMENT
+      const updateData: Record<string, unknown> = { paidAt: paidDate }
+      if (order.status === 'PENDING_PAYMENT') {
+        updateData.status = 'PROCESSING'
       }
+
+      await db.salesOrder.update({ where: { id: order.id }, data: updateData })
+
+      // Auto-allocate if status was just advanced
+      if (order.status === 'PENDING_PAYMENT') {
+        try {
+          const { autoAllocateOrder } = await import('@/app/actions/allocation')
+          await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+        } catch { /* Non-critical */ }
+      }
+
+      result.salesPaid++
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: order.id,
+        action: 'payment_detected',
+        tag: 'sync',
+        level: 'INFO',
+        description: `Payment detected via Xero for order ${order.orderNumber ?? order.externalOrderNumber}`,
+        resolveUser: false,
+      })
     }
   } catch (e) {
     result.errors.push(`Sales polling error: ${String(e)}`)
@@ -168,24 +174,26 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
   // too. The WC refund webhook stays authoritative: handleDetectedReversal's
   // hasWooCommerceRefund dedup guard defers to any existing WC-side refund so the
   // poller never double-reverses an order the refund path already handled.
-  // NOTE: must run AFTER the forward pass above so a pay-then-reverse within one
-  // window nets to the correct (unpaid) final state.
+  // NOTE: still ordered after the forward pass, but the hazard that note describes is now gone at
+  // the source: both passes read ONE snapshot, in which a pay-then-reverse invoice holds exactly
+  // one current status (AUTHORISED) and so cannot appear in the paid set at all.
   try {
-    const paidOrders = await db.salesOrder.findMany({
+    // Bounded by the delta: ask only about orders whose invoice actually regressed. The old query
+    // loaded every order ever paid on every run to intersect client-side.
+    const paidOrders = reversedSalesIds.size === 0 ? [] : await db.salesOrder.findMany({
       where: {
-        accountingInvoiceId: { not: null },
+        accountingInvoiceId: { in: [...reversedSalesIds] },
         paidAt: { not: null },
       },
       select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true },
     })
     if (paidOrders.length > 0) {
-      const reversedIds = await fetchReversedInvoiceIds('ACCREC', lastPoll)
       const windowStart = new Date(lastPoll)
-      for (const order of detectPaymentReversals(paidOrders, reversedIds.all)) {
+      for (const order of detectPaymentReversals(paidOrders, reversedSalesIds)) {
         // A VOIDED invoice has already had its AR/revenue reversed by Xero, so a
         // separate credit note would double-reverse — only auto-chargeback an
         // AUTHORISED payment removal where the invoice is still live (Codex P2).
-        const invoiceVoided = order.accountingInvoiceId != null && reversedIds.voided.has(order.accountingInvoiceId)
+        const invoiceVoided = order.accountingInvoiceId != null && voidedSalesIds.has(order.accountingInvoiceId)
         const { outcome, error } = await handleDetectedReversal(order, { invoiceVoided }, {
           // Dedup (window-scoped): a WC-side refund (SalesOrderRefund carrying the WC
           // externalRefundId) recorded within THIS poll window means the WC refund
@@ -244,49 +252,33 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
 
   // --- Purchase bills (all POs) ---
   try {
-    const unpaidBills = await db.purchaseInvoice.findMany({
+    const unpaidBills = paidBillIds.size === 0 ? [] : await db.purchaseInvoice.findMany({
       where: {
-        accountingInvoiceId: { not: null },
+        accountingInvoiceId: { in: [...paidBillIds] },
         paidAt: null,
       },
       select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true } } },
     })
 
-    if (unpaidBills.length > 0) {
-      // Single url-encoded `where`, for the reason spelled out in the ACCREC pass above:
-      // a raw `&&` drops the Status filter and every unpaid bill gets marked paid.
-      const modifiedAfter = new Date(lastPoll).toISOString()
-      const where = encodeURIComponent('Type=="ACCPAY"&&Status=="PAID"')
-      const res = await xeroGet<XeroInvoicesResponse>(
-        `Invoices?where=${where}&ModifiedAfter=${modifiedAfter}`,
-      )
+    for (const bill of unpaidBills) {
+      const paidInvoice = bill.accountingInvoiceId ? invoiceById.get(bill.accountingInvoiceId) : undefined
+      const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
 
-      if (res.ok && res.data?.Invoices) {
-        const paidIds = new Set(res.data.Invoices.map(i => i.InvoiceID))
+      await db.purchaseInvoice.update({
+        where: { id: bill.id },
+        data: { paidAt: paidDate },
+      })
 
-        for (const bill of unpaidBills) {
-          if (bill.accountingInvoiceId && paidIds.has(bill.accountingInvoiceId)) {
-            const paidInvoice = res.data.Invoices.find(i => i.InvoiceID === bill.accountingInvoiceId)
-            const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
-
-            await db.purchaseInvoice.update({
-              where: { id: bill.id },
-              data: { paidAt: paidDate },
-            })
-
-            result.billsPaid++
-            await logActivity({
-              entityType: 'PURCHASE_ORDER',
-              entityId: bill.poId,
-              action: 'bill_payment_detected',
-              tag: 'sync',
-              level: 'INFO',
-              description: `Bill payment detected via Xero for PO ${bill.po.reference}`,
-              resolveUser: false,
-            })
-          }
-        }
-      }
+      result.billsPaid++
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: bill.poId,
+        action: 'bill_payment_detected',
+        tag: 'sync',
+        level: 'INFO',
+        description: `Bill payment detected via Xero for PO ${bill.po.reference}`,
+        resolveUser: false,
+      })
     }
   } catch (e) {
     result.errors.push(`Bills polling error: ${String(e)}`)
@@ -294,13 +286,12 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
 
   // --- Purchase bill payment reversals (audit-M-acct #3) ---
   try {
-    const paidBills = await db.purchaseInvoice.findMany({
-      where: { accountingInvoiceId: { not: null }, paidAt: { not: null } },
+    const paidBills = reversedBillIds.size === 0 ? [] : await db.purchaseInvoice.findMany({
+      where: { accountingInvoiceId: { in: [...reversedBillIds] }, paidAt: { not: null } },
       select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true } } },
     })
     if (paidBills.length > 0) {
-      const reversedIds = await fetchReversedInvoiceIds('ACCPAY', lastPoll)
-      for (const bill of detectPaymentReversals(paidBills, reversedIds.all)) {
+      for (const bill of detectPaymentReversals(paidBills, reversedBillIds)) {
         await db.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
         result.billsReversed++
         await logActivity({
@@ -319,10 +310,13 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
   }
 
   if (result.errors.length === 0) {
+    // pollStartedAt, NOT now(): the passes above take real time, and anything Xero changed while
+    // they ran must land in the next window instead of falling into the gap. CURSOR_OVERLAP_MS
+    // then re-reads the boundary anyway, so the cost of being slightly early is one no-op.
     await db.setting.upsert({
       where: { key: 'xero_last_payment_poll' },
-      create: { key: 'xero_last_payment_poll', value: new Date().toISOString() },
-      update: { value: new Date().toISOString() },
+      create: { key: 'xero_last_payment_poll', value: pollStartedAt.toISOString() },
+      update: { value: pollStartedAt.toISOString() },
     })
   } else {
     await logActivity({

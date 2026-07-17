@@ -1,0 +1,158 @@
+import assert from 'node:assert/strict'
+import test, { mock } from 'node:test'
+
+/**
+ * Product.accountingItemId exists to stop us asking Xero "does an item with this code exist?" once
+ * per distinct SKU, per invoice, forever. On a 3-line invoice that was 3 GETs to 1 POST — ~75% of
+ * the cost of posting an invoice, against a cap of 1,000 calls per org per rolling 24h (o3d-3nc).
+ *
+ * The saving is invisible: nothing breaks if the short-circuit silently stops working, the bill just
+ * comes back. So these pin the CALL COUNT, not the return value.
+ */
+
+type ProductRow = { accountingItemId: string | null } | null
+
+let storedProduct: ProductRow = null
+const updateManyCalls: Array<{ where: unknown; data: unknown }> = []
+const getPaths: string[] = []
+const postPaths: string[] = []
+/** Queued GET responses; the last one repeats once the queue drains. */
+let getResponses: unknown[] = []
+let postResponse: unknown = { ok: true, status: 200, data: { Items: [{ ItemID: 'created-id', Code: 'SKU-1', Name: 'n' }] } }
+
+const noItems = { ok: true, status: 200, data: { Items: [] } }
+
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      product: {
+        findUnique: async () => storedProduct,
+        updateMany: async (args: { where: unknown; data: unknown }) => {
+          updateManyCalls.push(args)
+          return { count: 1 }
+        },
+      },
+    },
+  },
+})
+mock.module('@/lib/connectors/xero/api', {
+  namedExports: {
+    xeroGet: async (path: string) => {
+      getPaths.push(path)
+      return getResponses.length > 1 ? getResponses.shift() : (getResponses[0] ?? noItems)
+    },
+    xeroPost: async (path: string) => { postPaths.push(path); return postResponse },
+  },
+})
+
+// Lazily imported: tsx transpiles this to CJS, where a top-level await will not compile. The mocks
+// above are registered before any test body runs, so the first call still gets them.
+type FindOrCreateItem = (
+  code: string,
+  name: string,
+  salesAccountCode?: string,
+  purchaseAccountCode?: string,
+) => Promise<{ success: boolean; itemId?: string; error?: string }>
+
+let impl: FindOrCreateItem | null = null
+const findOrCreateItem: FindOrCreateItem = async (...args) => {
+  if (!impl) {
+    const m = await import('@/lib/connectors/xero/items')
+    impl = m.findOrCreateItem as FindOrCreateItem
+  }
+  return impl(...args)
+}
+
+function reset() {
+  storedProduct = null
+  updateManyCalls.length = 0
+  getPaths.length = 0
+  postPaths.length = 0
+  getResponses = [noItems]
+  postResponse = { ok: true, status: 200, data: { Items: [{ ItemID: 'created-id', Code: 'SKU-1', Name: 'n' }] } }
+}
+
+test('a stored item id costs ZERO Xero calls', async () => {
+  reset()
+  storedProduct = { accountingItemId: 'xero-item-123' }
+
+  const res = await findOrCreateItem('SKU-1', 'Widget', '200')
+
+  assert.deepEqual(res, { success: true, itemId: 'xero-item-123' })
+  assert.equal(getPaths.length, 0, 'a known item must not be looked up again')
+  assert.equal(postPaths.length, 0, 'a known item must not be re-created')
+})
+
+test('an unknown SKU is looked up once, and the answer is remembered', async () => {
+  reset()
+  storedProduct = { accountingItemId: null }
+  getResponses = [{ ok: true, status: 200, data: { Items: [{ ItemID: 'found-id', Code: 'SKU-1', Name: 'Widget' }] } }]
+
+  const res = await findOrCreateItem('SKU-1', 'Widget', '200')
+
+  assert.deepEqual(res, { success: true, itemId: 'found-id' })
+  assert.equal(getPaths.length, 1)
+  assert.equal(postPaths.length, 0, 'an item that already exists must not be re-created')
+  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'found-id' } }])
+})
+
+test('a newly created item is remembered too', async () => {
+  reset()
+  storedProduct = { accountingItemId: null }
+
+  const res = await findOrCreateItem('SKU-1', 'Widget', '200')
+
+  assert.deepEqual(res, { success: true, itemId: 'created-id' })
+  assert.equal(postPaths.length, 1)
+  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'created-id' } }])
+})
+
+test('the id recovered from a create race is remembered', async () => {
+  // Two invoices for a new SKU at once: the loser gets "code already exists" and re-reads. That id
+  // is just as good, and forgetting it would leave the SKU permanently uncached.
+  reset()
+  storedProduct = { accountingItemId: null }
+  postResponse = { ok: false, status: 400, error: 'Item code already exists' }
+  getResponses = [
+    noItems, // first lookup: not there yet
+    { ok: true, status: 200, data: { Items: [{ ItemID: 'raced-id', Code: 'SKU-1', Name: 'n' }] } }, // re-read after the collision
+  ]
+
+  const res = await findOrCreateItem('SKU-1', 'Widget', '200')
+
+  assert.deepEqual(res, { success: true, itemId: 'raced-id' })
+  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'raced-id' } }])
+})
+
+test('a failed create stores nothing — a cached id must mean the item exists', async () => {
+  reset()
+  storedProduct = { accountingItemId: null }
+  postResponse = { ok: false, status: 400, error: 'Account code is required' }
+
+  const res = await findOrCreateItem('SKU-1', 'Widget', '200')
+
+  assert.equal(res.success, false)
+  assert.equal(updateManyCalls.length, 0, 'nothing was created, so there is nothing to remember')
+})
+
+test('an empty code is rejected before touching the database or Xero', async () => {
+  reset()
+
+  const res = await findOrCreateItem('', 'Widget', '200')
+
+  assert.equal(res.success, false)
+  assert.equal(getPaths.length, 0)
+  assert.equal(updateManyCalls.length, 0)
+})
+
+test('the write is an updateMany, so a code that is not a product cannot throw', async () => {
+  // Not every item code is a catalogue SKU. update() would throw RecordNotFound and fail the
+  // invoice; updateMany matches zero rows and moves on.
+  reset()
+  storedProduct = { accountingItemId: null }
+
+  await findOrCreateItem('Shipping', 'Shipping & Delivery', '200')
+
+  assert.equal(updateManyCalls.length, 1)
+  assert.deepEqual(updateManyCalls[0].where, { sku: 'Shipping' })
+})

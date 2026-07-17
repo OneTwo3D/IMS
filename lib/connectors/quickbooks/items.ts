@@ -7,6 +7,7 @@
  * Same principle as Xero's untracked items (see lib/connectors/xero/items.ts).
  */
 
+import { db } from '@/lib/db'
 import { qboQuery, qboPost, escapeQboQueryValue, resolveAccountRef } from './api'
 import { getQuickBooksSettings } from './settings'
 
@@ -24,6 +25,46 @@ type QboQueryResponse = {
 }
 
 /**
+ * The QBO item Id already resolved for this code, if any.
+ *
+ * Product.accountingItemId is connector-agnostic (like accountingContactId): it holds an id owned
+ * by whichever accounting connector is connected, and both connectors clear it on disconnect, so a
+ * Xero ItemID can never be read back here as a QBO Id (o3d-3nc).
+ */
+async function getStoredItemId(code: string): Promise<string | null> {
+  const row = await db.product.findUnique({
+    where: { sku: code },
+    select: { accountingItemId: true },
+  })
+  return row?.accountingItemId ?? null
+}
+
+/**
+ * Remember the item id for this code.
+ *
+ * updateMany, not update: 'Shipping' (invoices.ts) is a real caller and is not a catalogue product,
+ * so a no-match must be a silent no-op.
+ *
+ * Never fatal — failing to CACHE an id must not fail an invoice QuickBooks already accepted — but
+ * not silent either: a caching layer that quietly stops caching is indistinguishable from a working
+ * one until the call budget is gone.
+ */
+async function storeItemId(code: string, itemId: string): Promise<void> {
+  if (!itemId) return
+  try {
+    await db.product.updateMany({
+      where: { sku: code },
+      data: { accountingItemId: itemId },
+    })
+  } catch (e) {
+    console.warn(
+      `[quickbooks] could not cache item id ${itemId} for SKU ${code}; the invoice is unaffected but ` +
+      `this SKU will cost a lookup on every future invoice until it succeeds: ${String(e)}`,
+    )
+  }
+}
+
+/**
  * Find or create a product item in QuickBooks.
  * Always uses Type: 'NonInventory' to avoid stock/COGS double-booking.
  */
@@ -32,13 +73,20 @@ export async function findOrCreateItem(
   name: string,
 ): Promise<{ success: boolean; itemId?: string; error?: string }> {
   try {
+    // Resolved once already — skip the round trip (o3d-3nc).
+    const storedItemId = await getStoredItemId(code)
+    if (storedItemId) return { success: true, itemId: storedItemId }
+
     // Search by Name (QBO items are unique by Name)
     const searchRes = await qboQuery<QboQueryResponse>(
       'Item',
       `Name = '${escapeQboQueryValue(code)}'`,
     )
     const existing = searchRes.data?.QueryResponse?.Item?.[0]
-    if (existing) return { success: true, itemId: existing.Id }
+    if (existing) {
+      await storeItemId(code, existing.Id)
+      return { success: true, itemId: existing.Id }
+    }
 
     // Resolve account refs for the item
     const settings = await getQuickBooksSettings()
@@ -69,11 +117,15 @@ export async function findOrCreateItem(
           `Name = '${escapeQboQueryValue(code)}'`,
         )
         const retryItem = retryRes.data?.QueryResponse?.Item?.[0]
-        if (retryItem) return { success: true, itemId: retryItem.Id }
+        if (retryItem) {
+          await storeItemId(code, retryItem.Id)
+          return { success: true, itemId: retryItem.Id }
+        }
       }
       return { success: false, error: createRes.error ?? 'Failed to create item' }
     }
 
+    await storeItemId(code, createRes.data.Item.Id)
     return { success: true, itemId: createRes.data.Item.Id }
   } catch (e) {
     return { success: false, error: String(e) }

@@ -435,7 +435,7 @@ export async function disconnect(): Promise<void> {
   await db.$transaction([
     db.accountingToken.deleteMany({ where: { connector: QBO_CONNECTOR } }),
     db.setting.deleteMany({ where: { key: QBO_EXPECTED_REALM_KEY } }),
-    // Clear cached contact IDs so stale QuickBooks IDs aren't reused after
+    // Clear cached contact + item IDs so stale QuickBooks IDs aren't reused after
     // reconnecting to a different company or switching connectors.
     db.customer.updateMany({
       where: { accountingContactId: { not: null } },
@@ -444,6 +444,10 @@ export async function disconnect(): Promise<void> {
     db.supplier.updateMany({
       where: { accountingContactId: { not: null } },
       data: { accountingContactId: null },
+    }),
+    db.product.updateMany({
+      where: { accountingItemId: { not: null } },
+      data: { accountingItemId: null },
     }),
   ])
 }

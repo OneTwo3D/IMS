@@ -400,12 +400,31 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
 }
 
 /**
- * Disconnect from Xero — clears stored token.
+ * Disconnect from Xero — clears the stored token and every id that token resolved.
+ *
+ * The accounting*Id columns are connector-agnostic: they hold ids belonging to whichever accounting
+ * connector is connected. Left behind, a Xero ContactID/ItemID is read straight back by the
+ * QuickBooks code path (or by a reconnect to a DIFFERENT Xero org) as if it were its own — the
+ * lookups short-circuit on a stored id precisely so they never re-verify it. QuickBooks' disconnect
+ * has always cleared contacts this way; Xero's did not, which was a live bug before the item column
+ * gave it a second column to leak (o3d-3nc).
  */
 export async function disconnect(): Promise<void> {
   await db.$transaction([
     db.accountingToken.deleteMany({ where: { connector: XERO_CONNECTOR } }),
     db.setting.deleteMany({ where: { key: XERO_EXPECTED_TENANT_KEY } }),
+    db.customer.updateMany({
+      where: { accountingContactId: { not: null } },
+      data: { accountingContactId: null },
+    }),
+    db.supplier.updateMany({
+      where: { accountingContactId: { not: null } },
+      data: { accountingContactId: null },
+    }),
+    db.product.updateMany({
+      where: { accountingItemId: { not: null } },
+      data: { accountingItemId: null },
+    }),
   ])
 }
 
