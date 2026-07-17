@@ -712,13 +712,23 @@ export async function allocateSalesOrder(
   const runAllocation = async (tx: Prisma.TransactionClient) => {
     await lockSalesOrder(tx, orderId)
 
+    // Re-read status UNDER the row lock. It was read above (for warehouse selection) BEFORE the lock,
+    // so a cancellation may have committed since. Allocating a CANCELLED order — creating reservations
+    // and flipping it to ALLOCATED — would silently un-cancel it. This is the window the payment
+    // reconcile/poller can hit: they advance PENDING_PAYMENT→PROCESSING under a guarded write, then
+    // call allocation separately, and a human cancel in between must win (o3d-2s8, Codex review #496).
+    const lockedStatus = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+    if (lockedStatus?.status === 'CANCELLED') {
+      return { nextAllocations: [], syncProductIds: [], refused: true as const, refusedReason: 'cancelled' as const }
+    }
+
     if (input.refuseIfShipmentsExist) {
       const shipmentExists = await tx.shipment.findFirst({
         where: { orderId },
         select: { id: true },
       })
       if (shipmentExists) {
-        return { nextAllocations: [], syncProductIds: [], refused: true as const }
+        return { nextAllocations: [], syncProductIds: [], refused: true as const, refusedReason: 'shipments' as const }
       }
     }
 
@@ -954,7 +964,9 @@ export async function allocateSalesOrder(
   if (allocationResult.refused) {
     return {
       success: false,
-      error: 'Order has existing shipments; reallocation refused',
+      error: allocationResult.refusedReason === 'cancelled'
+        ? 'Order was cancelled; allocation refused'
+        : 'Order has existing shipments; reallocation refused',
       syncProductIds: [],
       allocationCount: 0,
       unallocatedLines: [],

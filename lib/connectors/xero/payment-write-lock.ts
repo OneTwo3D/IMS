@@ -1,4 +1,4 @@
-import { db } from '@/lib/db'
+import { Pool, type PoolClient } from 'pg'
 
 /**
  * Serializes the two jobs that write `paidAt` from Xero — the 15-minute payment poll and the daily
@@ -8,31 +8,64 @@ import { db } from '@/lib/db'
  * The race it closes: reconcile reads an invoice PAID; Xero reverses it; the poll fetches that
  * reversal but, finding `paidAt` still null, its reversal pass does nothing and advances its cursor;
  * reconcile then writes `paidAt` on the now-reversed invoice, permanently. Holding this lock across
- * each job's whole read→write means they cannot interleave: while one runs, the other skips its cycle
- * and retries later, and the poll that runs AFTER a reconcile write sees `paidAt` set and can reverse
- * it through its normal reversal pass.
+ * each job's whole read→write means they cannot interleave.
  *
- * Session-scoped advisory lock, matching the daily-batch pattern already in this codebase
- * (daily-sync.ts). A DISTINCT key so it does not contend with that batch.
+ * CONNECTION-PINNED, unlike a Prisma $executeRaw pair. A PostgreSQL session advisory lock lives on
+ * the connection that took it; the app's Prisma client runs each statement on an arbitrary pooled
+ * connection, so acquiring and releasing through it can hit DIFFERENT sockets — the release then
+ * silently no-ops and the lock leaks until that connection resets, wedging every future poll. So this
+ * checks out ONE dedicated client and does acquire → run → release all on it, and verifies the
+ * release actually happened (Codex review of #496, round 3).
  */
 export const PAYMENT_WRITE_LOCK_KEY = 4_112_208_032
 
 export type LockSkipped = { lockSkipped: true }
 export const LOCK_SKIPPED: LockSkipped = { lockSkipped: true }
 
+// A tiny dedicated pool, separate from Prisma's, used ONLY to hold advisory locks on a stable
+// connection. Advisory locks are database-global, so the lock a connection here holds is visible to
+// every other session — it does not need to be the connection the writes happen on, only a stable
+// one held for the lock's lifetime. Lazily created; a handful of connections is plenty for two
+// low-frequency jobs.
+let lockPool: Pool | null = null
+function getLockPool(): Pool {
+  if (!lockPool) {
+    const connectionString = process.env.DATABASE_URL
+    if (!connectionString) throw new Error('DATABASE_URL is required for the payment-write lock')
+    lockPool = new Pool({ connectionString, max: 4 })
+  }
+  return lockPool
+}
+
 /**
  * Run `fn` holding the payment-write lock. If another payment-writing job holds it, DO NOT wait —
- * return LOCK_SKIPPED so the caller can defer to its next cycle. Always releases on the way out.
+ * return LOCK_SKIPPED so the caller can defer to its next cycle. Acquire, run and release all happen
+ * on ONE pinned connection, which is then returned to the pool.
  */
 export async function withPaymentWriteLockOrSkip<T>(fn: () => Promise<T>): Promise<T | LockSkipped> {
-  const rows = await db.$queryRaw<Array<{ locked: boolean }>>`
-    SELECT pg_try_advisory_lock(${PAYMENT_WRITE_LOCK_KEY}) AS locked
-  `
-  if (!rows[0]?.locked) return LOCK_SKIPPED
+  const client: PoolClient = await getLockPool().connect()
+  let held = false
   try {
+    const acquired = await client.query<{ locked: boolean }>(
+      'SELECT pg_try_advisory_lock($1) AS locked',
+      [PAYMENT_WRITE_LOCK_KEY],
+    )
+    if (!acquired.rows[0]?.locked) return LOCK_SKIPPED
+    held = true
     return await fn()
   } finally {
-    await db.$executeRaw`SELECT pg_advisory_unlock(${PAYMENT_WRITE_LOCK_KEY})`
+    if (held) {
+      // Same connection that acquired it, so this genuinely releases. Verify, because a silent
+      // false here would mean a leaked lock that wedges every subsequent poll.
+      const released = await client.query<{ unlocked: boolean }>(
+        'SELECT pg_advisory_unlock($1) AS unlocked',
+        [PAYMENT_WRITE_LOCK_KEY],
+      )
+      if (!released.rows[0]?.unlocked) {
+        console.error('[payment-write-lock] advisory unlock returned false — the lock may be leaked')
+      }
+    }
+    client.release()
   }
 }
 
