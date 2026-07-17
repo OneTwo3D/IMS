@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   classifyDoc,
   fetchInvoiceStatusesByIds,
+  parseSettlementDate,
   reconcileLinkedInvoices,
   RECONCILE_BATCH_SIZE,
   type LinkedDoc,
@@ -11,8 +12,15 @@ import {
   type XeroReconcileInvoice,
 } from '@/lib/connectors/xero/payment-reconcile'
 
+test('parseSettlementDate: a real date parses, absent/garbage is null (never fabricated)', () => {
+  assert.equal(parseSettlementDate('2026-07-01T00:00:00Z')?.toISOString(), '2026-07-01T00:00:00.000Z')
+  assert.equal(parseSettlementDate(undefined), null)
+  assert.equal(parseSettlementDate(''), null)
+  assert.equal(parseSettlementDate('not-a-date'), null)
+})
+
 function doc(over: Partial<LinkedDoc> = {}): LinkedDoc {
-  return { id: 'o1', accountingInvoiceId: 'INV-1', imsPaid: false, imsAdvanced: false, label: 'order 1', ...over }
+  return { id: 'o1', accountingInvoiceId: 'INV-1', imsPaid: false, label: 'order 1', ...over }
 }
 const xero = (status: string, fullyPaid?: string): XeroReconcileInvoice => ({ InvoiceID: 'INV-1', Status: status, FullyPaidOnDate: fullyPaid })
 
@@ -38,9 +46,10 @@ test('IMS paid + Xero AUTHORISED = suspect advance (the o3d-1d9 signal)', () => 
   assert.equal(v.kind === 'suspect-advance' && v.xeroStatus, 'AUTHORISED')
 })
 
-test('IMS advanced but unpaid + Xero not PAID = suspect advance', () => {
-  // An order moved to PROCESSING as if paid, but Xero never marked its invoice PAID.
-  assert.equal(classifyDoc(doc({ imsPaid: false, imsAdvanced: true }), xero('AUTHORISED')).kind, 'suspect-advance')
+test('advanced-but-unpaid (paidAt null) is NOT a suspect — shipped-on-credit is legitimate', () => {
+  // Only paidAt-set-but-Xero-not-PAID is the o3d-1d9 signal; flagging every credit-term order would
+  // bury the real damage (Codex review of #496).
+  assert.equal(classifyDoc(doc({ imsPaid: false }), xero('AUTHORISED')).kind, 'consistent')
 })
 
 test('IMS paid + Xero VOIDED = suspect advance (paid against a voided invoice)', () => {
@@ -101,8 +110,7 @@ function makeDeps(over: Partial<ReconcileDeps> & { docs: Array<LinkedDoc & { kin
   const deps: ReconcileDeps = {
     loadLinkedDocs: async () => over.docs,
     fetchStatuses: async () => ({ ok: true, statuses: over.statuses }),
-    markPaid: async (d) => { marked.push(d.id) },
-    now: () => new Date('2026-07-17T00:00:00Z'),
+    markPaid: async (d) => { marked.push(d.id); return { applied: true, paidDate: '2026-07-01T00:00:00.000Z' } },
     ...over,
   }
   return { deps, marked }
@@ -159,13 +167,40 @@ test('a markPaid failure is recorded and does not abort the sweep', async () => 
   ]
   const statuses = new Map([['a', xero('PAID')], ['b', xero('PAID')]])
   const { deps } = makeDeps({ docs, statuses })
-  deps.markPaid = async (d) => { if (d.id === 'boom') throw new Error('db down'); }
+  deps.markPaid = async (d) => {
+    if (d.id === 'boom') throw new Error('db down')
+    return { applied: true, paidDate: '2026-07-01T00:00:00.000Z' }
+  }
 
   const r = await reconcileLinkedInvoices(deps, { apply: true })
 
   assert.equal(r.errors.length, 1)
   assert.match(r.errors[0], /order BOOM.*db down/)
   assert.equal(r.missedPayments.find((m) => m.id === 'ok')?.applied, true, 'the other one still applied')
+})
+
+test('markPaid declining to apply (reversed/no-date/concurrent) is recorded as skipped, not an error', async () => {
+  // The re-verification path: markPaid returns applied:false with a reason instead of throwing. That
+  // is a normal, expected outcome — not an error — and the sweep continues.
+  const docs = [{ kind: 'sales' as const, ...doc({ id: 'flipped', accountingInvoiceId: 'A', label: 'order FLIP' }) }]
+  const { deps, marked } = makeDeps({ docs, statuses: new Map([['a', xero('PAID')]]) })
+  deps.markPaid = async () => ({ applied: false, reason: 'no longer PAID in Xero (now AUTHORISED) — the poller or a reversal moved first' })
+
+  const r = await reconcileLinkedInvoices(deps, { apply: true })
+
+  assert.equal(r.errors.length, 0, 'a declined apply is not an error')
+  assert.equal(r.missedPayments[0].applied, false)
+  assert.match(r.missedPayments[0].skipped ?? '', /no longer PAID/)
+  assert.deepEqual(marked, [], 'nothing was actually written')
+})
+
+test('report mode never fabricates a paid date — null when Xero gives none', async () => {
+  const docs = [{ kind: 'sales' as const, ...doc({ id: 'nodate', accountingInvoiceId: 'A' }) }]
+  const { deps } = makeDeps({ docs, statuses: new Map([['a', xero('PAID')]]) }) // no FullyPaidOnDate
+
+  const r = await reconcileLinkedInvoices(deps, { apply: false })
+
+  assert.equal(r.missedPayments[0].paidDate, null, 'no now() fallback for a possibly months-old payment')
 })
 
 test('a Xero fetch failure aborts with an error and applies nothing', async () => {

@@ -75,14 +75,12 @@ export type LinkedDoc = {
   accountingInvoiceId: string
   /** IMS believes this document is paid (paidAt is set). */
   imsPaid: boolean
-  /** IMS has advanced this document past its unpaid state (e.g. a sales order past PENDING_PAYMENT). */
-  imsAdvanced: boolean
   label: string
 }
 
 export type ReconcileVerdict =
   | { kind: 'missed-payment'; xero: XeroReconcileInvoice } // IMS unpaid, Xero PAID → collect it
-  | { kind: 'suspect-advance'; xeroStatus: string }        // IMS treats as paid/advanced, Xero not PAID
+  | { kind: 'suspect-advance'; xeroStatus: string }        // IMS PAID, Xero not PAID → review (o3d-1d9)
   | { kind: 'consistent' }
   | { kind: 'unknown' }                                    // Xero did not return this id
 
@@ -90,19 +88,33 @@ export type ReconcileVerdict =
  * Compare one document's IMS state against its Xero status. Pure — this is the whole decision, and it
  * is where a wrong call marks money collected that never arrived (or vice versa), so it is unit-tested
  * in isolation from the DB and the network.
+ *
+ * The suspect-advance signal is deliberately narrow: ONLY paidAt-set-but-Xero-not-PAID. An order that
+ * merely MOVED FORWARD unpaid (PROCESSING…DELIVERED with paidAt null) is not a suspect — "shipped on
+ * credit, never paid" is a legitimate workflow here, and flagging every credit-term order daily would
+ * bury the real o3d-1d9 damage, which always SET paidAt (Codex review of #496).
  */
 export function classifyDoc(doc: LinkedDoc, xero: XeroReconcileInvoice | undefined): ReconcileVerdict {
   if (!xero) return { kind: 'unknown' }
   const paidInXero = xero.Status === 'PAID'
 
   if (paidInXero && !doc.imsPaid) return { kind: 'missed-payment', xero }
-  if (!paidInXero && (doc.imsPaid || doc.imsAdvanced)) return { kind: 'suspect-advance', xeroStatus: xero.Status }
+  if (!paidInXero && doc.imsPaid) return { kind: 'suspect-advance', xeroStatus: xero.Status }
   return { kind: 'consistent' }
 }
 
+/** Parse a Xero settlement date, or null if absent/unparseable — never fabricate one. */
+export function parseSettlementDate(value: string | undefined): Date | null {
+  if (!value) return null
+  const d = new Date(value)
+  return Number.isFinite(d.getTime()) ? d : null
+}
+
+export type ApplyOutcome = { applied: boolean; paidDate?: string; reason?: string }
+
 export type ReconcileReport = {
   checked: number
-  missedPayments: Array<{ id: string; label: string; paidDate: string; applied: boolean }>
+  missedPayments: Array<{ id: string; label: string; paidDate: string | null; applied: boolean; skipped?: string }>
   suspectAdvances: Array<{ id: string; label: string; xeroStatus: string }>
   unknown: Array<{ id: string; label: string; accountingInvoiceId: string }>
   errors: string[]
@@ -114,9 +126,13 @@ export type ReconcileDeps = {
   fetchStatuses: (
     ids: string[],
   ) => Promise<{ ok: true; statuses: Map<string, XeroReconcileInvoice> } | { ok: false; error: string }>
-  /** Mark a missed payment paid (mirrors the poller's forward pass). Only called when apply=true. */
-  markPaid: (doc: LinkedDoc & { kind: 'sales' | 'bill' }, xero: XeroReconcileInvoice) => Promise<void>
-  now: () => Date
+  /**
+   * Collect a missed payment. Only called when apply=true. MUST re-verify against fresh Xero state
+   * and write conditionally (the classification snapshot is stale by the time we get here — hence no
+   * snapshot is passed in), and MUST refuse to apply without a valid settlement date. Returns what it
+   * actually did.
+   */
+  markPaid: (doc: LinkedDoc & { kind: 'sales' | 'bill' }) => Promise<ApplyOutcome>
 }
 
 /**
@@ -145,19 +161,24 @@ export async function reconcileLinkedInvoices(
     const verdict = classifyDoc(doc, xero)
 
     if (verdict.kind === 'missed-payment') {
-      const paidDate = verdict.xero.FullyPaidOnDate
-        ? new Date(verdict.xero.FullyPaidOnDate)
-        : deps.now()
-      let applied = false
+      // Report the settlement date Xero gave us, or null — NEVER now(). This sweep recovers payments
+      // that may be months old, so stamping "paid today" would fabricate settlement timing that
+      // AP/AR aging and realised-FX depend on (Codex review of #496).
+      const settled = parseSettlementDate(verdict.xero.FullyPaidOnDate)
+      const entry: ReconcileReport['missedPayments'][number] = {
+        id: doc.id, label: doc.label, paidDate: settled ? settled.toISOString() : null, applied: false,
+      }
       if (opts.apply) {
         try {
-          await deps.markPaid(doc, verdict.xero)
-          applied = true
+          const outcome = await deps.markPaid(doc)
+          entry.applied = outcome.applied
+          if (outcome.paidDate) entry.paidDate = outcome.paidDate
+          if (!outcome.applied && outcome.reason) entry.skipped = outcome.reason
         } catch (e) {
           report.errors.push(`Failed to mark ${doc.label} paid: ${e instanceof Error ? e.message : String(e)}`)
         }
       }
-      report.missedPayments.push({ id: doc.id, label: doc.label, paidDate: paidDate.toISOString(), applied })
+      report.missedPayments.push(entry)
     } else if (verdict.kind === 'suspect-advance') {
       report.suspectAdvances.push({ id: doc.id, label: doc.label, xeroStatus: verdict.xeroStatus })
     } else if (verdict.kind === 'unknown') {
@@ -170,17 +191,11 @@ export async function reconcileLinkedInvoices(
 
 // --- production wiring -------------------------------------------------------
 
-/** Sales-order statuses that mean IMS has moved the order on as if it were paid (o3d-1d9 signal). */
-const ADVANCED_SALES_STATUSES = new Set([
-  'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED',
-])
-
 /**
  * Reconcile Xero payment state for every locally-linked document.
  *
  * apply:false is a read-only audit — the safe default, and the way to answer o3d-1d9 without touching
- * anything. apply:true collects genuinely-missed payments exactly as the poller would (paidAt, status
- * advance, auto-allocation), and still only REPORTS suspect advances.
+ * anything. apply:true collects genuinely-missed payments, and still only REPORTS suspect advances.
  */
 export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<ReconcileReport> {
   const deps: ReconcileDeps = {
@@ -193,7 +208,7 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
           refundStatus: { not: 'FULL' },
           shoppingLinks: { none: {} },
         },
-        select: { id: true, accountingInvoiceId: true, paidAt: true, status: true, orderNumber: true, externalOrderNumber: true },
+        select: { id: true, accountingInvoiceId: true, paidAt: true, orderNumber: true, externalOrderNumber: true },
       })
       const bills = await db.purchaseInvoice.findMany({
         where: { accountingInvoiceId: { not: null } },
@@ -205,7 +220,6 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
           id: o.id,
           accountingInvoiceId: o.accountingInvoiceId as string,
           imsPaid: o.paidAt != null,
-          imsAdvanced: ADVANCED_SALES_STATUSES.has(o.status),
           label: `order ${o.orderNumber ?? o.externalOrderNumber ?? o.id}`,
         })),
         ...bills.map((b) => ({
@@ -213,7 +227,6 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
           id: b.id,
           accountingInvoiceId: b.accountingInvoiceId as string,
           imsPaid: b.paidAt != null,
-          imsAdvanced: false,
           label: `bill for PO ${b.po?.reference ?? b.poId}`,
         })),
       ]
@@ -221,15 +234,32 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
 
     fetchStatuses: (ids) => fetchInvoiceStatusesByIds(ids, (path) => xeroGet(path)),
 
-    markPaid: async (doc, xero) => {
-      const paidDate = xero.FullyPaidOnDate ? new Date(xero.FullyPaidOnDate) : new Date()
+    // Re-verifies against FRESH Xero state and writes conditionally. The classification snapshot was
+    // taken before the whole batch fetch + loop; by now the poller (every 15 min) may have consumed a
+    // reversal, or Xero may have changed. Writing on the stale snapshot could re-mark a reversed
+    // document paid, permanently (later sweeps only REPORT that mismatch). So: read now, and only
+    // write if it is STILL paid, has a real settlement date, and is STILL locally unpaid (Codex #496).
+    markPaid: async (doc): Promise<ApplyOutcome> => {
+      const fresh = await xeroGet<{ Invoices?: XeroReconcileInvoice[] }>(`Invoices/${doc.accountingInvoiceId}`)
+      const inv = fresh.ok ? fresh.data?.Invoices?.[0] : undefined
+      if (!inv) return { applied: false, reason: `could not re-read the invoice from Xero: ${fresh.error ?? fresh.status}` }
+      if (inv.Status !== 'PAID') return { applied: false, reason: `no longer PAID in Xero (now ${inv.Status}) — the poller or a reversal moved first` }
+
+      const settled = parseSettlementDate(inv.FullyPaidOnDate)
+      if (!settled) {
+        return { applied: false, reason: 'PAID but Xero returned no valid settlement date — review manually rather than stamp an approximate one' }
+      }
+
       if (doc.kind === 'sales') {
-        // Read status fresh: the load and the apply are separated by the Xero round trip.
         const order = await db.salesOrder.findUnique({ where: { id: doc.id }, select: { status: true } })
-        const updateData: Record<string, unknown> = { paidAt: paidDate }
         const advancing = order?.status === 'PENDING_PAYMENT'
-        if (advancing) updateData.status = 'PROCESSING'
-        await db.salesOrder.update({ where: { id: doc.id }, data: updateData })
+        // Guarded: only flip a row that is STILL unpaid, so a concurrent poller write cannot be
+        // clobbered. count 0 = someone else got there first.
+        const res = await db.salesOrder.updateMany({
+          where: { id: doc.id, paidAt: null },
+          data: advancing ? { paidAt: settled, status: 'PROCESSING' } : { paidAt: settled },
+        })
+        if (res.count === 0) return { applied: false, reason: 'already marked paid concurrently (poller)' }
         if (advancing) {
           try {
             const { autoAllocateOrder } = await import('@/app/actions/allocation')
@@ -238,18 +268,19 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
         }
         await logActivity({
           entityType: 'SALES_ORDER', entityId: doc.id, action: 'payment_detected', tag: 'sync', level: 'INFO',
-          description: `Payment reconciled from Xero for ${doc.label} (backlog sweep)`, resolveUser: false,
+          description: `Payment reconciled from Xero for ${doc.label} (backlog sweep, settled ${settled.toISOString()})`, resolveUser: false,
         })
       } else {
-        await db.purchaseInvoice.update({ where: { id: doc.id }, data: { paidAt: paidDate } })
+        const res = await db.purchaseInvoice.updateMany({ where: { id: doc.id, paidAt: null }, data: { paidAt: settled } })
+        if (res.count === 0) return { applied: false, reason: 'already marked paid concurrently (poller)' }
         await logActivity({
           entityType: 'PURCHASE_ORDER', entityId: doc.id, action: 'bill_payment_detected', tag: 'sync', level: 'INFO',
-          description: `Bill payment reconciled from Xero for ${doc.label} (backlog sweep)`, resolveUser: false,
+          description: `Bill payment reconciled from Xero for ${doc.label} (backlog sweep, settled ${settled.toISOString()})`, resolveUser: false,
         })
       }
+      return { applied: true, paidDate: settled.toISOString() }
     },
 
-    now: () => new Date(),
   }
 
   const report = await reconcileLinkedInvoices(deps, opts)
