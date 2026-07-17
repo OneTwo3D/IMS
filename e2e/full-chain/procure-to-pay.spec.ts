@@ -15,13 +15,13 @@ import { expect, test } from '@playwright/test'
 import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import {
-  cancelPurchaseOrder, createAndSendPo, createBill, openPurchaseOrder, processPendingXeroSyncViaUi,
-  receiveGoods, setPostingMode,
+  cancelPurchaseOrder, createAndSendPo, createBill, openPurchaseOrder, postSupplierCreditNote,
+  processPendingXeroSyncViaUi, receiveGoods, returnItems, setPostingMode,
 } from './harness/ims.ts'
 import { createInventoryProduct } from '../helpers.ts'
 import {
-  billIdsForPo, expectJournalLine, expectLine, externalIdFor, externalIdsFor, getInvoice,
-  getManualJournal, trackDocument,
+  billIdsForPo, expectJournalLine, expectLine, externalIdFor, externalIdsFor, getCreditNote,
+  getInvoice, getManualJournal, trackDocument,
 } from './harness/xero.ts'
 
 test.describe.serial('@full-chain @xero procure to pay', () => {
@@ -452,7 +452,167 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     expect(sumFor(inventoryAccount)).toBeCloseTo(0, 2)
     expect(sumFor(transitAccount)).toBeCloseTo(0, 2)
   })
+
+  test('PP-05: returning goods to the supplier posts an ACCPAYCREDIT and ALLOCATES it to the bill', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // The first case in this suite where the credit has to LAND ON something: an ACCPAYCREDIT
+    // that exists but is not allocated leaves the bill fully payable, so the supplier gets paid
+    // for goods that went back. Asserting the credit document alone would pass in exactly that
+    // situation — the allocation is the point.
+    const sku = taggedSku(runId, 'PP05')
+    const reference = `${runTag(runId)}-PP05`
+    const orderedQty = 4
+    const returnedQty = 2
+    const unitCost = '12.50'
+    const orderedNet = Number(unitCost) * orderedQty // 50.00
+    const returnedNet = Number(unitCost) * returnedQty // 25.00
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP05`, price: '18.00' })
+
+    const { poId } = await createAndSendPo(page, { sku, qty: String(orderedQty), unitCost })
+    await receiveGoods(page, { expectStatus: 'Received' })
+    await createBill(page, { reference })
+
+    // DRAIN BEFORE RETURNING, and this ordering is load-bearing rather than tidiness.
+    //
+    // postSupplierCreditNote threads allocateToInvoiceId from the bill's accountingInvoiceId
+    // (purchase-orders.ts:3749), and enqueuePurchaseCreditNoteFollowUps bails outright when it is
+    // null (sync-processor.ts:1731). So a bill that has not yet reached Xero when the credit is
+    // posted yields NO allocation at all — the credit note would post, this test would find it,
+    // and the bill would quietly stay fully due. The bill must own a Xero id first.
+    await processPendingXeroSyncViaUi(page)
+    // billIdsForPo returns the IMS purchase_invoices.id; the Xero InvoiceID (a GUID) is resolved
+    // from it via externalIdFor, exactly as PP-01/PP-02 do. Tracking or GETting the IMS cuid
+    // straight from Xero 404s — which is how this first showed up.
+    const [billRecordId] = await billIdsForPo(poId)
+    const billId = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId })
+    trackDocument('Invoices', billId, `PP-05 bill ${runTag(runId)}`)
+    const billBefore = await getInvoice(billId)
+    expect(billBefore.Status, 'the bill must be in the ledger BEFORE the credit is posted').toBe('AUTHORISED')
+    expect(Number(billBefore.SubTotal)).toBeCloseTo(orderedNet, 2)
+    const billTotal = Number(billBefore.Total)
+
+    await openPurchaseOrder(page, poId)
+    await returnItems(page, {
+      qty: String(returnedQty),
+      reason: 'Damaged on arrival',
+      expectStatus: 'Partially Returned', // 2 of 4 back: partially, not fully, returned
+    })
+
+    // The return only DRAFTS the credit note; an operator posts it. Both are needed, and the
+    // draft only happens at all because the PO is already billed (purchase-orders.ts:2405).
+    await postSupplierCreditNote(page)
+
+    // TWO passes, not one. Both sync processors snapshot their batch at run start, and the
+    // ALLOCATION is only enqueued as a follow-up DURING the credit note's own pass
+    // (sync-processor.ts:1715). A single drain posts the ACCPAYCREDIT and leaves the allocation
+    // sitting pending — which is precisely the failure this test exists to catch, so it must not
+    // be the failure the test itself causes.
+    await processPendingXeroSyncViaUi(page)
+    await processPendingXeroSyncViaUi(page)
+
+    const transitAccount = await settingValue('xero_transit_account')
+    const inventoryAccount = await settingValue('xero_inventory_account')
+
+    // --- the return's stock reversal: DR transit / CR inventory.
+    //
+    // Keyed on the RETURN's id, not the PO's — unlike PP-04's cancellation adjustment, which
+    // keys on poId (purchase-orders.ts:2458). Same AccountingSyncType, different referenceId;
+    // passing poId here finds nothing and times out looking like a missing journal.
+    const returnId = await purchaseReturnIdFor(poId)
+    const adjustmentId = await externalIdFor({ type: 'INVENTORY_ADJUSTMENT', referenceId: returnId })
+    trackDocument('ManualJournals', adjustmentId, `PP-05 return reversal ${runTag(runId)}`)
+
+    const adjustment = await getManualJournal(adjustmentId)
+    expect(adjustment.Status).toBe('POSTED')
+    // The FIFO-consumed cost of the returned units, which for a single-receipt PO at one unit
+    // cost is simply qty x cost. Transit is DEBITED: the goods are heading back out.
+    expectJournalLine(adjustment.JournalLines, { accountCode: transitAccount, debit: returnedNet })
+    expectJournalLine(adjustment.JournalLines, { accountCode: inventoryAccount, credit: returnedNet })
+
+    // --- the ACCPAYCREDIT itself.
+    const creditNoteRowId = await supplierCreditNoteIdFor(poId)
+    const creditNoteId = await externalIdFor({ type: 'PURCHASE_CREDIT_NOTE', referenceId: creditNoteRowId })
+    trackDocument('CreditNotes', creditNoteId, `PP-05 supplier credit ${runTag(runId)}`)
+
+    const creditNote = await getCreditNote(creditNoteId)
+    expect(creditNote.Type).toBe('ACCPAYCREDIT') // payable credit — the mirror of OC-05's ACCRECCREDIT
+    // PAID, not AUTHORISED: this credit (25.00) is fully consumed by its allocation to the larger
+    // bill (50.00), and Xero moves a fully-allocated credit note to PAID — which is itself proof the
+    // allocation landed, the whole point of PP-05. AUTHORISED would be the status of a credit that
+    // posted but never allocated, i.e. the bug this test guards against. (Still not DRAFT/DELETED.)
+    expect(creditNote.Status).toBe('PAID')
+    expect(creditNote.CurrencyCode).toBe('GBP')
+    // The credit lands on TRANSIT, not inventory (supplier-credit-note.ts:153): the stock left
+    // via the adjustment above, and this is the money leg catching up with it.
+    expectLine(creditNote.LineItems, { accountCode: transitAccount })
+
+    // --- THE POINT: the credit is ALLOCATED, so the bill is no longer fully payable.
+    //
+    // Asserted by reading the BILL back, not by looking up the allocation's own document, because
+    // PURCHASE_CREDIT_NOTE_ALLOCATION stores NO externalTransactionId by design (sync-processor.ts:1334)
+    // — externalIdFor would throw on it. The bill's AmountDue is the observable that actually
+    // matters to whoever pays the supplier.
+    // Pin the credit to the RETURNED half, absolutely — not merely > 0. A credit for the whole bill
+    // (or any wrong amount) would otherwise slip through: the AmountDue check below subtracts the
+    // SAME observed creditTotal, so it stays self-consistent whatever the credit is worth (Codex
+    // review of PR #495). SubTotal ties it to returnedNet; the gross is the matching half of the
+    // bill (2 of 4 units at one rate).
+    const creditTotal = Number(creditNote.Total)
+    expect(Number(creditNote.SubTotal), 'the credit is for the returned 2 units, not the whole order')
+      .toBeCloseTo(returnedNet, 2)
+    expect(creditTotal, 'gross credit is the returned half of the bill').toBeCloseTo(billTotal / 2, 2)
+
+    const billAfter = await getInvoice(billId)
+    expect(Number(billAfter.Total), 'allocating a credit must not alter the bill itself').toBeCloseTo(billTotal, 2)
+    // Absolute expected balance: full bill minus the (now-pinned) returned-half credit.
+    expect(
+      Number(billAfter.AmountDue),
+      'the allocation must reduce AmountDue by exactly the returned-half credit',
+    ).toBeCloseTo(billTotal - creditTotal, 2)
+  })
 })
+
+/** The PurchaseReturn row this PO produced. Its id — not the PO's — keys the return's journal. */
+async function purchaseReturnIdFor(poId: string): Promise<string> {
+  const rows = await queryRows<{ id: string }>(
+    `select id from purchase_returns where "poId" = $1 order by "createdAt" desc`,
+    [poId],
+  )
+  if (!rows.length) throw new Error(`No purchase_returns row for PO ${poId} — the return never recorded.`)
+  // One return, one credit: more than one means the dialog submitted twice and the amounts below
+  // would be asserted against whichever happened to be newest.
+  if (rows.length > 1) throw new Error(`Expected ONE return for PO ${poId}, found ${rows.length}.`)
+  return rows[0].id
+}
+
+/** The return-generated SupplierCreditNote row. Keys both the credit note and its allocation. */
+async function supplierCreditNoteIdFor(poId: string): Promise<string> {
+  const rows = await queryRows<{ id: string }>(
+    `select id from supplier_credit_notes where "poId" = $1 and "isReturnGenerated" = true order by "createdAt" desc`,
+    [poId],
+  )
+  if (!rows.length) {
+    throw new Error(`No return-generated supplier_credit_notes row for PO ${poId}. A return only drafts a credit note when the PO is already billed.`)
+  }
+  if (rows.length > 1) throw new Error(`Expected ONE return credit note for PO ${poId}, found ${rows.length}.`)
+  return rows[0].id
+}
+
+/** Read rows from this instance. */
+async function queryRows<T extends Record<string, unknown>>(sql: string, params: unknown[]): Promise<T[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<T>(sql, params)
+    return r.rows
+  } finally {
+    await db.end()
+  }
+}
 
 /** Read a setting from this instance (account codes are per-instance config). */
 async function settingValue(key: string): Promise<string> {

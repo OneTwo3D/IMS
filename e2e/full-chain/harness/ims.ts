@@ -240,6 +240,78 @@ export async function cancelPurchaseOrder(page: Page, opts: { expectStatus?: str
 }
 
 /**
+ * Return received goods to the supplier, the way an operator does.
+ *
+ * Unlike cancelPurchaseOrder this is a real shadcn <Dialog>, NOT a native confirm(), so it needs
+ * no dialog handler — adding one here would be cargo cult.
+ *
+ * The button is gated on canReturn && hasReturnable (po-detail-client.tsx:1918/:1926), and
+ * hasReturnable is `qtyReceived - qtyReturned > 0`. So there must be RECEIVED, un-returned stock
+ * before this is reachable at all: a PO that has only been sent or shipped has no button.
+ *
+ * REASON IS REQUIRED (:466) and the warehouse must be chosen per line (:434) — the dialog
+ * validates both client-side and refuses to submit, which would surface much later as a missing
+ * credit note rather than as the form error it actually is.
+ */
+export async function returnItems(
+  page: Page,
+  opts: { qty: string; reason: string; notes?: string; expectStatus?: string },
+): Promise<void> {
+  const expectStatus = opts.expectStatus ?? 'Partially Returned'
+
+  await page.getByRole('button', { name: /return items/i }).click()
+  const dialog = page.getByRole('dialog', { name: /Return Items/ })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+
+  // Same lesson as createBill: the returnable lines arrive asynchronously, so filling the qty
+  // before the table exists is a race that only loses under load.
+  await expect(dialog.locator('table')).toBeVisible({ timeout: 30_000 })
+
+  await dialog.locator('#returnReason').fill(opts.reason)
+  if (opts.notes) await dialog.locator('#returnNotes').fill(opts.notes)
+
+  await dialog.locator('input[type="number"]').first().fill(opts.qty)
+
+  // The warehouse <select> opens on "Select…" (index 0) and the dialog rejects that with
+  // "Select a warehouse for each line". Index 1 is the first real warehouse.
+  const warehouse = dialog.locator('select').first()
+  await expect(warehouse).toBeVisible({ timeout: 30_000 })
+  await warehouse.selectOption({ index: 1 })
+
+  await dialog.getByRole('button', { name: /confirm return/i }).click()
+  await expect(dialog).toBeHidden({ timeout: 30_000 })
+
+  await page.reload()
+  await expectPoStatus(page, expectStatus)
+}
+
+/**
+ * Post the return-generated supplier credit note to the accounting connector.
+ *
+ * A return does NOT post a credit note by itself: returnPurchaseOrder only DRAFTS one, and only
+ * when the PO already has a bill (purchase-orders.ts:2405). An operator then posts it from the
+ * "Supplier credit notes" card, which is what queues PURCHASE_CREDIT_NOTE (:3727).
+ *
+ * The card self-hides when there are no credits and no bills, so its presence is itself the
+ * assertion that the draft was created.
+ */
+export async function postSupplierCreditNote(page: Page): Promise<void> {
+  // Match the card heading's "Supplier credit notes (N)" specifically. A bare /Supplier credit
+  // notes/i also matches the prose hint above the table ("…(Supplier credit notes, below)…",
+  // po-detail-client.tsx:2121), so it resolves to two elements and strict mode throws.
+  const card = page.getByText(/Supplier credit notes \(\d+\)/i)
+  await expect(card).toBeVisible({ timeout: 30_000 })
+
+  const post = page.getByRole('button', { name: /^Post$/ })
+  await expect(post).toBeVisible({ timeout: 30_000 })
+  await post.click()
+
+  // The row's badge flips DRAFT -> POSTED once the action returns. Waiting on the badge rather
+  // than the button avoids racing the "Posting…" label back to "Post".
+  await expect(page.getByText(/^POSTED$/).first()).toBeVisible({ timeout: 60_000 })
+}
+
+/**
  * Enter the supplier bill against the PO. Returns the supplier invoice number used.
  *
  * `expectBillCount` is how many bills the PO should carry AFTERWARDS, and defaults to the first.
