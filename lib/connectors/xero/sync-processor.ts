@@ -1037,12 +1037,32 @@ async function processEntry(
 
   switch (type) {
     case 'SALES_INVOICE': {
-      const customerId = referenceType === 'SalesOrder'
-        ? (await db.salesOrder.findUnique({
-            where: { id: referenceId },
-            select: { customerId: true },
-          }).catch(() => null))?.customerId ?? undefined
-        : undefined
+      let customerId: string | undefined
+      if (referenceType === 'SalesOrder') {
+        const so = await db.salesOrder.findUnique({
+          where: { id: referenceId },
+          select: { customerId: true, status: true },
+        }).catch(() => null)
+        // A cancelled (or still-draft) order recognises no revenue, so its queued invoice must NOT
+        // post. This entry is enqueued at import while the order is PROCESSING; the order can be
+        // cancelled before the entry drains (cancellation is only allowed pre-dispatch, so there is
+        // genuinely no revenue). The daily-batch path already excludes these orders (status notIn
+        // [CANCELLED, DRAFT]); without the same guard here the real-time sync drain posts an
+        // AUTHORISED invoice for a cancelled sale — money on the books for an order that never
+        // shipped (o3d-5rs). Resolve the entry with no external id (skip, no post, no retry).
+        if (so && (so.status === 'CANCELLED' || so.status === 'DRAFT')) {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: referenceId,
+            action: 'xero_sales_invoice_skipped_terminal_status',
+            tag: 'sync',
+            level: 'INFO',
+            description: `Skipped posting a SALES_INVOICE for an order in ${so.status} status — no revenue to recognise`,
+          })
+          return { success: true }
+        }
+        customerId = so?.customerId ?? undefined
+      }
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
