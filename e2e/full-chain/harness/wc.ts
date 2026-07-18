@@ -186,7 +186,7 @@ export async function getWcOrder(c: WcCreds, orderId: number): Promise<WcOrderDe
  * Fire-and-forget: wp-cron.php can take seconds and we do not want to block the poll
  * loop on it, and a failed nudge is not itself a test failure — the next poll retries.
  */
-async function nudgeWpCron(c: WcCreds): Promise<void> {
+export async function nudgeWpCron(c: WcCreds): Promise<void> {
   try {
     // Give it room to finish. WordPress holds a `doing_cron` lock for ~60s, so nudges
     // are no-ops most of the time anyway; aborting the one request that DID win the
