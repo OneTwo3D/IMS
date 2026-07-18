@@ -7,6 +7,7 @@
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db } from '@/lib/db'
+import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
@@ -145,6 +146,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
   })
 
   for (const entry of pending) {
+    const claimedAt = new Date()
     const claim = await db.accountingSyncLog.updateMany({
       where: {
         id: entry.id,
@@ -166,7 +168,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       },
       data: {
         status: 'PROCESSING',
-        processingStartedAt: new Date(),
+        processingStartedAt: claimedAt,
       },
     })
     if (claim.count === 0) continue
@@ -204,8 +206,14 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimedAt)
 
+      if (syncResult.skipped) {
+        // processEntry already terminalised this row (its order was cancelled — o3d-5rs/o3d-ejg).
+        // Nothing was posted, so do NOT mark it SYNCED/POSTED; it is a resolved no-op.
+        result.skipped++
+        continue
+      }
       if (syncResult.success) {
         // Persist external ID and SYNCED status BEFORE any follow-up work.
         // If follow-ups fail, the next retry will see externalTransactionId
@@ -332,7 +340,9 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
   const skippedCount = await db.accountingSyncLog.count({
     where: { connector: QBO_CONNECTOR, status: 'FAILED', retryCount: { gte: MAX_RETRIES } },
   })
-  result.skipped = skippedCount
+  // Add, don't overwrite: the loop above already counted per-run skips (e.g. cancelled-order invoice
+  // retirements, o3d-5rs/o3d-ejg) that this exhausted-FAILED count must not erase.
+  result.skipped += skippedCount
 
   if (result.processed > 0) {
     await logActivity({
@@ -353,17 +363,36 @@ async function processEntry(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string }> {
+  claimedAt: Date,
+): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string; skipped?: boolean }> {
   const requestId = buildQboRequestId(getIdempotencySource(entryId, type, referenceId, payload))
 
   switch (type) {
     case 'SALES_INVOICE': {
-      const customerId = referenceType === 'SalesOrder'
-        ? (await db.salesOrder.findUnique({
-            where: { id: referenceId },
-            select: { customerId: true },
-          }).catch(() => null))?.customerId ?? undefined
-        : undefined
+      // Cancelled-order backstop, parity with the Xero processor (o3d-5rs / o3d-ejg): re-read the order
+      // status before posting. A SALES_INVOICE queued at import can be cancelled before it drains (cancel
+      // is only allowed pre-dispatch, so no revenue) — never post an invoice for a cancelled sale. Fail
+      // CLOSED on an unreadable/missing order; retire THIS claimed row (claim-fenced) if cancelled.
+      // Residual (same as the Xero backstop): cancellation can still commit AFTER this read but before
+      // the irreversible QBO POST (a lock-less TOCTOU). Fully closing it needs a posting-intent/lock
+      // protocol coordinating cancellation with posting — tracked cross-connector as o3d-7o0.
+      let customerId: string | undefined
+      if (referenceType === 'SalesOrder') {
+        let so: { customerId: string | null; status: string } | null
+        try {
+          so = await db.salesOrder.findUnique({ where: { id: referenceId }, select: { customerId: true, status: true } })
+        } catch (error) {
+          return { success: false, error: `Could not read sales order ${referenceId} status before posting: ${String(error)}` }
+        }
+        if (!so) {
+          return { success: false, error: `Sales order ${referenceId} not found before posting an invoice` }
+        }
+        if (so.status === 'CANCELLED') {
+          await db.$transaction((tx) => retireSalesInvoiceForCancelledOrder(tx, entryId, referenceId, claimedAt))
+          return { success: true, skipped: true }
+        }
+        customerId = so.customerId ?? undefined
+      }
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
         contactName: payload.contactName as string,
