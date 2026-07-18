@@ -153,6 +153,14 @@ function createClient(state: MemoryState): AllocationServiceClient {
     stockLevel: {
       findMany: async ({ where }: { where: { OR?: Array<{ productId: string; warehouseId: string }>; productId?: { in: string[] }; warehouseId?: { in: string[] } } }) => {
         if (where.OR) {
+          // Mimic Prisma's argument validation: a scope may only filter by productId/warehouseId.
+          // Passing an allocation row verbatim (which also carries `qty`) is exactly the bug that made
+          // cancelling an allocated order throw "Unknown argument `qty`" — reject it here so a mock,
+          // unlike a permissive one, catches the regression a real database would.
+          for (const scope of where.OR) {
+            const extra = Object.keys(scope).filter((k) => k !== 'productId' && k !== 'warehouseId')
+            if (extra.length) throw new Error(`Unknown argument \`${extra[0]}\` in stockLevel.findMany where.OR scope`)
+          }
           return state.stockLevels.filter((row) => (
             where.OR?.some((scope) => scope.productId === row.productId && scope.warehouseId === row.warehouseId)
           )).map((row) => ({ ...row }))

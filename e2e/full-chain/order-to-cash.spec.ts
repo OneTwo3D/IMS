@@ -18,7 +18,7 @@ import { expect, test } from '@playwright/test'
 import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import {
-  awaitWebhookDelivery, cleanupWc, createWcOrder, createWcProduct, getWcOrder, refundWcOrder,
+  awaitWebhookDelivery, cancelWcOrder, cleanupWc, createWcOrder, createWcProduct, getWcOrder, refundWcOrder,
   wcCreds, type WcCreds,
 } from './harness/wc.ts'
 import { allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, setPostingMode } from './harness/ims.ts'
@@ -260,6 +260,49 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     // pending a finance-reviewed fix. `!== 'NONE'` stays green both before and after that fix lands.
     expect(await orderRefundStatus(imported.salesOrderId)).not.toBe('NONE')
   })
+
+  test('OC-03: cancel in Woo before shipment -> SO CANCELLED, allocation released', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // A customer cancellation before anything ships must cancel the IMS order and release its stock
+    // reservation. The order is auto-allocated at import (10 in stock, 2 ordered), so the cancel path
+    // releases a live reservation — the exact path that used to throw an invalid stockLevel.findMany
+    // (o3d-8m7: cancelling any ALLOCATED order failed, leaving it stuck PROCESSING). This proves the
+    // full Woo->IMS cancel round-trip and the reservation release, read back from the DB.
+    const sku = taggedSku(runId, 'OC03')
+    const unitPrice = '40.00'
+    const qty = 2
+
+    // Inventory-only scenario: Xero posting stays DISABLED. Arming it would queue a SALES_INVOICE at
+    // import that the cancel does not retire; a later test's queue drain would then post an AUTHORISED
+    // invoice for this cancelled order (o3d-5rs) — an untracked, invalid receivable left in the shared
+    // Demo ledger. This spec asserts nothing in Xero, so it must not touch it.
+    await setPostingMode({ sync: false, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC03`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC03', price: unitPrice })
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+    const imported = await awaitWebhookDelivery(order.id, { creds })
+
+    // Prove a reservation actually exists BEFORE cancelling — auto-allocation happens after the webhook
+    // is visible, and without it the cancel skips the very stockLevel.findMany reads this fix repairs
+    // (the test would then pass green without exercising the regression path at all).
+    const scope = await awaitAllocated(imported.salesOrderId, qty)
+    const reservedBefore = await reservedQtyFor(scope.productId, scope.warehouseId)
+    expect(reservedBefore, 'the order must hold a live reservation before cancel').toBeGreaterThanOrEqual(qty)
+
+    // Cancel in Woo before allocating/shipping. The order.updated webhook syncs the status to CANCELLED,
+    // which drives the IMS cancel flow (releasing the reservation).
+    await cancelWcOrder(creds, order.id)
+    await awaitOrderStatus(imported.salesOrderId, 'CANCELLED')
+
+    expect(await orderStatus(imported.salesOrderId)).toBe('CANCELLED')
+    // The reservation is released: no orderAllocation rows remain AND the stock level's reservedQty
+    // drops by exactly the ordered quantity (the delta the cancel's findMany reads verify).
+    expect(await openAllocationCount(imported.salesOrderId)).toBe(0)
+    expect(await reservedQtyFor(scope.productId, scope.warehouseId)).toBeCloseTo(reservedBefore - qty, 4)
+  })
 })
 
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
@@ -296,6 +339,92 @@ async function orderRefundStatus(salesOrderId: string): Promise<string> {
       `select "refundStatus" from sales_orders where id = $1`, [salesOrderId],
     )
     return r.rows[0]?.refundStatus ?? '(none)'
+  } finally {
+    await db.end()
+  }
+}
+
+async function orderStatus(salesOrderId: string): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ status: string }>(`select status from sales_orders where id = $1`, [salesOrderId])
+    return r.rows[0]?.status ?? '(none)'
+  } finally {
+    await db.end()
+  }
+}
+
+/** Wait for the Woo status change to sync through to the SO (there is no status topic; it rides order.updated). */
+async function awaitOrderStatus(salesOrderId: string, target: string, timeoutMs = 180_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let last = '(unread)'
+  while (Date.now() < deadline) {
+    last = await orderStatus(salesOrderId)
+    if (last === target) return
+    await new Promise((res) => setTimeout(res, 3_000))
+  }
+  throw new Error(`SO ${salesOrderId} never reached status ${target} within ${timeoutMs}ms (last: ${last}).`)
+}
+
+/** How many stock reservations the order still holds. A released/cancelled order should hold none. */
+async function openAllocationCount(salesOrderId: string): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ count: string }>(
+      `select count(*)::int as count from order_allocations where "orderId" = $1`, [salesOrderId],
+    )
+    return Number(r.rows[0]?.count ?? 0)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Wait until the order has auto-allocated to the expected quantity; returns the (single) scope it reserved. */
+async function awaitAllocated(
+  salesOrderId: string,
+  expectedQty: number,
+  timeoutMs = 120_000,
+): Promise<{ productId: string; warehouseId: string }> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + timeoutMs
+    let last = 0
+    while (Date.now() < deadline) {
+      const r = await db.query<{ productId: string; warehouseId: string; sum: string }>(
+        `select "productId", "warehouseId", sum(qty)::float8 as sum from order_allocations
+          where "orderId" = $1 group by "productId", "warehouseId"`,
+        [salesOrderId],
+      )
+      const total = r.rows.reduce((s, row) => s + Number(row.sum), 0)
+      last = total
+      if (total >= expectedQty && r.rows[0]) {
+        return { productId: r.rows[0].productId, warehouseId: r.rows[0].warehouseId }
+      }
+      await new Promise((res) => setTimeout(res, 3_000))
+    }
+    throw new Error(`Order ${salesOrderId} never auto-allocated to qty ${expectedQty} within ${timeoutMs}ms (last: ${last}).`)
+  } finally {
+    await db.end()
+  }
+}
+
+/** The reservedQty a stock level currently holds for a product+warehouse. */
+async function reservedQtyFor(productId: string, warehouseId: string): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ reservedQty: string }>(
+      `select "reservedQty"::float8 as "reservedQty" from stock_levels where "productId" = $1 and "warehouseId" = $2`,
+      [productId, warehouseId],
+    )
+    return Number(r.rows[0]?.reservedQty ?? 0)
   } finally {
     await db.end()
   }

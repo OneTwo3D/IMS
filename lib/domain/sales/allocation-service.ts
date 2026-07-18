@@ -323,7 +323,11 @@ function reservationScopeKey(scope: ReservationScope): string {
 function uniqueReservationScopes(rows: ReservationScope[]): ReservationScope[] {
   const scopes = new Map<string, ReservationScope>()
   for (const row of rows) {
-    scopes.set(reservationScopeKey(row), row)
+    // Construct a clean scope rather than storing `row`: callers pass allocation rows that also carry
+    // `qty`, and these scopes are fed straight into `stockLevel.findMany({ where: { OR: scopes } })`.
+    // A stray `qty` there is an "Unknown argument `qty`" Prisma error that makes cancelling any
+    // ALLOCATED order throw (unallocated orders skip the read, which is why it stayed hidden).
+    scopes.set(reservationScopeKey(row), { productId: row.productId, warehouseId: row.warehouseId })
   }
   return [...scopes.values()]
 }
