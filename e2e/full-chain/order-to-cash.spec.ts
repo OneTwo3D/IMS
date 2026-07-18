@@ -261,23 +261,22 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     expect(await orderRefundStatus(imported.salesOrderId)).not.toBe('NONE')
   })
 
-  test('OC-03: cancel in Woo before shipment -> SO CANCELLED, allocation released', async ({ page }) => {
+  test('OC-03: cancel in Woo before shipment -> SO CANCELLED, allocation released, invoice NOT posted', async ({ page }) => {
     test.setTimeout(600_000)
 
-    // A customer cancellation before anything ships must cancel the IMS order and release its stock
-    // reservation. The order is auto-allocated at import (10 in stock, 2 ordered), so the cancel path
-    // releases a live reservation — the exact path that used to throw an invalid stockLevel.findMany
-    // (o3d-8m7: cancelling any ALLOCATED order failed, leaving it stuck PROCESSING). This proves the
-    // full Woo->IMS cancel round-trip and the reservation release, read back from the DB.
+    // A customer cancellation before anything ships must (a) cancel the IMS order and release its stock
+    // reservation, and (b) recognise NO revenue — the queued sales invoice must never reach Xero.
+    // The order is auto-allocated at import (10 in stock, 2 ordered), so the cancel path releases a live
+    // reservation — the exact path that used to throw an invalid stockLevel.findMany (o3d-8m7). And the
+    // SALES_INVOICE is queued at import while PROCESSING, so draining after the cancel used to post an
+    // AUTHORISED invoice for a cancelled sale (o3d-5rs). Both are read back from the DB / ledger.
     const sku = taggedSku(runId, 'OC03')
     const unitPrice = '40.00'
     const qty = 2
 
-    // Inventory-only scenario: Xero posting stays DISABLED. Arming it would queue a SALES_INVOICE at
-    // import that the cancel does not retire; a later test's queue drain would then post an AUTHORISED
-    // invoice for this cancelled order (o3d-5rs) — an untracked, invalid receivable left in the shared
-    // Demo ledger. This spec asserts nothing in Xero, so it must not touch it.
-    await setPostingMode({ sync: false, dailyBatch: false })
+    // Arm sync so the SALES_INVOICE IS queued at import — that is the whole point: prove that the cancel
+    // retires it (o3d-5rs) so a later drain posts nothing for the cancelled order.
+    await setPostingMode({ sync: true, dailyBatch: false })
     await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC03`, price: unitPrice })
     await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
 
@@ -293,7 +292,7 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     expect(reservedBefore, 'the order must hold a live reservation before cancel').toBeGreaterThanOrEqual(qty)
 
     // Cancel in Woo before allocating/shipping. The order.updated webhook syncs the status to CANCELLED,
-    // which drives the IMS cancel flow (releasing the reservation).
+    // which drives the IMS cancel flow (releasing the reservation AND retiring the queued invoice).
     await cancelWcOrder(creds, order.id)
     await awaitOrderStatus(imported.salesOrderId, 'CANCELLED')
 
@@ -302,6 +301,15 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     // drops by exactly the ordered quantity (the delta the cancel's findMany reads verify).
     expect(await openAllocationCount(imported.salesOrderId)).toBe(0)
     expect(await reservedQtyFor(scope.productId, scope.warehouseId)).toBeCloseTo(reservedBefore - qty, 4)
+
+    // Drain the pending queue the way an operator would — the cancel retired the SALES_INVOICE, so the
+    // drain must post nothing and leave no external document in Xero (o3d-5rs).
+    await processPendingXeroSyncViaUi(page)
+    const postedInvoiceId = await postedExternalId('SALES_INVOICE', imported.salesOrderId)
+    // If the guard ever regresses and an invoice IS posted, track it so teardown voids it rather than
+    // leaving an invalid receivable in the shared Demo ledger — THEN fail.
+    if (postedInvoiceId) trackDocument('Invoices', postedInvoiceId, `OC-03 UNEXPECTED invoice ${runTag(runId)}`)
+    expect(postedInvoiceId, 'a cancelled order must not post an ACCREC invoice').toBeNull()
   })
 })
 
@@ -415,6 +423,25 @@ async function awaitAllocated(
 }
 
 /** The reservedQty a stock level currently holds for a product+warehouse. */
+/** The external id a posted accounting doc got, or null if the sync never reached the ledger. Single read, no wait. */
+async function postedExternalId(type: string, referenceId: string): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ externalTransactionId: string | null }>(
+      `select "externalTransactionId" from accounting_sync_logs
+        where connector = 'xero' and type = $1::"AccountingSyncType" and "referenceId" = $2
+          and "externalTransactionId" is not null
+        order by "createdAt" desc limit 1`,
+      [type, referenceId],
+    )
+    return r.rows[0]?.externalTransactionId ?? null
+  } finally {
+    await db.end()
+  }
+}
+
 async function reservedQtyFor(productId: string, warehouseId: string): Promise<number> {
   const { Client } = await import('pg')
   const db = new Client({ connectionString: process.env.DATABASE_URL })

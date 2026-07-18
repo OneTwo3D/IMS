@@ -14,6 +14,7 @@ import {
   type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
 import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
+import { cancelPendingSalesInvoiceSyncForOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import {
   validateManualSalesOrderStatusTransition,
   validateSalesOrderStatusTransition,
@@ -462,6 +463,10 @@ export async function cancelSalesOrderFulfillmentState(
     where: { id: input.orderId },
     data: { ...(input.data ?? {}), status: 'CANCELLED' },
   })
+
+  // Retire any still-pending SALES_INVOICE accounting work in the SAME transaction, so the real-time
+  // sync drain cannot post an ACCREC invoice for this now-cancelled, never-shipped order (o3d-5rs).
+  await cancelPendingSalesInvoiceSyncForOrder(tx, input.orderId, new Date())
 
   return {
     previousStatus: lockedOrder.status,
