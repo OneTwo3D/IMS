@@ -18,8 +18,8 @@ import { expect, test } from '@playwright/test'
 import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import {
-  awaitWebhookDelivery, cancelWcOrder, cleanupWc, createWcOrder, createWcProduct, getWcOrder, refundWcOrder,
-  wcCreds, type WcCreds,
+  awaitWebhookDelivery, cancelWcOrder, cleanupWc, createWcOrder, createWcProduct, getWcOrder, nudgeWpCron,
+  refundWcOrder, wcCreds, type WcCreds,
 } from './harness/wc.ts'
 import { allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, setPostingMode } from './harness/ims.ts'
 import { addStockAdjustment, createInventoryProduct } from '../helpers.ts'
@@ -311,6 +311,67 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     if (postedInvoiceId) trackDocument('Invoices', postedInvoiceId, `OC-03 UNEXPECTED invoice ${runTag(runId)}`)
     expect(postedInvoiceId, 'a cancelled order must not post an ACCREC invoice').toBeNull()
   })
+
+  test('OC-04: cancel in Woo AFTER a full shipment+invoice is REJECTED — SO stays SHIPPED, invoice intact', async ({ page }) => {
+    // Worst case bounds THREE independent 300s delivery windows — the import delivery, the cancellation
+    // status_sync_failed wait, and the finally-block retirement of the cancellation event — plus product
+    // setup, the shipment UI, Xero posting, and poll overshoot. The ceiling must exceed all of them so
+    // Playwright can never abort the cleanup mid-run and leave a late cancellation event to poison-retry.
+    test.setTimeout(1_800_000)
+
+    // The mirror image of OC-03. Once the whole order has shipped and the ACCREC invoice posted, a Woo
+    // cancellation must NOT unwind revenue: the IMS refuses to cancel a shipped order ("Cannot cancel a
+    // shipped order — process a refund instead", allocation-service.ts), so the status sync fails LOUDLY
+    // (an activity log carrying that exact reason) rather than silently voiding a real receivable. This
+    // asserts the invariant end-to-end AND that this specific refusal fired — the SO stays SHIPPED and
+    // the AUTHORISED invoice is still on the Xero ledger.
+    const sku = taggedSku(runId, 'OC04')
+    const unitPrice = '35.00'
+    const qty = 2
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC04`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC04', price: unitPrice })
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+    const imported = await awaitWebhookDelivery(order.id, { creds })
+
+    // Ship the whole order (-> SHIPPED) and post the invoice — now there is a real receivable.
+    await openSalesOrder(page, imported.salesOrderId)
+    await allocateAndShip(page, { tracking: `${runTag(runId)}-OC04` })
+    await processPendingXeroSyncViaUi(page)
+
+    const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+    trackDocument('Invoices', invoiceId, `OC-04 invoice ${runTag(runId)}`)
+    expect((await getInvoice(invoiceId)).Status).toBe('AUTHORISED')
+    expect(await orderStatus(imported.salesOrderId), 'the whole order shipped before we try to cancel it').toBe('SHIPPED')
+
+    // Cancel in Woo. The order.updated webhook drives syncWcOrderStatus, which attempts the CANCELLED
+    // transition and is REFUSED — logged as status_sync_failed carrying the refusal reason. Capture a
+    // cutoff BEFORE the cancel so cleanup targets THIS cancellation event, not an earlier order.updated
+    // (shipping wrote status back to Woo). The try starts BEFORE cancelWcOrder so cleanup still runs if
+    // the request throws after Woo committed and queued the webhook.
+    const cancelAt = new Date()
+    try {
+      await cancelWcOrder(creds, order.id)
+      const rejection = await awaitActivity(imported.salesOrderId, 'status_sync_failed', creds)
+      // Prove the RIGHT thing fired — a cancellation refusal, not some unrelated status-sync error.
+      expect(rejection, 'the cancel was refused because the order is shipped').toContain('Cannot cancel a shipped order')
+
+      // The refusal held: the order keeps its SHIPPED lifecycle status (not CANCELLED, not silently
+      // reverted to any other state)...
+      expect(await orderStatus(imported.salesOrderId)).toBe('SHIPPED')
+      // ...and the receivable is untouched — still AUTHORISED, not VOIDED, on the ledger.
+      expect((await getInvoice(invoiceId)).Status).toBe('AUTHORISED')
+    } finally {
+      // Good-citizen cleanup, ALWAYS: this refusal currently poison-retries the cancellation's
+      // order.updated webhook (o3d-bx9 — a rejected status transition is returned as a retryable HTTP
+      // 500, so the inbox re-hits the same impossible rule up to 24× to dead-letter). Retire that
+      // specific event so a run never leaves churn on the SHARED e2e instance.
+      await retireCancellationWebhookEvent(order.id, cancelAt, creds)
+    }
+  })
 })
 
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
@@ -347,6 +408,84 @@ async function orderRefundStatus(salesOrderId: string): Promise<string> {
       `select "refundStatus" from sales_orders where id = $1`, [salesOrderId],
     )
     return r.rows[0]?.refundStatus ?? '(none)'
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Wait for an activity-log entry (action) for an entity — used to observe an async rejection — and
+ * return its description. Nudges WP-Cron each poll and uses the established 300s delivery budget: this
+ * waits on a NEW order.updated delivery (the cancellation), and this store has no organic traffic, so
+ * webhooks only fire when wp-cron is prodded (see awaitWebhookDelivery, measured just over 3 minutes).
+ */
+async function awaitActivity(entityId: string, action: string, creds: WcCreds, timeoutMs = 300_000): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const r = await db.query<{ description: string | null }>(
+        `select description from activity_logs where "entityId" = $1 and action = $2 order by "createdAt" desc limit 1`,
+        [entityId, action],
+      )
+      if (r.rows.length) return r.rows[0].description ?? ''
+      await nudgeWpCron(creds)
+      await new Promise((res) => setTimeout(res, 5_000))
+    }
+    throw new Error(`No '${action}' activity for ${entityId} within ${timeoutMs}ms (the async action never landed).`)
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Retire the cancellation's order.updated inbox event so a run leaves NO churn on the SHARED e2e
+ * instance. A refused status sync currently returns a retryable 500 (o3d-bx9), so the event would keep
+ * re-hitting the same impossible rule up to 24× to dead-letter. Waits for the specific event to reach a
+ * terminal state, then deletes it BY ID and verifies exactly one row went. A PROCESSED event is the
+ * future o3d-bx9 no-op (nothing to retire). Throws if it can't confirm the residue is gone — a silent
+ * no-op would let churn escape.
+ */
+async function retireCancellationWebhookEvent(wcOrderId: number, cancelAt: Date, creds: WcCreds, timeoutMs = 300_000): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    // Identify the CANCELLATION event precisely: an order.updated whose payload status is 'cancelled'
+    // and that arrived after we issued the cancel — not an earlier ship-status-back write. It goes
+    // PENDING -> PROCESSING -> FAILED after the handler returns 500, so poll until it settles. NUDGE
+    // WP-Cron each poll and use the 300s delivery budget: if the cancel threw after Woo committed, the
+    // webhook may still be queued in this trafficless store (measured >3 min), so we must drive delivery
+    // before it is safe to conclude nothing was queued.
+    const deadline = Date.now() + timeoutMs
+    let event: { id: string; status: string } | null = null
+    while (Date.now() < deadline) {
+      const r = await db.query<{ id: string; status: string }>(
+        `select id, status from shopping_webhook_events
+          where topic = 'order.updated'
+            and ("payloadJson"->>'id')::bigint = $1
+            and ("payloadJson"->>'status') = 'cancelled'
+            and "receivedAt" >= $2
+          order by "receivedAt" desc limit 1`,
+        [wcOrderId, cancelAt.toISOString()],
+      )
+      event = r.rows[0] ?? null
+      if (event && (event.status === 'FAILED' || event.status === 'PROCESSED')) break
+      await nudgeWpCron(creds)
+      await new Promise((res) => setTimeout(res, 5_000))
+    }
+    // No cancellation event delivered within the full delivery budget (e.g. the cancel request failed
+    // before Woo queued it) — nothing to retire, so no churn to leave. Only ACT on an event we
+    // positively identified.
+    if (!event) return
+    if (event.status === 'PROCESSED') return // o3d-bx9 fixed: the refusal was acknowledged — no residue.
+    if (event.status !== 'FAILED') {
+      throw new Error(`Cancellation webhook event ${event.id} for WC order ${wcOrderId} did not settle (status ${event.status}); residue may churn.`)
+    }
+    const del = await db.query(`delete from shopping_webhook_events where id = $1`, [event.id])
+    if (del.rowCount !== 1) throw new Error(`Expected to retire exactly 1 FAILED cancellation event for ${wcOrderId}, deleted ${del.rowCount}.`)
   } finally {
     await db.end()
   }
