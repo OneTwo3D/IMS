@@ -129,7 +129,19 @@ export async function createWcOrder(
 export async function refundWcOrder(
   c: WcCreds,
   orderId: number,
-  opts: { amount: string; reason?: string; lineItems?: Array<{ id: number; quantity: number; refund_total: string }> },
+  opts: {
+    amount: string
+    reason?: string
+    // refund_tax is the per-line tax refund. A FULL refund must include it: WooCommerce validates
+    // `amount` against the sum of line refund_total + refund_tax, and the IMS only treats a refund as
+    // FULL once it reaches the GROSS order total (goods + tax). Omit it for a goods-only partial refund.
+    lineItems?: Array<{
+      id: number
+      quantity: number
+      refund_total: string
+      refund_tax?: Array<{ id: number; refund_total: string }>
+    }>
+  },
 ): Promise<{ id: number; amount: string }> {
   return wcRequest(c, `/orders/${orderId}/refunds`, {
     method: 'POST',
@@ -153,7 +165,14 @@ export type WcOrderDetail = WcOrder & {
   billing?: { first_name?: string; last_name?: string; email?: string }
   customer_note?: string
   meta_data?: Array<{ key: string; value: unknown }>
-  line_items?: Array<{ id: number; sku: string; quantity: number; total: string }>
+  line_items?: Array<{
+    id: number
+    sku: string
+    quantity: number
+    total: string
+    total_tax?: string
+    taxes?: Array<{ id: number; total: string }>
+  }>
   refunds?: Array<{ id: number; total: string }>
 }
 
