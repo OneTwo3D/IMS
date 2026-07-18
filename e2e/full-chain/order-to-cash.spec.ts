@@ -372,6 +372,71 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       await retireCancellationWebhookEvent(order.id, cancelAt, creds)
     }
   })
+
+  test('OC-02: under-stocked order dispatches only the available units, and invoices the FULL order', async ({ page }) => {
+    // The ceiling must exceed the worst-case body (webhook delivery ~300s + allocate/ship + drain +
+    // external-id lookup) AND leave room for the finally-block cleanup poll (up to 90s), so Playwright's
+    // overall timeout can never pre-empt the failure-safe invoice registration and strand a document.
+    test.setTimeout(1_800_000)
+
+    // A part shipment driven by short stock: the order asks for 3 but only 2 are in stock, so
+    // auto-allocation covers 2 and the shipment dispatches 2 — a genuinely partial fulfilment (shipped <
+    // ordered). Two things must hold. Inventory: exactly the in-stock quantity leaves, and the order
+    // reaches SHIPPED once its (single) shipment dispatches — the lifecycle flips on all SHIPMENTS
+    // shipping, not on every ordered unit (allocation-service.ts:400). Ledger: the ACCREC is raised for
+    // the WHOLE customer order at import (invoiced at order — the payload carries the ordered qty), so it
+    // posts the full goods value even though only part shipped. Read both back from the DB / Xero.
+    const sku = taggedSku(runId, 'OC02')
+    const unitPrice = '20.00'
+    const orderedQty = 3
+    const stockQty = 2 // only 2 in stock -> a partial shipment of 2, 1 unit short
+    const fullGoods = Number(unitPrice) * orderedQty // 60.00 — the invoice covers all 3
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC02`, price: unitPrice })
+    await addStockAdjustment(page, sku, stockQty, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC02', price: unitPrice })
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: orderedQty }] })
+    const imported = await awaitWebhookDelivery(order.id, { creds })
+
+    // Auto-allocation can only cover 2 of 3, so this dispatches a partial shipment of the in-stock units.
+    await openSalesOrder(page, imported.salesOrderId)
+    await allocateAndShip(page, { tracking: `${runTag(runId)}-OC02` })
+
+    try {
+      await processPendingXeroSyncViaUi(page)
+
+      // GENUINELY partial: exactly the in-stock quantity shipped, and it is strictly fewer than ordered
+      // (so the test can't pass on a full-stock full ship). The order reaches SHIPPED (its one shipment
+      // dispatched); the short unit had no stock to allocate.
+      const shipped = await shippedQtyFor(imported.salesOrderId)
+      expect(shipped, 'only the in-stock units shipped').toBe(stockQty)
+      expect(shipped, 'this must be a real partial fulfilment, not a full ship').toBeLessThan(orderedQty)
+      expect(await orderStatus(imported.salesOrderId)).toBe('SHIPPED')
+
+      // The ACCREC is raised for the WHOLE customer order at import, so it posts the full goods value
+      // even though only 2 of 3 units shipped — the LINE carries the ordered quantity at the unit price,
+      // not a collapsed qty-1 or the shipped qty.
+      const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+      const invoice = await getInvoice(invoiceId)
+      expect(invoice.Type).toBe('ACCREC')
+      expect(invoice.Status).toBe('AUTHORISED')
+      const salesAccount = await settingValue('xero_sales_account')
+      const line = expectLine(invoice.LineItems, { accountCode: salesAccount, lineAmount: fullGoods })
+      expect(line.Quantity, 'the line carries the full ORDERED quantity, not the shipped quantity').toBe(orderedQty)
+      expect(line.UnitAmount, 'at the ordered unit price').toBeCloseTo(Number(unitPrice), 2)
+      expect(Number(invoice.SubTotal), 'the invoice covers the FULL ordered quantity, not just the shipped units').toBeCloseTo(fullGoods, 2)
+    } finally {
+      // Failure-safe: register any invoice that actually posted for teardown even if a lookup/assertion
+      // above threw. POLL (not a single read): if the drain's server action timed out here it may still
+      // be finishing the post, persisting the external id shortly after — so wait a bounded window before
+      // concluding nothing posted, or a post-then-fail could strand an AUTHORISED invoice in the shared
+      // Demo ledger.
+      const posted = await awaitPostedExternalId('SALES_INVOICE', imported.salesOrderId, 90_000)
+      if (posted) trackDocument('Invoices', posted, `OC-02 invoice ${runTag(runId)}`)
+    }
+  })
 })
 
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
@@ -491,6 +556,25 @@ async function retireCancellationWebhookEvent(wcOrderId: number, cancelAt: Date,
   }
 }
 
+/** Total quantity actually dispatched for an order — summed over its SHIPPED shipments' lines. */
+async function shippedQtyFor(salesOrderId: string): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ qty: string }>(
+      `select coalesce(sum(sl.qty), 0)::float8 as qty
+         from shipment_lines sl
+         join shipments s on s.id = sl."shipmentId"
+        where s."orderId" = $1 and s.status = 'SHIPPED'`,
+      [salesOrderId],
+    )
+    return Number(r.rows[0]?.qty ?? 0)
+  } finally {
+    await db.end()
+  }
+}
+
 async function orderStatus(salesOrderId: string): Promise<string> {
   const { Client } = await import('pg')
   const db = new Client({ connectionString: process.env.DATABASE_URL })
@@ -562,6 +646,17 @@ async function awaitAllocated(
 }
 
 /** The reservedQty a stock level currently holds for a product+warehouse. */
+/** Poll (bounded) for a posted external id — for failure-safe teardown registration when a server action may still be finishing. */
+async function awaitPostedExternalId(type: string, referenceId: string, timeoutMs: number): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const id = await postedExternalId(type, referenceId)
+    if (id) return id
+    if (Date.now() >= deadline) return null
+    await new Promise((res) => setTimeout(res, 3_000))
+  }
+}
+
 /** The external id a posted accounting doc got, or null if the sync never reached the ledger. Single read, no wait. */
 async function postedExternalId(type: string, referenceId: string): Promise<string | null> {
   const { Client } = await import('pg')
