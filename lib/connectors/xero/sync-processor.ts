@@ -14,6 +14,7 @@ import { pushManualJournal } from './journals'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
+import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { applyBackReference, backReferenceIsMissing, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -594,11 +595,12 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
   const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, pending)
 
   for (const entry of pending) {
+    const claimedAt = new Date()
     const claim = await db.accountingSyncLog.updateMany({
       where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
       data: {
         status: 'PROCESSING',
-        processingStartedAt: new Date(),
+        processingStartedAt: claimedAt,
       },
     })
     if (claim.count === 0) continue
@@ -652,8 +654,14 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimedAt)
 
+      if (syncResult.skipped) {
+        // processEntry already terminalised this row (e.g. its order was cancelled — o3d-5rs). Nothing
+        // was posted, so do NOT mark it SYNCED/POSTED; it is a resolved no-op.
+        result.skipped++
+        continue
+      }
       if (syncResult.success) {
         await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
@@ -729,7 +737,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
   const skippedCount = await db.accountingSyncLog.count({
     where: { connector: XERO_CONNECTOR, status: 'FAILED', retryCount: { gte: MAX_RETRIES } },
   })
-  result.skipped = skippedCount
+  // Add, don't overwrite: the loop above already counted per-run skips (e.g. cancelled-order
+  // invoice retirements, o3d-5rs) that this exhausted-FAILED count must not erase.
+  result.skipped += skippedCount
 
   if (result.processed > 0) {
     await logActivity({
@@ -796,17 +806,28 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       continue
     }
 
+    const claimedAt = new Date()
     const claim = await db.accountingSyncLog.updateMany({
       where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
       data: {
         status: 'PROCESSING',
-        processingStartedAt: new Date(),
+        processingStartedAt: claimedAt,
       },
     })
     if (claim.count === 0) {
-      if (entry.status === 'SYNCED') {
+      // The claim failed because the row is no longer PENDING/claimable. `entry` is a snapshot, so
+      // re-read the live status: it may have been retired (CANCELLED — e.g. its order was cancelled,
+      // o3d-5rs) or posted (SYNCED) since. CANCELLED is an INTENTIONAL no-op, not a failure — completing
+      // the outbox job as success stops the retry churn / false PERMANENT_FAILED alerts a cancelled sync
+      // would otherwise raise.
+      const fresh = await db.accountingSyncLog.findUnique({
+        where: { id: entry.id },
+        select: { status: true },
+      })
+      const liveStatus = fresh?.status ?? entry.status
+      if (liveStatus === 'SYNCED' || liveStatus === 'CANCELLED') {
         await markXeroOutboxSuccess(job)
-      } else if (entry.status === 'FAILED' || entry.retryCount >= MAX_RETRIES) {
+      } else if (liveStatus === 'FAILED' || entry.retryCount >= MAX_RETRIES) {
         await markXeroOutboxPermanent(job, entry.errorMessage ?? `Accounting sync log ${entry.id} is not claimable`)
       } else {
         await markXeroOutboxRetry(job, `Accounting sync log ${entry.id} is not currently claimable`)
@@ -896,8 +917,15 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimedAt)
 
+      if (syncResult.skipped) {
+        // processEntry already terminalised this row (e.g. its order was cancelled — o3d-5rs). Complete
+        // the outbox job as a successful no-op; nothing was posted, so do NOT mark it SYNCED/POSTED.
+        await markXeroOutboxSuccess(job)
+        result.skipped++
+        continue
+      }
       if (syncResult.success) {
         await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
@@ -1003,7 +1031,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
   const skippedCount = await db.accountingSyncLog.count({
     where: { connector: XERO_CONNECTOR, status: 'FAILED', retryCount: { gte: MAX_RETRIES } },
   })
-  result.skipped = skippedCount
+  // Add, don't overwrite: the loop above already counted per-run skips (e.g. cancelled-order
+  // invoice retirements, o3d-5rs) that this exhausted-FAILED count must not erase.
+  result.skipped += skippedCount
 
   if (result.processed > 0) {
     await logActivity({
@@ -1026,23 +1056,60 @@ function resolveJournalStatus(mode: unknown): string {
   return mode === 'draft' ? 'DRAFT' : 'POSTED'
 }
 
+type EntryResult = { success: boolean; externalId?: string; invoiceNumber?: string; error?: string; skipped?: boolean }
+
+/**
+ * Post-time backstop for the cancel-time sweep (o3d-5rs), shared by SALES_INVOICE and its UPDATE. A row
+ * can be enqueued (Woo import) or re-queued (rate-limit/defer/failure) AFTER the order was cancelled and
+ * its then-pending rows swept, so re-read the order status right before posting:
+ *  - CANCELLED  → retire THIS claimed row (claim-fenced) and skip; no revenue for a cancelled sale.
+ *  - unreadable / missing → FAIL CLOSED (return a retryable failure, do NOT post): a transient read
+ *    outage must not become permission to post.
+ *  - live → return the customerId and let the caller post.
+ * A residual remains: cancellation can still commit AFTER this read but before the external Xero call
+ * (a lock-less TOCTOU shared with the daily-batch's own select-then-post window); closing it fully needs
+ * a posting-intent/lock protocol between cancellation and posting (tracked separately).
+ */
+async function guardCancelledSalesOrderInvoice(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+  claimedAt: Date,
+): Promise<{ post: true; customerId?: string } | { post: false; result: EntryResult }> {
+  if (referenceType !== 'SalesOrder') return { post: true }
+  let so: { customerId: string | null; status: string } | null
+  try {
+    so = await db.salesOrder.findUnique({ where: { id: referenceId }, select: { customerId: true, status: true } })
+  } catch (error) {
+    return { post: false, result: { success: false, error: `Could not read sales order ${referenceId} status before posting: ${String(error)}` } }
+  }
+  if (!so) {
+    return { post: false, result: { success: false, error: `Sales order ${referenceId} not found before posting an invoice` } }
+  }
+  if (so.status === 'CANCELLED') {
+    // Claim-fenced: only retire if this exact claim still owns the row (retire returns false otherwise).
+    // Either way nothing was posted, so skip — a lost fence means another worker owns/posted it.
+    await db.$transaction((tx) => retireSalesInvoiceForCancelledOrder(tx, entryId, referenceId, claimedAt))
+    return { post: false, result: { success: true, skipped: true } }
+  }
+  return { post: true, customerId: so.customerId ?? undefined }
+}
+
 async function processEntry(
   entryId: string,
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string }> {
+  claimedAt: Date,
+): Promise<EntryResult> {
   const postingMode = payload._postingMode
 
   switch (type) {
     case 'SALES_INVOICE': {
-      const customerId = referenceType === 'SalesOrder'
-        ? (await db.salesOrder.findUnique({
-            where: { id: referenceId },
-            select: { customerId: true },
-          }).catch(() => null))?.customerId ?? undefined
-        : undefined
+      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, claimedAt)
+      if (!guard.post) return guard.result
+      const customerId = guard.customerId
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
@@ -1071,12 +1138,11 @@ async function processEntry(
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
       }
-      const customerId = referenceType === 'SalesOrder'
-        ? (await db.salesOrder.findUnique({
-            where: { id: referenceId },
-            select: { customerId: true },
-          }).catch(() => null))?.customerId ?? undefined
-        : undefined
+      // Same cancelled-order backstop as the create: don't modify an external receivable for an order
+      // that has since been cancelled (retire the update instead), and fail closed on an unreadable order.
+      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, claimedAt)
+      if (!guard.post) return guard.result
+      const customerId = guard.customerId
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice-update', payload)
       const invoiceResult = await updateSalesInvoice(accountingInvoiceId, {
         invoiceNumber: payload.invoiceNumber as string,

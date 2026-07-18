@@ -364,3 +364,58 @@ export async function resetMirroredAccountingEventsToPending(
     }) as never),
   })
 }
+
+/**
+ * Terminalise (VOID) the mirrored events for an order's not-yet-posted documents — used when the order
+ * is cancelled, so a never-shipped sale leaves no dangling PENDING/FAILED event that reconciliation
+ * would otherwise treat as work still owed. Only un-posted events (PENDING/FAILED) are voided; an
+ * already-POSTED event is left for the normal reversal path (a cancel of a dispatched order is blocked
+ * upstream, so this should not arise). Mirror of resetMirroredAccountingEventsToPending, opposite way.
+ */
+export async function voidMirroredAccountingEventsForOrder(
+  client: AccountingEventMirrorTransactionClient,
+  params: { types: string[]; referenceType: string; referenceId: string; reason?: string },
+): Promise<void> {
+  const types = params.types.filter(isMirrorableAccountingSyncType)
+  if (types.length === 0 || !params.referenceId.trim()) return
+
+  const events = await client.accountingEvent.findMany({
+    where: {
+      type: { in: types },
+      sourceEntityType: params.referenceType,
+      sourceEntityId: params.referenceId,
+      status: { in: ['PENDING', 'FAILED'] },
+    },
+    select: { id: true, type: true, sourceEntityType: true, sourceEntityId: true },
+  })
+  if (events.length === 0) return
+
+  // Compare-and-swap: re-assert status IN (PENDING, FAILED) in the update itself, not just the read. A
+  // concurrent worker can flip one of these events to POSTED (with an external id) between the findMany
+  // and here; without the predicate we would clobber that real post to VOID and lose its id. `count` is
+  // the rows we actually voided, so only those get an audit log.
+  const voidableIds = events.map((event) => event.id)
+  const updated = await client.accountingEvent.updateMany({
+    where: { id: { in: voidableIds }, status: { in: ['PENDING', 'FAILED'] } },
+    data: { status: 'VOID', externalId: null },
+  })
+  if (updated.count === 0) return
+
+  // Re-read to log exactly the events that ended up VOID (the CAS may have skipped a now-POSTED one).
+  const voided = await client.accountingEvent.findMany({
+    where: { id: { in: voidableIds }, status: 'VOID' },
+    select: { id: true, type: true, sourceEntityType: true, sourceEntityId: true },
+  })
+  await client.accountingEventLog.createMany({
+    data: voided.map((event) => buildAccountingEventLog({
+      accountingEventId: event.id,
+      action: 'voided_source_cancelled',
+      metadata: {
+        syncType: event.type,
+        referenceType: event.sourceEntityType,
+        referenceId: event.sourceEntityId,
+        reason: params.reason ?? 'source order cancelled',
+      },
+    }) as never),
+  })
+}

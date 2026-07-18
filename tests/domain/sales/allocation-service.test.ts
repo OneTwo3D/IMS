@@ -240,6 +240,18 @@ function createClient(state: MemoryState): AllocationServiceClient {
         .filter((refundLine) => refundLine.orderId === where.refund.orderId)
         .map((refundLine) => ({ salesOrderLineId: refundLine.salesOrderLineId, qty: refundLine.qty })),
     },
+    // Cancelling retires the order's pending SALES_INVOICE accounting work in the same tx
+    // (cancel-order-invoice-sync); these stubs let that run without a real accounting queue.
+    accountingSyncLog: {
+      updateMany: async () => ({ count: 0 }),
+    },
+    accountingEvent: {
+      findMany: async () => [],
+      updateMany: async () => ({ count: 0 }),
+    },
+    accountingEventLog: {
+      createMany: async () => ({ count: 0 }),
+    },
   }
 
   return client as unknown as AllocationServiceClient
