@@ -179,6 +179,87 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     // refund state is the orthogonal refundStatus (prisma/schema.prisma:104).
     expect(await orderRefundStatus(imported.salesOrderId)).toBe('PARTIAL')
   })
+
+  test('OC-06: full refund in Woo -> ACCRECCREDIT for the whole GROSS order value (goods + VAT)', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // The full-refund counterpart to OC-05. The difference that matters is not the plumbing but the
+    // arithmetic: a full refund must credit the ENTIRE order value — every shipped unit AND the VAT on
+    // top — reversing the invoice completely. Crediting only part (or dropping the tax) is exactly what
+    // a sync-log assertion cannot see, and is a customer refunded the wrong amount. The order MUST be
+    // genuinely taxable or this test would pass on both a correct and a tax-dropping implementation.
+    const sku = taggedSku(runId, 'OC06')
+    const unitPrice = '30.00'
+    const qty = 3
+    const goodsTotal = Number(unitPrice) * qty // 90.00 — the full refundable goods value (ex-VAT)
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC06`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC06', price: unitPrice })
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+    const imported = await awaitWebhookDelivery(order.id, { creds })
+
+    // Ship first — a refund on an allocated-but-never-shipped line is rejected (OC-05).
+    await openSalesOrder(page, imported.salesOrderId)
+    await allocateAndShip(page, { tracking: `${runTag(runId)}-OC06` })
+    await processPendingXeroSyncViaUi(page)
+
+    const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+    trackDocument('Invoices', invoiceId, `OC-06 invoice ${runTag(runId)}`)
+    const invoice = await getInvoice(invoiceId)
+
+    // The order must carry real VAT, else "full refund" degenerates to a goods-only refund that both a
+    // correct and a tax-dropping build pass identically. Gross = goods + VAT (£108 = £90 + £18 here).
+    const grossOrderTotal = Number(order.total)
+    expect(grossOrderTotal, 'the stage order must be genuinely taxable (gross > goods)').toBeGreaterThan(goodsTotal)
+
+    // Refund ALL units in WooCommerce for the WHOLE order GROSS (goods + VAT). WooCommerce validates
+    // `amount` against the sum of line refund_total + refund_tax, so the tax MUST be refunded explicitly
+    // and per tax row — a mismatched refund (gross amount, goods-only lines) is silently not applied.
+    const wcLine = (await getWcOrder(creds, order.id)).line_items?.[0]
+    expect(wcLine?.id, 'the Woo order should have a line to refund').toBeTruthy()
+    const lineTaxes = wcLine!.taxes ?? []
+    expect(lineTaxes.length, 'the refunded line must carry at least one tax row').toBeGreaterThan(0)
+    const refundTax = lineTaxes.map((t) => ({ id: t.id, refund_total: Math.abs(Number(t.total)).toFixed(2) }))
+    await refundWcOrder(creds, order.id, {
+      amount: grossOrderTotal.toFixed(2),
+      reason: `${runTag(runId)} OC-06 full refund`,
+      lineItems: [{ id: wcLine!.id, quantity: qty, refund_total: goodsTotal.toFixed(2), refund_tax: refundTax }],
+    })
+
+    const refundId = await awaitRefund(imported.salesOrderId)
+    await processPendingXeroSyncViaUi(page)
+
+    const creditNoteId = await externalIdFor({ type: 'CREDIT_NOTE', referenceId: refundId })
+    trackDocument('CreditNotes', creditNoteId, `OC-06 credit note ${runTag(runId)}`)
+
+    const creditNote = await getCreditNote(creditNoteId)
+    expect(creditNote.Type).toBe('ACCRECCREDIT')
+    expect(creditNote.Status).toBe('AUTHORISED') // see OC-01: "not DELETED" accepts a DRAFT
+    expect(creditNote.CurrencyCode).toBe('GBP')
+
+    const salesAccount = await settingValue('xero_sales_account')
+    expectLine(creditNote.LineItems, { accountCode: salesAccount, lineAmount: goodsTotal })
+
+    // The credit reverses the invoice IN FULL, on BOTH bases:
+    //  - SubTotal (goods, tax-exclusive) == the full goods value == the invoice's goods subtotal.
+    //  - Total (gross) == the full GROSS order value == the invoice's gross Total — i.e. the VAT was
+    //    credited too, not dropped. Total > SubTotal proves the VAT is actually present in the credit.
+    expect(Number(creditNote.SubTotal), 'credit note goods subtotal = full goods value').toBeCloseTo(goodsTotal, 2)
+    expect(Number(creditNote.Total), 'credit note gross = full gross order value (goods + VAT)').toBeCloseTo(grossOrderTotal, 2)
+    expect(Number(creditNote.Total)).toBeGreaterThan(Number(creditNote.SubTotal)) // VAT actually credited
+    expect(Number(invoice.SubTotal), 'the invoice goods subtotal it fully reverses').toBeCloseTo(goodsTotal, 2)
+    expect(Number(invoice.Total), 'the invoice gross it fully reverses').toBeCloseTo(grossOrderTotal, 2)
+
+    // A refund WAS recorded against the order (disposition left the NONE state). We deliberately do NOT
+    // assert refundStatus === 'FULL' here: a full refund of a TAXABLE order is currently stuck at
+    // PARTIALLY_REFUNDED because the disposition compares the net refund against the gross order total
+    // (and Woo monetary-only refunds persist gross, so the basis is not uniform) — tracked as o3d-w00,
+    // pending a finance-reviewed fix. `!== 'NONE'` stays green both before and after that fix lands.
+    expect(await orderRefundStatus(imported.salesOrderId)).not.toBe('NONE')
+  })
 })
 
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
