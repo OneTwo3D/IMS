@@ -16,6 +16,7 @@ import {
   type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
 import { toDecimal } from '@/lib/domain/math/decimal'
+import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 
 type ProductRow = {
   id: string
@@ -820,6 +821,35 @@ test('cancelSalesOrderFulfillmentState refuses a partially-shipped order with a 
     /Cannot cancel an order with a dispatched shipment/,
   )
   assert.equal(state.order.status, 'ALLOCATED')
+})
+
+test('a SHIPPED order WITH a dispatched shipment refuses PERMANENTLY', async () => {
+  // Goods actually left, so this refusal can never become valid — the webhook may acknowledge it.
+  const state = baseState({
+    order: { ...baseState().order, status: 'SHIPPED' },
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null }],
+  })
+  const client = createClient(state)
+
+  const error = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }).catch((e) => e)
+  assert.match(String(error?.message), /Cannot cancel a shipped order/)
+  assert.equal(isPermanentStatusTransitionError(error), true)
+})
+
+test('a SHIPPED order with NO dispatch evidence refuses TRANSIENTLY (o3d-bx9)', async () => {
+  // SalesOrder.status alone is not proof of dispatch: importWcOrder writes the configurable WooCommerce
+  // status mapping straight into it, so a store can map a status to SHIPPED on an order that has no
+  // shipment at all. Acknowledging that would strand IMS as SHIPPED while Woo says CANCELLED, so it must
+  // stay retryable — the mapping may yet be corrected.
+  const state = baseState({
+    order: { ...baseState().order, status: 'SHIPPED' },
+    shipments: [],
+  })
+  const client = createClient(state)
+
+  const error = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }).catch((e) => e)
+  assert.match(String(error?.message), /Cannot cancel a shipped order/)
+  assert.equal(isPermanentStatusTransitionError(error), false, 'no dispatch evidence => not terminal')
 })
 
 test('updateSalesOrderStatusUnderLock refuses PICKING when allocations disappeared before locked update', async () => {

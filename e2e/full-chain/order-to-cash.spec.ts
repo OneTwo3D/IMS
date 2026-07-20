@@ -364,11 +364,14 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       expect(await orderStatus(imported.salesOrderId)).toBe('SHIPPED')
       // ...and the receivable is untouched — still AUTHORISED, not VOIDED, on the ledger.
       expect((await getInvoice(invoiceId)).Status).toBe('AUTHORISED')
+
+      // ...and the refusal is ACKNOWLEDGED, not retried: a stable business rule will refuse the identical
+      // payload every time, so the cancellation's order.updated event settles PROCESSED instead of
+      // churning to a dead letter (o3d-bx9). This is the live proof of that classification.
+      expect(await cancellationWebhookStatus(order.id, cancelAt, creds)).toBe('PROCESSED')
     } finally {
-      // Good-citizen cleanup, ALWAYS: this refusal currently poison-retries the cancellation's
-      // order.updated webhook (o3d-bx9 — a rejected status transition is returned as a retryable HTTP
-      // 500, so the inbox re-hits the same impossible rule up to 24× to dead-letter). Retire that
-      // specific event so a run never leaves churn on the SHARED e2e instance.
+      // Safety net only: if the classification ever regresses the event lands FAILED and would retry, so
+      // retire it rather than leave churn on the SHARED e2e instance. A PROCESSED event is left alone.
       await retireCancellationWebhookEvent(order.id, cancelAt, creds)
     }
   })
@@ -500,6 +503,35 @@ async function awaitActivity(entityId: string, action: string, creds: WcCreds, t
       await new Promise((res) => setTimeout(res, 5_000))
     }
     throw new Error(`No '${action}' activity for ${entityId} within ${timeoutMs}ms (the async action never landed).`)
+  } finally {
+    await db.end()
+  }
+}
+
+/** The terminal status of the cancellation's own order.updated inbox event (PROCESSED once acknowledged). */
+async function cancellationWebhookStatus(wcOrderId: number, cancelAt: Date, creds: WcCreds, timeoutMs = 300_000): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + timeoutMs
+    let last = '(none)'
+    while (Date.now() < deadline) {
+      const r = await db.query<{ status: string }>(
+        `select status from shopping_webhook_events
+          where topic = 'order.updated'
+            and ("payloadJson"->>'id')::bigint = $1
+            and ("payloadJson"->>'status') = 'cancelled'
+            and "receivedAt" >= $2
+          order by "receivedAt" desc limit 1`,
+        [wcOrderId, cancelAt.toISOString()],
+      )
+      last = r.rows[0]?.status ?? '(none)'
+      if (last === 'PROCESSED' || last === 'FAILED' || last === 'DEAD_LETTER') return last
+      await nudgeWpCron(creds)
+      await new Promise((res) => setTimeout(res, 5_000))
+    }
+    return last
   } finally {
     await db.end()
   }

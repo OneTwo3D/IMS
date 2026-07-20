@@ -160,6 +160,9 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   const wcOrder = payload as WcFullOrder
 
   const failures: string[] = []
+  // Failures a stable business rule caused. Re-delivering the identical payload re-hits the identical
+  // rule, so these are acknowledged rather than retried into the dead-letter queue (o3d-bx9).
+  const permanentFailures: string[] = []
   if (topic === 'order.created') {
     const importResult = await importWcOrder(wcOrder)
     if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
@@ -201,7 +204,11 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
     if (!suppressed.suppress) {
       const statusResult = await syncWcOrderStatus(wcOrder)
-      if (!statusResult.success) failures.push(`syncWcOrderStatus: ${statusResult.error ?? 'unknown error'}`)
+      if (!statusResult.success) {
+        const detail = `syncWcOrderStatus: ${statusResult.error ?? 'unknown error'}`
+        if (statusResult.permanent) permanentFailures.push(detail)
+        else failures.push(detail)
+      }
     }
     try {
       await syncRefundsForOrder(wcOrder.id)
@@ -211,8 +218,21 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   }
 
   if (failures.length === 0) {
+    // A PERMANENT rejection is a resolved outcome, not a pending one: the work will never succeed, so
+    // the delivery is acknowledged and the cursor advances. It is still logged loudly for visibility —
+    // retrying it 24 times to a dead letter told operators nothing they could act on (o3d-bx9).
+    if (permanentFailures.length > 0) {
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_order_webhook_rejected',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `WooCommerce order webhook for #${wcOrder.number} was refused by a business rule; acknowledged rather than retried`,
+        metadata: { externalOrderId: wcOrder.id, topic, status: wcOrder.status, permanentFailures },
+      })
+    }
     await advanceWcOrderSyncCursor()
-    return NextResponse.json({ ok: true })
+    return NextResponse.json({ ok: true, ...(permanentFailures.length > 0 ? { permanentFailures } : {}) })
   }
 
   await logActivity({
@@ -221,11 +241,10 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     tag: 'sync',
     level: 'WARNING',
     description: `WooCommerce order webhook for #${wcOrder.number} had failures; cursor not advanced so polling can retry`,
-    metadata: { externalOrderId: wcOrder.id, topic, status: wcOrder.status, failures },
+    metadata: { externalOrderId: wcOrder.id, topic, status: wcOrder.status, failures, permanentFailures },
   })
-  // Return HTTP 500 so WooCommerce retries delivery (any 2xx is treated as
-  // delivered regardless of body). Polling reconcile is suppressed while
-  // webhooks are primary, so we rely on WC's retry to recover.
+  // Return HTTP 500 so the delivery is RETRIED — the inbox treats 5xx as retryable. Only genuinely
+  // transient failures reach here; permanent business rejections were acknowledged above.
   return NextResponse.json({ ok: false, failures }, { status: 500 })
 }
 
