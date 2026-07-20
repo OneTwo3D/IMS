@@ -56,6 +56,7 @@ import {
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
+import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
   cancelSalesOrderFulfillmentState,
@@ -1316,7 +1317,9 @@ export async function applySalesOrderStatusTransition(
   targetStatus: SoStatus,
   extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
   options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol; skipPermissionCheck?: boolean },
-): Promise<{ success: boolean; error?: string }> {
+  // `permanent: true` marks a failure a stable business rule refused, so a caller driving this from a
+  // retrying transport (the Woo webhook inbox) can acknowledge it instead of retrying forever (o3d-bx9).
+): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
   try {
     // internalBypassToken skips BOTH the permission check and the state-machine
     // guard — used by external systems (WooCommerce) that may legitimately force
@@ -1574,7 +1577,11 @@ export async function applySalesOrderStatusTransition(
       description: `Failed to update sales order status: ${errorMessage}`,
       metadata: null,
     })
-    return { success: false, error: errorMessage }
+    // Classify rather than flatten (o3d-bx9). A stable business rejection and a transient DB/lock
+    // failure both land here as thrown Errors; returning them identically is what made the Woo webhook
+    // retry an impossible cancellation ~24 times into the dead-letter queue. Anything unrecognised stays
+    // transient, so a new failure mode keeps retrying rather than being silently acknowledged.
+    return { success: false, error: errorMessage, permanent: isPermanentStatusTransitionError(e) }
   }
 }
 

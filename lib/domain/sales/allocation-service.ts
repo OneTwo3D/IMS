@@ -15,6 +15,7 @@ import {
 } from '@/lib/products/kit-fulfillment'
 import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
 import { cancelPendingSalesInvoiceSyncForOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { PermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import {
   validateManualSalesOrderStatusTransition,
   validateSalesOrderStatusTransition,
@@ -393,12 +394,14 @@ export async function cancelSalesOrderFulfillmentState(
     select: { status: true },
   })
   if (!lockedOrder) throw new Error('Order not found')
-  if (lockedOrder.status === 'SHIPPED') {
-    throw new Error('Cannot cancel a shipped order — process a refund instead')
-  }
 
+  // Durable evidence that goods actually left. Read BEFORE the status guard because it is what decides
+  // whether a refusal is PERMANENT: SalesOrder.status alone is not proof of dispatch — importWcOrder
+  // writes the configurable WooCommerce status mapping straight into it, and a store may map a status to
+  // SHIPPED on an order that has allocations but no shipment at all (o3d-bx9).
+  //
   // A partially-shipped order stays ALLOCATED (it only flips to SHIPPED when ALL
-  // shipments ship), so the order-status guard above is not enough. If any
+  // shipments ship), so the order-status guard below is not enough on its own. If any
   // shipment has already been dispatched/journaled, cancelling would release
   // reservations and delete pending shipments while the dispatched shipment's
   // COGS + revenue stay recognised in the ledger with no reversal. The
@@ -411,8 +414,22 @@ export async function cancelSalesOrderFulfillmentState(
     },
     select: { id: true },
   })
+
+  if (lockedOrder.status === 'SHIPPED') {
+    // Only irreversible once something actually shipped. A SHIPPED status with NO dispatch evidence is a
+    // data inconsistency rather than a terminal fact, so it is NOT marked permanent.
+    //
+    // KNOWN GAP (o3d-gz6), unchanged by o3d-bx9: such an order also cannot currently self-heal, because
+    // importWcOrder's existing-order path refreshes addresses/notes/paidAt but never status, and nothing
+    // re-runs a status sync. So a Woo cancel of a falsely-SHIPPED order still exhausts its retries — as
+    // it did before this change. Deciding to let that cancel through would release fulfilment state on an
+    // order the IMS believes shipped, which is a product call, not a classification one.
+    const message = 'Cannot cancel a shipped order — process a refund instead'
+    throw dispatchedShipment ? new PermanentStatusTransitionError(message) : new Error(message)
+  }
+
   if (dispatchedShipment) {
-    throw new Error('Cannot cancel an order with a dispatched shipment — process a refund instead')
+    throw new PermanentStatusTransitionError('Cannot cancel an order with a dispatched shipment — process a refund instead')
   }
 
   const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, 'CANCELLED', {

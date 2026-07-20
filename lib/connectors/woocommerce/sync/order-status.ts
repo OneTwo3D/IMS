@@ -5,6 +5,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
+import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import { wcFetch, wcPut } from '../api'
 import type { WcFullOrder } from './types'
 
@@ -14,7 +15,11 @@ type SalesOrderStatus = string
 // WC → IMS status sync
 // ---------------------------------------------------------------------------
 
-export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success: boolean; error?: string }> {
+/**
+ * `permanent: true` means a stable business rule refused the transition, so re-delivering the identical
+ * webhook re-hits the identical rule. The caller acknowledges those instead of retrying (o3d-bx9).
+ */
+export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
   try {
     const link = await db.shoppingOrderLink.findUnique({
       where: {
@@ -71,7 +76,7 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
 
     return result
   } catch (e) {
-    return { success: false, error: String(e) }
+    return { success: false, error: String(e), permanent: isPermanentStatusTransitionError(e) }
   }
 }
 
