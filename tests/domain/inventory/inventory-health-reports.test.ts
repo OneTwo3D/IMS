@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
+import { calculateDailyVelocity } from '@/lib/domain/inventory/velocity'
 import {
+  attributeWarehouseLessDemand,
   getDeadStockReport,
   getInventoryAgingReport,
   type InventoryHealthReportClient,
@@ -254,6 +256,286 @@ test('inventory aging caps KIT component layer scans before component bucketing'
     /KIT component cost-layer scan exceeds 100,000 rows/,
   )
   assert.deepEqual(observedTakes, [50001, 100001])
+})
+
+test('warehouse-less imported sales history counts as demand, so the SKU is not called dead (o3d-t9k)', async () => {
+  // The historical/initial sales import records past sales as WAREHOUSE-LESS SALE_DISPATCH movements
+  // (migration 20260616120000_exempt_historical_imports_from_cogs_guard). Those rows used to be keyed by
+  // bare productId while positions are keyed productId:warehouseId, so the key spaces never intersected
+  // and the demand evidence was discarded — an import-reliant SKU could be recommended for reorder and
+  // listed as dead at the same time. Acting on that would liquidate stock that is demonstrably selling.
+  const capturedWhere: Array<Record<string, unknown>> = []
+  const client = makeClient({
+    stockLevel: {
+      findMany: async () => [{
+        productId: 'imported-1',
+        warehouseId: 'warehouse-1',
+        quantity: decimal('4'),
+        product: product({ id: 'imported-1', sku: 'IMPORTED-1', name: 'Imported history item' }),
+        warehouse,
+      }],
+    },
+    costLayer: {
+      findMany: async () => [{
+        productId: 'imported-1',
+        warehouseId: 'warehouse-1',
+        remainingQty: decimal('4'),
+        unitCostBase: decimal('5'),
+        receivedAt: new Date('2026-01-01T00:00:00.000Z'),
+      }],
+    },
+    stockMovement: {
+      findMany: async (args?: unknown) => {
+        capturedWhere.push((args as { where: Record<string, unknown> }).where)
+        return [{
+          id: 'sale-imported',
+          productId: 'imported-1',
+          fromWarehouseId: null,
+          toWarehouseId: null,
+          referenceType: 'WcHistorical', // <- the historical import shape: warehouse-less AND imported
+          qty: decimal('1'),
+          totalValueBase: decimal('5'),
+          createdAt: new Date('2026-05-15T00:00:00.000Z'), // recent: well inside the 90-day threshold
+          product: product({ id: 'imported-1', sku: 'IMPORTED-1', name: 'Imported history item' }),
+        }]
+      },
+    },
+  })
+
+  const report = await getDeadStockReport(
+    { asOf: '2026-06-01', thresholdDays: 90, warehouseId: 'warehouse-1' },
+    { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
+  )
+
+  // 1. The query must not filter the warehouse-less rows out in the first place.
+  const or = capturedWhere[0]?.OR as Array<Record<string, unknown>> | undefined
+  assert.ok(or?.some((clause) => clause.fromWarehouseId === null), 'warehouse-less demand must not be filtered out')
+
+  // 2. And the evidence must actually reach the position, not be dropped on a key that matches nothing.
+  assert.deepEqual(report.rows.map((row) => row.sku), [], 'a SKU with recent imported demand is not dead')
+  assert.equal(report.totals.neverSoldRows, 0)
+})
+
+test('collapsing warehouse-less demand is EXACT — identical velocity to cloning each movement (o3d-t9k)', async () => {
+  // The commit claims collapsing is safe because calculateDailyVelocity is an associative fold and the
+  // source query is already window-bounded. This proves it rather than asserting it: the collapsed
+  // attribution and the naive clone-per-movement approach must produce byte-identical velocity rows,
+  // including firstSaleAt — which the dead-stock report itself never surfaces, so nothing else covers it.
+  const positions = [
+    { productId: 'p1', warehouseId: 'w1' },
+    { productId: 'p1', warehouseId: 'w2' },
+  ]
+  const base = { productId: 'p1', sku: 'P1', productName: 'Product 1' }
+  // Revenue values DIFFER per row on purpose: revenueBase is additive, so a collapse that carried the
+  // first row's value instead of summing it (and left it on the zero-quantity carrier) would double-count.
+  // Metadata DIFFERS per row too: calculateDailyVelocity takes the LAST defined value for categoryName
+  // and supplierNames, so a collapse that kept the first row's copy would disagree with the clone path.
+  // The nullish row must be skipped rather than overwriting, exactly as `?? current` does.
+  const sales = [
+    { ...base, qty: 2, cogsBase: 10, revenueBase: 20, categoryName: 'First', supplierNames: ['A'], occurredAt: new Date('2025-07-01T00:00:00.000Z') },
+    { ...base, qty: 3, cogsBase: 15, revenueBase: 30, categoryName: null, supplierNames: undefined, occurredAt: new Date('2026-05-15T00:00:00.000Z') },
+    { ...base, qty: 1, cogsBase: 5, revenueBase: 10, categoryName: 'Last', supplierNames: ['B'], occurredAt: new Date('2026-01-10T00:00:00.000Z') },
+  ]
+  const window = { dateFrom: new Date('2025-06-02T00:00:00.000Z'), dateTo: new Date('2026-06-01T23:59:59.999Z') }
+
+  const collapsed = calculateDailyVelocity(attributeWarehouseLessDemand(sales, positions), window)
+  // The naive approach this replaces: one clone per (movement, position).
+  const cloned = calculateDailyVelocity(
+    sales.flatMap((sale) => positions.map((position) => ({ ...sale, key: `${position.productId}:${position.warehouseId}` }))),
+    window,
+  )
+
+  const sortByKey = (rows: typeof collapsed) => [...rows].sort((a, b) => String(a.key).localeCompare(String(b.key)))
+  assert.deepEqual(sortByKey(collapsed), sortByKey(cloned))
+  // And sanity-check the values themselves, so an equal-but-both-wrong result cannot pass.
+  assert.deepEqual(sortByKey(collapsed).map((row) => [row.key, row.qtySold, row.cogsBase, row.revenueBase, row.categoryName, row.supplierNames, row.firstSaleAt, row.lastSaleAt]), [
+    ['p1:w1', '6', '30', '60', 'Last', ['B'], '2025-07-01T00:00:00.000Z', '2026-05-15T00:00:00.000Z'],
+    ['p1:w2', '6', '30', '60', 'Last', ['B'], '2025-07-01T00:00:00.000Z', '2026-05-15T00:00:00.000Z'],
+  ])
+})
+
+test('the collapse validates each row, so a negative cannot cancel against a positive (o3d-t9k)', async () => {
+  // calculateDailyVelocity rejects negative inputs PER ROW. Summing before validating would let a
+  // negative row net off against a positive one and slip past the check entirely.
+  const positions = [{ productId: 'p1', warehouseId: 'w1' }]
+  const base = { productId: 'p1', sku: 'P1', productName: 'Product 1' }
+  assert.throws(
+    () => attributeWarehouseLessDemand([
+      { ...base, qty: 5, occurredAt: new Date('2026-01-10T00:00:00.000Z') },
+      { ...base, qty: -5, occurredAt: new Date('2026-02-10T00:00:00.000Z') },
+    ], positions),
+    /negative qty/,
+  )
+  assert.throws(
+    () => attributeWarehouseLessDemand([
+      { ...base, qty: 1, revenueBase: 5, occurredAt: new Date('2026-01-10T00:00:00.000Z') },
+      { ...base, qty: 1, revenueBase: -5, occurredAt: new Date('2026-02-10T00:00:00.000Z') },
+    ], positions),
+    /negative revenueBase/,
+  )
+})
+
+test('a warehouse-less ordinary dispatch is NOT treated as imported demand (o3d-t9k)', async () => {
+  // StockMovement's warehouse relations are optional with no explicit onDelete, so Prisma defaults to
+  // SetNull: DELETING A WAREHOUSE rewrites its ordinary SalesOrder dispatches into the warehouse-less
+  // shape. If provenance were not checked, that one warehouse's sales would be spread across every
+  // warehouse holding the product and suppress legitimate dead-stock rows for the whole lookback window.
+  // Only a genuine historical import may carry demand with no warehouse.
+  const client = makeClient({
+    stockLevel: {
+      findMany: async () => [{
+        productId: 'orphaned-1',
+        warehouseId: 'warehouse-1',
+        quantity: decimal('4'),
+        product: product({ id: 'orphaned-1', sku: 'ORPHANED-1', name: 'Stock whose sale lost its warehouse' }),
+        warehouse,
+      }],
+    },
+    costLayer: {
+      findMany: async () => [{
+        productId: 'orphaned-1',
+        warehouseId: 'warehouse-1',
+        remainingQty: decimal('4'),
+        unitCostBase: decimal('5'),
+        receivedAt: new Date('2026-01-01T00:00:00.000Z'),
+      }],
+    },
+    stockMovement: {
+      findMany: async () => [{
+        id: 'sale-orphaned',
+        productId: 'orphaned-1',
+        fromWarehouseId: null,       // warehouse deleted...
+        referenceType: 'SalesOrder', // ...but this is a REAL dispatch, not an import
+        qty: decimal('1'),
+        totalValueBase: decimal('5'),
+        createdAt: new Date('2026-05-15T00:00:00.000Z'),
+        product: product({ id: 'orphaned-1', sku: 'ORPHANED-1', name: 'Stock whose sale lost its warehouse' }),
+      }],
+    },
+  })
+
+  const report = await getDeadStockReport(
+    { asOf: '2026-06-01', thresholdDays: 90 },
+    { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
+  )
+
+  // It must not count as demand for warehouse-1 — the SKU still reports as dead.
+  assert.deepEqual(report.rows.map((row) => row.sku), ['ORPHANED-1'])
+})
+
+test('a historical-typed row WITH a destination warehouse is not imported demand either (o3d-t9k)', async () => {
+  // The mapper guard must match HISTORICAL_IMPORT_MOVEMENT_SHAPE exactly — BOTH warehouse columns null.
+  // Checking only fromWarehouseId would leave it weaker than the query it backstops, so a row carrying a
+  // destination warehouse could still be spread across every warehouse if that predicate were loosened.
+  const client = makeClient({
+    stockLevel: {
+      findMany: async () => [{
+        productId: 'moved-1',
+        warehouseId: 'warehouse-1',
+        quantity: decimal('4'),
+        product: product({ id: 'moved-1', sku: 'MOVED-1', name: 'Item with a destination warehouse' }),
+        warehouse,
+      }],
+    },
+    costLayer: {
+      findMany: async () => [{
+        productId: 'moved-1',
+        warehouseId: 'warehouse-1',
+        remainingQty: decimal('4'),
+        unitCostBase: decimal('5'),
+        receivedAt: new Date('2026-01-01T00:00:00.000Z'),
+      }],
+    },
+    stockMovement: {
+      findMany: async () => [{
+        id: 'sale-moved',
+        productId: 'moved-1',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-2', // <- has a destination, so NOT the import shape
+        referenceType: 'WcHistorical',
+        qty: decimal('1'),
+        totalValueBase: decimal('5'),
+        createdAt: new Date('2026-05-15T00:00:00.000Z'),
+        product: product({ id: 'moved-1', sku: 'MOVED-1', name: 'Item with a destination warehouse' }),
+      }],
+    },
+  })
+
+  const report = await getDeadStockReport(
+    { asOf: '2026-06-01', thresholdDays: 90 },
+    { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
+  )
+
+  assert.deepEqual(report.rows.map((row) => row.sku), ['MOVED-1'])
+})
+
+test('warehouse-less demand is collapsed per product, not cloned per movement, and reaches every position (o3d-t9k)', async () => {
+  // Cloning each movement per position would allocate movements x warehouses rows — up to the 100k source
+  // limit times N, which defeats a guard that runs BEFORE the fan-out. Collapsing first is exact because
+  // the velocity calculation is an associative fold and the query is already window-bounded. This asserts
+  // the OBSERVABLE consequence: two warehouse-less sales on different dates, one product, two warehouses.
+  const capturedWhere: Array<Record<string, unknown>> = []
+  const twoWarehousePositions = [
+    { productId: 'imported-1', warehouseId: 'warehouse-1', quantity: decimal('4'), product: product({ id: 'imported-1', sku: 'IMPORTED-1', name: 'Imported history item' }), warehouse },
+    { productId: 'imported-1', warehouseId: 'warehouse-2', quantity: decimal('6'), product: product({ id: 'imported-1', sku: 'IMPORTED-1', name: 'Imported history item' }), warehouse: { ...warehouse, id: 'warehouse-2', code: 'WH2', name: 'Second warehouse' } },
+  ]
+  const client = makeClient({
+    stockLevel: { findMany: async () => twoWarehousePositions },
+    costLayer: {
+      findMany: async () => [
+        { productId: 'imported-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('5'), receivedAt: new Date('2026-01-01T00:00:00.000Z') },
+        { productId: 'imported-1', warehouseId: 'warehouse-2', remainingQty: decimal('6'), unitCostBase: decimal('5'), receivedAt: new Date('2026-01-01T00:00:00.000Z') },
+      ],
+    },
+    stockMovement: {
+      findMany: async (args?: unknown) => {
+        capturedWhere.push((args as { where: Record<string, unknown> }).where)
+        return [
+          // Two sales, different dates — the collapse must keep BOTH ends of the range.
+          { id: 'sale-old', productId: 'imported-1', fromWarehouseId: null, toWarehouseId: null, referenceType: 'WcHistorical', qty: decimal('2'), totalValueBase: decimal('10'), createdAt: new Date('2025-07-01T00:00:00.000Z'), product: product({ id: 'imported-1', sku: 'IMPORTED-1', name: 'Imported history item' }) },
+          { id: 'sale-new', productId: 'imported-1', fromWarehouseId: null, toWarehouseId: null, referenceType: 'WcHistorical', qty: decimal('3'), totalValueBase: decimal('15'), createdAt: new Date('2026-05-15T00:00:00.000Z') , product: product({ id: 'imported-1', sku: 'IMPORTED-1', name: 'Imported history item' }) },
+        ]
+      },
+    },
+  })
+
+  const report = await getDeadStockReport(
+    { asOf: '2026-06-01', thresholdDays: 90 },
+    { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
+  )
+
+  // Demand reached BOTH positions, so neither warehouse is called dead.
+  assert.deepEqual(report.rows.map((row) => row.sku), [])
+  assert.equal(report.totals.neverSoldRows, 0)
+  // And the movement scan is bounded to products that actually hold stock in scope — as a RELATION
+  // predicate, not an id list, which would bind one parameter per product and blow PostgreSQL's 32,767
+  // bind limit well below the 100k position cap.
+  const productPredicate = capturedWhere[0]?.product as { stockLevels?: { some?: Record<string, unknown> } } | undefined
+  assert.deepEqual(productPredicate?.stockLevels?.some, { quantity: { gt: 0 } })
+  assert.equal('productId' in (capturedWhere[0] ?? {}), false, 'must not bind an id list')
+})
+
+test('dead stock skips the movement scan entirely when no positions are in scope (o3d-t9k)', async () => {
+  // Nothing can be dead if nothing is stocked, so the (potentially 100k-row) scan must not run at all.
+  let movementScans = 0
+  const client = makeClient({
+    stockLevel: { findMany: async () => [] },
+    costLayer: { findMany: async () => [] },
+    stockMovement: {
+      findMany: async () => {
+        movementScans += 1
+        return []
+      },
+    },
+  })
+
+  const report = await getDeadStockReport(
+    { asOf: '2026-06-01', thresholdDays: 90, warehouseId: 'warehouse-1' },
+    { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
+  )
+
+  assert.equal(movementScans, 0)
+  assert.deepEqual(report.rows, [])
 })
 
 test('dead stock report sources current stocked rows and sale-dispatch velocity', async () => {

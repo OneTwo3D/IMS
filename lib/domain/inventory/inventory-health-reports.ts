@@ -12,7 +12,8 @@ import {
   type VelocitySaleInput,
 } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
-import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { HISTORICAL_IMPORT_REFERENCE_TYPES } from '@/lib/domain/inventory/stock-movement-value'
 import { exclusiveEndOfUtcDay, subtractUtcDays } from '@/lib/domain/math/date-window'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
@@ -25,6 +26,18 @@ const FUTURE_COGS_SOURCE_ROW_LIMIT = 100000
 const DEAD_STOCK_STOCK_LEVEL_ROW_LIMIT = 100000
 const DEAD_STOCK_COST_LAYER_ROW_LIMIT = 100000
 const DEAD_STOCK_SALE_MOVEMENT_ROW_LIMIT = 100000
+
+/**
+ * The only movement shape allowed to carry demand with no warehouse: a historical/initial sales import.
+ * Both warehouse columns null AND a historical referenceType, matching the repository invariant — a bare
+ * `fromWarehouseId: null` is NOT sufficient, because deleting a warehouse nulls the column on ordinary
+ * dispatches (optional relation, Prisma's default onDelete: SetNull).
+ */
+const HISTORICAL_IMPORT_MOVEMENT_SHAPE = {
+  fromWarehouseId: null,
+  toWarehouseId: null,
+  referenceType: { in: [...HISTORICAL_IMPORT_REFERENCE_TYPES] },
+} as const
 const DEFAULT_DEAD_STOCK_THRESHOLD_DAYS = 90
 const DEFAULT_DEAD_STOCK_LOOKBACK_DAYS = 365
 const PRODUCT_TYPES = Object.values(ProductType)
@@ -212,6 +225,8 @@ type DeadStockSaleMovementRow = {
   id: string
   productId: string
   fromWarehouseId: string | null
+  toWarehouseId: string | null
+  referenceType: string | null
   qty: DecimalInput
   totalValueBase: DecimalInput | null
   cogsEntries: Array<{ totalCostBase: DecimalInput }>
@@ -770,13 +785,49 @@ async function loadDeadStockVelocityRows(
     where: {
       type: StockMovementType.SALE_DISPATCH,
       createdAt: { gte: velocityWindow.dateFrom, lt: dateToExclusive },
-      ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
-      product: productWhere(filters),
+      // Admit warehouse-less rows alongside warehouse-attributed ones (o3d-t9k). Historical/initial sales
+      // imports record past sales as warehouse-less SALE_DISPATCH movements that exist purely as demand
+      // evidence (migration 20260616120000_exempt_historical_imports_from_cogs_guard); excluding them
+      // would report a SKU that is demonstrably selling as never-sold/dead. attributeWarehouseLessDemand
+      // below spreads them across the product's positions.
+      //
+      // The NULL branch demands the EXACT import shape — both warehouses null AND a historical
+      // referenceType — not merely a missing fromWarehouseId. The warehouse relations are optional with
+      // no explicit onDelete, so Prisma defaults to SetNull: deleting a warehouse rewrites its ordinary
+      // SalesOrder dispatches into the warehouse-less shape. Treating those as unattributed demand would
+      // spread one warehouse's sales across every warehouse holding the product and suppress legitimate
+      // dead-stock rows for the whole lookback window. Anything warehouse-less WITHOUT that provenance is
+      // excluded here, which is what already happened to it downstream (it could match no position).
+      ...(filters.warehouseId
+        ? { OR: [{ fromWarehouseId: filters.warehouseId }, HISTORICAL_IMPORT_MOVEMENT_SHAPE] }
+        : { OR: [{ fromWarehouseId: { not: null } }, HISTORICAL_IMPORT_MOVEMENT_SHAPE] }),
+      // Only products that actually hold stock in scope can produce a dead-stock row, so anything else is
+      // wasted budget against DEAD_STOCK_SALE_MOVEMENT_ROW_LIMIT. That matters most for the NULL branch
+      // above: without this, imported history for stock held ENTIRELY in other warehouses would be
+      // admitted by a warehouse-filtered query and could trip the limit, turning a small in-scope report
+      // into an empty page or a 413 export.
+      //
+      // Expressed as a RELATION PREDICATE, not an id list. Passing the loaded position product ids as
+      // `productId: { in: [...] }` would bind one parameter per id, and positions are capped at 100k while
+      // PostgreSQL takes at most 32,767 bind values — so a large tenant would get a P2029 bind error
+      // instead of a report, below the advertised position cap and not converted to the source-limit
+      // response. A subquery mirrors loadDeadStockPositions' own filter with no parameter growth.
+      product: {
+        ...productWhere(filters),
+        stockLevels: {
+          some: {
+            quantity: { gt: 0 },
+            ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
+          },
+        },
+      },
     },
     select: {
       id: true,
       productId: true,
       fromWarehouseId: true,
+      toWarehouseId: true,
+      referenceType: true,
       qty: true,
       totalValueBase: true,
       cogsEntries: { select: { totalCostBase: true } },
@@ -800,12 +851,26 @@ async function loadDeadStockVelocityRows(
   }) as DeadStockSaleMovementRow[]
   rejectOverLimit(movements, DEAD_STOCK_SALE_MOVEMENT_ROW_LIMIT, 'sale-dispatch movement scan')
 
-  return movements.map((movement) => {
+  const historicalReferenceTypes: ReadonlySet<string> = new Set(HISTORICAL_IMPORT_REFERENCE_TYPES)
+
+  return movements.flatMap((movement) => {
     const qty = toDecimal(movement.qty)
     if (qty.lt(0)) {
       throw new Error(`SALE_DISPATCH movement ${movement.id} has negative qty: ${qty.toString()}`)
     }
-    return {
+    // Belt and braces with the query's HISTORICAL_IMPORT_MOVEMENT_SHAPE: a warehouse-less row is only
+    // demand-without-a-warehouse if it really is an import. Enforcing it here too means the invariant does
+    // not rest solely on the where clause, so a future edit there cannot silently start spreading an
+    // ordinary dispatch (warehouse deleted => fromWarehouseId nulled) across every warehouse.
+    // The full import shape, matching HISTORICAL_IMPORT_MOVEMENT_SHAPE exactly: BOTH warehouse columns
+    // null and a historical referenceType. Checking only fromWarehouseId would leave the guard weaker than
+    // the query it is meant to backstop, so a row with a destination warehouse could still be spread
+    // across every warehouse if the predicate were ever loosened.
+    if (!movement.fromWarehouseId) {
+      const isHistoricalImport = movement.toWarehouseId == null && historicalReferenceTypes.has(movement.referenceType ?? '')
+      if (!isHistoricalImport) return []
+    }
+    return [{
       key: movement.fromWarehouseId ? stockKey(movement.productId, movement.fromWarehouseId) : movement.productId,
       productId: movement.productId,
       sku: movement.product.sku,
@@ -815,8 +880,116 @@ async function loadDeadStockVelocityRows(
       qty,
       cogsBase: saleMovementCogsBase(movement),
       occurredAt: movement.createdAt,
-    }
+    }]
   })
+}
+
+/**
+ * Attribute warehouse-less demand to every position of that product (o3d-t9k).
+ *
+ * Sales rows are matched to stock positions by `productId:warehouseId`. A warehouse-less movement was
+ * keyed by bare `productId`, which is a key space no position ever occupies — so its demand evidence was
+ * silently discarded and the SKU read as never-sold even when the reorder report was simultaneously
+ * recommending more of it.
+ *
+ * The source data does not say which warehouse shipped these, so the evidence is attributed WHOLE to each
+ * position rather than being split. That is deliberate: the question dead stock answers is "has this sold
+ * recently?", and over-attributing demand merely declines to call something dead, whereas splitting (or
+ * dropping) it can liquidate stock that is actually selling. It also matches the reorder report, which
+ * counts unassigned demand toward every warehouse (o3d-s8n.1).
+ *
+ * COLLAPSED FIRST, then attributed. Cloning each movement per position would allocate movements ×
+ * warehouses objects — up to DEAD_STOCK_SALE_MOVEMENT_ROW_LIMIT (100k) × N, which is millions in a
+ * many-warehouse tenant and defeats a source guard that ran before the fan-out. Collapsing is exact here
+ * because calculateDailyVelocity is an associative fold (sum qty/cogs/revenue, min/max dates) and the
+ * source query is already bounded to the velocity window, so no out-of-window row can be folded in. The
+ * result is at most 2 rows per (product, position): a second zero-quantity row carries firstSaleAt so the
+ * fold's min/max still reproduces both ends of the range exactly, and every additive field (qty, cogs,
+ * revenue) is summed into the aggregate and zeroed on the carrier.
+ *
+ * A movement whose product has no position in scope stays dropped — there is nothing to report it against.
+ */
+export function attributeWarehouseLessDemand<T extends VelocitySaleInput>(
+  sales: T[],
+  positions: Array<{ productId: string; warehouseId: string }>,
+): VelocitySaleInput[] {
+  const isUnattributed = (sale: T) => (sale.key ?? sale.productId) === sale.productId
+  if (!sales.some(isUnattributed)) return sales
+
+  const warehousesByProduct = new Map<string, string[]>()
+  for (const position of positions) {
+    const list = warehousesByProduct.get(position.productId)
+    if (list) list.push(position.warehouseId)
+    else warehousesByProduct.set(position.productId, [position.warehouseId])
+  }
+
+  type Collapsed = {
+    sample: T
+    categoryName: string | null | undefined
+    supplierNames: string[] | undefined
+    qty: Decimal
+    cogsBase: Decimal
+    revenueBase: Decimal
+    firstSaleAt: Date
+    lastSaleAt: Date
+  }
+  const collapsedByProduct = new Map<string, Collapsed>()
+  const attributed: VelocitySaleInput[] = []
+
+  for (const sale of sales) {
+    if (!isUnattributed(sale)) {
+      attributed.push(sale)
+      continue
+    }
+    // Validate PER ROW, before anything is summed. calculateDailyVelocity rejects negative inputs per
+    // input row; if the collapse summed first, a negative row could cancel a positive one and slip past.
+    for (const [field, value] of [['qty', sale.qty], ['cogsBase', sale.cogsBase ?? 0], ['revenueBase', sale.revenueBase ?? 0]] as const) {
+      if (toDecimal(value).lt(0)) {
+        throw new Error(`attributeWarehouseLessDemand received a negative ${field} for product ${sale.productId}`)
+      }
+    }
+    const occurredAt = new Date(sale.occurredAt)
+    const current = collapsedByProduct.get(sale.productId)
+    if (!current) {
+      collapsedByProduct.set(sale.productId, {
+        sample: sale,
+        categoryName: sale.categoryName,
+        supplierNames: sale.supplierNames,
+        qty: toDecimal(sale.qty),
+        cogsBase: toDecimal(sale.cogsBase ?? 0),
+        revenueBase: toDecimal(sale.revenueBase ?? 0),
+        firstSaleAt: occurredAt,
+        lastSaleAt: occurredAt,
+      })
+      continue
+    }
+    // calculateDailyVelocity takes the LAST defined value for these, so the collapse must too or the
+    // helper is not the exact equivalent it claims to be.
+    if (sale.categoryName != null) current.categoryName = sale.categoryName
+    if (sale.supplierNames != null) current.supplierNames = sale.supplierNames
+    current.qty = current.qty.add(toDecimal(sale.qty))
+    current.cogsBase = current.cogsBase.add(toDecimal(sale.cogsBase ?? 0))
+    current.revenueBase = current.revenueBase.add(toDecimal(sale.revenueBase ?? 0))
+    if (occurredAt < current.firstSaleAt) current.firstSaleAt = occurredAt
+    if (occurredAt > current.lastSaleAt) current.lastSaleAt = occurredAt
+  }
+
+  for (const [productId, collapsed] of collapsedByProduct) {
+    for (const warehouseId of warehousesByProduct.get(productId) ?? []) {
+      const key = stockKey(productId, warehouseId)
+      const metadata = { categoryName: collapsed.categoryName, supplierNames: collapsed.supplierNames }
+      attributed.push({ ...collapsed.sample, ...metadata, key, qty: collapsed.qty, cogsBase: collapsed.cogsBase, revenueBase: collapsed.revenueBase, occurredAt: collapsed.lastSaleAt })
+      // Zero-quantity carrier so the fold's min still sees the true first sale. Skipped when the window
+      // holds a single sale date, where the row above already carries both ends.
+      if (collapsed.firstSaleAt.getTime() !== collapsed.lastSaleAt.getTime()) {
+        // Every ADDITIVE field must be zeroed here, not just qty — inheriting them from `sample` would
+        // double-count. revenueBase is unused by the dead-stock loader today but the helper is generic.
+        attributed.push({ ...collapsed.sample, ...metadata, key, qty: 0, cogsBase: 0, revenueBase: 0, occurredAt: collapsed.firstSaleAt })
+      }
+    }
+  }
+
+  return attributed
 }
 
 export async function getDeadStockReport(
@@ -828,11 +1001,13 @@ export async function getDeadStockReport(
   const asOf = parseAsOf(filters.asOf, now())
   const thresholdDays = parseThresholdDays(filters.thresholdDays)
   const velocityWindow = deadStockVelocityWindow(asOf, thresholdDays)
-  const [{ positions, notices: positionNotices }, sales] = await Promise.all([
-    loadDeadStockPositions(client, filters),
-    loadDeadStockVelocityRows(client, filters, velocityWindow),
-  ])
-  const velocityRows = calculateDailyVelocity(sales, velocityWindow)
+  // Positions load FIRST so the movement scan can be bounded to products that actually hold stock in
+  // scope (o3d-t9k). Nothing else can produce a dead-stock row.
+  const { positions, notices: positionNotices } = await loadDeadStockPositions(client, filters)
+  const sales = positions.length === 0
+    ? []
+    : await loadDeadStockVelocityRows(client, filters, velocityWindow)
+  const velocityRows = calculateDailyVelocity(attributeWarehouseLessDemand(sales, positions), velocityWindow)
   const positionsByKey = new Map(positions.map((position) => [
     position.key ?? stockKey(position.productId, position.warehouseId),
     position,
