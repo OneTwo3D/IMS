@@ -14,6 +14,7 @@ import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { clearXeroReferenceCache } from './api'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_CONNECTOR = 'xero'
@@ -426,6 +427,9 @@ export async function disconnect(): Promise<void> {
       data: { accountingItemId: null, accountingItemProvenance: null },
     }),
   ])
+  // Drop cached reference data too (o3d-e2j) — the next connection is a different org and must not read
+  // this one's tax rates / base currency.
+  clearXeroReferenceCache()
 }
 
 /**
