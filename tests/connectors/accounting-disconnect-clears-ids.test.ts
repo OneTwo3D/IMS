@@ -64,11 +64,11 @@ test('disconnecting Xero clears contact AND item ids', async () => {
   assert.deepEqual(models, ['customer', 'product', 'supplier'])
   assert.deepEqual(
     cleared.find((c) => c.model === 'product')?.data,
-    { accountingItemId: null },
+    { accountingItemId: null, accountingItemProvenance: null },
     'a Xero ItemID left on a product is a live id for a system we are no longer talking to',
   )
-  assert.deepEqual(cleared.find((c) => c.model === 'customer')?.data, { accountingContactId: null })
-  assert.deepEqual(cleared.find((c) => c.model === 'supplier')?.data, { accountingContactId: null })
+  assert.deepEqual(cleared.find((c) => c.model === 'customer')?.data, { accountingContactId: null, accountingContactProvenance: null })
+  assert.deepEqual(cleared.find((c) => c.model === 'supplier')?.data, { accountingContactId: null, accountingContactProvenance: null })
 })
 
 test('disconnecting QuickBooks clears contact AND item ids', async () => {
@@ -76,5 +76,5 @@ test('disconnecting QuickBooks clears contact AND item ids', async () => {
 
   const models = cleared.map((c) => c.model).sort()
   assert.deepEqual(models, ['customer', 'product', 'supplier'])
-  assert.deepEqual(cleared.find((c) => c.model === 'product')?.data, { accountingItemId: null })
+  assert.deepEqual(cleared.find((c) => c.model === 'product')?.data, { accountingItemId: null, accountingItemProvenance: null })
 })

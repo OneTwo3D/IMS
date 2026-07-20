@@ -7,6 +7,7 @@
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db } from '@/lib/db'
+import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
@@ -25,6 +26,21 @@ const CLAIM_STALE_MS = 15 * 60 * 1000
 const RATE_LIMIT_BACKOFF_BASE_MS = 10_000
 const RATE_LIMIT_BACKOFF_MAX_MS = 5 * 60_000
 const QBO_CONNECTOR = 'quickbooks'
+
+/**
+ * A stored contact id, but ONLY if its provenance matches the active QuickBooks company (o3d-6nd).
+ * These payment/follow-up paths read the cached id via a join rather than through
+ * contacts.getStoredContactId, so they need the same guard applied here or a former realm's id leaks
+ * through. Returns null when there is no id or its provenance does not match — callers already treat a
+ * missing id as a clean, retryable failure.
+ */
+export async function customerContactIdIfCurrent(
+  contact: { accountingContactId: string | null; accountingContactProvenance: string | null } | null | undefined,
+): Promise<string | null> {
+  if (!contact?.accountingContactId) return null
+  const active = await activeAccountingIdProvenance(QBO_CONNECTOR)
+  return accountingIdProvenanceMatches(contact.accountingContactProvenance, active) ? contact.accountingContactId : null
+}
 
 type ProcessResult = {
   processed: number
@@ -468,14 +484,23 @@ async function processEntry(
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
-      // Resolve customer ref: prefer payload, fall back to order's customer
+      // Resolve customer ref: prefer payload, fall back to order's customer.
+      // RESIDUAL (o3d-gfh): payload.customerRef is a naked id stamped at ENQUEUE time and is NOT
+      // provenance-checked here — the payment row carries no provenance to check it against. A payment
+      // queued under realm A and processed after a disconnect+reconnect to realm B would send A's id (and
+      // the equally tenant-owned accountingInvoiceId/bankAccountId) to B. The fallback DB read below IS
+      // guarded (o3d-6nd); closing the payload path needs the queued row stamped with its connection and
+      // the whole payment context validated at execution, tracked in o3d-gfh.
       let customerRefId = payload.customerRef as string | undefined
       if (!customerRefId && referenceType === 'SalesOrder') {
         const order = await db.salesOrder.findUnique({
           where: { id: referenceId },
-          select: { customer: { select: { accountingContactId: true } } },
+          select: { customer: { select: { accountingContactId: true, accountingContactProvenance: true } } },
         })
-        customerRefId = order?.customer?.accountingContactId ?? undefined
+        // Provenance-guarded (o3d-6nd): a contact id issued by a former realm must not be sent to the
+        // active company. A mismatch reads as "no id" and surfaces the existing missing-reference error,
+        // so the payment fails cleanly and retries rather than posting against the wrong company.
+        customerRefId = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
       }
       if (!customerRefId) {
         return { success: false, error: 'Missing customer reference for INVOICE_PAYMENT — customer has no QuickBooks contact ID' }
@@ -512,14 +537,16 @@ async function processEntry(
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for BILL_PAYMENT' }
       }
-      // Resolve vendor ref: prefer payload, fall back to PO's supplier
+      // Resolve vendor ref: prefer payload, fall back to PO's supplier.
+      // Same residual as INVOICE_PAYMENT above — payload.vendorRef is unchecked; see o3d-gfh.
       let vendorRefId = payload.vendorRef as string | undefined
       if (!vendorRefId && referenceType === 'PurchaseInvoice') {
         const invoice = await db.purchaseInvoice.findUnique({
           where: { id: referenceId },
-          select: { po: { select: { supplier: { select: { accountingContactId: true } } } } },
+          select: { po: { select: { supplier: { select: { accountingContactId: true, accountingContactProvenance: true } } } } },
         })
-        vendorRefId = invoice?.po?.supplier?.accountingContactId ?? undefined
+        // Provenance-guarded (o3d-6nd) — see INVOICE_PAYMENT above.
+        vendorRefId = (await customerContactIdIfCurrent(invoice?.po?.supplier)) ?? undefined
       }
       if (!vendorRefId) {
         return { success: false, error: 'Missing vendor reference for BILL_PAYMENT — supplier has no QuickBooks contact ID' }
@@ -740,9 +767,11 @@ async function enqueueSalesInvoiceFollowUps(
           if (referenceType === 'SalesOrder') {
             const order = await db.salesOrder.findUnique({
               where: { id: referenceId },
-              select: { customer: { select: { accountingContactId: true } } },
+              select: { customer: { select: { accountingContactId: true, accountingContactProvenance: true } } },
             })
-            customerRef = order?.customer?.accountingContactId ?? undefined
+            // Provenance-guarded (o3d-6nd): only enqueue an id that belongs to the active company, so a
+            // follow-up queued now cannot carry a former realm's id.
+            customerRef = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
           }
 
           await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {

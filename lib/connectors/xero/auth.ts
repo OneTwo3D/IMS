@@ -415,15 +415,15 @@ export async function disconnect(): Promise<void> {
     db.setting.deleteMany({ where: { key: XERO_EXPECTED_TENANT_KEY } }),
     db.customer.updateMany({
       where: { accountingContactId: { not: null } },
-      data: { accountingContactId: null },
+      data: { accountingContactId: null, accountingContactProvenance: null },
     }),
     db.supplier.updateMany({
       where: { accountingContactId: { not: null } },
-      data: { accountingContactId: null },
+      data: { accountingContactId: null, accountingContactProvenance: null },
     }),
     db.product.updateMany({
       where: { accountingItemId: { not: null } },
-      data: { accountingItemId: null },
+      data: { accountingItemId: null, accountingItemProvenance: null },
     }),
   ])
 }

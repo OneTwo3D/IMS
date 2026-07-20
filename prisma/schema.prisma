@@ -629,7 +629,11 @@ model Product {
   // Connector-agnostic by design: it holds an id belonging to whichever accounting
   // connector is currently connected, so BOTH connectors clear it on disconnect —
   // a Xero ItemID handed to QuickBooks is meaningless.
-  accountingItemId String?    @unique
+  accountingItemId String?
+  // "<connector>:<tenantId>" of the connection that issued accountingItemId (o3d-6nd). A reader ignores
+  // an id whose provenance does not match the active connection and re-resolves it, so a connector/org
+  // switch that bypasses disconnect cannot serve one connection's id to another. NULL => re-resolve once.
+  accountingItemProvenance String?
 
   // Pricing (GBP)
   salesPriceBase   Decimal?    @db.Decimal(12, 4)   // regular / list price
@@ -711,6 +715,7 @@ model Product {
   @@index([preferredSupplierId])
   @@index([sku(ops: raw("gin_trgm_ops"))], type: Gin, map: "products_sku_trgm_idx")
   @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "products_name_trgm_idx")
+  @@unique([accountingItemId, accountingItemProvenance])
   @@map("products")
 }
 
@@ -1091,7 +1096,9 @@ model InventoryReservationSnapshotRun {
 model Supplier {
   id              String    @id @default(cuid())
   name            String
-  accountingContactId String?   @unique
+  accountingContactId String?
+  // Provenance of accountingContactId — see Product.accountingItemProvenance (o3d-6nd).
+  accountingContactProvenance String?
   contactName     String?
   email           String?
   phone           String?
@@ -1133,6 +1140,7 @@ model Supplier {
   users           User[]
 
   @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "suppliers_name_trgm_idx")
+  @@unique([accountingContactId, accountingContactProvenance])
   @@map("suppliers")
 }
 
@@ -1497,7 +1505,9 @@ model Customer {
   id              String    @id @default(cuid())
   firstName       String
   lastName        String
-  accountingContactId String?   @unique
+  accountingContactId String?
+  // Provenance of accountingContactId — see Product.accountingItemProvenance (o3d-6nd).
+  accountingContactProvenance String?
   email           String?
   phone           String?
   company         String?
@@ -1515,6 +1525,7 @@ model Customer {
   salesOrders     SalesOrder[]
   shoppingLinks   ShoppingCustomerLink[]
 
+  @@unique([accountingContactId, accountingContactProvenance])
   @@map("customers")
 }
 

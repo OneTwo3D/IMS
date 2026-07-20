@@ -8,7 +8,10 @@
  */
 
 import { db } from '@/lib/db'
+import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
 import { qboQuery, qboPost, escapeQboQueryValue, resolveAccountRef } from './api'
+
+const QBO_CONNECTOR = 'quickbooks'
 import { getQuickBooksSettings } from './settings'
 
 type QboItem = {
@@ -34,9 +37,13 @@ type QboQueryResponse = {
 async function getStoredItemId(code: string): Promise<string | null> {
   const row = await db.product.findUnique({
     where: { sku: code },
-    select: { accountingItemId: true },
+    select: { accountingItemId: true, accountingItemProvenance: true },
   })
-  return row?.accountingItemId ?? null
+  if (!row?.accountingItemId) return null
+  // Ignore an id issued by a different connector/org (o3d-6nd) — resolve it fresh instead.
+  const active = await activeAccountingIdProvenance(QBO_CONNECTOR)
+  if (!accountingIdProvenanceMatches(row.accountingItemProvenance, active)) return null
+  return row.accountingItemId
 }
 
 /**
@@ -54,7 +61,8 @@ async function storeItemId(code: string, itemId: string): Promise<void> {
   try {
     await db.product.updateMany({
       where: { sku: code },
-      data: { accountingItemId: itemId },
+      // RACE (o3d-gfh): provenance sampled after the id-issuing API call — see xero/items.ts.
+      data: { accountingItemId: itemId, accountingItemProvenance: await activeAccountingIdProvenance(QBO_CONNECTOR) },
     })
   } catch (e) {
     console.warn(
