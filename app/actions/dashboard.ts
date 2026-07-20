@@ -1,6 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
+import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { getSetting } from '@/app/actions/settings'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
@@ -212,9 +213,10 @@ export async function getDashboardData(
       where: { remainingQty: { gt: 0 } },
       select: { remainingQty: true, unitCostBase: true },
     }),
-    // Next 5 incoming purchase orders
+    // Next 5 incoming purchase orders (o3d-s8n.8: use the canonical incoming set so a SHIPPED PO does
+    // not vanish from this card while still counting as Incoming on the product/replenishment views).
     db.purchaseOrder.findMany({
-      where: { type: 'GOODS', status: { in: ['PO_SENT', 'PARTIALLY_RECEIVED'] } },
+      where: { type: 'GOODS', status: { in: INCOMING_PO_STATUSES } },
       select: {
         id: true, reference: true, status: true, totalBase: true, expectedDelivery: true, createdAt: true,
         supplier: { select: { name: true } },

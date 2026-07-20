@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { redirect } from 'next/navigation'
 import { z } from 'zod'
 import { db } from '@/lib/db'
@@ -216,7 +217,7 @@ export async function listProducts(params: {
       by: ['productId'],
       where: {
         productId: { in: allProductIds },
-        po: { status: { in: ['DRAFT', 'RFQ_SENT', 'PO_SENT', 'PARTIALLY_RECEIVED'] }, type: 'GOODS' },
+        po: { status: { in: INCOMING_PO_STATUSES }, type: 'GOODS' },
       },
       _sum: { qty: true, qtyReceived: true },
     }),
@@ -362,7 +363,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       where: {
         productId: id,
         po: {
-          status: { in: ['DRAFT', 'RFQ_SENT', 'PO_SENT', 'PARTIALLY_RECEIVED'] },
+          status: { in: INCOMING_PO_STATUSES },
           type: 'GOODS',
         },
       },
@@ -424,7 +425,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
         by: ['productId'],
         where: {
           productId: { in: variantIds },
-          po: { status: { in: ['DRAFT', 'RFQ_SENT', 'PO_SENT', 'PARTIALLY_RECEIVED'] }, type: 'GOODS' },
+          po: { status: { in: INCOMING_PO_STATUSES }, type: 'GOODS' },
         },
         _sum: { qty: true, qtyReceived: true },
       }),
@@ -1836,7 +1837,7 @@ export async function getIncomingDetails(productId: string, warehouseId: string)
         productId,
         po: {
           destinationWarehouseId: warehouseId,
-          status: { in: ['PO_SENT', 'PARTIALLY_RECEIVED'] },
+          status: { in: INCOMING_PO_STATUSES },
         },
       },
       select: {
