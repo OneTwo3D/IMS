@@ -1701,6 +1701,14 @@ model SalesOrderRefundLine {
   totalForeign     Decimal          @db.Decimal(18, 4) @default(0)
   totalBase        Decimal          @db.Decimal(18, 4)
   costLayerSnapshot Json?
+  // The VAT identity RESOLVED AT CREATION (o3d-w00), so the credit note posts under the rate the invoice
+  // actually validated instead of re-predicting it from the order default at post time — which mis-taxed
+  // deactivated-rate, reverse-charged and mixed-rate refunds. accountingTaxType is the resolved connector
+  // tax type (reverse-charge swap already applied); reverseCharge records whether the swap applied, for
+  // audit. NULL on legacy rows and on lines whose identity could not be established (the credit note
+  // refuses those rather than guessing). amounts on this model are NET (tax-exclusive) for every caller.
+  accountingTaxType String?
+  reverseCharge    Boolean?
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)

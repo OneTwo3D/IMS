@@ -31,6 +31,7 @@ export type RefundStatusOrderRow = {
   status: string
   refundStatus: string
   totalBase: DecimalInput
+  taxBase?: DecimalInput
   refunds: Array<{
     id: string
     creditNoteNumber: string | null
@@ -70,7 +71,11 @@ function buildSummary(findings: RefundStatusReconciliationFinding[]): RefundStat
 // Refund disposition implied by the refund records (null = no refunds = NONE).
 function expectedRefundDisposition(order: RefundStatusOrderRow): 'FULL' | 'PARTIAL' | null {
   if (order.refunds.length === 0) return null
-  const orderTotal = toDecimal(order.totalBase)
+  // Refund totals are stored NET (o3d-w00), so compare against the NET order total (totalBase - taxBase)
+  // — the same basis createSalesOrderRefund now classifies on. A gross basis reported a fully-refunded
+  // taxable order as PARTIAL and raised a false mismatch finding.
+  const netOrderTotal = toDecimal(order.totalBase).sub(toDecimal(order.taxBase ?? 0))
+  const orderTotal = netOrderTotal.lt(0) ? toDecimal(0) : netOrderTotal
   const refundedTotal = order.refunds.reduce((sum, refund) => sum.add(toDecimal(refund.totalBase)), toDecimal(0))
 
   if (orderTotal.lte(0)) {
@@ -165,6 +170,7 @@ export async function collectRefundStatusReconciliationRows(
       status: true,
       refundStatus: true,
       totalBase: true,
+      taxBase: true,
       refunds: {
         orderBy: { refundedAt: 'asc' },
         select: {
