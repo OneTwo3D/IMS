@@ -45,11 +45,20 @@ function externalRefundIdUniqueError() {
   })
 }
 
-function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) {
+function makeDependencies(options: {
+  alwaysMissExistingRefund?: boolean
+  order?: { totalBase?: number; taxBase?: number; taxRateName?: string | null }
+  /** Extra order lines, used to model a MIXED-rate order. */
+  extraLines?: Array<{ id: string; taxRateId: string | null; taxBase: number; totalBase: number }>
+  /** Model a store whose Woo tax rates never mapped: lines keep tax amounts but no taxRateId. */
+  unmappedTaxRates?: boolean
+  /** Force the primary line's NET, so value can be left OUTSIDE the lines (e.g. shipping). */
+  lineNetOverride?: number
+} = {}) {
   const refunds: Array<{ id: string; externalRefundId: number }> = []
   const syncLogs: unknown[] = []
   const activityLogs: unknown[] = []
-  const createRefundLines: Array<{ lineId?: string; productId: string | null }> = []
+  const createRefundLines: Array<{ lineId?: string; productId: string | null; totalBase?: number; qty?: number }> = []
   let createRefundCalls = 0
 
   const dependencies: WcRefundSyncDependencies = {
@@ -60,7 +69,11 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
             id: 'so-1',
             externalOrderNumber: 'WC-1001',
             fxRateToBase: 1,
-            totalBase: 12.5,
+            totalBase: options.order?.totalBase ?? 12.5,
+            taxBase: options.order?.taxBase ?? 0,
+            taxRateName: options.order?.taxRateName !== undefined
+              ? options.order.taxRateName
+              : ((options.order?.taxBase ?? 0) > 0 ? 'Standard' : null),
             lines: [
               {
                 id: 'line-1',
@@ -68,8 +81,25 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
                 externalLineItemId: 501,
                 description: 'Widget',
                 qty: 1,
-                totalBase: 12.5,
+                // Line NET + line tax must account for the whole order gross, or the uniform-tax guard
+                // (correctly) refuses: value outside the lines has its own unknown tax treatment.
+                totalBase: options.lineNetOverride ?? (options.order ? (options.order.totalBase ?? 0) - (options.order.taxBase ?? 0) - (options.extraLines ?? []).reduce((s, l) => s + l.totalBase, 0) : 12.5),
+                // Line tax mirrors the order's, so a taxed order reads as uniformly single-rate.
+                taxRateId: options.unmappedTaxRates ? null : ((options.order?.taxBase ?? 0) > 0 ? 'rate-standard' : null),
+                taxBase: options.order?.taxBase ?? 0,
+                taxRate: options.unmappedTaxRates || (options.order?.taxBase ?? 0) === 0 ? null : { name: 'Standard' },
               },
+              ...(options.extraLines ?? []).map((line) => ({
+                id: line.id,
+                productId: 'product-2',
+                externalLineItemId: 502,
+                description: 'Other',
+                qty: 1,
+                totalBase: line.totalBase,
+                taxRateId: line.taxRateId,
+                taxBase: line.taxBase,
+                taxRate: line.taxRateId ? { name: line.taxRateId === 'rate-standard' ? 'Standard' : 'Zero' } : null,
+              })),
             ],
           }
         },
@@ -167,6 +197,120 @@ test('syncWcRefund reconciles a VAT line refund on the gross basis (amount inclu
     state.syncLogs.some((log) => /amount mismatch/.test(String((log as { data?: { errorMessage?: string } }).data?.errorMessage ?? ''))),
     false,
   )
+})
+
+test('syncWcRefund normalises a monetary-only refund to the NET basis on a taxable order (o3d-w00)', async () => {
+  // A goodwill refund with no line breakdown: wcRefund.amount is the money actually returned to the
+  // customer, i.e. TAX-INCLUSIVE. Every other refund line is stored NET, and the credit note re-applies
+  // VAT (lineAmountsIncludeTax: false), so storing the gross here both broke the disposition basis and
+  // grossed the amount up a SECOND time — £120 posting as £120 + £24 VAT = £144.
+  // Order: £120 gross = £100 net + £20 VAT -> net ratio 100/120.
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { totalBase: 120, taxBase: 20 } })
+  const refund = makeRefund({ amount: '120.00', line_items: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, true)
+  assert.equal(state.createRefundLines.length, 1)
+  // £120 gross -> £100 net, so the credit note re-grosses to exactly the £120 refunded.
+  assert.ok(
+    Math.abs((state.createRefundLines[0].totalBase ?? 0) - 100) < 0.01,
+    `expected the monetary-only line to be stored NET (100), got ${state.createRefundLines[0].totalBase}`,
+  )
+})
+
+test('syncWcRefund leaves a monetary-only refund unchanged on a zero-tax order (o3d-w00)', async () => {
+  // taxBase 0 -> net ratio 1, so the normalisation is a no-op and the full amount is still recorded.
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { totalBase: 120, taxBase: 0 } })
+  const refund = makeRefund({ amount: '120.00', line_items: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, true)
+  assert.ok(
+    Math.abs((state.createRefundLines[0].totalBase ?? 0) - 120) < 0.01,
+    `expected no change on an untaxed order (120), got ${state.createRefundLines[0].totalBase}`,
+  )
+})
+
+test('syncWcRefund REFUSES a monetary-only refund on a mixed-rate order (o3d-w00)', async () => {
+  // £100 @20% + £100 zero-rated = £220 gross. A bare £110 amount carries no VAT breakdown, and the
+  // credit note would post an unmapped line under ONE order-level tax type — so a blended ratio invents
+  // a split that is wrong in the ledger AND depends on refund ordering. There is nothing safe to infer,
+  // so the sync refuses and asks for line detail rather than guessing.
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { totalBase: 220, taxBase: 20 },
+    extraLines: [{ id: 'line-2', taxRateId: 'rate-zero', taxBase: 0, totalBase: 100 }],
+  })
+  const refund = makeRefund({ amount: '110.00', line_items: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /tax treatment is not uniform/i)
+  // The message must NEVER tell an operator to re-refund: the customer has already been paid, so
+  // "re-issue the refund" would pay them twice.
+  assert.match(String(result.error), /DO NOT issue another WooCommerce refund/i)
+  // Nothing was recorded: no refund created, and the refusal is surfaced for a human.
+  assert.equal(state.createRefundCalls, 0)
+})
+
+test('syncWcRefund REFUSES a monetary-only refund when tax rates are unmapped (o3d-w00)', async () => {
+  // Woo can retain a monetary tax amount on a line whose rate never mapped (taxRateId null). Several
+  // null-rate lines are NOT evidence of one uniform rate — they are evidence that we do not know the
+  // rates at all, so a mixed-rate order could otherwise slip through and be blended. Fail closed.
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { totalBase: 220, taxBase: 20 },
+    unmappedTaxRates: true,
+    extraLines: [{ id: 'line-2', taxRateId: null, taxBase: 0, totalBase: 100 }],
+  })
+  const refund = makeRefund({ amount: '110.00', line_items: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /tax treatment is not uniform/i)
+  assert.equal(state.createRefundCalls, 0)
+})
+
+test('syncWcRefund REFUSES a monetary-only refund when untaxed value sits outside the lines (o3d-w00)', async () => {
+  // £120 taxable goods (£100 net + £20 VAT) plus £10 ZERO-RATED shipping = £130 gross. Order tax still
+  // equals the line tax, so a tax-only reconciliation would call this uniform — but the goods:gross ratio
+  // it implies (110/130) would store a £130 refund as £110 net, which the 20% credit-note type re-grosses
+  // to £132. Reconciling the whole GROSS against the lines is what catches it.
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { totalBase: 130, taxBase: 20 },
+    // Lines cover only the goods (net 100 + tax 20 = 120); the £10 shipping sits outside them.
+    lineNetOverride: 100,
+  })
+  const refund = makeRefund({ amount: '130.00', line_items: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /tax treatment is not uniform/i)
+  assert.equal(state.createRefundCalls, 0)
+})
+
+test('syncWcRefund REFUSES when the order default tax rate differs from the lines (o3d-w00)', async () => {
+  // A wholly ZERO-RATED order whose order-level default is still standard VAT. The lines are uniform and
+  // untaxed, so the ratio is 1 and the full amount would be stored — but the credit note resolves an
+  // unmapped line's tax type from the ORDER's taxRateName, so it would add 20% to money that never
+  // carried VAT. The rate the credit note WILL use must be the rate we validated, or we refuse.
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { totalBase: 120, taxBase: 0, taxRateName: 'Standard' },
+  })
+  const refund = makeRefund({ amount: '120.00', line_items: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /tax treatment is not uniform/i)
+  assert.equal(state.createRefundCalls, 0)
 })
 
 test('syncWcRefund still rejects a genuine amount mismatch', async () => {

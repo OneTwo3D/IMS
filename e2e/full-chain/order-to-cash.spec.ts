@@ -254,10 +254,11 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     expect(Number(invoice.Total), 'the invoice gross it fully reverses').toBeCloseTo(grossOrderTotal, 2)
 
     // A refund WAS recorded against the order (disposition left the NONE state). We deliberately do NOT
-    // assert refundStatus === 'FULL' here: a full refund of a TAXABLE order is currently stuck at
-    // PARTIALLY_REFUNDED because the disposition compares the net refund against the gross order total
-    // (and Woo monetary-only refunds persist gross, so the basis is not uniform) — tracked as o3d-w00,
-    // pending a finance-reviewed fix. `!== 'NONE'` stays green both before and after that fix lands.
+    // assert refundStatus === 'FULL': a full refund of a TAXABLE order is still stuck at
+    // PARTIALLY_REFUNDED because the disposition measures NET refund totals against the GROSS order
+    // total — and the refund basis is not yet uniform ACROSS CALLERS (the manual refund UI submits
+    // qty * unitPriceForeign, a GROSS amount). Tracked as o3d-w00, pending a net-valued service
+    // contract. `!== 'NONE'` stays green both before and after that lands.
     expect(await orderRefundStatus(imported.salesOrderId)).not.toBe('NONE')
   })
 

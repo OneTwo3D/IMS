@@ -32,6 +32,54 @@ function parseDecimalAbs(value: string | number | null | undefined) {
   return decimal.lt(0) ? decimal.neg() : decimal
 }
 
+/** Rounding tolerance when reconciling order tax against the sum of its line tax. */
+const TAX_RECONCILE_EPSILON = 0.01
+
+/**
+ * Is this order taxed uniformly enough that a bare monetary amount can be split into net + VAT?
+ *
+ * All three are required (o3d-w00), and anything unproven fails CLOSED:
+ *  1. the lines account for the ENTIRE order gross — no shipping/discount value with its own (possibly
+ *     zero) tax treatment sitting outside them;
+ *  2. every line carries the SAME EXPLICIT tax rate — a null taxRateId is ignorance, not uniformity; and
+ *  3. the order's tax reconciles to the lines' tax.
+ * A wholly untaxed order that satisfies (1) trivially qualifies: the ratio is 1, so normalising is a no-op.
+ */
+function isUniformlyTaxedOrder(
+  lines: Array<{ taxRateId: string | null; taxBase: DecimalInput; totalBase: DecimalInput; taxRate: { name: string } | null }>,
+  orderTax: ReturnType<typeof toDecimal>,
+  orderGross: ReturnType<typeof toDecimal>,
+  orderTaxRateName: string | null,
+): boolean {
+  const lineTaxTotal = lines.reduce((sum, line) => sum.add(toDecimal(line.taxBase)), toDecimal(0))
+  // Order lines store NET, so their net + their tax must account for the ENTIRE order gross. Any value
+  // left over is something charged outside the lines — shipping, a discount — whose own tax treatment we
+  // cannot see here. Crucially this catches ZERO-RATED extras too: £120 taxable goods plus £10 zero-rated
+  // shipping leaves orderTax equal to the line tax (a false proof of uniformity), yet the goods:gross
+  // ratio it implies would post a £130 refund as £110 net that the 20% credit-note type re-grosses to
+  // £132. Reconciling the gross is what makes "uniform" mean uniform across the whole order.
+  const lineGrossTotal = lines.reduce(
+    (sum, line) => sum.add(toDecimal(line.totalBase)).add(toDecimal(line.taxBase)),
+    toDecimal(0),
+  )
+  if (orderGross.sub(lineGrossTotal).abs().gt(TAX_RECONCILE_EPSILON)) return false
+  // The credit note posts this line under the tax type resolved from the ORDER's taxRateName, not from
+  // the lines we just validated — and those can legitimately differ (zero-rated lines under a standard
+  // order default; a reverse-charge order whose per-line swap an unmapped line would lose). If they do
+  // not name the SAME rate, the amount we store would be grossed up under a rate we never proved, so
+  // refuse rather than post a wrong credit.
+  if (lines.some((line) => (line.taxRate?.name ?? null) !== orderTaxRateName)) return false
+  // A wholly untaxed order is then safe — the ratio is 1, so normalising is a no-op.
+  if (orderTax.abs().lte(TAX_RECONCILE_EPSILON) && lineTaxTotal.abs().lte(TAX_RECONCILE_EPSILON)) return true
+  if (lines.length === 0) return false
+  // FAIL CLOSED on an unmapped rate. A null taxRateId means we do not know what rate applies, and Woo
+  // can retain a monetary tax amount on a line whose rate never mapped — so several null-rate lines are
+  // NOT evidence of one rate, they are evidence of ignorance. Anything taxed must be explicit.
+  if (lines.some((line) => line.taxRateId === null)) return false
+  if (new Set(lines.map((line) => line.taxRateId)).size > 1) return false
+  return orderTax.sub(lineTaxTotal).abs().lte(TAX_RECONCILE_EPSILON)
+}
+
 export async function syncWcRefund(
   externalOrderId: number,
   wcRefund: WcRefund,
@@ -55,7 +103,14 @@ export async function syncWcRefund(
         externalOrderNumber: true,
         fxRateToBase: true,
         totalBase: true,
-        lines: { select: { id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true } },
+        // taxBase is needed to normalise a monetary-only refund to the NET basis (see below).
+        taxBase: true,
+        // The credit note resolves an unmapped line's tax type from THIS name, so it must match the
+        // lines' own rate or the amount we store would be grossed up under a different rate.
+        taxRateName: true,
+        // taxRateId + per-line taxBase let us prove the order is UNIFORMLY taxed before inferring the
+        // VAT split of a monetary-only refund (see below).
+        lines: { select: { id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true, taxRateId: true, taxBase: true, taxRate: { select: { name: true } } } },
       },
     })
     if (!so) return { success: false, error: `IMS order not found for WC order ${externalOrderId}` }
@@ -138,16 +193,61 @@ export async function syncWcRefund(
     }
 
     if (refundLines.length === 0) {
-      // Monetary-only refund (no line items / shipping to break down): treat the
-      // whole gross amount as a single line. Its gross equals wcRefund.amount.
+      // Monetary-only refund (a goodwill amount with no line/shipping breakdown). wcRefund.amount is the
+      // money actually returned to the customer, i.e. TAX-INCLUSIVE. Refund lines are stored NET
+      // everywhere else (the line/shipping branches above store the ex-tax `total`, accumulating tax only
+      // into mappedGrossForeign), and the credit note re-applies VAT via taxType with
+      // lineAmountsIncludeTax: false. Storing the gross here therefore broke two things at once:
+      //   - the refund basis was inconsistent BETWEEN refunds on one order, so the disposition /
+      //     over-refund maths could not use a single canonical total (o3d-w00);
+      //   - the credit note grossed the already-gross amount up AGAIN — a £120 monetary refund on a
+      //     20% order posted £120 + £24 VAT = £144, crediting VAT that was never charged.
+      // Normalise to NET using the order's own goods:gross proportion — but ONLY when the order is
+      // unambiguously taxed at a SINGLE rate, because a bare amount carries no VAT breakdown and the
+      // credit note posts an unmapped line under ONE order-level taxType (sales.ts fallbackCnTaxType).
+      // On a mixed-rate order (say £100 @20% + £100 zero-rated) a blended ratio is simply wrong: it
+      // would turn a £110 refund into a £100 net line that the credit note re-grosses at 20% to £120,
+      // and the split it assumed would depend on which refund happened to be recorded first. Nothing in
+      // the payload can resolve that, so refuse and let a human refund against specific lines.
+      const orderGross = toDecimal(so.totalBase)
+      const orderTax = toDecimal(so.taxBase)
+      const orderNet = orderGross.sub(orderTax)
+      if (!isUniformlyTaxedOrder(so.lines, orderTax, orderGross, so.taxRateName ?? null)) {
+        // NOTE the wording: this money has ALREADY been returned to the customer in WooCommerce. Telling
+        // an operator to "re-issue the refund" would have them pay twice. The refund must instead be
+        // recorded in the IMS against specific lines so its VAT split is explicit, quoting the Woo refund
+        // id below so the two can be reconciled. (A first-class manual-resolution path that preserves
+        // externalRefundId is tracked separately.)
+        const error =
+          `WooCommerce refund ${wcRefund.id} is monetary-only (no line breakdown) and this order's tax ` +
+          `treatment is not uniform, so its VAT split cannot be determined safely. DO NOT issue another ` +
+          `WooCommerce refund — the customer has already been paid. Record this refund in the IMS ` +
+          `against the specific lines it covers, referencing Woo refund ${wcRefund.id}.`
+        await client.shoppingSyncLog.create({
+          data: {
+            direction: 'FROM_CONNECTOR',
+            status: 'PENDING',
+            entityType: 'SalesOrder',
+            entityId: so.id,
+            externalId: String(wcRefund.id),
+            payload: wcRefund as never,
+            errorMessage: error,
+          },
+        })
+        return { success: false, error }
+      }
+      const netRatio = orderGross.gt(0) && orderNet.gt(0) ? orderNet.div(orderGross) : toDecimal(1)
+      const netAmountForeign = refundAmountForeign.mul(netRatio)
       refundLines.push({
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',
         qty: 0,
-        totalForeign: roundDecimalNumber(refundAmountForeign, 4),
-        totalBase: divideRoundedNumber(refundAmountForeign, fxRate, 4),
+        totalForeign: roundDecimalNumber(netAmountForeign, 4),
+        totalBase: divideRoundedNumber(netAmountForeign, fxRate, 4),
         lineKind: 'sale',
       })
+      // The mapped GROSS still equals the full refunded amount — that is what the amount-mismatch check
+      // below reconciles against, exactly as the line-based branches do (net line + tax into the gross).
       mappedGrossForeign = refundAmountForeign
     }
 
