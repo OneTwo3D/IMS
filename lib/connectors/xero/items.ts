@@ -10,7 +10,10 @@
  */
 
 import { db } from '@/lib/db'
+import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
 import { xeroGet, xeroPost } from './api'
+
+const XERO_CONNECTOR = 'xero'
 
 type XeroItemResponse = {
   Items: Array<{
@@ -33,9 +36,13 @@ function escapeXeroWhereValue(value: string): string {
 async function getStoredItemId(code: string): Promise<string | null> {
   const row = await db.product.findUnique({
     where: { sku: code },
-    select: { accountingItemId: true },
+    select: { accountingItemId: true, accountingItemProvenance: true },
   })
-  return row?.accountingItemId ?? null
+  if (!row?.accountingItemId) return null
+  // Ignore an id issued by a different connector/org (o3d-6nd) — resolve it fresh instead.
+  const active = await activeAccountingIdProvenance(XERO_CONNECTOR)
+  if (!accountingIdProvenanceMatches(row.accountingItemProvenance, active)) return null
+  return row.accountingItemId
 }
 
 /**
@@ -54,7 +61,11 @@ async function storeItemId(code: string, itemId: string): Promise<void> {
   try {
     await db.product.updateMany({
       where: { sku: code },
-      data: { accountingItemId: itemId },
+      // RACE (o3d-gfh): provenance is sampled here, after the API call that issued the id. A reconnect to a
+      // different tenant mid-call could stamp the new tenant on an old-tenant id. Same root cause as the
+      // read-side race — needs the API response to carry its issuing tenant. No worse than pre-o3d-6nd,
+      // which stored the id with no provenance and read it unconditionally.
+      data: { accountingItemId: itemId, accountingItemProvenance: await activeAccountingIdProvenance(XERO_CONNECTOR) },
     })
   } catch (e) {
     console.warn(

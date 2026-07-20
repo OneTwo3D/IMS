@@ -3,7 +3,10 @@
  */
 
 import { db } from '@/lib/db'
+import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
 import { xeroGet, xeroPost } from './api'
+
+const XERO_CONNECTOR = 'xero'
 
 type XeroContactResponse = {
   Contacts: Array<{
@@ -33,36 +36,31 @@ function buildWhereQuery(expression: string): string {
 }
 
 async function getStoredContactId(ref?: ContactRef): Promise<string | null> {
-  if (ref?.customerId) {
-    const row = await db.customer.findUnique({
-      where: { id: ref.customerId },
-      select: { accountingContactId: true },
-    })
-    return row?.accountingContactId ?? null
-  }
-
-  if (ref?.supplierId) {
-    const row = await db.supplier.findUnique({
-      where: { id: ref.supplierId },
-      select: { accountingContactId: true },
-    })
-    return row?.accountingContactId ?? null
-  }
-
-  return null
+  const row = ref?.customerId
+    ? await db.customer.findUnique({ where: { id: ref.customerId }, select: { accountingContactId: true, accountingContactProvenance: true } })
+    : ref?.supplierId
+      ? await db.supplier.findUnique({ where: { id: ref.supplierId }, select: { accountingContactId: true, accountingContactProvenance: true } })
+      : null
+  if (!row?.accountingContactId) return null
+  // Ignore an id issued by a different connector/org (o3d-6nd) — resolve it fresh instead.
+  const active = await activeAccountingIdProvenance(XERO_CONNECTOR)
+  if (!accountingIdProvenanceMatches(row.accountingContactProvenance, active)) return null
+  return row.accountingContactId
 }
 
 async function storeContactId(contactId: string, ref?: ContactRef): Promise<void> {
   if (!contactId) return
+  // RACE (o3d-gfh): provenance sampled after the id-issuing API call — see xero/items.ts.
+  const provenance = await activeAccountingIdProvenance(XERO_CONNECTOR)
   if (ref?.customerId) {
     await db.customer.update({
       where: { id: ref.customerId },
-      data: { accountingContactId: contactId },
+      data: { accountingContactId: contactId, accountingContactProvenance: provenance },
     }).catch(() => {})
   } else if (ref?.supplierId) {
     await db.supplier.update({
       where: { id: ref.supplierId },
-      data: { accountingContactId: contactId },
+      data: { accountingContactId: contactId, accountingContactProvenance: provenance },
     }).catch(() => {})
   }
 }

@@ -439,15 +439,15 @@ export async function disconnect(): Promise<void> {
     // reconnecting to a different company or switching connectors.
     db.customer.updateMany({
       where: { accountingContactId: { not: null } },
-      data: { accountingContactId: null },
+      data: { accountingContactId: null, accountingContactProvenance: null },
     }),
     db.supplier.updateMany({
       where: { accountingContactId: { not: null } },
-      data: { accountingContactId: null },
+      data: { accountingContactId: null, accountingContactProvenance: null },
     }),
     db.product.updateMany({
       where: { accountingItemId: { not: null } },
-      data: { accountingItemId: null },
+      data: { accountingItemId: null, accountingItemProvenance: null },
     }),
   ])
 }

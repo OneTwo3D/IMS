@@ -10,9 +10,11 @@ import test, { mock } from 'node:test'
  * comes back. So these pin the CALL COUNT, not the return value.
  */
 
-type ProductRow = { accountingItemId: string | null } | null
+type ProductRow = { accountingItemId: string | null; accountingItemProvenance?: string | null } | null
 
 let storedProduct: ProductRow = null
+// The connection the guard compares against. 'xero:tenant-A' is the default "matching" connection.
+let activeTenantId: string | null = 'tenant-A'
 const updateManyCalls: Array<{ where: unknown; data: unknown }> = []
 const getPaths: string[] = []
 const postPaths: string[] = []
@@ -25,6 +27,9 @@ const noItems = { ok: true, status: 200, data: { Items: [] } }
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      accountingToken: {
+        findUnique: async () => (activeTenantId === null ? null : { tenantId: activeTenantId }),
+      },
       product: {
         findUnique: async () => storedProduct,
         updateMany: async (args: { where: unknown; data: unknown }) => {
@@ -65,6 +70,7 @@ const findOrCreateItem: FindOrCreateItem = async (...args) => {
 
 function reset() {
   storedProduct = null
+  activeTenantId = 'tenant-A'
   updateManyCalls.length = 0
   getPaths.length = 0
   postPaths.length = 0
@@ -74,13 +80,42 @@ function reset() {
 
 test('a stored item id costs ZERO Xero calls', async () => {
   reset()
-  storedProduct = { accountingItemId: 'xero-item-123' }
+  storedProduct = { accountingItemId: 'xero-item-123', accountingItemProvenance: 'xero:tenant-A' }
 
   const res = await findOrCreateItem('SKU-1', 'Widget', '200')
 
   assert.deepEqual(res, { success: true, itemId: 'xero-item-123' })
   assert.equal(getPaths.length, 0, 'a known item must not be looked up again')
   assert.equal(postPaths.length, 0, 'a known item must not be re-created')
+})
+
+test('a stored id from a DIFFERENT org is ignored and re-resolved (o3d-6nd)', async () => {
+  // Re-authorising to a different Xero org (or a connector switch that bypassed disconnect) leaves the
+  // old org's id cached. Serving it would post against an item that org never issued. The guard must
+  // treat it as uncached and look it up fresh against the CURRENT org.
+  reset()
+  storedProduct = { accountingItemId: 'stale-other-org', accountingItemProvenance: 'xero:tenant-OLD' }
+  getResponses = [{ ok: true, status: 200, data: { Items: [{ ItemID: 'fresh-id', Code: 'SKU-1', Name: 'Widget' }] } }]
+
+  const res = await findOrCreateItem('SKU-1', 'Widget', '200')
+
+  assert.deepEqual(res, { success: true, itemId: 'fresh-id' })
+  assert.equal(getPaths.length, 1, 'a foreign-org id must be re-resolved, not trusted')
+  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'fresh-id', accountingItemProvenance: 'xero:tenant-A' } }])
+})
+
+test('a legacy id with NULL provenance is re-resolved once, then stamped (o3d-6nd)', async () => {
+  // Ids cached before this column existed carry NULL provenance. They cannot be trusted (that is the
+  // whole bug), so they re-resolve once and backfill their own provenance.
+  reset()
+  storedProduct = { accountingItemId: 'legacy-id', accountingItemProvenance: null }
+  getResponses = [{ ok: true, status: 200, data: { Items: [{ ItemID: 'reverified-id', Code: 'SKU-1', Name: 'Widget' }] } }]
+
+  const res = await findOrCreateItem('SKU-1', 'Widget', '200')
+
+  assert.deepEqual(res, { success: true, itemId: 'reverified-id' })
+  assert.equal(getPaths.length, 1)
+  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'reverified-id', accountingItemProvenance: 'xero:tenant-A' } }])
 })
 
 test('an unknown SKU is looked up once, and the answer is remembered', async () => {
@@ -93,7 +128,7 @@ test('an unknown SKU is looked up once, and the answer is remembered', async () 
   assert.deepEqual(res, { success: true, itemId: 'found-id' })
   assert.equal(getPaths.length, 1)
   assert.equal(postPaths.length, 0, 'an item that already exists must not be re-created')
-  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'found-id' } }])
+  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'found-id', accountingItemProvenance: 'xero:tenant-A' } }])
 })
 
 test('a newly created item is remembered too', async () => {
@@ -104,7 +139,7 @@ test('a newly created item is remembered too', async () => {
 
   assert.deepEqual(res, { success: true, itemId: 'created-id' })
   assert.equal(postPaths.length, 1)
-  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'created-id' } }])
+  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'created-id', accountingItemProvenance: 'xero:tenant-A' } }])
 })
 
 test('the id recovered from a create race is remembered', async () => {
@@ -121,7 +156,7 @@ test('the id recovered from a create race is remembered', async () => {
   const res = await findOrCreateItem('SKU-1', 'Widget', '200')
 
   assert.deepEqual(res, { success: true, itemId: 'raced-id' })
-  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'raced-id' } }])
+  assert.deepEqual(updateManyCalls, [{ where: { sku: 'SKU-1' }, data: { accountingItemId: 'raced-id', accountingItemProvenance: 'xero:tenant-A' } }])
 })
 
 test('a failed create stores nothing — a cached id must mean the item exists', async () => {
