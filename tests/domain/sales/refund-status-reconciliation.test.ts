@@ -171,6 +171,7 @@ test('refund disposition reconciliation reports source row cap and caps collecte
       status: true,
       refundStatus: true,
       totalBase: true,
+      taxBase: true,
       refunds: {
         orderBy: { refundedAt: 'asc' },
         select: {

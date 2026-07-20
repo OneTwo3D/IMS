@@ -1,6 +1,7 @@
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import type { AccountingSettings } from '@/lib/accounting'
+import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import {
   parseCostLayerSnapshot,
@@ -214,6 +215,10 @@ export type CreatedRefundLine = {
   totalForeign: number
   totalBase: number
   lineKind: 'sale' | 'shipping' | 'discount'
+  // The VAT identity resolved at refund creation (o3d-w00). NULL for legacy rows created before the
+  // snapshot existed; the credit-note poster falls back to its prior prediction only then.
+  accountingTaxType?: string | null
+  reverseCharge?: boolean | null
 }
 
 export type RefundAccountingSyncRequest = {
@@ -1635,7 +1640,17 @@ export async function createSalesOrderRefund(
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
         allocationBatchAmount: true,
-        lines: { select: { id: true, productId: true, qty: true } },
+        // taxRateName -> the order-default tax type; per-line taxRate -> each line's own identity. Both
+        // are needed to snapshot the SAME tax type the invoice resolved, at creation time (o3d-w00).
+        taxRateName: true,
+        lines: {
+          select: {
+            id: true,
+            productId: true,
+            qty: true,
+            taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
+          },
+        },
         shipments: {
           where: { status: 'SHIPPED' },
           select: { id: true },
@@ -1645,6 +1660,33 @@ export async function createSalesOrderRefund(
     if (!so) return { error: 'Order not found' } as const
 
     const fxRate = refundBoundaryNumber(so.fxRateToBase) || 1
+
+    // Snapshot each refund line's VAT identity at creation, resolved EXACTLY as the invoice did
+    // (o3d-w00). Store the resolved connector tax type so the credit note posts under the rate that was
+    // actually validated, instead of re-predicting it from the order default at post time — which
+    // mis-taxed deactivated-rate, reverse-charged and mixed-rate refunds.
+    const orderDefaultTaxType = so.taxRateName
+      ? (await tx.taxRate.findFirst({
+          where: { name: so.taxRateName, active: true },
+          select: { accountingTaxType: true },
+        }))?.accountingTaxType ?? null
+      : null
+    const salesLineTaxById = new Map(so.lines.map((line) => [line.id, line.taxRate]))
+    const reverseChargeSalesTaxType = input.accountingSettings?.reverseChargeSalesTaxType
+    const resolveRefundLineTaxIdentity = (lineId: string | null | undefined) => {
+      // A line-linked refund carries its OWN rate (read via the relation, so a rate deactivated after the
+      // sale still resolves). An unlinked line (monetary-only, shipping) uses the order default WITHOUT
+      // the reverse-charge swap — mirroring how the invoice posts its shipping/unlinked lines.
+      const linked = lineId ? salesLineTaxById.get(lineId) : undefined
+      return {
+        accountingTaxType: resolveSalesLineTaxType({
+          baseTaxType: linked?.accountingTaxType ?? orderDefaultTaxType,
+          reverseCharge: linked?.reverseCharge,
+          reverseChargeSalesTaxType,
+        }) ?? null,
+        reverseCharge: linked?.reverseCharge ?? null,
+      }
+    }
 
     // External refund deliveries provide a stable replay key. Manual refunds
     // intentionally rely on the operator UI's double-submit guard instead of
@@ -1793,7 +1835,7 @@ export async function createSalesOrderRefund(
     // audit-M-o2c: cumulative refunded must not exceed the order total, with a
     // fixed rounding epsilon (not a 0.1% relative slack, which on a large order
     // is pounds of headroom) so N partial refunds can't creep over.
-    if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, refundBoundaryNumber(so.totalBase))) {
+    if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase)))) {
       return { error: 'Refund total would exceed order total' } as const
     }
 
@@ -1862,6 +1904,7 @@ export async function createSalesOrderRefund(
       const lineTotalForeign = refundLine.totalForeign != null
         ? Math.round(refundLine.totalForeign * 10000) / 10000
         : Math.round(refundLine.totalBase * fxRate * 10000) / 10000
+      const taxIdentity = resolveRefundLineTaxIdentity(refundLine.lineId)
       const createdLine = await tx.salesOrderRefundLine.create({
         data: {
           refundId: createdRefund.id,
@@ -1873,6 +1916,8 @@ export async function createSalesOrderRefund(
           unitPriceBase: refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : 0,
           totalForeign: lineTotalForeign,
           totalBase: refundLine.totalBase,
+          accountingTaxType: taxIdentity.accountingTaxType,
+          reverseCharge: taxIdentity.reverseCharge,
         },
         select: {
           id: true,
@@ -1884,6 +1929,8 @@ export async function createSalesOrderRefund(
           unitPriceBase: true,
           totalForeign: true,
           totalBase: true,
+          accountingTaxType: true,
+          reverseCharge: true,
         },
       })
       createdRefundLines.push({
@@ -1897,6 +1944,8 @@ export async function createSalesOrderRefund(
         totalForeign: refundBoundaryNumber(createdLine.totalForeign),
         totalBase: refundBoundaryNumber(createdLine.totalBase),
         lineKind: refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale',
+        accountingTaxType: createdLine.accountingTaxType,
+        reverseCharge: createdLine.reverseCharge,
       })
     }
 
@@ -1908,9 +1957,11 @@ export async function createSalesOrderRefund(
     // order total — comparing against the gross so.totalBase would leave a full
     // revenue unwind stuck at PARTIALLY_REFUNDED on taxable orders. Non-taxable
     // orders have taxBase 0, so this is identical to the gross basis for them.
-    const orderTotal = input.chargeback
-      ? Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase))
-      : refundBoundaryNumber(so.totalBase)
+    // Refund totals are NET for every caller (o3d-w00 gave the WooCommerce monetary-only refund a net
+    // contract like the others), so compare against the NET order total. Using the gross so.totalBase
+    // left a full refund of a taxable order stuck at PARTIALLY_REFUNDED. Non-taxable orders have taxBase
+    // 0, so this is identical to the gross basis for them.
+    const orderTotal = Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase))
     // `newStatus` is the refund *classification* (drives the accounting reversal
     // treatment), NOT the order's lifecycle status — refund state is now the
     // orthogonal refundStatus dimension.
@@ -2104,6 +2155,8 @@ export async function retrySalesOrderRefundAccounting(
               unitPriceBase: true,
               totalForeign: true,
               totalBase: true,
+              accountingTaxType: true,
+              reverseCharge: true,
             },
           },
         },
@@ -2148,6 +2201,8 @@ export async function retrySalesOrderRefundAccounting(
         totalForeign: refundBoundaryNumber(line.totalForeign),
         totalBase: refundBoundaryNumber(line.totalBase),
         lineKind: line.productId ? 'sale' : 'shipping',
+        accountingTaxType: line.accountingTaxType,
+        reverseCharge: line.reverseCharge,
       }))
       // Refund classification comes from the orthogonal refundStatus now (the lifecycle
       // status is no longer set to REFUNDED on a full refund).

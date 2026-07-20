@@ -55,6 +55,7 @@ export async function syncWcRefund(
         externalOrderNumber: true,
         fxRateToBase: true,
         totalBase: true,
+        taxRatePercent: true,
         lines: { select: { id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true } },
       },
     })
@@ -138,14 +139,19 @@ export async function syncWcRefund(
     }
 
     if (refundLines.length === 0) {
-      // Monetary-only refund (no line items / shipping to break down): treat the
-      // whole gross amount as a single line. Its gross equals wcRefund.amount.
+      // Monetary-only refund (no line items / shipping to break down): the money returned to the customer
+      // is GROSS (tax-inclusive), but every refund line is stored NET (o3d-w00) — the credit note grosses
+      // it back up via the snapshotted tax type. So convert the gross refund to net using the order's VAT
+      // rate here; a non-taxable order (rate 0) leaves it unchanged. The gross accumulator below stays
+      // GROSS, because the amount-mismatch reconciliation checks against wcRefund.amount which is gross.
+      const vatRate = toDecimal(so.taxRatePercent ?? 0).div(100)
+      const netForeign = toDecimal(refundAmountForeign).div(toDecimal(1).add(vatRate))
       refundLines.push({
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',
         qty: 0,
-        totalForeign: roundDecimalNumber(refundAmountForeign, 4),
-        totalBase: divideRoundedNumber(refundAmountForeign, fxRate, 4),
+        totalForeign: roundDecimalNumber(netForeign, 4),
+        totalBase: divideRoundedNumber(netForeign, fxRate, 4),
         lineKind: 'sale',
       })
       mappedGrossForeign = refundAmountForeign

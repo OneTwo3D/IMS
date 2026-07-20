@@ -1695,8 +1695,16 @@ async function queueRefundAccountingActions(input: {
           : line.lineKind === 'discount'
             ? (settings.discountAccount || settings.salesAccount)
             : settings.salesAccount,
-        taxType: (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined) ?? fallbackCnTaxType,
+        // Post under the tax identity SNAPSHOTTED at refund creation (o3d-w00) — the rate the invoice
+        // actually validated — instead of re-predicting it from the order default here, which mis-taxed
+        // deactivated-rate/reverse-charge/mixed-rate refunds. Fall back to the old prediction only for
+        // legacy rows with no snapshot (created before the column existed).
+        taxType: line.accountingTaxType
+          ?? (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined)
+          ?? fallbackCnTaxType,
       })),
+      // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
+      // that had a gross amount — is now netted at source, so this correctly grosses every line up.
       lineAmountsIncludeTax: false,
       currencyRateToBase: Number(input.refundFxRate) || undefined,
     },

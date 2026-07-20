@@ -49,7 +49,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
   const refunds: Array<{ id: string; externalRefundId: number }> = []
   const syncLogs: unknown[] = []
   const activityLogs: unknown[] = []
-  const createRefundLines: Array<{ lineId?: string; productId: string | null }> = []
+  const createRefundLines: Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }> = []
   let createRefundCalls = 0
 
   const dependencies: WcRefundSyncDependencies = {
@@ -61,6 +61,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
             externalOrderNumber: 'WC-1001',
             fxRateToBase: 1,
             totalBase: 12.5,
+            taxRatePercent: 20,
             lines: [
               {
                 id: 'line-1',
@@ -97,7 +98,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
       // Capture the lines. Without this nothing could assert that a refund line was
       // actually LINKED to its IMS order line, which is how the _refunded_item_id bug
       // survived: createRefund was only ever checked for being called.
-      createRefundLines.push(...(lines as unknown as Array<{ lineId?: string; productId: string | null }>))
+      createRefundLines.push(...(lines as unknown as Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }>))
       refunds.push({ id: `refund-${refunds.length + 1}`, externalRefundId: createOptions?.externalRefundId ?? 0 })
       return { success: true }
     },
@@ -167,6 +168,21 @@ test('syncWcRefund reconciles a VAT line refund on the gross basis (amount inclu
     state.syncLogs.some((log) => /amount mismatch/.test(String((log as { data?: { errorMessage?: string } }).data?.errorMessage ?? ''))),
     false,
   )
+})
+
+test('a monetary-only WooCommerce refund is stored NET, not gross (o3d-w00)', async () => {
+  // The money returned to the customer is GROSS (£12 incl. 20% VAT). Every refund line is stored NET now,
+  // so the credit note grosses it back up via the snapshotted tax type. If it were stored gross, the
+  // credit note would re-gross it (£12 -> £14.40). A monetary-only refund has no line_items/shipping.
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  const refund = makeRefund({ amount: '12.00', line_items: [], shipping_lines: [] })
+
+  await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(state.createRefundCalls, 1)
+  assert.equal(state.createRefundLines.length, 1)
+  // 12.00 gross / 1.20 = 10.00 net.
+  assert.equal(state.createRefundLines[0].totalForeign, 10)
 })
 
 test('syncWcRefund still rejects a genuine amount mismatch', async () => {

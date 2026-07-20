@@ -24,12 +24,16 @@ type Order = {
   refundStatus?: string
   fxRateToBase: number
   totalBase: number
+  taxBase?: number
+  taxRatePercent?: number
+  taxRateName?: string | null
   revenueDeferredDate: Date | null
   unearnedRevenueAmount: number | null
   inventoryAllocatedDate: Date | null
   allocationBatchAmount: number | null
 }
 
+type LineTaxRate = { accountingTaxType: string | null; reverseCharge: boolean | null }
 type SalesLine = {
   id: string
   orderId: string
@@ -37,6 +41,7 @@ type SalesLine = {
   description: string
   qty: number
   totalBase: number
+  taxRate?: LineTaxRate | null
 }
 
 function uniqueStockMovementError() {
@@ -83,6 +88,8 @@ type RefundLine = {
   totalForeign: number
   totalBase: number
   costLayerSnapshot?: unknown
+  accountingTaxType?: string | null
+  reverseCharge?: boolean | null
 }
 
 type State = {
@@ -127,6 +134,7 @@ type State = {
   activityLogs: unknown[]
   cogsSubledgerMovements: unknown[]
   settings: Record<string, string>
+  taxRates?: Array<{ name: string; accountingTaxType: string | null; active?: boolean }>
   executeRawCalls: number
   nextRefundId: number
   nextRefundLineId: number
@@ -210,6 +218,7 @@ function baseState(overrides: Partial<State> = {}): State {
     activityLogs: [],
     cogsSubledgerMovements: [],
     settings: {},
+    taxRates: [],
     executeRawCalls: 0,
     nextRefundId: 1,
     nextRefundLineId: 1,
@@ -241,6 +250,13 @@ function createClient(state: State): RefundServiceClient {
         throw error
       }
     },
+    taxRate: {
+      findFirst: async ({ where }: { where: { name?: string; active?: boolean } }) => {
+        const match = (state.taxRates ?? []).find((rate) =>
+          rate.name === where.name && (where.active ? rate.active !== false : true))
+        return match ? { accountingTaxType: match.accountingTaxType } : null
+      },
+    },
     setting: {
       findUnique: async ({ where }: { where: { key: string } }) => {
         const value = state.settings[where.key]
@@ -259,7 +275,7 @@ function createClient(state: State): RefundServiceClient {
             ...order,
             lines: state.lines
               .filter((line) => line.orderId === order.id)
-              .map((line) => ({ id: line.id, productId: line.productId, qty: line.qty })),
+              .map((line) => ({ id: line.id, productId: line.productId, qty: line.qty, taxRate: line.taxRate ?? null })),
             shipments: state.shipments
               .filter((row) => row.orderId === order.id && row.status === 'SHIPPED')
               .map((row) => ({ id: row.id })),
@@ -516,6 +532,62 @@ test('createSalesOrderRefund dual-writes refundStatus=FULL on a full refund', as
   assert.equal(result.success, true)
   assert.equal(state.orders[0].status, 'SHIPPED') // lifecycle status is left untouched
   assert.equal(state.orders[0].refundStatus, 'FULL')
+})
+
+test('a full NET refund of a TAXABLE order reaches refundStatus=FULL, not stuck at PARTIAL (o3d-w00)', async () => {
+  // Order: gross 120, tax 20, net 100. Refund lines are stored NET, so a full refund is net 100. Against
+  // the GROSS 120 it stuck at PARTIAL forever; against the NET 100 it correctly reaches FULL.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 20, taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Full return',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL', 'a full net refund of a taxable order is FULL, not stuck PARTIAL')
+})
+
+test('a refund line SNAPSHOTS the resolved tax identity at creation (o3d-w00)', async () => {
+  // The linked sales line carries its own rate; the snapshot must capture that connector tax type so the
+  // credit note posts under it instead of re-predicting from the order default at post time.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 20, taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+  })
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Return',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(state.refundLines[0].accountingTaxType, 'OUTPUT2', 'the resolved tax type is snapshotted')
+  assert.equal(state.refundLines[0].reverseCharge, false)
+})
+
+test('a reverse-charge line snapshots the SWAPPED tax type (o3d-w00)', async () => {
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, taxRatePercent: 0, taxRateName: 'RC' }],
+    taxRates: [{ name: 'RC', accountingTaxType: 'ZERORATEDOUTPUT', active: true }],
+    settings: { reverse_charge_sales_tax_type: 'REVERSECHARGE' },
+  })
+  state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }
+  await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Return',
+    creditNotePrefix: 'CN-',
+    accountingSettings: { ...accountingSettings, reverseChargeSalesTaxType: 'REVERSECHARGE' },
+  })
+
+  assert.equal(state.refundLines[0].accountingTaxType, 'REVERSECHARGE', 'reverse-charge swap is captured in the snapshot')
+  assert.equal(state.refundLines[0].reverseCharge, true)
 })
 
 test('createSalesOrderRefund converts refund totals from base to foreign currency', async () => {
