@@ -310,6 +310,58 @@ test('allocateSalesOrder creates no allocation when the whole line is refunded',
   assert.deepEqual(state.allocations, [])
 })
 
+test('allocation decides the ALLOCATED promotion on the UNDER-LOCK status, not the stale pre-lock one (o3d-aoo)', async () => {
+  // The pre-lock status read (for warehouse selection) can be stale: a PROCESSING->ON_HOLD (or
+  // ->CANCELLED) commit can land between it and the FOR UPDATE lock. Promoting off the stale value would
+  // RESUME a paused order to ALLOCATED. The fix re-reads under the lock and decides on that. Modelled
+  // here by flipping the order to ON_HOLD after the first read, so the under-lock read sees ON_HOLD.
+  const state = baseState() // starts PROCESSING
+  const client = createClient(state)
+  const realFindUnique = client.salesOrder.findUnique
+  let reads = 0
+  client.salesOrder.findUnique = (async (args: never) => {
+    reads += 1
+    if (reads >= 1) state.order.status = 'ON_HOLD' // the concurrent transition commits after the pre-lock read
+    return realFindUnique(args)
+  }) as typeof client.salesOrder.findUnique
+
+  await allocateSalesOrder(client, { orderId: 'order-1' })
+
+  // ON_HOLD is not in the promotable set, so allocation must NOT un-pause the order.
+  assert.equal(state.order.status, 'ON_HOLD', 'a held order must not be resumed to ALLOCATED off a stale read')
+})
+
+test('a CANCELLED order reaching allocation releases reservations and deletes allocations WITHOUT promoting (o3d-aoo)', async () => {
+  // Dual-use: the refund/cancel workflow calls allocation on a terminal order specifically to RELEASE its
+  // demand. So the fix is not to refuse — it is to treat CANCELLED as zero remaining demand under the
+  // lock: release the reservation deltas and delete existing allocations, but never promote status.
+  const state = baseState({
+    order: { ...baseState().order, status: 'CANCELLED' },
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(state.allocations, [], 'a cancelled order keeps no reservations')
+  assert.equal(state.stockLevels[0].reservedQty, 0, 'its reserved stock is released')
+  assert.equal(state.order.status, 'CANCELLED', 'allocation must not resurrect a cancelled order')
+})
+
+test('a fully-refunded order reaching allocation releases and deletes WITHOUT promoting (o3d-aoo)', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'PROCESSING', refundStatus: 'FULL' },
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(state.allocations, [], 'a fully-refunded order keeps no reservations')
+  assert.equal(state.stockLevels[0].reservedQty, 0)
+  assert.notEqual(state.order.status, 'ALLOCATED', 'a fully-refunded order is not promoted to ALLOCATED')
+})
+
 test('allocateSalesOrder allocates available stock and advances order status', async () => {
   const state = baseState()
   const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
