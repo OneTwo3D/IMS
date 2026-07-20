@@ -1,4 +1,5 @@
-import { Prisma, ProductType, PurchaseOrderStatus, SalesOrderStatus, StockMovementType } from '@/app/generated/prisma/client'
+import { Prisma, ProductType, SalesOrderStatus, StockMovementType } from '@/app/generated/prisma/client'
+import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
@@ -35,11 +36,9 @@ const REPLENISHMENT_PRODUCT_TYPES: ProductType[] = [
   ProductType.KIT,
   ProductType.BOM,
 ]
-const OPEN_PO_STATUSES: PurchaseOrderStatus[] = [
-  PurchaseOrderStatus.PO_SENT,
-  PurchaseOrderStatus.SHIPPED,
-  PurchaseOrderStatus.PARTIALLY_RECEIVED,
-]
+// The canonical committed-incoming-supply set (o3d-s8n.8) — shared so it can't drift from the product
+// page / drill-down / lifecycle-archive.
+const OPEN_PO_STATUSES = INCOMING_PO_STATUSES
 const ACTIVE_SALES_ORDER_STATUSES: SalesOrderStatus[] = [
   SalesOrderStatus.DRAFT,
   SalesOrderStatus.PENDING_PAYMENT,

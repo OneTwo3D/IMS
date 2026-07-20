@@ -51,9 +51,11 @@ test('open purchase order report uses only open statuses and nets received and r
     purchaseOrder: {
       findMany: async (args?: unknown) => {
         const where = (args as { where: { status: { in: PurchaseOrderStatus[] } } }).where
-        assert.deepEqual(where.status.in, [
-          PurchaseOrderStatus.PO_SENT,
+        // Order-insensitive: it is the canonical committed-incoming set (o3d-s8n.8) shared from
+        // INCOMING_PO_STATUSES; only the SET matters for a Prisma `in`.
+        assert.deepEqual([...where.status.in].sort(), [
           PurchaseOrderStatus.PARTIALLY_RECEIVED,
+          PurchaseOrderStatus.PO_SENT,
           PurchaseOrderStatus.SHIPPED,
         ])
         return [{

@@ -1,4 +1,5 @@
 import { Prisma, PurchaseOrderStatus } from '@/app/generated/prisma/client'
+import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -12,11 +13,9 @@ const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_PERIOD_DAYS = 30
 
-export const OPEN_PURCHASE_ORDER_STATUSES: PurchaseOrderStatus[] = [
-  PurchaseOrderStatus.PO_SENT,
-  PurchaseOrderStatus.PARTIALLY_RECEIVED,
-  PurchaseOrderStatus.SHIPPED,
-]
+// The Open-POs quantity report's "outstanding" set is the same committed-incoming-supply set — source it
+// from the single canonical constant so it can't drift (o3d-s8n.8).
+export const OPEN_PURCHASE_ORDER_STATUSES: PurchaseOrderStatus[] = INCOMING_PO_STATUSES
 
 const RECEIVED_PURCHASE_ORDER_STATUSES: PurchaseOrderStatus[] = [
   PurchaseOrderStatus.RECEIVED,

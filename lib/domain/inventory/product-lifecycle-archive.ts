@@ -1,9 +1,10 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 
 import { db } from '@/lib/db'
 import { toDecimal } from '@/lib/domain/math/decimal'
 
-const OPEN_PO_STATUSES = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'] as const
+const OPEN_PO_STATUSES = INCOMING_PO_STATUSES
 const OPEN_PRODUCTION_STATUSES = ['DRAFT', 'IN_PROGRESS'] as const
 // Only WMS-confirmed ASNs count as incoming stock. Pre-confirmation create states
 // can dead-letter indefinitely and should not block EOL auto-archive forever.
