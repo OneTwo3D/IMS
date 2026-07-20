@@ -60,6 +60,27 @@ Inventory valuation and COGS only show accounting variance when matching account
 
 Reorder suggestions are never negative. They are planning guidance and should be reviewed before creating supplier documents.
 
+### Warehouse filtering
+
+When you filter reorder planning to a warehouse, available stock, inbound open POs and sales demand are
+all scoped to that warehouse.
+
+Sales demand was previously company-wide even under a warehouse filter, which divided warehouse-scoped
+stock by whole-company demand and so **overstated reorder points and suggested quantities**. Since that
+was corrected, a warehouse-filtered report shows lower demand and therefore smaller (or fewer)
+suggestions than before. The unfiltered, all-warehouse report is unchanged.
+
+Dead stock reads demand the same way, so a SKU whose only recent sales are imported history is **not**
+reported as dead. Before that was fixed, such a SKU could appear on the dead-stock list and the reorder
+list at the same time.
+
+**Demand imported as sales history is an exception.** The historical/initial sales import records past
+sales without a warehouse, because the source data does not say which one shipped them. That demand
+continues to count toward **every** warehouse rather than being dropped from warehouse-filtered reports —
+excluding it would understate demand and risk stockouts. So a tenant whose recent history is mostly
+imported will see warehouse-filtered demand that is closer to the company-wide figure. To get demand
+attributed per warehouse, it has to come from dispatches recorded in IMS.
+
 ### Lifecycle filtering
 
 Only **Draft** and **Active** products appear in reorder planning by default. **EOL** and **Archived** products are excluded — you should be running them down, not reordering them. To see EOL products too, toggle the "Include EOL" filter.
