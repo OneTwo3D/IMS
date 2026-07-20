@@ -232,7 +232,20 @@ async function xeroFetch<T = unknown>(
 ): Promise<XeroResponse<T>> {
   const auth = await getAccessToken()
   if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  return xeroFetchWithAuth<T>(auth, method, path, body, opts)
+}
 
+// The body of a Xero request against an ALREADY-RESOLVED auth. Split out so xeroGetCached can resolve
+// auth exactly once and use the SAME auth for both the cache key and the request — otherwise a
+// concurrent reconnect between two getAccessToken() calls could store one tenant's response under
+// another tenant's key (o3d-e2j).
+async function xeroFetchWithAuth<T = unknown>(
+  auth: { accessToken: string; tenantId: string },
+  method: 'GET' | 'POST' | 'PUT',
+  path: string,
+  body?: unknown,
+  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
+): Promise<XeroResponse<T>> {
   const url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
 
   const headers: Record<string, string> = {
@@ -298,6 +311,72 @@ async function xeroFetch<T = unknown>(
 
   const data = await res.json() as T
   return { ok: true, status: res.status, data }
+}
+
+/**
+ * TTL cache for Xero REFERENCE data only (o3d-e2j).
+ *
+ * xeroGet is a genuine single chokepoint, but it serves both reference data AND per-transaction lookups
+ * (Invoices?where=..., contact/item searches) that MUST stay live — so this is a sibling with an explicit
+ * allowlist, never a blanket cache over xeroGet. A caller opts in by using xeroGetCached, and the path
+ * head must be on XERO_CACHEABLE_REFERENCE_PATHS or the call throws rather than silently serving stale
+ * data for something that should be live.
+ *
+ * Xero's own guidance is to cache Chart of Accounts / Tax Rates / Currencies / Tracking Categories for
+ * 4-12h; 4h is chosen as the conservative end, since these are things a user can change in Xero and would
+ * expect to see reflected reasonably soon. Deliberately NOT cached: tax-rate drift detection
+ * (fetchXeroTaxRates), which is the freshness authority and must read live, and one-shot enable-sync
+ * validation gates, where a cache buys nothing and stale data could wrongly pass/fail the gate.
+ */
+export const XERO_REFERENCE_CACHE_TTL_MS = 4 * 60 * 60 * 1000
+
+const XERO_CACHEABLE_REFERENCE_PATHS = ['TaxRates', 'Organisation', 'Currencies', 'TrackingCategories'] as const
+
+type XeroReferenceCacheEntry = { expiresAt: number; response: XeroResponse<unknown> }
+const xeroReferenceCache = new Map<string, XeroReferenceCacheEntry>()
+
+/** Drop all cached reference data — call when the connection changes (disconnect/reconnect). */
+export function clearXeroReferenceCache(): void {
+  xeroReferenceCache.clear()
+}
+
+/**
+ * Like xeroGet, but serves a cached body for up to ttlMs when the path is reference data.
+ *
+ * The cache key includes the tenant id, so a reconnect to a different org never serves the previous org's
+ * reference data (the same lesson as o3d-6nd). Only a genuinely successful response is cached — never a
+ * 429 or error, or a transient failure would be pinned for the whole TTL.
+ */
+export async function xeroGetCached<T = unknown>(
+  path: string,
+  ttlMs: number = XERO_REFERENCE_CACHE_TTL_MS,
+): Promise<XeroResponse<T>> {
+  // EXACT match, not a prefix/head parse. The cacheable reads are all bare endpoint names, so requiring
+  // the whole path to equal an allowlisted name means a crafted path can never slip a live endpoint past
+  // the guard — "TaxRates/../Invoices/{id}" and "Organisation/%2e%2e/Invoices" are simply not equal to
+  // "TaxRates"/"Organisation" and are rejected before any URL normalisation could reinterpret them.
+  if (!(XERO_CACHEABLE_REFERENCE_PATHS as readonly string[]).includes(path)) {
+    throw new Error(
+      `xeroGetCached refused path "${path}"; only the exact reference endpoints ` +
+      `${XERO_CACHEABLE_REFERENCE_PATHS.join(', ')} may be cached. Per-transaction lookups (and any ` +
+      'subpath or query) must use xeroGet so they stay live.',
+    )
+  }
+
+  // Resolve auth ONCE and use it for both the key and the request. Never touch the cache when
+  // disconnected — no read from and no write to a 'no-tenant' key, so a disconnected call can neither
+  // serve nor create connected data.
+  const auth = await getAccessToken()
+  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+
+  const key = `${auth.tenantId}:${path}`
+  const now = Date.now()
+  const hit = xeroReferenceCache.get(key)
+  if (hit && hit.expiresAt > now) return hit.response as XeroResponse<T>
+
+  const response = await xeroFetchWithAuth<T>(auth, 'GET', path)
+  if (response.ok) xeroReferenceCache.set(key, { expiresAt: now + ttlMs, response })
+  return response
 }
 
 export async function xeroGet<T = unknown>(

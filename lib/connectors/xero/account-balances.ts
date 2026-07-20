@@ -7,7 +7,7 @@ import {
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { getXeroSettings } from './settings'
-import { xeroGet } from './api'
+import { xeroGet, xeroGetCached } from './api'
 
 const XERO_CONNECTOR = 'xero'
 
@@ -168,7 +168,7 @@ function matchParsedBalance(
 
 async function getXeroBaseCurrency(): Promise<string | null> {
   try {
-    const res = await xeroGet<XeroOrganisationResponse>('Organisation')
+    const res = await xeroGetCached<XeroOrganisationResponse>('Organisation')
     const organisations = res.data?.Organisations ?? res.data?.Organisation ?? []
     return res.ok ? organisations[0]?.BaseCurrency?.trim().toUpperCase() ?? null : null
   } catch {
