@@ -112,6 +112,147 @@ test('reorder report nets available and inbound open PO against lead-time demand
   assert.equal(report.rows[0]?.urgency, 'reorder')
 })
 
+test('reorder demand is scoped to the filtered warehouse, like the stock it is compared against (o3d-s8n.1)', async () => {
+  // Demand must come from the SAME warehouse as availableQty. Its siblings already scope — stock levels
+  // by warehouseId, open POs by destinationWarehouseId — so a company-wide demand figure divided into
+  // warehouse-scoped stock inflates reorderPoint, and would make every row in a multi-warehouse tenant
+  // look overdue once run-out dates use the same ratio.
+  const capturedWhere: Array<Record<string, unknown>> = []
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1',
+        sku: 'SKU-1',
+        name: 'Widget',
+        type: 'SIMPLE',
+        reorderPoint: null,
+        reorderQty: null,
+        safetyStockQty: null,
+        category,
+        supplierProducts: [{ supplierId: 'supplier-1', leadTimeDays: 10, supplier }],
+      }],
+    },
+    stockLevel: {
+      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1'), warehouse: { code: 'WH1', name: 'Main Warehouse' } }],
+    },
+    stockMovement: {
+      findMany: async (args: { where: Record<string, unknown> }) => {
+        capturedWhere.push(args.where)
+        return [{
+          productId: 'product-1',
+          qty: decimal('90'),
+          totalValueBase: decimal('180'),
+          createdAt: new Date('2026-06-01T12:00:00.000Z'),
+          product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [{ supplier }] },
+        }]
+      },
+    },
+    purchaseOrderLine: { findMany: async () => [] },
+  }
+
+  await getReorderReport(
+    { thresholdDays: 90, warehouseId: 'warehouse-1' },
+    { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } },
+  )
+
+  // fromWarehouseId is the decrement side of a dispatch, verified against live data (every real
+  // SALE_DISPATCH row carries it and none carry toWarehouseId). Warehouse-LESS rows are kept: see the
+  // historical-import test below.
+  assert.deepEqual(capturedWhere[0]?.OR, [
+    { fromWarehouseId: 'warehouse-1' },
+    { fromWarehouseId: null },
+  ])
+})
+
+test('warehouse-scoped demand still counts warehouse-less historical imports (o3d-s8n.1)', async () => {
+  // The historical/initial sales import records past sales as zero-cost, WAREHOUSE-LESS SALE_DISPATCH
+  // rows whose whole purpose is to seed velocity (migration
+  // 20260616120000_exempt_historical_imports_from_cogs_guard). Filtering them out on warehouse would
+  // understate demand and risk stockouts — the opposite and worse failure than the over-ordering this
+  // change fixes. The predicate must therefore admit NULL alongside the selected warehouse.
+  const capturedWhere: Array<Record<string, unknown>> = []
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1',
+        sku: 'SKU-1',
+        name: 'Widget',
+        type: 'SIMPLE',
+        reorderPoint: null,
+        reorderQty: null,
+        safetyStockQty: null,
+        category,
+        supplierProducts: [{ supplierId: 'supplier-1', leadTimeDays: 10, supplier }],
+      }],
+    },
+    stockLevel: {
+      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main Warehouse' } }],
+    },
+    stockMovement: {
+      findMany: async (args: { where: Record<string, unknown> }) => {
+        capturedWhere.push(args.where)
+        // A warehouse-less historical row: 90 units over the 90-day window = 1/day.
+        return [{
+          productId: 'product-1',
+          qty: decimal('90'),
+          totalValueBase: decimal('0'),
+          createdAt: new Date('2026-06-01T12:00:00.000Z'),
+          product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [{ supplier }] },
+        }]
+      },
+    },
+    purchaseOrderLine: { findMany: async () => [] },
+  }
+
+  const report = await getReorderReport(
+    { thresholdDays: 90, warehouseId: 'warehouse-1' },
+    { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } },
+  )
+
+  // The predicate admits unassigned demand...
+  const or = capturedWhere[0]?.OR as Array<Record<string, unknown>> | undefined
+  assert.ok(or?.some((clause) => clause.fromWarehouseId === null), 'warehouse-less demand must not be filtered out')
+  // ...and it still reaches the computed demand, so planning does not silently collapse to zero.
+  assert.equal(report.rows[0]?.averageDailyDemand, '1')
+})
+
+test('reorder demand is NOT warehouse-filtered when no warehouse is selected', async () => {
+  const capturedWhere: Array<Record<string, unknown>> = []
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1',
+        sku: 'SKU-1',
+        name: 'Widget',
+        type: 'SIMPLE',
+        reorderPoint: null,
+        reorderQty: null,
+        safetyStockQty: null,
+        category,
+        supplierProducts: [{ supplierId: 'supplier-1', leadTimeDays: 10, supplier }],
+      }],
+    },
+    stockLevel: { findMany: async () => [] },
+    stockMovement: {
+      findMany: async (args: { where: Record<string, unknown> }) => {
+        capturedWhere.push(args.where)
+        return []
+      },
+    },
+    purchaseOrderLine: { findMany: async () => [] },
+  }
+
+  await getReorderReport(
+    { thresholdDays: 90 },
+    { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } },
+  )
+
+  assert.equal('fromWarehouseId' in (capturedWhere[0] ?? {}), false, 'company-wide demand must stay unfiltered')
+})
+
 test('reorder report orders up to N weeks of supply, not just to the reorder point', async () => {
   // SIMPLE product, no configured reorderQty/safety, lead time 10, available 0.
   // 90 units over a 90-day window → 1 unit/day. reorderPoint = 1×10 = 10.

@@ -610,6 +610,26 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
       type: StockMovementType.SALE_DISPATCH,
       createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       product: productWhere(filters),
+      // Scope demand to the SAME warehouse as the stock it is compared against (o3d-s8n.1). Its siblings
+      // already do — loadStockLevels filters warehouseId, loadOpenPoLines filters
+      // po.destinationWarehouseId — but productWhere carries no warehouse clause, so under a warehouse
+      // filter availableQty was warehouse-scoped while averageDailyDemand stayed company-wide. That
+      // inflates reorderPoint (demand x leadTime + safetyStock), and once run-out dates are derived from
+      // the same ratio it would report EVERY row in a multi-warehouse tenant as overdue.
+      //
+      // fromWarehouseId is the decrement side of a dispatch (get-on-hand-as-of treats it that way);
+      // verified against live data that real dispatches carry it and never carry toWarehouseId.
+      //
+      // WAREHOUSE-LESS ROWS ARE DELIBERATELY KEPT. The historical/initial sales import records past
+      // sales as zero-cost, warehouse-less SALE_DISPATCH movements whose ENTIRE PURPOSE is to seed this
+      // velocity calculation (see migration 20260616120000_exempt_historical_imports_from_cogs_guard).
+      // An exact-equality filter would drop all of them the moment a warehouse is selected, understating
+      // demand and risking stockouts — the opposite and worse failure than the one being fixed. So
+      // unassigned historical demand keeps counting toward every warehouse, exactly as it does today,
+      // while demand that DOES know its warehouse is now scoped correctly.
+      ...(filters.warehouseId
+        ? { OR: [{ fromWarehouseId: filters.warehouseId }, { fromWarehouseId: null }] }
+        : {}),
     },
     select: {
       productId: true,
