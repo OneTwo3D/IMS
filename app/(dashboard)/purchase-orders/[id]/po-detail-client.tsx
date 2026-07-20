@@ -2381,7 +2381,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 <TableHead className="px-4 text-xs text-right w-28">Total ({sym})</TableHead>
                 <TableHead className="px-4 text-xs text-right w-20">Received</TableHead>
                 <TableHead className="px-4 text-xs text-right w-20">Returned</TableHead>
-                <TableHead className="px-4 text-xs text-right w-20">On Hand</TableHead>
+                <TableHead className="px-4 text-xs text-right w-20">Net Received</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
