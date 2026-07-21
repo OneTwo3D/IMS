@@ -100,6 +100,9 @@ type State = {
   lines: SalesLine[]
   refunds: Refund[]
   refundLines: RefundLine[]
+  // o3d-ee9: actionable WooCommerce refund parks, so createSalesOrderRefund's under-lock park check is testable.
+  shoppingSyncLogs?: Array<{ id: string; connector: string; direction: string; entityType: string; entityId: string | null; externalId: string; status: string }>
+
   shipments: Array<{
     id: string
     orderId: string
@@ -244,6 +247,38 @@ function createClient(state: State): RefundServiceClient {
     $executeRaw: async () => {
       state.executeRawCalls += 1
       return 0
+    },
+    shoppingSyncLog: {
+      // o3d-ee9: the under-lock park queries in createSalesOrderRefund.
+      findFirst: async ({ where }: { where: { externalId?: string; entityId?: { not?: string }; status?: { in?: string[] } } }) => {
+        const notOrder = where.entityId?.not
+        const statuses = where.status?.in
+        const match = (state.shoppingSyncLogs ?? []).find((log) =>
+          log.connector === 'woocommerce' &&
+          log.direction === 'FROM_CONNECTOR' &&
+          log.entityType === 'SalesOrder' &&
+          (where.externalId == null || log.externalId === where.externalId) &&
+          // Prisma `not` excludes NULL too, so a "different order" match requires a non-null, non-`notOrder` id.
+          (notOrder == null || (log.entityId != null && log.entityId !== notOrder)) &&
+          (statuses == null || statuses.includes(log.status)))
+        return match ? { entityId: match.entityId } : null
+      },
+      updateMany: async ({ where, data }: { where: { externalId?: string; entityId?: string; status?: { in?: string[] } }; data: { status?: string } }) => {
+        const statuses = where.status?.in
+        let count = 0
+        for (const log of state.shoppingSyncLogs ?? []) {
+          if (
+            log.connector === 'woocommerce' && log.direction === 'FROM_CONNECTOR' && log.entityType === 'SalesOrder' &&
+            (where.externalId == null || log.externalId === where.externalId) &&
+            (where.entityId == null || log.entityId === where.entityId) &&
+            (statuses == null || statuses.includes(log.status))
+          ) {
+            if (data.status != null) log.status = data.status
+            count += 1
+          }
+        }
+        return { count }
+      },
     },
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => {
       const snapshot = cloneTestStateValue(state)
@@ -605,6 +640,40 @@ test('a new refund is stamped totalsBasis=NET and a writer-derived source (o3d-n
     reason: 'Return', creditNotePrefix: 'CN-', externalRefundId: 4242,
   })
   assert.equal(woo.refunds[0].source, 'WOO_SYNC', 'externalRefundId => woo sync')
+})
+
+test('createSalesOrderRefund fails closed when the refund id is parked for a DIFFERENT order (o3d-ee9 park-first)', async () => {
+  // Park-first race: order B refused this refund id and wrote a park; order A must NOT silently create its
+  // refund and leave B's actionable park stranded. Under the per-refund lock the create refuses.
+  const state = baseState({
+    shoppingSyncLogs: [{ id: 'p1', connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'order-OTHER', externalId: '4242', status: 'FAILED' }],
+  })
+  await assert.rejects(
+    createSalesOrderRefund(createClient(state), {
+      orderId: 'order-1',
+      lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+      reason: 'Return', creditNotePrefix: 'CN-', externalRefundId: 4242,
+    }),
+    /parked for a different order/,
+  )
+  assert.equal(state.refunds.length, 0, 'no refund created for the cross-order-parked id')
+  assert.equal(state.shoppingSyncLogs?.[0].status, 'FAILED', "the other order's park is untouched")
+})
+
+test('createSalesOrderRefund resolves a SAME-order park atomically when the refund lands (o3d-ee9)', async () => {
+  // An earlier refused delivery of this refund parked it on THIS order; once the refund is created the park
+  // must be resolved in the same transaction, not left lingering as an exception.
+  const state = baseState({
+    shoppingSyncLogs: [{ id: 'p2', connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'order-1', externalId: '4242', status: 'FAILED' }],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Return', creditNotePrefix: 'CN-', externalRefundId: 4242,
+  })
+  assert.equal(result.success, true, 'the same-order refund is created')
+  assert.equal(state.refunds.length, 1)
+  assert.equal(state.shoppingSyncLogs?.[0].status, 'SYNCED', "this order's park was resolved atomically")
 })
 
 test('a later refund on an order with a legacy/unknown-basis refund is BLOCKED for manual reconciliation, never over-refunded (o3d-w00 #3 / o3d-n8p)', async () => {

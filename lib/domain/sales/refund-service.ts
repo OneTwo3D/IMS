@@ -1694,6 +1694,28 @@ export async function createSalesOrderRefund(
     // refund. Taken BEFORE the order row lock, matching upsertRefundPark's order, so the two cannot deadlock.
     if (input.externalRefundId != null) {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${input.externalRefundId}`}))`
+
+      // o3d-ee9 (park-first ordering): under the per-refund lock, refuse to create a refund whose external id
+      // is already parked as an actionable WooCommerce refund for a DIFFERENT order. Otherwise order B could
+      // win the lock, write its park, and commit; then order A creates its refund here without noticing —
+      // leaving order A's refund AND order B's stale actionable park (which blocks B's deletion/rebind and
+      // shows a phantom exception). A WC refund id maps to one order, so a foreign park is a genuine anomaly:
+      // fail closed and surface it rather than silently create contradictory state. (Same-order actionable
+      // parks are resolved atomically after the refund row is created, below.)
+      const foreignPark = await tx.shoppingSyncLog.findFirst({
+        where: {
+          connector: 'woocommerce',
+          direction: 'FROM_CONNECTOR',
+          entityType: 'SalesOrder',
+          externalId: String(input.externalRefundId),
+          entityId: { not: input.orderId }, // Prisma `not` also excludes NULL, so this is "another order".
+          status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+        },
+        select: { entityId: true },
+      })
+      if (foreignPark) {
+        throw new Error(`WooCommerce refund ${input.externalRefundId} is already parked for a different order (${foreignPark.entityId}); refusing to create it here.`)
+      }
     }
     await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
 
@@ -2091,6 +2113,24 @@ export async function createSalesOrderRefund(
       },
       select: { id: true },
     })
+
+    // o3d-ee9: the refund has now landed for THIS order, so resolve any actionable same-order WooCommerce
+    // park for the same external id atomically (in the same tx, under the per-refund + order locks). Without
+    // this, a park written by an earlier refused delivery of this refund could linger as an exception even
+    // though the refund succeeded. Cross-order parks were already refused above; QUARANTINED is operator-gated.
+    if (input.externalRefundId != null) {
+      await tx.shoppingSyncLog.updateMany({
+        where: {
+          connector: 'woocommerce',
+          direction: 'FROM_CONNECTOR',
+          entityType: 'SalesOrder',
+          externalId: String(input.externalRefundId),
+          entityId: input.orderId,
+          status: { in: ['PENDING', 'FAILED'] },
+        },
+        data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },
+      })
+    }
 
     const createdRefundLines: CreatedRefundLine[] = []
     for (const refundLine of refundLines) {
