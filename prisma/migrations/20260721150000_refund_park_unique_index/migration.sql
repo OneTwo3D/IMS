@@ -13,6 +13,13 @@
 -- connector/direction/type + an externalId but NO entityId) and from the entity-less missing-FX queue rows
 -- — so neither the dedup DELETE nor the index touch those.
 
+-- Exclude concurrent writers for the whole dedup+index build. Without this, a first-time refund delivery
+-- could INSERT a duplicate between the DELETE's snapshot and CREATE UNIQUE INDEX, making the index build
+-- fail and aborting the deploy (the exact race this index exists to prevent). The migration runs in one
+-- transaction, so this SHARE ROW EXCLUSIVE lock is held until commit and released immediately after; reads
+-- are unaffected and writers block only for the brief build.
+LOCK TABLE "shopping_sync_logs" IN SHARE ROW EXCLUSIVE MODE;
+
 -- First collapse any pre-existing duplicate actionable REFUND parks (keep the newest per
 -- connector+externalId), or the index build would fail. Import-failure rows (entityId IS NULL) are excluded.
 DELETE FROM "shopping_sync_logs" a
