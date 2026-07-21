@@ -116,9 +116,46 @@ export function evaluateRefundStatusReconciliationRows(
     const refundTotalBase = order.refunds.reduce((sum, refund) => sum.add(toDecimal(refund.totalBase)), toDecimal(0))
     const refundIds = order.refunds.map((refund) => refund.id)
 
-    // o3d-n8p: a legacy/unknown amount-basis refund can't be reconciled to FULL/PARTIAL — skip it entirely
-    // rather than raise a false mismatch or a false "no refund rows" finding (it HAS refund rows).
-    if (expectedDisposition === 'UNKNOWN') continue
+    // o3d-n8p: a legacy/unknown amount-basis refund can't be classified FULL vs PARTIAL (the sum mixes
+    // units). But don't SUPPRESS everything: a positive refund with refundStatus=NONE is invalid
+    // regardless of basis, so still flag that as critical; otherwise surface an explicit UNKNOWN finding
+    // for manual review rather than guessing or going silent.
+    if (expectedDisposition === 'UNKNOWN') {
+      if (order.refundStatus === 'NONE' && refundTotalBase.gt(0)) {
+        findings.push({
+          severity: 'critical',
+          code: 'sales_order_refund_status_mismatch',
+          orderId: order.id,
+          refundId: refundIds[0],
+          message: `Sales order ${label} has ${refundIds.length} refund row(s) but refundStatus is NONE`,
+          details: {
+            status: order.status,
+            refundStatus: order.refundStatus,
+            expectedDisposition: 'UNKNOWN',
+            totalBase: toDecimal(order.totalBase).toString(),
+            refundedTotalBase: refundTotalBase.toString(),
+            refundIds,
+            creditNoteNumbers: order.refunds.map((refund) => refund.creditNoteNumber).filter(Boolean),
+          },
+        })
+      } else {
+        findings.push({
+          severity: 'warning',
+          code: 'sales_order_refund_status_unknown_basis',
+          orderId: order.id,
+          refundId: refundIds[0],
+          message: `Sales order ${label} has refunds on a legacy/unknown amount basis; FULL vs PARTIAL cannot be auto-verified`,
+          details: {
+            status: order.status,
+            refundStatus: order.refundStatus,
+            totalBase: toDecimal(order.totalBase).toString(),
+            refundedTotalBase: refundTotalBase.toString(),
+            refundIds,
+          },
+        })
+      }
+      continue
+    }
 
     if (!expectedDisposition && order.refundStatus !== 'NONE') {
       findings.push({

@@ -203,9 +203,8 @@ test('a fully-refunded taxable order with only NET refunds is FULL; a legacy GRO
   })
   assert.deepEqual(netFindings, [], 'a full net refund of a taxable order reconciles as FULL')
 
-  // Legacy refund (null basis): its stored total may be GROSS and can't be summed with NET totals safely,
-  // so the reconciliation returns null (unknown disposition) and does NOT raise a mismatch either way —
-  // whatever the recorded refundStatus, no false finding is produced.
+  // Legacy refund (null basis) with a plausible status (FULL/PARTIAL): the sum mixes units so FULL vs
+  // PARTIAL is unknowable — surface an explicit UNKNOWN warning for manual review, NOT a false mismatch.
   const legacyFindings = evaluateRefundStatusReconciliationRows({
     sourceRowLimitReached: false,
     salesOrders: [
@@ -215,5 +214,22 @@ test('a fully-refunded taxable order with only NET refunds is FULL; a legacy GRO
       }),
     ],
   })
-  assert.deepEqual(legacyFindings, [], 'a legacy/unknown-basis refund is not flagged as a mismatch (disposition unknown)')
+  assert.equal(legacyFindings.length, 1)
+  assert.equal(legacyFindings[0]?.code, 'sales_order_refund_status_unknown_basis')
+  assert.equal(legacyFindings[0]?.severity, 'warning')
+
+  // Basis-INDEPENDENT corruption: a positive refund with refundStatus=NONE is wrong regardless of basis —
+  // still flagged critical even on an unknown basis (must not be suppressed by the UNKNOWN skip).
+  const noneFindings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-none', orderNumber: 'SO-NONE', refundStatus: 'NONE', totalBase: '120.00', taxBase: '20.00',
+        refunds: [{ id: 'r-none', creditNoteNumber: 'CN-NONE', totalBase: '50.00', refundedAt: REFUNDED_AT, totalsBasis: null }],
+      }),
+    ],
+  })
+  assert.equal(noneFindings.length, 1)
+  assert.equal(noneFindings[0]?.code, 'sales_order_refund_status_mismatch')
+  assert.equal(noneFindings[0]?.severity, 'critical')
 })
