@@ -64,17 +64,19 @@ export async function purgeExpiredData(): Promise<{
       db.shoppingSyncLog.deleteMany({
         where: {
           createdAt: { lt: cutoff },
-          // o3d-w00 / o3d-iup: never retention-delete an UNRESOLVED WooCommerce refund park. Each one is a
-          // refund whose money already left the business but has no SalesOrderRefund / credit note yet — a
-          // monetary-only QUARANTINED refund, or a PENDING/FAILED amount-mismatch park. Deleting it would
-          // erase the only record of an unaccounted refund. They must persist until an operator resolves
-          // them (which flips them to SYNCED); resolved and non-refund rows still expire. (entityId: not
-          // null also skips the entity-less missing-FX queue rows, which are not refund parks.)
+          // o3d-w00 / o3d-iup: never retention-delete a QUARANTINED WooCommerce refund park. It is a
+          // monetary-only refund whose money already left the business but has no SalesOrderRefund / credit
+          // note yet; deleting it erases the only record of an unaccounted refund. It must persist until an
+          // operator resolves it (which flips it to SYNCED, after which it expires normally). Scoped to
+          // QUARANTINED, which the sweep dedup bounds to exactly one row per refund — so this preserves a
+          // bounded set, NOT the unbounded PENDING/FAILED amount-mismatch parks (whose own dedup +
+          // retention are the separate refund-park-durability follow-up). entityId: not null also skips the
+          // entity-less missing-FX queue rows.
           NOT: {
             connector: 'woocommerce',
             direction: 'FROM_CONNECTOR',
             entityType: 'SalesOrder',
-            status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+            status: 'QUARANTINED',
             entityId: { not: null },
           },
         },
