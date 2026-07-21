@@ -135,10 +135,27 @@ export async function syncWcRefund(
     // o3d-iup: a refund we deliberately PARKED (a monetary-only refund the order can't tax uniformly)
     // creates no SalesOrderRefund, so without this guard the sweep would re-import and re-refuse it every
     // run. A QUARANTINED log means it is awaiting operator resolution — treat it as handled, not retryable.
+    // o3d-7yf: this MUST be scoped to THIS order (entityId = so.id). The park index is keyed by
+    // (connector, externalId), so a QUARANTINED park for refund X on a DIFFERENT order would otherwise make
+    // us return "handled" for order B — silently giving B neither a refund nor a failure. That is the same
+    // cross-order leak upsertRefundPark fails closed on, so mirror it here.
     const parked = await client.shoppingSyncLog.findFirst({
-      where: { entityType: 'SalesOrder', externalId: String(wcRefund.id), status: 'QUARANTINED' },
+      where: {
+        connector: 'woocommerce',
+        direction: 'FROM_CONNECTOR',
+        entityType: 'SalesOrder',
+        externalId: String(wcRefund.id),
+        entityId: { not: null },
+        status: 'QUARANTINED',
+      },
+      select: { entityId: true },
     })
-    if (parked) return { success: true }
+    if (parked) {
+      if (parked.entityId !== so.id) {
+        return { success: false, error: `WooCommerce refund ${wcRefund.id} is already parked (quarantined) for a different order (${parked.entityId}); refusing to process it for this order.` }
+      }
+      return { success: true }
+    }
 
     const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
     const refundAmountForeign = parseDecimalAbs(wcRefund.amount)
@@ -440,13 +457,10 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<numb
     const exists = await db.salesOrderRefund.findFirst({ where: { externalRefundId: refund.id } })
     if (exists) continue
 
-    // o3d-iup: skip a refund we deliberately PARKED — it has no SalesOrderRefund row, so without this it
-    // would be re-imported and re-refused every sweep. It stays parked until an operator resolves it.
-    const parked = await db.shoppingSyncLog.findFirst({
-      where: { entityType: 'SalesOrder', externalId: String(refund.id), status: 'QUARANTINED' },
-    })
-    if (parked) continue
-
+    // o3d-iup: a refund we deliberately PARKED has no SalesOrderRefund row and must not be re-refused every
+    // sweep. o3d-7yf: the QUARANTINED skip lives in syncWcRefund now (scoped to the resolved order id) — an
+    // un-scoped externalId pre-skip HERE would repeat the cross-order leak, since the sweep has only the WC
+    // order id, not the IMS order id the park is keyed to. syncWcRefund is idempotent for a parked refund.
     const result = await syncWcRefund(externalOrderId, refund)
     if (result.success) synced++
   }

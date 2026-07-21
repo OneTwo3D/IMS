@@ -27,14 +27,39 @@ BEGIN;
 
 LOCK TABLE "shopping_sync_logs" IN SHARE ROW EXCLUSIVE MODE;
 
--- First collapse any pre-existing duplicate actionable REFUND parks (keep the newest per
--- connector+externalId), or the index build would fail. Import-failure rows (entityId IS NULL) are excluded.
+-- A refund id maps to ONE order, so an actionable park is expected to be unique per externalId. But a
+-- pre-existing CROSS-ORDER collision (the same externalId parked for two different entityIds) is a genuine
+-- data anomaly: collapsing it to "the newest row" would permanently DELETE one order's error/payload and
+-- drop its deletion guard — the exact evidence the runtime now fails closed to preserve. Refuse to deploy
+-- and force manual resolution rather than silently destroy it. (The dedup below only touches same-entityId
+-- duplicates, which ARE safe to collapse.)
+DO $$
+DECLARE
+  collisions int;
+BEGIN
+  SELECT count(*) INTO collisions FROM (
+    SELECT "externalId"
+    FROM "shopping_sync_logs"
+    WHERE connector = 'woocommerce' AND direction = 'FROM_CONNECTOR' AND "entityType" = 'SalesOrder'
+      AND status IN ('PENDING', 'FAILED', 'QUARANTINED') AND "externalId" IS NOT NULL AND "entityId" IS NOT NULL
+    GROUP BY "externalId"
+    HAVING count(DISTINCT "entityId") > 1
+  ) x;
+  IF collisions > 0 THEN
+    RAISE EXCEPTION 'Refusing to build shopping_sync_logs_active_refund_park_uq: % refund externalId(s) are parked for more than one order. Resolve these cross-order collisions manually (keep the correct order''s park) before deploying.', collisions;
+  END IF;
+END $$;
+
+-- Collapse any pre-existing duplicate actionable REFUND parks that belong to the SAME order (keep the
+-- newest per connector+externalId+entityId), or the index build would fail. Import-failure rows
+-- (entityId IS NULL) are excluded, and cross-order collisions were already rejected above.
 DELETE FROM "shopping_sync_logs" a
 USING "shopping_sync_logs" b
 WHERE a.connector = 'woocommerce' AND a.direction = 'FROM_CONNECTOR' AND a."entityType" = 'SalesOrder'
   AND a.status IN ('PENDING', 'FAILED', 'QUARANTINED') AND a."externalId" IS NOT NULL AND a."entityId" IS NOT NULL
   AND b.connector = a.connector AND b.direction = a.direction AND b."entityType" = a."entityType"
-  AND b.status IN ('PENDING', 'FAILED', 'QUARANTINED') AND b."externalId" = a."externalId" AND b."entityId" IS NOT NULL
+  AND b.status IN ('PENDING', 'FAILED', 'QUARANTINED') AND b."externalId" = a."externalId"
+  AND b."entityId" = a."entityId"
   AND (b."createdAt" > a."createdAt" OR (b."createdAt" = a."createdAt" AND b.id > a.id));
 
 CREATE UNIQUE INDEX "shopping_sync_logs_active_refund_park_uq"
