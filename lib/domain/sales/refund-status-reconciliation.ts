@@ -37,6 +37,7 @@ export type RefundStatusOrderRow = {
     creditNoteNumber: string | null
     totalBase: DecimalInput
     refundedAt: Date | string
+    totalsBasis?: string | null
   }>
 }
 
@@ -73,9 +74,14 @@ function expectedRefundDisposition(order: RefundStatusOrderRow): 'FULL' | 'PARTI
   if (order.refunds.length === 0) return null
   // Refund totals are stored NET (o3d-w00), so compare against the NET order total (totalBase - taxBase)
   // — the same basis createSalesOrderRefund now classifies on. A gross basis reported a fully-refunded
-  // taxable order as PARTIAL and raised a false mismatch finding.
+  // taxable order as PARTIAL and raised a false mismatch finding. But mirror createSalesOrderRefund's
+  // o3d-n8p fail-safe: only use the net total when EVERY refund is NET-basis; a legacy GROSS refund
+  // (NULL basis) summed against the net total would raise a spurious mismatch, so fall back to the gross
+  // order total there (net current refunds are then undercounted → PARTIAL, matching the create path).
+  const allRefundsNet = order.refunds.every((refund) => refund.totalsBasis === 'NET')
   const netOrderTotal = toDecimal(order.totalBase).sub(toDecimal(order.taxBase ?? 0))
-  const orderTotal = netOrderTotal.lt(0) ? toDecimal(0) : netOrderTotal
+  const safeOrderTotal = allRefundsNet ? netOrderTotal : toDecimal(order.totalBase)
+  const orderTotal = safeOrderTotal.lt(0) ? toDecimal(0) : safeOrderTotal
   const refundedTotal = order.refunds.reduce((sum, refund) => sum.add(toDecimal(refund.totalBase)), toDecimal(0))
 
   if (orderTotal.lte(0)) {
@@ -178,6 +184,7 @@ export async function collectRefundStatusReconciliationRows(
           creditNoteNumber: true,
           totalBase: true,
           refundedAt: true,
+          totalsBasis: true,
         },
       },
     },
