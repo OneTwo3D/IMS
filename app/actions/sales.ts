@@ -55,6 +55,7 @@ import {
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
+import { releaseReservationsAfterRefund } from '@/lib/domain/sales/post-refund-release'
 import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
@@ -1907,13 +1908,18 @@ export async function createRefund(
     // and refuseIfShipmentsExist makes it a no-op once any shipment exists (the shipment build
     // caps shippable qty net of refunds for those). Limited to PROCESSING/ALLOCATED so a refund
     // can't promote a DRAFT/PENDING_PAYMENT order to ALLOCATED.
-    if (refundResult.so.status === 'PROCESSING' || refundResult.so.status === 'ALLOCATED') {
-      try {
-        const { autoAllocateOrder } = await import('./allocation')
-        await autoAllocateOrder(orderId, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true })
-      } catch (reallocationError) {
-        console.error(reallocationError)
-      }
+    // o3d-67y: release the refunded units' stock reservation, and make the failure DURABLE + operator-visible
+    // rather than a discarded result + a bare console line. releaseReservationsAfterRefund inspects both a
+    // throw and a { success: false } return and records a resolvable WARNING if the release didn't complete.
+    {
+      const { autoAllocateOrder } = await import('./allocation')
+      await releaseReservationsAfterRefund(
+        { orderId, refundId: refundResult.createdRefund?.id, status: refundResult.so.status },
+        {
+          allocate: (id) => autoAllocateOrder(id, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true }),
+          log: logActivity,
+        },
+      )
     }
 
     // Propagate the refund to a WMS the order was already pushed to. The push sweep drives
