@@ -405,10 +405,10 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
     where: { invoiceNumber: { not: null } },
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
-      currency: true, totalBase: true, invoicedAt: true, paidAt: true, createdAt: true,
+      currency: true, totalBase: true, taxBase: true, invoicedAt: true, paidAt: true, createdAt: true,
       shipFromWarehouse: { select: { code: true } },
       payments: { where: { refundId: null }, select: { amount: true } },
-      refunds: { select: { totalBase: true } },
+      refunds: { select: { totalBase: true, totalsBasis: true } },
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -417,7 +417,16 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   return orders.map((o) => {
     const total = Number(o.totalBase)
     const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
-    const refundsTotal = o.refunds.reduce((s, r) => s + Number(r.totalBase), 0)
+    // Refund totals are stored NET (o3d-w00) while the order total is GROSS (tax-inclusive). Subtracting
+    // NET refunds from a GROSS total would leave the VAT as phantom revenue (a fully-refunded £120/£20-tax
+    // order would show £20 net). Put refunds on the same GROSS basis first: gross up a NET refund by the
+    // order's gross/net ratio; a legacy/unknown-basis row (totalsBasis != 'NET') is already gross. (o3d-n8p)
+    const netOrderTotal = total - Number(o.taxBase ?? 0)
+    const grossRatio = netOrderTotal > 0.0001 ? total / netOrderTotal : 1
+    const refundsTotal = o.refunds.reduce(
+      (s, r) => s + (r.totalsBasis === 'NET' ? Number(r.totalBase) * grossRatio : Number(r.totalBase)),
+      0,
+    )
     const balance = Math.max(0, total - paid)
     const ageDays = o.invoicedAt ? Math.round((now - o.invoicedAt.getTime()) / 86400000) : 0
     let o0 = 0, o31 = 0, o61 = 0, o91 = 0
