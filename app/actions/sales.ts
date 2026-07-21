@@ -1972,8 +1972,18 @@ export async function createRefund(
   quarantine?: true
 }> {
   try {
-    if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+    const isInternal = options?.internalBypassToken === INTERNAL_ACTION_BYPASS
+    if (!isInternal) {
       await requirePermission('sales.refund')
+    }
+    // o3d-n8p (Codex): chargeback and externalRefundId are provenance-bearing and have material effects —
+    // chargeback suppresses restock + COGS reversal, and externalRefundId occupies the globally unique Woo
+    // replay key. They must come only from the trusted internal entry points (Woo sync, chargeback poller),
+    // which supply the unforgeable internal capability. Reject them from a public/manual caller so a
+    // network client with sales.refund can't forge a chargeback or squat a replay key (and so the derived
+    // `source` is trustworthy).
+    if (!isInternal && (options?.chargeback || options?.externalRefundId != null)) {
+      return { success: false, error: 'chargeback and externalRefundId may only be set by internal sync callers' }
     }
 
     const { getNumberingFormats } = await import('./company')
