@@ -46,7 +46,7 @@ function externalRefundIdUniqueError() {
 }
 
 function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseWithQuarantine?: boolean } = {}) {
-  const refunds: Array<{ id: string; externalRefundId: number }> = []
+  const refunds: Array<{ id: string; externalRefundId: number; orderId: string }> = []
   const syncLogs: unknown[] = []
   const activityLogs: unknown[] = []
   const createRefundLines: Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }> = []
@@ -66,7 +66,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
           (statuses == null || (d?.status != null && statuses.includes(d.status)))
         ) {
           // Project selected columns to the top level (real Prisma does this), keeping .data for assertions.
-          return { id: (syncLogs[i] as { id?: string }).id, entityId: d?.entityId, data: d }
+          return { id: (syncLogs[i] as { id?: string }).id, entityId: d?.entityId, status: d?.status, data: d }
         }
       }
       return null
@@ -147,7 +147,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
         // o3d-w00 #2/#5: a monetary-only refund on a non-uniform order is refused for quarantine.
         return { success: false, error: 'not uniformly taxed; parked for manual resolution', quarantine: true }
       }
-      refunds.push({ id: `refund-${refunds.length + 1}`, externalRefundId: createOptions?.externalRefundId ?? 0 })
+      refunds.push({ id: `refund-${refunds.length + 1}`, externalRefundId: createOptions?.externalRefundId ?? 0, orderId: 'so-1' })
       return { success: true }
     },
     async logActivity(input) {
@@ -442,4 +442,27 @@ test('a QUARANTINED park for a DIFFERENT order does not mark this order handled 
 
   assert.equal(result.success, false, 'B is NOT silently treated as handled by A\'s quarantined park')
   assert.match(result.error ?? '', /different order/i, 'the cross-order quarantine is surfaced, not swallowed')
+})
+
+test('an existing refund for a DIFFERENT order fails closed, not reported as already-synced (o3d-7yf)', async () => {
+  const state = makeDependencies()
+  // A refund with external id 7014 already exists — but on order so-other, not this order (so-1).
+  state.refunds.push({ id: 'refund-x', externalRefundId: 7014, orderId: 'so-other' })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7014 }), state.dependencies)
+
+  assert.equal(result.success, false, 'not silently treated as already-synced for this order')
+  assert.match(result.error ?? '', /different order/i, 'the cross-order existing refund is surfaced')
+  assert.equal(state.createRefundCalls, 0, 'no refund was created on this order')
+})
+
+test('a PENDING park for a DIFFERENT order blocks applying the same refund here (o3d-7yf)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.syncLogs.push({ id: 'log-p', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7015', status: 'PENDING' } })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7015 }), state.dependencies)
+
+  assert.equal(result.success, false, 'a PENDING park owned by another order fails closed too')
+  assert.match(result.error ?? '', /different order/i)
+  assert.equal(state.createRefundCalls, 0, 'no refund created on this order while another order holds the park')
 })

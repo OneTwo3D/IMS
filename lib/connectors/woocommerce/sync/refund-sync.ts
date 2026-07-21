@@ -128,17 +128,21 @@ export async function syncWcRefund(
     })
     if (!so) return { success: false, error: `IMS order not found for WC order ${externalOrderId}` }
 
-    // Check if already processed
-    const existing = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id } })
-    if (existing) return { success: true } // already synced
+    // Check if already processed. externalRefundId is GLOBALLY unique, so a matching refund may belong to
+    // ANOTHER order — o3d-7yf: verify ownership. Same order => idempotent success; different order => fail
+    // closed rather than silently reporting "handled" and leaving THIS order without its refund.
+    const existing = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
+    if (existing) {
+      if (existing.orderId === so.id) return { success: true } // already synced
+      return { success: false, error: `WooCommerce refund ${wcRefund.id} already exists on a different order (${existing.orderId}); refusing to apply it here.` }
+    }
 
     // o3d-iup: a refund we deliberately PARKED (a monetary-only refund the order can't tax uniformly)
     // creates no SalesOrderRefund, so without this guard the sweep would re-import and re-refuse it every
-    // run. A QUARANTINED log means it is awaiting operator resolution — treat it as handled, not retryable.
-    // o3d-7yf: this MUST be scoped to THIS order (entityId = so.id). The park index is keyed by
-    // (connector, externalId), so a QUARANTINED park for refund X on a DIFFERENT order would otherwise make
-    // us return "handled" for order B — silently giving B neither a refund nor a failure. That is the same
-    // cross-order leak upsertRefundPark fails closed on, so mirror it here.
+    // run. o3d-7yf: check EVERY actionable park (the index keeps at most one per externalId), scoped by
+    // order. A park for refund X on a DIFFERENT order fails closed (never apply X to two orders). This
+    // order's QUARANTINED park is "handled" (awaiting operator resolution — not retryable); a PENDING/FAILED
+    // park is this order's own retryable state, so fall through and let the sync re-attempt it.
     const parked = await client.shoppingSyncLog.findFirst({
       where: {
         connector: 'woocommerce',
@@ -146,15 +150,15 @@ export async function syncWcRefund(
         entityType: 'SalesOrder',
         externalId: String(wcRefund.id),
         entityId: { not: null },
-        status: 'QUARANTINED',
+        status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
       },
-      select: { entityId: true },
+      select: { entityId: true, status: true },
     })
-    if (parked) {
-      if (parked.entityId !== so.id) {
-        return { success: false, error: `WooCommerce refund ${wcRefund.id} is already parked (quarantined) for a different order (${parked.entityId}); refusing to process it for this order.` }
-      }
-      return { success: true }
+    if (parked && parked.entityId !== so.id) {
+      return { success: false, error: `WooCommerce refund ${wcRefund.id} is already parked for a different order (${parked.entityId}); refusing to process it for this order.` }
+    }
+    if (parked && parked.status === 'QUARANTINED') {
+      return { success: true } // this order's quarantined park — handled, not retryable
     }
 
     const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
@@ -289,6 +293,13 @@ export async function syncWcRefund(
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error
+      // o3d-7yf: the unique violation may be a CROSS-ORDER race — the refund that won the externalRefundId
+      // could belong to another order. Verify ownership before recording a SYNCED dedup log for THIS order;
+      // otherwise the loser is falsely marked synced while its refund lives on a different order.
+      const winner = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
+      if (winner && winner.orderId !== so.id) {
+        return { success: false, error: `WooCommerce refund ${wcRefund.id} was concurrently created on a different order (${winner.orderId}); refusing to mark it synced here.` }
+      }
       await client.shoppingSyncLog.create({
         data: {
           direction: 'FROM_CONNECTOR',
@@ -453,14 +464,10 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<numb
   let synced = 0
 
   for (const refund of refunds) {
-    // Check if already synced
-    const exists = await db.salesOrderRefund.findFirst({ where: { externalRefundId: refund.id } })
-    if (exists) continue
-
-    // o3d-iup: a refund we deliberately PARKED has no SalesOrderRefund row and must not be re-refused every
-    // sweep. o3d-7yf: the QUARANTINED skip lives in syncWcRefund now (scoped to the resolved order id) — an
-    // un-scoped externalId pre-skip HERE would repeat the cross-order leak, since the sweep has only the WC
-    // order id, not the IMS order id the park is keyed to. syncWcRefund is idempotent for a parked refund.
+    // o3d-7yf: BOTH the already-synced check and the parked-refund skip live in syncWcRefund now, scoped to
+    // the resolved IMS order id. An externalId-only pre-skip HERE (the sweep has only the WC order id) would
+    // repeat the cross-order leak — a refund/park owned by another order would wrongly skip this one.
+    // syncWcRefund is idempotent for an already-synced or parked refund, so it is the single scoped authority.
     const result = await syncWcRefund(externalOrderId, refund)
     if (result.success) synced++
   }

@@ -2239,6 +2239,13 @@ export async function createRefund(
     return { success: true, warning: accountingWarning }
   } catch (e) {
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
+      // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the
+      // winning refund could belong to a different order. Only report idempotent success when the existing
+      // refund is on THIS order; otherwise the loser would be marked synced while its refund lives elsewhere.
+      const winner = await db.salesOrderRefund.findFirst({ where: { externalRefundId: options.externalRefundId }, select: { orderId: true } })
+      if (winner && winner.orderId !== orderId) {
+        return { success: false, error: `A refund with external id ${options.externalRefundId} already exists on a different order; refusing to dedupe it here.` }
+      }
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: orderId,
