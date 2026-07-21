@@ -1251,6 +1251,30 @@ test('createSalesOrderRefund replays external refunds without duplicate stock si
   assert.equal(state.stockLevels[0]?.quantity, stockQty)
 })
 
+test('replaying a monetary-only external refund reconstructs lineKind=sale from the snapshot, not shipping (o3d-w00 #4)', async () => {
+  // A duplicate WooCommerce delivery hits the external-refund replay query, which used to re-infer the
+  // kind from salesOrderLineId (null => shipping) — re-posting a monetary 'sale' as shipping. It must now
+  // reconstruct from the PERSISTED lineKind instead.
+  const state = baseState()
+  const input = {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Goodwill refund', qty: 0, totalBase: 30, lineKind: 'sale' as const }],
+    reason: 'Goodwill',
+    externalRefundId: 55555,
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  }
+  const first = await createSalesOrderRefund(createClient(state), input)
+  assert.equal(first.success, true)
+
+  const replay = await createSalesOrderRefund(createClient(state), input)
+  assert.equal(replay.success, true)
+  const line = replay.success ? replay.createdRefundLines.find((l) => l.description === 'Goodwill refund') : undefined
+  assert.ok(line, 'the monetary-only line is present in the replay')
+  assert.equal(line?.productId, null, 'null-product line (the shape that inferred as shipping)')
+  assert.equal(line?.lineKind, 'sale', 'the replay uses the persisted kind, not the shipping inference')
+})
+
 test('createSalesOrderRefund reconstructs legacy shipment snapshots from COGS entries', async () => {
   const state = baseState({
     orders: [{

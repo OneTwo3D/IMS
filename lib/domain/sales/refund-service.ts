@@ -223,6 +223,43 @@ export type CreatedRefundLine = {
   reverseCharge?: boolean | null
 }
 
+// Reconstruct a CreatedRefundLine from a PERSISTED refund line for an idempotent replay (o3d-w00 #4).
+// Prefer the persisted lineKind + tax snapshot so a duplicate delivery posts identically to the first
+// attempt, instead of re-inferring the kind (which turned a monetary-only 'sale' line into 'shipping')
+// and re-predicting the tax type. Fall back to the historical inference ONLY for legacy rows whose
+// lineKind is NULL, keeping the same base (salesOrderLineId) the replay sites used before.
+function reconstructReplayLine(line: {
+  id: string
+  salesOrderLineId: string | null
+  productId: string | null
+  description: string
+  qty: Prisma.Decimal
+  unitPriceForeign: Prisma.Decimal
+  unitPriceBase: Prisma.Decimal
+  totalForeign: Prisma.Decimal
+  totalBase: Prisma.Decimal
+  lineKind: string | null
+  accountingTaxType: string | null
+  reverseCharge: boolean | null
+}): CreatedRefundLine {
+  const totalBase = refundBoundaryNumber(line.totalBase)
+  return {
+    id: line.id,
+    lineId: line.salesOrderLineId ?? null,
+    productId: line.productId,
+    description: line.description,
+    qty: refundBoundaryNumber(line.qty),
+    unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
+    unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
+    totalForeign: refundBoundaryNumber(line.totalForeign),
+    totalBase,
+    lineKind: (line.lineKind as 'sale' | 'shipping' | 'discount' | null)
+      ?? (line.salesOrderLineId != null ? 'sale' : (totalBase < 0 ? 'discount' : 'shipping')),
+    accountingTaxType: line.accountingTaxType,
+    reverseCharge: line.reverseCharge,
+  }
+}
+
 export type RefundAccountingSyncRequest = {
   type: AccountingSyncType
   referenceType: string
@@ -1740,6 +1777,11 @@ export async function createSalesOrderRefund(
               unitPriceBase: true,
               totalForeign: true,
               totalBase: true,
+              // The persisted kind + tax snapshot (o3d-w00 #4) so a duplicate external delivery replays
+              // the SAME posting the first attempt did, not a re-inferred one.
+              lineKind: true,
+              accountingTaxType: true,
+              reverseCharge: true,
             },
           },
         },
@@ -1751,20 +1793,7 @@ export async function createSalesOrderRefund(
           fxRate,
           replayTotalBase: refundBoundaryNumber(existingExternalRefund.totalBase),
           createdRefund: { id: existingExternalRefund.id },
-          createdRefundLines: existingExternalRefund.lines.map((line) => ({
-            id: line.id,
-            lineId: line.salesOrderLineId ?? null,
-            productId: line.productId,
-            description: line.description,
-            qty: refundBoundaryNumber(line.qty),
-            unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
-            unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
-            totalForeign: refundBoundaryNumber(line.totalForeign),
-            totalBase: refundBoundaryNumber(line.totalBase),
-            lineKind: line.salesOrderLineId != null
-              ? 'sale' as const
-              : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
-          })),
+          createdRefundLines: existingExternalRefund.lines.map(reconstructReplayLine),
           creditNoteNumber: existingExternalRefund.creditNoteNumber ?? '',
           newStatus: so.refundStatus === 'FULL' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
         }
@@ -1795,6 +1824,10 @@ export async function createSalesOrderRefund(
               unitPriceBase: true,
               totalForeign: true,
               totalBase: true,
+              // Persisted kind + tax snapshot (o3d-w00 #4) so a chargeback replay posts identically.
+              lineKind: true,
+              accountingTaxType: true,
+              reverseCharge: true,
             },
           },
         },
@@ -1814,20 +1847,7 @@ export async function createSalesOrderRefund(
           fxRate,
           replayTotalBase: refundBoundaryNumber(existingChargeback.totalBase),
           createdRefund: { id: existingChargeback.id },
-          createdRefundLines: existingChargeback.lines.map((line) => ({
-            id: line.id,
-            lineId: line.salesOrderLineId ?? null,
-            productId: line.productId,
-            description: line.description,
-            qty: refundBoundaryNumber(line.qty),
-            unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
-            unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
-            totalForeign: refundBoundaryNumber(line.totalForeign),
-            totalBase: refundBoundaryNumber(line.totalBase),
-            lineKind: line.salesOrderLineId != null
-              ? 'sale' as const
-              : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
-          })),
+          createdRefundLines: existingChargeback.lines.map(reconstructReplayLine),
           creditNoteNumber: existingChargeback.creditNoteNumber ?? '',
           newStatus: so.refundStatus === 'FULL' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
         }
