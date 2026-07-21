@@ -1998,6 +1998,10 @@ export async function createSalesOrderRefund(
         ? Math.round(refundLine.totalForeign * 10000) / 10000
         : Math.round(refundLine.totalBase * fxRate * 10000) / 10000
       const taxIdentity = resolveRefundLineTaxIdentity(refundLine.lineId)
+      // Normalize once and PERSIST it (o3d-w00 #4) so an accounting retry posts to the same account
+      // without re-inferring the kind from productId/amount sign.
+      const lineKind: 'sale' | 'shipping' | 'discount' =
+        refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
       const createdLine = await tx.salesOrderRefundLine.create({
         data: {
           refundId: createdRefund.id,
@@ -2011,6 +2015,7 @@ export async function createSalesOrderRefund(
           totalBase: refundLine.totalBase,
           accountingTaxType: taxIdentity.accountingTaxType,
           reverseCharge: taxIdentity.reverseCharge,
+          lineKind,
         },
         select: {
           id: true,
@@ -2036,7 +2041,7 @@ export async function createSalesOrderRefund(
         unitPriceBase: refundBoundaryNumber(createdLine.unitPriceBase),
         totalForeign: refundBoundaryNumber(createdLine.totalForeign),
         totalBase: refundBoundaryNumber(createdLine.totalBase),
-        lineKind: refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale',
+        lineKind,
         accountingTaxType: createdLine.accountingTaxType,
         reverseCharge: createdLine.reverseCharge,
       })

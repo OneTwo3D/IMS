@@ -1886,6 +1886,12 @@ async function loadRefundAccountingQueueInput(
           unitPriceBase: true,
           totalForeign: true,
           totalBase: true,
+          // Snapshot resolved at creation (o3d-w00). Selecting them here means an accounting RETRY posts
+          // under the SAME tax identity and to the SAME account as the first attempt, instead of
+          // re-predicting the tax type and re-inferring the kind (which mis-posted monetary refunds).
+          lineKind: true,
+          accountingTaxType: true,
+          reverseCharge: true,
         },
       },
     },
@@ -1908,13 +1914,16 @@ async function loadRefundAccountingQueueInput(
       unitPriceBase: decimalToNumber(line.unitPriceBase),
       totalForeign: decimalToNumber(line.totalForeign),
       totalBase: decimalToNumber(line.totalBase),
-      // lineKind isn't persisted: a null-product line is shipping, UNLESS its total is
-      // negative — that's the mirrored order-discount line, which must reload as
-      // 'discount' so an accounting RETRY re-posts it to the discount account (not
-      // shipping). Matches the replay reconstruction in refund-service.
-      lineKind: line.productId
-        ? 'sale'
-        : (decimalToNumber(line.totalBase) < 0 ? 'discount' : 'shipping'),
+      // Prefer the PERSISTED kind (o3d-w00 #4). Only a legacy row (created before the column existed)
+      // carries NULL, and for those we keep the historical inference: a null-product line is shipping
+      // UNLESS its total is negative — the mirrored order-discount line, which must reload as 'discount'
+      // so a retry re-posts it to the discount account. New monetary-only 'sale' lines no longer get
+      // mis-reconstructed as 'shipping'.
+      lineKind: (line.lineKind as 'sale' | 'shipping' | 'discount' | null) ?? (
+        line.productId ? 'sale' : (decimalToNumber(line.totalBase) < 0 ? 'discount' : 'shipping')
+      ),
+      accountingTaxType: line.accountingTaxType,
+      reverseCharge: line.reverseCharge,
     })),
     accountingSyncs,
   }
