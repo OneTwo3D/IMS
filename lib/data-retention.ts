@@ -71,7 +71,24 @@ export async function purgeExpiredData(): Promise<{
   if (syncMonths > 0) {
     const cutoff = monthsAgo(syncMonths)
     const [wc, acct] = await Promise.all([
-      db.shoppingSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
+      db.shoppingSyncLog.deleteMany({
+        where: {
+          createdAt: { lt: cutoff },
+          // o3d-w00 / o3d-iup: never retention-delete an UNRESOLVED WooCommerce refund park. Each one is a
+          // refund whose money already left the business but has no SalesOrderRefund / credit note yet — a
+          // monetary-only QUARANTINED refund, or a PENDING/FAILED amount-mismatch park. Deleting it would
+          // erase the only record of an unaccounted refund. They must persist until an operator resolves
+          // them (which flips them to SYNCED); resolved and non-refund rows still expire. (entityId: not
+          // null also skips the entity-less missing-FX queue rows, which are not refund parks.)
+          NOT: {
+            connector: 'woocommerce',
+            direction: 'FROM_CONNECTOR',
+            entityType: 'SalesOrder',
+            status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+            entityId: { not: null },
+          },
+        },
+      }),
       db.accountingSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
     ])
     syncLogsDeleted = wc.count + acct.count
