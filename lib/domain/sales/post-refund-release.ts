@@ -14,7 +14,14 @@
  * mis-handled as a refund failure by the caller's outer catch.
  */
 
-export type ReallocationResult = { success: boolean; error?: string }
+export type ReallocationResult = {
+  success: boolean
+  error?: string
+  // Set by autoAllocateOrder ONLY when its transaction threw and rolled back (reservations NOT mutated). A
+  // plain success:false — a refuseIfShipmentsExist no-op or a committed backorder/shortage — is NOT a
+  // stranding: the reservation state is consistent, so it must not raise a stale-reservation warning.
+  failed?: boolean
+}
 
 export type PostRefundReleaseDeps = {
   /** Re-run allocation for the order, netting the refunded qty and re-reserving only remaining demand. */
@@ -62,15 +69,21 @@ export async function releaseReservationsAfterRefund(
   const onError = deps.onError ?? ((message, detail) => console.error(message, detail))
 
   let releaseError: string | null = null
+  let released = false
   try {
     const result = await deps.allocate(input.orderId)
-    if (!result.success) releaseError = result.error ?? 'reallocation returned success:false'
+    // Warn ONLY on a genuine transaction failure (result.failed) — NOT on a plain success:false, which is a
+    // committed backorder/shortage or an expected refuseIfShipmentsExist no-op (reservations are consistent).
+    if (result.failed) releaseError = result.error ?? 'reservation release transaction rolled back'
+    released = result.success === true
   } catch (error) {
+    // autoAllocateOrder catches its own throws, so a throw here is a module-load / injection failure — the
+    // release definitely did not run.
     releaseError = String(error)
   }
 
   if (!releaseError) {
-    return { released: true, warned: false }
+    return { released, warned: false }
   }
 
   onError('[refund] post-refund reservation release failed', { orderId: input.orderId, releaseError })

@@ -1911,16 +1911,19 @@ export async function createRefund(
     // o3d-67y: release the refunded units' stock reservation, and make the failure DURABLE + operator-visible
     // rather than a discarded result + a bare console line. releaseReservationsAfterRefund inspects both a
     // throw and a { success: false } return and records a resolvable WARNING if the release didn't complete.
-    {
-      const { autoAllocateOrder } = await import('./allocation')
-      await releaseReservationsAfterRefund(
-        { orderId, refundId: refundResult.createdRefund?.id, status: refundResult.so.status },
-        {
-          allocate: (id) => autoAllocateOrder(id, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true }),
-          log: logActivity,
+    await releaseReservationsAfterRefund(
+      { orderId, refundId: refundResult.createdRefund?.id, status: refundResult.so.status },
+      {
+        // o3d-67y: the dynamic import lives INSIDE the guarded closure so a module-load/eval rejection is
+        // caught by releaseReservationsAfterRefund (recorded as a warning) rather than bubbling to
+        // createRefund's outer catch, which would report success:false for an ALREADY-COMMITTED refund.
+        allocate: async (id) => {
+          const { autoAllocateOrder } = await import('./allocation')
+          return autoAllocateOrder(id, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true })
         },
-      )
-    }
+        log: logActivity,
+      },
+    )
 
     // Propagate the refund to a WMS the order was already pushed to. The push sweep drives
     // the automatic side: a full refund cancels the WMS order while it is still NEW; a

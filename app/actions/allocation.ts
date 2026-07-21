@@ -257,6 +257,10 @@ export async function autoAllocateOrder(
   unallocatedLines?: AllocationUnallocatedLine[]
   unallocatedQty?: number
   backorderLineCount?: number
+  // o3d-67y: true ONLY when the allocation TRANSACTION threw and rolled back — i.e. reservations were NOT
+  // mutated. A plain success:false (a refuseIfShipmentsExist no-op, or a committed backorder/shortage) leaves
+  // reservations consistent and must NOT be treated as a stranded-reservation failure by callers.
+  failed?: boolean
 }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
@@ -359,7 +363,9 @@ export async function autoAllocateOrder(
       backorderLineCount: allocationResult.backorderLineCount,
     }
   } catch (e) {
-    return { success: false, error: String(e) }
+    // The allocation transaction threw and rolled back — reservations are unchanged. Flag it so a post-refund
+    // caller can tell this (a genuine stranding) apart from a committed backorder/refusal (o3d-67y).
+    return { success: false, error: String(e), failed: true }
   }
 }
 

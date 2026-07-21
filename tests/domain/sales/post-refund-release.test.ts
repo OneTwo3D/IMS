@@ -39,22 +39,36 @@ test('a THROWN reallocation records a resolvable WARNING instead of stranding th
   assert.deepEqual(w.metadata, { orderId: 'so-2', refundId: 'r-2', error: 'Error: lock timeout' })
 })
 
-test('a { success:false } reallocation (the swallowed-failure case) also warns (o3d-67y)', async () => {
-  // autoAllocateOrder converts its own failures to { success:false } — the exact result that used to be
-  // discarded. It must be treated as a failure, not silent success.
-  const { deps, warnings } = makeDeps({ allocate: async () => ({ success: false, error: 'insufficient stock' }) })
+test('a genuine transaction FAILURE (failed:true) warns (o3d-67y)', async () => {
+  // autoAllocateOrder sets failed:true only when its transaction threw and rolled back — reservations are
+  // stale, so this is the real stranding case that must be surfaced.
+  const { deps, warnings } = makeDeps({ allocate: async () => ({ success: false, failed: true, error: 'deadlock detected' }) })
   const outcome = await releaseReservationsAfterRefund({ orderId: 'so-3', status: 'ALLOCATED' }, deps)
 
   assert.deepEqual(outcome, { released: false, warned: true })
   assert.equal(warnings.length, 1)
-  assert.match(warnings[0].description, /insufficient stock/)
+  assert.match(warnings[0].description, /deadlock detected/)
 })
 
-test('a { success:false } with no error message still warns with a fallback reason (o3d-67y)', async () => {
+test('a committed backorder/shortage (success:false, NOT failed) does NOT warn — reservations are consistent (o3d-67y)', async () => {
+  // The allocation transaction committed (it released the refunded units, just could not re-reserve every
+  // remaining non-oversell unit). Reservations are correct, so a stale-reservation warning would be a false
+  // alarm telling the operator to re-run allocation pointlessly.
+  const { deps, warnings } = makeDeps({ allocate: async () => ({ success: false, error: 'insufficient stock' }) })
+  const outcome = await releaseReservationsAfterRefund({ orderId: 'so-3b', status: 'ALLOCATED' }, deps)
+
+  assert.deepEqual(outcome, { released: false, warned: false })
+  assert.equal(warnings.length, 0, 'a committed shortage is not a stranded reservation')
+})
+
+test('an expected refuseIfShipmentsExist no-op (success:false, NOT failed) does NOT warn (o3d-67y)', async () => {
+  // A refund on an allocated order that already has shipments: the caller passes refuseIfShipmentsExist, so
+  // autoAllocateOrder returns success:false WITHOUT failed. The shipment build caps shippable qty net of
+  // refunds, so nothing is stranded.
   const { deps, warnings } = makeDeps({ allocate: async () => ({ success: false }) })
   const outcome = await releaseReservationsAfterRefund({ orderId: 'so-4', status: 'PROCESSING' }, deps)
-  assert.equal(outcome.warned, true)
-  assert.match(warnings[0].description, /success:false/)
+  assert.deepEqual(outcome, { released: false, warned: false })
+  assert.equal(warnings.length, 0)
 })
 
 test('non-eligible statuses are a no-op — a refund never promotes DRAFT/PENDING_PAYMENT (o3d-67y)', async () => {
