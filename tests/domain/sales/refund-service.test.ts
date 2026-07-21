@@ -601,7 +601,9 @@ test('a monetary-only refund PERSISTS lineKind=sale so a retry does not re-post 
   // A WooCommerce monetary-only refund is a null-product 'sale' line with a POSITIVE total. The retry
   // loader used to re-infer the kind from productId/sign (null product + positive total => 'shipping'),
   // sending the credit-note revenue to the shipping account on a retry. Persisting the kind fixes that.
+  // The order is uniformly taxed so the monetary refund is allowed (mixed-rate orders are refused below).
   const state = baseState()
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
     lines: [{ lineId: null, productId: null, description: 'Goodwill refund', qty: 0, totalBase: 30, lineKind: 'sale' }],
@@ -618,6 +620,7 @@ test('a monetary-only refund PERSISTS lineKind=sale so a retry does not re-post 
 })
 
 test('a mirrored order-discount refund line persists lineKind=discount (o3d-w00 #4)', async () => {
+  // A discount line is exempt from the uniform-tax gate (it uses the order default, like the invoice).
   const state = baseState()
   await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
@@ -628,6 +631,61 @@ test('a mirrored order-discount refund line persists lineKind=discount (o3d-w00 
 
   const persisted = state.refundLines.find((line) => line.description === 'Order discount')
   assert.equal(persisted?.lineKind, 'discount', 'a discount line persists its kind')
+})
+
+test('a monetary-only refund on a MIXED-rate order is REFUSED and quarantined (o3d-w00 #2/#5)', async () => {
+  // Two order lines at different tax identities -> not uniform. A monetary-only SALE amount can't be
+  // attributed, so it must be refused (fail closed) and flagged for quarantine, not posted under one rate.
+  const state = baseState()
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  state.lines.push({
+    id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50,
+    taxRate: { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: false },
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 40, lineKind: 'sale' }],
+    reason: 'Partial monetary refund',
+    externalRefundId: 9001,
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, false, 'a monetary refund on a mixed-rate order is refused')
+  assert.equal(result.success === false && result.quarantine, true, 'and flagged for quarantine')
+  assert.match(result.success === false ? result.error : '', /not itemised|not uniformly taxed/i)
+  assert.equal(state.refundLines.length, 0, 'nothing was created')
+})
+
+test('a monetary-only refund on a REVERSE-CHARGE order is REFUSED (o3d-w00 #2/#5)', async () => {
+  const state = baseState()
+  state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 40, lineKind: 'sale' }],
+    reason: 'Monetary refund',
+    creditNotePrefix: 'CN-',
+  })
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.quarantine, true)
+})
+
+test('a monetary-only refund on a UNIFORM order posts under the single safe identity, even if the default rate is deactivated (o3d-w00 #5)', async () => {
+  // The order default rate is inactive, so the old order-default lookup (active=true) resolved NULL; the
+  // identity must instead come from the line relation, which still carries the type.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: false }],
+  })
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 40, lineKind: 'sale' }],
+    reason: 'Monetary refund',
+    creditNotePrefix: 'CN-',
+  })
+  assert.equal(result.success, true, 'a uniform order allows the monetary refund even with a deactivated default')
+  const line = state.refundLines.find((l) => l.description === 'Monetary refund')
+  assert.equal(line?.accountingTaxType, 'OUTPUT2', 'posted under the single safe identity from the line relation')
 })
 
 test('a reverse-charge line snapshots the SWAPPED tax type (o3d-w00)', async () => {
@@ -1256,6 +1314,7 @@ test('replaying a monetary-only external refund reconstructs lineKind=sale from 
   // kind from salesOrderLineId (null => shipping) — re-posting a monetary 'sale' as shipping. It must now
   // reconstruct from the PERSISTED lineKind instead.
   const state = baseState()
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false } // uniform: monetary refund allowed
   const input = {
     orderId: 'order-1',
     lines: [{ lineId: null, productId: null, description: 'Goodwill refund', qty: 0, totalBase: 30, lineKind: 'sale' as const }],

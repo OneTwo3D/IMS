@@ -74,6 +74,14 @@ export async function syncWcRefund(
     const existing = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id } })
     if (existing) return { success: true } // already synced
 
+    // o3d-iup: a refund we deliberately PARKED (a monetary-only refund the order can't tax uniformly)
+    // creates no SalesOrderRefund, so without this guard the sweep would re-import and re-refuse it every
+    // run. A QUARANTINED log means it is awaiting operator resolution — treat it as handled, not retryable.
+    const parked = await client.shoppingSyncLog.findFirst({
+      where: { entityType: 'SalesOrder', externalId: String(wcRefund.id), status: 'QUARANTINED' },
+    })
+    if (parked) return { success: true }
+
     const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
     const refundAmountForeign = parseDecimalAbs(wcRefund.amount)
 
@@ -306,10 +314,15 @@ export async function syncWcRefund(
     }
 
     if (!result.success) {
+      // o3d-iup: a deliberate refusal (result.quarantine) is PARKED, not a transient failure — record it
+      // as QUARANTINED so the sweep dedup skips it (no per-sweep re-refusal loop) and FAILED dashboards
+      // don't treat it as retryable. The refusal message already tells the operator to resolve it in IMS
+      // and not to issue another Woo refund.
+      const quarantined = result.quarantine === true
       await client.shoppingSyncLog.create({
         data: {
           direction: 'FROM_CONNECTOR',
-          status: 'FAILED',
+          status: quarantined ? 'QUARANTINED' : 'FAILED',
           entityType: 'SalesOrder',
           entityId: so.id,
           externalId: String(wcRefund.id),
@@ -377,6 +390,13 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<numb
     // Check if already synced
     const exists = await db.salesOrderRefund.findFirst({ where: { externalRefundId: refund.id } })
     if (exists) continue
+
+    // o3d-iup: skip a refund we deliberately PARKED — it has no SalesOrderRefund row, so without this it
+    // would be re-imported and re-refused every sweep. It stays parked until an operator resolves it.
+    const parked = await db.shoppingSyncLog.findFirst({
+      where: { entityType: 'SalesOrder', externalId: String(refund.id), status: 'QUARANTINED' },
+    })
+    if (parked) continue
 
     const result = await syncWcRefund(externalOrderId, refund)
     if (result.success) synced++

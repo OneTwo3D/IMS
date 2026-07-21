@@ -50,7 +50,7 @@ function externalRefundIdUniqueError() {
   })
 }
 
-function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) {
+function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseWithQuarantine?: boolean } = {}) {
   const refunds: Array<{ id: string; externalRefundId: number }> = []
   const syncLogs: unknown[] = []
   const activityLogs: unknown[] = []
@@ -92,6 +92,15 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
         },
       },
       shoppingSyncLog: {
+        async findFirst(args: { where?: { externalId?: string; status?: string } }) {
+          // o3d-iup: parked-refund lookup. Return a match only when a QUARANTINED log was recorded.
+          return (
+            syncLogs.find((log) => {
+              const data = (log as { data?: { externalId?: string; status?: string } }).data
+              return data?.status === 'QUARANTINED' && data?.externalId === args.where?.externalId
+            }) ?? null
+          )
+        },
         async create(args: unknown) {
           syncLogs.push(args)
           return args
@@ -113,6 +122,10 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
       // actually LINKED to its IMS order line, which is how the _refunded_item_id bug
       // survived: createRefund was only ever checked for being called.
       createRefundLines.push(...(lines as unknown as Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }>))
+      if (options.refuseWithQuarantine) {
+        // o3d-w00 #2/#5: a monetary-only refund on a non-uniform order is refused for quarantine.
+        return { success: false, error: 'not uniformly taxed; parked for manual resolution', quarantine: true }
+      }
       refunds.push({ id: `refund-${refunds.length + 1}`, externalRefundId: createOptions?.externalRefundId ?? 0 })
       return { success: true }
     },
@@ -420,4 +433,24 @@ test('o3d-1sc3: a monetary-only suppression stays a WARNING and claims no stock 
   const activity = state.activityLogs[0] as { level: string; description: string }
   assert.equal(activity.level, 'WARNING', 'nothing returned, nothing owed operationally')
   assert.doesNotMatch(activity.description, /unit\(s\)/)
+
+test('a refused monetary-only refund is QUARANTINED and not re-attempted on the next delivery (o3d-w00 #2/#5, o3d-iup)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, refuseWithQuarantine: true })
+
+  const first = await syncWcRefund(1001, makeRefund(), state.dependencies)
+  assert.equal(first.success, false, 'the refusal surfaces as a failed sync')
+
+  // It is parked as QUARANTINED (distinct from FAILED), keyed by the WC refund id.
+  const parked = state.syncLogs.find((log) => {
+    const data = (log as { data?: { status?: string; externalId?: string } }).data
+    return data?.status === 'QUARANTINED'
+  }) as { data?: { externalId?: string } } | undefined
+  assert.ok(parked, 'a QUARANTINED log was written')
+  assert.equal(parked?.data?.externalId, String(makeRefund().id), 'keyed by the WC refund id')
+
+  const callsAfterFirst = state.createRefundCalls
+  // A duplicate delivery must be skipped by the parked-log dedup — no re-refusal loop.
+  const second = await syncWcRefund(1001, makeRefund(), state.dependencies)
+  assert.equal(second.success, true, 'the parked refund is treated as handled, not retried')
+  assert.equal(state.createRefundCalls, callsAfterFirst, 'createRefund was NOT called again for a parked refund')
 })

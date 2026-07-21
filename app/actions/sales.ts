@@ -1958,11 +1958,19 @@ export async function createRefund(
   reason: string,
   returnWarehouseId?: string,
   options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
-  // o3d-6oyu.18: `conflict` is set when the refund transaction refused this credit note
-  // because the OTHER reversal path (WC refund webhook vs payment-poller chargeback) had
-  // already committed one for this order. It is a no-op the caller must not retry, not a
-  // failure — see RefundCreationConflict.
-): Promise<{ success: boolean; error?: string; warning?: string; conflict?: RefundCreationConflict }> {
+  // Two independent outcomes ride alongside `error`:
+  //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
+  //                OTHER reversal path (WC refund webhook vs payment-poller chargeback) had
+  //                already committed one for this order. A no-op the caller must not retry.
+  //   `quarantine` (o3d-w00) — the refund is monetary-only and the order cannot be taxed
+  //                uniformly, so it was parked for a human rather than posted on a guess.
+): Promise<{
+  success: boolean
+  error?: string
+  warning?: string
+  conflict?: RefundCreationConflict
+  quarantine?: true
+}> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.refund')

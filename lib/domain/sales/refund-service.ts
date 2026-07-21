@@ -285,7 +285,7 @@ export type RefundAccountingSyncRequest = {
 export type RefundCreationConflict = 'prior-refund' | 'prior-chargeback'
 
 export type CreateSalesOrderRefundResult =
-  | { success: false; error: string; conflict?: RefundCreationConflict }
+  | { success: false; error: string; conflict?: RefundCreationConflict; quarantine?: true }
   | {
       success: true
       orderId: string
@@ -1738,19 +1738,41 @@ export async function createSalesOrderRefund(
       : null
     const salesLineTaxById = new Map(so.lines.map((line) => [line.id, line.taxRate]))
     const reverseChargeSalesTaxType = input.accountingSettings?.reverseChargeSalesTaxType
-    const resolveRefundLineTaxIdentity = (lineId: string | null | undefined) => {
+
+    // Order tax uniformity, resolved from the LINES via the relation (active-independent, so a rate
+    // deactivated after the sale still counts) — o3d-w00 #5. The order is uniformly taxed when every line
+    // shares one non-null connector tax type and none is reverse-charged. Only then can a monetary-only
+    // (unlinked, un-attributable) SALE amount be posted under a single identity without mis-allocating.
+    const orderBaseTaxTypes = new Set(so.lines.map((line) => line.taxRate?.accountingTaxType ?? null))
+    const orderHasReverseCharge = so.lines.some((line) => line.taxRate?.reverseCharge)
+    const orderUniformlyTaxed = orderBaseTaxTypes.size === 1 && !orderBaseTaxTypes.has(null) && !orderHasReverseCharge
+    const orderSingleSafeTaxType = orderUniformlyTaxed ? ([...orderBaseTaxTypes][0] as string) : null
+
+    const resolveRefundLineTaxIdentity = (
+      lineId: string | null | undefined,
+      lineKind: 'sale' | 'shipping' | 'discount',
+    ) => {
       // A line-linked refund carries its OWN rate (read via the relation, so a rate deactivated after the
-      // sale still resolves). An unlinked line (monetary-only, shipping) uses the order default WITHOUT
-      // the reverse-charge swap — mirroring how the invoice posts its shipping/unlinked lines.
+      // sale still resolves).
       const linked = lineId ? salesLineTaxById.get(lineId) : undefined
-      return {
-        accountingTaxType: resolveSalesLineTaxType({
-          baseTaxType: linked?.accountingTaxType ?? orderDefaultTaxType,
-          reverseCharge: linked?.reverseCharge,
-          reverseChargeSalesTaxType,
-        }) ?? null,
-        reverseCharge: linked?.reverseCharge ?? null,
+      if (linked) {
+        return {
+          accountingTaxType: resolveSalesLineTaxType({
+            baseTaxType: linked.accountingTaxType ?? orderDefaultTaxType,
+            reverseCharge: linked.reverseCharge,
+            reverseChargeSalesTaxType,
+          }) ?? null,
+          reverseCharge: linked.reverseCharge ?? null,
+        }
       }
+      // Unlinked. A monetary-only SALE line uses the order's single safe identity — guaranteed present,
+      // since a non-uniform order with such a line is REFUSED below (o3d-w00 #2/#5). Shipping/discount
+      // lines keep the order-default treatment, consistent with how the invoice posts them (even on a
+      // mixed-rate order the invoice posts shipping under the order default), so they are not gated.
+      if (lineKind === 'sale') {
+        return { accountingTaxType: orderSingleSafeTaxType, reverseCharge: false }
+      }
+      return { accountingTaxType: orderDefaultTaxType, reverseCharge: null }
     }
 
     // External refund deliveries provide a stable replay key. Manual refunds
@@ -1914,6 +1936,26 @@ export async function createSalesOrderRefund(
       return { error: 'Cannot return refunded stock before the order has shipped' } as const
     }
 
+    // o3d-w00 #2/#5 + o3d-iup: fail closed on a monetary-only (unlinked) SALE line the order can't tax
+    // uniformly. Such a line is an un-attributable goods amount; posting it under one header rate would
+    // mis-allocate the credit note on a mixed-rate / reverse-charged / deactivated-rate order (e.g.
+    // £100@20% + £100@0% posted entirely at 20%). Refuse and PARK it (the caller quarantines) rather than
+    // silently mis-tax it. Shipping/discount unlinked lines are exempt — the invoice posts them under the
+    // order default too, so a refund matching that is consistent.
+    const hasUnlinkedSaleLine = refundLines.some(
+      (refundLine) => refundLine.lineId == null && refundLine.lineKind !== 'shipping' && refundLine.lineKind !== 'discount',
+    )
+    if (hasUnlinkedSaleLine && !orderUniformlyTaxed) {
+      return {
+        error:
+          'This refund is monetary-only (not itemised) but the order is not uniformly taxed, so its VAT ' +
+          'cannot be determined automatically. It has been parked for manual resolution: do NOT issue ' +
+          'another refund — record it in the IMS against the specific lines / tax rates it covers' +
+          (input.externalRefundId != null ? `, quoting refund id ${input.externalRefundId}.` : '.'),
+        quarantine: true as const,
+      } as const
+    }
+
     const existingRefunds = await tx.salesOrderRefund.findMany({
       where: { orderId: input.orderId },
       select: { totalBase: true, accountingRetryRequired: true },
@@ -2017,11 +2059,12 @@ export async function createSalesOrderRefund(
       const lineTotalForeign = refundLine.totalForeign != null
         ? Math.round(refundLine.totalForeign * 10000) / 10000
         : Math.round(refundLine.totalBase * fxRate * 10000) / 10000
-      const taxIdentity = resolveRefundLineTaxIdentity(refundLine.lineId)
       // Normalize once and PERSIST it (o3d-w00 #4) so an accounting retry posts to the same account
-      // without re-inferring the kind from productId/amount sign.
+      // without re-inferring the kind from productId/amount sign. Kind also drives the unlinked tax
+      // identity (a monetary SALE line uses the order's single safe type; shipping/discount the default).
       const lineKind: 'sale' | 'shipping' | 'discount' =
         refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
+      const taxIdentity = resolveRefundLineTaxIdentity(refundLine.lineId, lineKind)
       const createdLine = await tx.salesOrderRefundLine.create({
         data: {
           refundId: createdRefund.id,
@@ -2170,13 +2213,26 @@ export async function createSalesOrderRefund(
     throw error
   })
 
-  // o3d-6oyu.18: a cross-path conflict is reported BEFORE the generic error path and carries
-  // `conflict`, so callers can tell "the other path already reversed this order" (a no-op the
-  // caller must never retry) from "the refund failed" (which the poller retries by holding paidAt).
+  // Two INDEPENDENT discriminators ride on the failure result, and a caller may see either:
+  //
+  //   `conflict`   (o3d-6oyu.18) — the other path already reversed this order. A no-op the caller
+  //                must never retry. Reported BEFORE the generic error path.
+  //   `quarantine` (o3d-w00 #2/#5) — the refund is monetary-only and the order cannot be taxed
+  //                uniformly, so it is parked for a human rather than posted on a guess.
+  //
+  // They are not mutually exclusive in principle, so the conflict branch is checked first (it is
+  // the stronger statement: there is nothing left to refund) and quarantine is carried through on
+  // the generic path.
   if ('conflict' in txResult) {
     return { success: false, error: txResult.conflictError, conflict: txResult.conflict }
   }
-  if ('error' in txResult) return { success: false, error: txResult.error ?? 'Refund failed' }
+  if ('error' in txResult) {
+    return {
+      success: false,
+      error: txResult.error ?? 'Refund failed',
+      ...('quarantine' in txResult && txResult.quarantine ? { quarantine: true as const } : {}),
+    }
+  }
 
   const refundOrderRef = getSalesOrderReference(txResult.so)
   if ('replay' in txResult) {
