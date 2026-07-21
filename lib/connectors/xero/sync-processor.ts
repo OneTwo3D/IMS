@@ -368,7 +368,7 @@ const INVOICE_UPDATE_TO_CREATE_TYPE: Partial<Record<AccountingSyncType, Accounti
 }
 
 function invoiceCreateKey(createType: AccountingSyncType, referenceType: string, referenceId: string): string {
-  return `${createType} ${referenceType} ${referenceId}`
+  return `${createType}\x00${referenceType}\x00${referenceId}`
 }
 
 /**
