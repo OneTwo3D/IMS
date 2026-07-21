@@ -3,9 +3,11 @@ import test from 'node:test'
 
 import {
   classifyLinkedRefundLine,
+  classifyRefundBasis,
   collectRefundBasisRows,
   evaluateRefundBasisRows,
   type RefundBasisAuditClient,
+  type RefundBasisOrderLineRow,
   type RefundBasisOrderRow,
   type RefundBasisRefundRow,
 } from '@/lib/domain/sales/refund-basis-audit'
@@ -393,4 +395,41 @@ test('the audit reports the row cap and selects the provenance it classifies by'
   assert.equal(args.select.refunds.select?.chargeback, true)
   assert.equal(args.select.refunds.select?.externalRefundId, true)
   assert.equal(args.select.lines.select?.taxBase, true)
+})
+
+test('classifyRefundBasis stamps a whole refund only on unanimous, unambiguous linked-line evidence (o3d-lvk)', () => {
+  // Order line: 2 @ £50 net (£100 net + £20 VAT = £120 gross). Per unit: net 50, gross 60.
+  const orderLines = new Map<string, RefundBasisOrderLineRow>([
+    ['line-1', { id: 'line-1', productId: 'product-1', qty: 2, totalBase: 100, taxBase: 20 }],
+  ])
+
+  // All linked lines match NET -> NET.
+  assert.equal(classifyRefundBasis([{ productId: 'product-1', salesOrderLineId: 'line-1', qty: 1, totalBase: 50 }], orderLines), 'NET')
+  // A linked line matches GROSS -> GROSS.
+  assert.equal(classifyRefundBasis([{ productId: 'product-1', salesOrderLineId: 'line-1', qty: 1, totalBase: 60 }], orderLines), 'GROSS')
+
+  // Monetary-only / unlinked lines carry no evidence -> UNKNOWN.
+  assert.equal(classifyRefundBasis([{ productId: null, salesOrderLineId: null, qty: 0, totalBase: 40 }], orderLines), 'UNKNOWN')
+
+  // A net product line PLUS an unlinked shipping line: the product line classifies it, shipping skipped.
+  assert.equal(classifyRefundBasis([
+    { productId: 'product-1', salesOrderLineId: 'line-1', qty: 1, totalBase: 50 },
+    { productId: null, salesOrderLineId: null, qty: 0, totalBase: 5 },
+  ], orderLines), 'NET')
+
+  // Contradictory linked lines (one net, one gross — impossible from one writer) -> UNKNOWN, fail safe.
+  const twoLines = new Map<string, RefundBasisOrderLineRow>([
+    ['line-1', { id: 'line-1', productId: 'product-1', qty: 2, totalBase: 100, taxBase: 20 }],
+    ['line-2', { id: 'line-2', productId: 'product-2', qty: 2, totalBase: 100, taxBase: 20 }],
+  ])
+  assert.equal(classifyRefundBasis([
+    { productId: 'product-1', salesOrderLineId: 'line-1', qty: 1, totalBase: 50 }, // net
+    { productId: 'product-2', salesOrderLineId: 'line-2', qty: 1, totalBase: 60 }, // gross
+  ], twoLines), 'UNKNOWN')
+
+  // A line the classifier finds ambiguous -> UNKNOWN.
+  const tiny = new Map<string, RefundBasisOrderLineRow>([
+    ['line-tiny', { id: 'line-tiny', productId: 'p', qty: 2, totalBase: 0.04, taxBase: 0.008 }],
+  ])
+  assert.equal(classifyRefundBasis([{ productId: 'p', salesOrderLineId: 'line-tiny', qty: 1, totalBase: 0.02 }], tiny), 'UNKNOWN')
 })

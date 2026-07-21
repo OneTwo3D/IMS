@@ -184,6 +184,40 @@ export function classifyLinkedRefundLine(
   return 'ambiguous'
 }
 
+export type RefundStoredBasis = 'NET' | 'GROSS' | 'UNKNOWN'
+
+/**
+ * Classify a whole refund's stored basis from arithmetic evidence across its LINKED lines (o3d-lvk: the
+ * o3d-n8p historical backfill). Conservative — stamp NET or GROSS only when the linked-line evidence is
+ * unanimous and unambiguous, so a backfill NEVER mislabels a refund that money-adjacent logic then trusts:
+ *  - Unlinked lines (monetary-only / shipping / discount) carry no per-line evidence and are skipped; a
+ *    refund made ENTIRELY of them yields UNKNOWN.
+ *  - A single ambiguous linked line (net and gross windows overlap) yields UNKNOWN.
+ *  - Contradictory linked lines (one net, one gross — impossible from a single writer) yield UNKNOWN.
+ * Everything a single writer produced classifies to that writer's basis; anything unprovable stays UNKNOWN
+ * and the reports/guards must treat it as unknown rather than guessing.
+ */
+export function classifyRefundBasis(
+  refundLines: RefundBasisRefundLineRow[],
+  orderLinesById: Map<string, RefundBasisOrderLineRow>,
+): RefundStoredBasis {
+  let sawNet = false
+  let sawGross = false
+  for (const refundLine of refundLines) {
+    const orderLine = refundLine.salesOrderLineId ? orderLinesById.get(refundLine.salesOrderLineId) : undefined
+    if (!orderLine) continue
+    const verdict = classifyLinkedRefundLine(refundLine, orderLine)
+    if (verdict === 'ambiguous') return 'UNKNOWN'
+    if (verdict === 'net') sawNet = true
+    else if (verdict === 'gross') sawGross = true
+    // null = no evidence (untaxed line) — ignore
+  }
+  if (sawNet && sawGross) return 'UNKNOWN'
+  if (sawGross) return 'GROSS'
+  if (sawNet) return 'NET'
+  return 'UNKNOWN'
+}
+
 export function evaluateRefundBasisRows(rows: RefundBasisRows): RefundBasisFinding[] {
   const findings: RefundBasisFinding[] = []
 
