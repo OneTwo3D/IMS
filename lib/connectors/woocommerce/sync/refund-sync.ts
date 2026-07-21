@@ -41,6 +41,40 @@ function parseDecimalAbs(value: string | number | null | undefined) {
   return decimal.lt(0) ? decimal.neg() : decimal
 }
 
+// o3d-7yf: record a refund park deduplicated by externalId. Repeated deliveries of the same unresolved
+// WooCommerce refund (an amount mismatch re-imported every sweep, a still-failing retry) must keep ONE
+// current row, not append a fresh one each time — unbounded copies would grow the table and crowd real
+// QUARANTINED refunds out of the 50-row exception inbox. Updates the existing actionable park in place.
+async function upsertRefundPark(
+  client: Pick<typeof db, 'shoppingSyncLog'>,
+  input: { soId: string; externalId: string; status: 'PENDING' | 'FAILED' | 'QUARANTINED'; errorMessage: string; payload?: unknown },
+): Promise<void> {
+  const existing = await client.shoppingSyncLog.findFirst({
+    where: {
+      entityType: 'SalesOrder',
+      externalId: input.externalId,
+      status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+    },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true },
+  })
+  const data = {
+    direction: 'FROM_CONNECTOR' as const,
+    status: input.status,
+    entityType: 'SalesOrder',
+    entityId: input.soId,
+    externalId: input.externalId,
+    errorMessage: input.errorMessage,
+    syncedAt: new Date(),
+    ...(input.payload !== undefined ? { payload: input.payload as never } : {}),
+  }
+  if (existing) {
+    await client.shoppingSyncLog.update({ where: { id: existing.id }, data })
+  } else {
+    await client.shoppingSyncLog.create({ data })
+  }
+}
+
 export async function syncWcRefund(
   externalOrderId: number,
   wcRefund: WcRefund,
@@ -177,16 +211,12 @@ export async function syncWcRefund(
     const mappedGrossRounded = roundDecimalNumber(mappedGrossForeign, 4)
     if (refundLines.length > 0 && toDecimal(mappedGrossRounded).sub(refundAmountForeign).abs().gt(0.01)) {
       const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${toDecimal(mappedGrossRounded).toFixed(2)} but refund total is ${refundAmountForeign.toDecimalPlaces(2).toFixed(2)}`
-      await client.shoppingSyncLog.create({
-        data: {
-          direction: 'FROM_CONNECTOR',
-          status: 'PENDING',
-          entityType: 'SalesOrder',
-          entityId: so.id,
-          externalId: String(wcRefund.id),
-          payload: wcRefund as never,
-          errorMessage: error,
-        },
+      await upsertRefundPark(client, {
+        soId: so.id,
+        externalId: String(wcRefund.id),
+        status: 'PENDING',
+        errorMessage: error,
+        payload: wcRefund,
       })
       return {
         success: false,
@@ -319,16 +349,11 @@ export async function syncWcRefund(
       // don't treat it as retryable. The refusal message already tells the operator to resolve it in IMS
       // and not to issue another Woo refund.
       const quarantined = result.quarantine === true
-      await client.shoppingSyncLog.create({
-        data: {
-          direction: 'FROM_CONNECTOR',
-          status: quarantined ? 'QUARANTINED' : 'FAILED',
-          entityType: 'SalesOrder',
-          entityId: so.id,
-          externalId: String(wcRefund.id),
-          errorMessage: result.error,
-          syncedAt: new Date(),
-        },
+      await upsertRefundPark(client, {
+        soId: so.id,
+        externalId: String(wcRefund.id),
+        status: quarantined ? 'QUARANTINED' : 'FAILED',
+        errorMessage: result.error ?? 'refund sync failed',
       })
       return { success: false, error: result.error }
     }

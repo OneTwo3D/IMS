@@ -56,6 +56,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
   const activityLogs: unknown[] = []
   const createRefundLines: Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }> = []
   let createRefundCalls = 0
+  let nextLogId = 1
 
   const dependencies: WcRefundSyncDependencies = {
     db: {
@@ -92,18 +93,31 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
         },
       },
       shoppingSyncLog: {
-        async findFirst(args: { where?: { externalId?: string; status?: string } }) {
-          // o3d-iup: parked-refund lookup. Return a match only when a QUARANTINED log was recorded.
-          return (
-            syncLogs.find((log) => {
-              const data = (log as { data?: { externalId?: string; status?: string } }).data
-              return data?.status === 'QUARANTINED' && data?.externalId === args.where?.externalId
-            }) ?? null
-          )
+        async findFirst(args: { where?: { externalId?: string; entityType?: string; status?: string | { in?: string[] } } }) {
+          const where = args?.where ?? {}
+          const statuses = typeof where.status === 'object' ? where.status.in : (where.status != null ? [where.status] : null)
+          // Newest-first (orderBy createdAt desc) — scan from the end.
+          for (let i = syncLogs.length - 1; i >= 0; i--) {
+            const d = (syncLogs[i] as { data?: { externalId?: string; entityType?: string; status?: string } }).data
+            if (
+              (where.externalId == null || d?.externalId === where.externalId) &&
+              (where.entityType == null || d?.entityType === where.entityType) &&
+              (statuses == null || (d?.status != null && statuses.includes(d.status)))
+            ) {
+              return syncLogs[i]
+            }
+          }
+          return null
         },
-        async create(args: unknown) {
-          syncLogs.push(args)
-          return args
+        async create(args: { data: Record<string, unknown> }) {
+          const row = { id: `log-${nextLogId++}`, data: args.data }
+          syncLogs.push(row)
+          return row
+        },
+        async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+          const row = syncLogs.find((r) => (r as { id?: string }).id === args.where.id) as { data: Record<string, unknown> } | undefined
+          if (row) row.data = { ...row.data, ...args.data }
+          return row
         },
         // o3d-6oyu.18: the chargeback-suppression path dedups its warning on the marker
         // message, so `order.updated` re-runs don't re-log it forever.
@@ -244,6 +258,22 @@ test('syncWcRefund still rejects a genuine amount mismatch', async () => {
   assert.equal(state.createRefundCalls, 0)
 })
 
+test('repeated deliveries of the same mismatched refund keep ONE park, not an unbounded pile (o3d-7yf)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  const refund = makeRefund({
+    id: 7009, amount: '99.00',
+    line_items: [{ id: 501, name: 'Widget', product_id: 10, variation_id: 0, quantity: -1, tax_class: '', subtotal: '-10.00', subtotal_tax: '-1.00', total: '-10.00', total_tax: '-1.00', sku: 'WIDGET', meta_data: [], refund_total: 11 }],
+  })
+
+  await syncWcRefund(1001, refund, state.dependencies)
+  await syncWcRefund(1001, refund, state.dependencies)
+  await syncWcRefund(1001, refund, state.dependencies)
+
+  const parksForRefund = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7009')
+  assert.equal(parksForRefund.length, 1, 'three deliveries produce exactly one park row (updated in place), not three')
+  assert.equal((parksForRefund[0] as { data: { status: string } }).data.status, 'PENDING')
+})
+
 test('syncWcRefund treats external refund unique conflicts as idempotent races', async () => {
   const state = makeDependencies({ alwaysMissExistingRefund: true })
   state.dependencies.createRefund = async () => {
@@ -254,16 +284,14 @@ test('syncWcRefund treats external refund unique conflicts as idempotent races',
 
   assert.deepEqual(result, { success: true })
   assert.equal(state.syncLogs.length, 1)
-  assert.deepEqual(state.syncLogs[0], {
-    data: {
-      direction: 'FROM_CONNECTOR',
-      status: 'SYNCED',
-      entityType: 'SalesOrder',
-      entityId: 'so-1',
-      externalId: '7001',
-      errorMessage: 'Duplicate WooCommerce refund delivery deduped by external refund id',
-      syncedAt: (state.syncLogs[0] as { data: { syncedAt: Date } }).data.syncedAt,
-    },
+  assert.deepEqual((state.syncLogs[0] as { data: unknown }).data, {
+    direction: 'FROM_CONNECTOR',
+    status: 'SYNCED',
+    entityType: 'SalesOrder',
+    entityId: 'so-1',
+    externalId: '7001',
+    errorMessage: 'Duplicate WooCommerce refund delivery deduped by external refund id',
+    syncedAt: (state.syncLogs[0] as { data: { syncedAt: Date } }).data.syncedAt,
   })
   assert.equal(state.activityLogs.length, 1)
   assert.deepEqual(state.activityLogs[0], {
