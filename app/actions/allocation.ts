@@ -262,6 +262,10 @@ export async function autoAllocateOrder(
   // reservations consistent and must NOT be treated as a stranded-reservation failure by callers.
   failed?: boolean
 }> {
+  // o3d-67y: distinguish a rolled-back allocation transaction (reservations stale) from a POST-commit throw
+  // (revalidate / stock-sync enqueue) that leaves reservations already correct. Only the former is a
+  // stranded-reservation failure; a post-commit throw must NOT raise a false stale-reservation warning.
+  let allocationCommitted = false
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
@@ -270,6 +274,7 @@ export async function autoAllocateOrder(
       orderId,
       refuseIfShipmentsExist: options?.refuseIfShipmentsExist,
     })
+    allocationCommitted = true
 
     if (!allocationResult.logAttempt && !allocationResult.success) {
       return {
@@ -363,9 +368,11 @@ export async function autoAllocateOrder(
       backorderLineCount: allocationResult.backorderLineCount,
     }
   } catch (e) {
-    // The allocation transaction threw and rolled back — reservations are unchanged. Flag it so a post-refund
-    // caller can tell this (a genuine stranding) apart from a committed backorder/refusal (o3d-67y).
-    return { success: false, error: String(e), failed: true }
+    // Flag a genuine stranding ONLY when the allocation transaction did not commit (it threw + rolled back,
+    // or permission/setup failed before it ran). A throw AFTER allocationCommitted is a post-commit
+    // side-effect failure (cache revalidation, stock-sync enqueue) — reservations are already correct, so it
+    // is not a stranded-reservation failure (o3d-67y).
+    return { success: false, error: String(e), failed: !allocationCommitted }
   }
 }
 
