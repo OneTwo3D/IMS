@@ -179,8 +179,36 @@ test('refund disposition reconciliation reports source row cap and caps collecte
           creditNoteNumber: true,
           totalBase: true,
           refundedAt: true,
+          totalsBasis: true,
         },
       },
     },
   }])
+})
+
+test('a fully-refunded taxable order with only NET refunds is FULL; a legacy GROSS refund falls back to the gross basis (o3d-w00 #3 / o3d-n8p)', () => {
+  // NET-basis: gross 120, tax 20, net 100; a net-100 refund is a FULL refund vs the net total.
+  const netFindings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-net', orderNumber: 'SO-NET', refundStatus: 'FULL', totalBase: '120.00', taxBase: '20.00',
+        refunds: [{ id: 'r-net', creditNoteNumber: 'CN-NET', totalBase: '100.00', refundedAt: REFUNDED_AT, totalsBasis: 'NET' }],
+      }),
+    ],
+  })
+  assert.deepEqual(netFindings, [], 'a full net refund of a taxable order reconciles as FULL')
+
+  // Legacy GROSS refund (no basis marker): summing 100 against the NET total (100) would look FULL, but
+  // the stored 100 is GROSS. Fail-safe uses the GROSS total (120), so 100 is PARTIAL — no false FULL.
+  const legacyFindings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-legacy', orderNumber: 'SO-LEGACY', refundStatus: 'PARTIAL', totalBase: '120.00', taxBase: '20.00',
+        refunds: [{ id: 'r-legacy', creditNoteNumber: 'CN-LEGACY', totalBase: '100.00', refundedAt: REFUNDED_AT }],
+      }),
+    ],
+  })
+  assert.deepEqual(legacyFindings, [], 'a legacy gross refund is treated as PARTIAL against the gross total, not a false FULL mismatch')
 })

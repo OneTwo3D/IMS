@@ -1666,6 +1666,13 @@ model SalesOrderRefund {
   reason          String?
   totalForeign    Decimal    @db.Decimal(18, 4)
   totalBase        Decimal    @db.Decimal(18, 4)
+  // What the stored totals MEAN, and which trusted writer created the refund (o3d-n8p). Set by the
+  // writer (never a caller option) so refund classification is a lookup, not a reconstruction. totalsBasis
+  // is 'NET' for every refund created since the net contract; a NULL row is a legacy refund whose totals
+  // are GROSS. The o3d-w00 net ceiling/status is only applied when ALL of an order's refunds are NET —
+  // otherwise a mixed gross+net sum could mark an order FULL early, so it falls back to the gross basis.
+  totalsBasis     String?    @map("totals_basis")
+  source          String?
   accountingRetryRequired Boolean @default(false) @map("accounting_retry_required")
   accountingWarning String?   @map("accounting_warning")
   accountingRetrySyncs Json?  @map("accounting_retry_syncs")

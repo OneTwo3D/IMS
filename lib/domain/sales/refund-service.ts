@@ -1878,7 +1878,7 @@ export async function createSalesOrderRefund(
 
     const existingRefunds = await tx.salesOrderRefund.findMany({
       where: { orderId: input.orderId },
-      select: { totalBase: true, accountingRetryRequired: true },
+      select: { totalBase: true, accountingRetryRequired: true, totalsBasis: true },
     })
     // scjz.22: block a NEW refund while a prior refund on this order still has
     // unresolved accounting (accountingRetryRequired). A refund whose accounting
@@ -1894,10 +1894,19 @@ export async function createSalesOrderRefund(
       return { error: 'A previous refund on this order has unresolved accounting and must be retried before another refund can be created.' } as const
     }
     const previouslyRefunded = existingRefunds.reduce((sum, refund) => sum + refundBoundaryNumber(refund.totalBase), 0)
+    // o3d-w00 / o3d-n8p: the NET ceiling is only sound when every existing refund on this order stores NET
+    // totals (totalsBasis='NET'). A legacy refund (NULL basis) stored GROSS, so summing it with new NET
+    // refunds against the net ceiling could mark the order fully refunded early or wrongly block a refund.
+    // When any legacy refund is present, fall back to the GROSS order total: the net current refund is then
+    // undercounted against a larger ceiling, which errs toward "still PARTIAL" (safe) rather than early
+    // FULL or a spurious over-total block. Orders with only new refunds get the correct net ceiling.
+    const allExistingRefundsNet = existingRefunds.every((refund) => refund.totalsBasis === 'NET')
+    const netOrderTotal = Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase))
+    const refundCeiling = allExistingRefundsNet ? netOrderTotal : refundBoundaryNumber(so.totalBase)
     // audit-M-o2c: cumulative refunded must not exceed the order total, with a
     // fixed rounding epsilon (not a 0.1% relative slack, which on a large order
     // is pounds of headroom) so N partial refunds can't creep over.
-    if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase)))) {
+    if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, refundCeiling)) {
       return { error: 'Refund total would exceed order total' } as const
     }
 
@@ -1945,6 +1954,14 @@ export async function createSalesOrderRefund(
       prefix: input.creditNotePrefix,
     })
 
+    // o3d-n8p: the WRITER stamps what the stored totals mean and where the refund came from — derived from
+    // the call context here, not taken from a caller option. Every refund created on this path stores NET
+    // totals. source lets the audit/classification be a lookup instead of a reconstruction.
+    const refundSource = input.chargeback
+      ? 'CHARGEBACK_POLLER'
+      : input.externalRefundId != null
+        ? 'WOO_SYNC'
+        : 'MANUAL_UI'
     const createdRefund = await tx.salesOrderRefund.create({
       data: {
         orderId: input.orderId,
@@ -1953,6 +1970,8 @@ export async function createSalesOrderRefund(
         reason: input.reason || null,
         totalForeign,
         totalBase,
+        totalsBasis: 'NET',
+        source: refundSource,
         returnWarehouseId: effectiveReturnWarehouseId || null,
         // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
         // the stored syncs) reproduces the revenue-only treatment.
@@ -2028,8 +2047,10 @@ export async function createSalesOrderRefund(
     // Refund totals are NET for every caller (o3d-w00 gave the WooCommerce monetary-only refund a net
     // contract like the others), so compare against the NET order total. Using the gross so.totalBase
     // left a full refund of a taxable order stuck at PARTIALLY_REFUNDED. Non-taxable orders have taxBase
-    // 0, so this is identical to the gross basis for them.
-    const orderTotal = Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase))
+    // 0, so this is identical to the gross basis for them. refundCeiling applies the same o3d-n8p fail-safe
+    // as the over-total guard: net only when every existing refund is NET-basis, else the gross total (so a
+    // legacy gross + new net order errs toward PARTIAL, never a premature FULL).
+    const orderTotal = refundCeiling
     // `newStatus` is the refund *classification* (drives the accounting reversal
     // treatment), NOT the order's lifecycle status — refund state is now the
     // orthogonal refundStatus dimension.
