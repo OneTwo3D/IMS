@@ -121,7 +121,10 @@ export function evaluateRefundStatusReconciliationRows(
     // regardless of basis, so still flag that as critical; otherwise surface an explicit UNKNOWN finding
     // for manual review rather than guessing or going silent.
     if (expectedDisposition === 'UNKNOWN') {
-      if (order.refundStatus === 'NONE' && refundTotalBase.gt(0)) {
+      // Test the basis-INDEPENDENT invariant without summing incomparable amounts: any single positive
+      // refund row means the order can't legitimately be NONE. Summing the aggregate would let a +50
+      // legacy refund and a -50 correction net to 0 and downgrade a real NONE corruption to a warning.
+      if (order.refundStatus === 'NONE' && order.refunds.some((refund) => toDecimal(refund.totalBase).gt(0))) {
         findings.push({
           severity: 'critical',
           code: 'sales_order_refund_status_mismatch',

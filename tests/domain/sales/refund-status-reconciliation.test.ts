@@ -232,4 +232,22 @@ test('a fully-refunded taxable order with only NET refunds is FULL; a legacy GRO
   assert.equal(noneFindings.length, 1)
   assert.equal(noneFindings[0]?.code, 'sales_order_refund_status_mismatch')
   assert.equal(noneFindings[0]?.severity, 'critical')
+
+  // A positive legacy refund + a negative correction sum to ZERO, but a positive refund row still exists
+  // with refundStatus=NONE — must stay CRITICAL, not be downgraded to a warning by the aggregate == 0.
+  const nettedNoneFindings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-netted', orderNumber: 'SO-NETTED', refundStatus: 'NONE', totalBase: '120.00', taxBase: '20.00',
+        refunds: [
+          { id: 'r-pos', creditNoteNumber: 'CN-POS', totalBase: '50.00', refundedAt: REFUNDED_AT, totalsBasis: null },
+          { id: 'r-neg', creditNoteNumber: 'CN-NEG', totalBase: '-50.00', refundedAt: REFUNDED_AT, totalsBasis: null },
+        ],
+      }),
+    ],
+  })
+  assert.equal(nettedNoneFindings.length, 1)
+  assert.equal(nettedNoneFindings[0]?.code, 'sales_order_refund_status_mismatch')
+  assert.equal(nettedNoneFindings[0]?.severity, 'critical')
 })
