@@ -11,7 +11,7 @@ import {
 const REFUNDED_AT = new Date('2026-01-01T12:00:00.000Z')
 
 function order(overrides: Partial<RefundStatusOrderRow> = {}): RefundStatusOrderRow {
-  return {
+  const row: RefundStatusOrderRow = {
     id: 'order-1',
     orderNumber: 'SO-1',
     externalOrderNumber: null,
@@ -21,6 +21,10 @@ function order(overrides: Partial<RefundStatusOrderRow> = {}): RefundStatusOrder
     refunds: [],
     ...overrides,
   }
+  // Default refunds to NET basis (the post-o3d-n8p norm); a test marks a legacy refund with
+  // totalsBasis: null explicitly to exercise the mixed-basis fallback.
+  row.refunds = row.refunds.map((refund) => ({ totalsBasis: 'NET' as const, ...refund }))
+  return row
 }
 
 test('clean refund disposition rows produce no findings', () => {
@@ -199,16 +203,17 @@ test('a fully-refunded taxable order with only NET refunds is FULL; a legacy GRO
   })
   assert.deepEqual(netFindings, [], 'a full net refund of a taxable order reconciles as FULL')
 
-  // Legacy GROSS refund (no basis marker): summing 100 against the NET total (100) would look FULL, but
-  // the stored 100 is GROSS. Fail-safe uses the GROSS total (120), so 100 is PARTIAL — no false FULL.
+  // Legacy refund (null basis): its stored total may be GROSS and can't be summed with NET totals safely,
+  // so the reconciliation returns null (unknown disposition) and does NOT raise a mismatch either way —
+  // whatever the recorded refundStatus, no false finding is produced.
   const legacyFindings = evaluateRefundStatusReconciliationRows({
     sourceRowLimitReached: false,
     salesOrders: [
       order({
-        id: 'order-legacy', orderNumber: 'SO-LEGACY', refundStatus: 'PARTIAL', totalBase: '120.00', taxBase: '20.00',
-        refunds: [{ id: 'r-legacy', creditNoteNumber: 'CN-LEGACY', totalBase: '100.00', refundedAt: REFUNDED_AT }],
+        id: 'order-legacy', orderNumber: 'SO-LEGACY', refundStatus: 'FULL', totalBase: '120.00', taxBase: '20.00',
+        refunds: [{ id: 'r-legacy', creditNoteNumber: 'CN-LEGACY', totalBase: '100.00', refundedAt: REFUNDED_AT, totalsBasis: null }],
       }),
     ],
   })
-  assert.deepEqual(legacyFindings, [], 'a legacy gross refund is treated as PARTIAL against the gross total, not a false FULL mismatch')
+  assert.deepEqual(legacyFindings, [], 'a legacy/unknown-basis refund is not flagged as a mismatch (disposition unknown)')
 })

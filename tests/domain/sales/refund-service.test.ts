@@ -189,7 +189,7 @@ const accountingSettings: AccountingSettings = {
 }
 
 function baseState(overrides: Partial<State> = {}): State {
-  return {
+  const state: State = {
     orders: [{
       id: 'order-1',
       externalOrderNumber: null,
@@ -228,6 +228,10 @@ function baseState(overrides: Partial<State> = {}): State {
     nextCostLayerId: 1,
     ...overrides,
   }
+  // Default seeded existing refunds to NET basis (the post-o3d-n8p norm); a test that exercises the
+  // legacy/unknown-basis block pushes a refund with totalsBasis omitted AFTER baseState().
+  state.refunds = state.refunds.map((refund) => ({ totalsBasis: 'NET' as const, ...refund }))
+  return state
 }
 
 function createClient(state: State): RefundServiceClient {
@@ -578,25 +582,26 @@ test('a new refund is stamped totalsBasis=NET and a writer-derived source (o3d-n
   assert.equal(woo.refunds[0].source, 'WOO_SYNC', 'externalRefundId => woo sync')
 })
 
-test('a legacy GROSS refund makes a later refund use the GROSS ceiling, not a premature FULL (o3d-w00 #3 / o3d-n8p)', async () => {
-  // Order: gross 120, tax 20, net 100. A pre-existing LEGACY refund stored 100 GROSS (totalsBasis null).
-  // A new net-15 refund brings the sum to 115. Against the net total (100) that is >100 and would look
-  // FULL (and could even over-total); against the gross total (120) it is PARTIAL — the safe direction.
+test('a later refund on an order with a legacy/unknown-basis refund is BLOCKED for manual reconciliation, never over-refunded (o3d-w00 #3 / o3d-n8p)', async () => {
+  // A legacy refund stored 100 (basis unknown/GROSS). Summing it with new NET totals against any single
+  // ceiling can either over-refund (gross ceiling grosses the new line up) or mark FULL early (net
+  // ceiling). Conversion is undecidable, so createSalesOrderRefund fails closed and refuses.
   const state = baseState({
     orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 20, taxRateName: 'Standard' }],
     taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
   })
   state.refunds.push({
     id: 'legacy-refund', orderId: 'order-1', creditNoteNumber: 'CN-legacy', externalRefundId: null,
-    reason: 'legacy', totalForeign: 100, totalBase: 100, returnWarehouseId: null, // totalsBasis omitted => legacy GROSS
+    reason: 'legacy', totalForeign: 100, totalBase: 100, returnWarehouseId: null, // totalsBasis omitted => legacy/unknown
   })
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 15 }],
     reason: 'Small extra refund', creditNotePrefix: 'CN-',
   })
-  assert.equal(result.success, true, 'the new refund is allowed (gross ceiling 120 not exceeded), not spuriously blocked')
-  assert.equal(state.orders[0].refundStatus, 'PARTIAL', 'not marked FULL early despite the net sum exceeding the net total')
+  assert.equal(result.success, false, 'blocked rather than risk an over-refund / premature FULL')
+  assert.equal(result.success === false && result.quarantine, true, 'routed to manual reconciliation')
+  assert.equal(state.refundLines.length, 0, 'nothing created')
 })
 
 test('a refund line SNAPSHOTS the resolved tax identity at creation (o3d-w00)', async () => {
