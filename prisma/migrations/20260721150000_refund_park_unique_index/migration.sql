@@ -15,9 +15,16 @@
 
 -- Exclude concurrent writers for the whole dedup+index build. Without this, a first-time refund delivery
 -- could INSERT a duplicate between the DELETE's snapshot and CREATE UNIQUE INDEX, making the index build
--- fail and aborting the deploy (the exact race this index exists to prevent). The migration runs in one
--- transaction, so this SHARE ROW EXCLUSIVE lock is held until commit and released immediately after; reads
--- are unaffected and writers block only for the brief build.
+-- fail and aborting the deploy (the exact race this index exists to prevent).
+--
+-- Wrap the dedup + index build in an EXPLICIT transaction so the SHARE ROW EXCLUSIVE lock is held across
+-- both statements and released at COMMIT. Prisma 7.8's runner does not auto-wrap a migration, and its
+-- bundled parser doesn't recognise LOCK TABLE, so relying on an implicit single-statement transaction is
+-- fragile — an explicit BEGIN/COMMIT makes the atomicity independent of that. DELETE and a non-CONCURRENT
+-- CREATE UNIQUE INDEX are both transaction-safe; reads are unaffected, writers block only for the brief
+-- build.
+BEGIN;
+
 LOCK TABLE "shopping_sync_logs" IN SHARE ROW EXCLUSIVE MODE;
 
 -- First collapse any pre-existing duplicate actionable REFUND parks (keep the newest per
@@ -38,3 +45,5 @@ WHERE connector = 'woocommerce'
   AND status IN ('PENDING', 'FAILED', 'QUARANTINED')
   AND "externalId" IS NOT NULL
   AND "entityId" IS NOT NULL;
+
+COMMIT;
