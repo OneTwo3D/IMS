@@ -42,6 +42,30 @@ function parseDecimalAbs(value: string | number | null | undefined) {
   return decimal.lt(0) ? decimal.neg() : decimal
 }
 
+// o3d-7yf: when a refund finally lands (a successful retry or a verified same-order dedup), RESOLVE this
+// order's lingering actionable park instead of only appending a separate SYNCED log. The partial unique
+// index excludes SYNCED rows, so a fresh SYNCED log never collides with — nor clears — the old PENDING/
+// FAILED park; left alone it keeps counting in the exception inbox, blocks deletion/rebind, and evades
+// retention forever. Scoped to THIS order + refund. QUARANTINED is left untouched: it is an operator-gated
+// refusal that never reaches a successful auto-sync (the preflight returns it as handled first).
+async function resolveActionableParks(
+  client: Pick<typeof db, 'shoppingSyncLog'>,
+  soId: string,
+  externalId: string,
+): Promise<void> {
+  await client.shoppingSyncLog.updateMany({
+    where: {
+      connector: 'woocommerce',
+      direction: 'FROM_CONNECTOR',
+      entityType: 'SalesOrder',
+      externalId,
+      entityId: soId,
+      status: { in: ['PENDING', 'FAILED'] },
+    },
+    data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },
+  })
+}
+
 // o3d-7yf: record a refund park deduplicated by externalId. Repeated deliveries of the same unresolved
 // WooCommerce refund (an amount mismatch re-imported every sweep, a still-failing retry) must keep ONE
 // current row, not append a fresh one each time — unbounded copies would grow the table and crowd real
@@ -311,6 +335,8 @@ export async function syncWcRefund(
           syncedAt: new Date(),
         },
       })
+      // The verified same-order refund exists — resolve any lingering actionable park for it too.
+      await resolveActionableParks(client, so.id, String(wcRefund.id))
       await writeActivity({
         entityType: 'SALES_ORDER',
         entityId: so.id,
@@ -420,6 +446,8 @@ export async function syncWcRefund(
         syncedAt: new Date(),
       },
     })
+    // A same-order PENDING/FAILED park intentionally fell through to this retry — now that it landed, clear it.
+    await resolveActionableParks(client, so.id, String(wcRefund.id))
 
     await writeActivity({
       entityType: 'SALES_ORDER',

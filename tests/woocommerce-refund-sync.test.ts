@@ -90,6 +90,23 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
       if (row) row.data = { ...row.data, ...args.data }
       return row
     },
+    async updateMany(args: { where?: { externalId?: string; entityId?: string; status?: string | { in?: string[] } }; data: Record<string, unknown> }) {
+      const where = args?.where ?? {}
+      const statuses = typeof where.status === 'object' ? where.status?.in : (where.status != null ? [where.status] : null)
+      let count = 0
+      for (const r of syncLogs) {
+        const d = (r as { data: { externalId?: string; entityId?: string; status?: string } }).data
+        if (
+          (where.externalId == null || d?.externalId === where.externalId) &&
+          (where.entityId == null || d?.entityId === where.entityId) &&
+          (statuses == null || (d?.status != null && statuses.includes(d.status)))
+        ) {
+          (r as { data: Record<string, unknown> }).data = { ...d, ...args.data }
+          count += 1
+        }
+      }
+      return { count }
+    },
   }
 
   const dependencies: WcRefundSyncDependencies = {
@@ -465,4 +482,17 @@ test('a PENDING park for a DIFFERENT order blocks applying the same refund here 
   assert.equal(result.success, false, 'a PENDING park owned by another order fails closed too')
   assert.match(result.error ?? '', /different order/i)
   assert.equal(state.createRefundCalls, 0, 'no refund created on this order while another order holds the park')
+})
+
+test('a successful retry RESOLVES this order\'s lingering actionable park (o3d-7yf)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  // This order (so-1) has a FAILED park for refund 7016 from an earlier transient failure.
+  state.syncLogs.push({ id: 'log-f', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-1', externalId: '7016', status: 'FAILED' } })
+
+  // The refund now lands (createRefund succeeds — makeDependencies default doesn't refuse).
+  const result = await syncWcRefund(1001, makeRefund({ id: 7016 }), state.dependencies)
+
+  assert.equal(result.success, true, 'the refund landed')
+  const park = state.syncLogs.find((log) => (log as { id?: string }).id === 'log-f') as { data: { status: string } }
+  assert.equal(park.data.status, 'SYNCED', 'the lingering FAILED park was resolved, not left actionable')
 })
