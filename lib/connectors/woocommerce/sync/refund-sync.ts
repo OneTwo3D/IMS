@@ -7,7 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
+import { isExternalRefundIdUniqueConflict, isUniqueConstraintViolation } from '@/lib/domain/sales/refund-idempotency'
 import type { WcRefund, WcRefundLineItem } from './types'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
@@ -70,8 +70,22 @@ async function upsertRefundPark(
   }
   if (existing) {
     await client.shoppingSyncLog.update({ where: { id: existing.id }, data })
-  } else {
+    return
+  }
+  try {
     await client.shoppingSyncLog.create({ data })
+  } catch (error) {
+    // o3d-7yf finding 4: a concurrent delivery inserted the actionable park between our findFirst and this
+    // create. The partial unique index (shopping_sync_logs_active_refund_park_uq) rejects the second
+    // insert; fall back to updating the winner's row so we still end with ONE current park, never a
+    // duplicate or an unhandled error.
+    if (!isUniqueConstraintViolation(error)) throw error
+    const winner = await client.shoppingSyncLog.findFirst({
+      where: { entityType: 'SalesOrder', externalId: input.externalId, status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] } },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    })
+    if (winner) await client.shoppingSyncLog.update({ where: { id: winner.id }, data })
   }
 }
 

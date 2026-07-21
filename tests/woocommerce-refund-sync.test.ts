@@ -57,6 +57,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
   const createRefundLines: Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }> = []
   let createRefundCalls = 0
   let nextLogId = 1
+  let hideNextActionableFindFirst = false
 
   const dependencies: WcRefundSyncDependencies = {
     db: {
@@ -95,6 +96,11 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
       shoppingSyncLog: {
         async findFirst(args: { where?: { externalId?: string; entityType?: string; status?: string | { in?: string[] } } }) {
           const where = args?.where ?? {}
+          // o3d-7yf: simulate a stale read that misses a concurrently-inserted park exactly once — only for
+          // upsertRefundPark's ACTIONABLE-SET query (status.in[...]), not the single-QUARANTINED parked
+          // check — to exercise the P2002 fallback.
+          const isActionableSetQuery = typeof where.status === 'object' && Array.isArray(where.status.in) && where.status.in.includes('PENDING')
+          if (hideNextActionableFindFirst && isActionableSetQuery) { hideNextActionableFindFirst = false; return null }
           const statuses = typeof where.status === 'object' ? where.status.in : (where.status != null ? [where.status] : null)
           // Newest-first (orderBy createdAt desc) — scan from the end.
           for (let i = syncLogs.length - 1; i >= 0; i--) {
@@ -110,6 +116,17 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
           return null
         },
         async create(args: { data: Record<string, unknown> }) {
+          // Enforce the partial unique index shopping_sync_logs_active_refund_park_uq: at most one
+          // ACTIONABLE park per externalId. A racing second insert gets a P2002, like the real DB.
+          const d = args.data as { externalId?: string; entityType?: string; direction?: string; status?: string }
+          const actionable = ['PENDING', 'FAILED', 'QUARANTINED']
+          if (d.entityType === 'SalesOrder' && d.direction === 'FROM_CONNECTOR' && actionable.includes(d.status ?? '')) {
+            const dup = syncLogs.some((r) => {
+              const rd = (r as { data?: typeof d }).data
+              return rd?.entityType === 'SalesOrder' && rd?.direction === 'FROM_CONNECTOR' && rd?.externalId === d.externalId && actionable.includes(rd?.status ?? '')
+            })
+            if (dup) throw new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion: 'test', meta: { target: ['shopping_sync_logs_active_refund_park_uq'] } })
+          }
           const row = { id: `log-${nextLogId++}`, data: args.data }
           syncLogs.push(row)
           return row
@@ -157,6 +174,9 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
     get createRefundCalls() {
       return createRefundCalls
     },
+    // Make the NEXT park findFirst miss a concurrently-inserted row once (stale read), so the following
+    // create races the unique index and upsertRefundPark must fall back to update.
+    simulateParkRace() { hideNextActionableFindFirst = true },
   }
 }
 
@@ -272,6 +292,27 @@ test('repeated deliveries of the same mismatched refund keep ONE park, not an un
   const parksForRefund = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7009')
   assert.equal(parksForRefund.length, 1, 'three deliveries produce exactly one park row (updated in place), not three')
   assert.equal((parksForRefund[0] as { data: { status: string } }).data.status, 'PENDING')
+})
+
+test('a concurrent park insert (unique-index race) falls back to update, not a duplicate or error (o3d-7yf #4)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  const refund = makeRefund({
+    id: 7010, amount: '99.00',
+    line_items: [{ id: 501, name: 'Widget', product_id: 10, variation_id: 0, quantity: -1, tax_class: '', subtotal: '-10.00', subtotal_tax: '-1.00', total: '-10.00', total_tax: '-1.00', sku: 'WIDGET', meta_data: [], refund_total: 11 }],
+  })
+
+  await syncWcRefund(1001, refund, state.dependencies) // creates the park
+  // Next delivery: the park findFirst goes stale (misses the row), so upsertRefundPark tries to CREATE and
+  // hits the partial unique index (P2002) — it must recover by updating the existing park.
+  state.simulateParkRace()
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  // The fallback must SWALLOW the P2002 and let the normal amount-mismatch result surface. If it rethrew,
+  // syncWcRefund's outer catch would return the raw P2002 string instead.
+  assert.match(result.error ?? '', /amount mismatch/, 'upsertRefundPark recovered from the race, not propagated the P2002')
+  const parks = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7010')
+  assert.equal(parks.length, 1, 'the race did not create a duplicate park')
 })
 
 test('syncWcRefund treats external refund unique conflicts as idempotent races', async () => {
