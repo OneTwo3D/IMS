@@ -83,12 +83,15 @@ async function upsertRefundPark(
 
     // The order row lock SERIALIZES every park write for this refund's order, so the findFirst reliably
     // sees an already-committed park and no two deliveries can race the create. (The partial unique index
-    // shopping_sync_logs_active_refund_park_uq stays as a DB backstop.) We therefore do NOT catch a P2002
-    // here — a unique violation would abort THIS transaction, so an in-transaction findFirst/update
-    // fallback could not run; letting it propagate surfaces the anomaly (a cross-order externalId reuse)
-    // instead of failing silently.
-    const existing = await tx.shoppingSyncLog.findFirst({ where: parkWhere, orderBy: { createdAt: 'desc' }, select: { id: true } })
+    // shopping_sync_logs_active_refund_park_uq stays as a DB backstop.)
+    const existing = await tx.shoppingSyncLog.findFirst({ where: parkWhere, orderBy: { createdAt: 'desc' }, select: { id: true, entityId: true } })
     if (existing) {
+      if (existing.entityId !== input.soId) {
+        // The index is keyed by (connector, externalId), so an actionable park for this refund id on a
+        // DIFFERENT order is a genuine anomaly (a WC refund id maps to one order). Fail CLOSED — never
+        // move A's durable refund evidence onto B's row, which would let A be deleted and mis-block B.
+        throw new Error(`WooCommerce refund ${input.externalId} is already parked for a different order (${existing.entityId}); refusing to move it.`)
+      }
       await tx.shoppingSyncLog.update({ where: { id: existing.id }, data })
     } else {
       await tx.shoppingSyncLog.create({ data })
