@@ -157,7 +157,13 @@ export async function syncWcRefund(
     // closed rather than silently reporting "handled" and leaving THIS order without its refund.
     const existing = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
     if (existing) {
-      if (existing.orderId === so.id) return { success: true } // already synced
+      if (existing.orderId === so.id) {
+        // Already synced. A prior delivery may have committed the refund but then failed a post-commit step
+        // and written a FAILED park — every later delivery lands here, so resolve that lingering park now
+        // rather than leaving it actionable forever (inbox / deletion+rebind guard / retention exemption).
+        await resolveActionableParks(client, so.id, String(wcRefund.id))
+        return { success: true }
+      }
       return { success: false, error: `WooCommerce refund ${wcRefund.id} already exists on a different order (${existing.orderId}); refusing to apply it here.` }
     }
 

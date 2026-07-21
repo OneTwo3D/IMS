@@ -496,3 +496,23 @@ test('a successful retry RESOLVES this order\'s lingering actionable park (o3d-7
   const park = state.syncLogs.find((log) => (log as { id?: string }).id === 'log-f') as { data: { status: string } }
   assert.equal(park.data.status, 'SYNCED', 'the lingering FAILED park was resolved, not left actionable')
 })
+
+test('an already-synced same-order refund resolves its lingering park but leaves QUARANTINED + other orders alone (o3d-7yf)', async () => {
+  const state = makeDependencies() // createRefund succeeds by default, but we seed an existing refund directly
+  // Refund 7017 already exists on THIS order, with a leftover FAILED park (post-commit step had failed once).
+  state.refunds.push({ id: 'refund-e', externalRefundId: 7017, orderId: 'so-1' })
+  state.syncLogs.push({ id: 'p-mine', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-1', externalId: '7017', status: 'FAILED' } })
+  // Unrelated parks that MUST stay untouched: a QUARANTINED for the same refund on another order, and a
+  // different refund's FAILED park on another order.
+  state.syncLogs.push({ id: 'p-q-other', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7017', status: 'QUARANTINED' } })
+  state.syncLogs.push({ id: 'p-other', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '9999', status: 'FAILED' } })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7017 }), state.dependencies)
+
+  assert.equal(result.success, true, 'already-synced same-order refund reports success')
+  assert.equal(state.createRefundCalls, 0, 'no new refund created for the already-synced id')
+  const byId = (id: string) => (state.syncLogs.find((l) => (l as { id?: string }).id === id) as { data: { status: string } }).data.status
+  assert.equal(byId('p-mine'), 'SYNCED', 'this order\'s lingering FAILED park was resolved')
+  assert.equal(byId('p-q-other'), 'QUARANTINED', 'the other order\'s QUARANTINED park is untouched')
+  assert.equal(byId('p-other'), 'FAILED', 'an unrelated refund\'s park on another order is untouched')
+})
