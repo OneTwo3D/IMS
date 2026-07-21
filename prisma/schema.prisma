@@ -223,6 +223,11 @@ enum ShoppingSyncStatus {
   PENDING
   SYNCED
   FAILED
+  // o3d-iup: a connector refund the sync DELIBERATELY parked because it cannot be posted safely
+  // (a monetary-only refund on a non-uniformly-taxed order). Distinct from FAILED so the refund
+  // sweep's dedup skips it instead of re-importing and re-refusing it every run, and so FAILED-error
+  // dashboards don't treat it as a transient failure. An operator resolves it (o3d-w00 #2/#5).
+  QUARANTINED
 }
 
 enum StockSyncReason {

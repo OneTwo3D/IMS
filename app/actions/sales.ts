@@ -1829,7 +1829,7 @@ export async function createRefund(
   reason: string,
   returnWarehouseId?: string,
   options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
-): Promise<{ success: boolean; error?: string; warning?: string }> {
+): Promise<{ success: boolean; error?: string; warning?: string; quarantine?: true }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.refund')
