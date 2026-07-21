@@ -2,6 +2,7 @@
  * WooCommerce → IMS refund sync.
  */
 
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
@@ -49,16 +50,24 @@ async function upsertRefundPark(
   client: Pick<typeof db, 'shoppingSyncLog'>,
   input: { soId: string; externalId: string; status: 'PENDING' | 'FAILED' | 'QUARANTINED'; errorMessage: string; payload?: unknown },
 ): Promise<void> {
+  // Match the partial unique index shopping_sync_logs_active_refund_park_uq EXACTLY (connector, direction,
+  // entityType, actionable status, externalId, and entityId NOT NULL) so this can never pick up an
+  // order-import failure log (same connector/type but no entityId) that happens to share an externalId.
+  const parkWhere: Prisma.ShoppingSyncLogWhereInput = {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    entityType: 'SalesOrder',
+    externalId: input.externalId,
+    entityId: { not: null },
+    status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+  }
   const existing = await client.shoppingSyncLog.findFirst({
-    where: {
-      entityType: 'SalesOrder',
-      externalId: input.externalId,
-      status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
-    },
+    where: parkWhere,
     orderBy: { createdAt: 'desc' },
     select: { id: true },
   })
   const data = {
+    connector: 'woocommerce' as const,
     direction: 'FROM_CONNECTOR' as const,
     status: input.status,
     entityType: 'SalesOrder',
@@ -81,7 +90,7 @@ async function upsertRefundPark(
     // duplicate or an unhandled error.
     if (!isUniqueConstraintViolation(error)) throw error
     const winner = await client.shoppingSyncLog.findFirst({
-      where: { entityType: 'SalesOrder', externalId: input.externalId, status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] } },
+      where: parkWhere,
       orderBy: { createdAt: 'desc' },
       select: { id: true },
     })
