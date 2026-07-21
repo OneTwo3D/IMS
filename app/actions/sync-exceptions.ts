@@ -557,12 +557,17 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     }
 
     // o3d-w00 #2/#5 / o3d-iup: a QUARANTINED park makes the sweep dedup skip this refund. An explicit
-    // operator retry must clear the quarantine FIRST so the re-fetch actually re-attempts it — the refund
-    // then either lands (if the operator has since made the order's tax attribution resolvable) or re-parks
-    // as a fresh quarantine (visible again, never lost). Scoped to this refund's externalId.
+    // operator retry must let the re-fetch re-attempt it — but we must NOT delete the park before the
+    // fallible fetch, or a fetch error / a refund missing from the response would leave nothing behind and
+    // strand the refund. Instead TRANSITION the quarantine to PENDING atomically: the row stays durable
+    // and visible in the inbox, and PENDING is not skipped by the dedup, so the re-fetch re-attempts it.
+    // The refund then lands (post-processing marks it SYNCED), or re-parks as a fresh QUARANTINED (the
+    // duplicate-dedup below keeps exactly one), or — if the fetch fails — remains a visible PENDING park to
+    // retry again. Scoped to this refund's externalId.
     if (row.externalId) {
-      await db.shoppingSyncLog.deleteMany({
+      await db.shoppingSyncLog.updateMany({
         where: { ...REFUND_PARK_WHERE, externalId: row.externalId, status: 'QUARANTINED' },
+        data: { status: 'PENDING' },
       })
     }
 
