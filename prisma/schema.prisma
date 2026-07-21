@@ -1708,6 +1708,12 @@ model SalesOrderRefundLine {
   // refuses those rather than guessing). amounts on this model are NET (tax-exclusive) for every caller.
   accountingTaxType String?
   reverseCharge    Boolean?
+  // The posting kind resolved AT CREATION (o3d-w00 #4). Persisted so an accounting RETRY posts to the
+  // same account the initial run did, instead of re-inferring it from productId/amount sign — that
+  // inference reconstructs a monetary-only 'sale' line (null product, positive total) as 'shipping', so
+  // revenue lands in the shipping account on retry. NULL on legacy rows: the loader keeps its historical
+  // inference for those, so no backfill is required and existing behaviour is unchanged.
+  lineKind         String?
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)

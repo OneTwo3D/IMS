@@ -90,6 +90,7 @@ type RefundLine = {
   costLayerSnapshot?: unknown
   accountingTaxType?: string | null
   reverseCharge?: boolean | null
+  lineKind?: string | null
 }
 
 type State = {
@@ -569,6 +570,39 @@ test('a refund line SNAPSHOTS the resolved tax identity at creation (o3d-w00)', 
 
   assert.equal(state.refundLines[0].accountingTaxType, 'OUTPUT2', 'the resolved tax type is snapshotted')
   assert.equal(state.refundLines[0].reverseCharge, false)
+})
+
+test('a monetary-only refund PERSISTS lineKind=sale so a retry does not re-post it as shipping (o3d-w00 #4)', async () => {
+  // A WooCommerce monetary-only refund is a null-product 'sale' line with a POSITIVE total. The retry
+  // loader used to re-infer the kind from productId/sign (null product + positive total => 'shipping'),
+  // sending the credit-note revenue to the shipping account on a retry. Persisting the kind fixes that.
+  const state = baseState()
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Goodwill refund', qty: 0, totalBase: 30, lineKind: 'sale' }],
+    reason: 'Goodwill',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+  const persisted = state.refundLines.find((line) => line.description === 'Goodwill refund')
+  assert.ok(persisted, 'the monetary-only line was created')
+  assert.equal(persisted?.productId, null, 'it is a null-product line (would infer as shipping)')
+  assert.ok(persisted && persisted.totalBase > 0, 'with a positive total (would infer as shipping, not discount)')
+  assert.equal(persisted?.lineKind, 'sale', 'the resolved kind is persisted, not left to be re-inferred on retry')
+})
+
+test('a mirrored order-discount refund line persists lineKind=discount (o3d-w00 #4)', async () => {
+  const state = baseState()
+  await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Order discount', qty: 0, totalBase: 10, lineKind: 'discount' }],
+    reason: 'Discount reversal',
+    creditNotePrefix: 'CN-',
+  })
+
+  const persisted = state.refundLines.find((line) => line.description === 'Order discount')
+  assert.equal(persisted?.lineKind, 'discount', 'a discount line persists its kind')
 })
 
 test('a reverse-charge line snapshots the SWAPPED tax type (o3d-w00)', async () => {
