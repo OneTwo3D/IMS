@@ -349,8 +349,8 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
   const refunds = await db.salesOrderRefund.findMany({
     where: Object.keys(dateFilter).length ? { refundedAt: dateFilter } : undefined,
     select: {
-      id: true, creditNoteNumber: true, reason: true, totalBase: true, totalsBasis: true, refundedAt: true,
-      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, totalBase: true, taxBase: true } },
+      id: true, creditNoteNumber: true, reason: true, totalBase: true, refundedAt: true,
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, totalBase: true } },
       lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
     },
     orderBy: { refundedAt: 'desc' },
@@ -358,15 +358,7 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
 
   const rows: RefundRow[] = []
   for (const r of refunds) {
-    // Compare the refund line to the order total on the SAME basis as the line. A NET-contract refund's
-    // lines are NET, so measure against the order's NET total (totalBase - taxBase); a legacy refund's
-    // lines are GROSS, so measure against the gross order total. Either way a full refund reads 100% — a
-    // fixed net denominator would show a legacy gross line as >100%, a gross denominator a net line as
-    // ~83%. (o3d-w00 / o3d-n8p)
-    const grossOrderTotal = Number(r.order.totalBase)
-    const denomOrderTotal = r.totalsBasis === 'NET'
-      ? grossOrderTotal - Number(r.order.taxBase ?? 0)
-      : grossOrderTotal
+    const orderTotal = Number(r.order.totalBase)
     for (const l of r.lines) {
       const lineTotal = Number(l.totalBase)
       rows.push({
@@ -376,7 +368,7 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
         customerName: r.order.customerName ?? '—', salesRep: r.order.salesRep,
         reason: r.reason, refundedAt: r.refundedAt.toISOString(),
         qty: Number(l.qty), totalBase: lineTotal,
-        pctOfSale: denomOrderTotal > 0 ? Math.round((lineTotal / denomOrderTotal) * 1000) / 10 : 0,
+        pctOfSale: orderTotal > 0 ? Math.round((lineTotal / orderTotal) * 1000) / 10 : 0,
       })
     }
   }
@@ -415,8 +407,8 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
       currency: true, totalBase: true, invoicedAt: true, paidAt: true, createdAt: true,
       shipFromWarehouse: { select: { code: true } },
-      // Both non-refund payments (paid) and refund payments (money returned) — split in code.
-      payments: { select: { amount: true, refundId: true } },
+      payments: { where: { refundId: null }, select: { amount: true } },
+      refunds: { select: { totalBase: true } },
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -424,14 +416,8 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   const now = Date.now()
   return orders.map((o) => {
     const total = Number(o.totalBase)
-    const paid = o.payments.reduce((s, p) => s + (p.refundId == null ? Number(p.amount) : 0), 0)
-    // Use refund PAYMENTS (money actually returned, GROSS) for the refund column, NOT SalesOrderRefund
-    // .totalBase which is now stored NET (o3d-w00). Summing net refund records against the gross order
-    // total left the VAT as phantom revenue, and converting them (gross-up) is unreliable for mixed-rate /
-    // legacy rows. Refund payments are already on the same gross, tax-inclusive basis as salesTotal and the
-    // AR balance, so salesTotal / refundsTotal / netTotal are all consistent and exact. (Mirrors how
-    // finance-period-analytics computes outstanding.)
-    const refundsPaid = o.payments.reduce((s, p) => s + (p.refundId != null ? Number(p.amount) : 0), 0)
+    const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
+    const refundsTotal = o.refunds.reduce((s, r) => s + Number(r.totalBase), 0)
     const balance = Math.max(0, total - paid)
     const ageDays = o.invoicedAt ? Math.round((now - o.invoicedAt.getTime()) / 86400000) : 0
     let o0 = 0, o31 = 0, o61 = 0, o91 = 0
@@ -447,8 +433,8 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       salesRep: o.salesRep, warehouse: o.shipFromWarehouse?.code ?? null,
       createdAt: o.createdAt.toISOString(), currency: o.currency,
       salesTotal: Math.round(total * 100) / 100,
-      refundsTotal: Math.round(refundsPaid * 100) / 100,
-      netTotal: Math.round((total - refundsPaid) * 100) / 100,
+      refundsTotal: Math.round(refundsTotal * 100) / 100,
+      netTotal: Math.round((total - refundsTotal) * 100) / 100,
       dueAmount: Math.round(balance * 100) / 100, avgDso: ageDays,
       overdue0_30: Math.round(o0 * 100) / 100, overdue31_60: Math.round(o31 * 100) / 100,
       overdue61_90: Math.round(o61 * 100) / 100, overdue91plus: Math.round(o91 * 100) / 100,
