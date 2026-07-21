@@ -8,7 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { isExternalRefundIdUniqueConflict, isUniqueConstraintViolation } from '@/lib/domain/sales/refund-idempotency'
+import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import type { WcRefund, WcRefundLineItem } from './types'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
@@ -81,18 +81,17 @@ async function upsertRefundPark(
     const rows = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE id = ${input.soId} FOR UPDATE`
     if (rows.length === 0) return
 
+    // The order row lock SERIALIZES every park write for this refund's order, so the findFirst reliably
+    // sees an already-committed park and no two deliveries can race the create. (The partial unique index
+    // shopping_sync_logs_active_refund_park_uq stays as a DB backstop.) We therefore do NOT catch a P2002
+    // here — a unique violation would abort THIS transaction, so an in-transaction findFirst/update
+    // fallback could not run; letting it propagate surfaces the anomaly (a cross-order externalId reuse)
+    // instead of failing silently.
     const existing = await tx.shoppingSyncLog.findFirst({ where: parkWhere, orderBy: { createdAt: 'desc' }, select: { id: true } })
     if (existing) {
       await tx.shoppingSyncLog.update({ where: { id: existing.id }, data })
-      return
-    }
-    try {
+    } else {
       await tx.shoppingSyncLog.create({ data })
-    } catch (error) {
-      // finding 4: a concurrent delivery won the insert against the partial unique index — update its row.
-      if (!isUniqueConstraintViolation(error)) throw error
-      const winner = await tx.shoppingSyncLog.findFirst({ where: parkWhere, orderBy: { createdAt: 'desc' }, select: { id: true } })
-      if (winner) await tx.shoppingSyncLog.update({ where: { id: winner.id }, data })
     }
   })
 }
