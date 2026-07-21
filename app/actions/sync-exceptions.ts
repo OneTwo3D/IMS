@@ -143,7 +143,10 @@ const REFUND_PARK_WHERE = {
   connector: 'woocommerce',
   direction: 'FROM_CONNECTOR' as const,
   entityType: 'SalesOrder',
-  status: { in: ['PENDING' as const, 'FAILED' as const] },
+  // QUARANTINED (o3d-w00 #2/#5 / o3d-iup): a monetary-only refund deliberately parked because the order
+  // isn't uniformly taxed. It has no SalesOrderRefund and the sweep skips it, so the exception inbox is
+  // the ONLY way an operator sees and recovers it — it must appear here alongside PENDING/FAILED.
+  status: { in: ['PENDING' as const, 'FAILED' as const, 'QUARANTINED' as const] },
   entityId: { not: null },
   OR: [
     { payload: { equals: Prisma.DbNull } },
@@ -551,6 +554,16 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     })
     if (!orderLink) {
       return { success: false, error: 'The order has no WooCommerce link, so its refunds cannot be re-fetched.' }
+    }
+
+    // o3d-w00 #2/#5 / o3d-iup: a QUARANTINED park makes the sweep dedup skip this refund. An explicit
+    // operator retry must clear the quarantine FIRST so the re-fetch actually re-attempts it — the refund
+    // then either lands (if the operator has since made the order's tax attribution resolvable) or re-parks
+    // as a fresh quarantine (visible again, never lost). Scoped to this refund's externalId.
+    if (row.externalId) {
+      await db.shoppingSyncLog.deleteMany({
+        where: { ...REFUND_PARK_WHERE, externalId: row.externalId, status: 'QUARANTINED' },
+      })
     }
 
     await syncRefundsForOrder(Number(orderLink.externalOrderId))
