@@ -1686,6 +1686,15 @@ export async function createSalesOrderRefund(
   const totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
   const txResult = await runInTransaction(client, async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REFUND_ACCOUNTING_LOCK_KEY})`
+    // o3d-ee9: serialize this refund CREATE against the park CREATE for the SAME external refund id
+    // (upsertRefundPark takes the same per-refund advisory lock). The global lock above + the order row lock
+    // below do NOT cover the cross-order case — a refund committing on order A while a park commits on order B
+    // take different order locks and would not conflict, leaving a refund on A and a stale actionable park on
+    // B. This per-refund key closes that window; held until commit, so the park path re-reads the committed
+    // refund. Taken BEFORE the order row lock, matching upsertRefundPark's order, so the two cannot deadlock.
+    if (input.externalRefundId != null) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${input.externalRefundId}`}))`
+    }
     await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
 
     const so = await tx.salesOrder.findUnique({

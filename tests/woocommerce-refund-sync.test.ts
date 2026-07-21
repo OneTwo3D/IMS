@@ -115,7 +115,15 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
       // order. The order row lock returns [] once the order is "deleted", so the park write is skipped.
       async $transaction(cb: (tx: unknown) => unknown) {
         const tx = {
+          // o3d-ee9: the per-refund advisory lock (pg_advisory_xact_lock) is a no-op in the mock.
+          async $executeRaw() { return 0 },
           async $queryRaw() { return orderDeleted ? [] : [{ id: 'so-1' }] },
+          // o3d-ee9: the landed-refund re-read under the lock. Returns a row only when the test seeds one.
+          salesOrderRefund: {
+            async findFirst(args: { where?: { externalRefundId?: number } }) {
+              return refunds.find((r) => r.externalRefundId === args.where?.externalRefundId) ?? null
+            },
+          },
           shoppingSyncLog: shoppingSyncLogMock,
         }
         return cb(tx)
@@ -515,4 +523,18 @@ test('an already-synced same-order refund resolves its lingering park but leaves
   assert.equal(byId('p-mine'), 'SYNCED', 'this order\'s lingering FAILED park was resolved')
   assert.equal(byId('p-q-other'), 'QUARANTINED', 'the other order\'s QUARANTINED park is untouched')
   assert.equal(byId('p-other'), 'FAILED', 'an unrelated refund\'s park on another order is untouched')
+})
+
+test('a refund that LANDS concurrently (seen under the per-refund lock) is not also parked (o3d-ee9)', async () => {
+  // alwaysMissExistingRefund makes the PREFLIGHT existing-refund check miss (as if the refund had not yet
+  // committed when we read it), while the in-transaction re-read under the per-refund advisory lock DOES see
+  // it — simulating a refund CREATE committing on the order between preflight and the park write.
+  const state = makeDependencies({ alwaysMissExistingRefund: true, refuseWithQuarantine: true })
+  state.refunds.push({ id: 'refund-c', externalRefundId: 7018, orderId: 'so-1' })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7018 }), state.dependencies)
+
+  assert.equal(result.success, false, 'the refusal still surfaces')
+  const parks = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7018')
+  assert.equal(parks.length, 0, 'no park was written because the refund had already landed under the lock')
 })

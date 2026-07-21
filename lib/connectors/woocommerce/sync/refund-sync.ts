@@ -102,6 +102,16 @@ async function upsertRefundPark(
   // Under the lock we re-verify the order still exists; if it was deleted, we do NOT write an orphaned
   // park (the refund is for a gone order — surfaced by the caller's earlier resolve failing next time).
   await client.$transaction(async (tx) => {
+    // o3d-ee9: take the per-refund advisory lock FIRST (before the order row lock — matching
+    // createSalesOrderRefund's order so the two can't deadlock). This serializes the park write against a
+    // concurrent refund CREATE for the same refund id on ANY order, closing the window where a refund could
+    // commit on order A while a stale actionable park is written for order B.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${input.externalId}`}))`
+    // Under that lock, re-read whether the refund has now LANDED (on any order). If a SalesOrderRefund exists
+    // for this external id, a park (which asserts the refund is unresolved) would be contradictory — skip it.
+    const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: Number(input.externalId) }, select: { id: true } })
+    if (landed) return
+
     const rows = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE id = ${input.soId} FOR UPDATE`
     if (rows.length === 0) return
 
