@@ -15,7 +15,7 @@ import type { createRefund as createRefundAction } from '@/app/actions/sales'
 type CreateRefundAction = typeof createRefundAction
 
 export type WcRefundSyncDependencies = {
-  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog'>
+  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | '$transaction'>
   createRefund?: CreateRefundAction
   logActivity?: typeof logActivity
 }
@@ -47,7 +47,7 @@ function parseDecimalAbs(value: string | number | null | undefined) {
 // current row, not append a fresh one each time — unbounded copies would grow the table and crowd real
 // QUARANTINED refunds out of the 50-row exception inbox. Updates the existing actionable park in place.
 async function upsertRefundPark(
-  client: Pick<typeof db, 'shoppingSyncLog'>,
+  client: Pick<typeof db, '$transaction'>,
   input: { soId: string; externalId: string; status: 'PENDING' | 'FAILED' | 'QUARANTINED'; errorMessage: string; payload?: unknown },
 ): Promise<void> {
   // Match the partial unique index shopping_sync_logs_active_refund_park_uq EXACTLY (connector, direction,
@@ -61,11 +61,6 @@ async function upsertRefundPark(
     entityId: { not: null },
     status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
   }
-  const existing = await client.shoppingSyncLog.findFirst({
-    where: parkWhere,
-    orderBy: { createdAt: 'desc' },
-    select: { id: true },
-  })
   const data = {
     connector: 'woocommerce' as const,
     direction: 'FROM_CONNECTOR' as const,
@@ -77,25 +72,29 @@ async function upsertRefundPark(
     syncedAt: new Date(),
     ...(input.payload !== undefined ? { payload: input.payload as never } : {}),
   }
-  if (existing) {
-    await client.shoppingSyncLog.update({ where: { id: existing.id }, data })
-    return
-  }
-  try {
-    await client.shoppingSyncLog.create({ data })
-  } catch (error) {
-    // o3d-7yf finding 4: a concurrent delivery inserted the actionable park between our findFirst and this
-    // create. The partial unique index (shopping_sync_logs_active_refund_park_uq) rejects the second
-    // insert; fall back to updating the winner's row so we still end with ONE current park, never a
-    // duplicate or an unhandled error.
-    if (!isUniqueConstraintViolation(error)) throw error
-    const winner = await client.shoppingSyncLog.findFirst({
-      where: parkWhere,
-      orderBy: { createdAt: 'desc' },
-      select: { id: true },
-    })
-    if (winner) await client.shoppingSyncLog.update({ where: { id: winner.id }, data })
-  }
+  // o3d-7yf finding 2: create/update the park under the SAME order row lock deleteSalesOrder takes
+  // (lockSalesOrder = SELECT ... FOR UPDATE). A refund sweep could otherwise read the order, deletion
+  // observe no park, and the sweep then insert an actionable park after the check/delete — orphaning it.
+  // Under the lock we re-verify the order still exists; if it was deleted, we do NOT write an orphaned
+  // park (the refund is for a gone order — surfaced by the caller's earlier resolve failing next time).
+  await client.$transaction(async (tx) => {
+    const rows = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE id = ${input.soId} FOR UPDATE`
+    if (rows.length === 0) return
+
+    const existing = await tx.shoppingSyncLog.findFirst({ where: parkWhere, orderBy: { createdAt: 'desc' }, select: { id: true } })
+    if (existing) {
+      await tx.shoppingSyncLog.update({ where: { id: existing.id }, data })
+      return
+    }
+    try {
+      await tx.shoppingSyncLog.create({ data })
+    } catch (error) {
+      // finding 4: a concurrent delivery won the insert against the partial unique index — update its row.
+      if (!isUniqueConstraintViolation(error)) throw error
+      const winner = await tx.shoppingSyncLog.findFirst({ where: parkWhere, orderBy: { createdAt: 'desc' }, select: { id: true } })
+      if (winner) await tx.shoppingSyncLog.update({ where: { id: winner.id }, data })
+    }
+  })
 }
 
 export async function syncWcRefund(
