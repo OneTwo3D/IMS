@@ -8,7 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
-import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
+import { DEFAULT_COUNTRY_OF_ORIGIN, toIsoCountryCode } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import { scheduleWmsProductSync, isAnyWmsConnectorEnabled } from '@/lib/domain/wms/product-sync-dispatch'
@@ -620,7 +620,7 @@ export async function listProductSupplierOptions(): Promise<ProductSupplierOptio
 // Mutations
 // ---------------------------------------------------------------------------
 
-const productSchema = z.object({
+export const productSchema = z.object({
   sku: z.string().min(1).max(100),
   name: z.string().min(1).max(255),
   categoryName: z.string().max(PRODUCT_CATEGORY_NAME_MAX_LENGTH).optional().nullable(),
@@ -632,7 +632,20 @@ const productSchema = z.object({
   barcode: z.string().optional().nullable(),
   mpn: z.string().max(100).optional().nullable(),
   hsCode: z.string().optional().nullable(),
-  countryOfOrigin: z.string().max(2).optional().nullable(),
+  // bhdm.7: the dropdown is not a trust boundary (FormData is client-controlled). Normalise + validate here:
+  // blank -> null, a recognised country (name/alias/code) -> canonical uppercase ISO-2, and a nonblank
+  // unrecognised or reserved value (EU/ZZ/!!) is rejected rather than stored verbatim and forwarded to the WMS.
+  countryOfOrigin: z.string().max(64).optional().nullable().transform((value, ctx) => {
+    if (value == null) return null
+    const trimmed = value.trim()
+    if (trimmed === '') return null
+    const iso = toIsoCountryCode(trimmed)
+    if (!iso) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Unrecognised country of origin "${trimmed}"` })
+      return z.NEVER
+    }
+    return iso
+  }),
   customsDescription: z.string().optional().nullable(),
   weight: z.string().optional().nullable(),
   salesPriceBase: z.string().optional().nullable(),

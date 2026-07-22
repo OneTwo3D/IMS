@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
-import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
+import { DEFAULT_COUNTRY_OF_ORIGIN, toIsoCountryCode } from '@/lib/countries'
 import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 
@@ -172,7 +172,9 @@ export function buildMintsoftProductDto(product: ProductSyncCandidate): WmsProdu
     customsDescription: trimToNull(product.customsDescription),
     barcode: trimToNull(product.barcode),
     commodityCode: trimToNull(product.hsCode),
-    countryOfManufacture: trimToNull(product.countryOfOrigin) ?? DEFAULT_COUNTRY_OF_ORIGIN,
+    // bhdm.7: normalise at the WMS boundary so a legacy/invalid stored origin (e.g. a reserved code or wrong
+    // case) is canonicalised, or falls back to CN, rather than declaring a bogus country to customs.
+    countryOfManufacture: toIsoCountryCode(product.countryOfOrigin) ?? DEFAULT_COUNTRY_OF_ORIGIN,
     weightKg: toNullableNumber(product.weight),
     heightCm: toNullableNumber(product.heightCm),
     widthCm: toNullableNumber(product.widthCm),

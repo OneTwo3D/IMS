@@ -253,6 +253,20 @@ test('buildMintsoftProductDto defaults country of manufacture to CN when origin 
     productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: 'GB' }).countryOfManufacture,
     'GB',
   )
+  // bhdm.7: the WMS boundary normalises a legacy stored value — lowercase canonicalises, and a reserved/invalid
+  // stored code falls back to CN rather than declaring a bogus country to customs.
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: 'ad' }).countryOfManufacture,
+    'AD',
+  )
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: 'EU' }).countryOfManufacture,
+    'CN',
+  )
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: 'ZZ' }).countryOfManufacture,
+    'CN',
+  )
 })
 
 test('resolveMintsoftCommodityCode omits a non-declarable CN code and reports it', () => {
