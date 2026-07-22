@@ -27,3 +27,12 @@ test('an absent, blank, or genuinely unrecognised origin yields null — never a
   assert.equal(normalizeCsvCountryOfOrigin('X'), null, 'a single letter is not a valid code')
   assert.equal(normalizeCsvCountryOfOrigin('!!'), null, 'non-letters are not a valid code')
 })
+
+test('reserved / pseudo / retired region codes are rejected — not assigned ISO 3166-1 countries (bhdm.7 r3)', () => {
+  // Intl.DisplayNames resolves these, but they are not assigned country codes and must not reach WMS/customs.
+  for (const code of ['EU', 'UN', 'ZZ', 'XA', 'XB', 'BU', 'SU', 'YU', 'QO']) {
+    assert.equal(normalizeCsvCountryOfOrigin(code), null, `${code} is not an assigned ISO 3166-1 alpha-2 country`)
+  }
+  // XK (Kosovo) is the one intentional user-assigned exception we DO accept.
+  assert.equal(normalizeCsvCountryOfOrigin('XK'), 'XK')
+})
