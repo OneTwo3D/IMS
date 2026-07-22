@@ -129,8 +129,8 @@ Expected result:
    - The order is recorded in `wc_pending_fx_orders` with the missing rate's date and currency.
    - Sync is deferred (no half-finished journal posting).
    - An activity-log entry `wc_order_pending_fx` is written.
-3. Populate the missing FX rate (manually upsert, or run `GET /api/cron/fx-rates`).
-4. Trigger `GET /api/cron/wc-fx-retry` (or wait for the hourly cron).
+3. Populate the missing FX rate and drain the queue by running `GET /api/cron/fx-rates`: it fetches the rates, upserts them, and then automatically re-attempts any orders queued for a previously-missing rate (`retryPendingWcOrdersWaitingForFx`).
+4. If you instead upserted the rate by hand, run `GET /api/cron/fx-rates` (or wait for the scheduled fx-rates cron) to re-attempt the queued orders — there is no separate retry route.
 5. Confirm:
    - The pending row is drained and the order syncs to Xero with the now-available rate.
    - The activity log records `wc_order_fx_retry_succeeded`.

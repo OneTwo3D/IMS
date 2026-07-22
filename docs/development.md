@@ -56,6 +56,28 @@ Focused tests can also be run directly:
 npx tsx --test tests/<relevant-file>.test.ts
 ```
 
+### Full-chain E2E tier
+
+`e2e/full-chain/` is a separate, opt-in tier that originates a real order in the stage
+WooCommerce store, lets Woo's own webhook deliver it to a **dedicated** IMS instance
+(`ims-e2e-dev.service`, port 3002, its own `onetwo3d_ims_e2e` database), drives the real UI,
+lets the real sync post to the **Xero Demo company**, and asserts against documents **read
+back from the Xero API** — then voids them. It is the only tier that proves the whole chain;
+the other Xero tests stop at IMS's own sync-log/UI rows and cannot see a wrong account code,
+tax type, or amount.
+
+It is excluded from CI (it crosses two external systems and takes a quiesce lock on the shared
+stage store) and runs against the always-up rig, not a webServer started by Playwright:
+
+```bash
+npm run e2e:full-chain -- --grep "OC-01"   # from the rig worktree, HOME=the worktree
+```
+
+**Do not** add it to `npm run e2e:select` — that selector drives the local chromium suites,
+whereas this tier runs against the dedicated instance under a quiesce lock with its own
+config. See [`docs/ops/full-chain-e2e-runbook.md`](ops/full-chain-e2e-runbook.md) for rig
+setup, the quiesce lock and its manual recovery, Demo reset/OAuth re-consent, and teardown.
+
 ## Invariant Preflight
 
 Production-readiness CI runs the invariant reporters against a freshly migrated database as a code-correctness gate, not as tenant-data validation. The workflow first runs `npm run invariant-check:preflight:fixture`, which seeds a known reserved-source mismatch, asserts the preflight fails, removes the fixture rows, and asserts the clean database passes. It then runs `npm run invariant-check:preflight` against the clean migrated database.
