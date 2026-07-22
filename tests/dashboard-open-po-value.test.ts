@@ -49,6 +49,46 @@ test('empty input is zero', () => {
   assert.equal(outstandingPoValueBase([]), 0)
 })
 
+test('an order-level header discount is netted pro-rata to the outstanding portion (o3d-1di)', () => {
+  // qty 10 received 0 @ £10 => £100 outstanding goods; £50 header discount (fx 1) fully outstanding
+  // => 100 - 50*(100/100) = £50
+  assert.equal(
+    outstandingPoValueBase([
+      { discountAmount: 50, fxRateToBase: 1, lines: [{ qty: 10, qtyReceived: 0, unitCostBase: 10 }] },
+    ]),
+    50,
+  )
+})
+
+test('header discount allocates only the outstanding fraction on a partially-received PO', () => {
+  // qty 10 received 5 @ £10 => gross 100, outstanding 50; £50 discount => 50 - 50*(50/100) = £25
+  assert.equal(
+    outstandingPoValueBase([
+      { discountAmount: 50, fxRateToBase: 1, lines: [{ qty: 10, qtyReceived: 5, unitCostBase: 10 }] },
+    ]),
+    25,
+  )
+})
+
+test('header discount is converted from foreign to base via fxRateToBase', () => {
+  // discount 10 foreign * fx 2 = £20 base; qty 10 @ £5 gross 50 all outstanding => 50 - 20 = £30
+  assert.equal(
+    outstandingPoValueBase([
+      { discountAmount: 10, fxRateToBase: 2, lines: [{ qty: 10, qtyReceived: 0, unitCostBase: 5 }] },
+    ]),
+    30,
+  )
+})
+
+test('an oversized header discount never drives a PO negative (floored at 0)', () => {
+  assert.equal(
+    outstandingPoValueBase([
+      { discountAmount: 999, fxRateToBase: 1, lines: [{ qty: 10, qtyReceived: 0, unitCostBase: 10 }] },
+    ]),
+    0,
+  )
+})
+
 test('committed-incoming population includes SHIPPED and excludes the quote pipeline (o3d-1di)', () => {
   // Regression for the reported contradiction: a SHIPPED PO must count as Open;
   // an RFQ_SENT / QUOTE_RECEIVED PO must not.

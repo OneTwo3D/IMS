@@ -147,20 +147,39 @@ const COMPLETED_LIFECYCLE_STATUSES: ('SHIPPED' | 'COMPLETED')[] = ['SHIPPED', 'C
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 /**
- * Outstanding (not-yet-received) value of open purchase orders, in base currency (o3d-1di).
- * Values only the remaining line qty — max(0, qty − qtyReceived) — at the line's effective net
- * unit cost, so a mostly-received PO contributes only what is still on the way, not its whole
- * original total. Exported for unit testing; the caller passes the INCOMING_PO_STATUSES POs.
+ * Outstanding (not-yet-received) NET GOODS value of open purchase orders, in base currency (o3d-1di).
+ *
+ * Basis: remaining line qty — max(0, qty − qtyReceived) — at the line's effective net unit cost
+ * (unitCostBase: post line-discount, post-VAT), with the ORDER-LEVEL (header) discount netted off
+ * pro-rata to the still-outstanding fraction. unitCostBase does NOT reflect the header discount, so a
+ * PO with a header discount would otherwise be overstated. Goods only: VAT (recoverable) and freight
+ * (tracked separately as landed cost) are intentionally excluded — this is the committed goods spend
+ * still to arrive, so a mostly-received PO contributes only what is still on the way, not its whole
+ * total. Exported for unit testing; the caller passes the INCOMING_PO_STATUSES POs.
  */
 export function outstandingPoValueBase(
-  pos: { lines: { qty: unknown; qtyReceived: unknown; unitCostBase: unknown }[] }[],
+  pos: {
+    discountAmount?: unknown
+    fxRateToBase?: unknown
+    lines: { qty: unknown; qtyReceived: unknown; unitCostBase: unknown }[]
+  }[],
 ): number {
   let total = 0
   for (const po of pos) {
+    let grossGoods = 0
+    let outstandingGoods = 0
     for (const l of po.lines) {
-      const remaining = Math.max(0, Number(l.qty) - Number(l.qtyReceived))
-      total += remaining * Number(l.unitCostBase)
+      const qty = Number(l.qty)
+      const lineCost = Number(l.unitCostBase)
+      grossGoods += qty * lineCost
+      outstandingGoods += Math.max(0, qty - Number(l.qtyReceived)) * lineCost
     }
+    if (grossGoods <= 0 || outstandingGoods <= 0) continue
+    // Header discount is stored in foreign currency (same VAT convention as line net costs);
+    // convert to base and allocate the outstanding fraction of it against the remaining goods.
+    const headerDiscountBase = Number(po.discountAmount ?? 0) * Number(po.fxRateToBase ?? 1)
+    const outstandingNet = outstandingGoods - headerDiscountBase * (outstandingGoods / grossGoods)
+    total += Math.max(0, outstandingNet)
   }
   return total
 }
@@ -221,7 +240,10 @@ export async function getDashboardData(
     // product/replenishment views. Line qty/received drive the outstanding (not whole) value below.
     db.purchaseOrder.findMany({
       where: { type: 'GOODS', status: { in: INCOMING_PO_STATUSES } },
-      select: { lines: { select: { qty: true, qtyReceived: true, unitCostBase: true } } },
+      select: {
+        discountAmount: true, fxRateToBase: true,
+        lines: { select: { qty: true, qtyReceived: true, unitCostBase: true } },
+      },
     }),
     db.salesOrder.findMany({
       where: { status: { in: ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] } },
