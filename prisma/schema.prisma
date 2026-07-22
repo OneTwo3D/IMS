@@ -2461,6 +2461,7 @@ enum WmsDiscrepancyCategory {
   BARCODE_CONFLICT
   BARCODE_BACKFILLED_FROM_WMS
   INVALID_HS_CODE
+  INVALID_COUNTRY_OF_ORIGIN
 }
 
 enum WmsDiscrepancyStatus {

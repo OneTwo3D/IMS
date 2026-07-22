@@ -253,6 +253,30 @@ test('buildMintsoftProductDto defaults country of manufacture to CN when origin 
     productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: 'GB' }).countryOfManufacture,
     'GB',
   )
+  // bhdm.7: the WMS boundary canonicalises a legacy lowercase value.
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: 'ad' }).countryOfManufacture,
+    'AD',
+  )
+  // A reserved/invalid stored code declares CN (so customs still gets a country) — but is NOT silent.
+  assert.equal(
+    productSync.buildMintsoftProductDto({ ...base, countryOfOrigin: 'EU' }).countryOfManufacture,
+    'CN',
+  )
+})
+
+test('resolveMintsoftCountryOfManufacture distinguishes blank, valid, and invalid origins for discrepancy reporting (bhdm.7)', () => {
+  // Blank -> CN default, no discrepancy (legitimate customs parity).
+  assert.deepEqual(productSync.resolveMintsoftCountryOfManufacture(null), { countryOfManufacture: 'CN', invalidCountryOfOrigin: null })
+  assert.deepEqual(productSync.resolveMintsoftCountryOfManufacture('  '), { countryOfManufacture: 'CN', invalidCountryOfOrigin: null })
+  // Recognised -> canonical uppercase ISO-2, no discrepancy.
+  assert.deepEqual(productSync.resolveMintsoftCountryOfManufacture('gb'), { countryOfManufacture: 'GB', invalidCountryOfOrigin: null })
+  assert.deepEqual(productSync.resolveMintsoftCountryOfManufacture('ad'), { countryOfManufacture: 'AD', invalidCountryOfOrigin: null })
+  assert.deepEqual(productSync.resolveMintsoftCountryOfManufacture('CN'), { countryOfManufacture: 'CN', invalidCountryOfOrigin: null })
+  // Nonblank invalid/reserved -> CN declared, but the offending value is surfaced for an INVALID_COUNTRY_OF_ORIGIN discrepancy.
+  assert.deepEqual(productSync.resolveMintsoftCountryOfManufacture('EU'), { countryOfManufacture: 'CN', invalidCountryOfOrigin: 'EU' })
+  assert.deepEqual(productSync.resolveMintsoftCountryOfManufacture('ZZ'), { countryOfManufacture: 'CN', invalidCountryOfOrigin: 'ZZ' })
+  assert.deepEqual(productSync.resolveMintsoftCountryOfManufacture('Narnia'), { countryOfManufacture: 'CN', invalidCountryOfOrigin: 'Narnia' })
 })
 
 test('resolveMintsoftCommodityCode omits a non-declarable CN code and reports it', () => {

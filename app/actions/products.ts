@@ -9,7 +9,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
-import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
+import { DEFAULT_COUNTRY_OF_ORIGIN, toIsoCountryCode } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import { scheduleWmsProductSync, isAnyWmsConnectorEnabled } from '@/lib/domain/wms/product-sync-dispatch'
@@ -22,6 +22,8 @@ import {
   validateProductStructureChange,
 } from '@/lib/products/type-transforms'
 import { detectComponentCycle } from '@/lib/products/component-cycle'
+import { blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
+import { productSchema } from '@/lib/products/product-schema'
 import {
   cleanProductCategoryName,
   listProductCategoryNodes,
@@ -621,36 +623,6 @@ export async function listProductSupplierOptions(): Promise<ProductSupplierOptio
 // Mutations
 // ---------------------------------------------------------------------------
 
-const productSchema = z.object({
-  sku: z.string().min(1).max(100),
-  name: z.string().min(1).max(255),
-  categoryName: z.string().max(PRODUCT_CATEGORY_NAME_MAX_LENGTH).optional().nullable(),
-  description: z.string().optional(),
-  type: z.nativeEnum(ProductType),
-  parentId: z.string().optional().nullable(),
-  preferredSupplierId: z.string().optional().nullable(),
-  preferredSupplierLocked: z.boolean().default(false),
-  barcode: z.string().optional().nullable(),
-  mpn: z.string().max(100).optional().nullable(),
-  hsCode: z.string().optional().nullable(),
-  countryOfOrigin: z.string().max(2).optional().nullable(),
-  customsDescription: z.string().optional().nullable(),
-  weight: z.string().optional().nullable(),
-  salesPriceBase: z.string().optional().nullable(),
-  salePriceBase: z.string().optional().nullable(),
-  salesPriceTaxInclusive: z.boolean().default(false),
-  taxCategory: z.enum(['STANDARD', 'REDUCED', 'SECOND_REDUCED', 'ZERO', 'EXEMPT']).default('STANDARD'),
-  stockUnit: z.string().default('pcs'),
-  oversellAllowed: z.boolean().default(true),
-  imageUrl: z.string().optional().nullable(),
-  widthCm: z.string().optional().nullable(),
-  heightCm: z.string().optional().nullable(),
-  depthCm: z.string().optional().nullable(),
-  active: z.boolean().default(true),
-  lifecycleStatus: z.enum(['DRAFT', 'ACTIVE', 'EOL', 'ARCHIVED']).default('ACTIVE'),
-  leadTimeDays: z.string().optional().nullable(),
-})
-
 // Manual lead-time override: blank / non-numeric / <= 0 → null (use observed/default).
 function parseLeadTimeOverride(value: string | null | undefined): number | null {
   if (value == null) return null
@@ -865,6 +837,18 @@ export async function updateProduct(
   })
   if (!structureValidation.ok) {
     return { errors: structureValidation.fieldErrors, message: structureValidation.message }
+  }
+
+  // bhdm.7: if the persisted origin is a nonblank value that is not a valid country (a legacy bad row), a blank
+  // submission must NOT clear it — that would erase the evidence and let the WMS declare CN with the
+  // INVALID_COUNTRY_OF_ORIGIN discrepancy resolved, without anyone choosing a real country. Require a valid
+  // replacement. (A valid current origin, or a blank current origin, may still be cleared as before.)
+  const current = await db.product.findUnique({ where: { id }, select: { countryOfOrigin: true } })
+  if (blocksClearingInvalidOrigin(current?.countryOfOrigin, data.countryOfOrigin)) {
+    return {
+      errors: { countryOfOrigin: ['This product has an invalid stored country of origin — select a valid country to save.'] },
+      message: 'Select a valid country of origin',
+    }
   }
 
   const updatedCategoryChange = await db.$transaction(async (tx) => {
@@ -1500,7 +1484,9 @@ export async function generateVariantsFromOptions(
         depthCm:  product.depthCm  ?? undefined,
         // Variants inherit the parent's customs data; can be overridden per variant afterwards.
         hsCode:             product.hsCode             ?? undefined,
-        countryOfOrigin:    product.countryOfOrigin    ?? undefined,
+        // bhdm.7: normalise the inherited origin so a legacy reserved/noncanonical parent value (EU/ZZ/'ad') is
+        // never multiplied verbatim into new variant rows, bypassing productSchema.
+        countryOfOrigin:    toIsoCountryCode(product.countryOfOrigin) ?? undefined,
         customsDescription: product.customsDescription ?? undefined,
       },
     })
