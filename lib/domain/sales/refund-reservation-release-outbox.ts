@@ -26,17 +26,23 @@
 // ---------------------------------------------------------------------------
 
 import type { Prisma } from '@/app/generated/prisma/client'
+import { db } from '@/lib/db'
 import {
   enqueueIntegrationOutbox,
   claimIntegrationOutboxWork,
   markIntegrationOutboxSuccess,
   markIntegrationOutboxRetryableFailure,
   buildOutboxIdempotencyKey,
+  INTEGRATION_OUTBOX_STATUS,
   DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
   type IntegrationOutboxClient,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
 import { SalesRefundReservationReleaseOutboxPayloadSchema } from '@/lib/domain/integrations/outbox-registry'
+
+type OutboxUpdateClient = {
+  integrationOutbox: { updateMany(args: unknown): Promise<{ count: number }> }
+}
 
 export const REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR = 'sales'
 export const REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION = 'refund.reservation-release'
@@ -48,10 +54,11 @@ const REFUND_RESERVATION_RELEASE_OUTBOX_WORKER = 'refund-reservation-release-dra
 // bypass that lost the immediate call is still recovered on a following tick.
 const DEFAULT_DRAIN_GRACE_MS = 120_000
 
-// Only an already-allocated, not-yet-shipped order holds reservations a refund
-// should release. Matches RELEASE_ELIGIBLE_STATUSES in post-refund-release.ts — a
-// DRAFT / PENDING_PAYMENT order must never be promoted to ALLOCATED by a refund.
-const RELEASE_ELIGIBLE_STATUSES = new Set(['PROCESSING', 'ALLOCATED'])
+// Any allocated, not-yet-shipped order holds reservations a refund should release.
+// Matches RELEASE_ELIGIBLE_STATUSES in post-refund-release.ts — PICKING/PACKING keep
+// their allocations until dispatch (o3d-67y, Codex review r2); DRAFT / PENDING_PAYMENT
+// (and terminal/shipped states) must never be promoted/reallocated by a refund.
+const RELEASE_ELIGIBLE_STATUSES = new Set(['PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'])
 
 /** True when an order in this lifecycle status can hold reservations a refund should release. */
 export function refundReleaseEligible(status: string): boolean {
@@ -93,6 +100,38 @@ export async function scheduleRefundReservationReleaseOutbox(
     },
     { client: tx as unknown as IntegrationOutboxClient },
   )
+}
+
+/**
+ * Mark the backstop row for this refund SUCCEEDED after the IMMEDIATE post-refund
+ * release reconciled the reservation, so the cron drain does NOT re-run allocation.
+ * Re-running allocation is not side-effect-idempotent (it deletes/recreates
+ * OrderAllocation rows and resets staged allocation accounting), so once the
+ * immediate attempt has released, the durable backstop's work is done (Codex review
+ * r2). Only resolves a still-open (PENDING / RETRYABLE_FAILED) row — a row the drain
+ * has already claimed (PROCESSING) or finished is left untouched. Best-effort: if this
+ * fails, the drain re-runs the (numerically idempotent) release on the next tick.
+ */
+export async function resolveRefundReservationReleaseOutbox(
+  refundId: string,
+  options: { client?: OutboxUpdateClient } = {},
+): Promise<number> {
+  const client = options.client ?? (db as unknown as OutboxUpdateClient)
+  const idempotencyKey = buildOutboxIdempotencyKey(
+    REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+    REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
+    refundId,
+  )
+  const { count } = await client.integrationOutbox.updateMany({
+    where: {
+      connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+      operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
+      idempotencyKey,
+      status: { in: [INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED] },
+    },
+    data: { status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED, lockedAt: null, lockedBy: null },
+  })
+  return count
 }
 
 /** The subset of autoAllocateOrder's result the drain classifies on. */

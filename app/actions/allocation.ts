@@ -261,6 +261,9 @@ export async function autoAllocateOrder(
   // mutated. A plain success:false (a refuseIfShipmentsExist no-op, or a committed backorder/shortage) leaves
   // reservations consistent and must NOT be treated as a stranded-reservation failure by callers.
   failed?: boolean
+  // o3d-67y: true when refuseIfShipmentsExist declined because a shipment exists. The reservation was left
+  // untouched by design; the shipment-vs-refund reservation reconciliation is tracked separately (o3d-339).
+  refused?: boolean
 }> {
   // o3d-67y: distinguish a rolled-back allocation transaction (reservations stale) from a POST-commit throw
   // (revalidate / stock-sync enqueue) that leaves reservations already correct. Only the former is a
@@ -285,6 +288,7 @@ export async function autoAllocateOrder(
         unallocatedLines: allocationResult.unallocatedLines,
         unallocatedQty: allocationResult.unallocatedQty,
         backorderLineCount: allocationResult.backorderLineCount,
+        refused: allocationResult.refused,
       }
     }
 

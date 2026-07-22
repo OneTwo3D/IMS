@@ -979,6 +979,7 @@ CRON_JOBS=(
   "0 2 * * *|backup|Database Backup"
   "0 4 * * *|wc-reconcile|WooCommerce Reconciliation"
   "*/15 * * * *|delivery-status|Delivery Status Check"
+  "*/15 * * * *|refund-reservation-release|Refund Reservation Release"
 )
 
 # Build the fresh managed block into a temp file (cleaned up on ANY exit —

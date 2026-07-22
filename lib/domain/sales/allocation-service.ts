@@ -45,6 +45,9 @@ export type AllocateSalesOrderResult = {
   isShoppingOrder?: boolean
   shipFromWarehouseId?: string | null
   logAttempt?: boolean
+  // o3d-67y: true when refuseIfShipmentsExist declined because a shipment exists — the
+  // reservation was deliberately left untouched (not a failure, not a reconciliation).
+  refused?: boolean
 }
 
 export type AllocationUnallocatedLine = Pick<
@@ -987,6 +990,7 @@ export async function allocateSalesOrder(
       orderRef,
       isShoppingOrder,
       shipFromWarehouseId: so.shipFromWarehouseId,
+      refused: true,
     }
   }
 

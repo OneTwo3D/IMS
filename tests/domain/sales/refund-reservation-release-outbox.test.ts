@@ -5,6 +5,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import {
   scheduleRefundReservationReleaseOutbox,
   processRefundReservationReleaseOutbox,
+  resolveRefundReservationReleaseOutbox,
   refundReleaseEligible,
   REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
   REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
@@ -28,12 +29,39 @@ function fakeTx() {
   return { tx, created }
 }
 
-test('refundReleaseEligible only accepts already-allocated, not-yet-shipped statuses', () => {
+test('refundReleaseEligible accepts every allocated, not-yet-shipped status (incl PICKING/PACKING)', () => {
   assert.equal(refundReleaseEligible('PROCESSING'), true)
   assert.equal(refundReleaseEligible('ALLOCATED'), true)
+  assert.equal(refundReleaseEligible('PICKING'), true)
+  assert.equal(refundReleaseEligible('PACKING'), true)
   assert.equal(refundReleaseEligible('DRAFT'), false)
   assert.equal(refundReleaseEligible('PENDING_PAYMENT'), false)
+  assert.equal(refundReleaseEligible('ON_HOLD'), false)
   assert.equal(refundReleaseEligible('SHIPPED'), false)
+  assert.equal(refundReleaseEligible('DELIVERED'), false)
+  assert.equal(refundReleaseEligible('CANCELLED'), false)
+})
+
+test('resolve marks a still-open backstop row SUCCEEDED so the drain does not re-run allocation', async () => {
+  const calls: Array<Record<string, unknown>> = []
+  const client = {
+    integrationOutbox: {
+      updateMany: async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        calls.push(args)
+        return { count: 1 }
+      },
+    },
+  }
+  const count = await resolveRefundReservationReleaseOutbox('refund-9', { client })
+  assert.equal(count, 1)
+  assert.equal(calls.length, 1)
+  const where = calls[0].where as Record<string, unknown>
+  assert.equal(where.connector, REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR)
+  assert.equal(where.operation, REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION)
+  assert.match(String(where.idempotencyKey), /refund-9/)
+  // Only PENDING / RETRYABLE_FAILED rows are resolved — never one the drain already claimed (PROCESSING).
+  assert.deepEqual((where.status as { in: string[] }).in, ['PENDING', 'RETRYABLE_FAILED'])
+  assert.equal((calls[0].data as Record<string, unknown>).status, 'SUCCEEDED')
 })
 
 test('schedule enqueues a backstop row inside the tx for an eligible order', async () => {

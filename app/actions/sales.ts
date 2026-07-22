@@ -56,6 +56,7 @@ import {
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { releaseReservationsAfterRefund } from '@/lib/domain/sales/post-refund-release'
+import { resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
@@ -1878,7 +1879,7 @@ export async function createRefund(
     // demand; refuseIfShipmentsExist makes it a no-op once any shipment exists (the
     // shipment build caps shippable qty net of refunds). Limited to PROCESSING/ALLOCATED
     // so a refund can't promote a DRAFT/PENDING_PAYMENT order to ALLOCATED.
-    await releaseReservationsAfterRefund(
+    const releaseOutcome = await releaseReservationsAfterRefund(
       { orderId, refundId: refundResult.createdRefund?.id, status: refundResult.so.status },
       {
         // The dynamic import lives INSIDE the guarded closure so a module-load/eval rejection is
@@ -1891,6 +1892,17 @@ export async function createRefund(
         log: logActivity,
       },
     )
+    // o3d-67y: the immediate release reconciled the reservation, so resolve the durable
+    // backstop — otherwise the drain would re-run allocation, which is NOT
+    // side-effect-idempotent (it deletes/recreates OrderAllocation rows and resets staged
+    // allocation accounting). A refuse / failure leaves the row PENDING for the drain.
+    if (releaseOutcome.released) {
+      try {
+        await resolveRefundReservationReleaseOutbox(refundResult.createdRefund.id)
+      } catch (resolveError) {
+        console.error('[refund] failed to resolve reservation-release backstop', resolveError)
+      }
+    }
 
     let accountingWarning = refundResult.accountingWarning
     try {
