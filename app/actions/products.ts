@@ -1512,7 +1512,9 @@ export async function generateVariantsFromOptions(
         depthCm:  product.depthCm  ?? undefined,
         // Variants inherit the parent's customs data; can be overridden per variant afterwards.
         hsCode:             product.hsCode             ?? undefined,
-        countryOfOrigin:    product.countryOfOrigin    ?? undefined,
+        // bhdm.7: normalise the inherited origin so a legacy reserved/noncanonical parent value (EU/ZZ/'ad') is
+        // never multiplied verbatim into new variant rows, bypassing productSchema.
+        countryOfOrigin:    toIsoCountryCode(product.countryOfOrigin) ?? undefined,
         customsDescription: product.customsDescription ?? undefined,
       },
     })

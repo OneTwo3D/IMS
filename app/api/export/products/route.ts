@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
+import { toIsoCountryCode } from '@/lib/countries'
 
 const HEADERS = [
   'productId', 'parentProductId',
@@ -80,7 +81,9 @@ export async function GET(req: Request) {
       parentSku: p.parent?.sku ?? '',
       barcode: p.barcode ?? '',
       mpn: p.mpn ?? '',
-      countryOfOrigin: p.countryOfOrigin ?? '',
+      // bhdm.7: normalise on export so a legacy reserved/noncanonical stored value (EU/ZZ/'ad') never leaves as
+      // an unrecognised code — export→import stays lossless (only re-importable values are emitted).
+      countryOfOrigin: toIsoCountryCode(p.countryOfOrigin) ?? '',
       preferredSupplierId: p.preferredSupplier?.id ?? '',
       preferredSupplierName: p.preferredSupplier?.name ?? '',
       preferredSupplierLocked: p.preferredSupplierLocked ? 'TRUE' : 'FALSE',
