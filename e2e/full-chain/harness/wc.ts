@@ -100,6 +100,10 @@ export async function createWcOrder(
     status?: string
     currency?: string
     setPaid?: boolean
+    // Pins the order's WC payment_method (and its title). order-import carries it into the accounting
+    // payload as _paymentMethod, which the payment-account map keys on ("method:currency"). Defaults to
+    // WooCommerce's own default (typically empty) — set it when a test needs a mapped method (OC-15).
+    paymentMethod?: string
     shipping?: { method_title: string; total: string }
     feeLines?: Array<{ name: string; total: string }>
     customerNote?: string
@@ -111,6 +115,8 @@ export async function createWcOrder(
       status: opts.status ?? 'processing',
       currency: opts.currency,
       set_paid: opts.setPaid ?? true,
+      payment_method: opts.paymentMethod,
+      payment_method_title: opts.paymentMethod ? opts.paymentMethod.toUpperCase() : undefined,
       customer_note: opts.customerNote ?? runTag(runId),
       billing: {
         first_name: 'E2E', last_name: runTag(runId), email: `e2e+${runId}@example.invalid`,

@@ -23,7 +23,7 @@ import {
 } from './harness/wc.ts'
 import { allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, setPostingMode } from './harness/ims.ts'
 import { addStockAdjustment, createInventoryProduct } from '../helpers.ts'
-import { expectLine, externalIdFor, getCreditNote, getInvoice, trackDocument } from './harness/xero.ts'
+import { expectLine, externalIdFor, getCreditNote, getInvoice, getPayment, trackDocument } from './harness/xero.ts'
 
 const WAREHOUSE_CODE = 'CBG'
 
@@ -957,6 +957,86 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       await deleteFxRate(fxRateId)
     }
   })
+
+  test('OC-15: a paid order records an INVOICE_PAYMENT that settles the Xero invoice from the mapped bank account', async ({ page }) => {
+    // Composed worst case as OC-14/OC-10: delivery + import barrier + setup + ship + a SECOND drain for the
+    // ordering-deferred payment.
+    test.setTimeout(1_800_000)
+
+    // WHY: a paid Woo order should not merely create an AUTHORISED receivable — it should record the customer
+    // PAYMENT against it, leaving the Xero invoice PAID with a zero balance, drawn from the bank account the
+    // operator mapped to that payment method. order-import sets _registerPayment from date_paid_gmt, and the
+    // SALES_INVOICE follow-up (enqueueSalesInvoiceFollowUps) enqueues INVOICE_PAYMENT ONLY when
+    // accounting_payment_account_map resolves a bank account for the order's method:currency — otherwise it
+    // logs "no payment account map" and skips (the reason no earlier OC case exercised a payment).
+    const sku = taggedSku(runId, 'OC15')
+    const unitPrice = '40.00'
+    const qty = 2
+    const method = 'bacs'
+    // Demo "Business Bank Account" (GBP). The processor resolves a payment account by EITHER Xero AccountID
+    // OR account code (sync-processor.ts), so the readable code is enough; it must exist in the synced chart
+    // of accounts (accounting_accounts), which the rig provisioning now populates via syncChartOfAccounts.
+    const bankCode = '090'
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+
+    // Configure the payment map PER-TEST and restore it in finally. A PERSISTENT map would make EVERY other
+    // paid GBP order (OC-01/05/06/…) register a payment too, and their teardown — which voids the invoice —
+    // would then fail, because Xero refuses to void an invoice that has a payment. Isolation is mandatory.
+    const priorMap = await readSetting(PAYMENT_MAP_KEY)
+    await writeSetting(PAYMENT_MAP_KEY, JSON.stringify({ [`${method}:*`]: bankCode }))
+    let imported: { salesOrderId: string } | undefined
+    try {
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC15`, price: unitPrice })
+      await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+      const product = await createWcProduct(creds, runId, { label: 'OC15', price: unitPrice })
+      const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }], paymentMethod: method })
+
+      imported = await awaitWebhookDelivery(order.id, { creds })
+      await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC15` })
+      try {
+        // First drain posts the SALES_INVOICE and enqueues the INVOICE_PAYMENT follow-up; the payment is
+        // ordering-deferred until the invoice CREATE is live (findInvoicePaymentsBlockedByEarlierLiveLogs),
+        // so it posts on a LATER drain. drainUntilInvoicePaid re-drains until the ledger shows it settled.
+        await processPendingXeroSyncViaUi(page)
+        const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+        const invoice = await drainUntilInvoicePaid(page, invoiceId)
+
+        expect(invoice.Type).toBe('ACCREC')
+        // THE POINT: the invoice is fully PAID in the ledger, not merely AUTHORISED. A dropped or skipped
+        // payment would leave it AUTHORISED with the full AmountDue, and a currency/line-only assertion could
+        // not tell the difference.
+        expect(invoice.Status, 'the receivable is settled, not just authorised').toBe('PAID')
+        expect(Number(invoice.AmountPaid), 'the whole invoice is paid').toBeCloseTo(Number(order.total), 2)
+        expect(Number(invoice.AmountDue), 'nothing is left outstanding').toBeCloseTo(0, 2)
+
+        // Exactly one payment, for the full amount, drawn from the MAPPED bank account. The invoice's own
+        // Payments sub-resource omits the account, so read the payment itself for the drawn-from account.
+        expect(invoice.Payments?.length, 'exactly one payment settles the invoice').toBe(1)
+        const paymentId = invoice.Payments![0].PaymentID
+        const payment = await getPayment(paymentId)
+        expect(Number(payment.Amount), 'the payment is for the invoice total').toBeCloseTo(Number(order.total), 2)
+        expect(payment.Account?.Code, 'payment drawn from the mapped bank account (Business Bank Account 090)').toBe(bankCode)
+      } finally {
+        // Failure-safe: register the PAYMENT before the invoice (VOID_ORDER deletes Payments first) so a
+        // post that beat a later throw is reversed and the invoice can then be voided. Re-read the invoice
+        // to discover any payment even if an assertion threw before we captured its id.
+        const posted = await awaitPostedExternalId('SALES_INVOICE', imported.salesOrderId, 90_000).catch(() => null)
+        if (posted) {
+          const inv = await getInvoice(posted).catch(() => null)
+          for (const p of inv?.Payments ?? []) trackDocument('Payments', p.PaymentID, `OC-15 payment ${runTag(runId)}`)
+          trackDocument('Invoices', posted, `OC-15 invoice ${runTag(runId)}`)
+        }
+      }
+    } finally {
+      if (priorMap == null) await clearSetting(PAYMENT_MAP_KEY)
+      else await writeSetting(PAYMENT_MAP_KEY, priorMap)
+    }
+  })
 })
 
 /**
@@ -1029,6 +1109,63 @@ async function salesOrderFx(salesOrderId: string): Promise<{
   } finally {
     await db.end()
   }
+}
+
+const PAYMENT_MAP_KEY = 'accounting_payment_account_map'
+
+/** Read a settings value, or null if the key is absent. */
+async function readSetting(key: string): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ value: string }>(`select value from settings where key = $1`, [key])
+    return r.rows[0]?.value ?? null
+  } finally {
+    await db.end()
+  }
+}
+
+/** Upsert a settings value (same shape setPostingMode uses). */
+async function writeSetting(key: string, value: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+       on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      [key, value],
+    )
+  } finally {
+    await db.end()
+  }
+}
+
+/** Delete a settings row (used to restore a key that did not exist before the test). */
+async function clearSetting(key: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(`delete from settings where key = $1`, [key])
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Drain the Xero queue until the invoice reads PAID, or a bounded number of passes elapses. The
+ * INVOICE_PAYMENT follow-up is enqueued while the SALES_INVOICE is being posted and is ordering-deferred
+ * until that CREATE is live, so it only settles on a drain AFTER the one that created the invoice.
+ */
+async function drainUntilInvoicePaid(page: import('@playwright/test').Page, invoiceId: string, maxDrains = 3) {
+  let invoice = await getInvoice(invoiceId)
+  for (let i = 0; i < maxDrains && invoice.Status !== 'PAID'; i++) {
+    await processPendingXeroSyncViaUi(page)
+    invoice = await getInvoice(invoiceId)
+  }
+  return invoice
 }
 
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
