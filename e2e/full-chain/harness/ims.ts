@@ -106,27 +106,44 @@ export async function openPurchaseOrder(page: Page, poId: string): Promise<void>
  */
 export async function createAndSendPo(
   page: Page,
-  opts: { sku: string; supplierLabel?: string; qty?: string; unitCost?: string },
+  opts: {
+    sku: string
+    supplierLabel?: string
+    qty?: string
+    unitCost?: string
+    /** Extra product lines beyond the first (for multi-line POs, e.g. landed-cost distribution across SKUs). */
+    extraLines?: Array<{ sku: string; qty: string; unitCost: string }>
+    /** An inline landed cost ("Additional Cost") on the PO — distributed into the cost layers at receipt. */
+    additionalCost?: { description: string; amount: string; distributionMethod?: 'BY_VALUE' | 'BY_QUANTITY' | 'BY_WEIGHT' | 'EQUAL_SPLIT' }
+  },
 ): Promise<{ poId: string; poReference: string }> {
   await page.goto('/purchase-orders')
   await page.getByRole('button', { name: /new po/i }).click()
 
   const dialog = page.getByRole('dialog', { name: 'New Purchase Order' })
   await dialog.locator('select').first().selectOption({ label: opts.supplierLabel ?? 'E2E Supplier' })
-  await dialog.getByPlaceholder(/search product to add/i).fill(opts.sku)
-  await dialog.getByRole('button', { name: new RegExp(opts.sku) }).first().click()
 
-  // A PO line's cost is entered by the BUYER — products carry a sales price, never a
-  // purchase cost (there is no cost column on products). Leaving it unset raises the PO
-  // at ZERO, which then bills at zero and posts a £0 ACCPAY to Xero: everything
-  // "succeeds" and the numbers are meaningless. Set it explicitly.
-  // The line inputs are unlabelled cells, so select on what distinguishes them:
-  // qty is min=1/step=1, cost is min=0/step=0.01, discount has a placeholder, and the
-  // FX rate is step=0.0001.
-  if (opts.qty !== undefined) {
-    await dialog.locator('input[type="number"][min="1"][step="1"]').first().fill(opts.qty)
+  // A PO line's cost is entered by the BUYER — products carry a sales price, never a purchase cost. Leaving
+  // it unset raises the PO at ZERO, which bills at zero and posts a £0 ACCPAY: everything "succeeds" and the
+  // numbers are meaningless. The line inputs are unlabelled cells; qty is min=1/step=1, cost is
+  // min=0/step=0.01. Each added product appends a row, so line i's inputs are the i-th of each kind.
+  const lines = [{ sku: opts.sku, qty: opts.qty ?? '1', unitCost: opts.unitCost ?? '12.00' }, ...(opts.extraLines ?? [])]
+  for (let i = 0; i < lines.length; i++) {
+    await dialog.getByPlaceholder(/search product to add/i).fill(lines[i].sku)
+    await dialog.getByRole('button', { name: new RegExp(lines[i].sku) }).first().click()
+    await dialog.locator('input[type="number"][min="1"][step="1"]').nth(i).fill(lines[i].qty)
+    await dialog.locator('input[type="number"][min="0"][step="0.01"]').nth(i).fill(lines[i].unitCost)
   }
-  await dialog.locator('input[type="number"][min="0"][step="0.01"]').first().fill(opts.unitCost ?? '12.00')
+
+  // Optional inline landed cost. "Add Cost" appends a row (in a SECOND table) with a Description input and an
+  // amount input sharing the line-cost attributes (min=0 step=0.01) — added AFTER every product line, so it
+  // is the LAST such input. A distribution-method select in the same row governs how it spreads across lines.
+  if (opts.additionalCost) {
+    await dialog.getByRole('button', { name: /add cost/i }).click()
+    await dialog.getByPlaceholder(/description \(e\.g\. shipping\)/i).fill(opts.additionalCost.description)
+    await dialog.locator('input[type="number"][min="0"][step="0.01"]').last().fill(opts.additionalCost.amount)
+    await dialog.locator('select').last().selectOption(opts.additionalCost.distributionMethod ?? 'BY_VALUE')
+  }
 
   await dialog.getByRole('button', { name: /create purchase order/i }).click()
 
@@ -321,7 +338,7 @@ export async function postSupplierCreditNote(page: Page): Promise<void> {
  */
 export async function createBill(
   page: Page,
-  opts: { reference: string; expectBillCount?: number },
+  opts: { reference: string; expectBillCount?: number; includeAdditionalCosts?: boolean },
 ): Promise<string> {
   await page.getByRole('button', { name: /create bill/i }).click()
   const dialog = page.getByRole('dialog', { name: /Create Bill/ })
@@ -336,10 +353,29 @@ export async function createBill(
   // lost behind the slower order-to-cash tests: Next fired against an empty selection,
   // the wizard stayed on step 1 showing "Select at least one line", and the failure
   // surfaced 30s later as a confusing "Review & Confirm dialog not found".
-  await expect(dialog.locator('table')).toBeVisible({ timeout: 30_000 })
-  const firstLine = dialog.locator('tbody input[type="checkbox"]').first()
+  // Scope to the FIRST table — the billable GOODS lines. A PO carrying an inline landed cost renders a
+  // SECOND table (the additional-costs billing rows), so a bare `dialog.locator('table')` is a strict-mode
+  // violation. `.first()` is the goods-lines table on every PO (single-table POs are unaffected).
+  const linesTable = dialog.locator('table').first()
+  await expect(linesTable).toBeVisible({ timeout: 30_000 })
+  const firstLine = linesTable.locator('tbody input[type="checkbox"]').first()
   await expect(firstLine).toBeVisible({ timeout: 30_000 })
   if (!(await firstLine.isChecked())) await firstLine.check()
+
+  // When the PO carries landed costs, also select every row in the SECOND (additional-costs) table so the
+  // freight is billed too. Leaving it unbilled would credit transit for the landed value at receipt but only
+  // debit the goods portion — stranding a permanent transit balance (Codex).
+  if (opts.includeAdditionalCosts) {
+    const costsTable = dialog.locator('table').nth(1)
+    await expect(costsTable).toBeVisible({ timeout: 30_000 })
+    const costBoxes = costsTable.locator('tbody input[type="checkbox"]')
+    const n = await costBoxes.count()
+    expect(n, 'the additional-costs table should have at least one billable row').toBeGreaterThan(0)
+    for (let i = 0; i < n; i++) {
+      const box = costBoxes.nth(i)
+      if (!(await box.isChecked())) await box.check()
+    }
+  }
 
   await dialog.getByRole('button', { name: /^Next$/ }).click()
   // Explicit timeout: this inherited Playwright's 5s default while every neighbour waits
