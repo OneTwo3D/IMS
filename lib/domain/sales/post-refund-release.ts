@@ -72,9 +72,10 @@ export type PostRefundReleaseOutcome = {
   /** true when allocation refused because a shipment exists — deferred to shipment reconciliation (o3d-339). */
   refused: boolean
   /**
-   * true when the reservation is in a consistent state and the durable backstop can be resolved: the release
-   * committed (incl. a committed backorder) OR was deliberately refused. False on a failure or a pre-transaction
-   * bail, so the caller leaves the backstop PENDING for the drain to retry.
+   * true ONLY when the allocation transaction COMMITTED (incl. a committed backorder), so reservedQty is
+   * reconciled and the durable backstop can be resolved. False on a failure, a pre-transaction bail, OR a
+   * shipment refuse (which leaves reservedQty untouched) — the caller leaves the backstop PENDING so the drain
+   * retries and dead-letters it visibly rather than silently marking it done.
    */
   reconciled: boolean
 }
@@ -117,16 +118,18 @@ export async function releaseReservationsAfterRefund(
   }
 
   // A refuse means an existing shipment holds the units, so the conservative release declines rather than
-  // re-pick stock. Safe for a fully-shipped order (its reservation is already consumed) but can leave a PENDING
-  // shipment's reservation covering now-refunded units — surface it (not silent) and let shipment reconciliation
-  // (o3d-339) net the refund. The reservation state is consistent, so the backstop can be resolved.
+  // re-pick stock. This does NOT reconcile reservedQty — it leaves the stale OrderAllocation rows untouched, so
+  // a partially-shipped order (alloc 5, ship 3, refund 2) keeps 2 units reserved. It is therefore NOT terminal:
+  // surface the deferral (not silent) AND return reconciled:false so the durable backstop stays PENDING and the
+  // drain keeps it as a visible dead-letter until shipment reconciliation (o3d-339) nets the refund. Eligibility
+  // is gated on residual OrderAllocation rows, so a fully-dispatched order never reaches here.
   if (refused) {
     await safeLog(deps, onError, {
       action: 'refund_reservation_release_deferred',
-      description: `Refund committed on order ${input.orderId}, but stock reservation release was deferred because a shipment already exists — if that shipment is still pending, verify it nets the refunded units so they are not dispatched.`,
+      description: `Refund committed on order ${input.orderId}, but stock reservation release was deferred because a shipment already exists — the refunded units may still be reserved; verify the pending shipment nets the refund so they are neither stranded-reserved nor dispatched.`,
       metadata: { orderId: input.orderId, refundId: input.refundId, reason: 'existing_shipment' },
     })
-    return { released: false, warned: true, refused: true, reconciled: true }
+    return { released: false, warned: true, refused: true, reconciled: false }
   }
 
   // The allocation transaction committed (a full release or a committed backorder) — reservedQty is reconciled.

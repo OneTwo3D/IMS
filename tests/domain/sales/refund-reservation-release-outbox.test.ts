@@ -115,12 +115,14 @@ test('drain: a committed backorder (success:false, committed:true) completes the
   assert.deepEqual(recorded.retryIds, [])
 })
 
-test('drain: a shipment refuse (refused:true, not committed) completes the job — deferred to o3d-339', async () => {
+test('drain: a shipment refuse (refused:true, not committed) RETRIES — never silently succeeded (o3d-67y r4)', async () => {
+  // Refuse does not reconcile reservedQty (stale allocation rows remain), so it must NOT be marked SUCCEEDED —
+  // it retries and dead-letters visibly as a durable record for shipment reconciliation (o3d-339).
   const recorded: Recorded = { successIds: [], retryIds: [] }
   const deps = drainDeps([job('a')], async () => ({ success: false, refused: true, committed: false }), recorded)
   await processRefundReservationReleaseOutbox(deps)
-  assert.deepEqual(recorded.successIds, ['a'])
-  assert.deepEqual(recorded.retryIds, [])
+  assert.deepEqual(recorded.retryIds, ['a'])
+  assert.deepEqual(recorded.successIds, [])
 })
 
 test('drain: a rolled-back allocation transaction (failed:true) retries with backoff', async () => {

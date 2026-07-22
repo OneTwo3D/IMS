@@ -169,9 +169,10 @@ export type ProcessRefundReservationReleaseResult = { claimed: number; succeeded
  * Drain pending reservation-release backstop jobs. Each job re-runs allocation for
  * the refunded order — idempotent, so a job whose reservation was already released
  * by the immediate attempt is a harmless no-op, and a job left behind by a bypass /
- * crash recovers. Only a ROLLED-BACK allocation transaction (result.failed) retries
- * with exponential backoff; a shipment refuse or a committed backorder leaves the
- * reservation in a consistent state and completes the job.
+ * crash recovers. A job completes ONLY when allocation COMMITTED (a full release or a
+ * committed backorder); a rollback, a pre-transaction bail, or a shipment refuse (which
+ * does not touch the stale reservation) retries with backoff and dead-letters visibly
+ * for shipment reconciliation (o3d-339) rather than being silently marked succeeded.
  */
 export async function processRefundReservationReleaseOutbox(
   deps: RefundReservationReleaseDrainDeps = defaultDrainDeps(),
@@ -201,18 +202,26 @@ async function processOneRefundReservationReleaseJob(
   try {
     const payload = SalesRefundReservationReleaseOutboxPayloadSchema.parse(job.payloadJson)
     const allocation = await deps.allocate(payload.orderId)
-    // The job is done ONLY when the reservation is in a consistent state: the allocation transaction COMMITTED
-    // (a full release or a committed backorder) OR was deliberately REFUSED (a shipment holds the units,
-    // deferred to o3d-339). Everything else — a rolled-back transaction (failed) OR a pre-transaction bail (no
-    // eligible warehouse: neither committed nor refused) — did NOT reconcile reservedQty, so it must retry with
-    // backoff and dead-letter visibly rather than be silently marked succeeded (Codex review r3).
-    const reconciled = allocation.committed === true || allocation.refused === true
+    // The job is done ONLY when the allocation transaction COMMITTED (a full release or a committed backorder) —
+    // that is the only outcome that actually reconciles reservedQty. Everything else must retry with backoff and
+    // dead-letter visibly rather than be silently marked succeeded (Codex review r3/r4):
+    //   - a rolled-back transaction (failed) or a pre-transaction bail (no eligible warehouse) did not run;
+    //   - a shipment REFUSE declines without touching the stale OrderAllocation rows, so a partially-shipped
+    //     order (alloc 5, ship 3, refund 2) keeps 2 units reserved — the residual is left as a durable
+    //     dead-letter for shipment reconciliation (o3d-339), NEVER marked SUCCEEDED.
+    // Eligibility is gated on residual OrderAllocation rows, so a fully-dispatched order never enqueues a row,
+    // which bounds refused dead-letters to the genuine strand population.
+    const reconciled = allocation.committed === true
     if (!reconciled) {
       await deps.markRetry({
         id: job.id,
         workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER,
         lockedAt,
-        error: new Error(allocation.error ?? 'reservation release did not commit (no eligible warehouse or rolled back)'),
+        error: new Error(
+          allocation.refused === true
+            ? 'reservation release refused: a shipment holds the units — needs shipment reconciliation (o3d-339)'
+            : allocation.error ?? 'reservation release did not commit (no eligible warehouse or rolled back)',
+        ),
         attemptsBeforeFailure: job.attempts,
         maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
       })

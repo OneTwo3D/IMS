@@ -63,10 +63,12 @@ test('a committed backorder (success:false, committed:true) does NOT warn and IS
   assert.equal(warnings.length, 0)
 })
 
-test('a shipment refuse (refused:true) surfaces a deferral WARNING but IS reconciled (o3d-67y r2)', async () => {
+test('a shipment refuse (refused:true) surfaces a deferral WARNING and is NOT reconciled — backstop stays pending (o3d-67y r4)', async () => {
+  // Refuse does not touch reservedQty, so it must not resolve the durable backstop; it stays pending and
+  // dead-letters visibly for shipment reconciliation (o3d-339) rather than being silently marked done.
   const { deps, warnings } = makeDeps({ allocate: async () => ({ success: false, refused: true, committed: false }) })
   const outcome = await releaseReservationsAfterRefund({ orderId: 'so-4', refundId: 'r-4', eligible: true }, deps)
-  assert.deepEqual(outcome, { released: false, warned: true, refused: true, reconciled: true })
+  assert.deepEqual(outcome, { released: false, warned: true, refused: true, reconciled: false })
   assert.equal(warnings[0].action, 'refund_reservation_release_deferred')
   assert.match(warnings[0].description, /shipment/i)
 })
