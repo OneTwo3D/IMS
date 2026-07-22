@@ -489,6 +489,7 @@ test('public WooCommerce signed webhook is accepted into the inbox without inlin
     accepted: true,
     queued: true,
     duplicate: false,
+    deferred: false,
     eventId: 'wc-event-1',
   })
   assert.deepEqual(receipts, ['orders'])
@@ -496,10 +497,11 @@ test('public WooCommerce signed webhook is accepted into the inbox without inlin
   assert.equal((persisted[0] as { externalEventId?: string | null }).externalEventId, 'delivery-1')
 })
 
-test('public WooCommerce signed webhook skips persistence when processing gate is disabled', async () => {
+test('public WooCommerce signed webhook PERSISTS (deferred) when the processing gate is disabled (o3d-56b)', async () => {
   assertRouteAccess('/api/webhooks/shopping/[connector]/[resource]', 'public-webhook')
 
   const rawBody = JSON.stringify({ id: 123 })
+  const persisted: unknown[] = []
   const response = await handleWcWebhook(
     'orders',
     apiRouteRequest('/api/webhooks/shopping/woocommerce/orders', {
@@ -515,15 +517,32 @@ test('public WooCommerce signed webhook skips persistence when processing gate i
       async getWebhookProcessingGate() {
         return { enabled: false, reason: 'wc_sync_disabled' }
       },
+      async persistWebhookEvent(_repository, input) {
+        persisted.push(input)
+        return {
+          status: 'created',
+          event: wcWebhookEvent({
+            id: 'wc-event-disabled',
+            resource: input.resource,
+            externalEventId: input.externalEventId,
+            topic: input.topic,
+            payloadJson: input.payload,
+          }),
+        }
+      },
     }),
   )
 
   assert.equal(response.status, 202)
+  // A disabled gate must NOT silently discard the event — it is persisted for replay when sync is re-enabled.
+  assert.equal(persisted.length, 1)
   assert.deepEqual(await response.json(), {
     accepted: true,
-    queued: false,
-    skipped: true,
+    queued: true,
+    duplicate: false,
+    deferred: true,
     reason: 'wc_sync_disabled',
+    eventId: 'wc-event-disabled',
   })
 })
 
@@ -564,6 +583,7 @@ test('public WooCommerce duplicate webhook is acknowledged without queueing dupl
     accepted: true,
     queued: false,
     duplicate: true,
+    deferred: false,
     eventId: 'wc-event-existing',
   })
 })
