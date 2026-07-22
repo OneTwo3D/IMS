@@ -21,6 +21,7 @@ import {
   validateProductStructureChange,
 } from '@/lib/products/type-transforms'
 import { detectComponentCycle } from '@/lib/products/component-cycle'
+import { blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
 import {
   cleanProductCategoryName,
   listProductCategoryNodes,
@@ -884,7 +885,7 @@ export async function updateProduct(
   // INVALID_COUNTRY_OF_ORIGIN discrepancy resolved, without anyone choosing a real country. Require a valid
   // replacement. (A valid current origin, or a blank current origin, may still be cleared as before.)
   const current = await db.product.findUnique({ where: { id }, select: { countryOfOrigin: true } })
-  if (current?.countryOfOrigin && !toIsoCountryCode(current.countryOfOrigin) && !data.countryOfOrigin) {
+  if (blocksClearingInvalidOrigin(current?.countryOfOrigin, data.countryOfOrigin)) {
     return {
       errors: { countryOfOrigin: ['This product has an invalid stored country of origin — select a valid country to save.'] },
       message: 'Select a valid country of origin',

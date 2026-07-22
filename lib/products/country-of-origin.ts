@@ -13,3 +13,16 @@ import { toIsoCountryCode } from '@/lib/countries'
 export function normalizeCsvCountryOfOrigin(raw: string | null | undefined): string | null {
   return toIsoCountryCode(raw)
 }
+
+/**
+ * bhdm.7: true when a product update must be BLOCKED because it would clear a legacy INVALID origin without a
+ * valid replacement. Only a nonblank persisted value that is not a valid country, combined with a blank/null
+ * submission, blocks — a blank/whitespace-only or already-valid persisted origin may still be cleared.
+ * `submittedIso` is the post-schema submitted value (null for blank, or a canonical ISO-2 code).
+ */
+export function blocksClearingInvalidOrigin(persisted: string | null | undefined, submittedIso: string | null): boolean {
+  const trimmed = (persisted ?? '').trim()
+  if (trimmed === '') return false
+  if (toIsoCountryCode(trimmed) !== null) return false
+  return !submittedIso
+}

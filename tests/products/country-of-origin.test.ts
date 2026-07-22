@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { normalizeCsvCountryOfOrigin } from '@/lib/products/country-of-origin'
+import { normalizeCsvCountryOfOrigin, blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
 
 test('a valid CSV country name/alias/code is normalised to ISO-2 (bhdm.7)', () => {
   assert.equal(normalizeCsvCountryOfOrigin('GB'), 'GB')
@@ -35,4 +35,19 @@ test('reserved / pseudo / retired region codes are rejected — not assigned ISO
   }
   // XK (Kosovo) is the one intentional user-assigned exception we DO accept.
   assert.equal(normalizeCsvCountryOfOrigin('XK'), 'XK')
+})
+
+test('blocksClearingInvalidOrigin: only a nonblank INVALID persisted origin + a blank submission blocks (bhdm.7 r12)', () => {
+  // Persisted null/empty/whitespace -> clearable (not blocked), regardless of submission.
+  assert.equal(blocksClearingInvalidOrigin(null, null), false)
+  assert.equal(blocksClearingInvalidOrigin('', null), false)
+  assert.equal(blocksClearingInvalidOrigin('   ', null), false, 'whitespace-only persisted origin is treated as blank')
+  // Persisted VALID origin -> clearable (a deliberate clear is allowed).
+  assert.equal(blocksClearingInvalidOrigin('GB', null), false)
+  assert.equal(blocksClearingInvalidOrigin('ad', null), false)
+  // Persisted INVALID nonblank origin + blank submission -> BLOCKED (must pick a valid country).
+  assert.equal(blocksClearingInvalidOrigin('EU', null), true)
+  assert.equal(blocksClearingInvalidOrigin('ZZ', null), true)
+  // Persisted INVALID origin BUT a valid replacement submitted -> allowed.
+  assert.equal(blocksClearingInvalidOrigin('EU', 'GB'), false)
 })
