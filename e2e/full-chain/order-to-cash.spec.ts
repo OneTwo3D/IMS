@@ -866,7 +866,170 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       if (posted) trackDocument('Invoices', posted, `OC-14 invoice ${runTag(runId)}`)
     }
   })
+
+  test('OC-10: a EUR order imports at the seeded FX rate and posts a genuine EUR invoice to Xero', async ({ page }) => {
+    // Composed worst case as OC-14: awaitWebhookDelivery (300s) + import barrier (300s) + setup + ship + drain.
+    test.setTimeout(1_800_000)
+
+    // WHY: every other OC case is GBP (the base currency), so the FX boundary is otherwise unproven —
+    // both order-import's foreign->base conversion (the single /fxRate boundary, divideRoundedNumber in
+    // order-import.ts) and Xero's multicurrency invoice. A EUR order also proves the rig's load-bearing
+    // FX precondition: with fx_rates EMPTY, getFxRateToGbp throws MissingFxRateError and the import
+    // QUARANTINES the order in the pending-FX queue instead of posting (field-mapping.ts refuses to
+    // silently fall back to 1:1). So the rate MUST be seeded BEFORE the order's webhook is imported;
+    // seeding afterwards would let the order dead-letter and the invoice would never exist.
+    const sku = taggedSku(runId, 'OC10')
+    const unitPriceEur = '25.00'
+    const qty = 2
+    const goodsEur = Number(unitPriceEur) * qty // 50.00 EUR net goods (mirrors OC-01's untaxed shape)
+    // 1 GBP = 1.15 EUR. Stored fromCurrency=GBP toCurrency=EUR rate=1.15; getFxRateToGbp reads that GBP->EUR
+    // row and order-import converts base = foreign / rate. A deliberately non-unit rate is what makes the
+    // conversion assertable: a 1:1 fallback regression would leave base == foreign and fail totalBase below.
+    const fxRate = 1.15
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+
+    // Seed the rate FIRST, with fetchedAt in the past so it satisfies getFxRateToGbp's fetchedAt <= orderedAt
+    // bound against the order created moments later. Removed in the outer finally to restore the rig's
+    // empty-fx_rates baseline — OC-17's pending-FX hazard and any later run both assume no seeded rate lingers.
+    const fxRateId = await seedGbpFxRate('EUR', fxRate)
+    let imported: { salesOrderId: string } | undefined
+    try {
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC10`, price: unitPriceEur })
+      await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+      const product = await createWcProduct(creds, runId, { label: 'OC10', price: unitPriceEur })
+      const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }], currency: 'EUR' })
+      expect(order.currency, 'the Woo order is denominated in EUR').toBe('EUR')
+
+      imported = await awaitWebhookDelivery(order.id, { creds })
+      // A truthy SO id here already carries weight: a missing rate would have quarantined the order and
+      // awaitWebhookDelivery would have timed out with no SO link at all.
+      expect(imported.salesOrderId, 'the EUR order imported rather than quarantining for a missing rate').toBeTruthy()
+      // Barrier before draining (OC-14's lesson): the SO link appears slightly before the SALES_INVOICE is
+      // queued in the same import, so wait for the import event to settle or the drain could beat the queue.
+      await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+      // --- IMS side: the foreign->base conversion actually happened at the /fxRate boundary ---
+      const fx = await salesOrderFx(imported.salesOrderId)
+      expect(fx.currency).toBe('EUR')
+      expect(Number(fx.fxRateToBase), 'the SO recorded the seeded GBP->EUR rate').toBeCloseTo(fxRate, 4)
+      expect(Number(fx.totalForeign), 'foreign total is the EUR order value').toBeCloseTo(Number(order.total), 2)
+      // base = foreign / rate. This is the assertion a GBP order cannot make — it is the proof the rate was
+      // applied, not ignored. A 1:1 fallback would make totalBase == totalForeign and fail here.
+      expect(Number(fx.totalBase), 'base total is the EUR value converted at the seeded rate').toBeCloseTo(Number(order.total) / fxRate, 2)
+      // Internal consistency of the conversion, independent of whether the order was taxed: net converts by
+      // the same rate as gross.
+      expect(Number(fx.subtotalBase), 'net converts by the same rate').toBeCloseTo(Number(fx.subtotalForeign) / fxRate, 2)
+
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC10` })
+      try {
+        await processPendingXeroSyncViaUi(page)
+
+        // --- Xero side: the ledger holds a EUR receivable, not a GBP one at the same numeric amount ---
+        const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+        const invoice = await getInvoice(invoiceId)
+        expect(invoice.Type).toBe('ACCREC')
+        expect(invoice.Status).toBe('AUTHORISED') // see OC-01: "not DELETED" would accept a DRAFT
+        expect(invoice.CurrencyCode, 'Xero recorded the invoice in EUR, not the base currency').toBe('EUR')
+        // THE RATE actually crossed into Xero, not just the currency label. IMS stamps CurrencyRate =
+        // 1/fxRateToBase (lib/connectors/xero/fx.ts) precisely so Xero does NOT substitute its own daily XE
+        // rate. Without this assertion a dropped, inverted, or Xero-substituted rate would still post an
+        // AUTHORISED EUR invoice at the right EUR face value — every other assertion here would pass while
+        // the GBP ledger value silently diverged. Xero's CurrencyRate is the inverse (1 EUR = X GBP).
+        expect(invoice.CurrencyRate, 'Xero echoes a CurrencyRate for the EUR invoice').toBeDefined()
+        expect(Number(invoice.CurrencyRate), 'Xero held the seeded rate (its inverse), not its own daily rate').toBeCloseTo(1 / fxRate, 5)
+
+        const salesAccount = await settingValue('xero_sales_account')
+        // Xero invoice lines are denominated in the invoice currency, so the EUR line value stands unconverted.
+        expectLine(invoice.LineItems, { accountCode: salesAccount, lineAmount: goodsEur })
+        expect(Number(invoice.SubTotal), 'EUR net ties out to the goods value').toBeCloseTo(goodsEur, 2)
+        expect(Number(invoice.Total), 'EUR gross ties out to the Woo order').toBeCloseTo(Number(order.total), 2)
+      } finally {
+        // Failure-safe registration (OC-14's pattern): if the drain's action timed out or an assertion threw
+        // AFTER Xero accepted the invoice, register whatever posted so teardown voids it rather than stranding
+        // an AUTHORISED EUR receivable in the shared Demo ledger. POLL — a timed-out action may still be posting.
+        const posted = await awaitPostedExternalId('SALES_INVOICE', imported.salesOrderId, 90_000).catch(() => null)
+        if (posted) trackDocument('Invoices', posted, `OC-10 invoice ${runTag(runId)}`)
+      }
+    } finally {
+      await deleteFxRate(fxRateId)
+    }
+  })
 })
+
+/**
+ * Seed a base(GBP)->foreign FX rate so a foreign-currency order can import. The rig keeps fx_rates EMPTY
+ * by design (getFxRateToGbp then quarantines a foreign order rather than falling back to 1:1), so OC-10
+ * seeds exactly the one rate it needs and deletes it in finally. fetchedAt is set an hour in the past so it
+ * satisfies getFxRateToGbp's `fetchedAt <= orderedAt` bound against an order created immediately after.
+ */
+async function seedGbpFxRate(toCurrency: string, rate: number): Promise<string> {
+  const { Client } = await import('pg')
+  const { randomUUID } = await import('node:crypto')
+  const id = `e2e-fc-fx-${randomUUID()}`
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into fx_rates (id, "fromCurrency", "toCurrency", rate, "fetchedAt", source, "manualOverride")
+       values ($1, 'GBP', $2, $3, now() - interval '1 hour', 'e2e-fc-seed', false)`,
+      [id, toCurrency.toUpperCase(), rate],
+    )
+    return id
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Remove a seeded FX rate to restore the rig's empty-fx_rates baseline. Never throws (it runs in a
+ * finally and must not mask a test result), but it is NOT silent: a missed delete leaves an eligible
+ * EUR rate that would let a LATER foreign order import at this artificial rate instead of exercising
+ * the missing-rate quarantine, so a rowCount != 1 or a failure is surfaced loudly. global-setup's
+ * sweepSeededFxRates() is the recovery net that clears any such residue before the next run.
+ */
+async function deleteFxRate(id: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query(`delete from fx_rates where id = $1`, [id])
+    if (r.rowCount !== 1) {
+      console.warn(`[OC-10] deleteFxRate(${id}) removed ${r.rowCount} row(s), expected 1 — a seeded FX rate may persist; global-setup will sweep it next run`)
+    }
+  } catch (e) {
+    console.warn(`[OC-10] deleteFxRate(${id}) failed: ${e instanceof Error ? e.message : String(e)} — global-setup will sweep it next run`)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Read a sales order's stored foreign/base FX figures to prove the import-time conversion. */
+async function salesOrderFx(salesOrderId: string): Promise<{
+  currency: string
+  fxRateToBase: string
+  subtotalForeign: string
+  subtotalBase: string
+  totalForeign: string
+  totalBase: string
+}> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query(
+      `select currency, "fxRateToBase", "subtotalForeign", "subtotalBase", "totalForeign", "totalBase"
+       from sales_orders where id = $1`,
+      [salesOrderId],
+    )
+    if (!r.rows.length) throw new Error(`No sales_orders row for ${salesOrderId}`)
+    return r.rows[0]
+  } finally {
+    await db.end()
+  }
+}
 
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
 async function awaitRefund(salesOrderId: string, timeoutMs = 180_000): Promise<string> {
