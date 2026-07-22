@@ -57,22 +57,39 @@ const DEFAULT_DRAIN_GRACE_MS = 120_000
 // Sub-unit tolerance for residual reserved qty (fractional kit/BOM quantities can leave rounding dust).
 export const REFUND_RESERVATION_EPSILON = 1e-6
 
+export type RefundReleaseLine = { lineKind: string; qty: number; lineId: string | null }
+
+/** A positive-quantity sale refund line linked to a persisted sales-order line — the only partial-refund shape
+ *  that actually reduces a tracked line's fulfilment demand (allocation ignores refund rows with a null
+ *  salesOrderLineId). */
+function isMatchedDemandLine(line: RefundReleaseLine): boolean {
+  return line.lineKind === 'sale' && line.qty > 0 && line.lineId != null
+}
+
+/** A positive-quantity sale refund line with NO persisted line link — WooCommerce permits this unmatched shape
+ *  ({ lineId: null, productId: null, lineKind: 'sale', qty: >0 }). Allocation cannot map it to a line, so it
+ *  neither reduces demand nor is a safe release target; treated as a data-quality anomaly, not demand-reducing. */
+export function hasUnmatchedSaleRefund(refundLines: ReadonlyArray<RefundReleaseLine>): boolean {
+  return refundLines.some((line) => line.lineKind === 'sale' && line.qty > 0 && line.lineId == null)
+}
+
 /**
- * A post-refund reservation release is warranted only when BOTH hold (Codex review r7):
+ * A post-refund reservation release is warranted only when BOTH hold (Codex review r7/r8):
  *   - there is a live residual reservation (allocated − shipped > 0), and
- *   - the refund actually REDUCES fulfilment demand: a positive-quantity sale line, or a FULL refund (zero
- *     remaining demand is intentional).
- * An amount-only partial — shipping, discount, goodwill, price-only — changes no product quantity, so it must
- * not enqueue release work that would refuse+dead-letter with a misleading stranded-reservation WARNING or
- * needlessly rebuild allocations.
+ *   - the refund actually REDUCES fulfilment demand: a positive-quantity sale line LINKED to a persisted
+ *     sales-order line, or a FULL refund (zero remaining demand is intentional, released via refundStatus=FULL).
+ * An amount-only partial (shipping/discount/goodwill/price-only) OR an unmatched external quantity line changes
+ * no tracked line's demand — allocation would ignore it — so it must not enqueue release work that would then be
+ * falsely resolved as successful while the reservation stays held (letting a later shipment include the
+ * refunded quantity).
  */
 export function isRefundReleaseEligible(input: {
   residualReserved: number
   newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED'
-  refundLines: ReadonlyArray<{ lineKind: string; qty: number }>
+  refundLines: ReadonlyArray<RefundReleaseLine>
 }): boolean {
   if (input.residualReserved <= REFUND_RESERVATION_EPSILON) return false
-  return input.newStatus === 'REFUNDED' || input.refundLines.some((line) => line.lineKind === 'sale' && line.qty > 0)
+  return input.newStatus === 'REFUNDED' || input.refundLines.some(isMatchedDemandLine)
 }
 
 export type ScheduleRefundReservationReleaseInput = {

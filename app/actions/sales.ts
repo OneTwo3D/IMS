@@ -1905,6 +1905,25 @@ export async function createRefund(
       }
     }
 
+    // o3d-67y (Codex r8): an unmatched external refund quantity (positive-qty sale line with no persisted
+    // sales-order-line link) cannot be released — allocation ignores it — but the order still holds a
+    // reservation a later shipment could dispatch. Surface it so an operator reconciles it manually.
+    if (refundResult.releaseUnmatchedAnomaly) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'refund_reservation_release_unmatched',
+        tag: 'sales',
+        level: 'WARNING',
+        description: `Refund on order ${refundResult.refundOrderRef} includes a quantity line that is not linked to any order line, so its stock reservation could not be released automatically. Reconcile the reservation manually — a later shipment could otherwise include the refunded quantity.`,
+        metadata: {
+          orderNumber: refundResult.refundOrderRef,
+          refundId: refundResult.createdRefund.id,
+          reason: 'unmatched_refund_line',
+        },
+      })
+    }
+
     let accountingWarning = refundResult.accountingWarning
     try {
       await queueRefundAccountingActions({

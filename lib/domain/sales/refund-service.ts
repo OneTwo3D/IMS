@@ -16,7 +16,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
-import { scheduleRefundReservationReleaseOutbox, isRefundReleaseEligible } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { scheduleRefundReservationReleaseOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import {
@@ -253,6 +253,10 @@ export type CreateSalesOrderRefundResult =
        *  caller should run the immediate post-refund reservation release. Derived under the order lock from
        *  actual allocations, not lifecycle status. Undefined on a replay (the original refund scheduled it). */
       releaseEligible?: boolean
+      /** o3d-67y: true when a positive-quantity sale refund line has no persisted sales-order-line link and a
+       *  live residual reservation exists on a partial refund — the reservation cannot be safely released and
+       *  the caller must surface it (a later shipment could include the refunded quantity). */
+      releaseUnmatchedAnomaly?: boolean
     }
 
 export type RetrySalesOrderRefundAccountingResult =
@@ -1961,6 +1965,16 @@ export async function createSalesOrderRefund(
     const residualReserved =
       refundBoundaryNumber(allocatedAgg._sum.qty ?? 0) - refundBoundaryNumber(shippedAgg._sum.qty ?? 0)
     const releaseEligible = isRefundReleaseEligible({ residualReserved, newStatus, refundLines: createdRefundLines })
+    // o3d-67y (Codex r8): a positive-qty sale refund line with no persisted sales-order-line link (an unmatched
+    // external WooCommerce line) can't reduce a tracked line's demand and is not a safe release target, so it is
+    // NOT eligible — but with a live residual reservation on a partial refund it is a data-quality anomaly the
+    // operator must see (the reservation stays held and a later shipment could include the refunded quantity),
+    // not a silent skip. Surfaced by the caller.
+    const releaseUnmatchedAnomaly =
+      !releaseEligible &&
+      residualReserved > 0 &&
+      newStatus !== 'REFUNDED' &&
+      hasUnmatchedSaleRefund(createdRefundLines)
 
     // Enqueue the durable reservation-release backstop INSIDE this tx so it commits atomically with the refund.
     // The immediate post-commit release (in the caller) stays for timeliness; this row guarantees the release
@@ -1980,6 +1994,7 @@ export async function createSalesOrderRefund(
       creditNoteNumber,
       newStatus,
       releaseEligible,
+      releaseUnmatchedAnomaly,
       fallbackReturnRows,
     }
   }).catch((error) => {
@@ -2091,6 +2106,7 @@ export async function createSalesOrderRefund(
     accountingWarning,
     returnedRows,
     releaseEligible: txResult.releaseEligible,
+    releaseUnmatchedAnomaly: txResult.releaseUnmatchedAnomaly,
   }
 }
 

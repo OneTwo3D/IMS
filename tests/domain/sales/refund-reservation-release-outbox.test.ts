@@ -7,6 +7,7 @@ import {
   processRefundReservationReleaseOutbox,
   resolveRefundReservationReleaseOutbox,
   isRefundReleaseEligible,
+  hasUnmatchedSaleRefund,
   writeRefundReleaseDeferralWarningOnce,
   DEFERRAL_WARNING_ACTION,
   REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
@@ -33,8 +34,9 @@ function fakeTx() {
 
 // ---- eligibility: residual reservation AND demand-reducing --------------------
 
-const saleLine = (qty: number) => ({ lineKind: 'sale', qty })
-const feeLine = (kind: string) => ({ lineKind: kind, qty: 0 })
+const saleLine = (qty: number) => ({ lineKind: 'sale', qty, lineId: 'line-1' })
+const unmatchedSaleLine = (qty: number) => ({ lineKind: 'sale', qty, lineId: null })
+const feeLine = (kind: string) => ({ lineKind: kind, qty: 0, lineId: null })
 
 test('eligibility: needs a live residual reservation', () => {
   assert.equal(isRefundReleaseEligible({ residualReserved: 0, newStatus: 'REFUNDED', refundLines: [saleLine(2)] }), false)
@@ -52,16 +54,31 @@ test('eligibility: a partial amount-only refund (no sale qty) is NOT eligible ev
   }
 })
 
-test('eligibility: a partial refund WITH a positive-qty sale line IS eligible', () => {
+test('eligibility: a partial refund WITH a matched positive-qty sale line IS eligible', () => {
   assert.equal(
     isRefundReleaseEligible({ residualReserved: 5, newStatus: 'PARTIALLY_REFUNDED', refundLines: [saleLine(2), feeLine('shipping')] }),
     true,
   )
 })
 
-test('eligibility: a FULL amount-only refund is still eligible — zero remaining demand is intentional', () => {
+test('eligibility: a partial refund with an UNMATCHED sale line (lineId null) is NOT eligible (o3d-67y r8)', () => {
+  // Allocation ignores refund rows with a null salesOrderLineId, so an unmatched external quantity line would
+  // otherwise enqueue and be falsely resolved as successful while the reservation stays held.
+  assert.equal(
+    isRefundReleaseEligible({ residualReserved: 5, newStatus: 'PARTIALLY_REFUNDED', refundLines: [unmatchedSaleLine(2)] }),
+    false,
+  )
+  assert.equal(hasUnmatchedSaleRefund([unmatchedSaleLine(2)]), true)
+  assert.equal(hasUnmatchedSaleRefund([saleLine(2)]), false)
+})
+
+test('eligibility: a FULL refund is still eligible regardless of line links — released via refundStatus=FULL', () => {
   assert.equal(
     isRefundReleaseEligible({ residualReserved: 5, newStatus: 'REFUNDED', refundLines: [feeLine('shipping')] }),
+    true,
+  )
+  assert.equal(
+    isRefundReleaseEligible({ residualReserved: 5, newStatus: 'REFUNDED', refundLines: [unmatchedSaleLine(2)] }),
     true,
   )
 })
