@@ -161,6 +161,19 @@ export async function cancelWcOrder(c: WcCreds, orderId: number): Promise<WcOrde
   })
 }
 
+/**
+ * Apply a benign edit to an order (default: a fresh customer note) to force a NEW order.updated delivery —
+ * used to REPLAY an order webhook deterministically. The note is changed so the payload differs and the
+ * inbox does not dedupe it as an identical (connector, resource, payloadHash) delivery, which makes the
+ * import path actually run again rather than being absorbed at the inbox.
+ */
+export async function updateWcOrder(c: WcCreds, orderId: number, changes?: Record<string, unknown>): Promise<WcOrder> {
+  return wcRequest<WcOrder>(c, `/orders/${orderId}`, {
+    method: 'PUT',
+    body: JSON.stringify(changes ?? { customer_note: `replay ${orderId}` }),
+  })
+}
+
 export type WcOrderDetail = WcOrder & {
   billing?: { first_name?: string; last_name?: string; email?: string }
   customer_note?: string

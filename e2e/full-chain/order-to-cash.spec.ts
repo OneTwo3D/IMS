@@ -19,7 +19,7 @@ import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import {
   awaitWebhookDelivery, cancelWcOrder, cleanupWc, createWcOrder, createWcProduct, getWcOrder, nudgeWpCron,
-  refundWcOrder, wcCreds, type WcCreds,
+  refundWcOrder, updateWcOrder, wcCreds, type WcCreds,
 } from './harness/wc.ts'
 import { allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, setPostingMode } from './harness/ims.ts'
 import { addStockAdjustment, createInventoryProduct } from '../helpers.ts'
@@ -708,6 +708,66 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     // proof that nothing was dropped or mis-added across the chain.
     expect(Number(invoice.Total)).toBeCloseTo(Number(order.total), 2)
   })
+
+  test('OC-16: replaying an order webhook is idempotent — one SO, one invoice, no duplicates', async ({ page }) => {
+    // Worst case chains two full delivery windows (the import, then the forced replay) plus setup, so the
+    // ceiling must clear their sum the way OC-13 does.
+    test.setTimeout(1_800_000)
+
+    // WooCommerce and its retries deliver the same order more than once — measured against the live store,
+    // a single order arrives as order.updated TWICE. A redelivery must be absorbed idempotently:
+    // importWcOrder takes the existing-order path (updateExistingWcOrderFromPayload) and must NOT fork a
+    // second sales order or re-queue the SALES_INVOICE. We do NOT drain to Xero here (the invoice stays
+    // queued; teardown cancels it) — the property under test is the import/queue side, not a ledger post.
+    const sku = taggedSku(runId, 'OC16')
+    const unitPrice = '25.00'
+    const qty = 2
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC16`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC16', price: unitPrice })
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+    const imported = await awaitWebhookDelivery(order.id, { creds })
+    // Settle ALL initial deliveries (the natural duplicates included) before the baseline. requireAllProcessed
+    // makes idempotency the bar: if any duplicate DEAD_LETTERED (i.e. was not absorbed gracefully) this fails
+    // rather than passing on the unique-constrained link count. This baseline alone already proves
+    // natural-duplicate idempotency: N deliveries, still one SO and one invoice, none dead-lettered.
+    await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+    // Oracle reads sales_orders directly (not the unique-capped link table), and counts invoices across
+    // EVERY sales order carrying this WC number — so a duplicate order (and its separately-keyed invoice)
+    // cannot hide.
+    const soIdsAfterImport = await salesOrderIdsForWcOrderNumber(order.number)
+    expect(soIdsAfterImport.length, 'exactly one sales order for the WC order after import').toBe(1)
+    expect(
+      await salesInvoiceLogCountForOrders(soIdsAfterImport),
+      'exactly one SALES_INVOICE queued at import, however many times it was delivered',
+    ).toBe(1)
+
+    // Force a DETERMINISTIC extra replay: a benign note edit fires a fresh order.updated (payload differs, so
+    // the inbox does not dedupe it by hash — the import path actually runs again). The note carries a UNIQUE
+    // marker so the barrier waits for THIS exact delivery, correlated by payload — not a wall-clock cutoff a
+    // late original delivery could satisfy first.
+    const replayMarker = `OC16-replay-${runId}`
+    await updateWcOrder(creds, order.id, { customer_note: `${runTag(runId)} ${replayMarker}` })
+    // Wait for the marked replay delivery specifically, and require it to PROCESS (fail if it dead-letters) —
+    // a redelivery that dead-letters is exactly the non-idempotent handling this test must catch.
+    await awaitWebhookEventProcessed(order.id, creds, { noteContains: replayMarker, requireAllProcessed: true })
+    // Then let ALL of the order's deliveries (not only the marked one) quiesce, so a late ORIGINAL delivery
+    // cannot land after the assertions and mutate state unseen.
+    await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+    // Idempotent: still exactly one SO and one SALES_INVOICE (across ALL SOs for this WC order) — the
+    // redelivery neither forked the order nor re-queued the invoice.
+    const soIdsAfterReplay = await salesOrderIdsForWcOrderNumber(order.number)
+    expect(soIdsAfterReplay.length, 'still exactly one sales order after the replay').toBe(1)
+    expect(
+      await salesInvoiceLogCountForOrders(soIdsAfterReplay),
+      'still exactly one SALES_INVOICE after the replay — the re-import did not re-queue',
+    ).toBe(1)
+  })
 })
 
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
@@ -959,32 +1019,72 @@ async function awaitAllocated(
  * transient error must NOT fail the run — only a permanent DEAD_LETTER (with nothing PROCESSED) does.
  * Topic-agnostic (order.created OR order.updated) and connector-scoped. Nudges WP-Cron each poll (this store
  * has no organic traffic).
+ *
+ * `opts.noteContains` scopes the barrier to the ONE delivery whose payload customer_note carries a unique
+ * marker — needed to wait on a specific REPLAY (a freshly triggered order.updated) by CORRELATING on its
+ * payload, not on a wall-clock cutoff. A cutoff was unsafe: a late ORIGINAL order.updated arriving after the
+ * cutoff could satisfy the barrier before the replay ever landed. Matching the marker pins it to the exact
+ * event we caused.
  */
-async function awaitWebhookEventProcessed(wcOrderId: number, creds: WcCreds, timeoutMs = 300_000): Promise<void> {
+async function awaitWebhookEventProcessed(
+  wcOrderId: number,
+  creds: WcCreds,
+  opts: { noteContains?: string; requireAllProcessed?: boolean; timeoutMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? 300_000
   const { Client } = await import('pg')
   const db = new Client({ connectionString: process.env.DATABASE_URL })
   await db.connect()
   try {
     const deadline = Date.now() + timeoutMs
     let snapshot = '(no events yet)'
+    // Quiescence — the hard part, and one with a KNOWN limit worth stating plainly. IMS can only see events
+    // it has RECEIVED; a duplicate still queued upstream in Woo's Action Scheduler creates no row here, so no
+    // in-test check can prove "Woo will deliver nothing further" without either Woo-side scheduler
+    // introspection (out of scope) or an unbounded wait. What IS deterministic — and is this test's
+    // authoritative assertion — is the DELIVERED replay: we trigger it, wait for its marker-matched event to
+    // PROCESS, then assert. Woo does not re-deliver a 2xx-acked event (its retries fire only on a non-2xx),
+    // so a minute-late duplicate of an already-processed delivery is not part of the model. Against the
+    // near-simultaneous duplicates that DO occur (measured: two order.updated seconds apart), we require the
+    // settled set to hold a STABLE row count across NUM_STABLE_POLLS further polls (~10s of no new delivery,
+    // nudging WP-Cron each time) before concluding the order has quiesced.
+    const NUM_STABLE_POLLS = 2
+    let settledCount = -1
+    let stableHits = 0
     while (Date.now() < deadline) {
       const r = await db.query<{ status: string; attempts: number; lastError: string | null; nextAttemptAt: Date | null }>(
         `select status, attempts, "lastError", "nextAttemptAt" from shopping_webhook_events
           where connector = 'woocommerce' and topic in ('order.created', 'order.updated')
             and ("payloadJson"->>'id')::bigint = $1
+            and ($2::text is null or ("payloadJson"->>'customer_note') like '%' || $2 || '%')
           order by "receivedAt"`,
-        [wcOrderId],
+        [wcOrderId, opts.noteContains ?? null],
       )
       const rows = r.rows
-      // PROCESSED / DEAD_LETTER are terminal; PENDING / PROCESSING / FAILED (retryable) are still in flight.
-      const inFlight = rows.filter((x) => x.status === 'PENDING' || x.status === 'PROCESSING' || x.status === 'FAILED')
-      if (rows.length > 0 && inFlight.length === 0) {
-        if (rows.some((x) => x.status === 'PROCESSED')) return
-        throw new Error(`Every import webhook for WC order ${wcOrderId} settled DEAD_LETTER with none PROCESSED — the import failed permanently.`)
-      }
       snapshot = rows.length
         ? rows.map((x) => `${x.status}${x.attempts ? ` (attempt ${x.attempts}${x.lastError ? `, last: ${x.lastError}` : ''}${x.nextAttemptAt ? `, next ${x.nextAttemptAt.toISOString()}` : ''})` : ''}`).join('; ')
         : '(no events yet)'
+      // PROCESSED / DEAD_LETTER are terminal; PENDING / PROCESSING / FAILED (retryable) are still in flight.
+      const inFlight = rows.filter((x) => x.status === 'PENDING' || x.status === 'PROCESSING' || x.status === 'FAILED')
+      // requireAllProcessed = idempotency mode: EVERY matched delivery must succeed. A DEAD_LETTERED
+      // duplicate means the redelivery was NOT absorbed gracefully — fail immediately rather than let the
+      // (unique-constrained) link count and un-re-queued invoice count mask it as a false green.
+      if (opts.requireAllProcessed && rows.some((x) => x.status === 'DEAD_LETTER')) {
+        throw new Error(`A matched import webhook for WC order ${wcOrderId} DEAD_LETTERED — a duplicate delivery was not absorbed idempotently. State: ${snapshot}`)
+      }
+      if (rows.length > 0 && inFlight.length === 0) {
+        // Settled this poll. In requireAllProcessed mode any dead-letter already threw, so all rows PROCESSED.
+        if (opts.requireAllProcessed || rows.some((x) => x.status === 'PROCESSED')) {
+          stableHits = settledCount === rows.length ? stableHits + 1 : 0
+          settledCount = rows.length
+          if (stableHits >= NUM_STABLE_POLLS) return // count held stable across the quiet window -> quiesced
+        } else {
+          throw new Error(`Every import webhook for WC order ${wcOrderId} settled DEAD_LETTER with none PROCESSED — the import failed permanently. State: ${snapshot}`)
+        }
+      } else {
+        settledCount = -1 // something back in flight -> the quiet window restarts
+        stableHits = 0
+      }
       await nudgeWpCron(creds)
       await new Promise((res) => setTimeout(res, 5_000))
     }
@@ -1018,6 +1118,46 @@ async function skipAccountingLogFor(salesOrderId: string, timeoutMs = 60_000): P
       await new Promise((res) => setTimeout(res, 2_000))
     }
     return null
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * The ids of every IMS sales order carrying a WC order's number. Reads sales_orders directly (by
+ * externalOrderNumber), NOT the shopping_order_links table — that table is unique on
+ * (connector, externalOrderId), so counting links is tautologically capped at one and could never observe
+ * an ORPHAN duplicate order (one created without a link). Returning the full id set lets the caller both
+ * assert exactly one order AND count invoices across all of them, so a duplicate order's invoice (keyed to
+ * a different sales-order id) cannot slip past.
+ */
+async function salesOrderIdsForWcOrderNumber(wcOrderNumber: string): Promise<string[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string }>(
+      `select id from sales_orders where "externalOrderNumber" = $1`, [wcOrderNumber],
+    )
+    return r.rows.map((row) => row.id)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Total SALES_INVOICE sync logs across a set of sales orders (0 if the set is empty). */
+async function salesInvoiceLogCountForOrders(salesOrderIds: string[]): Promise<number> {
+  if (salesOrderIds.length === 0) return 0
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ count: string }>(
+      `select count(*)::int as count from accounting_sync_logs
+        where connector = 'xero' and type = 'SALES_INVOICE'::"AccountingSyncType" and "referenceId" = ANY($1)`,
+      [salesOrderIds],
+    )
+    return Number(r.rows[0]?.count ?? 0)
   } finally {
     await db.end()
   }
