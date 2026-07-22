@@ -1965,16 +1965,14 @@ export async function createSalesOrderRefund(
     const residualReserved =
       refundBoundaryNumber(allocatedAgg._sum.qty ?? 0) - refundBoundaryNumber(shippedAgg._sum.qty ?? 0)
     const releaseEligible = isRefundReleaseEligible({ residualReserved, newStatus, refundLines: createdRefundLines })
-    // o3d-67y (Codex r8): a positive-qty sale refund line with no persisted sales-order-line link (an unmatched
-    // external WooCommerce line) can't reduce a tracked line's demand and is not a safe release target, so it is
-    // NOT eligible — but with a live residual reservation on a partial refund it is a data-quality anomaly the
-    // operator must see (the reservation stays held and a later shipment could include the refunded quantity),
-    // not a silent skip. Surfaced by the caller.
+    // o3d-67y (Codex r8/r9): a positive-qty sale refund line with no persisted sales-order-line link (an
+    // unmatched external WooCommerce line) can't reduce a tracked line's demand and is not a safe release
+    // target — but with a live residual reservation on a partial refund it is a data-quality anomaly the
+    // operator must see (the reservation stays held and a later shipment could include the refunded quantity).
+    // Computed INDEPENDENTLY of releaseEligible so a MIXED refund (one matched + one unmatched line) still
+    // surfaces it (a matched line makes the release eligible but does not resolve the unmatched line).
     const releaseUnmatchedAnomaly =
-      !releaseEligible &&
-      residualReserved > 0 &&
-      newStatus !== 'REFUNDED' &&
-      hasUnmatchedSaleRefund(createdRefundLines)
+      residualReserved > 0 && newStatus !== 'REFUNDED' && hasUnmatchedSaleRefund(createdRefundLines)
 
     // Enqueue the durable reservation-release backstop INSIDE this tx so it commits atomically with the refund.
     // The immediate post-commit release (in the caller) stays for timeliness; this row guarantees the release
@@ -1983,7 +1981,9 @@ export async function createSalesOrderRefund(
     await scheduleRefundReservationReleaseOutbox(tx, {
       orderId: input.orderId,
       refundId: createdRefund.id,
+      refundOrderRef: getSalesOrderReference(so),
       eligible: releaseEligible,
+      unmatched: releaseUnmatchedAnomaly,
     })
 
     return {

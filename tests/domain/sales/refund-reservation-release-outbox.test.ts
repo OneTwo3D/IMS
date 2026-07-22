@@ -8,8 +8,9 @@ import {
   resolveRefundReservationReleaseOutbox,
   isRefundReleaseEligible,
   hasUnmatchedSaleRefund,
-  writeRefundReleaseDeferralWarningOnce,
+  writeRefundWarningOnce,
   DEFERRAL_WARNING_ACTION,
+  UNMATCHED_WARNING_ACTION,
   REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
   REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
   type RefundReservationReleaseDrainDeps,
@@ -117,20 +118,28 @@ test('schedule enqueues a backstop row inside the tx when the order holds alloca
   assert.equal(data.connector, REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR)
   assert.equal(data.operation, REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION)
   assert.equal(data.status, 'PENDING')
-  assert.deepEqual(data.payloadJson, { orderId: 'order-1', refundId: 'refund-1' })
+  assert.deepEqual(data.payloadJson, { orderId: 'order-1', refundId: 'refund-1', attemptRelease: true, unmatched: false, refundOrderRef: '' })
   assert.match(String(data.idempotencyKey), /refund-1/)
   assert.ok(data.nextAttemptAt instanceof Date && (data.nextAttemptAt as Date).getTime() > new Date('2026-07-22T00:00:00.000Z').getTime())
 })
 
-test('schedule is a no-op when the order holds no allocations (eligible:false)', async () => {
+test('schedule enqueues an unmatched-only row (eligible:false, unmatched:true) to carry the durable WARNING', async () => {
   const { tx, created } = fakeTx()
-  await scheduleRefundReservationReleaseOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', eligible: false })
+  await scheduleRefundReservationReleaseOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', eligible: false, unmatched: true, refundOrderRef: 'SO-9' })
+  assert.equal(created.length, 1)
+  assert.deepEqual(created[0].data.payloadJson, { orderId: 'order-1', refundId: 'refund-1', attemptRelease: false, unmatched: true, refundOrderRef: 'SO-9' })
+})
+
+test('schedule is a no-op when neither eligible nor unmatched', async () => {
+  const { tx, created } = fakeTx()
+  await scheduleRefundReservationReleaseOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', eligible: false, unmatched: false })
   assert.equal(created.length, 0)
 })
 
 // ---- drain classification ---------------------------------------------------
 
-type Recorded = { successIds: string[]; retryIds: string[]; deferrals: Array<{ orderId: string; refundId: string }> }
+type Warn = { orderId: string; refundId: string }
+type Recorded = { successIds: string[]; retryIds: string[]; deferrals: Warn[]; unmatched: Warn[] }
 
 function drainDeps(
   jobs: Array<{ id: string; attempts: number; lockedAt: Date | null; payloadJson: unknown }>,
@@ -142,11 +151,12 @@ function drainDeps(
     allocate,
     markSuccess: async ({ id }) => { recorded.successIds.push(id) },
     markRetry: async ({ id }) => { recorded.retryIds.push(id) },
-    logDeferral: async ({ orderId, refundId }) => { recorded.deferrals.push({ orderId, refundId }) },
+    logDeferral: async ({ orderId, refundId }) => { recorded.deferrals.push({ orderId, refundId }); return 'written' },
+    logUnmatched: async ({ orderId, refundId }) => { recorded.unmatched.push({ orderId, refundId }); return 'written' },
   }
 }
 
-const emptyRecorded = (): Recorded => ({ successIds: [], retryIds: [], deferrals: [] })
+const emptyRecorded = (): Recorded => ({ successIds: [], retryIds: [], deferrals: [], unmatched: [] })
 
 const job = (id: string, over: Partial<{ attempts: number; lockedAt: Date | null; payloadJson: unknown }> = {}) => ({
   id,
@@ -215,38 +225,90 @@ test('drain: a non-refuse failure does NOT write a deferral WARNING', async () =
   assert.deepEqual(recorded.deferrals, [])
 })
 
-// ---- idempotent + retryable deferral WARNING --------------------------------
+// ---- two-duty rows: unmatched-line WARNING (o3d-67y r9) ----------------------
 
-test('deferral WARNING: writes when none is persisted, and carries the refund-scoped identity', async () => {
+test('drain: an unmatched-only row delivers the WARNING and completes without touching allocation', async () => {
+  const recorded = emptyRecorded()
+  let allocateCalls = 0
+  const deps = drainDeps(
+    [job('a', { payloadJson: { orderId: 'order-a', refundId: 'refund-a', attemptRelease: false, unmatched: true } })],
+    async () => { allocateCalls++; return { success: true, committed: true } },
+    recorded,
+  )
+  await processRefundReservationReleaseOutbox(deps)
+  assert.equal(allocateCalls, 0, 'no release is attempted for an unmatched-only refund')
+  assert.deepEqual(recorded.unmatched, [{ orderId: 'order-a', refundId: 'refund-a' }])
+  assert.deepEqual(recorded.successIds, ['a'], 'the job completes once the WARNING is delivered')
+})
+
+test('drain: an unmatched-only row whose WARNING delivery throws RETRIES (durable delivery, o3d-67y r9)', async () => {
+  const recorded = emptyRecorded()
+  const deps: RefundReservationReleaseDrainDeps = {
+    ...drainDeps([job('a', { payloadJson: { orderId: 'order-a', refundId: 'refund-a', attemptRelease: false, unmatched: true } })], async () => ({ success: true, committed: true }), recorded),
+    logUnmatched: async () => { throw new Error('activity log DB down') },
+  }
+  await processRefundReservationReleaseOutbox(deps)
+  assert.deepEqual(recorded.retryIds, ['a'], 'unconfirmed WARNING delivery keeps the job pending')
+  assert.deepEqual(recorded.successIds, [])
+})
+
+test('drain: a MIXED row delivers the unmatched WARNING AND completes the release (o3d-67y r9)', async () => {
+  const recorded = emptyRecorded()
+  const deps = drainDeps(
+    [job('a', { payloadJson: { orderId: 'order-a', refundId: 'refund-a', attemptRelease: true, unmatched: true } })],
+    async () => ({ success: true, committed: true }),
+    recorded,
+  )
+  await processRefundReservationReleaseOutbox(deps)
+  assert.deepEqual(recorded.unmatched, [{ orderId: 'order-a', refundId: 'refund-a' }])
+  assert.deepEqual(recorded.successIds, ['a'])
+})
+
+test('drain: a MIXED row whose release refuses still delivers the WARNING but RETRIES the release', async () => {
+  const recorded = emptyRecorded()
+  const deps = drainDeps(
+    [job('a', { payloadJson: { orderId: 'order-a', refundId: 'refund-a', attemptRelease: true, unmatched: true } })],
+    async () => ({ success: false, refused: true, committed: false }),
+    recorded,
+  )
+  await processRefundReservationReleaseOutbox(deps)
+  assert.deepEqual(recorded.unmatched, [{ orderId: 'order-a', refundId: 'refund-a' }], 'the WARNING is delivered even when release cannot complete')
+  assert.deepEqual(recorded.deferrals, [{ orderId: 'order-a', refundId: 'refund-a' }])
+  assert.deepEqual(recorded.retryIds, ['a'])
+})
+
+// ---- idempotent + retryable WARNING writer ----------------------------------
+
+const warnArgs = (action: string) => ({ orderId: 'order-1', refundId: 'refund-1', action, description: 'x', reason: 'r' })
+
+test('WARNING writer: writes when none is persisted, carrying the (action, refund) identity', async () => {
   const logged: Array<Record<string, unknown>> = []
-  const outcome = await writeRefundReleaseDeferralWarningOnce(
-    { orderId: 'order-1', refundId: 'refund-1' },
+  const outcome = await writeRefundWarningOnce(
+    warnArgs(UNMATCHED_WARNING_ACTION),
     { findExisting: async () => false, log: async (p) => { logged.push(p); return undefined } },
   )
   assert.equal(outcome, 'written')
   assert.equal(logged.length, 1)
-  assert.equal(logged[0].action, DEFERRAL_WARNING_ACTION)
+  assert.equal(logged[0].action, UNMATCHED_WARNING_ACTION)
   assert.equal(logged[0].entityId, 'order-1')
   assert.equal(logged[0].level, 'WARNING')
   assert.deepEqual((logged[0].metadata as { refundId: string }).refundId, 'refund-1')
 })
 
-test('deferral WARNING: skips (no duplicate) when one is already persisted', async () => {
-  let logCalls = 0
-  const outcome = await writeRefundReleaseDeferralWarningOnce(
-    { orderId: 'order-1', refundId: 'refund-1' },
-    { findExisting: async () => true, log: async () => { logCalls++; return undefined } },
+test('WARNING writer: dedups on (action, refundId) — findExisting receives the action', async () => {
+  const seenActions: string[] = []
+  const outcome = await writeRefundWarningOnce(
+    warnArgs(DEFERRAL_WARNING_ACTION),
+    { findExisting: async ({ action }) => { seenActions.push(action); return true }, log: async () => undefined },
   )
   assert.equal(outcome, 'skipped')
-  assert.equal(logCalls, 0, 'an already-persisted WARNING is never duplicated')
+  assert.deepEqual(seenActions, [DEFERRAL_WARNING_ACTION], 'dedup is scoped to the specific warning action')
 })
 
-test('deferral WARNING: a lost write (still not persisted next time) is retried, not permanently suppressed', async () => {
-  // Models logActivity swallowing a DB failure: findExisting still reports false on the next attempt, so the
-  // WARNING is written again until it actually persists — delivery does not hinge on one swallowed write.
+test('WARNING writer: a lost write (still not persisted next time) is retried, not permanently suppressed', async () => {
   let persisted = false
-  const attempt = () => writeRefundReleaseDeferralWarningOnce(
-    { orderId: 'order-1', refundId: 'refund-1' },
+  const attempt = () => writeRefundWarningOnce(
+    warnArgs(UNMATCHED_WARNING_ACTION),
     { findExisting: async () => persisted, log: async () => { /* swallowed: does not persist */ return undefined } },
   )
   assert.equal(await attempt(), 'written')

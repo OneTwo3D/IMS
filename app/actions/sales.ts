@@ -1897,7 +1897,10 @@ export async function createRefund(
     // drain would re-run allocation, which is NOT side-effect-idempotent (it deletes/recreates OrderAllocation
     // rows and resets staged allocation accounting). A genuine failure or a pre-transaction bail leaves the row
     // PENDING so the drain retries and dead-letters visibly.
-    if (releaseOutcome.reconciled) {
+    // Do NOT resolve when there is an unmatched-line anomaly: the outbox row also carries the durable
+    // unmatched-WARNING duty, which the drain must deliver (the immediate write below is best-effort and can be
+    // lost to a swallowed logActivity failure or a crash) (Codex review r9).
+    if (releaseOutcome.reconciled && !refundResult.releaseUnmatchedAnomaly) {
       try {
         await resolveRefundReservationReleaseOutbox(refundResult.createdRefund.id)
       } catch (resolveError) {

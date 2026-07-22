@@ -95,26 +95,31 @@ export function isRefundReleaseEligible(input: {
 export type ScheduleRefundReservationReleaseInput = {
   orderId: string
   refundId: string
+  refundOrderRef?: string
   /**
-   * Whether the order holds stock reservations to release — derived from persisted OrderAllocation rows under
-   * the refund's order lock, NOT from lifecycle status (an ON_HOLD / PICKING / PACKING order can still hold
-   * allocations; a never-allocated order holds none). Codex review r3.
+   * Whether this refund reduces a MATCHED line's demand and the order holds a live reservation — derived under
+   * the refund's order lock (isRefundReleaseEligible + residual reservation). Drives the release re-attempt.
    */
   eligible: boolean
+  /**
+   * Whether this refund has an UNMATCHED positive-qty sale line with a live residual reservation — allocation
+   * cannot release it, so a durable operator WARNING must be delivered (Codex review r9).
+   */
+  unmatched?: boolean
 }
 
 /**
  * Enqueue the durable reservation-release backstop — call INSIDE the
  * createSalesOrderRefund transaction so the outbox row commits atomically with the
- * refund. No-op when the order holds no allocations. The idempotency key is per-refund
- * so a replayed refund dedups to a single backstop row.
+ * refund. A single row carries two duties (release re-attempt and/or unmatched-line WARNING); no-op when
+ * neither applies. The idempotency key is per-refund so a replayed refund dedups to a single backstop row.
  */
 export async function scheduleRefundReservationReleaseOutbox(
   tx: Prisma.TransactionClient,
   input: ScheduleRefundReservationReleaseInput,
   options: { graceMs?: number; now?: Date } = {},
 ): Promise<void> {
-  if (!input.eligible) return
+  if (!input.eligible && !input.unmatched) return
   const now = options.now ?? new Date()
   const idempotencyKey = buildOutboxIdempotencyKey(
     REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
@@ -126,7 +131,13 @@ export async function scheduleRefundReservationReleaseOutbox(
       connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
       operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
       idempotencyKey,
-      payloadJson: { orderId: input.orderId, refundId: input.refundId },
+      payloadJson: {
+        orderId: input.orderId,
+        refundId: input.refundId,
+        attemptRelease: input.eligible,
+        unmatched: input.unmatched === true,
+        refundOrderRef: input.refundOrderRef ?? '',
+      },
       nextAttemptAt: new Date(now.getTime() + (options.graceMs ?? DEFAULT_DRAIN_GRACE_MS)),
     },
     { client: tx as unknown as IntegrationOutboxClient },
@@ -178,13 +189,85 @@ export type ReleaseAllocationResult = {
   committed?: boolean
 }
 
+export type RefundWarningParams = { orderId: string; refundId: string; refundOrderRef?: string }
+
 export type RefundReservationReleaseDrainDeps = {
   claimWork: typeof claimIntegrationOutboxWork
   allocate: (orderId: string) => Promise<ReleaseAllocationResult>
   markSuccess: (options: Parameters<typeof markIntegrationOutboxSuccess>[0]) => Promise<unknown>
   markRetry: (options: Parameters<typeof markIntegrationOutboxRetryableFailure>[0]) => Promise<unknown>
-  /** Record an order-scoped deferral WARNING (o3d-67y r5) — best-effort, must never throw into the drain. */
-  logDeferral: (params: { orderId: string; refundId: string }) => Promise<unknown>
+  /** Deliver the shipment-refuse deferral WARNING (o3d-67y r5) — idempotent, returns 'written'|'skipped'. */
+  logDeferral: (params: RefundWarningParams) => Promise<'written' | 'skipped'>
+  /** Deliver the unmatched-refund-line WARNING (o3d-67y r9) — idempotent, returns 'written'|'skipped'. */
+  logUnmatched: (params: RefundWarningParams) => Promise<'written' | 'skipped'>
+}
+
+export const DEFERRAL_WARNING_ACTION = 'refund_reservation_release_deferred'
+export const UNMATCHED_WARNING_ACTION = 'refund_reservation_release_unmatched'
+
+// Advisory-lock namespace for the per-refund WARNING dedup (distinct from REFUND_ACCOUNTING_LOCK_KEY).
+const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
+
+/** Stable signed-int32 hash of a refund id for the second pg_advisory_xact_lock parameter. */
+function advisoryHash(value: string): number {
+  let hash = 0
+  for (let i = 0; i < value.length; i++) {
+    hash = (Math.imul(31, hash) + value.charCodeAt(i)) | 0
+  }
+  return hash
+}
+
+const deferralDescription = (p: RefundWarningParams) =>
+  `Refund on order ${p.refundOrderRef || p.orderId} could not release its stock reservation because a shipment already exists (recovered by the durable backstop). The refunded units may still be reserved; verify the pending shipment nets the refund so they are neither stranded-reserved nor dispatched.`
+
+const unmatchedDescription = (p: RefundWarningParams) =>
+  `Refund on order ${p.refundOrderRef || p.orderId} includes a quantity line not linked to any order line, so its stock reservation could not be released automatically. Reconcile the reservation manually — a later shipment could otherwise include the refunded quantity.`
+
+/**
+ * Build the DEFAULT idempotent + retryable WARNING writer for one action. It serializes the check-then-write
+ * under a per-refund advisory lock so two concurrent workers (stale-lock reclamation, a delayed immediate
+ * helper) cannot both observe "no row" and both insert — ActivityLog has no refund-scoped unique constraint, so
+ * the lock is what makes it at-most-once (Codex r7). It confirms PERSISTENCE inside the same transaction, so a
+ * swallowed earlier write leaves no row and a later attempt re-delivers (Codex r6). Keyed on (action, refundId)
+ * so the deferral and unmatched warnings dedup independently.
+ */
+function lockedRefundWarningWriter(spec: {
+  action: string
+  reason: string
+  describe: (p: RefundWarningParams) => string
+}): (params: RefundWarningParams) => Promise<'written' | 'skipped'> {
+  return async (params) =>
+    db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REFUND_RELEASE_WARNING_LOCK_NAMESPACE}, ${advisoryHash(params.refundId)})`
+      return writeRefundWarningOnce(
+        { ...params, action: spec.action, description: spec.describe(params), reason: spec.reason },
+        {
+          findExisting: async ({ orderId, refundId, action }) => {
+            const existing = await tx.activityLog.findFirst({
+              where: {
+                entityType: 'SALES_ORDER',
+                entityId: orderId,
+                action,
+                metadata: { path: ['refundId'], equals: refundId },
+              },
+              select: { id: true },
+            })
+            return existing != null
+          },
+          log: async (logParams) => tx.activityLog.create({
+            data: {
+              entityType: logParams.entityType,
+              entityId: logParams.entityId,
+              action: logParams.action,
+              tag: logParams.tag,
+              level: logParams.level,
+              description: logParams.description,
+              metadata: logParams.metadata as Prisma.InputJsonValue,
+            },
+          }),
+        },
+      )
+    })
 }
 
 const defaultDrainDeps = (): RefundReservationReleaseDrainDeps => ({
@@ -201,60 +284,13 @@ const defaultDrainDeps = (): RefundReservationReleaseDrainDeps => ({
   },
   markSuccess: markIntegrationOutboxSuccess,
   markRetry: markIntegrationOutboxRetryableFailure,
-  logDeferral: async (params) =>
-    // Serialize the check-then-write under a per-refund advisory lock so two concurrent workers (a stale-lock
-    // reclamation, or a delayed immediate helper) cannot both observe "no row" and both insert — ActivityLog
-    // has no refund-scoped unique constraint, so the lock is what makes this at-most-once (Codex review r7).
-    // The findExisting + insert run in the SAME transaction as the lock so the second waiter reads the first's
-    // committed row and skips. Confirming PERSISTENCE (not logActivity's swallowed success) also keeps delivery
-    // retryable across drain attempts if an earlier write never landed (Codex review r6).
-    db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REFUND_RELEASE_WARNING_LOCK_NAMESPACE}, ${advisoryHash(params.refundId)})`
-      return writeRefundReleaseDeferralWarningOnce(params, {
-        findExisting: async ({ orderId, refundId }) => {
-          const existing = await tx.activityLog.findFirst({
-            where: {
-              entityType: 'SALES_ORDER',
-              entityId: orderId,
-              action: DEFERRAL_WARNING_ACTION,
-              metadata: { path: ['refundId'], equals: refundId },
-            },
-            select: { id: true },
-          })
-          return existing != null
-        },
-        log: async (logParams) => tx.activityLog.create({
-          data: {
-            entityType: logParams.entityType,
-            entityId: logParams.entityId,
-            action: logParams.action,
-            tag: logParams.tag,
-            level: logParams.level,
-            description: logParams.description,
-            metadata: logParams.metadata as Prisma.InputJsonValue,
-          },
-        }),
-      })
-    }),
+  logDeferral: lockedRefundWarningWriter({ action: DEFERRAL_WARNING_ACTION, reason: 'existing_shipment', describe: deferralDescription }),
+  logUnmatched: lockedRefundWarningWriter({ action: UNMATCHED_WARNING_ACTION, reason: 'unmatched_refund_line', describe: unmatchedDescription }),
 })
 
-export const DEFERRAL_WARNING_ACTION = 'refund_reservation_release_deferred'
-
-// Advisory-lock namespace for the per-refund deferral WARNING dedup (distinct from REFUND_ACCOUNTING_LOCK_KEY).
-const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
-
-/** Stable signed-int32 hash of a refund id for the second pg_advisory_xact_lock parameter. */
-function advisoryHash(value: string): number {
-  let hash = 0
-  for (let i = 0; i < value.length; i++) {
-    hash = (Math.imul(31, hash) + value.charCodeAt(i)) | 0
-  }
-  return hash
-}
-
-export type DeferralWarningDeps = {
-  /** True when a deferral WARNING for this refund is already durably persisted. */
-  findExisting: (params: { orderId: string; refundId: string }) => Promise<boolean>
+export type RefundWarningWriteDeps = {
+  /** True when a WARNING with this (action, refundId) is already durably persisted. */
+  findExisting: (params: { orderId: string; refundId: string; action: string }) => Promise<boolean>
   log: (params: {
     entityType: 'SALES_ORDER'
     entityId: string
@@ -268,29 +304,25 @@ export type DeferralWarningDeps = {
 }
 
 /**
- * Write the order-scoped reservation-release deferral WARNING at most once per refund, idempotently and
- * retryably: it writes ONLY when no persisted WARNING for the refund exists, so a swallowed logActivity failure
- * leaves no row and a later drain attempt re-attempts delivery, while a successful earlier write (from the
- * immediate helper or a prior drain attempt) suppresses a duplicate. The caller invokes this on EVERY refused
- * drain attempt — the persistence check, not an attempt counter, provides the once-only guarantee (Codex r6).
- *
- * CONCURRENCY: findExisting + log are separate operations, so strict at-most-once under concurrent writers
- * requires the caller to run them atomically (the default logDeferral wraps this in a per-refund advisory-lock
- * transaction, Codex r7). Callers that pass non-serialized deps get best-effort dedup only.
+ * Write an order-scoped refund WARNING at most once per (action, refund), idempotently and retryably: it writes
+ * ONLY when no persisted WARNING for that (action, refundId) exists, so a swallowed write leaves no row and a
+ * later attempt re-delivers, while an earlier success (from the immediate helper or a prior attempt) suppresses
+ * a duplicate. CONCURRENCY: findExisting + log are separate ops, so strict at-most-once requires the caller to
+ * run them atomically (the default writer wraps this in a per-refund advisory-lock transaction, Codex r7).
  */
-export async function writeRefundReleaseDeferralWarningOnce(
-  params: { orderId: string; refundId: string },
-  deps: DeferralWarningDeps,
+export async function writeRefundWarningOnce(
+  params: { orderId: string; refundId: string; action: string; description: string; reason: string },
+  deps: RefundWarningWriteDeps,
 ): Promise<'written' | 'skipped'> {
-  if (await deps.findExisting(params)) return 'skipped'
+  if (await deps.findExisting({ orderId: params.orderId, refundId: params.refundId, action: params.action })) return 'skipped'
   await deps.log({
     entityType: 'SALES_ORDER',
     entityId: params.orderId,
-    action: DEFERRAL_WARNING_ACTION,
+    action: params.action,
     tag: 'sales',
     level: 'WARNING',
-    description: `Refund on order ${params.orderId} could not release its stock reservation because a shipment already exists (recovered by the durable backstop). The refunded units may still be reserved; verify the pending shipment nets the refund so they are neither stranded-reserved nor dispatched.`,
-    metadata: { orderId: params.orderId, refundId: params.refundId, reason: 'existing_shipment', source: 'drain' },
+    description: params.description,
+    metadata: { orderId: params.orderId, refundId: params.refundId, reason: params.reason, source: 'drain' },
     resolveUser: false,
   })
   return 'written'
@@ -334,48 +366,61 @@ async function processOneRefundReservationReleaseJob(
   const lockedAt = job.lockedAt
   try {
     const payload = SalesRefundReservationReleaseOutboxPayloadSchema.parse(job.payloadJson)
-    const allocation = await deps.allocate(payload.orderId)
-    // The job is done ONLY when the allocation transaction COMMITTED (a full release or a committed backorder) —
-    // that is the only outcome that actually reconciles reservedQty. Everything else must retry with backoff and
-    // dead-letter visibly rather than be silently marked succeeded (Codex review r3/r4):
-    //   - a rolled-back transaction (failed) or a pre-transaction bail (no eligible warehouse) did not run;
-    //   - a shipment REFUSE declines without touching the stale OrderAllocation rows, so a partially-shipped
-    //     order (alloc 5, ship 3, refund 2) keeps 2 units reserved — the residual is left as a durable
-    //     dead-letter for shipment reconciliation (o3d-339), NEVER marked SUCCEEDED.
-    // Eligibility is gated on residual OrderAllocation rows, so a fully-dispatched order never enqueues a row,
-    // which bounds refused dead-letters to the genuine strand population.
-    const reconciled = allocation.committed === true
-    if (!reconciled) {
-      // If the immediate helper was bypassed (crash / post-commit throw) — the exact case this backstop exists
-      // to recover — a refuse here would otherwise dead-letter with only generic outbox health and no
-      // order-scoped signal. logDeferral is idempotent+retryable (it writes only when no persisted WARNING for
-      // the refund exists), so calling it on EVERY refused attempt delivers the warning at-most-once without
-      // depending on a single attempt's swallowed log succeeding (Codex review r6). Best-effort — a logging
-      // failure must not derail the retry.
-      if (allocation.refused === true) {
-        try {
-          await deps.logDeferral({ orderId: payload.orderId, refundId: payload.refundId })
-        } catch (logError) {
-          console.error('[refund] drain failed to record reservation-release deferral warning', logError)
-        }
+    const warningParams = { orderId: payload.orderId, refundId: payload.refundId, refundOrderRef: payload.refundOrderRef }
+
+    // Duty 1 — durably deliver the unmatched-refund-line WARNING (o3d-67y r9). This row exists partly/wholly for
+    // that signal; delivery is idempotent+retryable (writes only when not already persisted), so a swallowed
+    // earlier write (immediate helper or prior attempt) is re-attempted here without duplicating. A failure to
+    // confirm delivery keeps the job pending. Best-effort throw handling — never derail the release retry.
+    let unmatchedDelivered = true
+    if (payload.unmatched) {
+      try {
+        await deps.logUnmatched(warningParams)
+      } catch (logError) {
+        unmatchedDelivered = false
+        console.error('[refund] drain failed to deliver unmatched-refund-line warning', logError)
       }
-      await deps.markRetry({
-        id: job.id,
-        workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER,
-        lockedAt,
-        error: new Error(
+    }
+
+    // Duty 2 — re-attempt the reservation release (only when this refund reduces a matched line's demand). The
+    // job's release part is done ONLY when allocation COMMITTED; a rollback, a pre-transaction bail, or a
+    // shipment REFUSE (which leaves the stale reservation for o3d-339) must retry and dead-letter visibly, never
+    // be silently marked succeeded (Codex review r3/r4).
+    let releaseReconciled = true
+    let releaseError: Error | null = null
+    if (payload.attemptRelease) {
+      const allocation = await deps.allocate(payload.orderId)
+      releaseReconciled = allocation.committed === true
+      if (!releaseReconciled) {
+        if (allocation.refused === true) {
+          try {
+            await deps.logDeferral(warningParams)
+          } catch (logError) {
+            console.error('[refund] drain failed to record reservation-release deferral warning', logError)
+          }
+        }
+        releaseError = new Error(
           allocation.refused === true
             ? 'reservation release refused: a shipment holds the units — needs shipment reconciliation (o3d-339)'
             : allocation.error ?? 'reservation release did not commit (no eligible warehouse or rolled back)',
-        ),
-        attemptsBeforeFailure: job.attempts,
-        maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
-      })
-      result.failed++
+        )
+      }
+    }
+
+    if (unmatchedDelivered && releaseReconciled) {
+      await deps.markSuccess({ id: job.id, workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER, lockedAt })
+      result.succeeded++
       return
     }
-    await deps.markSuccess({ id: job.id, workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER, lockedAt })
-    result.succeeded++
+    await deps.markRetry({
+      id: job.id,
+      workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER,
+      lockedAt,
+      error: releaseError ?? new Error('unmatched-refund-line warning delivery not confirmed'),
+      attemptsBeforeFailure: job.attempts,
+      maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
+    })
+    result.failed++
   } catch (error) {
     await deps.markRetry({
       id: job.id,
