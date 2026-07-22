@@ -414,15 +414,13 @@ export async function handleWcWebhook(
   }
 
   const gate = await dependencies.getWebhookProcessingGate()
-  if (!gate.enabled) {
-    return NextResponse.json({
-      accepted: true,
-      queued: false,
-      skipped: true,
-      reason: gate.reason,
-    }, { status: 202 })
-  }
 
+  // o3d-56b: PERSIST the event even when the processing gate is disabled (plugin off / wc_sync_enabled=false).
+  // Previously a disabled gate returned 202 WITHOUT persisting: WooCommerce marks the delivery complete and
+  // never retries, so an order placed while sync was paused for maintenance was lost with no trace on either
+  // end. The event is stored as a normal PENDING row (idempotent by payload hash), so the shopping-webhook-inbox
+  // cron drains it automatically once sync is re-enabled — no orders are lost across a maintenance toggle. The
+  // immediate near-realtime drain is only kicked when the gate is enabled; while disabled the row simply waits.
   const parsed = parseWebhookJson<unknown>(body)
   if (!parsed.ok) return parsed.response
 
@@ -437,17 +435,20 @@ export async function handleWcWebhook(
     },
   )
 
-  // Near-realtime: kick a debounced, single-flight inbox drain for newly-received
-  // events instead of waiting for the 5-min cron. Non-blocking — the cron remains
-  // the durability backstop.
-  if (result.status === 'created') {
+  if (gate.enabled && result.status === 'created') {
+    // Near-realtime: kick a debounced, single-flight inbox drain for newly-received events instead of waiting
+    // for the 5-min cron. Non-blocking — the cron remains the durability backstop.
     scheduleInboxDrain('woocommerce')
   }
 
   return NextResponse.json({
     accepted: true,
+    // Persisted and awaiting processing. When the gate is disabled it is deferred until sync is re-enabled
+    // (the inbox cron picks up the PENDING backlog), rather than processed near-realtime.
     queued: result.status === 'created',
     duplicate: result.status === 'duplicate',
+    deferred: !gate.enabled,
+    ...(gate.enabled ? {} : { reason: gate.reason }),
     eventId: result.event.id,
   }, { status: 202 })
 }

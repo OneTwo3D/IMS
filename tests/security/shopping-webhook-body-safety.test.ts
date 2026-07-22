@@ -384,13 +384,14 @@ test('WooCommerce webhook persists valid signed JSON fixtures without inline pro
     accepted: true,
     queued: true,
     duplicate: false,
+    deferred: false,
     eventId: 'wc-webhook-event-1',
   })
 })
 
-test('WooCommerce webhook accepts but does not queue when WC sync is disabled', async () => {
+test('WooCommerce webhook PERSISTS (deferred) when WC sync is disabled — the event is not lost (o3d-56b)', async () => {
   const rawBody = JSON.stringify({ id: 123, sku: 'SKU-1', type: 'simple', name: 'Product', status: 'publish' })
-  let persisted = false
+  let persistedPayload: unknown
 
   const response = await handleWcWebhook(
     'products',
@@ -403,20 +404,41 @@ test('WooCommerce webhook accepts but does not queue when WC sync is disabled', 
       async getWebhookProcessingGate() {
         return { enabled: false, reason: 'wc_sync_disabled' }
       },
-      async persistWebhookEvent() {
-        persisted = true
-        throw new Error('persist should not run')
+      async persistWebhookEvent(_repository, input) {
+        persistedPayload = input.payload
+        return {
+          status: 'created',
+          event: {
+            id: 'wc-webhook-event-disabled',
+            connector: 'woocommerce',
+            resource: input.resource,
+            externalEventId: input.externalEventId ?? null,
+            topic: input.topic,
+            payloadHash: 'hash',
+            payloadJson: input.payload,
+            status: 'PENDING',
+            attempts: 0,
+            nextAttemptAt: null,
+            processedAt: null,
+            lastError: null,
+            receivedAt: new Date('2026-05-26T00:00:00.000Z'),
+            updatedAt: new Date('2026-05-26T00:00:00.000Z'),
+          },
+        }
       },
     }),
   )
 
   assert.equal(response.status, 202)
-  assert.equal(persisted, false)
+  // The event is durably persisted (replayable once sync is re-enabled), NOT silently discarded.
+  assert.deepEqual(persistedPayload, JSON.parse(rawBody))
   assert.deepEqual(await response.json(), {
     accepted: true,
-    queued: false,
-    skipped: true,
+    queued: true,
+    duplicate: false,
+    deferred: true,
     reason: 'wc_sync_disabled',
+    eventId: 'wc-webhook-event-disabled',
   })
 })
 
@@ -460,6 +482,7 @@ test('WooCommerce webhook returns accepted duplicate responses for repeated payl
     accepted: true,
     queued: false,
     duplicate: true,
+    deferred: false,
     eventId: 'wc-webhook-event-1',
   })
 })

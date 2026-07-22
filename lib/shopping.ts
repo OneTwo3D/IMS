@@ -686,7 +686,11 @@ export async function handleShoppingWebhook(
   rawBody: string,
 ) {
   const pluginState = await getIntegrationPluginState()
-  if (!pluginState[connector]) {
+  if (!pluginState[connector] && connector !== 'woocommerce') {
+    // o3d-56b: other connectors have no durable-persist path for a disabled plugin, so they reject with a
+    // retryable 423. WooCommerce falls through to handleWcWebhook, which verifies the signature and then
+    // durably PERSISTS the delivery (deferred, replayed once re-enabled) instead of dropping it — a 423 would
+    // depend entirely on WooCommerce's finite retry, after which the order is lost.
     return Response.json({ error: `${getShoppingConnector(connector).label} plugin is disabled` }, { status: 423 })
   }
 
