@@ -54,28 +54,21 @@ const REFUND_RESERVATION_RELEASE_OUTBOX_WORKER = 'refund-reservation-release-dra
 // bypass that lost the immediate call is still recovered on a following tick.
 const DEFAULT_DRAIN_GRACE_MS = 120_000
 
-// Any allocated, not-yet-shipped order holds reservations a refund should release.
-// Matches RELEASE_ELIGIBLE_STATUSES in post-refund-release.ts — PICKING/PACKING keep
-// their allocations until dispatch (o3d-67y, Codex review r2); DRAFT / PENDING_PAYMENT
-// (and terminal/shipped states) must never be promoted/reallocated by a refund.
-const RELEASE_ELIGIBLE_STATUSES = new Set(['PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'])
-
-/** True when an order in this lifecycle status can hold reservations a refund should release. */
-export function refundReleaseEligible(status: string): boolean {
-  return RELEASE_ELIGIBLE_STATUSES.has(status)
-}
-
 export type ScheduleRefundReservationReleaseInput = {
   orderId: string
   refundId: string
-  /** The order's lifecycle status AT REFUND TIME (read under the refund's order lock). */
-  status: string
+  /**
+   * Whether the order holds stock reservations to release — derived from persisted OrderAllocation rows under
+   * the refund's order lock, NOT from lifecycle status (an ON_HOLD / PICKING / PACKING order can still hold
+   * allocations; a never-allocated order holds none). Codex review r3.
+   */
+  eligible: boolean
 }
 
 /**
  * Enqueue the durable reservation-release backstop — call INSIDE the
  * createSalesOrderRefund transaction so the outbox row commits atomically with the
- * refund. No-op for a non-release-eligible order. The idempotency key is per-refund
+ * refund. No-op when the order holds no allocations. The idempotency key is per-refund
  * so a replayed refund dedups to a single backstop row.
  */
 export async function scheduleRefundReservationReleaseOutbox(
@@ -83,7 +76,7 @@ export async function scheduleRefundReservationReleaseOutbox(
   input: ScheduleRefundReservationReleaseInput,
   options: { graceMs?: number; now?: Date } = {},
 ): Promise<void> {
-  if (!refundReleaseEligible(input.status)) return
+  if (!input.eligible) return
   const now = options.now ?? new Date()
   const idempotencyKey = buildOutboxIdempotencyKey(
     REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
@@ -138,10 +131,13 @@ export async function resolveRefundReservationReleaseOutbox(
 export type ReleaseAllocationResult = {
   success: boolean
   error?: string
-  // Set ONLY when the allocation transaction threw and rolled back (reservations
-  // NOT mutated). A plain success:false — a shipment refuse or a committed
-  // backorder/shortage — leaves reservations consistent and is a terminal outcome.
+  // Set ONLY when the allocation transaction threw and rolled back (reservations NOT mutated).
   failed?: boolean
+  // Set when refuseIfShipmentsExist declined — a deliberate, consistent no-op (deferred to o3d-339).
+  refused?: boolean
+  // Set true ONLY when the allocation transaction committed (reservedQty reconciled). A pre-transaction bail
+  // (no eligible warehouse) leaves it false — that is NOT a completed release and must retry (Codex review r3).
+  committed?: boolean
 }
 
 export type RefundReservationReleaseDrainDeps = {
@@ -205,16 +201,18 @@ async function processOneRefundReservationReleaseJob(
   try {
     const payload = SalesRefundReservationReleaseOutboxPayloadSchema.parse(job.payloadJson)
     const allocation = await deps.allocate(payload.orderId)
-    // Only a rolled-back allocation transaction stranded the reservation and must
-    // retry. A plain success:false (shipment refuse / committed backorder) leaves
-    // reservedQty consistent — the release either ran or is legitimately declined —
-    // so the backstop's job is done.
-    if (allocation.failed) {
+    // The job is done ONLY when the reservation is in a consistent state: the allocation transaction COMMITTED
+    // (a full release or a committed backorder) OR was deliberately REFUSED (a shipment holds the units,
+    // deferred to o3d-339). Everything else — a rolled-back transaction (failed) OR a pre-transaction bail (no
+    // eligible warehouse: neither committed nor refused) — did NOT reconcile reservedQty, so it must retry with
+    // backoff and dead-letter visibly rather than be silently marked succeeded (Codex review r3).
+    const reconciled = allocation.committed === true || allocation.refused === true
+    if (!reconciled) {
       await deps.markRetry({
         id: job.id,
         workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER,
         lockedAt,
-        error: new Error(allocation.error ?? 'reservation release transaction rolled back'),
+        error: new Error(allocation.error ?? 'reservation release did not commit (no eligible warehouse or rolled back)'),
         attemptsBeforeFailure: job.attempts,
         maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
       })

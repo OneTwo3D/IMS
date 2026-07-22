@@ -250,6 +250,17 @@ function createClient(state: State): RefundServiceClient {
         state.settings[where.key] = state.settings[where.key] == null ? create.value : update.value
       },
     },
+    orderAllocation: {
+      // o3d-67y: refund-release eligibility is derived from actual OrderAllocation rows under the order lock.
+      count: async ({ where }: { where: { orderId: string } }) =>
+        state.allocations.filter((row) => row.orderId === where.orderId).length,
+    },
+    integrationOutbox: {
+      // o3d-67y: the durable reservation-release backstop is enqueued inside the refund tx when the order holds
+      // allocations. These unit tests don't assert on the outbox, so this is a sink.
+      create: async ({ data }: { data: Record<string, unknown> }) => data,
+      findUnique: async () => null,
+    },
     salesOrder: {
       findUnique: async ({ where, select }: { where: { id: string }; select: Record<string, unknown> }) => {
         const order = state.orders.find((row) => row.id === where.id)

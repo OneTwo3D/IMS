@@ -6,7 +6,6 @@ import {
   scheduleRefundReservationReleaseOutbox,
   processRefundReservationReleaseOutbox,
   resolveRefundReservationReleaseOutbox,
-  refundReleaseEligible,
   REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
   REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
   type RefundReservationReleaseDrainDeps,
@@ -28,19 +27,6 @@ function fakeTx() {
   } as unknown as Prisma.TransactionClient
   return { tx, created }
 }
-
-test('refundReleaseEligible accepts every allocated, not-yet-shipped status (incl PICKING/PACKING)', () => {
-  assert.equal(refundReleaseEligible('PROCESSING'), true)
-  assert.equal(refundReleaseEligible('ALLOCATED'), true)
-  assert.equal(refundReleaseEligible('PICKING'), true)
-  assert.equal(refundReleaseEligible('PACKING'), true)
-  assert.equal(refundReleaseEligible('DRAFT'), false)
-  assert.equal(refundReleaseEligible('PENDING_PAYMENT'), false)
-  assert.equal(refundReleaseEligible('ON_HOLD'), false)
-  assert.equal(refundReleaseEligible('SHIPPED'), false)
-  assert.equal(refundReleaseEligible('DELIVERED'), false)
-  assert.equal(refundReleaseEligible('CANCELLED'), false)
-})
 
 test('resolve marks a still-open backstop row SUCCEEDED so the drain does not re-run allocation', async () => {
   const calls: Array<Record<string, unknown>> = []
@@ -64,11 +50,11 @@ test('resolve marks a still-open backstop row SUCCEEDED so the drain does not re
   assert.equal((calls[0].data as Record<string, unknown>).status, 'SUCCEEDED')
 })
 
-test('schedule enqueues a backstop row inside the tx for an eligible order', async () => {
+test('schedule enqueues a backstop row inside the tx when the order holds allocations', async () => {
   const { tx, created } = fakeTx()
   await scheduleRefundReservationReleaseOutbox(
     tx,
-    { orderId: 'order-1', refundId: 'refund-1', status: 'ALLOCATED' },
+    { orderId: 'order-1', refundId: 'refund-1', eligible: true },
     { now: new Date('2026-07-22T00:00:00.000Z') },
   )
   assert.equal(created.length, 1)
@@ -77,15 +63,13 @@ test('schedule enqueues a backstop row inside the tx for an eligible order', asy
   assert.equal(data.operation, REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION)
   assert.equal(data.status, 'PENDING')
   assert.deepEqual(data.payloadJson, { orderId: 'order-1', refundId: 'refund-1' })
-  // Idempotency key is per-refund so a replayed refund dedups.
   assert.match(String(data.idempotencyKey), /refund-1/)
-  // Grace delay pushes the first drain past the immediate release.
   assert.ok(data.nextAttemptAt instanceof Date && (data.nextAttemptAt as Date).getTime() > new Date('2026-07-22T00:00:00.000Z').getTime())
 })
 
-test('schedule is a no-op for a non-release-eligible order status', async () => {
+test('schedule is a no-op when the order holds no allocations (eligible:false)', async () => {
   const { tx, created } = fakeTx()
-  await scheduleRefundReservationReleaseOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', status: 'DRAFT' })
+  await scheduleRefundReservationReleaseOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', eligible: false })
   assert.equal(created.length, 0)
 })
 
@@ -114,22 +98,26 @@ const job = (id: string, over: Partial<{ attempts: number; lockedAt: Date | null
   payloadJson: over.payloadJson ?? { orderId: `order-${id}`, refundId: `refund-${id}` },
 })
 
-test('drain: a successful release marks the job SUCCEEDED', async () => {
+test('drain: a committed release marks the job SUCCEEDED', async () => {
   const recorded: Recorded = { successIds: [], retryIds: [] }
-  const deps = drainDeps([job('a')], async () => ({ success: true }), recorded)
+  const deps = drainDeps([job('a')], async () => ({ success: true, committed: true }), recorded)
   const result = await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.successIds, ['a'])
   assert.deepEqual(recorded.retryIds, [])
   assert.deepEqual(result, { claimed: 1, succeeded: 1, failed: 0 })
 })
 
-test('drain: a shipment refuse (success:false, not failed) completes the job — reservedQty is consistent', async () => {
+test('drain: a committed backorder (success:false, committed:true) completes the job', async () => {
   const recorded: Recorded = { successIds: [], retryIds: [] }
-  const deps = drainDeps(
-    [job('a')],
-    async () => ({ success: false, error: 'Order has existing shipments; reallocation refused' }),
-    recorded,
-  )
+  const deps = drainDeps([job('a')], async () => ({ success: false, committed: true }), recorded)
+  await processRefundReservationReleaseOutbox(deps)
+  assert.deepEqual(recorded.successIds, ['a'])
+  assert.deepEqual(recorded.retryIds, [])
+})
+
+test('drain: a shipment refuse (refused:true, not committed) completes the job — deferred to o3d-339', async () => {
+  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const deps = drainDeps([job('a')], async () => ({ success: false, refused: true, committed: false }), recorded)
   await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.successIds, ['a'])
   assert.deepEqual(recorded.retryIds, [])
@@ -137,14 +125,24 @@ test('drain: a shipment refuse (success:false, not failed) completes the job —
 
 test('drain: a rolled-back allocation transaction (failed:true) retries with backoff', async () => {
   const recorded: Recorded = { successIds: [], retryIds: [] }
-  const deps = drainDeps([job('a')], async () => ({ success: false, failed: true, error: 'deadlock' }), recorded)
+  const deps = drainDeps([job('a')], async () => ({ success: false, failed: true, committed: false, error: 'deadlock' }), recorded)
   const result = await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.retryIds, ['a'])
   assert.deepEqual(recorded.successIds, [])
   assert.equal(result.failed, 1)
 })
 
-test('drain: a thrown allocate (or malformed payload) retries', async () => {
+test('drain: a pre-transaction bail (not committed, not refused, not failed) RETRIES — never silently succeeded (o3d-67y r3)', async () => {
+  // e.g. no eligible warehouse: allocation returns success:false without committing. reservedQty is untouched,
+  // so this must not be marked SUCCEEDED — it retries and eventually dead-letters visibly.
+  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const deps = drainDeps([job('a')], async () => ({ success: false, committed: false, error: 'No stock available for allocation' }), recorded)
+  await processRefundReservationReleaseOutbox(deps)
+  assert.deepEqual(recorded.retryIds, ['a'])
+  assert.deepEqual(recorded.successIds, [])
+})
+
+test('drain: a thrown allocate retries', async () => {
   const recorded: Recorded = { successIds: [], retryIds: [] }
   const deps = drainDeps([job('a')], async () => { throw new Error('boom') }, recorded)
   await processRefundReservationReleaseOutbox(deps)
@@ -155,7 +153,7 @@ test('drain: a malformed payload retries, it is not silently marked succeeded', 
   const recorded: Recorded = { successIds: [], retryIds: [] }
   const deps = drainDeps(
     [job('a', { payloadJson: { orderId: '' } })],
-    async () => ({ success: true }),
+    async () => ({ success: true, committed: true }),
     recorded,
   )
   await processRefundReservationReleaseOutbox(deps)
@@ -166,7 +164,7 @@ test('drain: a malformed payload retries, it is not silently marked succeeded', 
 test('drain: a job with no lock is skipped, never actioned', async () => {
   const recorded: Recorded = { successIds: [], retryIds: [] }
   let allocateCalls = 0
-  const deps = drainDeps([job('a', { lockedAt: null })], async () => { allocateCalls++; return { success: true } }, recorded)
+  const deps = drainDeps([job('a', { lockedAt: null })], async () => { allocateCalls++; return { success: true, committed: true } }, recorded)
   const result = await processRefundReservationReleaseOutbox(deps)
   assert.equal(allocateCalls, 0)
   assert.deepEqual(recorded.successIds, [])

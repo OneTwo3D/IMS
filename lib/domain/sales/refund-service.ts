@@ -249,6 +249,10 @@ export type CreateSalesOrderRefundResult =
       /** True when this is an idempotent replay of an already-recorded refund (duplicate
        *  external delivery), not a newly created one — callers skip one-time side effects. */
       replayed?: boolean
+      /** o3d-67y: true when the order held stock reservations (OrderAllocation rows) at refund time, so the
+       *  caller should run the immediate post-refund reservation release. Derived under the order lock from
+       *  actual allocations, not lifecycle status. Undefined on a replay (the original refund scheduled it). */
+      releaseEligible?: boolean
     }
 
 export type RetrySalesOrderRefundAccountingResult =
@@ -1941,15 +1945,19 @@ export async function createSalesOrderRefund(
       ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
       : []
 
-    // o3d-67y: enqueue the durable reservation-release backstop INSIDE this tx so it
-    // commits atomically with the refund. The immediate post-commit release (in the
-    // caller) stays for timeliness; this row guarantees the release still happens if
-    // that call is bypassed by a post-commit throw or lost to a crash. No-op for a
-    // non-release-eligible order status.
+    // o3d-67y: eligibility is derived from ACTUAL reservations (OrderAllocation rows) under this order lock,
+    // not lifecycle status — an ON_HOLD / PICKING / PACKING order can still hold allocations a refund must
+    // release, while a never-allocated order holds none (Codex review r3).
+    const releaseEligible = (await tx.orderAllocation.count({ where: { orderId: input.orderId } })) > 0
+
+    // Enqueue the durable reservation-release backstop INSIDE this tx so it commits atomically with the refund.
+    // The immediate post-commit release (in the caller) stays for timeliness; this row guarantees the release
+    // still happens if that call is bypassed by a post-commit throw or lost to a crash. No-op when the order
+    // holds no allocations.
     await scheduleRefundReservationReleaseOutbox(tx, {
       orderId: input.orderId,
       refundId: createdRefund.id,
-      status: so.status,
+      eligible: releaseEligible,
     })
 
     return {
@@ -1959,6 +1967,7 @@ export async function createSalesOrderRefund(
       createdRefundLines,
       creditNoteNumber,
       newStatus,
+      releaseEligible,
       fallbackReturnRows,
     }
   }).catch((error) => {
@@ -2069,6 +2078,7 @@ export async function createSalesOrderRefund(
     accountingSyncs,
     accountingWarning,
     returnedRows,
+    releaseEligible: txResult.releaseEligible,
   }
 }
 

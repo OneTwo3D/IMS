@@ -1880,7 +1880,7 @@ export async function createRefund(
     // shipment build caps shippable qty net of refunds). Limited to PROCESSING/ALLOCATED
     // so a refund can't promote a DRAFT/PENDING_PAYMENT order to ALLOCATED.
     const releaseOutcome = await releaseReservationsAfterRefund(
-      { orderId, refundId: refundResult.createdRefund?.id, status: refundResult.so.status },
+      { orderId, refundId: refundResult.createdRefund?.id, eligible: refundResult.releaseEligible === true },
       {
         // The dynamic import lives INSIDE the guarded closure so a module-load/eval rejection is
         // caught by releaseReservationsAfterRefund rather than bubbling to createRefund's outer
@@ -1892,11 +1892,12 @@ export async function createRefund(
         log: logActivity,
       },
     )
-    // o3d-67y: the immediate release reconciled the reservation, so resolve the durable
-    // backstop — otherwise the drain would re-run allocation, which is NOT
-    // side-effect-idempotent (it deletes/recreates OrderAllocation rows and resets staged
-    // allocation accounting). A refuse / failure leaves the row PENDING for the drain.
-    if (releaseOutcome.released) {
+    // o3d-67y: when the immediate release reconciled the reservation (committed, incl. a committed backorder, OR
+    // was deliberately refused because a shipment holds the units), resolve the durable backstop — otherwise the
+    // drain would re-run allocation, which is NOT side-effect-idempotent (it deletes/recreates OrderAllocation
+    // rows and resets staged allocation accounting). A genuine failure or a pre-transaction bail leaves the row
+    // PENDING so the drain retries and dead-letters visibly.
+    if (releaseOutcome.reconciled) {
       try {
         await resolveRefundReservationReleaseOutbox(refundResult.createdRefund.id)
       } catch (resolveError) {

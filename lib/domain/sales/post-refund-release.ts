@@ -7,29 +7,32 @@
  * caller discards that result and only logs a thrown error, a failed release strands the reservation on
  * `stockLevel.reservedQty`.
  *
- * This helper centralises the immediate attempt: it inspects BOTH a throw and a `success: false` return, and on
- * a genuine failure records a WARNING naming the order so the stranded reservation is surfaced (the
- * stock-position drift report quantifies it) and can be released by re-running allocation. The WARNING write is
- * itself guarded — the refund is already committed, so a logging failure must never bubble out and be
- * mis-handled as a refund failure by the caller's outer catch.
+ * This helper centralises the immediate attempt: it inspects a throw, a rolled-back transaction, a shipment
+ * refuse, a committed release, and a pre-transaction bail (no eligible warehouse), and records a WARNING for
+ * every case where the reservation was NOT reconciled so it is operator-visible. The WARNING write is itself
+ * guarded — the refund is already committed, so a logging failure must never bubble out and be mis-handled as a
+ * refund failure by the caller's outer catch.
  *
  * DURABILITY does NOT come from this helper: logActivity swallows write failures, so `warned` only means "we
  * attempted the WARNING", not "a durable recovery record exists". The durable guarantee is the backstop row
  * enqueued INSIDE the refund transaction (scheduleRefundReservationReleaseOutbox), drained by the
- * refund-reservation-release cron, which re-runs this same release idempotently if the immediate attempt was
- * bypassed or lost. This helper is the timeliness path; the outbox is the correctness path.
+ * refund-reservation-release cron, which re-runs this same release if the immediate attempt did not reconcile.
+ * `reconciled` tells the caller whether to resolve that backstop row (release done / deliberately deferred) or
+ * leave it PENDING for the drain (failure / bail). This helper is the timeliness path; the outbox is the
+ * correctness path.
  */
 
 export type ReallocationResult = {
   success: boolean
   error?: string
-  // Set by autoAllocateOrder ONLY when its transaction threw and rolled back (reservations NOT mutated). A
-  // plain success:false — a refuseIfShipmentsExist no-op or a committed backorder/shortage — is NOT a
-  // stranding: the reservation state is consistent, so it must not raise a stale-reservation warning.
+  // Set by autoAllocateOrder ONLY when its transaction threw and rolled back (reservations NOT mutated).
   failed?: boolean
   // Set when refuseIfShipmentsExist declined because a shipment exists. The reservation was left untouched;
   // whether the refunded units are truly stranded depends on shipment reconciliation (tracked in o3d-339).
   refused?: boolean
+  // Set true ONLY when the allocation transaction actually COMMITTED (reservedQty reconciled). A pre-transaction
+  // bail (no eligible warehouse) leaves it false — that is NOT a completed release.
+  committed?: boolean
 }
 
 export type PostRefundReleaseDeps = {
@@ -53,7 +56,12 @@ export type PostRefundReleaseDeps = {
 export type PostRefundReleaseInput = {
   orderId: string
   refundId?: string
-  status: string
+  /**
+   * Whether the order holds stock reservations a refund should release — derived from persisted
+   * OrderAllocation rows under the refund's order lock, NOT from lifecycle status (an ON_HOLD or PICKING order
+   * can still hold allocations). False for an order that was never allocated, so the release is a no-op.
+   */
+  eligible: boolean
 }
 
 export type PostRefundReleaseOutcome = {
@@ -63,19 +71,20 @@ export type PostRefundReleaseOutcome = {
   warned: boolean
   /** true when allocation refused because a shipment exists — deferred to shipment reconciliation (o3d-339). */
   refused: boolean
+  /**
+   * true when the reservation is in a consistent state and the durable backstop can be resolved: the release
+   * committed (incl. a committed backorder) OR was deliberately refused. False on a failure or a pre-transaction
+   * bail, so the caller leaves the backstop PENDING for the drain to retry.
+   */
+  reconciled: boolean
 }
-
-// Any allocated, not-yet-shipped order holds reservations a refund should release. PICKING/PACKING keep their
-// allocations until dispatch, so they are eligible too (o3d-67y, Codex review r2). A DRAFT / PENDING_PAYMENT
-// (or ON_HOLD, SHIPPED, COMPLETED, DELIVERED, CANCELLED) order must never be promoted/reallocated by a refund.
-const RELEASE_ELIGIBLE_STATUSES = new Set(['PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'])
 
 export async function releaseReservationsAfterRefund(
   input: PostRefundReleaseInput,
   deps: PostRefundReleaseDeps,
 ): Promise<PostRefundReleaseOutcome> {
-  if (!RELEASE_ELIGIBLE_STATUSES.has(input.status)) {
-    return { released: false, warned: false, refused: false }
+  if (!input.eligible) {
+    return { released: false, warned: false, refused: false, reconciled: false }
   }
 
   const onError = deps.onError ?? ((message, detail) => console.error(message, detail))
@@ -83,12 +92,12 @@ export async function releaseReservationsAfterRefund(
   let releaseError: string | null = null
   let released = false
   let refused = false
+  let committed = false
   try {
     const result = await deps.allocate(input.orderId)
-    // Warn ONLY on a genuine transaction failure (result.failed) — NOT on a plain success:false, which is a
-    // committed backorder/shortage (reservations are consistent). A refuse is surfaced separately below.
     if (result.failed) releaseError = result.error ?? 'reservation release transaction rolled back'
     refused = result.refused === true
+    committed = result.committed === true
     released = result.success === true
   } catch (error) {
     // autoAllocateOrder catches its own throws, so a throw here is a module-load / injection failure — the
@@ -96,46 +105,63 @@ export async function releaseReservationsAfterRefund(
     releaseError = String(error)
   }
 
+  // A genuine transaction failure (or a throw) — the reservation is stale. Surface it and leave the backstop
+  // PENDING (reconciled:false) so the drain retries.
+  if (releaseError) {
+    await safeLog(deps, onError, {
+      action: 'refund_reservation_release_failed',
+      description: `Refund committed, but the post-refund stock reservation release did not complete for order ${input.orderId} — it may still hold reservations for refunded units. Re-run allocation on this order to release them. (${releaseError})`,
+      metadata: { orderId: input.orderId, refundId: input.refundId, error: releaseError },
+    })
+    return { released: false, warned: true, refused: false, reconciled: false }
+  }
+
   // A refuse means an existing shipment holds the units, so the conservative release declines rather than
-  // re-pick stock. That is safe for a fully-shipped order (its reservation is already consumed) but can leave
-  // a PENDING shipment's reservation covering now-refunded units — surface it (not silent) and let shipment
-  // reconciliation (o3d-339) net the refund. Not a `released` and not a retryable failure.
-  if (refused && !releaseError) {
-    try {
-      await deps.log({
-        entityType: 'SALES_ORDER',
-        entityId: input.orderId,
-        action: 'refund_reservation_release_deferred',
-        tag: 'sales',
-        level: 'WARNING',
-        description: `Refund committed on order ${input.orderId}, but stock reservation release was deferred because a shipment already exists — if that shipment is still pending, verify it nets the refunded units so they are not dispatched.`,
-        metadata: { orderId: input.orderId, refundId: input.refundId, reason: 'existing_shipment' },
-        resolveUser: false,
-      })
-    } catch (logError) {
-      onError('[refund] failed to record reservation-release deferral warning', logError)
-    }
-    return { released: false, warned: true, refused: true }
+  // re-pick stock. Safe for a fully-shipped order (its reservation is already consumed) but can leave a PENDING
+  // shipment's reservation covering now-refunded units — surface it (not silent) and let shipment reconciliation
+  // (o3d-339) net the refund. The reservation state is consistent, so the backstop can be resolved.
+  if (refused) {
+    await safeLog(deps, onError, {
+      action: 'refund_reservation_release_deferred',
+      description: `Refund committed on order ${input.orderId}, but stock reservation release was deferred because a shipment already exists — if that shipment is still pending, verify it nets the refunded units so they are not dispatched.`,
+      metadata: { orderId: input.orderId, refundId: input.refundId, reason: 'existing_shipment' },
+    })
+    return { released: false, warned: true, refused: true, reconciled: true }
   }
 
-  if (!releaseError) {
-    return { released, warned: false, refused: false }
+  // The allocation transaction committed (a full release or a committed backorder) — reservedQty is reconciled.
+  if (committed) {
+    return { released, warned: false, refused: false, reconciled: true }
   }
 
-  onError('[refund] post-refund reservation release failed', { orderId: input.orderId, releaseError })
+  // Neither committed, refused, nor failed: a pre-transaction bail (e.g. no eligible warehouse). The release did
+  // NOT run and reservedQty is untouched — surface it and leave the backstop PENDING so the drain retries once a
+  // warehouse is eligible again (and dead-letters visibly if it never is).
+  await safeLog(deps, onError, {
+    action: 'refund_reservation_release_failed',
+    description: `Refund committed on order ${input.orderId}, but the post-refund stock reservation release could not run (no eligible warehouse / allocation bailed before committing). The refunded units may still be reserved; it will retry automatically.`,
+    metadata: { orderId: input.orderId, refundId: input.refundId, reason: 'allocation_not_committed' },
+  })
+  return { released: false, warned: true, refused: false, reconciled: false }
+}
+
+async function safeLog(
+  deps: PostRefundReleaseDeps,
+  onError: (message: string, detail: unknown) => void,
+  params: { action: string; description: string; metadata: object },
+): Promise<void> {
   try {
     await deps.log({
       entityType: 'SALES_ORDER',
-      entityId: input.orderId,
-      action: 'refund_reservation_release_failed',
+      entityId: (params.metadata as { orderId: string }).orderId,
+      action: params.action,
       tag: 'sales',
       level: 'WARNING',
-      description: `Refund committed, but the post-refund stock reservation release did not complete for order ${input.orderId} — it may still hold reservations for refunded units. Re-run allocation on this order to release them. (${releaseError})`,
-      metadata: { orderId: input.orderId, refundId: input.refundId, error: releaseError },
+      description: params.description,
+      metadata: params.metadata,
       resolveUser: false,
     })
   } catch (logError) {
     onError('[refund] failed to record reservation-release warning', logError)
   }
-  return { released: false, warned: true, refused: false }
 }
