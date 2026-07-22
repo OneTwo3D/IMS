@@ -222,9 +222,15 @@ export type ReleaseAllocationResult = {
 
 export type RefundWarningParams = { orderId: string; refundId: string; refundOrderRef?: string }
 
+/** The transaction client the drain hands to allocation's onReconciledInTx (structurally a Prisma tx). */
+export type ReconcileTxClient = Parameters<typeof markIntegrationOutboxSuccess>[0]['client']
+
 export type RefundReservationReleaseDrainDeps = {
   claimWork: typeof claimIntegrationOutboxWork
-  allocate: (orderId: string) => Promise<ReleaseAllocationResult>
+  // o3d-67y r12: the drain resolves its CLAIMED row inside allocation's transaction (onReconciledInTx),
+  // symmetric to the immediate path, so a crash between the allocation commit and a separate SUCCEEDED write
+  // can't leave the row PROCESSING for stale-lock recovery to re-run allocation.
+  allocate: (orderId: string, opts?: { onReconciledInTx?: (tx: ReconcileTxClient) => Promise<void> }) => Promise<ReleaseAllocationResult>
   markSuccess: (options: Parameters<typeof markIntegrationOutboxSuccess>[0]) => Promise<unknown>
   markRetry: (options: Parameters<typeof markIntegrationOutboxRetryableFailure>[0]) => Promise<unknown>
   /** Deliver the shipment-refuse deferral WARNING (o3d-67y r5) — idempotent, returns 'written'|'skipped'. */
@@ -303,12 +309,13 @@ const defaultDrainDeps = (): RefundReservationReleaseDrainDeps => ({
   claimWork: claimIntegrationOutboxWork,
   // Lazy import: allocation lives in a server-action module; importing it eagerly
   // from a lib module pulls the action graph into unrelated callers.
-  allocate: async (orderId) => {
+  allocate: async (orderId, opts) => {
     const { autoAllocateOrder } = await import('@/app/actions/allocation')
     const { INTERNAL_ACTION_BYPASS } = await import('@/lib/internal-action-bypass')
     return autoAllocateOrder(orderId, {
       internalBypassToken: INTERNAL_ACTION_BYPASS,
       refuseIfShipmentsExist: true,
+      onReconciledInTx: opts?.onReconciledInTx,
     })
   },
   markSuccess: markIntegrationOutboxSuccess,
@@ -395,37 +402,42 @@ async function processOneRefundReservationReleaseJob(
   try {
     const payload = SalesRefundReservationReleaseOutboxPayloadSchema.parse(job.payloadJson)
     const warningParams = { orderId: payload.orderId, refundId: payload.refundId }
-    const allocation = await deps.allocate(payload.orderId)
+    // Mark this CLAIMED row SUCCEEDED INSIDE allocation's transaction (committed path only) so the release and
+    // the PROCESSING→SUCCEEDED transition commit or roll back together — a crash can't leave the row PROCESSING
+    // for stale-lock recovery to re-run the non-idempotent allocation (Codex review r12).
+    const allocation = await deps.allocate(payload.orderId, {
+      onReconciledInTx: async (tx) => {
+        await deps.markSuccess({ id: job.id, workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER, lockedAt, client: tx })
+      },
+    })
     // The job is done ONLY when allocation COMMITTED (a full release or a committed backorder) — the only
-    // outcome that reconciles reservedQty. A rollback (failed), a pre-transaction bail (no eligible warehouse),
-    // or a shipment REFUSE (which leaves the stale reservation for o3d-339) must retry and dead-letter visibly,
-    // never be silently marked succeeded (Codex review r3/r4).
-    const reconciled = allocation.committed === true
-    if (!reconciled) {
-      if (allocation.refused === true) {
-        try {
-          await deps.logDeferral(warningParams)
-        } catch (logError) {
-          console.error('[refund] drain failed to record reservation-release deferral warning', logError)
-        }
-      }
-      await deps.markRetry({
-        id: job.id,
-        workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER,
-        lockedAt,
-        error: new Error(
-          allocation.refused === true
-            ? 'reservation release refused: a shipment holds the units — needs shipment reconciliation (o3d-339)'
-            : allocation.error ?? 'reservation release did not commit (no eligible warehouse or rolled back)',
-        ),
-        attemptsBeforeFailure: job.attempts,
-        maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
-      })
-      result.failed++
+    // outcome that reconciles reservedQty, and the only one where the in-tx hook marked the row SUCCEEDED. A
+    // rollback (failed), a pre-transaction bail (no eligible warehouse), or a shipment REFUSE (which leaves the
+    // stale reservation for o3d-339) must retry and dead-letter visibly (Codex review r3/r4).
+    if (allocation.committed === true) {
+      result.succeeded++
       return
     }
-    await deps.markSuccess({ id: job.id, workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER, lockedAt })
-    result.succeeded++
+    if (allocation.refused === true) {
+      try {
+        await deps.logDeferral(warningParams)
+      } catch (logError) {
+        console.error('[refund] drain failed to record reservation-release deferral warning', logError)
+      }
+    }
+    await deps.markRetry({
+      id: job.id,
+      workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER,
+      lockedAt,
+      error: new Error(
+        allocation.refused === true
+          ? 'reservation release refused: a shipment holds the units — needs shipment reconciliation (o3d-339)'
+          : allocation.error ?? 'reservation release did not commit (no eligible warehouse or rolled back)',
+      ),
+      attemptsBeforeFailure: job.attempts,
+      maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
+    })
+    result.failed++
   } catch (error) {
     await deps.markRetry({
       id: job.id,

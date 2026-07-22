@@ -160,7 +160,13 @@ function drainDeps(
 ): RefundReservationReleaseDrainDeps {
   return {
     claimWork: (async () => jobs) as unknown as RefundReservationReleaseDrainDeps['claimWork'],
-    allocate,
+    // Simulate allocation invoking the in-tx resolve hook on the committed path (r12): the real allocation calls
+    // onReconciledInTx inside its transaction just before commit, which is where the row is marked SUCCEEDED.
+    allocate: async (orderId, opts) => {
+      const result = await allocate(orderId)
+      if (result.committed === true) await opts?.onReconciledInTx?.({} as never)
+      return result
+    },
     markSuccess: async ({ id }) => { recorded.successIds.push(id) },
     markRetry: async ({ id }) => { recorded.retryIds.push(id) },
     logDeferral: async ({ orderId, refundId }) => { recorded.deferrals.push({ orderId, refundId }); return 'written' },
@@ -197,6 +203,20 @@ test('drain: a committed release marks the job SUCCEEDED', async () => {
   assert.deepEqual(recorded.successIds, ['a'])
   assert.deepEqual(recorded.retryIds, [])
   assert.deepEqual(result, { claimed: 1, succeeded: 1, failed: 0 })
+})
+
+test('drain: a committed release marks SUCCEEDED inside allocation tx (client passed), not a separate write (o3d-67y r12)', async () => {
+  const recorded = emptyRecorded()
+  let successClientSeen = false
+  let markSuccessCalls = 0
+  const base = drainDeps([job('a')], async () => ({ success: true, committed: true }), recorded)
+  const deps: RefundReservationReleaseDrainDeps = {
+    ...base,
+    markSuccess: async (options) => { markSuccessCalls++; if (options.client) successClientSeen = true },
+  }
+  await processRefundReservationReleaseOutbox(deps)
+  assert.equal(markSuccessCalls, 1, 'success is written exactly once')
+  assert.equal(successClientSeen, true, 'the SUCCEEDED transition rides the allocation transaction client')
 })
 
 test('drain: a committed backorder (success:false, committed:true) completes the job', async () => {
