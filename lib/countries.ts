@@ -3,10 +3,13 @@
  * hs-code-woo plugin (which defaults origin to China). Used at product persistence and before
  * declaring an origin to a WMS so customs paperwork always carries a country (bhdm.5).
  */
+import { ISO_3166_1_ALPHA2 } from '@/lib/iso-3166-1-alpha2'
+
 export const DEFAULT_COUNTRY_OF_ORIGIN = 'CN'
 
-/** ISO 3166-1 alpha-2 country codes → English names (common trading countries first). */
-const COUNTRIES: Record<string, string> = {
+// Preferred English names for common trading countries — these override the generic Intl names below (e.g.
+// "United Kingdom" over "UK", "South Korea" over "Korea, South") for a nicer dropdown.
+const CURATED_COUNTRY_NAMES: Record<string, string> = {
   GB: 'United Kingdom', US: 'United States', CN: 'China', DE: 'Germany', FR: 'France',
   IT: 'Italy', ES: 'Spain', NL: 'Netherlands', BE: 'Belgium', IE: 'Ireland',
   PL: 'Poland', CZ: 'Czech Republic', AT: 'Austria', SE: 'Sweden', DK: 'Denmark',
@@ -32,6 +35,32 @@ const COUNTRIES: Record<string, string> = {
   LA: 'Laos', NP: 'Nepal', LK: 'Sri Lanka', MN: 'Mongolia', KZ: 'Kazakhstan',
   UZ: 'Uzbekistan', GE: 'Georgia', AM: 'Armenia', AZ: 'Azerbaijan',
 }
+
+/**
+ * ISO 3166-1 alpha-2 country codes → English names, COMPLETE (bhdm.7). Built from the authoritative assigned-
+ * code set so every valid origin is recognised, editable in the product form, and displayable — not just the
+ * curated trading-country subset (which caused imported valid origins to be discarded or silently erased on the
+ * next product edit). Curated names above win; the rest use the Intl English name, falling back to the code.
+ */
+const COUNTRIES: Record<string, string> = (() => {
+  const regionNames = (() => {
+    try {
+      return new Intl.DisplayNames(['en'], { type: 'region' })
+    } catch {
+      return null
+    }
+  })()
+  const out: Record<string, string> = {}
+  for (const code of ISO_3166_1_ALPHA2) {
+    if (CURATED_COUNTRY_NAMES[code]) {
+      out[code] = CURATED_COUNTRY_NAMES[code]
+      continue
+    }
+    const intlName = regionNames?.of(code)
+    out[code] = intlName && intlName !== code ? intlName : code
+  }
+  return out
+})()
 
 /** All country entries sorted alphabetically by name. */
 export const COUNTRY_LIST: { code: string; name: string }[] = Object.entries(COUNTRIES)
