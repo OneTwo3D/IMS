@@ -158,6 +158,11 @@ const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Se
  * excluded — this is the committed goods spend still to arrive, so a mostly-received PO contributes
  * only what is still on the way, not its whole total. Exported for unit testing; the caller passes the
  * INCOMING_PO_STATUSES POs.
+ *
+ * Invariant: subtotalBase is the post-header-discount net goods value. A separate pre-existing bug
+ * (o3d-lx1) lets submitSupplierQuote overwrite subtotalBase without reapplying the header discount;
+ * that corrupts the PO's own totals for every consumer and is tracked/fixed there, not papered over
+ * here.
  */
 export function outstandingPoValueBase(
   pos: {
