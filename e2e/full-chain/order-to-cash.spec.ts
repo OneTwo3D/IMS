@@ -22,7 +22,7 @@ import {
   refundWcOrder, updateWcOrder, wcCreds, type WcCreds,
 } from './harness/wc.ts'
 import {
-  allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, runDailyBatch, setPostingMode,
+  allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, runDailyBatch, runWcOrderReconcile, setPostingMode,
 } from './harness/ims.ts'
 import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
 import {
@@ -1301,6 +1301,79 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       }
     }
   })
+
+  test('OC-19: an order the webhook never delivered is ingested by the reconcile sweep', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // Every other OC case rides the realtime webhook. OC-19 proves the SAFETY NET: syncNewWcOrders(reconcile)
+    // polls WooCommerce and imports an order the webhook missed. We create the order but DELIBERATELY never
+    // nudge WP-Cron, so Woo never delivers its webhook (this store fires deliveries only when WP-Cron is
+    // prodded — see awaitWebhookDelivery). Then we run the reconcile directly. The order must import anyway,
+    // and provably via reconcile: the shopping_webhook_events inbox holds NO event for it.
+    const sku = taggedSku(runId, 'OC19')
+    const unitPrice = '22.00'
+    const qty = 2
+
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC19`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC19', price: unitPrice })
+    // Bound the reconcile window to JUST this order: set the cursor AFTER the product setup and right before
+    // creating the order, so the shared store's pre-existing (stage) orders AND an earlier test's order are not
+    // re-swept. The -10s buffer absorbs any clock skew between this box and the WooCommerce server, whose time
+    // modified_after is compared against. existingOrder is truthy mid-run, so the cursor is honoured.
+    await setSetting('last_wc_order_reconcile_at', new Date(Date.now() - 10_000).toISOString())
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+    expect(order.status).toBe('processing')
+
+    // No awaitWebhookDelivery / nudgeWpCron — the whole point is that the webhook never fires.
+    const rec = await runWcOrderReconcile(page)
+    expect(rec.synced, 'the reconcile reported importing the order').toBeGreaterThanOrEqual(1)
+
+    // The reconcile is awaited, but the SO + link writes settle just after, so poll briefly.
+    const ids = await awaitReconciledSalesOrder(order.number, 60_000)
+    expect(ids.length, 'the reconcile sweep imported the order the webhook never delivered — exactly one SO').toBe(1)
+    // Proof it came from RECONCILE, not a webhook that snuck in: the inbox has no event for this order.
+    expect(await inboxEventCountForWcOrder(order.id), 'no webhook was delivered — the import is purely reconcile').toBe(0)
+    // And it is a real processing sale, not a parked one: import auto-allocates a processing order, so it lands
+    // PROCESSING or (once stock is allocated) ALLOCATED — either way a genuine sale, unlike OC-20's on-hold
+    // order which the status filter never even fetches.
+    expect(['PROCESSING', 'ALLOCATED'], 'imported as a genuine processing sale').toContain(await orderStatus(ids[0]))
+  })
+
+  test('OC-20: the reconcile sweep does NOT import an order whose status is not configured for sync', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // The counterpart to OC-13 (which proved the WEBHOOK path imports an on-hold order as a non-processing SO).
+    // The reconcile/poll path instead honours wc_sync_order_statuses at the WooCommerce FETCH (status=
+    // processing,completed in reconcile mode), so an on-hold order is never returned and never imported. Create
+    // an on-hold order, never nudge WP-Cron (no webhook delivers), run the reconcile, and assert NO SO exists.
+    const sku = taggedSku(runId, 'OC20')
+    const unitPrice = '19.00'
+
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC20`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC20', price: unitPrice })
+    // Cursor set right before the order (not at test start), so the window holds ONLY this on-hold order — an
+    // earlier test's processing order is not re-swept, which keeps the synced==0 assertion below exact. -10s
+    // buffer for WC-server clock skew.
+    await setSetting('last_wc_order_reconcile_at', new Date(Date.now() - 10_000).toISOString())
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: 1 }], status: 'on-hold', setPaid: false })
+    expect(order.status).toBe('on-hold')
+
+    // runWcOrderReconcile throws unless the sweep completed with NO result errors, so reaching here proves the
+    // reconcile actually ran against a reachable WooCommerce (a fetch/auth/rate-limit failure would throw, not
+    // silently import nothing). The order-specific proof is below: the sweep does not create an SO for the
+    // on-hold order — the status filter excludes it at the WooCommerce fetch. (We assert on THIS order's number,
+    // not the aggregate synced count: the sweep legitimately re-syncs other recently-modified store orders.)
+    await runWcOrderReconcile(page)
+
+    // No SO exists for it. (No webhook delivered it either — we never nudged WP-Cron. And OC-19 proves this same
+    // sweep DOES import a processing order under identical conditions, so a green OC-20 is a real skip.)
+    expect(await salesOrderIdsForWcOrderNumber(order.number), 'a non-configured status must not be imported by reconcile').toHaveLength(0)
+    expect(await inboxEventCountForWcOrder(order.id), 'and no webhook delivered it either').toBe(0)
+  })
 })
 
 /** A manual journal is balanced iff its signed LineAmounts (debits +, credits −) sum to zero (mirror of X-01). */
@@ -1810,6 +1883,53 @@ async function salesOrderIdsForWcOrderNumber(wcOrderNumber: string): Promise<str
       `select id from sales_orders where "externalOrderNumber" = $1`, [wcOrderNumber],
     )
     return r.rows.map((row) => row.id)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Poll for the SO(s) a reconcile sweep created for a WC order number (import + link writes settle just after). */
+async function awaitReconciledSalesOrder(wcOrderNumber: string, timeoutMs = 60_000): Promise<string[]> {
+  const deadline = Date.now() + timeoutMs
+  let ids = await salesOrderIdsForWcOrderNumber(wcOrderNumber)
+  while (ids.length === 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 3_000))
+    ids = await salesOrderIdsForWcOrderNumber(wcOrderNumber)
+  }
+  return ids
+}
+
+/** How many webhook inbox events reference this WC order — 0 proves an import was NOT webhook-delivered. */
+async function inboxEventCountForWcOrder(wcOrderId: number): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    // Query the JSON value, NOT a text LIKE: payloadJson is JSONB and its text form renders "id": 123 (with a
+    // space), so a `%"id":123%` LIKE never matches and would silently report 0 events even when one exists —
+    // making the "no webhook delivered" proof a false pass (Codex).
+    const r = await db.query<{ n: string }>(
+      `select count(*)::text as n from shopping_webhook_events
+        where connector = 'woocommerce' and ("payloadJson"->>'id')::bigint = $1`,
+      [wcOrderId],
+    )
+    return Number(r.rows[0]?.n ?? '0')
+  } finally {
+    await db.end()
+  }
+}
+
+/** Upsert a settings value (mirrors setPostingMode's shape). */
+async function setSetting(key: string, value: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+        on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      [key, value],
+    )
   } finally {
     await db.end()
   }
