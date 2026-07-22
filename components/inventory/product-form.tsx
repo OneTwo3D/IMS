@@ -111,9 +111,11 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
     barcode:              defaultValues?.barcode              ?? '',
     mpn:                  defaultValues?.mpn                  ?? '',
     hsCode:               defaultValues?.hsCode               ?? '',
-    // bhdm.7: canonicalise the stored origin so a legacy non-canonical value (e.g. lowercase 'ad') matches an
-    // uppercase COUNTRY_LIST option instead of rendering empty and being silently cleared on the next save.
-    countryOfOrigin:      toIsoCountryCode(defaultValues?.countryOfOrigin) ?? '',
+    // bhdm.7: canonicalise a recognised stored origin (lowercase 'ad' -> 'AD'); PRESERVE a nonblank
+    // unrecognised value ('EU') verbatim rather than blanking it — an unrelated edit must not silently erase an
+    // invalid origin and clear its discrepancy. The rendered sentinel option + server-schema rejection force the
+    // operator to pick a valid country before saving.
+    countryOfOrigin:      toIsoCountryCode(defaultValues?.countryOfOrigin) ?? (defaultValues?.countryOfOrigin?.trim() || ''),
     customsDescription:   defaultValues?.customsDescription   ?? '',
     weight:               defaultValues?.weight               ?? '',
     salesPriceBase:        defaultValues?.salesPriceBase        ?? '',
@@ -375,6 +377,11 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
             onChange={(ev) => set('countryOfOrigin', ev.target.value)}
           >
             <option value="">— Select —</option>
+            {/* bhdm.7: a legacy invalid stored origin is preserved as a sentinel option (so an unrelated edit
+                doesn't silently erase it); its label + the server-schema rejection force picking a real country. */}
+            {fields.countryOfOrigin && !toIsoCountryCode(fields.countryOfOrigin) && (
+              <option value={fields.countryOfOrigin}>{fields.countryOfOrigin} (invalid — choose a country)</option>
+            )}
             {COUNTRY_LIST.map((c) => (
               <option key={c.code} value={c.code}>{c.name}</option>
             ))}
