@@ -22,6 +22,7 @@ import {
 } from '@/lib/products/type-transforms'
 import { detectComponentCycle } from '@/lib/products/component-cycle'
 import { blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
+import { productSchema } from '@/lib/products/product-schema'
 import {
   cleanProductCategoryName,
   listProductCategoryNodes,
@@ -620,49 +621,6 @@ export async function listProductSupplierOptions(): Promise<ProductSupplierOptio
 // ---------------------------------------------------------------------------
 // Mutations
 // ---------------------------------------------------------------------------
-
-export const productSchema = z.object({
-  sku: z.string().min(1).max(100),
-  name: z.string().min(1).max(255),
-  categoryName: z.string().max(PRODUCT_CATEGORY_NAME_MAX_LENGTH).optional().nullable(),
-  description: z.string().optional(),
-  type: z.nativeEnum(ProductType),
-  parentId: z.string().optional().nullable(),
-  preferredSupplierId: z.string().optional().nullable(),
-  preferredSupplierLocked: z.boolean().default(false),
-  barcode: z.string().optional().nullable(),
-  mpn: z.string().max(100).optional().nullable(),
-  hsCode: z.string().optional().nullable(),
-  // bhdm.7: the dropdown is not a trust boundary (FormData is client-controlled). Normalise + validate here:
-  // blank -> null, a recognised country (name/alias/code) -> canonical uppercase ISO-2, and a nonblank
-  // unrecognised or reserved value (EU/ZZ/!!) is rejected rather than stored verbatim and forwarded to the WMS.
-  countryOfOrigin: z.string().max(64).optional().nullable().transform((value, ctx) => {
-    if (value == null) return null
-    const trimmed = value.trim()
-    if (trimmed === '') return null
-    const iso = toIsoCountryCode(trimmed)
-    if (!iso) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Unrecognised country of origin "${trimmed}"` })
-      return z.NEVER
-    }
-    return iso
-  }),
-  customsDescription: z.string().optional().nullable(),
-  weight: z.string().optional().nullable(),
-  salesPriceBase: z.string().optional().nullable(),
-  salePriceBase: z.string().optional().nullable(),
-  salesPriceTaxInclusive: z.boolean().default(false),
-  taxCategory: z.enum(['STANDARD', 'REDUCED', 'SECOND_REDUCED', 'ZERO', 'EXEMPT']).default('STANDARD'),
-  stockUnit: z.string().default('pcs'),
-  oversellAllowed: z.boolean().default(true),
-  imageUrl: z.string().optional().nullable(),
-  widthCm: z.string().optional().nullable(),
-  heightCm: z.string().optional().nullable(),
-  depthCm: z.string().optional().nullable(),
-  active: z.boolean().default(true),
-  lifecycleStatus: z.enum(['DRAFT', 'ACTIVE', 'EOL', 'ARCHIVED']).default('ACTIVE'),
-  leadTimeDays: z.string().optional().nullable(),
-})
 
 // Manual lead-time override: blank / non-numeric / <= 0 → null (use observed/default).
 function parseLeadTimeOverride(value: string | null | undefined): number | null {

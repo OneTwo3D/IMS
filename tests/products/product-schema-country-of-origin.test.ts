@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { ProductType } from '@/app/generated/prisma/client'
-import { productSchema } from '@/app/actions/products'
+import { productSchema } from '@/lib/products/product-schema'
 
 // bhdm.7 r5: the product server-action schema is the real trust boundary (FormData is client-controlled). It
 // must normalise + validate countryOfOrigin regardless of what the dropdown offers.
