@@ -440,6 +440,130 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       if (posted) trackDocument('Invoices', posted, `OC-02 invoice ${runTag(runId)}`)
     }
   })
+
+  test('OC-07: refund WITH restock -> returned units physically re-enter the return warehouse (RETURN_INBOUND, on-hand)', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // OC-05/06 proved the ACCOUNTING side of a Woo refund (the credit note read back from Xero). OC-07
+    // proves the INVENTORY side of the SAME inbound path: a refund carrying a line QUANTITY restocks, and
+    // the returned units must physically re-enter the correct warehouse, exactly once. That restock only
+    // happens when a default return warehouse exists (refund-sync.ts:176 resolves `defaultReturnWarehouse:
+    // true`); with none, a qty-refund silently degrades to cash-only and NOTHING here would fire. So we set
+    // one for this test and restore it after — deliberately NOT in beforeAll, so OC-05/06's established
+    // cash-only assertions upstream in this file are untouched.
+    //
+    // We return to the SAME warehouse the units shipped from (CBG), so on-hand simply goes down at ship
+    // and back up at refund — the cleanest possible before/after on the same stock level.
+    //
+    // SCOPE — why this stops at the physical re-entry and does NOT assert the returned-stock VALUATION or a
+    // recreated cost LAYER: posting mode is a branch. This runs SYNC mode, and a return re-enters at the
+    // shipped COGS basis (recreating a valued cost layer) ONLY when the source shipment has been JOURNALED
+    // — accounting_shipment_journal_date is set solely by the daily batch (daily-sync.ts). In sync mode the
+    // shipment is never journaled, so stageRefundAccountingReversals finds no cost snapshot and the restock
+    // falls back to buildRefundFallbackReturnRows, which carries QUANTITY ONLY (no cost) by design: the
+    // units re-enter physically, valuation deferred. PRODUCTION runs the daily batch (stage has
+    // xero_daily_batch_enabled), so there it re-enters at posted COGS with a recreated layer — that VALUED
+    // path plus the COGS_REVERSAL journal are the batch-mode tests' job (OC-08 / X-01, which drive
+    // runDailyBatchSync). Asserting a £10 layer here would either fail (sync mode) or force this test to run
+    // the GLOBAL daily batch, which would journal the ~90 unrelated unjournaled shipments accumulated in the
+    // shared e2e DB and strand their journals in the Demo ledger. So OC-07 owns the sync-mode restock PATH.
+    const sku = taggedSku(runId, 'OC07')
+    const unitPrice = '30.00'
+    const qty = 3
+    const refundQty = 1
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    const priorReturnWh = await setDefaultReturnWarehouse(WAREHOUSE_CODE, true)
+    try {
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC07`, price: unitPrice })
+      await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+      const product = await createWcProduct(creds, runId, { label: 'OC07', price: unitPrice })
+      const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+      const imported = await awaitWebhookDelivery(order.id, { creds })
+
+      // Ship the whole order from CBG — a refund needs a shipped stock source to restock against
+      // (docs/sales.md:135), the same precondition OC-05 documents.
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC07` })
+      await processPendingXeroSyncViaUi(page)
+
+      const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+      trackDocument('Invoices', invoiceId, `OC-07 invoice ${runTag(runId)}`)
+
+      const productId = await productIdBySku(sku)
+      const warehouseId = await warehouseIdByCode(WAREHOUSE_CODE)
+      // On-hand AFTER the ship, BEFORE the refund — the baseline the restock must move by exactly refundQty.
+      // (Seeded 10, shipped 3, so this reads 7; asserting the delta rather than the absolute keeps the test
+      // robust to the seed quantity.)
+      const onHandAfterShip = await onHandFor(productId, warehouseId)
+
+      // Refund ONE unit in Woo, carrying a line QUANTITY — that quantity (not the amount) is what makes
+      // refund-sync treat it as a restock (refund-sync.ts:72 hasQtyRefund). Mirrors OC-05's refund shape.
+      const wcOrder = await getWcOrder(creds, order.id)
+      const lineId = wcOrder.line_items?.[0]?.id
+      expect(lineId, 'the Woo order should have a line to refund').toBeTruthy()
+      const refundAmount = (Number(unitPrice) * refundQty).toFixed(2)
+      await refundWcOrder(creds, order.id, {
+        amount: refundAmount,
+        reason: `${runTag(runId)} OC-07 refund with restock`,
+        lineItems: [{ id: lineId!, quantity: refundQty, refund_total: refundAmount }],
+      })
+
+      const refundId = await awaitRefund(imported.salesOrderId)
+      await processPendingXeroSyncViaUi(page)
+
+      // NB posting mode is a BRANCH (ims.ts:setPostingMode). This test runs SYNC mode, where the revenue
+      // side (the credit note) posts but COGS does not — a shipment's COGS journal, and hence a refund's
+      // COGS_REVERSAL, only post via the daily batch's Group B. So the restock queues a COGS_REVERSAL that
+      // stays PENDING here (global teardown cancels the leftover queued log — nothing reaches the ledger).
+      // The COGS-reversal JOURNAL read back from Xero is OC-08's assertion, run in batch mode; OC-07 proves
+      // the INVENTORY subledger, which createRefund writes synchronously regardless of posting mode.
+
+      // --- ACCOUNTING: the full chain still reaches the Xero ledger (as OC-05) ---
+      const creditNoteId = await externalIdFor({ type: 'CREDIT_NOTE', referenceId: refundId })
+      trackDocument('CreditNotes', creditNoteId, `OC-07 credit note ${runTag(runId)}`)
+      const creditNote = await getCreditNote(creditNoteId)
+      expect(creditNote.Type).toBe('ACCRECCREDIT')
+      expect(creditNote.Status).toBe('AUTHORISED') // see OC-01: "not DELETED" would accept a DRAFT
+      const salesAccount = await settingValue('xero_sales_account')
+      expectLine(creditNote.LineItems, { accountCode: salesAccount, lineAmount: Number(refundAmount) })
+      expect(Number(creditNote.Total)).toBeGreaterThan(0)
+      expect(Number(creditNote.Total)).toBeLessThan(Number(order.total)) // partial, one of three units
+
+      // --- INVENTORY SUBLEDGER: the distinct claim of OC-07 ---
+      // 1) This ONE refund delivery produced EXACTLY ONE RETURN_INBOUND movement at the return warehouse —
+      //    not zero (no restock) and not two (a single delivery double-writing the movement). This is a
+      //    per-delivery correctness check, NOT an idempotency-under-duplicates proof: that requires a
+      //    SECOND delivery of the same refund, which is OC-16's dedicated scope (webhook replay
+      //    idempotency). The movement's own guard (idempotencyKey on refundId+refundLineId+warehouseId,
+      //    docs/sales.md "Warehouse-scoped idempotency") is what would dedup such a replay — exercised there.
+      const movements = await returnInboundMovementsFor('SalesOrderRefund', refundId, warehouseId)
+      expect(movements.length, 'one refund delivery -> exactly one RETURN_INBOUND movement').toBe(1)
+      const mv = movements[0]
+      expect(mv.productId).toBe(productId)
+      expect(mv.qty).toBeCloseTo(refundQty, 4)
+
+      // 2) The movement is SELF-CONSISTENT: totalValueBase == qty * unitCostBase, the invariant the schema
+      //    names (stock_movements.totalValueBase). We do NOT assert the ABSOLUTE cost — see the SCOPE note
+      //    above: in sync mode the return re-enters quantity-only (deferred valuation), so a hardcoded £10
+      //    would be wrong here and belongs to the batch-mode tests. Self-consistency still catches a
+      //    corrupt movement whose stated value contradicts its own qty×unit-cost.
+      expect(Number(mv.totalValueBase)).toBeCloseTo(Number(mv.unitCostBase ?? 0) * refundQty, 4)
+
+      // 3) On-hand at the return warehouse rose by EXACTLY the returned quantity — the units are physically
+      //    back (and by the delta, not over- or under-counted for this delivery).
+      const onHandAfterRefund = await onHandFor(productId, warehouseId)
+      expect(onHandAfterRefund).toBeCloseTo(onHandAfterShip + refundQty, 4)
+
+      // 4) And the order records a PARTIAL refund (one of three units) — the same disposition OC-05 asserts.
+      expect(await orderRefundStatus(imported.salesOrderId)).toBe('PARTIAL')
+    } finally {
+      // Restore the default-return-warehouse flag to whatever it was, so a later run (or OC-05/06 on a
+      // re-run) sees the store exactly as it found it. Runs even if an assertion above threw.
+      await setDefaultReturnWarehouse(WAREHOUSE_CODE, false, priorReturnWh)
+    }
+  })
 })
 
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
@@ -718,6 +842,108 @@ async function reservedQtyFor(productId: string, warehouseId: string): Promise<n
       [productId, warehouseId],
     )
     return Number(r.rows[0]?.reservedQty ?? 0)
+  } finally {
+    await db.end()
+  }
+}
+
+/** The IMS product id for a SKU. */
+async function productIdBySku(sku: string): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string }>(`select id from products where sku = $1`, [sku])
+    if (!r.rows.length) throw new Error(`No IMS product for SKU ${sku}.`)
+    return r.rows[0].id
+  } finally {
+    await db.end()
+  }
+}
+
+/** The warehouse id for a code (e.g. CBG). */
+async function warehouseIdByCode(code: string): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string }>(`select id from warehouses where code = $1`, [code])
+    if (!r.rows.length) throw new Error(`No warehouse with code ${code}.`)
+    return r.rows[0].id
+  } finally {
+    await db.end()
+  }
+}
+
+/** On-hand (physical) quantity a stock level holds for a product+warehouse. */
+async function onHandFor(productId: string, warehouseId: string): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ quantity: string }>(
+      `select quantity::float8 as quantity from stock_levels where "productId" = $1 and "warehouseId" = $2`,
+      [productId, warehouseId],
+    )
+    return Number(r.rows[0]?.quantity ?? 0)
+  } finally {
+    await db.end()
+  }
+}
+
+/** The RETURN_INBOUND stock movements a refund created at a warehouse (should be exactly one per refund line). */
+async function returnInboundMovementsFor(
+  referenceType: string,
+  referenceId: string,
+  warehouseId: string,
+): Promise<Array<{ productId: string; qty: number; unitCostBase: string | null; totalValueBase: string | null }>> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ productId: string; qty: number; unitCostBase: string | null; totalValueBase: string | null }>(
+      `select "productId", qty::float8 as qty, "unitCostBase", "totalValueBase"
+         from stock_movements
+        where type = 'RETURN_INBOUND' and "referenceType" = $1 and "referenceId" = $2 and "toWarehouseId" = $3
+        order by "createdAt"`,
+      [referenceType, referenceId, warehouseId],
+    )
+    return r.rows
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Set (or clear) the default-return-warehouse flag used by the Woo refund restock path.
+ *
+ * refund-sync.ts resolves ONE `defaultReturnWarehouse: true, active: true` warehouse to restock into, so
+ * for a qty-refund to restock at all exactly this warehouse must carry the flag. Returns the code of the
+ * warehouse that previously held it (or null) so the caller can restore the store afterwards. When turning
+ * OFF we re-set whatever was there before (`restoreCode`) rather than blanket-clearing, so we never strip a
+ * pre-existing configuration the rig depended on.
+ */
+async function setDefaultReturnWarehouse(code: string, on: boolean, restoreCode?: string | null): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const prior = await db.query<{ code: string }>(
+      `select code from warehouses where "defaultReturnWarehouse" = true limit 1`,
+    )
+    const priorCode = prior.rows[0]?.code ?? null
+    if (on) {
+      // Make exactly `code` the default return warehouse — clear any other holder first so findFirst is
+      // deterministic.
+      await db.query(`update warehouses set "defaultReturnWarehouse" = false where "defaultReturnWarehouse" = true and code <> $1`, [code])
+      await db.query(`update warehouses set "defaultReturnWarehouse" = true where code = $1`, [code])
+    } else {
+      await db.query(`update warehouses set "defaultReturnWarehouse" = false where code = $1`, [code])
+      if (restoreCode) {
+        await db.query(`update warehouses set "defaultReturnWarehouse" = true where code = $1`, [restoreCode])
+      }
+    }
+    return priorCode
   } finally {
     await db.end()
   }
