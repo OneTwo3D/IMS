@@ -15,7 +15,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import type { ProductFormState } from '@/app/actions/products'
-import { COUNTRY_LIST } from '@/lib/countries'
+import { COUNTRY_LIST, toIsoCountryCode } from '@/lib/countries'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
 type VariableProduct = { id: string; sku: string; name: string }
@@ -111,7 +111,9 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
     barcode:              defaultValues?.barcode              ?? '',
     mpn:                  defaultValues?.mpn                  ?? '',
     hsCode:               defaultValues?.hsCode               ?? '',
-    countryOfOrigin:      defaultValues?.countryOfOrigin      ?? '',
+    // bhdm.7: canonicalise the stored origin so a legacy non-canonical value (e.g. lowercase 'ad') matches an
+    // uppercase COUNTRY_LIST option instead of rendering empty and being silently cleared on the next save.
+    countryOfOrigin:      toIsoCountryCode(defaultValues?.countryOfOrigin) ?? '',
     customsDescription:   defaultValues?.customsDescription   ?? '',
     weight:               defaultValues?.weight               ?? '',
     salesPriceBase:        defaultValues?.salesPriceBase        ?? '',
