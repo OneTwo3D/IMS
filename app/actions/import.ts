@@ -311,6 +311,13 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
       }
     }
 
+    // bhdm.7: parse the CSV origin once. A nonblank cell that normalises to null is unrecognised — warned (not
+    // silently dropped) in the create/update branch that actually imports the row.
+    const csvOriginRaw = hasCsvValue(row, 'countryOfOrigin', 'countryoforigin')
+      ? readCsvValue(row, 'countryOfOrigin', 'countryoforigin').trim()
+      : ''
+    const csvOriginIso = csvOriginRaw ? normalizeCsvCountryOfOrigin(csvOriginRaw) : null
+
     const lifecycleStatusRaw = row['lifecycleStatus']?.trim() || row['lifecyclestatus']?.trim() || null
     const lifecycleStatus = lifecycleStatusRaw === 'DRAFT' || lifecycleStatusRaw === 'ACTIVE' || lifecycleStatusRaw === 'EOL' || lifecycleStatusRaw === 'ARCHIVED'
       ? lifecycleStatusRaw as ProductLifecycleStatus
@@ -369,11 +376,9 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
         if (mpn !== undefined) updateData.mpn = mpn
         if (hasCsvValue(row, 'weight')) updateData.weight = row['weight']!.trim()
         // bhdm.7: update origin only when the CSV supplies a VALID country — a blank/invalid cell never clears
-        // an existing origin.
-        if (hasCsvValue(row, 'countryOfOrigin', 'countryoforigin')) {
-          const originIso = normalizeCsvCountryOfOrigin(readCsvValue(row, 'countryOfOrigin', 'countryoforigin'))
-          if (originIso) updateData.countryOfOrigin = originIso
-        }
+        // an existing origin; a nonblank unrecognised value is warned.
+        if (csvOriginIso) updateData.countryOfOrigin = csvOriginIso
+        else if (csvOriginRaw) result.errors.push(`Row ${lineNum} (${sku}): unrecognised countryOfOrigin "${csvOriginRaw}" — existing origin left unchanged`)
         if (hasCsvValue(row, 'widthCm', 'widthcm')) updateData.widthCm = readCsvValue(row, 'widthCm', 'widthcm').trim()
         if (hasCsvValue(row, 'heightCm', 'heightcm')) updateData.heightCm = readCsvValue(row, 'heightCm', 'heightcm').trim()
         if (hasCsvValue(row, 'depthCm', 'depthcm')) updateData.depthCm = readCsvValue(row, 'depthCm', 'depthcm').trim()
@@ -494,11 +499,9 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           preferredSupplierUpdatedAt: preferredSupplierId ? new Date() : null,
           active: deriveLegacyActiveFromLifecycleStatus(lifecycleStatus),
           lifecycleStatus,
-          // bhdm.7: import origin from the CSV when present + valid (else null, unchanged). Additive
-          // operator-supplied data — never defaulted, so it cannot silently relabel a product.
-          countryOfOrigin: hasCsvValue(row, 'countryOfOrigin', 'countryoforigin')
-            ? normalizeCsvCountryOfOrigin(readCsvValue(row, 'countryOfOrigin', 'countryoforigin'))
-            : null,
+          // bhdm.7: import origin from the CSV when present + valid (else null). Additive operator-supplied
+          // data — never defaulted, so it cannot silently relabel a product.
+          countryOfOrigin: csvOriginIso,
         }
         const previewParent = createData.parentId ? (productById.get(createData.parentId) ?? null) : null
         const structureValidation = preview && createData.parentId && previewParent
@@ -562,6 +565,10 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           categoryId: created.categoryId,
           lifecycleStatus: created.lifecycleStatus,
         })
+        // bhdm.7: a nonblank origin that did not resolve to a valid country is imported as unset + warned.
+        if (csvOriginRaw && !csvOriginIso) {
+          result.errors.push(`Row ${lineNum} (${sku}): unrecognised countryOfOrigin "${csvOriginRaw}" — imported without an origin`)
+        }
         touchedProducts.push({ id: created.id, lifecycleStatus })
         result.created++
       }
