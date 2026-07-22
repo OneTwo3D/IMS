@@ -260,7 +260,7 @@ Transform rules:
 - `WcSyncLog` — WooCommerce sync log
 - `WcStatusMapping` — bidirectional WC-to-IMS status mapping (with seeded defaults)
 - `WcTaxClassMapping` — WC tax class to IMS TaxRate mapping
-- `WcPendingFxOrder` — WC orders queued when an FX rate is unavailable at sync time; drained by the hourly retry cron
+- `WcPendingFxOrder` — WC orders queued when an FX rate is unavailable at sync time; re-attempted by the FX-rate refresh cron (`/api/cron/fx-rates`), which drains the queue after upserting the newly fetched rates
 - `ConnectionTestRecord` — last successful test per connector with credential SHA256 fingerprint; required before any save is treated as "active"
 - `BackupManifest` — sidecar manifest per backup file (schema version, size, SHA256, app version)
 - `ShippingCarrier` — configurable shipping carriers with tracking URLs
@@ -339,13 +339,12 @@ There is no separate worker process. Background tasks are handled via HTTP endpo
 |---|---|---|---|
 | Account balance snapshot | `GET /api/cron/account-balance-snapshot` | Daily 01:00 | Fetch previous-day Xero Trial Balance account balances for inventory and COGS GL variance reporting |
 | Product lifecycle archive | `GET /api/cron/product-lifecycle-archive` | Daily 00:30 | Archive EOL products after all warehouse stock and incoming supply are depleted |
-| FX rate refresh | `GET /api/cron/fx-rates` | Daily 06:00 | Fetch rates from frankfurter.dev and upsert FxRate rows |
+| FX rate refresh | `GET /api/cron/fx-rates` | Daily 06:00 | Fetch rates from frankfurter.dev, upsert FxRate rows, and re-attempt any WooCommerce orders queued for a previously-missing rate |
 | Activity cleanup | `GET /api/cron/activity-cleanup` | Daily 03:00 | Purge activity log entries past retention |
 | Scheduled backup | `GET /api/cron/backup` | Daily 02:00 | Create backup, write manifest sidecar, apply retention, upload to remote storage |
 | Xero daily batch | `GET /api/cron/xero-daily-batch` | Daily 04:00 | Post Group A1/A2/B sub-ledger journals to Xero with deterministic split-batch refs when daily cap exceeded |
 | Xero payment poll | `GET /api/cron/xero-payment-poll` | Every 15 min | Detect paid invoices/bills in Xero and reconcile in IMS |
 | WooCommerce reconcile | `GET /api/cron/wc-reconcile` | Daily | Backup reconciliation for WooCommerce orders/products plus stock catch-up and queued retry draining |
-| WC pending-FX retry | `GET /api/cron/wc-fx-retry` | Hourly | Re-attempt orders queued due to missing FX rate at sync time |
 | Mintsoft webhook sweeper | `GET /api/cron/mintsoft-webhook-sweeper` | Every 5 minutes | Drain persisted Mintsoft ASN booked-in webhook events and apply stock/PO effects asynchronously |
 | Delivery status | `GET /api/cron/delivery-status` | Every 15 min | Poll delivery tracking providers for shipment status updates |
 | Auto-archive EOL | `GET /api/cron/auto-archive-eol` | Daily | Move EOL products with zero on-hand and zero incoming to ARCHIVED |
