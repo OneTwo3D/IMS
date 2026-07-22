@@ -315,6 +315,21 @@ export async function updateTaxRate(id: string, input: {
 }): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   try {
+    // o3d-r30: validate a mapped accounting TaxType against the LIVE active-connector rate set before
+    // persisting. The mapper UI is populated from a (now cacheable) display list, so a rate archived in
+    // Xero/QuickBooks after it was shown must not be persisted here and break later invoice/bill sync.
+    // Fetched LIVE (no allowCache); fails open only when the live list can't be obtained (connector down).
+    if (input.accountingTaxType) {
+      const { fetchAccountingTaxRates } = await import('@/app/actions/accounting-sync')
+      const { isUnknownActiveTaxType } = await import('@/lib/accounting/accounting-tax-type-validation')
+      const liveRates = await fetchAccountingTaxRates()
+      if (isUnknownActiveTaxType(input.accountingTaxType, liveRates)) {
+        return {
+          success: false,
+          error: `Tax type "${input.accountingTaxType}" is not a currently-active accounting tax rate — refresh the tax-rate list and re-map.`,
+        }
+      }
+    }
     const summary = await db.$transaction(async (tx) => {
       const components = input.components === undefined ? undefined : normalizeTaxRateComponents(input.components)
       const effectiveRate = components === undefined ? input.rate : (effectiveTaxRateFromComponents(components) ?? input.rate)
