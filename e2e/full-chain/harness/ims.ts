@@ -430,6 +430,40 @@ export async function runPaymentPoll(): Promise<unknown> {
   return pollXeroPayments()
 }
 
+/**
+ * Drive the WooCommerce order reconcile sweep — the safety net that ingests orders the realtime webhook
+ * missed. Posts the operator's "manual sync" endpoint (admin-authed, which the page already is), which runs
+ * syncNewWcOrders({ mode: 'manual_reconcile' }) IN THE APP and awaits it. This deliberately goes through the
+ * route rather than importing order-import.ts into the Playwright process: that module's graph pulls a
+ * CJS-only dependency and dies with "Cannot use import statement outside a module" (the same reason
+ * processPendingXeroSync drives the Xero sync through the UI). manual_reconcile honours wc_sync_order_statuses
+ * and adds 'completed', and is ungated (unlike runWcReconcile's 24h webhook-primary interval).
+ */
+export async function runWcOrderReconcile(page: Page): Promise<{ synced: number; skipped: number; errors: string[] }> {
+  const res = await page.request.post('/api/shopping/manual-sync', {
+    data: { type: 'orders', connector: 'woocommerce' },
+  })
+  if (!res.ok()) {
+    throw new Error(`WC manual reconcile HTTP ${res.status()}: ${(await res.text()).slice(0, 300)}`)
+  }
+  // Validate the RESULT, not just the HTTP status: the route answers 200 { success:true } even when
+  // syncNewWcOrders reported per-order or fetch failures in result.errors (WooCommerce unavailable, auth,
+  // rate limit). Left unchecked, a negative assertion (OC-20) could pass because reconciliation did nothing.
+  const body = (await res.json()) as {
+    success?: boolean
+    error?: string
+    result?: { synced?: number; skipped?: number; errors?: string[] }
+  }
+  if (!body.success) {
+    throw new Error(`WC manual reconcile not successful: ${body.error ?? JSON.stringify(body).slice(0, 300)}`)
+  }
+  const result = body.result ?? {}
+  if (result.errors && result.errors.length) {
+    throw new Error(`WC manual reconcile reported ${result.errors.length} order error(s): ${result.errors.slice(0, 3).join('; ')}`)
+  }
+  return { synced: result.synced ?? 0, skipped: result.skipped ?? 0, errors: result.errors ?? [] }
+}
+
 // --- posting-mode control ----------------------------------------------------
 
 /**
