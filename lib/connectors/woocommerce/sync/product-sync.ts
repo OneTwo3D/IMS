@@ -429,7 +429,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
       // --- Variations (VARIABLE products) ---
       if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
-        await syncVariations(wcProduct.id, syncedProductId, wcProduct.name, imsCategoryId)
+        await syncVariations(wcProduct.id, syncedProductId, wcProduct.name, imsCategoryId, saved.countryOfOrigin)
       }
 
       // --- Product options (variation attributes) ---
@@ -497,7 +497,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
       // --- Variations (VARIABLE products) ---
       if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
-        await syncVariations(wcProduct.id, created.id, wcProduct.name, imsCategoryId)
+        await syncVariations(wcProduct.id, created.id, wcProduct.name, imsCategoryId, created.countryOfOrigin)
       }
 
       // --- Product options (variation attributes) ---
@@ -565,7 +565,12 @@ async function syncVariations(
   // category is applied — a variant's category is never cleared by inheritance, even
   // if the parent currently resolves to no category (matches the backfill's policy).
   parentCategoryId: string | null | undefined,
+  // bhdm.7: a variant's country of origin is its parent's (the parent create already resolves to the WC
+  // attribute or the CN default). Inherited on create and backfilled on update when the variant has none, so a
+  // variant's displayed origin matches what the WMS/customs push sends instead of showing blank.
+  parentCountryOfOrigin: string | null,
 ) {
+  const inheritedCountryOfOrigin = parentCountryOfOrigin ?? DEFAULT_COUNTRY_OF_ORIGIN
   let page = 1
   let totalPages = 1
 
@@ -625,6 +630,8 @@ async function syncVariations(
         if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
         if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
         if (gtin && !existing.barcode) updateData.barcode = gtin
+        // bhdm.7: backfill origin only when the variant has none — never overwrite a real origin already set on it.
+        if (existing.countryOfOrigin == null) updateData.countryOfOrigin = inheritedCountryOfOrigin
 
         await db.product.update({ where: { id: existing.id }, data: updateData })
       } else {
@@ -645,6 +652,7 @@ async function syncVariations(
             lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status),
             type: 'VARIANT',
             parentId: imsParentId,
+            countryOfOrigin: inheritedCountryOfOrigin,
             ...(parentCategoryId != null ? { categoryId: parentCategoryId } : {}),
             externalProductId: BigInt(v.id),
           },

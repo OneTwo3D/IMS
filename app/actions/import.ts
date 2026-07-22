@@ -10,6 +10,7 @@ import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { deriveLegacyActiveFromLifecycleStatus, deriveLifecycleStatusFromLegacyActive } from '@/lib/products/lifecycle'
 import { validateProductStructureChange } from '@/lib/products/type-transforms'
 import { detectComponentCycle } from '@/lib/products/component-cycle'
+import { resolveImportedCountryOfOriginForCreate, resolveImportedCountryOfOriginForUpdate } from '@/lib/products/country-of-origin'
 import {
   cleanProductCategoryName,
   normalizeProductCategoryName,
@@ -367,6 +368,12 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
         if (barcode) updateData.barcode = barcode
         if (mpn !== undefined) updateData.mpn = mpn
         if (hasCsvValue(row, 'weight')) updateData.weight = row['weight']!.trim()
+        // bhdm.7: update origin only when the CSV supplies a VALID country — never clear an existing origin on a
+        // blank/invalid cell (which would reintroduce the display-vs-sent gap).
+        if (hasCsvValue(row, 'countryOfOrigin', 'countryoforigin')) {
+          const originIso = resolveImportedCountryOfOriginForUpdate(readCsvValue(row, 'countryOfOrigin', 'countryoforigin'))
+          if (originIso) updateData.countryOfOrigin = originIso
+        }
         if (hasCsvValue(row, 'widthCm', 'widthcm')) updateData.widthCm = readCsvValue(row, 'widthCm', 'widthcm').trim()
         if (hasCsvValue(row, 'heightCm', 'heightcm')) updateData.heightCm = readCsvValue(row, 'heightCm', 'heightcm').trim()
         if (hasCsvValue(row, 'depthCm', 'depthcm')) updateData.depthCm = readCsvValue(row, 'depthCm', 'depthcm').trim()
@@ -487,6 +494,12 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           preferredSupplierUpdatedAt: preferredSupplierId ? new Date() : null,
           active: deriveLegacyActiveFromLifecycleStatus(lifecycleStatus),
           lifecycleStatus,
+          // bhdm.7: import origin from CSV when present + valid, else default to CN — the same fallback the
+          // WMS/customs push applies (it sends countryOfOrigin ?? 'CN'), so an imported row's displayed origin
+          // matches what is actually sent instead of showing blank.
+          countryOfOrigin: resolveImportedCountryOfOriginForCreate(
+            hasCsvValue(row, 'countryOfOrigin', 'countryoforigin') ? readCsvValue(row, 'countryOfOrigin', 'countryoforigin') : null,
+          ),
         }
         const previewParent = createData.parentId ? (productById.get(createData.parentId) ?? null) : null
         const structureValidation = preview && createData.parentId && previewParent
