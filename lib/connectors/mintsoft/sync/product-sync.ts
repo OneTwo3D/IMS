@@ -606,6 +606,39 @@ async function syncOneMintsoftProduct(
   if (validatedCommodityCode !== dto.commodityCode) {
     dto = { ...dto, commodityCode: validatedCommodityCode }
   }
+
+  // Customs discrepancies (HS/CN code + country of origin) are reconciled HERE — BEFORE any barcode-related
+  // early return — so a barcode conflict can never suppress them and leave a legacy issue unreported (Codex
+  // review r9). A bad HS/CN code is omitted from the push; an invalid origin still declares CN for customs
+  // continuity but is flagged, never a silent false declaration. Each is cleared once corrected.
+  if (invalidCnCode) {
+    await upsertProductDiscrepancy({
+      scopes: context.scopes,
+      productId: context.product.id,
+      sku: context.product.sku,
+      category: 'INVALID_HS_CODE',
+      imsValue: invalidCnCode,
+      wmsValue: null,
+      message: `IMS HS/CN code "${invalidCnCode}" is not a declarable 2026 CN8 (must be exactly 8 digits and present in the EU CN list). Code was omitted from the Mintsoft push.`,
+    })
+  } else {
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'INVALID_HS_CODE')
+  }
+  const { invalidCountryOfOrigin } = resolveMintsoftCountryOfManufacture(context.product.countryOfOrigin)
+  if (invalidCountryOfOrigin) {
+    await upsertProductDiscrepancy({
+      scopes: context.scopes,
+      productId: context.product.id,
+      sku: context.product.sku,
+      category: 'INVALID_COUNTRY_OF_ORIGIN',
+      imsValue: invalidCountryOfOrigin,
+      wmsValue: null,
+      message: `IMS country of origin "${invalidCountryOfOrigin}" is not an assigned ISO 3166-1 alpha-2 country. Declared as ${DEFAULT_COUNTRY_OF_ORIGIN} to the WMS; correct the product's origin.`,
+    })
+  } else {
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'INVALID_COUNTRY_OF_ORIGIN')
+  }
+
   let payloadHash = hashMintsoftProductDto(dto)
   const wmsBarcode = trimToNull(authoritative?.barcode)
   const barcodePlan = resolveMintsoftBarcodePlan(dto.barcode, wmsBarcode)
@@ -654,38 +687,6 @@ async function syncOneMintsoftProduct(
     })
   } else {
     await resolveProductDiscrepancy(context.scopes, context.product.id, 'BARCODE_CONFLICT')
-  }
-
-  // Invalid HS/CN code (bhdm.3): flag the omitted code as a discrepancy, or clear a prior one.
-  if (invalidCnCode) {
-    await upsertProductDiscrepancy({
-      scopes: context.scopes,
-      productId: context.product.id,
-      sku: context.product.sku,
-      category: 'INVALID_HS_CODE',
-      imsValue: invalidCnCode,
-      wmsValue: null,
-      message: `IMS HS/CN code "${invalidCnCode}" is not a declarable 2026 CN8 (must be exactly 8 digits and present in the EU CN list). Code was omitted from the Mintsoft push.`,
-    })
-  } else {
-    await resolveProductDiscrepancy(context.scopes, context.product.id, 'INVALID_HS_CODE')
-  }
-
-  // bhdm.7: invalid stored country of origin — declared as CN to the WMS but flagged so a false China origin is
-  // never a silent declaration; cleared once the product origin is corrected.
-  const { invalidCountryOfOrigin } = resolveMintsoftCountryOfManufacture(context.product.countryOfOrigin)
-  if (invalidCountryOfOrigin) {
-    await upsertProductDiscrepancy({
-      scopes: context.scopes,
-      productId: context.product.id,
-      sku: context.product.sku,
-      category: 'INVALID_COUNTRY_OF_ORIGIN',
-      imsValue: invalidCountryOfOrigin,
-      wmsValue: null,
-      message: `IMS country of origin "${invalidCountryOfOrigin}" is not an assigned ISO 3166-1 alpha-2 country. Declared as ${DEFAULT_COUNTRY_OF_ORIGIN} to the WMS; correct the product's origin.`,
-    })
-  } else {
-    await resolveProductDiscrepancy(context.scopes, context.product.id, 'INVALID_COUNTRY_OF_ORIGIN')
   }
 
   const externalProductId = resolveMintsoftExternalProductId({
