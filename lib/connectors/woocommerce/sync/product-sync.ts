@@ -574,7 +574,14 @@ async function syncVariations(
       `/products/${wcParentId}/variations`,
       { per_page: '100', page: String(page) },
     )
-    if (error) break
+    // Propagate a variations-fetch failure so the parent product sync FAILS
+    // (recorded FAILED, no SYNCED log, cursors not advanced). Swallowing this
+    // used to leave variations un-synced while the parent looked SYNCED (o3d-q1w).
+    if (error) {
+      throw new Error(
+        `Failed to fetch variations for WC product ${wcParentId} (page ${page}/${totalPages}): ${error}`,
+      )
+    }
 
     totalPages = tp
     const variations = data as WcVariation[]
