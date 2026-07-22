@@ -16,7 +16,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
-import { scheduleRefundReservationReleaseOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { scheduleRefundReservationReleaseOutbox, scheduleRefundUnmatchedWarningOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import {
@@ -1981,8 +1981,14 @@ export async function createSalesOrderRefund(
     await scheduleRefundReservationReleaseOutbox(tx, {
       orderId: input.orderId,
       refundId: createdRefund.id,
-      refundOrderRef: getSalesOrderReference(so),
       eligible: releaseEligible,
+    })
+    // Separate durable row (Codex r10): delivering the unmatched-line WARNING must never re-run allocation, so
+    // it does not share the release row's lifecycle.
+    await scheduleRefundUnmatchedWarningOutbox(tx, {
+      orderId: input.orderId,
+      refundId: createdRefund.id,
+      refundOrderRef: getSalesOrderReference(so),
       unmatched: releaseUnmatchedAnomaly,
     })
 

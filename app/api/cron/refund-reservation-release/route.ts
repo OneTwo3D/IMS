@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { CRON_RATE_LIMIT_FIFTEEN_MINUTE_MAX, enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { processRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { processRefundReservationReleaseOutbox, processRefundUnmatchedWarningOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
 
 // o3d-67y: durable backstop for post-refund stock-reservation release. Unconditional
 // (no accounting/WMS connector dependency) — re-running allocation is a pure internal
@@ -21,6 +21,8 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const result = await processRefundReservationReleaseOutbox()
-  return NextResponse.json(result)
+  const release = await processRefundReservationReleaseOutbox()
+  // Separate row/duty: deliver durable unmatched-refund-line WARNINGs without re-running allocation (r10).
+  const unmatchedWarnings = await processRefundUnmatchedWarningOutbox()
+  return NextResponse.json({ release, unmatchedWarnings })
 }

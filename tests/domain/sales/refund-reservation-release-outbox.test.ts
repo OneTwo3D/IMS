@@ -4,7 +4,9 @@ import test from 'node:test'
 import type { Prisma } from '@/app/generated/prisma/client'
 import {
   scheduleRefundReservationReleaseOutbox,
+  scheduleRefundUnmatchedWarningOutbox,
   processRefundReservationReleaseOutbox,
+  processRefundUnmatchedWarningOutbox,
   resolveRefundReservationReleaseOutbox,
   isRefundReleaseEligible,
   hasUnmatchedSaleRefund,
@@ -13,7 +15,9 @@ import {
   UNMATCHED_WARNING_ACTION,
   REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
   REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
+  REFUND_UNMATCHED_WARNING_OUTBOX_OPERATION,
   type RefundReservationReleaseDrainDeps,
+  type RefundUnmatchedWarningDrainDeps,
   type ReleaseAllocationResult,
 } from '@/lib/domain/sales/refund-reservation-release-outbox'
 
@@ -118,21 +122,29 @@ test('schedule enqueues a backstop row inside the tx when the order holds alloca
   assert.equal(data.connector, REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR)
   assert.equal(data.operation, REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION)
   assert.equal(data.status, 'PENDING')
-  assert.deepEqual(data.payloadJson, { orderId: 'order-1', refundId: 'refund-1', attemptRelease: true, unmatched: false, refundOrderRef: '' })
+  assert.equal(data.operation, REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION)
+  assert.deepEqual(data.payloadJson, { orderId: 'order-1', refundId: 'refund-1' })
   assert.match(String(data.idempotencyKey), /refund-1/)
   assert.ok(data.nextAttemptAt instanceof Date && (data.nextAttemptAt as Date).getTime() > new Date('2026-07-22T00:00:00.000Z').getTime())
 })
 
-test('schedule enqueues an unmatched-only row (eligible:false, unmatched:true) to carry the durable WARNING', async () => {
+test('release schedule is a no-op when the refund does not reduce matched demand (eligible:false)', async () => {
   const { tx, created } = fakeTx()
-  await scheduleRefundReservationReleaseOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', eligible: false, unmatched: true, refundOrderRef: 'SO-9' })
-  assert.equal(created.length, 1)
-  assert.deepEqual(created[0].data.payloadJson, { orderId: 'order-1', refundId: 'refund-1', attemptRelease: false, unmatched: true, refundOrderRef: 'SO-9' })
+  await scheduleRefundReservationReleaseOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', eligible: false })
+  assert.equal(created.length, 0)
 })
 
-test('schedule is a no-op when neither eligible nor unmatched', async () => {
+test('unmatched-warning schedule enqueues a SEPARATE row (distinct operation) so delivery never re-runs allocation (o3d-67y r10)', async () => {
   const { tx, created } = fakeTx()
-  await scheduleRefundReservationReleaseOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', eligible: false, unmatched: false })
+  await scheduleRefundUnmatchedWarningOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', unmatched: true, refundOrderRef: 'SO-9' })
+  assert.equal(created.length, 1)
+  assert.equal(created[0].data.operation, REFUND_UNMATCHED_WARNING_OUTBOX_OPERATION)
+  assert.deepEqual(created[0].data.payloadJson, { orderId: 'order-1', refundId: 'refund-1', refundOrderRef: 'SO-9' })
+})
+
+test('unmatched-warning schedule is a no-op when there is no anomaly (unmatched:false)', async () => {
+  const { tx, created } = fakeTx()
+  await scheduleRefundUnmatchedWarningOutbox(tx, { orderId: 'order-1', refundId: 'refund-1', unmatched: false })
   assert.equal(created.length, 0)
 })
 
@@ -152,7 +164,19 @@ function drainDeps(
     markSuccess: async ({ id }) => { recorded.successIds.push(id) },
     markRetry: async ({ id }) => { recorded.retryIds.push(id) },
     logDeferral: async ({ orderId, refundId }) => { recorded.deferrals.push({ orderId, refundId }); return 'written' },
-    logUnmatched: async ({ orderId, refundId }) => { recorded.unmatched.push({ orderId, refundId }); return 'written' },
+  }
+}
+
+function unmatchedDrainDeps(
+  jobs: Array<{ id: string; attempts: number; lockedAt: Date | null; payloadJson: unknown }>,
+  recorded: Recorded,
+  logUnmatched?: RefundUnmatchedWarningDrainDeps['logUnmatched'],
+): RefundUnmatchedWarningDrainDeps {
+  return {
+    claimWork: (async () => jobs) as unknown as RefundUnmatchedWarningDrainDeps['claimWork'],
+    markSuccess: async ({ id }) => { recorded.successIds.push(id) },
+    markRetry: async ({ id }) => { recorded.retryIds.push(id) },
+    logUnmatched: logUnmatched ?? (async ({ orderId, refundId }) => { recorded.unmatched.push({ orderId, refundId }); return 'written' }),
   }
 }
 
@@ -225,56 +249,38 @@ test('drain: a non-refuse failure does NOT write a deferral WARNING', async () =
   assert.deepEqual(recorded.deferrals, [])
 })
 
-// ---- two-duty rows: unmatched-line WARNING (o3d-67y r9) ----------------------
+// ---- dedicated unmatched-warning drain (o3d-67y r10) — never runs allocation ---
 
-test('drain: an unmatched-only row delivers the WARNING and completes without touching allocation', async () => {
-  const recorded = emptyRecorded()
-  let allocateCalls = 0
-  const deps = drainDeps(
-    [job('a', { payloadJson: { orderId: 'order-a', refundId: 'refund-a', attemptRelease: false, unmatched: true } })],
-    async () => { allocateCalls++; return { success: true, committed: true } },
-    recorded,
-  )
-  await processRefundReservationReleaseOutbox(deps)
-  assert.equal(allocateCalls, 0, 'no release is attempted for an unmatched-only refund')
-  assert.deepEqual(recorded.unmatched, [{ orderId: 'order-a', refundId: 'refund-a' }])
-  assert.deepEqual(recorded.successIds, ['a'], 'the job completes once the WARNING is delivered')
+const warningJob = (id: string, over: Partial<{ attempts: number; lockedAt: Date | null }> = {}) => ({
+  id,
+  attempts: over.attempts ?? 0,
+  lockedAt: 'lockedAt' in over ? (over.lockedAt as Date | null) : new Date('2026-07-22T00:00:00.000Z'),
+  payloadJson: { orderId: `order-${id}`, refundId: `refund-${id}`, refundOrderRef: 'SO-1' },
 })
 
-test('drain: an unmatched-only row whose WARNING delivery throws RETRIES (durable delivery, o3d-67y r9)', async () => {
+test('unmatched drain: delivers the WARNING and completes — no allocation dep exists on this path (o3d-67y r10)', async () => {
   const recorded = emptyRecorded()
-  const deps: RefundReservationReleaseDrainDeps = {
-    ...drainDeps([job('a', { payloadJson: { orderId: 'order-a', refundId: 'refund-a', attemptRelease: false, unmatched: true } })], async () => ({ success: true, committed: true }), recorded),
-    logUnmatched: async () => { throw new Error('activity log DB down') },
-  }
-  await processRefundReservationReleaseOutbox(deps)
+  const deps = unmatchedDrainDeps([warningJob('a')], recorded)
+  const result = await processRefundUnmatchedWarningOutbox(deps)
+  assert.deepEqual(recorded.unmatched, [{ orderId: 'order-a', refundId: 'refund-a' }])
+  assert.deepEqual(recorded.successIds, ['a'])
+  assert.deepEqual(result, { claimed: 1, succeeded: 1, failed: 0 })
+})
+
+test('unmatched drain: a WARNING delivery that throws RETRIES (durable delivery)', async () => {
+  const recorded = emptyRecorded()
+  const deps = unmatchedDrainDeps([warningJob('a')], recorded, async () => { throw new Error('activity log DB down') })
+  await processRefundUnmatchedWarningOutbox(deps)
   assert.deepEqual(recorded.retryIds, ['a'], 'unconfirmed WARNING delivery keeps the job pending')
   assert.deepEqual(recorded.successIds, [])
 })
 
-test('drain: a MIXED row delivers the unmatched WARNING AND completes the release (o3d-67y r9)', async () => {
+test('unmatched drain: a job with no lock is skipped, never actioned', async () => {
   const recorded = emptyRecorded()
-  const deps = drainDeps(
-    [job('a', { payloadJson: { orderId: 'order-a', refundId: 'refund-a', attemptRelease: true, unmatched: true } })],
-    async () => ({ success: true, committed: true }),
-    recorded,
-  )
-  await processRefundReservationReleaseOutbox(deps)
-  assert.deepEqual(recorded.unmatched, [{ orderId: 'order-a', refundId: 'refund-a' }])
-  assert.deepEqual(recorded.successIds, ['a'])
-})
-
-test('drain: a MIXED row whose release refuses still delivers the WARNING but RETRIES the release', async () => {
-  const recorded = emptyRecorded()
-  const deps = drainDeps(
-    [job('a', { payloadJson: { orderId: 'order-a', refundId: 'refund-a', attemptRelease: true, unmatched: true } })],
-    async () => ({ success: false, refused: true, committed: false }),
-    recorded,
-  )
-  await processRefundReservationReleaseOutbox(deps)
-  assert.deepEqual(recorded.unmatched, [{ orderId: 'order-a', refundId: 'refund-a' }], 'the WARNING is delivered even when release cannot complete')
-  assert.deepEqual(recorded.deferrals, [{ orderId: 'order-a', refundId: 'refund-a' }])
-  assert.deepEqual(recorded.retryIds, ['a'])
+  const deps = unmatchedDrainDeps([warningJob('a', { lockedAt: null })], recorded)
+  const result = await processRefundUnmatchedWarningOutbox(deps)
+  assert.deepEqual(recorded.unmatched, [])
+  assert.equal(result.failed, 1)
 })
 
 // ---- idempotent + retryable WARNING writer ----------------------------------

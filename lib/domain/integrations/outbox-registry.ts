@@ -24,12 +24,14 @@ export const XeroAccountingOutboxPayloadSchema = z.object({
 export const SalesRefundReservationReleaseOutboxPayloadSchema = z.object({
   orderId: nonEmptyString,
   refundId: nonEmptyString,
-  // o3d-67y r9: a single durable row carries two backstop duties, either or both set. `attemptRelease` re-runs
-  // allocation to release a matched demand-reducing refund; `unmatched` durably delivers the operator WARNING
-  // for an unmatched external quantity line (which allocation cannot release). Optional+defaulted so pre-r9
-  // rows (release-only) still parse.
-  attemptRelease: z.boolean().optional().default(true),
-  unmatched: z.boolean().optional().default(false),
+})
+
+// o3d-67y r10: a SEPARATE row (independent idempotency + lifecycle) carries the durable operator WARNING for an
+// unmatched external refund quantity line that allocation cannot release. Kept distinct from the release row so
+// delivering the WARNING never re-runs the non-idempotent allocation (Codex review r10).
+export const SalesRefundUnmatchedWarningOutboxPayloadSchema = z.object({
+  orderId: nonEmptyString,
+  refundId: nonEmptyString,
   refundOrderRef: z.string().optional().default(''),
 })
 
@@ -88,6 +90,7 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
   },
   sales: {
     'refund.reservation-release': { name: 'processRefundReservationRelease', schema: SalesRefundReservationReleaseOutboxPayloadSchema },
+    'refund.unmatched-warning': { name: 'processRefundUnmatchedWarning', schema: SalesRefundUnmatchedWarningOutboxPayloadSchema },
   },
 })
 

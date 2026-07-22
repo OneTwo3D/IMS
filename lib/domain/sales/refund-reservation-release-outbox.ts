@@ -38,7 +38,10 @@ import {
   type IntegrationOutboxClient,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
-import { SalesRefundReservationReleaseOutboxPayloadSchema } from '@/lib/domain/integrations/outbox-registry'
+import {
+  SalesRefundReservationReleaseOutboxPayloadSchema,
+  SalesRefundUnmatchedWarningOutboxPayloadSchema,
+} from '@/lib/domain/integrations/outbox-registry'
 
 type OutboxUpdateClient = {
   integrationOutbox: { updateMany(args: unknown): Promise<{ count: number }> }
@@ -95,31 +98,25 @@ export function isRefundReleaseEligible(input: {
 export type ScheduleRefundReservationReleaseInput = {
   orderId: string
   refundId: string
-  refundOrderRef?: string
   /**
    * Whether this refund reduces a MATCHED line's demand and the order holds a live reservation — derived under
    * the refund's order lock (isRefundReleaseEligible + residual reservation). Drives the release re-attempt.
    */
   eligible: boolean
-  /**
-   * Whether this refund has an UNMATCHED positive-qty sale line with a live residual reservation — allocation
-   * cannot release it, so a durable operator WARNING must be delivered (Codex review r9).
-   */
-  unmatched?: boolean
 }
 
 /**
- * Enqueue the durable reservation-release backstop — call INSIDE the
- * createSalesOrderRefund transaction so the outbox row commits atomically with the
- * refund. A single row carries two duties (release re-attempt and/or unmatched-line WARNING); no-op when
- * neither applies. The idempotency key is per-refund so a replayed refund dedups to a single backstop row.
+ * Enqueue the durable reservation-RELEASE backstop — call INSIDE the createSalesOrderRefund transaction so the
+ * outbox row commits atomically with the refund. No-op when the refund does not reduce a matched line's demand.
+ * The idempotency key is per-refund so a replayed refund dedups to a single row. Kept separate from the
+ * unmatched-warning row so delivering that WARNING never re-runs allocation (Codex review r10).
  */
 export async function scheduleRefundReservationReleaseOutbox(
   tx: Prisma.TransactionClient,
   input: ScheduleRefundReservationReleaseInput,
   options: { graceMs?: number; now?: Date } = {},
 ): Promise<void> {
-  if (!input.eligible && !input.unmatched) return
+  if (!input.eligible) return
   const now = options.now ?? new Date()
   const idempotencyKey = buildOutboxIdempotencyKey(
     REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
@@ -131,13 +128,47 @@ export async function scheduleRefundReservationReleaseOutbox(
       connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
       operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
       idempotencyKey,
-      payloadJson: {
-        orderId: input.orderId,
-        refundId: input.refundId,
-        attemptRelease: input.eligible,
-        unmatched: input.unmatched === true,
-        refundOrderRef: input.refundOrderRef ?? '',
-      },
+      payloadJson: { orderId: input.orderId, refundId: input.refundId },
+      nextAttemptAt: new Date(now.getTime() + (options.graceMs ?? DEFAULT_DRAIN_GRACE_MS)),
+    },
+    { client: tx as unknown as IntegrationOutboxClient },
+  )
+}
+
+export const REFUND_UNMATCHED_WARNING_OUTBOX_OPERATION = 'refund.unmatched-warning'
+const REFUND_UNMATCHED_WARNING_OUTBOX_WORKER = 'refund-unmatched-warning-drain'
+
+export type ScheduleRefundUnmatchedWarningInput = {
+  orderId: string
+  refundId: string
+  refundOrderRef?: string
+  /** Whether this refund has an unmatched positive-qty sale line with a live residual reservation (Codex r8/r9). */
+  unmatched: boolean
+}
+
+/**
+ * Enqueue the durable unmatched-refund-line WARNING backstop — call INSIDE the createSalesOrderRefund
+ * transaction. This row's ONLY duty is delivering the operator WARNING (allocation cannot release an unmatched
+ * external quantity line), so it never re-runs allocation. No-op unless the anomaly holds.
+ */
+export async function scheduleRefundUnmatchedWarningOutbox(
+  tx: Prisma.TransactionClient,
+  input: ScheduleRefundUnmatchedWarningInput,
+  options: { graceMs?: number; now?: Date } = {},
+): Promise<void> {
+  if (!input.unmatched) return
+  const now = options.now ?? new Date()
+  const idempotencyKey = buildOutboxIdempotencyKey(
+    REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+    REFUND_UNMATCHED_WARNING_OUTBOX_OPERATION,
+    input.refundId,
+  )
+  await enqueueIntegrationOutbox(
+    {
+      connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+      operation: REFUND_UNMATCHED_WARNING_OUTBOX_OPERATION,
+      idempotencyKey,
+      payloadJson: { orderId: input.orderId, refundId: input.refundId, refundOrderRef: input.refundOrderRef ?? '' },
       nextAttemptAt: new Date(now.getTime() + (options.graceMs ?? DEFAULT_DRAIN_GRACE_MS)),
     },
     { client: tx as unknown as IntegrationOutboxClient },
@@ -198,8 +229,6 @@ export type RefundReservationReleaseDrainDeps = {
   markRetry: (options: Parameters<typeof markIntegrationOutboxRetryableFailure>[0]) => Promise<unknown>
   /** Deliver the shipment-refuse deferral WARNING (o3d-67y r5) — idempotent, returns 'written'|'skipped'. */
   logDeferral: (params: RefundWarningParams) => Promise<'written' | 'skipped'>
-  /** Deliver the unmatched-refund-line WARNING (o3d-67y r9) — idempotent, returns 'written'|'skipped'. */
-  logUnmatched: (params: RefundWarningParams) => Promise<'written' | 'skipped'>
 }
 
 export const DEFERRAL_WARNING_ACTION = 'refund_reservation_release_deferred'
@@ -285,7 +314,6 @@ const defaultDrainDeps = (): RefundReservationReleaseDrainDeps => ({
   markSuccess: markIntegrationOutboxSuccess,
   markRetry: markIntegrationOutboxRetryableFailure,
   logDeferral: lockedRefundWarningWriter({ action: DEFERRAL_WARNING_ACTION, reason: 'existing_shipment', describe: deferralDescription }),
-  logUnmatched: lockedRefundWarningWriter({ action: UNMATCHED_WARNING_ACTION, reason: 'unmatched_refund_line', describe: unmatchedDescription }),
 })
 
 export type RefundWarningWriteDeps = {
@@ -366,61 +394,38 @@ async function processOneRefundReservationReleaseJob(
   const lockedAt = job.lockedAt
   try {
     const payload = SalesRefundReservationReleaseOutboxPayloadSchema.parse(job.payloadJson)
-    const warningParams = { orderId: payload.orderId, refundId: payload.refundId, refundOrderRef: payload.refundOrderRef }
-
-    // Duty 1 — durably deliver the unmatched-refund-line WARNING (o3d-67y r9). This row exists partly/wholly for
-    // that signal; delivery is idempotent+retryable (writes only when not already persisted), so a swallowed
-    // earlier write (immediate helper or prior attempt) is re-attempted here without duplicating. A failure to
-    // confirm delivery keeps the job pending. Best-effort throw handling — never derail the release retry.
-    let unmatchedDelivered = true
-    if (payload.unmatched) {
-      try {
-        await deps.logUnmatched(warningParams)
-      } catch (logError) {
-        unmatchedDelivered = false
-        console.error('[refund] drain failed to deliver unmatched-refund-line warning', logError)
-      }
-    }
-
-    // Duty 2 — re-attempt the reservation release (only when this refund reduces a matched line's demand). The
-    // job's release part is done ONLY when allocation COMMITTED; a rollback, a pre-transaction bail, or a
-    // shipment REFUSE (which leaves the stale reservation for o3d-339) must retry and dead-letter visibly, never
-    // be silently marked succeeded (Codex review r3/r4).
-    let releaseReconciled = true
-    let releaseError: Error | null = null
-    if (payload.attemptRelease) {
-      const allocation = await deps.allocate(payload.orderId)
-      releaseReconciled = allocation.committed === true
-      if (!releaseReconciled) {
-        if (allocation.refused === true) {
-          try {
-            await deps.logDeferral(warningParams)
-          } catch (logError) {
-            console.error('[refund] drain failed to record reservation-release deferral warning', logError)
-          }
+    const warningParams = { orderId: payload.orderId, refundId: payload.refundId }
+    const allocation = await deps.allocate(payload.orderId)
+    // The job is done ONLY when allocation COMMITTED (a full release or a committed backorder) — the only
+    // outcome that reconciles reservedQty. A rollback (failed), a pre-transaction bail (no eligible warehouse),
+    // or a shipment REFUSE (which leaves the stale reservation for o3d-339) must retry and dead-letter visibly,
+    // never be silently marked succeeded (Codex review r3/r4).
+    const reconciled = allocation.committed === true
+    if (!reconciled) {
+      if (allocation.refused === true) {
+        try {
+          await deps.logDeferral(warningParams)
+        } catch (logError) {
+          console.error('[refund] drain failed to record reservation-release deferral warning', logError)
         }
-        releaseError = new Error(
+      }
+      await deps.markRetry({
+        id: job.id,
+        workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER,
+        lockedAt,
+        error: new Error(
           allocation.refused === true
             ? 'reservation release refused: a shipment holds the units — needs shipment reconciliation (o3d-339)'
             : allocation.error ?? 'reservation release did not commit (no eligible warehouse or rolled back)',
-        )
-      }
-    }
-
-    if (unmatchedDelivered && releaseReconciled) {
-      await deps.markSuccess({ id: job.id, workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER, lockedAt })
-      result.succeeded++
+        ),
+        attemptsBeforeFailure: job.attempts,
+        maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
+      })
+      result.failed++
       return
     }
-    await deps.markRetry({
-      id: job.id,
-      workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER,
-      lockedAt,
-      error: releaseError ?? new Error('unmatched-refund-line warning delivery not confirmed'),
-      attemptsBeforeFailure: job.attempts,
-      maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
-    })
-    result.failed++
+    await deps.markSuccess({ id: job.id, workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER, lockedAt })
+    result.succeeded++
   } catch (error) {
     await deps.markRetry({
       id: job.id,
@@ -432,4 +437,64 @@ async function processOneRefundReservationReleaseJob(
     })
     result.failed++
   }
+}
+
+// ---------------------------------------------------------------------------
+// Unmatched-refund-line WARNING drain (o3d-67y r10) — a SEPARATE row/duty so
+// delivering the WARNING never re-runs the non-idempotent allocation.
+// ---------------------------------------------------------------------------
+
+export type RefundUnmatchedWarningDrainDeps = {
+  claimWork: typeof claimIntegrationOutboxWork
+  markSuccess: (options: Parameters<typeof markIntegrationOutboxSuccess>[0]) => Promise<unknown>
+  markRetry: (options: Parameters<typeof markIntegrationOutboxRetryableFailure>[0]) => Promise<unknown>
+  /** Deliver the unmatched-refund-line WARNING — idempotent, returns 'written'|'skipped'. */
+  logUnmatched: (params: RefundWarningParams) => Promise<'written' | 'skipped'>
+}
+
+const defaultUnmatchedWarningDrainDeps = (): RefundUnmatchedWarningDrainDeps => ({
+  claimWork: claimIntegrationOutboxWork,
+  markSuccess: markIntegrationOutboxSuccess,
+  markRetry: markIntegrationOutboxRetryableFailure,
+  logUnmatched: lockedRefundWarningWriter({ action: UNMATCHED_WARNING_ACTION, reason: 'unmatched_refund_line', describe: unmatchedDescription }),
+})
+
+/**
+ * Drain pending unmatched-refund-line WARNING rows. Each job idempotently delivers the order-scoped WARNING and
+ * completes only once delivery is confirmed persisted (so a swallowed immediate write or a crash is recovered).
+ * No allocation is ever run here — this row's sole duty is the durable operator signal (Codex review r10).
+ */
+export async function processRefundUnmatchedWarningOutbox(
+  deps: RefundUnmatchedWarningDrainDeps = defaultUnmatchedWarningDrainDeps(),
+  limit = 50,
+): Promise<ProcessRefundReservationReleaseResult> {
+  const jobs = await deps.claimWork({
+    connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+    operation: REFUND_UNMATCHED_WARNING_OUTBOX_OPERATION,
+    workerId: REFUND_UNMATCHED_WARNING_OUTBOX_WORKER,
+    limit,
+    maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
+  })
+  const result: ProcessRefundReservationReleaseResult = { claimed: jobs.length, succeeded: 0, failed: 0 }
+  for (const job of jobs) {
+    if (!job.lockedAt) { result.failed++; continue }
+    const lockedAt = job.lockedAt
+    try {
+      const payload = SalesRefundUnmatchedWarningOutboxPayloadSchema.parse(job.payloadJson)
+      await deps.logUnmatched({ orderId: payload.orderId, refundId: payload.refundId, refundOrderRef: payload.refundOrderRef })
+      await deps.markSuccess({ id: job.id, workerId: REFUND_UNMATCHED_WARNING_OUTBOX_WORKER, lockedAt })
+      result.succeeded++
+    } catch (error) {
+      await deps.markRetry({
+        id: job.id,
+        workerId: REFUND_UNMATCHED_WARNING_OUTBOX_WORKER,
+        lockedAt,
+        error,
+        attemptsBeforeFailure: job.attempts,
+        maxAttempts: DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS,
+      })
+      result.failed++
+    }
+  }
+  return result
 }
