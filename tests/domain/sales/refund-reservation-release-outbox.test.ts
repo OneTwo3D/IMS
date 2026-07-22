@@ -75,7 +75,7 @@ test('schedule is a no-op when the order holds no allocations (eligible:false)',
 
 // ---- drain classification ---------------------------------------------------
 
-type Recorded = { successIds: string[]; retryIds: string[] }
+type Recorded = { successIds: string[]; retryIds: string[]; deferrals: Array<{ orderId: string; refundId: string }> }
 
 function drainDeps(
   jobs: Array<{ id: string; attempts: number; lockedAt: Date | null; payloadJson: unknown }>,
@@ -87,8 +87,11 @@ function drainDeps(
     allocate,
     markSuccess: async ({ id }) => { recorded.successIds.push(id) },
     markRetry: async ({ id }) => { recorded.retryIds.push(id) },
+    logDeferral: async ({ orderId, refundId }) => { recorded.deferrals.push({ orderId, refundId }) },
   }
 }
+
+const emptyRecorded = (): Recorded => ({ successIds: [], retryIds: [], deferrals: [] })
 
 const job = (id: string, over: Partial<{ attempts: number; lockedAt: Date | null; payloadJson: unknown }> = {}) => ({
   id,
@@ -99,7 +102,7 @@ const job = (id: string, over: Partial<{ attempts: number; lockedAt: Date | null
 })
 
 test('drain: a committed release marks the job SUCCEEDED', async () => {
-  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const recorded = emptyRecorded()
   const deps = drainDeps([job('a')], async () => ({ success: true, committed: true }), recorded)
   const result = await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.successIds, ['a'])
@@ -108,7 +111,7 @@ test('drain: a committed release marks the job SUCCEEDED', async () => {
 })
 
 test('drain: a committed backorder (success:false, committed:true) completes the job', async () => {
-  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const recorded = emptyRecorded()
   const deps = drainDeps([job('a')], async () => ({ success: false, committed: true }), recorded)
   await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.successIds, ['a'])
@@ -118,15 +121,38 @@ test('drain: a committed backorder (success:false, committed:true) completes the
 test('drain: a shipment refuse (refused:true, not committed) RETRIES — never silently succeeded (o3d-67y r4)', async () => {
   // Refuse does not reconcile reservedQty (stale allocation rows remain), so it must NOT be marked SUCCEEDED —
   // it retries and dead-letters visibly as a durable record for shipment reconciliation (o3d-339).
-  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const recorded = emptyRecorded()
   const deps = drainDeps([job('a')], async () => ({ success: false, refused: true, committed: false }), recorded)
   await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.retryIds, ['a'])
   assert.deepEqual(recorded.successIds, [])
 })
 
+test('drain: a first-attempt refuse writes the order-scoped deferral WARNING (crash-bypass visibility, o3d-67y r5)', async () => {
+  const recorded = emptyRecorded()
+  const deps = drainDeps([job('a', { attempts: 0 })], async () => ({ success: false, refused: true, committed: false }), recorded)
+  await processRefundReservationReleaseOutbox(deps)
+  assert.deepEqual(recorded.retryIds, ['a'])
+  assert.deepEqual(recorded.deferrals, [{ orderId: 'order-a', refundId: 'refund-a' }])
+})
+
+test('drain: a retried refuse (attempts>0) does NOT re-log the deferral WARNING — logged once per refund', async () => {
+  const recorded = emptyRecorded()
+  const deps = drainDeps([job('a', { attempts: 2 })], async () => ({ success: false, refused: true, committed: false }), recorded)
+  await processRefundReservationReleaseOutbox(deps)
+  assert.deepEqual(recorded.retryIds, ['a'])
+  assert.deepEqual(recorded.deferrals, [])
+})
+
+test('drain: a non-refuse failure does NOT write a deferral WARNING', async () => {
+  const recorded = emptyRecorded()
+  const deps = drainDeps([job('a')], async () => ({ success: false, failed: true, committed: false }), recorded)
+  await processRefundReservationReleaseOutbox(deps)
+  assert.deepEqual(recorded.deferrals, [])
+})
+
 test('drain: a rolled-back allocation transaction (failed:true) retries with backoff', async () => {
-  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const recorded = emptyRecorded()
   const deps = drainDeps([job('a')], async () => ({ success: false, failed: true, committed: false, error: 'deadlock' }), recorded)
   const result = await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.retryIds, ['a'])
@@ -137,7 +163,7 @@ test('drain: a rolled-back allocation transaction (failed:true) retries with bac
 test('drain: a pre-transaction bail (not committed, not refused, not failed) RETRIES — never silently succeeded (o3d-67y r3)', async () => {
   // e.g. no eligible warehouse: allocation returns success:false without committing. reservedQty is untouched,
   // so this must not be marked SUCCEEDED — it retries and eventually dead-letters visibly.
-  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const recorded = emptyRecorded()
   const deps = drainDeps([job('a')], async () => ({ success: false, committed: false, error: 'No stock available for allocation' }), recorded)
   await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.retryIds, ['a'])
@@ -145,14 +171,14 @@ test('drain: a pre-transaction bail (not committed, not refused, not failed) RET
 })
 
 test('drain: a thrown allocate retries', async () => {
-  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const recorded = emptyRecorded()
   const deps = drainDeps([job('a')], async () => { throw new Error('boom') }, recorded)
   await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.retryIds, ['a'])
 })
 
 test('drain: a malformed payload retries, it is not silently marked succeeded', async () => {
-  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const recorded = emptyRecorded()
   const deps = drainDeps(
     [job('a', { payloadJson: { orderId: '' } })],
     async () => ({ success: true, committed: true }),
@@ -164,7 +190,7 @@ test('drain: a malformed payload retries, it is not silently marked succeeded', 
 })
 
 test('drain: a job with no lock is skipped, never actioned', async () => {
-  const recorded: Recorded = { successIds: [], retryIds: [] }
+  const recorded = emptyRecorded()
   let allocateCalls = 0
   const deps = drainDeps([job('a', { lockedAt: null })], async () => { allocateCalls++; return { success: true, committed: true } }, recorded)
   const result = await processRefundReservationReleaseOutbox(deps)

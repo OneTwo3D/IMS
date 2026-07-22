@@ -30,6 +30,10 @@ import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subled
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
 
+// o3d-67y: sub-unit tolerance for the residual-reserved eligibility check (fractional quantities from
+// kit/BOM decomposition can leave rounding dust; treat anything at or below this as no live reservation).
+const REFUND_RESERVATION_EPSILON = 1e-6
+
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
  * Do not treat this as Decimal-internal arithmetic.
@@ -1945,10 +1949,22 @@ export async function createSalesOrderRefund(
       ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
       : []
 
-    // o3d-67y: eligibility is derived from ACTUAL reservations (OrderAllocation rows) under this order lock,
-    // not lifecycle status — an ON_HOLD / PICKING / PACKING order can still hold allocations a refund must
-    // release, while a never-allocated order holds none (Codex review r3).
-    const releaseEligible = (await tx.orderAllocation.count({ where: { orderId: input.orderId } })) > 0
+    // o3d-67y: eligibility is derived from RESIDUAL reserved quantity under this order lock, not lifecycle
+    // status and not raw allocation-row count. Dispatch decrements stockLevel.reservedQty but RETAINS the
+    // OrderAllocation rows for accounting snapshots (Codex review r5), so a fully-dispatched order still has
+    // rows yet nothing to release — counting rows would enqueue a job that refuses and becomes a false
+    // dead-letter. Residual = allocated qty − already-shipped qty; only a positive residual is a live
+    // reservation a refund can strand.
+    const [allocatedAgg, shippedAgg] = await Promise.all([
+      tx.orderAllocation.aggregate({ where: { orderId: input.orderId }, _sum: { qty: true } }),
+      tx.shipmentLine.aggregate({
+        where: { shipment: { orderId: input.orderId, status: 'SHIPPED' } },
+        _sum: { qty: true },
+      }),
+    ])
+    const residualReserved =
+      refundBoundaryNumber(allocatedAgg._sum.qty ?? 0) - refundBoundaryNumber(shippedAgg._sum.qty ?? 0)
+    const releaseEligible = residualReserved > REFUND_RESERVATION_EPSILON
 
     // Enqueue the durable reservation-release backstop INSIDE this tx so it commits atomically with the refund.
     // The immediate post-commit release (in the caller) stays for timeliness; this row guarantees the release

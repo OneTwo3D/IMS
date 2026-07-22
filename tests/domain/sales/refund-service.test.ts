@@ -251,9 +251,19 @@ function createClient(state: State): RefundServiceClient {
       },
     },
     orderAllocation: {
-      // o3d-67y: refund-release eligibility is derived from actual OrderAllocation rows under the order lock.
-      count: async ({ where }: { where: { orderId: string } }) =>
-        state.allocations.filter((row) => row.orderId === where.orderId).length,
+      // o3d-67y: refund-release eligibility is residual reserved qty = allocated − shipped, under the lock.
+      aggregate: async ({ where }: { where: { orderId: string } }) => ({
+        _sum: { qty: state.allocations.filter((row) => row.orderId === where.orderId).reduce((sum, row) => sum + row.qty, 0) },
+      }),
+    },
+    shipmentLine: {
+      aggregate: async ({ where }: { where: { shipment: { orderId: string; status: string } } }) => ({
+        _sum: {
+          qty: state.shipments
+            .filter((s) => s.orderId === where.shipment.orderId && s.status === where.shipment.status)
+            .reduce((sum, s) => sum + s.lines.reduce((lineSum, line) => lineSum + line.qty, 0), 0),
+        },
+      }),
     },
     integrationOutbox: {
       // o3d-67y: the durable reservation-release backstop is enqueued inside the refund tx when the order holds

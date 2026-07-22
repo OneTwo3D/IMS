@@ -145,6 +145,8 @@ export type RefundReservationReleaseDrainDeps = {
   allocate: (orderId: string) => Promise<ReleaseAllocationResult>
   markSuccess: (options: Parameters<typeof markIntegrationOutboxSuccess>[0]) => Promise<unknown>
   markRetry: (options: Parameters<typeof markIntegrationOutboxRetryableFailure>[0]) => Promise<unknown>
+  /** Record an order-scoped deferral WARNING (o3d-67y r5) — best-effort, must never throw into the drain. */
+  logDeferral: (params: { orderId: string; refundId: string }) => Promise<unknown>
 }
 
 const defaultDrainDeps = (): RefundReservationReleaseDrainDeps => ({
@@ -161,6 +163,19 @@ const defaultDrainDeps = (): RefundReservationReleaseDrainDeps => ({
   },
   markSuccess: markIntegrationOutboxSuccess,
   markRetry: markIntegrationOutboxRetryableFailure,
+  logDeferral: async ({ orderId, refundId }) => {
+    const { logActivity } = await import('@/lib/activity-log')
+    return logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'refund_reservation_release_deferred',
+      tag: 'sales',
+      level: 'WARNING',
+      description: `Refund on order ${orderId} could not release its stock reservation because a shipment already exists (recovered by the durable backstop). The refunded units may still be reserved; verify the pending shipment nets the refund so they are neither stranded-reserved nor dispatched.`,
+      metadata: { orderId, refundId, reason: 'existing_shipment', source: 'drain' },
+      resolveUser: false,
+    })
+  },
 })
 
 export type ProcessRefundReservationReleaseResult = { claimed: number; succeeded: number; failed: number }
@@ -213,6 +228,17 @@ async function processOneRefundReservationReleaseJob(
     // which bounds refused dead-letters to the genuine strand population.
     const reconciled = allocation.committed === true
     if (!reconciled) {
+      // If the immediate helper was bypassed (crash / post-commit throw) — the exact case this backstop exists
+      // to recover — a refuse here would otherwise dead-letter with only generic outbox health and no
+      // order-scoped signal. Emit the deferral WARNING once (on the first drain attempt) so operators see it on
+      // the order, not just in lastError. Best-effort — a logging failure must not derail the retry.
+      if (allocation.refused === true && job.attempts === 0) {
+        try {
+          await deps.logDeferral({ orderId: payload.orderId, refundId: payload.refundId })
+        } catch (logError) {
+          console.error('[refund] drain failed to record reservation-release deferral warning', logError)
+        }
+      }
       await deps.markRetry({
         id: job.id,
         workerId: REFUND_RESERVATION_RELEASE_OUTBOX_WORKER,
