@@ -2,6 +2,7 @@
 
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { PRE_COMMITMENT_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 
 // ---------------------------------------------------------------------------
 // Product purchase stats (Products tab)
@@ -36,8 +37,16 @@ export async function getPurchaseProductStats(dateFrom?: string, dateTo?: string
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
   const hasDate = Object.keys(dateFilter).length > 0
 
+  // o3d-27l: only COMMITTED purchase history — exclude the pre-commitment quote pipeline
+  // (RFQ_SENT/QUOTE_RECEIVED: a quote requested/received, nothing ordered) alongside DRAFT/CANCELLED,
+  // so Qty Ordered, spend (totalBase), average cost and Incoming all share one committed population and
+  // Incoming (committed-not-yet-received) is a clean subset rather than a differently-scoped column.
   const pos = await db.purchaseOrder.findMany({
-    where: { type: 'GOODS', status: { notIn: ['DRAFT', 'CANCELLED'] }, ...(hasDate ? { createdAt: dateFilter } : {}) },
+    where: {
+      type: 'GOODS',
+      status: { notIn: [...PRE_COMMITMENT_PO_STATUSES, 'CANCELLED'] },
+      ...(hasDate ? { createdAt: dateFilter } : {}),
+    },
     select: {
       id: true, supplierId: true, createdAt: true,
       supplier: { select: { name: true } },

@@ -146,6 +146,25 @@ function getComparisonRange(from: Date, to: Date, mode: CompareMode, fyMonth: nu
 const COMPLETED_LIFECYCLE_STATUSES: ('SHIPPED' | 'COMPLETED')[] = ['SHIPPED', 'COMPLETED']
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
+/**
+ * Outstanding (not-yet-received) value of open purchase orders, in base currency (o3d-1di).
+ * Values only the remaining line qty — max(0, qty − qtyReceived) — at the line's effective net
+ * unit cost, so a mostly-received PO contributes only what is still on the way, not its whole
+ * original total. Exported for unit testing; the caller passes the INCOMING_PO_STATUSES POs.
+ */
+export function outstandingPoValueBase(
+  pos: { lines: { qty: unknown; qtyReceived: unknown; unitCostBase: unknown }[] }[],
+): number {
+  let total = 0
+  for (const po of pos) {
+    for (const l of po.lines) {
+      const remaining = Math.max(0, Number(l.qty) - Number(l.qtyReceived))
+      total += remaining * Number(l.unitCostBase)
+    }
+  }
+  return total
+}
+
 // ---------------------------------------------------------------------------
 // Main dashboard data fetcher
 // ---------------------------------------------------------------------------
@@ -197,9 +216,12 @@ export async function getDashboardData(
     db.product.findMany({
       select: { id: true, lifecycleStatus: true, stockLevels: { select: { quantity: true, reservedQty: true } } },
     }),
+    // Open POs KPI (o3d-1di): the canonical COMMITTED-incoming set (includes SHIPPED, excludes the
+    // RFQ_SENT/QUOTE_RECEIVED quote pipeline) so this agrees with the incoming card and the
+    // product/replenishment views. Line qty/received drive the outstanding (not whole) value below.
     db.purchaseOrder.findMany({
-      where: { type: 'GOODS', status: { in: ['PO_SENT', 'PARTIALLY_RECEIVED', 'RFQ_SENT'] } },
-      select: { totalBase: true },
+      where: { type: 'GOODS', status: { in: INCOMING_PO_STATUSES } },
+      select: { lines: { select: { qty: true, qtyReceived: true, unitCostBase: true } } },
     }),
     db.salesOrder.findMany({
       where: { status: { in: ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] } },
@@ -281,7 +303,7 @@ export async function getDashboardData(
     activeProducts: products.filter((p) => p.lifecycleStatus === 'ACTIVE').length,
     inventoryValue: r2(inventoryValue),
     openPurchaseOrders: openPOs.length,
-    openPOValue: r2(openPOs.reduce((s, po) => s + Number(po.totalBase), 0)),
+    openPOValue: r2(outstandingPoValueBase(openPOs)),
     pendingSalesOrders: pendingSales.length,
     pendingSalesValue: r2(pendingSales.reduce((s, so) => s + Number(so.totalBase), 0)),
     avgOrderValue: currentOrders.length > 0 ? r2(cur.net / currentOrders.length) : 0,
