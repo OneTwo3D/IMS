@@ -19,6 +19,14 @@ export default async function globalSetup(): Promise<void> {
   // is wrong or the queue is dirty.
   await assertPreflight()
 
+  // Recover the FX baseline. The rig keeps fx_rates EMPTY on purpose: a foreign-currency order with no
+  // seeded rate must quarantine (getFxRateToGbp throws MissingFxRateError), which OC-10/OC-17 rely on.
+  // An FX test seeds exactly the rate it needs and deletes it in finally, but a crash between the INSERT
+  // and that cleanup would strand an eligible rate and silently import LATER foreign orders at it. Sweep
+  // any e2e-seeded rows here so every run starts from the intended empty baseline regardless of how a
+  // prior run died.
+  await sweepSeededFxRates()
+
   const runId = newRunId()
   const { writeFileSync } = await import('node:fs')
   writeFileSync(RUN_ID_FILE, runId)
@@ -52,6 +60,27 @@ async function warmRoutes(): Promise<void> {
       // Not fatal: the test will report the real failure better than we can here.
       console.warn(`[full-chain] could not warm ${path}: ${e instanceof Error ? e.message : e}`)
     }
+  }
+}
+
+/**
+ * Delete any e2e-seeded FX rates (source='e2e-fc-seed') left behind by a crashed FX test, restoring the
+ * rig's empty-fx_rates baseline. Idempotent and safe: production/frankfurter rows carry a different source
+ * and are never touched.
+ */
+async function sweepSeededFxRates(): Promise<void> {
+  const url = process.env.DATABASE_URL
+  if (!url) return
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: url })
+  await db.connect()
+  try {
+    const r = await db.query(`delete from fx_rates where source = 'e2e-fc-seed'`)
+    if (r.rowCount) {
+      console.log(`[full-chain] cleared ${r.rowCount} leftover e2e-seeded FX rate(s) — restoring the empty-fx_rates baseline`)
+    }
+  } finally {
+    await db.end()
   }
 }
 
