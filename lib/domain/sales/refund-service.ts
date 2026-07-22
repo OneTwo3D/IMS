@@ -16,7 +16,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
-import { scheduleRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { scheduleRefundReservationReleaseOutbox, isRefundReleaseEligible } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import {
@@ -29,10 +29,6 @@ import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subled
 
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
-
-// o3d-67y: sub-unit tolerance for the residual-reserved eligibility check (fractional quantities from
-// kit/BOM decomposition can leave rounding dust; treat anything at or below this as no live reservation).
-const REFUND_RESERVATION_EPSILON = 1e-6
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -1964,7 +1960,7 @@ export async function createSalesOrderRefund(
     ])
     const residualReserved =
       refundBoundaryNumber(allocatedAgg._sum.qty ?? 0) - refundBoundaryNumber(shippedAgg._sum.qty ?? 0)
-    const releaseEligible = residualReserved > REFUND_RESERVATION_EPSILON
+    const releaseEligible = isRefundReleaseEligible({ residualReserved, newStatus, refundLines: createdRefundLines })
 
     // Enqueue the durable reservation-release backstop INSIDE this tx so it commits atomically with the refund.
     // The immediate post-commit release (in the caller) stays for timeliness; this row guarantees the release

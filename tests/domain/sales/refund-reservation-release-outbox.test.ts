@@ -6,6 +6,7 @@ import {
   scheduleRefundReservationReleaseOutbox,
   processRefundReservationReleaseOutbox,
   resolveRefundReservationReleaseOutbox,
+  isRefundReleaseEligible,
   writeRefundReleaseDeferralWarningOnce,
   DEFERRAL_WARNING_ACTION,
   REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
@@ -29,6 +30,41 @@ function fakeTx() {
   } as unknown as Prisma.TransactionClient
   return { tx, created }
 }
+
+// ---- eligibility: residual reservation AND demand-reducing --------------------
+
+const saleLine = (qty: number) => ({ lineKind: 'sale', qty })
+const feeLine = (kind: string) => ({ lineKind: kind, qty: 0 })
+
+test('eligibility: needs a live residual reservation', () => {
+  assert.equal(isRefundReleaseEligible({ residualReserved: 0, newStatus: 'REFUNDED', refundLines: [saleLine(2)] }), false)
+  assert.equal(isRefundReleaseEligible({ residualReserved: 1e-9, newStatus: 'REFUNDED', refundLines: [saleLine(2)] }), false)
+  assert.equal(isRefundReleaseEligible({ residualReserved: 3, newStatus: 'REFUNDED', refundLines: [saleLine(2)] }), true)
+})
+
+test('eligibility: a partial amount-only refund (no sale qty) is NOT eligible even with a residual (o3d-67y r7)', () => {
+  for (const kind of ['shipping', 'discount', 'goodwill', 'fee']) {
+    assert.equal(
+      isRefundReleaseEligible({ residualReserved: 5, newStatus: 'PARTIALLY_REFUNDED', refundLines: [feeLine(kind)] }),
+      false,
+      `partial ${kind}-only refund must not enqueue release work`,
+    )
+  }
+})
+
+test('eligibility: a partial refund WITH a positive-qty sale line IS eligible', () => {
+  assert.equal(
+    isRefundReleaseEligible({ residualReserved: 5, newStatus: 'PARTIALLY_REFUNDED', refundLines: [saleLine(2), feeLine('shipping')] }),
+    true,
+  )
+})
+
+test('eligibility: a FULL amount-only refund is still eligible — zero remaining demand is intentional', () => {
+  assert.equal(
+    isRefundReleaseEligible({ residualReserved: 5, newStatus: 'REFUNDED', refundLines: [feeLine('shipping')] }),
+    true,
+  )
+})
 
 test('resolve marks a still-open backstop row SUCCEEDED so the drain does not re-run allocation', async () => {
   const calls: Array<Record<string, unknown>> = []

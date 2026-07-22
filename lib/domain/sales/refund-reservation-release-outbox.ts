@@ -54,6 +54,27 @@ const REFUND_RESERVATION_RELEASE_OUTBOX_WORKER = 'refund-reservation-release-dra
 // bypass that lost the immediate call is still recovered on a following tick.
 const DEFAULT_DRAIN_GRACE_MS = 120_000
 
+// Sub-unit tolerance for residual reserved qty (fractional kit/BOM quantities can leave rounding dust).
+export const REFUND_RESERVATION_EPSILON = 1e-6
+
+/**
+ * A post-refund reservation release is warranted only when BOTH hold (Codex review r7):
+ *   - there is a live residual reservation (allocated − shipped > 0), and
+ *   - the refund actually REDUCES fulfilment demand: a positive-quantity sale line, or a FULL refund (zero
+ *     remaining demand is intentional).
+ * An amount-only partial — shipping, discount, goodwill, price-only — changes no product quantity, so it must
+ * not enqueue release work that would refuse+dead-letter with a misleading stranded-reservation WARNING or
+ * needlessly rebuild allocations.
+ */
+export function isRefundReleaseEligible(input: {
+  residualReserved: number
+  newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED'
+  refundLines: ReadonlyArray<{ lineKind: string; qty: number }>
+}): boolean {
+  if (input.residualReserved <= REFUND_RESERVATION_EPSILON) return false
+  return input.newStatus === 'REFUNDED' || input.refundLines.some((line) => line.lineKind === 'sale' && line.qty > 0)
+}
+
 export type ScheduleRefundReservationReleaseInput = {
   orderId: string
   refundId: string
@@ -164,29 +185,55 @@ const defaultDrainDeps = (): RefundReservationReleaseDrainDeps => ({
   markSuccess: markIntegrationOutboxSuccess,
   markRetry: markIntegrationOutboxRetryableFailure,
   logDeferral: async (params) =>
-    writeRefundReleaseDeferralWarningOnce(params, {
-      // Confirm PERSISTENCE (not logActivity's swallowed success) so delivery is retryable — if the write never
-      // landed, no row exists and a later drain attempt writes it (Codex review r6).
-      findExisting: async ({ orderId, refundId }) => {
-        const existing = await db.activityLog.findFirst({
-          where: {
-            entityType: 'SALES_ORDER',
-            entityId: orderId,
-            action: DEFERRAL_WARNING_ACTION,
-            metadata: { path: ['refundId'], equals: refundId },
+    // Serialize the check-then-write under a per-refund advisory lock so two concurrent workers (a stale-lock
+    // reclamation, or a delayed immediate helper) cannot both observe "no row" and both insert — ActivityLog
+    // has no refund-scoped unique constraint, so the lock is what makes this at-most-once (Codex review r7).
+    // The findExisting + insert run in the SAME transaction as the lock so the second waiter reads the first's
+    // committed row and skips. Confirming PERSISTENCE (not logActivity's swallowed success) also keeps delivery
+    // retryable across drain attempts if an earlier write never landed (Codex review r6).
+    db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REFUND_RELEASE_WARNING_LOCK_NAMESPACE}, ${advisoryHash(params.refundId)})`
+      return writeRefundReleaseDeferralWarningOnce(params, {
+        findExisting: async ({ orderId, refundId }) => {
+          const existing = await tx.activityLog.findFirst({
+            where: {
+              entityType: 'SALES_ORDER',
+              entityId: orderId,
+              action: DEFERRAL_WARNING_ACTION,
+              metadata: { path: ['refundId'], equals: refundId },
+            },
+            select: { id: true },
+          })
+          return existing != null
+        },
+        log: async (logParams) => tx.activityLog.create({
+          data: {
+            entityType: logParams.entityType,
+            entityId: logParams.entityId,
+            action: logParams.action,
+            tag: logParams.tag,
+            level: logParams.level,
+            description: logParams.description,
+            metadata: logParams.metadata as Prisma.InputJsonValue,
           },
-          select: { id: true },
-        })
-        return existing != null
-      },
-      log: async (logParams) => {
-        const { logActivity } = await import('@/lib/activity-log')
-        return logActivity(logParams)
-      },
+        }),
+      })
     }),
 })
 
 export const DEFERRAL_WARNING_ACTION = 'refund_reservation_release_deferred'
+
+// Advisory-lock namespace for the per-refund deferral WARNING dedup (distinct from REFUND_ACCOUNTING_LOCK_KEY).
+const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
+
+/** Stable signed-int32 hash of a refund id for the second pg_advisory_xact_lock parameter. */
+function advisoryHash(value: string): number {
+  let hash = 0
+  for (let i = 0; i < value.length; i++) {
+    hash = (Math.imul(31, hash) + value.charCodeAt(i)) | 0
+  }
+  return hash
+}
 
 export type DeferralWarningDeps = {
   /** True when a deferral WARNING for this refund is already durably persisted. */
@@ -209,6 +256,10 @@ export type DeferralWarningDeps = {
  * leaves no row and a later drain attempt re-attempts delivery, while a successful earlier write (from the
  * immediate helper or a prior drain attempt) suppresses a duplicate. The caller invokes this on EVERY refused
  * drain attempt — the persistence check, not an attempt counter, provides the once-only guarantee (Codex r6).
+ *
+ * CONCURRENCY: findExisting + log are separate operations, so strict at-most-once under concurrent writers
+ * requires the caller to run them atomically (the default logDeferral wraps this in a per-refund advisory-lock
+ * transaction, Codex r7). Callers that pass non-serialized deps get best-effort dedup only.
  */
 export async function writeRefundReleaseDeferralWarningOnce(
   params: { orderId: string; refundId: string },
