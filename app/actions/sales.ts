@@ -1867,6 +1867,31 @@ export async function createRefund(
       })
     }
 
+    // o3d-67y: release the refunded units' stock reservation immediately, for
+    // timeliness. Run this BEFORE the fallible accounting queueing below so a throw
+    // there cannot bypass it (Codex review). DURABILITY does not depend on this call
+    // or on its activity-log warning (logActivity swallows write failures): a backstop
+    // row was enqueued INSIDE the refund transaction
+    // (scheduleRefundReservationReleaseOutbox), and the refund-reservation-release cron
+    // re-runs allocation idempotently if this immediate attempt was bypassed or lost.
+    // The allocator nets refunded qty (kit/BOM aware) and re-reserves only remaining
+    // demand; refuseIfShipmentsExist makes it a no-op once any shipment exists (the
+    // shipment build caps shippable qty net of refunds). Limited to PROCESSING/ALLOCATED
+    // so a refund can't promote a DRAFT/PENDING_PAYMENT order to ALLOCATED.
+    await releaseReservationsAfterRefund(
+      { orderId, refundId: refundResult.createdRefund?.id, status: refundResult.so.status },
+      {
+        // The dynamic import lives INSIDE the guarded closure so a module-load/eval rejection is
+        // caught by releaseReservationsAfterRefund rather than bubbling to createRefund's outer
+        // catch, which would report success:false for an ALREADY-COMMITTED refund.
+        allocate: async (id) => {
+          const { autoAllocateOrder } = await import('./allocation')
+          return autoAllocateOrder(id, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true })
+        },
+        log: logActivity,
+      },
+    )
+
     let accountingWarning = refundResult.accountingWarning
     try {
       await queueRefundAccountingActions({
@@ -1901,29 +1926,6 @@ export async function createRefund(
     if (!accountingWarning) {
       await clearRefundAccountingRetryState(refundResult.createdRefund.id)
     }
-
-    // A refund reduces outstanding demand. For an already-allocated, not-yet-shipped order,
-    // re-run allocation so the refunded units' stock reservation is released — the allocator
-    // nets refunded qty (kit/BOM aware) and re-reserves only the remaining demand. Best-effort,
-    // and refuseIfShipmentsExist makes it a no-op once any shipment exists (the shipment build
-    // caps shippable qty net of refunds for those). Limited to PROCESSING/ALLOCATED so a refund
-    // can't promote a DRAFT/PENDING_PAYMENT order to ALLOCATED.
-    // o3d-67y: release the refunded units' stock reservation, and make the failure DURABLE + operator-visible
-    // rather than a discarded result + a bare console line. releaseReservationsAfterRefund inspects both a
-    // throw and a { success: false } return and records a resolvable WARNING if the release didn't complete.
-    await releaseReservationsAfterRefund(
-      { orderId, refundId: refundResult.createdRefund?.id, status: refundResult.so.status },
-      {
-        // o3d-67y: the dynamic import lives INSIDE the guarded closure so a module-load/eval rejection is
-        // caught by releaseReservationsAfterRefund (recorded as a warning) rather than bubbling to
-        // createRefund's outer catch, which would report success:false for an ALREADY-COMMITTED refund.
-        allocate: async (id) => {
-          const { autoAllocateOrder } = await import('./allocation')
-          return autoAllocateOrder(id, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true })
-        },
-        log: logActivity,
-      },
-    )
 
     // Propagate the refund to a WMS the order was already pushed to. The push sweep drives
     // the automatic side: a full refund cancels the WMS order while it is still NEW; a

@@ -1,17 +1,23 @@
 /**
- * o3d-67y: durable, operator-visible post-refund reservation release.
+ * o3d-67y: IMMEDIATE, operator-visible post-refund reservation release.
  *
  * A refund reduces an allocated order's outstanding demand, so the refunded units' stock reservation must be
  * released. That release runs AFTER the refund transaction commits (it cannot be folded into it), which makes
  * it inherently best-effort. autoAllocateOrder swallows its own failures into `{ success: false }`; if the
- * caller discards that result and only logs a thrown error, a failed release silently strands the reservation
- * on `stockLevel.reservedQty` with no operator-visible signal.
+ * caller discards that result and only logs a thrown error, a failed release strands the reservation on
+ * `stockLevel.reservedQty`.
  *
- * This helper centralises the failure handling: it inspects BOTH a throw and a `success: false` return, and on
- * either records a resolvable WARNING naming the order so the stranded reservation is surfaced (the
+ * This helper centralises the immediate attempt: it inspects BOTH a throw and a `success: false` return, and on
+ * a genuine failure records a WARNING naming the order so the stranded reservation is surfaced (the
  * stock-position drift report quantifies it) and can be released by re-running allocation. The WARNING write is
  * itself guarded — the refund is already committed, so a logging failure must never bubble out and be
  * mis-handled as a refund failure by the caller's outer catch.
+ *
+ * DURABILITY does NOT come from this helper: logActivity swallows write failures, so `warned` only means "we
+ * attempted the WARNING", not "a durable recovery record exists". The durable guarantee is the backstop row
+ * enqueued INSIDE the refund transaction (scheduleRefundReservationReleaseOutbox), drained by the
+ * refund-reservation-release cron, which re-runs this same release idempotently if the immediate attempt was
+ * bypassed or lost. This helper is the timeliness path; the outbox is the correctness path.
  */
 
 export type ReallocationResult = {

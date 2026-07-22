@@ -16,6 +16,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
+import { scheduleRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import {
@@ -1939,6 +1940,17 @@ export async function createSalesOrderRefund(
     const fallbackReturnRows = effectiveReturnWarehouseId
       ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
       : []
+
+    // o3d-67y: enqueue the durable reservation-release backstop INSIDE this tx so it
+    // commits atomically with the refund. The immediate post-commit release (in the
+    // caller) stays for timeliness; this row guarantees the release still happens if
+    // that call is bypassed by a post-commit throw or lost to a crash. No-op for a
+    // non-release-eligible order status.
+    await scheduleRefundReservationReleaseOutbox(tx, {
+      orderId: input.orderId,
+      refundId: createdRefund.id,
+      status: so.status,
+    })
 
     return {
       so,
