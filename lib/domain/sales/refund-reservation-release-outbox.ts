@@ -163,20 +163,70 @@ const defaultDrainDeps = (): RefundReservationReleaseDrainDeps => ({
   },
   markSuccess: markIntegrationOutboxSuccess,
   markRetry: markIntegrationOutboxRetryableFailure,
-  logDeferral: async ({ orderId, refundId }) => {
-    const { logActivity } = await import('@/lib/activity-log')
-    return logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: 'refund_reservation_release_deferred',
-      tag: 'sales',
-      level: 'WARNING',
-      description: `Refund on order ${orderId} could not release its stock reservation because a shipment already exists (recovered by the durable backstop). The refunded units may still be reserved; verify the pending shipment nets the refund so they are neither stranded-reserved nor dispatched.`,
-      metadata: { orderId, refundId, reason: 'existing_shipment', source: 'drain' },
-      resolveUser: false,
-    })
-  },
+  logDeferral: async (params) =>
+    writeRefundReleaseDeferralWarningOnce(params, {
+      // Confirm PERSISTENCE (not logActivity's swallowed success) so delivery is retryable — if the write never
+      // landed, no row exists and a later drain attempt writes it (Codex review r6).
+      findExisting: async ({ orderId, refundId }) => {
+        const existing = await db.activityLog.findFirst({
+          where: {
+            entityType: 'SALES_ORDER',
+            entityId: orderId,
+            action: DEFERRAL_WARNING_ACTION,
+            metadata: { path: ['refundId'], equals: refundId },
+          },
+          select: { id: true },
+        })
+        return existing != null
+      },
+      log: async (logParams) => {
+        const { logActivity } = await import('@/lib/activity-log')
+        return logActivity(logParams)
+      },
+    }),
 })
+
+export const DEFERRAL_WARNING_ACTION = 'refund_reservation_release_deferred'
+
+export type DeferralWarningDeps = {
+  /** True when a deferral WARNING for this refund is already durably persisted. */
+  findExisting: (params: { orderId: string; refundId: string }) => Promise<boolean>
+  log: (params: {
+    entityType: 'SALES_ORDER'
+    entityId: string
+    action: string
+    tag: string
+    level: 'WARNING'
+    description: string
+    metadata: object
+    resolveUser: false
+  }) => Promise<unknown>
+}
+
+/**
+ * Write the order-scoped reservation-release deferral WARNING at most once per refund, idempotently and
+ * retryably: it writes ONLY when no persisted WARNING for the refund exists, so a swallowed logActivity failure
+ * leaves no row and a later drain attempt re-attempts delivery, while a successful earlier write (from the
+ * immediate helper or a prior drain attempt) suppresses a duplicate. The caller invokes this on EVERY refused
+ * drain attempt — the persistence check, not an attempt counter, provides the once-only guarantee (Codex r6).
+ */
+export async function writeRefundReleaseDeferralWarningOnce(
+  params: { orderId: string; refundId: string },
+  deps: DeferralWarningDeps,
+): Promise<'written' | 'skipped'> {
+  if (await deps.findExisting(params)) return 'skipped'
+  await deps.log({
+    entityType: 'SALES_ORDER',
+    entityId: params.orderId,
+    action: DEFERRAL_WARNING_ACTION,
+    tag: 'sales',
+    level: 'WARNING',
+    description: `Refund on order ${params.orderId} could not release its stock reservation because a shipment already exists (recovered by the durable backstop). The refunded units may still be reserved; verify the pending shipment nets the refund so they are neither stranded-reserved nor dispatched.`,
+    metadata: { orderId: params.orderId, refundId: params.refundId, reason: 'existing_shipment', source: 'drain' },
+    resolveUser: false,
+  })
+  return 'written'
+}
 
 export type ProcessRefundReservationReleaseResult = { claimed: number; succeeded: number; failed: number }
 
@@ -230,9 +280,11 @@ async function processOneRefundReservationReleaseJob(
     if (!reconciled) {
       // If the immediate helper was bypassed (crash / post-commit throw) — the exact case this backstop exists
       // to recover — a refuse here would otherwise dead-letter with only generic outbox health and no
-      // order-scoped signal. Emit the deferral WARNING once (on the first drain attempt) so operators see it on
-      // the order, not just in lastError. Best-effort — a logging failure must not derail the retry.
-      if (allocation.refused === true && job.attempts === 0) {
+      // order-scoped signal. logDeferral is idempotent+retryable (it writes only when no persisted WARNING for
+      // the refund exists), so calling it on EVERY refused attempt delivers the warning at-most-once without
+      // depending on a single attempt's swallowed log succeeding (Codex review r6). Best-effort — a logging
+      // failure must not derail the retry.
+      if (allocation.refused === true) {
         try {
           await deps.logDeferral({ orderId: payload.orderId, refundId: payload.refundId })
         } catch (logError) {

@@ -6,6 +6,8 @@ import {
   scheduleRefundReservationReleaseOutbox,
   processRefundReservationReleaseOutbox,
   resolveRefundReservationReleaseOutbox,
+  writeRefundReleaseDeferralWarningOnce,
+  DEFERRAL_WARNING_ACTION,
   REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
   REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
   type RefundReservationReleaseDrainDeps,
@@ -128,20 +130,29 @@ test('drain: a shipment refuse (refused:true, not committed) RETRIES — never s
   assert.deepEqual(recorded.successIds, [])
 })
 
-test('drain: a first-attempt refuse writes the order-scoped deferral WARNING (crash-bypass visibility, o3d-67y r5)', async () => {
-  const recorded = emptyRecorded()
-  const deps = drainDeps([job('a', { attempts: 0 })], async () => ({ success: false, refused: true, committed: false }), recorded)
-  await processRefundReservationReleaseOutbox(deps)
-  assert.deepEqual(recorded.retryIds, ['a'])
-  assert.deepEqual(recorded.deferrals, [{ orderId: 'order-a', refundId: 'refund-a' }])
+test('drain: a refuse delegates to logDeferral on EVERY attempt — once-only is enforced by persistence, not the counter (o3d-67y r6)', async () => {
+  const first = emptyRecorded()
+  const firstDeps = drainDeps([job('a', { attempts: 0 })], async () => ({ success: false, refused: true, committed: false }), first)
+  await processRefundReservationReleaseOutbox(firstDeps)
+  assert.deepEqual(first.retryIds, ['a'])
+  assert.deepEqual(first.deferrals, [{ orderId: 'order-a', refundId: 'refund-a' }])
+
+  // A retried refuse still delegates: a swallowed first-attempt write would otherwise be lost forever. The
+  // default logDeferral dedups on persisted state, so this is at-most-once, not attempt-gated.
+  const retried = emptyRecorded()
+  const retriedDeps = drainDeps([job('a', { attempts: 3 })], async () => ({ success: false, refused: true, committed: false }), retried)
+  await processRefundReservationReleaseOutbox(retriedDeps)
+  assert.deepEqual(retried.deferrals, [{ orderId: 'order-a', refundId: 'refund-a' }])
 })
 
-test('drain: a retried refuse (attempts>0) does NOT re-log the deferral WARNING — logged once per refund', async () => {
+test('a logging failure in the drain deferral path never derails the retry (o3d-67y r6)', async () => {
   const recorded = emptyRecorded()
-  const deps = drainDeps([job('a', { attempts: 2 })], async () => ({ success: false, refused: true, committed: false }), recorded)
+  const deps: RefundReservationReleaseDrainDeps = {
+    ...drainDeps([job('a')], async () => ({ success: false, refused: true, committed: false }), recorded),
+    logDeferral: async () => { throw new Error('activity log DB down') },
+  }
   await processRefundReservationReleaseOutbox(deps)
-  assert.deepEqual(recorded.retryIds, ['a'])
-  assert.deepEqual(recorded.deferrals, [])
+  assert.deepEqual(recorded.retryIds, ['a'], 'the retry still happens even when the deferral WARNING write throws')
 })
 
 test('drain: a non-refuse failure does NOT write a deferral WARNING', async () => {
@@ -149,6 +160,46 @@ test('drain: a non-refuse failure does NOT write a deferral WARNING', async () =
   const deps = drainDeps([job('a')], async () => ({ success: false, failed: true, committed: false }), recorded)
   await processRefundReservationReleaseOutbox(deps)
   assert.deepEqual(recorded.deferrals, [])
+})
+
+// ---- idempotent + retryable deferral WARNING --------------------------------
+
+test('deferral WARNING: writes when none is persisted, and carries the refund-scoped identity', async () => {
+  const logged: Array<Record<string, unknown>> = []
+  const outcome = await writeRefundReleaseDeferralWarningOnce(
+    { orderId: 'order-1', refundId: 'refund-1' },
+    { findExisting: async () => false, log: async (p) => { logged.push(p); return undefined } },
+  )
+  assert.equal(outcome, 'written')
+  assert.equal(logged.length, 1)
+  assert.equal(logged[0].action, DEFERRAL_WARNING_ACTION)
+  assert.equal(logged[0].entityId, 'order-1')
+  assert.equal(logged[0].level, 'WARNING')
+  assert.deepEqual((logged[0].metadata as { refundId: string }).refundId, 'refund-1')
+})
+
+test('deferral WARNING: skips (no duplicate) when one is already persisted', async () => {
+  let logCalls = 0
+  const outcome = await writeRefundReleaseDeferralWarningOnce(
+    { orderId: 'order-1', refundId: 'refund-1' },
+    { findExisting: async () => true, log: async () => { logCalls++; return undefined } },
+  )
+  assert.equal(outcome, 'skipped')
+  assert.equal(logCalls, 0, 'an already-persisted WARNING is never duplicated')
+})
+
+test('deferral WARNING: a lost write (still not persisted next time) is retried, not permanently suppressed', async () => {
+  // Models logActivity swallowing a DB failure: findExisting still reports false on the next attempt, so the
+  // WARNING is written again until it actually persists — delivery does not hinge on one swallowed write.
+  let persisted = false
+  const attempt = () => writeRefundReleaseDeferralWarningOnce(
+    { orderId: 'order-1', refundId: 'refund-1' },
+    { findExisting: async () => persisted, log: async () => { /* swallowed: does not persist */ return undefined } },
+  )
+  assert.equal(await attempt(), 'written')
+  assert.equal(await attempt(), 'written', 'a swallowed write is retried on the next attempt')
+  persisted = true
+  assert.equal(await attempt(), 'skipped', 'once it finally persists, no further duplicates')
 })
 
 test('drain: a rolled-back allocation transaction (failed:true) retries with backoff', async () => {
