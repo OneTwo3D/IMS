@@ -316,9 +316,11 @@ export async function getAccountingAccounts(): Promise<AccountingAccountRow[]> {
   return (connector ?? getAccountingConnector('xero')).getAccounts()
 }
 
-export async function fetchAccountingTaxRates(): Promise<AccountingTaxCodeRow[]> {
+export async function fetchAccountingTaxRates(
+  opts?: { allowCache?: boolean },
+): Promise<AccountingTaxCodeRow[]> {
   const connector = await getActiveAccountingConnector()
-  return (connector ?? getAccountingConnector('xero')).fetchTaxRates()
+  return (connector ?? getAccountingConnector('xero')).fetchTaxRates(opts)
 }
 
 export async function autoLinkAccountingTaxRates(): Promise<{

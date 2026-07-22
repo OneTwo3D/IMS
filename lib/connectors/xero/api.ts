@@ -341,6 +341,17 @@ export function clearXeroReferenceCache(): void {
 }
 
 /**
+ * Drop cached entries for a single reference path across all tenants — call right after mutating that
+ * data (e.g. after putXeroTaxRate) so a passive read can't serve the pre-mutation snapshot for the rest
+ * of the TTL. Keys are `${tenantId}:${path}` (o3d-r30).
+ */
+export function clearXeroReferenceCachePath(path: string): void {
+  for (const key of xeroReferenceCache.keys()) {
+    if (key.endsWith(`:${path}`)) xeroReferenceCache.delete(key)
+  }
+}
+
+/**
  * Like xeroGet, but serves a cached body for up to ttlMs when the path is reference data.
  *
  * The cache key includes the tenant id, so a reconnect to a different org never serves the previous org's

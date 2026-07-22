@@ -3,7 +3,7 @@
  */
 
 import { db } from '@/lib/db'
-import { xeroGet } from './api'
+import { xeroGet, xeroGetCached } from './api'
 
 const XERO_CONNECTOR = 'xero'
 
@@ -98,8 +98,19 @@ export async function listStoredBankAccounts(): Promise<Array<{ id: string; code
 /**
  * Get Xero tax rates for mapping UI.
  */
-export async function getXeroTaxRates(): Promise<{ taxRates: Array<{ taxType: string; name: string; rate: number }> } | null> {
-  const res = await xeroGet<{ TaxRates: Array<{ TaxType: string; Name: string; EffectiveRate: number; Status: string }> }>('TaxRates')
+/**
+ * Fetch Xero tax rates. LIVE by default because this feeds WRITE paths — auto-link, write-time re-plan,
+ * and mapping validation (settings.ts) — where a cached ACTIVE rate that was later archived/changed in
+ * Xero would persist a stale TaxType into IMS and break subsequent invoice/bill sync. PASSIVE display
+ * reads (the settings/onboarding rate lists) opt into the shared 4h reference cache via
+ * `allowCache: true`; the cache is invalidated whenever a TaxRate is mutated (putXeroTaxRate). o3d-r30.
+ */
+export async function getXeroTaxRates(
+  opts?: { allowCache?: boolean },
+): Promise<{ taxRates: Array<{ taxType: string; name: string; rate: number }> } | null> {
+  const res = opts?.allowCache
+    ? await xeroGetCached<{ TaxRates: Array<{ TaxType: string; Name: string; EffectiveRate: number; Status: string }> }>('TaxRates')
+    : await xeroGet<{ TaxRates: Array<{ TaxType: string; Name: string; EffectiveRate: number; Status: string }> }>('TaxRates')
   if (!res.ok || !res.data) return null
 
   return {

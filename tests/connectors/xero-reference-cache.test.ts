@@ -141,4 +141,49 @@ test('clearXeroReferenceCache forces a re-fetch', async () => {
   assert.equal(fetchCalls, 2)
 })
 
+// --- o3d-r30: targeted invalidation + passive/authoritative getXeroTaxRates split -----------------
+
+test('clearXeroReferenceCachePath drops only the named path, not siblings (o3d-r30)', async () => {
+  reset()
+  const { xeroGetCached, clearXeroReferenceCache, clearXeroReferenceCachePath } = await load()
+  clearXeroReferenceCache()
+  await xeroGetCached('TaxRates', 60_000)      // fetch 1
+  await xeroGetCached('Organisation', 60_000)  // fetch 2
+  clearXeroReferenceCachePath('TaxRates')
+  await xeroGetCached('TaxRates', 60_000)      // fetch 3 — TaxRates re-fetched
+  await xeroGetCached('Organisation', 60_000)  // still cached — no fetch
+  assert.equal(fetchCalls, 3, 'only TaxRates was invalidated; Organisation stayed cached')
+})
+
+test('getXeroTaxRates is LIVE by default and only caches with allowCache (o3d-r30)', async () => {
+  reset()
+  const { clearXeroReferenceCache } = await load()
+  clearXeroReferenceCache()
+  const { getXeroTaxRates } = await import('@/lib/connectors/xero/accounts')
+
+  await getXeroTaxRates()               // fetch 1 (live)
+  await getXeroTaxRates()               // fetch 2 (live — never cached)
+  assert.equal(fetchCalls, 2, 'default reads are authoritative/live')
+
+  await getXeroTaxRates({ allowCache: true }) // fetch 3 (populates cache)
+  await getXeroTaxRates({ allowCache: true }) // cache hit — no fetch
+  assert.equal(fetchCalls, 3, 'allowCache serves the second read from cache')
+})
+
+test('putXeroTaxRate invalidates the cached TaxRates on success (o3d-r30)', async () => {
+  reset()
+  const { xeroGetCached, clearXeroReferenceCache } = await load()
+  clearXeroReferenceCache()
+  await xeroGetCached('TaxRates', 60_000)      // fetch 1 — cached
+  const { putXeroTaxRate } = await import('@/lib/connectors/xero/tax-rates')
+  nextBody = { TaxRates: [{ TaxType: 'OUTPUT2', Name: 'Standard' }] }
+  const res = await putXeroTaxRate({          // fetch 2 — the POST
+    name: 'Standard',
+    components: [{ name: 'VAT', rate: 0.2, compoundOnPrevious: false }],
+  })
+  assert.equal(res.success, true)
+  await xeroGetCached('TaxRates', 60_000)      // fetch 3 — cache was invalidated by the mutation
+  assert.equal(fetchCalls, 3, 'the post-mutation read must not serve the stale pre-mutation snapshot')
+})
+
 test.after(() => { Date.now = realNow })

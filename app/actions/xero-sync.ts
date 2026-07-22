@@ -367,8 +367,10 @@ export async function getAccountingAccounts(): Promise<Array<{ id: string; exter
   })
 }
 
-export async function fetchXeroTaxRates(): Promise<Array<{ taxType: string; name: string; rate: number }>> {
-  const result = await getXeroTaxRates()
+export async function fetchXeroTaxRates(
+  opts?: { allowCache?: boolean },
+): Promise<Array<{ taxType: string; name: string; rate: number }>> {
+  const result = await getXeroTaxRates(opts)
   return result?.taxRates ?? []
 }
 

@@ -38,7 +38,9 @@ export async function getTaxRateMatchData(opts?: {
   const [imsRows, wcMappings, xeroRows] = await Promise.all([
     getTaxRates(false),
     includeWc ? getShoppingTaxRateMappings() : Promise.resolve([]),
-    includeXero ? fetchAccountingTaxRates() : Promise.resolve([]),
+    // o3d-r30: passive display read for the mapper UI (up to 4h stale); the explicit refresh + the
+    // authoritative auto-link read live, so a stale list here can't persist a stale mapping on its own.
+    includeXero ? fetchAccountingTaxRates({ allowCache: true }) : Promise.resolve([]),
   ])
 
   return {
