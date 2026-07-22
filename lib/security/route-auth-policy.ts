@@ -134,6 +134,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/refund-reservation-release': {
+    access: 'cron-secret',
+    reason: 'o3d-67y: durable post-refund reservation-release drain; guarded by verifyCron.',
+  },
   '/api/cron/email-outbox': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
