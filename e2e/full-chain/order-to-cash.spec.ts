@@ -564,6 +564,150 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       await setDefaultReturnWarehouse(WAREHOUSE_CODE, false, priorReturnWh)
     }
   })
+
+  test('OC-13: an UNPAID (on-hold) Woo order imports as a non-processing SO and recognises NO revenue', async ({ page }) => {
+    // The ceiling must exceed the SUM of the sequential bounded waits in the worst case, or Playwright can
+    // kill the test mid-wait before a helper emits its diagnostic: awaitWebhookDelivery (300s) +
+    // awaitWebhookEventProcessed (300s, a late delivery then a retryable FAILED) + skipAccountingLogFor
+    // (60s), plus product setup and the Xero drain. 600s was under that sum; 1,800s clears it (matches OC-02/04).
+    test.setTimeout(1_800_000)
+
+    // Order-to-cash must not recognise revenue before it is due. An order placed but not paid arrives in
+    // WooCommerce as 'on-hold'; IMS maps that to a NON-processing lifecycle (shopping_status_mappings:
+    // on-hold -> ON_HOLD) and queues a SALES_INVOICE only when the mapped status is PROCESSING
+    // (order-import.ts:710, shouldInvoice). So the order is still IMPORTED — it is a real customer order to
+    // fulfil once payment clears — but NO invoice is raised and nothing posts to Xero. Arming posting is the
+    // whole point: it proves the skip is the STATUS gate, not a disarmed connector. A regression that
+    // invoiced an unpaid order would post an AUTHORISED receivable for money never collected — exactly the
+    // class of error a sync-log assertion cannot see, caught here by reading the ledger back.
+    const sku = taggedSku(runId, 'OC13')
+    const unitPrice = '22.00'
+    const qty = 2
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC13`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC13', price: unitPrice })
+    // 'on-hold' + set_paid:false is an unpaid order. createWcOrder defaults to a paid 'processing' order,
+    // so both must be set explicitly.
+    const order = await createWcOrder(creds, runId, {
+      lines: [{ productId: product.id, quantity: qty }],
+      status: 'on-hold',
+      setPaid: false,
+    })
+    expect(order.status).toBe('on-hold')
+
+    // It still imports (a real order awaiting payment), so the webhook DOES create a SO link.
+    const imported = await awaitWebhookDelivery(order.id, { creds })
+    expect(imported.salesOrderId).toBeTruthy()
+
+    // BARRIER before any negative assertion. awaitWebhookDelivery returns as soon as the SO LINK is visible,
+    // but importWcOrder creates that link and only THEN reaches the invoice queue/skip decision — so an
+    // immediate "no invoice" check could read a half-finished import and pass even if a regressed status
+    // guard were about to queue one. Waiting for the import inbox event to reach its terminal PROCESSED
+    // state proves importWcOrder ran to completion, so the queue/skip decision is committed.
+    await awaitWebhookEventProcessed(order.id, creds)
+
+    // Imported as a NON-processing lifecycle status (ON_HOLD), never PROCESSING.
+    const status = await orderStatus(imported.salesOrderId)
+    expect(status, 'an unpaid order must not import as PROCESSING').not.toBe('PROCESSING')
+    expect(status).toBe('ON_HOLD')
+
+    // POSITIVE proof the accounting gate was actually REACHED and took the skip path — not merely that no
+    // invoice exists. The import writes a durable "skipped accounting sync" shopping_sync_logs row ONLY at
+    // the !shouldInvoice branch, AFTER the gate (order-import.ts:711-735). Inbox PROCESSED alone can't prove
+    // this: if a first attempt failed after creating the SO link, its retry returns via the existing-order
+    // shortcut WITHOUT revisiting the gate, so ON_HOLD + zero invoice logs could otherwise pass while the
+    // skip branch never ran. Asserting the skip evidence closes that false positive.
+    const skipEvidence = await skipAccountingLogFor(imported.salesOrderId)
+    expect(skipEvidence, 'the accounting gate must have run and skipped the sync for an unpaid order').not.toBeNull()
+    expect(skipEvidence, 'the skip evidence names the non-processing status it skipped for').toContain('ON_HOLD')
+
+    // NO SALES_INVOICE was queued at import — the status gate skipped the accounting sync entirely, so there
+    // is not even a PENDING row (distinct from "queued but not yet posted").
+    expect(
+      await accountingLogCountFor('SALES_INVOICE', imported.salesOrderId),
+      'no SALES_INVOICE queued for an unpaid order',
+    ).toBe(0)
+
+    // Drain the queue the way an operator would; with nothing queued for this order, nothing reaches Xero.
+    await processPendingXeroSyncViaUi(page)
+
+    // The authoritative check is the QUEUE, not a ledger scan. The gate under test lives at QUEUE time
+    // (shouldInvoice), and an invoice CANNOT reach Xero without first being written as a SALES_INVOICE sync
+    // row — the connector always persists that row before/around the Xero call. So the post-barrier
+    // "SALES_INVOICE count == 0" assertion above already proves nothing could have posted, and this confirms
+    // none carries an external id. We deliberately do NOT scan the shared Demo ledger by a fuzzy reference:
+    // a digit-substring match is not ownership-safe (the Invoices endpoint also holds stage's ACCPAY bills)
+    // and could VOID an unrelated shared-org document in teardown — a cure worse than the theoretical gap.
+    const posted = await postedExternalId('SALES_INVOICE', imported.salesOrderId)
+    // Failure-safe: if the gate ever regresses and an invoice DID post, track it so teardown voids OUR own
+    // document (keyed on our sales order) rather than leaving an invalid receivable — THEN fail.
+    if (posted) trackDocument('Invoices', posted, `OC-13 UNEXPECTED invoice ${runTag(runId)}`)
+    expect(posted, 'an unpaid order must never post an ACCREC invoice').toBeNull()
+  })
+
+  test('OC-11: shipping and fee lines each post to their own Xero account (not lumped into revenue)', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // An order is more than its goods: WooCommerce carries a shipping charge and ad-hoc fees, and each must
+    // land on the RIGHT account in the invoice. Shipping booked to the sales account overstates product
+    // revenue; the invoices.ts builder posts shipping as its OWN line on the shipping account and fees as
+    // ordinary lines on the sales account. This posts a taxable order with both and reads the invoice back
+    // from Xero, asserting the per-line account codes and that the gross ties out to the Woo order.
+    //
+    // Discount (coupon) lines are deliberately NOT covered here: a cart coupon is captured BOTH per-line
+    // (mapWcLineItems: subtotal-total) AND order-level (mapWcOrderDiscount from coupon_lines), and which one
+    // the invoice posts — and whether they can double-count — needs its own analysis before a test can
+    // assert the right answer. Tracked as an OC-11 follow-up.
+    const sku = taggedSku(runId, 'OC11')
+    const unitPrice = '40.00'
+    const qty = 2
+    const goods = Number(unitPrice) * qty // 80.00
+    const shippingNet = '8.00'
+    const feeNet = '5.00'
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC11`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC11', price: unitPrice })
+    const order = await createWcOrder(creds, runId, {
+      lines: [{ productId: product.id, quantity: qty }],
+      shipping: { method_title: 'Flat Rate', total: shippingNet },
+      feeLines: [{ name: 'Gift wrap', total: feeNet }],
+    })
+
+    const imported = await awaitWebhookDelivery(order.id, { creds })
+
+    await openSalesOrder(page, imported.salesOrderId)
+    await allocateAndShip(page, { tracking: `${runTag(runId)}-OC11` })
+    await processPendingXeroSyncViaUi(page)
+
+    const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+    trackDocument('Invoices', invoiceId, `OC-11 invoice ${runTag(runId)}`)
+    const invoice = await getInvoice(invoiceId)
+    expect(invoice.Type).toBe('ACCREC')
+    expect(invoice.Status).toBe('AUTHORISED')
+    expect(invoice.CurrencyCode).toBe('GBP')
+
+    const salesAccount = await settingValue('xero_sales_account')
+    const shippingAccount = await settingValue('xero_shipping_account')
+    // The two accounts must actually differ, or "posts to its own account" is vacuously true.
+    expect(shippingAccount, 'shipping and sales accounts must be distinct for this test to mean anything').not.toBe(salesAccount)
+
+    // Goods on the SALES account, at the full ex-VAT goods value.
+    expectLine(invoice.LineItems, { accountCode: salesAccount, lineAmount: goods })
+    // Shipping on the SHIPPING account — a separate line, NOT folded into sales.
+    expectLine(invoice.LineItems, { accountCode: shippingAccount, lineAmount: Number(shippingNet) })
+    // The fee is an ordinary line on the SALES account (there is no dedicated fee account).
+    expectLine(invoice.LineItems, { accountCode: salesAccount, lineAmount: Number(feeNet) })
+
+    // The gross Total ties out to the Woo order (goods + shipping + fee + VAT). This is the end-to-end
+    // proof that nothing was dropped or mis-added across the chain.
+    expect(Number(invoice.Total)).toBeCloseTo(Number(order.total), 2)
+  })
 })
 
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
@@ -796,6 +940,101 @@ async function awaitAllocated(
       await new Promise((res) => setTimeout(res, 3_000))
     }
     throw new Error(`Order ${salesOrderId} never auto-allocated to qty ${expectedQty} within ${timeoutMs}ms (last: ${last}).`)
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Wait for EVERY inbound import delivery of an order to settle — the barrier that proves importWcOrder ran
+ * to completion (SO link AND the invoice queue/skip decision), not just that the SO link became visible.
+ *
+ * Waiting for the newest row alone is NOT enough: a REST-created order can arrive as duplicate deliveries
+ * (measured: an on-hold order came through as order.updated twice), and importWcOrder creates the SO link
+ * BEFORE it reaches the accounting gate. A duplicate can take the fast existing-order path and reach
+ * PROCESSED while the ORIGINAL delivery is still PROCESSING — so "newest is PROCESSED" can return before the
+ * queue/skip decision commits. So we require that NO delivery is still in flight.
+ *
+ * FAILED is treated as in-flight, not terminal: the inbox retries FAILED rows after nextAttemptAt, so a
+ * transient error must NOT fail the run — only a permanent DEAD_LETTER (with nothing PROCESSED) does.
+ * Topic-agnostic (order.created OR order.updated) and connector-scoped. Nudges WP-Cron each poll (this store
+ * has no organic traffic).
+ */
+async function awaitWebhookEventProcessed(wcOrderId: number, creds: WcCreds, timeoutMs = 300_000): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + timeoutMs
+    let snapshot = '(no events yet)'
+    while (Date.now() < deadline) {
+      const r = await db.query<{ status: string; attempts: number; lastError: string | null; nextAttemptAt: Date | null }>(
+        `select status, attempts, "lastError", "nextAttemptAt" from shopping_webhook_events
+          where connector = 'woocommerce' and topic in ('order.created', 'order.updated')
+            and ("payloadJson"->>'id')::bigint = $1
+          order by "receivedAt"`,
+        [wcOrderId],
+      )
+      const rows = r.rows
+      // PROCESSED / DEAD_LETTER are terminal; PENDING / PROCESSING / FAILED (retryable) are still in flight.
+      const inFlight = rows.filter((x) => x.status === 'PENDING' || x.status === 'PROCESSING' || x.status === 'FAILED')
+      if (rows.length > 0 && inFlight.length === 0) {
+        if (rows.some((x) => x.status === 'PROCESSED')) return
+        throw new Error(`Every import webhook for WC order ${wcOrderId} settled DEAD_LETTER with none PROCESSED — the import failed permanently.`)
+      }
+      snapshot = rows.length
+        ? rows.map((x) => `${x.status}${x.attempts ? ` (attempt ${x.attempts}${x.lastError ? `, last: ${x.lastError}` : ''}${x.nextAttemptAt ? `, next ${x.nextAttemptAt.toISOString()}` : ''})` : ''}`).join('; ')
+        : '(no events yet)'
+      await nudgeWpCron(creds)
+      await new Promise((res) => setTimeout(res, 5_000))
+    }
+    throw new Error(`Import webhook(s) for WC order ${wcOrderId} did not all settle within ${timeoutMs}ms. Last: ${snapshot}.`)
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * The "skipped accounting sync" shopping_sync_logs message the WC import writes at its !shouldInvoice
+ * branch, AFTER the accounting gate (order-import.ts:711-735). Its presence is durable proof the gate was
+ * reached and the sync deliberately skipped — as opposed to never having run. Polls briefly (the barrier
+ * has already settled the import, but the row is written near the end of it). Returns null on timeout.
+ */
+async function skipAccountingLogFor(salesOrderId: string, timeoutMs = 60_000): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const r = await db.query<{ errorMessage: string | null }>(
+        `select "errorMessage" from shopping_sync_logs
+          where connector = 'woocommerce' and "entityType" = 'ORDER' and "entityId" = $1
+            and "errorMessage" ilike '%skipped accounting sync%'
+          order by "createdAt" desc limit 1`,
+        [salesOrderId],
+      )
+      if (r.rows.length) return r.rows[0].errorMessage
+      await new Promise((res) => setTimeout(res, 2_000))
+    }
+    return null
+  } finally {
+    await db.end()
+  }
+}
+
+/** How many accounting sync logs of a type exist for a reference (0 == the sync was never even queued). */
+async function accountingLogCountFor(type: string, referenceId: string): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ count: string }>(
+      `select count(*)::int as count from accounting_sync_logs
+        where connector = 'xero' and type = $1::"AccountingSyncType" and "referenceId" = $2`,
+      [type, referenceId],
+    )
+    return Number(r.rows[0]?.count ?? 0)
   } finally {
     await db.end()
   }
