@@ -7,12 +7,13 @@ import {
 } from '@/lib/fulfillment/reallocation-sweep'
 
 // o3d-9lx: the sweep re-runs allocation for PROCESSING orders with outstanding demand (a paid order
-// whose poller allocation failed transiently), gated on allocation state — not payment state. All
-// collaborators are injected so the orchestration is verified without a DB.
+// whose poller allocation failed transiently), gated on allocation state — not payment state — and
+// walks the PROCESSING set via a durable keyset cursor so permanent backorders can't starve later
+// orders. All collaborators are injected so the orchestration is verified without a DB.
 
 type Deps = Partial<ReallocationSweepDeps>
 type LogEntry = Parameters<ReallocationSweepDeps['logActivity']>[0]
-type Candidate = Awaited<ReturnType<ReallocationSweepDeps['loadCandidates']>>[number]
+type Candidate = Awaited<ReturnType<ReallocationSweepDeps['loadCandidatesPage']>>[number]
 
 function order(id: string): Candidate {
   return {
@@ -28,9 +29,16 @@ function baseDeps(over: Deps = {}) {
     alloc: [] as string[],
     sync: [] as string[][],
     logs: [] as { action: string; level: string | undefined }[],
+    cursorWrites: [] as string[],
   }
+  let cursor = ''
   const deps: Deps = {
-    loadCandidates: async () => [order('SO-1'), order('SO-2')],
+    readCursor: async () => cursor,
+    writeCursor: async (c) => {
+      cursor = c
+      calls.cursorWrites.push(c)
+    },
+    loadCandidatesPage: async () => [order('SO-1'), order('SO-2')],
     selectNeedingAllocation: async (c) => c, // by default all need allocation
     autoAllocateOrder: async (orderId) => {
       calls.alloc.push(orderId)
@@ -49,7 +57,7 @@ function baseDeps(over: Deps = {}) {
 
 test('only orders that still need allocation are re-allocated (o3d-9lx)', async () => {
   const { deps, calls } = baseDeps({
-    loadCandidates: async () => [order('SO-1'), order('SO-2'), order('SO-3')],
+    loadCandidatesPage: async () => [order('SO-1'), order('SO-2'), order('SO-3')],
     // SO-2 is already fully allocated -> excluded by the coverage filter.
     selectNeedingAllocation: async (c) => c.filter((o) => o.id !== 'SO-2'),
   })
@@ -73,7 +81,7 @@ test('a benign "no stock" result is not counted or logged as an error', async ()
 
 test('a real allocation error is counted and logged', async () => {
   const { deps, calls } = baseDeps({
-    loadCandidates: async () => [order('SO-1')],
+    loadCandidatesPage: async () => [order('SO-1')],
     autoAllocateOrder: async () => ({ success: false, error: 'lock acquisition timeout' }),
   })
   const result = await sweepUnallocatedProcessingOrders({ deps })
@@ -87,7 +95,7 @@ test('a real allocation error is counted and logged', async () => {
 
 test('a throwing autoAllocateOrder is caught, counted, and does not abort the sweep', async () => {
   const { deps } = baseDeps({
-    loadCandidates: async () => [order('SO-1'), order('SO-2')],
+    loadCandidatesPage: async () => [order('SO-1'), order('SO-2')],
     autoAllocateOrder: async (orderId) => {
       if (orderId === 'SO-1') throw new Error('boom')
       return { success: true, allocationCount: 1, syncProductIds: [] }
@@ -101,7 +109,7 @@ test('a throwing autoAllocateOrder is caught, counted, and does not abort the sw
 
 test('per-order stock syncs are coalesced into a single push', async () => {
   const { deps, calls } = baseDeps({
-    loadCandidates: async () => [order('SO-1'), order('SO-2')],
+    loadCandidatesPage: async () => [order('SO-1'), order('SO-2')],
     autoAllocateOrder: async (orderId) => ({
       success: true,
       allocationCount: 1,
@@ -121,15 +129,64 @@ test('nothing needing allocation -> no allocate calls, no sync', async () => {
   assert.equal(calls.sync.length, 0)
 })
 
-test('a full scan page sets limitReached and logs a capped warning', async () => {
+// --- Durable keyset cursor: guarantees progress, prevents starvation --------
+
+test('a full page advances the cursor to the last-scanned id and reports a remainder', async () => {
   const { deps, calls } = baseDeps({
-    loadCandidates: async (limit) => Array.from({ length: limit }, (_v, i) => order(`SO-${i}`)),
+    // limit=2 -> loader returns limit+1=3; the 3rd row signals a remainder.
+    loadCandidatesPage: async () => [order('SO-1'), order('SO-2'), order('SO-3')],
     selectNeedingAllocation: async () => [],
   })
   const result = await sweepUnallocatedProcessingOrders({ limit: 2, deps })
-  assert.equal(result.limitReached, true)
-  assert.equal(
-    calls.logs.filter((l) => l.action === 'reallocation_sweep_capped' && l.level === 'WARNING').length,
-    1,
-  )
+  assert.equal(result.hasRemainder, true)
+  assert.equal(result.scanned, 2) // the extra row is a lookahead, not processed
+  assert.equal(result.nextCursor, 'SO-2') // cursor = last id in the processed batch
+  assert.deepEqual(calls.cursorWrites, ['SO-2'])
+})
+
+test('a final (short) page wraps the cursor back to the start', async () => {
+  const { deps, calls } = baseDeps({
+    loadCandidatesPage: async () => [order('SO-9')], // fewer than limit+1 -> last page
+    selectNeedingAllocation: async () => [],
+  })
+  const result = await sweepUnallocatedProcessingOrders({ limit: 2, deps })
+  assert.equal(result.hasRemainder, false)
+  assert.equal(result.nextCursor, '')
+  assert.deepEqual(calls.cursorWrites, [''])
+})
+
+test('a stable first page of benign backorders does not starve a later eligible order (o3d-9lx)', async () => {
+  // Page 1 = two permanent no-stock backorders (always PROCESSING, never allocatable). Page 2 (after the
+  // cursor advances) holds a genuinely-stranded order WITH stock. The cursor must reach it on run 2.
+  const pages: Record<string, Candidate[]> = {
+    '': [order('SO-1'), order('SO-2'), order('SO-3')], // limit=2 -> remainder; batch = SO-1,SO-2
+    'SO-2': [order('SO-3')], // next page: the eligible order
+  }
+  let cursor = ''
+  const attempted: string[] = []
+  const deps: Deps = {
+    readCursor: async () => cursor,
+    writeCursor: async (c) => {
+      cursor = c
+    },
+    loadCandidatesPage: async (cur) => pages[cur] ?? [],
+    // SO-1/SO-2 never need allocation-that-succeeds (benign); SO-3 does.
+    selectNeedingAllocation: async (c) => c,
+    autoAllocateOrder: async (orderId) => {
+      attempted.push(orderId)
+      if (orderId === 'SO-3') return { success: true, allocationCount: 1, syncProductIds: [] }
+      return { success: false, error: 'No stock available for allocation' }
+    },
+    enqueueStockSync: async () => {},
+    logActivity: (async () => {}) as ReallocationSweepDeps['logActivity'],
+  }
+
+  const run1 = await sweepUnallocatedProcessingOrders({ limit: 2, deps })
+  assert.equal(run1.nextCursor, 'SO-2')
+  assert.deepEqual(attempted, ['SO-1', 'SO-2']) // page 1 only
+
+  const run2 = await sweepUnallocatedProcessingOrders({ limit: 2, deps })
+  assert.equal(run2.allocated, 1)
+  assert.ok(attempted.includes('SO-3'), 'the later eligible order is reached on the next tick, not starved')
+  assert.equal(run2.nextCursor, '') // short page -> wrap
 })
