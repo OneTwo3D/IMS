@@ -573,6 +573,113 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
       'the allocation must reduce AmountDue by exactly the returned-half credit',
     ).toBeCloseTo(billTotal - creditTotal, 2)
   })
+
+  test('PP-07: an inline landed cost distributes BY VALUE across SKUs and ties transit out to zero', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // A PO can carry landed costs (freight, duty) on top of goods; on receipt they must distribute across the
+    // received cost layers BY_VALUE (by EXTENDED line value = qty × unit cost) so each SKU is valued at its
+    // TRUE landed cost, not the bare goods price.
+    //
+    // The lines use UNEQUAL QUANTITIES so the extended-value ratio differs from the unit-cost ratio — a bug
+    // that weighted by unit price instead of qty × unit price would land a DIFFERENT (wrong) per-SKU cost and
+    // be caught, and so would dump-on-one-line or equal-split:
+    //   A: 2 @ £30 = £60 goods   B: 4 @ £10 = £40 goods   goods total £100   freight £40 (BY_VALUE)
+    //   correct (extended value): A = 40 × 60/100 = £24 -> A unit = (60+24)/2 = £42
+    //                             B = 40 × 40/100 = £16 -> B unit = (40+16)/4 = £14
+    //   (a unit-price-basis bug would give A £45 / B £12.50 — distinct, so it fails here.)
+    // Aggregate: inventory DR £140, stock-in-transit CR £140 at receipt; the bill debits transit £140; so
+    // transit NETS TO ZERO across the two Xero documents (the imbalance an unbilled freight would strand).
+    const skuA = taggedSku(runId, 'PP07A')
+    const skuB = taggedSku(runId, 'PP07B')
+    const reference = `${runTag(runId)}-PP07`
+    const qtyA = 2
+    const qtyB = 4
+    const landedTotal = 60 + 40 + 40 // 140.00 — full landed value (goodsA + goodsB + freight)
+    const expectedUnitA = (60 + 40 * (60 / 100)) / qtyA // (60 + 24) / 2 = 42.00
+    const expectedUnitB = (40 + 40 * (40 / 100)) / qtyB // (40 + 16) / 4 = 14.00
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku: skuA, name: `${runTag(runId)} PP07A`, price: '60.00' })
+    await createInventoryProduct(page, { sku: skuB, name: `${runTag(runId)} PP07B`, price: '25.00' })
+
+    const { poId } = await createAndSendPo(page, {
+      sku: skuA,
+      qty: String(qtyA),
+      unitCost: '30.00',
+      extraLines: [{ sku: skuB, qty: String(qtyB), unitCost: '10.00' }],
+      additionalCost: { description: 'Shipping', amount: '40', distributionMethod: 'BY_VALUE' },
+    })
+    await receiveGoods(page, { expectStatus: 'Received' })
+    // Bill BOTH the goods AND the landed cost — the receipt credited transit for the full £140, so the bill
+    // must debit transit for £140 too or a permanent transit balance is stranded.
+    await createBill(page, { reference, includeAdditionalCosts: true })
+
+    // Drain, then register BOTH posted documents in a FINALLY — the drain can post the bill + journal and
+    // THEN throw on the UI confirmation, and teardown only voids tracked ids. The registration is the very
+    // first thing to run afterwards (before any fallible settings read or assertion), and each lookup is
+    // independent (.catch -> '') so a failed resolve of one still registers the other.
+    let journalId = ''
+    let billId = ''
+    try {
+      await processPendingXeroSyncViaUi(page)
+    } finally {
+      journalId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: poId }).catch(() => '')
+      const billRecordId = (await billIdsForPo(poId).catch((): string[] => []))[0]
+      billId = billRecordId ? await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId }).catch(() => '') : ''
+      if (journalId) trackDocument('ManualJournals', journalId, `PP-07 stock receipt ${runTag(runId)}`)
+      if (billId) trackDocument('Invoices', billId, `PP-07 bill ${runTag(runId)}`)
+    }
+    expect(journalId, 'the STOCK_RECEIPT journal posted to Xero').toBeTruthy()
+    expect(billId, 'the ACCPAY bill posted to Xero').toBeTruthy()
+    const inventoryAccount = await settingValue('xero_inventory_account')
+    const transitAccount = await settingValue('xero_transit_account')
+
+    // 1) Each SKU's cost layer carries its OWN landed unit cost — proving BY_VALUE distribution, not mere
+    //    inclusion. A: £45, B: £15 (from the IMS subledger).
+    const unitCostFor = async (sku: string, expectedQty: number): Promise<number> => {
+      const rows = await queryRows<{ unitCostBase: string; receivedQty: string }>(
+        `select cl."unitCostBase", cl."receivedQty" from cost_layers cl
+           join products p on p.id = cl."productId"
+          where p.sku = $1 order by cl."receivedAt" desc limit 1`,
+        [sku],
+      )
+      expect(rows.length, `the receipt created a cost layer for ${sku}`).toBe(1)
+      expect(Number(rows[0].receivedQty)).toBeCloseTo(expectedQty, 4)
+      return Number(rows[0].unitCostBase)
+    }
+    expect(await unitCostFor(skuA, qtyA), 'A: landed unit = (goods 60 + BY_VALUE freight 24) / 2 = £42').toBeCloseTo(expectedUnitA, 2)
+    expect(await unitCostFor(skuB, qtyB), 'B: landed unit = (goods 40 + BY_VALUE freight 16) / 4 = £14').toBeCloseTo(expectedUnitB, 2)
+
+    // 2) The STOCK_RECEIPT journal moves the FULL LANDED value and BALANCES: the inventory-account lines total
+    //    a £120 debit, the transit-account lines a £120 credit. Summed across ALL lines per account (not a
+    //    single existential line) so an extra unexpected line cannot hide. (Already registered for teardown.)
+    const journal = await getManualJournal(journalId)
+    expect(journal.Status).toBe('POSTED')
+    const journalSumFor = (account: string) =>
+      journal.JournalLines.filter((l) => l.AccountCode === account).reduce((s, l) => s + l.LineAmount, 0)
+    // ManualJournal LineAmount is signed: + = debit, − = credit (expectJournalLine convention).
+    const journalInventory = journalSumFor(inventoryAccount)
+    const journalTransit = journalSumFor(transitAccount)
+    expect(journalInventory, 'receipt debits inventory for the full landed value').toBeCloseTo(landedTotal, 2)
+    expect(journalTransit, 'receipt credits transit for the full landed value').toBeCloseTo(-landedTotal, 2)
+
+    // 3) The ACCPAY bill covers the FULL £120 and DEBITS transit for £120 (goods + freight lines).
+    //    (Already registered for teardown.)
+    const bill = await getInvoice(billId)
+    expect(bill.Type).toBe('ACCPAY')
+    expect(bill.Status).toBe('AUTHORISED')
+    expect(Number(bill.SubTotal), 'bill covers goods + landed cost, not goods alone').toBeCloseTo(landedTotal, 2)
+    const billTransit = bill.LineItems
+      .filter((l) => l.AccountCode === transitAccount)
+      .reduce((sum, l) => sum + (l.LineAmount ?? 0), 0)
+    expect(billTransit, 'bill debits transit for the full landed value (goods + freight)').toBeCloseTo(landedTotal, 2)
+
+    // 4) THE TIE-OUT: the receipt's signed transit credit (−£120) and the bill's transit debit (+£120) net to
+    //    ZERO across both Xero documents. A goods-only bill (or a non-transit freight line) would leave a
+    //    residual — this is the aggregate signed balance, not two existential checks.
+    expect(journalTransit + billTransit, 'transit nets to zero across the receipt journal and the bill').toBeCloseTo(0, 2)
+  })
 })
 
 /** The PurchaseReturn row this PO produced. Its id — not the PO's — keys the return's journal. */
