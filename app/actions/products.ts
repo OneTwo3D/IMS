@@ -879,6 +879,18 @@ export async function updateProduct(
     return { errors: structureValidation.fieldErrors, message: structureValidation.message }
   }
 
+  // bhdm.7: if the persisted origin is a nonblank value that is not a valid country (a legacy bad row), a blank
+  // submission must NOT clear it — that would erase the evidence and let the WMS declare CN with the
+  // INVALID_COUNTRY_OF_ORIGIN discrepancy resolved, without anyone choosing a real country. Require a valid
+  // replacement. (A valid current origin, or a blank current origin, may still be cleared as before.)
+  const current = await db.product.findUnique({ where: { id }, select: { countryOfOrigin: true } })
+  if (current?.countryOfOrigin && !toIsoCountryCode(current.countryOfOrigin) && !data.countryOfOrigin) {
+    return {
+      errors: { countryOfOrigin: ['This product has an invalid stored country of origin — select a valid country to save.'] },
+      message: 'Select a valid country of origin',
+    }
+  }
+
   const updatedCategoryChange = await db.$transaction(async (tx) => {
     const previous = await tx.product.findUnique({
       where: { id },

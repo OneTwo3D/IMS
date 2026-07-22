@@ -376,11 +376,13 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
             value={fields.countryOfOrigin}
             onChange={(ev) => set('countryOfOrigin', ev.target.value)}
           >
-            <option value="">— Select —</option>
             {/* bhdm.7: a legacy invalid stored origin is preserved as a sentinel option (so an unrelated edit
-                doesn't silently erase it); its label + the server-schema rejection force picking a real country. */}
-            {fields.countryOfOrigin && !toIsoCountryCode(fields.countryOfOrigin) && (
+                doesn't silently erase it). While it is active the blank option is hidden and the server rejects a
+                blank/unchanged submission, forcing the operator to pick a real country. */}
+            {fields.countryOfOrigin && !toIsoCountryCode(fields.countryOfOrigin) ? (
               <option value={fields.countryOfOrigin}>{fields.countryOfOrigin} (invalid — choose a country)</option>
+            ) : (
+              <option value="">— Select —</option>
             )}
             {COUNTRY_LIST.map((c) => (
               <option key={c.code} value={c.code}>{c.name}</option>
