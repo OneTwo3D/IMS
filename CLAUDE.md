@@ -504,7 +504,10 @@ Copy `.env.example` to `.env` and configure. Uses **NextAuth.js v5** variable na
 | `XERO_CLIENT_ID` | No | Xero OAuth app client ID | From Xero Developer Portal (app.xero.com) |
 | `XERO_CLIENT_SECRET` | No | Xero OAuth app client secret | From Xero Developer Portal |
 | `XERO_TENANT_ID` | No | Xero tenant/organisation ID (auto-populated after first OAuth) | Retrieved after OAuth flow |
-| `XERO_TOKEN_PATH` | No | Path to store Xero OAuth refresh token (keep outside repo) | `/var/lib/onetwoinventory/xero-token.json` |
+
+> Xero OAuth tokens are **not** stored in a file. There is no `XERO_TOKEN_PATH`: the access/refresh
+> tokens are persisted **encrypted in Postgres** (settings/connector rows, decrypted with
+> `SETTINGS_ENCRYPTION_KEY`).
 
 ### Foreign Exchange Rates
 
@@ -562,16 +565,20 @@ See `.env.example` for complete list and additional settings.
 
 ## Production Deployment
 
-**Current Setup:** Runs as `next start` on machine at `10.0.3.99` from `/root/ims/onetwo3d-ims`
+**Current Setup:** The stage instance runs as the non-root **`ims`** user from
+`/opt/ims/onetwo3d-ims` (the tree `/root/ims/onetwo3d-ims` is a symlink to it) under systemd on
+port **3000**. The live unit is `ims-stage-dev.service` (`next dev`, hot-reload, on the
+`development` branch); the hardened `ims-stage.service` (`next start`, loopback-only, sandboxed)
+is its intended replacement — see [`deploy/README.md`](deploy/README.md) for the units and the
+migration. Xero tokens live encrypted in Postgres, not a token file (see the env note above).
 
-**After Code Changes:**
-1. Commit and push to main branch
-2. SSH to production machine
-3. Pull latest code: `git pull origin main`
-4. Install dependencies (if needed): `npm install`
-5. Build the application: `npm run build`
-6. Restart the service (systemd or manual): `sudo systemctl restart onetwoinventory` or manual restart
-7. Verify on `http://10.0.3.99:3000`
+**After Code Changes** (live stage tree, hot-reloaded — usually no rebuild needed):
+1. Merge to `development` (IMS PRs target `development`, not `main`).
+2. On the host, as the `ims` user: `git -C /opt/ims/onetwo3d-ims pull` (never run git in this tree as root).
+3. If dependencies/schema changed: `npm install`, `prisma migrate deploy`, `prisma generate`.
+4. `next dev` hot-reloads code edits; restart only when needed:
+   `systemctl restart ims-stage-dev.service` (or `ims-stage.service` once migrated).
+5. Verify locally on `http://127.0.0.1:3000` (behind nginx at the stage hostname).
 
 **Database migrations:**
 - Migrations are applied during `npm run build` via `prisma migrate deploy` in postinstall hook
