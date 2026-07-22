@@ -2,15 +2,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync } from '@/lib/shopping'
-import {
-  calculateCoverageByLine,
-  requirementsMapToRows,
-  type FulfillmentRequirement,
-} from '@/lib/products/fulfillment-coverage'
-import {
-  expandFulfillmentRequirementsDecimal,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+import { selectOrdersNeedingAllocation } from '@/lib/fulfillment/order-allocation-coverage'
 
 const BACKORDER_ELIGIBLE_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
 
@@ -93,63 +85,14 @@ export async function allocateBackordersForProducts(
   })
   if (candidates.length === 0) return result
 
-  const candidateIds = candidates.map((o) => o.id)
-
-  // Build per-line requirements expressed in leaf (component) units so
-  // KIT lines can be compared in kit units below. For SIMPLE/BOM lines
-  // this degenerates to a single requirement of factor 1.
-  const lineProductIds = [
-    ...new Set(
-      candidates.flatMap((order) =>
-        order.lines.map((line) => line.productId).filter((id): id is string => !!id),
-      ),
-    ),
-  ]
-  const graph = await loadFulfillmentProductGraph(db, lineProductIds)
-  const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
-  for (const order of candidates) {
-    for (const line of order.lines) {
-      if (!line.productId) continue
-      requirementsByLine.set(
-        line.id,
-        requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
-      )
-    }
-  }
-
-  // Coverage rows use OrderAllocation only (component units for KIT lines,
-  // BOM/SIMPLE units otherwise). Orders with any Shipment are already
-  // filtered out above, so there are no committed shipment rows to add.
-  const allocRows = await db.orderAllocation.findMany({
-    where: { orderId: { in: candidateIds } },
-    select: { orderId: true, lineId: true, productId: true, qty: true },
-  })
-
-  const coverageRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
-  for (const row of allocRows) {
-    const list = coverageRowsByOrder.get(row.orderId) ?? []
-    list.push({ lineId: row.lineId, productId: row.productId, qty: Number(row.qty) })
-    coverageRowsByOrder.set(row.orderId, list)
-  }
-
-  const needsAllocation = candidates.filter((order) => {
-    const coverageByLine = calculateCoverageByLine(
-      requirementsByLine,
-      coverageRowsByOrder.get(order.id) ?? [],
-    )
-    return order.lines.some((line) => {
-      if (!line.productId) return false
-      // Only retry if at least one of this line's leaf requirements is a
-      // directly-replenished product — otherwise a KIT parent whose
-      // bottleneck component is elsewhere would get its allocation
-      // needlessly rewritten without improving fulfillable qty.
-      const reqs = requirementsByLine.get(line.id) ?? []
-      const touchesReplenished = reqs.some((r) => directIdsSet.has(r.productId))
-      if (!touchesReplenished) return false
-      const coverage = coverageByLine.get(line.id) ?? 0
-      return Number(line.qty) > coverage + 1e-6
-    })
-  })
+  // Keep only orders with outstanding demand on a line whose leaf requirements touch a
+  // directly-replenished product — otherwise a KIT parent whose bottleneck component is elsewhere
+  // would get its allocation needlessly rewritten without improving fulfillable qty. Coverage is the
+  // shared, KIT-aware computation used by the periodic reallocation sweep too (o3d-9lx).
+  const needsAllocation = await selectOrdersNeedingAllocation(
+    candidates,
+    (_line, reqs) => reqs.some((r) => directIdsSet.has(r.productId)),
+  )
   if (needsAllocation.length === 0) return result
 
   const { autoAllocateOrder } = await import('@/app/actions/allocation')
