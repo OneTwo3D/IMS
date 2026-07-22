@@ -174,6 +174,12 @@ The flowchart below shows every path an order can take through the Xero sub-ledg
 
 ## Sync Cases in Detail
 
+> These cases are verified end-to-end (Woo stage → IMS → Xero Demo, read back from the Xero
+> API) by the full-chain E2E tier, `e2e/full-chain/order-to-cash.spec.ts`: **Case 1** ≈ OC-01
+> (paid order → ship → ACCREC invoice), **Case 2 / Case 4** ≈ OC-02 (under-stocked order ships
+> the available units yet invoices the full order), and the shipping/fee line breakdown ≈ OC-11.
+> See [`docs/ops/full-chain-e2e-runbook.md`](ops/full-chain-e2e-runbook.md).
+
 ### Case 1: WooCommerce Order (stock available, same-day ship)
 
 This is the most common case. The customer pays via WooCommerce, stock is available and allocated, and the order ships quickly.

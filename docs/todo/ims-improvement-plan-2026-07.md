@@ -27,7 +27,7 @@ The through-line: when the 3PL holds **less** than IMS believes (shrinkage, alre
 |---|------|----------|----|
 | B1 | Transit (`STOCK_IN_TRANSIT`) GL account has **no** reconciliation sweep — only INVENTORY + COGS are tied out. This is epic `khdw`'s remaining deliverable; design spec + open finance question (expected-transit-balance basis) live there | `account-gl-reconciliation.ts:20`; `daily-sync.ts:1325,1364`; no transit module | **6oyu.4 (P2)** → epic khdw |
 | B2 | Refund COGS reversal uses **current** layer cost, not originally-posted COGS — landed-cost revaluation after dispatch leaves a residual. Needs a finance decision (carrying-value vs posted-COGS reversal) | `refund-service.ts:962-968` (explicit trade-off comment) | **6oyu.5 (P2)** |
-| B3 | Xero payment-reversal/chargeback detection covers MANUAL orders only — WC-paid orders (most of onetwo3d's volume) are excluded; order status never auto-reverts on reversal | `payment-poller.ts:130` (`shoppingLinks:{none:{}}`), `:121-175` | **6oyu.6 (P2)** |
+| B3 | Xero payment-reversal/chargeback detection **covered MANUAL orders only** — WC-paid orders were excluded — **FIXED** (PR #480): the **reversal** pass (paid→reversed) now covers ALL sales orders incl. WC-linked, clearing `paidAt` + unwinding revenue on a chargeback regardless of channel; only the **forward** pass still (correctly) skips WC, as those arrive already paid. Policy is detect+notify with **no** status auto-revert by design, and the WC refund webhook stays authoritative via a per-order dedup guard | `payment-poller.ts:6,121-175` | **6oyu.6 (P2)** ✅ |
 | B4 | Retrospective-COGS exclusion lists are hand-maintained per movement type — a future non-customer movement type silently corrupts revaluation COGS | `cost-layers.ts:865-906` | **6oyu.7 (P3)** |
 | B5 | FIFO sub-tolerance shortfall absorbed with only `console.warn` — invisible to finance | `cost-layers.ts:342-350` | **6oyu.8 (P3)** |
 | B6 | Xero follow-up plan correctness items still open: VAT liability posting, request idempotency, failed-sync completeness hardening | `docs/todo/xero-followup-plan.md` Item 7 | **6oyu.9 (P3)** |
@@ -67,7 +67,7 @@ The through-line: when the 3PL holds **less** than IMS believes (shrinkage, alre
 
 1. **6oyu.1** (align-down) + **q66in.4.2** (exception inbox) — closes the "IMS oversells and nobody notices" loop end to end.
 2. **6oyu.2 / q66in.4.4 / 6oyu.3 / q66in.4.6** — the remaining Phase A drift-and-silence items.
-3. **6oyu.4 / .5 / .6** — GL tie-out (transit sweep, refund-COGS basis decision with finance, WC payment reversals).
+3. **6oyu.4 / .5** — GL tie-out (transit sweep, refund-COGS basis decision with finance). *(6oyu.6 WC payment reversals — done, PR #480.)*
 4. **6oyu.11 / .12 / q66in.4.1** — operator visibility + bulk actions.
 5. Phase C/D P3-P4 as capacity allows.
 
