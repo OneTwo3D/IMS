@@ -61,7 +61,7 @@ export type WcOrder = { id: number; number: string; status: string; total: strin
 export async function createWcProduct(
   c: WcCreds,
   runId: string,
-  opts: { label: string; price: string; manageStock?: boolean; stock?: number },
+  opts: { label: string; price: string; manageStock?: boolean; stock?: number; taxClass?: string },
 ): Promise<WcProduct> {
   const sku = taggedSku(runId, opts.label)
   const created = await wcRequest<WcProduct>(c, '/products', {
@@ -71,6 +71,10 @@ export async function createWcProduct(
       type: 'simple',
       sku,
       regular_price: opts.price,
+      // tax_class defaults to '' (standard). 'zero-rate' / 'reduced-rate' are WooCommerce's built-in
+      // classes; a product in a class with no GB rate is simply untaxed — either way this drives the
+      // per-line tax treatment.
+      tax_class: opts.taxClass ?? '',
       manage_stock: opts.manageStock ?? false,
       stock_quantity: opts.stock,
       status: 'publish',

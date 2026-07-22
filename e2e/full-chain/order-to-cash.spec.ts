@@ -717,8 +717,9 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     // WooCommerce and its retries deliver the same order more than once — measured against the live store,
     // a single order arrives as order.updated TWICE. A redelivery must be absorbed idempotently:
     // importWcOrder takes the existing-order path (updateExistingWcOrderFromPayload) and must NOT fork a
-    // second sales order or re-queue the SALES_INVOICE. We do NOT drain to Xero here (the invoice stays
-    // queued; teardown cancels it) — the property under test is the import/queue side, not a ledger post.
+    // second sales order or re-queue the SALES_INVOICE. We do NOT drain to Xero here — the property under
+    // test is the import/queue side, not a ledger post — and the finally CANCELS the order's own pending
+    // invoice so a LATER test's whole-queue drain can never post it (see the finally).
     const sku = taggedSku(runId, 'OC16')
     const unitPrice = '25.00'
     const qty = 2
@@ -729,44 +730,141 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
 
     const product = await createWcProduct(creds, runId, { label: 'OC16', price: unitPrice })
     const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+    try {
+      await awaitWebhookDelivery(order.id, { creds })
+      // Settle ALL initial deliveries (the natural duplicates included) before the baseline. requireAllProcessed
+      // makes idempotency the bar: if any duplicate DEAD_LETTERED (i.e. was not absorbed gracefully) this fails
+      // rather than passing on the unique-constrained link count. This baseline alone already proves
+      // natural-duplicate idempotency: N deliveries, still one SO and one invoice, none dead-lettered.
+      await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+      // Oracle reads sales_orders directly (not the unique-capped link table), and counts invoices across
+      // EVERY sales order carrying this WC number — so a duplicate order (and its separately-keyed invoice)
+      // cannot hide.
+      const soIdsAfterImport = await salesOrderIdsForWcOrderNumber(order.number)
+      expect(soIdsAfterImport.length, 'exactly one sales order for the WC order after import').toBe(1)
+      expect(
+        await salesInvoiceLogCountForOrders(soIdsAfterImport),
+        'exactly one SALES_INVOICE queued at import, however many times it was delivered',
+      ).toBe(1)
+
+      // Force a DETERMINISTIC extra replay: a benign note edit fires a fresh order.updated (payload differs, so
+      // the inbox does not dedupe it by hash — the import path actually runs again). The note carries a UNIQUE
+      // marker so the barrier waits for THIS exact delivery, correlated by payload — not a wall-clock cutoff a
+      // late original delivery could satisfy first.
+      const replayMarker = `OC16-replay-${runId}`
+      await updateWcOrder(creds, order.id, { customer_note: `${runTag(runId)} ${replayMarker}` })
+      // Wait for the marked replay delivery specifically, and require it to PROCESS (fail if it dead-letters) —
+      // a redelivery that dead-letters is exactly the non-idempotent handling this test must catch.
+      await awaitWebhookEventProcessed(order.id, creds, { noteContains: replayMarker, requireAllProcessed: true })
+      // Then let ALL of the order's deliveries (not only the marked one) quiesce, so a late ORIGINAL delivery
+      // cannot land after the assertions and mutate state unseen.
+      await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+      // Idempotent: still exactly one SO and one SALES_INVOICE (across ALL SOs for this WC order) — the
+      // redelivery neither forked the order nor re-queued the invoice.
+      const soIdsAfterReplay = await salesOrderIdsForWcOrderNumber(order.number)
+      expect(soIdsAfterReplay.length, 'still exactly one sales order after the replay').toBe(1)
+      expect(
+        await salesInvoiceLogCountForOrders(soIdsAfterReplay),
+        'still exactly one SALES_INVOICE after the replay — the re-import did not re-queue',
+      ).toBe(1)
+    } finally {
+      // OC-16 intentionally never drains its invoice, so it sits PENDING. processPendingXeroSync drains the
+      // WHOLE queue, so ANY later test's drain would post this invoice into the shared Demo ledger UNTRACKED
+      // (global teardown cancels leftover pending rows, but only AFTER any later drain). Cancel our own
+      // pending SALES_INVOICE now so the order is self-contained regardless of suite ordering.
+      const soIds = await salesOrderIdsForWcOrderNumber(order.number)
+      await cancelPendingSalesInvoicesForOrders(soIds)
+    }
+  })
+
+  test('OC-14: an order mixing a standard-rated and a zero-rated product posts each line at its own tax', async ({ page }) => {
+    // Clears the composed worst case: awaitWebhookDelivery (300s) + the import barrier (300s) + setup + ship
+    // + drain — 600s was under that sum. Matches OC-13/OC-16.
+    test.setTimeout(1_800_000)
+
+    // A single order can carry lines at DIFFERENT VAT rates, and each must keep its own tax treatment all
+    // the way into the Xero invoice — collapsing them to one rate, or dropping a zero-rating, is a VAT-return
+    // error a sync-log assertion cannot see. Product A is standard-rated (the store's GB standard rate, ~20%
+    // as OC-06 established); product B is in WooCommerce's built-in 'zero-rate' class, so WC charges it no
+    // tax. We read the invoice back and assert the two goods lines carry DIFFERENT Xero tax types and that
+    // only the standard line's tax reached the ledger — grounded in WooCommerce's OWN per-line tax figures
+    // so the test is not hostage to a hardcoded rate.
+    const skuA = taggedSku(runId, 'OC14A')
+    const skuB = taggedSku(runId, 'OC14B')
+    const priceA = '50.00'
+    const priceB = '30.00'
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku: skuA, name: `${runTag(runId)} OC14A`, price: priceA })
+    await addStockAdjustment(page, skuA, 10, WAREHOUSE_CODE)
+    await createInventoryProduct(page, { sku: skuB, name: `${runTag(runId)} OC14B`, price: priceB })
+    await addStockAdjustment(page, skuB, 10, WAREHOUSE_CODE)
+
+    const productA = await createWcProduct(creds, runId, { label: 'OC14A', price: priceA }) // '' => standard
+    const productB = await createWcProduct(creds, runId, { label: 'OC14B', price: priceB, taxClass: 'zero-rate' })
+    const order = await createWcOrder(creds, runId, {
+      lines: [{ productId: productA.id, quantity: 1 }, { productId: productB.id, quantity: 1 }],
+    })
     const imported = await awaitWebhookDelivery(order.id, { creds })
-    // Settle ALL initial deliveries (the natural duplicates included) before the baseline. requireAllProcessed
-    // makes idempotency the bar: if any duplicate DEAD_LETTERED (i.e. was not absorbed gracefully) this fails
-    // rather than passing on the unique-constrained link count. This baseline alone already proves
-    // natural-duplicate idempotency: N deliveries, still one SO and one invoice, none dead-lettered.
+    // Barrier before draining: awaitWebhookDelivery returns when the SO link appears, but the SALES_INVOICE
+    // is queued slightly later in the same import. Without this, a slow import could let the whole-queue drain
+    // below run BEFORE the invoice is queued — externalIdFor would then time out and the mixed-tax assertions
+    // would never run (same lesson as OC-13/OC-16).
     await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
 
-    // Oracle reads sales_orders directly (not the unique-capped link table), and counts invoices across
-    // EVERY sales order carrying this WC number — so a duplicate order (and its separately-keyed invoice)
-    // cannot hide.
-    const soIdsAfterImport = await salesOrderIdsForWcOrderNumber(order.number)
-    expect(soIdsAfterImport.length, 'exactly one sales order for the WC order after import').toBe(1)
-    expect(
-      await salesInvoiceLogCountForOrders(soIdsAfterImport),
-      'exactly one SALES_INVOICE queued at import, however many times it was delivered',
-    ).toBe(1)
+    await openSalesOrder(page, imported.salesOrderId)
+    await allocateAndShip(page, { tracking: `${runTag(runId)}-OC14` })
+    try {
+      await processPendingXeroSyncViaUi(page)
 
-    // Force a DETERMINISTIC extra replay: a benign note edit fires a fresh order.updated (payload differs, so
-    // the inbox does not dedupe it by hash — the import path actually runs again). The note carries a UNIQUE
-    // marker so the barrier waits for THIS exact delivery, correlated by payload — not a wall-clock cutoff a
-    // late original delivery could satisfy first.
-    const replayMarker = `OC16-replay-${runId}`
-    await updateWcOrder(creds, order.id, { customer_note: `${runTag(runId)} ${replayMarker}` })
-    // Wait for the marked replay delivery specifically, and require it to PROCESS (fail if it dead-letters) —
-    // a redelivery that dead-letters is exactly the non-idempotent handling this test must catch.
-    await awaitWebhookEventProcessed(order.id, creds, { noteContains: replayMarker, requireAllProcessed: true })
-    // Then let ALL of the order's deliveries (not only the marked one) quiesce, so a late ORIGINAL delivery
-    // cannot land after the assertions and mutate state unseen.
-    await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+      const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+      const invoice = await getInvoice(invoiceId)
+      expect(invoice.Type).toBe('ACCREC')
+      expect(invoice.Status).toBe('AUTHORISED')
 
-    // Idempotent: still exactly one SO and one SALES_INVOICE (across ALL SOs for this WC order) — the
-    // redelivery neither forked the order nor re-queued the invoice.
-    const soIdsAfterReplay = await salesOrderIdsForWcOrderNumber(order.number)
-    expect(soIdsAfterReplay.length, 'still exactly one sales order after the replay').toBe(1)
-    expect(
-      await salesInvoiceLogCountForOrders(soIdsAfterReplay),
-      'still exactly one SALES_INVOICE after the replay — the re-import did not re-queue',
-    ).toBe(1)
+      // Ground truth from WooCommerce's own tax computation (matched by SKU): standard line taxed, zero not.
+      const wcOrder = await getWcOrder(creds, order.id)
+      const wcLineA = wcOrder.line_items?.find((l) => l.sku === skuA)
+      const wcLineB = wcOrder.line_items?.find((l) => l.sku === skuB)
+      expect(wcLineA, 'the standard product is on the order').toBeTruthy()
+      expect(wcLineB, 'the zero-rate product is on the order').toBeTruthy()
+      const taxA = Number(wcLineA!.total_tax ?? 0)
+      const taxB = Number(wcLineB!.total_tax ?? 0)
+      expect(taxA, 'the standard product is taxed in WooCommerce').toBeGreaterThan(0)
+      expect(taxB, 'the zero-rate product is NOT taxed in WooCommerce').toBeCloseTo(0, 2)
+
+      const salesAccount = await settingValue('xero_sales_account')
+      const lineA = expectLine(invoice.LineItems, { accountCode: salesAccount, lineAmount: Number(priceA) })
+      const lineB = expectLine(invoice.LineItems, { accountCode: salesAccount, lineAmount: Number(priceB) })
+      // Pin the EXACT UK output-VAT codes, not merely "present and different". invoices.ts substitutes 'NONE'
+      // for a missing tax type, so a regression that DROPPED the zero-rating would still yield a different,
+      // truthy value ('NONE') and sail through a weaker check while the VAT return is misclassified. The
+      // standard line must post standard-rated output VAT (OUTPUT2); the zero-rate line must post a GENUINE
+      // zero-rated code (ZERORATEDOUTPUT) — explicitly not 'NONE' (untaxed) and not the standard code.
+      // The expected values are the store's own mappings, confirmed against shopping_tax_rate_mappings +
+      // tax_rates: GB standard 20% -> OUTPUT2, zero-rate -> ZERORATEDOUTPUT. If the Woo zero-rate class had no
+      // resolvable mapping, IMS would fall back to NONE and this assertion would (correctly) fail.
+      const expectedStandardTaxType = await taxTypeForRateName('UK Standard Rate (20%)')
+      const expectedZeroTaxType = await taxTypeForRateName('Zero Rated VAT')
+      expect(expectedStandardTaxType, 'store maps its standard rate to a real output-VAT code').toBe('OUTPUT2')
+      expect(expectedZeroTaxType, 'store maps its zero rate to a real zero-rated code').toBe('ZERORATEDOUTPUT')
+      expect(lineA.TaxType, 'standard line posts standard-rated output VAT').toBe(expectedStandardTaxType)
+      expect(lineB.TaxType, 'zero-rate line posts a GENUINE zero-rated code, not NONE or the standard rate').toBe(expectedZeroTaxType)
+
+      // Only the standard line's tax reached Xero — the zero-rate line added none. Grounded in WC's figures.
+      expect(Number(invoice.TotalTax), 'invoice tax equals the standard line tax alone').toBeCloseTo(taxA, 2)
+      expect(Number(invoice.SubTotal), 'net goods = both lines ex-VAT').toBeCloseTo(Number(priceA) + Number(priceB), 2)
+      expect(Number(invoice.Total), 'gross ties out to the Woo order').toBeCloseTo(Number(order.total), 2)
+    } finally {
+      // Failure-safe registration (OC-02's pattern): if the drain's action timed out or a lookup/assertion
+      // threw AFTER Xero accepted the invoice, register whatever actually posted so teardown voids it rather
+      // than stranding an AUTHORISED receivable in the shared Demo ledger. POLL, since a timed-out action may
+      // still be finishing the post.
+      const posted = await awaitPostedExternalId('SALES_INVOICE', imported.salesOrderId, 90_000)
+      if (posted) trackDocument('Invoices', posted, `OC-14 invoice ${runTag(runId)}`)
+    }
   })
 })
 
@@ -1145,6 +1243,39 @@ async function salesOrderIdsForWcOrderNumber(wcOrderNumber: string): Promise<str
   }
 }
 
+/**
+ * Cancel an order's still-UNPOSTED SALES_INVOICE sync rows (CANCELLED, as the global teardown abandons rows).
+ * Lets a test that deliberately leaves an invoice queued dispose of it itself, so a LATER test's whole-queue
+ * drain cannot post it into the shared ledger untracked.
+ *
+ * SAFE BY CONSTRUCTION: only status='PENDING' with externalTransactionId IS NULL — a row never claimed by a
+ * worker and never posted. It deliberately does NOT touch a PROCESSING (mid-post) row: flipping its status
+ * would not cancel the in-flight Xero call, so an active post could still land or the worker could overwrite
+ * CANCELLED. This matches the production primitive cancelOrphanedAccountingSyncRows, which leaves live claims
+ * to finish. (In OC-16's own flow nothing ever drains this queue, so the row is always PENDING regardless.)
+ * Like that primitive AND the global teardown, it intentionally leaves the mirrored accounting_event as-is —
+ * the reconciliation that would read it runs only in batch mode, which this sync-mode suite never triggers.
+ */
+async function cancelPendingSalesInvoicesForOrders(salesOrderIds: string[]): Promise<void> {
+  if (salesOrderIds.length === 0) return
+  const url = process.env.DATABASE_URL
+  if (!url || url.includes('onetwo3d_ims_dev')) return // never touch stage's queue
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: url })
+  await db.connect()
+  try {
+    await db.query(
+      `update accounting_sync_logs set status = 'CANCELLED',
+              "errorMessage" = 'Cancelled by the OC-16 self-cleanup so a later queue drain cannot post it.'
+        where connector = 'xero' and type = 'SALES_INVOICE'::"AccountingSyncType"
+          and status = 'PENDING' and "externalTransactionId" is null and "referenceId" = ANY($1)`,
+      [salesOrderIds],
+    )
+  } finally {
+    await db.end()
+  }
+}
+
 /** Total SALES_INVOICE sync logs across a set of sales orders (0 if the set is empty). */
 async function salesInvoiceLogCountForOrders(salesOrderIds: string[]): Promise<number> {
   if (salesOrderIds.length === 0) return 0
@@ -1323,6 +1454,28 @@ async function setDefaultReturnWarehouse(code: string, on: boolean, restoreCode?
       }
     }
     return priorCode
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * The Xero accounting tax type a named IMS tax rate carries. Used to derive OC-14's EXPECTED per-line tax
+ * types from the store's OWN provisioned mappings (not from the sales order's own resolution, which would be
+ * circular) — so a build that mis-resolved a line to the wrong code (e.g. NONE) is caught by comparison.
+ * Not filtered on `active`: the rate a WC mapping points at may be inactive yet still the correct code.
+ */
+async function taxTypeForRateName(name: string): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ t: string | null }>(
+      `select accounting_tax_type as t from tax_rates where name = $1 and accounting_tax_type is not null limit 1`,
+      [name],
+    )
+    if (!r.rows.length || !r.rows[0].t) throw new Error(`No accounting tax type for rate "${name}" — the store's tax mappings are not provisioned as OC-14 expects.`)
+    return r.rows[0].t
   } finally {
     await db.end()
   }
