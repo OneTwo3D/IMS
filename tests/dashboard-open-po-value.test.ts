@@ -49,41 +49,42 @@ test('empty input is zero', () => {
   assert.equal(outstandingPoValueBase([]), 0)
 })
 
-test('an order-level header discount is netted pro-rata to the outstanding portion (o3d-1di)', () => {
-  // qty 10 received 0 @ £10 => £100 outstanding goods; £50 header discount (fx 1) fully outstanding
-  // => 100 - 50*(100/100) = £50
+test('an order-level header discount uses net subtotalBase, scaled by the outstanding fraction (o3d-1di)', () => {
+  // qty 10 received 0 @ £10 => gross 100, fully outstanding; header discount reduced net goods to
+  // subtotalBase £50 => 50 * (100/100) = £50. (subtotalBase already reflects the discount, in net base.)
   assert.equal(
     outstandingPoValueBase([
-      { discountAmount: 50, fxRateToBase: 1, lines: [{ qty: 10, qtyReceived: 0, unitCostBase: 10 }] },
+      { subtotalBase: 50, lines: [{ qty: 10, qtyReceived: 0, unitCostBase: 10 }] },
     ]),
     50,
   )
 })
 
-test('header discount allocates only the outstanding fraction on a partially-received PO', () => {
-  // qty 10 received 5 @ £10 => gross 100, outstanding 50; £50 discount => 50 - 50*(50/100) = £25
+test('net subtotalBase is scaled by only the outstanding fraction on a partially-received PO', () => {
+  // qty 10 received 5 @ £10 => gross 100, outstanding 50 => fraction 0.5; net subtotalBase £50
+  // => 50 * 0.5 = £25
   assert.equal(
     outstandingPoValueBase([
-      { discountAmount: 50, fxRateToBase: 1, lines: [{ qty: 10, qtyReceived: 5, unitCostBase: 10 }] },
+      { subtotalBase: 50, lines: [{ qty: 10, qtyReceived: 5, unitCostBase: 10 }] },
     ]),
     25,
   )
 })
 
-test('header discount is converted from foreign to base via fxRateToBase', () => {
-  // discount 10 foreign * fx 2 = £20 base; qty 10 @ £5 gross 50 all outstanding => 50 - 20 = £30
+test('subtotalBase is already base currency and net of VAT — no FX/VAT reconstruction', () => {
+  // A foreign PO: subtotalBase £30 (net base), qty 10 @ £5 gross 50 all outstanding => 30 * 1 = £30.
   assert.equal(
     outstandingPoValueBase([
-      { discountAmount: 10, fxRateToBase: 2, lines: [{ qty: 10, qtyReceived: 0, unitCostBase: 5 }] },
+      { subtotalBase: 30, lines: [{ qty: 10, qtyReceived: 0, unitCostBase: 5 }] },
     ]),
     30,
   )
 })
 
-test('an oversized header discount never drives a PO negative (floored at 0)', () => {
+test('a fully-discounted PO (subtotalBase 0) contributes nothing', () => {
   assert.equal(
     outstandingPoValueBase([
-      { discountAmount: 999, fxRateToBase: 1, lines: [{ qty: 10, qtyReceived: 0, unitCostBase: 10 }] },
+      { subtotalBase: 0, lines: [{ qty: 10, qtyReceived: 0, unitCostBase: 10 }] },
     ]),
     0,
   )
