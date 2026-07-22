@@ -23,7 +23,13 @@ const XERO_OAUTH_STATE_TTL_MS = 10 * 60 * 1000 // 10 minutes
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections'
 const XERO_ORGANISATION_URL = 'https://api.xero.com/api.xro/2.0/Organisation'
-const XERO_SCOPES = 'openid profile email offline_access accounting.settings accounting.contacts accounting.invoices accounting.manualjournals accounting.attachments'
+// accounting.payments is REQUIRED to POST /Payments — i.e. to register a customer payment against a sales
+// invoice (INVOICE_PAYMENT) or a supplier payment against a bill (BILL_PAYMENT). Xero's granular scopes put
+// payments in accounting.payments; accounting.invoices covers invoices/credit notes but NOT payments, so
+// without this the payment POST returns 401 AuthorizationUnsuccessful while every invoice/journal succeeds.
+// NB adding a scope only takes effect after a RECONNECT (re-consent): a refreshed token carries only the
+// scopes granted at the original consent. (Latent bug surfaced by the full-chain OC-15 payment test.)
+const XERO_SCOPES = 'openid profile email offline_access accounting.settings accounting.contacts accounting.invoices accounting.payments accounting.manualjournals accounting.attachments'
 
 type TokenResponse = {
   access_token: string
