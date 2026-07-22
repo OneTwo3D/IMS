@@ -951,6 +951,9 @@ export async function allocateSalesOrder(
 
     // o3d-67y (Codex r11): resolve the durable release backstop atomically with the reservation mutations, so a
     // crash between this commit and a separate resolve cannot leave the row pending for a redundant re-allocation.
+    // NOTE: the storefront stock-sync (enqueueStockSync in autoAllocateOrder) still runs POST-commit and remains
+    // best-effort — a crash after commit can lose it. That is a pre-existing, cross-cutting stock-sync durability
+    // gap (all allocation flows, non-Woo connectors), tracked separately in o3d-jhq, not resolved here.
     await input.onReconciledInTx?.(tx)
 
     return {
