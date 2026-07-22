@@ -885,20 +885,40 @@ test('a SHIPPED order WITH a dispatched shipment refuses PERMANENTLY', async () 
   assert.equal(isPermanentStatusTransitionError(error), true)
 })
 
-test('a SHIPPED order with NO dispatch evidence refuses TRANSIENTLY (o3d-bx9)', async () => {
+test('a FALSE-SHIPPED order (no dispatch evidence) is REPAIRED and cancelled, not refused (o3d-gz6)', async () => {
   // SalesOrder.status alone is not proof of dispatch: importWcOrder writes the configurable WooCommerce
   // status mapping straight into it, so a store can map a status to SHIPPED on an order that has no
-  // shipment at all. Acknowledging that would strand IMS as SHIPPED while Woo says CANCELLED, so it must
-  // stay retryable — the mapping may yet be corrected.
+  // shipment at all. Rather than refuse the Woo cancellation forever (it exhausted its retries and
+  // dead-lettered), repair the unreliable status to its pre-ship state and let the cancel release
+  // fulfilment and reach CANCELLED.
   const state = baseState({
     order: { ...baseState().order, status: 'SHIPPED' },
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
     shipments: [],
   })
   const client = createClient(state)
 
-  const error = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }).catch((e) => e)
-  assert.match(String(error?.message), /Cannot cancel a shipped order/)
-  assert.equal(isPermanentStatusTransitionError(error), false, 'no dispatch evidence => not terminal')
+  const result = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+
+  assert.equal(result.repairedFalseShipped, true, 'the false-SHIPPED anomaly is flagged for audit')
+  assert.equal(result.previousStatus, 'SHIPPED')
+  assert.equal(result.releasedAllocationCount, 1)
+  assert.equal(state.order.status, 'CANCELLED', 'the cancel now completes instead of dead-lettering')
+  assert.equal(state.stockLevels[0].reservedQty, 0, 'reservations are released')
+})
+
+test('a FALSE-SHIPPED order with no allocations still cancels (repairs to PROCESSING) (o3d-gz6)', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'SHIPPED' },
+    allocations: [],
+    shipments: [],
+  })
+  const client = createClient(state)
+
+  const result = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+  assert.equal(result.repairedFalseShipped, true)
+  assert.equal(state.order.status, 'CANCELLED')
 })
 
 test('updateSalesOrderStatusUnderLock refuses PICKING when allocations disappeared before locked update', async () => {

@@ -1499,6 +1499,23 @@ export async function applySalesOrderStatusTransition(
         cancelSalesOrderFulfillmentState(tx, { orderId: id, data, bypass: bypassPermission })
       ), STOCK_TX_OPTIONS)
       previousStatusForLog = cancellation.previousStatus
+      if (cancellation.repairedFalseShipped) {
+        // o3d-gz6: the order was SHIPPED with no dispatch evidence (a configurable WC status mapping
+        // wrote SHIPPED without a real shipment). We repaired the false status so this cancel could
+        // proceed instead of dead-lettering forever — surface the data anomaly for review.
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: id,
+          action: 'false_shipped_status_repaired',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Order ${getSalesOrderReference(so)} was SHIPPED with no dispatch evidence; repaired the false status to allow cancellation (o3d-gz6)`,
+          metadata: {
+            orderNumber: getSalesOrderReference(so),
+            releasedAllocations: cancellation.releasedAllocationCount,
+          },
+        })
+      }
       if (cancellation.deletedShipmentCount > 0) {
         await logActivity({
           entityType: 'SALES_ORDER',
