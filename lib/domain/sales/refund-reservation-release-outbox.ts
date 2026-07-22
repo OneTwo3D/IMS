@@ -43,7 +43,7 @@ import {
   SalesRefundUnmatchedWarningOutboxPayloadSchema,
 } from '@/lib/domain/integrations/outbox-registry'
 
-type OutboxUpdateClient = {
+export type OutboxUpdateClient = {
   integrationOutbox: { updateMany(args: unknown): Promise<{ count: number }> }
 }
 

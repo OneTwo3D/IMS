@@ -706,6 +706,31 @@ test('allocateSalesOrder refuses to rebuild allocations when guarded shipments e
   assert.equal(state.order.status, 'PROCESSING')
 })
 
+test('onReconciledInTx runs on the committed path (atomic backstop resolve) — o3d-67y r11', async () => {
+  const state = baseState()
+  let calls = 0
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    onReconciledInTx: async () => { calls++ },
+  })
+  assert.equal(result.success, true)
+  assert.equal(calls, 1, 'the in-tx resolve hook fires exactly once when allocation commits')
+})
+
+test('onReconciledInTx does NOT run on the refused path — the backstop stays pending for the drain (o3d-67y r11)', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', shipmentJournalDate: null }],
+  })
+  let calls = 0
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    refuseIfShipmentsExist: true,
+    onReconciledInTx: async () => { calls++ },
+  })
+  assert.equal(result.success, false)
+  assert.equal(calls, 0, 'a refuse must not resolve the backstop')
+})
+
 test('allocateSalesOrder blocks allocation edits after shipment accounting is journaled', async () => {
   const state = baseState({
     order: {

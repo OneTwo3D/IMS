@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
@@ -248,7 +249,14 @@ export async function getOrderFulfillmentRequirements(
 
 export async function autoAllocateOrder(
   orderId: string,
-  options?: { internalBypassToken?: symbol; deferStockSync?: boolean; refuseIfShipmentsExist?: boolean },
+  options?: {
+    internalBypassToken?: symbol
+    deferStockSync?: boolean
+    refuseIfShipmentsExist?: boolean
+    // o3d-67y (Codex r11): resolve a durable backstop INSIDE the allocation tx (committed path only) so a
+    // redundant re-allocation can't run in the commit→resolve window. See AllocateSalesOrderInput.onReconciledInTx.
+    onReconciledInTx?: (tx: Prisma.TransactionClient) => Promise<void>
+  },
 ): Promise<{
   success: boolean
   error?: string
@@ -280,6 +288,7 @@ export async function autoAllocateOrder(
     const allocationResult = await allocateSalesOrder(db, {
       orderId,
       refuseIfShipmentsExist: options?.refuseIfShipmentsExist,
+      onReconciledInTx: options?.onReconciledInTx,
     })
     allocationCommitted = true
 

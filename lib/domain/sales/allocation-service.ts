@@ -31,6 +31,13 @@ export type AllocationServiceClient = Prisma.TransactionClient | typeof db
 export type AllocateSalesOrderInput = {
   orderId: string
   refuseIfShipmentsExist?: boolean
+  /**
+   * o3d-67y (Codex review r11): run INSIDE the allocation transaction, after reservations are mutated and
+   * immediately before it commits, ONLY on the committed (non-refused) path. Lets the caller atomically mark a
+   * durable backstop resolved so a redundant, non-idempotent re-allocation cannot run in the window between the
+   * allocation commit and a separate resolve. A throw here rolls the allocation back (the backstop then retries).
+   */
+  onReconciledInTx?: (tx: Prisma.TransactionClient) => Promise<void>
 }
 
 export type AllocateSalesOrderResult = {
@@ -941,6 +948,10 @@ export async function allocateSalesOrder(
         })),
       ])),
     })
+
+    // o3d-67y (Codex r11): resolve the durable release backstop atomically with the reservation mutations, so a
+    // crash between this commit and a separate resolve cannot leave the row pending for a redundant re-allocation.
+    await input.onReconciledInTx?.(tx)
 
     return {
       nextAllocations,

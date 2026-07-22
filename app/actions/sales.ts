@@ -56,7 +56,6 @@ import {
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { releaseReservationsAfterRefund } from '@/lib/domain/sales/post-refund-release'
-import { resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
@@ -1879,7 +1878,7 @@ export async function createRefund(
     // demand; refuseIfShipmentsExist makes it a no-op once any shipment exists (the
     // shipment build caps shippable qty net of refunds). Limited to PROCESSING/ALLOCATED
     // so a refund can't promote a DRAFT/PENDING_PAYMENT order to ALLOCATED.
-    const releaseOutcome = await releaseReservationsAfterRefund(
+    await releaseReservationsAfterRefund(
       { orderId, refundId: refundResult.createdRefund?.id, eligible: refundResult.releaseEligible === true },
       {
         // The dynamic import lives INSIDE the guarded closure so a module-load/eval rejection is
@@ -1887,23 +1886,22 @@ export async function createRefund(
         // catch, which would report success:false for an ALREADY-COMMITTED refund.
         allocate: async (id) => {
           const { autoAllocateOrder } = await import('./allocation')
-          return autoAllocateOrder(id, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true })
+          const { resolveRefundReservationReleaseOutbox } = await import('@/lib/domain/sales/refund-reservation-release-outbox')
+          return autoAllocateOrder(id, {
+            internalBypassToken: INTERNAL_ACTION_BYPASS,
+            refuseIfShipmentsExist: true,
+            // o3d-67y (Codex r11): resolve the durable backstop ATOMICALLY with the reservation mutations. The
+            // committed allocation and the outbox SUCCEEDED write share one transaction, so a crash cannot leave
+            // the row pending for a redundant, non-idempotent re-allocation. Runs on the committed path only; a
+            // refuse/bail leaves the row PENDING for the drain to retry.
+            onReconciledInTx: async (tx) => {
+              await resolveRefundReservationReleaseOutbox(refundResult.createdRefund.id, { client: tx })
+            },
+          })
         },
         log: logActivity,
       },
     )
-    // o3d-67y: when the immediate release reconciled the reservation (committed, incl. a committed backorder, OR
-    // was deliberately refused because a shipment holds the units), resolve the durable backstop — otherwise the
-    // drain would re-run allocation, which is NOT side-effect-idempotent (it deletes/recreates OrderAllocation
-    // rows and resets staged allocation accounting). A genuine failure or a pre-transaction bail leaves the row
-    // PENDING so the drain retries and dead-letters visibly.
-    if (releaseOutcome.reconciled) {
-      try {
-        await resolveRefundReservationReleaseOutbox(refundResult.createdRefund.id)
-      } catch (resolveError) {
-        console.error('[refund] failed to resolve reservation-release backstop', resolveError)
-      }
-    }
 
     // o3d-67y (Codex r8): an unmatched external refund quantity (positive-qty sale line with no persisted
     // sales-order-line link) cannot be released — allocation ignores it — but the order still holds a
