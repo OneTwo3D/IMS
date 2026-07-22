@@ -12,6 +12,11 @@ import {
 // monopolise the sweep and starve later stranded orders (o3d-9lx Codex review).
 const DEFAULT_SWEEP_LIMIT = 200
 const CURSOR_SETTING_KEY = 'reallocation_sweep_cursor'
+// Each cycle is bounded by a high-watermark id snapshotted when the cycle starts, so PROCESSING orders
+// inserted ABOVE the watermark mid-cycle (a sustained influx of higher ids) can't keep every page full
+// and prevent the wrap — the wrap is guaranteed once the fixed snapshot is exhausted, and rows below the
+// cursor are then picked up on the next cycle (o3d-9lx Codex review).
+const WATERMARK_SETTING_KEY = 'reallocation_sweep_watermark'
 
 // autoAllocateOrder reports these via { success:false, error } for orders that simply can't be covered
 // right now (a genuine backorder) or already have shipments — expected, not a failure to log.
@@ -43,11 +48,15 @@ export type ReallocationSweepResult = {
   nextCursor: string
 }
 
+export type SweepCursorState = { cursor: string; watermark: string }
+
 export interface ReallocationSweepDeps {
-  readCursor: () => Promise<string>
-  writeCursor: (cursor: string) => Promise<void>
-  /** Up to `limit + 1` PROCESSING, shipment-free orders with id > cursor, ordered by id ascending. */
-  loadCandidatesPage: (cursor: string, limit: number) => Promise<SweepCandidate[]>
+  readState: () => Promise<SweepCursorState>
+  writeState: (state: SweepCursorState) => Promise<void>
+  /** The current max PROCESSING order id — the per-cycle upper id bound. '' when there are none. */
+  snapshotWatermark: () => Promise<string>
+  /** Up to `limit + 1` PROCESSING, shipment-free orders with cursor < id <= watermark, id ascending. */
+  loadCandidatesPage: (cursor: string, watermark: string, limit: number) => Promise<SweepCandidate[]>
   selectNeedingAllocation: (candidates: SweepCandidate[]) => Promise<SweepCandidate[]>
   autoAllocateOrder: (
     orderId: string,
@@ -57,28 +66,52 @@ export interface ReallocationSweepDeps {
   logActivity: typeof logActivity
 }
 
-async function defaultReadCursor(): Promise<string> {
-  const row = await db.setting.findUnique({ where: { key: CURSOR_SETTING_KEY } })
-  return row?.value ?? ''
-}
-
-async function defaultWriteCursor(cursor: string): Promise<void> {
-  await db.setting.upsert({
-    where: { key: CURSOR_SETTING_KEY },
-    create: { key: CURSOR_SETTING_KEY, value: cursor },
-    update: { value: cursor },
+async function defaultReadState(): Promise<SweepCursorState> {
+  const rows = await db.setting.findMany({
+    where: { key: { in: [CURSOR_SETTING_KEY, WATERMARK_SETTING_KEY] } },
+    select: { key: true, value: true },
   })
+  const byKey = new Map(rows.map((r) => [r.key, r.value]))
+  return { cursor: byKey.get(CURSOR_SETTING_KEY) ?? '', watermark: byKey.get(WATERMARK_SETTING_KEY) ?? '' }
 }
 
-async function defaultLoadCandidatesPage(cursor: string, limit: number): Promise<SweepCandidate[]> {
-  // Keyset pagination by id (id > cursor). Shipped orders are excluded — reallocating one would decrement
-  // stock against stale ShipmentLines. take = limit + 1 so the caller can tell a full page (remainder
-  // exists) from the final page (wrap) without a separate count.
+async function defaultWriteState(state: SweepCursorState): Promise<void> {
+  await db.$transaction([
+    db.setting.upsert({
+      where: { key: CURSOR_SETTING_KEY },
+      create: { key: CURSOR_SETTING_KEY, value: state.cursor },
+      update: { value: state.cursor },
+    }),
+    db.setting.upsert({
+      where: { key: WATERMARK_SETTING_KEY },
+      create: { key: WATERMARK_SETTING_KEY, value: state.watermark },
+      update: { value: state.watermark },
+    }),
+  ])
+}
+
+async function defaultSnapshotWatermark(): Promise<string> {
+  const row = await db.salesOrder.findFirst({
+    where: { status: 'PROCESSING' },
+    orderBy: { id: 'desc' },
+    select: { id: true },
+  })
+  return row?.id ?? ''
+}
+
+async function defaultLoadCandidatesPage(
+  cursor: string,
+  watermark: string,
+  limit: number,
+): Promise<SweepCandidate[]> {
+  // Keyset pagination within the cycle snapshot: cursor < id <= watermark. Shipped orders are excluded —
+  // reallocating one would decrement stock against stale ShipmentLines. take = limit + 1 so the caller
+  // can tell a full page (remainder exists) from the final page (wrap) without a separate count.
   return db.salesOrder.findMany({
     where: {
       status: 'PROCESSING',
       shipments: { none: {} },
-      ...(cursor ? { id: { gt: cursor } } : {}),
+      ...(cursor ? { id: { gt: cursor, lte: watermark } } : { id: { lte: watermark } }),
     },
     select: {
       id: true,
@@ -112,8 +145,9 @@ export async function sweepUnallocatedProcessingOrders(
 ): Promise<ReallocationSweepResult> {
   const limit = opts.limit ?? DEFAULT_SWEEP_LIMIT
   const deps: ReallocationSweepDeps = {
-    readCursor: defaultReadCursor,
-    writeCursor: defaultWriteCursor,
+    readState: defaultReadState,
+    writeState: defaultWriteState,
+    snapshotWatermark: defaultSnapshotWatermark,
     loadCandidatesPage: defaultLoadCandidatesPage,
     selectNeedingAllocation: (candidates) => selectOrdersNeedingAllocation(candidates),
     autoAllocateOrder: async (orderId, o) =>
@@ -132,21 +166,42 @@ export async function sweepUnallocatedProcessingOrders(
     nextCursor: '',
   }
 
-  const cursor = await deps.readCursor()
-  const page = await deps.loadCandidatesPage(cursor, limit)
+  const state = await deps.readState()
+  const cursor = state.cursor
+  let watermark = state.watermark
+  // Start of a new cycle (cursor cleared): snapshot the current max PROCESSING id as the fixed upper
+  // bound for this cycle, so a mid-cycle influx of higher ids can't stop the wrap.
+  if (!cursor) {
+    watermark = await deps.snapshotWatermark()
+    if (!watermark) {
+      // No PROCESSING orders at all — clear any stale state and finish.
+      await deps.writeState({ cursor: '', watermark: '' })
+      return result
+    }
+  }
+
+  const page = await deps.loadCandidatesPage(cursor, watermark, limit)
   const hasRemainder = page.length > limit
   const batch = hasRemainder ? page.slice(0, limit) : page
 
-  // Advance the cursor over the RAW batch (not the allocation-filtered subset) so benign no-stock
-  // backorders still move the scan forward — that is what guarantees progress and prevents starvation.
-  // A short/empty page wraps the cursor to '' so the next run restarts from the beginning.
-  const nextCursor = hasRemainder && batch.length > 0 ? batch[batch.length - 1].id : ''
-  await deps.writeCursor(nextCursor)
+  // The cursor advances over the RAW batch (not the allocation-filtered subset) so benign no-stock
+  // backorders still move the scan forward — that is what guarantees progress. A full page continues the
+  // cycle from the last-scanned id; a short/empty page means the snapshot is exhausted, so wrap (clear
+  // both, re-snapshot next run). The state is persisted AFTER the batch is processed, so a mid-batch
+  // throw/crash leaves the cursor unchanged and the batch is retried idempotently next tick.
+  const nextState: SweepCursorState =
+    hasRemainder && batch.length > 0
+      ? { cursor: batch[batch.length - 1].id, watermark }
+      : { cursor: '', watermark: '' }
 
   result.scanned = batch.length
   result.hasRemainder = hasRemainder
-  result.nextCursor = nextCursor
-  if (batch.length === 0) return result
+  result.nextCursor = nextState.cursor
+
+  if (batch.length === 0) {
+    await deps.writeState(nextState)
+    return result
+  }
 
   const needing = await deps.selectNeedingAllocation(batch)
   result.needing = needing.length
@@ -209,6 +264,12 @@ export async function sweepUnallocatedProcessingOrders(
       resolveUser: false,
     })
   }
+
+  // Persist the cursor ONLY after the batch has been fully processed. A batch-level throw (selection,
+  // a timeout) above this point leaves the cursor unchanged, so the unprocessed batch is retried next
+  // tick rather than skipped until a full rotation. Per-order allocation failures are caught above and
+  // still advance (they're benign/logged), so a single bad order can't wedge the cursor.
+  await deps.writeState(nextState)
 
   return result
 }

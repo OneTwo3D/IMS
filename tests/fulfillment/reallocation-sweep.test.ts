@@ -4,12 +4,14 @@ import test from 'node:test'
 import {
   sweepUnallocatedProcessingOrders,
   type ReallocationSweepDeps,
+  type SweepCursorState,
 } from '@/lib/fulfillment/reallocation-sweep'
 
 // o3d-9lx: the sweep re-runs allocation for PROCESSING orders with outstanding demand (a paid order
-// whose poller allocation failed transiently), gated on allocation state — not payment state — and
-// walks the PROCESSING set via a durable keyset cursor so permanent backorders can't starve later
-// orders. All collaborators are injected so the orchestration is verified without a DB.
+// whose poller allocation failed transiently), gated on allocation state — not payment state. It walks
+// the PROCESSING set with a durable keyset cursor bounded by a per-cycle high-watermark, persisting the
+// cursor only after a batch is processed. All collaborators are injected so the orchestration is
+// verified without a DB.
 
 type Deps = Partial<ReallocationSweepDeps>
 type LogEntry = Parameters<ReallocationSweepDeps['logActivity']>[0]
@@ -29,14 +31,19 @@ function baseDeps(over: Deps = {}) {
     alloc: [] as string[],
     sync: [] as string[][],
     logs: [] as { action: string; level: string | undefined }[],
-    cursorWrites: [] as string[],
+    stateWrites: [] as SweepCursorState[],
+    snapshots: 0,
   }
-  let cursor = ''
+  let state: SweepCursorState = { cursor: '', watermark: '' }
   const deps: Deps = {
-    readCursor: async () => cursor,
-    writeCursor: async (c) => {
-      cursor = c
-      calls.cursorWrites.push(c)
+    readState: async () => state,
+    writeState: async (s) => {
+      state = s
+      calls.stateWrites.push(s)
+    },
+    snapshotWatermark: async () => {
+      calls.snapshots += 1
+      return 'WM-MAX'
     },
     loadCandidatesPage: async () => [order('SO-1'), order('SO-2')],
     selectNeedingAllocation: async (c) => c, // by default all need allocation
@@ -103,8 +110,7 @@ test('a throwing autoAllocateOrder is caught, counted, and does not abort the sw
   })
   const result = await sweepUnallocatedProcessingOrders({ deps })
   assert.equal(result.errors, 1)
-  // SO-2 is still allocated even though SO-1 threw first — the loop doesn't abort.
-  assert.equal(result.allocated, 1)
+  assert.equal(result.allocated, 1) // SO-2 still processed after SO-1 threw
 })
 
 test('per-order stock syncs are coalesced into a single push', async () => {
@@ -129,48 +135,69 @@ test('nothing needing allocation -> no allocate calls, no sync', async () => {
   assert.equal(calls.sync.length, 0)
 })
 
-// --- Durable keyset cursor: guarantees progress, prevents starvation --------
+test('no PROCESSING orders -> snapshot returns empty, state cleared, no work', async () => {
+  const { deps, calls } = baseDeps({ snapshotWatermark: async () => '' })
+  const result = await sweepUnallocatedProcessingOrders({ deps })
+  assert.equal(result.scanned, 0)
+  assert.deepEqual(calls.stateWrites, [{ cursor: '', watermark: '' }])
+  assert.equal(calls.alloc.length, 0)
+})
 
-test('a full page advances the cursor to the last-scanned id and reports a remainder', async () => {
+// --- Durable keyset cursor + per-cycle high-watermark -----------------------
+
+test('a full page advances the cursor and keeps the cycle watermark', async () => {
   const { deps, calls } = baseDeps({
-    // limit=2 -> loader returns limit+1=3; the 3rd row signals a remainder.
-    loadCandidatesPage: async () => [order('SO-1'), order('SO-2'), order('SO-3')],
+    loadCandidatesPage: async () => [order('SO-1'), order('SO-2'), order('SO-3')], // limit+1 -> remainder
     selectNeedingAllocation: async () => [],
   })
   const result = await sweepUnallocatedProcessingOrders({ limit: 2, deps })
   assert.equal(result.hasRemainder, true)
-  assert.equal(result.scanned, 2) // the extra row is a lookahead, not processed
-  assert.equal(result.nextCursor, 'SO-2') // cursor = last id in the processed batch
-  assert.deepEqual(calls.cursorWrites, ['SO-2'])
+  assert.equal(result.scanned, 2) // extra row is a lookahead, not processed
+  assert.deepEqual(calls.stateWrites, [{ cursor: 'SO-2', watermark: 'WM-MAX' }])
+  assert.equal(calls.snapshots, 1) // snapshot taken once at cycle start
 })
 
-test('a final (short) page wraps the cursor back to the start', async () => {
+test('a short final page wraps: cursor and watermark cleared', async () => {
   const { deps, calls } = baseDeps({
-    loadCandidatesPage: async () => [order('SO-9')], // fewer than limit+1 -> last page
+    loadCandidatesPage: async () => [order('SO-9')],
     selectNeedingAllocation: async () => [],
   })
   const result = await sweepUnallocatedProcessingOrders({ limit: 2, deps })
   assert.equal(result.hasRemainder, false)
-  assert.equal(result.nextCursor, '')
-  assert.deepEqual(calls.cursorWrites, [''])
+  assert.deepEqual(calls.stateWrites, [{ cursor: '', watermark: '' }])
+})
+
+test('mid-cycle the snapshot is NOT retaken and the stored watermark bounds the page (o3d-9lx)', async () => {
+  let passedWatermark = ''
+  const { deps, calls } = baseDeps({
+    readState: async () => ({ cursor: 'SO-2', watermark: 'WM-FIXED' }), // mid-cycle
+    loadCandidatesPage: async (_c, wm) => {
+      passedWatermark = wm
+      return [order('SO-3')]
+    },
+    selectNeedingAllocation: async () => [],
+  })
+  await sweepUnallocatedProcessingOrders({ limit: 2, deps })
+  assert.equal(calls.snapshots, 0, 'no re-snapshot while a cycle is in progress')
+  assert.equal(passedWatermark, 'WM-FIXED', 'the stored cycle watermark bounds the scan')
 })
 
 test('a stable first page of benign backorders does not starve a later eligible order (o3d-9lx)', async () => {
-  // Page 1 = two permanent no-stock backorders (always PROCESSING, never allocatable). Page 2 (after the
-  // cursor advances) holds a genuinely-stranded order WITH stock. The cursor must reach it on run 2.
+  // Page 1 = two permanent no-stock backorders. Page 2 (after the cursor advances) holds a genuinely
+  // stranded order WITH stock. The cursor must reach it on the next tick.
   const pages: Record<string, Candidate[]> = {
     '': [order('SO-1'), order('SO-2'), order('SO-3')], // limit=2 -> remainder; batch = SO-1,SO-2
-    'SO-2': [order('SO-3')], // next page: the eligible order
+    'SO-2': [order('SO-3')],
   }
-  let cursor = ''
+  let state: SweepCursorState = { cursor: '', watermark: '' }
   const attempted: string[] = []
   const deps: Deps = {
-    readCursor: async () => cursor,
-    writeCursor: async (c) => {
-      cursor = c
+    readState: async () => state,
+    writeState: async (s) => {
+      state = s
     },
+    snapshotWatermark: async () => 'SO-3',
     loadCandidatesPage: async (cur) => pages[cur] ?? [],
-    // SO-1/SO-2 never need allocation-that-succeeds (benign); SO-3 does.
     selectNeedingAllocation: async (c) => c,
     autoAllocateOrder: async (orderId) => {
       attempted.push(orderId)
@@ -183,10 +210,21 @@ test('a stable first page of benign backorders does not starve a later eligible 
 
   const run1 = await sweepUnallocatedProcessingOrders({ limit: 2, deps })
   assert.equal(run1.nextCursor, 'SO-2')
-  assert.deepEqual(attempted, ['SO-1', 'SO-2']) // page 1 only
+  assert.deepEqual(attempted, ['SO-1', 'SO-2'])
 
   const run2 = await sweepUnallocatedProcessingOrders({ limit: 2, deps })
   assert.equal(run2.allocated, 1)
-  assert.ok(attempted.includes('SO-3'), 'the later eligible order is reached on the next tick, not starved')
-  assert.equal(run2.nextCursor, '') // short page -> wrap
+  assert.ok(attempted.includes('SO-3'), 'the later eligible order is reached, not starved')
+})
+
+test('a batch-level failure leaves the cursor unchanged for an idempotent retry (o3d-9lx)', async () => {
+  const { deps, calls } = baseDeps({
+    loadCandidatesPage: async () => [order('SO-1'), order('SO-2')],
+    selectNeedingAllocation: async () => {
+      throw new Error('selection query failed')
+    },
+  })
+  await assert.rejects(() => sweepUnallocatedProcessingOrders({ deps }), /selection query failed/)
+  // The cursor is persisted only AFTER the batch is handled, so a throw leaves it untouched.
+  assert.deepEqual(calls.stateWrites, [])
 })
