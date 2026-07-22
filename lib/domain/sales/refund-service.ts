@@ -16,6 +16,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
+import { scheduleRefundReservationReleaseOutbox, scheduleRefundUnmatchedWarningOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import {
@@ -248,6 +249,14 @@ export type CreateSalesOrderRefundResult =
       /** True when this is an idempotent replay of an already-recorded refund (duplicate
        *  external delivery), not a newly created one — callers skip one-time side effects. */
       replayed?: boolean
+      /** o3d-67y: true when the order held stock reservations (OrderAllocation rows) at refund time, so the
+       *  caller should run the immediate post-refund reservation release. Derived under the order lock from
+       *  actual allocations, not lifecycle status. Undefined on a replay (the original refund scheduled it). */
+      releaseEligible?: boolean
+      /** o3d-67y: true when a positive-quantity sale refund line has no persisted sales-order-line link and a
+       *  live residual reservation exists on a partial refund — the reservation cannot be safely released and
+       *  the caller must surface it (a later shipment could include the refunded quantity). */
+      releaseUnmatchedAnomaly?: boolean
     }
 
 export type RetrySalesOrderRefundAccountingResult =
@@ -1940,6 +1949,49 @@ export async function createSalesOrderRefund(
       ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
       : []
 
+    // o3d-67y: eligibility is derived from RESIDUAL reserved quantity under this order lock, not lifecycle
+    // status and not raw allocation-row count. Dispatch decrements stockLevel.reservedQty but RETAINS the
+    // OrderAllocation rows for accounting snapshots (Codex review r5), so a fully-dispatched order still has
+    // rows yet nothing to release — counting rows would enqueue a job that refuses and becomes a false
+    // dead-letter. Residual = allocated qty − already-shipped qty; only a positive residual is a live
+    // reservation a refund can strand.
+    const [allocatedAgg, shippedAgg] = await Promise.all([
+      tx.orderAllocation.aggregate({ where: { orderId: input.orderId }, _sum: { qty: true } }),
+      tx.shipmentLine.aggregate({
+        where: { shipment: { orderId: input.orderId, status: 'SHIPPED' } },
+        _sum: { qty: true },
+      }),
+    ])
+    const residualReserved =
+      refundBoundaryNumber(allocatedAgg._sum.qty ?? 0) - refundBoundaryNumber(shippedAgg._sum.qty ?? 0)
+    const releaseEligible = isRefundReleaseEligible({ residualReserved, newStatus, refundLines: createdRefundLines })
+    // o3d-67y (Codex r8/r9): a positive-qty sale refund line with no persisted sales-order-line link (an
+    // unmatched external WooCommerce line) can't reduce a tracked line's demand and is not a safe release
+    // target — but with a live residual reservation on a partial refund it is a data-quality anomaly the
+    // operator must see (the reservation stays held and a later shipment could include the refunded quantity).
+    // Computed INDEPENDENTLY of releaseEligible so a MIXED refund (one matched + one unmatched line) still
+    // surfaces it (a matched line makes the release eligible but does not resolve the unmatched line).
+    const releaseUnmatchedAnomaly =
+      residualReserved > 0 && newStatus !== 'REFUNDED' && hasUnmatchedSaleRefund(createdRefundLines)
+
+    // Enqueue the durable reservation-release backstop INSIDE this tx so it commits atomically with the refund.
+    // The immediate post-commit release (in the caller) stays for timeliness; this row guarantees the release
+    // still happens if that call is bypassed by a post-commit throw or lost to a crash. No-op when the order
+    // holds no allocations.
+    await scheduleRefundReservationReleaseOutbox(tx, {
+      orderId: input.orderId,
+      refundId: createdRefund.id,
+      eligible: releaseEligible,
+    })
+    // Separate durable row (Codex r10): delivering the unmatched-line WARNING must never re-run allocation, so
+    // it does not share the release row's lifecycle.
+    await scheduleRefundUnmatchedWarningOutbox(tx, {
+      orderId: input.orderId,
+      refundId: createdRefund.id,
+      refundOrderRef: getSalesOrderReference(so),
+      unmatched: releaseUnmatchedAnomaly,
+    })
+
     return {
       so,
       fxRate,
@@ -1947,6 +1999,8 @@ export async function createSalesOrderRefund(
       createdRefundLines,
       creditNoteNumber,
       newStatus,
+      releaseEligible,
+      releaseUnmatchedAnomaly,
       fallbackReturnRows,
     }
   }).catch((error) => {
@@ -2057,6 +2111,8 @@ export async function createSalesOrderRefund(
     accountingSyncs,
     accountingWarning,
     returnedRows,
+    releaseEligible: txResult.releaseEligible,
+    releaseUnmatchedAnomaly: txResult.releaseUnmatchedAnomaly,
   }
 }
 

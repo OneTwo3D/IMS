@@ -130,11 +130,15 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
             data: updateData,
           })
 
-          // Trigger auto-allocation if status advanced
+          // Trigger auto-allocation if status advanced.
+          // o3d-67y: this runs in the sessionless cron, so it MUST pass INTERNAL_ACTION_BYPASS (as the Xero
+          // poller does) — otherwise requirePermission('sales.process') fails, autoAllocateOrder returns
+          // success:false, and since the poller only re-selects paidAt:null orders the paid order is never
+          // retried and silently stays unallocated.
           if (order.status === 'PENDING_PAYMENT') {
             try {
               const { autoAllocateOrder } = await import('@/app/actions/allocation')
-              await autoAllocateOrder(order.id)
+              await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
             } catch {
               // Non-critical — allocation can be done manually
             }

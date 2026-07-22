@@ -33,6 +33,13 @@ export type AllocationServiceClient = Prisma.TransactionClient | typeof db
 export type AllocateSalesOrderInput = {
   orderId: string
   refuseIfShipmentsExist?: boolean
+  /**
+   * o3d-67y (Codex review r11): run INSIDE the allocation transaction, after reservations are mutated and
+   * immediately before it commits, ONLY on the committed (non-refused) path. Lets the caller atomically mark a
+   * durable backstop resolved so a redundant, non-idempotent re-allocation cannot run in the window between the
+   * allocation commit and a separate resolve. A throw here rolls the allocation back (the backstop then retries).
+   */
+  onReconciledInTx?: (tx: Prisma.TransactionClient) => Promise<void>
 }
 
 export type AllocateSalesOrderResult = {
@@ -47,6 +54,9 @@ export type AllocateSalesOrderResult = {
   isShoppingOrder?: boolean
   shipFromWarehouseId?: string | null
   logAttempt?: boolean
+  // o3d-67y: true when refuseIfShipmentsExist declined because a shipment exists — the
+  // reservation was deliberately left untouched (not a failure, not a reconciliation).
+  refused?: boolean
 }
 
 export type AllocationUnallocatedLine = Pick<
@@ -965,6 +975,13 @@ export async function allocateSalesOrder(
       ])),
     })
 
+    // o3d-67y (Codex r11): resolve the durable release backstop atomically with the reservation mutations, so a
+    // crash between this commit and a separate resolve cannot leave the row pending for a redundant re-allocation.
+    // NOTE: the storefront stock-sync (enqueueStockSync in autoAllocateOrder) still runs POST-commit and remains
+    // best-effort — a crash after commit can lose it. That is a pre-existing, cross-cutting stock-sync durability
+    // gap (all allocation flows, non-Woo connectors), tracked separately in o3d-jhq, not resolved here.
+    await input.onReconciledInTx?.(tx)
+
     return {
       nextAllocations,
       syncProductIds: [...new Set([
@@ -1013,6 +1030,7 @@ export async function allocateSalesOrder(
       orderRef,
       isShoppingOrder,
       shipFromWarehouseId: so.shipFromWarehouseId,
+      refused: true,
     }
   }
 

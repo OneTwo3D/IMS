@@ -250,6 +250,27 @@ function createClient(state: State): RefundServiceClient {
         state.settings[where.key] = state.settings[where.key] == null ? create.value : update.value
       },
     },
+    orderAllocation: {
+      // o3d-67y: refund-release eligibility is residual reserved qty = allocated − shipped, under the lock.
+      aggregate: async ({ where }: { where: { orderId: string } }) => ({
+        _sum: { qty: state.allocations.filter((row) => row.orderId === where.orderId).reduce((sum, row) => sum + row.qty, 0) },
+      }),
+    },
+    shipmentLine: {
+      aggregate: async ({ where }: { where: { shipment: { orderId: string; status: string } } }) => ({
+        _sum: {
+          qty: state.shipments
+            .filter((s) => s.orderId === where.shipment.orderId && s.status === where.shipment.status)
+            .reduce((sum, s) => sum + s.lines.reduce((lineSum, line) => lineSum + line.qty, 0), 0),
+        },
+      }),
+    },
+    integrationOutbox: {
+      // o3d-67y: the durable reservation-release backstop is enqueued inside the refund tx when the order holds
+      // allocations. These unit tests don't assert on the outbox, so this is a sink.
+      create: async ({ data }: { data: Record<string, unknown> }) => data,
+      findUnique: async () => null,
+    },
     salesOrder: {
       findUnique: async ({ where, select }: { where: { id: string }; select: Record<string, unknown> }) => {
         const order = state.orders.find((row) => row.id === where.id)

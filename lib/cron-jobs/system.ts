@@ -82,4 +82,14 @@ registerCronJobs([
     defaultSchedule: '*/15 * * * *',
     defaultEnabled: true,
   },
+  {
+    slug: 'refund-reservation-release',
+    settingKey: 'refund_reservation_release',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Refund Reservation Release',
+    description: 'Durable backstop that re-runs allocation to release stock reservations for refunded units when the immediate post-refund release was bypassed or lost (o3d-67y).',
+    defaultSchedule: '*/15 * * * *',
+    defaultEnabled: true,
+  },
 ])

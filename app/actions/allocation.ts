@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
@@ -248,7 +249,14 @@ export async function getOrderFulfillmentRequirements(
 
 export async function autoAllocateOrder(
   orderId: string,
-  options?: { internalBypassToken?: symbol; deferStockSync?: boolean; refuseIfShipmentsExist?: boolean },
+  options?: {
+    internalBypassToken?: symbol
+    deferStockSync?: boolean
+    refuseIfShipmentsExist?: boolean
+    // o3d-67y (Codex r11): resolve a durable backstop INSIDE the allocation tx (committed path only) so a
+    // redundant re-allocation can't run in the commit→resolve window. See AllocateSalesOrderInput.onReconciledInTx.
+    onReconciledInTx?: (tx: Prisma.TransactionClient) => Promise<void>
+  },
 ): Promise<{
   success: boolean
   error?: string
@@ -257,7 +265,22 @@ export async function autoAllocateOrder(
   unallocatedLines?: AllocationUnallocatedLine[]
   unallocatedQty?: number
   backorderLineCount?: number
+  // o3d-67y: true ONLY when the allocation TRANSACTION threw and rolled back — i.e. reservations were NOT
+  // mutated. A plain success:false (a refuseIfShipmentsExist no-op, or a committed backorder/shortage) leaves
+  // reservations consistent and must NOT be treated as a stranded-reservation failure by callers.
+  failed?: boolean
+  // o3d-67y: true when refuseIfShipmentsExist declined because a shipment exists. The reservation was left
+  // untouched by design; the shipment-vs-refund reservation reconciliation is tracked separately (o3d-339).
+  refused?: boolean
+  // o3d-67y: true ONLY when the allocation transaction actually COMMITTED (runAllocation ran) — reservedQty is
+  // now reconciled. A pre-transaction exit (no eligible warehouse, permission bail) leaves committed FALSE, so
+  // a post-refund backstop must NOT treat it as a completed release (Codex review r3).
+  committed?: boolean
 }> {
+  // o3d-67y: distinguish a rolled-back allocation transaction (reservations stale) from a POST-commit throw
+  // (revalidate / stock-sync enqueue) that leaves reservations already correct. Only the former is a
+  // stranded-reservation failure; a post-commit throw must NOT raise a false stale-reservation warning.
+  let allocationCommitted = false
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
@@ -265,9 +288,13 @@ export async function autoAllocateOrder(
     const allocationResult = await allocateSalesOrder(db, {
       orderId,
       refuseIfShipmentsExist: options?.refuseIfShipmentsExist,
+      onReconciledInTx: options?.onReconciledInTx,
     })
+    allocationCommitted = true
 
     if (!allocationResult.logAttempt && !allocationResult.success) {
+      // No runAllocation commit: either an accepted refusal (shipment exists) or a pre-transaction bail
+      // (no eligible warehouse). committed:false so the backstop treats a bail as unreconciled/retryable.
       return {
         success: false,
         error: allocationResult.error,
@@ -276,6 +303,8 @@ export async function autoAllocateOrder(
         unallocatedLines: allocationResult.unallocatedLines,
         unallocatedQty: allocationResult.unallocatedQty,
         backorderLineCount: allocationResult.backorderLineCount,
+        refused: allocationResult.refused,
+        committed: false,
       }
     }
 
@@ -338,6 +367,8 @@ export async function autoAllocateOrder(
         unallocatedLines: allocationResult.unallocatedLines,
         unallocatedQty: allocationResult.unallocatedQty,
         backorderLineCount: allocationResult.backorderLineCount,
+        // logAttempt path — runAllocation committed (released refunded units, could not re-reserve all).
+        committed: true,
       }
     }
     if (!options?.deferStockSync) {
@@ -357,9 +388,15 @@ export async function autoAllocateOrder(
       unallocatedLines: allocationResult.unallocatedLines,
       unallocatedQty: allocationResult.unallocatedQty,
       backorderLineCount: allocationResult.backorderLineCount,
+      committed: true,
     }
   } catch (e) {
-    return { success: false, error: String(e) }
+    // Flag a genuine stranding ONLY when the allocation transaction did not commit (it threw + rolled back,
+    // or permission/setup failed before it ran). A throw AFTER allocationCommitted is a post-commit
+    // side-effect failure (cache revalidation, stock-sync enqueue) — reservations are already correct, so it
+    // is not a stranded-reservation failure (o3d-67y). committed mirrors that: a post-commit throw is
+    // reconciled, a pre-commit throw is not.
+    return { success: false, error: String(e), failed: !allocationCommitted, committed: allocationCommitted }
   }
 }
 

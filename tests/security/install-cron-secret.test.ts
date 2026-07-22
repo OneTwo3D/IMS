@@ -29,3 +29,16 @@ test('installer cron entries read the secret at runtime and never embed it', asy
     'install-time CRON_SECRET interpolation must not appear in generated crontab lines',
   )
 })
+
+test('installer bootstrap schedules the always-on durability crons (o3d-67y)', async () => {
+  const installScript = await readFile('scripts/install.sh', 'utf8')
+  const block = installScript.match(/CRON_JOBS=\(([\s\S]*?)\)/)
+  assert.ok(block, 'install.sh must declare a CRON_JOBS bootstrap array')
+  const jobs = block![1]
+  // These run every store regardless of which integrations are configured; registry
+  // registration alone does not touch the OS crontab until an operator saves the
+  // scheduler, so the durability backstops must be bootstrapped at install time.
+  for (const slug of ['delivery-status', 'refund-reservation-release']) {
+    assert.match(jobs, new RegExp(`\\|${slug}\\|`), `bootstrap crontab must include ${slug}`)
+  }
+})

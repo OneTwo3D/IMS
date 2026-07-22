@@ -14,6 +14,27 @@ export const XeroAccountingOutboxPayloadSchema = z.object({
   accountingSyncLogId: nonEmptyString,
 })
 
+// o3d-67y: a refund reduces an allocated order's demand, so the refunded units'
+// stock reservation must be released by re-running allocation AFTER the refund tx
+// commits. That release is best-effort and can be bypassed by a post-commit throw
+// or lost to a crash. This backstop row is enqueued INSIDE the refund tx (durable,
+// atomic with the refund) and drained idempotently — re-running allocation on an
+// already-released order is a harmless no-op. Payload carries only the identifiers
+// the drain re-reads under the order lock.
+export const SalesRefundReservationReleaseOutboxPayloadSchema = z.object({
+  orderId: nonEmptyString,
+  refundId: nonEmptyString,
+})
+
+// o3d-67y r10: a SEPARATE row (independent idempotency + lifecycle) carries the durable operator WARNING for an
+// unmatched external refund quantity line that allocation cannot release. Kept distinct from the release row so
+// delivering the WARNING never re-runs the non-idempotent allocation (Codex review r10).
+export const SalesRefundUnmatchedWarningOutboxPayloadSchema = z.object({
+  orderId: nonEmptyString,
+  refundId: nonEmptyString,
+  refundOrderRef: z.string().optional().default(''),
+})
+
 /**
  * Scaffolded for future outbox-based Mintsoft webhook processing. Current
  * Mintsoft webhook processing routes through the WMS booked-in job
@@ -67,6 +88,10 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
   accounting: {
     'landed-cost.adjustment-journal': { name: 'processLandedCostAdjustmentJournal', schema: LandedCostJournalOutboxPayloadSchema },
   },
+  sales: {
+    'refund.reservation-release': { name: 'processRefundReservationRelease', schema: SalesRefundReservationReleaseOutboxPayloadSchema },
+    'refund.unmatched-warning': { name: 'processRefundUnmatchedWarning', schema: SalesRefundUnmatchedWarningOutboxPayloadSchema },
+  },
 })
 
 type OperationConstants<T extends Record<string, Record<string, OutboxRegistryEntry>>> = {
@@ -93,6 +118,7 @@ export const INTEGRATION_OUTBOX_OPERATIONS = buildOperationConstants(INTEGRATION
 export type RegisteredOutboxConnector = keyof typeof INTEGRATION_OUTBOX_REGISTRY
 
 export type LandedCostJournalOutboxPayload = z.infer<typeof LandedCostJournalOutboxPayloadSchema>
+export type SalesRefundReservationReleaseOutboxPayload = z.infer<typeof SalesRefundReservationReleaseOutboxPayloadSchema>
 export type WcStockSyncOutboxPayload = z.infer<typeof WcStockSyncOutboxPayloadSchema>
 export type XeroAccountingOutboxPayload = z.infer<typeof XeroAccountingOutboxPayloadSchema>
 export type MintsoftBookedInOutboxPayload = z.infer<typeof MintsoftBookedInOutboxPayloadSchema>
