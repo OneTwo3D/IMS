@@ -5,7 +5,7 @@ import { hasPermission } from '@/lib/permissions'
 
 const HEADERS = [
   'productId', 'parentProductId',
-  'sku', 'name', 'description', 'type', 'parentSku', 'barcode', 'mpn',
+  'sku', 'name', 'description', 'type', 'parentSku', 'barcode', 'mpn', 'countryOfOrigin',
   'preferredSupplierId', 'preferredSupplierName', 'preferredSupplierLocked',
   'weight', 'widthCm', 'heightCm', 'depthCm',
   'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive',
@@ -16,7 +16,7 @@ const HEADERS = [
 
 const TEMPLATE_HEADERS = [
   'productId', 'parentProductId',
-  'sku', 'name', 'description', 'type', 'parentSku', 'barcode', 'mpn',
+  'sku', 'name', 'description', 'type', 'parentSku', 'barcode', 'mpn', 'countryOfOrigin',
   'preferredSupplierId', 'preferredSupplierName', 'preferredSupplierLocked',
   'weight', 'widthCm', 'heightCm', 'depthCm',
   'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive',
@@ -36,8 +36,8 @@ export async function GET(req: Request) {
   if (templateOnly) {
     // Add example rows for each type
     return csvResponse(buildTemplateCsv(TEMPLATE_HEADERS, REQUIRED_HEADERS, [
-      { sku: 'WIDGET-001', name: 'Widget', category: 'Components', description: 'A simple widget', type: 'SIMPLE', barcode: '1234567890123', mpn: 'MPN-WIDGET-001', preferredSupplierId: '', preferredSupplierName: '', preferredSupplierLocked: 'FALSE', weight: '0.5', widthCm: '10', heightCm: '5', depthCm: '3', salesPriceBase: '9.99', salePriceBase: '7.99', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
-      { sku: 'TSHIRT', name: 'T-Shirt Parent', category: 'Apparel', description: 'Variable product with sizes', type: 'VARIABLE', barcode: '', mpn: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'WIDGET-001', name: 'Widget', category: 'Components', description: 'A simple widget', type: 'SIMPLE', barcode: '1234567890123', mpn: 'MPN-WIDGET-001', countryOfOrigin: 'CN', preferredSupplierId: '', preferredSupplierName: '', preferredSupplierLocked: 'FALSE', weight: '0.5', widthCm: '10', heightCm: '5', depthCm: '3', salesPriceBase: '9.99', salePriceBase: '7.99', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'TSHIRT', name: 'T-Shirt Parent', category: 'Apparel', description: 'Variable product with sizes', type: 'VARIABLE', barcode: '', mpn: '', countryOfOrigin: 'GB', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
       { sku: 'TSHIRT-S', name: 'T-Shirt Small', category: 'Apparel', description: 'Size S variant', type: 'VARIANT', parentSku: 'TSHIRT', barcode: '', mpn: 'MPN-TSHIRT-S', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
       { sku: 'TSHIRT-M', name: 'T-Shirt Medium', category: 'Apparel', description: 'Size M variant', type: 'VARIANT', parentSku: 'TSHIRT', barcode: '', mpn: 'MPN-TSHIRT-M', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
       { sku: 'BUNDLE-01', name: 'Starter Kit', category: 'Bundles', description: 'A kit/bundle product', type: 'KIT', parentSku: '', barcode: '', mpn: '', weight: '', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '29.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: 'WIDGET-001:2;TSHIRT-S:1' },
@@ -80,6 +80,7 @@ export async function GET(req: Request) {
       parentSku: p.parent?.sku ?? '',
       barcode: p.barcode ?? '',
       mpn: p.mpn ?? '',
+      countryOfOrigin: p.countryOfOrigin ?? '',
       preferredSupplierId: p.preferredSupplier?.id ?? '',
       preferredSupplierName: p.preferredSupplier?.name ?? '',
       preferredSupplierLocked: p.preferredSupplierLocked ? 'TRUE' : 'FALSE',

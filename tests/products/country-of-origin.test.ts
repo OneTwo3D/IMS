@@ -1,29 +1,19 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import {
-  resolveImportedCountryOfOriginForCreate,
-  resolveImportedCountryOfOriginForUpdate,
-} from '@/lib/products/country-of-origin'
+import { normalizeCsvCountryOfOrigin } from '@/lib/products/country-of-origin'
 
-test('create: a valid CSV country is imported (normalised to ISO-2) — bhdm.7', () => {
-  assert.equal(resolveImportedCountryOfOriginForCreate('GB'), 'GB')
-  assert.equal(resolveImportedCountryOfOriginForCreate('united kingdom'), 'GB')
-  assert.equal(resolveImportedCountryOfOriginForCreate('  us  '), 'US')
+test('a valid CSV country is normalised to ISO-2 (bhdm.7)', () => {
+  assert.equal(normalizeCsvCountryOfOrigin('GB'), 'GB')
+  assert.equal(normalizeCsvCountryOfOrigin('united kingdom'), 'GB')
+  assert.equal(normalizeCsvCountryOfOrigin('  us  '), 'US')
+  assert.equal(normalizeCsvCountryOfOrigin('germany'), 'DE')
 })
 
-test('create: an absent, blank, or unrecognised origin defaults to CN (matches the WMS/customs fallback) — bhdm.7', () => {
-  assert.equal(resolveImportedCountryOfOriginForCreate(null), 'CN')
-  assert.equal(resolveImportedCountryOfOriginForCreate(undefined), 'CN')
-  assert.equal(resolveImportedCountryOfOriginForCreate(''), 'CN')
-  assert.equal(resolveImportedCountryOfOriginForCreate('   '), 'CN')
-  assert.equal(resolveImportedCountryOfOriginForCreate('Narnia'), 'CN')
-})
-
-test('update: only a valid country updates; blank/invalid leaves the existing origin untouched (null) — bhdm.7', () => {
-  assert.equal(resolveImportedCountryOfOriginForUpdate('DE'), 'DE')
-  assert.equal(resolveImportedCountryOfOriginForUpdate('germany'), 'DE')
-  assert.equal(resolveImportedCountryOfOriginForUpdate(''), null)
-  assert.equal(resolveImportedCountryOfOriginForUpdate(null), null)
-  assert.equal(resolveImportedCountryOfOriginForUpdate('Narnia'), null)
+test('an absent, blank, or unrecognised origin yields null — never a silent default (bhdm.7)', () => {
+  assert.equal(normalizeCsvCountryOfOrigin(null), null)
+  assert.equal(normalizeCsvCountryOfOrigin(undefined), null)
+  assert.equal(normalizeCsvCountryOfOrigin(''), null)
+  assert.equal(normalizeCsvCountryOfOrigin('   '), null)
+  assert.equal(normalizeCsvCountryOfOrigin('Narnia'), null)
 })
