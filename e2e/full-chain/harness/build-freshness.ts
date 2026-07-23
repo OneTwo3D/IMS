@@ -50,7 +50,7 @@ const SKIP_DIRS = new Set([
   // Written CONSTANTLY at runtime or by tooling. Without these the guard reports a stale
   // build after every bd command or invoice PDF — noise that would get it ignored, and an
   // ignored guard is worse than none.
-  '.beads', '.beads-hooks', '.remember', 'data',
+  '.beads', '.beads-hooks', '.remember', 'data', 'uploads',
 ])
 
 /**

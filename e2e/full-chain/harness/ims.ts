@@ -358,9 +358,18 @@ export async function recordFreightCreditNote(
  * be hardcoded to 1 — doing so would make the second bill of a two-delivery PO look like a
  * failure while it had in fact been created perfectly.
  */
+// A minimal but structurally-valid PDF (header + one empty page + xref/trailer). The upload endpoint
+// (/api/upload/invoice) accepts it by magic bytes + extension; it only needs to round-trip to Xero as an
+// attachment, not render anything. Kept inline so the harness needs no on-disk fixture.
+const MINIMAL_PDF = Buffer.from(
+  '%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n' +
+    '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 3 3]>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n',
+  'latin1',
+)
+
 export async function createBill(
   page: Page,
-  opts: { reference: string; expectBillCount?: number; includeAdditionalCosts?: boolean },
+  opts: { reference: string; expectBillCount?: number; includeAdditionalCosts?: boolean; attachPdf?: boolean },
 ): Promise<string> {
   await page.getByRole('button', { name: /create bill/i }).click()
   const dialog = page.getByRole('dialog', { name: /Create Bill/ })
@@ -404,6 +413,19 @@ export async function createBill(
   // 30s. A load-sensitive default is a flake generator.
   await expect(page.getByRole('dialog', { name: /Create Bill — Review & Confirm/ })).toBeVisible({ timeout: 30_000 })
   await dialog.getByPlaceholder(/supplier's invoice/i).fill(opts.reference)
+  // Attach a supplier-invoice PDF (the hidden accept=".pdf" input in the review step). This sets
+  // supplierInvoiceUrl on the bill, which becomes supplierInvoicePath and drives the BILL_ATTACHMENT
+  // follow-up (PP-10). setInputFiles works on the hidden input; wait for the "Uploaded" badge so the
+  // async upload has resolved before confirming.
+  if (opts.attachPdf) {
+    await dialog.locator('input[type="file"]').setInputFiles({
+      name: `supplier-invoice-${opts.reference}.pdf`,
+      mimeType: 'application/pdf',
+      buffer: MINIMAL_PDF,
+    })
+    await expect(dialog.getByText(/^Uploaded$/)).toBeVisible({ timeout: 30_000 })
+  }
+
   await dialog.getByRole('button', { name: /confirm bill/i }).click()
   await expect(dialog).toBeHidden({ timeout: 30_000 })
   await expect(page.getByRole('button', { name: new RegExp(`Bills \\(${opts.expectBillCount ?? 1}\\)`) }))

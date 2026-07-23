@@ -148,6 +148,13 @@ async function getOne<T>(kind: XeroDocKind, id: string, key: string): Promise<T>
   return list[0]
 }
 
+/** The attachments Xero holds against an invoice/bill — used to prove a BILL_ATTACHMENT rode all the way in. */
+export async function getInvoiceAttachments(invoiceId: string): Promise<Array<{ FileName: string; MimeType?: string }>> {
+  const res = await xeroGet<{ Attachments?: Array<{ FileName: string; MimeType?: string }> }>(`Invoices/${invoiceId}/Attachments`)
+  if (!res.ok) throw new Error(`Xero GET Invoices/${invoiceId}/Attachments failed: ${res.error ?? 'unknown error'}`)
+  return res.data?.Attachments ?? []
+}
+
 export const getInvoice = (id: string) => getOne<XeroInvoice>('Invoices', id, 'Invoices')
 export const getCreditNote = (id: string) => getOne<XeroCreditNote>('CreditNotes', id, 'CreditNotes')
 export const getManualJournal = (id: string) => getOne<XeroManualJournal>('ManualJournals', id, 'ManualJournals')

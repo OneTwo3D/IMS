@@ -21,7 +21,7 @@ import {
 import { createInventoryProduct } from '../helpers.ts'
 import {
   billIdsForPo, expectJournalLine, expectLine, externalIdFor, externalIdsFor, getCreditNote,
-  getInvoice, getManualJournal, trackDocument,
+  getInvoice, getInvoiceAttachments, getManualJournal, trackDocument,
 } from './harness/xero.ts'
 
 test.describe.serial('@full-chain @xero procure to pay', () => {
@@ -679,6 +679,88 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     //    ZERO across both Xero documents. A goods-only bill (or a non-transit freight line) would leave a
     //    residual — this is the aggregate signed balance, not two existential checks.
     expect(journalTransit + billTransit, 'transit nets to zero across the receipt journal and the bill').toBeCloseTo(0, 2)
+  })
+
+  test('PP-10: a bill carrying a supplier-invoice PDF attaches it to the Xero bill', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // The BILL_ATTACHMENT follow-up: a supplier invoice PDF uploaded with the bill must ride the sync all the
+    // way onto the Xero bill as an attachment, not merely sit in the IMS. enqueuePurchaseInvoiceFollowUps
+    // enqueues it ONLY when the bill carries a supplierInvoicePath, and it uploads on a LATER drain — the
+    // attachment needs the bill's Xero id first — so this drains twice and then reads the bill's Attachments
+    // back out of Xero. A "did it sync?" check on the bill alone cannot see whether the file actually landed.
+    const sku = taggedSku(runId, 'PP10')
+    const reference = `${runTag(runId)}-PP10`
+    const qty = 3
+    const unitCost = '15.00'
+    const expectedNet = Number(unitCost) * qty // 45.00
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP10`, price: '20.00' })
+
+    const { poId, poReference } = await createAndSendPo(page, { sku, qty: String(qty), unitCost })
+    await receiveGoods(page, { expectStatus: 'Received' })
+    // Attach the supplier invoice PDF as part of creating the bill.
+    await createBill(page, { reference, attachPdf: true })
+
+    let journalId = ''
+    let billId = ''
+    try {
+      // First drain posts the bill + STOCK_RECEIPT journal and enqueues BILL_ATTACHMENT; the attachment uploads
+      // on a later drain (it needs the bill's Xero id, like the payment follow-up), so drain twice.
+      await processPendingXeroSyncViaUi(page)
+      await processPendingXeroSyncViaUi(page)
+    } finally {
+      // Register both posted documents failure-safe (PP-07): the receipt journal is invisible to the straggler
+      // scan, and the drain can post then throw. Each lookup independent so a failed resolve still registers
+      // the other. The attachment is part of the bill and is voided with it — no separate teardown.
+      //
+      // GUARD before tracking the bill: only register an id we can INDEPENDENTLY confirm is THIS run's bill —
+      // its supplier InvoiceNumber is our unique reference. externalTransactionId comes from the sync log,
+      // which is part of the mapping under test; a stale/aliased id must never schedule an unrelated bill for
+      // irreversible voiding in the Demo ledger shared with stage.
+      journalId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: poId }).catch(() => '')
+      const billRecordId = (await billIdsForPo(poId).catch((): string[] => []))[0]
+      const candidateBillId = billRecordId
+        ? await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId }).catch(() => '')
+        : ''
+      if (candidateBillId) {
+        const confirm = await getInvoice(candidateBillId).catch(() => null)
+        if (confirm?.InvoiceNumber === reference) billId = candidateBillId
+      }
+      if (journalId) trackDocument('ManualJournals', journalId, `PP-10 stock receipt ${runTag(runId)}`)
+      if (billId) trackDocument('Invoices', billId, `PP-10 bill ${runTag(runId)}`)
+    }
+    expect(billId, 'the ACCPAY bill posted to Xero AND is confirmed to be this run\'s bill').toBeTruthy()
+
+    const bill = await getInvoice(billId)
+    expect(bill.Type).toBe('ACCPAY')
+    expect(bill.Status).toBe('AUTHORISED')
+    expect(Number(bill.SubTotal)).toBeCloseTo(expectedNet, 2)
+    // Identity, so a stale/aliased external id cannot pass against another £45 bill (PP-01's discipline):
+    // InvoiceNumber is our unique supplier reference, Reference is THIS PO's reference.
+    expect(bill.InvoiceNumber ?? '', 'the bill carries our unique supplier reference').toBe(reference)
+    expect(bill.Reference ?? '', 'the bill ties back to THIS PO').toBe(poReference)
+
+    // THE POINT: the supplier invoice PDF is attached to the bill IN Xero. The attachment uploads
+    // asynchronously on the follow-up drain, so poll the live ledger rather than reading once.
+    await expect
+      .poll(async () => (await getInvoiceAttachments(billId).catch(() => [])).length, {
+        timeout: 60_000,
+        message: 'the supplier-invoice PDF should be attached to the Xero bill',
+      })
+      .toBeGreaterThan(0)
+    const attachments = await getInvoiceAttachments(billId)
+    // OUR PDF specifically, not merely "a PDF": the upload sanitiser keeps the original base name
+    // (`<timestamp>-<safeBase>.pdf`, upload-validation.ts), and we named the file with this run's unique
+    // reference, so the Xero attachment name must contain it. Accepting any PDF would let an unrelated
+    // attachment satisfy the test.
+    const ours = attachments.find((a) => a.FileName.includes(reference))
+    expect(ours, `an attachment named for this run (${reference}) is on the Xero bill`).toBeTruthy()
+    expect(
+      ours!.FileName.toLowerCase().endsWith('.pdf') || (ours!.MimeType ?? '').includes('pdf'),
+      'the attached file is a PDF',
+    ).toBe(true)
   })
 
   test('PP-06: a manually-recorded freight credit note posts an ACCPAYCREDIT on transit and allocates to the bill', async ({ page }) => {
