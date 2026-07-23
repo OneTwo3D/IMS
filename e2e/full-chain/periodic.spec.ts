@@ -36,13 +36,15 @@ import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import { awaitWebhookDelivery, cleanupWc, createWcOrder, createWcProduct, wcCreds, type WcCreds } from './harness/wc.ts'
 import {
-  addManufacturingCostLine, allocateAndShip, applyStockWriteOff, completeProduction, createManufacturingOrder,
+  addManufacturingCostLine, allocateAndShip, applyStockWriteOff, completeProduction, createAndSendPo,
+  createLandedCostPo, createManufacturingOrder, createStockTransfer, dispatchStockTransfer,
   editManufacturingCostLineAmount, openManufacturingOrder, openSalesOrder, processPendingXeroSyncViaUi,
-  runDailyBatch, setPostingMode, startProduction,
+  receiveGoods, receiveStockTransfer, runDailyBatch, runTaxRateDriftCron, setPostingMode, startProduction,
 } from './harness/ims.ts'
 import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
 import {
-  expectJournalLine, externalIdFor, getInvoice, getManualJournal, trackDocument, type XeroManualJournal,
+  expectJournalLine, externalIdFor, getInvoice, getManualJournal, getXeroTaxRates, trackDocument,
+  type XeroManualJournal, type XeroTaxRate,
 } from './harness/xero.ts'
 import {
   dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
@@ -463,6 +465,202 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     }
   })
 
+  test('X-06: a retrospective landed cost on TRANSFERRED-OUT units posts a STOCK_IN_TRANSIT reval and NO COGS_JOURNAL — transit drains to zero IN Xero', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // Closes gate 6oyu.19.1. A warehouse transfer posts NO Xero journal; the testable content is the
+    // retrospective landed-cost revaluation that must EXCLUDE the transferred-out units from COGS.
+    //
+    // Scenario: a goods PO receives 100 @ £10 into WH-A; ALL 100 are transferred to WH-B (dispatch +
+    // receive), consuming the source cost layer via TRANSFER_OUT; THEN a £1/unit (£100) landed cost
+    // arrives and the reval runs. Because the 100 units left via TRANSFER_OUT (not a sale),
+    // getTransferConsumedQtyForCostLayer zeroes the source layer's netConsumedQty, so the reval must:
+    //   - post NO COGS_JOURNAL for the goods PO (a broken exclusion would book a spurious retrospective
+    //     COGS and, per scjz.34, credit transit a SECOND time — stranding a balance);
+    //   - post ONE STOCK_IN_TRANSIT journal revaluing the on-hand DESTINATION units (the £100 delta
+    //     reaches the destination layer via the transfer's costLayerSourceLine + propagateLandedCost-
+    //     ToOutputs): DR inventory £100 / CR transit £100;
+    //   - and, once the freight is billed (ACCPAY DR transit £100), transit drains to ZERO across the two
+    //     documents (mirror of PP-07's tie-out).
+    //
+    // SYNC mode, no daily batch — the reval queues an ordinary sync journal, so no clean baseline is
+    // needed. The reval legs are inventory (631) / transit (632), NOT the Xero SYSTEM AR/AP accounts, so
+    // this is unaffected by the o3d-lgo.6.1 FX-journal defect that parks X-03.
+    await setPostingMode({ sync: true, dailyBatch: false })
+
+    const sku = taggedSku(runId, 'X06')
+    const qty = 100
+    const unitCost = '10.00'
+    const freightTotal = qty * 1 // £100 landed cost, £1/unit
+
+    const inventoryAccount = await settingValue('xero_inventory_account') // 631
+    const transitAccount = await settingValue('xero_transit_account') // 632
+
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} X06`, price: '20.00' })
+
+    // Goods PO -> receive. The receipt lays down the source cost layer L1 (100 @ £10).
+    const { poId: goodsPoId, poReference } = await createAndSendPo(page, { sku, qty: String(qty), unitCost })
+    await receiveGoods(page, { expectStatus: 'Received' })
+
+    // Resolve the warehouse the receipt landed in (the transfer source) and a DIFFERENT destination — so
+    // the test is robust to whichever warehouse the PO defaulted to.
+    const { sourceWarehouseId, destWarehouseId } = await pickTransferWarehouses(sku)
+
+    // Real transfer of all 100 units: DRAFT -> dispatch (consumes L1 via TRANSFER_OUT, writing the
+    // costLayerSnapshot the exclusion query reads) -> receive (recreates the layer at WH-B). No journal.
+    const transferRef = await createStockTransfer(page, { fromWarehouseId: sourceWarehouseId, toWarehouseId: destWarehouseId, sku, qty })
+    await dispatchStockTransfer(page, transferRef)
+    await receiveStockTransfer(page, transferRef)
+
+    // Scope the read-back / no-COGS check to THIS run's journals.
+    const boundary = await dailyBatchBoundary()
+
+    // Retrospective landed cost: a freight PO (£100, BY_VALUE) linked to the goods PO. createFreightPo runs
+    // the recalc synchronously and queues the STOCK_IN_TRANSIT reval journal for the on-hand units.
+    //
+    // We deliberately do NOT bill the freight PO here. It is created DRAFT (createFreightPo sets no status),
+    // so billing it would need an extra confirm-and-send step and would couple this gate to the freight-PO
+    // billing flow — orthogonal to the TRANSFER_OUT exclusion under test (6oyu.19.1). "Transit drains
+    // exactly once" is proved directly instead: the reval routes the £100 landed cost through transit
+    // EXACTLY ONCE (a single −£100 credit) and books NO COGS. A broken exclusion would post a retrospective
+    // COGS_JOURNAL whose offset ALSO credits transit (scjz.34), doubling the transit movement to −£200 — so
+    // the single −£100 credit + zero COGS is the whole tie-out.
+    const { freightPoId } = await createLandedCostPo(page, {
+      goodsPoReference: poReference, amount: String(freightTotal), description: `${runTag(runId)} freight`,
+    })
+    expect(freightPoId, 'the freight PO was created').toBeTruthy()
+
+    // Drain everything queued (STOCK_RECEIPT and the STOCK_IN_TRANSIT reval), then resolve + REGISTER every
+    // posted document BEFORE any assertion — the drain can throw after Xero accepted a journal, so
+    // registration lives in a finally that is the ledger safety net.
+    let stockInTransitId = ''
+    let receiptId = ''
+    try {
+      await processPendingXeroSyncViaUi(page)
+    } finally {
+      stockInTransitId = await externalIdFor({ type: 'STOCK_IN_TRANSIT', referenceId: goodsPoId }).catch(() => '')
+      receiptId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: goodsPoId }).catch(() => '')
+      if (stockInTransitId) trackDocument('ManualJournals', stockInTransitId, `X-06 stock-in-transit reval ${runTag(runId)}`)
+      if (receiptId) trackDocument('ManualJournals', receiptId, `X-06 stock receipt ${runTag(runId)}`)
+      // Failure-safe net: if the exclusion REGRESSED and a spurious COGS_JOURNAL did post to the shared
+      // ledger, register it too so teardown voids it (the assertion below then fails loudly, not the ledger).
+      for (const id of await settledJournalExternalIds('COGS_JOURNAL', boundary)) {
+        trackDocument('ManualJournals', id, `X-06 UNEXPECTED cogs ${runTag(runId)}`)
+      }
+    }
+
+    // THE CRUX: NO COGS_JOURNAL was queued for the goods PO. The 100 units left via TRANSFER_OUT, so the
+    // source layer's netConsumedQty is zero and the reval must not book any retrospective COGS.
+    expect(
+      await cogsJournalCountForPo(goodsPoId, boundary),
+      'a retrospective landed cost on TRANSFERRED-out units must post NO COGS_JOURNAL (6oyu.19.1)',
+    ).toBe(0)
+
+    // The reval posted ONE STOCK_IN_TRANSIT journal revaluing the on-hand DESTINATION units: DR inventory
+    // £100 / CR transit £100, POSTED and balanced (not merely "not DELETED"). The transit credit is the £100
+    // landed cost routed through transit EXACTLY ONCE — the whole point of the exclusion.
+    expect(stockInTransitId, 'the STOCK_IN_TRANSIT reval journal posted to Xero').toBeTruthy()
+    const reval = await getManualJournal(stockInTransitId)
+    expect(reval.Status).toBe('POSTED')
+    expectBalanced(reval)
+    const revalInventory = journalSumFor(reval, inventoryAccount)
+    const revalTransit = journalSumFor(reval, transitAccount)
+    expect(revalInventory, 'reval debits inventory for the £100 landed cost on the on-hand units').toBeCloseTo(freightTotal, 2)
+    expect(revalTransit, 'reval credits transit for the £100 landed cost — routed through transit exactly once').toBeCloseTo(-freightTotal, 2)
+  })
+
+  test('X-04: IMS↔Xero tax-rate DRIFT is detected (Setting snapshot + WARNING ActivityLog), clears on reconcile — detect-only, no Xero write', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // Tax-rate drift is DETECT-ONLY: the cron GET /api/cron/xero-tax-rate-drift compares each active IMS
+    // TaxRate (that has active components) against the live Xero rate and, on divergence, writes a Setting
+    // snapshot (xero_tax_rate_drift_current) + last-checked stamp and a WARNING ActivityLog — it NEVER
+    // writes back to Xero (that is the separate TAX_RATE_SYNC subsystem). The rig carries 40 IMS rates but
+    // ZERO components, so the sweep normally short-circuits without even calling Xero.
+    //
+    // This seeds ONE IMS rate that MIRRORS a live Xero rate exactly (so the sweep loads exactly it), then
+    // drives the arc: baseline = no drift; perturb the IMS component rate = drift detected (snapshot +
+    // ActivityLog); reconcile = drift clears. The cron is rate-limited 1/hour/IP, so it runs three times in
+    // one test only because 'xero-tax-rate-drift' is in E2E_OVERRIDE_JOBS (lib/cron-rate-limit.ts) and the
+    // rig sets E2E_TEST_MODE=1 + E2E_CRON_RATE_LIMIT_MAX.
+    //
+    // The Xero connection MUST carry the accounting.settings scope or GET /TaxRates 403s; verified live on
+    // the rig (200, 57 rates). The plugin is enabled + connected here (every other Xero test posts), so the
+    // cron does not skip.
+
+    // Pick a live Xero rate with a single clean component to mirror. Prefer a non-sales "VAT on Expenses"
+    // rate so nothing an order-to-cash test maps to is touched; fall back to any single-component rate.
+    const xeroRates = await getXeroTaxRates()
+    const mirror = pickMirrorableXeroRate(xeroRates)
+    const component = mirror.TaxComponents![0]
+    const xeroPercent = component.Rate // e.g. 20
+    const driftedPercent = Math.abs(xeroPercent - 5) < 0.001 ? xeroPercent + 2 : xeroPercent - 2 // a distinct, non-zero divergence
+
+    // Clear any leftover seed from a crashed prior run so the sweep checks EXACTLY our one rate. On this
+    // rig the baseline is 0 tax-rate components, so any rate carrying components is e2e residue — delete it
+    // (a no-op on a clean rig). Then seed the mirror (equal to Xero).
+    await clearSeededTaxRateComponents()
+    const taxRateId = await seedMirroredTaxRate(mirror.Name, component.Name, xeroPercent, Boolean(component.IsCompound))
+    // Capture the prior drift settings (absent on a clean rig) so teardown restores EXACTLY.
+    const priorSnapshot = await getSettingRaw('xero_tax_rate_drift_current')
+    const priorChecked = await getSettingRaw('xero_tax_rate_drift_last_checked_at')
+
+    try {
+      // --- Phase A: BASELINE. IMS matches Xero exactly -> the sweep checks our rate and reports NO drift.
+      const a = await runTaxRateDriftCron(page)
+      expect(a.checked, 'exactly the one seeded rate (the only IMS rate with active components) is checked').toBe(1)
+      expect(a.drifted, 'a rate that mirrors Xero exactly is not drifted').toBe(0)
+      expect(
+        await driftSnapshotHasRate(taxRateId),
+        'a matching rate is absent from the drift snapshot',
+      ).toBe(false)
+
+      // --- Phase B: INJECT DRIFT. Move the IMS component rate off Xero's -> the sweep must detect it.
+      await setTaxRateComponentRate(taxRateId, driftedPercent / 100)
+      const b = await runTaxRateDriftCron(page)
+      expect(b.checked, 'still exactly our one seeded rate is checked').toBe(1)
+      expect(b.drifted, 'the perturbed rate is detected as drifted').toBeGreaterThanOrEqual(1)
+
+      // The Setting snapshot names our rate with a mismatch status; the last-checked stamp is fresh.
+      const snapshot = await getSettingRaw('xero_tax_rate_drift_current')
+      expect(snapshot, 'the cron wrote the drift snapshot Setting').toBeTruthy()
+      const entry = (JSON.parse(snapshot!) as Array<{ taxRateId: string; name: string; status: string; lines: string[] }>)
+        .find((e) => e.taxRateId === taxRateId)
+      expect(entry, 'the snapshot contains our drifted rate').toBeTruthy()
+      expect(entry!.status).toBe('mismatch')
+      expect(entry!.lines.join(' '), 'the snapshot describes the component-rate divergence').toMatch(new RegExp(component.Name, 'i'))
+      const checkedAt = await getSettingRaw('xero_tax_rate_drift_last_checked_at')
+      expect(checkedAt, 'the last-checked stamp was written').toBeTruthy()
+      expect(Date.now() - Date.parse(checkedAt!), 'the last-checked stamp is fresh').toBeLessThan(10 * 60_000)
+
+      // A WARNING ActivityLog row records the detection, keyed on our rate id.
+      const logs = await driftActivityLogRows(taxRateId)
+      expect(logs.length, 'a tax_rate_drift_detected ActivityLog row was written for our rate').toBeGreaterThanOrEqual(1)
+      const log = logs[0]
+      expect(log.action).toBe('tax_rate_drift_detected')
+      expect(log.entityType).toBe('SYSTEM')
+      expect(log.level).toBe('WARNING')
+      expect(log.tag).toBe('accounting')
+
+      // --- Phase C: RECONCILE. Restore the IMS component to Xero's rate -> the next sweep clears the drift.
+      await setTaxRateComponentRate(taxRateId, xeroPercent / 100)
+      const c = await runTaxRateDriftCron(page)
+      expect(c.checked, 'our one seeded rate is still checked').toBe(1)
+      expect(c.drifted, 'a reconciled rate is no longer drifted').toBe(0)
+      expect(
+        await driftSnapshotHasRate(taxRateId),
+        'the reconciled rate has dropped out of the drift snapshot',
+      ).toBe(false)
+    } finally {
+      // Remove the seeded rate (components cascade) and the ActivityLog rows it produced, and restore the
+      // drift Settings to EXACTLY their prior state (absent on a clean rig).
+      await deleteDriftActivityLogRows(taxRateId)
+      await deleteTaxRatesByName(mirror.Name)
+      await restoreSetting('xero_tax_rate_drift_current', priorSnapshot)
+      await restoreSetting('xero_tax_rate_drift_last_checked_at', priorChecked)
+    }
+  })
+
   test.fixme(
     'X-03: period-end UNREALISED_FX_JOURNAL revaluation posts to Xero — BLOCKED by o3d-lgo.6.1 (control leg hits Xero SYSTEM account 610/800)',
     async () => {
@@ -855,4 +1053,189 @@ async function seedTransitReconciliationResidue(
       }
     },
   }
+}
+
+/** Run a read query and return its rows (X-06 cost-layer/warehouse lookups). */
+async function queryRows<T extends import('pg').QueryResultRow>(sql: string, params: unknown[]): Promise<T[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<T>(sql, params)
+    return r.rows
+  } finally {
+    await db.end()
+  }
+}
+
+/** Signed sum of a manual journal's lines on one account (+ debit, − credit; expectJournalLine convention). */
+function journalSumFor(journal: XeroManualJournal, accountCode: string): number {
+  return journal.JournalLines.filter((l) => l.AccountCode === accountCode).reduce((s, l) => s + l.LineAmount, 0)
+}
+
+/**
+ * The warehouse the goods receipt landed in (transfer source), plus a DIFFERENT warehouse to transfer to
+ * (X-06). Source = the cost layer's warehouse (robust to whichever warehouse the PO defaulted to);
+ * destination prefers E2E-SECOND but is any other warehouse.
+ */
+async function pickTransferWarehouses(sku: string): Promise<{ sourceWarehouseId: string; destWarehouseId: string }> {
+  const layers = await queryRows<{ wid: string }>(
+    `select cl."warehouseId" as wid from cost_layers cl
+       join products p on p.id = cl."productId"
+      where p.sku = $1 order by cl."receivedAt" desc limit 1`,
+    [sku],
+  )
+  if (!layers.length) throw new Error(`pickTransferWarehouses: no cost layer found for ${sku} — did the receipt post?`)
+  const sourceWarehouseId = layers[0].wid
+  const others = await queryRows<{ id: string }>(
+    `select id from warehouses where id <> $1 order by (case when code = 'E2E-SECOND' then 0 else 1 end), code asc limit 1`,
+    [sourceWarehouseId],
+  )
+  if (!others.length) throw new Error('pickTransferWarehouses: the rig needs a second warehouse to transfer to.')
+  return { sourceWarehouseId, destWarehouseId: others[0].id }
+}
+
+/** Count COGS_JOURNAL sync-log rows for a PO — the exclusion check: TRANSFERRED-out units must post NONE. */
+async function cogsJournalCountForPo(poId: string, createdAfter: string): Promise<number> {
+  const rows = await queryRows<{ n: number }>(
+    `select count(*)::int as n from accounting_sync_logs
+      where connector = 'xero' and type = 'COGS_JOURNAL'::"AccountingSyncType"
+        and "referenceId" = $1 and "createdAt" > $2::timestamptz`,
+    [poId, createdAfter],
+  )
+  return rows[0]?.n ?? 0
+}
+
+// --- X-04 tax-rate drift helpers ---------------------------------------------
+
+/**
+ * Pick a live Xero rate to mirror: a single-component, non-zero rate, preferring a "VAT on Expenses"
+ * (input/purchases) rate so nothing an order-to-cash test maps to is perturbed. Falls back to any
+ * single-component rate with a positive component.
+ */
+function pickMirrorableXeroRate(rates: XeroTaxRate[]): XeroTaxRate {
+  const single = rates.filter((r) => (r.TaxComponents?.length ?? 0) === 1 && (r.TaxComponents![0].Rate ?? 0) > 0)
+  if (!single.length) {
+    throw new Error('X-04: no live Xero tax rate with a single positive component to mirror — cannot seed the drift baseline.')
+  }
+  const preferred = single.find((r) => /VAT on Expenses/i.test(r.Name) && r.Status === 'ACTIVE')
+    ?? single.find((r) => r.Status === 'ACTIVE')
+    ?? single[0]
+  return preferred
+}
+
+/** Delete every tax rate that carries components (e2e seed residue on this rig; components cascade). */
+async function clearSeededTaxRateComponents(): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(`delete from tax_rates where id in (select distinct tax_rate_id from tax_rate_components)`)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Delete tax rates by exact name (teardown of the seeded mirror; components cascade). */
+async function deleteTaxRatesByName(name: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(`delete from tax_rates where name = $1`, [name])
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Seed an active IMS TaxRate that MIRRORS a live Xero rate: same name (exact, so the sweep matches it by
+ * name key), one active component with `percent` as a decimal fraction (rate*100 = percent). Returns the
+ * new tax rate id. Relies on DB defaults for type/taxCategory/usedFor/flags; sets the @updatedAt columns.
+ */
+async function seedMirroredTaxRate(
+  name: string, componentName: string, percent: number, isCompound: boolean,
+): Promise<string> {
+  const { Client } = await import('pg')
+  const { randomUUID } = await import('node:crypto')
+  const rateId = `e2e-x04-${randomUUID()}`
+  const componentId = `e2e-x04c-${randomUUID()}`
+  const fraction = percent / 100
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into tax_rates (id, name, rate, is_compound, active, "createdAt", "updatedAt")
+         values ($1, $2, $3, $4, true, now(), now())`,
+      [rateId, name, fraction, isCompound],
+    )
+    await db.query(
+      `insert into tax_rate_components
+         (id, tax_rate_id, name, rate, compound_on_previous, "sort_order", active, created_at, updated_at)
+         values ($1, $2, $3, $4, $5, 0, true, now(), now())`,
+      [componentId, rateId, componentName, fraction, isCompound],
+    )
+    return rateId
+  } finally {
+    await db.end()
+  }
+}
+
+/** Set the (single) component rate of a seeded tax rate to `fraction` (decimal), to inject/clear drift. */
+async function setTaxRateComponentRate(taxRateId: string, fraction: number): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query(
+      `update tax_rate_components set rate = $2, updated_at = now() where tax_rate_id = $1`,
+      [taxRateId, fraction],
+    )
+    if (r.rowCount !== 1) throw new Error(`setTaxRateComponentRate: expected to update 1 component, updated ${r.rowCount}`)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Whether the drift snapshot Setting currently names a tax rate id. */
+async function driftSnapshotHasRate(taxRateId: string): Promise<boolean> {
+  const raw = await getSettingRaw('xero_tax_rate_drift_current')
+  if (!raw) return false
+  try {
+    const entries = JSON.parse(raw) as Array<{ taxRateId?: string }>
+    return Array.isArray(entries) && entries.some((e) => e.taxRateId === taxRateId)
+  } catch {
+    return false
+  }
+}
+
+/** The tax_rate_drift_detected ActivityLog rows for a tax rate id, newest first. */
+async function driftActivityLogRows(
+  taxRateId: string,
+): Promise<Array<{ action: string; entityType: string; level: string; tag: string }>> {
+  return queryRows(
+    `select action, "entityType"::text as "entityType", level::text as level, tag
+       from activity_logs
+      where action = 'tax_rate_drift_detected' and "entityId" = $1
+      order by "createdAt" desc`,
+    [taxRateId],
+  )
+}
+
+/** Remove the ActivityLog rows the drift detection wrote for a tax rate id (teardown). */
+async function deleteDriftActivityLogRows(taxRateId: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(`delete from activity_logs where action = 'tax_rate_drift_detected' and "entityId" = $1`, [taxRateId])
+  } finally {
+    await db.end()
+  }
+}
+
+/** Restore a settings key to EXACTLY its prior state — delete if it was absent, else write the value back. */
+async function restoreSetting(key: string, prior: string | null): Promise<void> {
+  if (prior === null) await deleteSetting(key)
+  else await setSetting(key, prior)
 }

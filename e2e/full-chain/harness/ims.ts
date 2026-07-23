@@ -841,3 +841,169 @@ export async function setPostingMode(mode: { sync: boolean; dailyBatch: boolean 
     await db.end()
   }
 }
+
+// --- stock-transfer drivers (X-06) -------------------------------------------
+//
+// A warehouse-to-warehouse transfer posts NO Xero journal (app/actions/transfers.ts has zero
+// accounting calls). X-06 uses a real transfer only to CONSUME the goods PO's source cost layer
+// via TRANSFER_OUT (writing stock_transfer_lines.costLayerSnapshot), which is what the retrospective
+// landed-cost recalc reads to EXCLUDE those units from COGS. The transfer server actions are guarded
+// by requirePermission, so they cannot be called headless — they must go through the authenticated UI.
+
+/**
+ * Create a DRAFT stock transfer of `qty` units of `sku` from one warehouse to another, the way an
+ * operator does. Warehouses are selected by their internal id (the <option> value), resolved by the
+ * caller from the DB, so the source is deterministically the warehouse the goods receipt landed in.
+ * Returns the transfer's human reference (TRF-YYYYMMDD-…), the handle for dispatch/receive.
+ */
+export async function createStockTransfer(
+  page: Page,
+  opts: { fromWarehouseId: string; toWarehouseId: string; sku: string; qty: number },
+): Promise<string> {
+  await page.goto('/stock-control/transfers')
+  await page.getByRole('button', { name: /new transfer/i }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'New Stock Transfer' })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+
+  // The two warehouse <select>s are, in DOM order, From then To (the warehouse grid renders them in
+  // that order). Selecting by the <option> value (warehouse id) is deterministic and sidesteps the
+  // em-dash in the "CODE — Name" label text.
+  const selects = dialog.locator('select')
+  await selects.nth(0).selectOption(opts.fromWarehouseId)
+  await selects.nth(1).selectOption(opts.toWarehouseId)
+
+  // Search the product in, then click the result. The result rows fire on mousedown (before the
+  // input's 150ms blur-hide), so a normal click — which presses mousedown first — selects it.
+  await dialog.getByPlaceholder(/search by sku or name/i).fill(opts.sku)
+  await dialog.getByRole('button', { name: new RegExp(opts.sku) }).first().click()
+
+  // The line's qty input is min=1/step=1; it is the only number input in the dialog.
+  await dialog.locator('input[type="number"][min="1"][step="1"]').first().fill(String(opts.qty))
+
+  await dialog.getByRole('button', { name: /save as draft/i }).click()
+  await expect(dialog).toBeHidden({ timeout: 30_000 })
+
+  // The new DRAFT is prepended to the list. Read its reference back off the row so dispatch/receive
+  // can target exactly this transfer (the list may hold prior transfers).
+  const row = page.locator('tr').filter({ hasText: /TRF-\d{8}-/ }).first()
+  await expect(row).toBeVisible({ timeout: 30_000 })
+  const reference = ((await row.locator('td').first().textContent()) ?? '').trim()
+  if (!/^TRF-\d{8}-/.test(reference)) {
+    throw new Error(`createStockTransfer: could not read the new transfer reference (got "${reference}")`)
+  }
+  return reference
+}
+
+/** Locate a transfer's summary row by its reference. */
+function transferRow(page: Page, reference: string) {
+  return page.locator('tr').filter({ hasText: reference }).first()
+}
+
+/**
+ * Dispatch the DRAFT transfer (DRAFT → IN_TRANSIT). This books stock OUT of the source warehouse and
+ * consumes its FIFO cost layers, writing the costLayerSnapshot the reval exclusion reads. Guarded by a
+ * native confirm() — Playwright auto-dismisses those unless something accepts, so without the handler
+ * the click is a silent no-op (same trap as cancelPurchaseOrder).
+ */
+export async function dispatchStockTransfer(page: Page, reference: string): Promise<void> {
+  await page.goto('/stock-control/transfers')
+  const row = transferRow(page, reference)
+  await expect(row).toBeVisible({ timeout: 30_000 })
+
+  const accept = (d: { accept: () => Promise<void> }) => { void d.accept() }
+  page.on('dialog', accept)
+  try {
+    await row.getByRole('button', { name: /dispatch/i }).click()
+    // The row flips to the In Transit badge once the action resolves (router.refresh is fired without
+    // await, so wait on the server-rendered badge rather than returning early).
+    await expect(transferRow(page, reference).getByText(/^In Transit$/)).toBeVisible({ timeout: 30_000 })
+  } finally {
+    page.off('dialog', accept)
+  }
+  await page.reload()
+  await expect(transferRow(page, reference).getByText(/^In Transit$/)).toBeVisible({ timeout: 30_000 })
+}
+
+/**
+ * Receive the whole in-transit transfer (IN_TRANSIT → RECEIVED) via "Mark Received". This recreates the
+ * FIFO layers at the destination warehouse (linked back to the source layer via costLayerSourceLine), so
+ * the landed-cost reval propagates the revaluation to the on-hand destination units.
+ */
+export async function receiveStockTransfer(page: Page, reference: string): Promise<void> {
+  await page.goto('/stock-control/transfers')
+  const row = transferRow(page, reference)
+  await expect(row).toBeVisible({ timeout: 30_000 })
+  await row.getByRole('button', { name: /mark received/i }).click()
+  await expect(transferRow(page, reference).getByText(/^Received$/)).toBeVisible({ timeout: 30_000 })
+  await page.reload()
+  await expect(transferRow(page, reference).getByText(/^Received$/)).toBeVisible({ timeout: 30_000 })
+}
+
+/**
+ * Create a FREIGHT-type "Landed Cost PO" linked to an already-confirmed goods PO, the way an operator
+ * does — the New Landed Cost PO dialog on the PO list (freight-po-form.tsx → createFreightPo). Creating
+ * it runs recalculateLandedCosts SYNCHRONOUSLY and queues the STOCK_IN_TRANSIT (and, for consumed units,
+ * COGS_JOURNAL) revaluation journals. Base currency only (no FX). Returns the new freight PO's id.
+ */
+export async function createLandedCostPo(
+  page: Page,
+  opts: { goodsPoReference: string; supplierLabel?: string; amount: string; description?: string },
+): Promise<{ freightPoId: string }> {
+  await page.goto('/purchase-orders')
+  await page.getByRole('button', { name: /landed cost po/i }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'New Landed Cost PO' })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+
+  // Supplier is the first <select> in the header. Pick the shared E2E supplier by default.
+  await dialog.locator('select').first().selectOption({ label: opts.supplierLabel ?? 'E2E Supplier' })
+
+  // Link the goods PO by ticking its checkbox row (matched by the PO reference).
+  const poRow = dialog.locator('label').filter({ hasText: opts.goodsPoReference }).first()
+  await expect(poRow).toBeVisible({ timeout: 30_000 })
+  const poBox = poRow.locator('input[type="checkbox"]')
+  if (!(await poBox.isChecked())) await poBox.check()
+
+  // Add one cost line: description + amount, distributed BY_VALUE (the default). The amount input is
+  // min=0/step=0.01 and appears only after "Add Cost".
+  await dialog.getByRole('button', { name: /add cost/i }).click()
+  await dialog.getByPlaceholder(/description/i).fill(opts.description ?? 'Freight')
+  await dialog.locator('input[type="number"][min="0"][step="0.01"]').first().fill(opts.amount)
+
+  await dialog.getByRole('button', { name: /create landed cost po/i }).click()
+  // On success the app navigates to the new freight PO.
+  await page.waitForURL(/\/purchase-orders\/.+/, { timeout: 30_000 })
+  const freightPoId = page.url().split('/').pop()!
+  await expect(page.getByRole('heading').filter({ hasText: /^PO-\d{8}-/ }).first()).toBeVisible({ timeout: 30_000 })
+  return { freightPoId }
+}
+
+/**
+ * Trigger the IMS↔Xero tax-rate drift detection cron IN THE APP, via its route (X-04). Same shape as
+ * runDailyBatch: the poster has no server action or UI button — the CRON_SECRET-gated cron is the only
+ * in-app trigger (app/api/cron/xero-tax-rate-drift/route.ts). Returns the parsed sweep result
+ * ({ checked, drifted }); throws on a non-2xx or a { skipped } body (plugin off / not connected), so a
+ * sweep that never ran fails the test loudly rather than reading as zero drift.
+ *
+ * The route is rate-limited 1/hour/IP by default; X-04 runs it three times in one test, which is why
+ * 'xero-tax-rate-drift' is in E2E_OVERRIDE_JOBS (lib/cron-rate-limit.ts) and the rig sets
+ * E2E_TEST_MODE=1 + E2E_CRON_RATE_LIMIT_MAX.
+ */
+export async function runTaxRateDriftCron(page: Page): Promise<{ checked: number; drifted: number }> {
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    throw new Error('CRON_SECRET is not set in the test environment — cannot trigger the tax-rate-drift cron route.')
+  }
+  const res = await page.request.get('/api/cron/xero-tax-rate-drift', {
+    headers: { Authorization: `Bearer ${secret}` },
+  })
+  if (!res.ok()) {
+    throw new Error(`xero-tax-rate-drift cron HTTP ${res.status()}: ${(await res.text()).slice(0, 300)}`)
+  }
+  const body = (await res.json()) as { checked?: number; drifted?: number; skipped?: boolean; reason?: string }
+  if (body.skipped) {
+    throw new Error(`tax-rate drift sweep was skipped: ${String(body.reason ?? 'unknown reason')}`)
+  }
+  return { checked: Number(body.checked ?? 0), drifted: Number(body.drifted ?? 0) }
+}

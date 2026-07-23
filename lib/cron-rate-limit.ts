@@ -63,8 +63,16 @@ export function cronRateLimitKey(jobName: string, sourceIp?: string | null): str
  * The only cron jobs whose 1/hour limit an e2e run legitimately needs widened.
  * Keep this list minimal — every entry is a job a leaked E2E_CRON_RATE_LIMIT_MAX
  * could widen (only if E2E_TEST_MODE=1 is ALSO set), so it is the blast radius.
+ *
+ * - `accounting-daily-batch`: OC-08 and X-01/X-02 each drive the daily batch, so a
+ *   single suite run triggers it several times (o3d-lgo.13).
+ * - `xero-tax-rate-drift`: the X-04 tax-rate drift full-chain test runs this cron
+ *   three times in ONE test — baseline (no drift), after injecting IMS-side drift,
+ *   and after reconciling — so the default 1/hour bucket would 429 the second run
+ *   (o3d-lgo.7 / X-04). Detect-only and CRON_SECRET-gated; the override is
+ *   defence-in-depth just like the batch job.
  */
-const E2E_OVERRIDE_JOBS = new Set<string>(['accounting-daily-batch'])
+const E2E_OVERRIDE_JOBS = new Set<string>(['accounting-daily-batch', 'xero-tax-rate-drift'])
 
 /**
  * Test/CI-only per-job max override. Returns `max` unchanged unless ALL hold:

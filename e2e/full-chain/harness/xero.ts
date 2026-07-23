@@ -141,6 +141,29 @@ export type XeroManualJournal = {
   JournalLines: XeroJournalLine[]
 }
 
+export type XeroTaxComponent = { Name: string; Rate: number; IsCompound?: boolean; IsNonRecoverable?: boolean }
+export type XeroTaxRate = {
+  Name: string
+  TaxType: string
+  Status: string
+  ReportTaxType?: string
+  EffectiveRate?: number
+  TaxComponents?: XeroTaxComponent[]
+}
+
+/**
+ * The live tax rates Xero holds (X-04), minus DELETED/ARCHIVED — matching what the drift sweeper reads
+ * (lib/connectors/xero/tax-rates.ts). X-04 mirrors one of these into the IMS to establish a clean
+ * (no-drift) baseline, then perturbs the IMS copy to prove the sweep detects the divergence. Reads LIVE
+ * (not the cached reference path) so the seed matches exactly what the sweep will compare against.
+ */
+export async function getXeroTaxRates(): Promise<XeroTaxRate[]> {
+  const res = await xeroGet<{ TaxRates?: XeroTaxRate[] }>('TaxRates')
+  if (!res.ok) throw new Error(`Xero GET TaxRates failed: ${res.error ?? 'unknown error'}`)
+  const rates = (res.data as { TaxRates?: XeroTaxRate[] })?.TaxRates ?? []
+  return rates.filter((r) => r.Status !== 'DELETED' && r.Status !== 'ARCHIVED')
+}
+
 async function getOne<T>(kind: XeroDocKind, id: string, key: string): Promise<T> {
   const res = await xeroGet<Record<string, T[]>>(`${kind}/${id}`)
   if (!res.ok) throw new Error(`Xero GET ${kind}/${id} failed: ${res.error ?? 'unknown error'}`)
