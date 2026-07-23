@@ -21,9 +21,17 @@ import {
   awaitWebhookDelivery, cancelWcOrder, cleanupWc, createWcOrder, createWcProduct, getWcOrder, nudgeWpCron,
   refundWcOrder, updateWcOrder, wcCreds, type WcCreds,
 } from './harness/wc.ts'
-import { allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, setPostingMode } from './harness/ims.ts'
-import { addStockAdjustment, createInventoryProduct } from '../helpers.ts'
-import { expectLine, externalIdFor, getCreditNote, getInvoice, trackDocument } from './harness/xero.ts'
+import {
+  allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, runDailyBatch, setPostingMode,
+} from './harness/ims.ts'
+import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
+import {
+  expectJournalLine, expectLine, externalIdFor, getCreditNote, getInvoice, getManualJournal, trackDocument,
+  type XeroManualJournal,
+} from './harness/xero.ts'
+import {
+  dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
+} from './harness/batch-fixture.ts'
 
 const WAREHOUSE_CODE = 'CBG'
 
@@ -957,7 +965,405 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       await deleteFxRate(fxRateId)
     }
   })
+
+  test('OC-08: return with restock in BATCH mode -> stock re-enters at POSTED COGS and a COGS-reversal journal posts to Xero', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // OC-07 proved the SYNC-mode restock PATH: a qty-refund re-enters the return warehouse physically, but
+    // QUANTITY-ONLY (unitCostBase 0) because the shipment was never journaled, so there is no cost snapshot to
+    // value the return against. OC-08 proves the OTHER branch of that same code — the one production actually
+    // runs (stage has xero_daily_batch_enabled). Here the daily batch JOURNALS the shipment first, so when the
+    // refund arrives stageRefundAccountingReversals FINDS the shipment cost snapshot (refund-service.ts filters
+    // shipments on shipmentJournalDate IS NOT NULL): the return re-enters at the POSTED COGS with a RECREATED
+    // cost layer, and a COGS_REVERSAL journal (DR inventory, CR COGS) posts to Xero. That valued return + the
+    // reversal journal are exactly what OC-07 scoped OUT and handed to this batch-mode test.
+    //
+    // Two batch-mode hazards, handled the same way X-01 does:
+    //   1. Posting mode is a BRANCH — batch posting needs sync AND dailyBatch both true (accounting.ts:196).
+    //   2. runDailyBatchSync is GLOBAL — it journals every un-journaled shipment in the DB, so the baseline is
+    //      cleared first (deleteUnjournaledShipmentBaseline) or the batch would post ~dozens of prior tests'
+    //      shipments into the shared Demo ledger. groupB === 1 below is the proof the baseline worked.
+    const sku = taggedSku(runId, 'OC08')
+    const unitPrice = '30.00'
+    const qty = 3
+    const refundQty = 1
+    const UNIT_COST = 10 // addStockAdjustment seeds every positive line at £10/unit (helpers.ts:136).
+    const expectedShipCogs = qty * UNIT_COST // 3 × £10 = £30 — the whole shipment's COGS the batch journals.
+    const expectedReturnCost = refundQty * UNIT_COST // 1 × £10 = £10 — the reversed COGS + the recreated layer value.
+
+    // 0. CLEAN BASELINE FIRST — idempotent, a no-op on an already-clean DB (see the header note).
+    const baseline = await deleteUnjournaledShipmentBaseline()
+    console.log(`[OC-08] baseline: deleted ${baseline.candidateOrders} batch-candidate order(s)`, baseline.deleted)
+
+    // 1. ARM BATCH MODE before import so the SALES_INVOICE is queued at import time and the order carries an
+    //    accountingInvoiceId (Group A1 requires it).
+    await setPostingMode({ sync: true, dailyBatch: true })
+
+    // Restock to the SAME warehouse the units shipped from (CBG), so on-hand simply goes down at ship and back
+    // up at refund — the cleanest before/after. Restored in finally so OC-05/06 stay cash-only on a re-run.
+    const priorReturnWh = await setDefaultReturnWarehouse(WAREHOUSE_CODE, true)
+    // Register every Xero doc failure-safe. Fill these as they post so a throw mid-way still voids what landed.
+    let invoiceId: string | null = null
+    let batchBoundary: string | null = null
+    let importedSalesOrderId: string | null = null
+    let refundId: string | null = null
+    try {
+      // 2. IMS product + priced stock at £10/unit (a known COGS the read-back asserts exactly).
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC08`, price: unitPrice })
+      await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+      // 3. Real Woo order, delivered by Woo's own webhook.
+      const product = await createWcProduct(creds, runId, { label: 'OC08', price: unitPrice })
+      const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+      const imported = await awaitWebhookDelivery(order.id, { creds })
+      expect(imported.salesOrderId).toBeTruthy()
+      importedSalesOrderId = imported.salesOrderId
+
+      // 4. Ship the whole order from CBG. In batch mode the dispatch posts NO COGS — it only stages the shipment.
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC08` })
+
+      // 5. Post the queued invoice BEFORE the batch: Group A1 filters on accountingInvoiceId, set only once the
+      //    SALES_INVOICE has synced.
+      await processPendingXeroSyncViaUi(page)
+      invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+      trackDocument('Invoices', invoiceId, `OC-08 invoice ${runTag(runId)}`)
+      expect((await getInvoice(invoiceId)).Status).toBe('AUTHORISED')
+
+      // 6. Run the batch — A1 -> A2 -> B in one call. groupB === 1 proves ONLY this shipment was journaled.
+      //    Capture the DB clock boundary first so the read-back is scoped to THIS run's journals.
+      batchBoundary = await dailyBatchBoundary()
+      const batch = (await runDailyBatch(page)) as unknown as {
+        groupA1: number; groupA2: number; groupB: number; errors: string[]
+      }
+      expect(batch.errors, `daily batch reported errors: ${batch.errors.join('; ')}`).toEqual([])
+      expect(batch.groupA1, 'exactly one order deferred (Group A1)').toBe(1)
+      expect(batch.groupA2, 'exactly one order reclassified (Group A2)').toBe(1)
+      expect(batch.groupB, 'exactly one shipment journaled (Group B)').toBe(1)
+
+      // 7. Drain the batch journals and REGISTER every DailyBatch document for teardown BEFORE any refund —
+      //    the drain can throw after Xero accepted a journal, and the batch posts MORE than A1/A2/B (a
+      //    reconciliation sweep may queue its own journal). trackDocument dedupes.
+      try {
+        await processPendingXeroSyncViaUi(page)
+        // Resolve + assert the Group B shipment-COGS journal so the shipment really was journaled at £30 COGS —
+        // the precondition that makes the coming refund re-enter VALUED rather than quantity-only.
+        const bDoc = await dailyBatchDoc('DAILY_BATCH_GROUP_B', { createdAfter: batchBoundary })
+        trackDocument('ManualJournals', bDoc.externalId, `OC-08 B shipment COGS ${runTag(runId)}`)
+        const bJournal = await getManualJournal(bDoc.externalId)
+        expect(bJournal.Status).toBe('POSTED')
+        expectBalanced(bJournal)
+        const cogsAccount = await settingValue('xero_cogs_account')
+        const allocatedAccount = await settingValue('xero_allocated_inventory_account')
+        expectJournalLine(bJournal.JournalLines, { accountCode: cogsAccount, debit: expectedShipCogs })
+        expectJournalLine(bJournal.JournalLines, { accountCode: allocatedAccount, credit: expectedShipCogs })
+      } finally {
+        for (const posted of await postedDailyBatchJournalIds(batchBoundary)) {
+          trackDocument('ManualJournals', posted.externalId, `OC-08 ${posted.type} ${runTag(runId)}`)
+        }
+      }
+
+      // 8. Confirm from the DB that the shipment is now journaled — the branch selector for the valued return.
+      expect(await shipmentJournalDateSet(imported.salesOrderId), 'shipment must be journaled before the refund').toBe(true)
+
+      const productId = await productIdBySku(sku)
+      const warehouseId = await warehouseIdByCode(WAREHOUSE_CODE)
+      const onHandAfterShip = await onHandFor(productId, warehouseId) // 10 seeded − 3 shipped = 7.
+      // Snapshot the cost-layer ids BEFORE the refund so the valued-return assertion can prove a NEW layer was
+      // recreated — not merely that the (identically-costed) seeded layer still reads £10 (Codex r1).
+      const priorLayerIds = await costLayerIdsFor(productId, warehouseId)
+
+      // 9. Refund ONE unit in Woo carrying a line QUANTITY — that quantity is what makes refund-sync restock
+      //    (refund-sync.ts hasQtyRefund). Because the shipment is journaled, this return re-enters VALUED.
+      const wcOrder = await getWcOrder(creds, order.id)
+      const lineId = wcOrder.line_items?.[0]?.id
+      expect(lineId, 'the Woo order should have a line to refund').toBeTruthy()
+      const refundAmount = (Number(unitPrice) * refundQty).toFixed(2)
+      await refundWcOrder(creds, order.id, {
+        amount: refundAmount,
+        reason: `${runTag(runId)} OC-08 return with restock`,
+        lineItems: [{ id: lineId!, quantity: refundQty, refund_total: refundAmount }],
+      })
+
+      const rid = await awaitRefund(imported.salesOrderId)
+      refundId = rid // hoisted for the finally's failure-safe registration (Codex r1).
+      // Drain the refund's queued documents — CREDIT_NOTE (revenue) AND COGS_REVERSAL (the batch-mode journal
+      // that is the whole point of OC-08). In sync mode the COGS_REVERSAL would stage at £0 and never post.
+      await processPendingXeroSyncViaUi(page)
+
+      // --- XERO: the credit note (as OC-05/07) AND the COGS-reversal journal, both read back and POSTED ---
+      const creditNoteId = await externalIdFor({ type: 'CREDIT_NOTE', referenceId: rid })
+      trackDocument('CreditNotes', creditNoteId, `OC-08 credit note ${runTag(runId)}`)
+      const creditNote = await getCreditNote(creditNoteId)
+      expect(creditNote.Type).toBe('ACCRECCREDIT')
+      expect(creditNote.Status).toBe('AUTHORISED') // "not DELETED" would accept a DRAFT — see OC-01.
+      const salesAccount = await settingValue('xero_sales_account')
+      expectLine(creditNote.LineItems, { accountCode: salesAccount, lineAmount: Number(refundAmount) })
+
+      // The COGS_REVERSAL manual journal: DR inventory, CR COGS, for the RETURNED unit's posted cost (£10) —
+      // reversing exactly the COGS Group B booked for that unit. This journal exists ONLY in batch mode.
+      const cogsReversalId = await externalIdFor({ type: 'COGS_REVERSAL', referenceId: rid })
+      trackDocument('ManualJournals', cogsReversalId, `OC-08 COGS reversal ${runTag(runId)}`)
+      const reversal = await getManualJournal(cogsReversalId)
+      expect(reversal.Status).toBe('POSTED')
+      expectBalanced(reversal)
+      const inventoryAccount = await settingValue('xero_inventory_account')
+      const cogsAccount = await settingValue('xero_cogs_account')
+      expectJournalLine(reversal.JournalLines, { accountCode: inventoryAccount, debit: expectedReturnCost })
+      expectJournalLine(reversal.JournalLines, { accountCode: cogsAccount, credit: expectedReturnCost })
+
+      // --- INVENTORY SUBLEDGER: the return re-enters VALUED (NOT 0 — the OC-07 sync-mode behaviour) ---
+      const movements = await returnInboundMovementsFor('SalesOrderRefund', rid, warehouseId)
+      expect(movements.length, 'one refund delivery -> exactly one RETURN_INBOUND movement').toBe(1)
+      const mv = movements[0]
+      expect(mv.productId).toBe(productId)
+      expect(mv.qty).toBeCloseTo(refundQty, 4)
+      // The distinct OC-08 claim: the return is valued at the RECREATED layer's unit cost (£10), NOT 0.
+      expect(Number(mv.unitCostBase ?? 0), 'return re-enters at posted COGS, not quantity-only').toBeCloseTo(UNIT_COST, 2)
+      expect(Number(mv.totalValueBase), 'movement value == qty × unit cost').toBeCloseTo(expectedReturnCost, 2)
+
+      // A DISTINCT cost LAYER was recreated for the returned unit at the posted cost — proven by id, not just by
+      // "the newest layer is £10" (which the identically-costed seeded layer would satisfy even if NO layer were
+      // recreated, Codex r1). The physical stock is back WITH a valuation basis, so a later sale of it costs at
+      // £10, not £0.
+      const returnLayers = await newCostLayersSince(productId, warehouseId, priorLayerIds)
+      expect(returnLayers.length, 'exactly one NEW cost layer recreated for the return').toBe(1)
+      const returnLayer = returnLayers[0]
+      expect(Number(returnLayer.unitCostBase ?? 0), 'recreated layer valued at posted COGS, not 0').toBeCloseTo(UNIT_COST, 2)
+      expect(Number(returnLayer.receivedQty), 'recreated layer received the returned qty').toBeCloseTo(refundQty, 4)
+      expect(Number(returnLayer.remainingQty), 'recreated layer still holds the returned qty').toBeCloseTo(refundQty, 4)
+
+      // On-hand at the return warehouse rose by EXACTLY the returned quantity.
+      const onHandAfterRefund = await onHandFor(productId, warehouseId)
+      expect(onHandAfterRefund).toBeCloseTo(onHandAfterShip + refundQty, 4)
+
+      // And the order records a PARTIAL disposition (one of three units).
+      expect(await orderRefundStatus(imported.salesOrderId)).toBe('PARTIAL')
+    } finally {
+      // Restore the default-return-warehouse flag, then register EVERY Xero doc that could have posted, even if
+      // an assertion or the drain threw before its inline registration (Codex r1). The refund drain can post the
+      // credit note and/or the COGS-reversal journal before a later throw, and the global straggler scan only
+      // finds invoices — so an untracked credit note / manual journal would strand silently in the shared Demo
+      // ledger. Each lookup is isolated so one failure cannot suppress the others. trackDocument dedupes.
+      await setDefaultReturnWarehouse(WAREHOUSE_CODE, false, priorReturnWh)
+      if (!invoiceId && importedSalesOrderId) {
+        const posted = await awaitPostedExternalId('SALES_INVOICE', importedSalesOrderId, 90_000).catch(() => null)
+        if (posted) trackDocument('Invoices', posted, `OC-08 invoice ${runTag(runId)}`)
+      }
+      if (refundId) {
+        const cn = await awaitPostedExternalId('CREDIT_NOTE', refundId, 30_000).catch(() => null)
+        if (cn) trackDocument('CreditNotes', cn, `OC-08 credit note ${runTag(runId)}`)
+        const cr = await awaitPostedExternalId('COGS_REVERSAL', refundId, 30_000).catch(() => null)
+        if (cr) trackDocument('ManualJournals', cr, `OC-08 COGS reversal ${runTag(runId)}`)
+      }
+    }
+  })
+
+  // PARKED (test.fixme) — BLOCKED on a real product bug this test SURFACED live: o3d-odu.
+  // A KIT order imports as ONE sales_order_line (type KIT, qty = kits ordered) whose stock comes from
+  // component allocations; every component's shipment_line carries the KIT line's lineId.
+  // validateActiveShipmentTotalsWithinOrder (shipment-service.ts:123, added PR #140) groups shipment lines
+  // by lineId and compares the SUM to that line's ordered qty — so a kit's summed component qty (here 1+2=3)
+  // exceeds the kit line's ordered qty (1) and confirm-shipment rejects with "exceeds ordered quantity".
+  // Any multi-unit kit therefore cannot reach SHIPPED via the UI. The create→import→auto-allocate portion
+  // below IS verified working live (run E2E-FC-mrx4dwjzop1e); it fails only at the ship confirm. The
+  // post-ship batch/COGS assertions mirror the VERIFIED OC-08 / X-01 batch-mode patterns. Flip
+  // test.fixme→test and re-run once o3d-odu makes the guard kit-aware.
+  test.fixme('OC-12: a KIT order in BATCH mode -> shipment COGS is the SUM of the consumed COMPONENT layers', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // A KIT is a virtual bundle: it holds no stock and no cost layer of its own — its stock comes from its
+    // components, deducted on sale, and its COGS is Σ of the consumed component cost layers. OC-12 proves that
+    // end to end: a Woo order for the kit imports, IMS explodes it into component allocations, the daily batch
+    // journals the shipment, and the Group B COGS leg read back from Xero equals the components' summed cost —
+    // NOT the kit's (nonexistent) own cost. Two DISTINCT components at different quantities make the sum a
+    // genuine Σ, so a build that costed the kit itself (£0, or its sales price) would fail here.
+    //
+    // Batch mode for the same two reasons as OC-08/X-01: COGS in batch mode appears ONLY via Group B, and the
+    // GLOBAL batch needs a clean baseline first.
+    const kitSku = taggedSku(runId, 'OC12KIT')
+    const compASku = taggedSku(runId, 'OC12A')
+    const compBSku = taggedSku(runId, 'OC12B')
+    const kitPrice = '50.00'
+    const UNIT_COST = 10 // addStockAdjustment seeds every component layer at £10/unit (helpers.ts:136).
+    const compAQtyPerKit = 1
+    const compBQtyPerKit = 2
+    const kitQty = 1
+    // COGS = Σ (component qty per kit × kits × £10). (1 + 2) × 1 × £10 = £30 — a sum across two layers.
+    const expectedCogs = (compAQtyPerKit + compBQtyPerKit) * kitQty * UNIT_COST
+    const expectedRevenue = Number(kitPrice) * kitQty // £50 — the kit line's own price, the revenue the batch recognises.
+
+    // 0. CLEAN BASELINE FIRST (idempotent).
+    const baseline = await deleteUnjournaledShipmentBaseline()
+    console.log(`[OC-12] baseline: deleted ${baseline.candidateOrders} batch-candidate order(s)`, baseline.deleted)
+
+    // 1. ARM BATCH MODE before import.
+    await setPostingMode({ sync: true, dailyBatch: true })
+
+    let batchBoundary: string | null = null
+    let invoiceId: string | null = null
+    let importedSalesOrderId: string | null = null
+    try {
+      // 2. Build the KIT in IMS: two SIMPLE components first (so the kit can reference them), then the KIT, then
+      //    its component recipe, then component stock at £10/unit. The kit's SKU is what the Woo product maps to.
+      await createInventoryProduct(page, { sku: compASku, name: `${runTag(runId)} OC12 A`, price: '5.00' })
+      await createInventoryProduct(page, { sku: compBSku, name: `${runTag(runId)} OC12 B`, price: '6.00' })
+      await createInventoryProduct(page, { sku: kitSku, name: `${runTag(runId)} OC12 KIT`, price: kitPrice, type: 'KIT' })
+      await openInventoryProduct(page, kitSku)
+      await configureProductComponents(page, [
+        { sku: compASku, qty: String(compAQtyPerKit) },
+        { sku: compBSku, qty: String(compBQtyPerKit) },
+      ])
+      await addStockAdjustment(page, compASku, 10, WAREHOUSE_CODE)
+      await addStockAdjustment(page, compBSku, 10, WAREHOUSE_CODE)
+
+      // 3. Real Woo product mapped to the kit BY SKU, ordered for real; Woo's own webhook imports it. IMS
+      //    resolves the line to the KIT and auto-allocates the COMPONENTS (proven by the bundle-refund spec).
+      const product = await createWcProduct(creds, runId, { label: 'OC12KIT', price: kitPrice })
+      expect(product.sku).toBe(kitSku)
+      const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: kitQty }] })
+      const imported = await awaitWebhookDelivery(order.id, { creds })
+      expect(imported.salesOrderId).toBeTruthy()
+      importedSalesOrderId = imported.salesOrderId
+
+      // 4. Ship — dispatches the component allocations. Batch mode posts NO COGS at dispatch.
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC12` })
+
+      // 5. Post the queued invoice BEFORE the batch (Group A1 needs the accountingInvoiceId).
+      await processPendingXeroSyncViaUi(page)
+      invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+      trackDocument('Invoices', invoiceId, `OC-12 invoice ${runTag(runId)}`)
+      expect((await getInvoice(invoiceId)).Status).toBe('AUTHORISED')
+
+      // 6. Run the batch. groupB === 1 proves only this shipment was journaled.
+      batchBoundary = await dailyBatchBoundary()
+      const batch = (await runDailyBatch(page)) as unknown as {
+        groupA1: number; groupA2: number; groupB: number; errors: string[]
+      }
+      expect(batch.errors, `daily batch reported errors: ${batch.errors.join('; ')}`).toEqual([])
+      expect(batch.groupA1, 'exactly one order deferred (Group A1)').toBe(1)
+      expect(batch.groupA2, 'exactly one order reclassified (Group A2)').toBe(1)
+      expect(batch.groupB, 'exactly one shipment journaled (Group B)').toBe(1)
+
+      // 7. Drain + register every DailyBatch document failure-safe (Codex-proven X-01 pattern), then read the
+      //    Group B journal back and assert the COGS leg is the SUMMED component cost.
+      try {
+        await processPendingXeroSyncViaUi(page)
+
+        const cogsAccount = await settingValue('xero_cogs_account')
+        const allocatedAccount = await settingValue('xero_allocated_inventory_account')
+        const unearnedAccount = await settingValue('xero_unearned_revenue_account')
+        const salesAccount = await settingValue('xero_sales_account')
+
+        // A2 — inventory reclassification: DR allocated, CR inventory, for the SUMMED component COGS. Proves the
+        // allocated cost the batch parks equals Σ component layers.
+        const a2Doc = await dailyBatchDoc('DAILY_BATCH_INVENTORY_ALLOC', { createdAfter: batchBoundary })
+        trackDocument('ManualJournals', a2Doc.externalId, `OC-12 A2 inventory alloc ${runTag(runId)}`)
+        const a2Journal = await getManualJournal(a2Doc.externalId)
+        expect(a2Journal.Status).toBe('POSTED')
+        expectBalanced(a2Journal)
+        const inventoryAccount = await settingValue('xero_inventory_account')
+        expectJournalLine(a2Journal.JournalLines, { accountCode: allocatedAccount, debit: expectedCogs })
+        expectJournalLine(a2Journal.JournalLines, { accountCode: inventoryAccount, credit: expectedCogs })
+
+        // B — the point: DR COGS / CR allocated for Σ component layers (£30), and the revenue legs recognise the
+        // kit's OWN line price (£50). The COGS being £30 not £50 (and not £0) is the whole kit-costing claim.
+        const bDoc = await dailyBatchDoc('DAILY_BATCH_GROUP_B', { createdAfter: batchBoundary })
+        trackDocument('ManualJournals', bDoc.externalId, `OC-12 B shipment COGS ${runTag(runId)}`)
+        const bJournal = await getManualJournal(bDoc.externalId)
+        expect(bJournal.Status).toBe('POSTED')
+        expectBalanced(bJournal)
+        expectJournalLine(bJournal.JournalLines, { accountCode: cogsAccount, debit: expectedCogs })
+        expectJournalLine(bJournal.JournalLines, { accountCode: allocatedAccount, credit: expectedCogs })
+        expectJournalLine(bJournal.JournalLines, { accountCode: unearnedAccount, debit: expectedRevenue })
+        expectJournalLine(bJournal.JournalLines, { accountCode: salesAccount, credit: expectedRevenue })
+      } finally {
+        for (const posted of await postedDailyBatchJournalIds(batchBoundary)) {
+          trackDocument('ManualJournals', posted.externalId, `OC-12 ${posted.type} ${runTag(runId)}`)
+        }
+      }
+
+      // 8. INVENTORY SUBLEDGER cross-check: the shipment consumed the components (not the kit), so each
+      //    component's on-hand dropped by its per-kit qty. The kit itself never held stock.
+      const compAId = await productIdBySku(compASku)
+      const compBId = await productIdBySku(compBSku)
+      const warehouseId = await warehouseIdByCode(WAREHOUSE_CODE)
+      expect(await onHandFor(compAId, warehouseId), 'component A consumed by the kit shipment').toBeCloseTo(10 - compAQtyPerKit * kitQty, 4)
+      expect(await onHandFor(compBId, warehouseId), 'component B consumed by the kit shipment').toBeCloseTo(10 - compBQtyPerKit * kitQty, 4)
+    } finally {
+      if (!invoiceId && importedSalesOrderId) {
+        const posted = await awaitPostedExternalId('SALES_INVOICE', importedSalesOrderId, 90_000).catch(() => null)
+        if (posted) trackDocument('Invoices', posted, `OC-12 invoice ${runTag(runId)}`)
+      }
+    }
+  })
 })
+
+/** A manual journal is balanced iff its signed LineAmounts (debits +, credits −) sum to zero (mirror of X-01). */
+function expectBalanced(journal: XeroManualJournal): void {
+  const net = journal.JournalLines.reduce((sum, line) => sum + line.LineAmount, 0)
+  expect(Math.abs(net), `journal ${journal.ManualJournalID} is unbalanced by ${net}`).toBeLessThan(0.005)
+}
+
+/** Whether the order's shipment has been journaled by the daily batch — the branch selector for a VALUED return. */
+async function shipmentJournalDateSet(salesOrderId: string): Promise<boolean> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ n: number }>(
+      `select count(*)::int as n from shipments
+        where "orderId" = $1 and accounting_shipment_journal_date is not null`,
+      [salesOrderId],
+    )
+    return (r.rows[0]?.n ?? 0) > 0
+  } finally {
+    await db.end()
+  }
+}
+
+/** The set of cost-layer ids currently on a product+warehouse — snapshotted before a refund to detect a NEW layer. */
+async function costLayerIdsFor(productId: string, warehouseId: string): Promise<Set<string>> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string }>(
+      `select id from cost_layers where "productId" = $1 and "warehouseId" = $2`,
+      [productId, warehouseId],
+    )
+    return new Set(r.rows.map((row) => row.id))
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * The cost layers created for a product+warehouse SINCE a prior id snapshot — i.e. the layers a valued
+ * batch-mode return recreated. Identifying by id (not "newest layer's cost") is what makes the assertion real:
+ * the seeded stock-adjustment layer is also £10, so a cost-only check would pass even if NO layer were
+ * recreated. Returns the new layers' qty/value so the caller can assert the recreated layer's shape.
+ */
+async function newCostLayersSince(
+  productId: string,
+  warehouseId: string,
+  priorIds: Set<string>,
+): Promise<Array<{ id: string; unitCostBase: string | null; receivedQty: string; remainingQty: string }>> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string; unitCostBase: string | null; receivedQty: string; remainingQty: string }>(
+      `select id, "unitCostBase", "receivedQty"::text as "receivedQty", "remainingQty"::text as "remainingQty"
+         from cost_layers where "productId" = $1 and "warehouseId" = $2 order by "receivedAt"`,
+      [productId, warehouseId],
+    )
+    return r.rows.filter((row) => !priorIds.has(row.id))
+  } finally {
+    await db.end()
+  }
+}
 
 /**
  * Seed a base(GBP)->foreign FX rate so a foreign-currency order can import. The rig keeps fx_rates EMPTY
