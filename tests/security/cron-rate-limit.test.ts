@@ -112,6 +112,34 @@ test('E2E override NEVER applies to a non-allowlisted job (blast-radius guard)',
   })
 })
 
+test('xero-tax-rate-drift is capped at its per-job ceiling — never inherits the full E2E max (shared Xero tenant quota)', () => {
+  const DRIFT = 'xero-tax-rate-drift'
+  const CAP = 20
+  withEnv({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '10000' }, () => {
+    // A large E2E_CRON_RATE_LIMIT_MAX must NOT flow through to a job that hits a quota-limited external
+    // dependency each run — it is bounded above by the per-job cap, so a leak/runaway can't exhaust the
+    // shared Xero tenant.
+    assert.equal(applyE2eMaxOverride(DRIFT, 1), CAP, 'capped at the per-job ceiling, not the 10000 global')
+  })
+  withEnv({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '5' }, () => {
+    // Below the cap, the override value itself wins (it is the min of the two).
+    assert.equal(applyE2eMaxOverride(DRIFT, 1), 5, 'a value below the cap is honoured as-is')
+  })
+  withEnv({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '10000' }, () => {
+    // Raise-only still holds: a base max already above the cap is never lowered.
+    assert.equal(applyE2eMaxOverride(DRIFT, 50), 50, 'a base max above the cap is never lowered (raise-only)')
+  })
+  withEnv({ E2E_TEST_MODE: undefined, E2E_CRON_RATE_LIMIT_MAX: '10000' }, () => {
+    assert.equal(applyE2eMaxOverride(DRIFT, 1), 1, 'guard off: never applies')
+  })
+})
+
+test('accounting-daily-batch has no per-job cap — honours the full E2E max', () => {
+  withEnv({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '10000' }, () => {
+    assert.equal(applyE2eMaxOverride('accounting-daily-batch', 1), 10000, 'uncapped internal job uses the full value')
+  })
+})
+
 test('enforceCronRateLimit passes the E2E-overridden max only for the allowlisted job', async () => {
   await withEnvAsync({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '5000' }, async () => {
     const seen: Record<string, number> = {}

@@ -60,19 +60,26 @@ export function cronRateLimitKey(jobName: string, sourceIp?: string | null): str
 }
 
 /**
- * The only cron jobs whose 1/hour limit an e2e run legitimately needs widened.
- * Keep this list minimal — every entry is a job a leaked E2E_CRON_RATE_LIMIT_MAX
- * could widen (only if E2E_TEST_MODE=1 is ALSO set), so it is the blast radius.
+ * The only cron jobs whose 1/hour limit an e2e run legitimately needs widened, each mapped to an OPTIONAL
+ * per-job ceiling on how far `E2E_CRON_RATE_LIMIT_MAX` may raise it. Keep this list minimal — every entry
+ * is a job a leaked E2E_CRON_RATE_LIMIT_MAX could widen (only if E2E_TEST_MODE=1 is ALSO set), so it is the
+ * blast radius.
  *
- * - `accounting-daily-batch`: OC-08 and X-01/X-02 each drive the daily batch, so a
- *   single suite run triggers it several times (o3d-lgo.13).
- * - `xero-tax-rate-drift`: the X-04 tax-rate drift full-chain test runs this cron
- *   three times in ONE test — baseline (no drift), after injecting IMS-side drift,
- *   and after reconciling — so the default 1/hour bucket would 429 the second run
- *   (o3d-lgo.7 / X-04). Detect-only and CRON_SECRET-gated; the override is
- *   defence-in-depth just like the batch job.
+ * - `accounting-daily-batch` → null (no per-job cap): a purely internal batch with no per-run external
+ *   dependency to exhaust, so it honours E2E_CRON_RATE_LIMIT_MAX in full (OC-08 and X-01/X-02 each drive it;
+ *   o3d-lgo.13).
+ * - `xero-tax-rate-drift` → 20 (hard per-job cap): the X-04 test runs it three times in ONE test — baseline,
+ *   after injecting IMS-side drift, and after reconciling — so the default 1/hour bucket would 429 the
+ *   second run (o3d-lgo.7 / X-04). But EACH sweep with a component-backed IMS rate makes a LIVE Xero
+ *   /TaxRates call, and the rig shares a quota-limited Xero tenant with stage (~1000 calls/day), so this is
+ *   capped WELL below that quota regardless of how large E2E_CRON_RATE_LIMIT_MAX is set — a leaked secret or
+ *   runaway retry loop can never turn the e2e allowance into shared-tenant quota exhaustion (Codex). 20
+ *   comfortably covers X-04's three sweeps with retry headroom.
  */
-const E2E_OVERRIDE_JOBS = new Set<string>(['accounting-daily-batch', 'xero-tax-rate-drift'])
+const E2E_OVERRIDE_JOBS = new Map<string, number | null>([
+  ['accounting-daily-batch', null],
+  ['xero-tax-rate-drift', 20],
+])
 
 /**
  * Test/CI-only per-job max override. Returns `max` unchanged unless ALL hold:
@@ -80,9 +87,10 @@ const E2E_OVERRIDE_JOBS = new Set<string>(['accounting-daily-batch', 'xero-tax-r
  *      NODE_ENV can't be the guard because the rig serves a production build);
  *   2. `jobName` is in E2E_OVERRIDE_JOBS (scopes the blast radius to one job);
  *   3. `E2E_CRON_RATE_LIMIT_MAX` parses to a positive integer.
- * Even then it only RAISES the max (`Math.max`), never lowers it — so a stray
- * value can never tighten a limit into a production denial, and can only widen
- * the one allowlisted, CRON_SECRET-gated job.
+ * Even then it only RAISES the max (`Math.max`), never lowers it — so a stray value can never tighten a
+ * limit into a production denial — and it is bounded ABOVE by the job's per-job ceiling when one is set, so
+ * a job with a live external dependency (e.g. xero-tax-rate-drift's Xero /TaxRates call) can never inherit
+ * the full E2E_CRON_RATE_LIMIT_MAX and exhaust a shared quota.
  */
 export function applyE2eMaxOverride(jobName: string, max: number): number {
   if (process.env.E2E_TEST_MODE !== '1') return max
@@ -91,7 +99,9 @@ export function applyE2eMaxOverride(jobName: string, max: number): number {
   if (!raw) return max
   const override = Number(raw)
   if (!Number.isFinite(override) || override <= 0) return max
-  return Math.max(max, Math.floor(override))
+  const perJobCap = E2E_OVERRIDE_JOBS.get(jobName) ?? null
+  const capped = perJobCap == null ? Math.floor(override) : Math.min(Math.floor(override), perJobCap)
+  return Math.max(max, capped)
 }
 
 export async function enforceCronRateLimit(
