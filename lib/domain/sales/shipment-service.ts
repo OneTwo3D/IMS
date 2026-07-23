@@ -158,6 +158,13 @@ async function validateActiveShipmentTotalsWithinOrder(
   // confirmSalesOrderShipments nets refunds at build time. Comparing component shipment qty against
   // parent-kit ordered/refunded qty would let a fractional-component kit slip refunded units past the
   // cap (e.g. two kits needing 0.1 of a component ship 0.2, but a per-kit cap of 1 would pass it).
+  //
+  // NB: this expands ordered/refunded qty through the CURRENT kit graph, matching the existing
+  // build-time refund netting (confirmSalesOrderShipments) and the allocation path — the codebase has
+  // no immutable per-order BOM snapshot, so a kit re-composed BETWEEN packing and dispatch can drift
+  // this cap. Fixing that uniformly (persist a per-order-line fulfillment snapshot, or lock kit edits
+  // while orders are in flight) is systemic and tracked separately; this guard is a strict improvement
+  // over shipping every refunded unit and shares the same live-graph assumption already in force.
   const productIds = [...new Set([
     ...orderLines.map((line) => line.productId).filter((id): id is string => !!id),
     ...refundLines.map((refundLine) => refundLine.productId).filter((id): id is string => !!id),
