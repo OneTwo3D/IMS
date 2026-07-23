@@ -82,8 +82,9 @@ export async function purgeExpiredData(): Promise<{
   // idempotency record, so deleting it would let a redelivered or replayed old payload be accepted as
   // new and reprocessed (re-applying stale addresses/status, re-enqueueing stock). Only PROCESSED rows
   // are compacted; DEAD_LETTER (failed/unresolved — the only record of the failed event) and
-  // PENDING/FAILED (undelivered work) are left fully intact. Compaction bumps updatedAt, so an
-  // already-compacted row isn't re-selected until the next cutoff window (a cheap no-op if it is).
+  // PENDING/FAILED (undelivered work) are left fully intact. The `payloadJson != {}` predicate
+  // PERMANENTLY excludes already-compacted rows, so each daily run only touches the newly-eligible set
+  // (a day's worth of rows crossing the cutoff) rather than rewriting the whole retained tombstone set.
   const webhookMonths = settings.retention_webhook_events_months
   if (webhookMonths > 0) {
     const cutoff = monthsAgo(webhookMonths)
@@ -91,6 +92,7 @@ export async function purgeExpiredData(): Promise<{
       where: {
         status: WC_WEBHOOK_EVENT_STATUS.processed,
         updatedAt: { lt: cutoff },
+        NOT: { payloadJson: { equals: {} } },
       },
       data: { payloadJson: {}, lastError: null },
     })

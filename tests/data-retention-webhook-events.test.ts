@@ -68,6 +68,8 @@ test('compacts ONLY PROCESSED rows past the cutoff, clearing payloadJson but kee
   assert.equal(args.where.status, WC_WEBHOOK_EVENT_STATUS.processed)
   assert.notEqual(args.where.status, WC_WEBHOOK_EVENT_STATUS.deadLetter)
   assert.ok((args.where.updatedAt as { lt?: Date })?.lt instanceof Date, 'bounded by an updatedAt cutoff')
+  // Already-compacted rows are permanently excluded so each run only touches the newly-eligible set.
+  assert.deepEqual((args.where.NOT as { payloadJson?: { equals?: unknown } })?.payloadJson?.equals, {})
   // Clears the bulky payload, keeps the row (dedup key + status untouched).
   assert.deepEqual(args.data.payloadJson, {})
   assert.equal(args.data.lastError, null)
