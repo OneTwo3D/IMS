@@ -1519,6 +1519,14 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     // SALES_INVOICE follow-up (enqueueSalesInvoiceFollowUps) enqueues INVOICE_PAYMENT ONLY when
     // accounting_payment_account_map resolves a bank account for the order's method:currency — otherwise it
     // logs "no payment account map" and skips (the reason no earlier OC case exercised a payment).
+    //
+    // ZERO-RATED line on purpose (o3d-c0n). This case isolates the PAYMENT mechanism — scope -> map ->
+    // POST /Payments -> invoice PAID -> drawn from the mapped bank account. A production bug OC-15
+    // caught means a TAXED order would under-settle: order-import never sets _paymentAmount, so the
+    // poster falls back to the NET line sum and registers £net against a £gross invoice, leaving it
+    // AUTHORISED with the VAT outstanding forever. Using a zero-rated line makes net == gross, so the
+    // payment fully settles and this test asserts the mechanism without depending on the (filed) bug.
+    // Once o3d-c0n is fixed, extend this to a taxed order that settles to PAID for its GROSS total.
     const sku = taggedSku(runId, 'OC15')
     const unitPrice = '40.00'
     const qty = 2
@@ -1540,8 +1548,11 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC15`, price: unitPrice })
       await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
 
-      const product = await createWcProduct(creds, runId, { label: 'OC15', price: unitPrice })
+      const product = await createWcProduct(creds, runId, { label: 'OC15', price: unitPrice, taxClass: 'zero-rate' })
       const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }], paymentMethod: method })
+      // Zero-rated: WC charges no VAT, so the gross the customer paid equals the net line value and the
+      // registered payment settles the invoice in full (see the header note on o3d-c0n).
+      expect(Number(order.total), 'the zero-rated order total carries no VAT').toBeCloseTo(Number(unitPrice) * qty, 2)
 
       imported = await awaitWebhookDelivery(order.id, { creds })
       await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
@@ -1554,7 +1565,7 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
         // so it posts on a LATER drain. drainUntilInvoicePaid re-drains until the ledger shows it settled.
         await processPendingXeroSyncViaUi(page)
         const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
-        const invoice = await drainUntilInvoicePaid(page, invoiceId)
+        const invoice = await drainUntilInvoicePaid(page, invoiceId, imported.salesOrderId)
 
         expect(invoice.Type).toBe('ACCREC')
         // THE POINT: the invoice is fully PAID in the ledger, not merely AUTHORISED. A dropped or skipped
@@ -2612,6 +2623,62 @@ async function webhookEventStatuses(wcOrderId: number): Promise<string[]> {
       [wcOrderId],
     )
     return r.rows.map((x) => x.status)
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Drain the Xero queue until the invoice reads PAID. The INVOICE_PAYMENT follow-up is enqueued while
+ * the SALES_INVOICE is being posted and is ordering-deferred until that CREATE is live, so it posts on
+ * a drain AFTER the one that created the invoice.
+ *
+ * Two things this must handle beyond a naive "drain then read" (which flaked: the payment posted
+ * SYNCED yet the invoice still read AUTHORISED):
+ *   - gate on the SUBLEDGER truth, not the invoice: poll the INVOICE_PAYMENT sync log. FAILED means
+ *     the payment could not post (e.g. a scope/mapping regression) — fail loudly rather than spin to a
+ *     confusing timeout; SYNCED means Xero accepted the POST.
+ *   - once the payment is SYNCED, Xero can lag a beat applying it to the invoice AGGREGATE, so poll
+ *     getInvoice for PAID rather than reading once.
+ */
+async function drainUntilInvoicePaid(
+  page: import('@playwright/test').Page,
+  invoiceId: string,
+  salesOrderId: string,
+  maxDrains = 5,
+) {
+  let invoice = await getInvoice(invoiceId)
+  for (let i = 0; i < maxDrains && invoice.Status !== 'PAID'; i++) {
+    await processPendingXeroSyncViaUi(page)
+    const pay = await invoicePaymentLogStatus(salesOrderId)
+    if (pay?.status === 'FAILED') {
+      throw new Error(`INVOICE_PAYMENT failed to post to Xero: ${pay.error ?? 'no error recorded'}`)
+    }
+    if (pay?.status === 'SYNCED') {
+      for (let j = 0; j < 6 && invoice.Status !== 'PAID'; j++) {
+        invoice = await getInvoice(invoiceId)
+        if (invoice.Status === 'PAID') break
+        await new Promise((res) => setTimeout(res, 5_000))
+      }
+    } else {
+      invoice = await getInvoice(invoiceId)
+    }
+  }
+}
+
+/** The latest INVOICE_PAYMENT sync-log status for a sales order (its referenceId), or null. */
+async function invoicePaymentLogStatus(salesOrderId: string): Promise<{ status: string; error: string | null } | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ status: string; errorMessage: string | null }>(
+      `select status, "errorMessage" from accounting_sync_logs
+        where connector = 'xero' and type = 'INVOICE_PAYMENT' and "referenceId" = $1
+        order by "createdAt" desc limit 1`,
+      [salesOrderId],
+    )
+    return r.rows.length ? { status: r.rows[0].status, error: r.rows[0].errorMessage } : null
   } finally {
     await db.end()
   }
