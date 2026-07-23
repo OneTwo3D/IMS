@@ -43,8 +43,8 @@ import {
 } from './harness/ims.ts'
 import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
 import {
-  expectJournalLine, externalIdFor, getInvoice, getManualJournal, getXeroTaxRates, trackDocument,
-  type XeroManualJournal, type XeroTaxRate,
+  expectJournalLine, externalIdFor, externalIdsFor, getInvoice, getManualJournal, getXeroTaxRates,
+  trackDocument, type XeroManualJournal, type XeroTaxRate,
 } from './harness/xero.ts'
 import {
   dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
@@ -546,14 +546,21 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     // Drain everything queued (STOCK_RECEIPT and the STOCK_IN_TRANSIT reval), then resolve + REGISTER every
     // posted document BEFORE any assertion — the drain can throw after Xero accepted a journal, so
     // registration lives in a finally that is the ledger safety net.
-    let stockInTransitId = ''
+    //
+    // Enumerate ALL distinct STOCK_IN_TRANSIT documents for the PO (externalIdsFor dedupes SYNCED ids),
+    // not just the latest — "routed through transit exactly once" is only meaningful if there is EXACTLY
+    // one such journal. externalIdFor returns only the most recent, so a duplicate reval (a retry or
+    // idempotency regression posting a SECOND £100 journal) would slip through it while transit is credited
+    // £200 (Codex). We assert the count AND aggregate the transit movement across every matching journal.
+    let stockInTransitIds: string[] = []
     let receiptId = ''
     try {
       await processPendingXeroSyncViaUi(page)
     } finally {
-      stockInTransitId = await externalIdFor({ type: 'STOCK_IN_TRANSIT', referenceId: goodsPoId }).catch(() => '')
+      stockInTransitIds = await externalIdsFor({ type: 'STOCK_IN_TRANSIT', referenceId: goodsPoId, expected: 1 })
+        .catch((): string[] => [])
       receiptId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: goodsPoId }).catch(() => '')
-      if (stockInTransitId) trackDocument('ManualJournals', stockInTransitId, `X-06 stock-in-transit reval ${runTag(runId)}`)
+      for (const id of stockInTransitIds) trackDocument('ManualJournals', id, `X-06 stock-in-transit reval ${runTag(runId)}`)
       if (receiptId) trackDocument('ManualJournals', receiptId, `X-06 stock receipt ${runTag(runId)}`)
       // Failure-safe net: if the exclusion REGRESSED and a spurious COGS_JOURNAL did post to the shared
       // ledger, register it too so teardown voids it (the assertion below then fails loudly, not the ledger).
@@ -569,17 +576,25 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       'a retrospective landed cost on TRANSFERRED-out units must post NO COGS_JOURNAL (6oyu.19.1)',
     ).toBe(0)
 
-    // The reval posted ONE STOCK_IN_TRANSIT journal revaluing the on-hand DESTINATION units: DR inventory
-    // £100 / CR transit £100, POSTED and balanced (not merely "not DELETED"). The transit credit is the £100
-    // landed cost routed through transit EXACTLY ONCE — the whole point of the exclusion.
-    expect(stockInTransitId, 'the STOCK_IN_TRANSIT reval journal posted to Xero').toBeTruthy()
-    const reval = await getManualJournal(stockInTransitId)
-    expect(reval.Status).toBe('POSTED')
-    expectBalanced(reval)
-    const revalInventory = journalSumFor(reval, inventoryAccount)
-    const revalTransit = journalSumFor(reval, transitAccount)
-    expect(revalInventory, 'reval debits inventory for the £100 landed cost on the on-hand units').toBeCloseTo(freightTotal, 2)
-    expect(revalTransit, 'reval credits transit for the £100 landed cost — routed through transit exactly once').toBeCloseTo(-freightTotal, 2)
+    // EXACTLY ONE STOCK_IN_TRANSIT journal posted for the PO — a duplicate would credit transit twice
+    // (£200) and defeat "routed through transit exactly once", so counting the distinct documents is the
+    // load-bearing check, not just inspecting one.
+    expect(stockInTransitIds.length, 'the reval posted EXACTLY ONE STOCK_IN_TRANSIT journal for the PO').toBe(1)
+
+    // Aggregate across every matching journal (exactly one here): revaluing the on-hand DESTINATION units
+    // DR inventory £100 / CR transit £100, each POSTED and balanced (not merely "not DELETED"). The total
+    // transit credit is the £100 landed cost routed through transit EXACTLY ONCE — the point of the exclusion.
+    let totalInventory = 0
+    let totalTransit = 0
+    for (const id of stockInTransitIds) {
+      const reval = await getManualJournal(id)
+      expect(reval.Status).toBe('POSTED')
+      expectBalanced(reval)
+      totalInventory += journalSumFor(reval, inventoryAccount)
+      totalTransit += journalSumFor(reval, transitAccount)
+    }
+    expect(totalInventory, 'the reval debits inventory for the £100 landed cost on the on-hand units').toBeCloseTo(freightTotal, 2)
+    expect(totalTransit, 'the reval credits transit for the £100 landed cost — routed through transit exactly once').toBeCloseTo(-freightTotal, 2)
   })
 
   test('X-04: IMS↔Xero tax-rate DRIFT is detected (Setting snapshot + WARNING ActivityLog), clears on reconcile — detect-only, no Xero write', async ({ page }) => {
