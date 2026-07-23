@@ -129,7 +129,7 @@ async function validateActiveShipmentTotalsWithinOrder(
   // plan, so this check intentionally includes PICKING/PACKED rows as well as
   // SHIPPED rows. That makes concurrent dispatches race-safe for total-qty
   // validation: both transactions see the same active planned shipment set.
-  const [orderLines, activeShipmentLines] = await Promise.all([
+  const [orderLines, activeShipmentLines, refundLines] = await Promise.all([
     client.salesOrderLine.findMany({
       where: { orderId },
       select: { id: true, productId: true, qty: true, sku: true, description: true },
@@ -137,6 +137,13 @@ async function validateActiveShipmentTotalsWithinOrder(
     client.shipmentLine.findMany({
       where: { shipment: { orderId, status: { not: 'PENDING' } } },
       select: { lineId: true, productId: true, qty: true },
+    }),
+    // o3d-339: confirmSalesOrderShipments already nets refunds at BUILD time; this is the
+    // dispatch-time backstop for a shipment BUILT BEFORE the refund landed. Runs under the order
+    // lock transitionShipmentStatus already holds, so a concurrent refund is serialized.
+    client.salesOrderRefundLine.findMany({
+      where: { refund: { orderId } },
+      select: { salesOrderLineId: true, qty: true },
     }),
   ])
 
@@ -157,12 +164,34 @@ async function validateActiveShipmentTotalsWithinOrder(
   )]
   const graph = productIds.length > 0 ? await loadFulfillmentProductGraph(client, productIds) : new Map()
 
+  // Refunded quantities are in ORDER LINE units (kit units for a kit line), the same units as
+  // line.qty — so they are netted BEFORE the kit expansion, not after. Expanding the already-netted
+  // figure makes the component entitlement fall proportionally through the SAME expansion the
+  // entitlement itself uses, instead of distributing a refund across component leaves by hand. That
+  // hand-distribution is precisely where the KIT proportionality invariant gets broken (o3d-i4qd),
+  // so it is avoided entirely here.
+  const refundedByLine = new Map<string, Prisma.Decimal>()
+  for (const refundLine of refundLines) {
+    // An unmatched external refund (no order line) can't be attributed to a shippable line — skip it.
+    if (!refundLine.salesOrderLineId) continue
+    refundedByLine.set(
+      refundLine.salesOrderLineId,
+      (refundedByLine.get(refundLine.salesOrderLineId) ?? new Prisma.Decimal(0)).add(toDecimal(refundLine.qty)),
+    )
+  }
+
   const lineLabelById = new Map<string, string>()
+  const refundedLineIds = new Set<string>()
   const orderedByLeaf = new Map<string, Prisma.Decimal>()
   for (const line of orderLines) {
     lineLabelById.set(line.id, line.sku ?? line.description ?? line.id)
     if (!line.productId) continue // a description-only line has no product to ship
-    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(line.productId, toDecimal(line.qty), graph)) {
+    // Shippable = ordered minus refunded, never below zero: refunded units are no longer owed.
+    const refundedQty = refundedByLine.get(line.id) ?? new Prisma.Decimal(0)
+    if (refundedQty.gt(0)) refundedLineIds.add(line.id)
+    let shippableQty = toDecimal(line.qty).sub(refundedQty)
+    if (shippableQty.lt(0)) shippableQty = new Prisma.Decimal(0)
+    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(line.productId, shippableQty, graph)) {
       const key = `${line.id}|${componentId}`
       orderedByLeaf.set(key, (orderedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
     }
@@ -189,6 +218,9 @@ async function validateActiveShipmentTotalsWithinOrder(
     // immutable per-row snapshot (o3d-2uh), and the pre-fix code rejects ALL kit dispatches regardless.
     const orderedQty = roundQuantity(orderedByLeaf.get(key) ?? new Prisma.Decimal(0), 4)
     if (activeQty.gt(orderedQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
+      if (refundedLineIds.has(lineId)) {
+        return `Shipment quantity for line ${label} exceeds the quantity still owed after refunds. Rebuild the shipment and retry.`
+      }
       return `Shipment quantity for line ${label} exceeds ordered quantity. Reload and retry.`
     }
   }
