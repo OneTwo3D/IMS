@@ -1302,7 +1302,7 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     }
   })
 
-  test('OC-15: a paid order records an INVOICE_PAYMENT that settles the Xero invoice from the mapped bank account', async ({ page }) => {
+  test('OC-15: a paid (zero-rated) order records an INVOICE_PAYMENT that settles the Xero invoice from the mapped bank account', async ({ page }) => {
     // Composed worst case as OC-14/OC-10: delivery + import barrier + setup + ship + a SECOND drain for the
     // ordering-deferred payment.
     test.setTimeout(1_800_000)
@@ -1378,14 +1378,18 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
         expect(payment.Account?.Code, 'payment drawn from the mapped bank account (Business Bank Account 090)').toBe(bankCode)
       } finally {
         // Failure-safe: register the PAYMENT before the invoice (VOID_ORDER deletes Payments first) so a
-        // post that beat a later throw is reversed and the invoice can then be voided. Re-read the invoice
-        // to discover any payment even if an assertion threw before we captured its id.
+        // post that beat a later throw is reversed and the invoice can then be voided.
+        //
+        // Register the EXACT payment THIS order recorded — the INVOICE_PAYMENT sync log's own
+        // externalTransactionId (Codex r1) — never "every payment on the invoice aggregate". The
+        // aggregate approach is both unsafe (a stale/mis-mapped invoice id would mark a stranger's
+        // payment for deletion in the shared ledger) and unreliable (Xero can lag reflecting the
+        // payment on the invoice, so a just-posted payment would be absent and left untracked). The
+        // sync log carries the id the moment the POST is accepted, independent of that lag.
+        const paymentExtId = await invoicePaymentExternalId(imported.salesOrderId).catch(() => null)
+        if (paymentExtId) trackDocument('Payments', paymentExtId, `OC-15 payment ${runTag(runId)}`)
         const posted = await awaitPostedExternalId('SALES_INVOICE', imported.salesOrderId, 90_000).catch(() => null)
-        if (posted) {
-          const inv = await getInvoice(posted).catch(() => null)
-          for (const p of inv?.Payments ?? []) trackDocument('Payments', p.PaymentID, `OC-15 payment ${runTag(runId)}`)
-          trackDocument('Invoices', posted, `OC-15 invoice ${runTag(runId)}`)
-        }
+        if (posted) trackDocument('Invoices', posted, `OC-15 invoice ${runTag(runId)}`)
       }
     } finally {
       if (priorMap == null) await clearSetting(PAYMENT_MAP_KEY)
@@ -2239,6 +2243,25 @@ async function drainUntilInvoicePaid(
     }
   }
   return invoice
+}
+
+/** The Xero external id of the INVOICE_PAYMENT this order recorded (once posted), or null. */
+async function invoicePaymentExternalId(salesOrderId: string): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ externalTransactionId: string | null }>(
+      `select "externalTransactionId" from accounting_sync_logs
+        where connector = 'xero' and type = 'INVOICE_PAYMENT' and "referenceId" = $1
+          and "externalTransactionId" is not null
+        order by "createdAt" desc limit 1`,
+      [salesOrderId],
+    )
+    return r.rows.length ? r.rows[0].externalTransactionId : null
+  } finally {
+    await db.end()
+  }
 }
 
 /** The latest INVOICE_PAYMENT sync-log status for a sales order (its referenceId), or null. */
