@@ -55,6 +55,8 @@ type State = {
   lines: OrderLine[]
   allocations: Allocation[]
   refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
+  // Kit/BOM graph: productId -> its component requirements. Absent products are treated as SIMPLE.
+  kits?: Record<string, Array<{ componentId: string; qty: number; sku?: string }>>
   shipments: Shipment[]
   shipmentLines: ShipmentLine[]
   stockLevels: StockLevel[]
@@ -158,11 +160,21 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     product: {
-      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => ({
-        id,
-        type: 'SIMPLE',
-        productComponents: [],
-      })),
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => {
+        const components = state.kits?.[id]
+        if (components && components.length > 0) {
+          return {
+            id,
+            type: 'KIT',
+            productComponents: components.map((component) => ({
+              componentId: component.componentId,
+              qty: component.qty,
+              component: { sku: component.sku ?? component.componentId, type: 'SIMPLE', oversellAllowed: false },
+            })),
+          }
+        }
+        return { id, type: 'SIMPLE', productComponents: [] }
+      }),
     },
     orderAllocation: {
       findMany: async ({ where }: { where: { orderId: string } }) => state.allocations
@@ -647,11 +659,7 @@ test('transitionShipmentStatus dispatches a KIT order whose component lines sum 
   // expanded requirement (2 ≤ 2, 3 ≤ 3) and lets it ship.
   const state = baseState({
     lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
-    // The kit was allocated as its leaf components (this is what the shipment was built from).
-    allocations: [
-      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-1', qty: 2 },
-      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-2', warehouseId: 'warehouse-1', qty: 3 },
-    ],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 2, sku: 'COMP-1' }, { componentId: 'comp-2', qty: 3, sku: 'COMP-2' }] },
     shipments: [
       { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
     ],
@@ -684,7 +692,7 @@ test('transitionShipmentStatus dispatches a fractional kit at the Decimal(12,4) 
   // must be quantised to 4dp before comparison, else 0.1667 > 0.16665 falsely rejects a valid dispatch.
   const state = baseState({
     lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1', description: 'Kit 1' }],
-    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-1', qty: 0.1667 }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.3333, sku: 'COMP-1' }] },
     shipments: [
       { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
     ],
@@ -706,15 +714,12 @@ test('transitionShipmentStatus dispatches a fractional kit at the Decimal(12,4) 
 })
 
 test('transitionShipmentStatus dispatches a fractional kit split 0.5/0.5 across two warehouses (o3d-odu)', async () => {
-  // One kit split across two warehouses, 0.3333 component each side → both allocation AND shipment rows
-  // persist as 0.1667, so the active total (0.3334) matches the summed allocation cap (0.3334). A cap
-  // recomputed as round(1 × 0.3333) = 0.3333 would wrongly reject the second dispatch.
+  // One kit split across two warehouses, 0.3333 component each side. Each shipment row persists as 0.1667
+  // so the active total is 0.3334, while the once-rounded entitlement round(1 × 0.3333) = 0.3333. The
+  // per-row quantisation tolerance absorbs that 0.0001, so the legitimate second dispatch is not rejected.
   const state = baseState({
     lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
-    allocations: [
-      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-1', qty: 0.1667 },
-      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-2', qty: 0.1667 },
-    ],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.3333, sku: 'COMP-1' }] },
     shipments: [
       { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
       { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'PACKED', trackingNumber: null, shippingService: null },
@@ -740,7 +745,7 @@ test('transitionShipmentStatus still rejects a KIT whose component ships above i
   // 3 of comp-1 shipped for a kit that only needs 2 → over the expanded requirement, still rejected.
   const state = baseState({
     lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
-    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-1', qty: 2 }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 2, sku: 'COMP-1' }] },
     shipments: [
       { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
     ],
@@ -839,10 +844,6 @@ test('transitionShipmentStatus rolls back earlier line mutations when a later di
     lines: [
       { id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 1, sku: 'SKU-1', description: 'Product 1' },
       { id: 'line-2', orderId: 'order-1', productId: 'product-2', qty: 1, sku: 'SKU-2', description: 'Product 2' },
-    ],
-    allocations: [
-      { orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 1 },
-      { orderId: 'order-1', lineId: 'line-2', productId: 'product-2', warehouseId: 'warehouse-1', qty: 1 },
     ],
     shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
     shipmentLines: [

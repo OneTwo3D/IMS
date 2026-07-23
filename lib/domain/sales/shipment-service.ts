@@ -22,6 +22,10 @@ import { withSavepoint } from '@/lib/db/savepoint'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const SHIPMENT_QTY_EPSILON_DECIMAL = new Prisma.Decimal('0.000001')
+// Half a unit in the last place of the Decimal(12,4) quantity persistence — the maximum rounding error
+// a single persisted shipment/allocation row can carry. Used to absorb per-row quantisation when
+// summing split rows against a once-rounded entitlement (o3d-odu).
+const QTY_HALF_ULP_4DP = new Prisma.Decimal('0.00005')
 
 /**
  * Deliberate call-site boundary for this number-shaped shipment service contract.
@@ -129,14 +133,10 @@ async function validateActiveShipmentTotalsWithinOrder(
   // plan, so this check intentionally includes PICKING/PACKED rows as well as
   // SHIPPED rows. That makes concurrent dispatches race-safe for total-qty
   // validation: both transactions see the same active planned shipment set.
-  const [orderLines, allocations, activeShipmentLines] = await Promise.all([
+  const [orderLines, activeShipmentLines] = await Promise.all([
     client.salesOrderLine.findMany({
       where: { orderId },
-      select: { id: true, sku: true, description: true },
-    }),
-    client.orderAllocation.findMany({
-      where: { orderId },
-      select: { lineId: true, productId: true, qty: true },
+      select: { id: true, productId: true, qty: true, sku: true, description: true },
     }),
     client.shipmentLine.findMany({
       where: { shipment: { orderId, status: { not: 'PENDING' } } },
@@ -147,36 +147,52 @@ async function validateActiveShipmentTotalsWithinOrder(
   // Shipment lines are LEAF-product rows: a KIT order line expands to its component products, so a kit
   // line has several shipment lines (one per component) under the same lineId, each in COMPONENT units.
   // Summing them against the kit line's OWN qty (kit units) always over-counts and falsely rejects every
-  // kit dispatch (o3d-odu). Instead compare in leaf-product units keyed by (orderLineId, productId)
-  // against the PERSISTED OrderAllocation quantities — the Decimal(12,4) leaf rows the shipments were
-  // built from (confirmSalesOrderShipments builds directly from these). Using the persisted allocations
-  // rather than a live re-expansion of the kit line qty means the cap already matches the per-row
-  // rounding of the shipment lines (a 0.5/0.5 split of a 0.3333 component is 0.1667 + 0.1667 on both
-  // sides) and is immune to later kit-composition edits. Simple products allocate 1:1, so their
-  // behaviour is unchanged.
-  const lineLabelById = new Map(orderLines.map((line) => [line.id, line.sku ?? line.description ?? line.id]))
+  // kit dispatch (o3d-odu). Instead compare in leaf-product units keyed by (orderLineId, productId): the
+  // per-leaf entitlement is the order line qty expanded through the kit/BOM graph (the same expansion
+  // confirmSalesOrderShipments uses), quantised to the Decimal(12,4) persistence boundary. Simple
+  // products are the identity expansion, so their behaviour and the reject message are unchanged. The
+  // base is the ORDER LINE qty — immutable across the fulfilment lifecycle — NOT the current allocations
+  // (which the reallocation workflow shrinks to the remainder after a partial shipment). Residual: the
+  // kit COMPOSITION can be edited mid-fulfilment, drifting this entitlement — tracked systemically in
+  // o3d-2uh (an immutable per-order fulfilment snapshot); the current code rejects ALL kit dispatches,
+  // so this is strictly better.
+  const productIds = [...new Set(
+    orderLines.map((line) => line.productId).filter((id): id is string => !!id),
+  )]
+  const graph = productIds.length > 0 ? await loadFulfillmentProductGraph(client, productIds) : new Map()
 
-  const allocatedByLeaf = new Map<string, Prisma.Decimal>()
-  for (const allocation of allocations) {
-    const key = `${allocation.lineId}|${allocation.productId}`
-    allocatedByLeaf.set(key, (allocatedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(allocation.qty)))
+  const lineLabelById = new Map<string, string>()
+  const orderedByLeaf = new Map<string, Prisma.Decimal>()
+  for (const line of orderLines) {
+    lineLabelById.set(line.id, line.sku ?? line.description ?? line.id)
+    if (!line.productId) continue // a description-only line has no product to ship
+    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(line.productId, toDecimal(line.qty), graph)) {
+      const key = `${line.id}|${componentId}`
+      orderedByLeaf.set(key, (orderedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
+    }
   }
 
-  const activeByLeaf = new Map<string, { lineId: string; activeQty: Prisma.Decimal }>()
+  const activeByLeaf = new Map<string, { lineId: string; activeQty: Prisma.Decimal; rows: number }>()
   for (const shipmentLine of activeShipmentLines) {
     const key = `${shipmentLine.lineId}|${shipmentLine.productId}`
-    const entry = activeByLeaf.get(key) ?? { lineId: shipmentLine.lineId, activeQty: new Prisma.Decimal(0) }
+    const entry = activeByLeaf.get(key) ?? { lineId: shipmentLine.lineId, activeQty: new Prisma.Decimal(0), rows: 0 }
     entry.activeQty = entry.activeQty.add(toDecimal(shipmentLine.qty))
+    entry.rows += 1
     activeByLeaf.set(key, entry)
   }
 
-  for (const [key, { lineId, activeQty }] of activeByLeaf) {
+  for (const [key, { lineId, activeQty, rows }] of activeByLeaf) {
     const label = lineLabelById.get(lineId)
     if (!label) {
       return `Shipment line ${lineId} no longer belongs to this order. Reload and retry.`
     }
-    const allocatedQty = allocatedByLeaf.get(key) ?? new Prisma.Decimal(0)
-    if (activeQty.gt(allocatedQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
+    const orderedQty = roundQuantity(orderedByLeaf.get(key) ?? new Prisma.Decimal(0), 4)
+    // Each shipment/allocation row is independently rounded to Decimal(12,4), so the active sum of N
+    // split rows can exceed the once-rounded entitlement by up to N half-ulps (a 0.5/0.5 split of a
+    // 0.3333 component sums to 0.1667+0.1667=0.3334 vs a 0.3333 entitlement). Absorb exactly that
+    // per-row quantisation in the tolerance; a real over-ship far exceeds it.
+    const tolerance = SHIPMENT_QTY_EPSILON_DECIMAL.add(QTY_HALF_ULP_4DP.mul(rows))
+    if (activeQty.gt(orderedQty.add(tolerance))) {
       return `Shipment quantity for line ${label} exceeds ordered quantity. Reload and retry.`
     }
   }
