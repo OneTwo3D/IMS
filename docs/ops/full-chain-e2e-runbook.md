@@ -95,6 +95,26 @@ WooCommerce creds are **not** in `.env` — `wcCreds()` reads `wc_url`/`wc_consu
 e2e DB `settings` table (values are encrypted; the harness decrypts with
 `SETTINGS_ENCRYPTION_KEY`).
 
+### Batch-cron rate limit — required for running >1 batch test per invocation (o3d-lgo.13)
+
+`accounting-daily-batch` is rate-limited to **1/hour/IP** (`lib/cron-rate-limit.ts`, defence-in-
+depth over `CRON_SECRET`). A single suite run that drives the daily batch more than once —
+**OC-08 and X-01 both do** — otherwise 429s on the second trigger (the spec detects it and
+**skips loudly**, never a false pass). To let one invocation cover both, the rig's `.env.local`
+sets **both** of:
+
+```
+E2E_TEST_MODE=1          # the repo's e2e flag; also gates lib/testing/e2e-route-guard etc.
+E2E_CRON_RATE_LIMIT_MAX=10000
+```
+
+`applyE2eMaxOverride` only honours `E2E_CRON_RATE_LIMIT_MAX` when `E2E_TEST_MODE=1` **and** the
+job is the allowlisted `accounting-daily-batch`, and it can only **raise** the limit — so it
+cannot widen any other cron or tighten production (production leaves both unset). These are
+**server-side** env vars: after adding them, **rebuild + restart** `ims-e2e-dev.service` (Next
+reads them at server start). Without them the rig keeps the 1/hour limit and batch tests must run
+in **separate invocations** (or restart the service — memory-backed limiter — between them).
+
 ## The quiesce lock (single point of failure)
 
 `global-setup.ts` takes a **quiesce lock** that disables the stage store's connectors

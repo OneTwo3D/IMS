@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  applyE2eMaxOverride,
   CRON_RATE_LIMIT_FIVE_MINUTE_MAX,
   CRON_RATE_LIMIT_MAX,
   CRON_RATE_LIMIT_WINDOW_MS,
@@ -58,6 +59,89 @@ test('cron rate-limit helper returns 429 with retry metadata when quota is consu
     retryAfterSec: 123,
   })
 })
+
+function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
+  const prev: Record<string, string | undefined> = {}
+  for (const k of Object.keys(vars)) prev[k] = process.env[k]
+  try {
+    for (const [k, v] of Object.entries(vars)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    fn()
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
+
+test('E2E override raises the allowlisted job max, but only when E2E_TEST_MODE=1', () => {
+  const ALLOWED = 'accounting-daily-batch'
+  // Guard off: no override applies even with a value set (production posture).
+  withEnv({ E2E_TEST_MODE: undefined, E2E_CRON_RATE_LIMIT_MAX: '10000' }, () => {
+    assert.equal(applyE2eMaxOverride(ALLOWED, 1), 1, 'E2E_TEST_MODE unset: never applies')
+  })
+  withEnv({ E2E_TEST_MODE: '0', E2E_CRON_RATE_LIMIT_MAX: '10000' }, () => {
+    assert.equal(applyE2eMaxOverride(ALLOWED, 1), 1, 'E2E_TEST_MODE!=1: never applies')
+  })
+  // Guard on: raises the allowlisted job, raise-only, rejects junk.
+  withEnv({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '10000' }, () => {
+    assert.equal(applyE2eMaxOverride(ALLOWED, 1), 10000, 'raises the default max')
+  })
+  withEnv({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '3' }, () => {
+    assert.equal(applyE2eMaxOverride(ALLOWED, 15), 15, 'below base: never lowers (raise-only)')
+  })
+  withEnv({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: undefined }, () => {
+    assert.equal(applyE2eMaxOverride(ALLOWED, 1), 1, 'value unset: unchanged')
+  })
+  for (const bad of ['0', '-5', 'nope', '', '1.5e3nope']) {
+    withEnv({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: bad }, () => {
+      assert.equal(applyE2eMaxOverride(ALLOWED, 1), 1, `invalid/zero (${JSON.stringify(bad)}): unchanged`)
+    })
+  }
+})
+
+test('E2E override NEVER applies to a non-allowlisted job (blast-radius guard)', () => {
+  // Even fully "armed", the override must not touch backup/archival/etc.
+  withEnv({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '10000' }, () => {
+    for (const job of ['backup', 'accounting-sync', 'product-lifecycle-archive', 'email-outbox']) {
+      assert.equal(applyE2eMaxOverride(job, 1), 1, `${job} must ignore the override`)
+    }
+  })
+})
+
+test('enforceCronRateLimit passes the E2E-overridden max only for the allowlisted job', async () => {
+  await withEnvAsync({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '5000' }, async () => {
+    const seen: Record<string, number> = {}
+    const checker = (job: string) => async (_key: string, max: number) => {
+      seen[job] = max
+      return { allowed: true as const, retryAfterSec: 0, remaining: 0 }
+    }
+    await enforceCronRateLimit('accounting-daily-batch', checker('accounting-daily-batch'))
+    await enforceCronRateLimit('backup', checker('backup'))
+    assert.equal(seen['accounting-daily-batch'], 5000, 'allowlisted job widened')
+    assert.equal(seen['backup'], CRON_RATE_LIMIT_MAX, 'non-allowlisted job untouched')
+  })
+})
+
+async function withEnvAsync(vars: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
+  const prev: Record<string, string | undefined> = {}
+  for (const k of Object.keys(vars)) prev[k] = process.env[k]
+  try {
+    for (const [k, v] of Object.entries(vars)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    await fn()
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
 
 test('five-minute cron quota keeps jitter headroom beyond exact twelve-per-hour cadence', async () => {
   let now = Date.UTC(2026, 5, 9, 12, 0, 0)

@@ -40,10 +40,50 @@ export type CronRateLimitOptions = {
  *   rate-limit backend outage must not block legitimate scheduled jobs. This is
  *   the opposite trade-off from the auth endpoints (login/reset/TOTP/step-up),
  *   which fail closed because they are the primary brute-force barrier.
+ * - `E2E_CRON_RATE_LIMIT_MAX` is a test/CI-only override for the full-chain
+ *   e2e rig, where one suite run legitimately triggers a batch cron many times
+ *   (e.g. OC-08 and X-01 both drive accounting-daily-batch). It is guarded
+ *   THREE ways so it cannot silently weaken production (see applyE2eMaxOverride):
+ *     1. requires `E2E_TEST_MODE=1` — the repo's existing e2e-only flag, unset
+ *        in production (we cannot gate on NODE_ENV: the rig serves a PRODUCTION
+ *        build, so NODE_ENV=production there);
+ *     2. applies ONLY to an allowlisted job (accounting-daily-batch) — a leaked
+ *        value can never widen backup/archival/accounting-sync/etc.;
+ *     3. RAISE-only (`Math.max`) — can never tighten a configured max into a
+ *        production denial.
+ *   The allowlisted job is still CRON_SECRET-gated; this limit is defence-in-
+ *   depth. Production leaves both E2E vars unset.
  */
 export function cronRateLimitKey(jobName: string, sourceIp?: string | null): string {
   if (sourceIp?.trim()) return `cron:${jobName}:${sourceIp.trim()}`
   return `cron:${jobName}`
+}
+
+/**
+ * The only cron jobs whose 1/hour limit an e2e run legitimately needs widened.
+ * Keep this list minimal — every entry is a job a leaked E2E_CRON_RATE_LIMIT_MAX
+ * could widen (only if E2E_TEST_MODE=1 is ALSO set), so it is the blast radius.
+ */
+const E2E_OVERRIDE_JOBS = new Set<string>(['accounting-daily-batch'])
+
+/**
+ * Test/CI-only per-job max override. Returns `max` unchanged unless ALL hold:
+ *   1. `E2E_TEST_MODE === '1'` (the repo's e2e flag; unset in production — and
+ *      NODE_ENV can't be the guard because the rig serves a production build);
+ *   2. `jobName` is in E2E_OVERRIDE_JOBS (scopes the blast radius to one job);
+ *   3. `E2E_CRON_RATE_LIMIT_MAX` parses to a positive integer.
+ * Even then it only RAISES the max (`Math.max`), never lowers it — so a stray
+ * value can never tighten a limit into a production denial, and can only widen
+ * the one allowlisted, CRON_SECRET-gated job.
+ */
+export function applyE2eMaxOverride(jobName: string, max: number): number {
+  if (process.env.E2E_TEST_MODE !== '1') return max
+  if (!E2E_OVERRIDE_JOBS.has(jobName)) return max
+  const raw = process.env.E2E_CRON_RATE_LIMIT_MAX
+  if (!raw) return max
+  const override = Number(raw)
+  if (!Number.isFinite(override) || override <= 0) return max
+  return Math.max(max, Math.floor(override))
 }
 
 export async function enforceCronRateLimit(
@@ -53,7 +93,8 @@ export async function enforceCronRateLimit(
   const options = typeof optionsOrChecker === 'function'
     ? { checker: optionsOrChecker }
     : optionsOrChecker
-  const max = options.max ?? CRON_RATE_LIMIT_MAX
+  const baseMax = options.max ?? CRON_RATE_LIMIT_MAX
+  const max = applyE2eMaxOverride(jobName, baseMax)
   const windowMs = options.windowMs ?? CRON_RATE_LIMIT_WINDOW_MS
   const checker = options.checker ?? checkRateLimit
   const sourceIp = options.request ? getClientIp(options.request.headers) : null
