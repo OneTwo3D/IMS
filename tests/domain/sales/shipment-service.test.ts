@@ -55,6 +55,8 @@ type State = {
   lines: OrderLine[]
   allocations: Allocation[]
   refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
+  // Kit/BOM graph: productId -> its component requirements. Absent products are treated as SIMPLE.
+  kits?: Record<string, Array<{ componentId: string; qty: number; sku?: string }>>
   shipments: Shipment[]
   shipmentLines: ShipmentLine[]
   stockLevels: StockLevel[]
@@ -158,11 +160,21 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     product: {
-      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => ({
-        id,
-        type: 'SIMPLE',
-        productComponents: [],
-      })),
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => {
+        const components = state.kits?.[id]
+        if (components && components.length > 0) {
+          return {
+            id,
+            type: 'KIT',
+            productComponents: components.map((component) => ({
+              componentId: component.componentId,
+              qty: component.qty,
+              component: { sku: component.sku ?? component.componentId, type: 'SIMPLE', oversellAllowed: false },
+            })),
+          }
+        }
+        return { id, type: 'SIMPLE', productComponents: [] }
+      }),
     },
     orderAllocation: {
       findMany: async ({ where }: { where: { orderId: string } }) => state.allocations
@@ -661,7 +673,7 @@ test('transitionShipmentStatus refuses to dispatch refunded units on a shipment 
   })
 
   assert.equal(result.success, false)
-  assert.match((result as { error: string }).error, /still owed after refunds/)
+  assert.match((result as { error: string }).error, /packed before the refund/)
   // Nothing dispatched: status unchanged, no stock decrement, no COGS.
   assert.equal(state.shipments[0].status, 'PACKED')
   assert.equal(state.stockLevels[0].quantity, 2)
@@ -693,6 +705,36 @@ test('transitionShipmentStatus dispatches a shipment whose quantity is within or
   assert.equal(result.success, true)
   assert.equal(state.shipments[0].status, 'SHIPPED')
   assert.equal(state.movements.length, 1) // the single still-owed unit dispatched
+})
+
+test('transitionShipmentStatus nets refunds at KIT leaf level so fractional components cannot over-dispatch (o3d-339)', async () => {
+  // A kit needs 0.1 of comp-1 per kit. Two kits ordered → 0.2 comp-1 packed. One kit is refunded →
+  // 0.1 comp-1 refunded, so only 0.1 comp-1 remains shippable. A LINE-level cap (ordered 2 − refunded 1
+  // = 1 kit) would wrongly pass the 0.2 component shipment; the leaf-level cap (0.2 − 0.1 = 0.1) rejects
+  // it, catching the refunded fractional component.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 2, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.1, sku: 'COMP-1' }] },
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 0.2 },
+    ],
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'kit-1', qty: 1 }],
+    stockLevels: [{ productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /packed before the refund/)
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.movements.length, 0)
 })
 
 test('transitionShipmentStatus fails cleanly when dispatch shipment starts with no lines', async () => {
