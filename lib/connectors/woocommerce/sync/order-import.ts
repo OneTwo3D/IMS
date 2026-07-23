@@ -158,6 +158,21 @@ export function pendingFxQueueWhere(externalOrderId?: string): Prisma.ShoppingSy
   }
 }
 
+/**
+ * The amount to settle the sales invoice for — the GROSS (tax-inclusive) total the customer paid, in the
+ * order currency the invoice is raised in (wcOrder.total). Undefined when the order isn't paid, where no
+ * payment is registered anyway. Without this, the payment sync-processor falls back to the NET line sum
+ * (+shipping −discount, no tax), so a taxed invoice is under-settled by its VAT and never reaches PAID
+ * (o3d-c0n). Non-taxed orders are unaffected because net == gross.
+ */
+export function resolveWcInvoicePaymentAmount(
+  wcOrder: Pick<WcFullOrder, 'date_paid_gmt' | 'total'>,
+): number | undefined {
+  if (!wcOrder.date_paid_gmt || !wcOrder.total) return undefined
+  const gross = Number(wcOrder.total)
+  return Number.isFinite(gross) && gross > 0 ? gross : undefined
+}
+
 export function buildPendingFxOrderPayload(
   wcOrder: WcFullOrder,
   error: { currency: string; asOf?: Date },
@@ -794,6 +809,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           _registerPayment: !!wcOrder.date_paid_gmt,
           _paymentMethod: wcOrder.payment_method || undefined,
           _paymentDate: wcOrder.date_paid_gmt || undefined,
+          _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder),
         },
       })
     } catch (accountingError) {
