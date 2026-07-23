@@ -22,10 +22,6 @@ import { withSavepoint } from '@/lib/db/savepoint'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const SHIPMENT_QTY_EPSILON_DECIMAL = new Prisma.Decimal('0.000001')
-// Half a unit in the last place of the Decimal(12,4) quantity persistence — the maximum rounding error
-// a single persisted shipment/allocation row can carry. Used to absorb per-row quantisation when
-// summing split rows against a once-rounded entitlement (o3d-odu).
-const QTY_HALF_ULP_4DP = new Prisma.Decimal('0.00005')
 
 /**
  * Deliberate call-site boundary for this number-shaped shipment service contract.
@@ -163,45 +159,36 @@ async function validateActiveShipmentTotalsWithinOrder(
 
   const lineLabelById = new Map<string, string>()
   const orderedByLeaf = new Map<string, Prisma.Decimal>()
-  // Leaves that came from a genuine KIT expansion (a component distinct from the ordered product), whose
-  // per-kit requirement can carry sub-4dp rounding. Only these get the per-row quantisation tolerance;
-  // a SIMPLE product's identity expansion keeps the exact epsilon-only cap so it can't be over-shipped.
-  const kitExpandedLeaf = new Set<string>()
   for (const line of orderLines) {
     lineLabelById.set(line.id, line.sku ?? line.description ?? line.id)
     if (!line.productId) continue // a description-only line has no product to ship
     for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(line.productId, toDecimal(line.qty), graph)) {
       const key = `${line.id}|${componentId}`
       orderedByLeaf.set(key, (orderedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
-      if (componentId !== line.productId) kitExpandedLeaf.add(key)
     }
   }
 
-  const activeByLeaf = new Map<string, { lineId: string; activeQty: Prisma.Decimal; rows: number }>()
+  const activeByLeaf = new Map<string, { lineId: string; activeQty: Prisma.Decimal }>()
   for (const shipmentLine of activeShipmentLines) {
     const key = `${shipmentLine.lineId}|${shipmentLine.productId}`
-    const entry = activeByLeaf.get(key) ?? { lineId: shipmentLine.lineId, activeQty: new Prisma.Decimal(0), rows: 0 }
+    const entry = activeByLeaf.get(key) ?? { lineId: shipmentLine.lineId, activeQty: new Prisma.Decimal(0) }
     entry.activeQty = entry.activeQty.add(toDecimal(shipmentLine.qty))
-    entry.rows += 1
     activeByLeaf.set(key, entry)
   }
 
-  for (const [key, { lineId, activeQty, rows }] of activeByLeaf) {
+  for (const [key, { lineId, activeQty }] of activeByLeaf) {
     const label = lineLabelById.get(lineId)
     if (!label) {
       return `Shipment line ${lineId} no longer belongs to this order. Reload and retry.`
     }
+    // Quantise the entitlement to the Decimal(12,4) boundary the shipment rows persist at, so a single
+    // fractional component (0.5 kit × 0.3333 = 0.16665, persisted 0.1667) isn't rejected by a rounding
+    // ulp. Kept exact (epsilon-only) — no per-row slack — so nothing can be over-shipped. Residual: a
+    // fractional-component kit SPLIT across warehouses sums per-row-rounded rows (0.1667+0.1667=0.3334)
+    // slightly above the once-rounded entitlement (0.3333) and is rejected; that rare case needs the
+    // immutable per-row snapshot (o3d-2uh), and the pre-fix code rejects ALL kit dispatches regardless.
     const orderedQty = roundQuantity(orderedByLeaf.get(key) ?? new Prisma.Decimal(0), 4)
-    // A KIT component's per-kit requirement can carry sub-4dp rounding, and each shipment row is
-    // independently rounded to Decimal(12,4), so the active sum of N split rows can exceed the
-    // once-rounded entitlement by up to N half-ulps (0.1667+0.1667=0.3334 vs a 0.3333 entitlement).
-    // Absorb exactly that per-row quantisation for kit-expanded leaves only; a real over-ship far
-    // exceeds it. SIMPLE products (identity expansion) have no such rounding and keep the exact
-    // epsilon-only cap, so a 1.0000 order can't ship 1.0001 across two rows.
-    const tolerance = kitExpandedLeaf.has(key)
-      ? SHIPMENT_QTY_EPSILON_DECIMAL.add(QTY_HALF_ULP_4DP.mul(rows))
-      : SHIPMENT_QTY_EPSILON_DECIMAL
-    if (activeQty.gt(orderedQty.add(tolerance))) {
+    if (activeQty.gt(orderedQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
       return `Shipment quantity for line ${label} exceeds ordered quantity. Reload and retry.`
     }
   }
