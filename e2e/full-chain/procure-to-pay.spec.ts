@@ -16,7 +16,7 @@ import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import {
   cancelPurchaseOrder, createAndSendPo, createBill, openPurchaseOrder, postSupplierCreditNote,
-  processPendingXeroSyncViaUi, receiveGoods, returnItems, setPostingMode,
+  processPendingXeroSyncViaUi, receiveGoods, recordFreightCreditNote, returnItems, setPostingMode,
 } from './harness/ims.ts'
 import { createInventoryProduct } from '../helpers.ts'
 import {
@@ -762,6 +762,109 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
       'the attached file is a PDF',
     ).toBe(true)
   })
+
+  test('PP-06: a manually-recorded freight credit note posts an ACCPAYCREDIT on transit and allocates to the bill', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // PP-05 credited a GOODS return (a return-generated draft). PP-06 is the OTHER supplier-credit path: an
+    // operator credits an over-charged / duplicate FREIGHT bill BY HAND (recordSupplierFreightCreditNote), with
+    // no goods movement at all. It must still post as an ACCPAYCREDIT on the TRANSIT account — freight is
+    // capitalised via transit (PP-07 bills it there), so its reversal lands there too — and, the point, ALLOCATE
+    // to the bill so the supplier is not paid for freight that was refunded. A credit that posts but never
+    // allocates leaves the bill fully payable, which is exactly the bug this guards.
+    const sku = taggedSku(runId, 'PP06')
+    const reference = `${runTag(runId)}-PP06`
+    const goodsQty = 4
+    const unitCost = '10.00'            // goods net 40.00
+    const freight = '30.00'            // inline freight, billed with the goods (debits transit)
+    const freightCreditGross = '30.00' // credit the whole freight back — GROSS, and <= the bill total
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP06`, price: '18.00' })
+
+    const { poId } = await createAndSendPo(page, {
+      sku, qty: String(goodsQty), unitCost,
+      additionalCost: { description: 'Freight', amount: freight, distributionMethod: 'BY_VALUE' },
+    })
+    await receiveGoods(page, { expectStatus: 'Received' })
+    await createBill(page, { reference, includeAdditionalCosts: true })
+
+    // Drain to post the bill AND the landed-cost STOCK_RECEIPT journal, registering BOTH in a FINALLY first.
+    // The inline freight makes the receipt journal post in sync mode too (PP-07), and the drain can post both
+    // then throw on the UI confirmation; teardown only voids tracked ids and its straggler scan does not find
+    // manual journals, so an untracked receipt journal leaks SILENTLY. Each lookup is independent (.catch) so a
+    // failed resolve of one still registers the other. The bill must own a Xero id BEFORE the credit is posted
+    // (PP-05's lesson): the allocation follow-up bails on a null accountingInvoiceId, leaving the credit posted
+    // but the bill fully due.
+    let journalId = ''
+    let billId = ''
+    try {
+      await processPendingXeroSyncViaUi(page)
+    } finally {
+      journalId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: poId }).catch(() => '')
+      const billRecordId = (await billIdsForPo(poId).catch((): string[] => []))[0]
+      billId = billRecordId ? await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId }).catch(() => '') : ''
+      if (journalId) trackDocument('ManualJournals', journalId, `PP-06 stock receipt ${runTag(runId)}`)
+      if (billId) trackDocument('Invoices', billId, `PP-06 bill ${runTag(runId)}`)
+    }
+    expect(journalId, 'the landed-cost STOCK_RECEIPT journal posted to Xero').toBeTruthy()
+    expect(billId, 'the ACCPAY bill posted to Xero').toBeTruthy()
+    const billBefore = await getInvoice(billId)
+    expect(billBefore.Status, 'the bill must be in the ledger before the credit is posted').toBe('AUTHORISED')
+    const billTotal = Number(billBefore.Total)
+
+    // Record the freight credit BY HAND, then post it (PP-05: the draft exists, an operator posts it).
+    await openPurchaseOrder(page, poId)
+    await recordFreightCreditNote(page, { amount: freightCreditGross, creditNoteNumber: `CN-${reference}`, reason: 'Freight over-charged' })
+    await postSupplierCreditNote(page)
+
+    try {
+      // TWO drains (PP-05): the ALLOCATION is a follow-up enqueued DURING the credit note's own pass, so a
+      // single drain posts the ACCPAYCREDIT and leaves the allocation pending — the very failure under test.
+      await processPendingXeroSyncViaUi(page)
+      await processPendingXeroSyncViaUi(page)
+
+      const transitAccount = await settingValue('xero_transit_account')
+
+      // This is the MANUAL freight credit (isReturnGenerated=false), not a return-generated one, so it needs
+      // its own oracle — supplierCreditNoteIdFor filters on isReturnGenerated=true and would not find it.
+      const creditNoteId = await externalIdFor({ type: 'PURCHASE_CREDIT_NOTE', referenceId: await freightCreditNoteIdFor(poId) })
+      trackDocument('CreditNotes', creditNoteId, `PP-06 freight credit ${runTag(runId)}`)
+
+      const creditNote = await getCreditNote(creditNoteId)
+      expect(creditNote.Type).toBe('ACCPAYCREDIT')
+      // PAID, not AUTHORISED: the credit (30) is fully consumed by its allocation to the larger bill, and Xero
+      // moves a fully-allocated credit note to PAID — itself proof the allocation landed. AUTHORISED would be an
+      // unallocated credit, the bug this test guards against. (Still not DRAFT/DELETED.)
+      expect(creditNote.Status).toBe('PAID')
+      expect(creditNote.CurrencyCode).toBe('GBP')
+      // The freight credit reverses on the TRANSIT account (supplier-credit-note.ts builds the line on transit),
+      // mirroring where PP-07 billed the freight.
+      expectLine(creditNote.LineItems, { accountCode: transitAccount })
+      // The credit is the GROSS freight we entered. It posts tax-inclusive, so Total equals the entered gross
+      // whatever VAT the bill's tax type mirrors — VAT-robust, no dependence on whether the bill was taxed.
+      const creditTotal = Number(creditNote.Total)
+      expect(creditTotal, 'the credit is the entered gross freight amount').toBeCloseTo(Number(freightCreditGross), 2)
+
+      // THE POINT: the credit is ALLOCATED, so the bill is no longer fully payable — reduced by exactly the credit.
+      const billAfter = await getInvoice(billId)
+      expect(Number(billAfter.Total), 'allocating a credit must not alter the bill itself').toBeCloseTo(billTotal, 2)
+      expect(
+        Number(billAfter.AmountDue),
+        'the allocation reduces AmountDue by exactly the freight credit',
+      ).toBeCloseTo(billTotal - creditTotal, 2)
+    } finally {
+      // Failure-safe: if an assertion threw AFTER the ACCPAYCREDIT posted, register it anyway. An allocated
+      // credit note left untracked strands BOTH documents — teardown then can't void the bill (Xero refuses a
+      // bill that has an allocation) and never sees the credit. Registering both lets teardown un-allocate and
+      // void the pair.
+      const cnRow = await freightCreditNoteIdFor(poId).catch(() => null)
+      if (cnRow) {
+        const cnXero = await externalIdFor({ type: 'PURCHASE_CREDIT_NOTE', referenceId: cnRow }).catch(() => null)
+        if (cnXero) trackDocument('CreditNotes', cnXero, `PP-06 freight credit ${runTag(runId)}`)
+      }
+    }
+  })
 })
 
 /** The PurchaseReturn row this PO produced. Its id — not the PO's — keys the return's journal. */
@@ -787,6 +890,19 @@ async function supplierCreditNoteIdFor(poId: string): Promise<string> {
     throw new Error(`No return-generated supplier_credit_notes row for PO ${poId}. A return only drafts a credit note when the PO is already billed.`)
   }
   if (rows.length > 1) throw new Error(`Expected ONE return credit note for PO ${poId}, found ${rows.length}.`)
+  return rows[0].id
+}
+
+/** The MANUAL (freight/over-charge) SupplierCreditNote row — the counterpart that is NOT return-generated. */
+async function freightCreditNoteIdFor(poId: string): Promise<string> {
+  const rows = await queryRows<{ id: string }>(
+    `select id from supplier_credit_notes where "poId" = $1 and "isReturnGenerated" = false order by "createdAt" desc`,
+    [poId],
+  )
+  if (!rows.length) {
+    throw new Error(`No manually-recorded supplier_credit_notes row for PO ${poId} — recordSupplierFreightCreditNote never created it (needs a bill on the PO).`)
+  }
+  if (rows.length > 1) throw new Error(`Expected ONE freight credit note for PO ${poId}, found ${rows.length}.`)
   return rows[0].id
 }
 

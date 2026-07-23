@@ -329,6 +329,28 @@ export async function postSupplierCreditNote(page: Page): Promise<void> {
 }
 
 /**
+ * Record a MANUAL freight/additional-cost supplier credit note against the PO's bill — the
+ * "Record credit note" flow on the Supplier credit notes card (recordSupplierFreightCreditNote,
+ * supplier-credit-notes-card.tsx). Unlike a goods return (which DRAFTS a credit automatically),
+ * an over-charged or duplicate freight bill is credited BY HAND: enter a GROSS amount and it drafts
+ * a credit note the operator then posts with postSupplierCreditNote(). Requires the PO to already
+ * have a bill (the card self-hides otherwise).
+ */
+export async function recordFreightCreditNote(
+  page: Page,
+  opts: { amount: string; creditNoteNumber?: string; reason?: string },
+): Promise<void> {
+  await page.getByRole('button', { name: /record credit note/i }).click()
+  const dialog = page.getByRole('dialog', { name: /Record supplier credit note/i })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+  await dialog.locator('#cn-amount').fill(opts.amount)
+  if (opts.creditNoteNumber) await dialog.locator('#cn-number').fill(opts.creditNoteNumber)
+  await dialog.locator('#cn-reason').fill(opts.reason ?? 'Duplicate freight bill')
+  await dialog.getByRole('button', { name: /record \(draft\)/i }).click()
+  await expect(dialog).toBeHidden({ timeout: 30_000 })
+}
+
+/**
  * Enter the supplier bill against the PO. Returns the supplier invoice number used.
  *
  * `expectBillCount` is how many bills the PO should carry AFTERWARDS, and defaults to the first.
@@ -440,10 +462,45 @@ export async function processPendingXeroSync(): Promise<unknown> {
   return run()
 }
 
-/** Groups A1 → A2 → B, plus the three reconciliation sweeps. */
-export async function runDailyBatch(): Promise<unknown> {
-  const { runDailyBatchSync } = await import('../../../lib/connectors/xero/daily-sync.ts')
-  return runDailyBatchSync()
+/**
+ * Run the daily batch — Groups A1 → A2 → B, plus the three reconciliation sweeps —
+ * IN THE APP, via its cron route.
+ *
+ * NOT a direct `import(daily-sync.ts)`: that module's graph reaches the invoice-PDF stack
+ * (pdfkit/sharp) and other CJS-only packages, so pulling it into the Playwright process
+ * dies with "Cannot use import statement outside a module" — the same reason
+ * processPendingXeroSync and runWcOrderReconcile go through the app rather than importing
+ * their module here. Driving the route runs runDailyBatchSync where those deps resolve,
+ * and is the faithful path (the poster has NO server action or UI button — the cron is the
+ * only in-app trigger, app/actions/accounting-batch.ts:71).
+ *
+ * Auth is the cron bearer secret (lib/cron-auth.ts). The route is rate-limited to ONCE per
+ * hour (lib/cron-rate-limit.ts, memory-backed), so a debugging re-run inside the hour 429s
+ * — restart ims-e2e-dev.service between runs to clear the bucket, which also clears the
+ * login limiter.
+ *
+ * Returns the batch result (groupA1/A2/B counts, errors, sweep deltas) parsed from the
+ * response — runDailyBatchSync only QUEUES the journals (PENDING); drain them to Xero with
+ * processPendingXeroSyncViaUi afterwards.
+ */
+export async function runDailyBatch(page: Page): Promise<Record<string, unknown>> {
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    throw new Error('CRON_SECRET is not set in the test environment — cannot trigger the daily-batch cron route.')
+  }
+  const res = await page.request.get('/api/cron/accounting-daily-batch', {
+    headers: { Authorization: `Bearer ${secret}` },
+  })
+  if (!res.ok()) {
+    throw new Error(`daily-batch cron HTTP ${res.status()}: ${(await res.text()).slice(0, 300)}`)
+  }
+  const body = (await res.json()) as Record<string, unknown>
+  // The route answers 200 with { skipped, reason } when the plugin/flags are off — a batch
+  // that never ran must fail the test loudly, not silently return zero counts.
+  if (body.skipped) {
+    throw new Error(`daily batch was skipped: ${String(body.reason ?? 'unknown reason')}`)
+  }
+  return body
 }
 
 /** Detect paid/reversed invoices + bills (the chargeback path). */

@@ -54,6 +54,7 @@
 import { Client } from 'pg'
 import { readFileSync } from 'node:fs'
 import { xeroGet, xeroPost, xeroPut } from '../lib/connectors/xero/api.ts'
+import { syncChartOfAccounts } from '../lib/connectors/xero/accounts.ts'
 import { xeroReportTaxType } from '../lib/connectors/xero/tax-rate-report-type.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
@@ -412,6 +413,17 @@ async function main() {
     await ensureCurrencies(t, baseCurrency)
     await ensureAccounts(t)
     await ensureBankAccounts(t)
+    // Populate the LOCAL chart-of-accounts cache (accounting_accounts) from Xero, after the accounts and
+    // bank accounts exist so the cache captures them. The payment processor resolves a bankAccountId
+    // against this table and the Pay Bill UI lists bank accounts from it (listStoredBankAccounts); an
+    // unpopulated cache makes INVOICE_PAYMENT/BILL_PAYMENT fail "Bank account not found in synced Xero
+    // chart of accounts". The Demo resets ~4-weekly, so this must run every provision, not once. (o3d-lgo.12)
+    if (DRY_RUN) {
+      log('DRY RUN — would sync the Xero chart of accounts into the local accounting_accounts cache')
+    } else {
+      const chart = await syncChartOfAccounts()
+      log(`synced ${chart.synced} account(s) into the local chart-of-accounts cache${chart.errors.length ? ` (${chart.errors.length} error(s))` : ''}`)
+    }
     const resolved = await ensureTaxRates(t)
     if (!DRY_RUN) {
       await remapTaxTypes(db, resolved)
