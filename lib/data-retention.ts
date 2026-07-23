@@ -17,9 +17,11 @@ const DEFAULTS: Record<string, number> = {
   retention_customers_months: 0,
   retention_stock_movements_months: 0,
   retention_sync_logs_months: 6,
-  // o3d-ahk: terminal shopping-webhook-inbox rows (PROCESSED / DEAD_LETTER) are transient delivery
-  // records with no long-term value; default to a 3-month purge so the inbox can't grow unbounded (it
-  // had NO retention before). PENDING/FAILED rows are never purged here — they are undelivered work.
+  // o3d-ahk: COMPACT succeeded shopping-webhook-inbox rows after N months — clear the bulky payloadJson
+  // to reclaim storage while KEEPING the (connector, resource, payloadHash) row as an idempotency
+  // tombstone (deleting it would let a redelivered/replayed old payload reprocess). Default 3 months.
+  // Only PROCESSED rows are compacted; DEAD_LETTER (failed, unresolved) and PENDING/FAILED (undelivered)
+  // are left fully intact for investigation/replay.
   retention_webhook_events_months: 3,
 }
 
@@ -51,7 +53,7 @@ function monthsAgo(months: number): Date {
 export async function purgeExpiredData(): Promise<{
   syncLogsDeleted: number
   stockMovementsDeleted: number
-  webhookEventsDeleted: number
+  webhookEventsCompacted: number
   salesOrdersArchived: number
   purchaseOrdersArchived: number
   customersArchived: number
@@ -59,7 +61,7 @@ export async function purgeExpiredData(): Promise<{
   const settings = await getRetentionSettings()
   let syncLogsDeleted = 0
   let stockMovementsDeleted = 0
-  let webhookEventsDeleted = 0
+  let webhookEventsCompacted = 0
   let salesOrdersArchived = 0
   let purchaseOrdersArchived = 0
   let customersArchived = 0
@@ -75,19 +77,24 @@ export async function purgeExpiredData(): Promise<{
     syncLogsDeleted = wc.count + acct.count
   }
 
-  // Shopping webhook inbox — hard delete TERMINAL rows only (o3d-ahk). PROCESSED and DEAD_LETTER are
-  // done; PENDING/FAILED are undelivered work and are never purged here. Keyed on updatedAt (the last
-  // state change = when the row became terminal).
+  // Shopping webhook inbox — COMPACT succeeded rows (o3d-ahk). Clear the bulky payloadJson to reclaim
+  // storage but KEEP the row: its (connector, resource, payloadHash) unique key is the inbox's
+  // idempotency record, so deleting it would let a redelivered or replayed old payload be accepted as
+  // new and reprocessed (re-applying stale addresses/status, re-enqueueing stock). Only PROCESSED rows
+  // are compacted; DEAD_LETTER (failed/unresolved — the only record of the failed event) and
+  // PENDING/FAILED (undelivered work) are left fully intact. Compaction bumps updatedAt, so an
+  // already-compacted row isn't re-selected until the next cutoff window (a cheap no-op if it is).
   const webhookMonths = settings.retention_webhook_events_months
   if (webhookMonths > 0) {
     const cutoff = monthsAgo(webhookMonths)
-    const { count } = await db.shoppingWebhookEvent.deleteMany({
+    const { count } = await db.shoppingWebhookEvent.updateMany({
       where: {
-        status: { in: [WC_WEBHOOK_EVENT_STATUS.processed, WC_WEBHOOK_EVENT_STATUS.deadLetter] },
+        status: WC_WEBHOOK_EVENT_STATUS.processed,
         updatedAt: { lt: cutoff },
       },
+      data: { payloadJson: {}, lastError: null },
     })
-    webhookEventsDeleted = count
+    webhookEventsCompacted = count
   }
 
   // Stock movements — hard delete (exclude historical import types)
@@ -170,7 +177,7 @@ export async function purgeExpiredData(): Promise<{
   const parts: string[] = []
   if (syncLogsDeleted > 0) parts.push(`${syncLogsDeleted} sync logs deleted`)
   if (stockMovementsDeleted > 0) parts.push(`${stockMovementsDeleted} stock movements deleted`)
-  if (webhookEventsDeleted > 0) parts.push(`${webhookEventsDeleted} webhook events deleted`)
+  if (webhookEventsCompacted > 0) parts.push(`${webhookEventsCompacted} webhook events compacted`)
   if (salesOrdersArchived > 0) parts.push(`${salesOrdersArchived} sales orders archived`)
   if (purchaseOrdersArchived > 0) parts.push(`${purchaseOrdersArchived} purchase orders archived`)
   if (customersArchived > 0) parts.push(`${customersArchived} customers archived`)
@@ -181,10 +188,10 @@ export async function purgeExpiredData(): Promise<{
       action: 'cleanup',
       tag: 'system',
       description: `Data retention cleanup: ${parts.join(', ')}`,
-      metadata: { syncLogsDeleted, stockMovementsDeleted, webhookEventsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
+      metadata: { syncLogsDeleted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
       resolveUser: false,
     })
   }
 
-  return { syncLogsDeleted, stockMovementsDeleted, webhookEventsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
+  return { syncLogsDeleted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
 }
