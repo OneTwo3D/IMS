@@ -1784,20 +1784,6 @@ async function clearSetting(key: string): Promise<void> {
   }
 }
 
-/**
- * Drain the Xero queue until the invoice reads PAID, or a bounded number of passes elapses. The
- * INVOICE_PAYMENT follow-up is enqueued while the SALES_INVOICE is being posted and is ordering-deferred
- * until that CREATE is live, so it only settles on a drain AFTER the one that created the invoice.
- */
-async function drainUntilInvoicePaid(page: import('@playwright/test').Page, invoiceId: string, maxDrains = 3) {
-  let invoice = await getInvoice(invoiceId)
-  for (let i = 0; i < maxDrains && invoice.Status !== 'PAID'; i++) {
-    await processPendingXeroSyncViaUi(page)
-    invoice = await getInvoice(invoiceId)
-  }
-  return invoice
-}
-
 /** Wait for the Woo refund to arrive as a SalesOrderRefund and return its id. */
 async function awaitRefund(salesOrderId: string, timeoutMs = 180_000): Promise<string> {
   const { Client } = await import('pg')
@@ -2668,6 +2654,7 @@ async function drainUntilInvoicePaid(
       invoice = await getInvoice(invoiceId)
     }
   }
+  return invoice
 }
 
 /** The Xero external id of the INVOICE_PAYMENT this order recorded (once posted), or null. */
