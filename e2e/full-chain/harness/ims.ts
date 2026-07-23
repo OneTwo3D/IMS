@@ -115,6 +115,16 @@ export async function createAndSendPo(
     extraLines?: Array<{ sku: string; qty: string; unitCost: string }>
     /** An inline landed cost ("Additional Cost") on the PO — distributed into the cost layers at receipt. */
     additionalCost?: { description: string; amount: string; distributionMethod?: 'BY_VALUE' | 'BY_QUANTITY' | 'BY_WEIGHT' | 'EQUAL_SPLIT' }
+    /**
+     * Raise the PO in a FOREIGN currency (e.g. 'EUR'), with `fxRate` as the booked base→foreign rate the
+     * bill records (PP-08). The currency select is driven AFTER the supplier is chosen, because picking a
+     * supplier resets the currency to that supplier's default (po-form.tsx handleSupplierChange). A seeded
+     * fx_rate for base→currency on or before "now" is REQUIRED — createPurchaseOrder throws
+     * "Missing … FX rate" otherwise (purchase-order-fx.ts) — and the typed rate must be within 2% of it
+     * (PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE), so the caller seeds the booked rate first and passes it here.
+     */
+    currency?: string
+    fxRate?: string
   },
 ): Promise<{ poId: string; poReference: string }> {
   await page.goto('/purchase-orders')
@@ -122,6 +132,17 @@ export async function createAndSendPo(
 
   const dialog = page.getByRole('dialog', { name: 'New Purchase Order' })
   await dialog.locator('select').first().selectOption({ label: opts.supplierLabel ?? 'E2E Supplier' })
+
+  // Foreign-currency PO. Do this AFTER the supplier select (which resets currency to the supplier default)
+  // and BEFORE entering line costs so the costs are read as foreign amounts. The currency <select> is the
+  // only one carrying an <option value="EUR">-style code option; the FX <input> is min=0.0001/step=0.0001,
+  // distinct from the qty (min=1) and cost (min=0) line inputs, and is enabled once currency != base.
+  if (opts.currency) {
+    await dialog.locator(`select:has(option[value="${opts.currency}"])`).selectOption(opts.currency)
+    if (opts.fxRate) {
+      await dialog.locator('input[type="number"][min="0.0001"][step="0.0001"]').fill(opts.fxRate)
+    }
+  }
 
   // A PO line's cost is entered by the BUYER — products carry a sales price, never a purchase cost. Leaving
   // it unset raises the PO at ZERO, which bills at zero and posts a £0 ACCPAY: everything "succeeds" and the
@@ -431,6 +452,52 @@ export async function createBill(
   await expect(page.getByRole('button', { name: new RegExp(`Bills \\(${opts.expectBillCount ?? 1}\\)`) }))
     .toBeVisible({ timeout: 30_000 })
   return opts.reference
+}
+
+/**
+ * Mark the PO's (single) bill as paid from a chosen bank account, the way an operator does — the AP mirror
+ * of a customer payment (PP-09). This is the ONLY in-app trigger for a BILL_PAYMENT (and, for a foreign
+ * bill, the REALISED_FX_JOURNAL): markBillPaid enqueues both (app/actions/purchase-orders.ts). It is an
+ * OPERATOR action against an EXPLICIT bank account, NOT the payment-account map — that map is read only on
+ * the sales side (enqueueSalesInvoiceFollowUps), so unlike OC-15 there is no per-test map to configure here.
+ *
+ * The bill must already carry an accountingInvoiceId (i.e. its PURCHASE_INVOICE CREATE has posted and been
+ * written back) BEFORE this runs, or markBillPaid records the payment locally only and queues nothing to
+ * Xero (po-detail-client.tsx warns exactly this). Callers therefore drain the bill to Xero first.
+ *
+ * `bankAccountId` is the Bank Account <option> VALUE — the connector-native id (Xero AccountID,
+ * accounting_accounts.externalAccountId), which the caller resolves from the DB. Selecting by value rather
+ * than the "<code> — <name>" option text is deterministic and sidesteps the em-dash in that label. PP-09
+ * settles a GBP bill from the Business Bank Account (090); PP-08 settles a EUR bill from a EUR bank account
+ * (avoiding a cross-currency payment). `paymentDate` overrides the dialog's today default (PP-08 dates the
+ * settlement so its seeded settlement FX rate is the latest on or before it).
+ */
+export async function markBillPaidViaUi(
+  page: Page,
+  opts: { bankAccountId: string; reference?: string; paymentDate?: string },
+): Promise<void> {
+  // The Bills section is collapsed by default (po-detail-client.tsx showInvoices=false); expand it so the
+  // per-bill "Mark Paid" button renders. Idempotent-safe: only toggle when the button is not already shown.
+  const markPaidBtn = page.getByRole('button', { name: /^Mark Paid$/ }).first()
+  if (!(await markPaidBtn.isVisible().catch(() => false))) {
+    await page.getByRole('button', { name: /^Bills \(\d+\)$/ }).click()
+  }
+  await expect(markPaidBtn).toBeVisible({ timeout: 30_000 })
+  await markPaidBtn.click()
+
+  const dialog = page.getByRole('dialog', { name: /Mark Bill as Paid/i })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+  // Bank accounts load asynchronously (getBillPaymentAccounts on mount); the select is absent until then.
+  const bankSelect = dialog.locator('#bank-account')
+  await expect(bankSelect).toBeVisible({ timeout: 30_000 })
+  await bankSelect.selectOption({ value: opts.bankAccountId })
+  if (opts.paymentDate) await dialog.locator('#payment-date').fill(opts.paymentDate)
+  if (opts.reference !== undefined) await dialog.locator('#payment-ref').fill(opts.reference)
+
+  await dialog.getByRole('button', { name: /^Mark Paid$/ }).click()
+  await expect(dialog).toBeHidden({ timeout: 30_000 })
+  // The bill row flips to a "Paid" badge once markBillPaid returns and the page refreshes.
+  await expect(page.getByText(/^Paid/).first()).toBeVisible({ timeout: 30_000 })
 }
 
 /** Drive the Xero connector page's "Process pending now". */

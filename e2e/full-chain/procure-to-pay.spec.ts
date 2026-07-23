@@ -15,14 +15,16 @@ import { expect, test } from '@playwright/test'
 import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import {
-  cancelPurchaseOrder, createAndSendPo, createBill, openPurchaseOrder, postSupplierCreditNote,
-  processPendingXeroSyncViaUi, receiveGoods, recordFreightCreditNote, returnItems, setPostingMode,
+  cancelPurchaseOrder, createAndSendPo, createBill, markBillPaidViaUi, openPurchaseOrder,
+  postSupplierCreditNote, processPendingXeroSyncViaUi, receiveGoods, recordFreightCreditNote,
+  returnItems, setPostingMode,
 } from './harness/ims.ts'
 import { createInventoryProduct } from '../helpers.ts'
 import {
   billIdsForPo, expectJournalLine, expectLine, externalIdFor, externalIdsFor, getCreditNote,
-  getInvoice, getInvoiceAttachments, getManualJournal, trackDocument,
+  getInvoice, getInvoiceAttachments, getManualJournal, getPayment, trackDocument,
 } from './harness/xero.ts'
+import type { XeroInvoice } from './harness/xero.ts'
 
 test.describe.serial('@full-chain @xero procure to pay', () => {
   let runId: string
@@ -865,6 +867,231 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
       }
     }
   })
+
+  // FIXME (o3d-lgo.6.1): written and verified to reach Xero, but BLOCKED by a real product defect this test
+  // surfaced. markBillPaid queues the REALISED_FX_JOURNAL with its control leg on getRealisedFxAccounts()
+  // .controlAccount = the Accounts Payable account (setting xero_accounts_payable_account = 800 on BOTH the
+  // rig and stage). Xero 800 is a SYSTEM control account (CURRLIAB); Xero refuses manual-journal lines to
+  // system accounts, so pushManualJournal 400s with "Account code '800' is not a valid code for this
+  // document" and the journal never posts. This is not a rig misconfig (stage matches) and was never caught
+  // because no prior e2e test posted an FX journal to real Xero. Same defect on the receivable side
+  // (sales.ts, account 610) and the period-end unrealised revaluation. Enable this test once o3d-lgo.6.1 is
+  // fixed (suppress the Xero MJ, or target a non-system FX clearing account). The BILL_PAYMENT half of this
+  // flow (the EUR bill settling to PAID) does work — it is the FX-journal assertion that is blocked.
+  //
+  // Verified live 2026-07-23: the run reached "No SYNCED REALISED_FX_JOURNAL … status=PENDING, error=…
+  // Account code '800' is not a valid code for this document." Teardown stayed clean (voided the bill,
+  // receipt journal and payment; the FX journal never posted so there was nothing to void).
+  test.fixme('PP-08: paying a EUR supplier bill at a different settlement rate posts a REALISED_FX_JOURNAL', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // The AP mirror of OC-10's FX boundary, but the point is the SETTLEMENT, not the import: a EUR bill
+    // booked at one rate and PAID at another realises an FX gain/loss on the payable. markBillPaid computes
+    // it (computeRealisedFx, side 'payable') and queues a REALISED_FX_JOURNAL — DR/CR between accounts
+    // payable and the realised FX gain/loss account — alongside the BILL_PAYMENT that settles the bill
+    // (app/actions/purchase-orders.ts). It only fires when the bill currency != base AND both FX accounts are
+    // configured (getRealisedFxAccounts), so this is otherwise unproven on the base-currency GBP path.
+    //
+    // Same load-bearing precondition as OC-10: with fx_rates EMPTY, createPurchaseOrder THROWS
+    // "Missing … FX rate" (purchase-order-fx.ts) — a foreign PO cannot even be raised — so the BOOKED rate
+    // must be seeded BEFORE the PO. The realised gain then needs a DIFFERENT settlement rate on the payment
+    // date, so a second rate is seeded AFTER the bill is booked (a later fetchedAt) and the payment is dated
+    // TOMORROW so resolveSettlementFxRateToBase (fetchedAt <= asOf, latest wins) resolves the settlement
+    // rate, never the booked one. Seeding order + a future payment date make this independent of wall-clock.
+    const sku = taggedSku(runId, 'PP08')
+    const reference = `${runTag(runId)}-PP08`
+    const qty = 4
+    const unitCostEur = '25.00'
+    const goodsEur = Number(unitCostEur) * qty // 100.00 EUR net
+    const bookedRate = 1.15   // 1 GBP = 1.15 EUR at booking
+    const settlementRate = 1.35 // EUR weakened by payment day: fewer GBP settle the EUR payable -> a GAIN
+    // Payment date TOMORROW: its asOf (midnight) is >= the booked rate's fetchedAt yet the settlement rate
+    // (seeded later, after the bill) has the latest fetchedAt, so it is the one resolved. See helper notes.
+    const paymentDate = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10)
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+
+    // Seed the BOOKED rate first (fetchedAt in the past) so the PO can be raised and books at ~1.15.
+    const bookedRateId = await seedFxRateAt('EUR', bookedRate, "now() - interval '2 hours'")
+    let settlementRateId = ''
+    try {
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP08`, price: '60.00' })
+
+      const { poId } = await createAndSendPo(page, {
+        sku, qty: String(qty), unitCost: unitCostEur, currency: 'EUR', fxRate: String(bookedRate),
+      })
+      await receiveGoods(page, { expectStatus: 'Received' })
+      await createBill(page, { reference })
+
+      // First drain: the ACCPAY bill posts (writing back its accountingInvoiceId, the precondition for a
+      // BILL_PAYMENT) and the base-currency STOCK_RECEIPT journal posts. Register both failure-safe (PP-07).
+      let receiptJournalId = ''
+      let billId = ''
+      try {
+        await processPendingXeroSyncViaUi(page)
+      } finally {
+        receiptJournalId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: poId }).catch(() => '')
+        const billRecordId = (await billIdsForPo(poId).catch((): string[] => []))[0]
+        billId = billRecordId ? await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId }).catch(() => '') : ''
+        if (receiptJournalId) trackDocument('ManualJournals', receiptJournalId, `PP-08 stock receipt ${runTag(runId)}`)
+        if (billId) trackDocument('Invoices', billId, `PP-08 bill ${runTag(runId)}`)
+      }
+      expect(billId, 'the EUR ACCPAY bill posted to Xero').toBeTruthy()
+
+      const [billRecordId] = await billIdsForPo(poId)
+      const bill = await getInvoice(billId)
+      expect(bill.Type).toBe('ACCPAY')
+      expect(bill.Status).toBe('AUTHORISED')
+      expect(bill.CurrencyCode, 'the bill is denominated in EUR, not the base currency').toBe('EUR')
+      expect(Number(bill.SubTotal), 'EUR net ties out to the goods value').toBeCloseTo(goodsEur, 2)
+
+      // The stored booked figures the realised-FX maths measures against — read them rather than assume the
+      // penny, so the expected gain ties to the ACTUAL AP carrying value (bookedBase = stored totalBase for a
+      // full settlement; amountForeign = stored totalForeign).
+      const [{ totalForeign, totalBase }] = await queryRows<{ totalForeign: string; totalBase: string }>(
+        `select "totalForeign", "totalBase" from purchase_invoices where id = $1`, [billRecordId],
+      )
+      const amountForeign = Number(totalForeign)
+      const bookedBase = Number(totalBase)
+      // computeRealisedFx: payable gain = round(bookedBase - amountForeign/settlementRate). Non-zero and
+      // material by construction (1.15 -> 1.35).
+      const expectedGain = Math.round((bookedBase - amountForeign / settlementRate) * 100) / 100
+      expect(expectedGain, 'the rate move realises a material FX gain').toBeGreaterThan(1)
+
+      // Now seed the SETTLEMENT rate (a LATER fetchedAt than the booked rate) and pay the bill from a EUR
+      // bank account (a EUR payment from a EUR account — no cross-currency payment leg to complicate teardown).
+      settlementRateId = await seedFxRateAt('EUR', settlementRate, 'now()')
+      const eurBankId = await bankAccountIdForName('Revolut (EUR)')
+
+      await openPurchaseOrder(page, poId)
+      await markBillPaidViaUi(page, { bankAccountId: eurBankId, reference, paymentDate })
+
+      // Second drain: BILL_PAYMENT settles the bill and REALISED_FX_JOURNAL posts. Register the payment (so
+      // teardown deletes it before voiding the bill) and the FX journal, failure-safe.
+      let fxJournalId = ''
+      try {
+        await processPendingXeroSyncViaUi(page)
+        fxJournalId = await externalIdFor({ type: 'REALISED_FX_JOURNAL', referenceId: billRecordId })
+        trackDocument('ManualJournals', fxJournalId, `PP-08 realised FX ${runTag(runId)}`)
+
+        // THE POINT: the ledger holds a POSTED realised-FX journal that moves EXACTLY the gain between
+        // accounts payable and the realised FX gain/loss account, and balances.
+        const apAccount = await settingValue('xero_accounts_payable_account')
+        const fxAccount = await settingValue('xero_realised_fx_gain_loss_account')
+        const journal = await getManualJournal(fxJournalId)
+        expect(journal.Status, 'the realised-FX journal is in the ledger, not a draft').toBe('POSTED')
+        // Payable GAIN (buildRealisedFxJournal, side 'payable', gainLoss > 0): DR accounts payable (the EUR
+        // liability now costs fewer GBP), CR realised FX gain/loss. The pair, at exactly the computed gain.
+        expectJournalLine(journal.JournalLines, { accountCode: apAccount, debit: expectedGain })
+        expectJournalLine(journal.JournalLines, { accountCode: fxAccount, credit: expectedGain })
+        // And it balances end to end — no third leg smuggled in.
+        const net = journal.JournalLines.reduce((s, l) => s + l.LineAmount, 0)
+        expect(Math.abs(net), 'the realised-FX journal balances').toBeLessThan(0.005)
+
+        // The realised FX is only real because a PAYMENT actually settled the bill: prove the BILL_PAYMENT
+        // landed and drew from the EUR bank account.
+        const payExtId = await billPaymentExternalId(billRecordId)
+        expect(payExtId, 'the BILL_PAYMENT posted a Xero payment').toBeTruthy()
+        trackDocument('Payments', payExtId!, `PP-08 bill payment ${runTag(runId)}`)
+        const payment = await getPayment(payExtId!)
+        expect(Number(payment.Amount), 'the payment settled the full EUR bill').toBeCloseTo(amountForeign, 2)
+      } finally {
+        // Failure-safe: if an assertion threw after the payment posted, register it so teardown can delete it
+        // before voiding the bill (Xero refuses to void a bill that has a payment).
+        const payExtId = await billPaymentExternalId(billRecordId).catch(() => null)
+        if (payExtId) trackDocument('Payments', payExtId, `PP-08 bill payment ${runTag(runId)}`)
+        if (!fxJournalId) {
+          const late = await externalIdFor({ type: 'REALISED_FX_JOURNAL', referenceId: billRecordId }).catch(() => '')
+          if (late) trackDocument('ManualJournals', late, `PP-08 realised FX ${runTag(runId)}`)
+        }
+      }
+    } finally {
+      await deleteFxRate(bookedRateId)
+      if (settlementRateId) await deleteFxRate(settlementRateId)
+    }
+  })
+
+  test('PP-09: paying a supplier bill records a BILL_PAYMENT that settles it in Xero from the mapped bank account', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // The procure-to-pay MIRROR of OC-15 (INVOICE_PAYMENT -> BILL_PAYMENT; accounts payable, not receivable):
+    // a supplier bill, once paid, should not merely sit AUTHORISED but be SETTLED in Xero — the payable
+    // discharged, the bill PAID with a zero balance, drawn from the operator's chosen bank account.
+    //
+    // NOTE ON THE TRIGGER (differs from OC-15, deliberately). On the SALES side the payment auto-registers
+    // from the Woo order via the payment-account map (enqueueSalesInvoiceFollowUps). The AP side has no such
+    // map path — enqueuePurchaseInvoiceFollowUps never reads accounting_payment_account_map — so a bill
+    // payment is an OPERATOR action: markBillPaid against an EXPLICIT bank account queues the BILL_PAYMENT
+    // (app/actions/purchase-orders.ts). There is therefore no per-test map to configure or restore here; the
+    // "mapped bank account" is the one selected in the Pay Bill dialog, asserted below by the drawn-from code.
+    const sku = taggedSku(runId, 'PP09')
+    const reference = `${runTag(runId)}-PP09`
+    const qty = 2
+    const unitCost = '40.00'
+    const expectedNet = Number(unitCost) * qty // 80.00 GBP
+    const bankCode = '090' // Demo "Business Bank Account" (GBP)
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP09`, price: '55.00' })
+
+    const { poId } = await createAndSendPo(page, { sku, qty: String(qty), unitCost })
+    await receiveGoods(page, { expectStatus: 'Received' })
+    await createBill(page, { reference })
+
+    // First drain: the ACCPAY bill posts and gets its accountingInvoiceId (the precondition for BILL_PAYMENT
+    // — without it markBillPaid records only locally). Register the bill + receipt journal failure-safe.
+    let receiptJournalId = ''
+    let billId = ''
+    try {
+      await processPendingXeroSyncViaUi(page)
+    } finally {
+      receiptJournalId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: poId }).catch(() => '')
+      const rec = (await billIdsForPo(poId).catch((): string[] => []))[0]
+      billId = rec ? await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: rec }).catch(() => '') : ''
+      if (receiptJournalId) trackDocument('ManualJournals', receiptJournalId, `PP-09 stock receipt ${runTag(runId)}`)
+      if (billId) trackDocument('Invoices', billId, `PP-09 bill ${runTag(runId)}`)
+    }
+    expect(billId, 'the ACCPAY bill posted to Xero').toBeTruthy()
+
+    const [billRecordId] = await billIdsForPo(poId)
+    const billBefore = await getInvoice(billId)
+    expect(billBefore.Type).toBe('ACCPAY')
+    expect(billBefore.Status, 'the bill is authorised (payable), not yet paid').toBe('AUTHORISED')
+    expect(Number(billBefore.SubTotal)).toBeCloseTo(expectedNet, 2)
+    const billTotal = Number(billBefore.Total)
+
+    const bankAccountId = await bankAccountIdForCode(bankCode)
+
+    await openPurchaseOrder(page, poId)
+    await markBillPaidViaUi(page, { bankAccountId, reference })
+
+    try {
+      // The BILL_PAYMENT needs no CREATE-ordering deferral (the bill's CREATE is already live — its
+      // accountingInvoiceId is set — see app/actions/purchase-orders.ts), so it posts on the next drain;
+      // drainUntilBillPaid re-drains defensively and gates on the BILL_PAYMENT subledger truth.
+      const bill = await drainUntilBillPaid(page, billId, billRecordId)
+
+      expect(bill.Type).toBe('ACCPAY')
+      // THE POINT: the bill is fully PAID in the ledger, not merely AUTHORISED. A dropped/skipped payment
+      // would leave it AUTHORISED with the full AmountDue, and a structural check could not tell them apart.
+      expect(bill.Status, 'the payable is settled, not just authorised').toBe('PAID')
+      expect(Number(bill.AmountPaid), 'the whole bill is paid').toBeCloseTo(billTotal, 2)
+      expect(Number(bill.AmountDue), 'nothing is left outstanding').toBeCloseTo(0, 2)
+
+      // Exactly one payment, for the full amount, drawn from the CHOSEN bank account. The bill's Payments
+      // sub-resource omits the account, so read the payment itself for the drawn-from code.
+      expect(bill.Payments?.length, 'exactly one payment settles the bill').toBe(1)
+      const payment = await getPayment(bill.Payments![0].PaymentID)
+      expect(Number(payment.Amount), 'the payment is for the bill total').toBeCloseTo(billTotal, 2)
+      expect(payment.Account?.Code, 'payment drawn from the chosen bank account (Business Bank Account 090)').toBe(bankCode)
+    } finally {
+      // Failure-safe: register the payment BEFORE the bill (VOID_ORDER deletes Payments first) so a post that
+      // beat a later throw is reversed and the bill can then be voided. Use the BILL_PAYMENT sync log's own
+      // externalTransactionId — the exact payment THIS bill recorded — never "every payment on the bill".
+      const payExtId = await billPaymentExternalId(billRecordId).catch(() => null)
+      if (payExtId) trackDocument('Payments', payExtId, `PP-09 bill payment ${runTag(runId)}`)
+    }
+  })
 })
 
 /** The PurchaseReturn row this PO produced. Its id — not the PO's — keys the return's journal. */
@@ -931,4 +1158,112 @@ async function settingValue(key: string): Promise<string> {
   } finally {
     await db.end()
   }
+}
+
+/**
+ * Seed a base(GBP)->foreign FX rate with an explicit `fetchedAt` SQL expression (e.g. "now()" or
+ * "now() - interval '2 hours'"), so PP-08 can control the booked vs settlement ordering precisely: the
+ * settlement rate is seeded with a LATER fetchedAt than the booked rate. source='e2e-fc-seed' so
+ * global-setup's sweepSeededFxRates() clears any residue a crash leaves behind (mirrors OC-10). The
+ * fetchedAt expression is a fixed test literal, never external input.
+ */
+async function seedFxRateAt(toCurrency: string, rate: number, fetchedAtSql: string): Promise<string> {
+  const { randomUUID } = await import('node:crypto')
+  const id = `e2e-fc-fx-${randomUUID()}`
+  await queryRows(
+    `insert into fx_rates (id, "fromCurrency", "toCurrency", rate, "fetchedAt", source, "manualOverride")
+     values ($1, 'GBP', $2, $3, ${fetchedAtSql}, 'e2e-fc-seed', false)`,
+    [id, toCurrency.toUpperCase(), rate],
+  )
+  return id
+}
+
+/**
+ * Remove a seeded FX rate to restore the rig's empty-fx_rates baseline. Never throws (it runs in a finally
+ * and must not mask a test result) but is not silent: a residual seeded EUR rate would let a later foreign
+ * order/PO book at this artificial rate. global-setup's sweep is the recovery net (mirrors OC-10).
+ */
+async function deleteFxRate(id: string): Promise<void> {
+  try {
+    const rows = await queryRows<{ id: string }>(`delete from fx_rates where id = $1 returning id`, [id])
+    if (rows.length !== 1) {
+      console.warn(`[PP-08] deleteFxRate(${id}) removed ${rows.length} row(s), expected 1 — global-setup will sweep it next run`)
+    }
+  } catch (e) {
+    console.warn(`[PP-08] deleteFxRate(${id}) failed: ${e instanceof Error ? e.message : String(e)} — global-setup will sweep it next run`)
+  }
+}
+
+/** The connector-native id (Xero AccountID) of a synced bank account, resolved by its account CODE. */
+async function bankAccountIdForCode(code: string): Promise<string> {
+  const rows = await queryRows<{ externalAccountId: string }>(
+    `select "externalAccountId" from accounting_accounts where connector = 'xero' and code = $1 and "externalAccountId" is not null limit 1`,
+    [code],
+  )
+  if (!rows.length) throw new Error(`No synced Xero bank account with code ${code} — is the chart of accounts synced?`)
+  return rows[0].externalAccountId
+}
+
+/** The connector-native id (Xero AccountID) of a synced bank account, resolved by its NAME (for code-less accounts). */
+async function bankAccountIdForName(name: string): Promise<string> {
+  const rows = await queryRows<{ externalAccountId: string }>(
+    `select "externalAccountId" from accounting_accounts where connector = 'xero' and name = $1 and "externalAccountId" is not null limit 1`,
+    [name],
+  )
+  if (!rows.length) throw new Error(`No synced Xero bank account named "${name}" — is the chart of accounts synced?`)
+  return rows[0].externalAccountId
+}
+
+/** The Xero external id of the BILL_PAYMENT this bill recorded (once posted), or null. Keyed on the PurchaseInvoice id. */
+async function billPaymentExternalId(invoiceRecordId: string): Promise<string | null> {
+  const rows = await queryRows<{ externalTransactionId: string | null }>(
+    `select "externalTransactionId" from accounting_sync_logs
+      where connector = 'xero' and type = 'BILL_PAYMENT' and "referenceId" = $1 and "externalTransactionId" is not null
+      order by "createdAt" desc limit 1`,
+    [invoiceRecordId],
+  )
+  return rows.length ? rows[0].externalTransactionId : null
+}
+
+/** The latest BILL_PAYMENT sync-log status for a bill (its referenceId), or null. */
+async function billPaymentLogStatus(invoiceRecordId: string): Promise<{ status: string; error: string | null } | null> {
+  const rows = await queryRows<{ status: string; errorMessage: string | null }>(
+    `select status, "errorMessage" from accounting_sync_logs
+      where connector = 'xero' and type = 'BILL_PAYMENT' and "referenceId" = $1
+      order by "createdAt" desc limit 1`,
+    [invoiceRecordId],
+  )
+  return rows.length ? { status: rows[0].status, error: rows[0].errorMessage } : null
+}
+
+/**
+ * Drain the Xero queue until the bill reads PAID — the AP mirror of order-to-cash's drainUntilInvoicePaid.
+ * Gates on the BILL_PAYMENT subledger truth (FAILED -> fail loudly with the recorded error rather than spin
+ * to a confusing timeout; SYNCED -> Xero accepted the POST) and, once SYNCED, polls getInvoice for PAID
+ * because Xero can lag a beat reflecting the payment on the bill aggregate.
+ */
+async function drainUntilBillPaid(
+  page: import('@playwright/test').Page,
+  billXeroId: string,
+  invoiceRecordId: string,
+  maxDrains = 5,
+): Promise<XeroInvoice> {
+  let bill = await getInvoice(billXeroId)
+  for (let i = 0; i < maxDrains && bill.Status !== 'PAID'; i++) {
+    await processPendingXeroSyncViaUi(page)
+    const pay = await billPaymentLogStatus(invoiceRecordId)
+    if (pay?.status === 'FAILED') {
+      throw new Error(`BILL_PAYMENT failed to post to Xero: ${pay.error ?? 'no error recorded'}`)
+    }
+    if (pay?.status === 'SYNCED') {
+      for (let j = 0; j < 6 && bill.Status !== 'PAID'; j++) {
+        bill = await getInvoice(billXeroId)
+        if (bill.Status === 'PAID') break
+        await new Promise((res) => setTimeout(res, 5_000))
+      }
+    } else {
+      bill = await getInvoice(billXeroId)
+    }
+  }
+  return bill
 }
