@@ -277,7 +277,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         .map((line) => {
           if (select?.shipment) {
             const shipment = state.shipments.find((row) => row.id === line.shipmentId)!
-            return { lineId: line.lineId, productId: line.productId, qty: line.qty, shipment: { warehouseId: shipment.warehouseId } }
+            return { lineId: line.lineId, productId: line.productId, qty: line.qty, shipment: { warehouseId: shipment.warehouseId, status: shipment.status } }
           }
           if (select?.costLayerSnapshot) return { lineId: line.lineId, costLayerSnapshot: line.costLayerSnapshot }
           return { lineId: line.lineId, productId: line.productId, qty: line.qty }
@@ -735,6 +735,37 @@ test('transitionShipmentStatus nets refunds at KIT leaf level so fractional comp
   assert.match((result as { error: string }).error, /packed before the refund/)
   assert.equal(state.shipments[0].status, 'PACKED')
   assert.equal(state.movements.length, 0)
+})
+
+test('transitionShipmentStatus lets an unrelated line dispatch after another line was shipped then refunded (o3d-339)', async () => {
+  // Line A shipped in full, THEN refunded (a post-delivery return). Its already-SHIPPED qty now exceeds
+  // ordered-minus-refunded — but that is historical and must not wedge dispatching the still-owed line B.
+  const state = baseState({
+    lines: [
+      { id: 'line-a', orderId: 'order-1', productId: 'product-a', qty: 2, sku: 'SKU-A', description: 'Product A' },
+      { id: 'line-b', orderId: 'order-1', productId: 'product-b', qty: 1, sku: 'SKU-B', description: 'Product B' },
+    ],
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-a', shipmentId: 'shipment-a', lineId: 'line-a', productId: 'product-a', qty: 2 },
+      { id: 'shipment-line-b', shipmentId: 'shipment-b', lineId: 'line-b', productId: 'product-b', qty: 1 },
+    ],
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-a', productId: 'product-a', qty: 2 }],
+    stockLevels: [{ productId: 'product-b', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-b', productId: 'product-b', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[1].status, 'SHIPPED') // line B dispatched, not wedged by line A's refund
+  assert.equal(state.movements.length, 1)
 })
 
 test('transitionShipmentStatus fails cleanly when dispatch shipment starts with no lines', async () => {

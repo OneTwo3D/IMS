@@ -136,7 +136,7 @@ async function validateActiveShipmentTotalsWithinOrder(
     }),
     client.shipmentLine.findMany({
       where: { shipment: { orderId, status: { not: 'PENDING' } } },
-      select: { lineId: true, productId: true, qty: true },
+      select: { lineId: true, productId: true, qty: true, shipment: { select: { status: true } } },
     }),
     // o3d-339: refunded units must never be dispatched. A PENDING shipment built BEFORE a refund lands
     // is not rebuilt on refund — releaseReservationsAfterRefund refuses the reservation release while a
@@ -185,31 +185,38 @@ async function validateActiveShipmentTotalsWithinOrder(
     }
   }
 
-  const activeByLeaf = new Map<string, { lineId: string; activeQty: Prisma.Decimal }>()
+  // Split active leaf qty into ALREADY-SHIPPED (historical, cannot be un-shipped) and STILL-PLANNED
+  // (PICKING/PACKED — what a dispatch is about to send). A POST-shipment refund (a return) legitimately
+  // pushes already-shipped qty above ordered-minus-refunded; counting SHIPPED rows in the dispatch cap
+  // would then wedge every future dispatch on the order (line A shipped-then-refunded fails the recheck,
+  // blocking an unrelated PACKED line B). So only the still-planned qty is capped, against what remains
+  // to ship after refunds AND after what already shipped (o3d-339).
+  const shippedByLeaf = new Map<string, Prisma.Decimal>()
+  const plannedByLeaf = new Map<string, { lineId: string; plannedQty: Prisma.Decimal }>()
   for (const shipmentLine of activeShipmentLines) {
     const key = `${shipmentLine.lineId}|${shipmentLine.productId}`
-    const entry = activeByLeaf.get(key) ?? { lineId: shipmentLine.lineId, activeQty: new Prisma.Decimal(0) }
-    entry.activeQty = entry.activeQty.add(toDecimal(shipmentLine.qty))
-    activeByLeaf.set(key, entry)
+    if (shipmentLine.shipment.status === 'SHIPPED') {
+      shippedByLeaf.set(key, (shippedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)))
+    } else {
+      const entry = plannedByLeaf.get(key) ?? { lineId: shipmentLine.lineId, plannedQty: new Prisma.Decimal(0) }
+      entry.plannedQty = entry.plannedQty.add(toDecimal(shipmentLine.qty))
+      plannedByLeaf.set(key, entry)
+    }
   }
 
-  for (const [key, { lineId, activeQty }] of activeByLeaf) {
+  for (const [key, { lineId, plannedQty }] of plannedByLeaf) {
     const label = lineLabelById.get(lineId)
     if (!label) {
       return `Shipment line ${lineId} no longer belongs to this order. Reload and retry.`
     }
     const orderedQty = orderedByLeaf.get(key) ?? new Prisma.Decimal(0)
     const refundedQty = refundedByLeaf.get(key) ?? new Prisma.Decimal(0)
-    // Shippable = ordered minus refunded, never below zero: refunded units are no longer owed.
-    //
-    // Quantised to the Decimal(12,4) boundary the shipment rows persist at (o3d-odu), so a single
-    // fractional component (0.5 kit x 0.3333 = 0.16665, persisted 0.1667) isn't rejected by a
-    // rounding ulp. Rounded AFTER the subtraction, not before: rounding each side separately would
-    // let two half-ulp errors compound into a full one. Kept exact (epsilon-only) beyond that — no
-    // per-row slack — so nothing can be over-shipped.
-    let shippableQty = roundQuantity(orderedQty.sub(refundedQty), 4)
+    const shippedQty = shippedByLeaf.get(key) ?? new Prisma.Decimal(0)
+    // Still shippable = ordered − refunded − already-shipped, never below zero. Only the not-yet-shipped
+    // planned quantity is checked against it, so a historical post-ship refund doesn't fail the order.
+    let shippableQty = orderedQty.sub(refundedQty).sub(shippedQty)
     if (shippableQty.lt(0)) shippableQty = new Prisma.Decimal(0)
-    if (activeQty.gt(shippableQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
+    if (plannedQty.gt(shippableQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
       if (refundedQty.gt(0)) {
         // A PACKED shipment can't be rebuilt via confirmSalesOrderShipments (it only replaces PENDING
         // shipments) — this was packed before the refund, so it needs an operator to unpack/cancel and
