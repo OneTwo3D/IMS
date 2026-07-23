@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -7,6 +8,7 @@ const RETENTION_KEYS = [
   'retention_customers_months',
   'retention_stock_movements_months',
   'retention_sync_logs_months',
+  'retention_webhook_events_months',
 ] as const
 
 const DEFAULTS: Record<string, number> = {
@@ -15,6 +17,10 @@ const DEFAULTS: Record<string, number> = {
   retention_customers_months: 0,
   retention_stock_movements_months: 0,
   retention_sync_logs_months: 6,
+  // o3d-ahk: terminal shopping-webhook-inbox rows (PROCESSED / DEAD_LETTER) are transient delivery
+  // records with no long-term value; default to a 3-month purge so the inbox can't grow unbounded (it
+  // had NO retention before). PENDING/FAILED rows are never purged here — they are undelivered work.
+  retention_webhook_events_months: 3,
 }
 
 async function getRetentionSettings(): Promise<Record<string, number>> {
@@ -45,6 +51,7 @@ function monthsAgo(months: number): Date {
 export async function purgeExpiredData(): Promise<{
   syncLogsDeleted: number
   stockMovementsDeleted: number
+  webhookEventsDeleted: number
   salesOrdersArchived: number
   purchaseOrdersArchived: number
   customersArchived: number
@@ -52,6 +59,7 @@ export async function purgeExpiredData(): Promise<{
   const settings = await getRetentionSettings()
   let syncLogsDeleted = 0
   let stockMovementsDeleted = 0
+  let webhookEventsDeleted = 0
   let salesOrdersArchived = 0
   let purchaseOrdersArchived = 0
   let customersArchived = 0
@@ -65,6 +73,21 @@ export async function purgeExpiredData(): Promise<{
       db.accountingSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
     ])
     syncLogsDeleted = wc.count + acct.count
+  }
+
+  // Shopping webhook inbox — hard delete TERMINAL rows only (o3d-ahk). PROCESSED and DEAD_LETTER are
+  // done; PENDING/FAILED are undelivered work and are never purged here. Keyed on updatedAt (the last
+  // state change = when the row became terminal).
+  const webhookMonths = settings.retention_webhook_events_months
+  if (webhookMonths > 0) {
+    const cutoff = monthsAgo(webhookMonths)
+    const { count } = await db.shoppingWebhookEvent.deleteMany({
+      where: {
+        status: { in: [WC_WEBHOOK_EVENT_STATUS.processed, WC_WEBHOOK_EVENT_STATUS.deadLetter] },
+        updatedAt: { lt: cutoff },
+      },
+    })
+    webhookEventsDeleted = count
   }
 
   // Stock movements — hard delete (exclude historical import types)
@@ -147,6 +170,7 @@ export async function purgeExpiredData(): Promise<{
   const parts: string[] = []
   if (syncLogsDeleted > 0) parts.push(`${syncLogsDeleted} sync logs deleted`)
   if (stockMovementsDeleted > 0) parts.push(`${stockMovementsDeleted} stock movements deleted`)
+  if (webhookEventsDeleted > 0) parts.push(`${webhookEventsDeleted} webhook events deleted`)
   if (salesOrdersArchived > 0) parts.push(`${salesOrdersArchived} sales orders archived`)
   if (purchaseOrdersArchived > 0) parts.push(`${purchaseOrdersArchived} purchase orders archived`)
   if (customersArchived > 0) parts.push(`${customersArchived} customers archived`)
@@ -157,10 +181,10 @@ export async function purgeExpiredData(): Promise<{
       action: 'cleanup',
       tag: 'system',
       description: `Data retention cleanup: ${parts.join(', ')}`,
-      metadata: { syncLogsDeleted, stockMovementsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
+      metadata: { syncLogsDeleted, stockMovementsDeleted, webhookEventsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
       resolveUser: false,
     })
   }
 
-  return { syncLogsDeleted, stockMovementsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
+  return { syncLogsDeleted, stockMovementsDeleted, webhookEventsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
 }
