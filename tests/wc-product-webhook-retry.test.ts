@@ -10,7 +10,7 @@ import test, { mock } from 'node:test'
 // conflict, and — crucially — returns BEFORE the best-effort stock correction so a retry can't replay the
 // forced stock write.
 
-type SyncResult = { success: boolean; error?: string; permanent?: boolean }
+type SyncResult = { success: boolean; error?: string }
 const syncResult = { current: { success: true } as SyncResult }
 const upsertCalls: unknown[] = []
 const stockEnqueueCalls: unknown[] = []
@@ -45,18 +45,12 @@ async function processProduct(payload: unknown) {
 
 const basePayload = { id: 42, sku: 'SKU-42', type: 'simple', name: 'Widget', status: 'publish' }
 
-test('a TRANSIENT product import failure returns a retryable 500 and does not advance the cursor (o3d-i0y)', async () => {
+test('a product import failure returns a retryable 500 and does not advance the cursor (o3d-i0y)', async () => {
   syncResult.current = { success: false, error: 'db connection reset' }
   upsertCalls.length = 0
   const response = await processProduct(basePayload)
-  assert.equal(response.status, 500, 'transient failure is a retryable 5xx, not a 200 ack')
+  assert.equal(response.status, 500, 'failure is a retryable 5xx, not a 200 ack')
   assert.equal(upsertCalls.length, 0, 'the sync cursor is not advanced on failure')
-})
-
-test('a PERMANENT product conflict is acknowledged 200, not retried (o3d-i0y)', async () => {
-  syncResult.current = { success: false, error: 'Unique constraint failed', permanent: true }
-  const response = await processProduct(basePayload)
-  assert.equal(response.status, 200, 'a deterministic conflict is acknowledged, not retried to a dead letter')
 })
 
 test('a successful product import returns 200 and advances the shared cursor (o3d-i0y)', async () => {
