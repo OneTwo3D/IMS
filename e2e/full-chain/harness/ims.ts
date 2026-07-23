@@ -329,6 +329,28 @@ export async function postSupplierCreditNote(page: Page): Promise<void> {
 }
 
 /**
+ * Record a MANUAL freight/additional-cost supplier credit note against the PO's bill — the
+ * "Record credit note" flow on the Supplier credit notes card (recordSupplierFreightCreditNote,
+ * supplier-credit-notes-card.tsx). Unlike a goods return (which DRAFTS a credit automatically),
+ * an over-charged or duplicate freight bill is credited BY HAND: enter a GROSS amount and it drafts
+ * a credit note the operator then posts with postSupplierCreditNote(). Requires the PO to already
+ * have a bill (the card self-hides otherwise).
+ */
+export async function recordFreightCreditNote(
+  page: Page,
+  opts: { amount: string; creditNoteNumber?: string; reason?: string },
+): Promise<void> {
+  await page.getByRole('button', { name: /record credit note/i }).click()
+  const dialog = page.getByRole('dialog', { name: /Record supplier credit note/i })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+  await dialog.locator('#cn-amount').fill(opts.amount)
+  if (opts.creditNoteNumber) await dialog.locator('#cn-number').fill(opts.creditNoteNumber)
+  await dialog.locator('#cn-reason').fill(opts.reason ?? 'Duplicate freight bill')
+  await dialog.getByRole('button', { name: /record \(draft\)/i }).click()
+  await expect(dialog).toBeHidden({ timeout: 30_000 })
+}
+
+/**
  * Enter the supplier bill against the PO. Returns the supplier invoice number used.
  *
  * `expectBillCount` is how many bills the PO should carry AFTERWARDS, and defaults to the first.
