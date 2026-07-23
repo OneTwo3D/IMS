@@ -518,7 +518,10 @@ export async function runPaymentPoll(): Promise<unknown> {
  * processPendingXeroSync drives the Xero sync through the UI). manual_reconcile honours wc_sync_order_statuses
  * and adds 'completed', and is ungated (unlike runWcReconcile's 24h webhook-primary interval).
  */
-export async function runWcOrderReconcile(page: Page): Promise<{ synced: number; skipped: number; errors: string[] }> {
+export async function runWcOrderReconcile(
+  page: Page,
+  opts: { allowErrors?: boolean } = {},
+): Promise<{ synced: number; skipped: number; errors: string[] }> {
   const res = await page.request.post('/api/shopping/manual-sync', {
     data: { type: 'orders', connector: 'woocommerce' },
   })
@@ -537,7 +540,10 @@ export async function runWcOrderReconcile(page: Page): Promise<{ synced: number;
     throw new Error(`WC manual reconcile not successful: ${body.error ?? JSON.stringify(body).slice(0, 300)}`)
   }
   const result = body.result ?? {}
-  if (result.errors && result.errors.length) {
+  // By default a reported per-order/fetch error is a hard failure (a WooCommerce outage must not read as a
+  // clean no-op). OC-17 opts into allowErrors: a missing-FX order is EXPECTED to fail import and quarantine,
+  // and the test asserts that outcome from result.errors + the pending-FX queue.
+  if (!opts.allowErrors && result.errors && result.errors.length) {
     throw new Error(`WC manual reconcile reported ${result.errors.length} order error(s): ${result.errors.slice(0, 3).join('; ')}`)
   }
   return { synced: result.synced ?? 0, skipped: result.skipped ?? 0, errors: result.errors ?? [] }
