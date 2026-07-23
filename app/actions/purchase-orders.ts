@@ -1402,22 +1402,19 @@ export async function updatePurchaseOrder(
       // BEFORE additional-cost VAT is folded in so the discount only
       // scales the line portion of the order.
       const orderDiscountForeignInput = Math.max(0, input.orderDiscountForeign ?? 0)
-      if (orderDiscountForeignInput > 0 && subtotalForeign > 0) {
-        const grossBase = subtotalForeign + totalTaxForeign
-        const netFrac = grossBase > 0 ? subtotalForeign / grossBase : 1
-        const grossDisc = inclVat
-          ? orderDiscountForeignInput
-          : orderDiscountForeignInput / Math.max(netFrac, 0.000001)
-        const cappedGrossDisc = Math.min(grossDisc, grossBase)
-        const orderDiscountNetForeign = Math.round(cappedGrossDisc * netFrac * 10000) / 10000
-        const orderDiscountVatForeign = Math.round((cappedGrossDisc - orderDiscountNetForeign) * 10000) / 10000
-        const orderDiscountNetBase = Math.round((orderDiscountNetForeign / fxRate) * 10000) / 10000
-        const orderDiscountVatBase = Math.round((orderDiscountVatForeign / fxRate) * 10000) / 10000
-        subtotalForeign = Math.max(0, subtotalForeign - orderDiscountNetForeign)
-        subtotalBase = Math.max(0, subtotalBase - orderDiscountNetBase)
-        totalTaxForeign = Math.max(0, totalTaxForeign - orderDiscountVatForeign)
-        totalTaxBase = Math.max(0, totalTaxBase - orderDiscountVatBase)
-      }
+      const editDiscounted = applyHeaderOrderDiscount({
+        subtotalForeign,
+        subtotalBase,
+        taxForeign: totalTaxForeign,
+        taxBase: totalTaxBase,
+        orderDiscountForeign: orderDiscountForeignInput,
+        inclVat,
+        fxRate,
+      })
+      subtotalForeign = editDiscounted.subtotalForeign
+      subtotalBase = editDiscounted.subtotalBase
+      totalTaxForeign = editDiscounted.taxForeign
+      totalTaxBase = editDiscounted.taxBase
       updates.discountStr = input.orderDiscountStr ?? null
       updates.discountAmount = orderDiscountForeignInput
 
@@ -1475,6 +1472,10 @@ export async function updatePurchaseOrder(
       updates.taxBase = totalTaxBase
       updates.totalForeign = subtotalForeign + totalTaxForeign + currentDirectFreightForeign
       updates.totalBase = subtotalBase + totalTaxBase + currentDirectFreightBase
+      // Persist the VAT convention actually used to recompute these totals + the header discount, so a
+      // later supplier requote reapplies the discount in the same convention (o3d-lx1). Kept aligned with
+      // the recalculation: an edit that recomputes as net stores false, inclusive stores true.
+      updates.pricesIncludeVat = inclVat
     }
 
     const po = rateOnlyFxRefresh
