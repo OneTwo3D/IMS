@@ -512,6 +512,16 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     await dispatchStockTransfer(page, transferRef)
     await receiveStockTransfer(page, transferRef)
 
+    // The transfer MUST have genuinely drained the source layer — otherwise the "no COGS" assertion below
+    // is trivially true (nothing consumed) rather than proof the exclusion fired. With the source layer
+    // fully consumed via TRANSFER_OUT, the reval's netConsumedQty would be 100 WITHOUT the exclusion and it
+    // would book £100 of spurious COGS; that it books none is the exclusion working.
+    const source = await costLayerTotalsAt(sku, sourceWarehouseId)
+    expect(source.received, 'the goods receipt laid down 100 units at the source warehouse').toBeCloseTo(qty, 4)
+    expect(source.remaining, 'the transfer consumed the ENTIRE source layer (TRANSFER_OUT) — nothing left on hand there').toBeCloseTo(0, 4)
+    const dest = await costLayerTotalsAt(sku, destWarehouseId)
+    expect(dest.remaining, 'all 100 units are on hand at the destination warehouse after the transfer').toBeCloseTo(qty, 4)
+
     // Scope the read-back / no-COGS check to THIS run's journals.
     const boundary = await dailyBatchBoundary()
 
@@ -1093,6 +1103,18 @@ async function pickTransferWarehouses(sku: string): Promise<{ sourceWarehouseId:
   )
   if (!others.length) throw new Error('pickTransferWarehouses: the rig needs a second warehouse to transfer to.')
   return { sourceWarehouseId, destWarehouseId: others[0].id }
+}
+
+/** Total received/remaining qty across a SKU's cost layers in one warehouse (X-06 transfer verification). */
+async function costLayerTotalsAt(sku: string, warehouseId: string): Promise<{ received: number; remaining: number }> {
+  const rows = await queryRows<{ received: number; remaining: number }>(
+    `select coalesce(sum(cl."receivedQty"), 0)::float8 as received,
+            coalesce(sum(cl."remainingQty"), 0)::float8 as remaining
+       from cost_layers cl join products p on p.id = cl."productId"
+      where p.sku = $1 and cl."warehouseId" = $2`,
+    [sku, warehouseId],
+  )
+  return { received: rows[0]?.received ?? 0, remaining: rows[0]?.remaining ?? 0 }
 }
 
 /** Count COGS_JOURNAL sync-log rows for a PO — the exclusion check: TRANSFERRED-out units must post NONE. */
