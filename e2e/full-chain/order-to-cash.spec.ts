@@ -1140,12 +1140,12 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       // And the order records a PARTIAL disposition (one of three units).
       expect(await orderRefundStatus(imported.salesOrderId)).toBe('PARTIAL')
     } finally {
-      // Restore the default-return-warehouse flag, then register EVERY Xero doc that could have posted, even if
-      // an assertion or the drain threw before its inline registration (Codex r1). The refund drain can post the
-      // credit note and/or the COGS-reversal journal before a later throw, and the global straggler scan only
-      // finds invoices — so an untracked credit note / manual journal would strand silently in the shared Demo
-      // ledger. Each lookup is isolated so one failure cannot suppress the others. trackDocument dedupes.
-      await setDefaultReturnWarehouse(WAREHOUSE_CODE, false, priorReturnWh)
+      // Register EVERY Xero doc that could have posted FIRST — even if an assertion or the drain threw before its
+      // inline registration (Codex r1). The refund drain can post the credit note and/or the COGS-reversal
+      // journal before a later throw, and the global straggler scan only finds invoices — so an untracked credit
+      // note / manual journal would strand silently in the shared Demo ledger. Each lookup is isolated so one
+      // failure cannot suppress the others. trackDocument dedupes. The warehouse restore runs LAST and in its
+      // own catch, so a transient failure there cannot skip the doc registration above (Codex r2).
       if (!invoiceId && importedSalesOrderId) {
         const posted = await awaitPostedExternalId('SALES_INVOICE', importedSalesOrderId, 90_000).catch(() => null)
         if (posted) trackDocument('Invoices', posted, `OC-08 invoice ${runTag(runId)}`)
@@ -1156,6 +1156,9 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
         const cr = await awaitPostedExternalId('COGS_REVERSAL', refundId, 30_000).catch(() => null)
         if (cr) trackDocument('ManualJournals', cr, `OC-08 COGS reversal ${runTag(runId)}`)
       }
+      await setDefaultReturnWarehouse(WAREHOUSE_CODE, false, priorReturnWh).catch((e) => {
+        console.warn(`[OC-08] default-return-warehouse restore failed (non-fatal, docs already registered): ${e instanceof Error ? e.message : e}`)
+      })
     }
   })
 
