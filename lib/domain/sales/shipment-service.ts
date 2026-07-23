@@ -129,10 +129,14 @@ async function validateActiveShipmentTotalsWithinOrder(
   // plan, so this check intentionally includes PICKING/PACKED rows as well as
   // SHIPPED rows. That makes concurrent dispatches race-safe for total-qty
   // validation: both transactions see the same active planned shipment set.
-  const [orderLines, activeShipmentLines] = await Promise.all([
+  const [orderLines, allocations, activeShipmentLines] = await Promise.all([
     client.salesOrderLine.findMany({
       where: { orderId },
-      select: { id: true, productId: true, qty: true, sku: true, description: true },
+      select: { id: true, sku: true, description: true },
+    }),
+    client.orderAllocation.findMany({
+      where: { orderId },
+      select: { lineId: true, productId: true, qty: true },
     }),
     client.shipmentLine.findMany({
       where: { shipment: { orderId, status: { not: 'PENDING' } } },
@@ -142,25 +146,20 @@ async function validateActiveShipmentTotalsWithinOrder(
 
   // Shipment lines are LEAF-product rows: a KIT order line expands to its component products, so a kit
   // line has several shipment lines (one per component) under the same lineId, each in COMPONENT units.
-  // Summing them against the kit line's OWN qty (kit units) therefore always over-counts and falsely
-  // rejects every kit dispatch (o3d-odu). Compare in leaf-product units keyed by (orderLineId, productId)
-  // instead: expand each line's ordered qty through the kit/BOM graph (the same expansion
-  // confirmSalesOrderShipments builds from), and cap each component's shipped total at its ordered
-  // component requirement. Simple products are the identity expansion, so their behaviour is unchanged.
-  const productIds = [...new Set(
-    orderLines.map((line) => line.productId).filter((id): id is string => !!id),
-  )]
-  const graph = productIds.length > 0 ? await loadFulfillmentProductGraph(client, productIds) : new Map()
+  // Summing them against the kit line's OWN qty (kit units) always over-counts and falsely rejects every
+  // kit dispatch (o3d-odu). Instead compare in leaf-product units keyed by (orderLineId, productId)
+  // against the PERSISTED OrderAllocation quantities — the Decimal(12,4) leaf rows the shipments were
+  // built from (confirmSalesOrderShipments builds directly from these). Using the persisted allocations
+  // rather than a live re-expansion of the kit line qty means the cap already matches the per-row
+  // rounding of the shipment lines (a 0.5/0.5 split of a 0.3333 component is 0.1667 + 0.1667 on both
+  // sides) and is immune to later kit-composition edits. Simple products allocate 1:1, so their
+  // behaviour is unchanged.
+  const lineLabelById = new Map(orderLines.map((line) => [line.id, line.sku ?? line.description ?? line.id]))
 
-  const lineLabelById = new Map<string, string>()
-  const orderedByLeaf = new Map<string, Prisma.Decimal>()
-  for (const line of orderLines) {
-    lineLabelById.set(line.id, line.sku ?? line.description ?? line.id)
-    if (!line.productId) continue // a description-only line has no product to ship
-    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(line.productId, toDecimal(line.qty), graph)) {
-      const key = `${line.id}|${componentId}`
-      orderedByLeaf.set(key, (orderedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
-    }
+  const allocatedByLeaf = new Map<string, Prisma.Decimal>()
+  for (const allocation of allocations) {
+    const key = `${allocation.lineId}|${allocation.productId}`
+    allocatedByLeaf.set(key, (allocatedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(allocation.qty)))
   }
 
   const activeByLeaf = new Map<string, { lineId: string; activeQty: Prisma.Decimal }>()
@@ -176,11 +175,8 @@ async function validateActiveShipmentTotalsWithinOrder(
     if (!label) {
       return `Shipment line ${lineId} no longer belongs to this order. Reload and retry.`
     }
-    // Quantise the expanded requirement to the Decimal(12,4) boundary that OrderAllocation/ShipmentLine
-    // quantities persist at, so a full-precision expansion (e.g. 0.5 kit × 0.3333 = 0.16665) doesn't sit
-    // a rounding ulp below the persisted shipment qty (0.1667) and falsely reject a valid dispatch.
-    const orderedQty = roundQuantity(orderedByLeaf.get(key) ?? new Prisma.Decimal(0), 4)
-    if (activeQty.gt(orderedQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
+    const allocatedQty = allocatedByLeaf.get(key) ?? new Prisma.Decimal(0)
+    if (activeQty.gt(allocatedQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
       return `Shipment quantity for line ${label} exceeds ordered quantity. Reload and retry.`
     }
   }
