@@ -307,8 +307,9 @@ async function handleProductWebhook(payload: unknown) {
     && typeof productPayload.name === 'string'
     && typeof productPayload.status === 'string'
 
-  // Set when the product import fails, so the delivery is RETRIED rather than acknowledged (o3d-i0y).
-  let productSyncError: string | null = null
+  // Set only for a TRANSIENT product-import failure, so the delivery is RETRIED (a permanent, deterministic
+  // conflict is acknowledged and logged instead of retried 24× to a dead letter). o3d-i0y.
+  let transientProductSyncError: string | null = null
 
   if (canSyncProduct) {
     const result = await syncWcProductToIms(productPayload as WcFullProduct)
@@ -343,17 +344,24 @@ async function handleProductWebhook(payload: unknown) {
       // productSyncError and turns the delivery into a retryable HTTP 500 (o3d-i0y). Keeping the
       // two apart here is the whole point of o3d-gtk: without it, the 500 would also retry the
       // permanent conflicts above, ~24 times, into the dead-letter queue.
+      //
+      // The classification itself comes from development (o3d-gtk/o3d-fsi), NOT from this
+      // branch's earlier P2002 sniffing: the Prisma driver adapter does not populate meta.target,
+      // so raw P2002 detection misses which constraint actually collided.
       productSyncError = result.error ?? 'Unknown product sync error'
       await logActivity({
         entityType: 'SYNC',
-        action: 'wc_product_webhook',
+        action: result.permanent ? 'wc_product_webhook_rejected' : 'wc_product_webhook',
         tag: 'sync',
         level: 'WARNING',
-        description: `WooCommerce product webhook import failed for ${productPayload.sku}`,
+        description: result.permanent
+          ? `WooCommerce product webhook for ${productPayload.sku} was rejected by a deterministic conflict; acknowledged rather than retried`
+          : `WooCommerce product webhook import failed for ${productPayload.sku}`,
         metadata: {
           externalId: productPayload.id,
           sku: productPayload.sku,
-          error: productSyncError,
+          error,
+          permanent: result.permanent ?? false,
         },
       })
     }
@@ -373,6 +381,15 @@ async function handleProductWebhook(payload: unknown) {
         payloadKeys: Object.keys(productPayload).sort(),
       },
     })
+  }
+
+  // Return the retryable 500 BEFORE the best-effort stock correction, so an inbox retry of a transient
+  // product failure re-attempts the product import WITHOUT replaying the forced stock write below
+  // (force:true bypasses the stock dedupe and reopens completed/permanently-failed stock rows). The stock
+  // correction runs only on a product success, a permanent product rejection (once, not retried), or a
+  // stock-only webhook. Mirrors handleOrderWebhook's retry-on-failure contract (o3d-i0y).
+  if (transientProductSyncError) {
+    return NextResponse.json({ ok: false, error: transientProductSyncError }, { status: 500 })
   }
 
   if (typeof productPayload.id === 'number' && Object.prototype.hasOwnProperty.call(productPayload, 'stock_quantity')) {
@@ -411,15 +428,6 @@ async function handleProductWebhook(payload: unknown) {
     }
   }
 
-  // A product import failure is a transient exception (DB/network in syncWcProductToIms). Return HTTP 500
-  // so the webhook inbox retries the delivery (assertSuccessfulResponse treats >= 500 as retryable),
-  // rather than ACK'ing 200 and marking the event terminally PROCESSED. That stranded the failed product
-  // until the slow reconcile window — the shared last_wc_product_sync_at cursor only advances on success,
-  // but any LATER successful product webhook moves it past the failed product, so the poll path can't
-  // re-fetch it either. Mirrors handleOrderWebhook's retry-on-failure contract (o3d-i0y).
-  if (productSyncError) {
-    return NextResponse.json({ ok: false, error: productSyncError }, { status: 500 })
-  }
   return NextResponse.json({ ok: true })
 }
 
