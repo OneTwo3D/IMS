@@ -307,6 +307,9 @@ async function handleProductWebhook(payload: unknown) {
     && typeof productPayload.name === 'string'
     && typeof productPayload.status === 'string'
 
+  // Set when the product import fails, so the delivery is RETRIED rather than acknowledged (o3d-i0y).
+  let productSyncError: string | null = null
+
   if (canSyncProduct) {
     const result = await syncWcProductToIms(productPayload as WcFullProduct)
     if (result.success) {
@@ -336,9 +339,11 @@ async function handleProductWebhook(payload: unknown) {
         },
       })
     } else {
-      // TRANSIENT: a retry can still succeed, so this branch — and only this branch — is the one
-      // o3d-i0y (PR #551) turns into a retryable HTTP 500. Keeping the two apart here is the whole
-      // point of o3d-gtk: without it, i0y's 500 also retries the permanent conflicts above.
+      // TRANSIENT: a retry can still succeed, so this branch — and only this branch — sets
+      // productSyncError and turns the delivery into a retryable HTTP 500 (o3d-i0y). Keeping the
+      // two apart here is the whole point of o3d-gtk: without it, the 500 would also retry the
+      // permanent conflicts above, ~24 times, into the dead-letter queue.
+      productSyncError = result.error ?? 'Unknown product sync error'
       await logActivity({
         entityType: 'SYNC',
         action: 'wc_product_webhook',
@@ -348,7 +353,7 @@ async function handleProductWebhook(payload: unknown) {
         metadata: {
           externalId: productPayload.id,
           sku: productPayload.sku,
-          error: result.error ?? 'Unknown product sync error',
+          error: productSyncError,
         },
       })
     }
@@ -406,6 +411,15 @@ async function handleProductWebhook(payload: unknown) {
     }
   }
 
+  // A product import failure is a transient exception (DB/network in syncWcProductToIms). Return HTTP 500
+  // so the webhook inbox retries the delivery (assertSuccessfulResponse treats >= 500 as retryable),
+  // rather than ACK'ing 200 and marking the event terminally PROCESSED. That stranded the failed product
+  // until the slow reconcile window — the shared last_wc_product_sync_at cursor only advances on success,
+  // but any LATER successful product webhook moves it past the failed product, so the poll path can't
+  // re-fetch it either. Mirrors handleOrderWebhook's retry-on-failure contract (o3d-i0y).
+  if (productSyncError) {
+    return NextResponse.json({ ok: false, error: productSyncError }, { status: 500 })
+  }
   return NextResponse.json({ ok: true })
 }
 
