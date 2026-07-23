@@ -509,6 +509,84 @@ export async function runPaymentPoll(): Promise<unknown> {
   return pollXeroPayments()
 }
 
+/**
+ * Drive the WooCommerce order reconcile sweep — the safety net that ingests orders the realtime webhook
+ * missed. Posts the operator's "manual sync" endpoint (admin-authed, which the page already is), which runs
+ * syncNewWcOrders({ mode: 'manual_reconcile' }) IN THE APP and awaits it. This deliberately goes through the
+ * route rather than importing order-import.ts into the Playwright process: that module's graph pulls a
+ * CJS-only dependency and dies with "Cannot use import statement outside a module" (the same reason
+ * processPendingXeroSync drives the Xero sync through the UI). manual_reconcile honours wc_sync_order_statuses
+ * and adds 'completed', and is ungated (unlike runWcReconcile's 24h webhook-primary interval).
+ */
+export async function runWcOrderReconcile(
+  page: Page,
+  opts: { allowErrors?: boolean } = {},
+): Promise<{ synced: number; skipped: number; errors: string[] }> {
+  const res = await page.request.post('/api/shopping/manual-sync', {
+    data: { type: 'orders', connector: 'woocommerce' },
+  })
+  if (!res.ok()) {
+    throw new Error(`WC manual reconcile HTTP ${res.status()}: ${(await res.text()).slice(0, 300)}`)
+  }
+  // Validate the RESULT, not just the HTTP status: the route answers 200 { success:true } even when
+  // syncNewWcOrders reported per-order or fetch failures in result.errors (WooCommerce unavailable, auth,
+  // rate limit). Left unchecked, a negative assertion (OC-20) could pass because reconciliation did nothing.
+  const body = (await res.json()) as {
+    success?: boolean
+    error?: string
+    result?: { synced?: number; skipped?: number; errors?: string[] }
+  }
+  if (!body.success) {
+    throw new Error(`WC manual reconcile not successful: ${body.error ?? JSON.stringify(body).slice(0, 300)}`)
+  }
+  const result = body.result ?? {}
+  // By default a reported per-order/fetch error is a hard failure (a WooCommerce outage must not read as a
+  // clean no-op). OC-17 opts into allowErrors: a missing-FX order is EXPECTED to fail import and quarantine,
+  // and the test asserts that outcome from result.errors + the pending-FX queue.
+  if (!opts.allowErrors && result.errors && result.errors.length) {
+    throw new Error(`WC manual reconcile reported ${result.errors.length} order error(s): ${result.errors.slice(0, 3).join('; ')}`)
+  }
+  return { synced: result.synced ?? 0, skipped: result.skipped ?? 0, errors: result.errors ?? [] }
+}
+
+/**
+ * Drain the shopping-webhook inbox — the consumer that reprocesses PENDING
+ * `shopping_webhook_events` into sales orders — IN THE APP, via its cron route.
+ *
+ * Same reasoning as runDailyBatch: the domain job (processPendingWcWebhookEvents) reaches
+ * a CJS-only graph and cannot be imported into the Playwright process, so the faithful
+ * trigger is the cron route. Auth is the cron bearer secret (lib/cron-auth.ts).
+ *
+ * Two behaviours the caller must respect:
+ *   - the woocommerce tick only PROCESSES when wc_sync_enabled is true; with the gate off
+ *     it returns { skipped: true, reason: 'wc_sync_disabled' } and drains nothing (the
+ *     route reads the gate per-connector, app/api/cron/shopping-webhook-inbox/route.ts);
+ *   - it is rate-limited to CRON_RATE_LIMIT_FIVE_MINUTE_MAX (15) per five minutes per IP,
+ *     far looser than the daily batch's 1/hour, so ordinary retries are fine.
+ *
+ * Returns the parsed WOOCOMMERCE connector tick — either the
+ * ProcessPendingWcWebhookEventsResult counters { attempted, processed, failed,
+ * deadLettered, skipped } or a { skipped, reason } shape.
+ */
+export async function runInboxDrain(page: Page): Promise<Record<string, unknown>> {
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    throw new Error('CRON_SECRET is not set in the test environment — cannot trigger the shopping-webhook-inbox cron route.')
+  }
+  const res = await page.request.get('/api/cron/shopping-webhook-inbox', {
+    headers: { Authorization: `Bearer ${secret}` },
+  })
+  if (!res.ok()) {
+    throw new Error(`shopping-webhook-inbox cron HTTP ${res.status()}: ${(await res.text()).slice(0, 300)}`)
+  }
+  const body = (await res.json()) as { connectors?: { woocommerce?: Record<string, unknown> } }
+  const wc = body.connectors?.woocommerce
+  if (!wc) {
+    throw new Error(`shopping-webhook-inbox response missing the woocommerce connector tick: ${JSON.stringify(body).slice(0, 300)}`)
+  }
+  return wc
+}
+
 // --- posting-mode control ----------------------------------------------------
 
 /**

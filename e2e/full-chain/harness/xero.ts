@@ -54,7 +54,7 @@ async function xeroDelete(path: string): Promise<{ ok: boolean; status: number; 
   }
 }
 
-export type XeroDocKind = 'Invoices' | 'CreditNotes' | 'ManualJournals' | 'PurchaseOrders'
+export type XeroDocKind = 'Invoices' | 'CreditNotes' | 'ManualJournals' | 'PurchaseOrders' | 'Payments'
 
 type Tracked = { kind: XeroDocKind; id: string; label: string }
 
@@ -117,6 +117,7 @@ export type XeroInvoice = {
   Reference?: string
   AmountDue?: number
   AmountPaid?: number
+  Payments?: Array<{ PaymentID: string; Amount?: number; Date?: string; Account?: { AccountID?: string; Code?: string } }>
   LineItems: XeroLine[]
 }
 export type XeroCreditNote = {
@@ -155,9 +156,21 @@ export async function getInvoiceAttachments(invoiceId: string): Promise<Array<{ 
   return res.data?.Attachments ?? []
 }
 
+export type XeroPayment = {
+  PaymentID: string
+  Amount?: number
+  Status?: string
+  Reference?: string
+  // GET /Payments/{id} carries the full bank account (the invoice's own Payments sub-resource does not),
+  // which is why a payment assertion on the drawn-from account must read the payment, not the invoice.
+  Account?: { AccountID?: string; Code?: string; Name?: string }
+  Invoice?: { InvoiceID?: string }
+}
+
 export const getInvoice = (id: string) => getOne<XeroInvoice>('Invoices', id, 'Invoices')
 export const getCreditNote = (id: string) => getOne<XeroCreditNote>('CreditNotes', id, 'CreditNotes')
 export const getManualJournal = (id: string) => getOne<XeroManualJournal>('ManualJournals', id, 'ManualJournals')
+export const getPayment = (id: string) => getOne<XeroPayment>('Payments', id, 'Payments')
 
 /**
  * The IMS bill ids on a PO, oldest first.
@@ -330,6 +343,7 @@ const ID_FIELD = {
   CreditNotes: 'CreditNoteID',
   ManualJournals: 'ManualJournalID',
   PurchaseOrders: 'PurchaseOrderID',
+  Payments: 'PaymentID',
 } as const
 
 /**
@@ -348,8 +362,13 @@ const SUPPORTS_IDS_FILTER = new Set(['Invoices', 'CreditNotes'])
  * This replaces the old blanket `[...tracked].reverse()`, which got the same effect by accident
  * of insertion order. A credit note allocated to a bill must go first, or voiding the bill is
  * rejected while the allocation still points at it. Journals stand alone and can go any time.
+ *
+ * Payments go FIRST: Xero refuses to void an invoice or bill "as it has a payment … allocated to
+ * it", so a tracked payment must be deleted (reversed) before the invoice/bill it settles can be
+ * voided in the same teardown pass. A payment is removed with Status=DELETED (there is no VOIDED for
+ * payments), which the void loop applies via the same batch POST used for every other kind.
  */
-const VOID_ORDER: ReadonlyArray<string> = ['ManualJournals', 'CreditNotes', 'Invoices', 'PurchaseOrders']
+const VOID_ORDER: ReadonlyArray<string> = ['Payments', 'ManualJournals', 'CreditNotes', 'Invoices', 'PurchaseOrders']
 
 /** Read the current status of every tracked document of one kind, in as few calls as possible. */
 async function statusesFor(kind: string, ids: string[]): Promise<Map<string, string | undefined>> {
@@ -478,7 +497,11 @@ export async function voidTrackedDocuments(): Promise<{ voided: number; failed: 
         }
         payload.push({
           [idField]: d.id,
-          Status: kind === 'ManualJournals' && status === 'DRAFT' ? 'DELETED' : 'VOIDED',
+          // Payments can only be removed with DELETED (there is no VOIDED payment); a DRAFT manual
+          // journal is DELETED, a POSTED one is VOIDED; everything else voids.
+          Status: kind === 'Payments' ? 'DELETED'
+            : kind === 'ManualJournals' && status === 'DRAFT' ? 'DELETED'
+            : 'VOIDED',
         })
       }
       if (!payload.length) continue

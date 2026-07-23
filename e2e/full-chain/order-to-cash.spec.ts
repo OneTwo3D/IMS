@@ -22,11 +22,11 @@ import {
   refundWcOrder, updateWcOrder, wcCreds, type WcCreds,
 } from './harness/wc.ts'
 import {
-  allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, runDailyBatch, setPostingMode,
+  allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, runDailyBatch, runInboxDrain, runWcOrderReconcile, setPostingMode,
 } from './harness/ims.ts'
 import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
 import {
-  expectJournalLine, expectLine, externalIdFor, getCreditNote, getInvoice, getManualJournal, trackDocument,
+  expectJournalLine, expectLine, externalIdFor, getCreditNote, getInvoice, getManualJournal, getPayment, trackDocument,
   type XeroManualJournal,
 } from './harness/xero.ts'
 import {
@@ -1301,6 +1301,307 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       }
     }
   })
+
+  test('OC-19: an order the webhook never delivered is ingested by the reconcile sweep', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // Every other OC case rides the realtime webhook. OC-19 proves the SAFETY NET: syncNewWcOrders(reconcile)
+    // polls WooCommerce and imports an order the webhook missed. We create the order but DELIBERATELY never
+    // nudge WP-Cron, so Woo never delivers its webhook (this store fires deliveries only when WP-Cron is
+    // prodded — see awaitWebhookDelivery). Then we run the reconcile directly. The order must import anyway,
+    // and provably via reconcile: the shopping_webhook_events inbox holds NO event for it.
+    const sku = taggedSku(runId, 'OC19')
+    const unitPrice = '22.00'
+    const qty = 2
+
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC19`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC19', price: unitPrice })
+    // Bound the reconcile window to JUST this order: set the cursor AFTER the product setup and right before
+    // creating the order, so the shared store's pre-existing (stage) orders AND an earlier test's order are not
+    // re-swept. The -10s buffer absorbs any clock skew between this box and the WooCommerce server, whose time
+    // modified_after is compared against. existingOrder is truthy mid-run, so the cursor is honoured.
+    await setSetting('last_wc_order_reconcile_at', new Date(Date.now() - 10_000).toISOString())
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+    expect(order.status).toBe('processing')
+
+    // No awaitWebhookDelivery / nudgeWpCron — the whole point is that the webhook never fires.
+    const rec = await runWcOrderReconcile(page)
+    expect(rec.synced, 'the reconcile reported importing the order').toBeGreaterThanOrEqual(1)
+
+    // The reconcile is awaited, but the SO + link writes settle just after, so poll briefly.
+    const ids = await awaitReconciledSalesOrder(order.number, 60_000)
+    expect(ids.length, 'the reconcile sweep imported the order the webhook never delivered — exactly one SO').toBe(1)
+    // Proof it came from RECONCILE, not a webhook that snuck in: the inbox has no event for this order.
+    expect(await inboxEventCountForWcOrder(order.id), 'no webhook was delivered — the import is purely reconcile').toBe(0)
+    // And it is a real processing sale, not a parked one: import auto-allocates a processing order, so it lands
+    // PROCESSING or (once stock is allocated) ALLOCATED — either way a genuine sale, unlike OC-20's on-hold
+    // order which the status filter never even fetches.
+    expect(['PROCESSING', 'ALLOCATED'], 'imported as a genuine processing sale').toContain(await orderStatus(ids[0]))
+  })
+
+  test('OC-20: the reconcile sweep does NOT import an order whose status is not configured for sync', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // The counterpart to OC-13 (which proved the WEBHOOK path imports an on-hold order as a non-processing SO).
+    // The reconcile/poll path instead honours wc_sync_order_statuses at the WooCommerce FETCH (status=
+    // processing,completed in reconcile mode), so an on-hold order is never returned and never imported. Create
+    // an on-hold order, never nudge WP-Cron (no webhook delivers), run the reconcile, and assert NO SO exists.
+    const sku = taggedSku(runId, 'OC20')
+    const unitPrice = '19.00'
+
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC20`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC20', price: unitPrice })
+    // Cursor set right before the order (not at test start), so the window holds ONLY this on-hold order — an
+    // earlier test's processing order is not re-swept, which keeps the synced==0 assertion below exact. -10s
+    // buffer for WC-server clock skew.
+    await setSetting('last_wc_order_reconcile_at', new Date(Date.now() - 10_000).toISOString())
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: 1 }], status: 'on-hold', setPaid: false })
+    expect(order.status).toBe('on-hold')
+
+    // runWcOrderReconcile throws unless the sweep completed with NO result errors, so reaching here proves the
+    // reconcile actually ran against a reachable WooCommerce (a fetch/auth/rate-limit failure would throw, not
+    // silently import nothing). The order-specific proof is below: the sweep does not create an SO for the
+    // on-hold order — the status filter excludes it at the WooCommerce fetch. (We assert on THIS order's number,
+    // not the aggregate synced count: the sweep legitimately re-syncs other recently-modified store orders.)
+    await runWcOrderReconcile(page)
+
+    // No SO exists for it. (No webhook delivered it either — we never nudged WP-Cron. And OC-19 proves this same
+    // sweep DOES import a processing order under identical conditions, so a green OC-20 is a real skip.)
+    expect(await salesOrderIdsForWcOrderNumber(order.number), 'a non-configured status must not be imported by reconcile').toHaveLength(0)
+    expect(await inboxEventCountForWcOrder(order.id), 'and no webhook delivered it either').toBe(0)
+  })
+
+  test('OC-17: a foreign order with no FX rate quarantines (pending-FX), then imports once the rate exists', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // The pending-FX quarantine: order-import refuses to import a foreign-currency order with no matching FX
+    // rate (getFxRateToGbp throws MissingFxRateError) and PARKS it in the shopping_sync_logs pending queue
+    // rather than importing at a wrong or 1:1 rate. Driven via the RECONCILE path deliberately: the webhook
+    // path answers HTTP 500 on a missing-FX order, which makes WooCommerce retry and eventually DISABLE the
+    // webhook (a rig hazard) — the reconcile merely records the error. We prove the order does NOT import while
+    // unrated, then seed the rate, re-open the window, re-reconcile, and prove it imports at the seeded rate.
+    const sku = taggedSku(runId, 'OC17')
+    const unitPriceEur = '24.00'
+    const qty = 2
+    const fxRate = 1.15
+
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC17`, price: unitPriceEur })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC17', price: unitPriceEur })
+    // Bound the reconcile window to this order (OC-19/20's technique), set right before creating it.
+    await setSetting('last_wc_order_reconcile_at', new Date(Date.now() - 10_000).toISOString())
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }], currency: 'EUR' })
+    expect(order.currency).toBe('EUR')
+
+    let fxRateId: string | undefined
+    try {
+      // 1) Reconcile with NO rate seeded: the EUR order fails import and quarantines. allowErrors, because the
+      //    missing-FX failure is the EXPECTED outcome here, not a rig fault.
+      const rec1 = await runWcOrderReconcile(page, { allowErrors: true })
+      expect(rec1.errors.length, 'the unrated EUR order was reported as a failed import').toBeGreaterThanOrEqual(1)
+      expect(await pendingFxCountForWcOrder(order.id), 'the order is parked in the pending-FX queue').toBe(1)
+      expect(await salesOrderIdsForWcOrderNumber(order.number), 'no SO is created while the FX rate is missing').toHaveLength(0)
+
+      // 2) Once a rate EXISTS the same order imports — proving the quarantine is a pure missing-rate HOLD, not
+      //    a broken order. We seed the rate and re-drive the reconcile (re-opening its window) as the recovery
+      //    trigger. NB the PRODUCTION auto-recovery consumer is retryPendingWcOrdersWaitingForFx, reachable only
+      //    via fetchAllFxRates — which additionally calls the external frankfurter API, seeds rates for EVERY
+      //    active currency (polluting the rig's deliberately-empty fx_rates baseline), and PUSHES rates to the
+      //    SHARED Woo store. Those side effects are unsuitable for a routine full-chain run, and that consumer
+      //    has its own unit coverage; this test proves the full-chain-only behaviour (the real WC order is held
+      //    at import, then admitted once a rate exists).
+      fxRateId = await seedGbpFxRate('EUR', fxRate)
+      await setSetting('last_wc_order_reconcile_at', new Date(Date.now() - 20_000).toISOString())
+      const rec2 = await runWcOrderReconcile(page)
+      expect(rec2.synced, 'the order imports once the rate exists').toBeGreaterThanOrEqual(1)
+
+      const ids = await awaitReconciledSalesOrder(order.number, 60_000)
+      expect(ids.length, 'exactly one SO now exists for the previously-quarantined order').toBe(1)
+      // Imported at the SEEDED rate (the /fxRate boundary applied).
+      const fx = await salesOrderFx(ids[0])
+      expect(fx.currency).toBe('EUR')
+      expect(Number(fx.fxRateToBase), 'imported at the seeded GBP->EUR rate').toBeCloseTo(fxRate, 4)
+    } finally {
+      // Clear the superseded pending-FX row so no stale retry work is left behind (the re-import created the SO
+      // directly rather than through the queue consumer, so the original PENDING row would otherwise linger),
+      // then remove the seeded rate to restore the empty-fx_rates baseline.
+      await clearPendingFxRowsForWcOrder(order.id)
+      if (fxRateId) await deleteFxRate(fxRateId)
+    }
+  })
+
+  test('OC-18: an order delivered while sync is paused is ingested by the inbox DRAIN, not the synchronous webhook', async ({ page }) => {
+    // Composed worst case: awaitWebhookEventPending (300s, a late duplicate re-arms the quiet window) +
+    // the drain + setup. Generous because Woo's Action Scheduler drives delivery off nudged WP-Cron.
+    test.setTimeout(1_800_000)
+
+    // WHY THIS TEST EXISTS. A WooCommerce order webhook is never imported inline: handleWcWebhook
+    // (webhooks.ts) verifies the signature, PERSISTS the delivery as a PENDING shopping_webhook_events
+    // row, and returns 202 — the import happens later, in the inbox consumer
+    // (processPendingWcWebhookEvents). Every other OC case lets that consumer run near-realtime (the
+    // route kicks a debounced drain when the processing gate is enabled), so the SO appears within
+    // seconds and the inbox is invisible. This case proves the DURABILITY contract behind o3d-56b: an
+    // order that arrives while sync is PAUSED (wc_sync_enabled=false, e.g. a maintenance window) is not
+    // lost — the route still persists it, the near-realtime kick is suppressed, and the SO is created
+    // only when the shopping-webhook-inbox cron later drains the PENDING backlog.
+    //
+    // No Xero posting: this is a WC->IMS ingest assertion (SO creation), so the ledger is never touched.
+    await setPostingMode({ sync: false, dailyBatch: false })
+
+    const sku = taggedSku(runId, 'OC18')
+    const unitPrice = '18.00'
+    const qty = 1
+
+    // 1. The IMS needs the product so the drained import resolves the line by SKU (an unmapped line still
+    //    creates a SO, but mapping keeps the oracle unambiguous).
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC18`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    // 2. PAUSE the processing gate. handleWcWebhook still persists the delivery (o3d-56b), but
+    //    scheduleInboxDrain only fires when the gate is enabled (webhooks.ts) — so with it off the event
+    //    sits PENDING and nothing imports it. The rig's run baseline is wc_sync_enabled=true (the quiesce
+    //    lock arms it), so this is restored in finally.
+    await setWcSyncGate(false)
+    let salesOrderId: string | null = null
+    try {
+      // 3. Place the order in Woo for real; Woo delivers the webhook and the route persists it PENDING.
+      const product = await createWcProduct(creds, runId, { label: 'OC18', price: unitPrice })
+      const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+      expect(order.status).toBe('processing')
+
+      // 4. Wait for the PENDING backlog to arrive and quiesce. With the gate off every delivered row must
+      //    be PENDING (nothing drains), and NO sales order may exist yet — proof the synchronous path did
+      //    not import it. Quiescing on a stable row count means a late duplicate delivery cannot race the
+      //    drain in step 6.
+      const pending = await awaitWebhookEventPending(order.id, creds)
+      expect(pending.count, 'at least one PENDING import event was persisted while the gate was off').toBeGreaterThanOrEqual(1)
+      expect(await salesOrderIdForWcOrder(order.id), 'no SO exists before the drain — the webhook did not import inline').toBeNull()
+
+      // 5. RE-ARM the gate (the inbox cron's woocommerce tick only processes when wc_sync_enabled is true)
+      //    and 6. DRAIN the inbox via its cron route — the consumer under test.
+      await setWcSyncGate(true)
+      const drain = await runInboxDrain(page)
+      expect(drain.skipped, `the woocommerce inbox tick was skipped: ${JSON.stringify(drain)}`).toBeFalsy()
+      expect(
+        Number(drain.processed ?? 0),
+        `the drain processed at least one event (result: ${JSON.stringify(drain)})`,
+      ).toBeGreaterThanOrEqual(1)
+      expect(Number(drain.deadLettered ?? 0), 'no event dead-lettered in the drain').toBe(0)
+
+      // 7. THE POINT: the SO now exists, created BY THE DRAIN, and its import event(s) are all PROCESSED.
+      salesOrderId = await awaitSalesOrderIdForWcOrder(order.id)
+      expect(salesOrderId, 'the inbox drain created the sales order the synchronous path had left PENDING').toBeTruthy()
+      const statuses = await webhookEventStatuses(order.id)
+      expect(statuses.length, 'the import event(s) are recorded').toBeGreaterThanOrEqual(1)
+      expect(
+        statuses.every((s) => s === 'PROCESSED'),
+        `every import event reached PROCESSED after the drain (saw: ${statuses.join(', ')})`,
+      ).toBe(true)
+    } finally {
+      // Restore the run baseline the quiesce lock established, regardless of outcome.
+      await setWcSyncGate(true)
+    }
+  })
+
+  test('OC-15: a paid (zero-rated) order records an INVOICE_PAYMENT that settles the Xero invoice from the mapped bank account', async ({ page }) => {
+    // Composed worst case as OC-14/OC-10: delivery + import barrier + setup + ship + a SECOND drain for the
+    // ordering-deferred payment.
+    test.setTimeout(1_800_000)
+
+    // WHY: a paid Woo order should not merely create an AUTHORISED receivable — it should record the customer
+    // PAYMENT against it, leaving the Xero invoice PAID with a zero balance, drawn from the bank account the
+    // operator mapped to that payment method. order-import sets _registerPayment from date_paid_gmt, and the
+    // SALES_INVOICE follow-up (enqueueSalesInvoiceFollowUps) enqueues INVOICE_PAYMENT ONLY when
+    // accounting_payment_account_map resolves a bank account for the order's method:currency — otherwise it
+    // logs "no payment account map" and skips (the reason no earlier OC case exercised a payment).
+    //
+    // ZERO-RATED line on purpose (o3d-c0n). This case isolates the PAYMENT mechanism — scope -> map ->
+    // POST /Payments -> invoice PAID -> drawn from the mapped bank account. A production bug OC-15
+    // caught means a TAXED order would under-settle: order-import never sets _paymentAmount, so the
+    // poster falls back to the NET line sum and registers £net against a £gross invoice, leaving it
+    // AUTHORISED with the VAT outstanding forever. Using a zero-rated line makes net == gross, so the
+    // payment fully settles and this test asserts the mechanism without depending on the (filed) bug.
+    // Once o3d-c0n is fixed, extend this to a taxed order that settles to PAID for its GROSS total.
+    const sku = taggedSku(runId, 'OC15')
+    const unitPrice = '40.00'
+    const qty = 2
+    const method = 'bacs'
+    // Demo "Business Bank Account" (GBP). The processor resolves a payment account by EITHER Xero AccountID
+    // OR account code (sync-processor.ts), so the readable code is enough; it must exist in the synced chart
+    // of accounts (accounting_accounts), which the rig provisioning now populates via syncChartOfAccounts.
+    const bankCode = '090'
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+
+    // Configure the payment map PER-TEST and restore it in finally. A PERSISTENT map would make EVERY other
+    // paid GBP order (OC-01/05/06/…) register a payment too, and their teardown — which voids the invoice —
+    // would then fail, because Xero refuses to void an invoice that has a payment. Isolation is mandatory.
+    const priorMap = await readSetting(PAYMENT_MAP_KEY)
+    await writeSetting(PAYMENT_MAP_KEY, JSON.stringify({ [`${method}:*`]: bankCode }))
+    let imported: { salesOrderId: string } | undefined
+    try {
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC15`, price: unitPrice })
+      await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+      const product = await createWcProduct(creds, runId, { label: 'OC15', price: unitPrice, taxClass: 'zero-rate' })
+      const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }], paymentMethod: method })
+      // Zero-rated: WC charges no VAT, so the gross the customer paid equals the net line value and the
+      // registered payment settles the invoice in full (see the header note on o3d-c0n).
+      expect(Number(order.total), 'the zero-rated order total carries no VAT').toBeCloseTo(Number(unitPrice) * qty, 2)
+
+      imported = await awaitWebhookDelivery(order.id, { creds })
+      await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC15` })
+      try {
+        // First drain posts the SALES_INVOICE and enqueues the INVOICE_PAYMENT follow-up; the payment is
+        // ordering-deferred until the invoice CREATE is live (findInvoicePaymentsBlockedByEarlierLiveLogs),
+        // so it posts on a LATER drain. drainUntilInvoicePaid re-drains until the ledger shows it settled.
+        await processPendingXeroSyncViaUi(page)
+        const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+        const invoice = await drainUntilInvoicePaid(page, invoiceId, imported.salesOrderId)
+
+        expect(invoice.Type).toBe('ACCREC')
+        // THE POINT: the invoice is fully PAID in the ledger, not merely AUTHORISED. A dropped or skipped
+        // payment would leave it AUTHORISED with the full AmountDue, and a currency/line-only assertion could
+        // not tell the difference.
+        expect(invoice.Status, 'the receivable is settled, not just authorised').toBe('PAID')
+        expect(Number(invoice.AmountPaid), 'the whole invoice is paid').toBeCloseTo(Number(order.total), 2)
+        expect(Number(invoice.AmountDue), 'nothing is left outstanding').toBeCloseTo(0, 2)
+
+        // Exactly one payment, for the full amount, drawn from the MAPPED bank account. The invoice's own
+        // Payments sub-resource omits the account, so read the payment itself for the drawn-from account.
+        expect(invoice.Payments?.length, 'exactly one payment settles the invoice').toBe(1)
+        const paymentId = invoice.Payments![0].PaymentID
+        const payment = await getPayment(paymentId)
+        expect(Number(payment.Amount), 'the payment is for the invoice total').toBeCloseTo(Number(order.total), 2)
+        expect(payment.Account?.Code, 'payment drawn from the mapped bank account (Business Bank Account 090)').toBe(bankCode)
+      } finally {
+        // Failure-safe: register the PAYMENT before the invoice (VOID_ORDER deletes Payments first) so a
+        // post that beat a later throw is reversed and the invoice can then be voided.
+        //
+        // Register the EXACT payment THIS order recorded — the INVOICE_PAYMENT sync log's own
+        // externalTransactionId (Codex r1) — never "every payment on the invoice aggregate". The
+        // aggregate approach is both unsafe (a stale/mis-mapped invoice id would mark a stranger's
+        // payment for deletion in the shared ledger) and unreliable (Xero can lag reflecting the
+        // payment on the invoice, so a just-posted payment would be absent and left untracked). The
+        // sync log carries the id the moment the POST is accepted, independent of that lag.
+        const paymentExtId = await invoicePaymentExternalId(imported.salesOrderId).catch(() => null)
+        if (paymentExtId) trackDocument('Payments', paymentExtId, `OC-15 payment ${runTag(runId)}`)
+        const posted = await awaitPostedExternalId('SALES_INVOICE', imported.salesOrderId, 90_000).catch(() => null)
+        if (posted) trackDocument('Invoices', posted, `OC-15 invoice ${runTag(runId)}`)
+      }
+    } finally {
+      if (priorMap == null) await clearSetting(PAYMENT_MAP_KEY)
+      else await writeSetting(PAYMENT_MAP_KEY, priorMap)
+    }
+  })
 })
 
 /** A manual journal is balanced iff its signed LineAmounts (debits +, credits −) sum to zero (mirror of X-01). */
@@ -1435,6 +1736,49 @@ async function salesOrderFx(salesOrderId: string): Promise<{
     )
     if (!r.rows.length) throw new Error(`No sales_orders row for ${salesOrderId}`)
     return r.rows[0]
+  } finally {
+    await db.end()
+  }
+}
+
+const PAYMENT_MAP_KEY = 'accounting_payment_account_map'
+
+/** Read a settings value, or null if the key is absent. */
+async function readSetting(key: string): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ value: string }>(`select value from settings where key = $1`, [key])
+    return r.rows[0]?.value ?? null
+  } finally {
+    await db.end()
+  }
+}
+
+/** Upsert a settings value (same shape setPostingMode uses). */
+async function writeSetting(key: string, value: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+       on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      [key, value],
+    )
+  } finally {
+    await db.end()
+  }
+}
+
+/** Delete a settings row (used to restore a key that did not exist before the test). */
+async function clearSetting(key: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(`delete from settings where key = $1`, [key])
   } finally {
     await db.end()
   }
@@ -1815,6 +2159,90 @@ async function salesOrderIdsForWcOrderNumber(wcOrderNumber: string): Promise<str
   }
 }
 
+/** Poll for the SO(s) a reconcile sweep created for a WC order number (import + link writes settle just after). */
+async function awaitReconciledSalesOrder(wcOrderNumber: string, timeoutMs = 60_000): Promise<string[]> {
+  const deadline = Date.now() + timeoutMs
+  let ids = await salesOrderIdsForWcOrderNumber(wcOrderNumber)
+  while (ids.length === 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 3_000))
+    ids = await salesOrderIdsForWcOrderNumber(wcOrderNumber)
+  }
+  return ids
+}
+
+/** How many webhook inbox events reference this WC order — 0 proves an import was NOT webhook-delivered. */
+async function inboxEventCountForWcOrder(wcOrderId: number): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    // Query the JSON value, NOT a text LIKE: payloadJson is JSONB and its text form renders "id": 123 (with a
+    // space), so a `%"id":123%` LIKE never matches and would silently report 0 events even when one exists —
+    // making the "no webhook delivered" proof a false pass (Codex).
+    const r = await db.query<{ n: string }>(
+      `select count(*)::text as n from shopping_webhook_events
+        where connector = 'woocommerce' and ("payloadJson"->>'id')::bigint = $1`,
+      [wcOrderId],
+    )
+    return Number(r.rows[0]?.n ?? '0')
+  } finally {
+    await db.end()
+  }
+}
+
+/** How many pending-FX quarantine rows exist for a WC order — recordPendingFxOrder writes exactly one. */
+async function pendingFxCountForWcOrder(wcOrderId: number): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ n: string }>(
+      `select count(*)::text as n from shopping_sync_logs
+        where connector='woocommerce' and status='PENDING' and direction='FROM_CONNECTOR'
+          and "entityType"='SalesOrder' and "externalId"=$1`,
+      [String(wcOrderId)],
+    )
+    return Number(r.rows[0]?.n ?? '0')
+  } finally {
+    await db.end()
+  }
+}
+
+/** Remove any pending-FX quarantine rows for a WC order (teardown after a superseded manual recovery). */
+async function clearPendingFxRowsForWcOrder(wcOrderId: number): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `delete from shopping_sync_logs
+        where connector='woocommerce' and direction='FROM_CONNECTOR' and "entityType"='SalesOrder'
+          and "externalId"=$1 and status='PENDING'`,
+      [String(wcOrderId)],
+    )
+  } catch {
+    // best-effort cleanup — a leftover PENDING row is inert (preflight gates on accounting_sync_logs, not these)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Upsert a settings value (mirrors setPostingMode's shape). */
+async function setSetting(key: string, value: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+        on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      [key, value],
+    )
+  } finally {
+    await db.end()
+  }
+}
+
 /**
  * Cancel an order's still-UNPOSTED SALES_INVOICE sync rows (CANCELLED, as the global teardown abandons rows).
  * Lets a test that deliberately leaves an invoice queued dispose of it itself, so a LATER test's whole-queue
@@ -2062,6 +2490,205 @@ async function settingValue(key: string): Promise<string> {
     const r = await db.query<{ value: string }>(`select value from settings where key = $1`, [key])
     if (!r.rows.length || !r.rows[0].value) throw new Error(`Setting ${key} is not configured on this instance.`)
     return r.rows[0].value
+  } finally {
+    await db.end()
+  }
+}
+
+// --- OC-18 inbox-drain helpers ----------------------------------------------
+
+/** Arm/disarm the WooCommerce webhook processing gate (wc_sync_enabled) for OC-18. */
+async function setWcSyncGate(enabled: boolean): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into settings (key, value, "updatedAt") values ('wc_sync_enabled', $1, now())
+         on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      [String(enabled)],
+    )
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Wait for Woo to DELIVER an order webhook and the route to PERSIST it as PENDING
+ * shopping_webhook_events — without it being drained into a SO. OC-18 runs with the gate off, so
+ * nothing should ever advance a row past PENDING; a non-PENDING row means the gate slipped on and
+ * the assertion "the drain, not the synchronous path, imports it" is compromised, so fail loudly.
+ *
+ * Nudges WP-Cron each poll (stage has no visitors, so Action Scheduler would otherwise never fire —
+ * see awaitWebhookDelivery) and QUIESCES on a stable row count so a late duplicate delivery cannot
+ * race the drain that follows (mirrors awaitWebhookEventProcessed's stabilisation).
+ */
+async function awaitWebhookEventPending(
+  wcOrderId: number,
+  creds: WcCreds,
+  opts: { timeoutMs?: number } = {},
+): Promise<{ count: number }> {
+  const timeoutMs = opts.timeoutMs ?? 300_000
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + timeoutMs
+    const NUM_STABLE_POLLS = 2
+    let settledCount = -1
+    let stableHits = 0
+    let snapshot = '(no events yet)'
+    while (Date.now() < deadline) {
+      const r = await db.query<{ status: string }>(
+        `select status from shopping_webhook_events
+          where connector = 'woocommerce' and topic in ('order.created', 'order.updated')
+            and ("payloadJson"->>'id')::bigint = $1
+          order by "receivedAt"`,
+        [wcOrderId],
+      )
+      const rows = r.rows
+      snapshot = rows.length ? rows.map((x) => x.status).join('; ') : '(no events yet)'
+      const nonPending = rows.filter((x) => x.status !== 'PENDING')
+      if (nonPending.length) {
+        throw new Error(
+          `OC-18 expected only PENDING inbox rows for WC order ${wcOrderId} while the gate is off, but saw: ${snapshot}. ` +
+            'Something drained the event before the test could — the near-realtime kick should be suppressed with wc_sync_enabled=false.',
+        )
+      }
+      if (rows.length > 0) {
+        stableHits = settledCount === rows.length ? stableHits + 1 : 0
+        settledCount = rows.length
+        if (stableHits >= NUM_STABLE_POLLS) return { count: rows.length }
+      }
+      await nudgeWpCron(creds)
+      await new Promise((res) => setTimeout(res, 5_000))
+    }
+    throw new Error(`No PENDING import webhook for WC order ${wcOrderId} within ${timeoutMs}ms. Last seen: ${snapshot}.`)
+  } finally {
+    await db.end()
+  }
+}
+
+/** The IMS sales order id linked to a WC order, or null if none exists yet. Single-shot. */
+async function salesOrderIdForWcOrder(wcOrderId: number): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string }>(
+      `select so.id from sales_orders so
+         join shopping_order_links sol on sol."orderId" = so.id
+        where sol."externalOrderId" = $1 and sol.connector = 'woocommerce'
+        limit 1`,
+      [String(wcOrderId)],
+    )
+    return r.rows.length ? r.rows[0].id : null
+  } finally {
+    await db.end()
+  }
+}
+
+/** Poll the link table until the drain has created the SO (or time out with a clear message). */
+async function awaitSalesOrderIdForWcOrder(wcOrderId: number, timeoutMs = 60_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const id = await salesOrderIdForWcOrder(wcOrderId)
+    if (id) return id
+    await new Promise((res) => setTimeout(res, 2_000))
+  }
+  throw new Error(`The inbox drain did not create a sales order for WC order ${wcOrderId} within ${timeoutMs}ms.`)
+}
+
+/** The statuses of a WC order's import events, in receipt order. */
+async function webhookEventStatuses(wcOrderId: number): Promise<string[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ status: string }>(
+      `select status from shopping_webhook_events
+        where connector = 'woocommerce' and topic in ('order.created', 'order.updated')
+          and ("payloadJson"->>'id')::bigint = $1
+        order by "receivedAt"`,
+      [wcOrderId],
+    )
+    return r.rows.map((x) => x.status)
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Drain the Xero queue until the invoice reads PAID. The INVOICE_PAYMENT follow-up is enqueued while
+ * the SALES_INVOICE is being posted and is ordering-deferred until that CREATE is live, so it posts on
+ * a drain AFTER the one that created the invoice.
+ *
+ * Two things this must handle beyond a naive "drain then read" (which flaked: the payment posted
+ * SYNCED yet the invoice still read AUTHORISED):
+ *   - gate on the SUBLEDGER truth, not the invoice: poll the INVOICE_PAYMENT sync log. FAILED means
+ *     the payment could not post (e.g. a scope/mapping regression) — fail loudly rather than spin to a
+ *     confusing timeout; SYNCED means Xero accepted the POST.
+ *   - once the payment is SYNCED, Xero can lag a beat applying it to the invoice AGGREGATE, so poll
+ *     getInvoice for PAID rather than reading once.
+ */
+async function drainUntilInvoicePaid(
+  page: import('@playwright/test').Page,
+  invoiceId: string,
+  salesOrderId: string,
+  maxDrains = 5,
+) {
+  let invoice = await getInvoice(invoiceId)
+  for (let i = 0; i < maxDrains && invoice.Status !== 'PAID'; i++) {
+    await processPendingXeroSyncViaUi(page)
+    const pay = await invoicePaymentLogStatus(salesOrderId)
+    if (pay?.status === 'FAILED') {
+      throw new Error(`INVOICE_PAYMENT failed to post to Xero: ${pay.error ?? 'no error recorded'}`)
+    }
+    if (pay?.status === 'SYNCED') {
+      for (let j = 0; j < 6 && invoice.Status !== 'PAID'; j++) {
+        invoice = await getInvoice(invoiceId)
+        if (invoice.Status === 'PAID') break
+        await new Promise((res) => setTimeout(res, 5_000))
+      }
+    } else {
+      invoice = await getInvoice(invoiceId)
+    }
+  }
+  return invoice
+}
+
+/** The Xero external id of the INVOICE_PAYMENT this order recorded (once posted), or null. */
+async function invoicePaymentExternalId(salesOrderId: string): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ externalTransactionId: string | null }>(
+      `select "externalTransactionId" from accounting_sync_logs
+        where connector = 'xero' and type = 'INVOICE_PAYMENT' and "referenceId" = $1
+          and "externalTransactionId" is not null
+        order by "createdAt" desc limit 1`,
+      [salesOrderId],
+    )
+    return r.rows.length ? r.rows[0].externalTransactionId : null
+  } finally {
+    await db.end()
+  }
+}
+
+/** The latest INVOICE_PAYMENT sync-log status for a sales order (its referenceId), or null. */
+async function invoicePaymentLogStatus(salesOrderId: string): Promise<{ status: string; error: string | null } | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ status: string; errorMessage: string | null }>(
+      `select status, "errorMessage" from accounting_sync_logs
+        where connector = 'xero' and type = 'INVOICE_PAYMENT' and "referenceId" = $1
+        order by "createdAt" desc limit 1`,
+      [salesOrderId],
+    )
+    return r.rows.length ? { status: r.rows[0].status, error: r.rows[0].errorMessage } : null
   } finally {
     await db.end()
   }
