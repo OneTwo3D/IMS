@@ -22,15 +22,25 @@
  *
  * As with every spec in this tier, the assertion is the journal READ BACK OUT OF XERO, not
  * the IMS's own sync-log row, and every posted document is registered for teardown.
+ *
+ * RUNNING THE BATCH-TRIGGERING TESTS (X-01 and X-02): both invoke the accounting-daily-batch cron,
+ * which production rate-limits to ONCE per hour per IP (memory-backed; o3d-lgo.13, unfixed by design —
+ * do NOT weaken it for tests). In a single invocation the SECOND of them 429s, so run them in SEPARATE
+ * invocations, e.g. `npm run e2e:full-chain -- --grep "X-01:"` then `--grep "X-02:"`, restarting
+ * ims-e2e-dev.service between them (which resets the limiter). X-02 detects the 429 and SKIPS loudly
+ * (never a false pass) so the suite stays green when they are accidentally co-run; it is exercised for
+ * real in its own invocation. X-05/X-07 are SYNC-mode and never touch the batch, so they co-run freely.
  */
 import { expect, test } from '@playwright/test'
 import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import { awaitWebhookDelivery, cleanupWc, createWcOrder, createWcProduct, wcCreds, type WcCreds } from './harness/wc.ts'
 import {
-  allocateAndShip, applyStockWriteOff, openSalesOrder, processPendingXeroSyncViaUi, runDailyBatch, setPostingMode,
+  addManufacturingCostLine, allocateAndShip, applyStockWriteOff, completeProduction, createManufacturingOrder,
+  editManufacturingCostLineAmount, openManufacturingOrder, openSalesOrder, processPendingXeroSyncViaUi,
+  runDailyBatch, setPostingMode, startProduction,
 } from './harness/ims.ts'
-import { addStockAdjustment, createInventoryProduct } from '../helpers.ts'
+import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
 import {
   expectJournalLine, externalIdFor, getInvoice, getManualJournal, trackDocument, type XeroManualJournal,
 } from './harness/xero.ts'
@@ -196,7 +206,13 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     // SYNC mode: INVENTORY_ADJUSTMENT queues at adjustment time and posts on the next drain. It is an
     // ordinary sync journal, NOT a daily-batch one, so the batch stays off and no clean baseline is
     // needed.
-    await setPostingMode({ sync: true, dailyBatch: false })
+    //
+    // Seed with posting DISARMED (a prior serial test may have left it armed). The +10 stock seed below
+    // must not queue an untracked INVENTORY_ADJUSTMENT: the bulk-adjustment dialog defaults a new line to
+    // the FIRST active reason, so if any active reason existed the seed would post a stray journal the
+    // boundary-scoped teardown could never register (Codex r2). With posting DISARMED the seed cannot
+    // queue anything whatever reasons exist; sync is armed AFTER the seed, for the write-off itself.
+    await setPostingMode({ sync: false, dailyBatch: false })
 
     const sku = taggedSku(runId, 'X07')
     const reasonName = `${runTag(runId)} X07 shrinkage`
@@ -210,12 +226,14 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
 
     // Product + priced stock to write off. The +10 seed MUST run BEFORE the reason is seeded: the
     // bulk-adjustment dialog defaults a new line's reason to the FIRST available reason
-    // (bulk-adjustment-form.tsx), so a reason present at seed time would make this "reasonless" +10
-    // silently queue its OWN £100 INVENTORY_ADJUSTMENT and strand it untracked in the shared ledger
-    // (Codex r1). With adjustment_reasons empty here, the line carries no reason and posts nothing —
-    // its only job is to lay down a £10/unit cost layer for the write-off to consume.
+    // (bulk-adjustment-form.tsx). Seeding with sync DISARMED (above) means the line cannot post a journal
+    // whatever reasons exist; its only job is to lay down a £10/unit cost layer for the write-off. The
+    // reason is seeded AFTER, so the write-off (with sync armed) is the only thing that journals.
     await createInventoryProduct(page, { sku, name: `${runTag(runId)} X07`, price: '20.00' })
     await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    // Arm posting now — only the reason-coded write-off below should queue an INVENTORY_ADJUSTMENT.
+    await setPostingMode({ sync: true, dailyBatch: false })
 
     const reasonId = await seedAdjustmentReason(reasonName, writeOffAccount)
     try {
@@ -239,7 +257,7 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
         // after Xero accepted the journal, or the external-id write-back can lag a UI-signal timeout,
         // so a single immediate read could miss the real document. Mirrors postedDailyBatchJournalIds.
         // trackDocument dedupes, so re-registering the happy-path id is harmless.
-        for (const posted of await settledJournalExternalIds('INVENTORY_ADJUSTMENT', boundary).catch(() => [])) {
+        for (const posted of await settledJournalExternalIds('INVENTORY_ADJUSTMENT', boundary)) {
           trackDocument('ManualJournals', posted, `X-07 write-off ${runTag(runId)}`)
         }
       }
@@ -257,6 +275,223 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       await deleteAdjustmentReason(reasonId)
     }
   })
+
+  test('X-05: manufacturing completion posts MANUFACTURING_JOURNAL, and a post-completion cost-line edit posts MANUFACTURING_RECLASS — both verified IN Xero', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // SYNC mode: both journals queue at their transition (completion, then the cost-line edit) and
+    // post on the next drain — ordinary sync journals, NOT daily-batch ones, so the batch stays off
+    // and no clean baseline is needed.
+    //
+    // Seed with posting DISARMED (a prior serial test may have left it armed): the component stock
+    // adjustments below must not queue untracked INVENTORY_ADJUSTMENT journals — the bulk-adjustment
+    // dialog defaults a new line to the first active reason, so any active reason would make each seed
+    // post a stray journal the boundary-scoped teardown could never register (Codex r2). With posting
+    // DISARMED the seeds cannot queue anything; posting is armed only AFTER seeding, right before the MO.
+    await setPostingMode({ sync: false, dailyBatch: false })
+
+    const overheadAccount = await settingValue('xero_manufacturing_overhead_account') // 330
+    const inventoryAccount = await settingValue('xero_inventory_account') // 631
+    const overhead = 20 // £ capitalised overhead the completion journal books
+    const reclassDelta = 10 // £20 → £30: with all output still on hand the delta reclassifies wholly to inventory
+
+    const compA = taggedSku(runId, 'X05A')
+    const compB = taggedSku(runId, 'X05B')
+    const bomSku = taggedSku(runId, 'X05BOM')
+    // Captured just before the setting is armed (inside the try); undefined means "not yet touched".
+    let priorMfgSetting: string | null | undefined
+
+    try {
+      // Two priced components + a BOM consuming 2×A + 1×B per unit. Component stock is seeded at
+      // £10/unit, but the journal books ONLY the overhead — the component→finished-goods legs net to
+      // zero on the inventory account — so the component cost never enters the assertion.
+      await createInventoryProduct(page, { sku: compA, name: `${runTag(runId)} X05 A`, price: '2.00' })
+      await createInventoryProduct(page, { sku: compB, name: `${runTag(runId)} X05 B`, price: '3.00' })
+      await addStockAdjustment(page, compA, 10, WAREHOUSE_CODE)
+      await addStockAdjustment(page, compB, 5, WAREHOUSE_CODE)
+      await createInventoryProduct(page, { sku: bomSku, name: `${runTag(runId)} X05 BOM`, type: 'BOM', price: '30.00' })
+      await openInventoryProduct(page, bomSku)
+      await configureProductComponents(page, [{ sku: compA, qty: '2' }, { sku: compB, qty: '1' }])
+
+      // Seeding done — arm posting now. The rig leaves the per-type manufacturing setting UNSET, which
+      // makes queueAccountingSync a silent no-op for these two types (getAccountingPostingContext returns
+      // null); 'authorised' resolves to a POSTED journal. Both types share this one key. Capture its EXACT
+      // prior state (absent vs a specific value) and restore it in finally — never blanket-delete, which
+      // would drop a deliberate 'off'/'draft' config and let later sync-enabled activity post journals
+      // (Codex r3).
+      priorMfgSetting = await getSettingRaw('xero_sync_manufacturing_journal')
+      await setPostingMode({ sync: true, dailyBatch: false })
+      await setSetting('xero_sync_manufacturing_journal', 'authorised')
+
+      // Build qty 2. The overhead line MUST be added before completion for the journal to capture it.
+      const moId = await createManufacturingOrder(page, { bomSku, warehouseCode: WAREHOUSE_CODE, qty: 2 })
+      await addManufacturingCostLine(page, { description: `${runTag(runId)} labour`, amount: String(overhead) })
+      await startProduction(page)
+      const journalBoundary = await dailyBatchBoundary()
+      await completeProduction(page)
+
+      // --- MANUFACTURING_JOURNAL: DR inventory / CR overhead for the capitalised overhead. Register
+      //     the posted id (failure-safe) before asserting, mirroring X-07's teardown net.
+      let mfgJournalId: string | undefined
+      try {
+        await processPendingXeroSyncViaUi(page)
+        mfgJournalId = (await awaitSyncedJournal('MANUFACTURING_JOURNAL', journalBoundary)).externalId
+        trackDocument('ManualJournals', mfgJournalId, `X-05 mfg journal ${runTag(runId)}`)
+      } finally {
+        for (const id of await settledJournalExternalIds('MANUFACTURING_JOURNAL', journalBoundary)) {
+          trackDocument('ManualJournals', id, `X-05 mfg journal ${runTag(runId)}`)
+        }
+      }
+      const mfgJournal = await getManualJournal(mfgJournalId!)
+      expect(mfgJournal.Status).toBe('POSTED')
+      expectBalanced(mfgJournal)
+      expectJournalLine(mfgJournal.JournalLines, { accountCode: inventoryAccount, debit: overhead })
+      expectJournalLine(mfgJournal.JournalLines, { accountCode: overheadAccount, credit: overhead })
+
+      // --- MANUFACTURING_RECLASS: raise the overhead £20 → £30 on the COMPLETED order. Nothing was
+      //     shipped, so all output is on hand and the whole £10 delta reclassifies into inventory
+      //     (DR inventory / CR overhead) — no COGS leg.
+      // The prior drain navigated to /sync, so return to the MO detail page before editing its costs.
+      await openManufacturingOrder(page, moId)
+      const reclassBoundary = await dailyBatchBoundary()
+      await editManufacturingCostLineAmount(page, String(overhead + reclassDelta))
+      let reclassId: string | undefined
+      try {
+        await processPendingXeroSyncViaUi(page)
+        reclassId = (await awaitSyncedJournal('MANUFACTURING_RECLASS', reclassBoundary)).externalId
+        trackDocument('ManualJournals', reclassId, `X-05 mfg reclass ${runTag(runId)}`)
+      } finally {
+        for (const id of await settledJournalExternalIds('MANUFACTURING_RECLASS', reclassBoundary)) {
+          trackDocument('ManualJournals', id, `X-05 mfg reclass ${runTag(runId)}`)
+        }
+      }
+      const reclassJournal = await getManualJournal(reclassId!)
+      expect(reclassJournal.Status).toBe('POSTED')
+      expectBalanced(reclassJournal)
+      expectJournalLine(reclassJournal.JournalLines, { accountCode: inventoryAccount, debit: reclassDelta })
+      expectJournalLine(reclassJournal.JournalLines, { accountCode: overheadAccount, credit: reclassDelta })
+    } finally {
+      // Restore the manufacturing posting setting to EXACTLY its prior state (Codex r3): delete only if it
+      // was absent before this run, otherwise write the captured prior value back. Never blanket-delete —
+      // that would drop a deliberate 'off'/'draft'. `undefined` means we never got as far as arming it.
+      if (priorMfgSetting === null) await deleteSetting('xero_sync_manufacturing_journal')
+      else if (priorMfgSetting !== undefined) await setSetting('xero_sync_manufacturing_journal', priorMfgSetting)
+    }
+  })
+
+  test('X-02: a never-swept transit GL residue gets swept by the daily-batch transit reconciliation — DAILY_BATCH_TRANSIT_RECONCILIATION posted IN Xero', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // The transit subledger-vs-GL rounding sweep (6oyu.4/khdw) runs at the END of the daily batch:
+    // when the transit account's GL period-movement differs from the transit subledger by a residue
+    // within the £1 sweep tolerance it posts a DAILY_BATCH_TRANSIT_RECONCILIATION journal to the
+    // rounding account; a MATERIAL gap FLAGS and is NEVER swept (the scjz.13 trap). The rig carries NO
+    // transit GL balance snapshots, so the reconciliation is normally "unavailable" — the transit
+    // account has never been swept. This seeds a controlled, sub-£1 residue for a fresh snapshot date
+    // (an entity that was never swept) and proves the batch sweeps it EXACTLY once into a real POSTED
+    // Xero journal. Closes gate 6oyu.4.1.
+    const transitAccount = await settingValue('xero_transit_account') // 632
+    const roundingAccount = await settingValue('xero_rounding_difference_account') // 860
+    const residue = 0.3 // £ — inside the £1 sweep tolerance, so classified 'sweep' not 'flag'
+
+    // 0. Clean baseline + arm batch mode. The sweep needs sync AND dailyBatch both armed; the clean
+    //    baseline keeps Groups A1/A2/B empty so the transit sweep is the only tie-out journal.
+    const baseline = await deleteUnjournaledShipmentBaseline()
+    console.log(`[X-02] baseline: deleted ${baseline.candidateOrders} batch-candidate order(s)`)
+    await setPostingMode({ sync: true, dailyBatch: true })
+
+    // 1. Seed the residue: an opening (yesterday) + closing (today) GL balance snapshot for account 632
+    //    whose MOVEMENT sits exactly `residue` below the live transit subledger movement over the same
+    //    window → delta = subledger − GL = +£0.30 → the sweep DRs transit / CRs rounding.
+    const seed = await seedTransitReconciliationResidue(transitAccount, residue)
+    console.log(`[X-02] seeding a ${residue} transit residue for reconciliation date ${seed.dateIso}`)
+    try {
+      const boundary = await dailyBatchBoundary()
+      // accounting-daily-batch is rate-limited to 1/hour/IP (o3d-lgo.13). X-01 triggers the same route
+      // earlier in this serial suite, so in a NORMAL full-suite invocation X-02's call is the SECOND and
+      // is refused with HTTP 429 — the batch cannot run and there is nothing to assert. Rather than fail
+      // the suite on a production rate limit we must not weaken, SKIP with a clear pointer: X-02 is
+      // validated in its OWN invocation (or after a `systemctl restart ims-e2e-dev.service`, which resets
+      // the memory-backed limiter). The seed + any log are still retired in finally.
+      let batch: {
+        groupA1: number; groupA2: number; groupB: number; errors: string[]
+        transitReconciliationSwept?: number | null
+      }
+      try {
+        batch = (await runDailyBatch(page)) as unknown as typeof batch
+      } catch (e) {
+        const msg = String(e)
+        if (/HTTP 429|rate.?limit/i.test(msg)) {
+          // LOUD, not silent: a skipped X-02 means NO transit-sweep coverage in this invocation, so say
+          // so in the run log. This is the documented o3d-lgo.13 mitigation (the daily-batch cron is
+          // 1/hour/IP and X-01 already spent the quota) — X-02 must run in its own invocation or after a
+          // `systemctl restart ims-e2e-dev.service`. Not a pass masquerading as coverage.
+          console.warn('[X-02] SKIPPED — accounting-daily-batch hourly quota already consumed this invocation (X-01 ran the batch earlier; o3d-lgo.13). No transit-reconciliation coverage in THIS run. Re-run X-02 in a dedicated invocation (or after a service restart, which resets the memory-backed limiter) to exercise it.')
+          test.skip(true, 'accounting-daily-batch hourly quota already consumed this invocation (o3d-lgo.13); run X-02 in its own invocation or after a service restart.')
+        }
+        throw e
+      }
+      expect(batch.errors, `daily batch reported errors: ${batch.errors.join('; ')}`).toEqual([])
+      // The never-swept entity got swept, for exactly the seeded signed residue (subledger higher → +).
+      expect(batch.transitReconciliationSwept, 'transit reconciliation swept the seeded residue').toBeCloseTo(residue, 2)
+
+      // 2. Drain, then resolve + REGISTER the sweep journal (and any other daily-batch journal that
+      //    posted) before asserting — same ledger-safety-net shape as X-01.
+      let sweepId: string | undefined
+      try {
+        await processPendingXeroSyncViaUi(page)
+        sweepId = (await awaitSyncedJournal('DAILY_BATCH_TRANSIT_RECONCILIATION', boundary)).externalId
+        trackDocument('ManualJournals', sweepId, `X-02 transit sweep ${runTag(runId)}`)
+      } finally {
+        for (const posted of await postedDailyBatchJournalIds(boundary)) {
+          trackDocument('ManualJournals', posted.externalId, `X-02 ${posted.type} ${runTag(runId)}`)
+        }
+      }
+
+      // 3. THE POINT: read the sweep journal back out of Xero — DR transit / CR rounding for £0.30,
+      //    POSTED (not merely "not DELETED").
+      const journal = await getManualJournal(sweepId!)
+      expect(journal.Status).toBe('POSTED')
+      expectBalanced(journal)
+      expectJournalLine(journal.JournalLines, { accountCode: transitAccount, debit: residue })
+      expectJournalLine(journal.JournalLines, { accountCode: roundingAccount, credit: residue })
+    } finally {
+      // Remove the seeded snapshots. The reconciliation sync log + accounting_event for the CHOSEN date
+      // are deliberately LEFT as a "date used" marker so the next run in this rolling window picks a fresh
+      // date (the sweep is idempotent per date at Xero); teardown voids the Xero document.
+      await seed.cleanup()
+    }
+  })
+
+  test.fixme(
+    'X-03: period-end UNREALISED_FX_JOURNAL revaluation posts to Xero — BLOCKED by o3d-lgo.6.1 (control leg hits Xero SYSTEM account 610/800)',
+    async () => {
+      // PARKED — do not un-fixme until bd o3d-lgo.6.1 (P1) lands.
+      //
+      // This test would prove the period-end AR/AP FX revaluation (lib/accounting-fx-revaluation.ts,
+      // triggered by GET /api/cron/accounting-fx-revaluation) posts an UNREALISED_FX_JOURNAL to the
+      // Xero Demo ledger. It cannot pass today because of the SAME product defect PP-08 surfaced live
+      // against real Xero: getUn/RealisedFxAccounts() resolves the journal's CONTROL leg to
+      // settings.accountsReceivableAccount / accountsPayableAccount, which on BOTH the e2e rig and
+      // stage are Xero SYSTEM accounts 610 (Accounts Receivable) and 800 (Accounts Payable). Xero
+      // refuses manual-journal lines to system accounts, so pushManualJournal 400s with
+      //   "A validation exception occurred: Account code 800 is not a valid code for this document."
+      // and the journal never posts (the sync log stays PENDING/FAILED). This is a connector DESIGN
+      // decision, not a rig config fix (stage matches the rig), tracked as bd o3d-lgo.6.1 — which
+      // blocks both PP-08 and this X-03. Un-fixme once it lands (target a non-system FX clearing
+      // account, or suppress the FX journal for the Xero connector, which auto-posts realised FX on
+      // settlement anyway).
+      //
+      // The scenario it would drive (UNREALISED_FX_JOURNAL; referenceType 'FxRevaluation'; referenceId
+      // = the valuation date; posted as a Xero ManualJournal): arm sync mode; import an unpaid EUR
+      // sales order (or EUR supplier bill) at a booked rate; seed a divergent GBP→EUR fx_rate
+      // (source 'e2e-fc-seed', swept by global-setup) dated ≤ the valuation date so an unrealised
+      // gain/loss exists; GET /api/cron/accounting-fx-revaluation with the CRON_SECRET bearer; drain
+      // via processPendingXeroSyncViaUi; then read the POSTED journal back from Xero and assert the
+      // FX-gain/loss and control legs. Today the drain fails at the control leg — exactly the defect
+      // o3d-lgo.6.1 must resolve.
+    },
+  )
 })
 
 /**
@@ -345,22 +580,78 @@ async function awaitSyncedJournal(
  * EVERY external id that posted regardless of final status. A journal Xero accepted but whose status
  * write-back lagged (or later FAILED) still recorded its id and is a real document that must be
  * voided. Best-effort — waits out PENDING/PROCESSING rows up to a bounded deadline, then reads.
- * Mirrors batch-fixture.postedDailyBatchJournalIds.
+ *
+ * NEVER throws (teardown must run even if this cannot resolve), but — unlike a silent `catch(() => [])`
+ * at the call site — when it CANNOT resolve (no connection, reads still failing, or the settle deadline
+ * expiring) it WARNS LOUDLY with the boundary rather than returning an indistinguishable empty list, so
+ * a possibly-stranded journal in the SHARED Demo ledger is surfaced in the run log. Transient
+ * connection AND read failures are retried. Mirrors batch-fixture.postedDailyBatchJournalIds (Codex).
  */
 async function settledJournalExternalIds(type: string, createdAfter: string, timeoutMs = 30_000): Promise<string[]> {
+  const warn = (why: string) =>
+    console.warn(`[fc-teardown] ${why} for ${type} journals created after ${createdAfter} — a posted journal may be left in the shared ledger; check ${type} sync logs.`)
+
   const { Client } = await import('pg')
-  const db = new Client({ connectionString: process.env.DATABASE_URL })
-  await db.connect()
+  // A node-postgres Client cannot be re-connected after a failed connect(), so each retry needs a FRESH
+  // client — reusing one (as an earlier cut did) makes attempts 2-3 fail instantly and the retry useless
+  // (Codex r4).
+  let db: import('pg').Client | null = null
+  for (let attempt = 0; attempt < 3 && !db; attempt++) {
+    const candidate = new Client({ connectionString: process.env.DATABASE_URL })
+    try {
+      await candidate.connect()
+      db = candidate
+    } catch {
+      await candidate.end().catch(() => {})
+      await new Promise((res) => setTimeout(res, 1_000))
+    }
+  }
+  if (!db) { warn('could not connect to the database'); return [] }
+
   try {
     const deadline = Date.now() + timeoutMs
+    // Settle: wait out in-flight post-boundary work so the snapshot does not race a journal the server
+    // is still posting. A transient read here is tolerated and retried against the deadline.
+    let settled = false
     for (;;) {
-      const inFlight = await db.query<{ n: number }>(
+      let inFlight = -1
+      try {
+        const r = await db.query<{ n: number }>(
+          `select count(*)::int as n from accounting_sync_logs
+            where connector = 'xero' and type = $1::"AccountingSyncType"
+              and "createdAt" > $2::timestamptz and status in ('PENDING', 'PROCESSING')`,
+          [type, createdAfter],
+        )
+        inFlight = r.rows[0]?.n ?? 0
+      } catch { /* transient — fall through to the deadline check and retry */ }
+      if (inFlight === 0) { settled = true; break }
+      if (Date.now() >= deadline) break
+      await new Promise((res) => setTimeout(res, 2_000))
+    }
+    if (!settled) warn('the drain did not settle within the deadline (rows still in flight)')
+
+    // Surface the ONE window this (and batch-fixture.postedDailyBatchJournalIds) cannot close: a row that
+    // is FAILED yet carries NO external id — i.e. Xero may have accepted the POST but the id write-back
+    // was lost. No id is registrable, so teardown cannot void it; warn loudly so a possibly-stranded
+    // journal is visible in the run log. Recovering it needs a run-id-tagged Xero rescan, the suite-wide
+    // follow-up tracked as o3d-lgo.7.1 (not built here).
+    try {
+      const stranded = await db.query<{ n: number }>(
         `select count(*)::int as n from accounting_sync_logs
           where connector = 'xero' and type = $1::"AccountingSyncType"
-            and "createdAt" > $2::timestamptz and status in ('PENDING', 'PROCESSING')`,
+            and "createdAt" > $2::timestamptz and status = 'FAILED' and "externalTransactionId" is null`,
         [type, createdAfter],
       )
-      if ((inFlight.rows[0]?.n ?? 0) === 0 || Date.now() >= deadline) {
+      if ((stranded.rows[0]?.n ?? 0) > 0) {
+        warn(`${stranded.rows[0].n} FAILED ${type} row(s) carry NO external id — if Xero accepted the POST the journal is unrecoverable here (o3d-lgo.7.1)`)
+      }
+    } catch { /* best-effort surfacing only */ }
+
+    // Snapshot every post-boundary document that carries a Xero id (ANY status — a POST Xero accepted
+    // whose status write-back lagged or later FAILED still recorded a real, voidable id), retrying a
+    // transient read before giving up — a partial set beats a silent empty one.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
         const r = await db.query<{ externalTransactionId: string }>(
           `select "externalTransactionId" from accounting_sync_logs
             where connector = 'xero' and type = $1::"AccountingSyncType"
@@ -368,11 +659,12 @@ async function settledJournalExternalIds(type: string, createdAfter: string, tim
           [type, createdAfter],
         )
         return r.rows.map((row) => row.externalTransactionId)
-      }
-      await new Promise((res) => setTimeout(res, 2_000))
+      } catch { await new Promise((res) => setTimeout(res, 1_000)) }
     }
+    warn('could not read the posted journals')
+    return []
   } finally {
-    await db.end()
+    await db.end().catch(() => {})
   }
 }
 
@@ -392,5 +684,175 @@ async function settingValue(key: string): Promise<string> {
     return r.rows[0].value
   } finally {
     await db.end()
+  }
+}
+
+/** Read a settings value, or null when the row is absent — so a test can restore the EXACT prior state
+ *  (delete vs. write-back) rather than blanket-deleting a key it only temporarily overrode. */
+async function getSettingRaw(key: string): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ value: string }>(`select value from settings where key = $1`, [key])
+    return r.rows.length ? r.rows[0].value : null
+  } finally {
+    await db.end()
+  }
+}
+
+/** Upsert a settings row (X-05 arms the per-type manufacturing posting setting the rig leaves unset). */
+async function setSetting(key: string, value: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+         on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      [key, value],
+    )
+  } finally {
+    await db.end()
+  }
+}
+
+/** Delete a settings row, restoring the rig's baseline for a key a test armed. */
+async function deleteSetting(key: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(`delete from settings where key = $1`, [key])
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Seed a controlled, within-tolerance transit subledger-vs-GL residue so the daily-batch transit
+ * reconciliation (transit-gl-reconciliation.ts) sweeps EXACTLY `residue` (X-02).
+ *
+ * The reconciliation compares the transit account's GL PERIOD MOVEMENT between two balance snapshots
+ * (opening = closing − 1 day, closing) against Σ of the transit subledger movements over that same
+ * half-open window (opening.balanceDate, closing.balanceDate]. delta = subledger − GL classifies the
+ * gap; |delta| ≤ £1 sweeps. The rig holds NO transit balance snapshots, so this seeds both:
+ *   - read the LIVE subledger movement S over the window (whatever real purchase postings sit there),
+ *   - set opening.amountBase = 0 and closing.amountBase = round2(S) − residue,
+ * so GL movement = round2(S) − residue while the subledger sums to S → delta = +residue exactly,
+ * regardless of what real transit activity the window already contains. Uses base currency GBP and a
+ * synthetic externalAccountId (distinct from any real Xero account id) under accountCode 632, so
+ * findLatestAccountBalanceSnapshot resolves it by account code.
+ *
+ * FRESH DATE PER RUN (Codex): the sweep's Xero Idempotency-Key is STABLE per date
+ * (`DAILY_BATCH_TRANSIT_RECONCILIATION:TRANSITRECON-<date>`, sync-processor.ts:1425), so re-posting the
+ * SAME date returns the prior — now teardown-voided — journal and the accounting-event mirror collides
+ * on (externalSystem, externalId). So this scans the coverage window newest-first for a date whose
+ * reconciliation was NEVER posted (no DAILY_BATCH_TRANSIT_RECONCILIATION accounting_event), and uses
+ * that as the closing date — guaranteeing a fresh Xero idempotency key AND a clean mirror every run.
+ * The window is [today−6 … today]: every such date's opening (date−1) still satisfies the coverage
+ * watermark (transit_ledger_coverage_start_date = 2026-07-16). The chosen date's event is left in place
+ * as a "used" marker so it is not reused within the same rolling window; a new UTC day frees a fresh
+ * date automatically. Throws (→ the test fails loudly) if all seven are exhausted in one window.
+ *
+ * Returns the chosen dateIso and a cleanup that removes only the two snapshot rows it seeded (tagged by
+ * sourcePayloadRef); it also clears any STALE seeded snapshots up front so findLatest resolves to this
+ * run's closing date rather than a crashed run's leftover.
+ */
+async function seedTransitReconciliationResidue(
+  transitAccount: string,
+  residue: number,
+): Promise<{ cleanup: () => Promise<void>; dateIso: string }> {
+  const { Client } = await import('pg')
+  const { randomUUID } = await import('node:crypto')
+  const TAG = 'e2e-fc-x02'
+  const externalAccountId = `e2e-fc-x02-${transitAccount}`
+
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+
+  const midnightUtc = (d: Date) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
+  const isoOf = (d: Date) => d.toISOString().slice(0, 10)
+
+  let dateIso = ''
+  try {
+    // Clear stale seeded snapshots first, so findLatestAccountBalanceSnapshot resolves 632 to THIS run's
+    // closing date and not a crashed run's leftover at a later date.
+    await db.query(`delete from accounting_account_balance_snapshots where "sourcePayloadRef" = $1`, [TAG])
+
+    // Pick a fresh, never-posted closing date in [today−6 … today] (all satisfy the coverage watermark).
+    // A date counts as USED if it carries EITHER a DAILY_BATCH_TRANSIT_RECONCILIATION accounting_event OR a
+    // LIVE (PENDING/PROCESSING/SYNCED) sync log for TRANSITRECON-<date>. Checking the sync log too matters
+    // because production deliberately allows the accounting-event MIRROR to fail while the sync log stays
+    // queued and posts — and daily-batch dedup (hasLiveDailyBatchLog) keys on that live sync log. Skipping
+    // it would let us pick a date whose sweep is suppressed by an existing live log, wasting the batch
+    // quota and finding no journal (Codex r4).
+    const today = midnightUtc(new Date())
+    let closingDate: Date | null = null
+    for (let back = 0; back <= 6; back++) {
+      const d = new Date(today)
+      d.setUTCDate(d.getUTCDate() - back)
+      const ref = `TRANSITRECON-${isoOf(d)}`
+      const used = await db.query<{ n: number }>(
+        `select (
+           (select count(*) from accounting_events
+              where type = 'DAILY_BATCH_TRANSIT_RECONCILIATION' and "sourceEntityId" = $1)
+         + (select count(*) from accounting_sync_logs
+              where connector = 'xero' and type = 'DAILY_BATCH_TRANSIT_RECONCILIATION'
+                and "referenceId" = $1 and status in ('PENDING', 'PROCESSING', 'SYNCED'))
+         )::int as n`,
+        [ref],
+      )
+      if ((used.rows[0]?.n ?? 0) === 0) { closingDate = d; break }
+    }
+    if (!closingDate) {
+      throw new Error(
+        'X-02: every transit reconciliation date in the coverage window [today−6 … today] is already used. ' +
+          'The sweep is idempotent per date at Xero, so a used date returns the voided journal — wait for a new UTC day.',
+      )
+    }
+    const openingDate = new Date(closingDate)
+    openingDate.setUTCDate(openingDate.getUTCDate() - 1)
+    dateIso = isoOf(closingDate)
+
+    // Live subledger movement over (openingDate, closingDate], rounded to GL precision (2dp). This is
+    // whatever real PURCHASE_BILL/STOCK_RECEIPT/etc. rows the window already holds — the closing
+    // snapshot below absorbs it so only `residue` is left as the gap.
+    const s = await db.query<{ sum: string | null }>(
+      `select coalesce(sum(base_delta), 0)::text as sum from transit_subledger_movements
+        where journal_date > $1 and journal_date <= $2`,
+      [openingDate, closingDate],
+    )
+    const subledgerSum = Math.round(Number(s.rows[0]?.sum ?? 0) * 100) / 100
+    const closingAmount = Math.round((subledgerSum - residue) * 100) / 100
+
+    const insert = async (balanceDate: Date, amountBase: number) =>
+      db.query(
+        `insert into accounting_account_balance_snapshots
+           (id, connector, "externalAccountId", "accountCode", "accountName", "balanceDate", currency,
+            "amountForeign", "amountBase", "sourcePayloadRef", "fetchedAt", "createdAt", "updatedAt")
+         values ($1, 'xero', $2, $3, 'Stock in Transit (e2e)', $4, 'GBP', $5, $5, $6, now(), now(), now())
+         on conflict (connector, "externalAccountId", "balanceDate", currency)
+           do update set "amountBase" = excluded."amountBase", "amountForeign" = excluded."amountForeign",
+                         "sourcePayloadRef" = excluded."sourcePayloadRef", "fetchedAt" = now()`,
+        [`${TAG}-${randomUUID()}`, externalAccountId, transitAccount, balanceDate, amountBase, TAG],
+      )
+    await insert(openingDate, 0)
+    await insert(closingDate, closingAmount)
+  } finally {
+    await db.end()
+  }
+
+  return {
+    dateIso,
+    cleanup: async () => {
+      const c = new Client({ connectionString: process.env.DATABASE_URL })
+      await c.connect()
+      try {
+        await c.query(`delete from accounting_account_balance_snapshots where "sourcePayloadRef" = $1`, [TAG])
+      } finally {
+        await c.end()
+      }
+    },
   }
 }

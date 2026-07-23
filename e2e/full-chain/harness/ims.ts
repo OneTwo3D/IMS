@@ -700,6 +700,113 @@ export async function runInboxDrain(page: Page): Promise<Record<string, unknown>
   return wc
 }
 
+// --- manufacturing ----------------------------------------------------------
+
+/**
+ * Create a manufacturing order for a BOM product and open its detail page, the way an operator
+ * does (X-05). Returns the production-order id (the URL tail), which is the referenceId every
+ * MANUFACTURING_JOURNAL / MANUFACTURING_RECLASS sync log keys on.
+ *
+ * The MO is created in DRAFT — it posts NOTHING yet. The manufacturing overhead journal only
+ * appears at completion, and only if an overhead cost line was added first (a bare component→
+ * finished-goods movement nets to zero on the inventory account, so with no overhead there is no
+ * journal at all). Mirrors the proven flow in admin-workflows.spec.ts:252.
+ */
+export async function createManufacturingOrder(
+  page: Page,
+  opts: { bomSku: string; warehouseCode: string; qty: number },
+): Promise<string> {
+  await page.goto('/manufacturing')
+  await page.getByRole('button', { name: /new order/i }).click()
+
+  const dialog = page.getByRole('dialog', { name: /New Manufacturing Order/i })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+  await dialog.getByPlaceholder(/search by sku or name/i).fill(opts.bomSku)
+  await dialog.getByRole('button', { name: new RegExp(opts.bomSku) }).first().click()
+  // Consume from the warehouse holding the seeded component stock. The option label carries the
+  // warehouse NAME plus its code in parentheses (e.g. "Cambridge (CBG)"), so match by the code
+  // substring rather than a hardcoded label (mirrors addStockAdjustment's warehouse pick).
+  const warehouseSelect = dialog.locator('select').first()
+  const wanted = warehouseSelect.locator('option', { hasText: opts.warehouseCode })
+  await expect(wanted.first()).toHaveCount(1)
+  const wantedLabel = ((await wanted.first().textContent()) ?? '').trim()
+  await warehouseSelect.selectOption({ label: wantedLabel })
+  await dialog.locator('input[type="number"]').first().fill(String(opts.qty))
+  await dialog.getByRole('button', { name: /create order/i }).click()
+
+  // The new order lands in the list; open it and confirm we are on a detail page that offers the
+  // DRAFT→IN_PROGRESS action, so subsequent steps drive the right screen.
+  const row = page.getByRole('row').filter({ hasText: opts.bomSku }).first()
+  await expect(row).toBeVisible({ timeout: 30_000 })
+  await Promise.all([
+    page.waitForURL(/\/manufacturing\/.+/),
+    row.locator('td').first().click(),
+  ])
+  await expect(page.getByRole('button', { name: /start production/i })).toBeVisible({ timeout: 30_000 })
+  return page.url().split('/').pop()!
+}
+
+/**
+ * Open an MO detail page by id. Needed because processPendingXeroSyncViaUi navigates AWAY to the
+ * sync dashboard, so anything driving the MO afterwards (e.g. the post-completion cost-line edit that
+ * triggers MANUFACTURING_RECLASS) must first return to the detail page — otherwise it hunts for the
+ * cost editor on /sync and hangs. Same hazard as openPurchaseOrder.
+ */
+export async function openManufacturingOrder(page: Page, moId: string): Promise<void> {
+  await page.goto(`/manufacturing/${moId}`)
+  await expect(page.getByRole('button', { name: /save manufacturing costs/i })).toBeVisible({ timeout: 30_000 })
+}
+
+/**
+ * Add an overhead cost line on the MO detail page and save it — the capitalised overhead that
+ * MANUFACTURING_JOURNAL books (DR inventory / CR the line's account) at completion. `accountCode`
+ * overrides the default overhead account per line; omit it to use xero_manufacturing_overhead_account.
+ * The cost editor is editable in any non-CANCELLED status, so this works before completion (to seed
+ * the journal) or after (to trigger a MANUFACTURING_RECLASS — see editManufacturingCostLineAmount).
+ */
+export async function addManufacturingCostLine(
+  page: Page,
+  opts: { description: string; amount: string; accountCode?: string },
+): Promise<void> {
+  await page.getByRole('button', { name: /add line/i }).click()
+  await page.getByPlaceholder(/e\.g\. Labour, Machine time/i).last().fill(opts.description)
+  await page.getByPlaceholder('0.00').last().fill(opts.amount)
+  if (opts.accountCode) await page.getByPlaceholder(/default overhead account/i).last().fill(opts.accountCode)
+  await page.getByRole('button', { name: /save manufacturing costs/i }).click()
+  await expect(page.getByText(/^Saved\.$/)).toBeVisible({ timeout: 30_000 })
+}
+
+/**
+ * Change the (single) overhead cost line's amount on an already-COMPLETED MO and save — the edit
+ * that queues a MANUFACTURING_RECLASS reclassifying the overhead delta between inventory (units
+ * still on hand) and COGS (units already consumed). Targets the first amount input.
+ */
+export async function editManufacturingCostLineAmount(page: Page, amount: string): Promise<void> {
+  await page.getByPlaceholder('0.00').first().fill(amount)
+  await page.getByRole('button', { name: /save manufacturing costs/i }).click()
+  await expect(page.getByText(/^Saved\.$/)).toBeVisible({ timeout: 30_000 })
+}
+
+/** DRAFT → IN_PROGRESS. Reserves component stock; posts no journal. */
+export async function startProduction(page: Page): Promise<void> {
+  await page.getByRole('button', { name: /start production/i }).click()
+  await expect(page.getByText(/^IN PROGRESS$/i).first()).toBeVisible({ timeout: 30_000 })
+}
+
+/**
+ * IN_PROGRESS → COMPLETED. Consumes the component layers, creates the finished-goods layer, and —
+ * if an overhead cost line exists — queues the MANUFACTURING_JOURNAL. Completing at the planned
+ * quantity (the dialog default) avoids any yield-loss reweighting.
+ */
+export async function completeProduction(page: Page): Promise<void> {
+  await page.getByRole('button', { name: /mark completed/i }).click()
+  const dialog = page.getByRole('dialog', { name: /Complete production/i })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+  await dialog.getByRole('button', { name: /^Complete$/ }).click()
+  await expect(dialog).toBeHidden({ timeout: 30_000 })
+  await expect(page.getByText(/^COMPLETED$/i).first()).toBeVisible({ timeout: 30_000 })
+}
+
 // --- posting-mode control ----------------------------------------------------
 
 /**
