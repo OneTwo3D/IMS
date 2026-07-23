@@ -163,12 +163,17 @@ async function validateActiveShipmentTotalsWithinOrder(
 
   const lineLabelById = new Map<string, string>()
   const orderedByLeaf = new Map<string, Prisma.Decimal>()
+  // Leaves that came from a genuine KIT expansion (a component distinct from the ordered product), whose
+  // per-kit requirement can carry sub-4dp rounding. Only these get the per-row quantisation tolerance;
+  // a SIMPLE product's identity expansion keeps the exact epsilon-only cap so it can't be over-shipped.
+  const kitExpandedLeaf = new Set<string>()
   for (const line of orderLines) {
     lineLabelById.set(line.id, line.sku ?? line.description ?? line.id)
     if (!line.productId) continue // a description-only line has no product to ship
     for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(line.productId, toDecimal(line.qty), graph)) {
       const key = `${line.id}|${componentId}`
       orderedByLeaf.set(key, (orderedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
+      if (componentId !== line.productId) kitExpandedLeaf.add(key)
     }
   }
 
@@ -187,11 +192,15 @@ async function validateActiveShipmentTotalsWithinOrder(
       return `Shipment line ${lineId} no longer belongs to this order. Reload and retry.`
     }
     const orderedQty = roundQuantity(orderedByLeaf.get(key) ?? new Prisma.Decimal(0), 4)
-    // Each shipment/allocation row is independently rounded to Decimal(12,4), so the active sum of N
-    // split rows can exceed the once-rounded entitlement by up to N half-ulps (a 0.5/0.5 split of a
-    // 0.3333 component sums to 0.1667+0.1667=0.3334 vs a 0.3333 entitlement). Absorb exactly that
-    // per-row quantisation in the tolerance; a real over-ship far exceeds it.
-    const tolerance = SHIPMENT_QTY_EPSILON_DECIMAL.add(QTY_HALF_ULP_4DP.mul(rows))
+    // A KIT component's per-kit requirement can carry sub-4dp rounding, and each shipment row is
+    // independently rounded to Decimal(12,4), so the active sum of N split rows can exceed the
+    // once-rounded entitlement by up to N half-ulps (0.1667+0.1667=0.3334 vs a 0.3333 entitlement).
+    // Absorb exactly that per-row quantisation for kit-expanded leaves only; a real over-ship far
+    // exceeds it. SIMPLE products (identity expansion) have no such rounding and keep the exact
+    // epsilon-only cap, so a 1.0000 order can't ship 1.0001 across two rows.
+    const tolerance = kitExpandedLeaf.has(key)
+      ? SHIPMENT_QTY_EPSILON_DECIMAL.add(QTY_HALF_ULP_4DP.mul(rows))
+      : SHIPMENT_QTY_EPSILON_DECIMAL
     if (activeQty.gt(orderedQty.add(tolerance))) {
       return `Shipment quantity for line ${label} exceeds ordered quantity. Reload and retry.`
     }

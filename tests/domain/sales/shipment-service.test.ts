@@ -652,6 +652,34 @@ test('transitionShipmentStatus rejects multi-warehouse shipment totals above the
   assert.equal(state.cogsEntries.length, 0)
 })
 
+test('transitionShipmentStatus keeps the exact cap for SIMPLE products — no row-tolerance over-ship (o3d-odu)', async () => {
+  // A simple product ordered 1.0000 split across two rows as 0.5 + 0.5001 = 1.0001. The per-row
+  // quantisation tolerance must NOT apply to identity (non-kit) expansions, so this real 0.0001 over-ship
+  // is still rejected exactly as the epsilon-only guard did.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 1, sku: 'SKU-1', description: 'Product 1' }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'PICKING', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 0.5 },
+      { id: 'shipment-line-2', shipmentId: 'shipment-2', lineId: 'line-1', productId: 'product-1', qty: 0.5001 },
+    ],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /exceeds ordered quantity/)
+  assert.equal(state.movements.length, 0)
+})
+
 test('transitionShipmentStatus dispatches a KIT order whose component lines sum above the kit qty (o3d-odu)', async () => {
   // A kit ordered ×1 needs 2 of comp-1 and 3 of comp-2. The shipment therefore has two component lines
   // (2 + 3 = 5) under the one kit line. The OLD guard summed those 5 against the kit line's own qty (1)
