@@ -1177,6 +1177,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         subtotalBase,
         taxRateName: input.taxRateName || null,
         taxRatePercent: vatRate > 0 ? vatRate : null,
+        pricesIncludeVat: inclVat,
         taxForeign: totalTaxForeign,
         taxBase: totalTaxBase,
         totalForeign: grandTotalForeign,

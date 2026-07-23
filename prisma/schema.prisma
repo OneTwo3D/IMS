@@ -1178,6 +1178,7 @@ model PurchaseOrder {
   subtotalBase     Decimal             @db.Decimal(18, 4)
   taxRateName     String?             // e.g. "UK Standard Rate"
   taxRatePercent  Decimal?            @db.Decimal(5, 4) // e.g. 0.2000
+  pricesIncludeVat Boolean            @default(false) // true when unit prices (and the header discount) are tax-inclusive (o3d-lx1)
   taxForeign      Decimal             @db.Decimal(18, 4) @default(0)
   taxBase          Decimal             @db.Decimal(18, 4) @default(0)
   totalForeign    Decimal             @db.Decimal(18, 4)

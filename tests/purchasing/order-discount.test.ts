@@ -105,6 +105,25 @@ test('applyHeaderOrderDiscount is a no-op for a zero discount or empty subtotal'
   assert.equal(zeroDisc.discountNetForeign, 0)
 })
 
+test('a FIXED inclusive-VAT discount is reapplied as GROSS, not re-grossed-up (o3d-lx1)', () => {
+  // The Codex scenario: a fixed header discount of 120 on a VAT-inclusive PO (200 net + 40 tax @ 20%).
+  // Created inclusive, discountAmount 120 IS the gross reduction (100 net + 20 vat). On requote it must
+  // resolve to 120 and split to net 100 / vat 20 — NOT be treated as a net 120 (which would gross up to
+  // 144 and over-discount). This is why the PO now persists pricesIncludeVat.
+  const resolved = resolveHeaderOrderDiscountForeign({
+    discountStr: '120', originalDiscountForeign: 120, subtotalForeign: 200, taxForeign: 40, inclVat: true,
+  })
+  assert.equal(resolved, 120)
+  const out = applyHeaderOrderDiscount({
+    subtotalForeign: 200, subtotalBase: 200, taxForeign: 40, taxBase: 40,
+    orderDiscountForeign: resolved, inclVat: true, fxRate: 1,
+  })
+  assert.equal(out.discountNetForeign, 100)
+  assert.equal(out.discountVatForeign, 20)
+  assert.equal(out.subtotalForeign, 100)
+  assert.equal(out.taxForeign, 20)
+})
+
 test('applyHeaderOrderDiscount caps a discount larger than the gross subtotal at 100%', () => {
   const out = applyHeaderOrderDiscount({
     subtotalForeign: 100, subtotalBase: 100, taxForeign: 0, taxBase: 0,

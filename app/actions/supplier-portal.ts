@@ -288,7 +288,7 @@ export async function submitSupplierQuote(
         where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
         select: {
           id: true, supplierId: true, reference: true, currency: true, fxRateToBase: true,
-          discountStr: true, discountAmount: true,
+          discountStr: true, discountAmount: true, pricesIncludeVat: true,
         },
       })
       if (!lockedPo) throw new Error('RFQ not found or not accessible')
@@ -337,9 +337,10 @@ export async function submitSupplierQuote(
       // discountAmount orphaned (which overstated subtotalBase/totalBase). A percentage discount
       // (discountStr like "10%") scales with the new prices; a fixed amount is kept (capped). The same
       // net/VAT split as createPurchaseOrder is applied so subtotalBase/taxBase/totalBase stay consistent.
-      // A PurchaseOrder persists a NET line subtotal with tax separate and no VAT-inclusive flag, so the
-      // requote reapplies the discount in net convention (matching how an ex-VAT PO was created).
-      const inclVat = false
+      // Reapply in the SAME VAT convention the PO was created in (persisted per o3d-lx1), so a FIXED
+      // inclusive-VAT discount is treated as gross — not re-grossed-up as if it were net. Existing RFQs
+      // predating the column default to false (net), the typical purchase-order convention.
+      const inclVat = lockedPo.pricesIncludeVat
       const orderDiscountForeign = resolveHeaderOrderDiscountForeign({
         discountStr: lockedPo.discountStr,
         originalDiscountForeign: Number(lockedPo.discountAmount ?? 0),
