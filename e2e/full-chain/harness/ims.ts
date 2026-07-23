@@ -84,6 +84,52 @@ export async function refundOrder(page: Page, opts: { quantity: number; reason?:
   await expect(dialog).toBeHidden({ timeout: 30_000 })
 }
 
+/**
+ * Write stock OFF against a configured adjustment reason, the way an operator does — the flow
+ * that queues an INVENTORY_ADJUSTMENT journal (X-07).
+ *
+ * A stock adjustment only posts to the ledger when its line carries a reason whose account_code
+ * is set (stock-adjustment-apply.ts): the reason account is the P&L/contra leg, inventory (631)
+ * the other. A NEGATIVE quantity books a write-off — DR reason account / CR inventory at the FIFO
+ * cost of the layers it consumes — so the SKU must already hold priced stock. The plain
+ * addStockAdjustment helper never selects a reason (its positive seed posts nothing), which is
+ * exactly why it could not exercise this path.
+ *
+ * Reuses the same "New Stock Adjustment" dialog as addStockAdjustment. `qty` is the magnitude to
+ * remove (a positive number entered as a negative quantity); no unit cost is supplied — a
+ * write-off is valued from the existing layers, not re-priced.
+ */
+export async function applyStockWriteOff(
+  page: Page,
+  opts: { sku: string; qty: number; reasonName: string; warehouseCode: string },
+): Promise<void> {
+  await page.goto('/stock-control/stock-adjustments')
+  await page.getByRole('button', { name: /new adjustment/i }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'New Stock Adjustment' })
+  await dialog.getByPlaceholder(/search by sku or name/i).fill(opts.sku)
+  await dialog.getByRole('option', { name: new RegExp(opts.sku) }).first().click()
+
+  // Warehouse must be the one holding the stock, or the write-off has no layers to consume.
+  const warehouseSelect = dialog.locator('select[aria-label="Warehouse"]').first()
+  const wantedOption = warehouseSelect.locator('option', { hasText: opts.warehouseCode })
+  await expect(wantedOption.first()).toHaveCount(1)
+  const wantedLabel = ((await wantedOption.first().textContent()) ?? '').trim()
+  await warehouseSelect.selectOption({ label: wantedLabel })
+
+  // Select the reason by its unique name. Without a reason (value=''), no accountCode resolves and
+  // NO journal is queued — the whole point of the test would silently evaporate, so assert it took.
+  const reasonSelect = dialog.locator('select[aria-label="Reason"]').first()
+  await expect(reasonSelect).toBeVisible({ timeout: 30_000 })
+  await reasonSelect.selectOption({ label: opts.reasonName })
+
+  // Negative quantity = removal. No unit cost: a write-off is valued at the consumed layers' cost.
+  await dialog.getByRole('spinbutton', { name: /quantity to add or remove/i }).last().fill(String(-Math.abs(opts.qty)))
+  await dialog.getByRole('button', { name: /save adjustments/i }).click()
+  await dialog.getByText(/1 adjustment saved\./i).waitFor({ timeout: 30_000 })
+  await dialog.waitFor({ state: 'hidden' })
+}
+
 // --- purchasing -------------------------------------------------------------
 
 /**

@@ -28,7 +28,7 @@ import { currentRunId } from './harness/global-setup.ts'
 import { runTag, taggedSku } from './harness/tag.ts'
 import { awaitWebhookDelivery, cleanupWc, createWcOrder, createWcProduct, wcCreds, type WcCreds } from './harness/wc.ts'
 import {
-  allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, runDailyBatch, setPostingMode,
+  allocateAndShip, applyStockWriteOff, openSalesOrder, processPendingXeroSyncViaUi, runDailyBatch, setPostingMode,
 } from './harness/ims.ts'
 import { addStockAdjustment, createInventoryProduct } from '../helpers.ts'
 import {
@@ -181,7 +181,200 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     expectJournalLine(bJournal.JournalLines, { accountCode: cogsAccount, debit: expectedCogs })
     expectJournalLine(bJournal.JournalLines, { accountCode: allocatedAccount, credit: expectedCogs })
   })
+
+  test('X-07: a stock write-off posts an INVENTORY_ADJUSTMENT journal (DR write-off / CR inventory) verified IN Xero', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // Closes the e2e/xero.spec.ts:139 test.fixme — that test only ever checked for a sync-LOG row,
+    // and it never appeared because the flow it drove queued NO journal at all: an adjustment posts
+    // to the ledger ONLY when its line carries a reason whose account_code is set
+    // (stock-adjustment-apply.ts). The rig's adjustment_reasons table is empty, so the plain
+    // addStockAdjustment helper (no reason) is silently journal-less. This test seeds a reason with
+    // an account, writes stock OFF against it, and asserts the POSTED ManualJournal in Xero — the
+    // ledger, not a log row.
+    //
+    // SYNC mode: INVENTORY_ADJUSTMENT queues at adjustment time and posts on the next drain. It is an
+    // ordinary sync journal, NOT a daily-batch one, so the batch stays off and no clean baseline is
+    // needed.
+    await setPostingMode({ sync: true, dailyBatch: false })
+
+    const sku = taggedSku(runId, 'X07')
+    const reasonName = `${runTag(runId)} X07 shrinkage`
+    const writeOffQty = 2
+    const expectedValue = writeOffQty * UNIT_COST // 2 × £10 = £20, the FIFO cost of the consumed layers
+
+    const inventoryAccount = await settingValue('xero_inventory_account') // 631
+    // The reason's contra leg. inventory_revaluation (311) is a real, postable Demo account already
+    // used by the landed-cost revaluation journals, so a manual journal can DR it.
+    const writeOffAccount = await settingValue('xero_inventory_revaluation_account')
+
+    // Product + priced stock to write off. The +10 seed MUST run BEFORE the reason is seeded: the
+    // bulk-adjustment dialog defaults a new line's reason to the FIRST available reason
+    // (bulk-adjustment-form.tsx), so a reason present at seed time would make this "reasonless" +10
+    // silently queue its OWN £100 INVENTORY_ADJUSTMENT and strand it untracked in the shared ledger
+    // (Codex r1). With adjustment_reasons empty here, the line carries no reason and posts nothing —
+    // its only job is to lay down a £10/unit cost layer for the write-off to consume.
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} X07`, price: '20.00' })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const reasonId = await seedAdjustmentReason(reasonName, writeOffAccount)
+    try {
+      // Capture the DB clock AFTER the seed and BEFORE the write-off, so the read-back is scoped to
+      // THIS run's journal (a prior run's INVENTORY_ADJUSTMENT would otherwise be a false match).
+      const boundary = await dailyBatchBoundary()
+      await applyStockWriteOff(page, { sku, qty: writeOffQty, reasonName, warehouseCode: WAREHOUSE_CODE })
+
+      let externalId: string | undefined
+      try {
+        // Drain the queued INVENTORY_ADJUSTMENT to Xero, then resolve + REGISTER it before asserting —
+        // the drain can throw after Xero has already accepted the journal (a UI completion-signal
+        // timeout), so registration lives in a try whose finally is the ledger safety net.
+        await processPendingXeroSyncViaUi(page)
+        const doc = await awaitSyncedJournal('INVENTORY_ADJUSTMENT', boundary)
+        externalId = doc.externalId
+        trackDocument('ManualJournals', externalId, `X-07 write-off ${runTag(runId)}`)
+      } finally {
+        // Failure-safe (Codex r1): settle any in-flight post-boundary INVENTORY_ADJUSTMENT work and
+        // register EVERY external id that posted, regardless of final status — the drain can throw
+        // after Xero accepted the journal, or the external-id write-back can lag a UI-signal timeout,
+        // so a single immediate read could miss the real document. Mirrors postedDailyBatchJournalIds.
+        // trackDocument dedupes, so re-registering the happy-path id is harmless.
+        for (const posted of await settledJournalExternalIds('INVENTORY_ADJUSTMENT', boundary).catch(() => [])) {
+          trackDocument('ManualJournals', posted, `X-07 write-off ${runTag(runId)}`)
+        }
+      }
+
+      // THE POINT: read the journal back out of Xero. A write-off DEBITS the reason account and
+      // CREDITS inventory for the FIFO cost of the units removed. POSTED, not merely "not DELETED".
+      const journal = await getManualJournal(externalId!)
+      expect(journal.Status).toBe('POSTED')
+      expectBalanced(journal)
+      expectJournalLine(journal.JournalLines, { accountCode: writeOffAccount, debit: expectedValue })
+      expectJournalLine(journal.JournalLines, { accountCode: inventoryAccount, credit: expectedValue })
+    } finally {
+      // Remove the seeded reason regardless of outcome. No FK RESTRICTs it (only external_wms_bindings
+      // references it, ON DELETE SET NULL), so the delete is safe even after a movement used it.
+      await deleteAdjustmentReason(reasonId)
+    }
+  })
 })
+
+/**
+ * Seed an active adjustment reason carrying a P&L/contra account code, so a stock adjustment line
+ * against it queues an INVENTORY_ADJUSTMENT journal. Returns the reason id for teardown. The rig
+ * keeps adjustment_reasons EMPTY, so the name is unique per run and cleaned up in finally.
+ */
+async function seedAdjustmentReason(name: string, accountCode: string): Promise<string> {
+  const { Client } = await import('pg')
+  const { randomUUID } = await import('node:crypto')
+  const id = `e2e-x07-${randomUUID()}`
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into adjustment_reasons (id, name, account_code, "sortOrder", active, "createdAt", "updatedAt")
+         values ($1, $2, $3, 0, true, now(), now())`,
+      [id, name, accountCode],
+    )
+    return id
+  } finally {
+    await db.end()
+  }
+}
+
+async function deleteAdjustmentReason(id: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(`delete from adjustment_reasons where id = $1`, [id])
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Poll for a SYNCED accounting_sync_log of `type` created after `createdAfter`, returning its Xero
+ * external id. Scoped to this run by the boundary (mirrors batch-fixture's dailyBatchDoc): without
+ * it a prior run's journal of the same type would be a false match and teardown would void the wrong
+ * document. Fails loudly on a FAILED log or timeout rather than returning null.
+ */
+async function awaitSyncedJournal(
+  type: string,
+  createdAfter: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<{ referenceId: string; externalId: string }> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + (opts.timeoutMs ?? 120_000)
+    let last: { status: string; error: string | null } | null = null
+    while (Date.now() < deadline) {
+      const r = await db.query<{ referenceId: string; externalTransactionId: string | null; status: string; errorMessage: string | null }>(
+        `select "referenceId", "externalTransactionId", status, "errorMessage"
+           from accounting_sync_logs
+          where connector = 'xero' and type = $1::"AccountingSyncType"
+            and "createdAt" > $2::timestamptz
+          order by "createdAt" desc limit 1`,
+        [type, createdAfter],
+      )
+      if (r.rows.length) {
+        const row = r.rows[0]
+        last = { status: row.status, error: row.errorMessage }
+        if (row.status === 'SYNCED' && row.externalTransactionId) {
+          return { referenceId: row.referenceId, externalId: row.externalTransactionId }
+        }
+        if (row.status === 'FAILED') {
+          throw new Error(`${type} FAILED in Xero sync: ${row.errorMessage ?? 'no error recorded'}`)
+        }
+      }
+      await new Promise((res) => setTimeout(res, 2_000))
+    }
+    throw new Error(
+      `No SYNCED ${type} journal created after ${createdAfter} within the timeout` +
+        (last ? ` (last seen: status=${last.status}${last.error ? `, error=${last.error}` : ''})` : ' (none queued — did the adjustment carry a reason with an account?)'),
+    )
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Failure-safe teardown net: SETTLE any in-flight post-boundary sync work of `type`, then return
+ * EVERY external id that posted regardless of final status. A journal Xero accepted but whose status
+ * write-back lagged (or later FAILED) still recorded its id and is a real document that must be
+ * voided. Best-effort — waits out PENDING/PROCESSING rows up to a bounded deadline, then reads.
+ * Mirrors batch-fixture.postedDailyBatchJournalIds.
+ */
+async function settledJournalExternalIds(type: string, createdAfter: string, timeoutMs = 30_000): Promise<string[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const inFlight = await db.query<{ n: number }>(
+        `select count(*)::int as n from accounting_sync_logs
+          where connector = 'xero' and type = $1::"AccountingSyncType"
+            and "createdAt" > $2::timestamptz and status in ('PENDING', 'PROCESSING')`,
+        [type, createdAfter],
+      )
+      if ((inFlight.rows[0]?.n ?? 0) === 0 || Date.now() >= deadline) {
+        const r = await db.query<{ externalTransactionId: string }>(
+          `select "externalTransactionId" from accounting_sync_logs
+            where connector = 'xero' and type = $1::"AccountingSyncType"
+              and "createdAt" > $2::timestamptz and "externalTransactionId" is not null`,
+          [type, createdAfter],
+        )
+        return r.rows.map((row) => row.externalTransactionId)
+      }
+      await new Promise((res) => setTimeout(res, 2_000))
+    }
+  } finally {
+    await db.end()
+  }
+}
 
 /** A manual journal is balanced iff its signed LineAmounts (debits +, credits −) sum to zero. */
 function expectBalanced(journal: XeroManualJournal): void {
