@@ -549,6 +549,44 @@ export async function runWcOrderReconcile(
   return { synced: result.synced ?? 0, skipped: result.skipped ?? 0, errors: result.errors ?? [] }
 }
 
+/**
+ * Drain the shopping-webhook inbox — the consumer that reprocesses PENDING
+ * `shopping_webhook_events` into sales orders — IN THE APP, via its cron route.
+ *
+ * Same reasoning as runDailyBatch: the domain job (processPendingWcWebhookEvents) reaches
+ * a CJS-only graph and cannot be imported into the Playwright process, so the faithful
+ * trigger is the cron route. Auth is the cron bearer secret (lib/cron-auth.ts).
+ *
+ * Two behaviours the caller must respect:
+ *   - the woocommerce tick only PROCESSES when wc_sync_enabled is true; with the gate off
+ *     it returns { skipped: true, reason: 'wc_sync_disabled' } and drains nothing (the
+ *     route reads the gate per-connector, app/api/cron/shopping-webhook-inbox/route.ts);
+ *   - it is rate-limited to CRON_RATE_LIMIT_FIVE_MINUTE_MAX (15) per five minutes per IP,
+ *     far looser than the daily batch's 1/hour, so ordinary retries are fine.
+ *
+ * Returns the parsed WOOCOMMERCE connector tick — either the
+ * ProcessPendingWcWebhookEventsResult counters { attempted, processed, failed,
+ * deadLettered, skipped } or a { skipped, reason } shape.
+ */
+export async function runInboxDrain(page: Page): Promise<Record<string, unknown>> {
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    throw new Error('CRON_SECRET is not set in the test environment — cannot trigger the shopping-webhook-inbox cron route.')
+  }
+  const res = await page.request.get('/api/cron/shopping-webhook-inbox', {
+    headers: { Authorization: `Bearer ${secret}` },
+  })
+  if (!res.ok()) {
+    throw new Error(`shopping-webhook-inbox cron HTTP ${res.status()}: ${(await res.text()).slice(0, 300)}`)
+  }
+  const body = (await res.json()) as { connectors?: { woocommerce?: Record<string, unknown> } }
+  const wc = body.connectors?.woocommerce
+  if (!wc) {
+    throw new Error(`shopping-webhook-inbox response missing the woocommerce connector tick: ${JSON.stringify(body).slice(0, 300)}`)
+  }
+  return wc
+}
+
 // --- posting-mode control ----------------------------------------------------
 
 /**
