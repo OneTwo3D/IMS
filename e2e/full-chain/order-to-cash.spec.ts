@@ -21,7 +21,7 @@ import {
   awaitWebhookDelivery, cancelWcOrder, cleanupWc, createWcOrder, createWcProduct, getWcOrder, nudgeWpCron,
   refundWcOrder, updateWcOrder, wcCreds, type WcCreds,
 } from './harness/wc.ts'
-import { allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, setPostingMode } from './harness/ims.ts'
+import { allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, runInboxDrain, setPostingMode } from './harness/ims.ts'
 import { addStockAdjustment, createInventoryProduct } from '../helpers.ts'
 import { expectLine, externalIdFor, getCreditNote, getInvoice, trackDocument } from './harness/xero.ts'
 
@@ -957,6 +957,79 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       await deleteFxRate(fxRateId)
     }
   })
+
+  test('OC-18: an order delivered while sync is paused is ingested by the inbox DRAIN, not the synchronous webhook', async ({ page }) => {
+    // Composed worst case: awaitWebhookEventPending (300s, a late duplicate re-arms the quiet window) +
+    // the drain + setup. Generous because Woo's Action Scheduler drives delivery off nudged WP-Cron.
+    test.setTimeout(1_800_000)
+
+    // WHY THIS TEST EXISTS. A WooCommerce order webhook is never imported inline: handleWcWebhook
+    // (webhooks.ts) verifies the signature, PERSISTS the delivery as a PENDING shopping_webhook_events
+    // row, and returns 202 — the import happens later, in the inbox consumer
+    // (processPendingWcWebhookEvents). Every other OC case lets that consumer run near-realtime (the
+    // route kicks a debounced drain when the processing gate is enabled), so the SO appears within
+    // seconds and the inbox is invisible. This case proves the DURABILITY contract behind o3d-56b: an
+    // order that arrives while sync is PAUSED (wc_sync_enabled=false, e.g. a maintenance window) is not
+    // lost — the route still persists it, the near-realtime kick is suppressed, and the SO is created
+    // only when the shopping-webhook-inbox cron later drains the PENDING backlog.
+    //
+    // No Xero posting: this is a WC->IMS ingest assertion (SO creation), so the ledger is never touched.
+    await setPostingMode({ sync: false, dailyBatch: false })
+
+    const sku = taggedSku(runId, 'OC18')
+    const unitPrice = '18.00'
+    const qty = 1
+
+    // 1. The IMS needs the product so the drained import resolves the line by SKU (an unmapped line still
+    //    creates a SO, but mapping keeps the oracle unambiguous).
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC18`, price: unitPrice })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    // 2. PAUSE the processing gate. handleWcWebhook still persists the delivery (o3d-56b), but
+    //    scheduleInboxDrain only fires when the gate is enabled (webhooks.ts) — so with it off the event
+    //    sits PENDING and nothing imports it. The rig's run baseline is wc_sync_enabled=true (the quiesce
+    //    lock arms it), so this is restored in finally.
+    await setWcSyncGate(false)
+    let salesOrderId: string | null = null
+    try {
+      // 3. Place the order in Woo for real; Woo delivers the webhook and the route persists it PENDING.
+      const product = await createWcProduct(creds, runId, { label: 'OC18', price: unitPrice })
+      const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+      expect(order.status).toBe('processing')
+
+      // 4. Wait for the PENDING backlog to arrive and quiesce. With the gate off every delivered row must
+      //    be PENDING (nothing drains), and NO sales order may exist yet — proof the synchronous path did
+      //    not import it. Quiescing on a stable row count means a late duplicate delivery cannot race the
+      //    drain in step 6.
+      const pending = await awaitWebhookEventPending(order.id, creds)
+      expect(pending.count, 'at least one PENDING import event was persisted while the gate was off').toBeGreaterThanOrEqual(1)
+      expect(await salesOrderIdForWcOrder(order.id), 'no SO exists before the drain — the webhook did not import inline').toBeNull()
+
+      // 5. RE-ARM the gate (the inbox cron's woocommerce tick only processes when wc_sync_enabled is true)
+      //    and 6. DRAIN the inbox via its cron route — the consumer under test.
+      await setWcSyncGate(true)
+      const drain = await runInboxDrain(page)
+      expect(drain.skipped, `the woocommerce inbox tick was skipped: ${JSON.stringify(drain)}`).toBeFalsy()
+      expect(
+        Number(drain.processed ?? 0),
+        `the drain processed at least one event (result: ${JSON.stringify(drain)})`,
+      ).toBeGreaterThanOrEqual(1)
+      expect(Number(drain.deadLettered ?? 0), 'no event dead-lettered in the drain').toBe(0)
+
+      // 7. THE POINT: the SO now exists, created BY THE DRAIN, and its import event(s) are all PROCESSED.
+      salesOrderId = await awaitSalesOrderIdForWcOrder(order.id)
+      expect(salesOrderId, 'the inbox drain created the sales order the synchronous path had left PENDING').toBeTruthy()
+      const statuses = await webhookEventStatuses(order.id)
+      expect(statuses.length, 'the import event(s) are recorded').toBeGreaterThanOrEqual(1)
+      expect(
+        statuses.every((s) => s === 'PROCESSED'),
+        `every import event reached PROCESSED after the drain (saw: ${statuses.join(', ')})`,
+      ).toBe(true)
+    } finally {
+      // Restore the run baseline the quiesce lock established, regardless of outcome.
+      await setWcSyncGate(true)
+    }
+  })
 })
 
 /**
@@ -1653,6 +1726,129 @@ async function settingValue(key: string): Promise<string> {
     const r = await db.query<{ value: string }>(`select value from settings where key = $1`, [key])
     if (!r.rows.length || !r.rows[0].value) throw new Error(`Setting ${key} is not configured on this instance.`)
     return r.rows[0].value
+  } finally {
+    await db.end()
+  }
+}
+
+// --- OC-18 inbox-drain helpers ----------------------------------------------
+
+/** Arm/disarm the WooCommerce webhook processing gate (wc_sync_enabled) for OC-18. */
+async function setWcSyncGate(enabled: boolean): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into settings (key, value, "updatedAt") values ('wc_sync_enabled', $1, now())
+         on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      [String(enabled)],
+    )
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Wait for Woo to DELIVER an order webhook and the route to PERSIST it as PENDING
+ * shopping_webhook_events — without it being drained into a SO. OC-18 runs with the gate off, so
+ * nothing should ever advance a row past PENDING; a non-PENDING row means the gate slipped on and
+ * the assertion "the drain, not the synchronous path, imports it" is compromised, so fail loudly.
+ *
+ * Nudges WP-Cron each poll (stage has no visitors, so Action Scheduler would otherwise never fire —
+ * see awaitWebhookDelivery) and QUIESCES on a stable row count so a late duplicate delivery cannot
+ * race the drain that follows (mirrors awaitWebhookEventProcessed's stabilisation).
+ */
+async function awaitWebhookEventPending(
+  wcOrderId: number,
+  creds: WcCreds,
+  opts: { timeoutMs?: number } = {},
+): Promise<{ count: number }> {
+  const timeoutMs = opts.timeoutMs ?? 300_000
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const deadline = Date.now() + timeoutMs
+    const NUM_STABLE_POLLS = 2
+    let settledCount = -1
+    let stableHits = 0
+    let snapshot = '(no events yet)'
+    while (Date.now() < deadline) {
+      const r = await db.query<{ status: string }>(
+        `select status from shopping_webhook_events
+          where connector = 'woocommerce' and topic in ('order.created', 'order.updated')
+            and ("payloadJson"->>'id')::bigint = $1
+          order by "receivedAt"`,
+        [wcOrderId],
+      )
+      const rows = r.rows
+      snapshot = rows.length ? rows.map((x) => x.status).join('; ') : '(no events yet)'
+      const nonPending = rows.filter((x) => x.status !== 'PENDING')
+      if (nonPending.length) {
+        throw new Error(
+          `OC-18 expected only PENDING inbox rows for WC order ${wcOrderId} while the gate is off, but saw: ${snapshot}. ` +
+            'Something drained the event before the test could — the near-realtime kick should be suppressed with wc_sync_enabled=false.',
+        )
+      }
+      if (rows.length > 0) {
+        stableHits = settledCount === rows.length ? stableHits + 1 : 0
+        settledCount = rows.length
+        if (stableHits >= NUM_STABLE_POLLS) return { count: rows.length }
+      }
+      await nudgeWpCron(creds)
+      await new Promise((res) => setTimeout(res, 5_000))
+    }
+    throw new Error(`No PENDING import webhook for WC order ${wcOrderId} within ${timeoutMs}ms. Last seen: ${snapshot}.`)
+  } finally {
+    await db.end()
+  }
+}
+
+/** The IMS sales order id linked to a WC order, or null if none exists yet. Single-shot. */
+async function salesOrderIdForWcOrder(wcOrderId: number): Promise<string | null> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string }>(
+      `select so.id from sales_orders so
+         join shopping_order_links sol on sol."orderId" = so.id
+        where sol."externalOrderId" = $1 and sol.connector = 'woocommerce'
+        limit 1`,
+      [String(wcOrderId)],
+    )
+    return r.rows.length ? r.rows[0].id : null
+  } finally {
+    await db.end()
+  }
+}
+
+/** Poll the link table until the drain has created the SO (or time out with a clear message). */
+async function awaitSalesOrderIdForWcOrder(wcOrderId: number, timeoutMs = 60_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const id = await salesOrderIdForWcOrder(wcOrderId)
+    if (id) return id
+    await new Promise((res) => setTimeout(res, 2_000))
+  }
+  throw new Error(`The inbox drain did not create a sales order for WC order ${wcOrderId} within ${timeoutMs}ms.`)
+}
+
+/** The statuses of a WC order's import events, in receipt order. */
+async function webhookEventStatuses(wcOrderId: number): Promise<string[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ status: string }>(
+      `select status from shopping_webhook_events
+        where connector = 'woocommerce' and topic in ('order.created', 'order.updated')
+          and ("payloadJson"->>'id')::bigint = $1
+        order by "receivedAt"`,
+      [wcOrderId],
+    )
+    return r.rows.map((x) => x.status)
   } finally {
     await db.end()
   }
