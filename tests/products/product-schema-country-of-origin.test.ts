@@ -27,6 +27,15 @@ test('blank / absent origin is null (bhdm.7)', () => {
   assert.equal(parseOrigin(undefined), null)
 })
 
+test('the schema is the single origin trust boundary — create and update both persist it as-is (o3d-vj5)', () => {
+  // o3d-vj5 option (a): BOTH createProduct and updateProduct now write `data.countryOfOrigin || null`
+  // (the schema-parsed value) — createProduct no longer defaults a blank origin to CN. So a blank origin
+  // is stored NULL on create as well as update; the WMS/customs push resolves the CN fallback at send
+  // time. This pins the boundary the actions depend on: a blank parses to null (nothing to default).
+  assert.equal(parseOrigin(''), null)
+  assert.equal(parseOrigin('GB'), 'GB')
+})
+
 test('a nonblank reserved / invalid origin is REJECTED, never stored verbatim (bhdm.7 r5)', () => {
   for (const bad of ['EU', 'UN', 'ZZ', 'SU', 'XA', '!!', 'Narnia']) {
     assert.throws(() => parseOrigin(bad), /Unrecognised country of origin/, `${bad} must be rejected`)

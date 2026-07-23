@@ -9,7 +9,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
-import { DEFAULT_COUNTRY_OF_ORIGIN, toIsoCountryCode } from '@/lib/countries'
+import { toIsoCountryCode } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import { scheduleWmsProductSync, isAnyWmsConnectorEnabled } from '@/lib/domain/wms/product-sync-dispatch'
@@ -714,9 +714,12 @@ export async function createProduct(
         barcode: data.barcode || null,
         mpn: data.mpn || null,
         hsCode: data.hsCode || null,
-        // New products with no origin default to China for customs parity with hs-code-woo
-        // (bhdm.5). Only on create — see updateProduct for why update must not default.
-        countryOfOrigin: data.countryOfOrigin || DEFAULT_COUNTRY_OF_ORIGIN,
+        // o3d-vj5 (option a): store NULL for a blank origin — matching updateProduct — not a persisted
+        // CN default. A stored default is indistinguishable from a declared origin and blocks a later
+        // parent/WC correction (bhdm.7, superseding bhdm.5's create-time default). What is SENT is
+        // unchanged: the WMS/customs push resolves the CN fallback at send time
+        // (resolveMintsoftCountryOfManufacture), so only provenance is preserved.
+        countryOfOrigin: data.countryOfOrigin || null,
         customsDescription: data.customsDescription || null,
         weight: data.weight ? data.weight : null,
         salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
