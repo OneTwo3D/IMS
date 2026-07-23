@@ -687,6 +687,32 @@ test('transitionShipmentStatus dispatches a KIT order whose component lines sum 
   assert.equal(state.movements.length, 2) // both components dispatched
 })
 
+test('transitionShipmentStatus dispatches a fractional kit at the Decimal(12,4) rounding boundary (o3d-odu)', async () => {
+  // 0.5 kit × a 0.3333 component = 0.16665, which persists as the shipment qty 0.1667. The requirement
+  // must be quantised to 4dp before comparison, else 0.1667 > 0.16665 falsely rejects a valid dispatch.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.3333, sku: 'COMP-1' }] },
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 0.1667 },
+    ],
+    stockLevels: [{ productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+  assert.equal(state.movements.length, 1)
+})
+
 test('transitionShipmentStatus still rejects a KIT whose component ships above its expanded requirement (o3d-odu)', async () => {
   // 3 of comp-1 shipped for a kit that only needs 2 → over the expanded requirement, still rejected.
   const state = baseState({

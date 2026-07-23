@@ -176,7 +176,10 @@ async function validateActiveShipmentTotalsWithinOrder(
     if (!label) {
       return `Shipment line ${lineId} no longer belongs to this order. Reload and retry.`
     }
-    const orderedQty = orderedByLeaf.get(key) ?? new Prisma.Decimal(0)
+    // Quantise the expanded requirement to the Decimal(12,4) boundary that OrderAllocation/ShipmentLine
+    // quantities persist at, so a full-precision expansion (e.g. 0.5 kit × 0.3333 = 0.16665) doesn't sit
+    // a rounding ulp below the persisted shipment qty (0.1667) and falsely reject a valid dispatch.
+    const orderedQty = roundQuantity(orderedByLeaf.get(key) ?? new Prisma.Decimal(0), 4)
     if (activeQty.gt(orderedQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
       return `Shipment quantity for line ${label} exceeds ordered quantity. Reload and retry.`
     }
