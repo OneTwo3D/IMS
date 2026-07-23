@@ -14,6 +14,7 @@ import {
 test('parseDiscountPercent recognises percentage strings, rejects fixed/blank/negative', () => {
   assert.equal(parseDiscountPercent('10%'), 0.1)
   assert.equal(parseDiscountPercent('  7.5 % '), 0.075)
+  assert.equal(parseDiscountPercent('.5%'), 0.005) // leading-dot form the PO form's parseFloat accepts
   assert.equal(parseDiscountPercent('0%'), 0)
   assert.equal(parseDiscountPercent('50.00'), null) // fixed amount
   assert.equal(parseDiscountPercent(null), null)

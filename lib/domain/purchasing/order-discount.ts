@@ -36,10 +36,14 @@ export function resolveHeaderOrderDiscountForeign(params: {
   return round4(Math.min(Math.max(0, originalDiscountForeign), conventionSubtotal))
 }
 
-/** Parse a "10%" / "10 %" discount string into a fraction (0.1), or null when it is not a percentage. */
+/**
+ * Parse a "10%" / "10 %" / ".5%" discount string into a fraction (0.1), or null when it is not a
+ * percentage. Accepts a leading-dot form (".5%") because the PO form parses percentage text with
+ * parseFloat, which accepts it — the requote resolver must recognise the same percentages it stored.
+ */
 export function parseDiscountPercent(discountStr: string | null): number | null {
   if (!discountStr) return null
-  const match = /^\s*(\d+(?:\.\d+)?)\s*%\s*$/.exec(discountStr)
+  const match = /^\s*(\d*\.?\d+)\s*%\s*$/.exec(discountStr)
   if (!match) return null
   const pct = Number(match[1])
   if (!Number.isFinite(pct) || pct < 0) return null
