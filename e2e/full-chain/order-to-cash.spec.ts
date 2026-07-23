@@ -1030,6 +1030,66 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     expect(await salesOrderIdsForWcOrderNumber(order.number), 'a non-configured status must not be imported by reconcile').toHaveLength(0)
     expect(await inboxEventCountForWcOrder(order.id), 'and no webhook delivered it either').toBe(0)
   })
+
+  test('OC-17: a foreign order with no FX rate quarantines (pending-FX), then imports once the rate exists', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // The pending-FX quarantine: order-import refuses to import a foreign-currency order with no matching FX
+    // rate (getFxRateToGbp throws MissingFxRateError) and PARKS it in the shopping_sync_logs pending queue
+    // rather than importing at a wrong or 1:1 rate. Driven via the RECONCILE path deliberately: the webhook
+    // path answers HTTP 500 on a missing-FX order, which makes WooCommerce retry and eventually DISABLE the
+    // webhook (a rig hazard) — the reconcile merely records the error. We prove the order does NOT import while
+    // unrated, then seed the rate, re-open the window, re-reconcile, and prove it imports at the seeded rate.
+    const sku = taggedSku(runId, 'OC17')
+    const unitPriceEur = '24.00'
+    const qty = 2
+    const fxRate = 1.15
+
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC17`, price: unitPriceEur })
+    await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+    const product = await createWcProduct(creds, runId, { label: 'OC17', price: unitPriceEur })
+    // Bound the reconcile window to this order (OC-19/20's technique), set right before creating it.
+    await setSetting('last_wc_order_reconcile_at', new Date(Date.now() - 10_000).toISOString())
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }], currency: 'EUR' })
+    expect(order.currency).toBe('EUR')
+
+    let fxRateId: string | undefined
+    try {
+      // 1) Reconcile with NO rate seeded: the EUR order fails import and quarantines. allowErrors, because the
+      //    missing-FX failure is the EXPECTED outcome here, not a rig fault.
+      const rec1 = await runWcOrderReconcile(page, { allowErrors: true })
+      expect(rec1.errors.length, 'the unrated EUR order was reported as a failed import').toBeGreaterThanOrEqual(1)
+      expect(await pendingFxCountForWcOrder(order.id), 'the order is parked in the pending-FX queue').toBe(1)
+      expect(await salesOrderIdsForWcOrderNumber(order.number), 'no SO is created while the FX rate is missing').toHaveLength(0)
+
+      // 2) Once a rate EXISTS the same order imports — proving the quarantine is a pure missing-rate HOLD, not
+      //    a broken order. We seed the rate and re-drive the reconcile (re-opening its window) as the recovery
+      //    trigger. NB the PRODUCTION auto-recovery consumer is retryPendingWcOrdersWaitingForFx, reachable only
+      //    via fetchAllFxRates — which additionally calls the external frankfurter API, seeds rates for EVERY
+      //    active currency (polluting the rig's deliberately-empty fx_rates baseline), and PUSHES rates to the
+      //    SHARED Woo store. Those side effects are unsuitable for a routine full-chain run, and that consumer
+      //    has its own unit coverage; this test proves the full-chain-only behaviour (the real WC order is held
+      //    at import, then admitted once a rate exists).
+      fxRateId = await seedGbpFxRate('EUR', fxRate)
+      await setSetting('last_wc_order_reconcile_at', new Date(Date.now() - 20_000).toISOString())
+      const rec2 = await runWcOrderReconcile(page)
+      expect(rec2.synced, 'the order imports once the rate exists').toBeGreaterThanOrEqual(1)
+
+      const ids = await awaitReconciledSalesOrder(order.number, 60_000)
+      expect(ids.length, 'exactly one SO now exists for the previously-quarantined order').toBe(1)
+      // Imported at the SEEDED rate (the /fxRate boundary applied).
+      const fx = await salesOrderFx(ids[0])
+      expect(fx.currency).toBe('EUR')
+      expect(Number(fx.fxRateToBase), 'imported at the seeded GBP->EUR rate').toBeCloseTo(fxRate, 4)
+    } finally {
+      // Clear the superseded pending-FX row so no stale retry work is left behind (the re-import created the SO
+      // directly rather than through the queue consumer, so the original PENDING row would otherwise linger),
+      // then remove the seeded rate to restore the empty-fx_rates baseline.
+      await clearPendingFxRowsForWcOrder(order.id)
+      if (fxRateId) await deleteFxRate(fxRateId)
+    }
+  })
 })
 
 /**
@@ -1505,6 +1565,43 @@ async function inboxEventCountForWcOrder(wcOrderId: number): Promise<number> {
       [wcOrderId],
     )
     return Number(r.rows[0]?.n ?? '0')
+  } finally {
+    await db.end()
+  }
+}
+
+/** How many pending-FX quarantine rows exist for a WC order — recordPendingFxOrder writes exactly one. */
+async function pendingFxCountForWcOrder(wcOrderId: number): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ n: string }>(
+      `select count(*)::text as n from shopping_sync_logs
+        where connector='woocommerce' and status='PENDING' and direction='FROM_CONNECTOR'
+          and "entityType"='SalesOrder' and "externalId"=$1`,
+      [String(wcOrderId)],
+    )
+    return Number(r.rows[0]?.n ?? '0')
+  } finally {
+    await db.end()
+  }
+}
+
+/** Remove any pending-FX quarantine rows for a WC order (teardown after a superseded manual recovery). */
+async function clearPendingFxRowsForWcOrder(wcOrderId: number): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `delete from shopping_sync_logs
+        where connector='woocommerce' and direction='FROM_CONNECTOR' and "entityType"='SalesOrder'
+          and "externalId"=$1 and status='PENDING'`,
+      [String(wcOrderId)],
+    )
+  } catch {
+    // best-effort cleanup — a leftover PENDING row is inert (preflight gates on accounting_sync_logs, not these)
   } finally {
     await db.end()
   }
