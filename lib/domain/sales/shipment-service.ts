@@ -132,31 +132,53 @@ async function validateActiveShipmentTotalsWithinOrder(
   const [orderLines, activeShipmentLines] = await Promise.all([
     client.salesOrderLine.findMany({
       where: { orderId },
-      select: { id: true, qty: true, sku: true, description: true },
+      select: { id: true, productId: true, qty: true, sku: true, description: true },
     }),
     client.shipmentLine.findMany({
       where: { shipment: { orderId, status: { not: 'PENDING' } } },
-      select: { lineId: true, qty: true },
+      select: { lineId: true, productId: true, qty: true },
     }),
   ])
 
-  const orderedByLine = new Map(orderLines.map((line) => [line.id, line]))
-  const activeQtyByLine = new Map<string, Prisma.Decimal>()
-  for (const shipmentLine of activeShipmentLines) {
-    activeQtyByLine.set(
-      shipmentLine.lineId,
-      (activeQtyByLine.get(shipmentLine.lineId) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)),
-    )
+  // Shipment lines are LEAF-product rows: a KIT order line expands to its component products, so a kit
+  // line has several shipment lines (one per component) under the same lineId, each in COMPONENT units.
+  // Summing them against the kit line's OWN qty (kit units) therefore always over-counts and falsely
+  // rejects every kit dispatch (o3d-odu). Compare in leaf-product units keyed by (orderLineId, productId)
+  // instead: expand each line's ordered qty through the kit/BOM graph (the same expansion
+  // confirmSalesOrderShipments builds from), and cap each component's shipped total at its ordered
+  // component requirement. Simple products are the identity expansion, so their behaviour is unchanged.
+  const productIds = [...new Set(
+    orderLines.map((line) => line.productId).filter((id): id is string => !!id),
+  )]
+  const graph = productIds.length > 0 ? await loadFulfillmentProductGraph(client, productIds) : new Map()
+
+  const lineLabelById = new Map<string, string>()
+  const orderedByLeaf = new Map<string, Prisma.Decimal>()
+  for (const line of orderLines) {
+    lineLabelById.set(line.id, line.sku ?? line.description ?? line.id)
+    if (!line.productId) continue // a description-only line has no product to ship
+    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(line.productId, toDecimal(line.qty), graph)) {
+      const key = `${line.id}|${componentId}`
+      orderedByLeaf.set(key, (orderedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
+    }
   }
 
-  for (const [lineId, activeQty] of activeQtyByLine) {
-    const line = orderedByLine.get(lineId)
-    if (!line) {
+  const activeByLeaf = new Map<string, { lineId: string; activeQty: Prisma.Decimal }>()
+  for (const shipmentLine of activeShipmentLines) {
+    const key = `${shipmentLine.lineId}|${shipmentLine.productId}`
+    const entry = activeByLeaf.get(key) ?? { lineId: shipmentLine.lineId, activeQty: new Prisma.Decimal(0) }
+    entry.activeQty = entry.activeQty.add(toDecimal(shipmentLine.qty))
+    activeByLeaf.set(key, entry)
+  }
+
+  for (const [key, { lineId, activeQty }] of activeByLeaf) {
+    const label = lineLabelById.get(lineId)
+    if (!label) {
       return `Shipment line ${lineId} no longer belongs to this order. Reload and retry.`
     }
-    const orderedQty = toDecimal(line.qty)
+    const orderedQty = orderedByLeaf.get(key) ?? new Prisma.Decimal(0)
     if (activeQty.gt(orderedQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
-      return `Shipment quantity for line ${line.sku ?? line.description} exceeds ordered quantity. Reload and retry.`
+      return `Shipment quantity for line ${label} exceeds ordered quantity. Reload and retry.`
     }
   }
 
