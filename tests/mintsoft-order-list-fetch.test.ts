@@ -17,6 +17,10 @@ let listError: string | null = null
 // multi-row page must not fan out one settings/statuses lookup per order.
 let settingsCalls = 0
 let statusCalls = 0
+// The /api/Order/Statuses body, swappable per test so the o3d-bjc.2.2 fail-closed
+// status-map cases (malformed / empty / unresolvable id) can be exercised.
+const DEFAULT_STATUSES: unknown = [{ ID: 4, Name: 'DESPATCHED' }, { ID: 17, Name: 'PICKED' }]
+let statusResponder: () => unknown = () => DEFAULT_STATUSES
 
 mock.module('@/lib/connectors/mintsoft/settings/schema', {
   namedExports: {
@@ -40,7 +44,7 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
     mintsoftRequest: async (path: string) => {
       if (path.startsWith('/api/Order/Statuses')) {
         statusCalls += 1
-        return { data: [{ ID: 4, Name: 'DESPATCHED' }, { ID: 17, Name: 'PICKED' }], status: 200 }
+        return { data: statusResponder(), status: 200 }
       }
       const qs = new URLSearchParams(path.split('?')[1] ?? '')
       listCalls.push(Object.fromEntries(qs.entries()))
@@ -52,6 +56,11 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
 
 async function loadFetch(): Promise<(typeof import('@/lib/connectors/mintsoft/api/orders'))['fetchMintsoftOrderList']> {
   return (await import('@/lib/connectors/mintsoft/api/orders')).fetchMintsoftOrderList
+}
+
+/** Drop the memoised status map so a test can serve its own /Order/Statuses body. */
+async function resetStatusCache(): Promise<void> {
+  ;(await import('@/lib/connectors/mintsoft/api/orders')).resetMintsoftOrderStatusCacheForTests()
 }
 
 // Every delta is scoped to our ClientId, and every ROW must echo it (fail closed).
@@ -200,6 +209,82 @@ test('[o3d-bjc] a row missing an order number throws (fails closed)', async () =
     () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
     /missing an order number/,
   )
+})
+
+// --- o3d-bjc.2.2: an UNRESOLVED dispatch status must never ride through clean --
+// A lenient status map (empty/malformed) normalises every row to status '' →
+// dispatched:false → a clean `pending`, so the sweep's watermark would advance
+// past orders whose real dispatch state was never determined and a genuinely
+// DESPATCHED order could be aged out of the delta window.
+
+test('[o3d-bjc.2.2] a malformed /Order/Statuses body throws and is NOT cached as an empty map', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => [row(1)]
+
+  await resetStatusCache()
+  statusResponder = () => ({ Message: 'temporarily unavailable' })
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /Order\/Statuses: expected an array/,
+  )
+
+  // An empty list is equally unusable — every OrderStatusId would be unresolvable.
+  statusResponder = () => []
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /returned no statuses/,
+  )
+
+  // An entry without a usable ID/Name is drift, not a status we can skip.
+  statusResponder = () => [{ ID: 4, Name: 'DESPATCHED' }, { Name: 'PICKED' }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /missing a numeric ID or a Name/,
+  )
+
+  // Nothing above was cached: a healthy body still resolves normally afterwards.
+  statusResponder = () => DEFAULT_STATUSES
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out.length, 1)
+  assert.equal(out[0].status, 'DESPATCHED')
+})
+
+test('[o3d-bjc.2.2] a delta row whose OrderStatusId is unresolvable throws (the watermark is retained)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // OrderStatusId 999 is absent from the status map → dispatch state unknown.
+  listResponder = () => [row(1), row(2, { OrderStatusId: 999 })]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /unresolved OrderStatusId \(999\) and no despatch date/,
+  )
+
+  // A row with NO OrderStatusId at all is the same unknown state.
+  listResponder = () => [row(3, { OrderStatusId: null })]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /unresolved OrderStatusId \(missing\) and no despatch date/,
+  )
+})
+
+test('[o3d-bjc.2.2] an unresolvable status is allowed when a DespatchDate proves the goods left', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: '2026-07-15T09:00:00', TrackingNumber: 'TN9' })]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out.length, 1)
+  assert.equal(out[0].status, '') // status name still unknown…
+  assert.equal(out[0].dispatched, true) // …but the despatch date is authoritative
 })
 
 test('fetchMintsoftOrderList throws on an HTTP error (so the sweep fails safe to reconcile)', async () => {

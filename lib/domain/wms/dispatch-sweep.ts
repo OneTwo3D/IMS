@@ -316,7 +316,7 @@ export async function reconcileOneOrder(
   // instead of a per-order status fetch. `null`/omitted → fetch as before (the
   // caller passes null to force a fetch for an ambiguous split — see the core).
   preloaded?: WmsOrderStatus | null,
-  // A split-only number lookup is a candidate-enumeration hint, not a join.
+  // A number-only lookup is a candidate-enumeration hint, not a join.
   // Require its authoritative primary row to echo the link's stable ID before
   // applying anything, so a reused/colliding number cannot dispatch this link.
   expectedExternalOrderId?: string,
@@ -326,9 +326,18 @@ export async function reconcileOneOrder(
     return { action: 'pending', reason: 'Order not found in the WMS' }
   }
   if (expectedExternalOrderId && status.externalOrderId !== expectedExternalOrderId) {
-    return {
-      action: 'pending',
-      reason: `Order-number lookup returned stable ID ${status.externalOrderId || 'unknown'}; expected ${expectedExternalOrderId}`,
+    // A MERGE is the one legitimate stable-ID change (o3d-bjc.2.1): the survivor
+    // authoritatively names our order number among the numbers it folded in, so a
+    // different id is expected and the link is repointed just below. The
+    // connector's number lookup is already tenant-scoped and fails closed on an
+    // ambiguous merge, so this is strictly stronger evidence than the per-order
+    // reconcile pass (which repoints on the merge marker with no id check at all).
+    const provesMerge = status.isMerged && status.mergedOrderNumbers.includes(candidate.externalOrderNumber)
+    if (!provesMerge) {
+      return {
+        action: 'pending',
+        reason: `Order-number lookup returned stable ID ${status.externalOrderId || 'unknown'}; expected ${expectedExternalOrderId}`,
+      }
     }
   }
 
@@ -399,6 +408,10 @@ export async function runWmsDispatchSweepCore(
   const deltaActive = Boolean(deps.fetchDelta) && (options?.deltaEnabled ?? true)
   let deltaById: Map<string, WmsOrderStatus> | null = null
   let deltaByNumber: Map<string, WmsOrderStatus[]> | null = null
+  // Component numbers folded into a merge survivor this delta (o3d-bjc.2.1) —
+  // links still holding one of these can only be found by NUMBER, never by the
+  // stable-ID join, so they must also drive the number supplement below.
+  const mergedComponentNumbers = new Set<string>()
   let reconcileDue = true
   let deltaFetched = false
   let ranReconcile = false
@@ -427,13 +440,24 @@ export async function runWmsDispatchSweepCore(
       const rows = await deps.fetchDelta!(sinceIso)
       deltaById = new Map<string, WmsOrderStatus>()
       deltaByNumber = new Map<string, WmsOrderStatus[]>()
+      const indexByNumber = (number: string, row: WmsOrderStatus) => {
+        const bucket = deltaByNumber!.get(number)
+        if (!bucket) deltaByNumber!.set(number, [row])
+        else if (!bucket.includes(row)) bucket.push(row)
+      }
       for (const row of rows) {
         if (row.externalOrderId) deltaById.set(row.externalOrderId, row)
-        const number = row.externalOrderNumber
-        if (number) {
-          const bucket = deltaByNumber.get(number)
-          if (bucket) bucket.push(row)
-          else deltaByNumber.set(number, [row])
+        if (row.externalOrderNumber) indexByNumber(row.externalOrderNumber, row)
+        // o3d-bjc.2.1: a merge survivor's row is keyed by the COMBINED number
+        // ("WC-1001+WC-1002") and carries the survivor's stable id, while our
+        // links still hold an ORIGINAL component number and the ABSORBED order's
+        // id until repointLink runs — so neither index would find them. Index the
+        // survivor under every component number too, or the component link is
+        // never reconciled and the watermark ages the merge out of the window.
+        for (const component of row.mergedOrderNumbers) {
+          if (!component || component === row.externalOrderNumber) continue
+          indexByNumber(component, row)
+          mergedComponentNumbers.add(component)
         }
       }
       deltaFetched = true
@@ -447,6 +471,7 @@ export async function runWmsDispatchSweepCore(
       console.error('[wms-dispatch-sweep] Order/List delta fetch failed — full per-order poll this run:', deltaError)
       deltaById = null
       deltaByNumber = null
+      mergedComponentNumbers.clear()
       reconcileDue = true
     }
   }
@@ -520,25 +545,30 @@ export async function runWmsDispatchSweepCore(
       deltaCandidates = batch
     }
 
-    const splitNumbers = [...deltaByNumber.entries()]
-      .filter(([, rows]) =>
-        rows.length > 1 || rows.some((row) => row.isSplit || (row.partCount ?? 1) > 1),
-      )
-      .map(([number]) => number)
-    if (splitNumbers.length > 0) {
+    // Numbers the stable-ID join cannot be trusted to cover on its own:
+    //  - shared/split numbers: the changed sibling part's id may not be the one
+    //    stored on the link;
+    //  - merged components (o3d-bjc.2.1): the link still holds the ABSORBED
+    //    order's id, which the survivor's row no longer carries at all.
+    const supplementNumbers = new Set<string>(
+      [...deltaByNumber.entries()]
+        .filter(([, rows]) => rows.length > 1 || rows.some((row) => row.isSplit || (row.partCount ?? 1) > 1))
+        .map(([number]) => number),
+    )
+    for (const number of mergedComponentNumbers) supplementNumbers.add(number)
+    if (supplementNumbers.size > 0) {
       if (deps.listActiveByOrderNumbers) {
-        const splitCandidates = await deps.listActiveByOrderNumbers(splitNumbers)
+        const supplementCandidates = await deps.listActiveByOrderNumbers([...supplementNumbers])
         const seen = new Set(deltaCandidates.map((candidate) => candidate.linkId))
-        for (const candidate of splitCandidates) {
+        for (const candidate of supplementCandidates) {
           if (!seen.has(candidate.linkId)) {
             deltaCandidates.push(candidate)
             seen.add(candidate.linkId)
           }
         }
       } else {
-        // Stable IDs alone cannot prove split coverage: the changed sibling part
-        // may not be the ID stored on the link. Keep the watermark until a later
-        // run can enumerate that shared-number group.
+        // Stable IDs alone cannot prove split/merge coverage. Keep the watermark
+        // until a later run can enumerate that shared-number group.
         deltaCoverageComplete = false
       }
     }
@@ -550,7 +580,13 @@ export async function runWmsDispatchSweepCore(
       const candidateRows = deltaByNumber.get(candidate.externalOrderNumber)
       const splitByNumber = candidateRows?.some((row) => row.isSplit || (row.partCount ?? 1) > 1)
         || (candidateRows?.length ?? 0) > 1
-      if (!idRow && !splitByNumber) continue
+      // o3d-bjc.2.1: this link's number was folded into a merge survivor in this
+      // delta. Its stored id is the absorbed order's, so the stable-ID join can
+      // never match — reconcile it by number so the link is repointed.
+      const mergedByNumber = candidateRows?.some(
+        (row) => row.isMerged && row.mergedOrderNumbers.includes(candidate.externalOrderNumber),
+      ) ?? false
+      if (!idRow && !splitByNumber && !mergedByNumber) continue
       if (!idRow && !candidate.externalOrderId) continue
 
       const idRows = idRow ? deltaByNumber.get(idRow.externalOrderNumber) : undefined

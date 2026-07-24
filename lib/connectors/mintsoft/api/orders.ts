@@ -32,7 +32,16 @@ function toInt(value: unknown): number | null {
   return null
 }
 
-/** OrderStatusId → uppercased status name. Cached for STATUSES_TTL_MS. */
+/**
+ * OrderStatusId → uppercased status name. Cached for STATUSES_TTL_MS.
+ *
+ * STRICT (o3d-bjc.2.2): a malformed or empty 2xx `/api/Order/Statuses` body must
+ * never be cached as an empty map. Every subsequent row would then resolve to an
+ * unresolved status `''` → `dispatched:false` → counted as a clean `pending`, and
+ * the Order/List delta watermark would advance past orders whose real dispatch
+ * state was never determined — aging a genuinely DESPATCHED order out of the
+ * window. Throwing instead keeps the cache empty and fails the delta safe.
+ */
 async function fetchMintsoftOrderStatusMap(): Promise<Map<number, string>> {
   if (statusCache && Date.now() - statusCache.at < STATUSES_TTL_MS) {
     return statusCache.map
@@ -41,14 +50,30 @@ async function fetchMintsoftOrderStatusMap(): Promise<Map<number, string>> {
   if (result.error) throw new Error(result.error)
 
   const map = new Map<number, string>()
-  for (const item of extractMintsoftArrayPayload(result.data)) {
+  for (const item of extractMintsoftArrayPayloadStrict(result.data, 'Order/Statuses')) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      throw new Error('Mintsoft Order/Statuses: entry is not an object — refusing to cache an unusable status map')
+    }
     const row = item as RawOrder
     const id = toInt(row.ID ?? row.Id ?? row.id)
     const name = toStr(row.Name ?? row.name)
-    if (id !== null && name) map.set(id, name.toUpperCase())
+    if (id === null || !name) {
+      throw new Error(
+        'Mintsoft Order/Statuses: entry is missing a numeric ID or a Name — refusing to cache an unusable status map',
+      )
+    }
+    map.set(id, name.toUpperCase())
+  }
+  if (map.size === 0) {
+    throw new Error('Mintsoft Order/Statuses returned no statuses — refusing to cache an empty status map')
   }
   statusCache = { at: Date.now(), map }
   return map
+}
+
+/** Drop the memoised status map (tests only — the TTL handles it in production). */
+export function resetMintsoftOrderStatusCacheForTests(): void {
+  statusCache = null
 }
 
 function requireMintsoftClientId(clientId: number | null | undefined, operation: string): number {
@@ -183,7 +208,14 @@ export async function normalizeMintsoftOrderRow(
   // multi-row page resolves them ONCE, not once per row — otherwise a cold status
   // cache with no in-flight dedup fans out one /api/Order/Statuses request and one
   // settings read per row (o3d-bjc Codex: a request storm that trips throttling).
-  ctx?: { statusMap: Map<number, string>; settings: MintsoftSettings },
+  //
+  // `strictStatus` (o3d-bjc.2.2) is set by the DELTA path only: there an
+  // unresolvable dispatch state must fail the whole delta, because a lenient
+  // `status: ''` normalises to "not dispatched" → a clean `pending` → the
+  // watermark advances past a row whose true state was never determined. The
+  // per-order path stays lenient: it re-polls the same order every reconcile
+  // tick, so nothing can age out.
+  ctx?: { statusMap: Map<number, string>; settings: MintsoftSettings; strictStatus?: boolean },
 ): Promise<WmsOrderStatus | null> {
   const externalOrderId = toStr(order.ID ?? order.Id ?? order.id)
   if (!externalOrderId) return null
@@ -197,6 +229,16 @@ export async function normalizeMintsoftOrderRow(
   const merged = mergedParts(externalOrderNumber)
   const settings = ctx?.settings ?? (await getMintsoftSettings())
   const tracking = readTracking(order)
+
+  // Fail closed on an unresolved dispatch state (delta path only). A DespatchDate
+  // is authoritative on its own — the goods demonstrably left — so a row that
+  // carries one is allowed through even without a resolvable status name.
+  if (ctx?.strictStatus && !status && !tracking.some((entry) => Boolean(entry.despatchedAt))) {
+    throw new Error(
+      `Mintsoft Order/List: order ${externalOrderId} has an unresolved OrderStatusId ` +
+        `(${statusId ?? 'missing'}) and no despatch date — refusing to treat an unknown dispatch state as pending`,
+    )
+  }
 
   return {
     externalOrderId,
@@ -353,7 +395,9 @@ export async function fetchMintsoftOrderList(opts: {
       // same for every row) so normalisation makes no per-row API/DB calls.
       const statusMap = await fetchMintsoftOrderStatusMap()
       const settings = await getMintsoftSettings()
-      const normalized = await Promise.all(collected.map((row) => normalizeMintsoftOrderRow(row, { statusMap, settings })))
+      const normalized = await Promise.all(
+        collected.map((row) => normalizeMintsoftOrderRow(row, { statusMap, settings, strictStatus: true })),
+      )
       return normalized.filter((row): row is WmsOrderStatus => row !== null)
     }
   }

@@ -552,6 +552,104 @@ test('[o3d-bjc.2 finding 2] the split number supplement cannot apply a reused-nu
   assert.equal(counters.pending, 1)
 })
 
+// --- o3d-bjc.2.1: merged orders must not slip the delta's coverage -----------
+// A merge survivor's delta row carries the COMBINED number ("WC-1001+WC-1002")
+// and the survivor's stable id, while our links still hold an ORIGINAL component
+// number and the ABSORBED order's id until repointLink runs. Neither index would
+// find them, yet coverage read complete and the watermark advanced — so an
+// out-of-batch merged order could stay unreconciled while its delta row aged out.
+
+const MERGED_SURVIVOR = {
+  externalOrderId: 'M-9',
+  externalOrderNumber: 'WC-1001+WC-1002',
+  isMerged: true,
+  mergedOrderNumbers: ['WC-1001', 'WC-1002'],
+  status: 'DESPATCHED',
+  dispatched: true,
+}
+
+test('[o3d-bjc.2.1] an out-of-batch merged order is enumerated by COMPONENT number, repointed and dispatched — and the watermark advances', async () => {
+  const numbersAsked: string[][] = []
+  const repointed: Array<{ linkId: string; externalOrderId: string; externalOrderNumber: string }> = []
+  const applied: string[] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      // The link's stored id (M-1) is the ABSORBED order's — the survivor's row
+      // carries M-9, so the stable-id join finds nothing.
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async (numbers) => {
+        numbersAsked.push([...numbers])
+        return [candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' })]
+      },
+      // The authoritative number lookup resolves WC-1001 to its merge survivor.
+      fetchOrderStatus: async () => status(MERGED_SURVIVOR),
+      repointLink: async (linkId, to) => { repointed.push({ linkId, ...to }) },
+      applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+      fetchDelta: async () => [status(MERGED_SURVIVOR)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+
+  // Both components are supplemented, not just the combined key.
+  assert.ok(numbersAsked.length === 1, 'the number supplement ran exactly once')
+  assert.ok(numbersAsked[0].includes('WC-1001'), 'component WC-1001 was enumerated')
+  assert.ok(numbersAsked[0].includes('WC-1002'), 'component WC-1002 was enumerated')
+  // The stable-id change is accepted BECAUSE the survivor names our number.
+  assert.deepEqual(repointed, [{ linkId: 'l1', externalOrderId: 'M-9', externalOrderNumber: 'WC-1001+WC-1002' }])
+  assert.deepEqual(applied, ['o1'])
+  assert.equal(counters.dispatched, 1)
+  assert.deepEqual(saved, [{ watermark: NOW.toISOString() }])
+})
+
+test('[o3d-bjc.2.1] merged components hold the watermark when the connector cannot enumerate by number', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      // no listActiveByOrderNumbers → the component links cannot be proven covered
+      fetchDelta: async () => [status(MERGED_SURVIVOR)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] the merge exception does NOT admit a reused number: a non-merged row with a different stable ID stays pending', async () => {
+  const repointed: string[] = []
+  const applied: string[] = []
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      // WC-1001 now resolves to a DIFFERENT, non-merged order (number reuse) —
+      // no merge evidence, so the stable-ID guard must reject it.
+      fetchOrderStatus: async () => status({
+        externalOrderId: 'M-77',
+        externalOrderNumber: 'WC-1001',
+        status: 'DESPATCHED',
+        dispatched: true,
+      }),
+      repointLink: async (linkId) => { repointed.push(linkId) },
+      applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+      fetchDelta: async () => [status(MERGED_SURVIVOR)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async () => {},
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(applied, [])
+  assert.deepEqual(repointed, [])
+  assert.equal(counters.pending, 1)
+})
+
 test('(m) [o3d-bjc finding 3a] a delta-fetch failure is surfaced as deltaError (not swallowed) while the sweep still per-order reconciles', async () => {
   const { counters, deltaError } = await runWmsDispatchSweepCore(
     deps({
