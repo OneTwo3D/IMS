@@ -6,6 +6,7 @@ import {
   CRON_RATE_LIMIT_FIVE_MINUTE_MAX,
   CRON_RATE_LIMIT_MAX,
   CRON_RATE_LIMIT_WINDOW_MS,
+  E2E_GLOBAL_CAP_WINDOW_MS,
   cronRateLimitGlobalKey,
   cronRateLimitKey,
   enforceCronRateLimit,
@@ -221,19 +222,29 @@ test('a capped E2E job cannot exceed its ceiling by rotating source IPs (tenant-
   const ATTEMPTS_PER_IP = 3
   const SOURCE_IPS = Array.from({ length: 50 }, (_, i) => `203.0.113.${i + 1}`)
 
+  // Spread the traffic across simulated HOURS, not one instant: an hourly ceiling would silently refill
+  // between rounds, so a same-instant burst would pass while sustained abuse still drained the daily quota.
+  const HOURS = 6
   const drive = async (): Promise<number> => {
-    const backend = new MemoryRateLimitBackend(() => Date.UTC(2026, 5, 9, 12, 0, 0))
+    let now = Date.UTC(2026, 5, 9, 12, 0, 0)
+    const backend = new MemoryRateLimitBackend(() => now)
     const checker = (key: string, max: number, windowMs: number) => backend.check(key, max, windowMs)
     let allowed = 0
-    for (const ip of SOURCE_IPS) {
-      for (let attempt = 0; attempt < ATTEMPTS_PER_IP; attempt += 1) {
-        const request = new Request('https://ims.example.com/api/cron/xero-tax-rate-drift', {
-          headers: { 'x-real-ip': ip },
-        })
-        const denial = await enforceCronRateLimit(DRIFT, { request, checker })
-        if (denial === null) allowed += 1
-        else assert.equal(denial.status, 429)
+    for (let hour = 0; hour < HOURS; hour += 1) {
+      for (const ip of SOURCE_IPS) {
+        for (let attempt = 0; attempt < ATTEMPTS_PER_IP; attempt += 1) {
+          const request = new Request('https://ims.example.com/api/cron/xero-tax-rate-drift', {
+            headers: { 'x-real-ip': ip },
+          })
+          const denial = await enforceCronRateLimit(DRIFT, { request, checker })
+          if (denial === null) allowed += 1
+          else assert.equal(denial.status, 429)
+        }
       }
+      // Next hour: every IP-scoped bucket has refilled, the daily one has not. The +1ms matters — the
+      // backend's window is SLIDING and drops entries strictly older than `now - windowMs`, so an advance of
+      // exactly windowMs leaves the previous entry live and the IP would only refill every other hour.
+      now += 60 * 60_000 + 1
     }
     return allowed
   }
@@ -243,7 +254,9 @@ test('a capped E2E job cannot exceed its ceiling by rotating source IPs (tenant-
     assert.equal(
       allowed,
       CAP,
-      `150 requests from 50 distinct IPs must yield exactly ${CAP} live sweeps, not ${CAP} per IP`,
+      `${HOURS * SOURCE_IPS.length * ATTEMPTS_PER_IP} requests from ${SOURCE_IPS.length} IPs over ${HOURS} ` +
+        `hours must yield exactly ${CAP} live sweeps — the ceiling is a tenant-wide DAILY budget, so it is ` +
+        `neither multiplied by the caller count nor refilled hourly`,
     )
   })
 
@@ -251,8 +264,43 @@ test('a capped E2E job cannot exceed its ceiling by rotating source IPs (tenant-
   // per-IP 1/hour slice still applies and no legitimate scheduled caller gains a new denial path.
   await withEnvAsync({ E2E_TEST_MODE: undefined, E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
     const allowed = await drive()
-    assert.equal(allowed, SOURCE_IPS.length, 'production keeps the IP-scoped 1/hour slice, unchanged')
+    assert.equal(
+      allowed,
+      SOURCE_IPS.length * HOURS,
+      'production keeps the IP-scoped 1/hour slice — one per IP per hour, unchanged',
+    )
   })
+})
+
+test('the tenant-wide ceiling is applied over 24h, not the job window (daily quota is what it protects)', async () => {
+  // Pins the WINDOW, which the counting test alone cannot: with the job's 1h window the budget would refill
+  // every hour (~480 live Xero calls a day against a ~1000/day shared tenant quota) and bound nothing.
+  const seen: Array<{ key: string; max: number; windowMs: number }> = []
+  await withEnvAsync({ E2E_TEST_MODE: '1', E2E_CRON_RATE_LIMIT_MAX: '10000' }, async () => {
+    await enforceCronRateLimit('xero-tax-rate-drift', {
+      request: new Request('https://ims.example.com/api/cron/xero-tax-rate-drift', {
+        headers: { 'x-real-ip': '203.0.113.9' },
+      }),
+      checker: async (key, max, windowMs) => {
+        seen.push({ key, max, windowMs })
+        return { allowed: true, retryAfterSec: 0, remaining: 0 }
+      },
+    })
+  })
+
+  assert.deepEqual(seen, [
+    {
+      key: cronRateLimitKey('xero-tax-rate-drift', '203.0.113.9'),
+      max: 20,
+      windowMs: CRON_RATE_LIMIT_WINDOW_MS,
+    },
+    {
+      key: cronRateLimitGlobalKey('xero-tax-rate-drift'),
+      max: 20,
+      windowMs: E2E_GLOBAL_CAP_WINDOW_MS,
+    },
+  ])
+  assert.equal(E2E_GLOBAL_CAP_WINDOW_MS, 24 * 60 * 60_000, 'the tenant-wide budget window is a full day')
 })
 
 test('five-minute cron quota keeps jitter headroom beyond exact twelve-per-hour cadence', async () => {

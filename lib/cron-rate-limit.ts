@@ -75,6 +75,19 @@ export function cronRateLimitGlobalKey(jobName: string): string {
 }
 
 /**
+ * The tenant-wide ceiling is a DAILY budget, not an hourly one — deliberately decoupled from the job's own
+ * window. The quota it protects is a daily one (Xero allows ~1000 calls/day per tenant), so an hourly
+ * ceiling would not bound it: 20/hour sustained is ~480/day, roughly half the shared allowance, which is
+ * exactly the exhaustion the ceiling exists to prevent (Codex). Applied over 24h, the ceiling IS the daily
+ * budget — 20 live sweeps a day, tenant-wide, whatever the caller does.
+ *
+ * Consequence for the rig, which is the intended trade: X-04 spends 3 of the 20 per run, so ~6 runs a day
+ * before it 429s. The backend is memory-backed, so restarting ims-e2e-dev.service clears it (the same
+ * restart that clears the login limiter).
+ */
+export const E2E_GLOBAL_CAP_WINDOW_MS = 24 * 60 * 60_000
+
+/**
  * The only cron jobs whose 1/hour limit an e2e run legitimately needs widened, each mapped to an OPTIONAL
  * per-job ceiling on how far `E2E_CRON_RATE_LIMIT_MAX` may raise it. Keep this list minimal — every entry
  * is a job a leaked E2E_CRON_RATE_LIMIT_MAX could widen (only if E2E_TEST_MODE=1 is ALSO set), so it is the
@@ -89,8 +102,8 @@ export function cronRateLimitGlobalKey(jobName: string): string {
  *   /TaxRates call, and the rig shares a quota-limited Xero tenant with stage (~1000 calls/day), so this is
  *   capped WELL below that quota regardless of how large E2E_CRON_RATE_LIMIT_MAX is set — a leaked secret or
  *   runaway retry loop can never turn the e2e allowance into shared-tenant quota exhaustion (Codex). 20
- *   comfortably covers X-04's three sweeps with retry headroom. A ceiling here is enforced TENANT-WIDE, not
- *   merely per source IP — see e2eGlobalCapFor / cronRateLimitGlobalKey.
+ *   comfortably covers X-04's three sweeps with retry headroom. A ceiling here is a TENANT-WIDE DAILY budget,
+ *   not a per-IP hourly one — see e2eGlobalCapFor / cronRateLimitGlobalKey / E2E_GLOBAL_CAP_WINDOW_MS.
  */
 const E2E_OVERRIDE_JOBS = new Map<string, number | null>([
   ['accounting-daily-batch', null],
@@ -160,7 +173,9 @@ export async function enforceCronRateLimit(
   // a caller already denied on its own slice does not also burn the shared allowance. Null in production.
   const globalCap = e2eGlobalCapFor(jobName, baseMax)
   if (result.allowed && globalCap != null) {
-    result = await checker(cronRateLimitGlobalKey(jobName), globalCap, windowMs)
+    // E2E_GLOBAL_CAP_WINDOW_MS, NOT the job's own window: the quota being protected is daily, so an hourly
+    // ceiling would allow ~480 live calls a day and bound nothing that matters.
+    result = await checker(cronRateLimitGlobalKey(jobName), globalCap, E2E_GLOBAL_CAP_WINDOW_MS)
   }
 
   if (result.allowed) return null
