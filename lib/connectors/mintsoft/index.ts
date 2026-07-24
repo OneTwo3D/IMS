@@ -5,8 +5,9 @@ import {
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
-import { fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
+import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
 import { addMintsoftOrderComment, cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
+import { getSettingValue } from '@/lib/settings-store'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -82,6 +83,28 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftOrderStatus(orderNumber)
   }
 
+  async fetchOrderDelta(sinceIso: string): Promise<WmsOrderStatus[]> {
+    // Scope the delta to our own traffic where configured — on a shared 3PL
+    // tenant other clients' orders would otherwise consume the page budget.
+    // Any unset/unparseable filter is passed as undefined (no scoping).
+    const [clientId, channelId, warehouseId] = await Promise.all([
+      getSettingValue('mintsoft_client_id'),
+      getSettingValue('mintsoft_channel_id'),
+      getSettingValue('mintsoft_warehouse_id'),
+    ])
+    const toId = (value: string | null): number | undefined => {
+      if (!value) return undefined
+      const parsed = Number.parseInt(value.trim(), 10)
+      return Number.isFinite(parsed) ? parsed : undefined
+    }
+    return fetchMintsoftOrderList({
+      sinceLastUpdated: sinceIso,
+      clientId: toId(clientId),
+      channelId: toId(channelId),
+      warehouseId: toId(warehouseId),
+    })
+  }
+
   async probeOrderPresence(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
     return probeMintsoftOrderPresence(orderNumber)
   }
@@ -154,7 +177,7 @@ export {
   mintsoftRequest,
   upsertMintsoftProduct,
 } from './api/client'
-export { fetchMintsoftOrderStatus } from './api/orders'
+export { fetchMintsoftOrderList, fetchMintsoftOrderStatus, normalizeMintsoftOrderRow } from './api/orders'
 export { cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
 export {
   normalizeMintsoftAsn,

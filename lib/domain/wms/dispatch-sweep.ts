@@ -4,9 +4,10 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import type { WmsConnector, WmsConnectorId, WmsOrderTracking } from '@/lib/connectors/wms/types'
+import type { WmsConnector, WmsConnectorId, WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
+import { getSettingValue } from '@/lib/settings-store'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent } from './mutation-audit'
 
@@ -25,6 +26,58 @@ import { recordWmsMutationEvent } from './mutation-audit'
  */
 
 const DISPATCH_SWEEP_DEFAULT_BATCH_SIZE = 50
+
+/**
+ * Inbound Order/List delta defaults (mirrors the woo-mintsoft Python plugin).
+ * The delta hot-path fetches every order changed since a persisted watermark in
+ * ONE bulk call and processes only those; a throttled full reconcile restores
+ * the per-order poll so vanished/merged orders are still noticed.
+ */
+const DISPATCH_DELTA_DEFAULT_OVERLAP_SECONDS = 900
+const DISPATCH_DELTA_DEFAULT_LOOKBACK_SECONDS = 24 * 60 * 60
+const DISPATCH_DELTA_DEFAULT_RECONCILE_INTERVAL_SECONDS = 30 * 60
+/**
+ * Mintsoft compares SinceLastUpdated against LastUpdated in the tenant
+ * DATABASE's timezone, NOT UTC (verified live: the tenant runs Europe/London,
+ * so LastUpdated sits +1h under BST). The UTC cursor is converted into this
+ * zone before it's formatted. Overridable per-tenant via the
+ * `mintsoft_api_timezone` setting; `"UTC"` (or an invalid zone) disables the
+ * conversion.
+ */
+export const DISPATCH_DELTA_DEFAULT_TIMEZONE = 'Europe/London'
+
+/**
+ * Format a UTC instant as a `YYYY-MM-DDTHH:MM:SS` wall-clock string in `timeZone`.
+ * Intl handles the GMT/BST DST switch so the delta window is correct year-round.
+ * A blank/`"UTC"`/invalid zone yields the UTC wall-clock (no conversion).
+ */
+export function formatCursorInTimeZone(instant: Date, timeZone?: string | null): string {
+  const zone = timeZone && timeZone.trim() ? timeZone.trim() : 'UTC'
+  const build = (tz: string): Intl.DateTimeFormatPart[] =>
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).formatToParts(instant)
+
+  let parts: Intl.DateTimeFormatPart[]
+  try {
+    parts = build(zone)
+  } catch {
+    // Unknown/invalid IANA zone → send the cursor in UTC (no conversion).
+    parts = build('UTC')
+  }
+  const pick = (type: Intl.DateTimeFormatPart['type']): string =>
+    parts.find((part) => part.type === type)?.value ?? ''
+  // en-GB renders midnight as hour "24" in some runtimes — normalise to "00".
+  const hour = pick('hour') === '24' ? '00' : pick('hour')
+  return `${pick('year')}-${pick('month')}-${pick('day')}T${hour}:${pick('minute')}:${pick('second')}`
+}
 
 /** Lifecycle statuses where the IMS order has already left the dispatch-poll set. */
 const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] as const
@@ -108,6 +161,15 @@ export type WmsDispatchSweepDeps = {
   // so only CONSECUTIVE failures accumulate.
   recordDispatchError(candidate: WmsDispatchCandidate, reason: string): Promise<{ deadLettered: boolean }>
   clearDispatchFailures(linkId: string): Promise<void>
+  // Inbound Order/List delta (o3d-bjc). Optional so a WMS without a bulk delta
+  // (ShipHero) keeps per-order polling exactly as before. fetchDelta returns
+  // every order changed since `sinceIso` (already in the tenant timezone) and
+  // MUST throw on a truncated/failed delta so the sweep fails safe to a full
+  // per-order reconcile. getDeltaState/saveDeltaState persist the watermark +
+  // last-reconcile cursors (advanced only on a clean pass).
+  fetchDelta?(sinceIso: string): Promise<import('@/lib/connectors/wms/types').WmsOrderStatus[]>
+  getDeltaState?(): Promise<{ watermark: string | null; lastReconcile: string | null }>
+  saveDeltaState?(state: { watermark?: string; lastReconcile?: string }): Promise<void>
 }
 
 /**
@@ -190,8 +252,12 @@ async function reconcileSplitOrder(
 export async function reconcileOneOrder(
   deps: WmsDispatchSweepDeps,
   candidate: WmsDispatchCandidate,
+  // When a delta row for this order is preloaded (Order/List hot-path), use it
+  // instead of a per-order status fetch. `null`/omitted → fetch as before (the
+  // caller passes null to force a fetch for an ambiguous split — see the core).
+  preloaded?: WmsOrderStatus | null,
 ): Promise<{ action: 'dispatched' | 'pending' | 'error'; reason: string }> {
-  const status = await deps.fetchOrderStatus(candidate.externalOrderNumber)
+  const status = preloaded ?? (await deps.fetchOrderStatus(candidate.externalOrderNumber))
   if (!status) {
     return { action: 'pending', reason: 'Order not found in the WMS' }
   }
@@ -231,16 +297,95 @@ export async function reconcileOneOrder(
  * Testable core — operates purely on the injected deps so the reconciliation can be
  * unit-tested with in-memory fakes (no DB / no HTTP).
  */
+export type WmsDispatchSweepCoreOptions = {
+  batchSize?: number
+  /** Injected clock for deterministic cursor tests; defaults to now. */
+  now?: Date
+  /** Feature flag — when false, always per-order poll (behaves as pre-delta). */
+  deltaEnabled?: boolean
+  /** Tenant timezone the delta cursor is converted into before formatting. */
+  deltaTimeZone?: string
+  deltaOverlapSeconds?: number
+  deltaLookbackSeconds?: number
+  reconcileIntervalSeconds?: number
+}
+
 export async function runWmsDispatchSweepCore(
   deps: WmsDispatchSweepDeps,
-  options?: { batchSize?: number },
+  options?: WmsDispatchSweepCoreOptions,
 ): Promise<{ counters: WmsDispatchCounters; logs: WmsDispatchLog[] }> {
   const batchSize = options?.batchSize ?? DISPATCH_SWEEP_DEFAULT_BATCH_SIZE
+  const now = options?.now ?? new Date()
   const counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
   const logs: WmsDispatchLog[] = []
 
+  // --- Inbound Order/List delta (o3d-bjc) ---------------------------------
+  // Only engages when the connector supplies a bulk delta AND the flag is on.
+  // deltaMap groups changed orders by their order number (a split shares one
+  // number across several part-rows → a list). deltaFetched/ranReconcile gate
+  // the clean-pass cursor advance; passClean holds it back on any error.
+  const deltaActive = Boolean(deps.fetchDelta) && (options?.deltaEnabled ?? true)
+  let deltaMap: Map<string, WmsOrderStatus[]> | null = null
+  let reconcileDue = true
+  let deltaFetched = false
+  let ranReconcile = false
+  let passClean = true
+
+  if (deltaActive) {
+    const state = deps.getDeltaState
+      ? await deps.getDeltaState()
+      : { watermark: null, lastReconcile: null }
+    const overlapMs = (options?.deltaOverlapSeconds ?? DISPATCH_DELTA_DEFAULT_OVERLAP_SECONDS) * 1000
+    const lookbackMs = (options?.deltaLookbackSeconds ?? DISPATCH_DELTA_DEFAULT_LOOKBACK_SECONDS) * 1000
+    const intervalMs = (options?.reconcileIntervalSeconds ?? DISPATCH_DELTA_DEFAULT_RECONCILE_INTERVAL_SECONDS) * 1000
+
+    const watermarkMs = state.watermark ? Date.parse(state.watermark) : NaN
+    const baseMs = Number.isFinite(watermarkMs) ? watermarkMs : now.getTime() - lookbackMs
+    // Bound the window so a watermark held back by a prior dirty pass can't let
+    // the query window grow without limit.
+    const sinceMs = Math.max(baseMs - overlapMs, now.getTime() - lookbackMs)
+    const sinceIso = formatCursorInTimeZone(new Date(sinceMs), options?.deltaTimeZone ?? DISPATCH_DELTA_DEFAULT_TIMEZONE)
+
+    try {
+      const rows = await deps.fetchDelta!(sinceIso)
+      deltaMap = new Map<string, WmsOrderStatus[]>()
+      for (const row of rows) {
+        const key = row.externalOrderNumber
+        if (!key) continue
+        const bucket = deltaMap.get(key)
+        if (bucket) bucket.push(row)
+        else deltaMap.set(key, [row])
+      }
+      deltaFetched = true
+      const lastReconcileMs = state.lastReconcile ? Date.parse(state.lastReconcile) : NaN
+      reconcileDue = !Number.isFinite(lastReconcileMs) || now.getTime() - lastReconcileMs >= intervalMs
+    } catch (error) {
+      // Fail SAFE: a fetch error must never masquerade as an empty delta that
+      // would silently skip every order. Full per-order poll this run.
+      console.error('[wms-dispatch-sweep] Order/List delta fetch failed — full per-order poll this run:', scrubWmsError(error, 'delta fetch error'))
+      deltaMap = null
+      reconcileDue = true
+    }
+  }
+
   const candidates = await deps.listCandidates(batchSize)
   for (const candidate of candidates) {
+    // Resolve how to process this candidate: prefer the delta row (no per-order
+    // call); else per-order poll on a reconcile tick; else skip an unchanged
+    // order (no fetch, no counters, no failure bookkeeping).
+    const deltaRows = deltaMap?.get(candidate.externalOrderNumber)
+    let preload: WmsOrderStatus | null | undefined
+    if (deltaMap && deltaRows && deltaRows.length > 0) {
+      // A split shares one number across >1 rows — preloading a single row is
+      // ambiguous, so force a fetch (which re-reads every part) by passing null.
+      preload = deltaRows.length === 1 ? deltaRows[0] : null
+    } else if (reconcileDue) {
+      preload = undefined // legacy per-order fetch (not-found / merge detection)
+      ranReconcile = true
+    } else {
+      continue
+    }
+
     counters.totalChecked += 1
 
     // Reconcile first; the failure-tracking bookkeeping below runs OUTSIDE this
@@ -249,10 +394,13 @@ export async function runWmsDispatchSweepCore(
     // recursed into itself) nor abort the rest of the batch.
     let outcome: { action: 'dispatched' | 'pending' | 'error'; reason: string }
     try {
-      outcome = await reconcileOneOrder(deps, candidate)
+      outcome = await reconcileOneOrder(deps, candidate, preload)
     } catch (error) {
       outcome = { action: 'error', reason: scrubWmsError(error, 'WMS dispatch sweep error') }
     }
+    // Any error holds the watermark back so a changed row can't age out of the
+    // next window before it's applied.
+    if (outcome.action === 'error') passClean = false
     counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
 
     // 6oyu.2: only CONSECUTIVE errors dead-letter — any non-error outcome resets.
@@ -275,6 +423,18 @@ export async function runWmsDispatchSweepCore(
       action: outcome.action,
       reason,
     })
+  }
+
+  // Advance the delta cursors only after a fully clean pass, so a Mintsoft/WC
+  // blip can't age a changed row out of the next window before it's applied.
+  //  - watermark: advance iff we fetched a delta this run (store UTC ISO);
+  //  - lastReconcile: stamp iff the per-order reconcile pass ran, so a skipped
+  //    reconcile re-runs next tick instead of waiting a full interval.
+  if (deltaActive && passClean && deps.saveDeltaState && (deltaFetched || ranReconcile)) {
+    const toSave: { watermark?: string; lastReconcile?: string } = {}
+    if (deltaFetched) toSave.watermark = now.toISOString()
+    if (ranReconcile) toSave.lastReconcile = now.toISOString()
+    await deps.saveDeltaState(toSave)
   }
 
   return { counters, logs }
@@ -319,6 +479,42 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
     fetchOrderStatus(orderNumber) {
       return connector.fetchOrderStatus ? connector.fetchOrderStatus(orderNumber) : Promise.resolve(null)
     },
+    // Inbound Order/List delta (o3d-bjc). Only wired when the connector supports
+    // a bulk delta; the watermark + last-reconcile cursors live in Setting keys.
+    ...(connector.fetchOrderDelta
+      ? {
+          fetchDelta: (sinceIso: string) => connector.fetchOrderDelta!(sinceIso),
+          async getDeltaState() {
+            const rows = await db.setting.findMany({
+              where: { key: { in: ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] } },
+              select: { key: true, value: true },
+            })
+            const map = new Map(rows.map((row) => [row.key, row.value]))
+            return {
+              watermark: map.get('mintsoft_order_delta_since') || null,
+              lastReconcile: map.get('mintsoft_order_reconcile_at') || null,
+            }
+          },
+          async saveDeltaState(state: { watermark?: string; lastReconcile?: string }) {
+            const writes: Array<Promise<unknown>> = []
+            if (state.watermark !== undefined) {
+              writes.push(db.setting.upsert({
+                where: { key: 'mintsoft_order_delta_since' },
+                create: { key: 'mintsoft_order_delta_since', value: state.watermark },
+                update: { value: state.watermark },
+              }))
+            }
+            if (state.lastReconcile !== undefined) {
+              writes.push(db.setting.upsert({
+                where: { key: 'mintsoft_order_reconcile_at' },
+                create: { key: 'mintsoft_order_reconcile_at', value: state.lastReconcile },
+                update: { value: state.lastReconcile },
+              }))
+            }
+            await Promise.all(writes)
+          },
+        }
+      : {}),
     async applyDispatch(orderId, tracking) {
       // q66in.4.6 audit timeline: capture the order status pre-image so the
       // dispatch event carries a real before/after, not just the target state.
@@ -484,6 +680,19 @@ export async function runWmsDispatchSweep(
 
   const deps = options?.deps ?? createPrismaDispatchDeps(connectorId, connector)
 
+  // Resolve the inbound Order/List delta config from settings (o3d-bjc). The
+  // flag defaults ON; `mintsoft_inbound_delta_enabled === 'false'` turns it off
+  // (behaves exactly as pre-delta). The cursor is sent in the tenant timezone.
+  const [deltaEnabledSetting, deltaTimeZoneSetting] = await Promise.all([
+    getSettingValue('mintsoft_inbound_delta_enabled'),
+    getSettingValue('mintsoft_api_timezone'),
+  ])
+  const coreOptions: WmsDispatchSweepCoreOptions = {
+    batchSize: options?.batchSize,
+    deltaEnabled: deltaEnabledSetting !== 'false',
+    deltaTimeZone: deltaTimeZoneSetting || DISPATCH_DELTA_DEFAULT_TIMEZONE,
+  }
+
   const startedAt = new Date()
   const job = await db.wmsSyncJob.create({
     data: { connector: connectorId, type: 'DISPATCH_SYNC', status: 'RUNNING', startedAt, triggeredBy },
@@ -494,7 +703,7 @@ export async function runWmsDispatchSweep(
   let counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
 
   try {
-    const core = await runWmsDispatchSweepCore(deps, options)
+    const core = await runWmsDispatchSweepCore(deps, coreOptions)
     counters = core.counters
     const { logs } = core
 

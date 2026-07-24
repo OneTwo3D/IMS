@@ -270,6 +270,14 @@ export interface WmsConnector {
   /** Resolve the live order status for a storefront order number, if supported. */
   fetchOrderStatus?(orderNumber: string): Promise<WmsOrderStatus | null>
   /**
+   * Bulk delta: every order changed since `sinceIso` (already expressed in the
+   * WMS tenant's timezone), for the dispatch sweep's Order/List hot-path. One
+   * (paginated) call replaces N per-order status polls. Optional — a WMS with
+   * no delta endpoint (ShipHero) omits it and the sweep per-order polls as
+   * before. Implementations MUST throw (never return a partial list) on a
+   * truncated/failed delta so the caller can fail safe to the per-order poll. */
+  fetchOrderDelta?(sinceIso: string): Promise<WmsOrderStatus[]>
+  /**
    * Tri-state order-presence probe for reconciliation (q66in.4.4). Distinct from
    * fetchOrderStatus, whose null CONFLATES "definitively absent" with
    * "ambiguous match" (e.g. several merged candidates) — a reconcile that reads

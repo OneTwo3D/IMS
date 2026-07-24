@@ -121,27 +121,23 @@ export function buildDeepLink(template: string, externalOrderId: string): string
   return base.replace('{id}', encodeURIComponent(externalOrderId))
 }
 
-export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
-  const reference = orderNumber.trim()
-  if (!reference) return null
-
-  const matches = await searchMintsoftOrdersByNumber(reference)
-  const picked = pickOrderRow(matches, reference)
-  if (!picked) return null
-
-  const pickedId = toStr(picked.ID ?? picked.Id ?? picked.id)
-  if (!pickedId) return null
-
-  // Re-read by id for authoritative status/tracking; fall back to the search row
-  // if the detail 404s (e.g. the order was merged away after the search).
-  const order = (await fetchMintsoftOrderById(pickedId)) ?? picked
-  const externalOrderId = toStr(order.ID ?? order.Id ?? order.id) ?? pickedId
+/**
+ * Build a WmsOrderStatus from a single raw Mintsoft Order row. Shared by the
+ * per-order lookup (fetchMintsoftOrderStatus) and the bulk Order/List delta
+ * (fetchMintsoftOrderList) so both derive status/tracking/split/merge/deep-link
+ * identically. Returns null when the row has no resolvable id. The row is
+ * trusted as-is (the delta path does not re-read by id) — callers that need the
+ * authoritative re-read do it before calling this.
+ */
+export async function normalizeMintsoftOrderRow(order: RawOrder): Promise<WmsOrderStatus | null> {
+  const externalOrderId = toStr(order.ID ?? order.Id ?? order.id)
+  if (!externalOrderId) return null
 
   const statusId = toInt(order.OrderStatusId)
   const statusMap = await fetchMintsoftOrderStatusMap()
   const status = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
 
-  const externalOrderNumber = toStr(order.OrderNumber) ?? reference
+  const externalOrderNumber = toStr(order.OrderNumber) ?? ''
   const partCount = toInt(order.NumberOfParts)
   const merged = mergedParts(externalOrderNumber)
   const settings = await getMintsoftSettings()
@@ -161,6 +157,96 @@ export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<Wms
     dispatched: isMintsoftDispatched({ status, tracking }),
     raw: order,
   }
+}
+
+export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
+  const reference = orderNumber.trim()
+  if (!reference) return null
+
+  const matches = await searchMintsoftOrdersByNumber(reference)
+  const picked = pickOrderRow(matches, reference)
+  if (!picked) return null
+
+  const pickedId = toStr(picked.ID ?? picked.Id ?? picked.id)
+  if (!pickedId) return null
+
+  // Re-read by id for authoritative status/tracking; fall back to the search row
+  // if the detail 404s (e.g. the order was merged away after the search).
+  const order = (await fetchMintsoftOrderById(pickedId)) ?? picked
+  const normalized = await normalizeMintsoftOrderRow(order)
+  if (!normalized) return null
+
+  // Preserve the historical fallbacks: a row with no id echoes the picked id;
+  // a row with no number echoes the caller's reference.
+  return {
+    ...normalized,
+    externalOrderId: normalized.externalOrderId || pickedId,
+    externalOrderNumber: normalized.externalOrderNumber || reference,
+  }
+}
+
+/**
+ * Bulk Order/List delta: every order changed since `sinceLastUpdated`, in one
+ * (paginated) call, normalised to WmsOrderStatus. This is the replacement for
+ * the per-active-order status poll — the dispatch sweep processes the orders in
+ * this delta directly and only per-order polls on a throttled reconcile.
+ *
+ * `sinceLastUpdated` must already be a `YYYY-MM-DDTHH:MM:SS` timestamp in the
+ * Mintsoft tenant's own timezone (Mintsoft compares SinceLastUpdated against
+ * LastUpdated in the database's zone, NOT UTC — the caller does the conversion).
+ * `IncludeOrderItems=true` + `SortOldestFirst=true` are always sent; ClientId /
+ * WarehouseId / ChannelId scope the query to our traffic on a shared tenant.
+ *
+ * THROWS (rather than returning a partial list) when the result overflows
+ * `maxPages * limit` — a truncated delta must never look complete, or the sweep
+ * would advance its watermark past orders it never saw. Like every other
+ * client.ts fetch it also throws on any HTTP error, so the caller can tell
+ * "nothing changed" (empty list) from "couldn't complete the delta" (throw) and
+ * fail safe to the per-order reconcile.
+ */
+export async function fetchMintsoftOrderList(opts: {
+  sinceLastUpdated: string
+  clientId?: number | null
+  warehouseId?: number | null
+  channelId?: number | null
+  limit?: number
+  maxPages?: number
+}): Promise<WmsOrderStatus[]> {
+  const since = opts.sinceLastUpdated.trim()
+  if (!since) return []
+  const limit = opts.limit && opts.limit > 0 ? Math.trunc(opts.limit) : 200
+  const maxPages = opts.maxPages && opts.maxPages > 0 ? Math.trunc(opts.maxPages) : 50
+
+  const collected: RawOrder[] = []
+  for (let pageNo = 1; pageNo <= maxPages; pageNo += 1) {
+    const query = new URLSearchParams({
+      SinceLastUpdated: since,
+      Limit: String(limit),
+      PageNo: String(pageNo),
+      SortOldestFirst: 'true',
+      IncludeOrderItems: 'true',
+    })
+    if (opts.clientId != null) query.set('ClientId', String(opts.clientId))
+    if (opts.warehouseId != null) query.set('WarehouseId', String(opts.warehouseId))
+    if (opts.channelId != null) query.set('ChannelId', String(opts.channelId))
+
+    const result = await mintsoftRequest<unknown>(`/api/Order/List?${query.toString()}`)
+    if (result.error) throw new Error(result.error)
+
+    const page = extractMintsoftArrayPayload(result.data) as RawOrder[]
+    collected.push(...page)
+    if (page.length < limit) {
+      const normalized = await Promise.all(collected.map((row) => normalizeMintsoftOrderRow(row)))
+      return normalized.filter((row): row is WmsOrderStatus => row !== null)
+    }
+  }
+
+  // No short page within the budget ⇒ more changed rows than maxPages*limit.
+  // Fail closed so the caller keeps its watermark and reconciles.
+  throw new Error(
+    `Mintsoft Order/List delta exceeded ${maxPages} pages at limit=${limit} (since=${since}); ` +
+      'refusing to treat a truncated delta as complete',
+  )
 }
 
 /**
