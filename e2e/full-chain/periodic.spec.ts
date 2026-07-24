@@ -582,6 +582,18 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       // defers the failure to the explicit count assertion.
       stockInTransitIds = await externalIdsFor({ type: 'STOCK_IN_TRANSIT', referenceId: goodsPoId, expected: 1 })
         .catch((): string[] => [])
+
+      // SECOND registration pass — not a redundant one. settledJournalExternalIds only WARNS and returns []
+      // when its database read fails transiently, so Xero can hold a posted journal, the recovery above can
+      // miss it, and this read (a later, independent connection) can still resolve it. Registering whatever
+      // EITHER path resolved closes that window; trackDocument dedupes, so re-registering costs nothing
+      // (Codex). The residual gap — Xero accepted a POST whose id no read can resolve — needs a run-id-tagged
+      // Xero rescan of manual journals, the suite-wide follow-up tracked as o3d-lgo.7.1.
+      for (const id of stockInTransitIds) {
+        trackDocument('ManualJournals', id, `X-06 stock-in-transit reval ${runTag(runId)}`)
+      }
+      const receiptId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: goodsPoId }).catch(() => '')
+      if (receiptId) trackDocument('ManualJournals', receiptId, `X-06 stock receipt ${runTag(runId)}`)
     }
 
     // THE CRUX: NO COGS_JOURNAL was queued for the goods PO. The 100 units left via TRANSFER_OUT, so the
