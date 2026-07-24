@@ -44,20 +44,40 @@ function strictPositiveInt(value: unknown): number | null {
 
 /**
  * A DespatchDate we are willing to treat as EVIDENCE the goods left. Mintsoft
- * sends `YYYY-MM-DDTHH:MM:SS`; anything that isn't a real calendar timestamp —
- * free text, `"0"` (which `new Date` would happily read as the year 2000), or a
- * .NET default/sentinel like `0001-01-01T00:00:00` — is NOT proof of despatch.
- * Without this check a malformed field would both mark an order SHIPPED and
+ * sends `YYYY-MM-DDTHH:MM:SS` (sometimes date-only, sometimes with fractional
+ * seconds and/or a zone). Anything that isn't a real calendar timestamp is NOT
+ * proof of despatch — and `Date.parse` alone is far too permissive to decide
+ * that: it happily accepts `"2026-07-15junk"` (trailing text ignored),
+ * `"2026-02-30"` and `"2026-04-31"` (rolled over into the next month),
+ * `"24:00:00"`, and reads bare `"0"` as the year 2000. So the grammar is fully
+ * ANCHORED and each component is range- and calendar-checked. .NET defaults
+ * (`0001-01-01T00:00:00`) fall below the floor.
+ *
+ * Without this, a malformed field would both mark an IMS order SHIPPED and
  * satisfy the unknown-status escape hatch below.
  */
-const DESPATCH_DATE_SHAPE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?/
-const DESPATCH_DATE_FLOOR_MS = Date.UTC(1990, 0, 1)
+const DESPATCH_DATE_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,7})?)?\s*(?:Z|[+-]\d{2}:?\d{2})?)?$/
+const DESPATCH_DATE_MIN_YEAR = 1990
 
 export function parseMintsoftDespatchDate(value: unknown): string | null {
   const raw = toStr(value)
-  if (!raw || !DESPATCH_DATE_SHAPE.test(raw)) return null
-  const ms = Date.parse(raw)
-  if (!Number.isFinite(ms) || ms < DESPATCH_DATE_FLOOR_MS) return null
+  if (!raw) return null
+  const match = DESPATCH_DATE_PATTERN.exec(raw)
+  if (!match) return null
+  const [, yearRaw, monthRaw, dayRaw, hourRaw, minuteRaw, secondRaw] = match
+  const year = Number(yearRaw)
+  const month = Number(monthRaw)
+  const day = Number(dayRaw)
+  // Checked BEFORE Date.UTC, whose two-digit-year remapping would turn year 1
+  // into 1901 and whose overflow silently rolls 02-30 into March.
+  if (year < DESPATCH_DATE_MIN_YEAR || month < 1 || month > 12 || day < 1 || day > 31) return null
+  const utc = new Date(Date.UTC(year, month - 1, day))
+  if (utc.getUTCFullYear() !== year || utc.getUTCMonth() !== month - 1 || utc.getUTCDate() !== day) return null
+  if (hourRaw !== undefined) {
+    if (Number(hourRaw) > 23 || Number(minuteRaw) > 59) return null
+    if (secondRaw !== undefined && Number(secondRaw) > 59) return null
+  }
   return raw
 }
 
@@ -266,7 +286,11 @@ export async function normalizeMintsoftOrderRow(
   const externalOrderId = toStr(order.ID ?? order.Id ?? order.id)
   if (!externalOrderId) return null
 
-  const statusId = toInt(order.OrderStatusId)
+  // strictPositiveInt, not toInt: toInt would read "4junk" as 4 and truncate 4.7 to
+  // 4, letting a malformed id resolve onto a REAL status — DESPATCHED off drifted
+  // input falsely ships the order, and a pending one advances the watermark.
+  // A malformed id is simply unresolved, which strictStatus below then rejects.
+  const statusId = strictPositiveInt(order.OrderStatusId)
   const statusMap = ctx?.statusMap ?? (await fetchMintsoftOrderStatusMap())
   const status = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
 
@@ -507,7 +531,9 @@ export async function fetchMintsoftOrderParts(
     if (!searchId) continue
     const detail = (await fetchMintsoftOrderById(searchId, scopedClientId)) ?? row
     const externalId = toStr(detail.ID ?? detail.Id ?? detail.id) ?? searchId
-    const statusId = toInt(detail.OrderStatusId)
+    // Same no-coercion rule as the order-level status (see normalizeMintsoftOrderRow):
+    // a coerced part status could falsely complete a split order.
+    const statusId = strictPositiveInt(detail.OrderStatusId)
     const partStatus = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
     const partTracking = readTracking(detail)
     parts.push({

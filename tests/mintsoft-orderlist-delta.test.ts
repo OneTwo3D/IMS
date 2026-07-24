@@ -54,6 +54,10 @@ function deps(overrides: Partial<WmsDispatchSweepDeps>): WmsDispatchSweepDeps {
     repointLink: async () => {},
     recordDispatchError: async () => ({ deadLettered: false }),
     clearDispatchFailures: async () => {},
+    // Merge evidence is number-based, so the sweep asks how many links claim each
+    // number before it will repoint. Default: one claimant per number (the normal
+    // case); tests that model a reused number override this.
+    countLinksByOrderNumber: async (numbers) => new Map(numbers.map((number) => [number, 1])),
     ...overrides,
   }
 }
@@ -175,7 +179,7 @@ test('(d) a delta fetch that throws falls back to a full per-order poll (every c
       ],
       fetchOrderStatus: async (orderNumber) => {
         fetched.push(orderNumber)
-        return status({ status: 'PROCESSING' })
+        return status({ externalOrderNumber: orderNumber, externalOrderId: orderNumber === 'WC-1001' ? 'M-1' : 'M-2', status: 'PROCESSING' })
       },
       fetchDelta: async () => {
         throw new Error('Mintsoft 500')
@@ -681,12 +685,13 @@ test('[o3d-bjc.2.1] an AMBIGUOUS merge (several active links share the number) r
   const { counters, logs } = await runWmsDispatchSweepCore(
     deps({
       listActiveByExternalOrderIds: async () => [],
-      // Order numbers are not unique: two live links both claim WC-1001. The
-      // survivor absorbed only ONE of them, and nothing in the row says which.
+      // Order numbers are not unique: two links both claim WC-1001. The survivor
+      // absorbed only ONE of them, and nothing in the row says which.
       listActiveByOrderNumbers: async () => [
         candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
         candidate({ linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1001', externalOrderId: 'M-77' }),
       ],
+      countLinksByOrderNumber: async (numbers) => new Map(numbers.map((n) => [n, n === 'WC-1001' ? 2 : 1])),
       fetchOrderStatus: async () => { statusFetches += 1; return status(MERGED_SURVIVOR) },
       repointLink: async (linkId) => { repointed.push(linkId) },
       applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
@@ -740,6 +745,260 @@ test('[o3d-bjc.2.1] a fresh watermark inside the lookback still advances normall
     { now: NOW, deltaTimeZone: 'UTC' },
   )
   assert.deepEqual(saved, [{ watermark: NOW.toISOString() }])
+})
+
+// --- Codex round 7: every delta-triggered "unknown" must hold the watermark ---
+
+const SPLIT_ROW = { externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', isSplit: true, partCount: 2 }
+
+test('[o3d-bjc.2.1] a split delta row with NO parts visible is unresolved — the watermark is held', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { counters, unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      fetchOrderStatus: async () => status(SPLIT_ROW),
+      fetchOrderParts: async () => [], // the WMS says it split but shows no parts
+      fetchDelta: async () => [status(SPLIT_ROW)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(counters.pending, 1)
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] a split delta row with FEWER part rows than the WMS reports is unresolved', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      fetchOrderStatus: async () => status(SPLIT_ROW),
+      // partCount says 2, only part 1 is visible → enumeration incomplete.
+      fetchOrderParts: async () => [part({ partNumber: 1, status: 'PICKED' })],
+      fetchDelta: async () => [status(SPLIT_ROW)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] a FULLY enumerated split that is genuinely part-way despatched is clean pending — the watermark advances', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { counters, unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      // A split number needs the shared-number supplement for coverage to be provable.
+      listActiveByOrderNumbers: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      fetchOrderStatus: async () => status(SPLIT_ROW),
+      // Both parts visible; one shipped. State is KNOWN — just not complete.
+      fetchOrderParts: async () => [
+        part({ externalId: 'P1', partNumber: 1, status: 'DESPATCHED', dispatched: true }),
+        part({ externalId: 'P2', partNumber: 2, status: 'PICKED' }),
+      ],
+      fetchPartItems: async () => [{ sku: 'SKU-1', qty: 1 }],
+      fetchDelta: async () => [status(SPLIT_ROW)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(counters.pending, 1)
+  assert.equal(unresolved, 0, 'a known-but-incomplete split is not "unresolved"')
+  assert.deepEqual(saved, [{ watermark: NOW.toISOString() }])
+})
+
+test('[o3d-bjc.2.1] a split delta row on a connector with no per-part support is unresolved', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      partsSupported: false,
+      listActiveByExternalOrderIds: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      fetchOrderStatus: async () => status(SPLIT_ROW),
+      fetchDelta: async () => [status(SPLIT_ROW)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] a delta-triggered forced fetch that returns nothing is unresolved even with no expected stable ID', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      // Split → forced authoritative fetch (no expectedExternalOrderId) → null.
+      fetchOrderStatus: async () => null,
+      fetchDelta: async () => [status(SPLIT_ROW)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] a TERMINAL link sharing the number still makes a merge ambiguous (the count is not taken from the candidate set)', async () => {
+  const repointed: string[] = []
+  const applied: string[] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      // Only ONE eligible link is returned — the other claimant is shipped or
+      // dead-lettered, so the candidate queries filter it out entirely.
+      listActiveByOrderNumbers: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      // …but the complete claimant count still sees both.
+      countLinksByOrderNumber: async (numbers) => new Map(numbers.map((n) => [n, n === 'WC-1001' ? 2 : 1])),
+      fetchOrderStatus: async () => status(MERGED_SURVIVOR),
+      repointLink: async (linkId) => { repointed.push(linkId) },
+      applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+      fetchDelta: async () => [status(MERGED_SURVIVOR)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(repointed, [])
+  assert.deepEqual(applied, [])
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] a connector that cannot count claimants refuses the merge relaxation outright', async () => {
+  const repointed: string[] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      countLinksByOrderNumber: undefined,
+      fetchOrderStatus: async () => status(MERGED_SURVIVOR),
+      repointLink: async (linkId) => { repointed.push(linkId) },
+      fetchDelta: async () => [status(MERGED_SURVIVOR)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(repointed, [])
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] the RECONCILE pass also refuses to repoint a merge on a shared number', async () => {
+  const repointed: string[] = []
+  const applied: string[] = []
+  const { counters, unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      // No delta at all — this is the pure per-order reconcile path, which used to
+      // repoint on the merge marker with no ambiguity check whatsoever.
+      listCandidates: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      countLinksByOrderNumber: async (numbers) => new Map(numbers.map((n) => [n, n === 'WC-1001' ? 2 : 1])),
+      fetchOrderStatus: async () => status(MERGED_SURVIVOR),
+      repointLink: async (linkId) => { repointed.push(linkId) },
+      applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(repointed, [])
+  assert.deepEqual(applied, [])
+  assert.equal(counters.pending, 1)
+  assert.equal(unresolved, 1)
+})
+
+test('[o3d-bjc.2.1] a truncated watermark RECOVERS once a reconcile pass verifies the whole active set', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const staleWatermark = new Date(NOW.getTime() - 30 * 60 * 60 * 1000).toISOString()
+  const { deltaWindowTruncated } = await runWmsDispatchSweepCore(
+    deps({
+      // A short reconcile batch (1 < batchSize 50) means every eligible link was
+      // just authoritatively verified, so the un-queryable gap IS covered.
+      listReconcileCandidates: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      listActiveByExternalOrderIds: async () => [],
+      fetchOrderStatus: async () => status({ status: 'PROCESSING' }),
+      fetchDelta: async () => [],
+      getDeltaState: async () => ({ watermark: staleWatermark, lastReconcile: null }), // reconcile DUE
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW, deltaTimeZone: 'UTC' },
+  )
+  assert.equal(deltaWindowTruncated, true, 'still reported as degraded')
+  assert.deepEqual(saved, [{ watermark: NOW.toISOString(), lastReconcile: NOW.toISOString() }])
+})
+
+test('[o3d-bjc.2.1] a truncated watermark does NOT recover while the reconcile backlog is still full', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const staleWatermark = new Date(NOW.getTime() - 30 * 60 * 60 * 1000).toISOString()
+  await runWmsDispatchSweepCore(
+    deps({
+      // A FULL batch → links beyond it were not verified → the gap is not covered.
+      listReconcileCandidates: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+        candidate({ linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1002', externalOrderId: 'M-2' }),
+      ],
+      listActiveByExternalOrderIds: async () => [],
+      fetchOrderStatus: async (orderNumber) => status({
+        externalOrderNumber: orderNumber,
+        externalOrderId: orderNumber === 'WC-1001' ? 'M-1' : 'M-2',
+        status: 'PROCESSING',
+      }),
+      fetchDelta: async () => [],
+      getDeltaState: async () => ({ watermark: staleWatermark, lastReconcile: null }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW, deltaTimeZone: 'UTC', batchSize: 2 },
+  )
+  assert.deepEqual(saved, [{ lastReconcile: NOW.toISOString() }], 'lastReconcile only — no watermark')
+})
+
+test('[o3d-bjc.2.1] an unresolved order does NOT reset the dead-letter streak (it is not evidence of health)', async () => {
+  const cleared: string[] = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      countLinksByOrderNumber: async (numbers) => new Map(numbers.map((n) => [n, n === 'WC-1001' ? 2 : 1])),
+      fetchOrderStatus: async () => status(MERGED_SURVIVOR),
+      clearDispatchFailures: async (linkId) => { cleared.push(linkId) },
+      fetchDelta: async () => [status(MERGED_SURVIVOR)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async () => {},
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(cleared, [])
+})
+
+test('resolveDispatchJobOutcome: unresolved orders and a truncated window both mark the job PARTIAL', async () => {
+  assert.deepEqual(resolveDispatchJobOutcome(0, null, {}), { status: 'SUCCEEDED', effectiveErrors: 0 })
+  assert.deepEqual(resolveDispatchJobOutcome(0, null, { unresolved: 2 }), { status: 'PARTIAL', effectiveErrors: 2 })
+  assert.deepEqual(
+    resolveDispatchJobOutcome(0, null, { deltaWindowTruncated: true }),
+    { status: 'PARTIAL', effectiveErrors: 1 },
+  )
+  assert.deepEqual(
+    resolveDispatchJobOutcome(1, 'delta down', { unresolved: 1, deltaWindowTruncated: true }),
+    { status: 'PARTIAL', effectiveErrors: 4 },
+  )
 })
 
 test('(m) [o3d-bjc finding 3a] a delta-fetch failure is surfaced as deltaError (not swallowed) while the sweep still per-order reconciles', async () => {
