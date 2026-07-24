@@ -54,6 +54,8 @@
  */
 import { Client } from 'pg'
 
+import { assertE2eDatabase } from './db-guard.ts'
+
 /**
  * The batch-candidate anchor — the exact set daily-sync.ts's Groups A1, A2 and B can reach
  * in one run, each arm mirroring that group's OWN production filter so the union neither
@@ -119,22 +121,10 @@ export type BatchBaselineResult = {
  */
 export async function deleteUnjournaledShipmentBaseline(): Promise<BatchBaselineResult> {
   const url = process.env.DATABASE_URL ?? ''
-  // POSITIVE allowlist (Codex r1/r2), not a STAGE denylist and not a substring test: this is
-  // a destructive, unscoped delete, so it runs ONLY when the URL's DATABASE NAME is exactly
-  // the e2e database. A substring check would pass for e.g. `onetwo3d_ims_e2e_backup` or a
-  // URL where the name appears in the host/password; parsing the pathname pins it to the one
-  // database. An unparseable URL fails closed.
-  let dbName = ''
-  try {
-    dbName = decodeURIComponent(new URL(url).pathname.replace(/^\//, ''))
-  } catch {
-    dbName = ''
-  }
-  if (dbName !== 'onetwo3d_ims_e2e') {
-    throw new Error(
-      `ABORT: deleteUnjournaledShipmentBaseline refuses to run unless DATABASE_URL names the e2e database exactly (onetwo3d_ims_e2e); got '${dbName || '(unparseable)'}'.`,
-    )
-  }
+  // POSITIVE allowlist (Codex r1/r2), not a STAGE denylist and not a substring test: this is a destructive,
+  // unscoped delete, so it runs ONLY when the URL's DATABASE NAME is exactly the e2e database. Now shared
+  // with the X-04 tax-rate fixture, which had a weaker denylist guard (harness/db-guard.ts).
+  assertE2eDatabase('deleteUnjournaledShipmentBaseline')
 
   const db = new Client({ connectionString: url })
   await db.connect()

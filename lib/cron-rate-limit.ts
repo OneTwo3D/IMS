@@ -60,11 +60,55 @@ export function cronRateLimitKey(jobName: string, sourceIp?: string | null): str
 }
 
 /**
- * The only cron jobs whose 1/hour limit an e2e run legitimately needs widened.
- * Keep this list minimal — every entry is a job a leaked E2E_CRON_RATE_LIMIT_MAX
- * could widen (only if E2E_TEST_MODE=1 is ALSO set), so it is the blast radius.
+ * IP-INDEPENDENT companion key for a job whose E2E override is capped (see E2E_OVERRIDE_JOBS).
+ *
+ * The per-job ceiling alone bounds each IP's bucket, not the tenant: `cron:<job>:<ip>` gives EVERY source IP
+ * its own allowance, so a caller holding the CRON_SECRET could rotate source addresses and multiply the
+ * allowance until it exhausted the shared external quota the ceiling exists to protect (Codex). This key is
+ * scoped to the job only, so all callers share ONE bucket at the ceiling regardless of source address.
+ *
+ * The sentinel can never collide with a real source IP: getClientIp() returns only a normalized, verified
+ * address (lib/request-ip.ts normalizeIp → isIP) or null, and `e2e-global` is neither.
  */
-const E2E_OVERRIDE_JOBS = new Set<string>(['accounting-daily-batch'])
+export function cronRateLimitGlobalKey(jobName: string): string {
+  return `cron:${jobName}:e2e-global`
+}
+
+/**
+ * The tenant-wide ceiling is a DAILY budget, not an hourly one — deliberately decoupled from the job's own
+ * window. The quota it protects is a daily one (Xero allows ~1000 calls/day per tenant), so an hourly
+ * ceiling would not bound it: 20/hour sustained is ~480/day, roughly half the shared allowance, which is
+ * exactly the exhaustion the ceiling exists to prevent (Codex). Applied over 24h, the ceiling IS the daily
+ * budget — 20 live sweeps a day, tenant-wide, whatever the caller does.
+ *
+ * Consequence for the rig, which is the intended trade: X-04 spends 3 of the 20 per run, so ~6 runs a day
+ * before it 429s. The backend is memory-backed, so restarting ims-e2e-dev.service clears it (the same
+ * restart that clears the login limiter).
+ */
+export const E2E_GLOBAL_CAP_WINDOW_MS = 24 * 60 * 60_000
+
+/**
+ * The only cron jobs whose 1/hour limit an e2e run legitimately needs widened, each mapped to an OPTIONAL
+ * per-job ceiling on how far `E2E_CRON_RATE_LIMIT_MAX` may raise it. Keep this list minimal — every entry
+ * is a job a leaked E2E_CRON_RATE_LIMIT_MAX could widen (only if E2E_TEST_MODE=1 is ALSO set), so it is the
+ * blast radius.
+ *
+ * - `accounting-daily-batch` → null (no per-job cap): a purely internal batch with no per-run external
+ *   dependency to exhaust, so it honours E2E_CRON_RATE_LIMIT_MAX in full (OC-08 and X-01/X-02 each drive it;
+ *   o3d-lgo.13).
+ * - `xero-tax-rate-drift` → 20 (hard per-job cap): the X-04 test runs it three times in ONE test — baseline,
+ *   after injecting IMS-side drift, and after reconciling — so the default 1/hour bucket would 429 the
+ *   second run (o3d-lgo.7 / X-04). But EACH sweep with a component-backed IMS rate makes a LIVE Xero
+ *   /TaxRates call, and the rig shares a quota-limited Xero tenant with stage (~1000 calls/day), so this is
+ *   capped WELL below that quota regardless of how large E2E_CRON_RATE_LIMIT_MAX is set — a leaked secret or
+ *   runaway retry loop can never turn the e2e allowance into shared-tenant quota exhaustion (Codex). 20
+ *   comfortably covers X-04's three sweeps with retry headroom. A ceiling here is a TENANT-WIDE DAILY budget,
+ *   not a per-IP hourly one — see e2eGlobalCapFor / cronRateLimitGlobalKey / E2E_GLOBAL_CAP_WINDOW_MS.
+ */
+const E2E_OVERRIDE_JOBS = new Map<string, number | null>([
+  ['accounting-daily-batch', null],
+  ['xero-tax-rate-drift', 20],
+])
 
 /**
  * Test/CI-only per-job max override. Returns `max` unchanged unless ALL hold:
@@ -72,9 +116,10 @@ const E2E_OVERRIDE_JOBS = new Set<string>(['accounting-daily-batch'])
  *      NODE_ENV can't be the guard because the rig serves a production build);
  *   2. `jobName` is in E2E_OVERRIDE_JOBS (scopes the blast radius to one job);
  *   3. `E2E_CRON_RATE_LIMIT_MAX` parses to a positive integer.
- * Even then it only RAISES the max (`Math.max`), never lowers it — so a stray
- * value can never tighten a limit into a production denial, and can only widen
- * the one allowlisted, CRON_SECRET-gated job.
+ * Even then it only RAISES the max (`Math.max`), never lowers it — so a stray value can never tighten a
+ * limit into a production denial — and it is bounded ABOVE by the job's per-job ceiling when one is set, so
+ * a job with a live external dependency (e.g. xero-tax-rate-drift's Xero /TaxRates call) can never inherit
+ * the full E2E_CRON_RATE_LIMIT_MAX and exhaust a shared quota.
  */
 export function applyE2eMaxOverride(jobName: string, max: number): number {
   if (process.env.E2E_TEST_MODE !== '1') return max
@@ -83,7 +128,26 @@ export function applyE2eMaxOverride(jobName: string, max: number): number {
   if (!raw) return max
   const override = Number(raw)
   if (!Number.isFinite(override) || override <= 0) return max
-  return Math.max(max, Math.floor(override))
+  const perJobCap = E2E_OVERRIDE_JOBS.get(jobName) ?? null
+  const capped = perJobCap == null ? Math.floor(override) : Math.min(Math.floor(override), perJobCap)
+  return Math.max(max, capped)
+}
+
+/**
+ * The tenant-wide ceiling to ALSO enforce (on cronRateLimitGlobalKey) for this request, or null for none.
+ *
+ * Returns a number ONLY when the E2E override actually RAISED this job's max AND the job has a per-job
+ * ceiling. Two consequences, both deliberate:
+ *   - Production is untouched. With E2E_TEST_MODE unset the override never applies, so this returns null and
+ *     the request takes exactly the same single IP-scoped check it always did — no new denial path.
+ *   - The ceiling becomes a real tenant-wide bound, not a per-IP one: under the E2E override, every caller
+ *     shares one bucket at the ceiling, so rotating source IPs cannot multiply the live external calls the
+ *     ceiling exists to cap.
+ */
+export function e2eGlobalCapFor(jobName: string, baseMax: number): number | null {
+  const perJobCap = E2E_OVERRIDE_JOBS.get(jobName)
+  if (perJobCap == null) return null
+  return applyE2eMaxOverride(jobName, baseMax) > baseMax ? perJobCap : null
 }
 
 export async function enforceCronRateLimit(
@@ -98,11 +162,22 @@ export async function enforceCronRateLimit(
   const windowMs = options.windowMs ?? CRON_RATE_LIMIT_WINDOW_MS
   const checker = options.checker ?? checkRateLimit
   const sourceIp = options.request ? getClientIp(options.request.headers) : null
-  const result = await checker(
+  let result = await checker(
     cronRateLimitKey(jobName, sourceIp),
     max,
     windowMs,
   )
+
+  // Under a CAPPED E2E override, the IP-scoped bucket above is per-caller; this second, IP-independent
+  // bucket makes the ceiling tenant-wide (see e2eGlobalCapFor). Checked only AFTER the IP bucket allows, so
+  // a caller already denied on its own slice does not also burn the shared allowance. Null in production.
+  const globalCap = e2eGlobalCapFor(jobName, baseMax)
+  if (result.allowed && globalCap != null) {
+    // E2E_GLOBAL_CAP_WINDOW_MS, NOT the job's own window: the quota being protected is daily, so an hourly
+    // ceiling would allow ~480 live calls a day and bound nothing that matters.
+    result = await checker(cronRateLimitGlobalKey(jobName), globalCap, E2E_GLOBAL_CAP_WINDOW_MS)
+  }
+
   if (result.allowed) return null
 
   return NextResponse.json(
