@@ -568,7 +568,10 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
         // it and the assertion below — not the ledger — is what fails.
         ['COGS_JOURNAL', 'UNEXPECTED cogs'],
       ] as const) {
-        for (const id of await settledJournalExternalIds(type, boundary, { referenceId: goodsPoId })) {
+        // NO timestamp bound: goodsPoId alone establishes ownership, and the PO's STOCK_RECEIPT row was
+        // written by receiveGoods BEFORE `boundary` was captured — filtering on it would skip the very
+        // receipt journal this recovery exists to void, leaking it into the shared ledger (Codex).
+        for (const id of await settledJournalExternalIds(type, null, { referenceId: goodsPoId })) {
           trackDocument('ManualJournals', id, `X-06 ${label} ${runTag(runId)}`)
         }
       }
@@ -824,7 +827,7 @@ async function awaitSyncedJournal(
  */
 async function settledJournalExternalIds(
   type: string,
-  createdAfter: string,
+  createdAfter: string | null,
   opts: { referenceId?: string; timeoutMs?: number } = {},
 ): Promise<string[]> {
   const { referenceId, timeoutMs = 30_000 } = opts
@@ -833,10 +836,23 @@ async function settledJournalExternalIds(
   // flow entirely — and every id returned here is registered for teardown, which VOIDS it. Passing the
   // referenceId confines both the recovery and the deletion to documents this test's own reference produced
   // (Codex). Omit it only where the caller has no reference to scope by and over-collection is impossible.
-  const scope = referenceId ? ` and "referenceId" = $3` : ''
-  const params = (base: unknown[]) => (referenceId ? [...base, referenceId] : base)
+  //
+  // A null `createdAfter` drops the timestamp predicate, and a referenceId-scoped call SHOULD drop it: the
+  // reference already establishes ownership, while the timestamp actively EXCLUDES rows the test owns but
+  // created earlier. That is not hypothetical — receiveGoods() writes the PENDING STOCK_RECEIPT row before
+  // X-06 takes its boundary, so a boundary-filtered recovery would skip the very receipt journal it exists
+  // to void and leak it into the shared ledger (Codex).
+  if (createdAfter === null && !referenceId) {
+    throw new Error('settledJournalExternalIds: dropping the timestamp predicate needs a referenceId — an unscoped snapshot would register (and void) unrelated documents.')
+  }
+  const since = createdAfter === null ? '' : ` and "createdAt" > $2::timestamptz`
+  const scope = referenceId ? ` and "referenceId" = $${createdAfter === null ? 2 : 3}` : ''
+  const params = (base: unknown[]) => {
+    const withTime = createdAfter === null ? [base[0]] : base
+    return referenceId ? [...withTime, referenceId] : withTime
+  }
   const warn = (why: string) =>
-    console.warn(`[fc-teardown] ${why} for ${type} journals created after ${createdAfter}${referenceId ? ` (reference ${referenceId})` : ''} — a posted journal may be left in the shared ledger; check ${type} sync logs.`)
+    console.warn(`[fc-teardown] ${why} for ${type} journals${createdAfter === null ? '' : ` created after ${createdAfter}`}${referenceId ? ` (reference ${referenceId})` : ''} — a posted journal may be left in the shared ledger; check ${type} sync logs.`)
 
   const { Client } = await import('pg')
   // A node-postgres Client cannot be re-connected after a failed connect(), so each retry needs a FRESH
@@ -866,7 +882,7 @@ async function settledJournalExternalIds(
         const r = await db.query<{ n: number }>(
           `select count(*)::int as n from accounting_sync_logs
             where connector = 'xero' and type = $1::"AccountingSyncType"
-              and "createdAt" > $2::timestamptz and status in ('PENDING', 'PROCESSING')${scope}`,
+              and status in ('PENDING', 'PROCESSING')${since}${scope}`,
           params([type, createdAfter]),
         )
         inFlight = r.rows[0]?.n ?? 0
@@ -886,7 +902,7 @@ async function settledJournalExternalIds(
       const stranded = await db.query<{ n: number }>(
         `select count(*)::int as n from accounting_sync_logs
           where connector = 'xero' and type = $1::"AccountingSyncType"
-            and "createdAt" > $2::timestamptz and status = 'FAILED' and "externalTransactionId" is null${scope}`,
+            and status = 'FAILED' and "externalTransactionId" is null${since}${scope}`,
         params([type, createdAfter]),
       )
       if ((stranded.rows[0]?.n ?? 0) > 0) {
@@ -902,7 +918,7 @@ async function settledJournalExternalIds(
         const r = await db.query<{ externalTransactionId: string }>(
           `select "externalTransactionId" from accounting_sync_logs
             where connector = 'xero' and type = $1::"AccountingSyncType"
-              and "createdAt" > $2::timestamptz and "externalTransactionId" is not null${scope}`,
+              and "externalTransactionId" is not null${since}${scope}`,
           params([type, createdAfter]),
         )
         return r.rows.map((row) => row.externalTransactionId)
