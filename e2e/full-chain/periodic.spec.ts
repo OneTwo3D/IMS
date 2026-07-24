@@ -50,6 +50,7 @@ import {
   dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
 } from './harness/batch-fixture.ts'
 import { runAllCleanups } from './harness/cleanup.ts'
+import { withoutX04DriftEntries, X04_TAX_RATE_ID_PREFIX } from './harness/x04-drift-snapshot.ts'
 
 const WAREHOUSE_CODE = 'CBG'
 const UNIT_COST = 10 // addStockAdjustment seeds every positive line at £10/unit (helpers.ts:136).
@@ -642,6 +643,13 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     // test stamps, NEVER by "has components" or by name (which could erase real, persistent tax config
     // that scripts/copy-tax-rates.ts legitimately seeds with components; Codex). Then seed the mirror.
     await deleteX04SeededTaxRates()
+    // CRASH RECOVERY, and it must happen BEFORE the baseline capture. A run that died after Phase B leaves
+    // the drift snapshot naming an e2e-x04-* rate. deleteX04SeededTaxRates() removes the rate but not the
+    // snapshot entry, so capturing the snapshot as-is would take a DANGLING entry as the baseline and
+    // faithfully restore it at teardown — every later run then reinstalling operator-visible drift for a
+    // rate that no longer exists, which is exactly the poisoning the cleanup exists to prevent (Codex).
+    // Purge X-04-owned entries from the live setting first, then capture what remains as the baseline.
+    await purgeX04DriftSnapshotEntries()
     const taxRateId = await seedMirroredTaxRate(mirror.Name, component.Name, xeroPercent, Boolean(component.IsCompound))
     // Capture the prior drift settings (absent on a clean rig) so teardown restores EXACTLY.
     const priorSnapshot = await getSettingRaw('xero_tax_rate_drift_current')
@@ -1213,8 +1221,7 @@ function pickMirrorableXeroRate(rates: XeroTaxRate[]): XeroTaxRate {
 
 // Every X-04 tax-rate row this test creates carries this id prefix, so all cleanup is scoped to rows THIS
 // test owns — never "all rates with components" and never by name (which could erase real, persistent tax
-// configuration; Codex HIGH). Cost the guard once, up front.
-const X04_TAX_RATE_ID_PREFIX = 'e2e-x04'
+// configuration; Codex HIGH). Defined in the harness because the pure snapshot filter is keyed on it too.
 
 /** Fail closed if the destructive tax-rate helpers are ever pointed at the stage database. */
 function assertNotStageDb(): void {
@@ -1231,6 +1238,35 @@ async function deleteX04SeededTaxRates(): Promise<void> {
   await db.connect()
   try {
     await db.query(`delete from tax_rates where id like $1`, [`${X04_TAX_RATE_ID_PREFIX}%`])
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Purge X-04-owned entries from the LIVE drift snapshot + their ActivityLog rows, so a crashed prior run
+ * cannot hand this run a dangling baseline to preserve.
+ *
+ * Runs before the baseline capture (see the call site). Everything is scoped by the X04 id prefix, so a
+ * real drifted rate detected by the operator's own hourly sweep survives untouched — the snapshot is
+ * operator-visible state, and erasing someone else's entry would be worse than leaving ours.
+ */
+async function purgeX04DriftSnapshotEntries(): Promise<void> {
+  assertNotStageDb()
+  const raw = await getSettingRaw('xero_tax_rate_drift_current')
+  const purged = withoutX04DriftEntries(raw)
+  if (purged !== raw) {
+    console.warn('[X-04] purged leftover e2e-x04 entries from xero_tax_rate_drift_current (a prior run crashed after injecting drift)')
+    await restoreSetting('xero_tax_rate_drift_current', purged)
+  }
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `delete from activity_logs where action = 'tax_rate_drift_detected' and "entityId" like $1`,
+      [`${X04_TAX_RATE_ID_PREFIX}%`],
+    )
   } finally {
     await db.end()
   }
