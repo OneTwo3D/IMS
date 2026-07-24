@@ -60,6 +60,21 @@ export function cronRateLimitKey(jobName: string, sourceIp?: string | null): str
 }
 
 /**
+ * IP-INDEPENDENT companion key for a job whose E2E override is capped (see E2E_OVERRIDE_JOBS).
+ *
+ * The per-job ceiling alone bounds each IP's bucket, not the tenant: `cron:<job>:<ip>` gives EVERY source IP
+ * its own allowance, so a caller holding the CRON_SECRET could rotate source addresses and multiply the
+ * allowance until it exhausted the shared external quota the ceiling exists to protect (Codex). This key is
+ * scoped to the job only, so all callers share ONE bucket at the ceiling regardless of source address.
+ *
+ * The sentinel can never collide with a real source IP: getClientIp() returns only a normalized, verified
+ * address (lib/request-ip.ts normalizeIp → isIP) or null, and `e2e-global` is neither.
+ */
+export function cronRateLimitGlobalKey(jobName: string): string {
+  return `cron:${jobName}:e2e-global`
+}
+
+/**
  * The only cron jobs whose 1/hour limit an e2e run legitimately needs widened, each mapped to an OPTIONAL
  * per-job ceiling on how far `E2E_CRON_RATE_LIMIT_MAX` may raise it. Keep this list minimal — every entry
  * is a job a leaked E2E_CRON_RATE_LIMIT_MAX could widen (only if E2E_TEST_MODE=1 is ALSO set), so it is the
@@ -74,7 +89,8 @@ export function cronRateLimitKey(jobName: string, sourceIp?: string | null): str
  *   /TaxRates call, and the rig shares a quota-limited Xero tenant with stage (~1000 calls/day), so this is
  *   capped WELL below that quota regardless of how large E2E_CRON_RATE_LIMIT_MAX is set — a leaked secret or
  *   runaway retry loop can never turn the e2e allowance into shared-tenant quota exhaustion (Codex). 20
- *   comfortably covers X-04's three sweeps with retry headroom.
+ *   comfortably covers X-04's three sweeps with retry headroom. A ceiling here is enforced TENANT-WIDE, not
+ *   merely per source IP — see e2eGlobalCapFor / cronRateLimitGlobalKey.
  */
 const E2E_OVERRIDE_JOBS = new Map<string, number | null>([
   ['accounting-daily-batch', null],
@@ -104,6 +120,23 @@ export function applyE2eMaxOverride(jobName: string, max: number): number {
   return Math.max(max, capped)
 }
 
+/**
+ * The tenant-wide ceiling to ALSO enforce (on cronRateLimitGlobalKey) for this request, or null for none.
+ *
+ * Returns a number ONLY when the E2E override actually RAISED this job's max AND the job has a per-job
+ * ceiling. Two consequences, both deliberate:
+ *   - Production is untouched. With E2E_TEST_MODE unset the override never applies, so this returns null and
+ *     the request takes exactly the same single IP-scoped check it always did — no new denial path.
+ *   - The ceiling becomes a real tenant-wide bound, not a per-IP one: under the E2E override, every caller
+ *     shares one bucket at the ceiling, so rotating source IPs cannot multiply the live external calls the
+ *     ceiling exists to cap.
+ */
+export function e2eGlobalCapFor(jobName: string, baseMax: number): number | null {
+  const perJobCap = E2E_OVERRIDE_JOBS.get(jobName)
+  if (perJobCap == null) return null
+  return applyE2eMaxOverride(jobName, baseMax) > baseMax ? perJobCap : null
+}
+
 export async function enforceCronRateLimit(
   jobName: string,
   optionsOrChecker: CronRateLimitOptions | CronRateLimitChecker = {},
@@ -116,11 +149,20 @@ export async function enforceCronRateLimit(
   const windowMs = options.windowMs ?? CRON_RATE_LIMIT_WINDOW_MS
   const checker = options.checker ?? checkRateLimit
   const sourceIp = options.request ? getClientIp(options.request.headers) : null
-  const result = await checker(
+  let result = await checker(
     cronRateLimitKey(jobName, sourceIp),
     max,
     windowMs,
   )
+
+  // Under a CAPPED E2E override, the IP-scoped bucket above is per-caller; this second, IP-independent
+  // bucket makes the ceiling tenant-wide (see e2eGlobalCapFor). Checked only AFTER the IP bucket allows, so
+  // a caller already denied on its own slice does not also burn the shared allowance. Null in production.
+  const globalCap = e2eGlobalCapFor(jobName, baseMax)
+  if (result.allowed && globalCap != null) {
+    result = await checker(cronRateLimitGlobalKey(jobName), globalCap, windowMs)
+  }
+
   if (result.allowed) return null
 
   return NextResponse.json(
