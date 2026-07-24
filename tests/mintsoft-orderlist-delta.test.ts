@@ -948,15 +948,18 @@ test('[o3d-bjc.2.1] a truncated watermark does NOT recover while the reconcile b
   const staleWatermark = new Date(NOW.getTime() - 30 * 60 * 60 * 1000).toISOString()
   await runWmsDispatchSweepCore(
     deps({
-      // A FULL batch → links beyond it were not verified → the gap is not covered.
-      listReconcileCandidates: async () => [
+      // More eligible links than the batch → links beyond it were not verified, so
+      // the gap is not covered. The sweep asks for batchSize + 1 and uses the extra
+      // row as a has-more sentinel, so the fake honours the limit.
+      listReconcileCandidates: async (limit) => [
         candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
         candidate({ linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1002', externalOrderId: 'M-2' }),
-      ],
+        candidate({ linkId: 'l3', orderId: 'o3', externalOrderNumber: 'WC-1003', externalOrderId: 'M-3' }),
+      ].slice(0, limit),
       listActiveByExternalOrderIds: async () => [],
       fetchOrderStatus: async (orderNumber) => status({
         externalOrderNumber: orderNumber,
-        externalOrderId: orderNumber === 'WC-1001' ? 'M-1' : 'M-2',
+        externalOrderId: `M-${orderNumber.slice(-1)}`,
         status: 'PROCESSING',
       }),
       fetchDelta: async () => [],
@@ -966,6 +969,115 @@ test('[o3d-bjc.2.1] a truncated watermark does NOT recover while the reconcile b
     { now: NOW, deltaTimeZone: 'UTC', batchSize: 2 },
   )
   assert.deepEqual(saved, [{ lastReconcile: NOW.toISOString() }], 'lastReconcile only — no watermark')
+})
+
+test('[o3d-bjc.2.1] truncation recovery does NOT certify an unresolvable read', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const staleWatermark = new Date(NOW.getTime() - 30 * 60 * 60 * 1000).toISOString()
+  const { unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      // The whole eligible set is one link — but its status lookup returns nothing,
+      // so this pass establishes nothing and cannot certify the un-queryable gap.
+      listReconcileCandidates: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      listActiveByExternalOrderIds: async () => [],
+      fetchOrderStatus: async () => null,
+      fetchDelta: async () => [],
+      getDeltaState: async () => ({ watermark: staleWatermark, lastReconcile: null }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW, deltaTimeZone: 'UTC' },
+  )
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [], 'no watermark reseed off an unresolved verdict')
+})
+
+test('[o3d-bjc.2.1] truncation recovery does NOT certify a BLANK order status', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const staleWatermark = new Date(NOW.getTime() - 30 * 60 * 60 * 1000).toISOString()
+  const { unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listReconcileCandidates: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      listActiveByExternalOrderIds: async () => [],
+      // An unmapped OrderStatusId reaches the lenient per-order path as status ''.
+      fetchOrderStatus: async () => status({ status: '', dispatched: false }),
+      fetchDelta: async () => [],
+      getDeltaState: async () => ({ watermark: staleWatermark, lastReconcile: null }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW, deltaTimeZone: 'UTC' },
+  )
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] a delta-triggered forced fetch with a BLANK status is unresolved', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      // Merge survivor resolves, the link repoints — but the survivor's own status is
+      // blank, so its dispatch state was never established.
+      fetchOrderStatus: async () => status({ ...MERGED_SURVIVOR, status: '', dispatched: false }),
+      fetchDelta: async () => [status(MERGED_SURVIVOR)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] a split part with an UNKNOWN status is unresolved, not "part-way despatched"', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      listActiveByOrderNumbers: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      fetchOrderStatus: async () => status(SPLIT_ROW),
+      // Both parts visible, but part 2's status is blank (unmapped OrderStatusId) —
+      // this used to read as a known "1/2 despatched" and advance the watermark.
+      fetchOrderParts: async () => [
+        part({ externalId: 'P1', partNumber: 1, status: 'DESPATCHED', dispatched: true }),
+        part({ externalId: 'P2', partNumber: 2, status: '', dispatched: false }),
+      ],
+      fetchPartItems: async () => [{ sku: 'SKU-1', qty: 1 }],
+      fetchDelta: async () => [status(SPLIT_ROW)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(unresolved, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] truncation recovers when the eligible set EQUALS batchSize (has-more sentinel, not a short batch)', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const staleWatermark = new Date(NOW.getTime() - 30 * 60 * 60 * 1000).toISOString()
+  await runWmsDispatchSweepCore(
+    deps({
+      // Exactly batchSize eligible links: `length < batchSize` would never be true,
+      // so this could never recover before the sentinel fix.
+      listReconcileCandidates: async (limit) => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ].slice(0, limit),
+      listActiveByExternalOrderIds: async () => [],
+      fetchOrderStatus: async () => status({ status: 'PROCESSING' }),
+      fetchDelta: async () => [],
+      getDeltaState: async () => ({ watermark: staleWatermark, lastReconcile: null }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW, deltaTimeZone: 'UTC', batchSize: 1 },
+  )
+  assert.deepEqual(saved, [{ watermark: NOW.toISOString(), lastReconcile: NOW.toISOString() }])
 })
 
 test('[o3d-bjc.2.1] an unresolved order does NOT reset the dead-letter streak (it is not evidence of health)', async () => {

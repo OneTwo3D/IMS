@@ -336,6 +336,31 @@ test('[o3d-bjc.2.2] a malformed or sentinel DespatchDate is NOT proof of despatc
     )
   }
 
+  // Trailing junk, calendar rollover, out-of-range time, and an out-of-range zone
+  // offset are all rejected — Date.parse alone accepts every one of them.
+  for (const despatchDate of [
+    '2026-07-15junk', '2026-02-30T09:00:00', '2026-04-31', '2026-07-15T24:00:00',
+    '2026-07-15T09:60:00', '2026-07-15T09:00:00+99:99', '2027-02-29',
+  ]) {
+    listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: despatchDate })]
+    await assert.rejects(
+      () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+      /unresolved OrderStatusId \(999\) and no despatch date/,
+      `DespatchDate ${JSON.stringify(despatchDate)} must not prove despatch`,
+    )
+  }
+
+  // …while every REAL Mintsoft form still counts (no shipping regression).
+  for (const despatchDate of [
+    '2026-07-15T09:00:00', '2026-07-15 09:00:00', '2026-07-15', '2026-07-15T09:00',
+    '2026-07-15T09:00:00.1234567', '2026-07-15T09:00:00Z', '2026-07-15T09:00:00+01:00',
+    '2026-07-15t09:00:00', '2028-02-29T09:00:00',
+  ]) {
+    listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: despatchDate })]
+    const proven = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+    assert.equal(proven[0].dispatched, true, `DespatchDate ${JSON.stringify(despatchDate)} must prove despatch`)
+  }
+
   // …and a sentinel date on a KNOWN, non-despatched status must not mark it shipped.
   listResponder = () => [row(1, { OrderStatusId: 17, DespatchDate: '0001-01-01T00:00:00' })]
   const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })

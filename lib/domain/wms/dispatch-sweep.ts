@@ -308,10 +308,13 @@ async function reconcileSplitOrder(
 
   if (!allRecorded || dispatchedParts.length < totalParts) {
     // A part set we could not fully account for is UNRESOLVED, not merely "not all
-    // parts shipped yet": either a despatched part's items were unreadable, or
-    // fewer part rows are visible than the WMS says exist. Either way the order's
-    // real state is unknown, so a delta-triggered pass must hold its watermark.
-    const incompleteEnumeration = !allRecorded || parts.length < totalParts
+    // parts shipped yet": a despatched part's items were unreadable, fewer part rows
+    // are visible than the WMS says exist, or a visible part's own dispatch state is
+    // blank (an unmapped part status — Codex round 8: one dispatched part plus one
+    // unknown-status part read as "genuinely part-way", advancing the watermark
+    // without ever knowing the second part). Any of those means unknown.
+    const anyPartStateUnknown = parts.some((entry) => !dispatchStateEstablished(entry))
+    const incompleteEnumeration = !allRecorded || parts.length < totalParts || anyPartStateUnknown
     return {
       action: 'pending',
       reason: !allRecorded
@@ -335,6 +338,24 @@ async function reconcileSplitOrder(
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
   }
   return { action: 'dispatched', reason: `All ${totalParts} parts despatched` }
+}
+
+/**
+ * Whether a connector actually TOLD us this order/part's dispatch state, as opposed
+ * to handing back a blank it normalised to "not dispatched". A blank status with no
+ * despatch evidence is unknown, not negative — the lenient per-order path yields
+ * exactly that when an OrderStatusId is missing or unmapped (the bulk delta path
+ * throws instead). Treating it as a clean "pending" is how an order silently ages
+ * out of the delta window (Codex round 8).
+ */
+function dispatchStateEstablished(state: {
+  status: string
+  dispatched: boolean
+  tracking: WmsOrderTracking[]
+}): boolean {
+  if (state.dispatched) return true
+  if (state.status.trim() !== '') return true
+  return state.tracking.some((entry) => Boolean(entry.despatchedAt))
 }
 
 /**
@@ -451,7 +472,14 @@ export async function reconcileOneOrder(
   }
 
   if (!status.dispatched) {
-    return { action: 'pending', reason: `Not dispatched (status ${status.status || 'Unknown'})` }
+    // A BLANK status is "we don't know", not "not shipped" (Codex round 8): the
+    // forced per-order lookup on a merge/split supplement uses the lenient path, so
+    // an unmapped OrderStatusId arrives here as status '' + dispatched false.
+    return {
+      action: 'pending',
+      reason: `Not dispatched (status ${status.status || 'Unknown'})`,
+      unresolved: requireResolution && !dispatchStateEstablished(status),
+    }
   }
 
   const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking))
@@ -490,7 +518,9 @@ export async function runWmsDispatchSweepCore(
   /** The delta window was clamped and could not cover its held-back backlog. */
   deltaWindowTruncated: boolean
 }> {
-  const batchSize = options?.batchSize ?? DISPATCH_SWEEP_DEFAULT_BATCH_SIZE
+  // At least 1: a batchSize of 0 would poll nothing yet still look like "covered
+  // the whole eligible set", which the truncation recovery below relies on.
+  const batchSize = Math.max(1, options?.batchSize ?? DISPATCH_SWEEP_DEFAULT_BATCH_SIZE)
   const now = options?.now ?? new Date()
   const counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
   const logs: WmsDispatchLog[] = []
@@ -810,12 +840,17 @@ export async function runWmsDispatchSweepCore(
   // the whole active set instead of re-polling the same oldest orders forever.
   if (reconcileDue) {
     ranReconcile = true
-    const candidates = deps.listReconcileCandidates
-      ? await deps.listReconcileCandidates(batchSize)
-      : await deps.listCandidates(batchSize)
-    // A short batch means every eligible link was verified this tick — the whole
-    // active set is covered, which is what lets a truncated watermark recover.
-    reconcileCoveredAllActive = candidates.length < batchSize
+    // Ask for ONE more than we intend to process and use the extra row purely as a
+    // has-more sentinel (Codex round 8): `length < batchSize` can never be true when
+    // the eligible count happens to EQUAL batchSize, so a stale watermark could
+    // never recover for a set of exactly 50 (or exactly 1 at batchSize 1).
+    const fetched = deps.listReconcileCandidates
+      ? await deps.listReconcileCandidates(batchSize + 1)
+      : await deps.listCandidates(batchSize + 1)
+    const candidates = fetched.slice(0, batchSize)
+    // No sentinel row ⇒ this batch WAS the whole eligible set, so every active link
+    // is verified this tick — the basis for recovering a truncated watermark.
+    reconcileCoveredAllActive = fetched.length <= batchSize
     // Codex round 7: the reconcile pass repoints a merge on order-NUMBER evidence
     // with no id check, so a reused-number link the delta pass had refused as an
     // ambiguous merge could simply be accepted here once the delta row aged out.
@@ -832,7 +867,11 @@ export async function runWmsDispatchSweepCore(
         candidate,
         undefined,
         undefined,
-        false,
+        // When this pass is the recovery mechanism for a truncated window, its
+        // verdicts are what CERTIFY the un-queryable gap — so they must be held to
+        // the same standard as the delta pass (Codex round 8: otherwise a null or
+        // blank lookup read as clean pending and reseeded the watermark anyway).
+        deltaWindowTruncated,
         claimantUniqueness(reconcileClaimants, candidate.externalOrderNumber),
       )
       processedLinkIds.add(candidate.linkId)

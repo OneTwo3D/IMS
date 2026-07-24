@@ -57,7 +57,7 @@ function strictPositiveInt(value: unknown): number | null {
  * satisfy the unknown-status escape hatch below.
  */
 const DESPATCH_DATE_PATTERN =
-  /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,7})?)?\s*(?:Z|[+-]\d{2}:?\d{2})?)?$/
+  /^(\d{4})-(\d{2})-(\d{2})(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,7})?)?\s*(?:[Zz]|([+-])(\d{2}):?(\d{2}))?)?$/
 const DESPATCH_DATE_MIN_YEAR = 1990
 
 export function parseMintsoftDespatchDate(value: unknown): string | null {
@@ -65,7 +65,7 @@ export function parseMintsoftDespatchDate(value: unknown): string | null {
   if (!raw) return null
   const match = DESPATCH_DATE_PATTERN.exec(raw)
   if (!match) return null
-  const [, yearRaw, monthRaw, dayRaw, hourRaw, minuteRaw, secondRaw] = match
+  const [, yearRaw, monthRaw, dayRaw, hourRaw, minuteRaw, secondRaw, , offsetHourRaw, offsetMinuteRaw] = match
   const year = Number(yearRaw)
   const month = Number(monthRaw)
   const day = Number(dayRaw)
@@ -78,6 +78,13 @@ export function parseMintsoftDespatchDate(value: unknown): string | null {
     if (Number(hourRaw) > 23 || Number(minuteRaw) > 59) return null
     if (secondRaw !== undefined && Number(secondRaw) > 59) return null
   }
+  // The grammar admits any two digits for a zone offset, so "+99:99" would slip
+  // through and — with an unknown status — falsely prove despatch. Range-check it.
+  if (offsetHourRaw !== undefined) {
+    if (Number(offsetHourRaw) > 14 || Number(offsetMinuteRaw) > 59) return null
+  }
+  // Belt and braces: after all of the above the value must still be a real instant.
+  if (!Number.isFinite(Date.parse(raw))) return null
   return raw
 }
 
