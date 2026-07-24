@@ -22,6 +22,10 @@ let clientIdSetting = String(CLIENT)
 let searchRows: unknown = []
 let details = new Map<string, unknown>()
 let createResult: unknown = null
+let itemRows: unknown[] = []
+// Ids whose detail request answers 2xx with NO readable order body (the client
+// renders a 204 that way) — an UNKNOWN state, not an authoritative "not found".
+let emptyDetailIds = new Set<string>()
 let calls: string[] = []
 let writes: Array<{ path: string; method: string }> = []
 
@@ -58,10 +62,11 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       const detailMatch = pathname.match(/^\/api\/Order\/([^/]+)$/)
       if (detailMatch) {
         const id = decodeURIComponent(detailMatch[1])
+        if (emptyDetailIds.has(id)) return { data: null, status: 204 }
         return details.has(id) ? { data: details.get(id), status: 200 } : { data: null, status: 404 }
       }
       const itemsMatch = pathname.match(/^\/api\/Order\/([^/]+)\/Items$/)
-      if (itemsMatch) return { data: [], status: 200 }
+      if (itemsMatch) return { data: itemRows, status: 200 }
       const cancelMatch = pathname.match(/^\/api\/Order\/([^/]+)\/Cancel$/)
       if (cancelMatch) {
         writes.push({ path, method: 'CANCEL' })
@@ -81,6 +86,8 @@ function reset() {
   searchRows = []
   details = new Map()
   createResult = null
+  itemRows = []
+  emptyDetailIds = new Set()
   calls = []
   writes = []
 }
@@ -152,25 +159,54 @@ test('[o3d-bjc.6] a malformed dedupe search body throws instead of reading as "n
   await assert.rejects(() => pushMintsoftOrder(INPUT), /Order\/Search \(push dedupe\): expected an array/)
 })
 
-test('[o3d-bjc.6] an ordinary create still works on a tenant with no mintsoft_client_id (only the dedupe needs scope)', async () => {
+test('[o3d-bjc.6] a create succeeds and binds only after the new order reads back under OUR ClientId', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  createResult = [{ Success: true, OrderId: 700, OrderNumber: 'WC-1001' }]
+  details.set('700', { ID: 700, OrderNumber: 'WC-1001', OrderStatusId: 1, ClientId: CLIENT })
+
+  const result = await pushMintsoftOrder(INPUT)
+  assert.equal(result.externalOrderId, '700')
+  const readBack = calls.find((path) => path.startsWith('/api/Order/700?'))
+  assert.ok(readBack, 'the created order is read back')
+  assert.equal(new URLSearchParams(readBack.split('?')[1]).get('ClientId'), String(CLIENT))
+})
+
+test('[o3d-bjc.6] a create whose order reads back FOREIGN is not bound', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  // A create routed into an unintended client context: it echoes an OrderId, but
+  // the order is not ours. Pre-fix the echoed id alone was enough to bind.
+  createResult = [{ Success: true, OrderId: 999, OrderNumber: 'WC-1001' }]
+  details.set('999', { ID: 999, OrderNumber: 'WC-1001', OrderStatusId: 1, ClientId: 99 })
+
+  await assert.rejects(() => pushMintsoftOrder(INPUT), /does not match configured 5/)
+})
+
+test('[o3d-bjc.6] a FAILED create that merely echoes an OrderId does not bind it — it falls through to the scoped dedupe', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  // Pre-fix `ok` was true whenever OrderId was present, so this bound order 999
+  // outright, before the scoped dedupe branch could ever run.
+  createResult = [{ Success: false, OrderId: 999, Message: 'Order already exists' }]
+  searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+
+  const result = await pushMintsoftOrder(INPUT)
+  assert.equal(result.externalOrderId, '900', 'bound the ClientId-verified order, not the echoed id')
+  assert.ok(calls.some((path) => path.startsWith('/api/Order/Search')), 'the scoped dedupe ran')
+})
+
+test('[o3d-bjc.6] the whole push fails closed when mintsoft_client_id is unset — no order is created', async () => {
   reset()
   clientIdSetting = ''
   const { pushMintsoftOrder } = await push()
   createResult = [{ Success: true, OrderId: 700, OrderNumber: 'WC-1001' }]
 
-  const result = await pushMintsoftOrder(INPUT)
-  assert.equal(result.externalOrderId, '700')
-  assert.equal(calls.filter((path) => path.startsWith('/api/Order/Search')).length, 0)
-})
-
-test('[o3d-bjc.6] the dedupe fails closed (no search issued) when mintsoft_client_id is unset', async () => {
-  reset()
-  clientIdSetting = ''
-  const { pushMintsoftOrder } = await push()
-  createResult = [DUPLICATE]
-
+  // Creating without the scope would mark the order SYNCED and then be unable to
+  // amend, hold or CANCEL it — the warehouse would ship a cancelled order. Never
+  // start a lifecycle we cannot finish.
   await assert.rejects(() => pushMintsoftOrder(INPUT), /requires a ClientId/)
-  assert.equal(calls.filter((path) => path.startsWith('/api/Order/Search')).length, 0)
+  assert.deepEqual(calls, [], 'no request at all was issued')
 })
 
 test('[o3d-bjc.6] cancel refuses a FOREIGN order id — the mutation gate re-proves ownership', async () => {
@@ -222,4 +258,48 @@ test('[o3d-bjc.6] a comment on our own order still posts', async () => {
 
   await addMintsoftOrderComment('900', 'IMS note')
   assert.deepEqual(writes.map((write) => write.path.split('?')[0]), ['/api/Order/900/Comments'])
+})
+
+test('[o3d-bjc.6] a 2xx detail with NO readable order is NOT reported as "not found"', async () => {
+  reset()
+  const { cancelMintsoftOrder, addMintsoftOrderComment, updateMintsoftOrder } = await push()
+  // The Mintsoft client renders a 204 as `data: null`. Reporting that as NOT_FOUND
+  // would tell the push sweep the remote cancel succeeded and move the local link to
+  // CANCELLED/HELD while the warehouse carries on fulfilling the order.
+  emptyDetailIds.add('900')
+
+  await assert.rejects(() => cancelMintsoftOrder('900'), /refusing to treat an unverifiable response as "not found"/)
+  await assert.rejects(() => updateMintsoftOrder('900', INPUT), /unverifiable response/)
+  await assert.rejects(() => addMintsoftOrderComment('900', 'IMS note'), /unverifiable response/)
+  assert.deepEqual(writes, [])
+})
+
+test('[o3d-bjc.6] a genuine 404 is still an authoritative NOT_FOUND for cancel/update', async () => {
+  reset()
+  const { cancelMintsoftOrder, updateMintsoftOrder } = await push()
+  // `details` has no entry for 900 → the mock returns a real 404.
+  assert.deepEqual(await cancelMintsoftOrder('900'), { cancelled: false, status: 'NOT_FOUND' })
+  assert.deepEqual(await updateMintsoftOrder('900', INPUT), { updated: false, status: 'NOT_FOUND' })
+  assert.deepEqual(writes, [])
+})
+
+test('[o3d-bjc.6] an owned NEW order amends its items and posts the update — the gate precedes every write', async () => {
+  reset()
+  const { updateMintsoftOrder } = await push()
+  details.set('900', { ID: 900, OrderNumber: 'WC-1001', OrderStatusId: 1, ClientId: CLIENT })
+  // One line to update and one stale line to delete, so the whole write set runs.
+  itemRows = [
+    { ID: 11, SKU: 'SKU-1', Quantity: 5 },
+    { ID: 12, SKU: 'SKU-GONE', Quantity: 2 },
+  ]
+
+  const result = await updateMintsoftOrder('900', INPUT)
+  assert.deepEqual(result, { updated: true, status: 'NEW' })
+  // The ownership gate is the FIRST call, before any mutation.
+  assert.ok(calls[0].startsWith('/api/Order/900?'), `gate ran first (was ${calls[0]})`)
+  assert.ok(writes.length > 0, 'item + order writes happened')
+  // The items read is scoped too (its DTO carries no ClientId of its own).
+  const itemsRead = calls.find((path) => path.startsWith('/api/Order/900/Items?'))
+  assert.ok(itemsRead, 'the items read ran')
+  assert.equal(new URLSearchParams(itemsRead.split('?')[1]).get('ClientId'), String(CLIENT))
 })

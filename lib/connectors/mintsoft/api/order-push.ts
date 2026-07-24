@@ -7,7 +7,7 @@ import type {
 } from '@/lib/connectors/wms/types'
 import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
-import { assertMintsoftOrderClient, requireMintsoftClientId } from './orders'
+import { assertMintsoftOrderClient, fetchMintsoftOrderById, requireMintsoftClientId } from './orders'
 import { getMintsoftSettings, parseMintsoftPositiveId } from '../settings/schema'
 
 /**
@@ -169,11 +169,22 @@ async function createOrder(payload: Record<string, unknown>): Promise<{ ok: bool
   const data: RawOrder | null = Array.isArray(raw)
     ? ((raw[0] as RawOrder) ?? null)
     : (extractMintsoftObjectPayload(raw) as RawOrder | null)
-  const ok = data?.Success === true || data?.OrderId != null
+  // Only an UNAMBIGUOUS success binds a link (o3d-bjc.6). Accepting any response
+  // that merely carries an OrderId meant `{Success:false, OrderId:999, Message:
+  // 'Order already exists'}` bound order 999 before the scoped dedupe branch could
+  // ever run — no ownership check at all. A response that reports failure now falls
+  // through to the dedupe path, which verifies the ClientId.
+  const ok = data?.Success === true
   return { ok, data, message: toStr(data?.Message) }
 }
 
 export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
+  // Fail closed BEFORE creating anything (o3d-bjc.6). Every later lifecycle step —
+  // amend, hold/cancel, warehouse comment — requires the tenant scope, so creating
+  // an order without one would mark it SYNCED and then be unable to propagate a
+  // cancellation: the warehouse ships an order the customer cancelled. Better to
+  // never start a lifecycle we cannot finish.
+  const clientId = await getPushClientId('Mintsoft order push')
   const settings = await getMintsoftSettings()
   // Courier selection: a configured shipping-service → CourierServiceId mapping
   // wins; else pass the name through for the WMS to resolve; else (no service on
@@ -203,21 +214,28 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   if (created.ok && created.data) {
     const externalOrderId = toStr(created.data.OrderId)
     if (externalOrderId) {
+      // Verify the order we just created really is ours before binding the link
+      // (o3d-bjc.6). A create routed into an unintended client context would
+      // otherwise be trusted purely because it echoed an OrderId.
+      const createdOrder = await fetchMintsoftOrderById(externalOrderId, clientId)
+      if (!createdOrder) {
+        throw new Error(
+          `Mintsoft order push created order ${externalOrderId} but it could not be read back under ClientId `
+            + `${clientId} — refusing to bind an unverifiable order`,
+        )
+      }
       return {
         externalOrderId,
-        externalOrderNumber: toStr(created.data.OrderNumber) ?? input.orderNumber,
+        externalOrderNumber: toStr(createdOrder.OrderNumber) ?? toStr(created.data.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
         courierFallback,
       }
     }
   }
 
-  // Duplicate → reconcile to the order that already exists (lost writeback).
-  // Only THIS branch binds our link to a pre-existing order, so it is the only
-  // part of the push that needs the tenant scope — an ordinary create stays
-  // usable on a tenant that has not configured mintsoft_client_id.
+  // Duplicate → reconcile to the order that already exists (lost writeback). This
+  // binds our link to a PRE-EXISTING order, so the tenant scope is essential here.
   if (created.message && /already exists/i.test(created.message)) {
-    const clientId = await getPushClientId('Mintsoft push dedupe lookup')
     const existing = await findExistingByReference(input, clientId)
     const externalOrderId = existing ? toStr(existing.ID ?? existing.Id ?? existing.id) : null
     if (existing && externalOrderId) {
@@ -249,10 +267,20 @@ async function fetchMintsoftOrderStatusId(
   const current = await mintsoftRequest<unknown>(
     `/api/Order/${encodeURIComponent(externalOrderId)}?ClientId=${clientId}`,
   )
+  // ONLY an explicit 404 is authoritative "this order does not exist". Anything
+  // else that yields no readable order is an UNKNOWN state and must throw: the
+  // client renders a 204 as `data: null`, and reporting that as NOT_FOUND would
+  // tell the push sweep the remote cancellation succeeded — moving the local link
+  // to CANCELLED/HELD while the warehouse carries on fulfilling the order.
   if (current.status === 404) return { found: false, isNew: false }
   if (current.error) throw new Error(current.error)
   const raw = extractMintsoftObjectPayload(current.data)
-  if (raw === null) return { found: false, isNew: false }
+  if (raw === null) {
+    throw new Error(
+      `Mintsoft Order detail (push gate): order ${externalOrderId} returned HTTP ${current.status} with no readable `
+        + 'order object — refusing to treat an unverifiable response as "not found"',
+    )
+  }
   const order = assertMintsoftOrderClient(raw, clientId, 'Mintsoft Order detail (push gate)')
   const statusId = order.OrderStatusId
   return { found: true, isNew: statusId === 1 || statusId === '1' }
@@ -411,7 +439,11 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
 export async function addMintsoftOrderComment(externalOrderId: string, comment: string): Promise<void> {
   const clientId = await getPushClientId('Mintsoft order comment')
   const { found } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
-  if (!found) return
+  if (!found) {
+    // Observable, not silent: callers audit this call's outcome, and a warehouse
+    // warning that was never posted must not be recorded as SUCCEEDED.
+    throw new Error(`Mintsoft order ${externalOrderId} not found — the warehouse note was not posted`)
+  }
 
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Comments`, {
     method: 'POST',

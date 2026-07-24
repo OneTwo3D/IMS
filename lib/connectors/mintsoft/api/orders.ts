@@ -198,7 +198,7 @@ async function searchMintsoftOrdersByNumber(orderNumber: string, clientId: numbe
  * status/courier fields, so we re-read the picked order by id (matching the
  * proven plugin, which follows every search hit with GET /api/Order/{id}).
  */
-async function fetchMintsoftOrderById(externalOrderId: string, clientId: number | null): Promise<RawOrder | null> {
+export async function fetchMintsoftOrderById(externalOrderId: string, clientId: number | null): Promise<RawOrder | null> {
   const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft Order detail')
   // Scope the request itself (defence in depth) in addition to validating the
   // returned row's ClientId below — so the shared-tenant boundary is enforced
