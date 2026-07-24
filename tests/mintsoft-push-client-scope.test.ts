@@ -26,6 +26,10 @@ let itemRows: unknown[] = []
 // Ids whose detail request answers 2xx with NO readable order body (the client
 // renders a 204 that way) — an UNKNOWN state, not an authoritative "not found".
 let emptyDetailIds = new Set<string>()
+// Ids whose detail request fails at the transport layer (5xx / network) — retryable,
+// and it must never cost us an id Mintsoft already minted.
+let detailErrorIds = new Set<string>()
+let searchError: string | null = null
 let calls: string[] = []
 let writes: Array<{ path: string; method: string }> = []
 
@@ -54,7 +58,10 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       const method = init?.method ?? 'GET'
       const pathname = path.split('?')[0]
       if (pathname === '/api/Order' && method === 'PUT') return { data: createResult, status: 200 }
-      if (pathname === '/api/Order/Search') return { data: searchRows, status: 200 }
+      if (pathname === '/api/Order/Search') {
+        if (searchError) return { data: null, error: searchError, status: 500 }
+        return { data: searchRows, status: 200 }
+      }
       if (method !== 'GET') {
         writes.push({ path, method })
         return { data: { Success: true }, status: 200 }
@@ -62,6 +69,9 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       const detailMatch = pathname.match(/^\/api\/Order\/([^/]+)$/)
       if (detailMatch) {
         const id = decodeURIComponent(detailMatch[1])
+        if (detailErrorIds.has(id)) {
+          return { data: null, error: 'Mintsoft request failed with status 503', status: 503 }
+        }
         if (emptyDetailIds.has(id)) return { data: null, status: 204 }
         return details.has(id) ? { data: details.get(id), status: 200 } : { data: null, status: 404 }
       }
@@ -88,6 +98,8 @@ function reset() {
   createResult = null
   itemRows = []
   emptyDetailIds = new Set()
+  detailErrorIds = new Set()
+  searchError = null
   calls = []
   writes = []
 }
@@ -200,6 +212,56 @@ test('[o3d-bjc.6] a created order invisible to BOTH lookups is still bound — n
   const result = await pushMintsoftOrder(INPUT)
   assert.equal(result.externalOrderId, '700')
   assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'created exactly once')
+})
+
+test('[o3d-bjc.6] the reference fallback never binds a DIFFERENT same-client order over the minted id', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  // Mintsoft minted 700, which isn't visible yet — but an OLDER order 600 shares the
+  // collidable number. Binding 600 would mutate and cancel the WRONG order while the
+  // order we just created stays unlinked and still ships.
+  createResult = [{ Success: true, OrderId: 700, OrderNumber: 'WC-1001' }]
+  searchRows = [{ ID: 600, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+
+  const result = await pushMintsoftOrder(INPUT)
+  assert.equal(result.externalOrderId, '700', 'kept the minted id, not the same-number match')
+})
+
+test('[o3d-bjc.6] a TRANSPORT failure on either verification request does not discard the minted id', async () => {
+  const { pushMintsoftOrder } = await push()
+
+  // (a) the scoped read-back errors (5xx / network), the reference lookup resolves it
+  reset()
+  createResult = [{ Success: true, OrderId: 700, OrderNumber: 'WC-1001' }]
+  detailErrorIds.add('700')
+  searchRows = [{ ID: 700, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  assert.equal((await pushMintsoftOrder(INPUT)).externalOrderId, '700')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'created exactly once')
+
+  // (b) BOTH verification requests error → still bound, still one create
+  reset()
+  createResult = [{ Success: true, OrderId: 700, OrderNumber: 'WC-1001' }]
+  detailErrorIds.add('700')
+  searchError = 'Mintsoft request failed with status 500'
+  try {
+    const result = await pushMintsoftOrder(INPUT)
+    assert.equal(result.externalOrderId, '700')
+    assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'created exactly once')
+  } finally {
+    searchError = null
+  }
+})
+
+test('[o3d-bjc.6] a search failure with NO minted id still fails (nothing to fall back on)', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  createResult = [DUPLICATE] // no OrderId → no minted identity
+  searchError = 'Mintsoft request failed with status 500'
+  try {
+    await assert.rejects(() => pushMintsoftOrder(INPUT), /Mintsoft request failed with status 500/)
+  } finally {
+    searchError = null
+  }
 })
 
 test('[o3d-bjc.6] …but a FOREIGN read-back is still fatal, never bound', async () => {

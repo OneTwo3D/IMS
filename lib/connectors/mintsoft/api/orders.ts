@@ -161,18 +161,34 @@ export function requireMintsoftClientId(clientId: number | null | undefined, ope
   return clientId as number
 }
 
+/**
+ * A row could not be proven to belong to our client. Typed so callers can tell a
+ * TENANT violation (always fatal — never bind or mutate) apart from a transport or
+ * parse failure (retryable, and must not discard identity we already hold).
+ */
+export class MintsoftTenantMismatchError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'MintsoftTenantMismatchError'
+  }
+}
+
 export function assertMintsoftOrderClient(row: unknown, clientId: number, context: string): RawOrder {
   if (typeof row !== 'object' || row === null || Array.isArray(row)) {
-    throw new Error(`${context}: row is not an object — refusing an unverifiable cross-client order lookup`)
+    throw new MintsoftTenantMismatchError(
+      `${context}: row is not an object — refusing an unverifiable cross-client order lookup`,
+    )
   }
   const order = row as RawOrder
   const rowId = toStr(order.ID ?? order.Id ?? order.id) ?? 'unknown'
   const rowClientId = toInt(order.ClientId ?? order.clientId)
   if (rowClientId === null) {
-    throw new Error(`${context}: row ${rowId} has no ClientId — refusing an unverifiable cross-client order lookup`)
+    throw new MintsoftTenantMismatchError(
+      `${context}: row ${rowId} has no ClientId — refusing an unverifiable cross-client order lookup`,
+    )
   }
   if (rowClientId !== clientId) {
-    throw new Error(
+    throw new MintsoftTenantMismatchError(
       `${context}: row ${rowId} ClientId ${rowClientId} does not match configured ${clientId} — ` +
         'refusing a cross-client order lookup',
     )
