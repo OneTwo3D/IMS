@@ -4,6 +4,7 @@ import {
   runWmsDispatchSweepCore,
   formatCursorInTimeZone,
   resolveDispatchJobOutcome,
+  isDispatchClientScoped,
 } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsDispatchSweepDeps, WmsDispatchCandidate } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsOrderStatus, WmsOrderTracking, WmsOrderPart } from '../lib/connectors/wms/types.ts'
@@ -68,6 +69,26 @@ test('formatCursorInTimeZone converts a UTC instant into the tenant wall-clock (
   assert.equal(formatCursorInTimeZone(new Date('2026-07-15T11:00:00Z'), 'UTC'), '2026-07-15T11:00:00')
   assert.equal(formatCursorInTimeZone(new Date('2026-07-15T11:00:00Z'), ''), '2026-07-15T11:00:00')
   assert.equal(formatCursorInTimeZone(new Date('2026-07-15T11:00:00Z'), 'Not/AZone'), '2026-07-15T11:00:00')
+})
+
+// --- Round-5 #3: unscoped Mintsoft must SKIP (not dead-letter) --------------
+
+test('[o3d-bjc #3] isDispatchClientScoped: Mintsoft needs a positive integer ClientId; other connectors are always scoped', () => {
+  // Mintsoft, unconfigured → NOT scoped → the wrapper SKIPs the whole sweep
+  // (no per-order reconcile that would throw + dead-letter every link).
+  assert.equal(isDispatchClientScoped('mintsoft', null), false)
+  assert.equal(isDispatchClientScoped('mintsoft', ''), false)
+  assert.equal(isDispatchClientScoped('mintsoft', '   '), false)
+  assert.equal(isDispatchClientScoped('mintsoft', '0'), false)
+  assert.equal(isDispatchClientScoped('mintsoft', '-5'), false)
+  assert.equal(isDispatchClientScoped('mintsoft', 'abc'), false)
+  assert.equal(isDispatchClientScoped('mintsoft', '12x'), false)
+  // Mintsoft, configured → scoped → the sweep runs.
+  assert.equal(isDispatchClientScoped('mintsoft', '1234'), true)
+  assert.equal(isDispatchClientScoped('mintsoft', ' 1234 '), true)
+  // A different WMS (e.g. shiphero) carries no shared-tenant scope → always ok.
+  assert.equal(isDispatchClientScoped('shiphero', null), true)
+  assert.equal(isDispatchClientScoped('shiphero', ''), true)
 })
 
 // --- Sweep-core delta behaviour --------------------------------------------

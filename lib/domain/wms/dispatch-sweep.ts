@@ -97,6 +97,20 @@ export function shouldDeadLetterDispatch(failureCount: number, deadLetteredAt: D
 }
 
 /**
+ * Round-5 #3: on the shared Mintsoft tenant every per-order lookup (Search /
+ * detail / parts) requires a ClientId and throws without one — so an unscoped
+ * Mintsoft dispatch sweep can only fail every candidate and dead-letter every
+ * link. This gate lets the wrapper SKIP the whole run instead. A positive
+ * integer `mintsoft_client_id` is required; other WMS connectors carry no such
+ * scope and are always considered scoped.
+ */
+export function isDispatchClientScoped(connectorId: string, clientIdRaw: string | null | undefined): boolean {
+  if (connectorId !== 'mintsoft') return true
+  const raw = (clientIdRaw ?? '').trim()
+  return /^\d+$/.test(raw) && Number.parseInt(raw, 10) > 0
+}
+
+/**
  * Job-outcome mapping (o3d-bjc finding 3a): a delta-fetch failure is a degraded
  * PRIMARY path — the sweep fell back to a bounded per-order reconcile, so it must
  * count as an error and mark the job PARTIAL rather than let a broken delta hide
@@ -953,9 +967,21 @@ export async function runWmsDispatchSweep(
   // call it) and fall back to the per-order reconcile (unchanged pre-delta
   // behaviour). Only Mintsoft carries this scope; other WMS connectors have no
   // delta wired, so this gate is a no-op for them. (Mirrors parseMintsoftPositiveId.)
-  const clientIdRaw = (deltaClientIdSetting ?? '').trim()
-  const clientScoped = connectorId !== 'mintsoft'
-    || (/^\d+$/.test(clientIdRaw) && Number.parseInt(clientIdRaw, 10) > 0)
+  const clientScoped = isDispatchClientScoped(connectorId, deltaClientIdSetting)
+  // Round-5 #3 regression fix: on the shared Mintsoft tenant EVERY per-order
+  // lookup (Search/detail/parts) now requires a ClientId and throws without one.
+  // The old "delta off, fall back to per-order reconcile" path would therefore
+  // throw for every candidate, accrue consecutive-failure strikes, and
+  // dead-letter every active link. So when Mintsoft is unscoped we SKIP the whole
+  // sweep (no candidates touched, no strikes) rather than run a reconcile that
+  // can only fail — a blank ClientId cleanly DISABLES Mintsoft dispatch sync.
+  if (!clientScoped) {
+    return {
+      ...empty,
+      status: 'SKIPPED',
+      skippedReason: 'Mintsoft dispatch sync is disabled until mintsoft_client_id is configured (Sync settings) — skipped to avoid unscoped cross-client lookups',
+    }
+  }
   const coreOptions: WmsDispatchSweepCoreOptions = {
     batchSize: options?.batchSize,
     deltaEnabled: deltaEnabledSetting !== 'false' && clientScoped,

@@ -173,8 +173,9 @@ export function MintsoftOrderDispatchSection() {
           className="w-40 rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
         />
         <p className="text-xs text-muted-foreground">
-          Our Mintsoft ClientId. <strong>Required</strong> to enable the fast inbound Order/List delta poll — Mintsoft is a
-          shared 3PL tenant, so without it the delta stays off and the sweep falls back to the per-order reconcile. Leave blank to disable.
+          Our Mintsoft ClientId. <strong>Required</strong> for all Mintsoft dispatch reconciliation — Mintsoft is a shared 3PL
+          tenant, so every order lookup must be scoped to our client to avoid acting on another client&apos;s order. Leave blank
+          and Mintsoft dispatch sync is <strong>disabled</strong> (skipped each run, no orders touched) until it is set.
         </p>
       </div>
 

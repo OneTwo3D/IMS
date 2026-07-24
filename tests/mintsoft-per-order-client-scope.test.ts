@@ -21,15 +21,19 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
   namedExports: {
     mintsoftRequest: async (path: string) => {
       calls.push(path)
-      if (path === '/api/Order/Statuses') {
+      // Match on the pathname; per-order detail/items requests now also carry a
+      // ?ClientId= query (finding 1 request-side scoping) — the full path stays
+      // in `calls` so tests can still assert the ClientId param.
+      const pathname = path.split('?')[0]
+      if (pathname === '/api/Order/Statuses') {
         return { data: [{ ID: 4, Name: 'DESPATCHED' }], status: 200 }
       }
-      if (path.startsWith('/api/Order/Search?')) {
+      if (pathname === '/api/Order/Search') {
         return { data: searchRows, status: 200 }
       }
-      const itemsMatch = path.match(/^\/api\/Order\/([^/]+)\/Items$/)
+      const itemsMatch = pathname.match(/^\/api\/Order\/([^/]+)\/Items$/)
       if (itemsMatch) return { data: itemRows, status: 200 }
-      const detailMatch = path.match(/^\/api\/Order\/([^/]+)$/)
+      const detailMatch = pathname.match(/^\/api\/Order\/([^/]+)$/)
       if (detailMatch) {
         const id = decodeURIComponent(detailMatch[1])
         return details.has(id)

@@ -100,7 +100,10 @@ async function searchMintsoftOrdersByNumber(orderNumber: string, clientId: numbe
  */
 async function fetchMintsoftOrderById(externalOrderId: string, clientId: number | null): Promise<RawOrder | null> {
   const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft Order detail')
-  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`)
+  // Scope the request itself (defence in depth) in addition to validating the
+  // returned row's ClientId below — so the shared-tenant boundary is enforced
+  // server-side wherever the API honours it, not only on the response.
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}?ClientId=${scopedClientId}`)
   if (result.status === 404) return null
   if (result.error) throw new Error(result.error)
   const row = extractMintsoftObjectPayload(result.data)
@@ -442,7 +445,9 @@ export async function fetchMintsoftPartItems(
   // the tenant boundary.
   const parent = await fetchMintsoftOrderById(externalOrderId, scopedClientId)
   if (!parent) return []
-  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Items`)
+  // Parent already validated as ours; scope the items request too (defence in
+  // depth) since the Items DTO carries no ClientId of its own.
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Items?ClientId=${scopedClientId}`)
   if (result.error) throw new Error(result.error)
   const out: Array<{ sku: string; qty: number }> = []
   for (const raw of extractMintsoftArrayPayload(result.data)) {
