@@ -51,11 +51,46 @@ async function fetchMintsoftOrderStatusMap(): Promise<Map<number, string>> {
   return map
 }
 
-async function searchMintsoftOrdersByNumber(orderNumber: string): Promise<RawOrder[]> {
-  const query = new URLSearchParams({ OrderNumber: orderNumber.trim() })
+function requireMintsoftClientId(clientId: number | null | undefined, operation: string): number {
+  if (!Number.isInteger(clientId) || (clientId ?? 0) <= 0) {
+    throw new Error(
+      `${operation} requires a ClientId (configure mintsoft_client_id) — ` +
+        'refusing to run an unscoped cross-client order lookup',
+    )
+  }
+  return clientId as number
+}
+
+function assertMintsoftOrderClient(row: unknown, clientId: number, context: string): RawOrder {
+  if (typeof row !== 'object' || row === null || Array.isArray(row)) {
+    throw new Error(`${context}: row is not an object — refusing an unverifiable cross-client order lookup`)
+  }
+  const order = row as RawOrder
+  const rowId = toStr(order.ID ?? order.Id ?? order.id) ?? 'unknown'
+  const rowClientId = toInt(order.ClientId ?? order.clientId)
+  if (rowClientId === null) {
+    throw new Error(`${context}: row ${rowId} has no ClientId — refusing an unverifiable cross-client order lookup`)
+  }
+  if (rowClientId !== clientId) {
+    throw new Error(
+      `${context}: row ${rowId} ClientId ${rowClientId} does not match configured ${clientId} — ` +
+        'refusing a cross-client order lookup',
+    )
+  }
+  return order
+}
+
+async function searchMintsoftOrdersByNumber(orderNumber: string, clientId: number | null): Promise<RawOrder[]> {
+  const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft Order/Search')
+  const query = new URLSearchParams({
+    OrderNumber: orderNumber.trim(),
+    ClientId: String(scopedClientId),
+  })
   const result = await mintsoftRequest<unknown>(`/api/Order/Search?${query.toString()}`)
+  if (result.status === 404) return []
   if (result.error) throw new Error(result.error)
-  return extractMintsoftArrayPayload(result.data) as RawOrder[]
+  const rows = extractMintsoftArrayPayloadStrict(result.data, 'Mintsoft Order/Search')
+  return rows.map((row) => assertMintsoftOrderClient(row, scopedClientId, 'Mintsoft Order/Search'))
 }
 
 /**
@@ -63,11 +98,13 @@ async function searchMintsoftOrdersByNumber(orderNumber: string): Promise<RawOrd
  * status/courier fields, so we re-read the picked order by id (matching the
  * proven plugin, which follows every search hit with GET /api/Order/{id}).
  */
-async function fetchMintsoftOrderById(externalOrderId: string): Promise<RawOrder | null> {
+async function fetchMintsoftOrderById(externalOrderId: string, clientId: number | null): Promise<RawOrder | null> {
+  const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft Order detail')
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`)
   if (result.status === 404) return null
   if (result.error) throw new Error(result.error)
-  return extractMintsoftObjectPayload(result.data) as RawOrder | null
+  const row = extractMintsoftObjectPayload(result.data)
+  return row === null ? null : assertMintsoftOrderClient(row, scopedClientId, 'Mintsoft Order detail')
 }
 
 export function mergedParts(orderNumber: string | null): string[] {
@@ -82,14 +119,17 @@ export function mergedParts(orderNumber: string | null): string[] {
  * a merged survivor that folded this number in — but only when EXACTLY ONE
  * merged candidate matches (fail closed on ambiguity, like the reference plugin).
  */
-export function pickOrderRow(orders: RawOrder[], orderNumber: string): RawOrder | null {
+export function pickOrderRow(orders: RawOrder[], orderNumber: string, clientId: number): RawOrder | null {
   const wanted = orderNumber.trim()
-  const exact = orders
+  // Defence in depth: even if Order/Search ignores its ClientId filter, a
+  // foreign or unverifiable row can never win the exact/merged selection.
+  const scoped = orders.filter((order) => toInt(order.ClientId ?? order.clientId) === clientId)
+  const exact = scoped
     .filter((order) => toStr(order.OrderNumber) === wanted)
     .sort((a, b) => (toInt(a.Part) ?? 1) - (toInt(b.Part) ?? 1))
   if (exact.length > 0) return exact[0]
 
-  const merged = orders.filter((order) => mergedParts(toStr(order.OrderNumber)).includes(wanted))
+  const merged = scoped.filter((order) => mergedParts(toStr(order.OrderNumber)).includes(wanted))
   return merged.length === 1 ? merged[0] : null
 }
 
@@ -100,12 +140,16 @@ export function pickOrderRow(orders: RawOrder[], orderNumber: string): RawOrder 
  * closed on multiple merged matches). Reconciliation only treats MISSING as
  * safe grounds for re-creating the order.
  */
-export async function probeMintsoftOrderPresence(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
+export async function probeMintsoftOrderPresence(
+  orderNumber: string,
+  clientId: number | null,
+): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
   const reference = orderNumber.trim()
   if (!reference) return 'MISSING'
-  const matches = await searchMintsoftOrdersByNumber(reference)
+  const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft order presence probe')
+  const matches = await searchMintsoftOrdersByNumber(reference, scopedClientId)
   if (matches.length === 0) return 'MISSING'
-  return pickOrderRow(matches, reference) ? 'FOUND' : 'AMBIGUOUS'
+  return pickOrderRow(matches, reference, scopedClientId) ? 'FOUND' : 'AMBIGUOUS'
 }
 
 export function readTracking(order: RawOrder): WmsOrderTracking[] {
@@ -167,12 +211,16 @@ export async function normalizeMintsoftOrderRow(
   }
 }
 
-export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
+export async function fetchMintsoftOrderStatus(
+  orderNumber: string,
+  clientId: number | null,
+): Promise<WmsOrderStatus | null> {
   const reference = orderNumber.trim()
   if (!reference) return null
 
-  const matches = await searchMintsoftOrdersByNumber(reference)
-  const picked = pickOrderRow(matches, reference)
+  const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft order status lookup')
+  const matches = await searchMintsoftOrdersByNumber(reference, scopedClientId)
+  const picked = pickOrderRow(matches, reference, scopedClientId)
   if (!picked) return null
 
   const pickedId = toStr(picked.ID ?? picked.Id ?? picked.id)
@@ -180,7 +228,7 @@ export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<Wms
 
   // Re-read by id for authoritative status/tracking; fall back to the search row
   // if the detail 404s (e.g. the order was merged away after the search).
-  const order = (await fetchMintsoftOrderById(pickedId)) ?? picked
+  const order = (await fetchMintsoftOrderById(pickedId, scopedClientId)) ?? picked
   const normalized = await normalizeMintsoftOrderRow(order)
   if (!normalized) return null
 
@@ -348,10 +396,14 @@ export type MintsoftOrderPart = {
  * re-read each by id for an authoritative status + tracking (search rows can carry
  * null status/courier). Used by dispatch-sync to reconcile per-part despatch.
  */
-export async function fetchMintsoftOrderParts(orderNumber: string): Promise<MintsoftOrderPart[]> {
+export async function fetchMintsoftOrderParts(
+  orderNumber: string,
+  clientId: number | null,
+): Promise<MintsoftOrderPart[]> {
   const reference = orderNumber.trim()
   if (!reference) return []
-  const rows = await searchMintsoftOrdersByNumber(reference)
+  const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft order-parts lookup')
+  const rows = await searchMintsoftOrdersByNumber(reference, scopedClientId)
   const exact = rows.filter((row) => toStr(row.OrderNumber) === reference)
   if (exact.length === 0) return []
 
@@ -360,7 +412,7 @@ export async function fetchMintsoftOrderParts(orderNumber: string): Promise<Mint
   for (const row of exact) {
     const searchId = toStr(row.ID ?? row.Id ?? row.id)
     if (!searchId) continue
-    const detail = (await fetchMintsoftOrderById(searchId)) ?? row
+    const detail = (await fetchMintsoftOrderById(searchId, scopedClientId)) ?? row
     const externalId = toStr(detail.ID ?? detail.Id ?? detail.id) ?? searchId
     const statusId = toInt(detail.OrderStatusId)
     const partStatus = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
@@ -380,7 +432,16 @@ export async function fetchMintsoftOrderParts(orderNumber: string): Promise<Mint
 }
 
 /** Line items (SKU + whole-unit qty) of a single Mintsoft order/part. */
-export async function fetchMintsoftPartItems(externalOrderId: string): Promise<Array<{ sku: string; qty: number }>> {
+export async function fetchMintsoftPartItems(
+  externalOrderId: string,
+  clientId: number | null,
+): Promise<Array<{ sku: string; qty: number }>> {
+  const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft part-items lookup')
+  // The Items DTO does not carry ClientId. Validate the parent part immediately
+  // before consuming its items so an arbitrary/foreign part id can never cross
+  // the tenant boundary.
+  const parent = await fetchMintsoftOrderById(externalOrderId, scopedClientId)
+  if (!parent) return []
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Items`)
   if (result.error) throw new Error(result.error)
   const out: Array<{ sku: string; qty: number }> = []

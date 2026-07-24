@@ -193,12 +193,17 @@ export type WmsDispatchSweepDeps = {
   fetchDelta?(sinceIso: string): Promise<import('@/lib/connectors/wms/types').WmsOrderStatus[]>
   getDeltaState?(): Promise<{ watermark: string | null; lastReconcile: string | null }>
   saveDeltaState?(state: { watermark?: string; lastReconcile?: string }): Promise<void>
-  // Active links (same eligibility as listCandidates) whose externalOrderNumber
-  // is in the given set — used by the delta pass to reconcile EVERY changed
-  // order, not just the reconcile batch, so the watermark can advance without
-  // ageing out a dispatch that sits beyond `batchSize`. Optional: without it the
-  // sweep falls back to filtering the batch and holds the watermark unless the
-  // batch enumerated every active link.
+  // Active links (same eligibility as listCandidates) whose STABLE
+  // externalOrderId is in the given set. This is the primary delta candidate
+  // lookup: order numbers can be renamed while the Mintsoft ID remains stable.
+  // Optional for connector/test compatibility; without it the sweep falls back
+  // to the bounded candidate batch and conservatively holds the watermark when
+  // that batch may be incomplete.
+  listActiveByExternalOrderIds?(externalOrderIds: string[]): Promise<WmsDispatchCandidate[]>
+  // Secondary split-only lookup. A split shares one order number across several
+  // part IDs, so the changed delta part ID may differ from the ID stored on the
+  // link. The delta pass uses this only for numbers identified as split, then
+  // forces an authoritative per-order fetch rather than trusting a number join.
   listActiveByOrderNumbers?(orderNumbers: string[]): Promise<WmsDispatchCandidate[]>
   // o3d-bjc reconcile rotation: the throttled per-order reconcile batch, ordered
   // least-recently-verified first (dispatchReconcileCheckedAt asc NULLS FIRST,
@@ -297,10 +302,20 @@ export async function reconcileOneOrder(
   // instead of a per-order status fetch. `null`/omitted → fetch as before (the
   // caller passes null to force a fetch for an ambiguous split — see the core).
   preloaded?: WmsOrderStatus | null,
+  // A split-only number lookup is a candidate-enumeration hint, not a join.
+  // Require its authoritative primary row to echo the link's stable ID before
+  // applying anything, so a reused/colliding number cannot dispatch this link.
+  expectedExternalOrderId?: string,
 ): Promise<{ action: 'dispatched' | 'pending' | 'error'; reason: string }> {
   const status = preloaded ?? (await deps.fetchOrderStatus(candidate.externalOrderNumber))
   if (!status) {
     return { action: 'pending', reason: 'Order not found in the WMS' }
+  }
+  if (expectedExternalOrderId && status.externalOrderId !== expectedExternalOrderId) {
+    return {
+      action: 'pending',
+      reason: `Order-number lookup returned stable ID ${status.externalOrderId || 'unknown'}; expected ${expectedExternalOrderId}`,
+    }
   }
 
   // Merge: the WMS merged this order into a survivor (combined "a+b" number); our original
@@ -363,10 +378,10 @@ export async function runWmsDispatchSweepCore(
   // --- Inbound Order/List delta (o3d-bjc) ---------------------------------
   // Only engages when the connector supplies a bulk delta AND the flag is on.
   // deltaById keys changed orders by their STABLE externalOrderId (order numbers
-  // aren't unique); deltaByNumber is a secondary index used to enumerate candidate
-  // links by number and to detect a shared number (split/reuse) that must not be
-  // preloaded. deltaFetched/ranReconcile gate the clean-pass cursor advance;
-  // passClean holds it back on any error.
+  // aren't unique); deltaByNumber is a secondary index used only to preserve
+  // split coverage and detect a shared number that must not be preloaded.
+  // deltaFetched/ranReconcile gate the clean-pass cursor advance; passClean
+  // holds it back on any error.
   const deltaActive = Boolean(deps.fetchDelta) && (options?.deltaEnabled ?? true)
   let deltaById: Map<string, WmsOrderStatus> | null = null
   let deltaByNumber: Map<string, WmsOrderStatus[]> | null = null
@@ -427,12 +442,16 @@ export async function runWmsDispatchSweepCore(
   // never count as another reconcile failure (Codex: recordDispatchError
   // throwing inside the catch would have recursed into itself) nor abort the
   // rest of the pass.
-  const processOne = async (candidate: WmsDispatchCandidate, preload: WmsOrderStatus | null | undefined) => {
+  const processOne = async (
+    candidate: WmsDispatchCandidate,
+    preload: WmsOrderStatus | null | undefined,
+    expectedExternalOrderId?: string,
+  ) => {
     counters.totalChecked += 1
 
     let outcome: { action: 'dispatched' | 'pending' | 'error'; reason: string }
     try {
-      outcome = await reconcileOneOrder(deps, candidate, preload)
+      outcome = await reconcileOneOrder(deps, candidate, preload, expectedExternalOrderId)
     } catch (error) {
       outcome = { action: 'error', reason: scrubWmsError(error, 'WMS dispatch sweep error') }
     }
@@ -470,22 +489,15 @@ export async function runWmsDispatchSweepCore(
   let deltaCoverageComplete = true
 
   // --- Delta pass: reconcile every active link whose order changed since the
-  // watermark. Coverage MUST span the whole delta, not just the reconcile batch
-  // (o3d-bjc Codex: a fixed batch let a changed order past position `batchSize`
-  // slip while the watermark still advanced). Prefer the by-order-number lookup;
-  // fall back to filtering the batch and hold the watermark if it was truncated.
-  //
-  // A link is joined to a delta row by its STABLE externalOrderId — never by
-  // order number alone (finding 2: numbers aren't unique, so a collision could
-  // apply one dispatched row to several local orders). Candidates are enumerated
-  // by number (that's the index we have), then filtered to those whose id is in
-  // the delta; a number match without an id match means THIS link's order did not
-  // change, so it's left to the throttled reconcile rotation.
-  if (deltaById && deltaByNumber && deltaByNumber.size > 0) {
-    const deltaNumbers = [...deltaByNumber.keys()]
+  // watermark. Coverage MUST span the whole delta, not just the reconcile batch.
+  // Enumerate by STABLE externalOrderId so a Mintsoft order-number rename cannot
+  // hide a linked order. A split-only number lookup supplements it because the
+  // changed part ID may be a sibling of the part ID stored on the local link.
+  if (deltaById && deltaByNumber && deltaById.size > 0) {
+    const changedIds = [...deltaById.keys()]
     let deltaCandidates: WmsDispatchCandidate[]
-    if (deps.listActiveByOrderNumbers) {
-      deltaCandidates = await deps.listActiveByOrderNumbers(deltaNumbers)
+    if (deps.listActiveByExternalOrderIds) {
+      deltaCandidates = await deps.listActiveByExternalOrderIds(changedIds)
     } else {
       const batch = await deps.listCandidates(batchSize)
       // A full batch means there may be active links we never saw — hold the
@@ -493,17 +505,57 @@ export async function runWmsDispatchSweepCore(
       deltaCoverageComplete = batch.length < batchSize
       deltaCandidates = batch
     }
+
+    const splitNumbers = [...deltaByNumber.entries()]
+      .filter(([, rows]) =>
+        rows.length > 1 || rows.some((row) => row.isSplit || (row.partCount ?? 1) > 1),
+      )
+      .map(([number]) => number)
+    if (splitNumbers.length > 0) {
+      if (deps.listActiveByOrderNumbers) {
+        const splitCandidates = await deps.listActiveByOrderNumbers(splitNumbers)
+        const seen = new Set(deltaCandidates.map((candidate) => candidate.linkId))
+        for (const candidate of splitCandidates) {
+          if (!seen.has(candidate.linkId)) {
+            deltaCandidates.push(candidate)
+            seen.add(candidate.linkId)
+          }
+        }
+      } else {
+        // Stable IDs alone cannot prove split coverage: the changed sibling part
+        // may not be the ID stored on the link. Keep the watermark until a later
+        // run can enumerate that shared-number group.
+        deltaCoverageComplete = false
+      }
+    }
+
     for (const candidate of deltaCandidates) {
-      // Stable-id join: only reconcile a link whose own order is in the delta.
+      // Stable-id join is authoritative. A candidate without one is eligible
+      // only through the split-only number lookup and is always force-fetched.
       const idRow = candidate.externalOrderId ? deltaById.get(candidate.externalOrderId) : undefined
-      if (!idRow) continue
-      // A split shares one number across several part-rows (distinct ids);
-      // preloading the single primary row is ambiguous, so force the authoritative
-      // per-order fetch (Search + pickOrderRow + parts). Only preload an
-      // unambiguous 1:1 (this number maps to exactly one delta row).
-      const numberRows = deltaByNumber.get(candidate.externalOrderNumber)
-      const preload = numberRows && numberRows.length === 1 ? idRow : null
-      await processOne(candidate, preload)
+      const candidateRows = deltaByNumber.get(candidate.externalOrderNumber)
+      const splitByNumber = candidateRows?.some((row) => row.isSplit || (row.partCount ?? 1) > 1)
+        || (candidateRows?.length ?? 0) > 1
+      if (!idRow && !splitByNumber) continue
+      if (!idRow && !candidate.externalOrderId) continue
+
+      const idRows = idRow ? deltaByNumber.get(idRow.externalOrderNumber) : undefined
+      const idIsSplit = idRow
+        ? idRow.isSplit || (idRow.partCount ?? 1) > 1 || (idRows?.length ?? 0) > 1
+        : false
+      // A renamed, non-split order is safe to preload by stable ID even though
+      // the local number is stale. Splits must be re-read authoritatively so all
+      // sibling parts are enumerated; use the delta's current number on an ID
+      // match so a renamed split is fetched under its new reference.
+      const effectiveCandidate = idRow && idIsSplit && idRow.externalOrderNumber
+        ? { ...candidate, externalOrderNumber: idRow.externalOrderNumber }
+        : candidate
+      const preload = idRow && !idIsSplit ? idRow : null
+      await processOne(
+        effectiveCandidate,
+        preload,
+        idRow ? undefined : candidate.externalOrderId ?? undefined,
+      )
       processedLinkIds.add(candidate.linkId)
     }
   }
@@ -598,9 +650,36 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           : [],
       )
     },
-    // Same eligibility as listCandidates but scoped to a set of order numbers and
-    // UNBOUNDED — the delta pass must see every changed active link, not just the
-    // oldest `batchSize`. Chunked so a large delta stays within a sane IN() size.
+    // Same eligibility as listCandidates but scoped to STABLE Mintsoft ids and
+    // UNBOUNDED — a mutable order-number rename must not hide a changed link.
+    // Chunked so a large delta stays within a sane IN() size.
+    async listActiveByExternalOrderIds(externalOrderIds) {
+      const unique = [...new Set(externalOrderIds.filter((id): id is string => Boolean(id)))]
+      if (unique.length === 0) return []
+      const CHUNK = 200
+      const out: WmsDispatchCandidate[] = []
+      for (let i = 0; i < unique.length; i += CHUNK) {
+        const rows = await db.wmsOrderPushLink.findMany({
+          where: {
+            connector: connectorId,
+            state: { in: ['SYNCED', 'MERGED'] },
+            externalOrderId: { in: unique.slice(i, i + CHUNK) },
+            externalOrderNumber: { not: null },
+            dispatchDeadLetteredAt: null,
+            order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+          },
+          select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
+        })
+        for (const row of rows) {
+          if (row.externalOrderNumber) {
+            out.push({ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber, externalOrderId: row.externalOrderId })
+          }
+        }
+      }
+      return out
+    },
+    // Split supplement: a changed sibling part can have a different stable ID
+    // from the one stored on the link, while all parts share an order number.
     async listActiveByOrderNumbers(orderNumbers) {
       const unique = [...new Set(orderNumbers.filter((n): n is string => Boolean(n)))]
       if (unique.length === 0) return []

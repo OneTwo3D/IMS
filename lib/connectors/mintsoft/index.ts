@@ -12,6 +12,16 @@ import { getSettingValue } from '@/lib/settings-store'
 
 const CONNECTOR = 'Mintsoft'
 
+async function getRequiredMintsoftClientId(): Promise<number> {
+  const clientId = parseMintsoftPositiveId(await getSettingValue('mintsoft_client_id'))
+  if (clientId === null) {
+    throw new Error(
+      'Mintsoft per-order lookup requires mintsoft_client_id — refusing an unscoped cross-client request',
+    )
+  }
+  return clientId
+}
+
 export class MintsoftConnector implements WmsConnector {
   readonly id = 'mintsoft' as const
   readonly name = CONNECTOR
@@ -81,7 +91,7 @@ export class MintsoftConnector implements WmsConnector {
   }
 
   async fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
-    return fetchMintsoftOrderStatus(orderNumber)
+    return fetchMintsoftOrderStatus(orderNumber, await getRequiredMintsoftClientId())
   }
 
   async fetchOrderDelta(sinceIso: string): Promise<WmsOrderStatus[]> {
@@ -106,15 +116,15 @@ export class MintsoftConnector implements WmsConnector {
   }
 
   async probeOrderPresence(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
-    return probeMintsoftOrderPresence(orderNumber)
+    return probeMintsoftOrderPresence(orderNumber, await getRequiredMintsoftClientId())
   }
 
   async fetchOrderParts(orderNumber: string): Promise<WmsOrderPart[]> {
-    return fetchMintsoftOrderParts(orderNumber)
+    return fetchMintsoftOrderParts(orderNumber, await getRequiredMintsoftClientId())
   }
 
   async fetchOrderPartItems(externalPartId: string): Promise<Array<{ sku: string; qty: number }>> {
-    return fetchMintsoftPartItems(externalPartId)
+    return fetchMintsoftPartItems(externalPartId, await getRequiredMintsoftClientId())
   }
 
   async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {

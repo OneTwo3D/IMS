@@ -241,17 +241,17 @@ test('the delta stays inert when the connector supplies no fetchDelta (behaves e
   assert.equal(counters.dispatched, 1)
 })
 
-test('(g) [o3d-bjc coverage] a changed order beyond the reconcile batch is processed via listActiveByOrderNumbers and the watermark advances', async () => {
-  const byNumberQueried: string[][] = []
+test('(g) [o3d-bjc coverage] a changed order beyond the reconcile batch is processed via listActiveByExternalOrderIds and the watermark advances', async () => {
+  const byIdQueried: string[][] = []
   const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
   let fetchStatusCalls = 0
   const { counters } = await runWmsDispatchSweepCore(
     deps({
       // Full batch of an UNRELATED link (not the changed order).
       listCandidates: async () => [candidate({ linkId: 'other', orderId: 'oo', externalOrderNumber: 'WC-9999', externalOrderId: 'M-9' })],
-      listActiveByOrderNumbers: async (numbers) => {
-        byNumberQueried.push(numbers)
-        return numbers.includes('WC-1001')
+      listActiveByExternalOrderIds: async (ids) => {
+        byIdQueried.push(ids)
+        return ids.includes('M-1')
           ? [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })]
           : []
       },
@@ -267,14 +267,14 @@ test('(g) [o3d-bjc coverage] a changed order beyond the reconcile batch is proce
     }),
     { now: NOW, batchSize: 1 },
   )
-  assert.deepEqual(byNumberQueried, [['WC-1001']]) // delta drove the by-number lookup
+  assert.deepEqual(byIdQueried, [['M-1']]) // delta drove the stable-ID lookup
   assert.equal(fetchStatusCalls, 0) // handled from the delta preload, no per-order poll
   assert.equal(counters.dispatched, 1) // the out-of-batch order WAS processed
   assert.equal(saved.length, 1)
   assert.equal(saved[0].watermark, NOW.toISOString()) // full coverage → watermark advanced
 })
 
-test('(h) [o3d-bjc coverage] fallback (no listActiveByOrderNumbers): a FULL batch holds the watermark so an out-of-batch change is not aged out', async () => {
+test('(h) [o3d-bjc coverage] fallback (no listActiveByExternalOrderIds): a FULL batch holds the watermark so an out-of-batch change is not aged out', async () => {
   const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
   const { counters } = await runWmsDispatchSweepCore(
     deps({
@@ -297,7 +297,7 @@ test('(i) [o3d-bjc coverage] an order handled in the delta pass is not double-pr
   const { counters } = await runWmsDispatchSweepCore(
     deps({
       listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
-      listActiveByOrderNumbers: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
+      listActiveByExternalOrderIds: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
       fetchOrderStatus: async () => {
         fetchStatusCalls += 1
         return status({ status: 'DESPATCHED', dispatched: true })
@@ -327,7 +327,7 @@ test('(j) [o3d-bjc rotation] the reconcile pass uses listReconcileCandidates (no
         usedReconcileList = true
         return [candidate({ linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1002', externalOrderId: 'M-2' })] // absent from delta → per-order poll
       },
-      listActiveByOrderNumbers: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
+      listActiveByExternalOrderIds: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
       fetchOrderStatus: async () => status({ status: 'PROCESSING' }),
       fetchDelta: async () => [
         status({ status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TN1' })] }),
@@ -349,7 +349,7 @@ test('(k) [o3d-bjc rotation] on a NON-reconcile tick a delta-verified link is st
   const stamped: string[][] = []
   await runWmsDispatchSweepCore(
     deps({
-      listActiveByOrderNumbers: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
+      listActiveByExternalOrderIds: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
       listReconcileCandidates: async () => { throw new Error('reconcile pass must not run on a non-due tick') },
       fetchDelta: async () => [status({ status: 'PROCESSING' })], // changed but not despatched
       getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }), // reconcile NOT due
@@ -367,7 +367,7 @@ test('(l) [o3d-bjc finding 2] a delta row joins by STABLE externalOrderId — tw
   const { counters } = await runWmsDispatchSweepCore(
     deps({
       // Both links carry the SAME order number but DIFFERENT stable ids.
-      listActiveByOrderNumbers: async () => [
+      listActiveByExternalOrderIds: async () => [
         candidate({ linkId: 'lA', orderId: 'oA', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }), // matches the delta id
         candidate({ linkId: 'lB', orderId: 'oB', externalOrderNumber: 'WC-1001', externalOrderId: 'M-2' }), // same number, id NOT in the delta
       ],
@@ -384,6 +384,151 @@ test('(l) [o3d-bjc finding 2] a delta row joins by STABLE externalOrderId — tw
   assert.deepEqual(applied, ['oA']) // ONLY the id-matching link — lB is never dispatched off WC-1001's despatch
   assert.equal(fetchStatusCalls, 0) // lA preloaded; lB skipped (its id M-2 is not in the delta)
   assert.equal(counters.dispatched, 1)
+})
+
+test('[o3d-bjc.2 finding 2] a renamed order is loaded and applied by stable ID even though the local link still has the old number', async () => {
+  const queriedIds: string[][] = []
+  const applied: string[] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  let fetchStatusCalls = 0
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async (ids) => {
+        queriedIds.push(ids)
+        return [candidate({
+          linkId: 'l1',
+          orderId: 'o1',
+          externalOrderId: 'M-1',
+          externalOrderNumber: 'WC-OLD',
+        })]
+      },
+      fetchOrderStatus: async () => {
+        fetchStatusCalls += 1
+        throw new Error('renamed order must use its stable-ID delta row')
+      },
+      applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+      fetchDelta: async () => [
+        status({
+          externalOrderId: 'M-1',
+          externalOrderNumber: 'WC-RENAMED',
+          status: 'DESPATCHED',
+          dispatched: true,
+          tracking: [tracking({ trackingNumber: 'TN-RENAMED' })],
+        }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(queriedIds, [['M-1']])
+  assert.equal(fetchStatusCalls, 0)
+  assert.deepEqual(applied, ['o1'])
+  assert.equal(counters.dispatched, 1)
+  assert.equal(saved[0]?.watermark, NOW.toISOString())
+})
+
+test('[o3d-bjc.2 finding 2] a changed split sibling ID still finds the stored primary link by split order number and forces part enumeration', async () => {
+  const queriedIds: string[][] = []
+  const queriedNumbers: string[][] = []
+  const partsFetchedFor: string[] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  let fetchStatusCalls = 0
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      // The delta changed M-2, while the link stores sibling part M-1.
+      listActiveByExternalOrderIds: async (ids) => { queriedIds.push(ids); return [] },
+      listActiveByOrderNumbers: async (numbers) => {
+        queriedNumbers.push(numbers)
+        return [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })]
+      },
+      fetchOrderStatus: async () => {
+        fetchStatusCalls += 1
+        return status({ externalOrderId: 'M-1', isSplit: true, partCount: 2 })
+      },
+      fetchOrderParts: async (orderNumber) => {
+        partsFetchedFor.push(orderNumber)
+        return [
+          part({ externalId: 'M-1', partNumber: 1, dispatched: true }),
+          part({ externalId: 'M-2', partNumber: 2, dispatched: true }),
+        ]
+      },
+      fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+      fetchDelta: async () => [
+        status({
+          externalOrderId: 'M-2',
+          externalOrderNumber: 'WC-1001',
+          isSplit: true,
+          partCount: 2,
+        }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(queriedIds, [['M-2']])
+  assert.deepEqual(queriedNumbers, [['WC-1001']])
+  assert.equal(fetchStatusCalls, 1)
+  assert.deepEqual(partsFetchedFor, ['WC-1001'])
+  assert.equal(counters.dispatched, 1)
+  assert.equal(saved[0]?.watermark, NOW.toISOString())
+})
+
+test('[o3d-bjc.2 finding 2] split coverage without the shared-number dependency holds the watermark', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      fetchDelta: async () => [
+        status({
+          externalOrderId: 'M-2',
+          externalOrderNumber: 'WC-1001',
+          isSplit: true,
+          partCount: 2,
+        }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2 finding 2] the split number supplement cannot apply a reused-number link whose stable ID differs', async () => {
+  const applied: string[] = []
+  let partsCalls = 0
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [
+        candidate({ linkId: 'foreign-link', orderId: 'foreign-order', externalOrderId: 'M-OTHER' }),
+      ],
+      fetchOrderStatus: async () => status({
+        externalOrderId: 'M-1',
+        externalOrderNumber: 'WC-1001',
+        isSplit: true,
+        partCount: 2,
+      }),
+      fetchOrderParts: async () => { partsCalls += 1; return [] },
+      applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+      fetchDelta: async () => [
+        status({
+          externalOrderId: 'M-2',
+          externalOrderNumber: 'WC-1001',
+          isSplit: true,
+          partCount: 2,
+        }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async () => {},
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(applied, [])
+  assert.equal(partsCalls, 0)
+  assert.equal(counters.pending, 1)
 })
 
 test('(m) [o3d-bjc finding 3a] a delta-fetch failure is surfaced as deltaError (not swallowed) while the sweep still per-order reconciles', async () => {
