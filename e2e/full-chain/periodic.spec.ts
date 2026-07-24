@@ -50,6 +50,7 @@ import {
   dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
 } from './harness/batch-fixture.ts'
 import { runAllCleanups } from './harness/cleanup.ts'
+import { assertE2eDatabase } from './harness/db-guard.ts'
 import { withoutX04DriftEntries, X04_TAX_RATE_ID_PREFIX } from './harness/x04-drift-snapshot.ts'
 
 const WAREHOUSE_CODE = 'CBG'
@@ -1291,11 +1292,16 @@ function pickMirrorableXeroRate(rates: XeroTaxRate[]): XeroTaxRate {
 // test owns — never "all rates with components" and never by name (which could erase real, persistent tax
 // configuration; Codex HIGH). Defined in the harness because the pure snapshot filter is keyed on it too.
 
-/** Fail closed if the destructive tax-rate helpers are ever pointed at the stage database. */
+/**
+ * Fail closed unless we are pointed at the disposable e2e database.
+ *
+ * Was a DENYLIST of the stage database name, which passed for production, a backup, a renamed clone or any
+ * misconfiguration we had not thought of — while the helpers behind it delete tax rates and ActivityLog rows
+ * and restore global Settings (Codex). assertE2eDatabase is the positive allowlist the batch fixture already
+ * used, now shared.
+ */
 function assertNotStageDb(): void {
-  if ((process.env.DATABASE_URL ?? '').includes('onetwo3d_ims_dev')) {
-    throw new Error('ABORT: refusing to mutate tax rates against the STAGE database.')
-  }
+  assertE2eDatabase('X-04 tax-rate fixture')
 }
 
 /** Delete ONLY X-04-owned seeded tax rates (id prefix), clearing a crashed prior run; components cascade. */
