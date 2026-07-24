@@ -49,6 +49,7 @@ import {
 import {
   dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
 } from './harness/batch-fixture.ts'
+import { runAllCleanups } from './harness/cleanup.ts'
 
 const WAREHOUSE_CODE = 'CBG'
 const UNIT_COST = 10 // addStockAdjustment seeds every positive line at £10/unit (helpers.ts:136).
@@ -694,10 +695,19 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       // Remove EXACTLY the seeded rate by its id (components cascade) and the ActivityLog rows it produced,
       // and restore the drift Settings to EXACTLY their prior state. Nothing here is name- or
       // component-scoped, so no pre-existing tax config can be touched.
-      await deleteDriftActivityLogRows(taxRateId)
-      await deleteTaxRateById(taxRateId)
-      await restoreSetting('xero_tax_rate_drift_current', priorSnapshot)
-      await restoreSetting('xero_tax_rate_drift_last_checked_at', priorChecked)
+      //
+      // EVERY step runs even if an earlier one rejects. Sequential awaits would abandon the rest on the
+      // first transient failure, and the two Settings restorations are the steps that must not be skipped:
+      // leaving the drift snapshot pointing at this test's deliberately-drifted rate poisons LATER runs,
+      // which capture that polluted snapshot as their "prior" state and faithfully restore it forever.
+      // Global teardown voids Xero documents; it does not repair these settings (Codex). runAllCleanups
+      // attempts every step and rethrows the collected failures, so cleanup stays loud.
+      await runAllCleanups('X-04', [
+        ['delete drift ActivityLog rows', () => deleteDriftActivityLogRows(taxRateId)],
+        ['delete seeded tax rate', () => deleteTaxRateById(taxRateId)],
+        ['restore xero_tax_rate_drift_current', () => restoreSetting('xero_tax_rate_drift_current', priorSnapshot)],
+        ['restore xero_tax_rate_drift_last_checked_at', () => restoreSetting('xero_tax_rate_drift_last_checked_at', priorChecked)],
+      ])
     }
   })
 
