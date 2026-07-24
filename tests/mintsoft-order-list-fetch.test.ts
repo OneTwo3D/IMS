@@ -341,6 +341,9 @@ test('[o3d-bjc.2.2] a malformed or sentinel DespatchDate is NOT proof of despatc
   for (const despatchDate of [
     '2026-07-15junk', '2026-02-30T09:00:00', '2026-04-31', '2026-07-15T24:00:00',
     '2026-07-15T09:60:00', '2026-07-15T09:00:00+99:99', '2027-02-29',
+    // Offset range is ±14:00 inclusive, and hour 14 admits only :00.
+    '2026-07-15T09:00:00+14:01', '2026-07-15T09:00:00+14:59', '2026-07-15T09:00:00-14:01',
+    '2026-07-15T09:00:00+15:00', '2026-07-15T09:00:00-15:00', '2026-07-15T09:00:00+',
   ]) {
     listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: despatchDate })]
     await assert.rejects(
@@ -355,6 +358,8 @@ test('[o3d-bjc.2.2] a malformed or sentinel DespatchDate is NOT proof of despatc
     '2026-07-15T09:00:00', '2026-07-15 09:00:00', '2026-07-15', '2026-07-15T09:00',
     '2026-07-15T09:00:00.1234567', '2026-07-15T09:00:00Z', '2026-07-15T09:00:00+01:00',
     '2026-07-15t09:00:00', '2028-02-29T09:00:00',
+    // The offset boundary itself is valid in both directions, with and without a colon.
+    '2026-07-15T09:00:00+14:00', '2026-07-15T09:00:00-14:00', '2026-07-15T09:00:00+0100',
   ]) {
     listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: despatchDate })]
     const proven = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })

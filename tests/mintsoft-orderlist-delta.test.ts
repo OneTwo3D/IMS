@@ -990,7 +990,9 @@ test('[o3d-bjc.2.1] truncation recovery does NOT certify an unresolvable read', 
     { now: NOW, deltaTimeZone: 'UTC' },
   )
   assert.equal(unresolved, 1)
-  assert.deepEqual(saved, [], 'no watermark reseed off an unresolved verdict')
+  // lastReconcile IS stamped (the pass ran) so a permanently unresolvable link does
+  // not force a full recovery reconcile every tick — but the watermark is withheld.
+  assert.deepEqual(saved, [{ lastReconcile: NOW.toISOString() }])
 })
 
 test('[o3d-bjc.2.1] truncation recovery does NOT certify a BLANK order status', async () => {
@@ -1011,7 +1013,7 @@ test('[o3d-bjc.2.1] truncation recovery does NOT certify a BLANK order status', 
     { now: NOW, deltaTimeZone: 'UTC' },
   )
   assert.equal(unresolved, 1)
-  assert.deepEqual(saved, [])
+  assert.deepEqual(saved, [{ lastReconcile: NOW.toISOString() }], 'cadence stamped, watermark withheld')
 })
 
 test('[o3d-bjc.2.1] a delta-triggered forced fetch with a BLANK status is unresolved', async () => {
@@ -1098,6 +1100,26 @@ test('[o3d-bjc.2.1] an unresolved order does NOT reset the dead-letter streak (i
     { now: NOW },
   )
   assert.deepEqual(cleared, [])
+})
+
+test('[o3d-bjc.2.1] a DIRTY pass still stamps the reconcile cadence (no full-reconcile-every-tick amplification)', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listReconcileCandidates: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      listActiveByExternalOrderIds: async () => [],
+      fetchOrderStatus: async () => { throw new Error('Mintsoft 500') },
+      fetchDelta: async () => [],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: null }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  // The watermark is withheld (the pass errored) but the cadence advances, so the
+  // reconcile honours its interval instead of re-running on every scheduler tick.
+  assert.deepEqual(saved, [{ lastReconcile: NOW.toISOString() }])
 })
 
 test('resolveDispatchJobOutcome: unresolved orders and a truncated window both mark the job PARTIAL', async () => {

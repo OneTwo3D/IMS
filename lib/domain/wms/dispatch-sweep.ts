@@ -347,6 +347,18 @@ async function reconcileSplitOrder(
  * exactly that when an OrderStatusId is missing or unmapped (the bulk delta path
  * throws instead). Treating it as a clean "pending" is how an order silently ages
  * out of the delta window (Codex round 8).
+ *
+ * A NON-BLANK status counts as established, deliberately. Codex round 9 asked for an
+ * allowlist of understood statuses instead, so that an unrecognised label stayed
+ * UNKNOWN — but that trades this bug for a worse one: any legitimate Mintsoft status
+ * missing from our list would make every ordinary pending order "unresolved", which
+ * pins the watermark and wedges the delta permanently. A non-blank name here can
+ * only have come from Mintsoft's own /api/Order/Statuses map, which is strictly
+ * validated (o3d-bjc.2.2), so it IS a status Mintsoft recognises — garbage cannot
+ * reach this point. What remains is a *connector semantics* risk: a real status that
+ * means "gone" but is absent from MINTSOFT_DISPATCHED_STATUSES would read as pending
+ * on every path, delta or not. That is tracked separately (o3d-bjc.7) and needs the
+ * live status vocabulary to settle, not a guessed allowlist here.
  */
 function dispatchStateEstablished(state: {
   status: string
@@ -897,7 +909,13 @@ export async function runWmsDispatchSweepCore(
   //  - watermark: advance iff we fetched a delta this run (store UTC ISO);
   //  - lastReconcile: stamp iff the per-order reconcile pass ran, so a skipped
   //    reconcile re-runs next tick instead of waiting a full interval.
-  if (deltaActive && passClean && deps.saveDeltaState) {
+  // NOTE the asymmetry (Codex round 9): `lastReconcile` is stamped whenever the
+  // reconcile pass RAN, independent of passClean. It only tracks the reconcile
+  // cadence, and gating it on a clean pass meant one permanently-unresolvable link
+  // forced a full recovery reconcile — and its log rows — on every scheduler tick
+  // instead of honouring the interval. The clean + fully-covered guard applies to
+  // the WATERMARK, which is the thing that can lose data.
+  if (deltaActive && deps.saveDeltaState) {
     const toSave: { watermark?: string; lastReconcile?: string } = {}
     // Watermark advances only when the delta pass covered EVERY changed link
     // (deltaCoverageComplete) — else a changed order beyond the batch would be
@@ -910,7 +928,7 @@ export async function runWmsDispatchSweepCore(
     // active link was just authoritatively per-order verified, so the gap IS
     // covered (by a different mechanism) and the watermark can be reseeded.
     const truncationRecovered = deltaWindowTruncated && reconcileCoveredAllActive
-    if (deltaFetched && deltaCoverageComplete && (!deltaWindowTruncated || truncationRecovered)) {
+    if (passClean && deltaFetched && deltaCoverageComplete && (!deltaWindowTruncated || truncationRecovered)) {
       toSave.watermark = now.toISOString()
     }
     if (ranReconcile) toSave.lastReconcile = now.toISOString()

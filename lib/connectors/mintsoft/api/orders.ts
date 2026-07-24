@@ -79,9 +79,14 @@ export function parseMintsoftDespatchDate(value: unknown): string | null {
     if (secondRaw !== undefined && Number(secondRaw) > 59) return null
   }
   // The grammar admits any two digits for a zone offset, so "+99:99" would slip
-  // through and — with an unknown status — falsely prove despatch. Range-check it.
+  // through and — with an unknown status — falsely prove despatch. Range-check it
+  // against the XSD dateTime offset range: ±14:00 inclusive, and at hour 14 the
+  // minutes must be exactly 00 (so "+14:01" and "+14:59" are NOT valid offsets).
   if (offsetHourRaw !== undefined) {
-    if (Number(offsetHourRaw) > 14 || Number(offsetMinuteRaw) > 59) return null
+    const offsetHour = Number(offsetHourRaw)
+    const offsetMinute = Number(offsetMinuteRaw)
+    if (offsetHour > 14 || offsetMinute > 59) return null
+    if (offsetHour === 14 && offsetMinute !== 0) return null
   }
   // Belt and braces: after all of the above the value must still be a real instant.
   if (!Number.isFinite(Date.parse(raw))) return null
