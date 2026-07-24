@@ -43,7 +43,7 @@ import {
 } from './harness/ims.ts'
 import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
 import {
-  expectJournalLine, externalIdFor, externalIdsFor, getInvoice, getManualJournal, getXeroTaxRates,
+  expectJournalLine, externalIdFor, getInvoice, getManualJournal, getXeroTaxRates,
   trackDocument, type XeroManualJournal, type XeroTaxRate,
 } from './harness/xero.ts'
 import {
@@ -549,12 +549,15 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     // posted document BEFORE any assertion — the drain can throw after Xero accepted a journal, so
     // registration lives in a finally that is the ledger safety net.
     //
-    // Enumerate ALL distinct STOCK_IN_TRANSIT documents for the PO (externalIdsFor dedupes SYNCED ids),
-    // not just the latest — "routed through transit exactly once" is only meaningful if there is EXACTLY
-    // one such journal. externalIdFor returns only the most recent, so a duplicate reval (a retry or
-    // idempotency regression posting a SECOND £100 journal) would slip through it while transit is credited
-    // £200 (Codex). We assert the count AND aggregate the transit movement across every matching journal.
+    // Enumerate ALL STOCK_IN_TRANSIT rows for the PO, not just the latest — "routed through transit exactly
+    // once" is only meaningful if there is EXACTLY one such journal, and externalIdFor returns only the most
+    // recent, so a duplicate reval (a retry or idempotency regression posting a SECOND £100 journal) would
+    // slip through it while transit is credited £200 (Codex). The set comes from transitSyncRowsForPo rather
+    // than externalIdsFor, which returns as soon as one document is SYNCED and so cannot see a duplicate
+    // still in flight. We assert no in-flight rows, then the distinct-document count, then aggregate the
+    // transit movement across every matching journal.
     let stockInTransitIds: string[] = []
+    let transitRows: Array<{ status: string; externalTransactionId: string | null }> = []
     try {
       await processPendingXeroSyncViaUi(page)
     } finally {
@@ -580,29 +583,32 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
           }
         }
       }
-      await recoverAndRegister()
-
-      // Now the ASSERTION read: distinct SYNCED documents only, since "posted exactly once" is a claim about
-      // successful documents. Registration above already covered the ledger, so tolerating a throw here just
-      // defers the failure to the explicit count assertion.
-      stockInTransitIds = await externalIdsFor({ type: 'STOCK_IN_TRANSIT', referenceId: goodsPoId, expected: 1 })
-        .catch((): string[] => [])
-
-      // SECOND pass over ALL THREE types — not a redundant one, and asymmetry here would be a hole. The first
-      // pass can miss a document two ways: its database read fails transiently (it only WARNS and returns []),
-      // or a row was still PROCESSING when its 30s settle window expired and only received its external id
-      // afterwards — the realistic case for a spurious COGS_JOURNAL under Xero throttling, which the very
-      // next assertion then aborts the test on. Re-running everything after the assertion read closes both;
-      // trackDocument dedupes, so re-registering costs nothing (Codex).
+      // TWO passes over ALL THREE types, and asymmetry between them would be a hole. One pass can miss a
+      // document two ways: its database read fails transiently (it only WARNS and returns []), or a row was
+      // still PROCESSING when the 30s settle window expired and received its external id afterwards — the
+      // realistic case for a spurious COGS_JOURNAL under Xero throttling. trackDocument dedupes, so the
+      // repeat costs nothing (Codex).
       //
       // The residual gap — Xero accepted a POST whose id NO read can resolve — needs a run-id-tagged Xero
       // rescan of manual journals, the suite-wide follow-up tracked as o3d-lgo.7.1.
-      for (const id of stockInTransitIds) {
-        trackDocument('ManualJournals', id, `X-06 stock-in-transit reval ${runTag(runId)}`)
-      }
+      await recoverAndRegister()
       const receiptId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: goodsPoId }).catch(() => '')
       if (receiptId) trackDocument('ManualJournals', receiptId, `X-06 stock receipt ${runTag(runId)}`)
       await recoverAndRegister()
+
+      // THE EXACT-ONCE SET, taken from a TERMINAL-STATE query rather than externalIdsFor. That helper
+      // returns as soon as `expected` distinct documents are SYNCED, so a duplicate still PENDING would
+      // leave a one-element array and the "exactly one" assertion would pass while transit was about to be
+      // credited twice — the very idempotency regression this test exists to catch (Codex). Enumerating
+      // every row for the PO after the settle passes makes both the in-flight count and the distinct-id
+      // count assertable below, and gives registration the complete set.
+      transitRows = await transitSyncRowsForPo(goodsPoId).catch(() => transitRows)
+      stockInTransitIds = [...new Set(
+        transitRows.map((r) => r.externalTransactionId).filter((id): id is string => Boolean(id)),
+      )]
+      for (const id of stockInTransitIds) {
+        trackDocument('ManualJournals', id, `X-06 stock-in-transit reval ${runTag(runId)}`)
+      }
     }
 
     // THE CRUX: NO COGS_JOURNAL was queued for the goods PO. The 100 units left via TRANSFER_OUT, so the
@@ -612,10 +618,24 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       'a retrospective landed cost on TRANSFERRED-out units must post NO COGS_JOURNAL (6oyu.19.1)',
     ).toBe(0)
 
+    // TERMINAL-STATE BARRIER, before the count. "Exactly one" is only a claim about the ledger if nothing is
+    // still on its way there: a second reval sitting PENDING would make the count read 1 and pass, then post
+    // afterwards and credit transit twice — or be cancelled by teardown and hide the regression permanently
+    // (Codex).
+    const inFlight = transitRows.filter((r) => r.status === 'PENDING' || r.status === 'PROCESSING')
+    expect(
+      inFlight.length,
+      `every STOCK_IN_TRANSIT row for the PO reached a terminal status before asserting exact-once; ` +
+        `${inFlight.length} still in flight: ${JSON.stringify(transitRows)}`,
+    ).toBe(0)
+
     // EXACTLY ONE STOCK_IN_TRANSIT journal posted for the PO — a duplicate would credit transit twice
-    // (£200) and defeat "routed through transit exactly once", so counting the distinct documents is the
-    // load-bearing check, not just inspecting one.
-    expect(stockInTransitIds.length, 'the reval posted EXACTLY ONE STOCK_IN_TRANSIT journal for the PO').toBe(1)
+    // (£200) and defeat "routed through transit exactly once", so counting the distinct documents across
+    // ALL terminal rows is the load-bearing check, not just inspecting one.
+    expect(
+      stockInTransitIds.length,
+      `the reval posted EXACTLY ONE STOCK_IN_TRANSIT journal for the PO; rows: ${JSON.stringify(transitRows)}`,
+    ).toBe(1)
 
     // Aggregate across every matching journal (exactly one here): revaluing the on-hand DESTINATION units
     // DR inventory £100 / CR transit £100, each POSTED and balanced (not merely "not DELETED"). The total
@@ -1212,6 +1232,25 @@ async function costLayerTotalsAt(sku: string, warehouseId: string): Promise<{ re
 }
 
 /** Count COGS_JOURNAL sync-log rows for a PO — the exclusion check: TRANSFERRED-out units must post NONE. */
+/**
+ * EVERY STOCK_IN_TRANSIT sync row for the PO — status and id, whatever the status.
+ *
+ * X-06's exact-once claim needs the complete picture, which externalIdsFor cannot give: that helper returns
+ * the moment `expected` distinct documents are SYNCED, so a duplicate still PENDING is invisible to it. Here
+ * an in-flight row is visible (the barrier) and every terminal row's id counts toward the distinct-document
+ * total (the count).
+ */
+async function transitSyncRowsForPo(
+  poId: string,
+): Promise<Array<{ status: string; externalTransactionId: string | null }>> {
+  return queryRows<{ status: string; externalTransactionId: string | null }>(
+    `select status, "externalTransactionId" from accounting_sync_logs
+      where connector = 'xero' and type = 'STOCK_IN_TRANSIT'::"AccountingSyncType" and "referenceId" = $1
+      order by "createdAt" asc`,
+    [poId],
+  )
+}
+
 async function cogsJournalCountForPo(poId: string, createdAfter: string): Promise<number> {
   const rows = await queryRows<{ n: number }>(
     `select count(*)::int as n from accounting_sync_logs
