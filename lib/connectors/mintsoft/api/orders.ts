@@ -151,7 +151,7 @@ export function resetMintsoftOrderStatusCacheForTests(): void {
   statusCache = null
 }
 
-function requireMintsoftClientId(clientId: number | null | undefined, operation: string): number {
+export function requireMintsoftClientId(clientId: number | null | undefined, operation: string): number {
   if (!Number.isInteger(clientId) || (clientId ?? 0) <= 0) {
     throw new Error(
       `${operation} requires a ClientId (configure mintsoft_client_id) — ` +
@@ -161,7 +161,7 @@ function requireMintsoftClientId(clientId: number | null | undefined, operation:
   return clientId as number
 }
 
-function assertMintsoftOrderClient(row: unknown, clientId: number, context: string): RawOrder {
+export function assertMintsoftOrderClient(row: unknown, clientId: number, context: string): RawOrder {
   if (typeof row !== 'object' || row === null || Array.isArray(row)) {
     throw new Error(`${context}: row is not an object — refusing an unverifiable cross-client order lookup`)
   }

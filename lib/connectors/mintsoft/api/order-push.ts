@@ -5,15 +5,23 @@ import type {
   WmsOrderPushResult,
   WmsOrderUpdateResult,
 } from '@/lib/connectors/wms/types'
-import { extractMintsoftArrayPayload, extractMintsoftObjectPayload } from './normalizers'
+import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
-import { getMintsoftSettings } from '../settings/schema'
+import { assertMintsoftOrderClient, requireMintsoftClientId } from './orders'
+import { getMintsoftSettings, parseMintsoftPositiveId } from '../settings/schema'
 
 /**
  * Outbound Mintsoft order push (Phase 8), modelled on the proven woo-mintsoft
  * plugin (wc_mintsoft_orders.py): create via `PUT /api/Order` (NewOrderWithItems),
  * dedupe on "already exists" by re-finding the order via ExternalOrderReference,
  * and cancel via `GET /api/Order/{id}/Cancel` — only while the order is still NEW.
+ *
+ * TENANT BOUNDARY (o3d-bjc.6): Mintsoft is a shared 3PL tenant, so an UNSCOPED
+ * lookup can surface ANOTHER client's order. Every path here that resolves or
+ * mutates an order by a reference we did not just create is therefore scoped by
+ * `mintsoft_client_id` AND re-validates the returned row's ClientId, exactly like
+ * the read path (assertMintsoftOrderClient). Order CREATION is unaffected — it
+ * binds nothing pre-existing.
  */
 
 type RawOrder = Record<string, unknown>
@@ -115,14 +123,31 @@ export function buildPushPayload(input: WmsOrderPushInput, courier: CourierOptio
   return payload
 }
 
-async function findExistingByReference(input: WmsOrderPushInput): Promise<RawOrder | null> {
+/**
+ * Resolve the configured shared-tenant ClientId, failing closed (o3d-bjc.6).
+ * `operation` names the caller so an unconfigured tenant produces an actionable
+ * error rather than a silent cross-client lookup.
+ */
+async function getPushClientId(operation: string): Promise<number> {
+  const settings = await getMintsoftSettings()
+  return requireMintsoftClientId(parseMintsoftPositiveId(settings.mintsoft_client_id), operation)
+}
+
+async function findExistingByReference(input: WmsOrderPushInput, clientId: number): Promise<RawOrder | null> {
   // Mintsoft's search is OrderNumber-based; match field-for-field (never
   // number-vs-reference) and only resolve when exactly one order matches.
-  const query = new URLSearchParams({ OrderNumber: input.orderNumber })
+  //
+  // o3d-bjc.6: scope the query by ClientId AND assert every returned row echoes
+  // it. Without this, a cross-client order-number collision on the shared tenant
+  // would bind our push link to a FOREIGN order — after which our own update and
+  // cancel calls would mutate someone else's order. A row that cannot be verified
+  // (no ClientId) or that is foreign rejects the whole response rather than being
+  // quietly filtered out, so a silently-ignored filter can't look like "no match".
+  const query = new URLSearchParams({ OrderNumber: input.orderNumber, ClientId: String(clientId) })
   const result = await mintsoftRequest<unknown>(`/api/Order/Search?${query.toString()}`)
   if (result.error) throw new Error(result.error)
-  const matches = extractMintsoftArrayPayload(result.data)
-    .map((row) => row as RawOrder)
+  const matches = extractMintsoftArrayPayloadStrict(result.data, 'Order/Search (push dedupe)')
+    .map((row) => assertMintsoftOrderClient(row, clientId, 'Mintsoft Order/Search (push dedupe)'))
     .filter((row) => {
       const number = toStr(row.OrderNumber)
       if (number && number.includes('+')) return false // skip merged survivors
@@ -188,8 +213,12 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   }
 
   // Duplicate → reconcile to the order that already exists (lost writeback).
+  // Only THIS branch binds our link to a pre-existing order, so it is the only
+  // part of the push that needs the tenant scope — an ordinary create stays
+  // usable on a tenant that has not configured mintsoft_client_id.
   if (created.message && /already exists/i.test(created.message)) {
-    const existing = await findExistingByReference(input)
+    const clientId = await getPushClientId('Mintsoft push dedupe lookup')
+    const existing = await findExistingByReference(input, clientId)
     const externalOrderId = existing ? toStr(existing.ID ?? existing.Id ?? existing.id) : null
     if (existing && externalOrderId) {
       return {
@@ -204,13 +233,28 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   throw new Error(created.message ?? 'Mintsoft order push failed')
 }
 
-/** Mintsoft OrderStatusId 1 === NEW; only NEW orders are mutable/cancellable. */
-async function fetchMintsoftOrderStatusId(externalOrderId: string): Promise<{ found: boolean; isNew: boolean }> {
-  const current = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`)
+/**
+ * Mintsoft OrderStatusId 1 === NEW; only NEW orders are mutable/cancellable.
+ *
+ * This is the gate every mutation (update / item amend / cancel) passes through,
+ * so it is also where the tenant boundary is enforced (o3d-bjc.6): the request is
+ * scoped by ClientId and the returned row must echo ours. A link that was
+ * mis-bound to a foreign order BEFORE the dedupe fix — the ids are persisted —
+ * therefore fails here instead of amending or cancelling someone else's order.
+ */
+async function fetchMintsoftOrderStatusId(
+  externalOrderId: string,
+  clientId: number,
+): Promise<{ found: boolean; isNew: boolean }> {
+  const current = await mintsoftRequest<unknown>(
+    `/api/Order/${encodeURIComponent(externalOrderId)}?ClientId=${clientId}`,
+  )
   if (current.status === 404) return { found: false, isNew: false }
   if (current.error) throw new Error(current.error)
-  const order = extractMintsoftObjectPayload(current.data) as RawOrder | null
-  const statusId = order?.OrderStatusId
+  const raw = extractMintsoftObjectPayload(current.data)
+  if (raw === null) return { found: false, isNew: false }
+  const order = assertMintsoftOrderClient(raw, clientId, 'Mintsoft Order detail (push gate)')
+  const statusId = order.OrderStatusId
   return { found: true, isNew: statusId === 1 || statusId === '1' }
 }
 
@@ -288,8 +332,11 @@ function buildMintsoftOrderItemPayload(line: WmsOrderPushLine, quantity: number,
   return payload
 }
 
-async function fetchMintsoftOrderItems(externalOrderId: string): Promise<MintsoftOrderItem[]> {
-  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Items`)
+// The Items DTO carries no ClientId of its own, so ownership is established by
+// the caller's gate (fetchMintsoftOrderStatusId) and the request is scoped too
+// (defence in depth, mirroring the read path's fetchMintsoftPartItems).
+async function fetchMintsoftOrderItems(externalOrderId: string, clientId: number): Promise<MintsoftOrderItem[]> {
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Items?ClientId=${clientId}`)
   if (result.error) throw new Error(result.error)
   return extractMintsoftArrayPayload(result.data)
     .map((raw) => {
@@ -302,13 +349,13 @@ async function fetchMintsoftOrderItems(externalOrderId: string): Promise<Mintsof
 }
 
 /** Bring a NEW Mintsoft order's line items in line with the (refund-netted) desired set. */
-async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOrderPushInput): Promise<void> {
+async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOrderPushInput, clientId: number): Promise<void> {
   // Mintsoft item quantities are whole units. If any desired line is non-integer or
   // negative, skip item reconciliation rather than send rejects in a retry loop — the
   // refund still surfaces a manual line-item query. Whole-unit orders (the norm) reconcile.
   if (input.lines.some((line) => !Number.isInteger(line.quantity) || line.quantity < 0)) return
 
-  const plan = planMintsoftItemAmendments(await fetchMintsoftOrderItems(externalOrderId), input.lines)
+  const plan = planMintsoftItemAmendments(await fetchMintsoftOrderItems(externalOrderId, clientId), input.lines)
   const base = `/api/Order/${encodeURIComponent(externalOrderId)}/Items`
   for (const amendment of plan) {
     let result
@@ -332,13 +379,14 @@ async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOr
 }
 
 export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
-  const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId)
+  const clientId = await getPushClientId('Mintsoft order update')
+  const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
   if (!found) return { updated: false, status: 'NOT_FOUND' }
   if (!isNew) return { updated: false, status: 'NOT_NEW' }
 
   // Line items are amended via the /Items sub-resource (the order-update endpoint ignores
   // them); this propagates refund-netted quantities to the still-NEW WMS order.
-  await reconcileMintsoftOrderItems(externalOrderId, input)
+  await reconcileMintsoftOrderItems(externalOrderId, input, clientId)
 
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}`, {
     method: 'POST',
@@ -352,8 +400,19 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order update failed')
 }
 
-/** Post an internal (admin) note onto a Mintsoft order via POST /api/Order/{id}/Comments. */
+/**
+ * Post an internal (admin) note onto a Mintsoft order via POST /api/Order/{id}/Comments.
+ *
+ * The note quotes IMS order context, so o3d-bjc.6 applies here too: prove the
+ * order is ours before writing to it, or a link mis-bound by the old unscoped
+ * dedupe would disclose our order detail on a FOREIGN order. Callers treat
+ * comments as best-effort, so the extra ownership read is cheap insurance.
+ */
 export async function addMintsoftOrderComment(externalOrderId: string, comment: string): Promise<void> {
+  const clientId = await getPushClientId('Mintsoft order comment')
+  const { found } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
+  if (!found) return
+
   const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/Comments`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -364,7 +423,9 @@ export async function addMintsoftOrderComment(externalOrderId: string, comment: 
 
 export async function cancelMintsoftOrder(externalOrderId: string): Promise<WmsOrderCancelResult> {
   // Only NEW orders are cancellable; check first so a dispatched order is a no-op.
-  const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId)
+  // The gate also proves the order is OURS before we cancel it (o3d-bjc.6).
+  const clientId = await getPushClientId('Mintsoft order cancel')
+  const { found, isNew } = await fetchMintsoftOrderStatusId(externalOrderId, clientId)
   if (!found) return { cancelled: false, status: 'NOT_FOUND' }
   if (!isNew) return { cancelled: false, status: 'NOT_CANCELLABLE' }
 
