@@ -241,7 +241,7 @@ test('[o3d-bjc.2.2] a malformed /Order/Statuses body throws and is NOT cached as
   statusResponder = () => [{ ID: 4, Name: 'DESPATCHED' }, { Name: 'PICKED' }]
   await assert.rejects(
     () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
-    /missing a numeric ID or a Name/,
+    /positive-integer ID or a non-empty string Name/,
   )
 
   // Nothing above was cached: a healthy body still resolves normally afterwards.
@@ -271,6 +271,77 @@ test('[o3d-bjc.2.2] a delta row whose OrderStatusId is unresolvable throws (the 
     () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
     /unresolved OrderStatusId \(missing\) and no despatch date/,
   )
+})
+
+test('[o3d-bjc.2.2] the status map rejects COERCIBLE junk (no "4junk" ids, no numeric names, no conflicting duplicates)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => [row(1)]
+
+  // "4junk" would parseInt to 4 — a plausible id built from drift.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: '4junk', Name: 'DESPATCHED' }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /positive-integer ID or a non-empty string Name/,
+  )
+
+  // A numeric Name would stringify to a truthy but meaningless status.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: 4, Name: 123 }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /positive-integer ID or a non-empty string Name/,
+  )
+
+  // A non-integer id would truncate onto a real status id.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: 4.7, Name: 'DESPATCHED' }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /positive-integer ID or a non-empty string Name/,
+  )
+
+  // A duplicate id with a CONFLICTING name silently overwrote the first entry.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: 4, Name: 'DESPATCHED' }, { ID: 4, Name: 'CANCELLED' }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /ambiguous status map/,
+  )
+
+  // An identical duplicate is harmless and still resolves.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: 4, Name: 'DESPATCHED' }, { ID: 4, Name: 'despatched' }]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out[0].status, 'DESPATCHED')
+})
+
+test('[o3d-bjc.2.2] a malformed or sentinel DespatchDate is NOT proof of despatch', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // Each of these previously satisfied the unknown-status escape hatch AND
+  // isMintsoftDispatched purely by being non-empty.
+  for (const despatchDate of ['not-a-date', '0001-01-01T00:00:00', 0, '0', '']) {
+    listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: despatchDate })]
+    await assert.rejects(
+      () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+      /unresolved OrderStatusId \(999\) and no despatch date/,
+      `DespatchDate ${JSON.stringify(despatchDate)} must not prove despatch`,
+    )
+  }
+
+  // …and a sentinel date on a KNOWN, non-despatched status must not mark it shipped.
+  listResponder = () => [row(1, { OrderStatusId: 17, DespatchDate: '0001-01-01T00:00:00' })]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out[0].status, 'PICKED')
+  assert.equal(out[0].dispatched, false)
+  assert.deepEqual(out[0].tracking, [])
 })
 
 test('[o3d-bjc.2.2] an unresolvable status is allowed when a DespatchDate proves the goods left', async () => {

@@ -623,6 +623,7 @@ test('[o3d-bjc.2.1] merged components hold the watermark when the connector cann
 test('[o3d-bjc.2.1] the merge exception does NOT admit a reused number: a non-merged row with a different stable ID stays pending', async () => {
   const repointed: string[] = []
   const applied: string[] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
   const { counters } = await runWmsDispatchSweepCore(
     deps({
       listActiveByExternalOrderIds: async () => [],
@@ -641,13 +642,104 @@ test('[o3d-bjc.2.1] the merge exception does NOT admit a reused number: a non-me
       applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
       fetchDelta: async () => [status(MERGED_SURVIVOR)],
       getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
-      saveDeltaState: async () => {},
+      saveDeltaState: async (state) => { saved.push(state) },
     }),
     { now: NOW },
   )
   assert.deepEqual(applied, [])
   assert.deepEqual(repointed, [])
   assert.equal(counters.pending, 1)
+  // Codex round-6 #1: a stable-ID rejection means UNRESOLVED, not "checked and
+  // pending". Advancing here would age the merge out before it was ever applied.
+  assert.deepEqual(saved, [], 'the watermark is held on an unresolved order')
+})
+
+test('[o3d-bjc.2.1] a supplemented link whose number resolves to NOTHING is unresolved — the watermark is held', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      fetchOrderStatus: async () => null, // the authoritative lookup finds nothing
+      fetchDelta: async () => [status(MERGED_SURVIVOR)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(counters.pending, 1)
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] an AMBIGUOUS merge (several active links share the number) repoints nothing and holds the watermark', async () => {
+  const repointed: string[] = []
+  const applied: string[] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  let statusFetches = 0
+  const { counters, logs } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      // Order numbers are not unique: two live links both claim WC-1001. The
+      // survivor absorbed only ONE of them, and nothing in the row says which.
+      listActiveByOrderNumbers: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+        candidate({ linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1001', externalOrderId: 'M-77' }),
+      ],
+      fetchOrderStatus: async () => { statusFetches += 1; return status(MERGED_SURVIVOR) },
+      repointLink: async (linkId) => { repointed.push(linkId) },
+      applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+      fetchDelta: async () => [status(MERGED_SURVIVOR)],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(repointed, [], 'neither link is repointed off ambiguous number evidence')
+  assert.deepEqual(applied, [], 'neither IMS order is dispatched')
+  assert.equal(statusFetches, 0, 'the ambiguity is refused before any lookup')
+  assert.equal(counters.pending, 2)
+  assert.ok(logs.every((entry) => /Ambiguous merge/.test(entry.reason)), 'the ambiguity is surfaced')
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.2.1] a watermark older than the lookback clamps the window and must NOT advance', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const sinceSeen: string[] = []
+  // Watermark 30h old, lookback 24h → the window is clamped and cannot cover the
+  // 6h gap. Advancing here is how a row held back by a failure silently ages out.
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      fetchDelta: async (since) => { sinceSeen.push(since); return [] },
+      getDeltaState: async () => ({
+        watermark: new Date(NOW.getTime() - 30 * 60 * 60 * 1000).toISOString(),
+        lastReconcile: RECENT,
+      }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW, deltaTimeZone: 'UTC' },
+  )
+  assert.equal(sinceSeen.length, 1)
+  assert.deepEqual(saved, [], 'a truncated window never advances the watermark')
+})
+
+test('[o3d-bjc.2.1] a fresh watermark inside the lookback still advances normally', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      fetchDelta: async () => [],
+      getDeltaState: async () => ({
+        watermark: new Date(NOW.getTime() - 10 * 60 * 1000).toISOString(),
+        lastReconcile: RECENT,
+      }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW, deltaTimeZone: 'UTC' },
+  )
+  assert.deepEqual(saved, [{ watermark: NOW.toISOString() }])
 })
 
 test('(m) [o3d-bjc finding 3a] a delta-fetch failure is surfaced as deltaError (not swallowed) while the sweep still per-order reconciles', async () => {

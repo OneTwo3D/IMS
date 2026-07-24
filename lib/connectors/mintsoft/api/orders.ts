@@ -32,6 +32,35 @@ function toInt(value: unknown): number | null {
   return null
 }
 
+/** A positive integer with NO coercion — rejects "4junk", 4.5, "", true, null. */
+function strictPositiveInt(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? value : null
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    const parsed = Number.parseInt(value.trim(), 10)
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+  }
+  return null
+}
+
+/**
+ * A DespatchDate we are willing to treat as EVIDENCE the goods left. Mintsoft
+ * sends `YYYY-MM-DDTHH:MM:SS`; anything that isn't a real calendar timestamp —
+ * free text, `"0"` (which `new Date` would happily read as the year 2000), or a
+ * .NET default/sentinel like `0001-01-01T00:00:00` — is NOT proof of despatch.
+ * Without this check a malformed field would both mark an order SHIPPED and
+ * satisfy the unknown-status escape hatch below.
+ */
+const DESPATCH_DATE_SHAPE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?/
+const DESPATCH_DATE_FLOOR_MS = Date.UTC(1990, 0, 1)
+
+export function parseMintsoftDespatchDate(value: unknown): string | null {
+  const raw = toStr(value)
+  if (!raw || !DESPATCH_DATE_SHAPE.test(raw)) return null
+  const ms = Date.parse(raw)
+  if (!Number.isFinite(ms) || ms < DESPATCH_DATE_FLOOR_MS) return null
+  return raw
+}
+
 /**
  * OrderStatusId → uppercased status name. Cached for STATUSES_TTL_MS.
  *
@@ -55,14 +84,28 @@ async function fetchMintsoftOrderStatusMap(): Promise<Map<number, string>> {
       throw new Error('Mintsoft Order/Statuses: entry is not an object — refusing to cache an unusable status map')
     }
     const row = item as RawOrder
-    const id = toInt(row.ID ?? row.Id ?? row.id)
-    const name = toStr(row.Name ?? row.name)
+    // Deliberately NOT toInt/toStr: those coerce ("4junk" → 4, numeric Name 123 →
+    // "123"), which would mint a truthy-but-meaningless status name that then
+    // passes the strictStatus gate below and lets an unknown dispatch state ride
+    // through as a clean `pending`. A status map must be exactly right or absent.
+    const id = strictPositiveInt(row.ID ?? row.Id ?? row.id)
+    const rawName = row.Name ?? row.name
+    const name = typeof rawName === 'string' ? rawName.trim() : ''
     if (id === null || !name) {
       throw new Error(
-        'Mintsoft Order/Statuses: entry is missing a numeric ID or a Name — refusing to cache an unusable status map',
+        'Mintsoft Order/Statuses: entry is missing a positive-integer ID or a non-empty string Name — ' +
+          'refusing to cache an unusable status map',
       )
     }
-    map.set(id, name.toUpperCase())
+    const upper = name.toUpperCase()
+    const existing = map.get(id)
+    if (existing !== undefined && existing !== upper) {
+      throw new Error(
+        `Mintsoft Order/Statuses: id ${id} maps to both "${existing}" and "${upper}" — ` +
+          'refusing to cache an ambiguous status map',
+      )
+    }
+    map.set(id, upper)
   }
   if (map.size === 0) {
     throw new Error('Mintsoft Order/Statuses returned no statuses — refusing to cache an empty status map')
@@ -183,7 +226,10 @@ export async function probeMintsoftOrderPresence(
 export function readTracking(order: RawOrder): WmsOrderTracking[] {
   const trackingNumber = toStr(order.TrackingNumber)
   const carrier = toStr(order.CourierServiceName)
-  const despatchedAt = toStr(order.DespatchDate)
+  // Validated, not merely non-empty: despatchedAt is consumed as dispatch proof
+  // (isMintsoftDispatched, the strictStatus escape) AND as the shipment date, so
+  // a sentinel/garbage value must never reach any of them.
+  const despatchedAt = parseMintsoftDespatchDate(order.DespatchDate)
   if (!trackingNumber && !carrier && !despatchedAt) return []
   return [{ trackingNumber, carrier, despatchedAt }]
 }

@@ -306,6 +306,18 @@ async function reconcileSplitOrder(
 }
 
 /**
+ * The result of reconciling one order. `unresolved` marks a `pending` that means
+ * "we could NOT determine this order's state", as opposed to "we determined it is
+ * not despatched yet". Only the latter is safe to advance the delta watermark
+ * over — an unresolved order must stay in the next delta window (o3d-bjc.2.1).
+ */
+export type WmsDispatchOutcome = {
+  action: 'dispatched' | 'pending' | 'error'
+  reason: string
+  unresolved?: boolean
+}
+
+/**
  * Reconcile ONE WMS order's dispatch — the per-order step shared by the poll sweep and a
  * webhook-driven reconcile. Returns the outcome; the caller records counters/logs.
  */
@@ -320,10 +332,17 @@ export async function reconcileOneOrder(
   // Require its authoritative primary row to echo the link's stable ID before
   // applying anything, so a reused/colliding number cannot dispatch this link.
   expectedExternalOrderId?: string,
-): Promise<{ action: 'dispatched' | 'pending' | 'error'; reason: string }> {
+): Promise<WmsDispatchOutcome> {
   const status = preloaded ?? (await deps.fetchOrderStatus(candidate.externalOrderNumber))
   if (!status) {
-    return { action: 'pending', reason: 'Order not found in the WMS' }
+    // A number-lookup hint that resolves to NOTHING is not "we checked and it is
+    // pending" — the delta named this link's order and we could not read it, so
+    // the pass must not advance the watermark past that change (o3d-bjc.2.1).
+    return {
+      action: 'pending',
+      reason: 'Order not found in the WMS',
+      unresolved: Boolean(expectedExternalOrderId),
+    }
   }
   if (expectedExternalOrderId && status.externalOrderId !== expectedExternalOrderId) {
     // A MERGE is the one legitimate stable-ID change (o3d-bjc.2.1): the survivor
@@ -334,9 +353,13 @@ export async function reconcileOneOrder(
     // reconcile pass (which repoints on the merge marker with no id check at all).
     const provesMerge = status.isMerged && status.mergedOrderNumbers.includes(candidate.externalOrderNumber)
     if (!provesMerge) {
+      // UNRESOLVED, not pending-and-clean: the delta said this order changed and
+      // the authoritative lookup handed back a different order, so its real state
+      // is unknown. Holding the watermark keeps the change in the next window.
       return {
         action: 'pending',
         reason: `Order-number lookup returned stable ID ${status.externalOrderId || 'unknown'}; expected ${expectedExternalOrderId}`,
+        unresolved: true,
       }
     }
   }
@@ -416,6 +439,9 @@ export async function runWmsDispatchSweepCore(
   let deltaFetched = false
   let ranReconcile = false
   let passClean = true
+  // True when the query window had to be clamped to the lookback floor, so it
+  // could not cover everything a held-back watermark owes (see below).
+  let deltaWindowTruncated = false
   // Set when the delta fetch fails: the sweep still fails safe to the per-order
   // reconcile, but the failure is surfaced (job PARTIAL + errors) so a broken
   // primary path can't hide behind a SUCCEEDED job.
@@ -433,7 +459,23 @@ export async function runWmsDispatchSweepCore(
     const baseMs = Number.isFinite(watermarkMs) ? watermarkMs : now.getTime() - lookbackMs
     // Bound the window so a watermark held back by a prior dirty pass can't let
     // the query window grow without limit.
-    const sinceMs = Math.max(baseMs - overlapMs, now.getTime() - lookbackMs)
+    const wantedSinceMs = baseMs - overlapMs
+    const floorMs = now.getTime() - lookbackMs
+    const sinceMs = Math.max(wantedSinceMs, floorMs)
+    // ...but a CLAMPED window no longer covers everything the held-back watermark
+    // owes us: rows that changed between the watermark and the floor are simply
+    // not in the response. Advancing on such a pass is how a row held back by a
+    // failure (e.g. an unresolvable status) silently ages out after the lookback
+    // elapses — the delta comes back empty, looks clean, and the gap is skipped
+    // forever. Only a REAL watermark can be truncated; a cold start legitimately
+    // begins at the floor.
+    deltaWindowTruncated = Number.isFinite(watermarkMs) && wantedSinceMs < floorMs
+    if (deltaWindowTruncated) {
+      console.warn(
+        '[wms-dispatch-sweep] delta watermark is older than the lookback window — ' +
+          'the window is clamped and cannot cover the gap; holding the watermark until the backlog clears',
+      )
+    }
     const sinceIso = formatCursorInTimeZone(new Date(sinceMs), options?.deltaTimeZone ?? DISPATCH_DELTA_DEFAULT_TIMEZONE)
 
     try {
@@ -488,15 +530,18 @@ export async function runWmsDispatchSweepCore(
   ) => {
     counters.totalChecked += 1
 
-    let outcome: { action: 'dispatched' | 'pending' | 'error'; reason: string }
+    let outcome: WmsDispatchOutcome
     try {
       outcome = await reconcileOneOrder(deps, candidate, preload, expectedExternalOrderId)
     } catch (error) {
       outcome = { action: 'error', reason: scrubWmsError(error, 'WMS dispatch sweep error') }
     }
-    // Any error holds the watermark back so a changed row can't age out of the
-    // next window before it's applied.
-    if (outcome.action === 'error') passClean = false
+    // Any error — or a pending we could not actually RESOLVE — holds the watermark
+    // back so a changed row can't age out of the next window before it's applied.
+    // `unresolved` deliberately does NOT count as an error: an ambiguous order
+    // would otherwise dead-letter itself after five sweeps for a condition the
+    // operator has to fix in the WMS, not in IMS.
+    if (outcome.action === 'error' || outcome.unresolved) passClean = false
     counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
 
     // 6oyu.2: only CONSECUTIVE errors dead-letter — any non-error outcome resets.
@@ -573,6 +618,16 @@ export async function runWmsDispatchSweepCore(
       }
     }
 
+    // Order numbers are NOT unique across links (there is no unique constraint on
+    // externalOrderNumber). The merge relaxation below repoints a link on
+    // number-based evidence alone, so it must never fire when several active links
+    // share the number — one merged lookup would otherwise repoint and dispatch
+    // ALL of them off a survivor that absorbed only one.
+    const linksPerNumber = new Map<string, number>()
+    for (const candidate of deltaCandidates) {
+      linksPerNumber.set(candidate.externalOrderNumber, (linksPerNumber.get(candidate.externalOrderNumber) ?? 0) + 1)
+    }
+
     for (const candidate of deltaCandidates) {
       // Stable-id join is authoritative. A candidate without one is eligible
       // only through the split-only number lookup and is always force-fetched.
@@ -588,6 +643,25 @@ export async function runWmsDispatchSweepCore(
       ) ?? false
       if (!idRow && !splitByNumber && !mergedByNumber) continue
       if (!idRow && !candidate.externalOrderId) continue
+
+      // Ambiguous merge: the survivor names this number, but more than one active
+      // link claims it and nothing ties the survivor to a specific absorbed id.
+      // Fail closed — hold the watermark and surface it rather than guess.
+      if (!idRow && mergedByNumber && (linksPerNumber.get(candidate.externalOrderNumber) ?? 0) > 1) {
+        deltaCoverageComplete = false
+        counters.totalChecked += 1
+        counters.pending += 1
+        logs.push({
+          orderId: candidate.orderId,
+          externalOrderNumber: candidate.externalOrderNumber,
+          action: 'pending',
+          reason:
+            `Ambiguous merge: ${linksPerNumber.get(candidate.externalOrderNumber)} active links share order number `
+            + `${candidate.externalOrderNumber} — refusing to repoint on number evidence alone`,
+        })
+        processedLinkIds.add(candidate.linkId)
+        continue
+      }
 
       const idRows = idRow ? deltaByNumber.get(idRow.externalOrderNumber) : undefined
       const idIsSplit = idRow
@@ -654,7 +728,7 @@ export async function runWmsDispatchSweepCore(
     // Watermark advances only when the delta pass covered EVERY changed link
     // (deltaCoverageComplete) — else a changed order beyond the batch would be
     // aged out. lastReconcile just tracks the per-order reconcile cadence.
-    if (deltaFetched && deltaCoverageComplete) toSave.watermark = now.toISOString()
+    if (deltaFetched && deltaCoverageComplete && !deltaWindowTruncated) toSave.watermark = now.toISOString()
     if (ranReconcile) toSave.lastReconcile = now.toISOString()
     if (toSave.watermark !== undefined || toSave.lastReconcile !== undefined) {
       await deps.saveDeltaState(toSave)
