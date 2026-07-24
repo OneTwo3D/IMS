@@ -553,20 +553,30 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     // idempotency regression posting a SECOND £100 journal) would slip through it while transit is credited
     // £200 (Codex). We assert the count AND aggregate the transit movement across every matching journal.
     let stockInTransitIds: string[] = []
-    let receiptId = ''
     try {
       await processPendingXeroSyncViaUi(page)
     } finally {
+      // REGISTER STATUS-AGNOSTICALLY, and only then read for the assertion. externalIdsFor/externalIdFor
+      // wait for SYNCED rows and THROW when any row for the reference FAILED — so a partial drain (one
+      // journal accepted by Xero, a sibling row failed) would leave a real, voidable document unregistered
+      // and stranded in the shared ledger (Codex). settledJournalExternalIds snapshots every id whatever the
+      // row's status, scoped to THIS PO, which is precisely the recovery those helpers cannot express.
+      for (const [type, label] of [
+        ['STOCK_IN_TRANSIT', 'stock-in-transit reval'],
+        ['STOCK_RECEIPT', 'stock receipt'],
+        // If the exclusion REGRESSED and a spurious COGS_JOURNAL posted, register that too so teardown voids
+        // it and the assertion below — not the ledger — is what fails.
+        ['COGS_JOURNAL', 'UNEXPECTED cogs'],
+      ] as const) {
+        for (const id of await settledJournalExternalIds(type, boundary, { referenceId: goodsPoId })) {
+          trackDocument('ManualJournals', id, `X-06 ${label} ${runTag(runId)}`)
+        }
+      }
+      // Now the ASSERTION read: distinct SYNCED documents only, since "posted exactly once" is a claim about
+      // successful documents. Registration above already covered the ledger, so tolerating a throw here just
+      // defers the failure to the explicit count assertion.
       stockInTransitIds = await externalIdsFor({ type: 'STOCK_IN_TRANSIT', referenceId: goodsPoId, expected: 1 })
         .catch((): string[] => [])
-      receiptId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: goodsPoId }).catch(() => '')
-      for (const id of stockInTransitIds) trackDocument('ManualJournals', id, `X-06 stock-in-transit reval ${runTag(runId)}`)
-      if (receiptId) trackDocument('ManualJournals', receiptId, `X-06 stock receipt ${runTag(runId)}`)
-      // Failure-safe net: if the exclusion REGRESSED and a spurious COGS_JOURNAL did post to the shared
-      // ledger, register it too so teardown voids it (the assertion below then fails loudly, not the ledger).
-      for (const id of await settledJournalExternalIds('COGS_JOURNAL', boundary)) {
-        trackDocument('ManualJournals', id, `X-06 UNEXPECTED cogs ${runTag(runId)}`)
-      }
     }
 
     // THE CRUX: NO COGS_JOURNAL was queued for the goods PO. The 100 units left via TRANSFER_OUT, so the
@@ -812,9 +822,21 @@ async function awaitSyncedJournal(
  * a possibly-stranded journal in the SHARED Demo ledger is surfaced in the run log. Transient
  * connection AND read failures are retried. Mirrors batch-fixture.postedDailyBatchJournalIds (Codex).
  */
-async function settledJournalExternalIds(type: string, createdAfter: string, timeoutMs = 30_000): Promise<string[]> {
+async function settledJournalExternalIds(
+  type: string,
+  createdAfter: string,
+  opts: { referenceId?: string; timeoutMs?: number } = {},
+): Promise<string[]> {
+  const { referenceId, timeoutMs = 30_000 } = opts
+  // OWNERSHIP SCOPE. Type + timestamp alone is not ownership: the rig takes live Woo webhooks and
+  // processPendingXeroSyncViaUi drains the WHOLE queue, so a post-boundary journal can belong to another
+  // flow entirely — and every id returned here is registered for teardown, which VOIDS it. Passing the
+  // referenceId confines both the recovery and the deletion to documents this test's own reference produced
+  // (Codex). Omit it only where the caller has no reference to scope by and over-collection is impossible.
+  const scope = referenceId ? ` and "referenceId" = $3` : ''
+  const params = (base: unknown[]) => (referenceId ? [...base, referenceId] : base)
   const warn = (why: string) =>
-    console.warn(`[fc-teardown] ${why} for ${type} journals created after ${createdAfter} — a posted journal may be left in the shared ledger; check ${type} sync logs.`)
+    console.warn(`[fc-teardown] ${why} for ${type} journals created after ${createdAfter}${referenceId ? ` (reference ${referenceId})` : ''} — a posted journal may be left in the shared ledger; check ${type} sync logs.`)
 
   const { Client } = await import('pg')
   // A node-postgres Client cannot be re-connected after a failed connect(), so each retry needs a FRESH
@@ -844,8 +866,8 @@ async function settledJournalExternalIds(type: string, createdAfter: string, tim
         const r = await db.query<{ n: number }>(
           `select count(*)::int as n from accounting_sync_logs
             where connector = 'xero' and type = $1::"AccountingSyncType"
-              and "createdAt" > $2::timestamptz and status in ('PENDING', 'PROCESSING')`,
-          [type, createdAfter],
+              and "createdAt" > $2::timestamptz and status in ('PENDING', 'PROCESSING')${scope}`,
+          params([type, createdAfter]),
         )
         inFlight = r.rows[0]?.n ?? 0
       } catch { /* transient — fall through to the deadline check and retry */ }
@@ -864,8 +886,8 @@ async function settledJournalExternalIds(type: string, createdAfter: string, tim
       const stranded = await db.query<{ n: number }>(
         `select count(*)::int as n from accounting_sync_logs
           where connector = 'xero' and type = $1::"AccountingSyncType"
-            and "createdAt" > $2::timestamptz and status = 'FAILED' and "externalTransactionId" is null`,
-        [type, createdAfter],
+            and "createdAt" > $2::timestamptz and status = 'FAILED' and "externalTransactionId" is null${scope}`,
+        params([type, createdAfter]),
       )
       if ((stranded.rows[0]?.n ?? 0) > 0) {
         warn(`${stranded.rows[0].n} FAILED ${type} row(s) carry NO external id — if Xero accepted the POST the journal is unrecoverable here (o3d-lgo.7.1)`)
@@ -880,8 +902,8 @@ async function settledJournalExternalIds(type: string, createdAfter: string, tim
         const r = await db.query<{ externalTransactionId: string }>(
           `select "externalTransactionId" from accounting_sync_logs
             where connector = 'xero' and type = $1::"AccountingSyncType"
-              and "createdAt" > $2::timestamptz and "externalTransactionId" is not null`,
-          [type, createdAfter],
+              and "createdAt" > $2::timestamptz and "externalTransactionId" is not null${scope}`,
+          params([type, createdAfter]),
         )
         return r.rows.map((row) => row.externalTransactionId)
       } catch { await new Promise((res) => setTimeout(res, 1_000)) }
