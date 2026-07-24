@@ -20,6 +20,7 @@ import {
   returnItems, setPostingMode,
 } from './harness/ims.ts'
 import { createInventoryProduct } from '../helpers.ts'
+import { deleteFxRate, queryRows, seedFxRateAt } from './harness/fx-fixture.ts'
 import {
   billIdsForPo, expectJournalLine, expectLine, externalIdFor, externalIdsFor, getCreditNote,
   getInvoice, getInvoiceAttachments, getManualJournal, getPayment, syncLogRowsFor, trackDocument,
@@ -1169,19 +1170,6 @@ async function freightCreditNoteIdFor(poId: string): Promise<string> {
   return rows[0].id
 }
 
-/** Read rows from this instance. */
-async function queryRows<T extends Record<string, unknown>>(sql: string, params: unknown[]): Promise<T[]> {
-  const { Client } = await import('pg')
-  const db = new Client({ connectionString: process.env.DATABASE_URL })
-  await db.connect()
-  try {
-    const r = await db.query<T>(sql, params)
-    return r.rows
-  } finally {
-    await db.end()
-  }
-}
-
 /** Read a setting from this instance (account codes are per-instance config). */
 async function settingValue(key: string): Promise<string> {
   const { Client } = await import('pg')
@@ -1193,40 +1181,6 @@ async function settingValue(key: string): Promise<string> {
     return r.rows[0].value
   } finally {
     await db.end()
-  }
-}
-
-/**
- * Seed a base(GBP)->foreign FX rate with an explicit `fetchedAt` SQL expression (e.g. "now()" or
- * "now() - interval '2 hours'"), so PP-08 can control the booked vs settlement ordering precisely: the
- * settlement rate is seeded with a LATER fetchedAt than the booked rate. source='e2e-fc-seed' so
- * global-setup's sweepSeededFxRates() clears any residue a crash leaves behind (mirrors OC-10). The
- * fetchedAt expression is a fixed test literal, never external input.
- */
-async function seedFxRateAt(toCurrency: string, rate: number, fetchedAtSql: string): Promise<string> {
-  const { randomUUID } = await import('node:crypto')
-  const id = `e2e-fc-fx-${randomUUID()}`
-  await queryRows(
-    `insert into fx_rates (id, "fromCurrency", "toCurrency", rate, "fetchedAt", source, "manualOverride")
-     values ($1, 'GBP', $2, $3, ${fetchedAtSql}, 'e2e-fc-seed', false)`,
-    [id, toCurrency.toUpperCase(), rate],
-  )
-  return id
-}
-
-/**
- * Remove a seeded FX rate to restore the rig's empty-fx_rates baseline. Never throws (it runs in a finally
- * and must not mask a test result) but is not silent: a residual seeded EUR rate would let a later foreign
- * order/PO book at this artificial rate. global-setup's sweep is the recovery net (mirrors OC-10).
- */
-async function deleteFxRate(id: string): Promise<void> {
-  try {
-    const rows = await queryRows<{ id: string }>(`delete from fx_rates where id = $1 returning id`, [id])
-    if (rows.length !== 1) {
-      console.warn(`[PP-08] deleteFxRate(${id}) removed ${rows.length} row(s), expected 1 — global-setup will sweep it next run`)
-    }
-  } catch (e) {
-    console.warn(`[PP-08] deleteFxRate(${id}) failed: ${e instanceof Error ? e.message : String(e)} — global-setup will sweep it next run`)
   }
 }
 
