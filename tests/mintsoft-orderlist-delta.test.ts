@@ -318,6 +318,53 @@ test('(i) [o3d-bjc coverage] an order handled in the delta pass is not double-pr
   assert.deepEqual(cleared, ['l1']) // bookkeeping ran exactly once
 })
 
+test('(j) [o3d-bjc rotation] the reconcile pass uses listReconcileCandidates (not listCandidates) and stamps EVERY verified link — delta + reconcile — with markReconcileChecked', async () => {
+  let plainListCalls = 0
+  let usedReconcileList = false
+  const stamped: Array<{ ids: string[]; at: string }> = []
+  await runWmsDispatchSweepCore(
+    deps({
+      // Plain (pushedAt-only) list must NOT drive the reconcile pass when the
+      // rotation-ordered list is available.
+      listCandidates: async () => { plainListCalls += 1; return [] },
+      listReconcileCandidates: async () => {
+        usedReconcileList = true
+        return [{ linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1002' }] // absent from the delta → per-order poll
+      },
+      listActiveByOrderNumbers: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+      fetchOrderStatus: async () => status({ status: 'PROCESSING' }),
+      fetchDelta: async () => [
+        status({ externalOrderNumber: 'WC-1001', status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TN1' })] }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: null }), // reconcile DUE
+      saveDeltaState: async () => {},
+      markReconcileChecked: async (ids, at) => { stamped.push({ ids: [...ids].sort(), at: at.toISOString() }) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(usedReconcileList, true)
+  assert.equal(plainListCalls, 0) // reconcile used the rotation-ordered list, not the plain one
+  assert.equal(stamped.length, 1)
+  assert.deepEqual(stamped[0].ids, ['l1', 'l2']) // delta-verified l1 AND reconcile-polled l2 both rotate to the back
+  assert.equal(stamped[0].at, NOW.toISOString())
+})
+
+test('(k) [o3d-bjc rotation] on a NON-reconcile tick a delta-verified link is still stamped (so an alive order rotates back and does not hog the reconcile batch)', async () => {
+  const stamped: string[][] = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByOrderNumbers: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+      listReconcileCandidates: async () => { throw new Error('reconcile pass must not run on a non-due tick') },
+      fetchDelta: async () => [status({ externalOrderNumber: 'WC-1001', status: 'PROCESSING' })], // changed but not despatched
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }), // reconcile NOT due
+      saveDeltaState: async () => {},
+      markReconcileChecked: async (ids) => { stamped.push([...ids]) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(stamped, [['l1']]) // stamped from the delta pass alone — no reconcile ran
+})
+
 test('the feature flag deltaEnabled:false forces per-order polling even when a delta is available', async () => {
   let deltaCalls = 0
   let fetchStatusCalls = 0

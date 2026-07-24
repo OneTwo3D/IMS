@@ -2394,6 +2394,13 @@ model WmsOrderPushLink {
   /// q66in.4.4: when the order reconcile last verified this link against the
   /// WMS — the capped daily sweep rotates least-recently-checked first.
   reconcileCheckedAt     DateTime?
+  /// o3d-bjc: when the DISPATCH sweep last verified this link's WMS state
+  /// (via the Order/List delta OR the throttled per-order reconcile). The
+  /// batched reconcile pass orders by this (nulls first) so links beyond the
+  /// first `batchSize` rotate in instead of the same oldest orders being
+  /// re-polled forever. Distinct from reconcileCheckedAt, which the separate
+  /// q66in.4.4 order-reconcile sweep owns — the two must not clobber each other.
+  dispatchReconcileCheckedAt DateTime?
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
@@ -2401,6 +2408,8 @@ model WmsOrderPushLink {
 
   @@index([connector, state])
   @@index([dispatchDeadLetteredAt])
+  /// o3d-bjc: supports the dispatch reconcile-pass rotation ordering.
+  @@index([connector, dispatchReconcileCheckedAt])
   @@map("wms_order_push_links")
 }
 

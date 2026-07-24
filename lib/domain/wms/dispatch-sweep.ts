@@ -177,6 +177,17 @@ export type WmsDispatchSweepDeps = {
   // sweep falls back to filtering the batch and holds the watermark unless the
   // batch enumerated every active link.
   listActiveByOrderNumbers?(orderNumbers: string[]): Promise<WmsDispatchCandidate[]>
+  // o3d-bjc reconcile rotation: the throttled per-order reconcile batch, ordered
+  // least-recently-verified first (dispatchReconcileCheckedAt asc NULLS FIRST,
+  // then pushedAt asc). Without it the sweep falls back to listCandidates, which
+  // is pushedAt-only and re-polls the same oldest batch every tick — links beyond
+  // `batchSize` never get their not-found/merge check (Codex round 2).
+  listReconcileCandidates?(limit: number): Promise<WmsDispatchCandidate[]>
+  // Stamp dispatchReconcileCheckedAt for every link verified this run (delta OR
+  // reconcile), so a verified link rotates to the back and un-verified links
+  // surface next tick. No-op when unset (keeps pre-rotation behaviour for tests /
+  // connectors that don't wire it).
+  markReconcileChecked?(linkIds: string[], checkedAt: Date): Promise<void>
 }
 
 /**
@@ -453,12 +464,33 @@ export async function runWmsDispatchSweepCore(
   // --- Throttled reconcile pass: per-order poll a batch of active links to catch
   // not-found strikes + merge detection (orders absent from the delta). This is
   // also the SOLE pass when the delta is inactive/failed (deltaMap is null).
+  //
+  // Rotation (o3d-bjc Codex round 2): the batch is ordered least-recently-verified
+  // first (dispatchReconcileCheckedAt NULLS FIRST, then pushedAt) so links beyond
+  // the first `batchSize` are not starved — a persistent backlog rotates through
+  // the whole active set instead of re-polling the same oldest orders forever.
   if (reconcileDue) {
     ranReconcile = true
-    const candidates = await deps.listCandidates(batchSize)
+    const candidates = deps.listReconcileCandidates
+      ? await deps.listReconcileCandidates(batchSize)
+      : await deps.listCandidates(batchSize)
     for (const candidate of candidates) {
       if (processedLinkIds.has(candidate.linkId)) continue // already handled from the delta
       await processOne(candidate, undefined) // legacy per-order fetch
+      processedLinkIds.add(candidate.linkId)
+    }
+  }
+
+  // Stamp the reconcile-recency cursor for EVERY link we verified this run (delta
+  // preload or per-order reconcile). A verified link rotates to the back; links
+  // never verified (NULL) always sort first, so the reconcile pass drains the
+  // whole active set over successive ticks even when the delta keeps re-covering
+  // the oldest orders. Best-effort — a stamp failure just delays rotation.
+  if (processedLinkIds.size > 0 && deps.markReconcileChecked) {
+    try {
+      await deps.markReconcileChecked([...processedLinkIds], now)
+    } catch (stampError) {
+      console.error('[wms-dispatch-sweep] reconcile-recency stamp failed:', stampError)
     }
   }
 
@@ -545,6 +577,36 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         }
       }
       return out
+    },
+    // o3d-bjc reconcile rotation: same eligibility as listCandidates, but ordered
+    // least-recently-verified first (dispatchReconcileCheckedAt asc NULLS FIRST,
+    // then pushedAt asc) so the capped reconcile pass rotates through the whole
+    // active set instead of re-polling the oldest `batchSize` every tick.
+    async listReconcileCandidates(limit) {
+      const rows = await db.wmsOrderPushLink.findMany({
+        where: {
+          connector: connectorId,
+          state: { in: ['SYNCED', 'MERGED'] },
+          externalOrderNumber: { not: null },
+          dispatchDeadLetteredAt: null,
+          order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+        },
+        select: { id: true, orderId: true, externalOrderNumber: true },
+        take: limit,
+        orderBy: [{ dispatchReconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { pushedAt: 'asc' }],
+      })
+      return rows.flatMap((row) =>
+        row.externalOrderNumber
+          ? [{ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber }]
+          : [],
+      )
+    },
+    async markReconcileChecked(linkIds, checkedAt) {
+      if (linkIds.length === 0) return
+      await db.wmsOrderPushLink.updateMany({
+        where: { id: { in: linkIds } },
+        data: { dispatchReconcileCheckedAt: checkedAt },
+      })
     },
     fetchOrderStatus(orderNumber) {
       return connector.fetchOrderStatus ? connector.fetchOrderStatus(orderNumber) : Promise.resolve(null)
