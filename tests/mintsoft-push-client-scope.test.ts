@@ -172,6 +172,62 @@ test('[o3d-bjc.6] a create succeeds and binds only after the new order reads bac
   assert.equal(new URLSearchParams(readBack.split('?')[1]).get('ClientId'), String(CLIENT))
 })
 
+test('[o3d-bjc.6] a create whose order is not yet readable by id resolves BY REFERENCE (no stranded order, no duplicate)', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  // The order was created but the detail read 404s (not queryable yet). Throwing
+  // here would leave the link unbound and rely on Mintsoft rejecting the duplicate
+  // next sweep; instead we resolve it through the ClientId-scoped reference lookup.
+  createResult = [{ Success: true, OrderId: 700, OrderNumber: 'WC-1001' }]
+  searchRows = [{ ID: 700, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+
+  const result = await pushMintsoftOrder(INPUT)
+  assert.equal(result.externalOrderId, '700')
+  assert.ok(calls.some((path) => path.startsWith('/api/Order/Search')), 'fell back to the scoped reference lookup')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'the order was created exactly once')
+})
+
+test('[o3d-bjc.6] a created order invisible to BOTH lookups is still bound — never re-created', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  // Mintsoft said Success and gave us the id, but neither the scoped detail read nor
+  // the reference lookup can see it yet. Throwing here would make the sweep re-PUT on
+  // the next tick and duplicate a real warehouse order (or dead-letter the link while
+  // a live order stays unlinked and can never be cancelled).
+  createResult = [{ Success: true, OrderId: 700, OrderNumber: 'WC-1001' }]
+  searchRows = []
+
+  const result = await pushMintsoftOrder(INPUT)
+  assert.equal(result.externalOrderId, '700')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'created exactly once')
+})
+
+test('[o3d-bjc.6] …but a FOREIGN read-back is still fatal, never bound', async () => {
+  reset()
+  const { pushMintsoftOrder } = await push()
+  // The distinction that makes the above safe: a ClientId MISMATCH throws out of the
+  // read-back, so only "not yet visible" (404) can reach the permissive bind.
+  createResult = [{ Success: true, OrderId: 999, OrderNumber: 'WC-1001' }]
+  details.set('999', { ID: 999, OrderNumber: 'WC-1001', OrderStatusId: 1, ClientId: 99 })
+
+  await assert.rejects(() => pushMintsoftOrder(INPUT), /does not match configured 5/)
+})
+
+test('[o3d-bjc.6] a link bound without a read-back can never be MUTATED without proving ownership', async () => {
+  reset()
+  const { pushMintsoftOrder, cancelMintsoftOrder } = await push()
+  createResult = [{ Success: true, OrderId: 700, OrderNumber: 'WC-1001' }]
+  searchRows = []
+  const pushed = await pushMintsoftOrder(INPUT)
+  assert.equal(pushed.externalOrderId, '700')
+
+  // Had that id somehow been another client's, the mutation gate refuses it — which
+  // is why the permissive bind above does not weaken the tenant boundary.
+  details.set('700', { ID: 700, OrderNumber: 'WC-1001', OrderStatusId: 1, ClientId: 99 })
+  await assert.rejects(() => cancelMintsoftOrder('700'), /does not match configured 5/)
+  assert.deepEqual(writes, [])
+})
+
 test('[o3d-bjc.6] a create whose order reads back FOREIGN is not bound', async () => {
   reset()
   const { pushMintsoftOrder } = await push()
