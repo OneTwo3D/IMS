@@ -753,13 +753,24 @@ export async function runWmsDispatchSweep(
   // Resolve the inbound Order/List delta config from settings (o3d-bjc). The
   // flag defaults ON; `mintsoft_inbound_delta_enabled === 'false'` turns it off
   // (behaves exactly as pre-delta). The cursor is sent in the tenant timezone.
-  const [deltaEnabledSetting, deltaTimeZoneSetting] = await Promise.all([
+  const [deltaEnabledSetting, deltaTimeZoneSetting, deltaClientIdSetting] = await Promise.all([
     getSettingValue('mintsoft_inbound_delta_enabled'),
     getSettingValue('mintsoft_api_timezone'),
+    getSettingValue('mintsoft_client_id'),
   ])
+  // FAIL CLOSED: the Mintsoft inbound delta returns EVERY client's orders on the
+  // shared 3PL tenant unless it's scoped by our ClientId — an order-number
+  // collision could otherwise mark OUR order shipped off a FOREIGN despatch.
+  // Without a valid, positive mintsoft_client_id we keep the delta INERT (never
+  // call it) and fall back to the per-order reconcile (unchanged pre-delta
+  // behaviour). Only Mintsoft carries this scope; other WMS connectors have no
+  // delta wired, so this gate is a no-op for them. (Mirrors parseMintsoftPositiveId.)
+  const clientIdRaw = (deltaClientIdSetting ?? '').trim()
+  const clientScoped = connectorId !== 'mintsoft'
+    || (/^\d+$/.test(clientIdRaw) && Number.parseInt(clientIdRaw, 10) > 0)
   const coreOptions: WmsDispatchSweepCoreOptions = {
     batchSize: options?.batchSize,
-    deltaEnabled: deltaEnabledSetting !== 'false',
+    deltaEnabled: deltaEnabledSetting !== 'false' && clientScoped,
     deltaTimeZone: deltaTimeZoneSetting || DISPATCH_DELTA_DEFAULT_TIMEZONE,
   }
 

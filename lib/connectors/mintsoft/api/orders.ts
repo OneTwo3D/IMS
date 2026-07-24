@@ -205,7 +205,14 @@ export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<Wms
  * `IncludeOrderItems=true` + `SortOldestFirst=true` are always sent; ClientId /
  * WarehouseId / ChannelId scope the query to our traffic on a shared tenant.
  *
- * THROWS (rather than returning a partial list) when the result overflows
+ * FAILS CLOSED on `clientId`: Mintsoft is a shared 3PL tenant, so an UNSCOPED
+ * Order/List returns EVERY client's orders — and matching a foreign row to a
+ * local link by order number alone could mark OUR order shipped off a FOREIGN
+ * despatch. A null/absent `clientId` therefore THROWS rather than running an
+ * unscoped delta. As defence in depth, any returned row whose echoed ClientId
+ * differs from `clientId` is DROPPED (it falls through to the per-order reconcile).
+ *
+ * Also THROWS (rather than returning a partial list) when the result overflows
  * `maxPages * limit` — a truncated delta must never look complete, or the sweep
  * would advance its watermark past orders it never saw. Like every other
  * client.ts fetch it also throws on any HTTP error, so the caller can tell
@@ -214,7 +221,7 @@ export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<Wms
  */
 export async function fetchMintsoftOrderList(opts: {
   sinceLastUpdated: string
-  clientId?: number | null
+  clientId: number | null
   warehouseId?: number | null
   channelId?: number | null
   limit?: number
@@ -222,6 +229,14 @@ export async function fetchMintsoftOrderList(opts: {
 }): Promise<WmsOrderStatus[]> {
   const since = opts.sinceLastUpdated.trim()
   if (!since) return []
+  // Fail closed: never run an unscoped cross-client delta (see the doc-comment).
+  const clientId = opts.clientId ?? null
+  if (clientId == null) {
+    throw new Error(
+      'Mintsoft Order/List delta requires a ClientId (configure mintsoft_client_id) — ' +
+        'refusing to run an unscoped cross-client delta',
+    )
+  }
   const limit = opts.limit && opts.limit > 0 ? Math.trunc(opts.limit) : 200
   const maxPages = opts.maxPages && opts.maxPages > 0 ? Math.trunc(opts.maxPages) : 50
 
@@ -233,8 +248,8 @@ export async function fetchMintsoftOrderList(opts: {
       PageNo: String(pageNo),
       SortOldestFirst: 'true',
       IncludeOrderItems: 'true',
+      ClientId: String(clientId),
     })
-    if (opts.clientId != null) query.set('ClientId', String(opts.clientId))
     if (opts.warehouseId != null) query.set('WarehouseId', String(opts.warehouseId))
     if (opts.channelId != null) query.set('ChannelId', String(opts.channelId))
 
@@ -263,8 +278,16 @@ export async function fetchMintsoftOrderList(opts: {
       if (toStr(record.OrderNumber) === null) {
         throw new Error(`Mintsoft Order/List page ${pageNo}: row ${rowId} missing an order number — refusing to treat a malformed delta as complete`)
       }
+      // Defence in depth: even with ClientId in the query, DROP any row whose
+      // echoed ClientId isn't ours — never trust an order-number match belonging
+      // to another client on the shared tenant. A row that omits ClientId is
+      // trusted via the query-param scoping. A dropped row simply isn't in the
+      // delta, so it falls through to the per-order reconcile. (This is a DROP,
+      // not a throw: a foreign row is valid data, just not ours.)
+      const rowClientId = toInt(record.ClientId ?? record.clientId)
+      if (rowClientId !== null && rowClientId !== clientId) continue
+      collected.push(record)
     }
-    collected.push(...(page as RawOrder[]))
     if (page.length < limit) {
       if (collected.length === 0) return []
       // Resolve the status map + settings ONCE for the whole list (they're the

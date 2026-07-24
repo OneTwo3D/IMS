@@ -674,18 +674,40 @@ export async function saveMintsoftCourierServiceMap(rawJson: unknown): Promise<{
 export async function getMintsoftOrderDispatchSettings(): Promise<{
   adminOrderUrlTemplate: string
   defaultCourierServiceId: string
+  clientId: string
+  channelId: string
+  warehouseId: string
 }> {
   await requireMintsoftReadAccess()
   const settings = await getMintsoftSettings()
   return {
     adminOrderUrlTemplate: settings.mintsoft_admin_order_url_template,
     defaultCourierServiceId: settings.mintsoft_default_courier_service_id,
+    clientId: settings.mintsoft_client_id,
+    channelId: settings.mintsoft_channel_id,
+    warehouseId: settings.mintsoft_warehouse_id,
   }
+}
+
+/**
+ * Coerce a positive-whole-number id setting (ClientId / ChannelId / WarehouseId)
+ * to its trimmed string form. Blank ⇒ unset (allowed). Any non-positive-integer
+ * value is rejected so the inbound-delta scope can never be silently misconfigured.
+ */
+function normalizeMintsoftIdSetting(raw: unknown): { ok: true; value: string } | { ok: false } {
+  const value =
+    typeof raw === 'number' ? String(raw) : typeof raw === 'string' ? raw.trim() : ''
+  if (!value) return { ok: true, value: '' }
+  if (!/^\d+$/.test(value) || Number.parseInt(value, 10) <= 0) return { ok: false }
+  return { ok: true, value }
 }
 
 export async function saveMintsoftOrderDispatchSettings(input: {
   adminOrderUrlTemplate?: unknown
   defaultCourierServiceId?: unknown
+  clientId?: unknown
+  channelId?: unknown
+  warehouseId?: unknown
 }): Promise<{ success: boolean; error?: string }> {
   await requireMintsoftWriteAccess()
 
@@ -704,6 +726,22 @@ export async function saveMintsoftOrderDispatchSettings(input: {
     return { success: false, error: 'Default courier service id must be a whole positive number, or blank for no fallback.' }
   }
 
+  // ClientId scopes the inbound Order/List delta to our own orders on the shared
+  // 3PL tenant (blank disables the delta → per-order reconcile). Channel/Warehouse
+  // are optional extra filters.
+  const clientId = normalizeMintsoftIdSetting(input?.clientId)
+  if (!clientId.ok) {
+    return { success: false, error: 'Mintsoft ClientId must be a whole positive number, or blank to disable the inbound Order/List delta.' }
+  }
+  const channelId = normalizeMintsoftIdSetting(input?.channelId)
+  if (!channelId.ok) {
+    return { success: false, error: 'Mintsoft ChannelId must be a whole positive number, or blank.' }
+  }
+  const warehouseId = normalizeMintsoftIdSetting(input?.warehouseId)
+  if (!warehouseId.ok) {
+    return { success: false, error: 'Mintsoft WarehouseId must be a whole positive number, or blank.' }
+  }
+
   await db.$transaction([
     db.setting.upsert({
       where: { key: 'mintsoft_admin_order_url_template' },
@@ -714,6 +752,21 @@ export async function saveMintsoftOrderDispatchSettings(input: {
       where: { key: 'mintsoft_default_courier_service_id' },
       create: { key: 'mintsoft_default_courier_service_id', value: serializeSettingValue('mintsoft_default_courier_service_id', courierRaw) },
       update: { value: serializeSettingValue('mintsoft_default_courier_service_id', courierRaw) },
+    }),
+    db.setting.upsert({
+      where: { key: 'mintsoft_client_id' },
+      create: { key: 'mintsoft_client_id', value: serializeSettingValue('mintsoft_client_id', clientId.value) },
+      update: { value: serializeSettingValue('mintsoft_client_id', clientId.value) },
+    }),
+    db.setting.upsert({
+      where: { key: 'mintsoft_channel_id' },
+      create: { key: 'mintsoft_channel_id', value: serializeSettingValue('mintsoft_channel_id', channelId.value) },
+      update: { value: serializeSettingValue('mintsoft_channel_id', channelId.value) },
+    }),
+    db.setting.upsert({
+      where: { key: 'mintsoft_warehouse_id' },
+      create: { key: 'mintsoft_warehouse_id', value: serializeSettingValue('mintsoft_warehouse_id', warehouseId.value) },
+      update: { value: serializeSettingValue('mintsoft_warehouse_id', warehouseId.value) },
     }),
   ])
   revalidatePath('/sync')

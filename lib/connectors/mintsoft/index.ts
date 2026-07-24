@@ -7,6 +7,7 @@ import {
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
 import { addMintsoftOrderComment, cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
+import { parseMintsoftPositiveId } from './settings/schema'
 import { getSettingValue } from '@/lib/settings-store'
 
 const CONNECTOR = 'Mintsoft'
@@ -84,24 +85,23 @@ export class MintsoftConnector implements WmsConnector {
   }
 
   async fetchOrderDelta(sinceIso: string): Promise<WmsOrderStatus[]> {
-    // Scope the delta to our own traffic where configured — on a shared 3PL
-    // tenant other clients' orders would otherwise consume the page budget.
-    // Any unset/unparseable filter is passed as undefined (no scoping).
+    // FAIL CLOSED: the delta MUST be scoped to our own ClientId. Mintsoft is a
+    // shared 3PL tenant, so an unscoped Order/List returns every client's orders
+    // — and matching a foreign row to a local link by order number alone could
+    // mark OUR order shipped off a FOREIGN despatch. Without a valid
+    // mintsoft_client_id we refuse (fetchMintsoftOrderList throws on a null
+    // clientId); the sweep also gates on this so we normally never get here
+    // unscoped. Channel/Warehouse are optional extra scoping filters.
     const [clientId, channelId, warehouseId] = await Promise.all([
       getSettingValue('mintsoft_client_id'),
       getSettingValue('mintsoft_channel_id'),
       getSettingValue('mintsoft_warehouse_id'),
     ])
-    const toId = (value: string | null): number | undefined => {
-      if (!value) return undefined
-      const parsed = Number.parseInt(value.trim(), 10)
-      return Number.isFinite(parsed) ? parsed : undefined
-    }
     return fetchMintsoftOrderList({
       sinceLastUpdated: sinceIso,
-      clientId: toId(clientId),
-      channelId: toId(channelId),
-      warehouseId: toId(warehouseId),
+      clientId: parseMintsoftPositiveId(clientId),
+      channelId: parseMintsoftPositiveId(channelId) ?? undefined,
+      warehouseId: parseMintsoftPositiveId(warehouseId) ?? undefined,
     })
   }
 
