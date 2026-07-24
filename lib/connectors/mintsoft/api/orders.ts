@@ -1,6 +1,7 @@
 import type { WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { getMintsoftSettings, MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE } from '../settings/schema'
-import { extractMintsoftArrayPayload, extractMintsoftObjectPayload } from './normalizers'
+import type { MintsoftSettings } from '../settings/schema'
+import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
 
 /**
@@ -129,18 +130,25 @@ export function buildDeepLink(template: string, externalOrderId: string): string
  * trusted as-is (the delta path does not re-read by id) — callers that need the
  * authoritative re-read do it before calling this.
  */
-export async function normalizeMintsoftOrderRow(order: RawOrder): Promise<WmsOrderStatus | null> {
+export async function normalizeMintsoftOrderRow(
+  order: RawOrder,
+  // Bulk callers (Order/List delta) pass a pre-fetched status map + settings so a
+  // multi-row page resolves them ONCE, not once per row — otherwise a cold status
+  // cache with no in-flight dedup fans out one /api/Order/Statuses request and one
+  // settings read per row (o3d-bjc Codex: a request storm that trips throttling).
+  ctx?: { statusMap: Map<number, string>; settings: MintsoftSettings },
+): Promise<WmsOrderStatus | null> {
   const externalOrderId = toStr(order.ID ?? order.Id ?? order.id)
   if (!externalOrderId) return null
 
   const statusId = toInt(order.OrderStatusId)
-  const statusMap = await fetchMintsoftOrderStatusMap()
+  const statusMap = ctx?.statusMap ?? (await fetchMintsoftOrderStatusMap())
   const status = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
 
   const externalOrderNumber = toStr(order.OrderNumber) ?? ''
   const partCount = toInt(order.NumberOfParts)
   const merged = mergedParts(externalOrderNumber)
-  const settings = await getMintsoftSettings()
+  const settings = ctx?.settings ?? (await getMintsoftSettings())
   const tracking = readTracking(order)
 
   return {
@@ -233,10 +241,37 @@ export async function fetchMintsoftOrderList(opts: {
     const result = await mintsoftRequest<unknown>(`/api/Order/List?${query.toString()}`)
     if (result.error) throw new Error(result.error)
 
-    const page = extractMintsoftArrayPayload(result.data) as RawOrder[]
-    collected.push(...page)
+    // Strict parse: a 2xx body that is neither an array nor a recognised wrapper
+    // (schema drift, a proxy error object, null) THROWS rather than looking like a
+    // complete empty page — else the caller would advance its watermark past rows
+    // it never saw. A genuine empty/short page still ends pagination normally.
+    const page = extractMintsoftArrayPayloadStrict(result.data, `Order/List page ${pageNo}`)
+    // Per-row fail-closed validation (parity with the Python delta reader): every
+    // row must be an object carrying a resolvable ID and a non-empty order number.
+    // A malformed row is schema/API drift, not "no change" — silently dropping it
+    // (normalize→null filter, or an empty delta-map key) would let the caller
+    // advance its watermark past an order it never applied.
+    for (const row of page) {
+      if (typeof row !== 'object' || row === null || Array.isArray(row)) {
+        throw new Error(`Mintsoft Order/List page ${pageNo}: row is not an object — refusing to treat a malformed delta as complete`)
+      }
+      const record = row as RawOrder
+      const rowId = toStr(record.ID ?? record.Id ?? record.id)
+      if (rowId === null) {
+        throw new Error(`Mintsoft Order/List page ${pageNo}: row missing a valid ID — refusing to treat a malformed delta as complete`)
+      }
+      if (toStr(record.OrderNumber) === null) {
+        throw new Error(`Mintsoft Order/List page ${pageNo}: row ${rowId} missing an order number — refusing to treat a malformed delta as complete`)
+      }
+    }
+    collected.push(...(page as RawOrder[]))
     if (page.length < limit) {
-      const normalized = await Promise.all(collected.map((row) => normalizeMintsoftOrderRow(row)))
+      if (collected.length === 0) return []
+      // Resolve the status map + settings ONCE for the whole list (they're the
+      // same for every row) so normalisation makes no per-row API/DB calls.
+      const statusMap = await fetchMintsoftOrderStatusMap()
+      const settings = await getMintsoftSettings()
+      const normalized = await Promise.all(collected.map((row) => normalizeMintsoftOrderRow(row, { statusMap, settings })))
       return normalized.filter((row): row is WmsOrderStatus => row !== null)
     }
   }

@@ -238,6 +238,86 @@ test('the delta stays inert when the connector supplies no fetchDelta (behaves e
   assert.equal(counters.dispatched, 1)
 })
 
+test('(g) [o3d-bjc coverage] a changed order beyond the reconcile batch is processed via listActiveByOrderNumbers and the watermark advances', async () => {
+  // Simulate "more active links than the batch": the reconcile batch (size 1) is
+  // FULL and does NOT contain the changed order, but the delta does. Without the
+  // by-number lookup this dispatch would be skipped while the watermark advanced.
+  const byNumberQueried: string[][] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  let fetchStatusCalls = 0
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      // Full batch of an UNRELATED link (not the changed order).
+      listCandidates: async () => [{ linkId: 'other', orderId: 'oo', externalOrderNumber: 'WC-9999' }],
+      listActiveByOrderNumbers: async (numbers) => {
+        byNumberQueried.push(numbers)
+        return numbers.includes('WC-1001')
+          ? [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }]
+          : []
+      },
+      fetchOrderStatus: async () => {
+        fetchStatusCalls += 1
+        return null
+      },
+      fetchDelta: async () => [
+        status({ externalOrderNumber: 'WC-1001', status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TN1', carrier: 'DPD' })] }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW, batchSize: 1 },
+  )
+  assert.deepEqual(byNumberQueried, [['WC-1001']]) // delta drove the by-number lookup
+  assert.equal(fetchStatusCalls, 0) // handled from the delta preload, no per-order poll
+  assert.equal(counters.dispatched, 1) // the out-of-batch order WAS processed
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].watermark, NOW.toISOString()) // full coverage → watermark advanced
+})
+
+test('(h) [o3d-bjc coverage] fallback (no listActiveByOrderNumbers): a FULL batch holds the watermark so an out-of-batch change is not aged out', async () => {
+  // No by-number lookup wired and the batch is full (length === batchSize=1), so
+  // coverage is not provably complete → the watermark must be held.
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+      fetchDelta: async () => [
+        status({ externalOrderNumber: 'WC-1001', status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TN1' })] }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW, batchSize: 1 },
+  )
+  assert.equal(counters.dispatched, 1) // the in-batch match is still processed
+  assert.equal(saved.length, 0) // watermark HELD (coverage not provably complete, no reconcile due)
+})
+
+test('(i) [o3d-bjc coverage] an order handled in the delta pass is not double-processed by a due reconcile pass', async () => {
+  let fetchStatusCalls = 0
+  const cleared: string[] = []
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+      listActiveByOrderNumbers: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+      fetchOrderStatus: async () => {
+        fetchStatusCalls += 1
+        return status({ status: 'DESPATCHED', dispatched: true })
+      },
+      fetchDelta: async () => [
+        status({ externalOrderNumber: 'WC-1001', status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TN1' })] }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: null }), // reconcile DUE
+      saveDeltaState: async () => {},
+      clearDispatchFailures: async (linkId) => { cleared.push(linkId) },
+    }),
+    { now: NOW },
+  )
+  assert.equal(fetchStatusCalls, 0) // processed once from the delta, not re-polled by reconcile
+  assert.equal(counters.totalChecked, 1)
+  assert.deepEqual(cleared, ['l1']) // bookkeeping ran exactly once
+})
+
 test('the feature flag deltaEnabled:false forces per-order polling even when a delta is available', async () => {
   let deltaCalls = 0
   let fetchStatusCalls = 0

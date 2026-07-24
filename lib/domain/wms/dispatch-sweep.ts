@@ -170,6 +170,13 @@ export type WmsDispatchSweepDeps = {
   fetchDelta?(sinceIso: string): Promise<import('@/lib/connectors/wms/types').WmsOrderStatus[]>
   getDeltaState?(): Promise<{ watermark: string | null; lastReconcile: string | null }>
   saveDeltaState?(state: { watermark?: string; lastReconcile?: string }): Promise<void>
+  // Active links (same eligibility as listCandidates) whose externalOrderNumber
+  // is in the given set — used by the delta pass to reconcile EVERY changed
+  // order, not just the reconcile batch, so the watermark can advance without
+  // ageing out a dispatch that sits beyond `batchSize`. Optional: without it the
+  // sweep falls back to filtering the batch and holds the watermark unless the
+  // batch enumerated every active link.
+  listActiveByOrderNumbers?(orderNumbers: string[]): Promise<WmsDispatchCandidate[]>
 }
 
 /**
@@ -368,30 +375,14 @@ export async function runWmsDispatchSweepCore(
     }
   }
 
-  const candidates = await deps.listCandidates(batchSize)
-  for (const candidate of candidates) {
-    // Resolve how to process this candidate: prefer the delta row (no per-order
-    // call); else per-order poll on a reconcile tick; else skip an unchanged
-    // order (no fetch, no counters, no failure bookkeeping).
-    const deltaRows = deltaMap?.get(candidate.externalOrderNumber)
-    let preload: WmsOrderStatus | null | undefined
-    if (deltaMap && deltaRows && deltaRows.length > 0) {
-      // A split shares one number across >1 rows — preloading a single row is
-      // ambiguous, so force a fetch (which re-reads every part) by passing null.
-      preload = deltaRows.length === 1 ? deltaRows[0] : null
-    } else if (reconcileDue) {
-      preload = undefined // legacy per-order fetch (not-found / merge detection)
-      ranReconcile = true
-    } else {
-      continue
-    }
-
+  // Reconcile one candidate + do its failure-tracking bookkeeping. The
+  // bookkeeping runs OUTSIDE the reconcile try/catch so a bookkeeping error can
+  // never count as another reconcile failure (Codex: recordDispatchError
+  // throwing inside the catch would have recursed into itself) nor abort the
+  // rest of the pass.
+  const processOne = async (candidate: WmsDispatchCandidate, preload: WmsOrderStatus | null | undefined) => {
     counters.totalChecked += 1
 
-    // Reconcile first; the failure-tracking bookkeeping below runs OUTSIDE this
-    // try/catch so a bookkeeping error can never count as another reconcile
-    // failure (Codex: recordDispatchError throwing inside the catch would have
-    // recursed into itself) nor abort the rest of the batch.
     let outcome: { action: 'dispatched' | 'pending' | 'error'; reason: string }
     try {
       outcome = await reconcileOneOrder(deps, candidate, preload)
@@ -425,16 +416,68 @@ export async function runWmsDispatchSweepCore(
     })
   }
 
-  // Advance the delta cursors only after a fully clean pass, so a Mintsoft/WC
-  // blip can't age a changed row out of the next window before it's applied.
+  const processedLinkIds = new Set<string>()
+  // Whether the delta pass examined EVERY active link the delta touched. Only
+  // then is advancing the watermark safe — otherwise a changed order beyond the
+  // reconcile batch would be skipped yet aged out of the next window.
+  let deltaCoverageComplete = true
+
+  // --- Delta pass: reconcile every active link whose order changed since the
+  // watermark. Coverage MUST span the whole delta, not just the reconcile batch
+  // (o3d-bjc Codex: a fixed batch let a changed order past position `batchSize`
+  // slip while the watermark still advanced). Prefer the by-order-number lookup;
+  // fall back to filtering the batch and hold the watermark if it was truncated.
+  if (deltaMap && deltaMap.size > 0) {
+    const deltaNumbers = [...deltaMap.keys()]
+    let deltaCandidates: WmsDispatchCandidate[]
+    if (deps.listActiveByOrderNumbers) {
+      deltaCandidates = await deps.listActiveByOrderNumbers(deltaNumbers)
+    } else {
+      const batch = await deps.listCandidates(batchSize)
+      // A full batch means there may be active links we never saw — hold the
+      // watermark so an out-of-batch changed order isn't aged out.
+      deltaCoverageComplete = batch.length < batchSize
+      deltaCandidates = batch.filter((candidate) => deltaMap!.has(candidate.externalOrderNumber))
+    }
+    for (const candidate of deltaCandidates) {
+      const deltaRows = deltaMap.get(candidate.externalOrderNumber)
+      if (!deltaRows || deltaRows.length === 0) continue
+      // A split shares one number across >1 rows — preloading a single row is
+      // ambiguous, so force a fetch (which re-reads every part) by passing null.
+      const preload = deltaRows.length === 1 ? deltaRows[0] : null
+      await processOne(candidate, preload)
+      processedLinkIds.add(candidate.linkId)
+    }
+  }
+
+  // --- Throttled reconcile pass: per-order poll a batch of active links to catch
+  // not-found strikes + merge detection (orders absent from the delta). This is
+  // also the SOLE pass when the delta is inactive/failed (deltaMap is null).
+  if (reconcileDue) {
+    ranReconcile = true
+    const candidates = await deps.listCandidates(batchSize)
+    for (const candidate of candidates) {
+      if (processedLinkIds.has(candidate.linkId)) continue // already handled from the delta
+      await processOne(candidate, undefined) // legacy per-order fetch
+    }
+  }
+
+  // Advance the delta cursors only after a fully clean, fully covered pass, so a
+  // Mintsoft/WC blip (or a batch-truncated delta pass) can't age a changed row
+  // out of the next window before it's applied.
   //  - watermark: advance iff we fetched a delta this run (store UTC ISO);
   //  - lastReconcile: stamp iff the per-order reconcile pass ran, so a skipped
   //    reconcile re-runs next tick instead of waiting a full interval.
-  if (deltaActive && passClean && deps.saveDeltaState && (deltaFetched || ranReconcile)) {
+  if (deltaActive && passClean && deps.saveDeltaState) {
     const toSave: { watermark?: string; lastReconcile?: string } = {}
-    if (deltaFetched) toSave.watermark = now.toISOString()
+    // Watermark advances only when the delta pass covered EVERY changed link
+    // (deltaCoverageComplete) — else a changed order beyond the batch would be
+    // aged out. lastReconcile just tracks the per-order reconcile cadence.
+    if (deltaFetched && deltaCoverageComplete) toSave.watermark = now.toISOString()
     if (ranReconcile) toSave.lastReconcile = now.toISOString()
-    await deps.saveDeltaState(toSave)
+    if (toSave.watermark !== undefined || toSave.lastReconcile !== undefined) {
+      await deps.saveDeltaState(toSave)
+    }
   }
 
   return { counters, logs }
@@ -475,6 +518,33 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           ? [{ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber }]
           : [],
       )
+    },
+    // Same eligibility as listCandidates but scoped to a set of order numbers and
+    // UNBOUNDED — the delta pass must see every changed active link, not just the
+    // oldest `batchSize`. Chunked so a large delta stays within a sane IN() size.
+    async listActiveByOrderNumbers(orderNumbers) {
+      const unique = [...new Set(orderNumbers.filter((n): n is string => Boolean(n)))]
+      if (unique.length === 0) return []
+      const CHUNK = 200
+      const out: WmsDispatchCandidate[] = []
+      for (let i = 0; i < unique.length; i += CHUNK) {
+        const rows = await db.wmsOrderPushLink.findMany({
+          where: {
+            connector: connectorId,
+            state: { in: ['SYNCED', 'MERGED'] },
+            externalOrderNumber: { in: unique.slice(i, i + CHUNK) },
+            dispatchDeadLetteredAt: null,
+            order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+          },
+          select: { id: true, orderId: true, externalOrderNumber: true },
+        })
+        for (const row of rows) {
+          if (row.externalOrderNumber) {
+            out.push({ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber })
+          }
+        }
+      }
+      return out
     },
     fetchOrderStatus(orderNumber) {
       return connector.fetchOrderStatus ? connector.fetchOrderStatus(orderNumber) : Promise.resolve(null)
