@@ -563,37 +563,46 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       // journal accepted by Xero, a sibling row failed) would leave a real, voidable document unregistered
       // and stranded in the shared ledger (Codex). settledJournalExternalIds snapshots every id whatever the
       // row's status, scoped to THIS PO, which is precisely the recovery those helpers cannot express.
-      for (const [type, label] of [
-        ['STOCK_IN_TRANSIT', 'stock-in-transit reval'],
-        ['STOCK_RECEIPT', 'stock receipt'],
-        // If the exclusion REGRESSED and a spurious COGS_JOURNAL posted, register that too so teardown voids
-        // it and the assertion below — not the ledger — is what fails.
-        ['COGS_JOURNAL', 'UNEXPECTED cogs'],
-      ] as const) {
-        // NO timestamp bound: goodsPoId alone establishes ownership, and the PO's STOCK_RECEIPT row was
-        // written by receiveGoods BEFORE `boundary` was captured — filtering on it would skip the very
-        // receipt journal this recovery exists to void, leaking it into the shared ledger (Codex).
-        for (const id of await settledJournalExternalIds(type, null, { referenceId: goodsPoId })) {
-          trackDocument('ManualJournals', id, `X-06 ${label} ${runTag(runId)}`)
+      //
+      // NO timestamp bound: goodsPoId alone establishes ownership, and the PO's STOCK_RECEIPT row was written
+      // by receiveGoods BEFORE `boundary` was captured — filtering on it would skip the very receipt journal
+      // this recovery exists to void, leaking it into the shared ledger (Codex).
+      const recoverAndRegister = async (): Promise<void> => {
+        for (const [type, label] of [
+          ['STOCK_IN_TRANSIT', 'stock-in-transit reval'],
+          ['STOCK_RECEIPT', 'stock receipt'],
+          // If the exclusion REGRESSED and a spurious COGS_JOURNAL posted, register that too so teardown
+          // voids it and the assertion below — not the ledger — is what fails.
+          ['COGS_JOURNAL', 'UNEXPECTED cogs'],
+        ] as const) {
+          for (const id of await settledJournalExternalIds(type, null, { referenceId: goodsPoId })) {
+            trackDocument('ManualJournals', id, `X-06 ${label} ${runTag(runId)}`)
+          }
         }
       }
+      await recoverAndRegister()
+
       // Now the ASSERTION read: distinct SYNCED documents only, since "posted exactly once" is a claim about
       // successful documents. Registration above already covered the ledger, so tolerating a throw here just
       // defers the failure to the explicit count assertion.
       stockInTransitIds = await externalIdsFor({ type: 'STOCK_IN_TRANSIT', referenceId: goodsPoId, expected: 1 })
         .catch((): string[] => [])
 
-      // SECOND registration pass — not a redundant one. settledJournalExternalIds only WARNS and returns []
-      // when its database read fails transiently, so Xero can hold a posted journal, the recovery above can
-      // miss it, and this read (a later, independent connection) can still resolve it. Registering whatever
-      // EITHER path resolved closes that window; trackDocument dedupes, so re-registering costs nothing
-      // (Codex). The residual gap — Xero accepted a POST whose id no read can resolve — needs a run-id-tagged
-      // Xero rescan of manual journals, the suite-wide follow-up tracked as o3d-lgo.7.1.
+      // SECOND pass over ALL THREE types — not a redundant one, and asymmetry here would be a hole. The first
+      // pass can miss a document two ways: its database read fails transiently (it only WARNS and returns []),
+      // or a row was still PROCESSING when its 30s settle window expired and only received its external id
+      // afterwards — the realistic case for a spurious COGS_JOURNAL under Xero throttling, which the very
+      // next assertion then aborts the test on. Re-running everything after the assertion read closes both;
+      // trackDocument dedupes, so re-registering costs nothing (Codex).
+      //
+      // The residual gap — Xero accepted a POST whose id NO read can resolve — needs a run-id-tagged Xero
+      // rescan of manual journals, the suite-wide follow-up tracked as o3d-lgo.7.1.
       for (const id of stockInTransitIds) {
         trackDocument('ManualJournals', id, `X-06 stock-in-transit reval ${runTag(runId)}`)
       }
       const receiptId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: goodsPoId }).catch(() => '')
       if (receiptId) trackDocument('ManualJournals', receiptId, `X-06 stock receipt ${runTag(runId)}`)
+      await recoverAndRegister()
     }
 
     // THE CRUX: NO COGS_JOURNAL was queued for the goods PO. The 100 units left via TRANSFER_OUT, so the
