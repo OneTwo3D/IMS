@@ -13,6 +13,7 @@ import {
   fetchMintsoftAsns,
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
+  mintsoftDeltaScopeChanged,
   testMintsoftConnectionSettings,
   validateMintsoftBaseUrl,
   type MintsoftSettings,
@@ -742,6 +743,18 @@ export async function saveMintsoftOrderDispatchSettings(input: {
     return { success: false, error: 'Mintsoft WarehouseId must be a whole positive number, or blank.' }
   }
 
+  // Finding 4: if the delta SCOPE changes (client/channel/warehouse), the persisted
+  // watermark + last-reconcile cursors belong to the OLD scope. Reusing them would
+  // start the first query after a scope correction from a stale point, so outstanding
+  // new-scope orders predating the overlap would never enter the delta. Detect a
+  // change and clear BOTH cursors in the SAME transaction so the next sweep restarts
+  // from the lookback window and reconciles immediately.
+  const existing = await getMintsoftSettings()
+  const scopeChanged = mintsoftDeltaScopeChanged(
+    { clientId: clientId.value, channelId: channelId.value, warehouseId: warehouseId.value },
+    existing,
+  )
+
   await db.$transaction([
     db.setting.upsert({
       where: { key: 'mintsoft_admin_order_url_template' },
@@ -768,6 +781,10 @@ export async function saveMintsoftOrderDispatchSettings(input: {
       create: { key: 'mintsoft_warehouse_id', value: serializeSettingValue('mintsoft_warehouse_id', warehouseId.value) },
       update: { value: serializeSettingValue('mintsoft_warehouse_id', warehouseId.value) },
     }),
+    // Reset the delta cursors when the scope changed (no-op count when they don't exist).
+    ...(scopeChanged
+      ? [db.setting.deleteMany({ where: { key: { in: ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] } } })]
+      : []),
   ])
   revalidatePath('/sync')
   return { success: true }

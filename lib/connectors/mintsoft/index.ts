@@ -192,4 +192,4 @@ export {
   normalizeMintsoftStockLine,
   normalizeMintsoftWarehouse,
 } from './api/normalizers'
-export { getMintsoftSettings, MINTSOFT_SETTING_KEYS, type MintsoftSettings } from './settings/schema'
+export { getMintsoftSettings, mintsoftDeltaScopeChanged, MINTSOFT_SETTING_KEYS, parseMintsoftPositiveId, type MintsoftSettings } from './settings/schema'

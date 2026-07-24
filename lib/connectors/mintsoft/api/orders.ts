@@ -209,8 +209,11 @@ export async function fetchMintsoftOrderStatus(orderNumber: string): Promise<Wms
  * Order/List returns EVERY client's orders — and matching a foreign row to a
  * local link by order number alone could mark OUR order shipped off a FOREIGN
  * despatch. A null/absent `clientId` therefore THROWS rather than running an
- * unscoped delta. As defence in depth, any returned row whose echoed ClientId
- * differs from `clientId` is DROPPED (it falls through to the per-order reconcile).
+ * unscoped delta. As defence in depth, EVERY returned row must carry a parseable
+ * ClientId exactly equal to `clientId`; a missing or mismatched ClientId (an
+ * ignored filter or contract drift) REJECTS THE WHOLE RESPONSE (throw), so a
+ * drifted contract can never quietly advance the watermark past unverified rows —
+ * the sweep fails safe to the per-order reconcile and holds the watermark.
  *
  * Also THROWS (rather than returning a partial list) when the result overflows
  * `maxPages * limit` — a truncated delta must never look complete, or the sweep
@@ -278,14 +281,19 @@ export async function fetchMintsoftOrderList(opts: {
       if (toStr(record.OrderNumber) === null) {
         throw new Error(`Mintsoft Order/List page ${pageNo}: row ${rowId} missing an order number — refusing to treat a malformed delta as complete`)
       }
-      // Defence in depth: even with ClientId in the query, DROP any row whose
-      // echoed ClientId isn't ours — never trust an order-number match belonging
-      // to another client on the shared tenant. A row that omits ClientId is
-      // trusted via the query-param scoping. A dropped row simply isn't in the
-      // delta, so it falls through to the per-order reconcile. (This is a DROP,
-      // not a throw: a foreign row is valid data, just not ours.)
+      // Tenant boundary — fail closed (o3d-bjc): EVERY row must carry a parseable
+      // ClientId exactly equal to ours. A missing ClientId (contract drift) or a
+      // mismatched one (the query filter was ignored) means we can NOT verify the
+      // response belongs to us — reject the WHOLE delta (throw → the sweep fails
+      // safe to per-order reconcile and holds the watermark) rather than trust an
+      // order-number match that could belong to another client on the shared tenant.
       const rowClientId = toInt(record.ClientId ?? record.clientId)
-      if (rowClientId !== null && rowClientId !== clientId) continue
+      if (rowClientId === null) {
+        throw new Error(`Mintsoft Order/List page ${pageNo}: row ${rowId} has no ClientId — refusing an unverifiable cross-client delta`)
+      }
+      if (rowClientId !== clientId) {
+        throw new Error(`Mintsoft Order/List page ${pageNo}: row ${rowId} ClientId ${rowClientId} does not match configured ${clientId} — refusing a cross-client delta`)
+      }
       collected.push(record)
     }
     if (page.length < limit) {

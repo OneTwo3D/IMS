@@ -67,6 +67,27 @@ export function parseMintsoftPositiveId(value: string | null | undefined): numbe
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null
 }
 
+/**
+ * True when the inbound-delta SCOPE (ClientId / ChannelId / WarehouseId) differs
+ * between the incoming values and the persisted settings. A scope change (a tenant
+ * correction, a channel/warehouse retarget) invalidates the persisted delta
+ * watermark + last-reconcile cursors — they belong to the OLD scope, and reusing
+ * them would start the next query from a stale point, so outstanding new-scope
+ * orders predating the overlap would never enter the delta. The caller must clear
+ * both cursors when this returns true. Compared as already-normalised strings
+ * (`''` = unset).
+ */
+export function mintsoftDeltaScopeChanged(
+  next: { clientId: string; channelId: string; warehouseId: string },
+  prev: Pick<MintsoftSettings, 'mintsoft_client_id' | 'mintsoft_channel_id' | 'mintsoft_warehouse_id'>,
+): boolean {
+  return (
+    next.clientId !== prev.mintsoft_client_id ||
+    next.channelId !== prev.mintsoft_channel_id ||
+    next.warehouseId !== prev.mintsoft_warehouse_id
+  )
+}
+
 export async function getMintsoftSettings(): Promise<MintsoftSettings> {
   const map = await getSettingValues([...MINTSOFT_SETTING_KEYS])
   const result = { ...MINTSOFT_DEFAULTS }

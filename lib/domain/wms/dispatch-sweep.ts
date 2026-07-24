@@ -96,6 +96,20 @@ export function shouldDeadLetterDispatch(failureCount: number, deadLetteredAt: D
   return failureCount >= DISPATCH_MAX_CONSECUTIVE_FAILURES && !deadLetteredAt
 }
 
+/**
+ * Job-outcome mapping (o3d-bjc finding 3a): a delta-fetch failure is a degraded
+ * PRIMARY path — the sweep fell back to a bounded per-order reconcile, so it must
+ * count as an error and mark the job PARTIAL rather than let a broken delta hide
+ * behind a SUCCEEDED / zero-error job. Pure so it's unit-testable.
+ */
+export function resolveDispatchJobOutcome(
+  errors: number,
+  deltaError: string | null,
+): { status: 'SUCCEEDED' | 'PARTIAL'; effectiveErrors: number } {
+  const effectiveErrors = errors + (deltaError ? 1 : 0)
+  return { status: effectiveErrors > 0 ? 'PARTIAL' : 'SUCCEEDED', effectiveErrors }
+}
+
 /** Map WMS tracking entries to the shape applyExternalFulfillmentUpdate expects. */
 export function toFulfillmentTracking(
   tracking: WmsOrderTracking[],
@@ -110,6 +124,15 @@ export type WmsDispatchCandidate = {
   orderId: string
   /** The WMS order number to look the live status up by. */
   externalOrderNumber: string
+  /**
+   * The WMS's own STABLE order id for this link (wmsOrderPushLink.externalOrderId).
+   * Order NUMBERS are not schema-unique (reused / edited / split across channels),
+   * so the delta pass joins a changed delta row to a local link by this id — never
+   * by number alone, which could apply one dispatched row to several local orders.
+   * May be null on a legacy link whose id was never captured; such a link can't be
+   * safely matched from the bulk delta and is left to the per-order reconcile.
+   */
+  externalOrderId?: string | null
 }
 
 export type WmsDispatchCounters = {
@@ -331,7 +354,7 @@ export type WmsDispatchSweepCoreOptions = {
 export async function runWmsDispatchSweepCore(
   deps: WmsDispatchSweepDeps,
   options?: WmsDispatchSweepCoreOptions,
-): Promise<{ counters: WmsDispatchCounters; logs: WmsDispatchLog[] }> {
+): Promise<{ counters: WmsDispatchCounters; logs: WmsDispatchLog[]; deltaError: string | null }> {
   const batchSize = options?.batchSize ?? DISPATCH_SWEEP_DEFAULT_BATCH_SIZE
   const now = options?.now ?? new Date()
   const counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
@@ -339,15 +362,22 @@ export async function runWmsDispatchSweepCore(
 
   // --- Inbound Order/List delta (o3d-bjc) ---------------------------------
   // Only engages when the connector supplies a bulk delta AND the flag is on.
-  // deltaMap groups changed orders by their order number (a split shares one
-  // number across several part-rows → a list). deltaFetched/ranReconcile gate
-  // the clean-pass cursor advance; passClean holds it back on any error.
+  // deltaById keys changed orders by their STABLE externalOrderId (order numbers
+  // aren't unique); deltaByNumber is a secondary index used to enumerate candidate
+  // links by number and to detect a shared number (split/reuse) that must not be
+  // preloaded. deltaFetched/ranReconcile gate the clean-pass cursor advance;
+  // passClean holds it back on any error.
   const deltaActive = Boolean(deps.fetchDelta) && (options?.deltaEnabled ?? true)
-  let deltaMap: Map<string, WmsOrderStatus[]> | null = null
+  let deltaById: Map<string, WmsOrderStatus> | null = null
+  let deltaByNumber: Map<string, WmsOrderStatus[]> | null = null
   let reconcileDue = true
   let deltaFetched = false
   let ranReconcile = false
   let passClean = true
+  // Set when the delta fetch fails: the sweep still fails safe to the per-order
+  // reconcile, but the failure is surfaced (job PARTIAL + errors) so a broken
+  // primary path can't hide behind a SUCCEEDED job.
+  let deltaError: string | null = null
 
   if (deltaActive) {
     const state = deps.getDeltaState
@@ -366,22 +396,28 @@ export async function runWmsDispatchSweepCore(
 
     try {
       const rows = await deps.fetchDelta!(sinceIso)
-      deltaMap = new Map<string, WmsOrderStatus[]>()
+      deltaById = new Map<string, WmsOrderStatus>()
+      deltaByNumber = new Map<string, WmsOrderStatus[]>()
       for (const row of rows) {
-        const key = row.externalOrderNumber
-        if (!key) continue
-        const bucket = deltaMap.get(key)
-        if (bucket) bucket.push(row)
-        else deltaMap.set(key, [row])
+        if (row.externalOrderId) deltaById.set(row.externalOrderId, row)
+        const number = row.externalOrderNumber
+        if (number) {
+          const bucket = deltaByNumber.get(number)
+          if (bucket) bucket.push(row)
+          else deltaByNumber.set(number, [row])
+        }
       }
       deltaFetched = true
       const lastReconcileMs = state.lastReconcile ? Date.parse(state.lastReconcile) : NaN
       reconcileDue = !Number.isFinite(lastReconcileMs) || now.getTime() - lastReconcileMs >= intervalMs
     } catch (error) {
       // Fail SAFE: a fetch error must never masquerade as an empty delta that
-      // would silently skip every order. Full per-order poll this run.
-      console.error('[wms-dispatch-sweep] Order/List delta fetch failed — full per-order poll this run:', scrubWmsError(error, 'delta fetch error'))
-      deltaMap = null
+      // would silently skip every order. Full per-order poll this run — AND
+      // surface the failure so the job reports it (finding 3a).
+      deltaError = scrubWmsError(error, 'delta fetch error')
+      console.error('[wms-dispatch-sweep] Order/List delta fetch failed — full per-order poll this run:', deltaError)
+      deltaById = null
+      deltaByNumber = null
       reconcileDue = true
     }
   }
@@ -438,8 +474,15 @@ export async function runWmsDispatchSweepCore(
   // (o3d-bjc Codex: a fixed batch let a changed order past position `batchSize`
   // slip while the watermark still advanced). Prefer the by-order-number lookup;
   // fall back to filtering the batch and hold the watermark if it was truncated.
-  if (deltaMap && deltaMap.size > 0) {
-    const deltaNumbers = [...deltaMap.keys()]
+  //
+  // A link is joined to a delta row by its STABLE externalOrderId — never by
+  // order number alone (finding 2: numbers aren't unique, so a collision could
+  // apply one dispatched row to several local orders). Candidates are enumerated
+  // by number (that's the index we have), then filtered to those whose id is in
+  // the delta; a number match without an id match means THIS link's order did not
+  // change, so it's left to the throttled reconcile rotation.
+  if (deltaById && deltaByNumber && deltaByNumber.size > 0) {
+    const deltaNumbers = [...deltaByNumber.keys()]
     let deltaCandidates: WmsDispatchCandidate[]
     if (deps.listActiveByOrderNumbers) {
       deltaCandidates = await deps.listActiveByOrderNumbers(deltaNumbers)
@@ -448,14 +491,18 @@ export async function runWmsDispatchSweepCore(
       // A full batch means there may be active links we never saw — hold the
       // watermark so an out-of-batch changed order isn't aged out.
       deltaCoverageComplete = batch.length < batchSize
-      deltaCandidates = batch.filter((candidate) => deltaMap!.has(candidate.externalOrderNumber))
+      deltaCandidates = batch
     }
     for (const candidate of deltaCandidates) {
-      const deltaRows = deltaMap.get(candidate.externalOrderNumber)
-      if (!deltaRows || deltaRows.length === 0) continue
-      // A split shares one number across >1 rows — preloading a single row is
-      // ambiguous, so force a fetch (which re-reads every part) by passing null.
-      const preload = deltaRows.length === 1 ? deltaRows[0] : null
+      // Stable-id join: only reconcile a link whose own order is in the delta.
+      const idRow = candidate.externalOrderId ? deltaById.get(candidate.externalOrderId) : undefined
+      if (!idRow) continue
+      // A split shares one number across several part-rows (distinct ids);
+      // preloading the single primary row is ambiguous, so force the authoritative
+      // per-order fetch (Search + pickOrderRow + parts). Only preload an
+      // unambiguous 1:1 (this number maps to exactly one delta row).
+      const numberRows = deltaByNumber.get(candidate.externalOrderNumber)
+      const preload = numberRows && numberRows.length === 1 ? idRow : null
       await processOne(candidate, preload)
       processedLinkIds.add(candidate.linkId)
     }
@@ -463,7 +510,7 @@ export async function runWmsDispatchSweepCore(
 
   // --- Throttled reconcile pass: per-order poll a batch of active links to catch
   // not-found strikes + merge detection (orders absent from the delta). This is
-  // also the SOLE pass when the delta is inactive/failed (deltaMap is null).
+  // also the SOLE pass when the delta is inactive/failed (deltaById is null).
   //
   // Rotation (o3d-bjc Codex round 2): the batch is ordered least-recently-verified
   // first (dispatchReconcileCheckedAt NULLS FIRST, then pushedAt) so links beyond
@@ -512,7 +559,7 @@ export async function runWmsDispatchSweepCore(
     }
   }
 
-  return { counters, logs }
+  return { counters, logs, deltaError }
 }
 
 export type WmsDispatchSweepResult = {
@@ -541,13 +588,13 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           dispatchDeadLetteredAt: null,
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },
-        select: { id: true, orderId: true, externalOrderNumber: true },
+        select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
         take: limit,
         orderBy: { pushedAt: 'asc' },
       })
       return rows.flatMap((row) =>
         row.externalOrderNumber
-          ? [{ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber }]
+          ? [{ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber, externalOrderId: row.externalOrderId }]
           : [],
       )
     },
@@ -568,11 +615,11 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             dispatchDeadLetteredAt: null,
             order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
           },
-          select: { id: true, orderId: true, externalOrderNumber: true },
+          select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
         })
         for (const row of rows) {
           if (row.externalOrderNumber) {
-            out.push({ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber })
+            out.push({ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber, externalOrderId: row.externalOrderId })
           }
         }
       }
@@ -591,13 +638,13 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           dispatchDeadLetteredAt: null,
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },
-        select: { id: true, orderId: true, externalOrderNumber: true },
+        select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
         take: limit,
         orderBy: [{ dispatchReconcileCheckedAt: { sort: 'asc', nulls: 'first' } }, { pushedAt: 'asc' }],
       })
       return rows.flatMap((row) =>
         row.externalOrderNumber
-          ? [{ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber }]
+          ? [{ linkId: row.id, orderId: row.orderId, externalOrderNumber: row.externalOrderNumber, externalOrderId: row.externalOrderId }]
           : [],
       )
     },
@@ -848,7 +895,7 @@ export async function runWmsDispatchSweep(
   try {
     const core = await runWmsDispatchSweepCore(deps, coreOptions)
     counters = core.counters
-    const { logs } = core
+    const { logs, deltaError } = core
 
     if (logs.length > 0) {
       // Map the dispatch outcomes onto the shared WmsSyncLogAction enum; the detail lives
@@ -870,7 +917,25 @@ export async function runWmsDispatchSweep(
       })
     }
 
-    const status: 'SUCCEEDED' | 'PARTIAL' = counters.errors > 0 ? 'PARTIAL' : 'SUCCEEDED'
+    // Finding 3a: a delta-fetch failure degrades the PRIMARY inbound path — the
+    // sweep fell back to a per-order reconcile of a bounded (rotating) batch, so
+    // newer dispatched orders may lag until the backlog rotates through. Surface
+    // it: mark the job PARTIAL, count it as an error, and log a distinct row so a
+    // persistent delta outage can't hide behind a SUCCEEDED/zero-error job.
+    if (deltaError) {
+      await db.wmsSyncLog.create({
+        data: {
+          jobId: job.id,
+          sku: null,
+          productId: null,
+          action: 'error',
+          reason: `Inbound Order/List delta fetch failed — fell back to the per-order reconcile this run: ${deltaError}`,
+          payload: { deltaFailure: true, connector: connectorId } as Prisma.InputJsonValue,
+        },
+      })
+    }
+
+    const { status, effectiveErrors } = resolveDispatchJobOutcome(counters.errors, deltaError)
     await db.wmsSyncJob.update({
       where: { id: job.id },
       data: {
@@ -880,22 +945,25 @@ export async function runWmsDispatchSweep(
         matched: counters.dispatched,
         mismatched: counters.pending,
         corrected: counters.dispatched,
-        errors: counters.errors,
+        errors: effectiveErrors,
       },
     })
 
-    if (counters.dispatched > 0 || counters.errors > 0) {
+    if (counters.dispatched > 0 || effectiveErrors > 0) {
       await logActivity({
         entityType: 'SYSTEM',
         tag: 'sync',
-        action: 'wms_dispatch_sync',
-        description: `WMS dispatch sync (${connectorId}): ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} errors.`,
-        metadata: { jobId: job.id, connector: connectorId, ...counters },
+        action: deltaError ? 'wms_dispatch_sync_degraded' : 'wms_dispatch_sync',
+        level: deltaError ? 'WARNING' : undefined,
+        description: deltaError
+          ? `WMS dispatch sync (${connectorId}) DEGRADED — inbound delta failed, ran per-order reconcile fallback: ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} order errors. Delta error: ${deltaError}`
+          : `WMS dispatch sync (${connectorId}): ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} errors.`,
+        metadata: { jobId: job.id, connector: connectorId, deltaError: deltaError ?? undefined, ...counters },
         resolveUser: false,
       })
     }
 
-    return { jobId: job.id, status, totalChecked: counters.totalChecked, dispatched: counters.dispatched, pending: counters.pending, errors: counters.errors }
+    return { jobId: job.id, status, totalChecked: counters.totalChecked, dispatched: counters.dispatched, pending: counters.pending, errors: effectiveErrors }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'WMS dispatch sync failed'
     await db.wmsSyncJob.update({ where: { id: job.id }, data: { status: 'FAILED', finishedAt: new Date() } })

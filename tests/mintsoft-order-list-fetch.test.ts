@@ -26,8 +26,6 @@ mock.module('@/lib/connectors/mintsoft/settings/schema', {
     },
     MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE: 'https://wms.example/Order/{id}',
     MINTSOFT_SETTING_KEYS: [],
-    // Real implementation (the paginator/connector share it) — keep it here so a
-    // mocked schema module still exposes the parser.
     parseMintsoftPositiveId: (value: string | null | undefined): number | null => {
       if (value == null) return null
       const trimmed = String(value).trim()
@@ -56,21 +54,19 @@ async function loadFetch(): Promise<(typeof import('@/lib/connectors/mintsoft/ap
   return (await import('@/lib/connectors/mintsoft/api/orders')).fetchMintsoftOrderList
 }
 
-// Every delta is scoped to our ClientId now (fail-closed) — a shared value the
-// tests reuse.
+// Every delta is scoped to our ClientId, and every ROW must echo it (fail closed).
 const CLIENT = 5
+// Build a well-formed, in-scope row (carries our ClientId).
+function row(id: number, over: Record<string, unknown> = {}) {
+  return { ID: id, OrderNumber: `N${id}`, OrderStatusId: 4, ClientId: CLIENT, ...over }
+}
 
 test('fetchMintsoftOrderList paginates until a short page and carries the delta params', async () => {
   const fetchMintsoftOrderList = await loadFetch()
   listCalls = []
   listError = null
-  const fullPage = Array.from({ length: 200 }, (_, i) => ({ ID: i + 1, OrderNumber: `N${i + 1}`, OrderStatusId: 4 }))
-  listResponder = (pageNo) =>
-    pageNo === 1
-      ? fullPage
-      : pageNo === 2
-        ? [{ ID: 201, OrderNumber: 'N201', OrderStatusId: 4 }, { ID: 202, OrderNumber: 'N202', OrderStatusId: 4 }]
-        : []
+  const fullPage = Array.from({ length: 200 }, (_, i) => row(i + 1))
+  listResponder = (pageNo) => (pageNo === 1 ? fullPage : pageNo === 2 ? [row(201), row(202)] : [])
 
   const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, limit: 200 })
   assert.equal(out.length, 202)
@@ -83,7 +79,7 @@ test('fetchMintsoftOrderList paginates until a short page and carries the delta 
   assert.equal(listCalls[1].PageNo, '2')
 })
 
-// --- Finding 1: ClientId scoping (fail closed + defence in depth) ----------
+// --- Finding 1: ClientId scoping (fail closed, whole-response) --------------
 
 test('[o3d-bjc] fetchMintsoftOrderList FAILS CLOSED without a clientId (never runs an unscoped cross-client delta)', async () => {
   const fetchMintsoftOrderList = await loadFetch()
@@ -113,26 +109,36 @@ test('[o3d-bjc] fetchMintsoftOrderList always sends ClientId and passes optional
   assert.equal(listCalls[0].ChannelId, '3')
 })
 
-test('[o3d-bjc] a delta row whose ClientId is NOT ours is dropped (never matched to a local link)', async () => {
+test('[o3d-bjc] a row MISSING a ClientId rejects the WHOLE response (fails closed — cannot verify tenant)', async () => {
   const fetchMintsoftOrderList = await loadFetch()
   listCalls = []
   listError = null
-  listResponder = () => [
-    { ID: 1, OrderNumber: 'SHARED-1001', OrderStatusId: 4, ClientId: CLIENT },   // ours → kept
-    { ID: 2, OrderNumber: 'SHARED-1001', OrderStatusId: 4, ClientId: 99 },       // FOREIGN (same number!) → dropped
-    { ID: 3, OrderNumber: 'N3', OrderStatusId: 4 },                              // no ClientId → trusted via query scope
-  ]
-  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
-  const ids = out.map((o) => o.externalOrderId).sort()
-  assert.deepEqual(ids, ['1', '3']) // the foreign ClientId-99 row is gone, so it can't hijack SHARED-1001
-  assert.equal(listCalls[0].ClientId, String(CLIENT))
+  // Second row has no ClientId — unverifiable → the whole delta is rejected so
+  // contract drift can never quietly advance the watermark past unverified rows.
+  listResponder = () => [row(1), { ID: 2, OrderNumber: 'N2', OrderStatusId: 4 }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /has no ClientId/,
+  )
+})
+
+test('[o3d-bjc] a row with a FOREIGN ClientId rejects the WHOLE response (fails closed — never applied to a local link)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  // A foreign row sharing our order number would otherwise be a cross-tenant hazard.
+  listResponder = () => [row(1), row(2, { ClientId: 99 })]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /does not match configured 5/,
+  )
 })
 
 test('fetchMintsoftOrderList throws (not truncates) when the delta overflows the page budget', async () => {
   const fetchMintsoftOrderList = await loadFetch()
   listCalls = []
   listError = null
-  const alwaysFull = Array.from({ length: 10 }, (_, i) => ({ ID: i + 1, OrderNumber: `N${i}`, OrderStatusId: 4 }))
+  const alwaysFull = Array.from({ length: 10 }, (_, i) => row(i + 1))
   listResponder = () => alwaysFull // every page full → never short
 
   await assert.rejects(
@@ -148,7 +154,7 @@ test('[o3d-bjc] a multi-row page resolves settings + statuses ONCE, not once per
   listError = null
   settingsCalls = 0
   statusCalls = 0
-  const rows = Array.from({ length: 30 }, (_, i) => ({ ID: i + 1, OrderNumber: `N${i + 1}`, OrderStatusId: 4 }))
+  const rows = Array.from({ length: 30 }, (_, i) => row(i + 1))
   listResponder = (pageNo) => (pageNo === 1 ? rows : []) // 30 < default limit 200 → short first page
 
   const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
@@ -161,15 +167,12 @@ test('[o3d-bjc] a malformed 2xx Order/List body throws (fails closed), not treat
   const fetchMintsoftOrderList = await loadFetch()
   listCalls = []
   listError = null
-  // A 200 with an unexpected shape (proxy error object / schema drift): must throw
-  // rather than end pagination as a "complete" empty page and advance the watermark.
   listResponder = () => ({ Message: 'temporarily unavailable' }) as unknown as unknown[]
   await assert.rejects(
     () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
     /expected an array/,
   )
 
-  // A 200 null body likewise fails closed.
   listResponder = () => null as unknown as unknown[]
   await assert.rejects(
     () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
@@ -181,13 +184,7 @@ test('[o3d-bjc] a row missing a valid ID throws (fails closed), not silently dro
   const fetchMintsoftOrderList = await loadFetch()
   listCalls = []
   listError = null
-  // A well-formed page shape, but one row has no ID — a schema/API fault. It must
-  // throw (Python parity) rather than normalise to null and be filtered away,
-  // which would advance the watermark past that order.
-  listResponder = () => [
-    { ID: 1, OrderNumber: 'N1', OrderStatusId: 4 },
-    { OrderNumber: 'N2', OrderStatusId: 4 }, // no ID
-  ]
+  listResponder = () => [row(1), { OrderNumber: 'N2', OrderStatusId: 4, ClientId: CLIENT }] // 2nd row: no ID
   await assert.rejects(
     () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
     /missing a valid ID/,
@@ -198,9 +195,7 @@ test('[o3d-bjc] a row missing an order number throws (fails closed)', async () =
   const fetchMintsoftOrderList = await loadFetch()
   listCalls = []
   listError = null
-  // The delta map is keyed by order number; a row without one can never be matched
-  // to an active link, so dropping it would silently lose the change. Fail closed.
-  listResponder = () => [{ ID: 7, OrderStatusId: 4 }] // no OrderNumber
+  listResponder = () => [{ ID: 7, OrderStatusId: 4, ClientId: CLIENT }] // no OrderNumber
   await assert.rejects(
     () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
     /missing an order number/,
