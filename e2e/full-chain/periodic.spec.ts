@@ -695,6 +695,10 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     // Capture the prior drift settings (absent on a clean rig) so teardown restores EXACTLY.
     const priorSnapshot = await getSettingRaw('xero_tax_rate_drift_current')
     const priorChecked = await getSettingRaw('xero_tax_rate_drift_last_checked_at')
+    // Cutoff for the ActivityLog cleanup, taken from the DB clock immediately BEFORE the first sweep: the
+    // sweeps are global and log a WARNING per drifted rate, so teardown must remove the rows THEY wrote
+    // while preserving anything older (see deleteDriftActivityLogRowsSince).
+    const driftLogCutoff = await dbNow()
 
     try {
       // Every assertion is scoped to OUR rate id, not the sweep's global counts — the rig may legitimately
@@ -752,7 +756,11 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       // Global teardown voids Xero documents; it does not repair these settings (Codex). runAllCleanups
       // attempts every step and rethrows the collected failures, so cleanup stays loud.
       await runAllCleanups('X-04', [
-        ['delete drift ActivityLog rows', () => deleteDriftActivityLogRows(taxRateId)],
+        ['delete drift ActivityLog rows for our rate', () => deleteDriftActivityLogRows(taxRateId)],
+        // ...and the rows OUR sweeps wrote for anyone else's drifted rate: three global sweeps would
+        // otherwise leave up to three duplicate WARNINGs per pre-existing drift, while the snapshot they
+        // belong to is rolled back (Codex). Older rows are preserved.
+        ['delete drift ActivityLog rows written by our sweeps', () => deleteDriftActivityLogRowsSince(driftLogCutoff)],
         ['delete seeded tax rate', () => deleteTaxRateById(taxRateId)],
         ['restore xero_tax_rate_drift_current', () => restoreSetting('xero_tax_rate_drift_current', priorSnapshot)],
         ['restore xero_tax_rate_drift_last_checked_at', () => restoreSetting('xero_tax_rate_drift_last_checked_at', priorChecked)],
@@ -1425,6 +1433,30 @@ async function driftActivityLogRows(
 }
 
 /** Remove the ActivityLog rows the drift detection wrote for a tax rate id (teardown). */
+/** The database's own clock — a cutoff taken from the app's clock could skew against the rows it filters. */
+async function dbNow(): Promise<string> {
+  const rows = await queryRows<{ now: string }>(`select now()::text as now`, [])
+  return rows[0].now
+}
+
+/**
+ * Delete tax_rate_drift_detected rows written SINCE `cutoff`, preserving everything older.
+ *
+ * X-04's three sweeps are global: each logs a WARNING for EVERY drifted component-backed IMS rate, not just
+ * the seeded one — and the spec deliberately tolerates other component-backed rates existing. Deleting only
+ * rows for our own taxRateId therefore left up to three duplicate warnings per run for any genuinely drifted
+ * rate, while the snapshot and last-checked stamp were rolled back — contradictory observability that buries
+ * real alerts (Codex). The cutoff is taken immediately before the first sweep, so rows the operator's own
+ * hourly sweep wrote earlier survive; on the rig the only sweeps inside the window are this test's.
+ */
+async function deleteDriftActivityLogRowsSince(cutoff: string): Promise<void> {
+  assertNotStageDb()
+  await queryRows(
+    `delete from activity_logs where action = 'tax_rate_drift_detected' and "createdAt" >= $1::timestamptz`,
+    [cutoff],
+  )
+}
+
 async function deleteDriftActivityLogRows(taxRateId: string): Promise<void> {
   const { Client } = await import('pg')
   const db = new Client({ connectionString: process.env.DATABASE_URL })
