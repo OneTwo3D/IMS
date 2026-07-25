@@ -835,7 +835,12 @@ export async function runWmsDispatchSweepCore(
     //    order's id, which the survivor's row no longer carries at all.
     // Links reached via the stable-ID split probe (o3d-bjc.5). Tracked so the
     // processing loop below can tell them apart from a bare number match.
-    const probeDiscovered = new Set<string>()
+    // linkId -> the CURRENT order number the probe found the group under. A
+    // probe-discovered link has no idRow, so without this the reconcile would
+    // look the status up by the link's STALE number — which is precisely what
+    // the rename broke, so the probe would find the order and the lookup would
+    // then fail anyway.
+    const probeDiscovered = new Map<string, string>()
     const supplementNumbers = new Set<string>(
       [...deltaByNumber.entries()]
         .filter(([, rows]) => rows.length > 1 || rows.some((row) => row.isSplit || (row.partCount ?? 1) > 1))
@@ -933,7 +938,7 @@ export async function runWmsDispatchSweepCore(
               // processing loop's own eligibility test is number/id-keyed
               // against the DELTA, which is exactly what a rename defeats — so
               // record the discovery here rather than let it fall through.
-              probeDiscovered.add(candidate.linkId)
+              probeDiscovered.set(candidate.linkId, number)
               if (!seen.has(candidate.linkId)) {
                 deltaCandidates.push(candidate)
                 seen.add(candidate.linkId)
@@ -981,7 +986,8 @@ export async function runWmsDispatchSweepCore(
       // has neither a matching delta id (the sibling changed) nor a matching
       // number (the link holds the old one), so without this it is skipped here
       // and ages out — which is the whole bug.
-      const probed = probeDiscovered.has(candidate.linkId)
+      const probedNumber = probeDiscovered.get(candidate.linkId)
+      const probed = probedNumber !== undefined
       if (!idRow && !splitByNumber && !mergedByNumber && !probed) continue
       if (!idRow && !candidate.externalOrderId) continue
 
@@ -1021,7 +1027,14 @@ export async function runWmsDispatchSweepCore(
       // match so a renamed split is fetched under its new reference.
       const effectiveCandidate = idRow && idIsSplit && idRow.externalOrderNumber
         ? { ...candidate, externalOrderNumber: idRow.externalOrderNumber }
-        : candidate
+        // o3d-bjc.5: a probe-discovered link has no idRow, so it would otherwise
+        // keep its STALE number here — and the production adapter exact-matches
+        // OrderNumber, so a genuine rename would return no status, go
+        // unresolved, and pin the watermark. Use the number the probe actually
+        // found the group under.
+        : probedNumber
+          ? { ...candidate, externalOrderNumber: probedNumber }
+          : candidate
       const preload = idRow && !idIsSplit ? idRow : null
       // Only a row the connector took STRAIGHT off the bulk feed counts as fetch-free.
       // A row it had to re-read authoritatively (o3d-6j8) cost a per-order request, and
