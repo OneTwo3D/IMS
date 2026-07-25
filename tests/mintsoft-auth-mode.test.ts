@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   MINTSOFT_AUTH_MODES,
+  MintsoftAuthModeError,
   parseMintsoftAuthMode,
+  mintsoftHasAuthMaterial,
+  resolveMintsoftAuthMode,
 } from '../lib/connectors/mintsoft/settings/schema.ts'
 import { SENSITIVE_SETTING_KEYS } from '../lib/settings-store.ts'
 
@@ -63,4 +66,66 @@ test('the fixed key does NOT reuse the rotating-token setting slot', () => {
   // lost when toggling modes.
   assert.notEqual('mintsoft_static_api_key', 'mintsoft_api_key')
   assert.ok(SENSITIVE_SETTING_KEYS.has('mintsoft_api_key'))
+})
+
+// --- Codex review of the o3d-rbe branch ---------------------------------
+
+test('resolveMintsoftAuthMode fails CLOSED on a typo instead of logging in', () => {
+  // mintsoft_auth_mode has an env fallback (MINTSOFT_AUTH_MODE), so an invalid
+  // value can arrive without ever passing through the validated settings
+  // action. `parse(x) ?? 'credentials'` would map `api-key` onto credentials
+  // and log in — rotating the tenant key off a typo.
+  for (const typo of ['api-key', 'apikey', 'fixed', 'static', 'off', 'false']) {
+    assert.throws(
+      () => resolveMintsoftAuthMode(typo),
+      MintsoftAuthModeError,
+      `expected "${typo}" to fail closed`,
+    )
+  }
+})
+
+test('resolveMintsoftAuthMode treats only absent/blank as the credentials default', () => {
+  assert.equal(resolveMintsoftAuthMode(undefined), 'credentials')
+  assert.equal(resolveMintsoftAuthMode(null), 'credentials')
+  assert.equal(resolveMintsoftAuthMode(''), 'credentials')
+  assert.equal(resolveMintsoftAuthMode('   '), 'credentials')
+  assert.equal(resolveMintsoftAuthMode('api_key'), 'api_key')
+  assert.equal(resolveMintsoftAuthMode('credentials'), 'credentials')
+})
+
+test('mintsoftHasAuthMaterial is mode-aware', () => {
+  const base = {
+    mintsoft_api_key: '',
+    mintsoft_static_api_key: '',
+    mintsoft_username: '',
+    mintsoft_password: '',
+  }
+
+  // Fixed-key mode: the fixed key alone is enough. The old predicate looked
+  // only at the rotating cache / username+password, so a valid key-only
+  // connection reported UNCONFIGURED — which skipped warehouse discovery and
+  // disabled product/bundle verification and returns polling.
+  assert.equal(
+    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'api_key', mintsoft_static_api_key: 'k' }),
+    true,
+  )
+  // ...and credentials do NOT substitute for it in that mode.
+  assert.equal(
+    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'api_key', mintsoft_username: 'u', mintsoft_password: 'p' }),
+    false,
+  )
+  // Credentials mode is unchanged.
+  assert.equal(
+    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'credentials', mintsoft_username: 'u', mintsoft_password: 'p' }),
+    true,
+  )
+  assert.equal(
+    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'credentials', mintsoft_api_key: 'cached' }),
+    true,
+  )
+  // A malformed mode is a broken configuration, not a configured one.
+  assert.equal(
+    mintsoftHasAuthMaterial({ ...base, mintsoft_auth_mode: 'api-key', mintsoft_static_api_key: 'k' }),
+    false,
+  )
 })

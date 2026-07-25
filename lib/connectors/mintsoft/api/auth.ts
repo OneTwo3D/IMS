@@ -2,7 +2,7 @@ import { createHash, createHmac, timingSafeEqual } from 'crypto'
 import { db } from '@/lib/db'
 import {
   getMintsoftSettings,
-  parseMintsoftAuthMode,
+  resolveMintsoftAuthMode,
   type MintsoftAuthMode,
 } from '@/lib/connectors/mintsoft/settings/schema'
 import { connectorFetch } from '@/lib/security/connector-fetch'
@@ -265,11 +265,13 @@ export async function getMintsoftApiConfiguration() {
 
   return {
     baseUrl: normalizeMintsoftBaseUrl(connection?.baseUrl ?? '') ?? '',
-    // An unrecognised stored value resolves to 'credentials' — the pre-o3d-092
-    // behaviour — rather than throwing, because this getter is on the read path
-    // of every sync. A bad value can only be written through the settings
-    // action, which validates it.
-    authMode: parseMintsoftAuthMode(settings.mintsoft_auth_mode) ?? 'credentials',
+    // Fails CLOSED on a malformed value. This is on the read path of every
+    // sync, so the tempting move is to swallow it and carry on — but "carry on"
+    // here means username/password, i.e. a login that rotates the tenant key.
+    // A typo cannot be assumed to be absent: mintsoft_auth_mode has an env
+    // fallback (MINTSOFT_AUTH_MODE), so an invalid value can arrive without
+    // ever passing through the validated settings action.
+    authMode: resolveMintsoftAuthMode(settings.mintsoft_auth_mode),
     staticApiKey: settings.mintsoft_static_api_key.trim(),
     username: settings.mintsoft_username.trim(),
     password: settings.mintsoft_password.trim(),
@@ -350,6 +352,25 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
   if (!mintsoftAuthRefreshInFlight) {
     const tracked = (async () => {
       const session = await requestMintsoftAuthSession(config.baseUrl, config.username, config.password)
+      // Re-read the mode AFTER the round trip. An operator can switch to
+      // api_key while this request is in flight; the switch clears the cached
+      // token, and persisting ours afterwards would resurrect a rotating token
+      // under a connection that is supposed to be on a fixed key.
+      //
+      // This cannot un-rotate the tenant key — that happened at Mintsoft the
+      // moment the request landed, and no local code can recall it. What it
+      // does is stop the local state from silently disagreeing with the chosen
+      // mode. Closing the window properly needs a durable cross-process lock
+      // around every /api/Auth call and mode transition: filed as follow-up.
+      const modeNow = await getMintsoftApiConfiguration().catch(() => null)
+      if (modeNow?.authMode === 'api_key') {
+        throw new Error(
+          'Mintsoft switched to fixed-key authentication while a credentials refresh was ' +
+          'in flight. Discarding the newly minted token. NOTE: that refresh already ' +
+          'regenerated the tenant API key, so the configured fixed key is now stale — ' +
+          'issue a new key in Mintsoft and update all integrations.',
+        )
+      }
       await persistMintsoftAuthSession(session.token, session.expiresAt)
       return session.token
     })()

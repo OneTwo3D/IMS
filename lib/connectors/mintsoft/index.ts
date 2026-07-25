@@ -209,9 +209,12 @@ export {
   getMintsoftSettings,
   MINTSOFT_AUTH_MODES,
   mintsoftDeltaScopeChanged,
+  mintsoftHasAuthMaterial,
   MINTSOFT_SETTING_KEYS,
+  MintsoftAuthModeError,
   parseMintsoftAuthMode,
   parseMintsoftPositiveId,
+  resolveMintsoftAuthMode,
   type MintsoftAuthMode,
   type MintsoftSettings,
 } from './settings/schema'

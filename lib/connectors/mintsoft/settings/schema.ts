@@ -25,6 +25,38 @@ export function parseMintsoftAuthMode(value: string | null | undefined): Mintsof
     : null
 }
 
+export class MintsoftAuthModeError extends Error {}
+
+/**
+ * Resolve the effective auth mode, failing CLOSED on a malformed value.
+ *
+ * `parseMintsoftAuthMode(x) ?? 'credentials'` is wrong on any path that can
+ * receive operator input, because it cannot tell "absent" from "present but
+ * misspelled" — and mapping a typo like `api-key` onto `credentials` enables
+ * exactly the login this mode exists to forbid. That distinction matters more
+ * than it looks: `mintsoft_auth_mode` has an env fallback
+ * (`MINTSOFT_AUTH_MODE`), so an invalid value can arrive without ever passing
+ * through the validated settings action.
+ *
+ * Absent/blank still means `credentials` — that is the documented default for
+ * an install that has never chosen a mode.
+ */
+export function resolveMintsoftAuthMode(value: string | null | undefined): MintsoftAuthMode {
+  const raw = String(value ?? '').trim()
+  if (!raw) return 'credentials'
+
+  const parsed = parseMintsoftAuthMode(raw)
+  if (!parsed) {
+    throw new MintsoftAuthModeError(
+      `Mintsoft auth mode "${raw}" is not recognised (expected ${MINTSOFT_AUTH_MODES.join(' or ')}). ` +
+      'Refusing to fall back to username/password: logging in would regenerate the tenant ' +
+      'API key and break the other Mintsoft integrations.',
+    )
+  }
+
+  return parsed
+}
+
 export type MintsoftSettings = {
   /**
    * The CACHED rotating 24-hour token, not an operator-supplied credential.
@@ -142,4 +174,32 @@ export async function getMintsoftSettings(): Promise<MintsoftSettings> {
   }
 
   return result
+}
+
+/**
+ * One mode-aware "is there usable auth material?" predicate, shared by the
+ * dashboard and onboarding status so they cannot drift apart.
+ *
+ * Lives HERE and not in app/actions/mintsoft-sync.ts because that file is
+ * `'use server'`, where every export must be an async server action — a
+ * synchronous export there compiles under tsc but fails `next build`.
+ */
+export function mintsoftHasAuthMaterial(
+  settings: Pick<MintsoftSettings,
+    'mintsoft_auth_mode' | 'mintsoft_static_api_key' | 'mintsoft_api_key' | 'mintsoft_username' | 'mintsoft_password'>,
+): boolean {
+  let mode: MintsoftAuthMode
+  try {
+    mode = resolveMintsoftAuthMode(settings.mintsoft_auth_mode)
+  } catch {
+    // A malformed mode is a broken configuration, not a configured one.
+    return false
+  }
+
+  if (mode === 'api_key') return Boolean(settings.mintsoft_static_api_key.trim())
+
+  return Boolean(
+    settings.mintsoft_api_key.trim()
+      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
+  )
 }

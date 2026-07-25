@@ -14,7 +14,9 @@ import {
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
   mintsoftDeltaScopeChanged,
+  mintsoftHasAuthMaterial,
   parseMintsoftAuthMode,
+  resolveMintsoftAuthMode,
   testMintsoftConnectionSettings,
   testMintsoftFixedApiKey,
   validateMintsoftBaseUrl,
@@ -331,15 +333,36 @@ export type MintsoftBindingInput = {
   alignDownReasonId?: string | null
 }
 
+/**
+ * The effective auth mode for a connection write/test.
+ *
+ * An OMITTED mode preserves whatever is stored — it must never default to
+ * 'credentials'. Not every caller submits the field (the onboarding form did
+ * not), and defaulting would silently downgrade a fixed-key connection back to
+ * credentials, log in, and rotate the tenant key.
+ */
+function resolveConnectionAuthMode(
+  submitted: MintsoftAuthMode | undefined,
+  existingSettings: Pick<MintsoftSettings, 'mintsoft_auth_mode'>,
+): MintsoftAuthMode {
+  return submitted ?? resolveMintsoftAuthMode(existingSettings.mintsoft_auth_mode)
+}
+
 const MintsoftConnectionInputSchema = z.object({
   label: z.string().max(120).optional(),
   baseUrl: z.string().min(1, 'Base URL is required.'),
   // o3d-092. 'api_key' is a hard guarantee that /api/Auth is never called:
   // logging in mints a NEW tenant key and invalidates the old one, knocking
   // the woocommerce-mintsoft-sync sweep and the shipping-label service (which
-  // share this tenant's key) offline. Defaults to 'credentials' so an existing
-  // connection is unaffected.
-  authMode: z.enum(['credentials', 'api_key']).optional().default('credentials'),
+  // share this tenant's key) offline.
+  //
+  // Deliberately NO .default(): an omitted field must PRESERVE the stored mode,
+  // not reset it. Not every caller submits it — the onboarding form does not —
+  // and defaulting to 'credentials' would let re-saving through onboarding
+  // silently downgrade a fixed-key connection, log in with the retained
+  // credentials, and rotate the tenant key. resolveConnectionAuthMode() below
+  // does the preserving.
+  authMode: z.enum(['credentials', 'api_key']).optional(),
   staticApiKey: z.string().optional().default(''),
   username: z.string().optional().default(''),
   password: z.string().optional().default(''),
@@ -1154,10 +1177,11 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
 
   let externalWarehouses: MintsoftExternalWarehouseOption[] = []
   let warehouseLookupError: string | null = null
-  const hasMintsoftAuthMaterial = Boolean(
-    settings.mintsoft_api_key.trim()
-      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
-  )
+  // Mode-aware. A fixed-key connection legitimately has NO username/password and
+  // has its cached rotating token cleared, so the old predicate reported it
+  // unconfigured — which silently skipped warehouse discovery and disabled
+  // product/bundle verification and returns polling on the dashboard.
+  const hasMintsoftAuthMaterial = mintsoftHasAuthMaterial(settings)
 
   if ((connection?.baseUrl ?? '').trim() && hasMintsoftAuthMaterial) {
     const warehouseLookup = await getMintsoftExternalWarehouses(
@@ -1240,10 +1264,11 @@ export async function getMintsoftOnboardingConnectionData(): Promise<MintsoftOnb
     select: { finishedAt: true },
   })
 
-  const hasMintsoftAuthMaterial = Boolean(
-    settings.mintsoft_api_key.trim()
-      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
-  )
+  // Mode-aware. A fixed-key connection legitimately has NO username/password and
+  // has its cached rotating token cleared, so the old predicate reported it
+  // unconfigured — which silently skipped warehouse discovery and disabled
+  // product/bundle verification and returns polling on the dashboard.
+  const hasMintsoftAuthMaterial = mintsoftHasAuthMaterial(settings)
 
   return {
     connection: mapMintsoftConnection(connection, settings, connectionTest),
@@ -1559,7 +1584,7 @@ export async function saveMintsoftConnectionSettings(
   ])
   const baseUrlValidation = validateMintsoftBaseUrl(data.baseUrl)
   const baseUrl = baseUrlValidation.ok ? baseUrlValidation.normalizedUrl : null
-  const authMode = data.authMode
+  const authMode = resolveConnectionAuthMode(data.authMode, existingSettings)
   // Blank keeps the stored key, matching how username/password/webhookSecret
   // behave — the form sends '' for an untouched masked field.
   const staticApiKey = data.staticApiKey.trim() || existingSettings.mintsoft_static_api_key
@@ -1729,6 +1754,12 @@ export async function testMintsoftConnection(input: unknown): Promise<{ success:
   ])
   const baseUrlValidation = validateMintsoftBaseUrl(data.baseUrl)
   const baseUrl = baseUrlValidation.ok ? baseUrlValidation.normalizedUrl : null
+  // Same mode resolution as the save action. Without this, clicking "Test
+  // Connection" on a fixed-key connection would post to /api/Auth and
+  // regenerate the tenant key — testing the connection by breaking it, and
+  // breaking the other two integrations with it.
+  const authMode = resolveConnectionAuthMode(data.authMode, existingSettings)
+  const staticApiKey = data.staticApiKey.trim() || existingSettings.mintsoft_static_api_key
   const username = data.username.trim() || existingSettings.mintsoft_username
   const password = data.password.trim() || existingSettings.mintsoft_password
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
@@ -1739,8 +1770,12 @@ export async function testMintsoftConnection(input: unknown): Promise<{ success:
   if (!baseUrl) {
     return { success: false, error: baseUrlValidation.ok ? 'Enter a valid Mintsoft base URL.' : baseUrlValidation.error }
   }
-  if (!username) return { success: false, error: 'Mintsoft username is required.' }
-  if (!password) return { success: false, error: 'Mintsoft password is required.' }
+  if (authMode === 'api_key') {
+    if (!staticApiKey) return { success: false, error: 'A Mintsoft API key is required when authentication is set to "Fixed API key".' }
+  } else {
+    if (!username) return { success: false, error: 'Mintsoft username is required.' }
+    if (!password) return { success: false, error: 'Mintsoft password is required.' }
+  }
   if (orderLookupConnector && !availableOrderLookupConnectors.includes(orderLookupConnector)) {
     return { success: false, error: 'Choose an enabled shopping connector for order lookup.' }
   }
@@ -1752,7 +1787,11 @@ export async function testMintsoftConnection(input: unknown): Promise<{ success:
     orderLookupConnector,
   })
   try {
-    await testMintsoftConnectionSettings(baseUrl, username, password)
+    if (authMode === 'api_key') {
+      await testMintsoftFixedApiKey(baseUrl, staticApiKey)
+    } else {
+      await testMintsoftConnectionSettings(baseUrl, username, password)
+    }
     await recordIntegrationConnectionTest('mintsoft', {
       success: true,
       fingerprint,
