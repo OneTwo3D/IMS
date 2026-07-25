@@ -130,7 +130,39 @@ runuser -u ims -- bash -c 'export HOME=/opt/ims/onetwo3d-ims-e2e; cd "$HOME" && 
   NODE_OPTIONS="--import tsx" node --env-file=.env scripts/restore-stage-connectors.ts'
 ```
 
-`acquire()` also has stale-lock recovery for the common case.
+Add `--status` to inspect without changing anything. It prints the lock's **owner** (host +
+pid), its **lease** (last renewal) and a **verdict** — `HELD`, `RECOVER` or `WAIT` — and warns
+before releasing one that still looks live.
+
+### One run at a time, enforced (o3d-lgo.14)
+
+The operating model has always been one invocation at a time. It is now enforced rather than
+assumed, by three things that only work together:
+
+- **Ownership.** `acquire()` returns a token; `release()` verifies it and is a **no-op for a
+  process that never acquired**. Playwright runs `globalTeardown` even when `globalSetup`
+  throws, so a *refused* second invocation reaches teardown — without the token it would
+  restore stage, cancel the running suite's queue and delete its lock. `runTeardown` skips
+  everything when it does not hold the lock, and `global-setup` touches nothing shared (the
+  fx_rates sweep, the run-id file) until the lock is really ours.
+- **Atomic claim.** The claim is one conditional `INSERT … ON CONFLICT DO NOTHING`, and
+  recovery deletes **compare-and-set** on the exact row it judged. Read-then-write let two
+  near-simultaneous runs both see no row and both write one.
+- **A renewed lease.** The holder heartbeats every 30s; a lock is abandoned only after
+  `LEASE_TTL_MS` (5 min) without renewal. A *fixed* staleness window cannot tell "still
+  running" from "died an hour ago" for a holder on another host — and a one-worker suite with
+  30-minute test timeouts can outlive any window short enough to be useful.
+
+So a second invocation **aborts with a clear message** instead of trampling the first.
+Same-host pid liveness is kept as a fast path on top of the lease: a crash on this box is
+recovered immediately rather than after the TTL, which is the case this recovery was
+originally written for. A live pid whose lease has lapsed is **refused, not recovered** —
+hung is not dead, and killing it is the operator's call. Locks written before leases existed
+are still recovered, on age alone, after `LOCK_STALE_AFTER_MS` (45 min).
+
+If a holder's lock is recovered from under it (an operator forcing the escape hatch, say), its
+next heartbeat logs `*** LOST THE QUIESCE LOCK ***` and that run stops touching shared state —
+it will **not** restore stage on the new owner's behalf.
 
 ## Webhook delivery + redirect-URI / OAuth
 

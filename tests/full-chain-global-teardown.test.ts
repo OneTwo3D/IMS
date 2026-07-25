@@ -21,9 +21,27 @@ function deps(over: Partial<TeardownDeps> = {}): TeardownDeps {
     voidTrackedDocuments: async () => ({ voided: 1, failed: [] }),
     findStragglers: async () => [],
     release: async () => {},
+    holdsLock: () => true,
     ...over,
   }
 }
+
+test('an invocation that never held the lock touches NOTHING', async () => {
+  // The rejected contender (o3d-lgo.14). acquire() refuses to steal a live lock — but Playwright runs
+  // globalTeardown even when globalSetup THROWS, so the refused invocation lands here next. Cancelling the
+  // "leftover" queue would cancel the RUNNING suite's in-flight sync logs, and releasing would restore
+  // stage and delete that run's lock mid-flight: refusing the theft at acquire and then committing it at
+  // teardown. It has nothing of its own to clean up, so the only correct teardown is no teardown.
+  const touched: string[] = []
+  await runTeardown(deps({
+    holdsLock: () => false,
+    cancelPendingQueue: async () => { touched.push('cancelPendingQueue'); return [] },
+    voidTrackedDocuments: async () => { touched.push('void'); return { voided: 0, failed: [] } },
+    findStragglers: async () => { touched.push('stragglers'); return [] },
+    release: async () => { touched.push('release') },
+  }))
+  assert.deepEqual(touched, [], 'a run that was refused the lock must not clean up on the holder’s behalf')
+})
 
 test('teardown passes cleanly when nothing is left behind', async () => {
   let released = false

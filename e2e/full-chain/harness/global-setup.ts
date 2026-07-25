@@ -19,6 +19,16 @@ export default async function globalSetup(): Promise<void> {
   // is wrong or the queue is dirty.
   await assertPreflight()
 
+  const runId = newRunId()
+  console.log(`\n[full-chain] run ${runTag(runId)}`)
+
+  // NOTHING SHARED IS TOUCHED BEFORE THE LOCK IS OURS (o3d-lgo.14). Everything below mutates state a
+  // concurrently running suite depends on — the rig's fx_rates and the run-id file its workers read — and
+  // an invocation that gets REFUSED the lock still executes every line up to the throw. Preflight above is
+  // read-only, so it stays first: no point disabling stage to discover the tenant is wrong.
+  await acquire(runId)
+  console.log('[full-chain] stage quiesced; delivery webhooks live.')
+
   // Recover the FX baseline. The rig keeps fx_rates EMPTY on purpose: a foreign-currency order with no
   // seeded rate must quarantine (getFxRateToGbp throws MissingFxRateError), which OC-10/OC-17 rely on.
   // An FX test seeds exactly the rate it needs and deletes it in finally, but a crash between the INSERT
@@ -27,14 +37,11 @@ export default async function globalSetup(): Promise<void> {
   // prior run died.
   await sweepSeededFxRates()
 
-  const runId = newRunId()
+  // The workers learn the tag from this file, so publish it only once the run is really ours.
   const { writeFileSync } = await import('node:fs')
   writeFileSync(RUN_ID_FILE, runId)
   process.env.FULL_CHAIN_RUN_ID = runId
 
-  console.log(`\n[full-chain] run ${runTag(runId)}`)
-  await acquire(runId)
-  console.log('[full-chain] stage quiesced; delivery webhooks live.')
   await warmRoutes()
   console.log('')
 }
