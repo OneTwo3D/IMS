@@ -31,10 +31,10 @@ export function buildSalesInvoicePayload(
   // caller hasn't supplied a specific tax type.
   const DEFAULT_TAX_TYPE = 'NONE'
 
-  // Build line items. Xero supports `DiscountRate` (a percentage, 0-100) on
-  // sales invoices (ACCREC) — translate the generic per-line `discountAmount`
-  // from the caller into that Xero-specific field here so that only this
-  // connector knows about the target system's discount representation.
+  // Build line items. Xero takes a per-line discount on a sales invoice (ACCREC) as either
+  // `DiscountAmount` (absolute) or `DiscountRate` (a percentage) — we send the amount, so the generic
+  // per-line `discountAmount` crosses the boundary without a lossy conversion. Only this connector
+  // knows about the target system's discount representation.
   const lineItems = data.lines.map((line: InvoiceLine) => {
     const xeroLine: Record<string, unknown> = {
       Description: line.description,
@@ -45,12 +45,14 @@ export function buildSalesInvoicePayload(
     }
     if (line.itemCode && !droppedItemCodes.has(line.itemCode)) xeroLine.ItemCode = line.itemCode
     if (line.discountAmount && line.discountAmount > 0) {
-      const lineGross = line.unitAmount * line.quantity
-      if (lineGross > 0) {
-        // DiscountRate is a percentage with 2dp precision (Xero rounds).
-        const rate = Math.round((line.discountAmount / lineGross) * 10000) / 100
-        if (rate > 0) xeroLine.DiscountRate = rate
-      }
+      // DiscountAmount, NOT DiscountRate. Xero accepts either on an ACCREC line, and the rate is a
+      // percentage it stores to 2dp — so converting an absolute discount into one is lossy in exactly
+      // the direction that loses money: £0.01 off a £1,000.00 line is 0.001%, which rounds to 0.00 and
+      // was dropped entirely, posting £1,000.00 for a £999.99 order. It went unnoticed while the same
+      // coupon was ALSO being sent as an order-level line (o3d-y14) — that duplicate happened to make
+      // small discounts land, while double-counting every normal one. Sending the amount Woo actually
+      // allocated removes the conversion, and with it the whole class of rounding drift.
+      xeroLine.DiscountAmount = Math.round(line.discountAmount * 100) / 100
     }
     return xeroLine
   })

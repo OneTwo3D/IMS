@@ -4,14 +4,18 @@ import test from 'node:test'
 import { buildSalesInvoicePayload } from '@/lib/connectors/xero/invoices'
 import { resolveWcOrderLevelDiscount } from '@/lib/connectors/woocommerce/sync/field-mapping'
 
-type Line = { Quantity?: number; UnitAmount?: number; DiscountRate?: number; AccountCode?: string; Description?: string }
+type Line = {
+  Quantity?: number; UnitAmount?: number; DiscountRate?: number; DiscountAmount?: number
+  AccountCode?: string; Description?: string
+}
 
-/** What Xero will actually charge: each line after its DiscountRate, summed (a negative line subtracts). */
+/** What Xero will actually charge: each line after its discount, summed (a negative line subtracts). */
 function effectiveTotal(payload: Record<string, unknown>): number {
   const lines = (payload.LineItems ?? []) as Line[]
   return lines.reduce((sum, l) => {
     const gross = (l.Quantity ?? 0) * (l.UnitAmount ?? 0)
-    return sum + gross * (1 - (l.DiscountRate ?? 0) / 100)
+    const discounted = l.DiscountAmount != null ? gross - l.DiscountAmount : gross * (1 - (l.DiscountRate ?? 0) / 100)
+    return sum + discounted
   }, 0)
 }
 
@@ -135,4 +139,46 @@ test('a NATIVE order keeps BOTH legs — the builder must not net them off', () 
     new Set<string>(),
   )
   assert.equal(effectiveTotal(payload), 85)
+})
+
+
+test('a discount too small to express as a percentage is not silently lost', () => {
+  // Xero stores DiscountRate to 2dp, so £0.01 off a £1,000.00 line is 0.001% — it rounded to 0.00 and
+  // the discount vanished, posting £1,000.00 for a £999.99 order. It went unnoticed while the same
+  // coupon was ALSO sent as an order-level line: the duplicate made small discounts land while
+  // double-counting every normal one. The line now carries DiscountAmount, so nothing is converted.
+  const payload = buildSalesInvoicePayload(
+    {
+      invoiceNumber: 'PRECISION-1',
+      date: '2026-07-25',
+      lines: [{ description: 'Widget', quantity: 1, unitAmount: 1000, accountCode: '200', discountAmount: 0.01 }],
+      discountAccountCode: '210',
+    } as unknown as Parameters<typeof buildSalesInvoicePayload>[0],
+    'AUTHORISED',
+    'contact-1',
+    new Set<string>(),
+  )
+
+  const line = (payload.LineItems as Line[])[0]
+  assert.equal(line.DiscountAmount, 0.01, 'the exact amount, not a percentage of it')
+  assert.equal(line.DiscountRate, undefined, 'and never both — Xero takes one or the other')
+  assert.equal(effectiveTotal(payload), 999.99)
+})
+
+test('an awkward fraction survives too, where a rounded percentage would drift', () => {
+  // 3.33 off 9.99 is 33.3333…%, which as a 2dp rate (33.33) leaves the line at 6.660333 — a third of a
+  // penny out on one line, and it scales with the order.
+  const payload = buildSalesInvoicePayload(
+    {
+      invoiceNumber: 'PRECISION-2',
+      date: '2026-07-25',
+      lines: [{ description: 'Widget', quantity: 3, unitAmount: 3.33, accountCode: '200', discountAmount: 3.33 }],
+      discountAccountCode: '210',
+    } as unknown as Parameters<typeof buildSalesInvoicePayload>[0],
+    'AUTHORISED',
+    'contact-1',
+    new Set<string>(),
+  )
+  assert.equal((payload.LineItems as Line[])[0].DiscountAmount, 3.33)
+  assert.equal(effectiveTotal(payload), 6.66)
 })
