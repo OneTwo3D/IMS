@@ -259,6 +259,42 @@ export async function probeMintsoftOrderPresence(
   return pickOrderRow(matches, reference, scopedClientId) ? 'FOUND' : 'AMBIGUOUS'
 }
 
+/**
+ * The keys the DISPATCH path reads off a delta row and whose ABSENCE it would
+ * otherwise read as a positive fact (o3d-6j8). Derived from the consumers in this
+ * module, not copied from the Python guard list — the IMS dispatch path reads a
+ * different set:
+ *
+ *  - `TrackingNumber` / `CourierServiceName` / `DespatchDate` — readTracking()
+ *    returns [] when all three are absent, so `dispatched` comes from the status
+ *    name alone and applyDispatch writes a SHIPPED order with NO tracking. SHIPPED
+ *    is in POST_DISPATCH_STATUSES, so the order leaves the poll set and the real
+ *    tracking number can NEVER land.
+ *  - `NumberOfParts` — absent ⇒ `toInt` gives null ⇒ `isSplit: (null ?? 1) > 1` is
+ *    false, so a split order silently takes the non-split path and
+ *    reconcileSplitOrder never runs, leaving partial shipments unrecorded.
+ *
+ * `Part` is deliberately NOT here: no delta row is ever read for it — the split
+ * path re-reads every part authoritatively (fetchMintsoftOrderParts). `ID`,
+ * `OrderNumber`, `OrderStatusId` and `ClientId` are already validated per row by
+ * fetchMintsoftOrderList before this point.
+ *
+ * PRESENCE, not truthiness: `TrackingNumber: null` on an otherwise complete row is
+ * a legitimate untracked shipment and MUST stay on the hot path, or the whole point
+ * of the bulk delta is undone.
+ */
+export const MINTSOFT_DISPATCH_ROW_KEYS = [
+  'TrackingNumber',
+  'CourierServiceName',
+  'DespatchDate',
+  'NumberOfParts',
+] as const
+
+/** Which dispatch-critical keys this row OMITS entirely (`null` counts as present). */
+export function missingMintsoftDispatchKeys(order: RawOrder): string[] {
+  return MINTSOFT_DISPATCH_ROW_KEYS.filter((key) => !(key in order))
+}
+
 export function readTracking(order: RawOrder): WmsOrderTracking[] {
   const trackingNumber = toStr(order.TrackingNumber)
   const carrier = toStr(order.CourierServiceName)
@@ -401,6 +437,55 @@ export async function fetchMintsoftOrderStatus(
  * "nothing changed" (empty list) from "couldn't complete the delta" (throw) and
  * fail safe to the per-order reconcile.
  */
+/**
+ * o3d-6j8 — an INCOMPLETE Order/List row must never be applied as a dispatch.
+ *
+ * The bulk delta trusts its rows as-is (that is the optimisation). But a row that
+ * resolves to a DISPATCHED status while omitting the fulfilment fields would be
+ * applied as "shipped, no tracking" — and because SHIPPED leaves the poll set, the
+ * real tracking number could never land afterwards. An absent field read as a
+ * positive fact, on a path whose outcome is irreversible.
+ *
+ * So: only for a row that is BOTH dispatched AND missing a dispatch-critical key,
+ * re-read the authoritative record by id. Everything else stays on the hot path —
+ * non-dispatched rows are never re-fetched, and a complete row carrying explicit
+ * nulls is not re-fetched either.
+ *
+ * Fails closed: if the authoritative record can't be read, or still omits the keys,
+ * THROW. The caller then holds its watermark and falls back to the per-order
+ * reconcile, and no per-link failure strike is taken (the delta failure is surfaced
+ * on the job, not blamed on the order).
+ */
+async function resolveDispatchableDeltaRow(
+  row: RawOrder,
+  statusMap: Map<number, string>,
+  clientId: number,
+): Promise<RawOrder> {
+  const statusId = strictPositiveInt(row.OrderStatusId)
+  const status = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
+  if (!isMintsoftDispatched({ status, tracking: readTracking(row) })) return row
+
+  const missing = missingMintsoftDispatchKeys(row)
+  if (missing.length === 0) return row
+
+  const rowId = toStr(row.ID ?? row.Id ?? row.id)
+  const authoritative = rowId === null ? null : await fetchMintsoftOrderById(rowId, clientId)
+  if (authoritative === null) {
+    throw new Error(
+      `Mintsoft Order/List: order ${rowId ?? 'unknown'} reads as dispatched (${status || 'via despatch date'}) but omits `
+        + `${missing.join(', ')}, and the authoritative record could not be read — refusing to apply an incomplete dispatch`,
+    )
+  }
+  const stillMissing = missingMintsoftDispatchKeys(authoritative)
+  if (stillMissing.length > 0) {
+    throw new Error(
+      `Mintsoft Order/List: order ${rowId} reads as dispatched but even the authoritative record omits `
+        + `${stillMissing.join(', ')} — refusing to apply an incomplete dispatch`,
+    )
+  }
+  return authoritative
+}
+
 export async function fetchMintsoftOrderList(opts: {
   sinceLastUpdated: string
   clientId: number | null
@@ -481,8 +566,11 @@ export async function fetchMintsoftOrderList(opts: {
       // same for every row) so normalisation makes no per-row API/DB calls.
       const statusMap = await fetchMintsoftOrderStatusMap()
       const settings = await getMintsoftSettings()
+      const resolved = await Promise.all(
+        collected.map((row) => resolveDispatchableDeltaRow(row, statusMap, clientId)),
+      )
       const normalized = await Promise.all(
-        collected.map((row) => normalizeMintsoftOrderRow(row, { statusMap, settings, strictStatus: true })),
+        resolved.map((row) => normalizeMintsoftOrderRow(row, { statusMap, settings, strictStatus: true })),
       )
       return normalized.filter((row): row is WmsOrderStatus => row !== null)
     }
