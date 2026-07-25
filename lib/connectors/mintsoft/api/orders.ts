@@ -16,7 +16,24 @@ import { mintsoftRequest } from './client'
 type RawOrder = Record<string, unknown>
 
 const STATUSES_TTL_MS = 10 * 60 * 1000
-let statusCache: { at: number; map: Map<number, string> } | null = null
+
+/**
+ * One row of `/api/Order/Statuses`. `externalName` is Mintsoft's OWN coarse grouping
+ * and is the authoritative post-despatch signal — verified live 2026-07-25, three
+ * distinct statuses share `ExternalName: "DESPATCHED"`:
+ *
+ *   ID 4 DESPATCHED     -> DESPATCHED
+ *   ID 5 INVOICED       -> DESPATCHED
+ *   ID 6 INVOICEFAILED  -> DESPATCHED   <-- we were missing this one (o3d-bjc.7)
+ *
+ * An order that despatched but whose invoicing failed therefore read as NOT dispatched
+ * forever: never marked SHIPPED in IMS, no despatch email, pending indefinitely.
+ * Reading the grouping from the API instead of maintaining a hand-written name list
+ * means a status Mintsoft adds later is classified correctly without a code change.
+ */
+export type MintsoftStatusEntry = { name: string; externalName: string }
+
+let statusCache: { at: number; map: Map<number, MintsoftStatusEntry> } | null = null
 
 function toStr(value: unknown): string | null {
   if (typeof value === 'string') return value.trim() || null
@@ -104,14 +121,14 @@ export function parseMintsoftDespatchDate(value: unknown): string | null {
  * state was never determined — aging a genuinely DESPATCHED order out of the
  * window. Throwing instead keeps the cache empty and fails the delta safe.
  */
-async function fetchMintsoftOrderStatusMap(): Promise<Map<number, string>> {
+async function fetchMintsoftOrderStatusMap(): Promise<Map<number, MintsoftStatusEntry>> {
   if (statusCache && Date.now() - statusCache.at < STATUSES_TTL_MS) {
     return statusCache.map
   }
   const result = await mintsoftRequest<unknown>('/api/Order/Statuses')
   if (result.error) throw new Error(result.error)
 
-  const map = new Map<number, string>()
+  const map = new Map<number, MintsoftStatusEntry>()
   for (const item of extractMintsoftArrayPayloadStrict(result.data, 'Order/Statuses')) {
     if (typeof item !== 'object' || item === null || Array.isArray(item)) {
       throw new Error('Mintsoft Order/Statuses: entry is not an object — refusing to cache an unusable status map')
@@ -131,14 +148,28 @@ async function fetchMintsoftOrderStatusMap(): Promise<Map<number, string>> {
       )
     }
     const upper = name.toUpperCase()
+    // ExternalName is Mintsoft's coarse grouping. Absent on a drifted payload → fall
+    // back to the name, which reproduces the pre-o3d-bjc.7 behaviour exactly rather
+    // than wedging the delta over a field we only recently started reading.
+    const rawExternal = row.ExternalName ?? row.externalName
+    const externalName = (typeof rawExternal === 'string' ? rawExternal.trim().toUpperCase() : '') || upper
     const existing = map.get(id)
-    if (existing !== undefined && existing !== upper) {
+    if (existing !== undefined && existing.name !== upper) {
       throw new Error(
-        `Mintsoft Order/Statuses: id ${id} maps to both "${existing}" and "${upper}" — ` +
+        `Mintsoft Order/Statuses: id ${id} maps to both "${existing.name}" and "${upper}" — ` +
           'refusing to cache an ambiguous status map',
       )
     }
-    map.set(id, upper)
+    // Drift alarm: Mintsoft says this status is post-despatch but our fallback name set
+    // does not know it. Harmless now (externalName decides), but it means the hardcoded
+    // set is stale for any caller that only has a name to go on.
+    if (externalName === MINTSOFT_EXTERNAL_DESPATCHED && !MINTSOFT_DISPATCHED_STATUSES.has(upper)) {
+      console.warn(
+        `[mintsoft-order-statuses] status ${id} "${upper}" is grouped as `
+          + `${MINTSOFT_EXTERNAL_DESPATCHED} by Mintsoft but is absent from MINTSOFT_DISPATCHED_STATUSES`,
+      )
+    }
+    map.set(id, { name: upper, externalName })
   }
   if (map.size === 0) {
     throw new Error('Mintsoft Order/Statuses returned no statuses — refusing to cache an empty status map')
@@ -150,6 +181,20 @@ async function fetchMintsoftOrderStatusMap(): Promise<Map<number, string>> {
 /** Drop the memoised status map (tests only — the TTL handles it in production). */
 export function resetMintsoftOrderStatusCacheForTests(): void {
   statusCache = null
+}
+
+/**
+ * Resolve a raw order row's status against the map. Returns blanks when the id is
+ * missing or unresolvable — callers decide whether that is fatal (the delta path) or
+ * merely unknown (the per-order path).
+ */
+function resolveRowStatus(
+  order: RawOrder,
+  statusMap: Map<number, MintsoftStatusEntry>,
+): MintsoftStatusEntry {
+  const statusId = strictPositiveInt(order.OrderStatusId)
+  const entry = statusId !== null ? statusMap.get(statusId) : undefined
+  return { name: entry?.name ?? '', externalName: entry?.externalName ?? '' }
 }
 
 export function requireMintsoftClientId(clientId: number | null | undefined, operation: string): number {
@@ -308,14 +353,14 @@ export function missingMintsoftDispatchKeys(order: RawOrder): string[] {
  */
 export function assertMintsoftDispatchRecordComplete(
   record: RawOrder,
-  statusName: string,
+  status: MintsoftStatusEntry,
   context: string,
 ): void {
   const missing = missingMintsoftDispatchKeys(record)
   if (missing.length === 0) return
-  if (!isMintsoftDispatched({ status: statusName, tracking: readTracking(record) })) return
+  if (!isMintsoftDispatched({ status: status.name, externalName: status.externalName, tracking: readTracking(record) })) return
   throw new WmsUnresolvableRecordError(
-    `${context} reads as dispatched (${statusName || 'via despatch date'}) but omits ${missing.join(', ')} — `
+    `${context} reads as dispatched (${status.name || 'via despatch date'}) but omits ${missing.join(', ')} — `
       + 'refusing to apply an incomplete dispatch',
   )
 }
@@ -358,7 +403,7 @@ export async function normalizeMintsoftOrderRow(
   // watermark advances past a row whose true state was never determined. The
   // per-order path stays lenient: it re-polls the same order every reconcile
   // tick, so nothing can age out.
-  ctx?: { statusMap: Map<number, string>; settings: MintsoftSettings; strictStatus?: boolean },
+  ctx?: { statusMap: Map<number, MintsoftStatusEntry>; settings: MintsoftSettings; strictStatus?: boolean },
 ): Promise<WmsOrderStatus | null> {
   const externalOrderId = toStr(order.ID ?? order.Id ?? order.id)
   if (!externalOrderId) return null
@@ -369,7 +414,8 @@ export async function normalizeMintsoftOrderRow(
   // A malformed id is simply unresolved, which strictStatus below then rejects.
   const statusId = strictPositiveInt(order.OrderStatusId)
   const statusMap = ctx?.statusMap ?? (await fetchMintsoftOrderStatusMap())
-  const status = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
+  const resolved = resolveRowStatus(order, statusMap)
+  const status = resolved.name
 
   const externalOrderNumber = toStr(order.OrderNumber) ?? ''
   const partCount = toInt(order.NumberOfParts)
@@ -398,7 +444,7 @@ export async function normalizeMintsoftOrderRow(
     mergedOrderNumbers: merged,
     deepLinkUrl: buildDeepLink(settings.mintsoft_admin_order_url_template, externalOrderId),
     tracking,
-    dispatched: isMintsoftDispatched({ status, tracking }),
+    dispatched: isMintsoftDispatched({ status, externalName: resolved.externalName, tracking }),
     raw: order,
   }
 }
@@ -435,12 +481,7 @@ export async function fetchMintsoftOrderStatus(
   // exception inbox for an operator instead of erroring silently forever.
   if (missingMintsoftDispatchKeys(order).length > 0) {
     const statusMap = await fetchMintsoftOrderStatusMap()
-    const statusId = strictPositiveInt(order.OrderStatusId)
-    assertMintsoftDispatchRecordComplete(
-      order,
-      (statusId !== null ? statusMap.get(statusId) : null) ?? '',
-      `Mintsoft order ${pickedId}`,
-    )
+    assertMintsoftDispatchRecordComplete(order, resolveRowStatus(order, statusMap), `Mintsoft order ${pickedId}`)
   }
   const normalized = await normalizeMintsoftOrderRow(order)
   if (!normalized) return null
@@ -504,12 +545,11 @@ export async function fetchMintsoftOrderStatus(
  */
 async function resolveDispatchableDeltaRow(
   row: RawOrder,
-  statusMap: Map<number, string>,
+  statusMap: Map<number, MintsoftStatusEntry>,
   clientId: number,
 ): Promise<RawOrder> {
-  const statusId = strictPositiveInt(row.OrderStatusId)
-  const status = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
-  if (!isMintsoftDispatched({ status, tracking: readTracking(row) })) return row
+  const status = resolveRowStatus(row, statusMap)
+  if (!isMintsoftDispatched({ status: status.name, externalName: status.externalName, tracking: readTracking(row) })) return row
 
   const missing = missingMintsoftDispatchKeys(row)
   if (missing.length === 0) return row
@@ -518,16 +558,14 @@ async function resolveDispatchableDeltaRow(
   const authoritative = rowId === null ? null : await fetchMintsoftOrderById(rowId, clientId)
   if (authoritative === null) {
     throw new WmsUnresolvableRecordError(
-      `Mintsoft Order/List: order ${rowId ?? 'unknown'} reads as dispatched (${status || 'via despatch date'}) but omits `
+      `Mintsoft Order/List: order ${rowId ?? 'unknown'} reads as dispatched (${status.name || 'via despatch date'}) but omits `
         + `${missing.join(', ')}, and the authoritative record could not be read — refusing to apply an incomplete dispatch`,
     )
   }
   // The authoritative record must itself be complete.
-  const authoritativeStatusId = strictPositiveInt(authoritative.OrderStatusId)
-  const authoritativeStatus = (authoritativeStatusId !== null ? statusMap.get(authoritativeStatusId) : null) ?? status
   assertMintsoftDispatchRecordComplete(
     authoritative,
-    authoritativeStatus,
+    resolveRowStatus(authoritative, statusMap),
     `Mintsoft Order/List: order ${rowId} (authoritative re-read)`,
   )
   return authoritative
@@ -570,7 +608,7 @@ export const MINTSOFT_ORDER_LIST_MAX_LIMIT = 100
  */
 async function resolveDispatchableDeltaRows(
   rows: RawOrder[],
-  statusMap: Map<number, string>,
+  statusMap: Map<number, MintsoftStatusEntry>,
   clientId: number,
   // Rows replaced by an authoritative per-order re-read. Reported so the sweep's
   // engagement metric cannot claim a row was "served from the bulk delta" when it
@@ -583,8 +621,10 @@ async function resolveDispatchableDeltaRows(
   for (const [index, row] of rows.entries()) {
     if (missingMintsoftDispatchKeys(row).length === 0) continue
     const statusId = strictPositiveInt(row.OrderStatusId)
-    const status = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
-    if (isMintsoftDispatched({ status, tracking: readTracking(row) })) pending.push(index)
+    const status = resolveRowStatus(row, statusMap)
+    if (isMintsoftDispatched({ status: status.name, externalName: status.externalName, tracking: readTracking(row) })) {
+      pending.push(index)
+    }
   }
   if (pending.length === 0) return out
 
@@ -756,10 +796,24 @@ export async function fetchMintsoftOrderList(opts: {
  * treats it as terminal/green); the despatchedAt fallback covers feeds where the status
  * row lags. If a proforma-style pre-despatch INVOICED ever appears, tighten to DESPATCHED.
  */
-export const MINTSOFT_DISPATCHED_STATUSES = new Set(['DESPATCHED', 'INVOICED'])
+export const MINTSOFT_DISPATCHED_STATUSES = new Set(['DESPATCHED', 'INVOICED', 'INVOICEFAILED'])
+
+/** Mintsoft's own coarse grouping for "the goods have left the warehouse". */
+export const MINTSOFT_EXTERNAL_DESPATCHED = 'DESPATCHED'
 
 /** Mintsoft's connector-specific "dispatched" decision (normalised onto WmsOrderStatus). */
-export function isMintsoftDispatched(status: { status: string; tracking: WmsOrderTracking[] }): boolean {
+export function isMintsoftDispatched(status: {
+  status: string
+  /**
+   * Mintsoft's ExternalName grouping for this status, when we resolved it from
+   * /api/Order/Statuses. AUTHORITATIVE when present (o3d-bjc.7): it is the vendor's own
+   * classification, so it stays correct for statuses added after this code was written —
+   * unlike the name set below, which is only a fallback for callers holding a bare name.
+   */
+  externalName?: string
+  tracking: WmsOrderTracking[]
+}): boolean {
+  if ((status.externalName ?? '').trim().toUpperCase() === MINTSOFT_EXTERNAL_DESPATCHED) return true
   if (MINTSOFT_DISPATCHED_STATUSES.has(status.status.trim().toUpperCase())) return true
   return status.tracking.some((entry) => Boolean(entry.despatchedAt))
 }
@@ -803,8 +857,8 @@ export async function fetchMintsoftOrderParts(
     const externalId = toStr(detail.ID ?? detail.Id ?? detail.id) ?? searchId
     // Same no-coercion rule as the order-level status (see normalizeMintsoftOrderRow):
     // a coerced part status could falsely complete a split order.
-    const statusId = strictPositiveInt(detail.OrderStatusId)
-    const partStatus = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
+    const partResolved = resolveRowStatus(detail, statusMap)
+    const partStatus = partResolved.name
     // o3d-6j8 — the SAME completeness gate, per PART. This path builds its own
     // `dispatched` flag, so guarding only the order-level lookup left the hole open
     // here: part 1 complete with NumberOfParts=2 enters split reconciliation, then an
@@ -812,7 +866,7 @@ export async function fetchMintsoftOrderParts(
     // fallback after a 404) would be returned dispatched with tracking=[] — and
     // reconcileSplitOrder would push a partial shipment with no tracking and
     // eventually mark the order SHIPPED without part 2's tracking ever landing.
-    assertMintsoftDispatchRecordComplete(detail, partStatus, `Mintsoft order ${reference} part ${externalId}`)
+    assertMintsoftDispatchRecordComplete(detail, partResolved, `Mintsoft order ${reference} part ${externalId}`)
     const partTracking = readTracking(detail)
     parts.push({
       externalId,
@@ -821,7 +875,7 @@ export async function fetchMintsoftOrderParts(
       // per-part idempotency dedupe distinct despatches into one.
       partNumber: toInt(detail.Part) ?? toInt(row.Part) ?? (parts.length + 1),
       status: partStatus,
-      dispatched: isMintsoftDispatched({ status: partStatus, tracking: partTracking }),
+      dispatched: isMintsoftDispatched({ status: partStatus, externalName: partResolved.externalName, tracking: partTracking }),
       tracking: partTracking,
     })
   }

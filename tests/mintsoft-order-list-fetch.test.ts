@@ -596,7 +596,12 @@ test('[o3d-6j8] drift lock: every dispatch-relevant row field read by this modul
   const guarded = new Set<string>(MINTSOFT_DISPATCH_ROW_KEYS)
 
   // Validated per row before dispatch resolution, so absence already fails closed.
-  const exempt = new Set(['ID', 'Id', 'OrderNumber', 'OrderStatusId', 'ClientId', 'Name', 'Part'])
+  // 'Name'/'ExternalName' are read off /Order/Statuses rows rather than ORDER rows, and
+  // an absent ExternalName falls back to Name (o3d-bjc.7), so neither can have its
+  // absence mistaken for a fact about a dispatch.
+  const exempt = new Set([
+    'ID', 'Id', 'OrderNumber', 'OrderStatusId', 'ClientId', 'Name', 'ExternalName', 'Part',
+  ])
 
   // Every PascalCase field read off a raw order/row/detail/record object.
   const read = new Set<string>()
@@ -815,4 +820,102 @@ test('[o3d-9vv] a re-read row is marked so the sweep can tell it apart from a bu
   assert.equal(out.length, 2)
   assert.equal(out[0].authoritativeReread, undefined, 'the complete row was taken off the bulk feed')
   assert.equal(out[1].authoritativeReread, true, 'the incomplete row cost a detail request')
+})
+
+// --- o3d-bjc.7: Mintsoft's ExternalName is the authoritative dispatch grouping ---
+// Verified live 2026-07-25 against the production tenant. THREE statuses share
+// ExternalName "DESPATCHED" — and we only knew about two:
+//   ID 4 DESPATCHED    -> DESPATCHED
+//   ID 5 INVOICED      -> DESPATCHED
+//   ID 6 INVOICEFAILED -> DESPATCHED   <-- missing, so these orders never shipped
+// An order that despatched but failed invoicing read as NOT dispatched forever: never
+// marked SHIPPED, no despatch email, pending indefinitely.
+
+/** The real /api/Order/Statuses payload, trimmed to the interesting rows. */
+const LIVE_STATUSES: unknown = [
+  { Name: 'NEW', ExternalName: 'NEW', ID: 1 },
+  { Name: 'CANCELLED', ExternalName: 'CANCELLED', ID: 3 },
+  { Name: 'DESPATCHED', ExternalName: 'DESPATCHED', ID: 4 },
+  { Name: 'INVOICED', ExternalName: 'DESPATCHED', ID: 5 },
+  { Name: 'INVOICEFAILED', ExternalName: 'DESPATCHED', ID: 6 },
+  { Name: 'PICKED', ExternalName: 'PICKED', ID: 17 },
+  { Name: 'PACKED', ExternalName: 'PACKED', ID: 20 },
+  { Name: 'PROCESSING', ExternalName: 'PROCESSING', ID: 22 },
+]
+
+test('[o3d-bjc.7] INVOICEFAILED is dispatched — the status that silently never shipped', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  detailRows = new Map()
+  await resetStatusCache()
+  statusResponder = () => LIVE_STATUSES
+
+  listResponder = () => [row(1, { OrderStatusId: 6, TrackingNumber: 'TN-6' })]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out[0].status, 'INVOICEFAILED')
+  assert.equal(out[0].dispatched, true, 'INVOICEFAILED is grouped DESPATCHED by Mintsoft itself')
+})
+
+test('[o3d-bjc.7] every ExternalName=DESPATCHED status is dispatched; the others are not', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  await resetStatusCache()
+  statusResponder = () => LIVE_STATUSES
+  listError = null
+  detailRows = new Map()
+
+  for (const [statusId, expected] of [[4, true], [5, true], [6, true], [1, false], [3, false], [17, false], [20, false], [22, false]] as const) {
+    listCalls = []
+    listResponder = () => [row(1, { OrderStatusId: statusId, TrackingNumber: 'TN' })]
+    const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+    assert.equal(out[0].dispatched, expected, `status id ${statusId} (${out[0].status}) dispatched=${expected}`)
+  }
+})
+
+test('[o3d-bjc.7] a NEW post-despatch status Mintsoft adds later is classified without a code change', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailRows = new Map()
+  await resetStatusCache()
+  // A status we have never heard of, which Mintsoft groups as post-despatch. Reading the
+  // vendor's own grouping is the whole point: a hand-maintained name list would miss it
+  // and the order would silently never ship — exactly the o3d-bjc.7 failure again.
+  statusResponder = () => [...(LIVE_STATUSES as unknown[]), { Name: 'COLLECTED', ExternalName: 'DESPATCHED', ID: 99 }]
+
+  listResponder = () => [row(1, { OrderStatusId: 99, TrackingNumber: 'TN-99' })]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out[0].status, 'COLLECTED')
+  assert.equal(out[0].dispatched, true)
+})
+
+test('[o3d-bjc.7] a status row with NO ExternalName falls back to its Name (no wedge on drift)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailRows = new Map()
+  await resetStatusCache()
+  // Pre-o3d-bjc.7 behaviour preserved exactly: the field we only recently started
+  // reading must not become a new way for the delta to fail.
+  statusResponder = () => [{ Name: 'DESPATCHED', ID: 4 }, { Name: 'PICKED', ID: 17 }]
+
+  listResponder = () => [row(1, { OrderStatusId: 4, TrackingNumber: 'TN' })]
+  assert.equal((await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }))[0].dispatched, true)
+
+  listCalls = []
+  listResponder = () => [row(2, { OrderStatusId: 17 })]
+  assert.equal((await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }))[0].dispatched, false)
+})
+
+test('[o3d-bjc.7] the fallback name set covers every post-despatch status seen live', async () => {
+  const { MINTSOFT_DISPATCHED_STATUSES } = await import('@/lib/connectors/mintsoft/api/orders')
+  // The set is only a fallback for callers holding a bare name, but it must not be
+  // STALE relative to what the live tenant actually reports.
+  for (const name of ['DESPATCHED', 'INVOICED', 'INVOICEFAILED']) {
+    assert.ok(MINTSOFT_DISPATCHED_STATUSES.has(name), `${name} must be in the fallback set`)
+  }
+  for (const name of ['NEW', 'CANCELLED', 'PICKED', 'PACKED', 'PROCESSING', 'HOLDING', 'FAILED']) {
+    assert.ok(!MINTSOFT_DISPATCHED_STATUSES.has(name), `${name} must NOT count as dispatched`)
+  }
 })
