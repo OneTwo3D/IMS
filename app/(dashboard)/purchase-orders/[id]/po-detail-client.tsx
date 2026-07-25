@@ -2706,10 +2706,31 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                         {inv.invoiceNumber ?? 'No invoice number'}
                       </span>
                       {inv.paidAt && (
-                        <span className="inline-flex items-center gap-1 rounded-full border border-green-200 bg-green-50 px-2 py-0.5 text-[10px] font-medium text-green-700 dark:bg-green-900/30 dark:text-green-300 dark:border-green-800">
-                          <CheckCircle2 className="h-3 w-3" />
+                        /*
+                          Green means the LEDGER agrees (o3d-lgo.15). Paying a bill in IMS only queues the
+                          payment; that sync can fail, be cancelled, or never be queued — and this badge
+                          used to read an unconditional green "Paid" over all three, so IMS claimed a
+                          settlement Xero had never recorded and nothing said so.
+                        */
+                        <span
+                          className={
+                            'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium ' +
+                            (inv.settlement.discrepancy
+                              ? 'border-red-200 bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300 dark:border-red-800'
+                              : inv.settlement.status === 'AWAITING_LEDGER'
+                              ? 'border-amber-200 bg-amber-50 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-800'
+                              : 'border-green-200 bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-300 dark:border-green-800')
+                          }
+                          title={inv.settlement.detail}
+                        >
+                          {inv.settlement.discrepancy
+                            ? <AlertTriangle className="h-3 w-3" />
+                            : <CheckCircle2 className="h-3 w-3" />}
                           Paid
                           {inv.paymentAccountName && ` · ${inv.paymentAccountName}`}
+                          {inv.settlement.status === 'AWAITING_LEDGER' && ' · awaiting ledger'}
+                          {inv.settlement.status === 'LEDGER_REJECTED' && ' · LEDGER REJECTED'}
+                          {inv.settlement.status === 'NOT_SENT' && ' · NOT SENT TO LEDGER'}
                         </span>
                       )}
                     </div>
@@ -2767,6 +2788,10 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                       Paid {formatDateTime(inv.paidAt, { day: 'numeric', month: 'short', year: 'numeric' })}
                       {inv.paymentReference ? ` · ref ${inv.paymentReference}` : ''}
                     </p>
+                  )}
+                  {inv.settlement.discrepancy && (
+                    /* The whole point: say what the ledger thinks, in words someone can act on. */
+                    <p className="text-[11px] text-red-700 dark:text-red-300">{inv.settlement.detail}</p>
                   )}
                   {inv.notes && <p className="text-muted-foreground text-xs">{inv.notes}</p>}
                   <Table className="text-xs">

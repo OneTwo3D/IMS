@@ -25,6 +25,7 @@ import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purcha
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
@@ -539,6 +540,33 @@ export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
   return pos.map(mapPoRow)
 }
 
+/**
+ * The latest BILL_PAYMENT sync row per bill — the ledger's side of "is this settled?" (o3d-lgo.15).
+ *
+ * Latest, not all: a retry writes a new row, and the current state is the one that decides whether the
+ * ledger agrees. Connector-agnostic on purpose (no connector filter) — a bill paid under Xero and read
+ * back after a switch to QuickBooks should still show the payment that exists.
+ */
+async function latestBillPaymentSyncRows(invoiceIds: string[]): Promise<Map<string, PaymentSyncRow>> {
+  const out = new Map<string, PaymentSyncRow>()
+  if (!invoiceIds.length) return out
+  const rows = await db.accountingSyncLog.findMany({
+    where: { type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: { in: invoiceIds } },
+    select: { referenceId: true, status: true, externalTransactionId: true, errorMessage: true, retryCount: true },
+    orderBy: { createdAt: 'desc' },
+  })
+  for (const r of rows) {
+    if (out.has(r.referenceId)) continue // desc order: the first one seen is the latest
+    out.set(r.referenceId, {
+      status: r.status,
+      externalTransactionId: r.externalTransactionId,
+      errorMessage: r.errorMessage,
+      retryCount: r.retryCount,
+    })
+  }
+  return out
+}
+
 export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   await requireAuth()
   const po = await db.purchaseOrder.findUnique({
@@ -725,6 +753,14 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     }
   })
 
+  // THE LEDGER'S OWN VIEW of each bill's payment (o3d-lgo.15). paidAt says IMS was told the bill was
+  // paid; the BILL_PAYMENT sync is what makes the ledger agree, and it can fail, be cancelled, or never
+  // have been queued at all. Read once for the whole PO rather than per bill.
+  const [accountingSyncEnabled, billPaymentByInvoice] = await Promise.all([
+    getAccountingSettings().then((a) => a.syncEnabled).catch(() => false),
+    latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id)),
+  ])
+
   const row = mapPoRow(po)
   return {
     ...row,
@@ -779,6 +815,12 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       paymentAccountId: inv.paymentAccountId ?? null,
       paymentAccountName: inv.paymentAccountName ?? null,
       paymentReference: inv.paymentReference ?? null,
+      settlement: settlementStatus({
+        paidLocally: !!inv.paidAt,
+        syncEnabled: accountingSyncEnabled,
+        documentPosted: !!inv.accountingInvoiceId,
+        payment: billPaymentByInvoice.get(inv.id) ?? null,
+      }),
       createdAt: inv.createdAt.toISOString(),
       lines: inv.lines.map((il) => {
         const isProduct = il.poLineId != null && il.poLine != null
@@ -2652,6 +2694,12 @@ export type InvoiceRow = {
   paymentAccountId: string | null
   paymentAccountName: string | null
   paymentReference: string | null
+  /**
+   * Whether the LEDGER agrees this bill is settled (o3d-lgo.15). paidAt alone only says IMS was told
+   * so; the payment is a separate sync that can fail, be cancelled, or never be queued — and the UI
+   * showed an unconditional green "Paid" over all three.
+   */
+  settlement: SettlementVerdict
   createdAt: string
   lines: {
     id: string
