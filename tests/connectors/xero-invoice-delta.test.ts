@@ -2,10 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
   idsWhere,
+  MAX_CHUNKS_PER_POLL,
   MAX_PAGES,
   PAGE_SIZE,
+  upperBoundWhere,
   type InvoiceFetcher,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
@@ -202,4 +205,239 @@ test('an invoice paid then reversed inside one window is reversed, not paid', as
 
   assert.equal(idsWhere(rows, 'ACCREC', ['PAID']).has('flip'), false, 'must not look paid')
   assert.equal(idsWhere(rows, 'ACCREC', ['AUTHORISED', 'VOIDED']).has('flip'), true)
+})
+
+// ---------------------------------------------------------------------------
+// Bounded-chunk drain of an oversized window (o3d-zdh)
+// ---------------------------------------------------------------------------
+
+const T0 = new Date('2026-07-17T12:00:00.000Z').getTime()
+
+/**
+ * One row in the fake tenant.
+ *
+ * Xero encodes dates on the wire as /Date(1234567890000+0000)/; nothing in this module parses
+ * UpdatedDateUTC, so the fake carries a plain ISO string purely so the test can reason about time.
+ */
+type Row = XeroInvoice & { UpdatedDateUTC: string }
+
+const at = (ms: number): string => new Date(ms).toISOString()
+
+function row(id: string, whenMs: number): Row {
+  return { InvoiceID: id, Type: 'ACCREC', Status: 'PAID', UpdatedDateUTC: at(whenMs) }
+}
+
+/** Parse `UpdatedDateUTC<DateTime(y,m,d,h,mi,s)` back into epoch ms. */
+function parseUpperBound(where: string): number {
+  const m = /^UpdatedDateUTC<DateTime\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)$/.exec(where)
+  assert.ok(m, `unrecognised where clause: ${where}`)
+  const [y, mo, d, h, mi, s] = m.slice(1).map(Number)
+  return Date.UTC(y, mo - 1, d, h, mi, s)
+}
+
+/**
+ * A fake tenant that filters the way Xero is ASSUMED to.
+ *
+ * Both assumptions are deliberately the PESSIMISTIC reading, because those are the ones that lose
+ * records if the real API behaves that way and the chunker had not allowed for it:
+ *  - If-Modified-Since is truncated to whole seconds (the client genuinely does that, see
+ *    formatIfModifiedSince) and compared STRICTLY greater-than, so a record sitting exactly on the
+ *    truncated second is EXCLUDED.
+ *  - the where upper bound is strictly less-than, at whole-second resolution.
+ * A record must therefore never sit at a chunk edge that both filters exclude.
+ */
+function fakeTenant(rows: Row[]): { get: InvoiceFetcher; paths: string[] } {
+  const paths: string[] = []
+  const get: InvoiceFetcher = async (path, opts) => {
+    paths.push(path)
+    const query = new URLSearchParams(path.slice(path.indexOf('?') + 1))
+    const page = Number(query.get('page'))
+    const pageSize = Number(query.get('pageSize'))
+    const where = query.get('where')
+    const upper = where === null ? null : parseUpperBound(where)
+    const floor = Math.floor(opts.ifModifiedSince.getTime() / 1000) * 1000
+    const matched = rows
+      .filter((r) => {
+        const t = Date.parse(r.UpdatedDateUTC)
+        return t > floor && (upper === null || t < upper)
+      })
+      .sort((a, b) => Date.parse(b.UpdatedDateUTC) - Date.parse(a.UpdatedDateUTC))
+    return { ok: true, status: 200, data: { Invoices: matched.slice((page - 1) * pageSize, page * pageSize) } }
+  }
+  return { get, paths }
+}
+
+/** Run the drain the way the poller does — repeatedly, resuming from the checkpointed cursor. */
+async function drainAcrossPolls(
+  rows: Row[],
+  opts: { startMs: number; endMs: number; maxPolls?: number },
+): Promise<{ seen: string[]; boundaries: number[]; polls: number; paths: string[] }> {
+  const { get, paths } = fakeTenant(rows)
+  const seen: string[] = []
+  const boundaries: number[] = []
+  let cursorMs = opts.startMs
+  let polls = 0
+  for (;;) {
+    polls++
+    assert.ok(polls <= (opts.maxPolls ?? 12), `drain did not finish within ${opts.maxPolls ?? 12} polls`)
+    const res = await drainInvoicesModifiedSince(new Date(cursorMs), new Date(opts.endMs), get, async (chunk) => {
+      for (const i of chunk.invoices) seen.push(i.InvoiceID)
+      assert.ok(chunk.through.getTime() > cursorMs, 'a chunk must move the cursor forward')
+      cursorMs = chunk.through.getTime()
+      boundaries.push(cursorMs)
+      return 'continue'
+    })
+    assert.equal(res.ok, true, res.ok ? '' : `drain failed: ${res.error}`)
+    if (res.ok && res.complete) return { seen, boundaries, polls, paths }
+  }
+}
+
+test('the upper bound is whole-second — a sub-second bound is FLOORED, never rounded up', () => {
+  // DateTime() has no sub-second component. Rounding up would report progress past records the
+  // truncated literal actually excluded, which is the gap that loses a payment.
+  assert.equal(upperBoundWhere(new Date('2026-07-17T12:34:56.789Z')), 'UpdatedDateUTC<DateTime(2026,7,17,12,34,56)')
+  assert.equal(upperBoundWhere(new Date('2026-01-02T03:04:05.000Z')), 'UpdatedDateUTC<DateTime(2026,1,2,3,4,5)')
+})
+
+test('a normal-sized window is still ONE unbounded request — no where clause on the hot path', async () => {
+  const { get, paths } = fakeTenant([row('a', T0 + 1_000)])
+  const chunks: Date[] = []
+
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(T0 + 900_000), get, async (c) => {
+    chunks.push(c.through)
+    return 'continue'
+  })
+
+  assert.equal(res.ok && res.complete, true)
+  assert.equal(paths.length, 1, 'the 15-minute poll must stay a single request')
+  assert.equal(paths[0].includes('where='), false, 'the unverified where clause must not touch the hot path')
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0].getTime(), T0 + 900_000, 'a complete unbounded read checkpoints the whole window')
+})
+
+test('an oversized window DRAINS instead of stalling, and skips nothing', async () => {
+  // The o3d-zdh bug: >MAX_PAGES*PAGE_SIZE invoices in one window used to fail every poll forever.
+  // 9,000 invoices over two hours is four-and-a-half caps' worth.
+  const rows = Array.from({ length: 9_000 }, (_, i) => row(`i-${i}`, T0 + i * 800))
+  const endMs = T0 + 9_000 * 800 + 60_000
+
+  const { seen, boundaries, polls } = await drainAcrossPolls(rows, { startMs: T0 - 1, endMs })
+
+  const seenIds = new Set(seen)
+  const missing = rows.filter((r) => !seenIds.has(r.InvoiceID))
+  assert.deepEqual(missing.map((r) => r.InvoiceID), [], 'every invoice in the window must be read')
+  assert.ok(polls > 1, 'a backlog this size cannot be drained in one poll — it must resume')
+  assert.ok(boundaries.length > 1, 'the window must be carved into chunks')
+  for (let i = 1; i < boundaries.length; i++) {
+    assert.ok(boundaries[i] > boundaries[i - 1], 'the cursor must advance monotonically')
+  }
+  assert.equal(boundaries.at(-1), endMs, 'the drain finishes at the window end')
+})
+
+test('a record sitting exactly on a chunk boundary is read exactly once — no gap, no double', async () => {
+  // Dense whole-second buckets force boundaries to land ON records: 800 invoices per second for
+  // seven seconds, so no chunk can hold more than two seconds' worth.
+  const rows: Row[] = []
+  for (let second = 1; second <= 7; second++) {
+    for (let n = 0; n < 800; n++) rows.push(row(`s${second}-${n}`, T0 + second * 1_000))
+  }
+  const endMs = T0 + 8_000
+
+  const { seen, boundaries } = await drainAcrossPolls(rows, { startMs: T0, endMs, maxPolls: 12 })
+
+  const counts = new Map<string, number>()
+  for (const id of seen) counts.set(id, (counts.get(id) ?? 0) + 1)
+  assert.equal(counts.size, rows.length, 'no invoice may be skipped')
+
+  const boundarySet = new Set(boundaries)
+  const onBoundary = rows.filter((r) => boundarySet.has(Date.parse(r.UpdatedDateUTC)))
+  assert.ok(onBoundary.length > 0, 'the fixture must actually put records on a boundary')
+  for (const r of onBoundary) {
+    assert.equal(counts.get(r.InvoiceID), 1, `${r.InvoiceID} sits on a chunk edge and must be read once`)
+  }
+})
+
+test('more than the cap inside ONE second fails loudly rather than looping forever', async () => {
+  // The floor of subdivision: Xero's date filters are whole-second, so a single second holding more
+  // than the cap cannot be split. It must still checkpoint everything BEFORE that second and then
+  // fail — not spin, and not jump the cursor over invoices nobody read.
+  const rows = Array.from({ length: 2_500 }, (_, i) => row(`same-${i}`, T0 + 5_000))
+  const { get } = fakeTenant(rows)
+  const boundaries: number[] = []
+  let cursorMs = T0
+  let failure = ''
+
+  for (let poll = 1; poll <= 6 && failure === ''; poll++) {
+    const res = await drainInvoicesModifiedSince(new Date(cursorMs), new Date(T0 + 10_000), get, async (c) => {
+      cursorMs = c.through.getTime()
+      boundaries.push(cursorMs)
+      return 'continue'
+    })
+    if (!res.ok) failure = res.error
+    else assert.equal(res.complete, false, 'a window it cannot drain must never report complete')
+  }
+
+  assert.match(failure, /cannot be split/i)
+  assert.match(failure, /o3d-zdh/)
+  assert.ok(boundaries.length > 0, 'progress up to the indivisible second must still be checkpointed')
+  assert.ok(
+    boundaries.every((b) => b <= T0 + 5_000),
+    'the cursor must never advance past the second it could not read',
+  )
+})
+
+test('a chunk the handler rejects stops the drain with earlier checkpoints intact', async () => {
+  // The handler reports a processing error; the drain must stop rather than march the cursor on.
+  const rows = Array.from({ length: 6_000 }, (_, i) => row(`i-${i}`, T0 + i * 1_000))
+  const { get } = fakeTenant(rows)
+  const boundaries: number[] = []
+
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(T0 + 6_000_000), get, async (c) => {
+    boundaries.push(c.through.getTime())
+    return boundaries.length === 1 ? 'continue' : 'stop'
+  })
+
+  assert.equal(res.ok, true)
+  assert.equal(res.ok && res.complete, false)
+  assert.equal(res.ok && res.stopped, true)
+  assert.equal(res.ok && res.chunks, 2)
+  assert.equal(boundaries.length, 2, 'the failed chunk is not silently retried inside the same poll')
+})
+
+test('an API error inside a bounded chunk fails the drain but keeps earlier chunks', async () => {
+  const rows = Array.from({ length: 6_000 }, (_, i) => row(`i-${i}`, T0 + i * 1_000))
+  const tenant = fakeTenant(rows)
+  let boundedRequests = 0
+  const get: InvoiceFetcher = async (path, opts) => {
+    if (path.includes('where=')) boundedRequests++
+    // Fail once the first bounded chunk has been walked.
+    if (boundedRequests > 25) return { ok: false, status: 503, error: 'Xero unavailable' }
+    return tenant.get(path, opts)
+  }
+  let chunks = 0
+
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(T0 + 6_000_000), get, async () => {
+    chunks++
+    return 'continue'
+  })
+
+  assert.equal(res.ok, false)
+  assert.match(res.ok === false ? res.error : '', /Xero unavailable/)
+  assert.equal(res.ok === false ? res.chunks : -1, chunks, 'chunks already handled are reported, not rolled back')
+  assert.ok(chunks >= 1, 'the checkpointed chunk survives the later failure')
+})
+
+test('one poll never drains more than MAX_CHUNKS_PER_POLL chunks', async () => {
+  // A backlog drain must not monopolise the Xero daily call budget in a single cron run.
+  const rows = Array.from({ length: 40_000 }, (_, i) => row(`i-${i}`, T0 + i * 100))
+  const { get } = fakeTenant(rows)
+  let chunks = 0
+
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(T0 + 4_100_000), get, async () => {
+    chunks++
+    return 'continue'
+  })
+
+  assert.equal(res.ok && res.complete, false, 'an unfinished drain must say so')
+  assert.ok(chunks <= MAX_CHUNKS_PER_POLL, `drained ${chunks} chunks in one poll`)
 })
