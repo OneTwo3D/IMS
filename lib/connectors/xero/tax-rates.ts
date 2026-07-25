@@ -13,7 +13,7 @@
  * sync is safe.
  */
 
-import { xeroGet, xeroPost } from './api'
+import { clearXeroReferenceCachePath, xeroGet, xeroPost } from './api'
 
 export type XeroTaxComponent = {
   Name: string
@@ -81,6 +81,9 @@ export async function putXeroTaxRate(
   if (!res.ok || !res.data?.TaxRates?.length) {
     return { success: false, error: res.error ?? 'Failed to push tax rate' }
   }
+  // o3d-r30: the TaxRates set just changed — drop the cached snapshot so a passive display read can't
+  // serve the pre-mutation list (including a now-archived rate) for the rest of the 4h TTL.
+  clearXeroReferenceCachePath('TaxRates')
   return { success: true, taxType: res.data.TaxRates[0].TaxType }
 }
 

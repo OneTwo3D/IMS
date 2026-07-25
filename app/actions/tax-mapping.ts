@@ -30,6 +30,7 @@ export type TaxRateMatchData = {
 export async function getTaxRateMatchData(opts?: {
   includeWc?: boolean
   includeXero?: boolean
+  forceLive?: boolean
 }): Promise<TaxRateMatchData> {
   await requirePermission('settings.company')
   const includeWc = opts?.includeWc ?? true
@@ -38,7 +39,10 @@ export async function getTaxRateMatchData(opts?: {
   const [imsRows, wcMappings, xeroRows] = await Promise.all([
     getTaxRates(false),
     includeWc ? getShoppingTaxRateMappings() : Promise.resolve([]),
-    includeXero ? fetchAccountingTaxRates() : Promise.resolve([]),
+    // o3d-r30: the mapper's INITIAL load uses the cached display list (up to 4h stale) — safe because
+    // every write re-validates the TaxType live. The explicit "Refresh accounting tax rates" button
+    // passes forceLive to bypass the cache and show the current rates.
+    includeXero ? fetchAccountingTaxRates({ allowCache: !opts?.forceLive }) : Promise.resolve([]),
   ])
 
   return {
@@ -70,19 +74,25 @@ export async function getTaxRateMatchData(opts?: {
 export async function applyTaxRateMatches(input: {
   wcLinks?: Array<{ externalTaxRateId: string; taxRateId: string }>
   xeroLinks?: Array<{ taxRateId: string; accountingTaxType: string }>
-}): Promise<{ success: boolean; wcLinked: number; xeroLinked: number; error?: string }> {
+}): Promise<{ success: boolean; wcLinked: number; xeroLinked: number; errors: string[]; error?: string }> {
   await requirePermission('settings.company')
   try {
     let wcLinked = 0
     let xeroLinked = 0
+    // o3d-r30: collect per-link failures instead of silently reporting success. A Xero link can now be
+    // REFUSED at the write boundary (a stale/archived TaxType), and auto-apply must surface that — else
+    // the UI claims success (often with zero links) and the operator retries an unrecoverable suggestion.
+    const errors: string[] = []
 
     for (const link of input.wcLinks ?? []) {
       const res = await updateShoppingTaxRateMapping(link.externalTaxRateId, link.taxRateId)
       if (res.success) wcLinked++
+      else errors.push(`Failed to link WooCommerce tax rate ${link.externalTaxRateId}`)
     }
     for (const link of input.xeroLinks ?? []) {
       const res = await updateTaxRate(link.taxRateId, { accountingTaxType: link.accountingTaxType })
       if (res.success) xeroLinked++
+      else errors.push(res.error ?? `Failed to map Xero tax type ${link.accountingTaxType}`)
     }
 
     if (wcLinked > 0 || xeroLinked > 0) {
@@ -91,14 +101,20 @@ export async function applyTaxRateMatches(input: {
         tag: 'settings',
         action: 'tax_rate_mapping_applied',
         description: `Applied tax-rate matches: ${wcLinked} WooCommerce link(s), ${xeroLinked} Xero link(s)`,
-        metadata: { wcLinked, xeroLinked },
+        metadata: { wcLinked, xeroLinked, failed: errors.length },
       })
       revalidatePath('/sync')
       revalidatePath('/onboarding')
     }
 
-    return { success: true, wcLinked, xeroLinked }
+    return {
+      success: errors.length === 0,
+      wcLinked,
+      xeroLinked,
+      errors,
+      ...(errors.length ? { error: errors.join('; ') } : {}),
+    }
   } catch (e) {
-    return { success: false, wcLinked: 0, xeroLinked: 0, error: String(e) }
+    return { success: false, wcLinked: 0, xeroLinked: 0, errors: [String(e)], error: String(e) }
   }
 }

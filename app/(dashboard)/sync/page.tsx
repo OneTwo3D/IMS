@@ -91,7 +91,9 @@ export default async function SyncPage() {
   // Only hit the accounting Tax Rates API when an accounting connector is live —
   // otherwise the sync page would pay for a round-trip on every render.
   const accountingTaxRates = (pluginState.xero || pluginState.quickbooks) && accountingStatus.connected
-    ? await fetchAccountingTaxRates().catch(() => [])
+    // o3d-r30: passive display read — the settings page rate list may be up to 4h stale; the explicit
+    // "Refresh Xero tax rates" button and the authoritative auto-link both read live.
+    ? await fetchAccountingTaxRates({ allowCache: true }).catch(() => [])
     : []
 
   // audit-H4: surface accounting sync rows stranded by a connector switch.

@@ -240,6 +240,13 @@ export async function createTaxRate(input: {
 }): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   try {
+    // o3d-r30: same write-time TaxType validation as updateTaxRate — createTaxRate is also a
+    // caller-controlled accountingTaxType write, so it must not bypass the guard.
+    if (input.accountingTaxType) {
+      const { validateAccountingTaxTypeForWrite } = await import('@/lib/accounting/accounting-tax-type-validation')
+      const check = await validateAccountingTaxTypeForWrite(input.accountingTaxType)
+      if (!check.ok) return { success: false, error: check.error }
+    }
     const components = normalizeTaxRateComponents(input.components)
     const effectiveRate = effectiveTaxRateFromComponents(components) ?? input.rate
     const created = await db.taxRate.create({
@@ -315,6 +322,15 @@ export async function updateTaxRate(id: string, input: {
 }): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   try {
+    // o3d-r30: validate a mapped accounting TaxType against Xero's LIVE rate set before persisting. The
+    // mapper UI is populated from a (now cacheable) display list, so a rate archived in Xero after it was
+    // shown must not be persisted here and break later invoice/bill sync. Fails CLOSED when Xero is
+    // unreachable (can't confirm) rather than trust an unvalidated type.
+    if (input.accountingTaxType) {
+      const { validateAccountingTaxTypeForWrite } = await import('@/lib/accounting/accounting-tax-type-validation')
+      const check = await validateAccountingTaxTypeForWrite(input.accountingTaxType)
+      if (!check.ok) return { success: false, error: check.error }
+    }
     const summary = await db.$transaction(async (tx) => {
       const components = input.components === undefined ? undefined : normalizeTaxRateComponents(input.components)
       const effectiveRate = components === undefined ? input.rate : (effectiveTaxRateFromComponents(components) ?? input.rate)

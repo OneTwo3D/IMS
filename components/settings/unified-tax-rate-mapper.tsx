@@ -38,10 +38,12 @@ export function UnifiedTaxRateMapper({ wcConnected, accountingConnected, onChang
   const [busy, setBusy] = useState<string | null>(null) // action key currently running
   const [message, setMessage] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (forceLive = false) => {
     setLoading(true)
     try {
-      const next = await getTaxRateMatchData({ includeWc: wcConnected, includeXero: accountingConnected })
+      // o3d-r30: forceLive bypasses the accounting rate cache so an explicit refresh shows the current
+      // Xero rates (an externally-archived rate isn't masked for the 4h TTL).
+      const next = await getTaxRateMatchData({ includeWc: wcConnected, includeXero: accountingConnected, forceLive })
       setData(next)
     } catch (e) {
       setMessage({ kind: 'error', text: e instanceof Error ? e.message : 'Failed to load tax rates.' })
@@ -76,7 +78,7 @@ export function UnifiedTaxRateMapper({ wcConnected, accountingConnected, onChang
 
   async function handleRefreshAccounting() {
     setBusy('refresh-accounting'); setMessage(null)
-    try { await load(); notify('ok', 'Refreshed accounting tax rates.') }
+    try { await load(true); notify('ok', 'Refreshed accounting tax rates.') }
     finally { setBusy(null) }
   }
 
@@ -90,8 +92,11 @@ export function UnifiedTaxRateMapper({ wcConnected, accountingConnected, onChang
         return
       }
       const res = await applyTaxRateMatches(links)
-      if (!res.success) { notify('error', res.error ?? 'Failed to apply matches.'); return }
-      await load()
+      // o3d-r30: reload live so any partially-applied links AND the current rate set are reflected, then
+      // surface refusals (a stale/archived TaxType is now rejected at the write boundary) instead of
+      // silently claiming success.
+      await load(true)
+      if (!res.success) { notify('error', res.error ?? 'Some matches could not be applied.'); return }
       notify('ok', `Auto-applied ${res.wcLinked} WooCommerce and ${res.xeroLinked} accounting link(s).`)
     } catch (e) {
       notify('error', e instanceof Error ? e.message : 'Failed to apply matches.')

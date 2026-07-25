@@ -70,7 +70,9 @@ export type AccountingConnector = AccountingConnectorDef & {
   syncAccounts(): Promise<{ synced: number; errors: string[] }>
   syncAccountBalanceSnapshots(balanceDate?: string): Promise<AccountingAccountBalanceSnapshotResult>
   getAccounts(): Promise<AccountingAccountRow[]>
-  fetchTaxRates(): Promise<AccountingTaxCodeRow[]>
+  // o3d-r30: allowCache opts into the shared reference cache for PASSIVE display reads only. Omit it
+  // (the default) for authoritative reads that feed mapping/write decisions or an explicit refresh.
+  fetchTaxRates(opts?: { allowCache?: boolean }): Promise<AccountingTaxCodeRow[]>
   autoLinkTaxRates(): Promise<{
     success: boolean
     linked: number
@@ -164,6 +166,8 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         return getQuickBooksAccounts()
       },
       async fetchTaxRates() {
+        // QuickBooks tax codes are not part of the Xero reference cache; the allowCache opt (present on
+        // the interface) is a no-op here, so the param is simply omitted.
         const { fetchQuickBooksTaxCodes } = await import('@/app/actions/quickbooks-sync')
         return fetchQuickBooksTaxCodes()
       },
@@ -259,9 +263,9 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         type: row.type,
       }))
     },
-    async fetchTaxRates() {
+    async fetchTaxRates(opts?: { allowCache?: boolean }) {
       const { fetchXeroTaxRates } = await import('@/app/actions/xero-sync')
-      return fetchXeroTaxRates()
+      return fetchXeroTaxRates(opts)
     },
     async autoLinkTaxRates() {
       const { autoLinkXeroTaxRates } = await import('@/app/actions/settings')
