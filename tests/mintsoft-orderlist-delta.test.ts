@@ -1327,3 +1327,30 @@ test('[o3d-9vv] a row the connector had to RE-READ is not counted as served fetc
   assert.equal(deltaPreloadServed, 1, 'only the untouched bulk row counts')
   assert.equal(deltaAuthoritativeRereads, 1, 'and the re-read is reported separately')
 })
+
+test('resolveDispatchJobOutcome: incomplete coverage marks the job PARTIAL (o3d-bjc.5)', async () => {
+  // When the sweep cannot prove it enumerated every changed order — a full
+  // candidate batch, or a shared-number/split group it could not resolve — it
+  // PINS the watermark. That is the correct safe behaviour, but it used to be
+  // invisible: the job reported SUCCEEDED with zero errors while the delta made
+  // no forward progress, so a pinned watermark could repeat every sweep
+  // indefinitely with nothing to alert on.
+  assert.deepEqual(
+    resolveDispatchJobOutcome(0, null, { deltaCoverageIncomplete: true }),
+    { status: 'PARTIAL', effectiveErrors: 1 },
+  )
+  // Complete coverage is still a clean success.
+  assert.deepEqual(
+    resolveDispatchJobOutcome(0, null, { deltaCoverageIncomplete: false }),
+    { status: 'SUCCEEDED', effectiveErrors: 0 },
+  )
+  // And it composes with the other degradations rather than masking them.
+  assert.deepEqual(
+    resolveDispatchJobOutcome(1, null, {
+      unresolved: 2,
+      deltaWindowTruncated: true,
+      deltaCoverageIncomplete: true,
+    }),
+    { status: 'PARTIAL', effectiveErrors: 5 },
+  )
+})

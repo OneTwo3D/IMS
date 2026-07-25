@@ -124,13 +124,26 @@ export function resolveDispatchJobOutcome(
   // delta window clamped so it can't cover its own backlog, are both degraded
   // states that must not hide behind a SUCCEEDED / zero-error job. They are
   // counted for the job outcome but deliberately never dead-letter a link.
-  degraded?: { unresolved?: number; deltaWindowTruncated?: boolean },
+  //
+  // deltaCoverageIncomplete (o3d-bjc.5) belongs here for the same reason: when
+  // the sweep cannot prove it enumerated every changed order — a full candidate
+  // batch, or a shared-number/split group it could not resolve — it PINS the
+  // watermark. That is the correct safe behaviour, but it was invisible: the
+  // job still reported SUCCEEDED with zero errors while the delta made no
+  // forward progress, so a pinned watermark could repeat every sweep
+  // indefinitely with nothing to alert on.
+  degraded?: {
+    unresolved?: number
+    deltaWindowTruncated?: boolean
+    deltaCoverageIncomplete?: boolean
+  },
 ): { status: 'SUCCEEDED' | 'PARTIAL'; effectiveErrors: number } {
   const effectiveErrors =
     errors
     + (deltaError ? 1 : 0)
     + (degraded?.unresolved ?? 0)
     + (degraded?.deltaWindowTruncated ? 1 : 0)
+    + (degraded?.deltaCoverageIncomplete ? 1 : 0)
   return { status: effectiveErrors > 0 ? 'PARTIAL' : 'SUCCEEDED', effectiveErrors }
 }
 
@@ -536,6 +549,8 @@ export async function runWmsDispatchSweepCore(
   unresolved: number
   /** The delta window was clamped and could not cover its held-back backlog. */
   deltaWindowTruncated: boolean
+  /** True when the sweep pinned the watermark because it could not prove full coverage. */
+  deltaCoverageIncomplete: boolean
 }> {
   // At least 1: a batchSize of 0 would poll nothing yet still look like "covered
   // the whole eligible set", which the truncation recovery below relies on.
@@ -981,6 +996,9 @@ export async function runWmsDispatchSweepCore(
     // Surfaced so the wrapper can mark the job PARTIAL: a clamped window means the
     // delta is running degraded and cannot cover its own backlog.
     deltaWindowTruncated,
+    // Likewise for coverage: the sweep pinned the watermark because it could not
+    // prove it saw every changed order. Safe, but it must not look like success.
+    deltaCoverageIncomplete: !deltaCoverageComplete,
   }
 }
 
@@ -1383,7 +1401,7 @@ export async function runWmsDispatchSweep(
     const core = await runWmsDispatchSweepCore(deps, coreOptions)
     counters = core.counters
     const {
-      logs, deltaError, unresolved, deltaWindowTruncated,
+      logs, deltaError, unresolved, deltaWindowTruncated, deltaCoverageIncomplete,
       deltaPreloadServed, deltaAuthoritativeRereads, deltaRowCount,
     } = core
 
@@ -1475,6 +1493,7 @@ export async function runWmsDispatchSweep(
     const { status, effectiveErrors } = resolveDispatchJobOutcome(counters.errors, deltaError, {
       unresolved,
       deltaWindowTruncated,
+      deltaCoverageIncomplete,
     })
     await db.wmsSyncJob.update({
       where: { id: job.id },
