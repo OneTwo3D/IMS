@@ -29,12 +29,20 @@ import { db } from '@/lib/db'
 const LOCK_KEY = 'mintsoft_auth_lock'
 
 /**
- * How long a holder may keep the lease. Must exceed the worst-case
- * /api/Auth round trip plus the token persist, or a slow login would have its
- * lease stolen and reintroduce the very overlap this prevents. It also bounds
- * how long a crashed holder can block others.
+ * How long a lease survives WITHOUT renewal. Kept short so a crashed holder
+ * unblocks others quickly; a live holder keeps it alive by heartbeat, so this
+ * is not a ceiling on how long the protected work may take.
+ *
+ * A fixed TTL alone would be unsound: CONNECTOR_FETCH_TIMEOUT_MS is
+ * env-configurable and can exceed any constant we pick, and a stalled process
+ * can too. The lease would then expire mid-flight, another caller would take
+ * it, and the overlap this lock exists to prevent would be back — silently.
+ * Hence renewal plus the fence below.
  */
-const LEASE_TTL_MS = 60_000
+const LEASE_TTL_MS = 30_000
+
+/** Renew comfortably inside the TTL so one slow round trip can't lose it. */
+const RENEW_INTERVAL_MS = 10_000
 
 /** How long a caller waits for a busy lease before giving up. */
 const DEFAULT_WAIT_MS = 30_000
@@ -82,6 +90,19 @@ async function tryAcquire(token: string): Promise<string | null> {
   return claimed.count === 1 ? token : null
 }
 
+/**
+ * Extend our lease. Returns false if we no longer own it — which means it
+ * expired and someone else took it, and anything we are still doing is now
+ * unprotected.
+ */
+async function renew(token: string): Promise<boolean> {
+  const renewed = await db.setting.updateMany({
+    where: { key: LOCK_KEY, value: { endsWith: `|${token}` } },
+    data: { value: `${expiryIso(Date.now())}|${token}` },
+  })
+  return renewed.count === 1
+}
+
 async function release(token: string): Promise<void> {
   // Only the owner may release: a holder whose lease already expired (and was
   // taken by someone else) must not delete the new owner's lease.
@@ -102,7 +123,7 @@ async function release(token: string): Promise<void> {
  */
 export async function withMintsoftAuthLock<T>(
   label: string,
-  fn: () => Promise<T>,
+  fn: (ctx: { assertHeld: () => Promise<void> }) => Promise<T>,
   options?: { waitMs?: number },
 ): Promise<T> {
   const waitMs = options?.waitMs ?? DEFAULT_WAIT_MS
@@ -125,9 +146,33 @@ export async function withMintsoftAuthLock<T>(
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
   }
 
+  let lost = false
+  const heartbeat = setInterval(() => {
+    void renew(token).then((ok) => { if (!ok) lost = true }, () => { /* transient; try again next tick */ })
+  }, RENEW_INTERVAL_MS)
+  // Don't hold the event loop open on the heartbeat alone.
+  if (typeof heartbeat.unref === 'function') heartbeat.unref()
+
+  /**
+   * Fence. Call immediately before any irreversible protected action (the
+   * /api/Auth request, the mode commit). Renewal alone is not enough: if we
+   * lost the lease we must NOT proceed, because another holder may already be
+   * doing the thing we were serialising against.
+   */
+  const assertHeld = async () => {
+    if (!lost && await renew(token)) return
+    lost = true
+    throw new MintsoftAuthLockTimeout(
+      `Lost the Mintsoft auth lease during "${label}" (it expired and was taken by ` +
+      'another process). Refusing to continue: another authentication or mode ' +
+      'transition may now be in progress.',
+    )
+  }
+
   try {
-    return await fn()
+    return await fn({ assertHeld })
   } finally {
+    clearInterval(heartbeat)
     await release(token).catch(() => {
       // A failed release is survivable — the lease expires on its own — and
       // must never mask the error from fn().

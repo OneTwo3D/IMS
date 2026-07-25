@@ -351,7 +351,7 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
   }
 
   if (!mintsoftAuthRefreshInFlight) {
-    const tracked = withMintsoftAuthLock('credentials-refresh', async () => {
+    const tracked = withMintsoftAuthLock('credentials-refresh', async ({ assertHeld }) => {
       // Re-read the mode INSIDE the lock, before the request. A transition to
       // fixed-key mode holds this same lease while it tests and commits, so by
       // the time we get here either it has not started (and it will then wait
@@ -369,6 +369,10 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
         return modeNow.staticApiKey
       }
 
+      // Fence immediately before the irreversible act. Renewal alone is not
+      // enough: if the lease lapsed, a mode transition may already be running,
+      // and this request would rotate the key out from under it.
+      await assertHeld()
       const session = await requestMintsoftAuthSession(modeNow.baseUrl, modeNow.username, modeNow.password)
       await persistMintsoftAuthSession(session.token, session.expiresAt)
       return session.token
@@ -434,7 +438,9 @@ export async function clearCachedMintsoftTokenForFixedKeyMode(
  * re-reads the mode and declines. Without this the switch could verify a fixed
  * key that an already-airborne login was about to invalidate.
  */
-export async function withMintsoftAuthModeTransition<T>(fn: () => Promise<T>): Promise<T> {
+export async function withMintsoftAuthModeTransition<T>(
+  fn: (ctx: { assertHeld: () => Promise<void> }) => Promise<T>,
+): Promise<T> {
   return withMintsoftAuthLock('auth-mode-transition', fn)
 }
 
