@@ -1304,3 +1304,26 @@ test('[o3d-9vv] a dead fast path is visible: 0 served even though the run "succe
   assert.equal(deltaPreloadServed, 0, 'but the hot path served nothing')
   assert.match(String(deltaError), /400/, 'and the cause is surfaced')
 })
+
+test('[o3d-9vv] a row the connector had to RE-READ is not counted as served fetch-free', async () => {
+  const { deltaPreloadServed, deltaAuthoritativeRereads, deltaRowCount } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+        candidate({ linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1002', externalOrderId: 'M-2' }),
+      ],
+      fetchDelta: async () => [
+        // M-1 came straight off the bulk feed; M-2 cost an authoritative detail read
+        // (o3d-6j8). Counting M-2 as "served from the bulk delta" would hide that cost.
+        status({ externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'PROCESSING' }),
+        { ...status({ externalOrderId: 'M-2', externalOrderNumber: 'WC-1002', status: 'PROCESSING' }), authoritativeReread: true },
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async () => {},
+    }),
+    { now: NOW },
+  )
+  assert.equal(deltaRowCount, 2)
+  assert.equal(deltaPreloadServed, 1, 'only the untouched bulk row counts')
+  assert.equal(deltaAuthoritativeRereads, 1, 'and the re-read is reported separately')
+})

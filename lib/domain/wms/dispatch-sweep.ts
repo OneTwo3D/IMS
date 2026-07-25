@@ -528,6 +528,10 @@ export async function runWmsDispatchSweepCore(
   deltaError: string | null
   /** Orders served straight from the bulk delta (no per-order fetch). */
   deltaPreloadServed: number
+  /** Delta rows the connector had to re-read authoritatively before applying. */
+  deltaAuthoritativeRereads: number
+  /** Rows the delta returned this run. */
+  deltaRowCount: number
   /** Orders whose real dispatch state could not be established this pass. */
   unresolved: number
   /** The delta window was clamped and could not cover its held-back backlog. */
@@ -562,6 +566,11 @@ export async function runWmsDispatchSweepCore(
   // every tick - correct sync, zero errors, nothing to see. A fail-safe fallback hides
   // the very failure it protects against, so the fast path must say it engaged.
   let deltaPreloadServed = 0
+  // Delta rows the connector had to re-read per order before they were safe to apply.
+  let deltaAuthoritativeRereads = 0
+  // How many rows the delta returned at all — a delta that returns rows yet serves
+  // none fetch-free is the shape of a silently dead fast path.
+  let deltaRowCount = 0
   let ranReconcile = false
   let passClean = true
   // True when the query window had to be clamped to the lookback floor, so it
@@ -635,6 +644,7 @@ export async function runWmsDispatchSweepCore(
         }
       }
       deltaFetched = true
+      deltaRowCount = rows.length
       const lastReconcileMs = state.lastReconcile ? Date.parse(state.lastReconcile) : NaN
       reconcileDue = !Number.isFinite(lastReconcileMs) || now.getTime() - lastReconcileMs >= intervalMs
     } catch (error) {
@@ -847,7 +857,11 @@ export async function runWmsDispatchSweepCore(
         ? { ...candidate, externalOrderNumber: idRow.externalOrderNumber }
         : candidate
       const preload = idRow && !idIsSplit ? idRow : null
-      if (preload) deltaPreloadServed += 1
+      // Only a row the connector took STRAIGHT off the bulk feed counts as fetch-free.
+      // A row it had to re-read authoritatively (o3d-6j8) cost a per-order request, and
+      // counting it here would mask exactly the slow path this metric exists to expose.
+      if (preload && !preload.authoritativeReread) deltaPreloadServed += 1
+      if (preload?.authoritativeReread) deltaAuthoritativeRereads += 1
       await processOne(
         effectiveCandidate,
         preload,
@@ -961,6 +975,8 @@ export async function runWmsDispatchSweepCore(
     logs,
     deltaError,
     deltaPreloadServed,
+    deltaAuthoritativeRereads,
+    deltaRowCount,
     unresolved: unresolvedCount,
     // Surfaced so the wrapper can mark the job PARTIAL: a clamped window means the
     // delta is running degraded and cannot cover its own backlog.
@@ -1366,7 +1382,10 @@ export async function runWmsDispatchSweep(
   try {
     const core = await runWmsDispatchSweepCore(deps, coreOptions)
     counters = core.counters
-    const { logs, deltaError, unresolved, deltaWindowTruncated, deltaPreloadServed } = core
+    const {
+      logs, deltaError, unresolved, deltaWindowTruncated,
+      deltaPreloadServed, deltaAuthoritativeRereads, deltaRowCount,
+    } = core
 
     if (logs.length > 0) {
       // Map the dispatch outcomes onto the shared WmsSyncLogAction enum; the detail lives
@@ -1424,21 +1443,29 @@ export async function runWmsDispatchSweep(
       })
     }
 
-    // Say out loud whether the fast path engaged (o3d-9vv). A silent fallback made a
-    // completely dead optimisation indistinguishable from a healthy run.
-    if (coreOptions.deltaEnabled && Boolean(deps.fetchDelta) && !deltaError) {
+    // Say out loud when the fast path is DEAD (o3d-9vv). A fail-safe fallback made a
+    // completely dead optimisation indistinguishable from a healthy run, so the
+    // condition worth surfacing is "the delta returned rows yet served none of them
+    // fetch-free" — that is the exact production symptom.
+    //
+    // Logged only when it holds, NOT once per run: an unconditional row would add
+    // ~263k rows/year at a 2-minute cadence to a table with no retention sweep, and a
+    // healthy signal nobody reads is not observability (Codex).
+    if (deltaRowCount > 0 && deltaPreloadServed === 0) {
       await db.wmsSyncLog.create({
         data: {
           jobId: job.id,
           sku: null,
           productId: null,
-          action: 'noop',
-          reason: `Inbound Order/List delta engaged — ${deltaPreloadServed} of ${counters.totalChecked} `
-            + 'orders served from the bulk delta without a per-order fetch',
+          action: 'error',
+          reason: `Inbound Order/List delta returned ${deltaRowCount} rows but served NONE without a `
+            + `per-order fetch (${deltaAuthoritativeRereads} needed an authoritative re-read) — the delta `
+            + 'optimisation is not engaging; check the page Limit, the status map, and row completeness',
           payload: {
-            deltaEngaged: true,
+            deltaEngaged: false,
+            deltaRowCount,
             deltaPreloadServed,
-            totalChecked: counters.totalChecked,
+            deltaAuthoritativeRereads,
             connector: connectorId,
           } as Prisma.InputJsonValue,
         },

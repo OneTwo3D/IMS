@@ -762,3 +762,57 @@ test('[o3d-9vv] the page budget keeps the overall delta capacity (100 x 100, not
   )
   assert.equal(listCalls.length, 100, 'halving the page size doubled the page budget')
 })
+
+test('[o3d-9vv] a page LARGER than the requested Limit is rejected at once (server ignored Limit)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  // 150 rows for Limit=100: `page.length < limit` would never terminate, so without
+  // this check every page in the budget would be fetched before failing.
+  listResponder = () => Array.from({ length: 150 }, (_, i) => row(i + 1))
+
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /returned 150 rows for Limit=100 — the server ignored the page size/,
+  )
+  assert.equal(listCalls.length, 1, 'failed on the first page, not after the whole budget')
+})
+
+test('[o3d-9vv] pagination is bounded by a WALL-CLOCK budget, not just a page count', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  const full = Array.from({ length: 100 }, (_, i) => row(i + 1))
+  listResponder = () => full // never short → would otherwise run the full page budget
+
+  // 100 sequential requests at the transport timeout is ~50 minutes, far beyond the
+  // 2-minute sweep cadence. A tiny budget proves the deadline is enforced.
+  await assert.rejects(
+    () => fetchMintsoftOrderList({
+      sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, deadlineMs: 1,
+    }),
+    /exceeded its 1ms budget after \d+ pages/,
+  )
+  assert.ok(listCalls.length < 100, `stopped at the deadline (${listCalls.length}) instead of running the full page budget`)
+})
+
+test('[o3d-9vv] a re-read row is marked so the sweep can tell it apart from a bulk row', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  listResponder = () => [row(1), incompleteRow(2)]
+  detailRows = new Map([['2', {
+    ID: 2, OrderNumber: 'N2', OrderStatusId: 4, ClientId: CLIENT,
+    TrackingNumber: 'TN-2', CourierServiceName: 'DPD',
+    DespatchDate: '2026-07-15T09:00:00', NumberOfParts: 1,
+  }]])
+
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out.length, 2)
+  assert.equal(out[0].authoritativeReread, undefined, 'the complete row was taken off the bulk feed')
+  assert.equal(out[1].authoritativeReread, true, 'the incomplete row cost a detail request')
+})

@@ -572,6 +572,10 @@ async function resolveDispatchableDeltaRows(
   rows: RawOrder[],
   statusMap: Map<number, string>,
   clientId: number,
+  // Rows replaced by an authoritative per-order re-read. Reported so the sweep's
+  // engagement metric cannot claim a row was "served from the bulk delta" when it
+  // actually cost a detail request (o3d-9vv / Codex).
+  rereadIndexes?: Set<number>,
 ): Promise<RawOrder[]> {
   const out = [...rows]
   // Pre-classify: only a dispatched row missing a dispatch-critical key needs I/O.
@@ -593,6 +597,7 @@ async function resolveDispatchableDeltaRows(
       const index = pending[next]
       try {
         out[index] = await resolveDispatchableDeltaRow(rows[index], statusMap, clientId)
+        rereadIndexes?.add(index)
       } catch (error) {
         failed = true // stop handing out further work; the whole delta is failing
         throw error
@@ -612,6 +617,8 @@ export async function fetchMintsoftOrderList(opts: {
   channelId?: number | null
   limit?: number
   maxPages?: number
+  /** Wall-clock budget across ALL pages; defaults to 60s (well under the sweep cadence). */
+  deadlineMs?: number
 }): Promise<WmsOrderStatus[]> {
   const since = opts.sinceLastUpdated.trim()
   if (!since) return []
@@ -640,9 +647,22 @@ export async function fetchMintsoftOrderList(opts: {
   // Halving the page size halves the rows per page, so the page budget is doubled to
   // keep the same overall delta capacity (100 x 100 = the previous 200 x 50).
   const maxPages = opts.maxPages && opts.maxPages > 0 ? Math.trunc(opts.maxPages) : 100
+  // ...but a page BUDGET is not a time budget. 100 sequential requests at the
+  // transport's 30s timeout is ~50 minutes, far beyond the 2-minute sweep cadence, so
+  // overlapping runs would multiply load on Mintsoft (Codex). Bound the wall clock
+  // too, and fail closed: the caller holds its watermark and falls back, exactly as it
+  // does for a page overflow.
+  const deadlineMs = opts.deadlineMs && opts.deadlineMs > 0 ? Math.trunc(opts.deadlineMs) : 60_000
+  const startedAt = Date.now()
 
   const collected: RawOrder[] = []
   for (let pageNo = 1; pageNo <= maxPages; pageNo += 1) {
+    if (pageNo > 1 && Date.now() - startedAt > deadlineMs) {
+      throw new Error(
+        `Mintsoft Order/List delta exceeded its ${deadlineMs}ms budget after ${pageNo - 1} pages `
+          + `(since=${since}); refusing to treat a truncated delta as complete`,
+      )
+    }
     const query = new URLSearchParams({
       SinceLastUpdated: since,
       Limit: String(limit),
@@ -662,6 +682,15 @@ export async function fetchMintsoftOrderList(opts: {
     // complete empty page — else the caller would advance its watermark past rows
     // it never saw. A genuine empty/short page still ends pagination normally.
     const page = extractMintsoftArrayPayloadStrict(result.data, `Order/List page ${pageNo}`)
+    // A page LARGER than we asked for means the server ignored Limit. Left unchecked
+    // `page.length < limit` could then never terminate, so every page in the budget
+    // would be fetched before failing (Codex). Reject it at once instead.
+    if (page.length > limit) {
+      throw new Error(
+        `Mintsoft Order/List page ${pageNo} returned ${page.length} rows for Limit=${limit} — `
+          + 'the server ignored the page size; refusing to page through an unbounded delta',
+      )
+    }
     // Per-row fail-closed validation (parity with the Python delta reader): every
     // row must be an object carrying a resolvable ID and a non-empty order number.
     // A malformed row is schema/API drift, not "no change" — silently dropping it
@@ -700,9 +729,14 @@ export async function fetchMintsoftOrderList(opts: {
       // same for every row) so normalisation makes no per-row API/DB calls.
       const statusMap = await fetchMintsoftOrderStatusMap()
       const settings = await getMintsoftSettings()
-      const resolved = await resolveDispatchableDeltaRows(collected, statusMap, clientId)
+      const rereadIndexes = new Set<number>()
+      const resolved = await resolveDispatchableDeltaRows(collected, statusMap, clientId, rereadIndexes)
       const normalized = await Promise.all(
-        resolved.map((row) => normalizeMintsoftOrderRow(row, { statusMap, settings, strictStatus: true })),
+        resolved.map(async (row, index) => {
+          const status = await normalizeMintsoftOrderRow(row, { statusMap, settings, strictStatus: true })
+          if (status && rereadIndexes.has(index)) status.authoritativeReread = true
+          return status
+        }),
       )
       return normalized.filter((row): row is WmsOrderStatus => row !== null)
     }
