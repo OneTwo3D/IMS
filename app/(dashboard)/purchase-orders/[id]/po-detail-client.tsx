@@ -2731,6 +2731,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           {inv.settlement.status === 'AWAITING_LEDGER' && ' · awaiting ledger'}
                           {inv.settlement.status === 'LEDGER_REJECTED' && ' · LEDGER REJECTED'}
                           {inv.settlement.status === 'NOT_SENT' && ' · NOT SENT TO LEDGER'}
+                          {inv.settlement.status === 'PARTIALLY_SETTLED' && ' · PART PAID IN LEDGER'}
                         </span>
                       )}
                     </div>

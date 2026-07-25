@@ -544,24 +544,37 @@ export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
  * The latest BILL_PAYMENT sync row per bill — the ledger's side of "is this settled?" (o3d-lgo.15).
  *
  * Latest, not all: a retry writes a new row, and the current state is the one that decides whether the
- * ledger agrees. Connector-agnostic on purpose (no connector filter) — a bill paid under Xero and read
- * back after a switch to QuickBooks should still show the payment that exists.
+ * ledger agrees.
+ *
+ * SCOPED TO THE ACTIVE CONNECTOR. Payment and invoice ids are owned by the connector and tenant that
+ * issued them, and disconnecting does not delete historical sync logs — so an old Xero SYNCED payment
+ * would otherwise be presented as proof that a now-active QuickBooks ledger agrees, which it cannot be
+ * (Codex, PR #570 round 2). With no active connector there is no ledger to agree, so nothing is
+ * returned and every locally-paid bill reads NOT_SENT rather than falsely settled.
  */
-async function latestBillPaymentSyncRows(invoiceIds: string[]): Promise<Map<string, PaymentSyncRow>> {
+async function latestBillPaymentSyncRows(
+  invoiceIds: string[],
+  connector: string | null,
+): Promise<Map<string, PaymentSyncRow>> {
   const out = new Map<string, PaymentSyncRow>()
-  if (!invoiceIds.length) return out
+  if (!invoiceIds.length || !connector) return out
   const rows = await db.accountingSyncLog.findMany({
-    where: { type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: { in: invoiceIds } },
-    select: { referenceId: true, status: true, externalTransactionId: true, errorMessage: true, retryCount: true },
+    where: { connector, type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: { in: invoiceIds } },
+    select: {
+      referenceId: true, status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true,
+    },
     orderBy: { createdAt: 'desc' },
   })
   for (const r of rows) {
     if (out.has(r.referenceId)) continue // desc order: the first one seen is the latest
+    // The amount that was actually SENT, so a part payment is not mistaken for full settlement.
+    const payload = (r.payload && typeof r.payload === 'object' ? r.payload : {}) as Record<string, unknown>
     out.set(r.referenceId, {
       status: r.status,
       externalTransactionId: r.externalTransactionId,
       errorMessage: r.errorMessage,
       retryCount: r.retryCount,
+      amount: typeof payload.amount === 'number' ? payload.amount : null,
     })
   }
   return out
@@ -756,9 +769,10 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   // THE LEDGER'S OWN VIEW of each bill's payment (o3d-lgo.15). paidAt says IMS was told the bill was
   // paid; the BILL_PAYMENT sync is what makes the ledger agree, and it can fail, be cancelled, or never
   // have been queued at all. Read once for the whole PO rather than per bill.
+  const activeConnector = await getActiveAccountingConnectorInfo().catch(() => null)
   const [accountingSyncEnabled, billPaymentByInvoice] = await Promise.all([
     getAccountingSettings().then((a) => a.syncEnabled).catch(() => false),
-    latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id)),
+    latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id), activeConnector?.id ?? null),
   ])
 
   const row = mapPoRow(po)
@@ -820,6 +834,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
         syncEnabled: accountingSyncEnabled,
         documentPosted: !!inv.accountingInvoiceId,
         payment: billPaymentByInvoice.get(inv.id) ?? null,
+        totalForeign: Number(inv.totalForeign),
       }),
       createdAt: inv.createdAt.toISOString(),
       lines: inv.lines.map((il) => {

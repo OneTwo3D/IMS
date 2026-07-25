@@ -22,13 +22,17 @@ export type PaymentSyncRow = {
   externalTransactionId?: string | null
   errorMessage?: string | null
   retryCount?: number
+  /** What was actually sent to the ledger, in the document's currency. */
+  amount?: number | null
 }
 
 export type SettlementStatus =
   /** Not paid in IMS either — nothing to reconcile. */
   | 'UNPAID'
-  /** Paid in IMS, and the ledger has confirmed the payment. The only fully-settled state. */
+  /** Paid in IMS, and the ledger has confirmed the payment IN FULL. The only fully-settled state. */
   | 'SETTLED'
+  /** The ledger confirmed a payment, but for LESS than the document total — a balance remains. */
+  | 'PARTIALLY_SETTLED'
   /** Paid in IMS, payment queued, ledger has not confirmed yet. Normal, briefly. */
   | 'AWAITING_LEDGER'
   /** Paid in IMS, and the payment FAILED to post. The ledger still shows it outstanding. */
@@ -59,18 +63,26 @@ export function settlementStatus(input: {
   documentPosted: boolean
   /** The latest payment sync row for this document, if any was ever queued. */
   payment: PaymentSyncRow | null
+  /** The document total in its own currency, to tell a full settlement from a part payment. */
+  totalForeign?: number | null
 }): SettlementVerdict {
   if (!input.paidLocally) {
     return { status: 'UNPAID', discrepancy: false, detail: 'Not marked as paid.' }
   }
-  if (!input.syncEnabled) {
+
+  // A payment that already FAILED or was CANCELLED is a fact, and turning sync off does not unmake it.
+  // Evaluating the flag first meant an operator disabling an unhealthy connector turned a known
+  // outstanding ledger balance into a green badge (Codex, PR #570 round 2).
+  const terminal = input.payment && (input.payment.status === 'FAILED' || input.payment.status === 'CANCELLED')
+
+  if (!input.syncEnabled && !terminal) {
     return {
       status: 'NOT_APPLICABLE',
       discrepancy: false,
       detail: 'Marked as paid. Accounting sync is off, so no payment is expected in the ledger.',
     }
   }
-  if (!input.documentPosted) {
+  if (!input.documentPosted && !terminal) {
     return {
       status: 'NOT_APPLICABLE',
       discrepancy: false,
@@ -92,16 +104,33 @@ export function settlementStatus(input: {
   }
 
   switch (p.status) {
-    case 'SYNCED':
-      return p.externalTransactionId
-        ? { status: 'SETTLED', discrepancy: false, detail: `Settled in the ledger (payment ${p.externalTransactionId}).` }
-        : {
-          // SYNCED with no id is not a settlement we can point at. Treat it as unconfirmed rather than
-          // asserting a payment exists that nothing can be reconciled against.
+    case 'SYNCED': {
+      if (!p.externalTransactionId) {
+        // A success we cannot point at is not a settlement: there is nothing to reconcile against, and
+        // claiming otherwise would hide the very disagreement this exists to surface.
+        return {
           status: 'AWAITING_LEDGER',
           discrepancy: true,
           detail: 'The payment sync reports success but recorded no ledger payment id, so the settlement cannot be verified.',
         }
+      }
+      // PART PAYMENT IS NOT SETTLEMENT. markBillPaid accepts an explicit amountForeign and queues only
+      // that, so a GBP1 payment against a GBP1,000 bill posted a SYNCED row with an id — and a green
+      // "Paid" badge over the GBP999 the ledger still shows outstanding (Codex, PR #570 round 2).
+      const total = input.totalForeign
+      const paid = p.amount
+      if (typeof total === 'number' && typeof paid === 'number' && total > 0 && paid + 0.005 < total) {
+        return {
+          status: 'PARTIALLY_SETTLED',
+          discrepancy: true,
+          detail:
+            `The ledger recorded a PART payment of ${paid} against a total of ${total} (payment ` +
+            `${p.externalTransactionId}), so a balance is still outstanding there while IMS shows this ` +
+            `as paid in full.`,
+        }
+      }
+      return { status: 'SETTLED', discrepancy: false, detail: `Settled in the ledger (payment ${p.externalTransactionId}).` }
+    }
     case 'PENDING':
     case 'PROCESSING':
       return {

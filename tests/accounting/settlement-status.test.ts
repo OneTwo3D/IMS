@@ -95,3 +95,55 @@ test('a document that has not posted yet points at the DOCUMENT, not the payment
   assert.equal(v.discrepancy, false)
   assert.match(v.detail, /document sync is what to chase/)
 })
+
+
+test('a PART payment the ledger accepted is not full settlement', () => {
+  // markBillPaid accepts an explicit amountForeign and queues only that. A GBP1 payment against a
+  // GBP1,000 bill posted a SYNCED row with an id — and the badge went green over the GBP999 the ledger
+  // still shows outstanding.
+  const v = settlementStatus({ ...base, totalForeign: 1000, payment: row({ amount: 1 }) })
+  assert.equal(v.status, 'PARTIALLY_SETTLED')
+  assert.equal(v.discrepancy, true)
+  assert.match(v.detail, /PART payment of 1 against a total of 1000/)
+})
+
+test('a payment for the full amount is settled, and sub-penny rounding does not make it partial', () => {
+  assert.equal(settlementStatus({ ...base, totalForeign: 1000, payment: row({ amount: 1000 }) }).status, 'SETTLED')
+  assert.equal(settlementStatus({ ...base, totalForeign: 1000, payment: row({ amount: 999.999 }) }).status, 'SETTLED')
+  assert.equal(settlementStatus({ ...base, totalForeign: 1000, payment: row({ amount: 1000.5 }) }).status, 'SETTLED')
+})
+
+test('with no amount recorded, a confirmed payment is still settled rather than guessed at', () => {
+  // Absent data must not manufacture a discrepancy: older rows carry no amount in their payload.
+  assert.equal(settlementStatus({ ...base, totalForeign: 1000, payment: row({ amount: null }) }).status, 'SETTLED')
+  assert.equal(settlementStatus({ ...base, totalForeign: null, payment: row({ amount: 1 }) }).status, 'SETTLED')
+})
+
+test('turning sync OFF does not unmake a payment the ledger already rejected', () => {
+  // The operator disabling an unhealthy connector is exactly when a known outstanding balance must stay
+  // visible — evaluating the flag first turned it green.
+  const v = settlementStatus({
+    ...base,
+    syncEnabled: false,
+    payment: row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'rejected' }),
+  })
+  assert.equal(v.status, 'LEDGER_REJECTED')
+  assert.equal(v.discrepancy, true)
+})
+
+test('a cancelled payment also survives sync being switched off', () => {
+  const v = settlementStatus({ ...base, syncEnabled: false, payment: row({ status: 'CANCELLED', externalTransactionId: null }) })
+  assert.equal(v.status, 'NOT_SENT')
+  assert.equal(v.discrepancy, true)
+})
+
+test('a rejected payment on an unposted document is still a discrepancy', () => {
+  // The document-not-posted shortcut is for the case where nothing has been attempted. Once a payment
+  // has actually FAILED, that fact outranks the tidy explanation.
+  const v = settlementStatus({
+    ...base,
+    documentPosted: false,
+    payment: row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'no such invoice' }),
+  })
+  assert.equal(v.status, 'LEDGER_REJECTED')
+})
