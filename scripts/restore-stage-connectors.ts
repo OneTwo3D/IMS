@@ -114,7 +114,12 @@ async function main() {
   // expectRaw pins it to the EXACT row the verdict above judged. Without that, a contender taking the
   // abandoned lock over between the check and the release would have stage restored underneath its
   // running suite. --force deliberately drops the pin: overriding is the operator's stated intent.
-  await release(FORCE ? { force: true } : { force: true, expectRaw: current!.raw })
+  // expectRunId pins BOTH paths to the holder that was inspected — forcing overrides the liveness
+  // verdict, never the target, or a successor claiming the lock in between would be released instead.
+  // The non-forced path additionally pins the exact bytes it judged.
+  await release(FORCE
+    ? { force: true, expectRunId: lock.runId }
+    : { force: true, expectRaw: current!.raw, expectRunId: lock.runId })
   await reportStage()
   console.log('\nDone. Re-check that stage resumed importing (its wc-reconcile / accounting-sync crons run every 5 min).')
 }

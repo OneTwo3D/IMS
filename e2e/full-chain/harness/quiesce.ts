@@ -52,6 +52,7 @@
  * recovered immediately rather than after the TTL.
  */
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { hostname } from 'node:os'
 
 import { Client } from 'pg'
@@ -122,6 +123,14 @@ export type LockRecord = {
   ownerPid?: number
   ownerHost?: string
   /**
+   * The holder process's BIRTH: its kernel start-time counter and the machine's boot id. A pid alone is
+   * a slot the kernel reissues, so after a crash or reboot an unrelated process holding the same pid
+   * would keep the lock looking LIVE forever. Absent on locks from an older build, and on any platform
+   * without /proc — the pid check then stands alone, as it used to.
+   */
+  ownerStart?: string
+  ownerBoot?: string
+  /**
    * Opaque proof of ownership. Only the process that minted it may release this lock — see the header:
    * a refused contender still runs globalTeardown, and without this it would restore stage on the
    * incumbent's behalf. Optional so a lock written by an older build can still be RECOVERED (release()
@@ -144,7 +153,39 @@ export type LockRecord = {
 }
 
 /** Just the ownership fields the liveness check reads, so it can be exercised without a whole lock record. */
-export type LockOwner = { ownerPid?: number; ownerHost?: string }
+export type LockOwner = { ownerPid?: number; ownerHost?: string; ownerStart?: string; ownerBoot?: string }
+
+/**
+ * A pid is not an identity — it is a slot, and the kernel reissues it.
+ *
+ * `process.kill(pid, 0)` proves only that SOMETHING owns that pid now. After a crash (and especially
+ * after a reboot, where pids restart low) an unrelated process — including the next Playwright run —
+ * can hold the dead holder's pid, and the lock would then read as permanently LIVE: stage stays
+ * disabled until a human forces it (Codex, PR #560 round 4).
+ *
+ * So the lock also records the process's BIRTH: the kernel's start-time counter for that pid, and the
+ * machine's boot id. Both are read straight from /proc; on a system without it we simply record nothing
+ * and fall back to the pid alone, which is the behaviour we had.
+ */
+function processStartedAt(pid: number): string | undefined {
+  try {
+    // Field 22 of /proc/<pid>/stat is starttime, in clock ticks since boot. comm (field 2) can contain
+    // spaces and brackets, so parse from the LAST ')' rather than splitting the whole line.
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const after = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+    return after[19] || undefined // field 22 = index 19 once pid and comm are removed
+  } catch {
+    return undefined
+  }
+}
+
+function bootId(): string | undefined {
+  try {
+    return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || undefined
+  } catch {
+    return undefined
+  }
+}
 
 /**
  * How long a lock with no provable owner may sit before recovery treats it as abandoned.
@@ -182,12 +223,26 @@ export const LEASE_TTL_MS = 10 * LEASE_RENEW_INTERVAL_MS
 export function isLockOwnerAlive(lock: LockOwner): boolean | null {
   if (!lock.ownerPid || !lock.ownerHost) return null
   if (lock.ownerHost !== hostname()) return null
+
+  // The host rebooted since the lock was taken, so its holder is definitively gone whatever now owns
+  // the pid. Checked first because it is the cheapest and most decisive signal.
+  const boot = bootId()
+  if (lock.ownerBoot && boot && lock.ownerBoot !== boot) return false
+
   try {
     process.kill(lock.ownerPid, 0)
-    return true
   } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'EPERM' ? true : false
+    // EPERM means the pid exists but belongs to another user — still alive.
+    if ((e as NodeJS.ErrnoException).code !== 'EPERM') return false
   }
+
+  // Something holds the pid. Is it the same PROCESS? A reused pid has a different birth time.
+  if (lock.ownerStart) {
+    const start = processStartedAt(lock.ownerPid)
+    if (start && start !== lock.ownerStart) return false
+    if (!start) return true // the pid answered but /proc did not — do not guess dead
+  }
+  return true
 }
 
 export type RecoveryDecision = {
@@ -207,7 +262,19 @@ export type RecoveryDecision = {
  * corruption this exists to prevent. Only when liveness is unknowable (another host, or a lock from an
  * older build) does the lease decide.
  */
-export function lockRecoveryDecision(lock: LockRecord, nowMs = Date.now()): RecoveryDecision {
+export function lockRecoveryDecision(
+  lock: LockRecord,
+  nowMs = Date.now(),
+  /**
+   * How long ago the DATABASE last saw this row written, if it told us.
+   *
+   * Preferred over any timestamp inside the record, because it is measured by one clock that every
+   * contender shares. Comparing a holder-written heartbeat against the contender's own Date.now() means
+   * two hosts whose clocks differ by more than the TTL disagree about whether a lease is alive — one
+   * side steals a healthy run, the other never recovers a dead one (Codex, PR #560 round 4).
+   */
+  dbAgeMs: number | null = null,
+): RecoveryDecision {
   const alive = isLockOwnerAlive(lock)
   const who = `run ${lock.runId}${lock.ownerHost ? ` on ${lock.ownerHost}` : ''}${lock.ownerPid ? ` (pid ${lock.ownerPid})` : ''}`
 
@@ -215,23 +282,30 @@ export function lockRecoveryDecision(lock: LockRecord, nowMs = Date.now()): Reco
     return { action: 'held', reason: `${who} is a LIVE process on this host` }
   }
   if (alive === false) {
-    return { action: 'recover', reason: `${who} is gone — its pid does not exist on this host` }
+    return { action: 'recover', reason: `${who} is gone — no live process with its identity on this host` }
   }
 
   // Unknowable owner: the lease is the only evidence.
-  if (lock.heartbeatAt) {
-    const sinceMs = nowMs - Date.parse(lock.heartbeatAt)
+  if (dbAgeMs !== null || lock.heartbeatAt) {
+    // The database's own measurement first; the recorded heartbeat is the fallback for a store that
+    // cannot report one (and it is the same signal, just measured on a clock we do not control).
+    const sinceMs = dbAgeMs ?? nowMs - Date.parse(lock.heartbeatAt as string)
+    const measuredBy = dbAgeMs !== null ? 'by the database' : "against this host's clock"
     if (!Number.isFinite(sinceMs)) {
       return { action: 'wait', reason: `${who} has an unparseable heartbeat (${lock.heartbeatAt})` }
     }
-    const since = `${Math.round(sinceMs / 1000)}s since its last renewal`
-    return sinceMs > LEASE_TTL_MS
-      ? { action: 'recover', reason: `${who} stopped renewing its lease — ${since}, past the ${Math.round(LEASE_TTL_MS / 1000)}s TTL` }
-      : { action: 'held', reason: `${who} is renewing its lease — ${since}` }
+    if (!lock.heartbeatAt && dbAgeMs !== null && !lock.token) {
+      // A pre-lease lock: it never renews, so row age is NOT lease age. Fall through to the legacy window.
+    } else {
+      const since = `${Math.round(sinceMs / 1000)}s since its last renewal (measured ${measuredBy})`
+      return sinceMs > LEASE_TTL_MS
+        ? { action: 'recover', reason: `${who} stopped renewing its lease — ${since}, past the ${Math.round(LEASE_TTL_MS / 1000)}s TTL` }
+        : { action: 'held', reason: `${who} is renewing its lease — ${since}` }
+    }
   }
 
   // Legacy lock (pre-heartbeat): age is all there is.
-  const ageMs = nowMs - Date.parse(lock.takenAt)
+  const ageMs = dbAgeMs ?? nowMs - Date.parse(lock.takenAt)
   if (!Number.isFinite(ageMs)) {
     return { action: 'wait', reason: `${who} has no heartbeat and an unparseable takenAt (${lock.takenAt})` }
   }
@@ -267,8 +341,16 @@ function e2eDb(): Client {
 export type LockStore = {
   /** Claim by conditional insert. false means someone else already holds it. Never overwrites. */
   claim(raw: string): Promise<boolean>
-  /** The current row, raw text and parsed, or null if unlocked. */
-  read(): Promise<{ raw: string; lock: LockRecord } | null>
+  /**
+   * The current row, raw text and parsed — plus how long ago the DATABASE last saw it written.
+   *
+   * `ageMs` is measured by Postgres (now() - updatedAt), not by subtracting a holder-written timestamp
+   * from the contender's clock. Two hosts whose clocks differ by more than the TTL would otherwise
+   * disagree about whether a lease had expired: one side declares every fresh renewal stale and takes
+   * the lock from a healthy run, or never recovers a dead one (Codex, PR #560 round 4). One clock,
+   * shared by everyone, removes the question.
+   */
+  read(): Promise<{ raw: string; lock: LockRecord; ageMs: number | null } | null>
   /** Replace ONLY if the row still reads exactly as `expected` (compare-and-set take-over). */
   replaceIfUnchanged(expected: string, raw: string): Promise<boolean>
   /** Delete ONLY if the row still reads exactly as `expected` (compare-and-set, for the forced release). */
@@ -313,9 +395,18 @@ export function pgLockStore(db: Client, key: string = LOCK_KEY): LockStore {
       return r.rowCount === 1
     },
     async read() {
-      const r = await db.query<{ value: string }>(`select value from settings where key = $1`, [key])
+      const r = await db.query<{ value: string; age_ms: string | null }>(
+        `select value, extract(epoch from (now() - "updatedAt")) * 1000 as age_ms
+           from settings where key = $1`,
+        [key],
+      )
       if (!r.rows.length) return null
-      return { raw: r.rows[0].value, lock: parseLock(r.rows[0].value) }
+      const ageMs = r.rows[0].age_ms == null ? null : Number(r.rows[0].age_ms)
+      return {
+        raw: r.rows[0].value,
+        lock: parseLock(r.rows[0].value),
+        ageMs: Number.isFinite(ageMs as number) ? (ageMs as number) : null,
+      }
     },
     async replaceIfUnchanged(expected, raw) {
       const r = await db.query(
@@ -385,7 +476,7 @@ export async function claimLock(
     // Gone between the failed claim and the read: someone released it. Try again immediately.
     if (!found) { lastReason = 'the holder released it as we looked'; continue }
 
-    const decision = lockRecoveryDecision(found.lock, now())
+    const decision = lockRecoveryDecision(found.lock, now(), found.ageMs)
     lastReason = decision.reason
     if (decision.action !== 'recover') {
       throw new Error(
@@ -707,6 +798,9 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
         // Owner identity, so the next acquire can tell a live run from a crash (o3d-lgo.14).
         ownerPid: process.pid,
         ownerHost: hostname(),
+        // Birth identity, so a REUSED pid cannot make a dead lock look live (Codex round 4).
+        ownerStart: processStartedAt(process.pid),
+        ownerBoot: bootId(),
         token,
         heartbeatAt: takenAt,
         stageSettings: prior,
@@ -858,7 +952,7 @@ export async function fenceForRelease(
  * `force` is the manual escape hatch (scripts/restore-stage-connectors.ts): an operator restoring stage
  * after a crash legitimately releases a lock this process never took.
  */
-export async function release(opts: { force?: boolean; expectRaw?: string } = {}): Promise<void> {
+export async function release(opts: { force?: boolean; expectRaw?: string; expectRunId?: string } = {}): Promise<void> {
   if (!held && !opts.force && !opts.expectRaw) {
     console.log('[quiesce] this process does not hold the quiesce lock — nothing to release.')
     return
@@ -885,6 +979,20 @@ export async function release(opts: { force?: boolean; expectRaw?: string } = {}
       console.error(
         `[quiesce] REFUSING to release: the lock row changed since it was judged recoverable — run ` +
           `${found.lock.runId} holds it now. Nothing was restored. Re-check with --status.`,
+      )
+      return
+    }
+
+    // IDENTITY, EVEN UNDER --force. Forcing overrides the LIVENESS verdict — "I know that holder is
+    // gone" — never the TARGET. If the inspected holder exits and a successor claims the lock before we
+    // read it, an unpinned force would fence and delete the successor's LIVE lock and restore stage
+    // beneath its suite (Codex, PR #560 round 4). Matching on the run id rather than the raw bytes is
+    // what lets a heartbeat tick in between without spuriously refusing.
+    if (opts.expectRunId && found.lock.runId !== opts.expectRunId) {
+      console.error(
+        `[quiesce] REFUSING to release: you inspected run ${opts.expectRunId}, but run ${found.lock.runId} ` +
+          `holds the lock now — it was taken over between the check and this release. Nothing was ` +
+          `restored. Re-check with --status; forcing overrides the verdict, never the target.`,
       )
       return
     }

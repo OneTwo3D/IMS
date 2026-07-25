@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { hostname } from 'node:os'
 import test from 'node:test'
 
@@ -130,7 +131,7 @@ function fakeStore(initial: LockRecord | null = null) {
   let row: string | null = initial ? JSON.stringify(initial) : null
   const store: LockStore = {
     async claim(raw) { if (row !== null) return false; row = raw; return true },
-    async read() { return row === null ? null : { raw: row, lock: JSON.parse(row) as LockRecord } },
+    async read() { return row === null ? null : { raw: row, lock: JSON.parse(row) as LockRecord, ageMs: null } },
     async replaceIfUnchanged(expected, raw) { if (row !== expected) return false; row = raw; return true },
     async deleteIfUnchanged(expected) { if (row !== expected) return false; row = null; return true },
     async deleteIfOwned(token) {
@@ -392,4 +393,81 @@ test('a fenced row is still refused to a stranger, not just to its owner', async
   const s = fakeStore(lockAt({ token: 'mine', releasing: true }))
   assert.equal(await s.store.writeIfOwned('someone-else', '{}'), false)
   assert.equal(await s.store.writeIfOwned('mine', '{}'), false)
+})
+
+
+// --- identity, not just a pid ------------------------------------------------
+
+test('a reused pid does not keep a dead lock looking alive', () => {
+  // process.kill(pid, 0) proves only that SOMETHING owns that pid. After a crash — especially after a
+  // reboot, where pids restart low — an unrelated process can hold it, and the lock would read LIVE
+  // forever with stage disabled behind it (Codex, PR #560 round 4). The recorded birth time settles it.
+  assert.equal(
+    isLockOwnerAlive({ ownerPid: process.pid, ownerHost: hostname(), ownerStart: '999999999999' }),
+    false,
+    'same pid, different process',
+  )
+})
+
+test('our own recorded identity still reads as alive', () => {
+  // The other direction, which matters just as much: a live run must never have its own lock recovered.
+  const start = readFileSync(`/proc/${process.pid}/stat`, 'utf8')
+  const ownerStart = start.slice(start.lastIndexOf(')') + 2).split(' ')[19]
+  assert.equal(isLockOwnerAlive({ ownerPid: process.pid, ownerHost: hostname(), ownerStart }), true)
+})
+
+test('a reboot makes a same-host lock definitively dead, whatever holds its pid now', () => {
+  assert.equal(
+    isLockOwnerAlive({ ownerPid: process.pid, ownerHost: hostname(), ownerBoot: '00000000-0000-0000-0000-000000000000' }),
+    false,
+  )
+})
+
+test('a lock from a build that recorded no birth identity is judged as before', () => {
+  // Backwards compatibility: the pid check stands alone rather than the lock becoming unjudgeable.
+  assert.equal(isLockOwnerAlive({ ownerPid: process.pid, ownerHost: hostname() }), true)
+  assert.equal(isLockOwnerAlive({ ownerPid: 4_194_304, ownerHost: hostname() }), false)
+})
+
+// --- lease age is measured by ONE clock --------------------------------------
+
+test('the database’s measurement of lease age wins over the recorded heartbeat', () => {
+  // Two hosts whose clocks differ by more than the TTL disagree about whether a lease is alive: one
+  // steals a healthy run, the other never recovers a dead one. Postgres is the clock everyone shares.
+  const crossHost = lockAt({
+    ownerPid: 1234,
+    ownerHost: 'some-other-box',
+    // The holder's clock says it renewed hours ago — but the holder's clock is wrong.
+    heartbeatAt: new Date(NOW - 10 * LEASE_TTL_MS).toISOString(),
+  })
+  assert.equal(
+    lockRecoveryDecision(crossHost, NOW, 5_000).action,
+    'held',
+    'the database saw it written 5s ago: it is renewing',
+  )
+  assert.equal(
+    lockRecoveryDecision(crossHost, NOW, LEASE_TTL_MS + 5_000).action,
+    'recover',
+    'and when the database agrees it has stopped, it is recoverable',
+  )
+})
+
+test('without a database measurement, the recorded heartbeat is still used', () => {
+  const crossHost = { ownerPid: 1234, ownerHost: 'some-other-box' }
+  assert.equal(
+    lockRecoveryDecision(lockAt({ ...crossHost, heartbeatAt: new Date(NOW - 5_000).toISOString() }), NOW, null).action,
+    'held',
+  )
+  assert.equal(
+    lockRecoveryDecision(lockAt({ ...crossHost, heartbeatAt: new Date(NOW - LEASE_TTL_MS - 5_000).toISOString() }), NOW, null).action,
+    'recover',
+  )
+})
+
+test('a pre-lease lock is still judged on the LEGACY window, not on row age', () => {
+  // Its row is written once and never renewed, so "the database last saw it 3 minutes ago" says nothing
+  // about a lease it does not have. Treating that as an expired lease would recover it far too eagerly.
+  const legacy = lockAt({ token: undefined, ownerPid: undefined, ownerHost: undefined, heartbeatAt: undefined })
+  assert.equal(lockRecoveryDecision(legacy, NOW, LEASE_TTL_MS + 5_000).action, 'wait')
+  assert.equal(lockRecoveryDecision(legacy, NOW, LOCK_STALE_AFTER_MS + 60_000).action, 'recover')
 })
