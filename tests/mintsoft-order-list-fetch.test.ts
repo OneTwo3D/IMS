@@ -534,7 +534,7 @@ test('[o3d-6j8] an authoritative record that ALSO omits the block throws rather 
   detailRows = new Map([['1', { ID: 1, OrderNumber: 'N1', OrderStatusId: 4, ClientId: CLIENT }]])
   await assert.rejects(
     () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
-    /even the authoritative record omits/,
+    /\(authoritative re-read\) reads as dispatched .* but omits/,
   )
 })
 
@@ -644,9 +644,51 @@ test('[o3d-6j8] the authoritative re-reads are CONCURRENCY-BOUNDED (drift cannot
     assert.equal(out.length, 40)
     assert.equal(detailCalls.length, 40)
     assert.ok(detailMaxInFlight <= 4, `at most 4 re-reads in flight (peaked at ${detailMaxInFlight})`)
+    assert.equal(detailMaxInFlight, 4, 'and the pool is actually SATURATED, not serialised')
     // Input order is preserved despite the chunked pool.
     assert.deepEqual(out.map((o) => o.externalOrderId), ids.map(String))
     assert.deepEqual(out.map((o) => o.tracking[0]?.trackingNumber), ids.map((id) => `TN-${id}`))
+  } finally {
+    detailDelayMs = 0
+  }
+})
+
+test('[o3d-6j8] SPARSE incomplete rows still overlap — the pool queues by row, not by chunk', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  detailMaxInFlight = 0
+  detailInFlight = 0
+  detailDelayMs = 10
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // 8 incomplete rows each separated by 9 COMPLETE ones. Chunking all rows in
+  // fours put every incomplete row in a different chunk, so they never overlapped
+  // and cost 8 sequential request latencies — worst exactly when little has drifted.
+  const rows: unknown[] = []
+  const incompleteIds: number[] = []
+  for (let i = 1; i <= 80; i += 1) {
+    if (i % 10 === 0) { rows.push(incompleteRow(i)); incompleteIds.push(i) }
+    else rows.push(row(i))
+  }
+  listResponder = () => rows
+  detailRows = new Map(incompleteIds.map((id) => [String(id), {
+    ID: id, OrderNumber: `N${id}`, OrderStatusId: 4, ClientId: CLIENT,
+    TrackingNumber: `TN-${id}`, CourierServiceName: 'DPD',
+    DespatchDate: '2026-07-15T09:00:00', NumberOfParts: 1,
+  }]))
+
+  try {
+    const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+    assert.equal(out.length, 80)
+    // ONLY the incomplete rows cost a network read.
+    assert.deepEqual(detailCalls.sort((a, b) => Number(a) - Number(b)), incompleteIds.map(String))
+    assert.equal(detailMaxInFlight, 4, `sparse re-reads must still overlap (peaked at ${detailMaxInFlight})`)
+    // Order preserved despite out-of-order completion.
+    assert.deepEqual(out.map((o) => o.externalOrderId), Array.from({ length: 80 }, (_, i) => String(i + 1)))
+    assert.equal(out[9].tracking[0]?.trackingNumber, 'TN-10')
   } finally {
     detailDelayMs = 0
   }

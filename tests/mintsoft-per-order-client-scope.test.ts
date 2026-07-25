@@ -219,3 +219,50 @@ test('[o3d-6j8] a NON-dispatched incomplete record is not refused (only the irre
   const out = await fetchMintsoftOrderStatus('WC-1001', CLIENT)
   assert.equal(out?.dispatched, false)
 })
+
+test('[o3d-6j8] an incomplete dispatched SPLIT PART is refused — no partial shipment is ever pushed', async () => {
+  reset()
+  const { fetchMintsoftOrderParts } = await orders()
+  // Part 1 complete and DESPATCHED; part 2's detail omits the fulfilment block.
+  // Pre-fix part 2 came back dispatched with tracking=[], so reconcileSplitOrder
+  // pushed a partial shipment with null tracking and could complete the order.
+  searchRows = [
+    ownOrder('M-1', { Part: 1, NumberOfParts: 2, TrackingNumber: 'TN-1', DespatchDate: '2026-07-15T09:00:00' }),
+    ownOrder('M-2', { Part: 2, NumberOfParts: 2 }),
+  ]
+  details.set('M-1', ownOrder('M-1', { Part: 1, NumberOfParts: 2, TrackingNumber: 'TN-1', DespatchDate: '2026-07-15T09:00:00' }))
+  details.set('M-2', { ID: 'M-2', OrderNumber: 'WC-1001', OrderStatusId: 4, ClientId: CLIENT, Part: 2 })
+
+  await assert.rejects(
+    () => fetchMintsoftOrderParts('WC-1001', CLIENT),
+    /refusing to apply an incomplete dispatch/,
+  )
+})
+
+test('[o3d-6j8] the completeness refusal is a WmsUnresolvableRecordError (unresolved, NOT a per-link strike)', async () => {
+  reset()
+  const { fetchMintsoftOrderStatus } = await orders()
+  const { isWmsUnresolvableRecordError } = await import('@/lib/connectors/wms/errors')
+  searchRows = [{ ID: 'M-1', OrderNumber: 'WC-1001', OrderStatusId: 4, ClientId: CLIENT }]
+
+  // Systemic drift must NOT dead-letter every link in the tenant, so the sweep has to
+  // be able to tell this apart from an ordinary reconciliation error.
+  const error = await fetchMintsoftOrderStatus('WC-1001', CLIENT).then(() => null, (e) => e)
+  assert.ok(isWmsUnresolvableRecordError(error), `expected a WmsUnresolvableRecordError, got ${error?.name}`)
+})
+
+test('[o3d-6j8] a COMPLETE split reconciles both parts normally', async () => {
+  reset()
+  const { fetchMintsoftOrderParts } = await orders()
+  const complete = (id: string, part: number) => ownOrder(id, {
+    Part: part, NumberOfParts: 2, TrackingNumber: `TN-${part}`, DespatchDate: '2026-07-15T09:00:00',
+  })
+  searchRows = [complete('M-1', 1), complete('M-2', 2)]
+  details.set('M-1', complete('M-1', 1))
+  details.set('M-2', complete('M-2', 2))
+
+  const parts = await fetchMintsoftOrderParts('WC-1001', CLIENT)
+  assert.equal(parts.length, 2)
+  assert.deepEqual(parts.map((p) => p.dispatched), [true, true])
+  assert.deepEqual(parts.map((p) => p.tracking[0]?.trackingNumber), ['TN-1', 'TN-2'])
+})

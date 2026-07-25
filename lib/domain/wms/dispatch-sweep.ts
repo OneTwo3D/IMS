@@ -5,6 +5,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
+import { isWmsUnresolvableRecordError } from '@/lib/connectors/wms/errors'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
 import { getSettingValue } from '@/lib/settings-store'
@@ -659,7 +660,16 @@ export async function runWmsDispatchSweepCore(
     try {
       outcome = await reconcileOneOrder(deps, candidate, preload, expectedExternalOrderId, requireResolution, mergeNumberUnique)
     } catch (error) {
-      outcome = { action: 'error', reason: scrubWmsError(error, 'WMS dispatch sweep error') }
+      // A record the WMS gave us that we cannot ACT on (o3d-6j8: dispatched but
+      // missing the fulfilment fields) is UNRESOLVED, not a per-link error. It is
+      // connector-level drift, not damage to this order — counting it as an error
+      // would strike the link and, under systemic drift, dead-letter every active
+      // link in turn: excluded from the candidate queries, one admin notification
+      // each, and manual replay needed even after the WMS recovers. Unresolved holds
+      // the watermark and marks the job PARTIAL while links stay eligible.
+      outcome = isWmsUnresolvableRecordError(error)
+        ? { action: 'pending', reason: scrubWmsError(error, 'WMS record unusable'), unresolved: true }
+        : { action: 'error', reason: scrubWmsError(error, 'WMS dispatch sweep error') }
     }
     // Any error — or a pending we could not actually RESOLVE — holds the watermark
     // back so a changed row can't age out of the next window before it's applied.
