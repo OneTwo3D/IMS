@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS } from '@/lib/security/connector-fetch'
 
 /**
  * A durable, cross-process mutex around Mintsoft authentication (o3d-092/o3d-8u7).
@@ -29,20 +30,41 @@ import { db } from '@/lib/db'
 const LOCK_KEY = 'mintsoft_auth_lock'
 
 /**
- * How long a lease survives WITHOUT renewal. Kept short so a crashed holder
- * unblocks others quickly; a live holder keeps it alive by heartbeat, so this
- * is not a ceiling on how long the protected work may take.
+ * How long a lease survives WITHOUT renewal.
  *
- * A fixed TTL alone would be unsound: CONNECTOR_FETCH_TIMEOUT_MS is
- * env-configurable and can exceed any constant we pick, and a stalled process
- * can too. The lease would then expire mid-flight, another caller would take
- * it, and the overlap this lock exists to prevent would be back — silently.
- * Hence renewal plus the fence below.
+ * This is a SAFETY bound, not a convenience one. Taking over an expired lease
+ * is only sound if the previous holder's `/api/Auth` request can no longer be
+ * in flight — otherwise a delayed login lands after the replacement holder has
+ * verified and committed fixed-key mode, rotating that key and taking every
+ * shared integration offline. Detecting that afterwards is useless: the
+ * rotation already happened at Mintsoft.
+ *
+ * So the TTL is derived from the connector fetch timeout (which is
+ * env-configurable via CONNECTOR_FETCH_TIMEOUT_MS, and which a fixed constant
+ * therefore could not safely bound) with a wide margin for the surrounding
+ * persist and for clock skew. Combined with the heartbeat below, a lease that
+ * is genuinely expired implies the holder's request has already timed out.
+ *
+ * Residual risk, stated plainly: a process suspended longer than this (SIGSTOP,
+ * a VM pause) could still resume mid-request after takeover. Bounding that
+ * needs a fencing token Mintsoft would have to honour, which the API does not
+ * offer. Tracked on o3d-8u7.
  */
-const LEASE_TTL_MS = 30_000
+function leaseTtlMs(): number {
+  const configured = Number(process.env.CONNECTOR_FETCH_TIMEOUT_MS)
+  const fetchTimeout = Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS
+  return Math.max(60_000, fetchTimeout * 2 + 30_000)
+}
 
-/** Renew comfortably inside the TTL so one slow round trip can't lose it. */
-const RENEW_INTERVAL_MS = 10_000
+/**
+ * Renew often relative to the TTL, so a single slow renewal (a brief DB stall)
+ * cannot cost us the lease.
+ */
+function renewIntervalMs(): number {
+  return Math.max(5_000, Math.floor(leaseTtlMs() / 6))
+}
 
 /** How long a caller waits for a busy lease before giving up. */
 const DEFAULT_WAIT_MS = 30_000
@@ -55,7 +77,7 @@ function nowIso(): string {
 }
 
 function expiryIso(fromMs: number): string {
-  return new Date(fromMs + LEASE_TTL_MS).toISOString()
+  return new Date(fromMs + leaseTtlMs()).toISOString()
 }
 
 /**
@@ -149,7 +171,7 @@ export async function withMintsoftAuthLock<T>(
   let lost = false
   const heartbeat = setInterval(() => {
     void renew(token).then((ok) => { if (!ok) lost = true }, () => { /* transient; try again next tick */ })
-  }, RENEW_INTERVAL_MS)
+  }, renewIntervalMs())
   // Don't hold the event loop open on the heartbeat alone.
   if (typeof heartbeat.unref === 'function') heartbeat.unref()
 
