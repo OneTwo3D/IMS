@@ -2734,6 +2734,18 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           {inv.settlement.status === 'PARTIALLY_SETTLED' && ' · PART PAID IN LEDGER'}
                         </span>
                       )}
+                      {!inv.paidAt && inv.settlement.status === 'LEDGER_UNMATCHED' && (
+                        /* Not paid HERE, but the ledger holds a payment for it. Without its own chip the
+                           disagreement pointing this way would be the one nobody could see, since the
+                           badge above only renders for a bill IMS believes is paid. */
+                        <span
+                          className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium border-red-200 bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300 dark:border-red-800"
+                          title={inv.settlement.detail}
+                        >
+                          <AlertTriangle className="h-3 w-3" />
+                          PAID IN LEDGER ONLY
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-3 text-xs text-muted-foreground">
                       <span>{formatDateTime(inv.invoiceDate, { day: 'numeric', month: 'short', year: 'numeric' })}</span>

@@ -41,6 +41,8 @@ export type SettlementStatus =
   | 'NOT_SENT'
   /** Paid in IMS while the accounting connector is off. Not a fault; nothing is expected to post. */
   | 'NOT_APPLICABLE'
+  /** NOT paid in IMS, yet the ledger holds a payment for it. The disagreement pointing the other way. */
+  | 'LEDGER_UNMATCHED'
 
 export type SettlementVerdict = {
   status: SettlementStatus
@@ -67,6 +69,23 @@ export function settlementStatus(input: {
   totalForeign?: number | null
 }): SettlementVerdict {
   if (!input.paidLocally) {
+    // THE DISAGREEMENT POINTING THE OTHER WAY. Deleting a receipt whose registration already reached the
+    // ledger succeeds locally — the payment is still attached to the invoice there, and paidAt clears
+    // here. Returning a flat UNPAID without looking at the payment row hid exactly the case this exists
+    // to surface, just mirrored (Codex, PR #582 round 1). A FAILED or CANCELLED row holds nothing in the
+    // ledger, so it is genuinely unpaid on both sides.
+    const p = input.payment
+    const heldByLedger = p && (p.status === 'SYNCED' || p.status === 'PROCESSING' || p.status === 'PENDING')
+    if (heldByLedger) {
+      return {
+        status: 'LEDGER_UNMATCHED',
+        discrepancy: true,
+        detail:
+          'This is NOT marked as paid in IMS, but a payment for it was sent to the ledger' +
+          (p.externalTransactionId ? ` (payment ${p.externalTransactionId})` : '') +
+          '. The ledger shows it settled while IMS does not — reverse the payment there, or restore it here.',
+      }
+    }
     return { status: 'UNPAID', discrepancy: false, detail: 'Not marked as paid.' }
   }
 
@@ -222,18 +241,30 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
  * The total the LEDGER's copy of a sales invoice was actually built at, which is what a payment against
  * it has to match — not necessarily the order total IMS shows.
  *
- * On a tax-INCLUSIVE order the two differ: the invoice is constructed at the NET total (WC REST line
- * amounts are always net but are sent flagged tax-inclusive) — that is o3d-cyn, an invoice-construction
- * defect with its own issue. A payment that matches the invoice IMS really posted is not a SETTLEMENT
- * discrepancy, and reporting it as one would send an operator to the payment when the invoice is what is
- * wrong. Same reasoning as the documentPosted branch above: name the fault people can act on.
+ * They differ in ONE case: a tax-inclusive order IMPORTED FROM A SHOP. WC REST line amounts are always
+ * net, and order-import sends them flagged tax-inclusive, so Xero reads the net figure as the gross one
+ * and the invoice posts at the NET total. That is o3d-cyn, an invoice-construction defect with its own
+ * issue. A payment that matches the invoice IMS really posted is not a SETTLEMENT discrepancy, and
+ * reporting it as one would send an operator to the payment when the invoice is what is wrong — the same
+ * reasoning as the documentPosted branch above: name the fault people can act on.
  *
- * When o3d-cyn lands, tax-inclusive invoices post at gross and this collapses to `totalForeign`.
+ * A tax-inclusive order raised IN IMS is NOT affected: queueSalesInvoiceSync sends the GROSS unit prices
+ * (and grosses shipping up) before flagging them inclusive, so that invoice posts at the order total.
+ * Keying on pricesIncludeVat ALONE understated it — and since a hand-recorded receipt is for the gross
+ * the customer paid, the over-pay guard then refused every ordinary VAT receipt it exists to allow
+ * (Codex, PR #582 round 1).
+ *
+ * When o3d-cyn lands, imported tax-inclusive invoices post at gross too and this collapses to
+ * `totalForeign`.
  */
 export function ledgerSalesInvoiceTotalForeign(input: {
   totalForeign: number
   taxForeign: number
   pricesIncludeVat: boolean
+  /** Did this order arrive from a shop connector (WooCommerce), rather than being raised in IMS? */
+  importedFromShop: boolean
 }): number {
-  return input.pricesIncludeVat ? input.totalForeign - input.taxForeign : input.totalForeign
+  return input.pricesIncludeVat && input.importedFromShop
+    ? input.totalForeign - input.taxForeign
+    : input.totalForeign
 }

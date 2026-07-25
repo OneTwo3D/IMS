@@ -242,14 +242,58 @@ test('a confirmed payment with no recorded amount makes the SUM unknown, not zer
 // ---------------------------------------------------------------------------
 
 test('a tax-exclusive invoice posts at the order total', () => {
-  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: false }), 120)
+  for (const importedFromShop of [true, false]) {
+    assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: false, importedFromShop }), 120)
+  }
 })
 
-test('a tax-inclusive invoice posts at the NET total (o3d-cyn), which is what a payment must match', () => {
+test('an IMPORTED tax-inclusive invoice posts at the NET total (o3d-cyn), which is what a payment must match', () => {
   // Not a claim that net is correct — o3d-cyn is the defect that builds it that way. But a payment that
   // matches the invoice IMS really posted is not a SETTLEMENT fault, and reporting it as one would send
   // an operator to the payment when the invoice is what is wrong.
-  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true }), 100)
+  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: true }), 100)
   const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows([row({ amount: 100 })])!, totalForeign: 100 })
   assert.equal(v.status, 'SETTLED')
+})
+
+test('a tax-inclusive order raised IN IMS posts at GROSS — the receipt it must match is the gross one', () => {
+  // queueSalesInvoiceSync sends the gross unit prices (and grosses shipping up) before flagging them
+  // inclusive, so o3d-cyn does not touch this path. Keying on pricesIncludeVat alone understated the
+  // invoice, and the over-pay guard then refused every ordinary VAT receipt it exists to allow.
+  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: false }), 120)
+})
+
+// ---------------------------------------------------------------------------
+// The disagreement pointing the OTHER way
+// ---------------------------------------------------------------------------
+
+test('a ledger payment for something IMS does not claim is a discrepancy, not "unpaid"', () => {
+  // Deleting a receipt whose registration already reached the ledger succeeds locally: the payment stays
+  // attached to the invoice there while paidAt clears here. A flat UNPAID hid exactly the case this
+  // exists to surface, mirrored.
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ externalTransactionId: 'PAY-9' }) })
+  assert.equal(v.status, 'LEDGER_UNMATCHED')
+  assert.equal(v.discrepancy, true)
+  assert.match(v.detail, /PAY-9/)
+})
+
+test('a payment still on its way also counts as the ledger holding it', () => {
+  for (const status of ['PENDING', 'PROCESSING'] as const) {
+    const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status, externalTransactionId: null }) })
+    assert.equal(v.status, 'LEDGER_UNMATCHED', status)
+  }
+})
+
+test('a rejected or cancelled payment leaves an unclaimed order genuinely unpaid', () => {
+  for (const status of ['FAILED', 'CANCELLED'] as const) {
+    const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status, externalTransactionId: null }) })
+    assert.equal(v.status, 'UNPAID', status)
+    assert.equal(v.discrepancy, false, status)
+  }
+})
+
+test('an order with no payment at all is simply unpaid', () => {
+  const v = settlementStatus({ ...base, paidLocally: false, payment: null })
+  assert.equal(v.status, 'UNPAID')
+  assert.equal(v.discrepancy, false)
 })

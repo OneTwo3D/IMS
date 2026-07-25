@@ -791,6 +791,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         totalForeign: Number(so.totalForeign),
         taxForeign: Number(so.taxForeign),
         pricesIncludeVat: so.pricesIncludeVat,
+        importedFromShop: so.shoppingLinks.length > 0,
       }),
     ),
   })
@@ -2827,7 +2828,10 @@ async function registerInvoicePaymentWithLedger(params: {
       isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false),
       db.salesOrder.findUnique({
         where: { id: params.orderId },
-        select: { accountingInvoiceId: true, currency: true, totalForeign: true, taxForeign: true, pricesIncludeVat: true },
+        select: {
+          accountingInvoiceId: true, currency: true, totalForeign: true, taxForeign: true, pricesIncludeVat: true,
+          shoppingLinks: { select: { connector: true }, take: 1 },
+        },
       }),
       getActiveAccountingConnectorInfo().catch(() => null),
     ])
@@ -2850,6 +2854,9 @@ async function registerInvoicePaymentWithLedger(params: {
         totalForeign: Number(so.totalForeign),
         taxForeign: Number(so.taxForeign),
         pricesIncludeVat: so.pricesIncludeVat,
+        // Only an IMPORTED tax-inclusive invoice posts at NET (o3d-cyn). An order raised in IMS posts at
+        // gross, and measuring its gross receipt against a net total refused every ordinary VAT receipt.
+        importedFromShop: so.shoppingLinks.length > 0,
       }),
     })
 
@@ -2906,25 +2913,38 @@ async function registerInvoicePaymentWithLedger(params: {
       }
     }
 
-    await queueAccountingSync({
-      type: 'INVOICE_PAYMENT',
-      referenceType: 'SalesOrder',
-      referenceId: params.orderId,
-      payload: {
-        accountingInvoiceId: so.accountingInvoiceId,
-        bankAccountId: decision.bankAccountId,
-        amount: params.amount,
-        currency: params.currency,
-        paymentDate: params.paidAt.toISOString().slice(0, 10),
-        method: params.method ?? '',
-        reference: params.reference ?? undefined,
-        // Which local receipt this is, so deletePayment can retract exactly this row rather than any row
-        // that happens to share its amount.
-        paymentId: params.paymentId,
-      },
-      // Exactly once per recorded receipt, however many times this runs.
-      idempotencyKey: `invoice-payment:payment:${params.paymentId}`,
-    })
+    // ENQUEUE UNDER THE ORDER LOCK, and only if the receipt is still there. The Payment row committed
+    // before this runs, and deletePayment cancels a queued registration by looking for one — so a delete
+    // landing in between saw nothing to cancel, and this then posted a payment to the ledger for a
+    // receipt IMS had already deleted, with no warning anywhere (Codex, PR #582 round 1).
+    //
+    // deletePayment takes the same per-order lock, so serialising on it closes the window in both
+    // directions: either we find the payment gone and do nothing, or we queue first and the delete finds
+    // our row and retracts it.
+    await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${params.orderId} FOR UPDATE`
+      const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
+      if (!stillRecorded) return
+      await queueAccountingSyncTx(tx, {
+        type: 'INVOICE_PAYMENT',
+        referenceType: 'SalesOrder',
+        referenceId: params.orderId,
+        payload: {
+          accountingInvoiceId: so.accountingInvoiceId,
+          bankAccountId: decision.bankAccountId,
+          amount: params.amount,
+          currency: params.currency,
+          paymentDate: params.paidAt.toISOString().slice(0, 10),
+          method: params.method ?? '',
+          reference: params.reference ?? undefined,
+          // Which local receipt this is, so deletePayment can retract exactly this row rather than any
+          // row that happens to share its amount.
+          paymentId: params.paymentId,
+        },
+        // Exactly once per recorded receipt, however many times this runs.
+        idempotencyKey: `invoice-payment:payment:${params.paymentId}`,
+      })
+    }, STOCK_TX_OPTIONS)
   } catch (e) {
     // Same shape as markBillPaid's queue failure: the receipt is recorded in IMS with nothing queued to
     // tell the ledger, so nothing will ever retry and there is no FAILED row to notice — the row was

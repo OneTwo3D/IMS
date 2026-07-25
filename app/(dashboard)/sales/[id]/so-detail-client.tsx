@@ -963,6 +963,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     : settlement.status === 'LEDGER_REJECTED' ? ' · LEDGER REJECTED'
     : settlement.status === 'NOT_SENT' ? ' · NOT SENT TO LEDGER'
     : settlement.status === 'PARTIALLY_SETTLED' ? ' · PART PAID IN LEDGER'
+    : settlement.status === 'LEDGER_UNMATCHED' ? ' · PAID IN LEDGER ONLY'
     : ''
   const settlementTone =
     settlement.discrepancy
@@ -1042,6 +1043,17 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           >
             {settlement.discrepancy && <AlertTriangle className="h-3.5 w-3.5" />}
             Part. Paid{settlementSuffix}
+          </span>
+        )}
+        {settlement.status === 'LEDGER_UNMATCHED' && (
+          /* The disagreement pointing the other way: nothing is paid here, so neither badge above renders
+             — and without its own chip the state with NO local claim would be the one nobody could see. */
+          <span
+            className="inline-flex items-center gap-1 rounded-full border px-3 py-1 text-sm font-medium bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200"
+            title={settlement.detail}
+          >
+            <AlertTriangle className="h-3.5 w-3.5" />
+            PAID IN LEDGER ONLY
           </span>
         )}
 
