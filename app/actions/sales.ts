@@ -3249,11 +3249,34 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       // in the ledger" warning about a payment that had nothing to do with the deletion (Codex, PR #582
       // round 2). A row that names no payment is nobody's to retract.
       const matchingLogs = paymentLogs.filter((log) => payloadPaymentId(log.payload) === paymentId)
+      // RETIRE the queued registration, guarded on the status we read — do not delete it blind. A worker
+      // can claim the row between the read above and this write, and deleting it then erased the only
+      // record of a payment the worker went on to post: the ledger kept the money, IMS kept nothing, not
+      // even the warning below (Codex, PR #582 round 3).
+      //
+      // CANCELLED rather than deleted, because that is the retirement the processor already understands —
+      // it re-reads the live status after claiming and treats CANCELLED as an intentional no-op — and it
+      // leaves the audit trail intact. The verdict reads a CANCELLED row as holding nothing, so an order
+      // whose only receipt was deleted goes back to plainly unpaid.
       const pendingIds = matchingLogs.filter((log) => log.status === 'PENDING').map((log) => log.id)
+      let claimedUnderUs: string[] = []
       if (pendingIds.length > 0) {
-        await db.accountingSyncLog.deleteMany({ where: { id: { in: pendingIds } } })
+        await db.accountingSyncLog.updateMany({
+          where: { id: { in: pendingIds }, status: 'PENDING' },
+          data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
+        })
+        // Whichever ids did NOT transition were taken by a worker first, so they belong with the rows
+        // that need reversing in the ledger rather than being silently forgotten.
+        const survivors = await db.accountingSyncLog.findMany({
+          where: { id: { in: pendingIds }, status: { in: ['PROCESSING', 'SYNCED'] } },
+          select: { id: true },
+        })
+        claimedUnderUs = survivors.map((row) => row.id)
       }
-      const externalLogs = matchingLogs.filter((log) => log.status === 'PROCESSING' || log.status === 'SYNCED')
+      const externalLogs = [
+        ...matchingLogs.filter((log) => log.status === 'PROCESSING' || log.status === 'SYNCED'),
+        ...claimedUnderUs.map((id) => ({ id })),
+      ]
       if (externalLogs.length > 0) {
         await logActivity({
           entityType: 'SALES_ORDER',
