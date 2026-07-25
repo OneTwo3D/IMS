@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { Prisma } from '@/app/generated/prisma/client'
 import { INTEGRATION_OUTBOX_STATUS, type IntegrationOutboxClient, type IntegrationOutboxRow } from '@/lib/domain/integrations/outbox'
 import {
   buildXeroAccountingOutboxIdempotencyKey,
@@ -10,12 +9,14 @@ import {
   XERO_ACCOUNTING_POST_OPERATION,
   XERO_OUTBOX_CONNECTOR,
 } from '@/lib/connectors/xero/outbox'
+import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
+// o3d-5od: the REAL @prisma/adapter-pg shape (no meta.target, quoted column), not a
+// hand-built meta.target that production never produces.
 function uniqueError() {
-  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
-    code: 'P2002',
-    clientVersion: 'test',
-    meta: { target: ['idempotencyKey'] },
+  return adapterUniqueViolation(['idempotencyKey'], {
+    modelName: 'IntegrationOutbox',
+    constraintName: 'integration_outbox_idempotencyKey_key',
   })
 }
 

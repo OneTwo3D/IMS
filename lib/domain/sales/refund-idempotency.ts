@@ -1,19 +1,17 @@
-import { Prisma } from '@/app/generated/prisma/client'
+import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 
-const EXTERNAL_REFUND_ID_TARGETS = new Set([
-  'externalRefundId',
-  'sales_order_refunds_externalRefundId_key',
-])
-
-function targetMentionsExternalRefundId(target: unknown): boolean {
-  if (Array.isArray(target)) {
-    return target.some((part) => targetMentionsExternalRefundId(part))
-  }
-  if (typeof target !== 'string') return false
-  return EXTERNAL_REFUND_ID_TARGETS.has(target)
-}
-
+/**
+ * Is this the `sales_order_refunds.externalRefundId` unique violation — i.e. the connector
+ * refund this request carries has already been turned into an IMS refund?
+ *
+ * o3d-5od: this used to read `error.meta.target` only, which the pg driver adapter never
+ * populates, so a duplicate WooCommerce refund delivery surfaced as a hard failure instead
+ * of being deduped. See lib/db/prisma-unique-violation.ts.
+ *
+ * Still deliberately narrow: `externalRefundIdHash` or a `tenantExternalRefundIdKey`-style
+ * constraint must NOT match, so the field name is matched exactly (or as the column inside
+ * Postgres' default `<table>_externalRefundId_key` constraint name), never as a substring.
+ */
 export function isExternalRefundIdUniqueConflict(error: unknown): boolean {
-  if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') return false
-  return targetMentionsExternalRefundId(error.meta?.target)
+  return uniqueViolationTargetsField(error, 'externalRefundId')
 }

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { Prisma } from '@/app/generated/prisma/client'
 import { syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
+import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 function makeRefund(overrides: Partial<WcRefund> = {}): WcRefund {
   return {
@@ -37,11 +37,11 @@ function makeRefund(overrides: Partial<WcRefund> = {}): WcRefund {
   }
 }
 
+// o3d-5od: the REAL @prisma/adapter-pg shape (no meta.target, quoted column).
 function externalRefundIdUniqueError() {
-  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
-    code: 'P2002',
-    clientVersion: 'test',
-    meta: { target: ['externalRefundId'] },
+  return adapterUniqueViolation(['externalRefundId'], {
+    modelName: 'SalesOrderRefund',
+    constraintName: 'sales_order_refunds_externalRefundId_key',
   })
 }
 

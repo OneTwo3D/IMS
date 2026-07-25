@@ -1,5 +1,9 @@
-import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import {
+  isUniqueConstraintViolation,
+  uniqueConstraintFields,
+  uniqueViolationTargetsField,
+} from '@/lib/db/prisma-unique-violation'
 import { parseIntegrationOutboxPayload } from '@/lib/domain/integrations/outbox-registry'
 
 export const INTEGRATION_OUTBOX_STATUS = {
@@ -189,13 +193,22 @@ export function buildOutboxIdempotencyKey(
   return [connector, operation, ...parts].map(normalizeIdempotencyPart).join(':')
 }
 
+/**
+ * Is this the `integration_outbox.idempotencyKey` unique violation — i.e. this work item is
+ * already queued and the enqueue is a benign replay?
+ *
+ * o3d-5od: the `meta.target` reading this replaced never matched under the pg driver adapter.
+ * It only kept working here because of the `target == null && modelName === 'IntegrationOutbox'`
+ * fallback below, which treated EVERY P2002 on the model as an idempotency-key conflict. Now
+ * that the violated column is readable, that fallback is narrowed to the case where the error
+ * genuinely names no constraint at all, so a future second unique index on IntegrationOutbox
+ * cannot be silently swallowed as a duplicate enqueue.
+ */
 function isIdempotencyKeyConflict(error: unknown): boolean {
-  if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') return false
-  const target = error.meta?.target
-  if (target == null && error.meta?.modelName === 'IntegrationOutbox') return true
-  return Array.isArray(target)
-    ? target.includes('idempotencyKey')
-    : String(target).includes('idempotencyKey')
+  if (!isUniqueConstraintViolation(error)) return false
+  if (uniqueViolationTargetsField(error, 'idempotencyKey')) return true
+  return uniqueConstraintFields(error) === null
+    && (error as { meta?: { modelName?: unknown } }).meta?.modelName === 'IntegrationOutbox'
 }
 
 function dueAtOrBefore(now: Date): unknown {

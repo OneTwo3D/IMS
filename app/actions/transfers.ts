@@ -16,6 +16,7 @@ import {
   copyCostLayerSourceLinesProportionally,
   createCostLayer,
 } from '@/lib/cost-layers'
+import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { planTransferPartialReceipt } from '@/lib/domain/inventory/transfer-partial-receipt'
 import { isStockMovementIdempotencyConflict } from '@/lib/domain/inventory/stock-movement-idempotency'
@@ -285,10 +286,10 @@ export async function createTransfer(
       } catch (e) {
         // Only retry a unique-constraint (P2002) collision on the `reference`
         // field — don't mask any other (future/nested) unique violation.
-        const err = e as { code?: string; meta?: { target?: unknown } } | null
-        const target = err?.meta?.target
-        const isReferenceCollision = err?.code === 'P2002'
-          && (Array.isArray(target) ? target.includes('reference') : String(target ?? '').includes('reference'))
+        // o3d-5od: this used to read `meta.target`, which the pg driver adapter never
+        // populates, so the auto-reference retry never actually fired and a colliding
+        // generated reference failed the whole action.
+        const isReferenceCollision = uniqueViolationTargetsField(e, 'reference')
         if (useAutoReference && attempt < maxAttempts && isReferenceCollision) continue
         throw e
       }

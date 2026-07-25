@@ -9,6 +9,7 @@ import {
   type ShipmentServiceClient,
 } from '@/lib/domain/sales/shipment-service'
 import { SHIPMENT_STATUSES } from '@/lib/domain/workflows/status-types'
+import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 type Order = {
   id: string
@@ -41,11 +42,11 @@ type ShipmentLine = {
 type StockLevel = { productId: string; warehouseId: string; quantity: number; reservedQty: number }
 type CostLayer = { id: string; productId: string; warehouseId: string; remainingQty: number; unitCostBase: number }
 
+// o3d-5od: the REAL @prisma/adapter-pg shape (no meta.target, quoted column).
 function uniqueStockMovementError() {
-  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
-    code: 'P2002',
-    clientVersion: 'test',
-    meta: { target: ['idempotencyKey'] },
+  return adapterUniqueViolation(['idempotencyKey'], {
+    modelName: 'StockMovement',
+    constraintName: 'stock_movements_idempotencyKey_key',
   })
 }
 

@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { Prisma } from '@/app/generated/prisma/client'
 import {
   runAccountingEventBackfill,
   type AccountingEventBackfillReport,
   type RunAccountingEventBackfillOptions,
 } from '@/lib/domain/accounting/accounting-event-backfill'
+import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 type SyncLog = {
   id: string
@@ -257,11 +257,11 @@ function resultBySyncLog(report: AccountingEventBackfillReport, syncLogId: strin
   return result
 }
 
-function uniqueError(target: string[]) {
-  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
-    code: 'P2002',
-    clientVersion: 'test',
-    meta: { target },
+// o3d-5od: the REAL @prisma/adapter-pg shape (no meta.target, quoted columns).
+function uniqueError(columns: string[]) {
+  return adapterUniqueViolation(columns, {
+    modelName: 'AccountingEvent',
+    constraintName: `accounting_events_${columns.join('_')}_key`,
   })
 }
 
