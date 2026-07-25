@@ -32,6 +32,32 @@ Official guide: <https://developer.xero.com/documentation/getting-started-guide/
 
 Like other integrations, Xero sync is gated behind a successful connection test. The fingerprint includes the Client ID, expected tenant ID, and authenticated tenant ID/name. If you rotate the Client Secret or re-authorise to a different Xero tenant, re-test before activating sync.
 
+### Permissions (scopes), and why a reconnect is sometimes required
+
+When you authorise IMS, Xero grants a fixed set of **permissions** — invoices, contacts, payments,
+manual journals, attachments, settings. **That grant is frozen at the moment you connect.** Refreshing
+the access token does not widen it: a refreshed token carries exactly the permissions the original
+consent screen granted.
+
+So when a new IMS release needs a permission an older connection never granted, the syncs that need it
+fail — and *only* those. Everything else keeps working, which is what makes it hard to spot. This is
+not hypothetical: the `accounting.payments` permission was added for payment registration, and on
+connections made before it, every invoice and bill was posted and marked paid in IMS while Xero never
+recorded the payment at all.
+
+IMS now records what Xero actually granted and checks it before running a sync that needs a particular
+permission:
+
+- The **Sync** tab shows a **"Reconnect required"** warning naming the missing permission(s).
+- Affected rows fail with `REQUIRES RECONNECT: …`, naming the permission and stating that **nothing was
+  sent** — instead of a bare `401 AuthorizationUnsuccessful` that could be any of a dozen causes.
+- The fix is always the same: **Reconnect** on the Connection tab and approve the consent screen. Then
+  retry the failed rows from the **Logs** tab.
+
+A connection made before IMS started recording grants has no record of its permissions. Those are
+treated as *unknown*, not as *missing* — nothing is blocked, and the record fills in on the next
+reconnect. QuickBooks connections do not record grants and never show this warning.
+
 ### Disconnecting
 
 Disconnecting removes the stored token **and forgets every Xero ID the IMS had cached** — the Xero

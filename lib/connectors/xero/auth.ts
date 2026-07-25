@@ -15,6 +15,7 @@ import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clearXeroReferenceCache } from './api'
+import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from './scopes'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_CONNECTOR = 'xero'
@@ -23,19 +24,21 @@ const XERO_OAUTH_STATE_TTL_MS = 10 * 60 * 1000 // 10 minutes
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections'
 const XERO_ORGANISATION_URL = 'https://api.xero.com/api.xro/2.0/Organisation'
-// accounting.payments is REQUIRED to POST /Payments — i.e. to register a customer payment against a sales
-// invoice (INVOICE_PAYMENT) or a supplier payment against a bill (BILL_PAYMENT). Xero's granular scopes put
-// payments in accounting.payments; accounting.invoices covers invoices/credit notes but NOT payments, so
-// without this the payment POST returns 401 AuthorizationUnsuccessful while every invoice/journal succeeds.
-// NB adding a scope only takes effect after a RECONNECT (re-consent): a refreshed token carries only the
-// scopes granted at the original consent. (Latent bug surfaced by the full-chain OC-15 payment test.)
-const XERO_SCOPES = 'openid profile email offline_access accounting.settings accounting.contacts accounting.invoices accounting.payments accounting.manualjournals accounting.attachments'
+// The scope list lives in ./scopes alongside the per-sync-type requirements and the validation, so what
+// we ASK for and what we CHECK can never drift apart (o3d-g2i). Adding a scope only takes effect after a
+// RECONNECT: a refreshed token carries only the scopes granted at the original consent, which is why the
+// grant is now recorded and checked rather than assumed.
 
 type TokenResponse = {
   access_token: string
   refresh_token?: string
   expires_in: number
   token_type: string
+  /**
+   * What Xero granted. NOT guaranteed to be present, and may be a string or an array — the authoritative
+   * copy is the `scope` claim inside the access-token JWT, which scopesFromTokenResponse falls back to.
+   */
+  scope?: string | string[]
 }
 
 type XeroConnection = {
@@ -52,6 +55,7 @@ type StoredAccountingToken = {
   expiresAt: Date
   tenantId: string
   tenantName: string | null
+  grantedScopes: string | null
 }
 
 type OAuthStatePayload = {
@@ -96,6 +100,7 @@ async function readStoredToken(): Promise<StoredAccountingToken | null> {
     expiresAt: row.expiresAt,
     tenantId: row.tenantId,
     tenantName: row.tenantName,
+    grantedScopes: row.grantedScopes,
   }
 }
 
@@ -105,6 +110,7 @@ async function upsertStoredToken(params: {
   expiresAt: Date
   tenantId: string
   tenantName: string | null
+  grantedScopes: string | null
 }): Promise<void> {
   const data = {
     connector: XERO_CONNECTOR,
@@ -113,6 +119,7 @@ async function upsertStoredToken(params: {
     expiresAt: params.expiresAt,
     tenantId: params.tenantId,
     tenantName: params.tenantName,
+    grantedScopes: params.grantedScopes,
   }
   await db.accountingToken.upsert({
     where: { connector: XERO_CONNECTOR },
@@ -220,7 +227,7 @@ export async function getAuthorizationUrl(
     response_type: 'code',
     client_id: clientId,
     redirect_uri: redirectUri,
-    scope: XERO_SCOPES,
+    scope: XERO_SCOPE_STRING,
     state,
   })
   return `${XERO_AUTHORIZE_URL}?${params.toString()}`
@@ -329,6 +336,11 @@ export async function exchangeCodeForTokens(
       expiresAt,
       tenantId: conn.tenantId,
       tenantName: conn.tenantName,
+      // What was actually GRANTED, which is not necessarily what we asked for: the operator can decline
+      // individual scopes on the consent screen, and Xero says so here rather than at the failing call.
+      // Read from the response field OR the access-token JWT claim — the top-level field is not
+      // guaranteed, and taking null from its absence would leave validation off on a fresh reconnect.
+      grantedScopes: scopesFromTokenResponse(tokenData),
     })
     await pinTenantId(conn.tenantId)
 
@@ -390,6 +402,12 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
         expiresAt,
         tenantId: token.tenantId,
         tenantName: token.tenantName,
+        // A refresh CANNOT widen a grant — it returns the scopes the original consent carried. Keeping
+        // the stored value when the response says nothing is therefore right; overwriting it with null
+        // would silently turn a known-deficient grant back into "unknown", which validation lets through.
+        // It is also how a pre-existing connection FILLS IN its record without a reconnect: the JWT
+        // fallback reads the grant off the new access token.
+        grantedScopes: scopesFromTokenResponse(data) ?? token.grantedScopes,
       })
 
       return { accessToken: data.access_token, tenantId: token.tenantId }
@@ -445,4 +463,18 @@ export async function isConnected(): Promise<{ connected: boolean; tenantName?: 
   const token = await readStoredToken()
   if (!token) return { connected: false }
   return { connected: true, tenantName: token.tenantName ?? undefined }
+}
+
+/**
+ * The scopes this connection was actually GRANTED, or null when that was never recorded (o3d-g2i).
+ *
+ * The null is load-bearing and must be passed through rather than defaulted to []: a token stored before
+ * the grant was recorded knows nothing about its own scopes, and treating that as "granted nothing" would
+ * block every scope-dependent sync on every installation the moment this shipped. Unknown means "let Xero
+ * answer"; only a grant we have read and found wanting stops anything.
+ */
+export async function getGrantedScopes(): Promise<string[] | null> {
+  const token = await readStoredToken()
+  if (!token) return null
+  return parseGrantedScopes(token.grantedScopes)
 }

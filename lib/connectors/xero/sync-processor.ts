@@ -11,6 +11,8 @@ import { pushSalesInvoice, updateSalesInvoice } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
 import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
+import { getGrantedScopes } from './auth'
+import { blockingScopeFor, scopeBlockedError } from './scopes'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -1104,6 +1106,18 @@ async function processEntry(
   claimedAt: Date,
 ): Promise<EntryResult> {
   const postingMode = payload._postingMode
+
+  // A MISSING SCOPE IS A CONFIGURATION FAULT, NOT AN API ERROR (o3d-g2i). Adding a scope to the
+  // authorization URL only affects future consents, so a connection made before it keeps 401ing
+  // AuthorizationUnsuccessful on exactly the calls that scope covers — while every other sync looks
+  // healthy. That is how payment registration shipped broken: invoices and bills posted, were marked
+  // paid locally, and were never settled in Xero. Refusing here means the row fails with something an
+  // operator can act on ("reconnect to grant accounting.payments") rather than a bare 401 that could be
+  // any of a dozen causes, and it means nothing is SENT on a call we know cannot succeed.
+  //
+  // Fails OPEN when the grant was never recorded — see getGrantedScopes.
+  const blockingScope = blockingScopeFor(type, await getGrantedScopes())
+  if (blockingScope) return { success: false, error: scopeBlockedError(type, blockingScope) }
 
   switch (type) {
     case 'SALES_INVOICE': {

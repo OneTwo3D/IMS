@@ -1,0 +1,13 @@
+-- o3d-g2i: record what Xero actually GRANTED, not just what we asked for.
+--
+-- Adding a scope to the authorization URL only affects future consents; an existing
+-- refresh token keeps the grant it was minted with. So an installation that never
+-- reconnects goes on 401ing AuthorizationUnsuccessful for exactly the calls the new
+-- scope covers, while every other sync looks healthy — which is how the payments
+-- scope shipped and stayed broken for weeks (invoices posted and marked paid locally,
+-- never settled in Xero).
+--
+-- NULL means "never recorded" and is deliberately NOT the same as "granted nothing":
+-- the validation fails OPEN on NULL, so a token stored before this column existed
+-- keeps working until its next refresh or reconnect fills it in.
+ALTER TABLE "accounting_tokens" ADD COLUMN "grantedScopes" TEXT;

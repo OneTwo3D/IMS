@@ -363,6 +363,8 @@ export type QuickBooksSyncReadiness = {
   notConnected: boolean
   missingAccounts: Array<{ key: string; label: string }>
   missingTaxTypes: Array<{ id: string; name: string }>
+  /** Always empty: QuickBooks does not record its granted scopes (o3d-g2i is Xero-only). */
+  missingScopes: string[]
 }
 
 const REQUIRED_ACCOUNTS: Array<{ key: keyof QuickBooksSettings; label: string }> = [
@@ -404,5 +406,8 @@ export async function getQuickBooksSyncReadiness(): Promise<QuickBooksSyncReadin
     notConnected: !connStatus.connected,
     missingAccounts,
     missingTaxTypes,
+    // QuickBooks does not record its granted scopes (o3d-g2i covers Xero only). Empty means "nothing to
+    // report", never "we checked and found none" — see AccountingSyncReadiness.
+    missingScopes: [],
   }
 }

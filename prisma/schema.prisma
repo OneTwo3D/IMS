@@ -2109,6 +2109,10 @@ model AccountingToken {
   expiresAt    DateTime
   tenantId     String
   tenantName   String?
+  // o3d-g2i: the scopes Xero actually GRANTED at consent, space-separated as returned
+  // by the token endpoint. NULL = never recorded (a token stored before this existed),
+  // which validation treats as UNKNOWN and lets through — not as "granted nothing".
+  grantedScopes String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

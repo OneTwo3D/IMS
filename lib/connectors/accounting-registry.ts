@@ -56,6 +56,11 @@ export type AccountingSyncReadiness = {
   notConnected: boolean
   missingAccounts: Array<{ key: string; label: string }>
   missingTaxTypes: Array<{ id: string; name: string }>
+  /**
+   * Scopes the connector asked for at consent but was NOT granted (o3d-g2i). Empty when the grant is
+   * complete, and also when the connector does not record grants — never report unknown as missing.
+   */
+  missingScopes: string[]
 }
 
 export type AccountingConnector = AccountingConnectorDef & {
