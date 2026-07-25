@@ -526,6 +526,8 @@ export async function runWmsDispatchSweepCore(
   counters: WmsDispatchCounters
   logs: WmsDispatchLog[]
   deltaError: string | null
+  /** Orders served straight from the bulk delta (no per-order fetch). */
+  deltaPreloadServed: number
   /** Orders whose real dispatch state could not be established this pass. */
   unresolved: number
   /** The delta window was clamped and could not cover its held-back backlog. */
@@ -554,6 +556,12 @@ export async function runWmsDispatchSweepCore(
   const mergedComponentNumbers = new Set<string>()
   let reconcileDue = true
   let deltaFetched = false
+  // How many orders the delta HOT PATH actually served (a preloaded row, no per-order
+  // fetch). Reported rather than assumed: o3d-9vv shipped a page Limit the API
+  // rejected, so every delta 400'd and the sweep fell back to the per-order poll on
+  // every tick - correct sync, zero errors, nothing to see. A fail-safe fallback hides
+  // the very failure it protects against, so the fast path must say it engaged.
+  let deltaPreloadServed = 0
   let ranReconcile = false
   let passClean = true
   // True when the query window had to be clamped to the lookback floor, so it
@@ -839,6 +847,7 @@ export async function runWmsDispatchSweepCore(
         ? { ...candidate, externalOrderNumber: idRow.externalOrderNumber }
         : candidate
       const preload = idRow && !idIsSplit ? idRow : null
+      if (preload) deltaPreloadServed += 1
       await processOne(
         effectiveCandidate,
         preload,
@@ -951,6 +960,7 @@ export async function runWmsDispatchSweepCore(
     counters,
     logs,
     deltaError,
+    deltaPreloadServed,
     unresolved: unresolvedCount,
     // Surfaced so the wrapper can mark the job PARTIAL: a clamped window means the
     // delta is running degraded and cannot cover its own backlog.
@@ -1356,7 +1366,7 @@ export async function runWmsDispatchSweep(
   try {
     const core = await runWmsDispatchSweepCore(deps, coreOptions)
     counters = core.counters
-    const { logs, deltaError, unresolved, deltaWindowTruncated } = core
+    const { logs, deltaError, unresolved, deltaWindowTruncated, deltaPreloadServed } = core
 
     if (logs.length > 0) {
       // Map the dispatch outcomes onto the shared WmsSyncLogAction enum; the detail lives
@@ -1410,6 +1420,27 @@ export async function runWmsDispatchSweep(
             'Inbound Order/List delta watermark is older than the lookback window — the query window is clamped '
             + 'and cannot cover the gap; the watermark is held until a reconcile pass verifies every active link',
           payload: { deltaWindowTruncated: true, connector: connectorId } as Prisma.InputJsonValue,
+        },
+      })
+    }
+
+    // Say out loud whether the fast path engaged (o3d-9vv). A silent fallback made a
+    // completely dead optimisation indistinguishable from a healthy run.
+    if (coreOptions.deltaEnabled && Boolean(deps.fetchDelta) && !deltaError) {
+      await db.wmsSyncLog.create({
+        data: {
+          jobId: job.id,
+          sku: null,
+          productId: null,
+          action: 'noop',
+          reason: `Inbound Order/List delta engaged — ${deltaPreloadServed} of ${counters.totalChecked} `
+            + 'orders served from the bulk delta without a per-order fetch',
+          payload: {
+            deltaEngaged: true,
+            deltaPreloadServed,
+            totalChecked: counters.totalChecked,
+            connector: connectorId,
+          } as Prisma.InputJsonValue,
         },
       })
     }

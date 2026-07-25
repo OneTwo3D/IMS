@@ -1255,3 +1255,52 @@ test('[o3d-6j8] an ORDINARY reconcile error still strikes the link (the classifi
   assert.equal(counters.errors, 1)
   assert.equal(unresolved, 0)
 })
+
+// --- o3d-9vv: the fast path must SAY it engaged -------------------------------
+// The delta shipped with a page Limit the API rejects, so every fetch 400'd and the
+// sweep fell back to the per-order poll on every tick. It failed SAFE — correct sync,
+// zero errors — so a completely dead optimisation looked exactly like a healthy run.
+// A fail-safe fallback hides the very failure it protects against.
+
+test('[o3d-9vv] the sweep reports how many orders the delta hot path actually served', async () => {
+  let fetchStatusCalls = 0
+  const { counters, deltaPreloadServed } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+        candidate({ linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1002', externalOrderId: 'M-2' }),
+      ],
+      fetchOrderStatus: async () => { fetchStatusCalls += 1; return null },
+      fetchDelta: async () => [
+        status({ externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', status: 'PROCESSING' }),
+        status({ externalOrderId: 'M-2', externalOrderNumber: 'WC-1002', status: 'PROCESSING' }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async () => {},
+    }),
+    { now: NOW },
+  )
+  assert.equal(fetchStatusCalls, 0, 'both orders came off the bulk delta')
+  assert.equal(deltaPreloadServed, 2, 'and the sweep says so, rather than leaving it assumed')
+  assert.equal(counters.pending, 2)
+})
+
+test('[o3d-9vv] a dead fast path is visible: 0 served even though the run "succeeds"', async () => {
+  // The exact production symptom — a delta that always fails, a fallback that always
+  // works. Counters look healthy; deltaPreloadServed is what betrays it.
+  const { counters, deltaPreloadServed, deltaError } = await runWmsDispatchSweepCore(
+    deps({
+      listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
+      listReconcileCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
+      fetchOrderStatus: async () => status({ status: 'PROCESSING' }),
+      fetchDelta: async () => { throw new Error('Mintsoft request failed with status 400') },
+      getDeltaState: async () => ({ watermark: null, lastReconcile: null }),
+      saveDeltaState: async () => {},
+    }),
+    { now: NOW },
+  )
+  assert.equal(counters.errors, 0, 'the fallback keeps the sync correct — nothing looks broken')
+  assert.equal(counters.pending, 1)
+  assert.equal(deltaPreloadServed, 0, 'but the hot path served nothing')
+  assert.match(String(deltaError), /400/, 'and the cause is surfaced')
+})

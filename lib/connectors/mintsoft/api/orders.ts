@@ -544,6 +544,21 @@ async function resolveDispatchableDeltaRow(
 const DELTA_REREAD_CONCURRENCY = 4
 
 /**
+ * Mintsoft's hard maximum for `GET /api/Order/List?Limit=`. Verified live by
+ * bisection against the production API (2026-07-25): `Limit=100` -> 200 OK,
+ * `Limit=101` -> HTTP 400, with the full production parameter set
+ * (SinceLastUpdated + SortOldestFirst + IncludeOrderItems + ClientId), so it is the
+ * Limit alone and not a parameter interaction. `PageNo` paging works normally.
+ *
+ * This shipped as 200 on both this connector and the Python plugin, which meant every
+ * delta fetch 400'd and the sweep fell back to the per-order reconcile on every tick -
+ * the whole optimisation never engaged once. It failed SAFE (correct sync, no errors),
+ * which is precisely why it went unnoticed: no unit test could catch it (they all mock
+ * the API) and ten rounds of adversarial review did not either. Only a live deploy did.
+ */
+export const MINTSOFT_ORDER_LIST_MAX_LIMIT = 100
+
+/**
  * Resolve every collected row, re-reading only the incomplete dispatched ones.
  *
  * A real worker QUEUE over just the rows that need network, not chunks over all rows
@@ -608,8 +623,23 @@ export async function fetchMintsoftOrderList(opts: {
         'refusing to run an unscoped cross-client delta',
     )
   }
-  const limit = opts.limit && opts.limit > 0 ? Math.trunc(opts.limit) : 200
-  const maxPages = opts.maxPages && opts.maxPages > 0 ? Math.trunc(opts.maxPages) : 50
+  // CLAMPED, not merely defaulted (o3d-9vv). Anything above the cap makes Mintsoft
+  // answer 400, which client.ts surfaces as a fetch error - so the sweep treats the
+  // whole delta as failed and falls back to the per-order reconcile. That fallback is
+  // fail-SAFE, which is exactly why this must be clamped rather than defaulted: the
+  // sync stays correct, so a configured-too-high value would disable the delta
+  // invisibly instead of failing loudly.
+  const requestedLimit = opts.limit && opts.limit > 0 ? Math.trunc(opts.limit) : MINTSOFT_ORDER_LIST_MAX_LIMIT
+  const limit = Math.min(requestedLimit, MINTSOFT_ORDER_LIST_MAX_LIMIT)
+  if (requestedLimit > MINTSOFT_ORDER_LIST_MAX_LIMIT) {
+    console.warn(
+      `[mintsoft-order-list] requested Limit ${requestedLimit} exceeds the API maximum `
+        + `${MINTSOFT_ORDER_LIST_MAX_LIMIT}; clamping (a larger value would 400 and silently disable the delta)`,
+    )
+  }
+  // Halving the page size halves the rows per page, so the page budget is doubled to
+  // keep the same overall delta capacity (100 x 100 = the previous 200 x 50).
+  const maxPages = opts.maxPages && opts.maxPages > 0 ? Math.trunc(opts.maxPages) : 100
 
   const collected: RawOrder[] = []
   for (let pageNo = 1; pageNo <= maxPages; pageNo += 1) {
