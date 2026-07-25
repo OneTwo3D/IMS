@@ -133,6 +133,8 @@ export type LockRecord = {
    * has stopped. Optional: an older build's lock has none and falls back to LOCK_STALE_AFTER_MS on takenAt.
    */
   heartbeatAt?: string
+  /** Diagnostics: the run whose abandoned lock this one took over, if any. */
+  recoveredFrom?: string
 }
 
 /** Just the ownership fields the liveness check reads, so it can be exercised without a whole lock record. */
@@ -261,7 +263,9 @@ export type LockStore = {
   claim(raw: string): Promise<boolean>
   /** The current row, raw text and parsed, or null if unlocked. */
   read(): Promise<{ raw: string; lock: LockRecord } | null>
-  /** Delete ONLY if the row still reads exactly as `expected` (compare-and-set, for recovery). */
+  /** Replace ONLY if the row still reads exactly as `expected` (compare-and-set take-over). */
+  replaceIfUnchanged(expected: string, raw: string): Promise<boolean>
+  /** Delete ONLY if the row still reads exactly as `expected` (compare-and-set, for the forced release). */
   deleteIfUnchanged(expected: string): Promise<boolean>
   /** Delete ONLY if the row still carries `token` (for our own release; the heartbeat rewrites `raw`). */
   deleteIfOwned(token: string): Promise<boolean>
@@ -304,6 +308,13 @@ export function pgLockStore(db: Client, key: string = LOCK_KEY): LockStore {
       if (!r.rows.length) return null
       return { raw: r.rows[0].value, lock: parseLock(r.rows[0].value) }
     },
+    async replaceIfUnchanged(expected, raw) {
+      const r = await db.query(
+        `update settings set value = $3, "updatedAt" = now() where key = $1 and value = $2`,
+        [key, expected, raw],
+      )
+      return r.rowCount === 1
+    },
     async deleteIfUnchanged(expected) {
       const r = await db.query(`delete from settings where key = $1 and value = $2`, [key, expected])
       return r.rowCount === 1
@@ -328,20 +339,25 @@ async function readLock(db: Client): Promise<LockRecord | null> {
 }
 
 /**
- * Take the lock row, recovering an abandoned one, refusing a live one.
+ * Take the lock row: claim a free one, TAKE OVER an abandoned one, refuse a live one.
  *
- * `snapshot` produces the record to claim with and is called ONCE PER ATTEMPT on purpose: recovery
- * restores stage's real settings, so a snapshot taken before that would record the DISABLED values as the
- * originals and release() would then "restore" stage to off — turning one crashed run into a permanent
- * outage.
+ * RECOVERY IS A TAKE-OVER, NOT A RESTORE-THEN-RECLAIM. The obvious shape — restore stage from the
+ * abandoned record, delete the row, then claim it fresh — has a race that survives compare-and-set on the
+ * delete: two recoverers can judge the same abandoned row, the first wins and DISABLES stage again, and
+ * the second is still in the middle of restoring it. Its CAS then fails and it aborts, but stage has
+ * already been re-enabled underneath the winner (Codex, PR #560). Idempotent writes do not help — the
+ * problem is that the restore crosses an ownership change.
  *
- * `recover` restores the world from the abandoned record and must delete the row compare-and-set; it
- * returns false when another contender got there first, which is not an error — we simply retry.
+ * So the abandoned row is converted into OUR row in a single compare-and-set, and we INHERIT the
+ * originals it recorded. Nothing is restored on the way in, there is no unlocked interval to lose a race
+ * in, and release() at the end of our run is what finally puts stage back — from the same values the
+ * crashed run recorded. Only one contender can win the CAS; the rest see a live lock and abort.
+ *
+ * `snapshot` is called once per attempt because losing a race means the world may have changed.
  */
 export async function claimLock(
   store: LockStore,
   snapshot: () => Promise<LockRecord>,
-  recover: (found: { raw: string; lock: LockRecord }) => Promise<boolean>,
   opts: { attempts?: number; now?: () => number } = {},
 ): Promise<{ raw: string; lock: LockRecord }> {
   const attempts = opts.attempts ?? 3
@@ -349,9 +365,9 @@ export async function claimLock(
   let lastReason = 'unknown'
 
   for (let i = 0; i < attempts; i++) {
-    const lock = await snapshot()
-    const raw = JSON.stringify(lock)
-    if (await store.claim(raw)) return { raw, lock }
+    const mine = await snapshot()
+    const raw = JSON.stringify(mine)
+    if (await store.claim(raw)) return { raw, lock: mine }
 
     const found = await store.read()
     // Gone between the failed claim and the read: someone released it. Try again immediately.
@@ -368,8 +384,31 @@ export async function claimLock(
       )
     }
 
-    console.warn(`[quiesce] recovering an ABANDONED lock — ${decision.reason} — restoring stage before starting.`)
-    await recover(found)
+    // Inherit what the abandoned run recorded — those are the true originals, since stage is still
+    // disabled by it. Our own snapshot would record the DISABLED values as the originals and release()
+    // would then "restore" stage to off, turning one crashed run into a permanent outage. Fall back to
+    // our snapshot only when the abandoned record has nothing (it died before recording, so it never
+    // disabled anything either).
+    const inherited = Object.keys(found.lock.stageSettings ?? {}).length ? found.lock.stageSettings : mine.stageSettings
+    const inheritedE2e = Object.keys(found.lock.e2eSettings ?? {}).length ? found.lock.e2eSettings : mine.e2eSettings
+    const takeover: LockRecord = {
+      ...mine,
+      stageSettings: inherited,
+      e2eSettings: inheritedE2e,
+      // Legacy per-run webhooks the crashed run created become ours to delete at release.
+      createdWebhookIds: found.lock.createdWebhookIds ?? [],
+      recoveredFrom: found.lock.runId,
+    }
+    const takeoverRaw = JSON.stringify(takeover)
+    if (await store.replaceIfUnchanged(found.raw, takeoverRaw)) {
+      console.warn(
+        `[quiesce] took over an ABANDONED lock — ${decision.reason}. Its recorded stage settings are now ` +
+          `ours to restore at the end of this run: ` +
+          `${Object.entries(inherited).map(([k, v]) => `${k}=${v ?? '(absent)'}`).join(', ') || '(none recorded)'}`,
+      )
+      return { raw: takeoverRaw, lock: takeover }
+    }
+    lastReason = `${decision.reason} — but another contender took it over first`
   }
 
   throw new Error(
@@ -453,6 +492,8 @@ export type LockToken = string
  */
 let held: { token: LockToken; raw: string } | null = null
 let heartbeat: NodeJS.Timeout | null = null
+/** When we last PROVED we still own the row. Not when we last tried. */
+let leaseProvenAt = 0
 
 /** Does THIS process hold the quiesce lock? Teardown asks before touching anything shared. */
 export function holdsQuiesceLock(): boolean {
@@ -460,39 +501,101 @@ export function holdsQuiesceLock(): boolean {
 }
 
 /**
+ * How long we may go without PROVING ownership before this run must stop.
+ *
+ * Strictly less than the TTL another run recovers us at, so we fail-stop BEFORE anyone can legitimately
+ * take the lock — never after. One renewal interval of margin is enough: a renewal that has not
+ * succeeded within it has already had nine attempts.
+ */
+export const LEASE_FENCE_AFTER_MS = LEASE_TTL_MS - LEASE_RENEW_INTERVAL_MS
+
+/**
+ * May this run keep touching shared state?
+ *
+ * 'stop' has two causes and one meaning. Either the row is provably someone else's now, or we simply
+ * cannot prove it is still ours and are close enough to the TTL that another host may take it. In both
+ * cases continuing means a second suite driving the same Woo store and Xero org — which is the entire
+ * thing this lock exists to prevent, so the run must not merely decline to clean up: it must STOP.
+ */
+export function leaseVerdict(o: { ownershipLost: boolean; msSinceProven: number }): 'ok' | 'stop' {
+  if (o.ownershipLost) return 'stop'
+  return o.msSinceProven >= LEASE_FENCE_AFTER_MS ? 'stop' : 'ok'
+}
+
+/**
+ * What to do when the lease is gone. Replaceable ONLY so the tests can observe the decision instead of
+ * exiting the test runner.
+ *
+ * The default really is a hard exit. Playwright has no "abort the run" hook a background timer can pull,
+ * and letting the suite carry on would have it drive the shared store while another run legitimately
+ * owns it. The cost is that our tracked Xero documents are left in the Demo ledger — the next run's
+ * straggler scan names them, and a manual void is cheap next to corrupting a live run.
+ */
+let onLeaseLost: (reason: string) => void = (reason) => {
+  console.error(
+    `\n[quiesce] *** STOPPING THE RUN *** ${reason}\n` +
+      `Another invocation may now legitimately hold the lock, so continuing would drive the shared Woo\n` +
+      `store and Xero Demo org from two suites at once. Any Xero documents this run created are LEFT in\n` +
+      `the Demo ledger — the next run's straggler scan will name them.\n`,
+  )
+  process.exit(1)
+}
+
+/** Test seam for the fail-stop above. Returns the previous handler so a test can restore it. */
+export function setLeaseLostHandler(fn: (reason: string) => void): (reason: string) => void {
+  const prev = onLeaseLost
+  onLeaseLost = fn
+  return prev
+}
+
+/**
  * Keep the lease alive while the suite runs.
  *
- * unref'd so it can never hold the process open on its own, and guarded on our token: if the renewal
- * finds the row gone or owned by someone else we have LOST the lock (recovered from under us), and the
- * only safe response is to stop pretending we hold it — release() then becomes a no-op rather than
- * restoring stage on the new owner's behalf.
+ * unref'd so it can never hold the process open on its own, and guarded on our token. Losing the row is
+ * not just a reason to skip teardown — see leaseVerdict: the run itself has to stop.
  */
 function startHeartbeat(token: LockToken, lock: LockRecord): void {
+  leaseProvenAt = Date.now()
   heartbeat = setInterval(() => {
     void (async () => {
       // Its own short-lived connection each time. acquire()'s clients are closed when it returns, and an
       // idle one held open for the whole suite is worse than reconnecting every 30 seconds.
       const db = e2eDb()
+      let ownershipLost = false
       try {
         await db.connect()
         const renewed: LockRecord = { ...lock, heartbeatAt: new Date().toISOString() }
         const raw = JSON.stringify(renewed)
         if (await pgLockStore(db).writeIfOwned(token, raw)) {
+          leaseProvenAt = Date.now()
           if (held) held = { token, raw }
           return
         }
+        ownershipLost = true
         console.error(
           `\n[quiesce] *** LOST THE QUIESCE LOCK *** run ${lock.runId} no longer owns '${LOCK_KEY}' — it was ` +
             `recovered or deleted while this run is still going. Stage settings are now another run's ` +
-            `responsibility, so this run will NOT restore them. Results from here are untrustworthy.\n`,
+            `responsibility, so this run will NOT restore them.\n`,
         )
-        held = null
-        stopHeartbeat()
       } catch (e) {
-        // A transient database blip must not kill the run; the lease has ten renewals of slack.
+        // A renewal that fails is not yet a lost lease — there is slack by design — but it is not proof
+        // of ownership either, and the clock below is what decides when the slack runs out.
         console.warn(`[quiesce] lease renewal failed (will retry): ${e instanceof Error ? e.message : e}`)
       } finally {
         await db.end().catch(() => {})
+      }
+
+      const msSinceProven = Date.now() - leaseProvenAt
+      if (leaseVerdict({ ownershipLost, msSinceProven }) === 'stop') {
+        held = null
+        stopHeartbeat()
+        onLeaseLost(
+          ownershipLost
+            ? `the quiesce lock was taken over by another run (${lock.runId} no longer owns it)`
+            : `the quiesce lock lease could not be renewed for ${Math.round(msSinceProven / 1000)}s, ` +
+              `within ${Math.round(LEASE_RENEW_INTERVAL_MS / 1000)}s of the ${Math.round(LEASE_TTL_MS / 1000)}s TTL ` +
+              `at which another run may recover it`,
+        )
       }
     })()
   }, LEASE_RENEW_INTERVAL_MS)
@@ -555,9 +658,7 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
 
     // The claim writes the record BEFORE anything is mutated, so a crash mid-acquire is still
     // recoverable. Recording the originals first is what makes release() truthful.
-    const claimed = await claimLock(store, snapshot, (found) =>
-      releaseInternal(e2e, stage, found.lock, { store, expect: found.raw }),
-    )
+    const claimed = await claimLock(store, snapshot)
     held = { token, raw: claimed.raw }
     startHeartbeat(token, claimed.lock)
 
@@ -679,9 +780,21 @@ export async function release(opts: { force?: boolean } = {}): Promise<void> {
     if (!found) { console.log('[quiesce] no lock row — nothing to release.'); return }
 
     if (!held) {
-      // force: no token to match, so delete exactly the row we just read and judged.
-      await releaseInternal(e2e, stage, found.lock, { store, expect: found.raw })
-      console.log('[quiesce] released (forced).')
+      // force: no token to match, so delete exactly the row we just read and judged. The compare-and-set
+      // is the only thing standing between an operator and a live run here, and it is checked AFTER the
+      // restore — so a failure means stage may now be armed underneath somebody. Say so plainly rather
+      // than printing "released" over it.
+      const dropped = await releaseInternal(e2e, stage, found.lock, { store, expect: found.raw })
+      if (dropped) {
+        console.log('[quiesce] released (forced).')
+      } else {
+        console.error(
+          `\n[quiesce] *** THE LOCK CHANGED HANDS MID-RELEASE *** run ${found.lock.runId}'s row was rewritten ` +
+            `(a heartbeat renewal, or another run taking over) while this forced release was restoring stage. ` +
+            `The row was NOT deleted — but stage settings HAVE been restored, possibly underneath a live run. ` +
+            `Re-check with --status before doing anything else.\n`,
+        )
+      }
       return
     }
 

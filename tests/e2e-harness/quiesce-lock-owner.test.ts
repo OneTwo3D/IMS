@@ -3,7 +3,8 @@ import { hostname } from 'node:os'
 import test from 'node:test'
 
 import {
-  claimLock, isLockOwnerAlive, lockRecoveryDecision, LEASE_TTL_MS, LOCK_STALE_AFTER_MS,
+  claimLock, isLockOwnerAlive, leaseVerdict, lockRecoveryDecision,
+  LEASE_FENCE_AFTER_MS, LEASE_RENEW_INTERVAL_MS, LEASE_TTL_MS, LOCK_STALE_AFTER_MS,
   type LockRecord, type LockStore,
 } from '../../e2e/full-chain/harness/quiesce.ts'
 
@@ -129,6 +130,7 @@ function fakeStore(initial: LockRecord | null = null) {
   const store: LockStore = {
     async claim(raw) { if (row !== null) return false; row = raw; return true },
     async read() { return row === null ? null : { raw: row, lock: JSON.parse(row) as LockRecord } },
+    async replaceIfUnchanged(expected, raw) { if (row !== expected) return false; row = raw; return true },
     async deleteIfUnchanged(expected) { if (row !== expected) return false; row = null; return true },
     async deleteIfOwned(token) {
       if (row === null || (JSON.parse(row) as LockRecord).token !== token) return false
@@ -147,12 +149,11 @@ function fakeStore(initial: LockRecord | null = null) {
 }
 
 const snapshotOf = (lock: LockRecord) => async () => lock
-const neverRecovers = async () => { throw new Error('recover must not be called here') }
 
 test('claimLock takes a free lock', async () => {
   const s = fakeStore()
   const mine = lockAt({ token: 'mine' })
-  const got = await claimLock(s.store, snapshotOf(mine), neverRecovers, { now: () => NOW })
+  const got = await claimLock(s.store, snapshotOf(mine), { now: () => NOW })
   assert.equal(got.lock.token, 'mine')
   assert.equal(s.current()?.token, 'mine')
 })
@@ -162,25 +163,49 @@ test('claimLock REFUSES a held lock and leaves it completely alone', async () =>
   const incumbent = lockAt({ token: 'theirs', ownerPid: process.pid, ownerHost: hostname() })
   const s = fakeStore(incumbent)
   await assert.rejects(
-    claimLock(s.store, snapshotOf(lockAt({ token: 'mine' })), neverRecovers, { now: () => NOW }),
+    claimLock(s.store, snapshotOf(lockAt({ token: 'mine' })), { now: () => NOW }),
     /ABORT: the quiesce lock is HELD/,
   )
   assert.equal(s.current()?.token, 'theirs', 'the incumbent lock must be untouched')
 })
 
-test('claimLock recovers an abandoned lock and then takes it', async () => {
-  const abandoned = lockAt({ token: 'dead', ownerPid: 4_194_304, ownerHost: hostname() })
+test('taking over an abandoned lock INHERITS the originals it recorded', async () => {
+  // Nothing is restored on the way in — the crashed run's record simply becomes ours, and OUR release is
+  // what puts stage back. Inheriting is not a nicety: our own snapshot is taken while stage is still
+  // disabled by the crashed run, so recording it as "the originals" would restore stage to OFF at the end
+  // and turn one crashed run into a permanent outage.
+  const abandoned = lockAt({
+    token: 'dead', ownerPid: 4_194_304, ownerHost: hostname(),
+    stageSettings: { wc_sync_enabled: 'true', xero_sync_enabled: 'true' },
+    e2eSettings: { wc_sync_enabled: 'false' },
+    createdWebhookIds: [847],
+  })
   const s = fakeStore(abandoned)
-  let restoredFrom: string | undefined
-  const got = await claimLock(
-    s.store,
-    snapshotOf(lockAt({ token: 'mine' })),
-    async (found) => { restoredFrom = found.lock.token; return s.store.deleteIfUnchanged(found.raw) },
-    { now: () => NOW },
-  )
-  assert.equal(restoredFrom, 'dead', 'stage is restored from the abandoned record before we take over')
-  assert.equal(got.lock.token, 'mine')
+  const mineSeesStageDisabled = lockAt({
+    token: 'mine',
+    stageSettings: { wc_sync_enabled: 'false', xero_sync_enabled: 'false' },
+    e2eSettings: { wc_sync_enabled: 'true' },
+  })
+
+  const got = await claimLock(s.store, snapshotOf(mineSeesStageDisabled), { now: () => NOW })
+
+  assert.equal(got.lock.token, 'mine', 'the row is ours now')
+  assert.equal(got.lock.recoveredFrom, abandoned.runId)
+  assert.deepEqual(got.lock.stageSettings, { wc_sync_enabled: 'true', xero_sync_enabled: 'true' })
+  assert.deepEqual(got.lock.e2eSettings, { wc_sync_enabled: 'false' })
+  assert.deepEqual(got.lock.createdWebhookIds, [847], 'its legacy webhooks are ours to delete at release')
   assert.equal(s.current()?.token, 'mine')
+})
+
+test('a take-over falls back to our own snapshot when the abandoned record holds nothing', async () => {
+  // It died before recording anything, which means it never disabled anything either — so what we can see
+  // now IS the original state.
+  const abandoned = lockAt({ token: 'dead', ownerPid: 4_194_304, ownerHost: hostname(), stageSettings: {}, e2eSettings: {} })
+  const s = fakeStore(abandoned)
+  const mine = lockAt({ token: 'mine', stageSettings: { wc_sync_enabled: 'true' }, e2eSettings: { wc_sync_enabled: 'false' } })
+  const got = await claimLock(s.store, snapshotOf(mine), { now: () => NOW })
+  assert.deepEqual(got.lock.stageSettings, { wc_sync_enabled: 'true' })
+  assert.deepEqual(got.lock.e2eSettings, { wc_sync_enabled: 'false' })
 })
 
 test('two simultaneous invocations: exactly one takes the lock, the other aborts', async () => {
@@ -191,7 +216,6 @@ test('two simultaneous invocations: exactly one takes the lock, the other aborts
     s.store,
     // Yield first, so both contenders are genuinely in flight when the claims land.
     async () => { await Promise.resolve(); return lockAt({ token, ownerPid: process.pid, ownerHost: hostname() }) },
-    neverRecovers,
     { now: () => NOW },
   )
   const results = await Promise.allSettled([contender('a'), contender('b'), contender('c')])
@@ -203,10 +227,28 @@ test('two simultaneous invocations: exactly one takes the lock, the other aborts
   assert.equal(s.current()?.token, (won[0] as PromiseFulfilledResult<{ lock: LockRecord }>).value.lock.token)
 })
 
-test('recovery is compare-and-set: losing the race deletes nobody else’s lock', async () => {
-  // Two runs can judge the same abandoned lock at the same moment. Whichever restores second must not
-  // delete the row the winner has since written — that would hand the lock to a third party while the
-  // winner is running.
+test('two recoverers judging the SAME abandoned lock: one takes over, the other never touches a thing', async () => {
+  // The race that killed the restore-then-reclaim shape (Codex, PR #560): both read the same abandoned
+  // row, the first won and disabled stage while the second was still restoring it. The take-over is a
+  // single compare-and-set, so the loser's very first shared-state write is the one that fails.
+  const abandoned = lockAt({
+    token: 'dead', ownerPid: 4_194_304, ownerHost: hostname(),
+    stageSettings: { wc_sync_enabled: 'true' },
+  })
+  const s = fakeStore(abandoned)
+  const recoverer = (token: string) => claimLock(
+    s.store,
+    async () => { await Promise.resolve(); return lockAt({ token, ownerPid: process.pid, ownerHost: hostname() }) },
+    { attempts: 1, now: () => NOW },
+  )
+  const results = await Promise.allSettled([recoverer('r1'), recoverer('r2')])
+  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1, 'exactly one take-over may win')
+  const winner = results.find((r) => r.status === 'fulfilled') as PromiseFulfilledResult<{ lock: LockRecord }>
+  assert.equal(s.current()?.token, winner.value.lock.token)
+  assert.deepEqual(s.current()?.stageSettings, { wc_sync_enabled: 'true' }, 'the originals survive the race intact')
+})
+
+test('losing the take-over race to a live claimant aborts rather than steals', async () => {
   const abandoned = lockAt({ token: 'dead', ownerPid: 4_194_304, ownerHost: hostname() })
   const s = fakeStore(abandoned)
   const winner = lockAt({ token: 'winner', ownerPid: process.pid, ownerHost: hostname() })
@@ -214,16 +256,12 @@ test('recovery is compare-and-set: losing the race deletes nobody else’s lock'
   await assert.rejects(
     claimLock(
       s.store,
-      snapshotOf(lockAt({ token: 'mine' })),
-      async (found) => {
-        // Another contender recovers and claims it first, in the window before our delete.
-        s.put(winner)
-        return s.store.deleteIfUnchanged(found.raw)
-      },
-      { now: () => NOW },
+      // Another contender takes it over in the window between our read and our compare-and-set.
+      async () => { s.put(winner); return lockAt({ token: 'mine' }) },
+      { attempts: 2, now: () => NOW },
     ),
     /ABORT: the quiesce lock is HELD/,
-    'having lost the recovery race, we must abort rather than steal',
+    'having lost the race, we must abort rather than steal',
   )
   assert.equal(s.current()?.token, 'winner', 'the winner still holds the lock it claimed')
 })
@@ -237,25 +275,42 @@ test('claimLock retries when the holder releases as we look, rather than failing
       // The holder finishes between our failed claim and the read that would have judged it.
       queueMicrotask(() => { void s.store.deleteIfOwned('going') })
     }
+    await Promise.resolve() // let that release land
     return lockAt({ token: 'mine' })
   }
-  // Drain the queued release before the read happens.
-  const got = await claimLock(s.store, async () => { const l = await snapshot(); await Promise.resolve(); return l }, neverRecovers, { now: () => NOW })
+  const got = await claimLock(s.store, snapshot, { now: () => NOW })
   assert.equal(got.lock.token, 'mine')
 })
 
 test('claimLock gives up loudly rather than looping forever', async () => {
   // A lock that keeps changing hands is a rig with two runners pointed at it — a configuration problem
   // that must be reported, not absorbed by an infinite retry.
-  const s = fakeStore()
+  const s = fakeStore(lockAt({ token: 'churn', ownerPid: 4_194_304, ownerHost: hostname() }))
+  // Every take-over loses its race: someone else always gets there between our read and our
+  // compare-and-set. The claim can never land either, because the row is never free.
+  const alwaysLoses: LockStore = { ...s.store, replaceIfUnchanged: async () => false }
   await assert.rejects(
-    claimLock(
-      s.store,
-      // Never actually claimable: something else always slips in.
-      async () => { s.put(lockAt({ token: 'other', ownerPid: 4_194_304, ownerHost: hostname() })); return lockAt({ token: 'mine' }) },
-      async () => true, // "recovered" but the next snapshot re-creates the squatter
-      { attempts: 3, now: () => NOW },
-    ),
+    claimLock(alwaysLoses, snapshotOf(lockAt({ token: 'mine' })), { attempts: 3, now: () => NOW }),
     /could not take the quiesce lock after 3 attempts/,
   )
+  assert.equal(s.current()?.token, 'churn', 'and we changed nothing while failing')
+})
+
+// --- fencing a run whose lease is gone ---------------------------------------
+
+test('a run that cannot prove its lease must STOP, not merely skip its teardown', () => {
+  // Clearing ownership only stops teardown; the suite itself would carry on driving the shared Woo store
+  // and Xero org while another host legitimately holds the lock (Codex, PR #560). The verdict below is
+  // what turns "we no longer own it" into "stop running".
+  assert.equal(leaseVerdict({ ownershipLost: true, msSinceProven: 0 }), 'stop', 'a proven loss is immediate')
+  assert.equal(leaseVerdict({ ownershipLost: false, msSinceProven: 0 }), 'ok')
+  assert.equal(leaseVerdict({ ownershipLost: false, msSinceProven: LEASE_FENCE_AFTER_MS - 1 }), 'ok')
+  assert.equal(leaseVerdict({ ownershipLost: false, msSinceProven: LEASE_FENCE_AFTER_MS }), 'stop')
+})
+
+test('the fence trips BEFORE anyone else may recover the lock, never after', () => {
+  // If we stopped at or after the TTL there would be a window in which two suites both believe they hold
+  // the lock — the fence would be theatre.
+  assert.ok(LEASE_FENCE_AFTER_MS < LEASE_TTL_MS, 'stop before the TTL another run recovers us at')
+  assert.ok(LEASE_FENCE_AFTER_MS > LEASE_RENEW_INTERVAL_MS, 'but not so eagerly that one slow renewal kills a run')
 })
