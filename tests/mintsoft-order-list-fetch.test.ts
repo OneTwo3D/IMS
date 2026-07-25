@@ -21,6 +21,13 @@ let statusCalls = 0
 // status-map cases (malformed / empty / unresolvable id) can be exercised.
 const DEFAULT_STATUSES: unknown = [{ ID: 4, Name: 'DESPATCHED' }, { ID: 17, Name: 'PICKED' }]
 let statusResponder: () => unknown = () => DEFAULT_STATUSES
+// o3d-6j8: authoritative per-id records + the ids actually re-read.
+let detailRows = new Map<string, unknown>()
+let detailCalls: string[] = []
+// Concurrency observability for the bounded re-read pool.
+let detailInFlight = 0
+let detailMaxInFlight = 0
+let detailDelayMs = 0
 
 mock.module('@/lib/connectors/mintsoft/settings/schema', {
   namedExports: {
@@ -46,6 +53,22 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
         statusCalls += 1
         return { data: statusResponder(), status: 200 }
       }
+      // o3d-6j8: an incomplete dispatched row is re-read by id before it is applied.
+      const detail = path.split('?')[0].match(/^\/api\/Order\/(\d+)$/)
+      if (detail) {
+        const id = detail[1]
+        detailCalls.push(id)
+        detailInFlight += 1
+        detailMaxInFlight = Math.max(detailMaxInFlight, detailInFlight)
+        try {
+          if (detailDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, detailDelayMs))
+          return detailRows.has(id)
+            ? { data: detailRows.get(id), status: 200 }
+            : { data: null, status: 404 }
+        } finally {
+          detailInFlight -= 1
+        }
+      }
       const qs = new URLSearchParams(path.split('?')[1] ?? '')
       listCalls.push(Object.fromEntries(qs.entries()))
       if (listError) return { data: null, error: listError, status: 500 }
@@ -66,7 +89,25 @@ async function resetStatusCache(): Promise<void> {
 // Every delta is scoped to our ClientId, and every ROW must echo it (fail closed).
 const CLIENT = 5
 // Build a well-formed, in-scope row (carries our ClientId).
+// A COMPLETE Order/List row: it carries the fulfilment block, with explicit nulls
+// for an untracked shipment. o3d-6j8 keys on PRESENCE, so a row like this stays on
+// the bulk hot path and is never re-read by id.
 function row(id: number, over: Record<string, unknown> = {}) {
+  return {
+    ID: id,
+    OrderNumber: `N${id}`,
+    OrderStatusId: 4,
+    ClientId: CLIENT,
+    TrackingNumber: null,
+    CourierServiceName: null,
+    DespatchDate: null,
+    NumberOfParts: 1,
+    ...over,
+  }
+}
+
+/** The same row with the fulfilment block OMITTED — the o3d-6j8 hazard shape. */
+function incompleteRow(id: number, over: Record<string, unknown> = {}) {
   return { ID: id, OrderNumber: `N${id}`, OrderStatusId: 4, ClientId: CLIENT, ...over }
 }
 
@@ -399,5 +440,256 @@ test('fetchMintsoftOrderList throws on an HTTP error (so the sweep fails safe to
     )
   } finally {
     listError = null
+  }
+})
+
+// --- o3d-6j8: an INCOMPLETE dispatched row must never be applied ---------------
+// readTracking() returns [] when TrackingNumber, CourierServiceName and DespatchDate
+// are all ABSENT, so `dispatched` comes from the status name alone and the order is
+// written SHIPPED with no tracking. SHIPPED then leaves the poll set
+// (POST_DISPATCH_STATUSES), so the real tracking number can never land afterwards.
+// An absent field read as a positive fact, on an irreversible path.
+
+test('[o3d-6j8] a DISPATCHED row missing the fulfilment block is re-read by id and the authoritative record is used', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  listResponder = () => [incompleteRow(1)] // status 4 = DESPATCHED, no fulfilment keys
+  detailRows = new Map([['1', {
+    ID: 1, OrderNumber: 'N1', OrderStatusId: 4, ClientId: CLIENT,
+    TrackingNumber: 'TN-REAL', CourierServiceName: 'DPD',
+    DespatchDate: '2026-07-15T09:00:00', NumberOfParts: 1,
+  }]])
+
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.deepEqual(detailCalls, ['1'], 'the incomplete row was re-read by id')
+  assert.equal(out.length, 1)
+  assert.equal(out[0].dispatched, true)
+  // The real tracking number is applied instead of a SHIPPED-with-nothing order.
+  assert.deepEqual(out[0].tracking, [{ trackingNumber: 'TN-REAL', carrier: 'DPD', despatchedAt: '2026-07-15T09:00:00' }])
+})
+
+test('[o3d-6j8] a COMPLETE row carrying explicit nulls stays on the bulk hot path (no re-read)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  detailRows = new Map()
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // A legitimate UNTRACKED despatch: the block is present, the values are null.
+  listResponder = () => [row(1)]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out.length, 1)
+  assert.equal(out[0].dispatched, true)
+  assert.deepEqual(detailCalls, [], 'presence, not truthiness — the optimisation is not undone')
+})
+
+test('[o3d-6j8] a NON-dispatched incomplete row is never re-read', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  detailRows = new Map()
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  listResponder = () => [incompleteRow(1, { OrderStatusId: 17 })] // PICKED
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out.length, 1)
+  assert.equal(out[0].dispatched, false)
+  assert.deepEqual(detailCalls, [])
+})
+
+test('[o3d-6j8] an incomplete row whose authoritative record cannot be read THROWS (holds the watermark)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  detailRows = new Map() // the detail read 404s
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  listResponder = () => [incompleteRow(1)]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /refusing to apply an incomplete dispatch/,
+  )
+})
+
+test('[o3d-6j8] an authoritative record that ALSO omits the block throws rather than shipping blind', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  listResponder = () => [incompleteRow(1)]
+  detailRows = new Map([['1', { ID: 1, OrderNumber: 'N1', OrderStatusId: 4, ClientId: CLIENT }]])
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /\(authoritative re-read\) reads as dispatched .* but omits/,
+  )
+})
+
+test('[o3d-6j8] a row dispatched only by DespatchDate but missing NumberOfParts is re-read (split decision unknowable)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // Unknown status, but a valid despatch date makes it dispatched — and NumberOfParts
+  // is absent, so `isSplit` would silently read false and skip part reconciliation.
+  listResponder = () => [{
+    ID: 1, OrderNumber: 'N1', OrderStatusId: 999, ClientId: CLIENT,
+    TrackingNumber: 'TN1', CourierServiceName: 'DPD', DespatchDate: '2026-07-15T09:00:00',
+  }]
+  detailRows = new Map([['1', {
+    ID: 1, OrderNumber: 'N1', OrderStatusId: 4, ClientId: CLIENT,
+    TrackingNumber: 'TN1', CourierServiceName: 'DPD',
+    DespatchDate: '2026-07-15T09:00:00', NumberOfParts: 3,
+  }]])
+
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.deepEqual(detailCalls, ['1'])
+  assert.equal(out[0].isSplit, true, 'the split is no longer silently missed')
+  assert.equal(out[0].partCount, 3)
+})
+
+test('[o3d-6j8] the re-read is scoped by ClientId', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  listResponder = () => [incompleteRow(1)]
+  detailRows = new Map([['1', {
+    ID: 1, OrderNumber: 'N1', OrderStatusId: 4, ClientId: 99, // FOREIGN
+    TrackingNumber: 'TN', CourierServiceName: 'DPD', DespatchDate: '2026-07-15T09:00:00', NumberOfParts: 1,
+  }]])
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /does not match configured 5/,
+  )
+})
+
+// --- Drift lock: the guard must keep covering what the dispatch path READS ------
+// The IMS analogue of the Python inspect.getsource() test. If someone adds a new
+// `order.X` read to readTracking / normalizeMintsoftOrderRow whose absence could be
+// mistaken for a fact, this fails until the key is guarded or explicitly exempted.
+
+test('[o3d-6j8] drift lock: every dispatch-relevant row field read by this module is guarded or exempted', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync(new URL('../lib/connectors/mintsoft/api/orders.ts', import.meta.url), 'utf8')
+
+  const { MINTSOFT_DISPATCH_ROW_KEYS } = await import('@/lib/connectors/mintsoft/api/orders')
+  const guarded = new Set<string>(MINTSOFT_DISPATCH_ROW_KEYS)
+
+  // Validated per row before dispatch resolution, so absence already fails closed.
+  const exempt = new Set(['ID', 'Id', 'OrderNumber', 'OrderStatusId', 'ClientId', 'Name', 'Part'])
+
+  // Every PascalCase field read off a raw order/row/detail/record object.
+  const read = new Set<string>()
+  for (const match of source.matchAll(/\b(?:order|row|detail|record)\.([A-Z][A-Za-z0-9]*)/g)) {
+    read.add(match[1])
+  }
+
+  const unaccounted = [...read].filter((field) => !guarded.has(field) && !exempt.has(field))
+  assert.deepEqual(
+    unaccounted,
+    [],
+    `New raw-row field(s) read by orders.ts are neither guarded by MINTSOFT_DISPATCH_ROW_KEYS nor exempt: `
+      + `${unaccounted.join(', ')}. If absence of the field could be read as a positive fact on the dispatch `
+      + `path, add it to MINTSOFT_DISPATCH_ROW_KEYS; if it is validated elsewhere, add it to this test's exempt set.`,
+  )
+  // And the guard must not have silently shrunk.
+  for (const key of ['TrackingNumber', 'CourierServiceName', 'DespatchDate', 'NumberOfParts']) {
+    assert.ok(guarded.has(key), `${key} must stay guarded`)
+  }
+})
+
+test('[o3d-6j8] the authoritative re-reads are CONCURRENCY-BOUNDED (drift cannot self-inflict a request storm)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  detailMaxInFlight = 0
+  detailInFlight = 0
+  detailDelayMs = 5 // hold each read open so overlap is observable
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // 40 dispatched rows, ALL incomplete — the schema-drift shape. Unbounded, this
+  // opened 40 simultaneous detail requests; at 10k rows it would be 10k.
+  const ids = Array.from({ length: 40 }, (_, i) => i + 1)
+  listResponder = () => ids.map((id) => incompleteRow(id))
+  detailRows = new Map(ids.map((id) => [String(id), {
+    ID: id, OrderNumber: `N${id}`, OrderStatusId: 4, ClientId: CLIENT,
+    TrackingNumber: `TN-${id}`, CourierServiceName: 'DPD',
+    DespatchDate: '2026-07-15T09:00:00', NumberOfParts: 1,
+  }]))
+
+  try {
+    const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+    assert.equal(out.length, 40)
+    assert.equal(detailCalls.length, 40)
+    assert.ok(detailMaxInFlight <= 4, `at most 4 re-reads in flight (peaked at ${detailMaxInFlight})`)
+    assert.equal(detailMaxInFlight, 4, 'and the pool is actually SATURATED, not serialised')
+    // Input order is preserved despite the chunked pool.
+    assert.deepEqual(out.map((o) => o.externalOrderId), ids.map(String))
+    assert.deepEqual(out.map((o) => o.tracking[0]?.trackingNumber), ids.map((id) => `TN-${id}`))
+  } finally {
+    detailDelayMs = 0
+  }
+})
+
+test('[o3d-6j8] SPARSE incomplete rows still overlap — the pool queues by row, not by chunk', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  detailMaxInFlight = 0
+  detailInFlight = 0
+  detailDelayMs = 10
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // 8 incomplete rows each separated by 9 COMPLETE ones. Chunking all rows in
+  // fours put every incomplete row in a different chunk, so they never overlapped
+  // and cost 8 sequential request latencies — worst exactly when little has drifted.
+  const rows: unknown[] = []
+  const incompleteIds: number[] = []
+  for (let i = 1; i <= 80; i += 1) {
+    if (i % 10 === 0) { rows.push(incompleteRow(i)); incompleteIds.push(i) }
+    else rows.push(row(i))
+  }
+  listResponder = () => rows
+  detailRows = new Map(incompleteIds.map((id) => [String(id), {
+    ID: id, OrderNumber: `N${id}`, OrderStatusId: 4, ClientId: CLIENT,
+    TrackingNumber: `TN-${id}`, CourierServiceName: 'DPD',
+    DespatchDate: '2026-07-15T09:00:00', NumberOfParts: 1,
+  }]))
+
+  try {
+    const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+    assert.equal(out.length, 80)
+    // ONLY the incomplete rows cost a network read.
+    assert.deepEqual(detailCalls.sort((a, b) => Number(a) - Number(b)), incompleteIds.map(String))
+    assert.equal(detailMaxInFlight, 4, `sparse re-reads must still overlap (peaked at ${detailMaxInFlight})`)
+    // Order preserved despite out-of-order completion.
+    assert.deepEqual(out.map((o) => o.externalOrderId), Array.from({ length: 80 }, (_, i) => String(i + 1)))
+    assert.equal(out[9].tracking[0]?.trackingNumber, 'TN-10')
+  } finally {
+    detailDelayMs = 0
   }
 })

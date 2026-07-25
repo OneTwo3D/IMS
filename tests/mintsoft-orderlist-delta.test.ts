@@ -1209,3 +1209,49 @@ test('resolveDispatchJobOutcome: a delta failure marks the job PARTIAL and count
   assert.deepEqual(resolveDispatchJobOutcome(2, 'delta down'), { status: 'PARTIAL', effectiveErrors: 3 })
   assert.deepEqual(resolveDispatchJobOutcome(2, null), { status: 'PARTIAL', effectiveErrors: 2 })
 })
+
+// --- o3d-6j8: an unusable WMS record is UNRESOLVED, never a per-link strike -----
+
+test('[o3d-6j8] a WmsUnresolvableRecordError holds the watermark WITHOUT striking the link', async () => {
+  const { WmsUnresolvableRecordError } = await import('../lib/connectors/wms/errors.ts')
+  const strikes: string[] = []
+  const cleared: string[] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+
+  const { counters, unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
+      // The connector refuses the record: dispatched but missing the fulfilment block.
+      fetchOrderStatus: async () => {
+        throw new WmsUnresolvableRecordError('reads as dispatched but omits TrackingNumber — refusing to apply an incomplete dispatch')
+      },
+      recordDispatchError: async (c) => { strikes.push(c.linkId); return { deadLettered: false } },
+      clearDispatchFailures: async (linkId) => { cleared.push(linkId) },
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+
+  // Systemic drift would otherwise strike EVERY link and dead-letter the tenant.
+  assert.deepEqual(strikes, [], 'no per-link failure strike')
+  assert.deepEqual(cleared, [], 'and it is not treated as evidence of health either')
+  assert.equal(counters.errors, 0)
+  assert.equal(counters.pending, 1)
+  assert.equal(unresolved, 1, 'counted so the job goes PARTIAL')
+  assert.deepEqual(saved, [], 'no delta state saved: the pass was not clean')
+})
+
+test('[o3d-6j8] an ORDINARY reconcile error still strikes the link (the classification is narrow)', async () => {
+  const strikes: string[] = []
+  const { counters, unresolved } = await runWmsDispatchSweepCore(
+    deps({
+      listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1', externalOrderId: 'M-1' })],
+      fetchOrderStatus: async () => { throw new Error('Mintsoft request failed with status 500') },
+      recordDispatchError: async (c) => { strikes.push(c.linkId); return { deadLettered: false } },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(strikes, ['l1'])
+  assert.equal(counters.errors, 1)
+  assert.equal(unresolved, 0)
+})
