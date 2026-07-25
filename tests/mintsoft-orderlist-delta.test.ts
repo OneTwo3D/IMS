@@ -747,6 +747,130 @@ test('[o3d-bjc.2.1] a fresh watermark inside the lookback still advances normall
   assert.deepEqual(saved, [{ watermark: NOW.toISOString() }])
 })
 
+// --- o3d-bjc.5: a RENAMED split defeats both indexes -------------------------
+// The link stores the OLD number and the PRIMARY part's id. When only a SIBLING
+// part changes, the delta carries the sibling's id (no link holds it) under the NEW
+// number (no link holds that either), so neither index finds the link — yet coverage
+// read complete and the change aged out. The group's CURRENT part ids are resolved
+// from the WMS and links enumerated by those.
+
+test('[o3d-bjc.5] a renamed split whose SIBLING changed is found via the live part ids and reconciled under the new number', async () => {
+  const partsFetchedFor: string[] = []
+  const idQueries: string[][] = []
+  const statusFetchedFor: string[] = []
+  const applied: string[] = []
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      // The link still stores the OLD number and part 1's id.
+      listActiveByExternalOrderIds: async (ids) => {
+        idQueries.push([...ids])
+        // The delta only carries sibling M-2, which no link holds. Only the live
+        // part-id enumeration (M-1 + M-2) matches our link.
+        return ids.includes('M-1')
+          ? [candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001-OLD', externalOrderId: 'M-1' })]
+          : []
+      },
+      // The number supplement asks for the NEW number, which no link holds.
+      listActiveByOrderNumbers: async () => [],
+      fetchOrderParts: async (orderNumber) => {
+        partsFetchedFor.push(orderNumber)
+        return [
+          part({ externalId: 'M-1', partNumber: 1, status: 'DESPATCHED', dispatched: true }),
+          part({ externalId: 'M-2', partNumber: 2, status: 'DESPATCHED', dispatched: true }),
+        ]
+      },
+      fetchPartItems: async () => [{ sku: 'SKU-1', qty: 1 }],
+      fetchOrderStatus: async (orderNumber) => {
+        statusFetchedFor.push(orderNumber)
+        return status({ externalOrderId: 'M-1', externalOrderNumber: 'WC-1001-NEW', isSplit: true, partCount: 2 })
+      },
+      applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+      fetchDelta: async () => [
+        status({ externalOrderId: 'M-2', externalOrderNumber: 'WC-1001-NEW', isSplit: true, partCount: 2 }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+
+  // The group's live parts were enumerated, then links looked up by those ids.
+  assert.ok(partsFetchedFor.includes('WC-1001-NEW'), 'the split group was enumerated from the WMS')
+  assert.ok(
+    idQueries.some((ids) => ids.includes('M-1') && ids.includes('M-2')),
+    `links were looked up by the live part ids (queries: ${JSON.stringify(idQueries)})`,
+  )
+  // Reconciled under the CURRENT number, not the stale one stored on the link.
+  assert.ok(statusFetchedFor.includes('WC-1001-NEW'), 'reconciled under the new number')
+  assert.ok(!statusFetchedFor.includes('WC-1001-OLD'), 'never looked up the stale number')
+  assert.deepEqual(applied, ['o1'])
+  assert.equal(counters.dispatched, 1)
+  assert.deepEqual(saved, [{ watermark: NOW.toISOString() }])
+})
+
+test('[o3d-bjc.5] a split group the WMS cannot enumerate holds the watermark', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [],
+      fetchOrderParts: async () => [], // the delta says split, the WMS shows no parts
+      fetchDelta: async () => [
+        status({ externalOrderId: 'M-2', externalOrderNumber: 'WC-1001-NEW', isSplit: true, partCount: 2 }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.5] a split group enumeration ERROR holds the watermark rather than assuming nothing of ours', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string }> = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [],
+      fetchOrderParts: async () => { throw new Error('Mintsoft 500') },
+      fetchDelta: async () => [
+        status({ externalOrderId: 'M-2', externalOrderNumber: 'WC-1001-NEW', isSplit: true, partCount: 2 }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(saved, [])
+})
+
+test('[o3d-bjc.5] a split group ALREADY matched by number costs no extra WMS enumeration', async () => {
+  const partsFetchedFor: string[] = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [
+        candidate({ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }),
+      ],
+      fetchOrderParts: async (orderNumber) => {
+        partsFetchedFor.push(orderNumber)
+        return [part({ externalId: 'M-1', partNumber: 1 }), part({ externalId: 'M-2', partNumber: 2 })]
+      },
+      fetchOrderStatus: async () => status({ externalOrderId: 'M-1', isSplit: true, partCount: 2 }),
+      fetchDelta: async () => [
+        status({ externalOrderId: 'M-2', externalOrderNumber: 'WC-1001', isSplit: true, partCount: 2 }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async () => {},
+    }),
+    { now: NOW },
+  )
+  // Exactly ONE parts call — the split reconcile itself, not a coverage probe too.
+  assert.deepEqual(partsFetchedFor, ['WC-1001'])
+})
+
 // --- Codex round 7: every delta-triggered "unknown" must hold the watermark ---
 
 const SPLIT_ROW = { externalOrderId: 'M-1', externalOrderNumber: 'WC-1001', isSplit: true, partCount: 2 }

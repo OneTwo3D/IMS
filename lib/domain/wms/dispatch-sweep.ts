@@ -737,11 +737,10 @@ export async function runWmsDispatchSweepCore(
     //    stored on the link;
     //  - merged components (o3d-bjc.2.1): the link still holds the ABSORBED
     //    order's id, which the survivor's row no longer carries at all.
-    const supplementNumbers = new Set<string>(
-      [...deltaByNumber.entries()]
-        .filter(([, rows]) => rows.length > 1 || rows.some((row) => row.isSplit || (row.partCount ?? 1) > 1))
-        .map(([number]) => number),
-    )
+    const splitGroupNumbers = [...deltaByNumber.entries()]
+      .filter(([, rows]) => rows.length > 1 || rows.some((row) => row.isSplit || (row.partCount ?? 1) > 1))
+      .map(([number]) => number)
+    const supplementNumbers = new Set<string>(splitGroupNumbers)
     for (const number of mergedComponentNumbers) supplementNumbers.add(number)
     if (supplementNumbers.size > 0) {
       if (deps.listActiveByOrderNumbers) {
@@ -757,6 +756,60 @@ export async function runWmsDispatchSweepCore(
         // Stable IDs alone cannot prove split/merge coverage. Keep the watermark
         // until a later run can enumerate that shared-number group.
         deltaCoverageComplete = false
+      }
+    }
+
+    // --- o3d-bjc.5: a RENAMED split defeats BOTH indexes -------------------
+    // The link stores the OLD number and the PRIMARY part's stable id. When only a
+    // SIBLING part changes, the delta carries the sibling's id (no link holds it)
+    // under the NEW number (no link holds that either) — so neither the stable-id
+    // join nor the number supplement finds the link, yet coverage read complete and
+    // the change aged out.
+    //
+    // Resolve the group's CURRENT part ids from the WMS (authoritative) and enumerate
+    // links by those. That is a stable-id match against live data — stronger evidence
+    // than any number match — so a hit is reconciled under the group's CURRENT number.
+    // Keyed by linkId → the number to reconcile it under.
+    const renamedSplitCandidates = new Map<string, { candidate: WmsDispatchCandidate; orderNumber: string }>()
+    if (splitGroupNumbers.length > 0 && deps.partsSupported && deps.listActiveByExternalOrderIds) {
+      const alreadyFound = new Set(deltaCandidates.map((candidate) => candidate.linkId))
+      // Only groups the cheap indexes MISSED need this — a group already matched by
+      // number, or by one of its own changed part ids, costs no extra WMS call.
+      const groupCovered = (number: string): boolean => {
+        const rowIds = new Set(
+          (deltaByNumber!.get(number) ?? []).map((row) => row.externalOrderId).filter(Boolean),
+        )
+        return deltaCandidates.some(
+          (candidate) => candidate.externalOrderNumber === number
+            || (candidate.externalOrderId ? rowIds.has(candidate.externalOrderId) : false),
+        )
+      }
+      for (const number of splitGroupNumbers) {
+        if (groupCovered(number)) continue
+        try {
+          const parts = await deps.fetchOrderParts(number)
+          const partIds = parts.map((part) => part.externalId).filter((id): id is string => Boolean(id))
+          if (partIds.length === 0) {
+            // The delta says this number is a split group but the WMS shows no parts —
+            // we cannot enumerate it, so we cannot claim coverage of it.
+            deltaCoverageComplete = false
+            continue
+          }
+          for (const candidate of await deps.listActiveByExternalOrderIds(partIds)) {
+            if (alreadyFound.has(candidate.linkId)) continue
+            alreadyFound.add(candidate.linkId)
+            deltaCandidates.push(candidate)
+            renamedSplitCandidates.set(candidate.linkId, { candidate, orderNumber: number })
+          }
+        } catch (error) {
+          // Could not enumerate the group → hold the watermark rather than assume it
+          // held nothing of ours.
+          deltaCoverageComplete = false
+          console.error(
+            `[wms-dispatch-sweep] could not enumerate split group ${number} for rename coverage:`,
+            scrubWmsError(error, 'split group enumeration error'),
+          )
+        }
       }
     }
 
@@ -776,6 +829,25 @@ export async function runWmsDispatchSweepCore(
     }
 
     for (const candidate of deltaCandidates) {
+      // o3d-bjc.5: found by matching a live WMS part id, not by number or by the
+      // delta's own ids. Its stored number is stale, so reconcile it under the
+      // group's CURRENT number and force an authoritative re-read (which enumerates
+      // every sibling part). No expectedExternalOrderId: the part-id match against
+      // live WMS data already proved membership, and the stored id may belong to a
+      // non-primary part that the number lookup would not echo.
+      const renamed = renamedSplitCandidates.get(candidate.linkId)
+      if (renamed) {
+        await processOne(
+          { ...candidate, externalOrderNumber: renamed.orderNumber },
+          null,
+          undefined,
+          true,
+          claimantUniqueness(linksPerNumber, candidate.externalOrderNumber),
+        )
+        processedLinkIds.add(candidate.linkId)
+        continue
+      }
+
       // Stable-id join is authoritative. A candidate without one is eligible
       // only through the split-only number lookup and is always force-fetched.
       const idRow = candidate.externalOrderId ? deltaById.get(candidate.externalOrderId) : undefined
