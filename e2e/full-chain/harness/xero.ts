@@ -617,17 +617,29 @@ export async function voidTrackedDocuments(): Promise<{ voided: number; failed: 
 export async function findStragglers(tagPrefix = 'E2E-FC'): Promise<string[]> {
   const out: string[] = []
 
+  // A FAILED request is NOT "no stragglers". Auth expiry, throttling or any transport error leaves
+  // `data` undefined, and reading through it turned every such failure into a clean bill of health — the
+  // worst possible answer from a scan whose entire job is to notice residue (Codex). Each endpoint's
+  // outcome is reported explicitly so an incomplete scan says so.
+  const report = <T>(kind: string, res: { ok: boolean; error?: string; data?: T }): T | null => {
+    if (!res.ok) {
+      out.push(`INCOMPLETE SCAN: Xero ${kind} query failed (${res.error ?? 'unknown error'}) — residue may exist unseen`)
+      return null
+    }
+    return res.data ?? null
+  }
+
   // INVOICES + CREDIT NOTES carry our Reference, so Xero can filter them server-side.
-  const inv = await xeroGet<{ Invoices?: Array<{ InvoiceID: string; Reference?: string; Status: string }> }>(
+  const inv = report('Invoices', await xeroGet<{ Invoices?: Array<{ InvoiceID: string; Reference?: string; Status: string }> }>(
     `Invoices?where=${encodeURIComponent(`Reference!=null&&Reference.StartsWith("${tagPrefix}")`)}`,
-  )
-  for (const i of inv.data?.Invoices ?? []) {
+  ))
+  for (const i of inv?.Invoices ?? []) {
     if (!isGoneFromLedger(i.Status)) out.push(`Invoice ${i.InvoiceID} (${i.Reference}) ${i.Status}`)
   }
-  const cn = await xeroGet<{ CreditNotes?: Array<{ CreditNoteID: string; Reference?: string; Status: string }> }>(
+  const cn = report('CreditNotes', await xeroGet<{ CreditNotes?: Array<{ CreditNoteID: string; Reference?: string; Status: string }> }>(
     `CreditNotes?where=${encodeURIComponent(`Reference!=null&&Reference.StartsWith("${tagPrefix}")`)}`,
-  )
-  for (const c of cn.data?.CreditNotes ?? []) {
+  ))
+  for (const c of cn?.CreditNotes ?? []) {
     if (!isGoneFromLedger(c.Status)) out.push(`CreditNote ${c.CreditNoteID} (${c.Reference}) ${c.Status}`)
   }
 
@@ -641,10 +653,10 @@ export async function findStragglers(tagPrefix = 'E2E-FC'): Promise<string[]> {
   // Two reasons this cannot mirror the invoice filter. A ManualJournal has no Reference field at all, only a
   // Narration, and Xero does not support StartsWith filtering on it. So the tag match is client-side over a
   // date-bounded page — journals dated today or later, which is the window a full-chain run posts into.
-  const mj = await xeroGet<{ ManualJournals?: Array<{ ManualJournalID: string; Narration?: string; Status: string; Date?: string }> }>(
-    `ManualJournals?where=${encodeURIComponent(`Date>=DateTime(${todayForXeroWhere()})`)}`,
-  )
-  for (const j of mj.data?.ManualJournals ?? []) {
+  const mj = report('ManualJournals', await xeroGet<{ ManualJournals?: Array<{ ManualJournalID: string; Narration?: string; Status: string; Date?: string }> }>(
+    `ManualJournals?where=${encodeURIComponent(`Date>=DateTime(${xeroWhereDate(STRAGGLER_LOOKBACK_DAYS)})`)}`,
+  ))
+  for (const j of mj?.ManualJournals ?? []) {
     if (isGoneFromLedger(j.Status)) continue
     // REPORT-ONLY, and tag-matched narrations are reported separately from the rest. A date window is not
     // ownership: the Demo org is shared, and voiding a journal nobody is expecting is worse than listing a
@@ -665,11 +677,20 @@ function isGoneFromLedger(status: string): boolean {
 }
 
 /**
- * Today as Xero's `DateTime(yyyy,mm,dd)` where-clause literal — its filter syntax takes that form, not an
- * ISO string. Bounded to today because a full-chain run posts documents dated today (or, for a deliberately
- * future-dated payment, later), so this is the narrowest window that cannot miss the run's own journals.
+ * How far back the manual-journal scan looks.
+ *
+ * NOT just today. This function's contract is residue from ANY earlier run — the case it exists for is a
+ * teardown that never ran at all — so a today-only bound would make yesterday's leak permanently invisible,
+ * which is exactly the silent gap it is meant to close (Codex). A week covers any plausible unnoticed
+ * weekend while keeping the page small; journals older than that are a manual cleanup, not a straggler.
  */
-function todayForXeroWhere(): string {
-  const now = new Date()
-  return `${now.getUTCFullYear()},${now.getUTCMonth() + 1},${now.getUTCDate()}`
+const STRAGGLER_LOOKBACK_DAYS = 7
+
+/**
+ * A date `days` ago as Xero's `DateTime(yyyy,mm,dd)` where-clause literal — its filter syntax takes that
+ * form, not an ISO string.
+ */
+function xeroWhereDate(days: number): string {
+  const d = new Date(Date.now() - days * 86_400_000)
+  return `${d.getUTCFullYear()},${d.getUTCMonth() + 1},${d.getUTCDate()}`
 }
