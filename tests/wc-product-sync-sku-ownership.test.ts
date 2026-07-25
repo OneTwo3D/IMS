@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
-import { wcProductWriteLockKeys } from '../lib/connectors/woocommerce/sync-lock.ts'
+import {
+  resolveWcProductWriteLockIds,
+  wcProductWriteLockKeys,
+} from '../lib/connectors/woocommerce/sync-lock.ts'
 import {
   assertWcRowNotClaimedByAnotherWcObject,
   isWcSkuOwnershipConflict,
@@ -23,7 +26,8 @@ const state = {
   products: [] as Row[],
   options: [] as Row[],
   syncLogs: [] as Row[],
-  advisoryLocks: [] as string[],
+  /** Advisory-lock IDs handed to pg_advisory_xact_lock, in acquisition order. */
+  advisoryLocks: [] as number[],
 }
 
 function snapshot() {
@@ -122,28 +126,47 @@ const txClient = {
     },
   },
   setting: { upsert: async () => ({}), findUnique: async () => null },
-  $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
-    state.advisoryLocks.push(String(values[values.length - 1] ?? strings.join('')))
+  // Records the lock ID argument of each pg_advisory_xact_lock call, in order.
+  $executeRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
+    state.advisoryLocks.push(Number(values[values.length - 1]))
     return 1
   },
 }
 
-mock.module('@/lib/db', {
-  namedExports: {
-    db: {
-      ...txClient,
-      $transaction: async <T>(fn: (tx: typeof txClient) => Promise<T>): Promise<T> => {
-        const snap = snapshot()
-        try {
-          return await fn(txClient)
-        } catch (error) {
-          restore(snap)
-          throw error
-        }
-      },
-    },
+/**
+ * Stand-in for Postgres `hashtext`. The real one is an internal 32-bit hash; all the
+ * code under test relies on is that it is DETERMINISTIC and that distinct SKUs may
+ * collide. `hashOverrides` lets a test force a collision or an order inversion.
+ */
+let hashOverrides: Record<string, number> = {}
+function fakeHashtext(sku: string): number {
+  if (sku in hashOverrides) return hashOverrides[sku]
+  let hash = 0
+  for (const char of sku) hash = (hash * 31 + char.charCodeAt(0)) | 0
+  return hash
+}
+
+const dbMock = {
+  ...txClient,
+  $queryRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
+    const skus = values[0] as string[]
+    // Mirrors SELECT DISTINCT hashtext(sku) FROM unnest($1) — set semantics, unordered.
+    // Returned deliberately SHUFFLED so a test can only pass if the caller sorts.
+    const distinct = [...new Set(skus.map(fakeHashtext))].reverse()
+    return distinct.map((lock_id) => ({ lock_id }))
   },
-})
+  $transaction: async <T>(fn: (tx: typeof txClient) => Promise<T>): Promise<T> => {
+    const snap = snapshot()
+    try {
+      return await fn(txClient)
+    } catch (error) {
+      restore(snap)
+      throw error
+    }
+  },
+}
+
+mock.module('@/lib/db', { namedExports: { db: dbMock } })
 
 async function loadSync() {
   return (await import('@/lib/connectors/woocommerce/sync/product-sync')).syncWcProductToIms
@@ -196,6 +219,7 @@ function resetState() {
   state.advisoryLocks.length = 0
   nextId = 1
   variationTotalPages = 1
+  hashOverrides = {}
   variationPages = {
     '1': [wcVariation(111, 'VAR-1', 'Red'), wcVariation(112, 'VAR-2', 'Blue')],
   }
@@ -203,24 +227,52 @@ function resetState() {
 
 // --- wcProductWriteLockKeys -------------------------------------------------
 
-test('lock keys cover the parent and every variation SKU, deduped and sorted (o3d-fsi)', () => {
+test('lock keys cover the parent and every variation SKU, deduped (o3d-fsi)', () => {
   assert.deepEqual(
-    wcProductWriteLockKeys('PARENT', ['VAR-B', 'VAR-A', 'VAR-B']),
+    [...wcProductWriteLockKeys('PARENT', ['VAR-B', 'VAR-A', 'VAR-B'])].sort(),
     ['PARENT', 'VAR-A', 'VAR-B'],
   )
 })
 
-test('lock key order is identical for two payloads sharing a SKU — the deadlock-freedom argument (o3d-fsi)', () => {
-  // Two different parents that happen to share SHARED-SKU. Whatever else each one
-  // touches, they must request SHARED-SKU at a consistent point in a single global
-  // order, or each could hold a key the other is waiting on.
-  const a = wcProductWriteLockKeys('P-A', ['SHARED-SKU', 'A-ONLY'])
-  const b = wcProductWriteLockKeys('P-B', ['B-ONLY', 'SHARED-SKU'])
+test('lock ids come back sorted ASCENDING BY ID, not by SKU (o3d-fsi)', async () => {
+  // Sorting SKU strings would be the wrong invariant: the lock identity is hashtext(sku),
+  // and string order and hash order are unrelated permutations. Force an inversion —
+  // 'AAA' hashes ABOVE 'ZZZ' — and the ids must still come back ascending.
+  hashOverrides = { AAA: 900, ZZZ: 100 }
+  const ids = await resolveWcProductWriteLockIds(dbMock, ['AAA', 'ZZZ'])
 
-  const shared = a.filter((key) => b.includes(key))
-  assert.deepEqual(shared, b.filter((key) => a.includes(key)), 'shared keys appear in the same relative order')
-  assert.deepEqual(a, [...a].sort(), 'A is globally sorted')
-  assert.deepEqual(b, [...b].sort(), 'B is globally sorted')
+  assert.deepEqual(ids, [100, 900], 'ascending by lock id, so SKU order is irrelevant')
+})
+
+test('two payloads sharing a SKU request their shared lock ids in the same order (o3d-fsi)', async () => {
+  // The deadlock-freedom argument, stated against LOCK IDS. Payload A is lexically
+  // sorted one way and payload B the other; both must still agree on id order.
+  hashOverrides = { 'A-ONLY': 500, SHARED: 300, 'B-ONLY': 100 }
+
+  const a = await resolveWcProductWriteLockIds(dbMock, wcProductWriteLockKeys('A-ONLY', ['SHARED']))
+  const b = await resolveWcProductWriteLockIds(dbMock, wcProductWriteLockKeys('B-ONLY', ['SHARED']))
+
+  assert.deepEqual(a, [300, 500])
+  assert.deepEqual(b, [100, 300])
+  const sharedInA = a.filter((id) => b.includes(id))
+  const sharedInB = b.filter((id) => a.includes(id))
+  assert.deepEqual(sharedInA, sharedInB, 'shared ids are requested in the same relative order')
+})
+
+test('two SKUs that collide on hashtext collapse to ONE lock id (o3d-fsi)', async () => {
+  // A real collision must over-serialize, never produce two ids that could be taken in
+  // opposite orders by two transactions.
+  hashOverrides = { 'SKU-ONE': 42, 'SKU-TWO': 42 }
+  const ids = await resolveWcProductWriteLockIds(dbMock, ['SKU-ONE', 'SKU-TWO'])
+
+  assert.deepEqual(ids, [42], 'one lock covers both colliding SKUs')
+})
+
+test('an empty SKU list needs no round trip and no locks (o3d-fsi)', async () => {
+  let called = false
+  const client = { $queryRaw: async () => { called = true; return [] } }
+  assert.deepEqual(await resolveWcProductWriteLockIds(client, []), [])
+  assert.equal(called, false)
 })
 
 // --- assertWcRowNotClaimedByAnotherWcObject ---------------------------------
@@ -267,9 +319,21 @@ test('every SKU written is locked, in sorted order, before the first lookup (o3d
   assert.equal(result.success, true, `sync should succeed, got: ${result.error}`)
   assert.deepEqual(
     state.advisoryLocks,
-    ['PARENT-SKU', 'VAR-1', 'VAR-2'],
-    'the parent SKU alone is not enough: a variant SKU must be locked too, and in sorted order',
+    [fakeHashtext('PARENT-SKU'), fakeHashtext('VAR-1'), fakeHashtext('VAR-2')].sort((a, b) => a - b),
+    'the parent SKU alone is not enough: every variant SKU is locked too, ascending by lock id',
   )
+})
+
+test('lock ids are acquired ascending even when SKU order disagrees (o3d-fsi)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  // PARENT-SKU is lexically first but hashes LAST. Acquisition must follow the hash.
+  hashOverrides = { 'PARENT-SKU': 9000, 'VAR-1': 10, 'VAR-2': 20 }
+
+  const result = await syncWcProductToIms(variableProduct())
+
+  assert.equal(result.success, true, `sync should succeed, got: ${result.error}`)
+  assert.deepEqual(state.advisoryLocks, [10, 20, 9000], 'ordered by lock id, not by SKU')
 })
 
 test('a variant SKU owned by ANOTHER WC object is refused, not reparented (o3d-fsi)', async () => {
@@ -383,5 +447,45 @@ test('one SKU repeated across variations of the SAME parent stays tolerated (o3d
   assert.equal(result.success, true, `duplicate variation SKUs must not fail the import, got: ${result.error}`)
   assert.equal(state.products.filter((row) => row.sku === 'DUP').length, 1, 'one row, not two')
   assert.equal(findProductBySku('DUP')?.externalProductId, BigInt(112), 'last variation wins, as before')
-  assert.deepEqual(state.advisoryLocks, ['DUP', 'PARENT-SKU'], 'the repeated SKU is locked once')
+  assert.deepEqual(
+    state.advisoryLocks,
+    [fakeHashtext('DUP'), fakeHashtext('PARENT-SKU')].sort((a, b) => a - b),
+    'the repeated SKU is locked once',
+  )
+})
+
+test('a duplicate variation SKU survives a SECOND identical sync (o3d-fsi)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  variationPages = { '1': [wcVariation(111, 'DUP', 'Red'), wcVariation(112, 'DUP', 'Blue')] }
+
+  // First import leaves the row mapped to the LAST duplicate (112). If the guard only
+  // accepted the variation currently being applied, the re-sync below would reach
+  // variation 111 first, find a row owned by 112, and refuse — turning a tolerated WC
+  // quirk into a permanent import failure. Every id in the duplicate group is accepted.
+  assert.equal((await syncWcProductToIms(variableProduct())).success, true, 'first sync')
+  assert.equal(findProductBySku('DUP')?.externalProductId, BigInt(112))
+
+  const second = await syncWcProductToIms(variableProduct())
+
+  assert.equal(second.success, true, `the re-sync must also succeed, got: ${second.error}`)
+  assert.equal(state.products.filter((row) => row.sku === 'DUP').length, 1, 'still one row')
+  assert.equal(findProductBySku('DUP')?.externalProductId, BigInt(112), 'still last-one-wins')
+})
+
+test('an id absent from the duplicate group is still refused (o3d-fsi)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  variationPages = { '1': [wcVariation(111, 'DUP', 'Red'), wcVariation(112, 'DUP', 'Blue')] }
+
+  // Accepting the whole duplicate group must not become "accept anything": a row owned
+  // by an object this payload does not contain is still someone else's.
+  state.products.push(imsRow({ id: 'ims-outsider', sku: 'DUP', name: 'Outsider', externalProductId: BigInt(555) }))
+  const before = snapshot()
+
+  const result = await syncWcProductToIms(variableProduct())
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /already mapped to WooCommerce object 555/)
+  assert.deepEqual(state.products, before.products, 'the outsider row is untouched')
 })

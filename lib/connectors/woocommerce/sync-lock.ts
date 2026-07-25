@@ -47,8 +47,14 @@ export const WC_SETTINGS_VERSION_KEY = 'wc_settings_version'
  * P2002 as permanent: doing so would discard a legitimate update. Taking
  * `pg_advisory_xact_lock(<this namespace>, hashtext(sku))` as the first
  * statements of the write transaction serializes those workers, so the second one
- * observes the rows the first committed and takes the update branch. A P2002 that
- * survives this is therefore a real conflict, not a race.
+ * observes the rows the first committed and takes the update branch.
+ *
+ * This is a COOPERATIVE lock, and it removes the WC-sync-versus-WC-sync race only.
+ * Other `Product` writers — the manual create in app/actions/products.ts, the CSV
+ * import — do not take it, so a manual create landing between this transaction's
+ * lookup and its create still raises a P2002 on `Product.sku`. That residual is why
+ * o3d-gtk keeps a `sku` P2002 TRANSIENT: the retry finds the committed row and
+ * adopts it. Making every `Product.sku` writer join this protocol is o3d-42hw.
  *
  * This relies on the transaction running at READ COMMITTED (Prisma's default): the
  * blocked worker's SKU lookup takes a fresh snapshot after the lock is granted, so
@@ -71,17 +77,47 @@ export const WC_SETTINGS_VERSION_KEY = 'wc_settings_version'
 export const WC_PRODUCT_WRITE_LOCK_NAMESPACE = 918_273_646
 
 /**
- * Every SKU one product-write transaction touches, deduplicated and in a single
- * global order (o3d-fsi).
+ * Every SKU one product-write transaction touches, deduplicated (o3d-fsi).
  *
- * The sort is what makes the multi-lock acquisition deadlock-free: two payloads
- * with overlapping SKU sets request their shared keys in the same sequence, so the
- * second blocks on the first shared key instead of holding one and waiting on
- * another the first already holds. Callers MUST acquire in the returned order.
+ * Order here is NOT the acquisition order — see `resolveWcProductWriteLockIds`.
+ * Sorting the SKU strings would be the wrong invariant: the lock identity is
+ * `hashtext(sku)`, and string order and 32-bit-hash order are unrelated
+ * permutations. Two transactions could each be lexically sorted and still request
+ * two shared hashes in opposite orders, which is a deadlock.
  */
 export function wcProductWriteLockKeys(
   parentSku: string,
   variationSkus: readonly string[],
 ): string[] {
-  return Array.from(new Set([parentSku, ...variationSkus])).sort()
+  return Array.from(new Set([parentSku, ...variationSkus]))
+}
+
+/**
+ * Resolve SKUs to the advisory-lock ids they map to, deduplicated and sorted
+ * ASCENDING BY ID — the order callers must acquire them in (o3d-fsi).
+ *
+ * Sorting the ids rather than the SKUs is what actually makes the multi-lock
+ * acquisition deadlock-free: two payloads whose SKU sets overlap request their
+ * shared LOCK IDS in the same sequence, so the second blocks on the first shared
+ * id instead of holding one while waiting on another the first already holds.
+ *
+ * A genuine `hashtext` collision between two different SKUs collapses to ONE id.
+ * That over-serializes two unrelated products, which is harmless, and — unlike
+ * ordering by SKU — it cannot produce a crossed acquisition order.
+ *
+ * `hashtext` is deterministic and side-effect free, so this runs BEFORE the write
+ * transaction opens: nothing here needs the transaction's snapshot, and resolving
+ * it outside keeps the lock-hold window to the acquisitions themselves.
+ */
+export async function resolveWcProductWriteLockIds(
+  client: { $queryRaw: (query: TemplateStringsArray, ...values: unknown[]) => Promise<unknown> },
+  skus: readonly string[],
+): Promise<number[]> {
+  if (skus.length === 0) return []
+
+  const rows = (await client.$queryRaw`
+    SELECT DISTINCT hashtext(sku) AS lock_id FROM unnest(${skus}::text[]) AS sku
+  `) as Array<{ lock_id: number | bigint }>
+
+  return rows.map((row) => Number(row.lock_id)).sort((a, b) => a - b)
 }

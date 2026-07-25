@@ -166,6 +166,13 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       ...txClient,
+      // Stands in for SELECT DISTINCT hashtext(sku) FROM unnest(...) — see
+      // resolveWcProductWriteLockIds. Ordering is asserted in the o3d-fsi suite; here
+      // it only has to resolve so the write transaction can take its locks.
+      $queryRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
+        const skus = values[0] as string[]
+        return [...new Set(skus)].map((sku, index) => ({ lock_id: index + 1, sku }))
+      },
       $transaction: async <T>(fn: (tx: typeof txClient) => Promise<T>): Promise<T> => {
         const snap = snapshot()
         try {

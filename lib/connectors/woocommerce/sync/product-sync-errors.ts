@@ -54,11 +54,19 @@ export function isWcSkuOwnershipConflict(error: unknown): boolean {
 }
 
 /**
- * Throw unless the matched IMS row is free for this WooCommerce object to write.
+ * Throw unless the matched IMS row is free for this WooCommerce payload to write.
  *
  * A row is writable when it is UNCLAIMED (`externalProductId` null — the ordinary
- * adopt-an-existing-IMS-product path on first import) or already claimed by this same
- * object. Any other value means a different WooCommerce product or variation owns it.
+ * adopt-an-existing-IMS-product path on first import) or already claimed by one of the
+ * `claimants`: the WooCommerce object ids in THIS payload that legitimately resolve to
+ * this SKU. Any other value means a different WooCommerce product or variation owns it.
+ *
+ * `claimants` is a SET, not a single id, because WooCommerce permits one SKU on several
+ * variations of a single parent. The sync has always resolved that last-one-wins, so the
+ * surviving row carries the LAST variation's id. Checking against only the variation
+ * currently being applied would reject that row on every subsequent re-sync — the first
+ * duplicate would find a row mapped to its sibling and refuse — turning a tolerated WC
+ * quirk into a permanent import failure. Every id in the duplicate group is accepted.
  *
  * Residual (deliberate): an unclaimed row is adopted even if it currently sits under a
  * different IMS parent. That is the initial-import path — an IMS-native catalogue being
@@ -67,20 +75,23 @@ export function isWcSkuOwnershipConflict(error: unknown): boolean {
  */
 export function assertWcRowNotClaimedByAnotherWcObject(
   row: { id: string; sku: string; externalProductId?: bigint | number | string | null },
-  incomingWcId: number | bigint,
+  claimants: number | bigint | ReadonlySet<bigint>,
 ): void {
   // `== null` on purpose: an unset mapping reaches here as null from Prisma and as
   // undefined from any caller that selected a narrower row shape. Both mean UNCLAIMED,
   // and coercing undefined through BigInt() would throw a TypeError instead.
   if (row.externalProductId == null) return
 
-  const incoming = BigInt(incomingWcId)
-  if (BigInt(row.externalProductId) === incoming) return
+  const accepted: ReadonlySet<bigint> =
+    typeof claimants === 'object' ? claimants : new Set([BigInt(claimants)])
+
+  const claimedBy = BigInt(row.externalProductId)
+  if (accepted.has(claimedBy)) return
 
   throw new WcSkuOwnershipConflictError({
     sku: row.sku,
-    claimedByWcId: String(BigInt(row.externalProductId)),
-    incomingWcId: String(incoming),
+    claimedByWcId: String(claimedBy),
+    incomingWcId: [...accepted].map(String).join(', '),
     imsProductId: row.id,
   })
 }

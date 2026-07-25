@@ -13,6 +13,7 @@ import {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   WC_SETTINGS_VERSION_KEY,
   WC_SYNC_ADVISORY_LOCK_KEY,
+  resolveWcProductWriteLockIds,
   wcProductWriteLockKeys,
 } from '../sync-lock'
 import { assertWcRowNotClaimedByAnotherWcObject } from './product-sync-errors'
@@ -403,27 +404,32 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
       ? wcProduct.attributes.filter((a) => a.variation)
       : []
 
-    // Every SKU this transaction will write, in one deterministic order (o3d-fsi).
-    // Computed out here because the variations are already in hand — the lock set has
-    // to be complete BEFORE the first lookup, not discovered as applyVariations walks.
-    const lockKeys = wcProductWriteLockKeys(
-      sku,
-      variations.map((v) => asTrimmedString(v.sku)).filter((s): s is string => Boolean(s)),
+    // Every SKU this transaction will write (o3d-fsi). Computed out here because the
+    // variations are already in hand — the lock set has to be complete BEFORE the first
+    // lookup, not discovered as applyVariations walks. Resolved to sorted advisory-lock
+    // ids outside the transaction: hashtext is pure, so this needs no snapshot, and the
+    // ids (not the SKU strings) are what has to be acquired in a single global order.
+    const lockIds = await resolveWcProductWriteLockIds(
+      db,
+      wcProductWriteLockKeys(
+        sku,
+        variations.map((v) => asTrimmedString(v.sku)).filter((s): s is string => Boolean(s)),
+      ),
     )
 
     // --- Local writes: all of them, in ONE transaction ---
     const { syncedProductId, syncedSku, tradeChanges, wasUpdate } = await db.$transaction(
       async (tx: Prisma.TransactionClient) => {
         // Serialize concurrent syncs touching ANY of these SKUs so the find-then-create
-        // below cannot race another worker into a P2002, and so two parents sharing a
+        // below cannot race another WC sync into a P2002, and so two parents sharing a
         // variation SKU cannot both take the create branch (o3d-uh2, o3d-fsi).
         //
-        // Acquired one statement at a time, in the sorted order the helper returns:
-        // that order is the deadlock-freedom argument, and a single set-returning
-        // statement would leave the acquisition sequence up to the planner. The extra
-        // round trips are proportionate — applyVariations already makes one per variant.
-        for (const lockKey of lockKeys) {
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_WRITE_LOCK_NAMESPACE}::int4, hashtext(${lockKey}))`
+        // Acquired one statement at a time, ascending by lock id: that order is the
+        // deadlock-freedom argument, and a single set-returning statement would leave the
+        // acquisition sequence up to the planner. The extra round trips are proportionate
+        // — applyVariations already makes one per variant.
+        for (const lockId of lockIds) {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_WRITE_LOCK_NAMESPACE}::int4, ${lockId}::int4)`
         }
 
         const existing = await tx.product.findFirst({ where: { sku } })
@@ -650,11 +656,19 @@ async function applyVariations(
   })
   const existingBySku = new Map(existingRows.map((row) => [row.sku, row]))
 
-  // SKUs this transaction has already written. WC can repeat one SKU across variations of
-  // a single parent, and that duplicate has always been tolerated last-one-wins; the
-  // ownership guard must not turn it into a hard failure, so it is checked only against
-  // rows that pre-date this transaction (o3d-fsi).
-  const writtenSkus = new Set<string>()
+  // Every WC variation id this payload maps to each SKU (o3d-fsi). WC permits one SKU on
+  // several variations of a parent, and the sync has always resolved that last-one-wins —
+  // so after an import the surviving row carries the LAST duplicate's id. Checking a row
+  // against only the variation currently being applied would then reject it on the very
+  // next re-sync: the first duplicate would find a row mapped to its sibling. Accepting
+  // the whole group keeps the quirk tolerated across repeated syncs, while still refusing
+  // any id that is not in this payload at all.
+  const claimantsBySku = new Map<string, Set<bigint>>()
+  for (const { v, sku } of entries) {
+    const claimants = claimantsBySku.get(sku) ?? new Set<bigint>()
+    claimants.add(BigInt(v.id))
+    claimantsBySku.set(sku, claimants)
+  }
 
   for (const { v, sku } of entries) {
     // Build variant name: parent name + attribute values
@@ -682,7 +696,7 @@ async function applyVariations(
       // The update below rewrites type/parentId/externalProductId, so refuse a row a
       // different WC object already owns instead of reparenting it (o3d-fsi). The
       // caller's advisory locks cover this SKU, so this decision is on stable state.
-      if (!writtenSkus.has(sku)) assertWcRowNotClaimedByAnotherWcObject(existing, v.id)
+      assertWcRowNotClaimedByAnotherWcObject(existing, claimantsBySku.get(sku) ?? new Set([BigInt(v.id)]))
 
       const updateData: Record<string, unknown> = {
         name: variantName,
@@ -706,7 +720,6 @@ async function applyVariations(
       if (gtin && !existing.barcode) updateData.barcode = gtin
 
       await tx.product.update({ where: { id: existing.id }, data: updateData })
-      writtenSkus.add(sku)
     } else {
       const created = await tx.product.create({
         data: {
@@ -732,7 +745,6 @@ async function applyVariations(
       // WC can repeat a SKU across variations of one parent; keep the map authoritative
       // so the duplicate updates the row we just created instead of colliding on it.
       existingBySku.set(sku, created)
-      writtenSkus.add(sku)
     }
   }
 }
