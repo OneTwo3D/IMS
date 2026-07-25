@@ -15,7 +15,7 @@ import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clearXeroReferenceCache } from './api'
-import { parseGrantedScopes, XERO_SCOPE_STRING } from './scopes'
+import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from './scopes'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_CONNECTOR = 'xero'
@@ -34,8 +34,11 @@ type TokenResponse = {
   refresh_token?: string
   expires_in: number
   token_type: string
-  /** What Xero actually granted. Present on both the code exchange and the refresh (o3d-g2i). */
-  scope?: string
+  /**
+   * What Xero granted. NOT guaranteed to be present, and may be a string or an array — the authoritative
+   * copy is the `scope` claim inside the access-token JWT, which scopesFromTokenResponse falls back to.
+   */
+  scope?: string | string[]
 }
 
 type XeroConnection = {
@@ -335,7 +338,9 @@ export async function exchangeCodeForTokens(
       tenantName: conn.tenantName,
       // What was actually GRANTED, which is not necessarily what we asked for: the operator can decline
       // individual scopes on the consent screen, and Xero says so here rather than at the failing call.
-      grantedScopes: tokenData.scope ?? null,
+      // Read from the response field OR the access-token JWT claim — the top-level field is not
+      // guaranteed, and taking null from its absence would leave validation off on a fresh reconnect.
+      grantedScopes: scopesFromTokenResponse(tokenData),
     })
     await pinTenantId(conn.tenantId)
 
@@ -398,9 +403,11 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
         tenantId: token.tenantId,
         tenantName: token.tenantName,
         // A refresh CANNOT widen a grant — it returns the scopes the original consent carried. Keeping
-        // the stored value when the response omits `scope` is therefore right; overwriting it with null
+        // the stored value when the response says nothing is therefore right; overwriting it with null
         // would silently turn a known-deficient grant back into "unknown", which validation lets through.
-        grantedScopes: data.scope ?? token.grantedScopes,
+        // It is also how a pre-existing connection FILLS IN its record without a reconnect: the JWT
+        // fallback reads the grant off the new access token.
+        grantedScopes: scopesFromTokenResponse(data) ?? token.grantedScopes,
       })
 
       return { accessToken: data.access_token, tenantId: token.tenantId }

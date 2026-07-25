@@ -3,8 +3,15 @@ import test from 'node:test'
 
 import {
   blockingScopeFor, missingScopes, parseGrantedScopes, requiredScopeForSyncType,
-  scopeBlockedError, SCOPE_RECONSENT_PREFIX, XERO_REQUESTED_SCOPES, XERO_SCOPE_STRING,
+  scopeBlockedError, scopesFromTokenResponse, SCOPE_RECONSENT_PREFIX,
+  XERO_REQUESTED_SCOPES, XERO_SCOPE_STRING,
 } from '@/lib/connectors/xero/scopes'
+
+/** A minimal JWT: header.payload.signature, payload base64url-encoded, as Xero's access token is. */
+function jwtWith(claims: Record<string, unknown>): string {
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url')
+  return `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64(claims)}.signature-not-checked`
+}
 
 /**
  * o3d-g2i. Adding a scope to the authorization URL only affects FUTURE consents: an existing refresh
@@ -94,4 +101,70 @@ test('the blocked-row error says what to DO, and is recognisable', () => {
   assert.match(msg, /INVOICE_PAYMENT/)
   assert.match(msg, /reconnect/i)
   assert.match(msg, /Nothing was sent/)
+})
+
+
+// --- reading the grant off a token response ----------------------------------
+
+test('the top-level scope field is used when Xero sends one', () => {
+  assert.equal(
+    scopesFromTokenResponse({ scope: 'accounting.invoices accounting.payments' }),
+    'accounting.invoices accounting.payments',
+  )
+})
+
+test('an ARRAY of scopes is normalised, not stringified into nonsense', () => {
+  assert.equal(scopesFromTokenResponse({ scope: ['accounting.invoices', 'accounting.payments'] }),
+    'accounting.invoices accounting.payments')
+})
+
+test('when the response omits scope, the access-token JWT claim is read instead', () => {
+  // Xero's auth-code response does not GUARANTEE a top-level `scope`. Taking null from its absence
+  // meant a perfectly good reconnect persisted "unknown" — and unknown fails open, so validation
+  // stayed switched off on precisely the connection someone had just fixed.
+  const token = jwtWith({ scope: 'accounting.settings accounting.payments', xero_userid: 'u' })
+  assert.equal(scopesFromTokenResponse({ access_token: token }), 'accounting.settings accounting.payments')
+})
+
+test('a JWT carrying its scope claim as an array works too', () => {
+  const token = jwtWith({ scope: ['accounting.settings', 'accounting.payments'] })
+  assert.equal(scopesFromTokenResponse({ access_token: token }), 'accounting.settings accounting.payments')
+})
+
+test('an opaque or malformed token yields UNKNOWN, and never throws', () => {
+  // Failing a connection Xero has just accepted, because we could not parse its token, would be a
+  // self-inflicted outage. Unknown is the safe answer.
+  assert.equal(scopesFromTokenResponse({ access_token: 'not-a-jwt' }), null)
+  assert.equal(scopesFromTokenResponse({ access_token: 'a.!!!not-base64!!!.c' }), null)
+  assert.equal(scopesFromTokenResponse({}), null)
+  assert.equal(scopesFromTokenResponse(null), null)
+  assert.equal(scopesFromTokenResponse({ scope: '   ' }), null)
+})
+
+// --- Xero's broad legacy scopes ----------------------------------------------
+
+test('a legacy accounting.transactions grant is NOT reported as missing the granular scopes', () => {
+  // Xero accepts accounting.transactions through September 2027 and it authorises the granular
+  // transactional endpoints. Judging such a connection "missing accounting.payments" would block every
+  // payment row that Xero would have accepted — a compatibility outage of our own making.
+  const granted = ['openid', 'profile', 'email', 'offline_access', 'accounting.settings',
+    'accounting.contacts', 'accounting.transactions', 'accounting.attachments']
+  assert.deepEqual(missingScopes(granted), [], 'the broad scope covers invoices, payments and journals')
+  assert.equal(blockingScopeFor('INVOICE_PAYMENT', granted), null)
+  assert.equal(blockingScopeFor('BILL_PAYMENT', granted), null)
+  assert.equal(blockingScopeFor('COGS_JOURNAL', granted), null)
+})
+
+test('a broad grant still cannot conjure a scope it does not entail', () => {
+  // accounting.transactions says nothing about attachments — so BILL_ATTACHMENT is still blocked, and
+  // the warning still names what is genuinely absent.
+  const granted = ['accounting.transactions']
+  assert.equal(blockingScopeFor('BILL_ATTACHMENT', granted), 'accounting.attachments')
+  assert.ok(missingScopes(granted).includes('accounting.attachments'))
+  assert.ok(!missingScopes(granted).includes('accounting.payments'))
+})
+
+test('a mixed broad-and-granular grant is fine', () => {
+  const granted = [...XERO_REQUESTED_SCOPES, 'accounting.transactions']
+  assert.deepEqual(missingScopes(granted), [])
 })
