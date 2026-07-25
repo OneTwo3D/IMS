@@ -13,7 +13,9 @@ import {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   WC_SETTINGS_VERSION_KEY,
   WC_SYNC_ADVISORY_LOCK_KEY,
+  wcProductWriteLockKeys,
 } from '../sync-lock'
+import { assertWcRowNotClaimedByAnotherWcObject } from './product-sync-errors'
 import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
 import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
@@ -401,14 +403,33 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
       ? wcProduct.attributes.filter((a) => a.variation)
       : []
 
+    // Every SKU this transaction will write, in one deterministic order (o3d-fsi).
+    // Computed out here because the variations are already in hand — the lock set has
+    // to be complete BEFORE the first lookup, not discovered as applyVariations walks.
+    const lockKeys = wcProductWriteLockKeys(
+      sku,
+      variations.map((v) => asTrimmedString(v.sku)).filter((s): s is string => Boolean(s)),
+    )
+
     // --- Local writes: all of them, in ONE transaction ---
     const { syncedProductId, syncedSku, tradeChanges, wasUpdate } = await db.$transaction(
       async (tx: Prisma.TransactionClient) => {
-        // Serialize concurrent syncs of this SKU so the find-then-create below cannot
-        // race another worker into a P2002 (see WC_PRODUCT_WRITE_LOCK_NAMESPACE).
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_WRITE_LOCK_NAMESPACE}::int4, hashtext(${sku}))`
+        // Serialize concurrent syncs touching ANY of these SKUs so the find-then-create
+        // below cannot race another worker into a P2002, and so two parents sharing a
+        // variation SKU cannot both take the create branch (o3d-uh2, o3d-fsi).
+        //
+        // Acquired one statement at a time, in the sorted order the helper returns:
+        // that order is the deadlock-freedom argument, and a single set-returning
+        // statement would leave the acquisition sequence up to the planner. The extra
+        // round trips are proportionate — applyVariations already makes one per variant.
+        for (const lockKey of lockKeys) {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_WRITE_LOCK_NAMESPACE}::int4, hashtext(${lockKey}))`
+        }
 
         const existing = await tx.product.findFirst({ where: { sku } })
+        // Never reassign a row another WooCommerce object already maps (o3d-fsi): the
+        // update branch below overwrites type/parentId/externalProductId.
+        if (existing) assertWcRowNotClaimedByAnotherWcObject(existing, wcProduct.id)
         const lifecycleStatus = deriveLifecycleStatusFromWooStatus(
           wcProduct.status,
           existing?.lifecycleStatus ?? null,
@@ -629,6 +650,12 @@ async function applyVariations(
   })
   const existingBySku = new Map(existingRows.map((row) => [row.sku, row]))
 
+  // SKUs this transaction has already written. WC can repeat one SKU across variations of
+  // a single parent, and that duplicate has always been tolerated last-one-wins; the
+  // ownership guard must not turn it into a hard failure, so it is checked only against
+  // rows that pre-date this transaction (o3d-fsi).
+  const writtenSkus = new Set<string>()
+
   for (const { v, sku } of entries) {
     // Build variant name: parent name + attribute values
     const attrSuffix = Array.isArray(v.attributes)
@@ -652,6 +679,11 @@ async function applyVariations(
     const existing = existingBySku.get(sku)
 
     if (existing) {
+      // The update below rewrites type/parentId/externalProductId, so refuse a row a
+      // different WC object already owns instead of reparenting it (o3d-fsi). The
+      // caller's advisory locks cover this SKU, so this decision is on stable state.
+      if (!writtenSkus.has(sku)) assertWcRowNotClaimedByAnotherWcObject(existing, v.id)
+
       const updateData: Record<string, unknown> = {
         name: variantName,
         description: description || existing.description,
@@ -674,6 +706,7 @@ async function applyVariations(
       if (gtin && !existing.barcode) updateData.barcode = gtin
 
       await tx.product.update({ where: { id: existing.id }, data: updateData })
+      writtenSkus.add(sku)
     } else {
       const created = await tx.product.create({
         data: {
@@ -699,6 +732,7 @@ async function applyVariations(
       // WC can repeat a SKU across variations of one parent; keep the map authoritative
       // so the duplicate updates the row we just created instead of colliding on it.
       existingBySku.set(sku, created)
+      writtenSkus.add(sku)
     }
   }
 }
