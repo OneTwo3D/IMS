@@ -5,6 +5,8 @@ import {
   formatCursorInTimeZone,
   resolveDispatchJobOutcome,
   isDispatchClientScoped,
+  coherentSplitPartIds,
+  SPLIT_PROBE_BUDGET_PER_SWEEP,
 } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsDispatchSweepDeps, WmsDispatchCandidate } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsOrderStatus, WmsOrderTracking, WmsOrderPart } from '../lib/connectors/wms/types.ts'
@@ -1353,4 +1355,141 @@ test('resolveDispatchJobOutcome: incomplete coverage marks the job PARTIAL (o3d-
     }),
     { status: 'PARTIAL', effectiveErrors: 5 },
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bjc.5: a RENAMED split whose sibling changed must not age out.
+//
+// The supplement looks links up by the delta row's CURRENT number, but the link
+// stores the number the split had when we created it. If Mintsoft renamed it and
+// only a SIBLING changed, neither the stable-ID join (wrong part id) nor the
+// number lookup (wrong number) finds the link — so the order is invisible and
+// ages out when the watermark advances.
+//
+// Attempt 1 fixed that by claiming coverage on number matches, which Codex
+// rejected: order numbers are not unique even within our own client, so that
+// risked dispatching one order's parts onto another's. Coverage is therefore
+// claimed only on STABLE-ID evidence, and an incoherent group is refused.
+// ---------------------------------------------------------------------------
+
+function splitPart(externalId: string, partNumber: number): WmsOrderPart {
+  return { externalId, partNumber, status: 'NEW', dispatched: false, tracking: [] }
+}
+
+test('coherentSplitPartIds: accepts one coherent group', () => {
+  assert.deepEqual(coherentSplitPartIds([splitPart('M-1', 1), splitPart('M-2', 2)], 2), ['M-1', 'M-2'])
+  assert.deepEqual(coherentSplitPartIds([splitPart('M-1', 1), splitPart('M-2', 2)], null), ['M-1', 'M-2'])
+})
+
+test('coherentSplitPartIds: refuses anything ambiguous', () => {
+  // Two records claiming the same part — two splits stapled together by a
+  // reused number. Enumerating against this could dispatch a stranger's parts.
+  assert.equal(coherentSplitPartIds([splitPart('M-1', 1), splitPart('M-9', 1)], 2), null)
+  // Duplicate external id.
+  assert.equal(coherentSplitPartIds([splitPart('M-1', 1), splitPart('M-1', 2)], 2), null)
+  // Count disagrees with what the delta row said the split has.
+  assert.equal(coherentSplitPartIds([splitPart('M-1', 1), splitPart('M-2', 2)], 3), null)
+  // Missing/blank id, or a nonsense part number.
+  assert.equal(coherentSplitPartIds([splitPart('', 1)], 1), null)
+  assert.equal(coherentSplitPartIds([splitPart('M-1', 0)], 1), null)
+  assert.equal(coherentSplitPartIds([], 2), null)
+})
+
+test('[o3d-bjc.5] a renamed split is found AND reconciled under its new number', async () => {
+  // The link stores the OLD number and the PRIMARY part id. The delta carries
+  // only the changed sibling, under the NEW number.
+  //
+  // The status stub EXACT-MATCHES the number, like the production Mintsoft
+  // adapter: looking the order up by the stale number returns nothing. A weaker
+  // stub hides the second half of this bug — the probe finds the link and then
+  // reconciliation fails anyway because it still uses the old number.
+  const applied: string[] = []
+  const idLookups: string[][] = []
+  const statusLookups: string[] = []
+  let saved = false
+  const { counters } = await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async (ids) => {
+        idLookups.push([...ids])
+        return ids.includes('M-OLD-1')
+          ? [candidate({ linkId: 'L1', orderId: 'O1', externalOrderId: 'M-OLD-1', externalOrderNumber: 'WC-OLD' })]
+          : []
+      },
+      listActiveByOrderNumbers: async () => [],
+      fetchOrderParts: async () => [splitPart('M-OLD-1', 1), splitPart('M-NEW-2', 2)],
+      fetchOrderStatus: async (number) => {
+        statusLookups.push(number)
+        if (number !== 'WC-NEW') return null       // the rename is real
+        return status({
+          externalOrderId: 'M-OLD-1', externalOrderNumber: 'WC-NEW',
+          isSplit: false, partCount: 1, dispatched: true,
+          tracking: [{ trackingNumber: 'TRK-1', carrier: 'RM', despatchedAt: '2026-07-23' }],
+        })
+      },
+      applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+      fetchDelta: async () => [
+        status({ externalOrderId: 'M-NEW-2', externalOrderNumber: 'WC-NEW', isSplit: true, partCount: 2 }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async () => { saved = true },
+    }),
+    { now: NOW },
+  )
+  assert.ok(idLookups.some((ids) => ids.includes('M-OLD-1') && ids.includes('M-NEW-2')),
+    'must enumerate links by the group\'s stable part ids')
+  assert.ok(statusLookups.includes('WC-NEW'),
+    'must reconcile under the CURRENT number, not the link\'s stale one')
+  assert.deepEqual(applied, ['O1'], 'the renamed split must actually dispatch')
+  assert.ok(counters.totalChecked > 0)
+  assert.equal(saved, true, 'a clean pass must advance the watermark')
+})
+
+test('[o3d-bjc.5] an incoherent part set is refused and holds the watermark', async () => {
+  let saved = false
+  const idLookups: string[][] = []
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async (ids) => { idLookups.push([...ids]); return [] },
+      listActiveByOrderNumbers: async () => [],
+      // Two records both claiming part 1 — a reused number, not one split.
+      fetchOrderParts: async () => [splitPart('M-A', 1), splitPart('M-B', 1)],
+      fetchDelta: async () => [
+        status({ externalOrderId: 'M-X', externalOrderNumber: 'WC-DUP', isSplit: true, partCount: 2 }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async () => { saved = true },
+    }),
+    { now: NOW },
+  )
+  // Never enumerated against the ambiguous group...
+  assert.ok(!idLookups.some((ids) => ids.includes('M-A') || ids.includes('M-B')),
+    'must not enumerate links against an incoherent group')
+  // ...and the watermark is held rather than advanced past the unresolved group.
+  assert.equal(saved, false, 'an unresolved group must hold the watermark')
+})
+
+test('[o3d-bjc.5] a failing probe stops immediately and holds the watermark', async () => {
+  let partsCalls = 0
+  let saved = false
+  await runWmsDispatchSweepCore(
+    deps({
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => [],
+      fetchOrderParts: async () => { partsCalls += 1; throw new Error('WMS throttled') },
+      fetchDelta: async () => [
+        status({ externalOrderId: 'M-1', externalOrderNumber: 'WC-A', isSplit: true, partCount: 2 }),
+        status({ externalOrderId: 'M-2', externalOrderNumber: 'WC-B', isSplit: true, partCount: 2 }),
+      ],
+      getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+      saveDeltaState: async () => { saved = true },
+    }),
+    { now: NOW },
+  )
+  assert.equal(partsCalls, 1, 'must stop on the FIRST failure, not hammer a degraded dependency')
+  assert.equal(saved, false, 'a failed probe must hold the watermark')
+})
+
+test('[o3d-bjc.5] the probe budget is bounded', () => {
+  assert.ok(SPLIT_PROBE_BUDGET_PER_SWEEP > 0 && SPLIT_PROBE_BUDGET_PER_SWEEP <= 100,
+    'a cold window with many unlinked split groups must not storm the WMS')
 })
