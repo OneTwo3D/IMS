@@ -25,6 +25,7 @@ import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purcha
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
@@ -539,6 +540,46 @@ export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
   return pos.map(mapPoRow)
 }
 
+/**
+ * The latest BILL_PAYMENT sync row per bill — the ledger's side of "is this settled?" (o3d-lgo.15).
+ *
+ * Latest, not all: a retry writes a new row, and the current state is the one that decides whether the
+ * ledger agrees.
+ *
+ * SCOPED TO THE ACTIVE CONNECTOR. Payment and invoice ids are owned by the connector and tenant that
+ * issued them, and disconnecting does not delete historical sync logs — so an old Xero SYNCED payment
+ * would otherwise be presented as proof that a now-active QuickBooks ledger agrees, which it cannot be
+ * (Codex, PR #570 round 2). With no active connector there is no ledger to agree, so nothing is
+ * returned and every locally-paid bill reads NOT_SENT rather than falsely settled.
+ */
+async function latestBillPaymentSyncRows(
+  invoiceIds: string[],
+  connector: string | null,
+): Promise<Map<string, PaymentSyncRow>> {
+  const out = new Map<string, PaymentSyncRow>()
+  if (!invoiceIds.length || !connector) return out
+  const rows = await db.accountingSyncLog.findMany({
+    where: { connector, type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: { in: invoiceIds } },
+    select: {
+      referenceId: true, status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true,
+    },
+    orderBy: { createdAt: 'desc' },
+  })
+  for (const r of rows) {
+    if (out.has(r.referenceId)) continue // desc order: the first one seen is the latest
+    // The amount that was actually SENT, so a part payment is not mistaken for full settlement.
+    const payload = (r.payload && typeof r.payload === 'object' ? r.payload : {}) as Record<string, unknown>
+    out.set(r.referenceId, {
+      status: r.status,
+      externalTransactionId: r.externalTransactionId,
+      errorMessage: r.errorMessage,
+      retryCount: r.retryCount,
+      amount: typeof payload.amount === 'number' ? payload.amount : null,
+    })
+  }
+  return out
+}
+
 export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   await requireAuth()
   const po = await db.purchaseOrder.findUnique({
@@ -725,6 +766,15 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     }
   })
 
+  // THE LEDGER'S OWN VIEW of each bill's payment (o3d-lgo.15). paidAt says IMS was told the bill was
+  // paid; the BILL_PAYMENT sync is what makes the ledger agree, and it can fail, be cancelled, or never
+  // have been queued at all. Read once for the whole PO rather than per bill.
+  const activeConnector = await getActiveAccountingConnectorInfo().catch(() => null)
+  const [accountingSyncEnabled, billPaymentByInvoice] = await Promise.all([
+    getAccountingSettings().then((a) => a.syncEnabled).catch(() => false),
+    latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id), activeConnector?.id ?? null),
+  ])
+
   const row = mapPoRow(po)
   return {
     ...row,
@@ -779,6 +829,13 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       paymentAccountId: inv.paymentAccountId ?? null,
       paymentAccountName: inv.paymentAccountName ?? null,
       paymentReference: inv.paymentReference ?? null,
+      settlement: settlementStatus({
+        paidLocally: !!inv.paidAt,
+        syncEnabled: accountingSyncEnabled,
+        documentPosted: !!inv.accountingInvoiceId,
+        payment: billPaymentByInvoice.get(inv.id) ?? null,
+        totalForeign: Number(inv.totalForeign),
+      }),
       createdAt: inv.createdAt.toISOString(),
       lines: inv.lines.map((il) => {
         const isProduct = il.poLineId != null && il.poLine != null
@@ -2652,6 +2709,12 @@ export type InvoiceRow = {
   paymentAccountId: string | null
   paymentAccountName: string | null
   paymentReference: string | null
+  /**
+   * Whether the LEDGER agrees this bill is settled (o3d-lgo.15). paidAt alone only says IMS was told
+   * so; the payment is a separate sync that can fail, be cancelled, or never be queued — and the UI
+   * showed an unconditional green "Paid" over all three.
+   */
+  settlement: SettlementVerdict
   createdAt: string
   lines: {
     id: string
@@ -3466,9 +3529,47 @@ export async function markBillPaid(
             reference: input.reference ?? undefined,
           },
         })
-      } catch {
-        // Accounting queue errors should never block the main flow.
+      } catch (e) {
+        // Queue errors must not block marking the bill paid — but they must not vanish either. The bill
+        // is now PAID in IMS with nothing queued to tell the ledger, so the ledger will go on showing
+        // the full amount outstanding and nothing will ever retry: there is no FAILED row to notice,
+        // because the row was never written (o3d-lgo.15). This is the quietest way the two systems can
+        // disagree, so it is recorded as an ERROR against the PO with the bill named.
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: invoice.poId,
+          action: 'bill_payment_not_queued',
+          tag: 'purchase',
+          level: 'ERROR',
+          description:
+            `Bill ${invoice.invoiceNumber ?? '(no number)'} was marked PAID in IMS, but the payment could ` +
+            `not be queued for the accounting connector — the ledger still shows it outstanding and ` +
+            `nothing will retry. Re-queue it, or record the payment in the ledger by hand.`,
+          metadata: {
+            invoiceId: invoice.id,
+            reference: invoice.po.reference,
+            accountingInvoiceId: invoice.accountingInvoiceId,
+            amountForeign: paymentAmount,
+            error: e instanceof Error ? e.message : String(e),
+          },
+        }).catch(() => { /* logging must never block the main flow either */ })
       }
+    } else {
+      // Paid in IMS against a bill the ledger has never seen. Not a settlement fault — a payment cannot
+      // attach to an invoice that does not exist there — but it does mean the payment is nobody's job
+      // once the bill finally posts, so say so rather than leaving it to be discovered by reconciliation.
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: invoice.poId,
+        action: 'bill_paid_before_posting',
+        tag: 'purchase',
+        level: 'WARNING',
+        description:
+          `Bill ${invoice.invoiceNumber ?? '(no number)'} was marked PAID before it posted to the ` +
+          `accounting connector, so no payment was queued. Once the bill posts, record the payment ` +
+          `again (or in the ledger directly) — posting the bill does not settle it.`,
+        metadata: { invoiceId: invoice.id, reference: invoice.po.reference, amountForeign: paymentAmount },
+      }).catch(() => {})
     }
 
     try {
