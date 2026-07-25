@@ -329,10 +329,14 @@ function createClient(state: State): RefundServiceClient {
       },
     },
     salesOrderRefund: {
-      findFirst: async ({ where }: { where: { orderId: string; externalRefundId: number } }) => {
+      // Filters on whatever keys the caller supplied. The refund service queries this three
+      // ways: by {orderId, externalRefundId} (external replay), by {orderId, chargeback} and
+      // by {orderId} alone (the o3d-6oyu.18 cross-path conflict guard).
+      findFirst: async ({ where }: { where: { orderId?: string; externalRefundId?: number; chargeback?: boolean } }) => {
         const refund = state.refunds.find((row) => (
-          row.orderId === where.orderId &&
-          row.externalRefundId === where.externalRefundId
+          (where.orderId === undefined || row.orderId === where.orderId) &&
+          (where.externalRefundId === undefined || row.externalRefundId === where.externalRefundId) &&
+          (where.chargeback === undefined || (row.chargeback ?? false) === where.chargeback)
         ))
         if (!refund) return null
         return {
@@ -859,6 +863,147 @@ test('createSalesOrderRefund chargeback mode suppresses COGS reversal AND restoc
   // credit-note-only), so the accounting evidence checks exempt it durably (scjz.71).
   assert.equal(state.refunds[0]?.chargeback, true)
   assert.equal(state.refunds[0]?.reversalStaged, false)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-6oyu.18 — concurrent double-reversal guard.
+//
+// A Xero payment removal and a WooCommerce refund can land inside one poll cycle.
+// Both credit-note paths pre-check "has this order already been reversed?" OUTSIDE
+// the refund transaction, so neither sees the other's uncommitted row and both post
+// a credit note. The authoritative guard is re-taken inside the refund transaction,
+// under pg_advisory_xact_lock + the sales_orders row lock, where the loser blocks
+// until the winner COMMITS and then reads its row.
+//
+// These two tests pin the DECISION (both orderings) against the same in-memory
+// client the rest of this suite uses. They cannot prove the LOCKING — the mock's
+// $transaction is not concurrent and its statements never block. That half needs a
+// real Postgres and lives in tests/concurrency/refund-chargeback-race.concurrent.test.ts.
+// ---------------------------------------------------------------------------
+
+function reversalRaceState(): State {
+  return baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: 'WC-1001',
+      orderNumber: null,
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      // Gross (VAT-inclusive) order total. The chargeback's NET lines (£100) plus a small
+      // WC refund still fit under it, which is precisely why the refund-total cap does not
+      // catch this race and an explicit conflict guard is needed.
+      totalBase: 120,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 2, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }] }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+}
+
+test('o3d-6oyu.18: WC refund commits first → the poller chargeback is refused as prior-refund, not double-credited', async () => {
+  const state = reversalRaceState()
+  // The WooCommerce refund webhook won the race: its row is COMMITTED by the time the
+  // chargeback transaction takes the order lock, even though it was invisible to
+  // raiseChargebackForReversedOrder's pre-check.
+  state.refunds.push({
+    id: 'refund-wc',
+    orderId: 'order-1',
+    creditNoteNumber: 'CN-0001',
+    externalRefundId: 7001,
+    reason: 'WooCommerce refund',
+    totalForeign: 10,
+    totalBase: 10,
+    returnWarehouseId: null,
+    chargeback: false,
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Payment reversed (chargeback)',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    chargeback: true,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.conflict, 'prior-refund')
+  assert.match(result.success === false ? result.error : '', /CN-0001/)
+  // The decisive assertion: exactly ONE credit note exists for the order.
+  assert.equal(state.refunds.length, 1)
+  assert.equal(state.refunds[0]?.id, 'refund-wc')
+})
+
+test('o3d-6oyu.18: chargeback commits first → the WC refund is refused as prior-chargeback, not double-credited', async () => {
+  const state = reversalRaceState()
+  // The payment poller won the race: its chargeback already unwound the WHOLE remaining
+  // order, so the Woo-side refund arriving after must not add a second credit note.
+  state.refunds.push({
+    id: 'refund-chargeback',
+    orderId: 'order-1',
+    creditNoteNumber: 'CN-0009',
+    externalRefundId: null,
+    reason: 'Payment reversed (chargeback)',
+    totalForeign: 100,
+    totalBase: 100,
+    returnWarehouseId: null,
+    chargeback: true,
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 10 }],
+    reason: 'WooCommerce refund',
+    externalRefundId: 7001,
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.conflict, 'prior-chargeback')
+  assert.match(result.success === false ? result.error : '', /CN-0009/)
+  assert.equal(state.refunds.length, 1)
+  assert.equal(state.refunds[0]?.id, 'refund-chargeback')
+})
+
+test('o3d-6oyu.18: an ordinary partial refund on an order with prior NON-chargeback refunds is untouched', async () => {
+  // The guard must not turn legitimate stacked partial refunds into conflicts — only a
+  // prior CHARGEBACK blocks an ordinary refund.
+  const state = reversalRaceState()
+  state.refunds.push({
+    id: 'refund-wc-1',
+    orderId: 'order-1',
+    creditNoteNumber: 'CN-0001',
+    externalRefundId: 7001,
+    reason: 'WooCommerce refund',
+    totalForeign: 10,
+    totalBase: 10,
+    returnWarehouseId: null,
+    chargeback: false,
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 10 }],
+    reason: 'WooCommerce refund',
+    externalRefundId: 7002,
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.refunds.length, 2)
 })
 
 test('createSalesOrderRefund reverses kit COGS in component units, not kit units', async () => {

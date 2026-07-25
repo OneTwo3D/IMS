@@ -226,8 +226,24 @@ export type RefundAccountingSyncRequest = {
   idempotencyKey?: string
 }
 
+/**
+ * o3d-6oyu.18: which of the two credit-note-raising paths already owns this order's
+ * reversal, when the OTHER one is refused under the refund transaction's locks.
+ *
+ *  - `prior-refund`     a chargeback was refused because the order already carries a
+ *                       refund (typically the WooCommerce refund webhook winning the
+ *                       race). The remaining balance is ambiguous → manual handling.
+ *  - `prior-chargeback` an ordinary refund was refused because the payment poller had
+ *                       already charged the whole order back → a second credit note
+ *                       would double-reverse it.
+ *
+ * A conflict is NOT a failure to retry: the reversal is already recorded. Callers map
+ * it to a clean no-op plus an operator-visible warning.
+ */
+export type RefundCreationConflict = 'prior-refund' | 'prior-chargeback'
+
 export type CreateSalesOrderRefundResult =
-  | { success: false; error: string }
+  | { success: false; error: string; conflict?: RefundCreationConflict }
   | {
       success: true
       orderId: string
@@ -1776,6 +1792,58 @@ export async function createSalesOrderRefund(
       }
     }
 
+    // -----------------------------------------------------------------------
+    // o3d-6oyu.18: CROSS-PATH double-reversal guard.
+    //
+    // Two independent paths raise credit notes for one order: the WooCommerce refund
+    // webhook (createRefund with an externalRefundId) and the Xero payment poller's
+    // chargeback (createRefund with chargeback: true). Each decides "is a credit note
+    // owed?" from a read taken OUTSIDE this transaction — raiseChargebackForReversedOrder's
+    // prior-refund pre-check and the poller's window-scoped wasHandledByRecentWcRefund.
+    // Neither can see the other path's UNCOMMITTED row, so when a Xero payment removal and
+    // a WC refund land in the same poll cycle both pre-checks pass and BOTH post a credit
+    // note. (The refund-total cap below does not catch it: chargeback lines are NET while
+    // so.totalBase is the order's gross, so on a VAT-inclusive order a full chargeback plus
+    // a partial WC refund can still sit under the gross total.)
+    //
+    // So the decision is re-taken HERE, inside the transaction that already holds
+    // pg_advisory_xact_lock(REFUND_ACCOUNTING_LOCK_KEY) and the sales_orders row lock. Both
+    // locks are held to COMMIT, so the second path BLOCKS on the first and then — under
+    // READ COMMITTED, where every statement takes a fresh snapshot — reads the row the
+    // first path just committed. That visibility is exactly what an application-level
+    // pre-check cannot buy at any distance.
+    //
+    // Deliberately NOT a unique index: SalesOrderRefund is legitimately many-per-order
+    // (partial refunds), and the two racing rows differ in `chargeback` / `externalRefundId`
+    // so no uniqueness key collides. The invariant is "an order carrying any refund must not
+    // also be charged back, and vice versa" — a cross-row CONDITIONAL predicate, which a
+    // unique index cannot express.
+    //
+    // The loser is a clean no-op, not an error: `conflict` tells the caller which path won,
+    // so the poller records a manual-handling warning and still reconciles paidAt, and the
+    // WC refund sync marks the delivery handled instead of dead-lettering it.
+    // -----------------------------------------------------------------------
+    const conflictingRefund = await tx.salesOrderRefund.findFirst({
+      // A chargeback is refused by ANY prior refund; an ordinary refund only by a chargeback
+      // (partial refunds may legitimately stack). An existing chargeback replayed above, so a
+      // hit here on the chargeback branch is always the other path's row.
+      where: input.chargeback ? { orderId: input.orderId } : { orderId: input.orderId, chargeback: true },
+      select: { id: true, creditNoteNumber: true },
+    })
+    if (conflictingRefund) {
+      const conflictRef = conflictingRefund.creditNoteNumber ?? conflictingRefund.id
+      const conflictResult: { conflict: RefundCreationConflict; conflictError: string } = input.chargeback
+        ? {
+            conflict: 'prior-refund',
+            conflictError: `Order already carries refund ${conflictRef} — auto-chargeback skipped because the remaining balance is ambiguous; raise the credit note manually.`,
+          }
+        : {
+            conflict: 'prior-chargeback',
+            conflictError: `Order was already charged back (credit note ${conflictRef}) — a second credit note would double-reverse it; reconcile this refund manually.`,
+          }
+      return conflictResult
+    }
+
     if (
       effectiveReturnWarehouseId &&
       refundLines.some((refundLine) => refundLine.productId && refundLine.qty > 0) &&
@@ -2013,6 +2081,12 @@ export async function createSalesOrderRefund(
     throw error
   })
 
+  // o3d-6oyu.18: a cross-path conflict is reported BEFORE the generic error path and carries
+  // `conflict`, so callers can tell "the other path already reversed this order" (a no-op the
+  // caller must never retry) from "the refund failed" (which the poller retries by holding paidAt).
+  if ('conflict' in txResult) {
+    return { success: false, error: txResult.conflictError, conflict: txResult.conflict }
+  }
   if ('error' in txResult) return { success: false, error: txResult.error ?? 'Refund failed' }
 
   const refundOrderRef = getSalesOrderReference(txResult.so)

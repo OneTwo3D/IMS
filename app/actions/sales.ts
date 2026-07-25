@@ -48,6 +48,7 @@ import {
   retrySalesOrderRefundAccounting,
   type CreatedRefundLine,
   type RefundAccountingSyncRequest,
+  type RefundCreationConflict,
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
 import {
@@ -1813,7 +1814,11 @@ export async function createRefund(
   reason: string,
   returnWarehouseId?: string,
   options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
-): Promise<{ success: boolean; error?: string; warning?: string }> {
+  // o3d-6oyu.18: `conflict` is set when the refund transaction refused this credit note
+  // because the OTHER reversal path (WC refund webhook vs payment-poller chargeback) had
+  // already committed one for this order. It is a no-op the caller must not retry, not a
+  // failure — see RefundCreationConflict.
+): Promise<{ success: boolean; error?: string; warning?: string; conflict?: RefundCreationConflict }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.refund')
@@ -2247,6 +2252,26 @@ export async function raiseChargebackForReversedOrder(
     internalBypassToken: INTERNAL_ACTION_BYPASS,
     chargeback: true,
   })
+  // o3d-6oyu.18: the refund transaction refused the chargeback because a refund for this
+  // order committed between the prior-refund pre-check above and the refund transaction —
+  // a WooCommerce refund webhook landing in the same poll cycle, whose row was still
+  // UNCOMMITTED (and so invisible) when this function read. The WC path WON the race and
+  // owns the revenue reversal; raising a second credit note is exactly what must not
+  // happen. Record the same manual-handling warning the pre-check raises and return a
+  // clean no-op — NOT an error, which would make the poller hold paidAt and re-attempt a
+  // chargeback that can now never succeed.
+  if (result.conflict === 'prior-refund') {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'chargeback_requires_manual_handling',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} but a refund was recorded concurrently — auto-chargeback skipped (remaining balance is ambiguous); raise the credit note manually. ${result.error ?? ''}`.trim(),
+      resolveUser: false,
+    })
+    return { raised: false, reason: 'order has prior refunds — manual chargeback required' }
+  }
   // A surfaced accounting warning means the refund row was created but its
   // credit-note / reversal staging did not fully complete. Treat it as an error so
   // the payment poller logs the failure and leaves paidAt set, rather than silently

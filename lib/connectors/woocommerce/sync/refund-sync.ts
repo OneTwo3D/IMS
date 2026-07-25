@@ -19,6 +19,15 @@ export type WcRefundSyncDependencies = {
   logActivity?: typeof logActivity
 }
 
+/**
+ * o3d-6oyu.18: recorded on the shoppingSyncLog row when a WooCommerce refund is
+ * suppressed because the payment poller had already charged the whole order back.
+ * Doubles as the dedup key — `order.updated` re-runs syncRefundsForOrder, and without
+ * it every subsequent order update would re-log the same warning forever.
+ */
+export const WC_REFUND_SUPPRESSED_BY_CHARGEBACK =
+  'WooCommerce refund suppressed: the order was already charged back by the payment poller — no duplicate credit note raised'
+
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
 }
@@ -216,6 +225,49 @@ export async function syncWcRefund(
         metadata: { externalRefundId: wcRefund.id, parentOrderId: externalOrderId },
         resolveUser: false,
       })
+      return { success: true }
+    }
+
+    // o3d-6oyu.18: the refund transaction refused this credit note because a payment-poller
+    // CHARGEBACK for the same order committed first — the other half of the concurrent
+    // double-reversal race (a Xero payment removal and this WC refund inside one poll cycle).
+    // A chargeback unwinds the WHOLE remaining order, so posting this refund's credit note on
+    // top would double-reverse it. Treat it as handled, NOT as a failure: a FAILED row would
+    // dead-letter into the exceptions inbox and be retried forever against a condition that can
+    // never clear. The reversal itself is not lost — the poller already raised the credit note
+    // and alerted admins; this WARNING records that the Woo-side refund needs reconciling.
+    if (result.conflict === 'prior-chargeback') {
+      const alreadyRecorded = await client.shoppingSyncLog.findFirst({
+        where: {
+          entityType: 'SalesOrder',
+          externalId: String(wcRefund.id),
+          errorMessage: WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
+        },
+        select: { id: true },
+      })
+      if (!alreadyRecorded) {
+        await client.shoppingSyncLog.create({
+          data: {
+            direction: 'FROM_CONNECTOR',
+            status: 'SYNCED',
+            entityType: 'SalesOrder',
+            entityId: so.id,
+            externalId: String(wcRefund.id),
+            errorMessage: WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
+            syncedAt: new Date(),
+          },
+        })
+        await writeActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'refund_sync_suppressed_by_chargeback',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `WooCommerce refund ${wcRefund.id} on order #${so.externalOrderNumber} was not recorded — the order was already charged back by the payment poller, and a second credit note would double-reverse it. Reconcile the Woo refund manually. ${result.error ?? ''}`.trim(),
+          metadata: { externalRefundId: wcRefund.id, parentOrderId: externalOrderId },
+          resolveUser: false,
+        })
+      }
       return { success: true }
     }
 

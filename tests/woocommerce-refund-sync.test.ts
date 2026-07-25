@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { Prisma } from '@/app/generated/prisma/client'
+import {
+  syncWcRefund,
+  WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
+  type WcRefundSyncDependencies,
+} from '@/lib/connectors/woocommerce/sync/refund-sync'
 import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
@@ -89,6 +94,15 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
         async create(args: unknown) {
           syncLogs.push(args)
           return args
+        },
+        // o3d-6oyu.18: the chargeback-suppression path dedups its warning on the marker
+        // message, so `order.updated` re-runs don't re-log it forever.
+        async findFirst(args: { where?: { externalId?: string; errorMessage?: string } }) {
+          const match = (syncLogs as Array<{ data: { externalId?: string; errorMessage?: string } }>).find((log) => (
+            (args.where?.externalId === undefined || log.data.externalId === args.where.externalId) &&
+            (args.where?.errorMessage === undefined || log.data.errorMessage === args.where.errorMessage)
+          ))
+          return match ? { id: 'sync-log-1' } : null
         },
       },
     } as unknown as WcRefundSyncDependencies['db'],
@@ -233,6 +247,48 @@ test('syncWcRefund treats external refund unique conflicts as idempotent races',
     metadata: { externalRefundId: 7001, parentOrderId: 1001 },
     resolveUser: false,
   })
+})
+
+test('o3d-6oyu.18: a WC refund refused because the order was already charged back is handled, not dead-lettered', async () => {
+  // The reverse ordering of the concurrent double-reversal race: the payment poller's
+  // chargeback committed first, so the refund transaction refuses this credit note with
+  // conflict: 'prior-chargeback'. A FAILED sync log here would dead-letter the delivery
+  // into the exceptions inbox and retry it forever against a condition that never clears.
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.dependencies.createRefund = async () => ({
+    success: false,
+    conflict: 'prior-chargeback' as const,
+    error: 'Order was already charged back (credit note CN-0009) — a second credit note would double-reverse it; reconcile this refund manually.',
+  })
+
+  const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
+
+  assert.deepEqual(result, { success: true })
+  assert.equal(state.syncLogs.length, 1)
+  const logged = state.syncLogs[0] as { data: { status: string; errorMessage: string } }
+  assert.equal(logged.data.status, 'SYNCED', 'not FAILED — this must not dead-letter')
+  assert.equal(logged.data.errorMessage, WC_REFUND_SUPPRESSED_BY_CHARGEBACK)
+  assert.equal(state.activityLogs.length, 1)
+  const activity = state.activityLogs[0] as { action: string; level: string; description: string }
+  assert.equal(activity.action, 'refund_sync_suppressed_by_chargeback')
+  assert.equal(activity.level, 'WARNING', 'operator-visible: the Woo refund still needs reconciling')
+  assert.match(activity.description, /CN-0009/)
+})
+
+test('o3d-6oyu.18: the chargeback-suppression warning is logged once, not on every order.updated re-run', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.dependencies.createRefund = async () => ({
+    success: false,
+    conflict: 'prior-chargeback' as const,
+    error: 'Order was already charged back (credit note CN-0009).',
+  })
+
+  await syncWcRefund(1001, makeRefund(), state.dependencies)
+  await syncWcRefund(1001, makeRefund(), state.dependencies)
+  await syncWcRefund(1001, makeRefund(), state.dependencies)
+
+  assert.equal(state.syncLogs.length, 1)
+  assert.equal(state.activityLogs.length, 1)
 })
 
 test('syncWcRefund links a refund line to its IMS order line via _refunded_item_id, not the refund line id', async () => {
