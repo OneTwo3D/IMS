@@ -138,7 +138,10 @@ function fakeStore(initial: LockRecord | null = null) {
       row = null; return true
     },
     async writeIfOwned(token, raw) {
-      if (row === null || (JSON.parse(row) as LockRecord).token !== token) return false
+      const cur = row === null ? null : (JSON.parse(row) as LockRecord)
+      // Mirrors the SQL: a FENCED row is refused even to its own token, so a renewal already in flight
+      // when release() fenced it cannot overwrite the fence.
+      if (!cur || cur.token !== token || cur.releasing) return false
       row = raw; return true
     },
   }
@@ -363,4 +366,30 @@ test('a release that lost the row restores NOTHING', async () => {
   assert.equal(await fenceForRelease(s.store, found), null, 'the claim must fail')
   assert.equal(s.current()?.token, 'theirs', 'and the new holder’s row is untouched')
   assert.equal(s.current()?.releasing, undefined, 'not even marked')
+})
+
+
+test('a renewal already in flight cannot overwrite a release fence', async () => {
+  // stopHeartbeat() clears the timers but does not cancel a renewal that has already started, and that
+  // renewal still writes. If it could overwrite the fenced row, our own final delete would fail and the
+  // release would end with stage restored but the lock row still sitting there (Codex, PR #560 round 3).
+  const mine = lockAt({ token: 'mine', ownerPid: process.pid, ownerHost: hostname() })
+  const s = fakeStore(mine)
+  const found = await s.store.read()
+  assert.ok(found)
+
+  const fencedRaw = await fenceForRelease(s.store, found)
+  assert.ok(fencedRaw)
+
+  // The straggler renewal lands now, with our own token.
+  const late = JSON.stringify({ ...mine, heartbeatAt: new Date(NOW).toISOString() })
+  assert.equal(await s.store.writeIfOwned('mine', late), false, 'the fence must refuse it')
+  assert.equal(s.current()?.releasing, true, 'the fence survives')
+  assert.equal(await s.store.deleteIfUnchanged(fencedRaw), true, 'so the release can still finish')
+})
+
+test('a fenced row is still refused to a stranger, not just to its owner', async () => {
+  const s = fakeStore(lockAt({ token: 'mine', releasing: true }))
+  assert.equal(await s.store.writeIfOwned('someone-else', '{}'), false)
+  assert.equal(await s.store.writeIfOwned('mine', '{}'), false)
 })

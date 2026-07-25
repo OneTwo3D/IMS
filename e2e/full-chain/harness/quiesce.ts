@@ -275,7 +275,10 @@ export type LockStore = {
   deleteIfUnchanged(expected: string): Promise<boolean>
   /** Delete ONLY if the row still carries `token` (for our own release; the heartbeat rewrites `raw`). */
   deleteIfOwned(token: string): Promise<boolean>
-  /** Overwrite ONLY if the row still carries `token`. false means we no longer hold the lock. */
+  /**
+   * Overwrite ONLY if the row still carries `token` AND is not being released. false means we no longer
+   * hold the lock — or that a release of ours has already fenced it, which a late renewal must not undo.
+   */
   writeIfOwned(token: string, raw: string): Promise<boolean>
 }
 
@@ -330,9 +333,12 @@ export function pgLockStore(db: Client, key: string = LOCK_KEY): LockStore {
       return r.rowCount === 1
     },
     async writeIfOwned(token, raw) {
+      // `releasing` is excluded so a renewal that was already in flight when release() fenced the row
+      // cannot overwrite the fence and make our own final delete fail (Codex, PR #560 round 3).
       const r = await db.query(
         `update settings set value = $2, "updatedAt" = now()
-          where key = $1 and value::jsonb ->> 'token' = $3`,
+          where key = $1 and value::jsonb ->> 'token' = $3
+            and coalesce(value::jsonb ->> 'releasing', 'false') <> 'true'`,
         [key, raw, token],
       )
       return r.rowCount === 1
@@ -500,6 +506,14 @@ let held: { token: LockToken; raw: string } | null = null
 let heartbeat: NodeJS.Timeout | null = null
 /** The I/O-free timer that enforces the fence even when a renewal never settles. */
 let watchdog: NodeJS.Timeout | null = null
+/**
+ * The renewal currently executing, if any.
+ *
+ * Clearing the interval does not cancel a renewal that has already started, and that renewal still
+ * writes. release() therefore AWAITS this before reading the row: a renewal landing between the read and
+ * the fence makes the fence fail and the release silently do nothing (Codex, PR #560 round 3).
+ */
+let renewInFlight: Promise<void> | null = null
 /** When we last PROVED we still own the row. Not when we last tried. */
 let leaseProvenAt = 0
 
@@ -602,12 +616,10 @@ function loseLease(reason: string): void {
  */
 function startHeartbeat(token: LockToken, lock: LockRecord): void {
   leaseProvenAt = Date.now()
-  let renewInFlight = false
 
   heartbeat = setInterval(() => {
     if (renewInFlight) return // serialized: never two renewals racing to write heartbeatAt
-    renewInFlight = true
-    void (async () => {
+    renewInFlight = (async () => {
       // Its own short-lived connection each time. acquire()'s clients are closed when it returns, and an
       // idle one held open for the whole suite is worse than reconnecting every 30 seconds.
       const db = e2eDb()
@@ -635,10 +647,11 @@ function startHeartbeat(token: LockToken, lock: LockRecord): void {
         // of ownership either. The watchdog owns the decision about when the slack runs out.
         console.warn(`[quiesce] lease renewal failed (will retry): ${e instanceof Error ? e.message : e}`)
       } finally {
-        renewInFlight = false
         void db.end().catch(() => {})
+        renewInFlight = null
       }
     })()
+    void renewInFlight
   }, LEASE_RENEW_INTERVAL_MS)
   heartbeat.unref()
 
@@ -845,16 +858,18 @@ export async function fenceForRelease(
  * `force` is the manual escape hatch (scripts/restore-stage-connectors.ts): an operator restoring stage
  * after a crash legitimately releases a lock this process never took.
  */
-export async function release(opts: { force?: boolean } = {}): Promise<void> {
-  if (!held && !opts.force) {
+export async function release(opts: { force?: boolean; expectRaw?: string } = {}): Promise<void> {
+  if (!held && !opts.force && !opts.expectRaw) {
     console.log('[quiesce] this process does not hold the quiesce lock — nothing to release.')
     return
   }
 
-  // Before anything else, so a renewal cannot rewrite the row between our read and our fence — which
-  // would make the fence fail and abort a release that is genuinely ours.
+  // Stop renewing, and WAIT for a renewal already in flight. Clearing the interval does not cancel one
+  // that has started, and it still writes: landing between our read and our fence it makes the fence
+  // fail, so the release quietly does nothing and stage stays disabled (Codex, PR #560 round 3).
   const ourToken = held?.token ?? null
   stopHeartbeat()
+  if (renewInFlight) await renewInFlight.catch(() => {})
 
   const e2e = e2eDb(); await e2e.connect()
   const stage = stageDb(); await stage.connect()
@@ -862,6 +877,17 @@ export async function release(opts: { force?: boolean } = {}): Promise<void> {
     const store = pgLockStore(e2e)
     const found = await store.read()
     if (!found) { console.log('[quiesce] no lock row — nothing to release.'); return }
+
+    // The operator path judged a SPECIFIC row recoverable. Releasing "whatever is current" instead lets a
+    // contender take the abandoned lock over in between and have stage restored underneath its running
+    // suite — the exact fault this script exists to fix, by a TOCTOU (Codex, PR #560 round 3).
+    if (opts.expectRaw && found.raw !== opts.expectRaw) {
+      console.error(
+        `[quiesce] REFUSING to release: the lock row changed since it was judged recoverable — run ` +
+          `${found.lock.runId} holds it now. Nothing was restored. Re-check with --status.`,
+      )
+      return
+    }
 
     if (ourToken && found.lock.token !== ourToken) {
       // Someone else's lock. Restoring from it would put THEIR run's settings back mid-flight.
@@ -886,7 +912,17 @@ export async function release(opts: { force?: boolean } = {}): Promise<void> {
 
     const dropped = await releaseInternal(e2e, stage, found.lock, fencedRaw, store)
     const how = ourToken ? '' : ' (forced)'
-    console.log(dropped ? `[quiesce] released${how}.` : `[quiesce] released${how}; the row had already gone.`)
+    if (!dropped) {
+      // The fence is ours and renewals cannot overwrite it, so this should be unreachable — which is
+      // exactly why it must not be logged as success. A row left behind means the next run finds a lock
+      // it has to recover, and the operator needs to know stage was restored while one still exists.
+      throw new Error(
+        `The quiesce lock row survived the release: stage HAS been restored from run ${found.lock.runId}'s ` +
+          `record, but the '${LOCK_KEY}' row could not be deleted. Inspect it — the next run will treat it ` +
+          `as an abandoned lock and take it over, which is safe but should not be silent.`,
+      )
+    }
+    console.log(`[quiesce] released${how}.`)
   } finally {
     held = null
     await e2e.end(); await stage.end()
@@ -895,6 +931,17 @@ export async function release(opts: { force?: boolean } = {}): Promise<void> {
 
 /** Report whether a lock is currently held (for diagnostics / the restore script). */
 export async function status(): Promise<LockRecord | null> {
+  return (await statusRaw())?.lock ?? null
+}
+
+/**
+ * The lock row AND the exact bytes it holds.
+ *
+ * The raw value is what makes the operator path safe: the script judges THAT row recoverable and hands
+ * it back to release(), which refuses if anything has changed since. Judging one row and then releasing
+ * "whatever is current" lets a contender take the abandoned lock over in between.
+ */
+export async function statusRaw(): Promise<{ raw: string; lock: LockRecord } | null> {
   const e2e = e2eDb(); await e2e.connect()
-  try { return await readLock(e2e) } finally { await e2e.end() }
+  try { return await pgLockStore(e2e).read() } finally { await e2e.end() }
 }

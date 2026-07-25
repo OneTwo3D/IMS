@@ -67,6 +67,20 @@ test(
       assert.equal(await stores[loser].deleteIfOwned(tokens[loser]), false)
       assert.ok(await stores[0].read(), 'the lock survives a stranger trying to release it')
 
+      // 4b. A FENCED ROW IS FROZEN. release() marks the row `releasing` before it restores anything; a
+      //     renewal already in flight must not be able to overwrite that fence, or the release's own
+      //     final delete fails and the lock row is left behind with stage already restored.
+      const beforeFence = await stores[0].read()
+      assert.ok(beforeFence)
+      const fenced = JSON.stringify({ ...beforeFence.lock, releasing: true })
+      assert.equal(await stores[winner].replaceIfUnchanged(beforeFence.raw, fenced), true)
+      assert.equal(
+        await stores[winner].writeIfOwned(tokens[winner], record(winner)),
+        false,
+        'even the OWNER cannot renew a row that is being released',
+      )
+      assert.equal((await stores[0].read())?.raw, fenced, 'the fence is intact')
+
       // 5. RECOVERY IS COMPARE-AND-SET. Deleting an abandoned lock is conditional on the exact bytes that
       //    were judged, so two recoverers cannot both conclude they took it over.
       const current = await stores[0].read()

@@ -23,7 +23,7 @@
  * "is stage actually armed right now?".
  */
 import { Client } from 'pg'
-import { lockRecoveryDecision, release, status } from '../e2e/full-chain/harness/quiesce.ts'
+import { lockRecoveryDecision, release, statusRaw } from '../e2e/full-chain/harness/quiesce.ts'
 
 const STATUS_ONLY = process.argv.includes('--status')
 const FORCE = process.argv.includes('--force')
@@ -62,7 +62,8 @@ async function reportStage() {
 }
 
 async function main() {
-  const lock = await status()
+  const current = await statusRaw()
+  const lock = current?.lock ?? null
   if (lock) {
     const ageMin = Math.round((Date.now() - Date.parse(lock.takenAt)) / 60000)
     console.log(`Lock HELD by run ${lock.runId}, taken ${lock.takenAt} (${ageMin} min ago)`)
@@ -107,9 +108,13 @@ async function main() {
   }
 
   console.log(FORCE && verdict.action !== 'recover' ? '\nReleasing (--force, against the verdict)…' : '\nReleasing…')
-  // force: release() is otherwise a no-op for a process that never acquired (o3d-lgo.14), and this script
-  // is by definition run by someone who did not take the lock — that is the whole point of an escape hatch.
-  await release({ force: true })
+  // release() is otherwise a no-op for a process that never acquired (o3d-lgo.14), and this script is by
+  // definition run by someone who did not take the lock — that is the whole point of an escape hatch.
+  //
+  // expectRaw pins it to the EXACT row the verdict above judged. Without that, a contender taking the
+  // abandoned lock over between the check and the release would have stage restored underneath its
+  // running suite. --force deliberately drops the pin: overriding is the operator's stated intent.
+  await release(FORCE ? { force: true } : { force: true, expectRaw: current!.raw })
   await reportStage()
   console.log('\nDone. Re-check that stage resumed importing (its wc-reconcile / accounting-sync crons run every 5 min).')
 }
