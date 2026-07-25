@@ -14,8 +14,11 @@ import {
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
   mintsoftDeltaScopeChanged,
+  parseMintsoftAuthMode,
   testMintsoftConnectionSettings,
+  testMintsoftFixedApiKey,
   validateMintsoftBaseUrl,
+  type MintsoftAuthMode,
   type MintsoftSettings,
 } from '@/lib/connectors/mintsoft'
 import { inferShoppingOrderLookupConnector } from '@/lib/fulfillment/shopping-order-lookup'
@@ -137,6 +140,10 @@ function normalizeMintsoftAsnStatus(status: string | null | undefined): WmsAsnSt
 export type MintsoftConnectionSettingsMasked = {
   label: string
   baseUrl: string
+  /** 'credentials' | 'api_key' — see MintsoftAuthMode (o3d-092). */
+  authMode: MintsoftAuthMode
+  staticApiKey: string
+  staticApiKeyMasked: boolean
   username: string
   password: string
   passwordMasked: boolean
@@ -327,6 +334,13 @@ export type MintsoftBindingInput = {
 const MintsoftConnectionInputSchema = z.object({
   label: z.string().max(120).optional(),
   baseUrl: z.string().min(1, 'Base URL is required.'),
+  // o3d-092. 'api_key' is a hard guarantee that /api/Auth is never called:
+  // logging in mints a NEW tenant key and invalidates the old one, knocking
+  // the woocommerce-mintsoft-sync sweep and the shipping-label service (which
+  // share this tenant's key) offline. Defaults to 'credentials' so an existing
+  // connection is unaffected.
+  authMode: z.enum(['credentials', 'api_key']).optional().default('credentials'),
+  staticApiKey: z.string().optional().default(''),
   username: z.string().optional().default(''),
   password: z.string().optional().default(''),
   webhookSecret: z.string().optional().default(''),
@@ -383,10 +397,14 @@ function mapMintsoftConnection(
   const username = settings.mintsoft_username
   const password = settings.mintsoft_password
   const webhookSecret = settings.mintsoft_webhook_secret
+  const staticApiKey = settings.mintsoft_static_api_key
 
   return {
     label: connection?.label ?? '',
     baseUrl: connection?.baseUrl ?? '',
+    authMode: parseMintsoftAuthMode(settings.mintsoft_auth_mode) ?? 'credentials',
+    staticApiKey: maskSecret(staticApiKey),
+    staticApiKeyMasked: Boolean(staticApiKey),
     username,
     password: maskSecret(password),
     passwordMasked: Boolean(password),
@@ -394,6 +412,8 @@ function mapMintsoftConnection(
     webhookSecretMasked: Boolean(webhookSecret),
     envOverrides: getActiveSettingEnvOverrides([
       'mintsoft_api_key',
+      'mintsoft_auth_mode',
+      'mintsoft_static_api_key',
       'mintsoft_username',
       'mintsoft_password',
       'mintsoft_webhook_secret',
@@ -1539,6 +1559,10 @@ export async function saveMintsoftConnectionSettings(
   ])
   const baseUrlValidation = validateMintsoftBaseUrl(data.baseUrl)
   const baseUrl = baseUrlValidation.ok ? baseUrlValidation.normalizedUrl : null
+  const authMode = data.authMode
+  // Blank keeps the stored key, matching how username/password/webhookSecret
+  // behave — the form sends '' for an untouched masked field.
+  const staticApiKey = data.staticApiKey.trim() || existingSettings.mintsoft_static_api_key
   const username = data.username.trim() || existingSettings.mintsoft_username
   const password = data.password.trim() || existingSettings.mintsoft_password
   const webhookSecret = data.webhookSecret.trim() || existingSettings.mintsoft_webhook_secret
@@ -1551,12 +1575,22 @@ export async function saveMintsoftConnectionSettings(
     return { success: false, error: baseUrlValidation.ok ? 'Enter a valid Mintsoft base URL.' : baseUrlValidation.error }
   }
 
-  if (!username) {
-    return { success: false, error: 'Mintsoft username is required.' }
-  }
+  // In fixed-key mode the username/password are not used at all, so requiring
+  // them would force the operator to keep dead credentials on file — and worse,
+  // would imply they are still load-bearing when the entire point is that we
+  // never log in.
+  if (authMode === 'api_key') {
+    if (!staticApiKey) {
+      return { success: false, error: 'A Mintsoft API key is required when authentication is set to "Fixed API key".' }
+    }
+  } else {
+    if (!username) {
+      return { success: false, error: 'Mintsoft username is required.' }
+    }
 
-  if (!password) {
-    return { success: false, error: 'Mintsoft password is required.' }
+    if (!password) {
+      return { success: false, error: 'Mintsoft password is required.' }
+    }
   }
 
   if (orderLookupConnector && !availableOrderLookupConnectors.includes(orderLookupConnector)) {
@@ -1574,7 +1608,15 @@ export async function saveMintsoftConnectionSettings(
     orderLookupConnector,
   })
   try {
-    await testMintsoftConnectionSettings(baseUrl, username, password)
+    // The credentials test works BY LOGGING IN, which mints a new tenant key.
+    // Running it to "test" a fixed-key connection would invalidate the very
+    // key being tested (and the other integrations sharing it), so fixed-key
+    // mode gets a read-only authenticated probe instead (o3d-092).
+    if (authMode === 'api_key') {
+      await testMintsoftFixedApiKey(baseUrl, staticApiKey)
+    } else {
+      await testMintsoftConnectionSettings(baseUrl, username, password)
+    }
   } catch (error) {
     await recordIntegrationConnectionTest('mintsoft', {
       success: false,
@@ -1615,6 +1657,19 @@ export async function saveMintsoftConnectionSettings(
       })
 
   await db.$transaction([
+    db.setting.upsert({
+      where: { key: 'mintsoft_auth_mode' },
+      create: { key: 'mintsoft_auth_mode', value: serializeSettingValue('mintsoft_auth_mode', authMode) },
+      update: { value: serializeSettingValue('mintsoft_auth_mode', authMode) },
+    }),
+    // Stored in its OWN slot, never in mintsoft_api_key: that key is the cache
+    // for the rotating 24-hour token, so a credentials-mode refresh would
+    // overwrite the operator's fixed key (o3d-092).
+    db.setting.upsert({
+      where: { key: 'mintsoft_static_api_key' },
+      create: { key: 'mintsoft_static_api_key', value: serializeSettingValue('mintsoft_static_api_key', staticApiKey) },
+      update: { value: serializeSettingValue('mintsoft_static_api_key', staticApiKey) },
+    }),
     db.setting.upsert({
       where: { key: 'mintsoft_username' },
       create: { key: 'mintsoft_username', value: serializeSettingValue('mintsoft_username', username) },

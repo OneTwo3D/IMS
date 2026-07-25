@@ -128,6 +128,8 @@ const MINTSOFT_SECRET = 'mintsoft-secret'
 function mintsoftConfig(secret: string = MINTSOFT_SECRET) {
   return {
     baseUrl: '',
+    authMode: 'credentials' as const,
+    staticApiKey: '',
     username: '',
     password: '',
     webhookSecret: secret,

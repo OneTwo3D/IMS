@@ -131,6 +131,8 @@ export function MintsoftClient({ data }: Props) {
   const [isRestockDialogOpen, setIsRestockDialogOpen] = useState(false)
   const [label, setLabel] = useState(data.connection.label)
   const [baseUrl, setBaseUrl] = useState(data.connection.baseUrl)
+  const [authMode, setAuthMode] = useState(data.connection.authMode)
+  const [staticApiKey, setStaticApiKey] = useState('')
   const [username, setUsername] = useState(data.connection.username)
   const [password, setPassword] = useState('')
   const [webhookSecret, setWebhookSecret] = useState('')
@@ -220,6 +222,8 @@ export function MintsoftClient({ data }: Props) {
       const result = await withStepUp(() => saveMintsoftConnectionSettings({
         label,
         baseUrl,
+        authMode,
+        staticApiKey,
         username,
         password,
         webhookSecret,
@@ -246,6 +250,8 @@ export function MintsoftClient({ data }: Props) {
       const result = await testMintsoftConnection({
         label,
         baseUrl,
+        authMode,
+        staticApiKey,
         username,
         password,
         webhookSecret,
@@ -968,7 +974,7 @@ export function MintsoftClient({ data }: Props) {
           <DialogHeader>
             <DialogTitle>Edit Mintsoft Connection</DialogTitle>
             <DialogDescription>
-              Save the Mintsoft login credentials used to renew Mintsoft&apos;s 24-hour API key and choose which shopping connector should resolve callback order numbers.
+              Choose how we authenticate to Mintsoft, and which shopping connector should resolve callback order numbers.
             </DialogDescription>
           </DialogHeader>
           <EnvOverrideNotice overrides={data.connection.envOverrides} />
@@ -982,26 +988,57 @@ export function MintsoftClient({ data }: Props) {
               <Label className="text-xs">Base URL</Label>
               <Input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.mintsoft.co.uk/" />
             </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">Username</Label>
-              <Input
-                value={username}
-                onChange={(event) => setUsername(event.target.value)}
-                placeholder="Mintsoft username"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">Password</Label>
-              <Input
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                placeholder={data.connection.passwordMasked ? '••••••••' : 'Mintsoft password'}
-              />
+            <div className="space-y-1.5 md:col-span-2">
+              <Label className="text-xs">Authentication</Label>
+              <Select value={authMode} onChange={(event) => setAuthMode(event.target.value as 'credentials' | 'api_key')}>
+                <option value="credentials">Username &amp; password — auto-renew the 24-hour key</option>
+                <option value="api_key">Fixed API key — never log in</option>
+              </Select>
               <p className="text-xs text-muted-foreground">
-                Mintsoft uses these credentials to renew the 24-hour API key automatically.
+                {authMode === 'api_key'
+                  ? 'Uses the key below verbatim and never calls Mintsoft\u2019s auth endpoint, so the tenant API key is never regenerated. Use this when the WooCommerce sync or the shipping-label service share this Mintsoft tenant \u2014 they all use the same key, and any login invalidates it for the others.'
+                  : 'Logs in to renew the 24-hour key automatically. Note that each renewal REGENERATES the tenant API key and invalidates it for every other Mintsoft integration sharing this tenant.'}
               </p>
             </div>
+            {authMode === 'api_key' ? (
+              <div className="space-y-1.5 md:col-span-2">
+                <Label className="text-xs">Mintsoft API key</Label>
+                <Input
+                  type="password"
+                  value={staticApiKey}
+                  onChange={(event) => setStaticApiKey(event.target.value)}
+                  placeholder={data.connection.staticApiKeyMasked ? '••••••••' : 'Fixed Mintsoft API key'}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {data.connection.staticApiKeyMasked
+                    ? 'Leave blank to keep the stored key.'
+                    : 'Required. Ask Mintsoft support for a fixed key.'}
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Username</Label>
+                  <Input
+                    value={username}
+                    onChange={(event) => setUsername(event.target.value)}
+                    placeholder="Mintsoft username"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Password</Label>
+                  <Input
+                    type="password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    placeholder={data.connection.passwordMasked ? '••••••••' : 'Mintsoft password'}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Mintsoft uses these credentials to renew the 24-hour API key automatically.
+                  </p>
+                </div>
+              </>
+            )}
             <div className="space-y-1.5">
               <Label className="text-xs">Webhook Secret</Label>
               <Input

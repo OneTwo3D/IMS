@@ -1,7 +1,45 @@
 import { getSettingValues } from '@/lib/settings-store'
 
+/**
+ * How we authenticate to Mintsoft (o3d-092).
+ *
+ * `POST /api/Auth` does NOT hand out a session token — it MINTS A NEW TENANT
+ * API KEY and invalidates the previous one. The key belongs to the Mintsoft
+ * tenant, not to the caller, and three of our systems share that tenant (this
+ * connector, the woocommerce-mintsoft-sync order sweep, and the shipping-label
+ * service). So every login here silently knocks the other two offline until
+ * their own refresh cycle runs.
+ *
+ * `api_key` is therefore a HARD guarantee that /api/Auth is never called — not
+ * on a cache miss, not on expiry, not on a 401.
+ */
+export type MintsoftAuthMode = 'credentials' | 'api_key'
+
+export const MINTSOFT_AUTH_MODES: readonly MintsoftAuthMode[] = ['credentials', 'api_key'] as const
+
+/** Narrow an arbitrary stored/submitted value to a MintsoftAuthMode. */
+export function parseMintsoftAuthMode(value: string | null | undefined): MintsoftAuthMode | null {
+  const trimmed = String(value ?? '').trim().toLowerCase()
+  return (MINTSOFT_AUTH_MODES as readonly string[]).includes(trimmed)
+    ? (trimmed as MintsoftAuthMode)
+    : null
+}
+
 export type MintsoftSettings = {
+  /**
+   * The CACHED rotating 24-hour token, not an operator-supplied credential.
+   * `credentials` mode overwrites this on every refresh — which is exactly why
+   * a fixed key must live in `mintsoft_static_api_key` instead.
+   */
   mintsoft_api_key: string
+  /** 'credentials' (default) or 'api_key'. See MintsoftAuthMode. */
+  mintsoft_auth_mode: string
+  /**
+   * The operator-supplied FIXED key, used only in `api_key` mode. Deliberately
+   * a separate slot from `mintsoft_api_key` so a credentials-mode refresh can
+   * never clobber it, and so switching modes back and forth doesn't lose it.
+   */
+  mintsoft_static_api_key: string
   mintsoft_username: string
   mintsoft_password: string
   mintsoft_webhook_secret: string
@@ -25,6 +63,8 @@ export type MintsoftSettings = {
 
 export const MINTSOFT_SETTING_KEYS = [
   'mintsoft_api_key',
+  'mintsoft_auth_mode',
+  'mintsoft_static_api_key',
   'mintsoft_username',
   'mintsoft_password',
   'mintsoft_webhook_secret',
@@ -42,6 +82,10 @@ export const MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE = 'https://app.fulfillabl
 
 const MINTSOFT_DEFAULTS: MintsoftSettings = {
   mintsoft_api_key: '',
+  // Default to today's behaviour so an existing install is untouched until an
+  // operator explicitly opts into the fixed key.
+  mintsoft_auth_mode: 'credentials',
+  mintsoft_static_api_key: '',
   mintsoft_username: '',
   mintsoft_password: '',
   mintsoft_webhook_secret: '',

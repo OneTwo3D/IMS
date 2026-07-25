@@ -98,6 +98,22 @@ export async function mintsoftRequest<T>(
       return firstAttempt
     }
 
+    // o3d-092: in fixed-key mode a 401 means the operator's key is wrong or was
+    // rotated out from under us by something else. There is nothing to refresh
+    // — and re-authenticating would MINT A NEW TENANT KEY, breaking the
+    // woocommerce-mintsoft-sync sweep and the shipping-label service that
+    // share it. So surface the 401 instead of retrying: no invalidate (the
+    // cached-token row is not what we authenticated with), no replay.
+    if (config.authMode === 'api_key') {
+      return {
+        ...firstAttempt,
+        error: firstAttempt.error
+          ?? 'Mintsoft rejected the fixed API key (401). Not re-authenticating: that would '
+            + 'regenerate the tenant API key and break the other Mintsoft integrations. '
+            + 'Check that the configured key is current.',
+      }
+    }
+
     await invalidateMintsoftAccessToken()
     const refreshedApiKey = await getMintsoftAccessToken({ forceRefresh: true })
     return sendMintsoftRequest<T>(path, config.baseUrl, refreshedApiKey, init)
