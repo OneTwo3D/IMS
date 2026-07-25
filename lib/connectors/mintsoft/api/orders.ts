@@ -151,13 +151,21 @@ async function fetchMintsoftOrderStatusMap(): Promise<Map<number, MintsoftStatus
     // ExternalName is Mintsoft's coarse grouping. Absent on a drifted payload → fall
     // back to the name, which reproduces the pre-o3d-bjc.7 behaviour exactly rather
     // than wedging the delta over a field we only recently started reading.
+    // Left BLANK when absent — deliberately NOT defaulted to the name. externalName is
+    // authoritative in both directions (below), so conflating "Mintsoft did not say" with
+    // "Mintsoft said the same as the name" would hand authority to a value Mintsoft never
+    // sent. Blank means "fall back to the name set", which reproduces the pre-o3d-bjc.7
+    // behaviour exactly.
     const rawExternal = row.ExternalName ?? row.externalName
-    const externalName = (typeof rawExternal === 'string' ? rawExternal.trim().toUpperCase() : '') || upper
+    const externalName = typeof rawExternal === 'string' ? rawExternal.trim().toUpperCase() : ''
     const existing = map.get(id)
-    if (existing !== undefined && existing.name !== upper) {
+    // Fail closed on EITHER field: externalName now decides dispatch, so two rows sharing
+    // an id but disagreeing about the grouping would otherwise be silently last-row-wins,
+    // making "is this order shipped?" depend on response ordering (Codex).
+    if (existing !== undefined && (existing.name !== upper || existing.externalName !== externalName)) {
       throw new Error(
-        `Mintsoft Order/Statuses: id ${id} maps to both "${existing.name}" and "${upper}" — ` +
-          'refusing to cache an ambiguous status map',
+        `Mintsoft Order/Statuses: id ${id} maps to both "${existing.name}"/"${existing.externalName || 'no group'}" `
+          + `and "${upper}"/"${externalName || 'no group'}" — refusing to cache an ambiguous status map`,
       )
     }
     // Drift alarm: Mintsoft says this status is post-despatch but our fallback name set
@@ -412,7 +420,6 @@ export async function normalizeMintsoftOrderRow(
   // 4, letting a malformed id resolve onto a REAL status — DESPATCHED off drifted
   // input falsely ships the order, and a pending one advances the watermark.
   // A malformed id is simply unresolved, which strictStatus below then rejects.
-  const statusId = strictPositiveInt(order.OrderStatusId)
   const statusMap = ctx?.statusMap ?? (await fetchMintsoftOrderStatusMap())
   const resolved = resolveRowStatus(order, statusMap)
   const status = resolved.name
@@ -429,7 +436,8 @@ export async function normalizeMintsoftOrderRow(
   if (ctx?.strictStatus && !status && !tracking.some((entry) => Boolean(entry.despatchedAt))) {
     throw new Error(
       `Mintsoft Order/List: order ${externalOrderId} has an unresolved OrderStatusId ` +
-        `(${statusId ?? 'missing'}) and no despatch date — refusing to treat an unknown dispatch state as pending`,
+        `(${strictPositiveInt(order.OrderStatusId) ?? 'missing'}) and no despatch date — `
+        + 'refusing to treat an unknown dispatch state as pending',
     )
   }
 
@@ -620,7 +628,6 @@ async function resolveDispatchableDeltaRows(
   const pending: number[] = []
   for (const [index, row] of rows.entries()) {
     if (missingMintsoftDispatchKeys(row).length === 0) continue
-    const statusId = strictPositiveInt(row.OrderStatusId)
     const status = resolveRowStatus(row, statusMap)
     if (isMintsoftDispatched({ status: status.name, externalName: status.externalName, tracking: readTracking(row) })) {
       pending.push(index)
@@ -805,17 +812,26 @@ export const MINTSOFT_EXTERNAL_DESPATCHED = 'DESPATCHED'
 export function isMintsoftDispatched(status: {
   status: string
   /**
-   * Mintsoft's ExternalName grouping for this status, when we resolved it from
-   * /api/Order/Statuses. AUTHORITATIVE when present (o3d-bjc.7): it is the vendor's own
-   * classification, so it stays correct for statuses added after this code was written —
-   * unlike the name set below, which is only a fallback for callers holding a bare name.
+   * Mintsoft's ExternalName grouping for this status, resolved from
+   * /api/Order/Statuses. AUTHORITATIVE IN BOTH DIRECTIONS when non-blank (o3d-bjc.7):
+   * it is the vendor's own lifecycle classification, so it stays correct for statuses
+   * added after this code was written.
+   *
+   * Both directions matters. Honouring it only positively would let the name set
+   * override it — so a tenant where INVOICEFAILED can occur BEFORE physical despatch
+   * (ExternalName PROCESSING, name INVOICEFAILED) would be irreversibly marked SHIPPED
+   * off a stale hardcoded list, which is the same class of bug this fix exists to close.
+   *
+   * Blank/absent = "Mintsoft did not tell us", and only then is the name set consulted.
    */
   externalName?: string
   tracking: WmsOrderTracking[]
 }): boolean {
-  if ((status.externalName ?? '').trim().toUpperCase() === MINTSOFT_EXTERNAL_DESPATCHED) return true
-  if (MINTSOFT_DISPATCHED_STATUSES.has(status.status.trim().toUpperCase())) return true
-  return status.tracking.some((entry) => Boolean(entry.despatchedAt))
+  // A valid despatch date is physical evidence and outranks any classification.
+  if (status.tracking.some((entry) => Boolean(entry.despatchedAt))) return true
+  const externalName = (status.externalName ?? '').trim().toUpperCase()
+  if (externalName) return externalName === MINTSOFT_EXTERNAL_DESPATCHED
+  return MINTSOFT_DISPATCHED_STATUSES.has(status.status.trim().toUpperCase())
 }
 
 export type MintsoftOrderPart = {

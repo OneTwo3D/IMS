@@ -919,3 +919,53 @@ test('[o3d-bjc.7] the fallback name set covers every post-despatch status seen l
     assert.ok(!MINTSOFT_DISPATCHED_STATUSES.has(name), `${name} must NOT count as dispatched`)
   }
 })
+
+test('[o3d-bjc.7] a duplicate status id with CONFLICTING groupings is rejected, not last-row-wins', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailRows = new Map()
+  await resetStatusCache()
+  // Same id and name, disagreeing groupings. Silently taking the last would make
+  // "is this order shipped?" depend on response ORDERING.
+  statusResponder = () => [
+    { Name: 'PICKED', ExternalName: 'PICKED', ID: 17 },
+    { Name: 'PICKED', ExternalName: 'DESPATCHED', ID: 17 },
+  ]
+  listResponder = () => [row(1, { OrderStatusId: 17 })]
+
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /ambiguous status map/,
+  )
+})
+
+test('[o3d-bjc.7] a non-DESPATCHED grouping VETOES the fallback name set (authoritative both ways)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailRows = new Map()
+  await resetStatusCache()
+  // Contradictory signals: the NAME is in our hardcoded dispatched set, but Mintsoft
+  // groups it as pre-despatch. Honouring the grouping only positively would ship this
+  // order irreversibly off a stale list — the same class of bug this fix closes.
+  statusResponder = () => [{ Name: 'INVOICEFAILED', ExternalName: 'PROCESSING', ID: 6 }]
+
+  listResponder = () => [row(1, { OrderStatusId: 6 })]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out[0].status, 'INVOICEFAILED')
+  assert.equal(out[0].dispatched, false, 'the vendor grouping wins over our name set')
+})
+
+test('[o3d-bjc.7] …but a real DespatchDate still outranks any grouping (physical evidence)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailRows = new Map()
+  await resetStatusCache()
+  statusResponder = () => [{ Name: 'INVOICEFAILED', ExternalName: 'PROCESSING', ID: 6 }]
+
+  listResponder = () => [row(1, { OrderStatusId: 6, DespatchDate: '2026-07-15T09:00:00', TrackingNumber: 'TN' })]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out[0].dispatched, true, 'the goods demonstrably left')
+})
