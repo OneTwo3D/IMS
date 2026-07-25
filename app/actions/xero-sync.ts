@@ -5,7 +5,7 @@ import { freshAuthFailureResult, requireFreshPermission, requirePermission, requ
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { getAuthorizationUrl, disconnect, isConnected } from '@/lib/connectors/xero'
+import { getAuthorizationUrl, disconnect, isConnected, getGrantedScopes, missingScopes } from '@/lib/connectors/xero'
 import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
 import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
 import { processPendingXeroSync } from '@/lib/connectors/xero'
@@ -486,6 +486,11 @@ export type XeroSyncReadiness = {
   notConnected: boolean
   missingAccounts: Array<{ key: string; label: string }>
   missingTaxTypes: Array<{ id: string; name: string }>
+  /**
+   * Scopes this connection was asked for but NOT granted (o3d-g2i). Empty when the grant is complete —
+   * and also when it was never recorded, because unknown must never be reported as missing.
+   */
+  missingScopes: string[]
 }
 
 const REQUIRED_ACCOUNTS: Array<{ key: keyof XeroSettings; label: string }> = [
@@ -504,7 +509,7 @@ const REQUIRED_ACCOUNTS: Array<{ key: keyof XeroSettings; label: string }> = [
 ]
 
 export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
-  const [settings, connStatus, taxRates] = await Promise.all([
+  const [settings, connStatus, taxRates, granted] = await Promise.all([
     getXeroSettings(),
     isConnected(),
     db.taxRate.findMany({
@@ -512,6 +517,7 @@ export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
       select: { id: true, name: true, accountingTaxType: true },
       orderBy: { name: 'asc' },
     }),
+    getGrantedScopes(),
   ])
 
   const missingAccounts = REQUIRED_ACCOUNTS
@@ -522,10 +528,16 @@ export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
     .filter(r => !r.accountingTaxType)
     .map(r => ({ id: r.id, name: r.name }))
 
+  // Deliberately NOT part of `ready`: an incomplete grant does not stop invoices or bills posting, it
+  // stops the specific syncs that need the missing scope. Blocking the whole connector over it would be a
+  // worse outage than the fault. It is surfaced as its own warning with the one action that fixes it.
+  const missing = missingScopes(granted)
+
   return {
     ready: connStatus.connected && missingAccounts.length === 0 && missingTaxTypes.length === 0,
     notConnected: !connStatus.connected,
     missingAccounts,
     missingTaxTypes,
+    missingScopes: missing,
   }
 }

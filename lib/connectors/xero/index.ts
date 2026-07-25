@@ -74,7 +74,8 @@ export class XeroConnector implements AccountingConnector {
 }
 
 // Re-export submodules for direct use
-export { getAuthorizationUrl, consumeXeroOAuthState, exchangeCodeForTokens, disconnect, isConnected, getAccessToken } from './auth'
+export { getAuthorizationUrl, consumeXeroOAuthState, exchangeCodeForTokens, disconnect, isConnected, getAccessToken, getGrantedScopes } from './auth'
+export { XERO_REQUESTED_SCOPES, blockingScopeFor, missingScopes, requiredScopeForSyncType, SCOPE_RECONSENT_PREFIX } from './scopes'
 export { syncChartOfAccounts, getXeroTaxRates } from './accounts'
 export { findOrCreateContact } from './contacts'
 export { findOrCreateItem } from './items'

@@ -839,6 +839,29 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             </div>
           )}
 
+          {/*
+            A missing SCOPE is separate from readiness on purpose: it does not stop the connector, it
+            stops the particular syncs that need it (payments, journals, attachments) — and those fail
+            one at a time with a 401 that names no cause. Reconnecting is the only fix, because a
+            refreshed token keeps the grant its original consent carried (o3d-g2i).
+          */}
+          {readiness.missingScopes.length > 0 && (
+            <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-950/30 p-3 space-y-2">
+              <div className="flex items-center gap-2 text-sm font-medium text-amber-900 dark:text-amber-200">
+                <AlertTriangle className="h-4 w-4" />
+                Reconnect required — this connection is missing {readiness.missingScopes.length === 1 ? 'a permission' : 'permissions'}
+              </div>
+              <p className="text-xs text-amber-800 dark:text-amber-300 ml-6">
+                Not granted: <span className="font-mono">{readiness.missingScopes.join(', ')}</span>.
+                {' '}Syncs that need {readiness.missingScopes.length === 1 ? 'it' : 'them'} — payments,
+                {' '}manual journals or attachments, depending on the permission — will fail until you
+                {' '}<strong>Reconnect</strong> on the Connection tab and approve the new consent screen.
+                {' '}Refreshing the token does not help: it keeps the permissions the original connection
+                {' '}was granted. Rows that failed for this reason can be retried afterwards from the Logs tab.
+              </p>
+            </div>
+          )}
+
           <label className={`flex items-center gap-3 ${readiness.ready || s[syncEnabledKey] === 'true' ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
             <input
               type="checkbox"

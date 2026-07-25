@@ -61,6 +61,13 @@ export type AccountingSyncReadiness = {
   notConnected: boolean
   missingAccounts: Array<{ key: string; label: string }>
   missingTaxTypes: Array<{ id: string; name: string }>
+  /**
+   * Scopes the connector asked for at consent but was NOT granted (o3d-g2i). Deliberately NOT part of
+   * `ready`: an incomplete grant does not stop the connector, it stops the specific syncs that need the
+   * missing scope, so blocking everything over it would be a worse outage than the fault. Empty when the
+   * grant is complete AND when the connector does not record grants — unknown is never reported missing.
+   */
+  missingScopes: string[]
 }
 
 async function getActiveConnector(preferredConnector?: AccountingConnectorId): Promise<AccountingConnectorId | null> {
