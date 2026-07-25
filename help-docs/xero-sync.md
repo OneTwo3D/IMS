@@ -487,6 +487,34 @@ The IMS maps payment methods to Xero bank accounts using a composite key of `{me
 
 Configure this mapping in **Integrations → Xero → Payment Account Mapping**.
 
+## Settlement: is the payment actually in the ledger?
+
+Marking something paid in the IMS and the ledger agreeing are two different facts. Registering the payment is a separate sync (`INVOICE_PAYMENT` for a customer receipt, `BILL_PAYMENT` for a supplier payment) that can fail, be cancelled, or never be queued — so a green **Paid** badge on its own only means the IMS was told the money arrived.
+
+Sales orders and supplier bills therefore show a **settlement verdict** derived from that payment sync row:
+
+| Shown as | Meaning |
+|---|---|
+| *Paid* (green) | The ledger confirmed the payment in full. |
+| *awaiting ledger* (amber) | The payment is queued or retrying. Normal, briefly. |
+| **LEDGER REJECTED** (red) | The payment sync failed. The ledger still shows the amount outstanding. |
+| **NOT SENT TO LEDGER** (red) | No payment was ever queued, or it was cancelled. The ledger will not learn about it on its own. |
+| **PART PAID IN LEDGER** (red) | The ledger recorded less than the document total, so a balance remains there. |
+
+Hover the badge for the detail; the red states also print it under the invoice. Nothing is expected to post while accounting sync is off, or before the invoice/bill itself has reached the ledger — a payment cannot attach to a document Xero has never seen, so in that case the **document** sync is what to chase.
+
+### Receipts recorded by hand
+
+A payment recorded on a sales order (**Add Payment**) is registered against the Xero invoice automatically, provided:
+
+- accounting sync is on and the invoice has already posted to Xero;
+- the payment method and currency resolve to a bank account in the mapping above;
+- the ledger has not already been sent enough payments to cover the invoice.
+
+If any of those does not hold, the receipt is still recorded in the IMS, nothing is sent, and a warning naming the order appears in the activity log — the order then shows **NOT SENT TO LEDGER** until it is registered. The last condition matters for imported orders: a paid WooCommerce order registers its payment automatically without creating a payment row in the IMS, so recording "the" payment by hand afterwards would pay the Xero invoice twice. The IMS refuses that rather than doing it silently.
+
+Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there.
+
 ## FIFO Cost Layers
 
 Group B of the daily batch consumes FIFO (First In, First Out) cost layers when booking COGS. Each shipment line decrements `remainingQty` on the oldest cost layers first. This ensures COGS reflects the actual purchase cost of the specific units shipped.

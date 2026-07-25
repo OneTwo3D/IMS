@@ -15,6 +15,7 @@ import {
   getAccountingSettings,
   getActiveAccountingConnectorInfo,
   getPaymentAccountMap,
+  isAccountingSyncTypeEnabled,
   lookupPaymentAccount,
   type AccountingSettings,
 } from '@/lib/accounting'
@@ -769,14 +770,17 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
   // per payment row: the verdict is about the order's settlement as a whole, and one rejected payment
   // among several means the ledger still shows a balance.
   const activeConnector = await getActiveAccountingConnectorInfo().catch(() => null)
-  const [accountingSyncEnabled, paymentSyncRows] = await Promise.all([
-    getAccountingSettings().then((a) => a.syncEnabled).catch(() => false),
+  const [paymentSyncEnabled, paymentSyncRows] = await Promise.all([
+    // The TYPE's own posting mode, not just the connector flag: an installation that has payment sync
+    // switched off expects no payment to post, and calling that a discrepancy would paint every paid
+    // order permanently red for a setting someone chose on purpose.
+    isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false),
     loadInvoicePaymentSyncRows(so.id, activeConnector?.id ?? null),
   ])
   const claimedForeign = claimedReceivedForeign(so)
   const settlement = settlementStatus({
     paidLocally: !!so.paidAt || claimedForeign > 0,
-    syncEnabled: accountingSyncEnabled,
+    syncEnabled: paymentSyncEnabled,
     documentPosted: !!so.accountingInvoiceId,
     payment: aggregatePaymentSyncRows(paymentSyncRows),
     // Compared against what the ledger's copy of the invoice was built at, capped by what IMS actually
@@ -2817,8 +2821,10 @@ async function registerInvoicePaymentWithLedger(params: {
   }
 
   try {
-    const [settings, so, connector] = await Promise.all([
-      getAccountingSettings(),
+    const [paymentSyncEnabled, so, connector] = await Promise.all([
+      // Not merely "is the connector on": if INVOICE_PAYMENT posting is off, queueAccountingSync would
+      // drop this silently, so treat it as nothing being expected rather than as a failure to report.
+      isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false),
       db.salesOrder.findUnique({
         where: { id: params.orderId },
         select: { accountingInvoiceId: true, currency: true, totalForeign: true, taxForeign: true, pricesIncludeVat: true },
@@ -2828,16 +2834,16 @@ async function registerInvoicePaymentWithLedger(params: {
     if (!so) return
 
     const decision = decideInvoicePaymentRegistration({
-      syncEnabled: settings.syncEnabled,
+      syncEnabled: paymentSyncEnabled,
       accountingInvoiceId: so.accountingInvoiceId,
       orderCurrency: so.currency,
       paymentCurrency: params.currency,
       paymentAmount: params.amount,
       paymentId: params.paymentId,
-      bankAccountId: settings.syncEnabled && so.accountingInvoiceId
+      bankAccountId: paymentSyncEnabled && so.accountingInvoiceId
         ? lookupPaymentAccount(await getPaymentAccountMap(), params.method ?? '', params.currency)
         : null,
-      existing: settings.syncEnabled && so.accountingInvoiceId
+      existing: paymentSyncEnabled && so.accountingInvoiceId
         ? await loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null)
         : [],
       ledgerTotal: ledgerSalesInvoiceTotalForeign({

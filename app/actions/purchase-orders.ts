@@ -771,7 +771,10 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   // have been queued at all. Read once for the whole PO rather than per bill.
   const activeConnector = await getActiveAccountingConnectorInfo().catch(() => null)
   const [accountingSyncEnabled, billPaymentByInvoice] = await Promise.all([
-    getAccountingSettings().then((a) => a.syncEnabled).catch(() => false),
+    // The TYPE's own posting mode, not just the connector flag: an installation with bill-payment sync
+    // switched off expects no payment to post, and calling that a discrepancy would paint every paid
+    // bill permanently red for a setting someone chose on purpose.
+    isAccountingSyncTypeEnabled('BILL_PAYMENT').catch(() => false),
     latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id), activeConnector?.id ?? null),
   ])
 
