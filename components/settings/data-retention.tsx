@@ -13,6 +13,7 @@ type Props = {
   customersValue: string
   stockMovementsValue: string
   syncLogsValue: string
+  webhookEventsValue: string
 }
 
 const FIELDS = [
@@ -21,6 +22,7 @@ const FIELDS = [
   { key: 'retention_customers_months', label: 'Customers', stateKey: 'customers' as const, hint: 'Archive inactive customers' },
   { key: 'retention_stock_movements_months', label: 'Stock Movements', stateKey: 'stockMovements' as const, hint: 'Permanently delete movements' },
   { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete sync logs' },
+  { key: 'retention_webhook_events_months', label: 'Webhook Events', stateKey: 'webhookEvents' as const, hint: 'Clear processed inbox payloads (keeps dedup + dead letters)' },
 ] as const
 
 export function DataRetentionSetting({
@@ -29,6 +31,7 @@ export function DataRetentionSetting({
   customersValue,
   stockMovementsValue,
   syncLogsValue,
+  webhookEventsValue,
 }: Props) {
   const [isPending, startTransition] = useTransition()
   const [values, setValues] = useState({
@@ -37,6 +40,7 @@ export function DataRetentionSetting({
     customers: customersValue,
     stockMovements: stockMovementsValue,
     syncLogs: syncLogsValue,
+    webhookEvents: webhookEventsValue,
   })
   const [saved, setSaved] = useState(false)
 
@@ -56,7 +60,7 @@ export function DataRetentionSetting({
       <p className="text-xs text-muted-foreground">
         Set to 0 to keep records forever. Financial records (orders, customers) are soft-archived — hidden from lists but accessible via direct link. Operational data (movements, sync logs) is permanently deleted. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
       </p>
-      <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-5 gap-x-4 max-w-3xl">
+      <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-x-4 max-w-4xl">
         {FIELDS.map((f) => (
           <div key={f.key} className="grid grid-rows-subgrid row-span-3 gap-0">
             <Label className="text-xs self-end pb-1">{f.label} (months)</Label>
