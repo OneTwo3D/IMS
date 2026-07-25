@@ -9,7 +9,11 @@ import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { getSettingValue } from '@/lib/settings-store'
 import { wcFetch, wcPut } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
-import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
+import {
+  WC_PRODUCT_WRITE_LOCK_NAMESPACE,
+  WC_SETTINGS_VERSION_KEY,
+  WC_SYNC_ADVISORY_LOCK_KEY,
+} from '../sync-lock'
 import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
 import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
@@ -26,6 +30,16 @@ import type { WcFullProduct, WcVariation, SyncResult } from './types'
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
 const MANUAL_PRODUCT_SYNC_JOB_KEY = 'manual_wc_product_sync_job'
 const MANUAL_PRODUCT_SYNC_STALE_MS = 30 * 60 * 1000
+
+/**
+ * Budget for the single product-write transaction (o3d-uh2). Every remote fetch
+ * happens BEFORE the transaction opens, so this covers local writes only: one
+ * parent row, N variant rows and the option/sync-log rows. Prisma's 5s default is
+ * too tight for a product with several hundred variations, but the ceiling stays
+ * low enough that a wedged transaction cannot hold its row locks indefinitely.
+ */
+const PRODUCT_WRITE_TX_TIMEOUT_MS = 60_000
+const PRODUCT_WRITE_TX_MAX_WAIT_MS = 15_000
 
 export type ManualProductSyncProgress = {
   status: 'idle' | 'running' | 'done' | 'error'
@@ -314,12 +328,33 @@ async function persistMappingIfVersionMatches(
 // WC → IMS product sync
 // ---------------------------------------------------------------------------
 
+/**
+ * Import one WooCommerce product (and, for VARIABLE products, all of its
+ * variations) into IMS.
+ *
+ * Ordering contract (o3d-uh2) — the whole point of this function's shape:
+ *
+ *   1. Everything remote happens FIRST: the category mirror and *every*
+ *      variations page are fetched and validated before a single row is
+ *      written. A page that fails throws here, while the database is still
+ *      untouched.
+ *   2. Everything local happens inside ONE transaction: parent, variants,
+ *      product options and the SYNCED log commit together or not at all.
+ *      Previously the parent was written first and each variations page as it
+ *      arrived, so a mid-sync failure left a parent with no variants, or a
+ *      parent with a mix of freshly-written and stale variants.
+ *   3. That transaction opens with a per-SKU advisory lock, so two workers
+ *      importing the same product serialize instead of both taking the create
+ *      branch and one dying on a P2002 (see WC_PRODUCT_WRITE_LOCK_NAMESPACE).
+ *   4. Only fire-and-forget/audit side effects run after the commit.
+ *
+ * No HTTP call may move inside the transaction: it holds row locks, and a slow
+ * WooCommerce would hold them for the length of the request.
+ */
 export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ success: boolean; error?: string }> {
   try {
     const sku = asTrimmedString(wcProduct.sku)
     if (!sku) return { success: true } // skip products without SKU
-
-    const existing = await db.product.findFirst({ where: { sku } })
 
     // --- Shared field extraction ---
     const description = stripHtml(wcProduct.short_description || wcProduct.description || '')
@@ -345,9 +380,6 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'
-    const existingLifecycleStatus = existing?.lifecycleStatus ?? null
-    const lifecycleStatus = deriveLifecycleStatusFromWooStatus(wcProduct.status, existingLifecycleStatus)
-    const active = deriveLegacyActiveFromLifecycleStatus(lifecycleStatus)
 
     // Mirror WC's category tree once per sync run (cached) and resolve this product's
     // IMS ProductCategory id — preferring the WC primary category (Yoast / Rank Math)
@@ -360,184 +392,164 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
       if (mirror) imsCategoryId = resolveImsCategoryId(wcCategories, wcProduct.meta_data, mirror)
     }
 
-    if (existing) {
-      // Build update data — always sync these fields
-      const updateData: Record<string, unknown> = {
-        name: wcProduct.name,
-        description: description || existing.description,
-        imageUrl: imageUrl ?? existing.imageUrl,
-        weight: weight ?? existing.weight,
-        depthCm: depthCm ?? existing.depthCm,
-        widthCm: widthCm ?? existing.widthCm,
-        heightCm: heightCm ?? existing.heightCm,
-        active,
-        lifecycleStatus,
-        type: productType,
-        externalProductId: BigInt(wcProduct.id),
-      }
+    // --- Remote reads: ALL of them, before anything is written (o3d-uh2) ---
+    // A variations page that fails throws from here, leaving the catalog untouched.
+    const isVariable = wcProduct.type === 'variable' && wcProduct.variations?.length > 0
+    const variations = isVariable ? await fetchAllWcVariations(wcProduct.id) : []
 
-      // Prices — only set on non-VARIABLE products (VARIABLE shows min-max from variants)
-      if (productType !== 'VARIABLE') {
-        if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
-        if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
-      } else {
-        updateData.salesPriceBase = null
-        updateData.salePriceBase = null
-      }
+    const variationAttrs = Array.isArray(wcProduct.attributes)
+      ? wcProduct.attributes.filter((a) => a.variation)
+      : []
 
-      // GTIN — only set if IMS field is currently null/empty
-      if (gtin && !existing.barcode) updateData.barcode = gtin
+    // --- Local writes: all of them, in ONE transaction ---
+    const { syncedProductId, syncedSku, tradeChanges, wasUpdate } = await db.$transaction(
+      async (tx: Prisma.TransactionClient) => {
+        // Serialize concurrent syncs of this SKU so the find-then-create below cannot
+        // race another worker into a P2002 (see WC_PRODUCT_WRITE_LOCK_NAMESPACE).
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_WRITE_LOCK_NAMESPACE}::int4, hashtext(${sku}))`
 
-      // Trade fields — hs-code-woo (WC pa_*) is authoritative: overwrite IMS when WC supplies
-      // a differing value so re-classifications propagate; preserve IMS when WC omits it.
-      const tradeChanges = resolveWcTradeFieldUpdates(
-        {
-          hsCode: existing.hsCode,
-          countryOfOrigin: existing.countryOfOrigin,
-          customsDescription: existing.customsDescription,
-        },
-        { hsCode: hsCodeAttr, countryOfOrigin: originIso, customsDescription: customsDescriptionAttr },
-      )
-      for (const change of tradeChanges) {
-        updateData[change.field] = change.to
-      }
+        const existing = await tx.product.findFirst({ where: { sku } })
+        const lifecycleStatus = deriveLifecycleStatusFromWooStatus(
+          wcProduct.status,
+          existing?.lifecycleStatus ?? null,
+        )
+        const active = deriveLegacyActiveFromLifecycleStatus(lifecycleStatus)
 
-      // Category — link to mirrored IMS category for the deepest WC category
-      // referenced by this product. If WC dropped all categories, clear the link.
-      if (imsCategoryId !== undefined) updateData.categoryId = imsCategoryId
+        let productId: string
+        let productSku: string
+        let changes: WcTradeFieldChange[] = []
 
-      const saved = await db.product.update({ where: { id: existing.id }, data: updateData })
-      const syncedProductId = saved.id
+        if (existing) {
+          // Build update data — always sync these fields
+          const updateData: Record<string, unknown> = {
+            name: wcProduct.name,
+            description: description || existing.description,
+            imageUrl: imageUrl ?? existing.imageUrl,
+            weight: weight ?? existing.weight,
+            depthCm: depthCm ?? existing.depthCm,
+            widthCm: widthCm ?? existing.widthCm,
+            heightCm: heightCm ?? existing.heightCm,
+            active,
+            lifecycleStatus,
+            type: productType,
+            externalProductId: BigInt(wcProduct.id),
+          }
 
-      // If WC changed the classification-relevant fields, drop the stale HS-code proposal so the
-      // sweep re-classifies (6igm.5/.7). Fire-and-forget (not after() — this runs in non-request
-      // sync/cron contexts too); never affects the import result.
-      void invalidateStaleHsProposal(syncedProductId).catch((err) => console.error(err))
+          // Prices — only set on non-VARIABLE products (VARIABLE shows min-max from variants)
+          if (productType !== 'VARIABLE') {
+            if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
+            if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
+          } else {
+            updateData.salesPriceBase = null
+            updateData.salePriceBase = null
+          }
 
-      // Audit trail when hs-code-woo overwrote IMS trade fields (bhdm.2).
-      if (tradeChanges.length > 0) {
-        await logActivity({
-          entityType: 'PRODUCT',
-          entityId: syncedProductId,
-          action: 'wc_trade_fields_updated',
-          tag: 'sync',
-          description: `WC trade fields updated on ${saved.sku}: ${tradeChanges
-            .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to}`)
-            .join(', ')}`,
+          // GTIN — only set if IMS field is currently null/empty
+          if (gtin && !existing.barcode) updateData.barcode = gtin
+
+          // Trade fields — hs-code-woo (WC pa_*) is authoritative: overwrite IMS when WC supplies
+          // a differing value so re-classifications propagate; preserve IMS when WC omits it.
+          changes = resolveWcTradeFieldUpdates(
+            {
+              hsCode: existing.hsCode,
+              countryOfOrigin: existing.countryOfOrigin,
+              customsDescription: existing.customsDescription,
+            },
+            { hsCode: hsCodeAttr, countryOfOrigin: originIso, customsDescription: customsDescriptionAttr },
+          )
+          for (const change of changes) {
+            updateData[change.field] = change.to
+          }
+
+          // Category — link to mirrored IMS category for the deepest WC category
+          // referenced by this product. If WC dropped all categories, clear the link.
+          if (imsCategoryId !== undefined) updateData.categoryId = imsCategoryId
+
+          const saved = await tx.product.update({ where: { id: existing.id }, data: updateData })
+          productId = saved.id
+          productSku = saved.sku
+        } else {
+          const created = await tx.product.create({
+            data: {
+              sku,
+              name: wcProduct.name,
+              description: description || null,
+              imageUrl,
+              barcode: gtin,
+              weight,
+              depthCm,
+              widthCm,
+              heightCm,
+              salesPriceBase: productType === 'VARIABLE' ? null : salesPriceBase,
+              salePriceBase: productType === 'VARIABLE' ? null : salePriceBase,
+              active,
+              lifecycleStatus,
+              type: productType,
+              hsCode: hsCodeAttr,
+              countryOfOrigin: originIso ?? DEFAULT_COUNTRY_OF_ORIGIN,
+              customsDescription: customsDescriptionAttr,
+              externalProductId: BigInt(wcProduct.id),
+              categoryId: imsCategoryId ?? null,
+            },
+          })
+          productId = created.id
+          productSku = created.sku
+        }
+
+        // --- Variations (VARIABLE products) — already fetched, just applied here ---
+        if (isVariable) {
+          await applyVariations(tx, variations, productId, wcProduct.name, imsCategoryId)
+        }
+
+        // --- Product options (variation attributes) ---
+        await applyProductOptions(tx, productId, variationAttrs)
+
+        await tx.shoppingSyncLog.create({
+          data: {
+            direction: 'FROM_CONNECTOR',
+            status: 'SYNCED',
+            entityType: 'Product',
+            entityId: productId,
+            externalId: String(wcProduct.id),
+            syncedAt: new Date(),
+          },
         })
-      }
 
-      // --- Variations (VARIABLE products) ---
-      if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
-        await syncVariations(wcProduct.id, syncedProductId, wcProduct.name, imsCategoryId)
-      }
-
-      // --- Product options (variation attributes) ---
-      if (Array.isArray(wcProduct.attributes) && wcProduct.attributes.length) {
-        const variationAttrs = wcProduct.attributes.filter((a) => a.variation)
-        for (const attr of variationAttrs) {
-          const attrName = asTrimmedString(attr.name)
-          const optionValues = normalizeAttributeOptions(attr.options)
-          if (!attrName || optionValues.length === 0) continue
-          await db.productOption.upsert({
-            where: {
-              productId_name: { productId: syncedProductId, name: attrName },
-            },
-            create: {
-              productId: syncedProductId,
-              name: attrName,
-              values: optionValues.join(','),
-              sortOrder: attr.position,
-            },
-            update: {
-              values: optionValues.join(','),
-              sortOrder: attr.position,
-            },
-          })
+        return {
+          syncedProductId: productId,
+          syncedSku: productSku,
+          tradeChanges: changes,
+          wasUpdate: Boolean(existing),
         }
-      }
+      },
+      { timeout: PRODUCT_WRITE_TX_TIMEOUT_MS, maxWait: PRODUCT_WRITE_TX_MAX_WAIT_MS },
+    )
 
-      await db.shoppingSyncLog.create({
-        data: {
-          direction: 'FROM_CONNECTOR',
-          status: 'SYNCED',
-          entityType: 'Product',
-          entityId: syncedProductId,
-          externalId: String(wcProduct.id),
-          syncedAt: new Date(),
-        },
-      })
+    // --- Post-commit side effects (never roll back, never fail the import) ---
 
-      return { success: true }
-    } else {
-      // Create new product
-      const created = await db.product.create({
-        data: {
-          sku,
-          name: wcProduct.name,
-          description: description || null,
-          imageUrl,
-          barcode: gtin,
-          weight,
-          depthCm,
-          widthCm,
-          heightCm,
-          salesPriceBase: productType === 'VARIABLE' ? null : salesPriceBase,
-          salePriceBase: productType === 'VARIABLE' ? null : salePriceBase,
-          active,
-          lifecycleStatus,
-          type: productType,
-          hsCode: hsCodeAttr,
-          countryOfOrigin: originIso ?? DEFAULT_COUNTRY_OF_ORIGIN,
-          customsDescription: customsDescriptionAttr,
-          externalProductId: BigInt(wcProduct.id),
-          categoryId: imsCategoryId ?? null,
-        },
-      })
-
-      // --- Variations (VARIABLE products) ---
-      if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
-        await syncVariations(wcProduct.id, created.id, wcProduct.name, imsCategoryId)
-      }
-
-      // --- Product options (variation attributes) ---
-      if (Array.isArray(wcProduct.attributes) && wcProduct.attributes.length) {
-        const variationAttrs = wcProduct.attributes.filter((a) => a.variation)
-        for (const attr of variationAttrs) {
-          const attrName = asTrimmedString(attr.name)
-          const optionValues = normalizeAttributeOptions(attr.options)
-          if (!attrName || optionValues.length === 0) continue
-          await db.productOption.upsert({
-            where: {
-              productId_name: { productId: created.id, name: attrName },
-            },
-            create: {
-              productId: created.id,
-              name: attrName,
-              values: optionValues.join(','),
-              sortOrder: attr.position,
-            },
-            update: {
-              values: optionValues.join(','),
-              sortOrder: attr.position,
-            },
-          })
-        }
-      }
-
-      await db.shoppingSyncLog.create({
-        data: {
-          direction: 'FROM_CONNECTOR',
-          status: 'SYNCED',
-          entityType: 'Product',
-          entityId: created.id,
-          externalId: String(wcProduct.id),
-          syncedAt: new Date(),
-        },
-      })
-
-      return { success: true }
+    // If WC changed the classification-relevant fields, drop the stale HS-code proposal so the
+    // sweep re-classifies (6igm.5/.7). Fire-and-forget (not after() — this runs in non-request
+    // sync/cron contexts too); never affects the import result.
+    if (wasUpdate) {
+      void invalidateStaleHsProposal(syncedProductId).catch((err) => console.error(err))
     }
+
+    // Audit trail when hs-code-woo overwrote IMS trade fields (bhdm.2). logActivity
+    // swallows its own errors, so running it after the commit cannot strand a
+    // committed import behind a FAILED log.
+    if (tradeChanges.length > 0) {
+      await logActivity({
+        entityType: 'PRODUCT',
+        entityId: syncedProductId,
+        action: 'wc_trade_fields_updated',
+        tag: 'sync',
+        description: `WC trade fields updated on ${syncedSku}: ${tradeChanges
+          .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to}`)
+          .join(', ')}`,
+      })
+    }
+
+    return { success: true }
   } catch (e) {
     await db.shoppingSyncLog.create({
       data: {
@@ -554,18 +566,24 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 }
 
 // ---------------------------------------------------------------------------
-// Variation sync helper
+// Variation sync helpers
+//
+// Deliberately split in two (o3d-uh2): fetchAllWcVariations does the remote work
+// and must complete before the write transaction opens; applyVariations does the
+// local work and must run inside it. Merging them again would either put HTTP
+// inside a lock-holding transaction or reintroduce page-by-page partial writes.
 // ---------------------------------------------------------------------------
 
-async function syncVariations(
-  wcParentId: number,
-  imsParentId: string,
-  parentName: string,
-  // Variants inherit the parent product's resolved category. Only a real (non-null)
-  // category is applied — a variant's category is never cleared by inheritance, even
-  // if the parent currently resolves to no category (matches the backfill's policy).
-  parentCategoryId: string | null | undefined,
-) {
+/**
+ * Fetch EVERY variations page for a WC parent, or throw.
+ *
+ * Nothing is written here, so a failure on any page (first or last) leaves the
+ * catalog exactly as it was. Propagating instead of swallowing is o3d-q1w: the
+ * parent sync then records FAILED, writes no SYNCED log, and neither the webhook
+ * nor the bulk cursor advances, so the reconcile re-attempts.
+ */
+async function fetchAllWcVariations(wcParentId: number): Promise<WcVariation[]> {
+  const all: WcVariation[] = []
   let page = 1
   let totalPages = 1
 
@@ -574,9 +592,6 @@ async function syncVariations(
       `/products/${wcParentId}/variations`,
       { per_page: '100', page: String(page) },
     )
-    // Propagate a variations-fetch failure so the parent product sync FAILS
-    // (recorded FAILED, no SYNCED log, cursors not advanced). Swallowing this
-    // used to leave variations un-synced while the parent looked SYNCED (o3d-q1w).
     if (error) {
       throw new Error(
         `Failed to fetch variations for WC product ${wcParentId} (page ${page}/${totalPages}): ${error}`,
@@ -584,82 +599,135 @@ async function syncVariations(
     }
 
     totalPages = tp
-    const variations = data as WcVariation[]
+    all.push(...(data as WcVariation[]))
+    page++
+  }
 
-    for (const v of variations) {
-      const sku = asTrimmedString(v.sku)
-      if (!sku) continue // skip variations without SKU
+  return all
+}
 
-      // Build variant name: parent name + attribute values
-      const attrSuffix = Array.isArray(v.attributes)
-        ? v.attributes
-          .map((a) => asTrimmedString(a.option))
-          .filter((option): option is string => Boolean(option))
-          .join(' / ')
-        : ''
-      const variantName = attrSuffix ? `${parentName} — ${attrSuffix}` : parentName
+/** Write already-fetched variations inside the caller's transaction. */
+async function applyVariations(
+  tx: Prisma.TransactionClient,
+  variations: WcVariation[],
+  imsParentId: string,
+  parentName: string,
+  // Variants inherit the parent product's resolved category. Only a real (non-null)
+  // category is applied — a variant's category is never cleared by inheritance, even
+  // if the parent currently resolves to no category (matches the backfill's policy).
+  parentCategoryId: string | null | undefined,
+) {
+  const entries = variations
+    .map((v) => ({ v, sku: asTrimmedString(v.sku) }))
+    .filter((entry): entry is { v: WcVariation; sku: string } => Boolean(entry.sku)) // skip variations without SKU
+  if (entries.length === 0) return
 
-      const description = stripHtml(v.description || '')
-      const salesPriceBase = parseNum(v.regular_price)
-      const salePriceBase = parseNum(v.sale_price)
-      const weight = parseNum(v.weight)
-      const depthCm = parseNum(v.dimensions?.length)
-      const widthCm = parseNum(v.dimensions?.width)
-      const heightCm = parseNum(v.dimensions?.height)
-      const imageUrl = getFirstImageUrl(v.images)
-      const gtin = asTrimmedString(v.global_unique_id)
+  // One lookup for all variant SKUs rather than one per variant. This runs inside a
+  // transaction holding row locks, so every saved round trip shortens the lock hold.
+  const existingRows = await tx.product.findMany({
+    where: { sku: { in: entries.map((entry) => entry.sku) } },
+  })
+  const existingBySku = new Map(existingRows.map((row) => [row.sku, row]))
 
-      const existing = await db.product.findFirst({ where: { sku } })
+  for (const { v, sku } of entries) {
+    // Build variant name: parent name + attribute values
+    const attrSuffix = Array.isArray(v.attributes)
+      ? v.attributes
+        .map((a) => asTrimmedString(a.option))
+        .filter((option): option is string => Boolean(option))
+        .join(' / ')
+      : ''
+    const variantName = attrSuffix ? `${parentName} — ${attrSuffix}` : parentName
 
-      if (existing) {
-        const updateData: Record<string, unknown> = {
+    const description = stripHtml(v.description || '')
+    const salesPriceBase = parseNum(v.regular_price)
+    const salePriceBase = parseNum(v.sale_price)
+    const weight = parseNum(v.weight)
+    const depthCm = parseNum(v.dimensions?.length)
+    const widthCm = parseNum(v.dimensions?.width)
+    const heightCm = parseNum(v.dimensions?.height)
+    const imageUrl = getFirstImageUrl(v.images)
+    const gtin = asTrimmedString(v.global_unique_id)
+
+    const existing = existingBySku.get(sku)
+
+    if (existing) {
+      const updateData: Record<string, unknown> = {
+        name: variantName,
+        description: description || existing.description,
+        imageUrl: imageUrl ?? existing.imageUrl,
+        weight: weight ?? existing.weight,
+        depthCm: depthCm ?? existing.depthCm,
+        widthCm: widthCm ?? existing.widthCm,
+        heightCm: heightCm ?? existing.heightCm,
+        active: deriveLegacyActiveFromLifecycleStatus(
+          deriveLifecycleStatusFromWooStatus(v.status, existing.lifecycleStatus),
+        ),
+        lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status, existing.lifecycleStatus),
+        type: 'VARIANT',
+        parentId: imsParentId,
+        externalProductId: BigInt(v.id),
+      }
+      if (parentCategoryId != null) updateData.categoryId = parentCategoryId
+      if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
+      if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
+      if (gtin && !existing.barcode) updateData.barcode = gtin
+
+      await tx.product.update({ where: { id: existing.id }, data: updateData })
+    } else {
+      const created = await tx.product.create({
+        data: {
+          sku,
           name: variantName,
-          description: description || existing.description,
-          imageUrl: imageUrl ?? existing.imageUrl,
-          weight: weight ?? existing.weight,
-          depthCm: depthCm ?? existing.depthCm,
-          widthCm: widthCm ?? existing.widthCm,
-          heightCm: heightCm ?? existing.heightCm,
-          active: deriveLegacyActiveFromLifecycleStatus(
-            deriveLifecycleStatusFromWooStatus(v.status, existing.lifecycleStatus),
-          ),
-          lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status, existing.lifecycleStatus),
+          description: description || null,
+          imageUrl,
+          barcode: gtin,
+          weight,
+          depthCm,
+          widthCm,
+          heightCm,
+          salesPriceBase,
+          salePriceBase,
+          active: deriveLegacyActiveFromLifecycleStatus(deriveLifecycleStatusFromWooStatus(v.status)),
+          lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status),
           type: 'VARIANT',
           parentId: imsParentId,
+          ...(parentCategoryId != null ? { categoryId: parentCategoryId } : {}),
           externalProductId: BigInt(v.id),
-        }
-        if (parentCategoryId != null) updateData.categoryId = parentCategoryId
-        if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
-        if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
-        if (gtin && !existing.barcode) updateData.barcode = gtin
-
-        await db.product.update({ where: { id: existing.id }, data: updateData })
-      } else {
-        await db.product.create({
-          data: {
-            sku,
-            name: variantName,
-            description: description || null,
-            imageUrl,
-            barcode: gtin,
-            weight,
-            depthCm,
-            widthCm,
-            heightCm,
-            salesPriceBase,
-            salePriceBase,
-            active: deriveLegacyActiveFromLifecycleStatus(deriveLifecycleStatusFromWooStatus(v.status)),
-            lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status),
-            type: 'VARIANT',
-            parentId: imsParentId,
-            ...(parentCategoryId != null ? { categoryId: parentCategoryId } : {}),
-            externalProductId: BigInt(v.id),
-          },
-        })
-      }
+        },
+      })
+      // WC can repeat a SKU across variations of one parent; keep the map authoritative
+      // so the duplicate updates the row we just created instead of colliding on it.
+      existingBySku.set(sku, created)
     }
+  }
+}
 
-    page++
+/** Write the parent's variation attributes as ProductOptions, inside the caller's transaction. */
+async function applyProductOptions(
+  tx: Prisma.TransactionClient,
+  productId: string,
+  variationAttrs: NonNullable<WcFullProduct['attributes']>,
+) {
+  for (const attr of variationAttrs) {
+    const attrName = asTrimmedString(attr.name)
+    const optionValues = normalizeAttributeOptions(attr.options)
+    if (!attrName || optionValues.length === 0) continue
+    await tx.productOption.upsert({
+      where: {
+        productId_name: { productId, name: attrName },
+      },
+      create: {
+        productId,
+        name: attrName,
+        values: optionValues.join(','),
+        sortOrder: attr.position,
+      },
+      update: {
+        values: optionValues.join(','),
+        sortOrder: attr.position,
+      },
+    })
   }
 }
 

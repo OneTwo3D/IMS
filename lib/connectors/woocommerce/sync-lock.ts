@@ -31,3 +31,39 @@
 export const WC_SYNC_ADVISORY_LOCK_KEY = 918_273_645
 
 export const WC_SETTINGS_VERSION_KEY = 'wc_settings_version'
+
+/**
+ * Namespace for the per-SKU advisory lock taken by the WC → IMS product write
+ * transaction (o3d-uh2).
+ *
+ * `syncWcProductToIms` resolves a product by SKU and then creates or updates it.
+ * Two workers importing the SAME WooCommerce product concurrently (a webhook
+ * delivery racing the poll, or two inbox workers on a duplicated event) would
+ * both observe "no such SKU" and both take the create branch — one of them then
+ * dies on a `P2002` unique-constraint violation on `Product.sku`.
+ *
+ * That failure is indistinguishable, from the outside, from a genuine
+ * deterministic mapping conflict, which is why o3d-gtk could not classify a
+ * P2002 as permanent: doing so would discard a legitimate update. Taking
+ * `pg_advisory_xact_lock(<this namespace>, hashtext(sku))` as the first
+ * statement of the write transaction serializes those workers, so the second one
+ * observes the row the first committed and takes the update branch. A P2002 that
+ * survives this is therefore a real conflict, not a race.
+ *
+ * This relies on the transaction running at READ COMMITTED (Prisma's default): the
+ * blocked worker's SKU lookup takes a fresh snapshot after the lock is granted, so
+ * it sees the row the other worker just committed. Raising the isolation level to
+ * REPEATABLE READ would silently defeat the lock — the second worker would still be
+ * reading its pre-lock snapshot and take the create branch anyway.
+ *
+ * Residual (deliberate): the lock is keyed on the PARENT sku, which covers the
+ * parent row and every variant written under it in the same transaction. Two
+ * DIFFERENT WooCommerce products claiming one SKU (e.g. a simple product and
+ * another parent's variation) are not serialized — but that is a genuine
+ * duplicate-SKU conflict in WooCommerce, deterministic on retry, and is exactly
+ * the case a permanent classification should reject.
+ *
+ * Two-argument (int4, int4) form, so it shares no key space with the
+ * single-argument (int8) `WC_SYNC_ADVISORY_LOCK_KEY` above.
+ */
+export const WC_PRODUCT_WRITE_LOCK_NAMESPACE = 918_273_646
