@@ -509,7 +509,13 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
       current.revenueDecimal = current.revenueDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.totalForeign : order.totalBase, lineAmount, lineTotal, fallbackShare))
       current.taxDecimal = current.taxDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.taxForeign : order.taxBase, lineAmount, lineTotal, fallbackShare))
       current.shippingDecimal = current.shippingDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.shippingForeign : order.shippingBase, lineAmount, lineTotal, fallbackShare))
-      current.discountDecimal = current.discountDecimal.add(toDecimal(line.discountAmount))
+      // The line's own discount PLUS this line's share of any order-level residual — the same whole
+      // that the customer/channel grouping above reports, allocated the way revenue, tax and shipping
+      // already are. Reading only the line field omitted a retained unallocated coupon, so the same
+      // orders reported different discount totals purely as a function of grouping (o3d-3gp).
+      current.discountDecimal = current.discountDecimal.add(
+        toDecimal(line.discountAmount).add(allocatedOrderAmount(order.discountAmount, lineAmount, lineTotal, fallbackShare)),
+      )
       current.currency = current.currency === (mode === 'foreign' ? order.currency : baseCurrency) ? current.currency : 'Multiple'
       rowsByKey.set(key, current)
     }
