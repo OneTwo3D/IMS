@@ -804,7 +804,13 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
 
     await setPostingMode({ sync: true, dailyBatch: false })
 
-    const bookedRateId = await seedFxRateAt('EUR', bookedRate, "now() - interval '2 hours'")
+    // MIDNIGHT-ANCHORED, not now()-relative — the trap that first failed this test. The sweep resolves each
+    // open balance with `fetchedAt <= asOf` where asOf is the valuation DATE at midnight, so a rate seeded
+    // at now() is ALWAYS after that boundary: the divergent rate is invisible, every balance falls back to
+    // its booked rate, the movement computes to zero and the sweep reports documents: 0 — no journal built,
+    // and the suppression assertion below would have nothing to prove. date_trunc puts the two seeds at
+    // 22:00 and 23:00 the previous day: both inside the boundary, in the intended order, at any run time.
+    const bookedRateId = await seedFxRateAt('EUR', bookedRate, "date_trunc('day', now()) - interval '2 hours'")
     let valuationRateId = ''
     try {
       await createInventoryProduct(page, { sku, name: `${runTag(runId)} X03`, price: '60.00' })
@@ -838,9 +844,10 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       // nothing to revalue, making the suppression assertion vacuous.
       expect(Number(totalForeign), 'the EUR bill is open and carries a foreign balance').toBeGreaterThan(0)
 
-      // Now the divergent valuation rate. fetchedAt = now() is <= the valuation date's asOf, so the sweep
-      // resolves THIS rate rather than the booked one, and the movement is material by construction.
-      valuationRateId = await seedFxRateAt('EUR', valuationRate, 'now()')
+      // Now the divergent valuation rate, seeded LATER than the booked one but still inside the valuation
+      // date's midnight boundary (see the anchoring note above), so the sweep resolves THIS rate rather than
+      // the booked one and the movement is material by construction.
+      valuationRateId = await seedFxRateAt('EUR', valuationRate, "date_trunc('day', now()) - interval '1 hour'")
       const revaluedBase = Number(totalForeign) / valuationRate
       expect(
         Math.abs(Number(totalBase) - revaluedBase),

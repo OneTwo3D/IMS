@@ -913,7 +913,14 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     await setPostingMode({ sync: true, dailyBatch: false })
 
     // Seed the BOOKED rate first (fetchedAt in the past) so the PO can be raised and books at ~1.15.
-    const bookedRateId = await seedFxRateAt('EUR', bookedRate, "now() - interval '2 hours'")
+    // MIDNIGHT-ANCHORED, not now()-relative. resolveSettlementFxRateToBase takes `fetchedAt <= asOf` where
+    // asOf is the payment DATE parsed to midnight, so a rate seeded at now() sits AFTER that boundary
+    // whenever the clock has rolled past midnight since paymentDate was computed — the settlement rate is
+    // then invisible, the booked rate resolves instead, and no FX is realised at all. That is not
+    // hypothetical: this test failed exactly that way on a run that crossed midnight. Anchoring both seeds
+    // to date_trunc('day', now()) puts them at 22:00 and 23:00 the previous day, so they are always <= the
+    // valuation boundary and always in the intended ORDER, whatever time the suite runs.
+    const bookedRateId = await seedFxRateAt('EUR', bookedRate, "date_trunc('day', now()) - interval '2 hours'")
     let settlementRateId = ''
     try {
       await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP08`, price: '60.00' })
@@ -961,7 +968,7 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
 
       // Now seed the SETTLEMENT rate (a LATER fetchedAt than the booked rate) and pay the bill from a EUR
       // bank account (a EUR payment from a EUR account — no cross-currency payment leg to complicate teardown).
-      settlementRateId = await seedFxRateAt('EUR', settlementRate, 'now()')
+      settlementRateId = await seedFxRateAt('EUR', settlementRate, "date_trunc('day', now()) - interval '1 hour'")
       const eurBankId = await bankAccountIdForName('Revolut (EUR)')
 
       await openPurchaseOrder(page, poId)
@@ -1003,14 +1010,17 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
         // Mirrors resolveSettlementFxRateToBase exactly: latest fetchedAt <= asOf, where asOf is
         // `new Date(input.paymentDate)` — a bare YYYY-MM-DD, so UTC midnight. Spelling the instant out in
         // full avoids a ::date cast resolving against the session timezone and quietly shifting the boundary.
-        const [resolvedRate] = await queryRows<{ rate: string }>(
-          `select rate from fx_rates
+        const resolvableRates = await queryRows<{ rate: string; fetchedAt: string }>(
+          `select rate, "fetchedAt"::text as "fetchedAt" from fx_rates
             where "fromCurrency" = 'GBP' and "toCurrency" = 'EUR' and "fetchedAt" <= $1::timestamptz
-            order by "fetchedAt" desc limit 1`,
+            order by "fetchedAt" desc`,
           [`${paymentDate}T00:00:00Z`],
         )
-        expect(Number(resolvedRate?.rate), 'the payment date resolves the SETTLEMENT rate, not the booked one')
-          .toBeCloseTo(settlementRate, 4)
+        expect(
+          Number(resolvableRates[0]?.rate),
+          `the payment date (${paymentDate}) resolves the SETTLEMENT rate, not the booked one; ` +
+            `rates at or before its midnight boundary: ${JSON.stringify(resolvableRates)}`,
+        ).toBeCloseTo(settlementRate, 4)
         //   4. and the resulting gain is material (asserted at expectedGain above, > 1 GBP).
 
         // THE POINT (o3d-lgo.6.1): every condition for a REALISED_FX_JOURNAL is met, and it is still never
