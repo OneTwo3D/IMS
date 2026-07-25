@@ -27,6 +27,8 @@
  * before doing anything else. scripts/restore-stage-connectors.ts is the manual escape
  * hatch.
  */
+import { hostname } from 'node:os'
+
 import { Client } from 'pg'
 import type { WcCreds } from './wc.ts'
 
@@ -88,6 +90,44 @@ type LockRecord = {
   stageSettings: Record<string, string | null>
   e2eSettings: Record<string, string | null>
   createdWebhookIds: number[]
+  /**
+   * Owner identity, so a LIVE holder can be told apart from the crash this lock's recovery was built for
+   * (o3d-lgo.14). Optional: a lock written by an older build has neither, and is judged on age alone.
+   */
+  ownerPid?: number
+  ownerHost?: string
+}
+
+/** Just the ownership fields the liveness check reads, so it can be exercised without a whole lock record. */
+export type LockOwner = { ownerPid?: number; ownerHost?: string }
+
+/**
+ * How long a lock with no provable owner may sit before recovery treats it as abandoned.
+ *
+ * A full-chain invocation is minutes, and the longest single test sets a 15-minute timeout, so 45 minutes is
+ * far beyond any legitimate hold while still recovering automatically from a crash nobody is watching.
+ */
+export const LOCK_STALE_AFTER_MS = 45 * 60_000
+
+/**
+ * Is the recorded owner still running?
+ *
+ *   true  — same host and the pid answers signal 0: a LIVE run holds this lock.
+ *   false — same host and the pid is gone: crashed, safe to recover immediately.
+ *   null  — cannot tell (different host, or no owner recorded by an older build): fall back to age.
+ *
+ * signal 0 performs the permission/existence check without delivering anything. EPERM means the process
+ * exists but belongs to another user, which still counts as alive.
+ */
+export function isLockOwnerAlive(lock: LockOwner): boolean | null {
+  if (!lock.ownerPid || !lock.ownerHost) return null
+  if (lock.ownerHost !== hostname()) return null
+  try {
+    process.kill(lock.ownerPid, 0)
+    return true
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM' ? true : false
+  }
 }
 
 function stageDb(): Client {
@@ -206,11 +246,42 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
   const e2e = e2eDb(); await e2e.connect()
   const stage = stageDb(); await stage.connect()
   try {
-    // Recover first, unconditionally. A stale lock means stage is still disabled.
-    const stale = await readLock(e2e)
-    if (stale) {
-      console.warn(`[quiesce] STALE LOCK from ${stale.takenAt} (run ${stale.runId}) — restoring stage before starting.`)
-      await releaseInternal(e2e, stage, stale)
+    // Recover a DEAD lock; refuse to steal a LIVE one.
+    //
+    // This used to recover unconditionally, on the reasoning that a lock present at acquire time must be
+    // stale because stage is still disabled. That is right for the crash it was written for and wrong for a
+    // second concurrent invocation: the newcomer restored the stage settings the first run was still relying
+    // on, and both then drove the one Woo store and the one Xero Demo org at once (o3d-lgo.14). The operating
+    // model has always been one invocation at a time; now it is enforced rather than assumed.
+    const existing = await readLock(e2e)
+    if (existing) {
+      const alive = isLockOwnerAlive(existing)
+      const ageMs = Date.now() - Date.parse(existing.takenAt)
+      const age = Number.isFinite(ageMs) ? `${Math.round(ageMs / 60_000)}m old` : `takenAt unparseable (${existing.takenAt})`
+      if (alive === true) {
+        throw new Error(
+          `ABORT: the quiesce lock is held by a LIVE run — pid ${existing.ownerPid} on ${existing.ownerHost}, ` +
+            `run ${existing.runId}, ${age}. The suite shares ONE Woo store and ONE Xero Demo org, so a second ` +
+            `concurrent invocation would corrupt both runs. Wait for it, or kill that process and re-run ` +
+            `(the lock then recovers automatically).`,
+        )
+      }
+      if (alive === null && Number.isFinite(ageMs) && ageMs < LOCK_STALE_AFTER_MS) {
+        throw new Error(
+          `ABORT: the quiesce lock (run ${existing.runId}, ${age}) has no provable owner` +
+            `${existing.ownerHost ? ` — it was taken on ${existing.ownerHost}, not this host` : ' (written by an older build)'}` +
+            `, and is too recent to assume abandoned. It auto-recovers once it is older than ` +
+            `${Math.round(LOCK_STALE_AFTER_MS / 60_000)}m; if you know the holder is gone, delete the ` +
+            `'${LOCK_KEY}' settings row on the e2e instance (release() restores stage from the record, so ` +
+            `prefer letting it recover).`,
+        )
+      }
+      console.warn(
+        `[quiesce] recovering an ABANDONED lock from ${existing.takenAt} (run ${existing.runId}, ${age}, ` +
+          `${alive === false ? `owner pid ${existing.ownerPid} is gone` : 'no provable owner and past the staleness window'}) ` +
+          `— restoring stage before starting.`,
+      )
+      await releaseInternal(e2e, stage, existing)
     }
 
     const prior: Record<string, string | null> = {}
@@ -236,6 +307,9 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
     const lock: LockRecord = {
       takenAt: new Date().toISOString(),
       runId,
+      // Owner identity, so the next acquire can tell a live run from a crash (o3d-lgo.14).
+      ownerPid: process.pid,
+      ownerHost: hostname(),
       stageSettings: prior,
       e2eSettings: priorE2e,
       createdWebhookIds: [],
