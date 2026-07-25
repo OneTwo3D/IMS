@@ -115,16 +115,16 @@ test('fetchMintsoftOrderList paginates until a short page and carries the delta 
   const fetchMintsoftOrderList = await loadFetch()
   listCalls = []
   listError = null
-  const fullPage = Array.from({ length: 200 }, (_, i) => row(i + 1))
+  const fullPage = Array.from({ length: 100 }, (_, i) => row(i + 1))
   listResponder = (pageNo) => (pageNo === 1 ? fullPage : pageNo === 2 ? [row(201), row(202)] : [])
 
-  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, limit: 200 })
-  assert.equal(out.length, 202)
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, limit: 100 })
+  assert.equal(out.length, 102)
   assert.equal(listCalls.length, 2) // stopped on the short 2nd page
   assert.equal(listCalls[0].SinceLastUpdated, '2026-07-15T12:00:00')
   assert.equal(listCalls[0].IncludeOrderItems, 'true')
   assert.equal(listCalls[0].SortOldestFirst, 'true')
-  assert.equal(listCalls[0].Limit, '200')
+  assert.equal(listCalls[0].Limit, '100')
   assert.equal(listCalls[0].ClientId, String(CLIENT)) // always scoped
   assert.equal(listCalls[1].PageNo, '2')
 })
@@ -692,4 +692,127 @@ test('[o3d-6j8] SPARSE incomplete rows still overlap — the pool queues by row,
   } finally {
     detailDelayMs = 0
   }
+})
+
+// --- o3d-9vv: the API 400s above Limit=100, so we must CLAMP, not just default ---
+// Verified live by bisection (2026-07-25): Limit=100 -> 200 OK, Limit=101 -> HTTP 400.
+// This shipped as 200, so EVERY delta fetch 400'd and the sweep fell back to the
+// per-order reconcile on every tick — the optimisation never engaged once. It failed
+// SAFE (correct sync, zero errors), which is exactly why nothing surfaced it.
+
+test('[o3d-9vv] the default Limit is at the API maximum, never above it', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  const { MINTSOFT_ORDER_LIST_MAX_LIMIT } = await import('@/lib/connectors/mintsoft/api/orders')
+  assert.equal(MINTSOFT_ORDER_LIST_MAX_LIMIT, 100)
+
+  listCalls = []
+  listError = null
+  listResponder = () => []
+  await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(listCalls[0].Limit, '100')
+})
+
+test('[o3d-9vv] an over-cap configured Limit is CLAMPED, not passed through (it would 400 and kill the delta silently)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => []
+
+  for (const requested of [101, 200, 500, 10_000]) {
+    listCalls = []
+    await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, limit: requested })
+    assert.equal(listCalls[0].Limit, '100', `Limit ${requested} must be clamped to 100`)
+  }
+})
+
+test('[o3d-9vv] a below-cap Limit is still honoured', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => []
+  await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, limit: 25 })
+  assert.equal(listCalls[0].Limit, '25')
+})
+
+test('[o3d-9vv] EVERY page of a multi-page delta stays within the cap', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  const full = Array.from({ length: 100 }, (_, i) => row(i + 1))
+  // Three full pages then a short one, so paging is genuinely exercised.
+  listResponder = (pageNo) => (pageNo <= 3 ? full : [row(999)])
+
+  await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, limit: 250 })
+  assert.equal(listCalls.length, 4)
+  for (const [index, call] of listCalls.entries()) {
+    assert.ok(Number(call.Limit) <= 100, `page ${index + 1} sent Limit ${call.Limit}, above the API maximum`)
+  }
+})
+
+test('[o3d-9vv] the page budget keeps the overall delta capacity (100 x 100, not 100 x 50)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  const full = Array.from({ length: 100 }, (_, i) => row(i + 1))
+  listResponder = () => full // never a short page → runs to the budget, then throws
+
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /exceeded 100 pages at limit=100/,
+  )
+  assert.equal(listCalls.length, 100, 'halving the page size doubled the page budget')
+})
+
+test('[o3d-9vv] a page LARGER than the requested Limit is rejected at once (server ignored Limit)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  // 150 rows for Limit=100: `page.length < limit` would never terminate, so without
+  // this check every page in the budget would be fetched before failing.
+  listResponder = () => Array.from({ length: 150 }, (_, i) => row(i + 1))
+
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /returned 150 rows for Limit=100 — the server ignored the page size/,
+  )
+  assert.equal(listCalls.length, 1, 'failed on the first page, not after the whole budget')
+})
+
+test('[o3d-9vv] pagination is bounded by a WALL-CLOCK budget, not just a page count', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  const full = Array.from({ length: 100 }, (_, i) => row(i + 1))
+  listResponder = () => full // never short → would otherwise run the full page budget
+
+  // 100 sequential requests at the transport timeout is ~50 minutes, far beyond the
+  // 2-minute sweep cadence. A tiny budget proves the deadline is enforced.
+  await assert.rejects(
+    () => fetchMintsoftOrderList({
+      sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, deadlineMs: 1,
+    }),
+    /exceeded its 1ms budget after \d+ pages/,
+  )
+  assert.ok(listCalls.length < 100, `stopped at the deadline (${listCalls.length}) instead of running the full page budget`)
+})
+
+test('[o3d-9vv] a re-read row is marked so the sweep can tell it apart from a bulk row', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  listResponder = () => [row(1), incompleteRow(2)]
+  detailRows = new Map([['2', {
+    ID: 2, OrderNumber: 'N2', OrderStatusId: 4, ClientId: CLIENT,
+    TrackingNumber: 'TN-2', CourierServiceName: 'DPD',
+    DespatchDate: '2026-07-15T09:00:00', NumberOfParts: 1,
+  }]])
+
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out.length, 2)
+  assert.equal(out[0].authoritativeReread, undefined, 'the complete row was taken off the bulk feed')
+  assert.equal(out[1].authoritativeReread, true, 'the incomplete row cost a detail request')
 })

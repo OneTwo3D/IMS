@@ -168,6 +168,15 @@ export type WmsOrderStatus = {
    *  semantics from its own status names/tracking, so core dispatch reconciliation stays
    *  connector-agnostic. */
   dispatched: boolean
+  /**
+   * True when this record came from an AUTHORITATIVE per-order re-read rather than
+   * straight off a bulk feed. Set by connectors whose bulk delta may re-read a row it
+   * cannot trust (o3d-6j8). The sweep uses it to report how much of the run genuinely
+   * avoided per-order I/O — without it, a delta where every row had to be re-read
+   * would still report "served from the bulk delta", masking the slow path that the
+   * engagement metric exists to expose (o3d-9vv).
+   */
+  authoritativeReread?: boolean
   raw?: Record<string, unknown> | null
 }
 
