@@ -24,6 +24,10 @@ let statusResponder: () => unknown = () => DEFAULT_STATUSES
 // o3d-6j8: authoritative per-id records + the ids actually re-read.
 let detailRows = new Map<string, unknown>()
 let detailCalls: string[] = []
+// Concurrency observability for the bounded re-read pool.
+let detailInFlight = 0
+let detailMaxInFlight = 0
+let detailDelayMs = 0
 
 mock.module('@/lib/connectors/mintsoft/settings/schema', {
   namedExports: {
@@ -54,9 +58,16 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       if (detail) {
         const id = detail[1]
         detailCalls.push(id)
-        return detailRows.has(id)
-          ? { data: detailRows.get(id), status: 200 }
-          : { data: null, status: 404 }
+        detailInFlight += 1
+        detailMaxInFlight = Math.max(detailMaxInFlight, detailInFlight)
+        try {
+          if (detailDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, detailDelayMs))
+          return detailRows.has(id)
+            ? { data: detailRows.get(id), status: 200 }
+            : { data: null, status: 404 }
+        } finally {
+          detailInFlight -= 1
+        }
       }
       const qs = new URLSearchParams(path.split('?')[1] ?? '')
       listCalls.push(Object.fromEntries(qs.entries()))
@@ -604,5 +615,39 @@ test('[o3d-6j8] drift lock: every dispatch-relevant row field read by this modul
   // And the guard must not have silently shrunk.
   for (const key of ['TrackingNumber', 'CourierServiceName', 'DespatchDate', 'NumberOfParts']) {
     assert.ok(guarded.has(key), `${key} must stay guarded`)
+  }
+})
+
+test('[o3d-6j8] the authoritative re-reads are CONCURRENCY-BOUNDED (drift cannot self-inflict a request storm)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  detailCalls = []
+  detailMaxInFlight = 0
+  detailInFlight = 0
+  detailDelayMs = 5 // hold each read open so overlap is observable
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // 40 dispatched rows, ALL incomplete — the schema-drift shape. Unbounded, this
+  // opened 40 simultaneous detail requests; at 10k rows it would be 10k.
+  const ids = Array.from({ length: 40 }, (_, i) => i + 1)
+  listResponder = () => ids.map((id) => incompleteRow(id))
+  detailRows = new Map(ids.map((id) => [String(id), {
+    ID: id, OrderNumber: `N${id}`, OrderStatusId: 4, ClientId: CLIENT,
+    TrackingNumber: `TN-${id}`, CourierServiceName: 'DPD',
+    DespatchDate: '2026-07-15T09:00:00', NumberOfParts: 1,
+  }]))
+
+  try {
+    const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+    assert.equal(out.length, 40)
+    assert.equal(detailCalls.length, 40)
+    assert.ok(detailMaxInFlight <= 4, `at most 4 re-reads in flight (peaked at ${detailMaxInFlight})`)
+    // Input order is preserved despite the chunked pool.
+    assert.deepEqual(out.map((o) => o.externalOrderId), ids.map(String))
+    assert.deepEqual(out.map((o) => o.tracking[0]?.trackingNumber), ids.map((id) => `TN-${id}`))
+  } finally {
+    detailDelayMs = 0
   }
 })

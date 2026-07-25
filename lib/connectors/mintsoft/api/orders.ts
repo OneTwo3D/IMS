@@ -396,6 +396,30 @@ export async function fetchMintsoftOrderStatus(
   // Re-read by id for authoritative status/tracking; fall back to the search row
   // if the detail 404s (e.g. the order was merged away after the search).
   const order = (await fetchMintsoftOrderById(pickedId, scopedClientId)) ?? picked
+  // o3d-6j8 — the SAME completeness rule as the delta path, because this is the
+  // sweep's FALLBACK: when the delta throws on an incomplete dispatched row it
+  // reconciles per order instead, and without this guard the very row the delta
+  // just refused would be applied here (Search rows are especially prone to it —
+  // they can omit the fulfilment block entirely, and this path accepts one when
+  // the detail read 404s). dispatched-with-no-tracking would mark the IMS order
+  // SHIPPED, after which it leaves the poll set and the real tracking never lands.
+  //
+  // Throwing here DOES take a per-order failure strike, unlike the delta path.
+  // That is deliberate and correct at this granularity: the fault is specific to
+  // this order, so after DISPATCH_MAX_CONSECUTIVE_FAILURES it dead-letters into the
+  // exception inbox for an operator instead of erroring silently forever.
+  const missingForDispatch = missingMintsoftDispatchKeys(order)
+  if (missingForDispatch.length > 0) {
+    const statusMap = await fetchMintsoftOrderStatusMap()
+    const statusId = strictPositiveInt(order.OrderStatusId)
+    const statusName = (statusId !== null ? statusMap.get(statusId) : null) ?? ''
+    if (isMintsoftDispatched({ status: statusName, tracking: readTracking(order) })) {
+      throw new Error(
+        `Mintsoft order ${pickedId} reads as dispatched (${statusName || 'via despatch date'}) but omits `
+          + `${missingForDispatch.join(', ')} — refusing to apply an incomplete dispatch`,
+      )
+    }
+  }
   const normalized = await normalizeMintsoftOrderRow(order)
   if (!normalized) return null
 
@@ -486,6 +510,35 @@ async function resolveDispatchableDeltaRow(
   return authoritative
 }
 
+/**
+ * How many authoritative re-reads may be in flight at once. The delta can legally
+ * carry thousands of rows (maxPages * limit), and if a schema change made every
+ * dispatched row incomplete, an unbounded fan-out would open one detail request per
+ * row simultaneously — turning ordinary drift into a self-inflicted throttling
+ * outage, repeated every sweep because the watermark is held. Small on purpose: the
+ * re-read is the exceptional path, not the hot one.
+ */
+const DELTA_REREAD_CONCURRENCY = 4
+
+/**
+ * Resolve every collected row, re-reading only the incomplete dispatched ones, with
+ * BOUNDED concurrency and input order preserved. A throw stops further chunks from
+ * being scheduled (the whole delta is failing anyway) rather than letting the rest of
+ * the burst continue against a WMS that may already be rate-limiting us.
+ */
+async function resolveDispatchableDeltaRows(
+  rows: RawOrder[],
+  statusMap: Map<number, string>,
+  clientId: number,
+): Promise<RawOrder[]> {
+  const out: RawOrder[] = []
+  for (let i = 0; i < rows.length; i += DELTA_REREAD_CONCURRENCY) {
+    const chunk = rows.slice(i, i + DELTA_REREAD_CONCURRENCY)
+    out.push(...await Promise.all(chunk.map((row) => resolveDispatchableDeltaRow(row, statusMap, clientId))))
+  }
+  return out
+}
+
 export async function fetchMintsoftOrderList(opts: {
   sinceLastUpdated: string
   clientId: number | null
@@ -566,9 +619,7 @@ export async function fetchMintsoftOrderList(opts: {
       // same for every row) so normalisation makes no per-row API/DB calls.
       const statusMap = await fetchMintsoftOrderStatusMap()
       const settings = await getMintsoftSettings()
-      const resolved = await Promise.all(
-        collected.map((row) => resolveDispatchableDeltaRow(row, statusMap, clientId)),
-      )
+      const resolved = await resolveDispatchableDeltaRows(collected, statusMap, clientId)
       const normalized = await Promise.all(
         resolved.map((row) => normalizeMintsoftOrderRow(row, { statusMap, settings, strictStatus: true })),
       )

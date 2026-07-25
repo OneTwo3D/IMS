@@ -49,12 +49,19 @@ async function orders() {
   return import('@/lib/connectors/mintsoft/api/orders')
 }
 
+// A COMPLETE Mintsoft order record: it carries the fulfilment block, with explicit
+// nulls for an untracked despatch. o3d-6j8 keys on PRESENCE, and refuses to apply a
+// dispatched record that OMITS these — so the fixture has to look like a real DTO.
 function ownOrder(id: string | number, over: Record<string, unknown> = {}) {
   return {
     ID: id,
     OrderNumber: 'WC-1001',
     OrderStatusId: 4,
     ClientId: CLIENT,
+    TrackingNumber: null,
+    CourierServiceName: null,
+    DespatchDate: null,
+    NumberOfParts: 1,
     ...over,
   }
 }
@@ -153,4 +160,62 @@ test('[o3d-bjc.2 finding 1] part-item lookup validates the parent part ClientId 
   details.set('M-2', ownOrder('M-2'))
   itemRows = [{ SKU: 'OWN-SKU', Quantity: 2 }]
   assert.deepEqual(await fetchMintsoftPartItems('M-2', CLIENT), [{ sku: 'OWN-SKU', qty: 2 }])
+})
+
+// --- o3d-6j8: the sweep's FALLBACK must not undo the delta's refusal ----------
+// When the delta throws on an incomplete dispatched row, the dispatch sweep falls
+// back to per-order reconciliation through fetchMintsoftOrderStatus. Without the
+// same completeness rule here, the very row the delta just refused would be applied:
+// dispatched=true with tracking=[] marks the IMS order SHIPPED, and SHIPPED leaves
+// the poll set, so the real tracking number can never land afterwards.
+
+test('[o3d-6j8] the per-order fallback REFUSES an incomplete dispatched record (never reports it dispatched)', async () => {
+  reset()
+  const { fetchMintsoftOrderStatus } = await orders()
+  // The Search row and the detail record both omit the fulfilment block.
+  searchRows = [{ ID: 'M-1', OrderNumber: 'WC-1001', OrderStatusId: 4, ClientId: CLIENT }]
+  details.set('M-1', { ID: 'M-1', OrderNumber: 'WC-1001', OrderStatusId: 4, ClientId: CLIENT })
+
+  await assert.rejects(
+    () => fetchMintsoftOrderStatus('WC-1001', CLIENT),
+    /refusing to apply an incomplete dispatch/,
+  )
+})
+
+test('[o3d-6j8] the per-order fallback also refuses when the detail 404s and only an incomplete SEARCH row is left', async () => {
+  reset()
+  const { fetchMintsoftOrderStatus } = await orders()
+  // No detail entry → the historical fallback consumes the Search row, which is the
+  // shape most likely to omit fulfilment fields.
+  searchRows = [{ ID: 'M-1', OrderNumber: 'WC-1001', OrderStatusId: 4, ClientId: CLIENT }]
+
+  await assert.rejects(
+    () => fetchMintsoftOrderStatus('WC-1001', CLIENT),
+    /refusing to apply an incomplete dispatch/,
+  )
+})
+
+test('[o3d-6j8] a COMPLETE dispatched record still resolves normally on the per-order path', async () => {
+  reset()
+  const { fetchMintsoftOrderStatus } = await orders()
+  searchRows = [ownOrder('M-1')]
+  details.set('M-1', ownOrder('M-1', {
+    TrackingNumber: 'TN-1', CourierServiceName: 'DPD', DespatchDate: '2026-07-15T09:00:00',
+  }))
+
+  const out = await fetchMintsoftOrderStatus('WC-1001', CLIENT)
+  assert.equal(out?.dispatched, true)
+  assert.equal(out?.tracking[0]?.trackingNumber, 'TN-1')
+})
+
+test('[o3d-6j8] a NON-dispatched incomplete record is not refused (only the irreversible path is guarded)', async () => {
+  reset()
+  const { fetchMintsoftOrderStatus } = await orders()
+  // PICKED (17) with no fulfilment block: nothing irreversible follows, so this must
+  // keep working or ordinary pre-despatch polling would break.
+  searchRows = [{ ID: 'M-1', OrderNumber: 'WC-1001', OrderStatusId: 17, ClientId: CLIENT }]
+  details.set('M-1', { ID: 'M-1', OrderNumber: 'WC-1001', OrderStatusId: 17, ClientId: CLIENT })
+
+  const out = await fetchMintsoftOrderStatus('WC-1001', CLIENT)
+  assert.equal(out?.dispatched, false)
 })
