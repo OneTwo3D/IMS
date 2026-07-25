@@ -74,6 +74,7 @@ With the initial import complete, new and updated WooCommerce orders are importe
 **What happens when an order is imported:**
 
 - A new sales order is created with all line items, prices, discounts, shipping, and tax
+- **Cart coupons ride on the line items.** WooCommerce allocates coupon money *into* the lines — each line's total is already its subtotal minus that line's share — so IMS imports the coupon as a per-line discount and leaves the order-level discount field at zero. The coupon codes are still recorded on the order for display. Only money WooCommerce left unallocated (a coupon shape IMS does not model) is stored as an order-level discount, and that is logged as a warning when it happens. Storing it in both places made every downstream document — the Xero/QuickBooks invoice, the credit note, the order totals — deduct the same coupon twice. Orders imported before this fix still carry the duplicate and are corrected separately
 - The customer is matched by WooCommerce customer ID or email, or created if new
 - Multi-currency orders are converted to the IMS base currency using the FX rate from `frankfurter.dev` (ECB) at import time. The same rate is stamped on the order's `fxRateToBase` field and forwarded to Xero as `CurrencyRate` on the resulting invoice — so the WooCommerce store, IMS, and Xero all see the same base-currency total for the order. See `docs/xero-sync.md` § Multi-Currency FX Rates.
 - Tax rates are resolved using the tax rate mappings you configure (see Tax Rates below)

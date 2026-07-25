@@ -168,8 +168,10 @@ export type InvoiceLine = {
    * Per-line discount amount (in the invoice currency, same tax convention
    * as `unitAmount`). Generic across connectors — each connector decides how
    * to represent it in its target system:
-   *   - Xero sales invoices (ACCREC) → converted to `DiscountRate` %
-   *   - Xero bills (ACCPAY) → applied by reducing `UnitAmount`
+   *   - Xero sales invoices (ACCREC) → sent as `DiscountAmount`, unconverted. It used to be turned
+   *     into a `DiscountRate` percentage, which Xero stores to 2dp — so a small absolute discount
+   *     rounded to 0.00 and vanished (o3d-y14).
+   *   - Xero bills (ACCPAY) → applied by reducing `UnitAmount` (ACCPAY takes no line discount)
    *   - QuickBooks → maps to `DiscountRate` / `DiscountAmt`
    */
   discountAmount?: number

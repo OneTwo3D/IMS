@@ -467,7 +467,13 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
       current.revenueDecimal = current.revenueDecimal.add(toDecimal(mode === 'foreign' ? order.totalForeign : order.totalBase))
       current.taxDecimal = current.taxDecimal.add(toDecimal(mode === 'foreign' ? order.taxForeign : order.taxBase))
       current.shippingDecimal = current.shippingDecimal.add(toDecimal(mode === 'foreign' ? order.shippingForeign : order.shippingBase))
-      current.discountDecimal = current.discountDecimal.add(toDecimal(order.discountAmount))
+      // The order's WHOLE discount: the order-level field PLUS what the lines carry. Adding only the
+      // order-level field made a WooCommerce coupon report as zero here while the product/category
+      // grouping below (which reads line discounts) reported the full amount — the same order, two
+      // answers. It is also simply wrong for a native order with a per-line markdown (o3d-y14).
+      current.discountDecimal = current.discountDecimal.add(
+        order.lines.reduce((sum, line) => sum.add(toDecimal(line.discountAmount)), toDecimal(order.discountAmount)),
+      )
       current.currency = current.currency === (mode === 'foreign' ? order.currency : baseCurrency) ? current.currency : 'Multiple'
       rowsByKey.set(key, current)
       continue

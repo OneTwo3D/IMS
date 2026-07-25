@@ -9,7 +9,7 @@ import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
-  readWcCustomerVat,
+  readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
@@ -550,8 +550,43 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       return { success: false, error: description }
     }
 
-    // Order-level discount (from coupons — separate from line discounts)
+    // Coupons. Woo allocates cart-coupon money INTO the lines (each line's `total` is already its
+    // `subtotal` minus that line's share), and mapWcLineItems turns that difference into a per-line
+    // discountAmount. IMS's ORDER-LEVEL discountAmount slot means the opposite — a discount that is
+    // NOT in the lines — so it must carry only the residual, normally zero. Storing the coupon in
+    // both places made every consumer deduct it twice (o3d-y14): the Xero/QuickBooks builders send
+    // the per-line figure as a DiscountRate AND append the order-level figure as a negative line.
     const orderDiscount = mapWcOrderDiscount(wcOrder.coupon_lines)
+    const lineDiscountTotalForeign = mappedLines.reduce(
+      (sum, line) => addMoney(sum, toDecimal(line.discountAmount)),
+      toDecimal(0),
+    )
+    const { orderLevelDiscount: orderLevelDiscountForeign, unallocated: unallocatedCouponForeign } =
+      resolveWcOrderLevelDiscount({
+        couponTotalForeign: orderDiscount.discountAmount,
+        lineDiscountTotalForeign,
+      })
+    if (unallocatedCouponForeign > 0) {
+      // A coupon shape we do not model. The residual is kept (dropping it would overstate the
+      // invoice by money the customer was never charged) but it is worth knowing about, because
+      // it is the one case where the order-level leg is still live on a WC order.
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: null,
+        action: 'wc_coupon_not_allocated_to_lines',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `WooCommerce order ${wcOrder.number}: ${unallocatedCouponForeign} of coupon ${orderDiscount.discountStr ?? ''} was not allocated to any line; kept as an order-level discount.`,
+        metadata: {
+          connector: 'woocommerce',
+          externalOrderId: String(wcOrder.id),
+          externalOrderNumber: wcOrder.number,
+          couponTotalForeign: orderDiscount.discountAmount,
+          lineDiscountTotalForeign: roundDecimalNumber(lineDiscountTotalForeign, 4),
+          unallocatedForeign: unallocatedCouponForeign,
+        },
+      })
+    }
 
     // Shipping
     const shipping = mapWcShipping(wcOrder)
@@ -663,8 +698,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           shippingBase,
           taxBase,
           totalBase,
+          // Coupon CODES are kept for display; the money lives on the lines (o3d-y14).
           discountStr: orderDiscount.discountStr,
-          discountAmount: orderDiscount.discountAmount,
+          discountAmount: orderLevelDiscountForeign,
           notes: wcOrder.customer_note || null,
           paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
           shoppingLinks: {
@@ -767,9 +803,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       // stay consistent with the LineAmountTypes flag.
       const vatMultiplier = toDecimal(1).add(taxRateValue || 0)
       const shippingSendForeign = pricesIncludeVat ? toDecimal(shippingForeign).mul(vatMultiplier) : toDecimal(shippingForeign)
-      // WooCommerce coupon discounts are imported exactly as stored on the
-      // order so the accounting connector sees the original order-currency
-      // discount amount without a base-currency round-trip.
+      // WooCommerce discounts are imported exactly as stored on the order so the accounting
+      // connector sees the original order-currency amounts without a base-currency round-trip.
+      // Coupons ride on the per-line discountAmount below (that is where Woo puts them); the
+      // order-level leg carries only what Woo left unallocated — see o3d-y14.
       await queueAccountingSync({
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
@@ -809,7 +846,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // matching the native invoice push + credit-note builder (the H1 rule —
           // only goods lines carry the reverse charge).
           shippingTaxType: accountingTaxType ?? undefined,
-          discountAmount: orderDiscount.discountAmount > 0 ? roundDecimalNumber(orderDiscount.discountAmount, 2) : undefined,
+          // Only the residual — the coupon itself is already on the lines above as a per-line
+          // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
+          // discount line. Sending both deducted it twice (o3d-y14).
+          discountAmount: orderLevelDiscountForeign > 0 ? roundDecimalNumber(orderLevelDiscountForeign, 2) : undefined,
           discountAccountCode: settings.discountAccount || undefined,
           discountTaxType: accountingTaxType ?? undefined,
           lineAmountsIncludeTax: pricesIncludeVat,
