@@ -151,7 +151,7 @@ export function resetMintsoftOrderStatusCacheForTests(): void {
   statusCache = null
 }
 
-function requireMintsoftClientId(clientId: number | null | undefined, operation: string): number {
+export function requireMintsoftClientId(clientId: number | null | undefined, operation: string): number {
   if (!Number.isInteger(clientId) || (clientId ?? 0) <= 0) {
     throw new Error(
       `${operation} requires a ClientId (configure mintsoft_client_id) — ` +
@@ -161,15 +161,19 @@ function requireMintsoftClientId(clientId: number | null | undefined, operation:
   return clientId as number
 }
 
-function assertMintsoftOrderClient(row: unknown, clientId: number, context: string): RawOrder {
+export function assertMintsoftOrderClient(row: unknown, clientId: number, context: string): RawOrder {
   if (typeof row !== 'object' || row === null || Array.isArray(row)) {
-    throw new Error(`${context}: row is not an object — refusing an unverifiable cross-client order lookup`)
+    throw new Error(
+      `${context}: row is not an object — refusing an unverifiable cross-client order lookup`,
+    )
   }
   const order = row as RawOrder
   const rowId = toStr(order.ID ?? order.Id ?? order.id) ?? 'unknown'
   const rowClientId = toInt(order.ClientId ?? order.clientId)
   if (rowClientId === null) {
-    throw new Error(`${context}: row ${rowId} has no ClientId — refusing an unverifiable cross-client order lookup`)
+    throw new Error(
+      `${context}: row ${rowId} has no ClientId — refusing an unverifiable cross-client order lookup`,
+    )
   }
   if (rowClientId !== clientId) {
     throw new Error(
@@ -198,7 +202,7 @@ async function searchMintsoftOrdersByNumber(orderNumber: string, clientId: numbe
  * status/courier fields, so we re-read the picked order by id (matching the
  * proven plugin, which follows every search hit with GET /api/Order/{id}).
  */
-async function fetchMintsoftOrderById(externalOrderId: string, clientId: number | null): Promise<RawOrder | null> {
+export async function fetchMintsoftOrderById(externalOrderId: string, clientId: number | null): Promise<RawOrder | null> {
   const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft Order detail')
   // Scope the request itself (defence in depth) in addition to validating the
   // returned row's ClientId below — so the shared-tenant boundary is enforced
