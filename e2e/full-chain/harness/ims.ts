@@ -656,6 +656,128 @@ export async function runFxRevaluation(
   return body
 }
 
+/**
+ * Drive the landed-cost adjustment-journal OUTBOX backstop to completion, now rather than in 90 seconds.
+ *
+ * recalculateDirectLandedCosts queues its journals directly post-commit AND enqueues an IntegrationOutbox
+ * row inside the recalc transaction (lib/domain/purchasing/landed-cost-journal-outbox.ts, audit-grob). The
+ * outbox is the recovery path for a crash between commit and queue, and its drain is deliberately delayed
+ * DEFAULT_DRAIN_GRACE_MS = 90s so it never races the direct call. It re-runs
+ * queueLandedCostAdjustmentJournals, which is idempotency-keyed, so a job whose journals already posted
+ * directly must be a NO-OP.
+ *
+ * "Must be" is the claim worth testing: if that idempotency ever breaks, the backstop posts a SECOND set of
+ * journals minutes after the test that was supposed to catch it has finished (o3d-lgo.7.4).
+ *
+ * Called IN-PROCESS rather than through GET /api/cron/accounting-sync, which is what makes this testable at
+ * all: that route carries the standard 1/hour/IP cron limit and is not in E2E_OVERRIDE_JOBS, so driving it
+ * would have needed another rate-limit override — the blast radius o3d-lgo.13 deliberately keeps minimal.
+ * Same direct-import pattern as runPaymentPoll.
+ *
+ * Rows are scoped to those created after `createdAfter` so only the caller's own recalc is forced eligible,
+ * and the row count is returned: ZERO rows means the backstop was never enqueued, which a test asserting on
+ * the drain must treat as a failure rather than a quiet pass.
+ */
+export async function drainLandedCostOutboxNow(
+  createdAfter: string,
+): Promise<{
+  rowIds: string[]
+  claimed: number
+  succeeded: number
+  failed: number
+  /** Final status of each row THIS call forced eligible, keyed by id — the only proof its own work ran. */
+  finalStatuses: Record<string, string>
+}> {
+  const { Client } = await import('pg')
+  // Literals rather than imports: pulling the outbox module into THIS process is what the subprocess below
+  // exists to avoid (see runOutboxDrainInSubprocess). Asserted against the module's own exports by
+  // tests/e2e-harness/landed-cost-outbox-constants.test.ts, so a rename cannot silently desync them.
+  const LANDED_COST_OUTBOX_CONNECTOR = 'accounting'
+  const LANDED_COST_OUTBOX_OPERATION = 'landed-cost.adjustment-journal'
+
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  let rowIds: string[]
+  try {
+    // Force ONLY these rows eligible. nextAttemptAt is the 90s grace; without this the claim query skips them
+    // and the drain reports claimed: 0, which reads like "idempotent no-op" when it actually means "never ran".
+    const r = await db.query<{ id: string }>(
+      `UPDATE integration_outbox
+          SET "nextAttemptAt" = now()
+        WHERE connector = $1 AND operation = $2 AND "createdAt" > $3::timestamptz
+        RETURNING id`,
+      [LANDED_COST_OUTBOX_CONNECTOR, LANDED_COST_OUTBOX_OPERATION, createdAfter],
+    )
+    rowIds = r.rows.map((row) => row.id)
+  } finally {
+    await db.end()
+  }
+
+  const result = await runOutboxDrainInSubprocess()
+
+  // Read back the state of OUR rows specifically. The processor is unscoped — it claims the oldest eligible
+  // landed-cost jobs and reports only aggregate counts — so `claimed > 0 && failed === 0` can be satisfied
+  // entirely by unrelated rows (a stale backlog, or one already at its attempt limit) while the row this call
+  // targeted was never touched. The caller would then read an unchanged journal count and conclude the
+  // backstop was idempotent when it simply had not run (Codex). Per-row statuses are the only honest proof.
+  const finalStatuses = await outboxStatusesFor(rowIds)
+  return { rowIds, ...result, finalStatuses }
+}
+
+/** Final status of each outbox row by id (absent ids simply do not appear). */
+async function outboxStatusesFor(rowIds: string[]): Promise<Record<string, string>> {
+  if (!rowIds.length) return {}
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string; status: string }>(
+      `SELECT id, status FROM integration_outbox WHERE id = ANY($1::text[])`,
+      [rowIds],
+    )
+    return Object.fromEntries(r.rows.map((row) => [row.id, row.status]))
+  } finally {
+    await db.end()
+  }
+}
+
+/**
+ * Run the landed-cost outbox drain in a CHILD process and read its result back as JSON.
+ *
+ * It cannot run in-process. processLandedCostJournalOutbox lazily imports landed-cost-service, whose module
+ * graph reaches a CJS-only dependency, and importing that into the Playwright worker dies with
+ * "SyntaxError: Cannot use import statement outside a module" — the same barrel poisoning that already
+ * forces processPendingXeroSyncViaUi to drive the Xero sync through the UI rather than importing it. Verified
+ * the hard way: the in-process version of this helper failed exactly that way on the rig.
+ *
+ * A subprocess keeps the drain honest without the alternative, which was to expose it through
+ * /api/cron/accounting-sync and widen the E2E cron rate-limit allowlist for it (o3d-lgo.13 keeps that list
+ * minimal deliberately). The child inherits this process's env, so it gets the same DATABASE_URL.
+ */
+async function runOutboxDrainInSubprocess(): Promise<{ claimed: number; succeeded: number; failed: number }> {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const run = promisify(execFile)
+
+  // Printed between markers so the JSON can be recovered even if the module graph logs on import.
+  const script = `
+    import('./lib/domain/purchasing/landed-cost-journal-outbox.ts')
+      // tsx can hand back a CJS namespace whose exports sit under .default, so accept either shape rather
+      // than failing with an opaque "is not a function".
+      .then((m) => (m.processLandedCostJournalOutbox ?? m.default?.processLandedCostJournalOutbox)())
+      .then((r) => { console.log('<<<OUTBOX>>>' + JSON.stringify(r) + '<<<END>>>') })
+      .catch((e) => { console.error(e); process.exit(1) })
+  `
+  const { stdout } = await run(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '--eval', script],
+    { cwd: process.cwd(), env: process.env, maxBuffer: 10 * 1024 * 1024 },
+  )
+  const match = stdout.match(/<<<OUTBOX>>>([\s\S]*)<<<END>>>/)
+  if (!match) throw new Error(`landed-cost outbox drain produced no result; stdout was:\n${stdout.slice(0, 2000)}`)
+  return JSON.parse(match[1]) as { claimed: number; succeeded: number; failed: number }
+}
+
 /** Detect paid/reversed invoices + bills (the chargeback path). */
 export async function runPaymentPoll(): Promise<unknown> {
   const { pollXeroPayments } = await import('../../../lib/connectors/xero/payment-poller.ts')

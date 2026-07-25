@@ -31,6 +31,7 @@ import {
 } from './harness/xero.ts'
 import {
   dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
+  registerRetiredPostedDocuments,
 } from './harness/batch-fixture.ts'
 
 const WAREHOUSE_CODE = 'CBG'
@@ -994,6 +995,9 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     // 0. CLEAN BASELINE FIRST — idempotent, a no-op on an already-clean DB (see the header note).
     const baseline = await deleteUnjournaledShipmentBaseline()
     console.log(`[OC-08] baseline: deleted ${baseline.candidateOrders} batch-candidate order(s)`, baseline.deleted)
+    // Any document the baseline retired that had ALREADY posted is live in the shared ledger;
+    // register it so teardown voids it rather than leaving it invisible (o3d-lgo.16).
+    registerRetiredPostedDocuments(baseline, 'OC-08')
 
     // 1. ARM BATCH MODE before import so the SALES_INVOICE is queued at import time and the order carries an
     //    accountingInvoiceId (Group A1 requires it).
@@ -1199,6 +1203,9 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     // 0. CLEAN BASELINE FIRST (idempotent).
     const baseline = await deleteUnjournaledShipmentBaseline()
     console.log(`[OC-12] baseline: deleted ${baseline.candidateOrders} batch-candidate order(s)`, baseline.deleted)
+    // Any document the baseline retired that had ALREADY posted is live in the shared ledger;
+    // register it so teardown voids it rather than leaving it invisible (o3d-lgo.16).
+    registerRetiredPostedDocuments(baseline, 'OC-12')
 
     // 1. ARM BATCH MODE before import.
     await setPostingMode({ sync: true, dailyBatch: true })
