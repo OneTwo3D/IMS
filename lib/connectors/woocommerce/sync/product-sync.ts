@@ -16,7 +16,10 @@ import {
   resolveWcProductWriteLockIds,
   wcProductWriteLockKeys,
 } from '../sync-lock'
-import { assertWcRowNotClaimedByAnotherWcObject } from './product-sync-errors'
+import {
+  assertWcRowNotClaimedByAnotherWcObject,
+  WcSkuOwnershipConflictError,
+} from './product-sync-errors'
 import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
 import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
@@ -434,8 +437,10 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
         const existing = await tx.product.findFirst({ where: { sku } })
         // Never reassign a row another WooCommerce object already maps (o3d-fsi): the
-        // update branch below overwrites type/parentId/externalProductId.
-        if (existing) assertWcRowNotClaimedByAnotherWcObject(existing, wcProduct.id)
+        // update branch below overwrites type/parentId/externalProductId. Checked here so a
+        // conflict fails BEFORE any write, and re-checked atomically inside the update itself.
+        const parentClaimants = new Set([BigInt(wcProduct.id)])
+        if (existing) assertWcRowNotClaimedByAnotherWcObject(existing, parentClaimants)
         const lifecycleStatus = deriveLifecycleStatusFromWooStatus(
           wcProduct.status,
           existing?.lifecycleStatus ?? null,
@@ -492,9 +497,11 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
           // referenced by this product. If WC dropped all categories, clear the link.
           if (imsCategoryId !== undefined) updateData.categoryId = imsCategoryId
 
-          const saved = await tx.product.update({ where: { id: existing.id }, data: updateData })
-          productId = saved.id
-          productSku = saved.sku
+          await updateProductGuardingOwnership(tx, existing, parentClaimants, updateData)
+          // `sku` is never in updateData — the row is resolved BY sku — so the pre-update values
+          // are still current, and re-reading only to learn what we already know costs a round trip.
+          productId = existing.id
+          productSku = existing.sku
         } else {
           const created = await tx.product.create({
             data: {
@@ -633,6 +640,55 @@ async function fetchAllWcVariations(wcParentId: number): Promise<WcVariation[]> 
   return all
 }
 
+/**
+ * Apply `data` to `row` ONLY while its WooCommerce mapping is still one this payload may write
+ * (o3d-fsi). Zero rows updated means someone reassigned it in between: an ownership conflict.
+ *
+ * The plain read-then-check-then-update is a TOCTOU. `assertWcRowNotClaimedByAnotherWcObject`
+ * decides on a snapshot, and the SKU advisory lock only excludes other WooCommerce IMPORTS —
+ * `persistMappingIfVersionMatches` and the stock-sync mapping path write `externalProductId`
+ * under a DIFFERENT lock. Either could reassign the row between the read and the write, after
+ * which the stale check still passes and this transaction overwrites `parentId` and
+ * `externalProductId` anyway. The exposure grows down the variation loop, because every prior
+ * iteration awaits its own writes.
+ *
+ * Folding the predicate into the UPDATE closes that window without asking every other writer to
+ * join the SKU-lock protocol: the row-level lock the update takes is what makes the check and
+ * the write one step.
+ */
+async function updateProductGuardingOwnership(
+  tx: Prisma.TransactionClient,
+  row: { id: string; sku: string; externalProductId?: bigint | number | string | null },
+  claimants: ReadonlySet<bigint>,
+  data: Record<string, unknown>,
+): Promise<void> {
+  const { count } = await tx.product.updateMany({
+    where: {
+      id: row.id,
+      OR: [{ externalProductId: null }, { externalProductId: { in: [...claimants] } }],
+    },
+    data,
+  })
+  if (count > 0) return
+
+  // Re-read so the error names the claimant that actually won the race rather than the stale one.
+  const current = await tx.product.findUnique({
+    where: { id: row.id },
+    select: { id: true, sku: true, externalProductId: true },
+  })
+  if (current) assertWcRowNotClaimedByAnotherWcObject(current, claimants)
+
+  // The row passed the guard on re-read (reassigned again, or deleted) yet the conditional update
+  // still matched nothing. Refuse rather than retry into an unbounded loop: the whole transaction
+  // rolls back and the delivery is retried from the top with a fresh snapshot.
+  throw new WcSkuOwnershipConflictError({
+    sku: row.sku,
+    claimedByWcId: current ? String(current.externalProductId ?? 'none') : 'deleted',
+    incomingWcId: [...claimants].map(String).join(', '),
+    imsProductId: row.id,
+  })
+}
+
 /** Write already-fetched variations inside the caller's transaction. */
 async function applyVariations(
   tx: Prisma.TransactionClient,
@@ -694,9 +750,10 @@ async function applyVariations(
 
     if (existing) {
       // The update below rewrites type/parentId/externalProductId, so refuse a row a
-      // different WC object already owns instead of reparenting it (o3d-fsi). The
-      // caller's advisory locks cover this SKU, so this decision is on stable state.
-      assertWcRowNotClaimedByAnotherWcObject(existing, claimantsBySku.get(sku) ?? new Set([BigInt(v.id)]))
+      // different WC object already owns instead of reparenting it (o3d-fsi). Checked here so
+      // the conflict is raised before any write, then re-checked atomically inside the update.
+      const claimants = claimantsBySku.get(sku) ?? new Set([BigInt(v.id)])
+      assertWcRowNotClaimedByAnotherWcObject(existing, claimants)
 
       const updateData: Record<string, unknown> = {
         name: variantName,
@@ -719,7 +776,9 @@ async function applyVariations(
       if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
       if (gtin && !existing.barcode) updateData.barcode = gtin
 
-      await tx.product.update({ where: { id: existing.id }, data: updateData })
+      await updateProductGuardingOwnership(tx, existing, claimants, updateData)
+      // Keep the map's mapping current for a repeated SKU later in this same payload.
+      existingBySku.set(sku, { ...existing, externalProductId: BigInt(v.id) })
     } else {
       const created = await tx.product.create({
         data: {

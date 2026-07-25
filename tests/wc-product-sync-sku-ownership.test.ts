@@ -90,8 +90,37 @@ function findProductBySku(sku: unknown) {
   return state.products.find((row) => row.sku === sku) ?? null
 }
 
+/**
+ * Emulates the conditional ownership update: `id` plus an OR over externalProductId.
+ * Returning { count: 0 } when the predicate does not match is what the production code
+ * reads as "someone reassigned this row underneath us".
+ */
+function updateManyMatching(where: Row, data: Row): { count: number } {
+  const row = state.products.find((candidate) => candidate.id === where.id)
+  if (!row) return { count: 0 }
+
+  const or = where.OR as Array<Row> | undefined
+  if (or) {
+    const matches = or.some((clause) => {
+      if ('externalProductId' in clause && clause.externalProductId === null) {
+        return row.externalProductId == null
+      }
+      const inClause = (clause.externalProductId as { in?: bigint[] } | undefined)?.in
+      return Array.isArray(inClause) && row.externalProductId != null
+        && inClause.some((id) => id === row.externalProductId)
+    })
+    if (!matches) return { count: 0 }
+  }
+
+  Object.assign(row, data)
+  return { count: 1 }
+}
+
 const productDelegate = {
   findFirst: async ({ where }: { where: { sku?: unknown } }) => findProductBySku(where?.sku),
+  findUnique: async ({ where }: { where: { id: string } }) =>
+    state.products.find((row) => row.id === where.id) ?? null,
+  updateMany: async ({ where, data }: { where: Row; data: Row }) => updateManyMatching(where, data),
   findMany: async ({ where }: { where?: { sku?: { in?: unknown[] } } } = {}) => {
     const wanted = where?.sku?.in
     if (!Array.isArray(wanted)) return state.products.map((row) => ({ ...row }))
@@ -488,4 +517,66 @@ test('an id absent from the duplicate group is still refused (o3d-fsi)', async (
   assert.equal(result.success, false)
   assert.match(String(result.error), /already mapped to WooCommerce object 555/)
   assert.deepEqual(state.products, before.products, 'the outsider row is untouched')
+})
+
+test('a mapping reassigned BETWEEN the read and the write is caught by the update itself (o3d-fsi)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+
+  // VAR-1 exists UNCLAIMED, so the snapshot check passes cleanly. A writer outside the SKU
+  // advisory-lock protocol — persistMappingIfVersionMatches, the stock-sync mapping path —
+  // then claims it for WC object 999 before this transaction reaches its update. The stale
+  // check has already said yes; only a conditional update can still refuse.
+  state.products.push(imsRow({ id: 'ims-var', sku: 'VAR-1', name: 'Unclaimed', type: 'VARIANT' }))
+
+  const realFindMany = productDelegate.findMany
+  productDelegate.findMany = async (args) => {
+    const rows = await realFindMany(args)
+    // The interleaving: after this read is served, the outsider commits its claim.
+    const victim = state.products.find((row) => row.id === 'ims-var')
+    if (victim && rows.some((row) => row.sku === 'VAR-1')) victim.externalProductId = BigInt(999)
+    return rows
+  }
+
+  try {
+    const result = await syncWcProductToIms(variableProduct())
+
+    assert.equal(result.success, false, 'the reassignment must be caught, not overwritten')
+    assert.match(String(result.error), /already mapped to WooCommerce object 999/)
+    // The victim row is back to its pre-transaction state — this double rolls back by
+    // snapshot, so the outsider's mid-transaction write is undone here too. What matters is
+    // that this import did NOT reparent it: no VARIANT type, no parentId, no WC id of ours.
+    const victim = state.products.find((row) => row.id === 'ims-var')
+    assert.equal(victim?.name, 'Unclaimed', 'fields not overwritten')
+    assert.equal(victim?.parentId, undefined, 'not reparented')
+    assert.notEqual(victim?.externalProductId, BigInt(111), 'our variation id was not written onto it')
+    assert.equal(findProductBySku('PARENT-SKU'), null, 'the whole transaction rolled back')
+  } finally {
+    productDelegate.findMany = realFindMany
+  }
+})
+
+test('the PARENT update is guarded the same way (o3d-fsi)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+
+  state.products.push(imsRow({ id: 'ims-parent', sku: 'PARENT-SKU', name: 'Unclaimed', type: 'VARIABLE' }))
+
+  const realFindFirst = productDelegate.findFirst
+  productDelegate.findFirst = async (args) => {
+    const row = await realFindFirst(args)
+    const victim = state.products.find((candidate) => candidate.id === 'ims-parent')
+    if (victim && row) victim.externalProductId = BigInt(888)
+    return row
+  }
+
+  try {
+    const result = await syncWcProductToIms(variableProduct())
+
+    assert.equal(result.success, false)
+    assert.match(String(result.error), /already mapped to WooCommerce object 888/)
+    assert.equal(state.products.find((row) => row.id === 'ims-parent')?.name, 'Unclaimed', 'not overwritten')
+  } finally {
+    productDelegate.findFirst = realFindFirst
+  }
 })
