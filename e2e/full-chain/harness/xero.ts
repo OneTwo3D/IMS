@@ -616,11 +616,60 @@ export async function voidTrackedDocuments(): Promise<{ voided: number; failed: 
  */
 export async function findStragglers(tagPrefix = 'E2E-FC'): Promise<string[]> {
   const out: string[] = []
+
+  // INVOICES + CREDIT NOTES carry our Reference, so Xero can filter them server-side.
   const inv = await xeroGet<{ Invoices?: Array<{ InvoiceID: string; Reference?: string; Status: string }> }>(
     `Invoices?where=${encodeURIComponent(`Reference!=null&&Reference.StartsWith("${tagPrefix}")`)}`,
   )
   for (const i of inv.data?.Invoices ?? []) {
-    if (i.Status !== 'VOIDED' && i.Status !== 'DELETED') out.push(`Invoice ${i.InvoiceID} (${i.Reference}) ${i.Status}`)
+    if (!isGoneFromLedger(i.Status)) out.push(`Invoice ${i.InvoiceID} (${i.Reference}) ${i.Status}`)
+  }
+  const cn = await xeroGet<{ CreditNotes?: Array<{ CreditNoteID: string; Reference?: string; Status: string }> }>(
+    `CreditNotes?where=${encodeURIComponent(`Reference!=null&&Reference.StartsWith("${tagPrefix}")`)}`,
+  )
+  for (const c of cn.data?.CreditNotes ?? []) {
+    if (!isGoneFromLedger(c.Status)) out.push(`CreditNote ${c.CreditNoteID} (${c.Reference}) ${c.Status}`)
+  }
+
+  // MANUAL JOURNALS are the gap this closes (o3d-lgo.7.1). They were invisible to this scan, which is the
+  // one class of document the tracked-registry teardown can miss: when Xero accepts the POST but the id
+  // write-back is lost, NO read of accounting_sync_logs can name the document, so it can only be found from
+  // the Xero side. And journals are the most consequential to leave live — X-02's transit reconciliation and
+  // the batch tie-outs compare GL movement against the IMS subledger, so a stray journal makes a LATER run
+  // fail for reasons that have nothing to do with it.
+  //
+  // Two reasons this cannot mirror the invoice filter. A ManualJournal has no Reference field at all, only a
+  // Narration, and Xero does not support StartsWith filtering on it. So the tag match is client-side over a
+  // date-bounded page — journals dated today or later, which is the window a full-chain run posts into.
+  const mj = await xeroGet<{ ManualJournals?: Array<{ ManualJournalID: string; Narration?: string; Status: string; Date?: string }> }>(
+    `ManualJournals?where=${encodeURIComponent(`Date>=DateTime(${todayForXeroWhere()})`)}`,
+  )
+  for (const j of mj.data?.ManualJournals ?? []) {
+    if (isGoneFromLedger(j.Status)) continue
+    // REPORT-ONLY, and tag-matched narrations are reported separately from the rest. A date window is not
+    // ownership: the Demo org is shared, and voiding a journal nobody is expecting is worse than listing a
+    // straggler (the same principle this scan was built on). An untagged journal in the window is still worth
+    // naming, because the narration of an IMS journal usually carries a PO/order reference, not the run tag.
+    const tagged = j.Narration?.includes(tagPrefix)
+    out.push(
+      `ManualJournal ${j.ManualJournalID} (${j.Narration ?? 'no narration'}) ${j.Status}` +
+        (tagged ? ' [run-tagged]' : ' [dated in the run window; verify before voiding]'),
+    )
   }
   return out
+}
+
+/** A document already VOIDED/DELETED is out of the ledger — exactly the outcome teardown wants, not a straggler. */
+function isGoneFromLedger(status: string): boolean {
+  return status === 'VOIDED' || status === 'DELETED'
+}
+
+/**
+ * Today as Xero's `DateTime(yyyy,mm,dd)` where-clause literal — its filter syntax takes that form, not an
+ * ISO string. Bounded to today because a full-chain run posts documents dated today (or, for a deliberately
+ * future-dated payment, later), so this is the narrowest window that cannot miss the run's own journals.
+ */
+function todayForXeroWhere(): string {
+  const now = new Date()
+  return `${now.getUTCFullYear()},${now.getUTCMonth() + 1},${now.getUTCDate()}`
 }

@@ -18,7 +18,9 @@ type XeroInvoiceResponse = {
   }>
 }
 
-function buildSalesInvoicePayload(
+// Exported for unit tests: the payload shape is where coupon/discount arithmetic actually resolves, and it
+// is far cheaper to pin here than through a full-chain order (o3d-lgo.5.1).
+export function buildSalesInvoicePayload(
   data: InvoiceData,
   status: string,
   contactId: string,

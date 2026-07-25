@@ -38,6 +38,7 @@ import { awaitWebhookDelivery, cleanupWc, createWcOrder, createWcProduct, wcCred
 import {
   addManufacturingCostLine, allocateAndShip, applyStockWriteOff, completeProduction, createAndSendPo,
   createBill, createLandedCostPo, createManufacturingOrder, createStockTransfer, dispatchStockTransfer,
+  drainLandedCostOutboxNow,
   editManufacturingCostLineAmount, openManufacturingOrder, openSalesOrder, processPendingXeroSyncViaUi,
   receiveGoods, receiveStockTransfer, runDailyBatch, runFxRevaluation, runTaxRateDriftCron, setPostingMode,
   startProduction,
@@ -50,6 +51,7 @@ import {
 } from './harness/xero.ts'
 import {
   dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
+  registerRetiredPostedDocuments,
 } from './harness/batch-fixture.ts'
 import { runAllCleanups } from './harness/cleanup.ts'
 import { assertE2eDatabase } from './harness/db-guard.ts'
@@ -88,6 +90,9 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     //    a no-op on an already-clean database.
     const baseline = await deleteUnjournaledShipmentBaseline()
     console.log(`[X-01] baseline: deleted ${baseline.candidateOrders} batch-candidate order(s)`, baseline.deleted)
+    // Any document the baseline retired that had ALREADY posted is live in the shared ledger;
+    // register it so teardown voids it rather than leaving it invisible (o3d-lgo.16).
+    registerRetiredPostedDocuments(baseline, 'X-01')
 
     // 1. ARM BATCH MODE — sync AND dailyBatch, both true (see the header note). Armed before
     //    import so the SALES_INVOICE is queued at import time (order-import.ts) and the
@@ -405,6 +410,9 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     //    baseline keeps Groups A1/A2/B empty so the transit sweep is the only tie-out journal.
     const baseline = await deleteUnjournaledShipmentBaseline()
     console.log(`[X-02] baseline: deleted ${baseline.candidateOrders} batch-candidate order(s)`)
+    // Any document the baseline retired that had ALREADY posted is live in the shared ledger;
+    // register it so teardown voids it rather than leaving it invisible (o3d-lgo.16).
+    registerRetiredPostedDocuments(baseline, 'X-02')
     await setPostingMode({ sync: true, dailyBatch: true })
 
     // 1. Seed the residue: an opening (yesterday) + closing (today) GL balance snapshot for account 632
@@ -559,6 +567,20 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     // than externalIdsFor, which returns as soon as one document is SYNCED and so cannot see a duplicate
     // still in flight. We assert no in-flight rows, then the distinct-document count, then aggregate the
     // transit movement across every matching journal.
+    const recoverAndRegister = async (): Promise<void> => {
+      for (const [type, label] of [
+        ['STOCK_IN_TRANSIT', 'stock-in-transit reval'],
+        ['STOCK_RECEIPT', 'stock receipt'],
+        // If the exclusion REGRESSED and a spurious COGS_JOURNAL posted, register that too so teardown
+        // voids it and the assertion below — not the ledger — is what fails.
+        ['COGS_JOURNAL', 'UNEXPECTED cogs'],
+      ] as const) {
+        for (const id of await settledJournalExternalIds(type, null, { referenceId: goodsPoId })) {
+          trackDocument('ManualJournals', id, `X-06 ${label} ${runTag(runId)}`)
+        }
+      }
+    }
+
     let stockInTransitIds: string[] = []
     let transitRows: Array<{ status: string; externalTransactionId: string | null }> = []
     try {
@@ -573,19 +595,6 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       // NO timestamp bound: goodsPoId alone establishes ownership, and the PO's STOCK_RECEIPT row was written
       // by receiveGoods BEFORE `boundary` was captured — filtering on it would skip the very receipt journal
       // this recovery exists to void, leaking it into the shared ledger (Codex).
-      const recoverAndRegister = async (): Promise<void> => {
-        for (const [type, label] of [
-          ['STOCK_IN_TRANSIT', 'stock-in-transit reval'],
-          ['STOCK_RECEIPT', 'stock receipt'],
-          // If the exclusion REGRESSED and a spurious COGS_JOURNAL posted, register that too so teardown
-          // voids it and the assertion below — not the ledger — is what fails.
-          ['COGS_JOURNAL', 'UNEXPECTED cogs'],
-        ] as const) {
-          for (const id of await settledJournalExternalIds(type, null, { referenceId: goodsPoId })) {
-            trackDocument('ManualJournals', id, `X-06 ${label} ${runTag(runId)}`)
-          }
-        }
-      }
       // TWO passes over ALL THREE types, and asymmetry between them would be a hole. One pass can miss a
       // document two ways: its database read fails transiently (it only WARNS and returns []), or a row was
       // still PROCESSING when the 30s settle window expired and received its external id afterwards — the
@@ -654,6 +663,63 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     }
     expect(totalInventory, 'the reval debits inventory for the £100 landed cost on the on-hand units').toBeCloseTo(freightTotal, 2)
     expect(totalTransit, 'the reval credits transit for the £100 landed cost — routed through transit exactly once').toBeCloseTo(-freightTotal, 2)
+
+    // --- AND AGAIN THROUGH THE OUTBOX BACKSTOP (o3d-lgo.7.4) ---------------------------------------------
+    //
+    // Everything above exercised the DIRECT post-commit path. recalculateDirectLandedCosts ALSO enqueues an
+    // IntegrationOutbox row inside the recalc transaction, drained 90s later, which re-runs
+    // queueLandedCostAdjustmentJournals. That re-run is idempotency-keyed and so must be a NO-OP — but until
+    // now nothing proved it, and a break there posts a SECOND £100 transit journal minutes after this test
+    // finished, doubling the very movement the assertions above just pinned to exactly one.
+    const outbox = await drainLandedCostOutboxNow(boundary)
+    // The backstop must EXIST. Zero rows would make the drain a vacuous no-op — and would itself be a
+    // regression, since the durable recovery path is the point of audit-grob.
+    expect(
+      outbox.rowIds.length,
+      'the recalc enqueued a landed-cost outbox backstop row for this run',
+    ).toBeGreaterThanOrEqual(1)
+    expect(outbox.claimed, 'the drain claimed the backstop row (it was forced eligible)').toBeGreaterThanOrEqual(1)
+    expect(
+      outbox.failed,
+      `the backstop drain must not fail: ${JSON.stringify(outbox)}`,
+    ).toBe(0)
+    // PER-ROW, not the aggregate counters. The processor is unscoped, so claimed/failed can be satisfied by
+    // unrelated backlog rows while THIS run's row sat untouched — after which the unchanged journal count
+    // below would "prove" idempotency that was never exercised (Codex). Require every targeted row SUCCEEDED.
+    for (const id of outbox.rowIds) {
+      expect(
+        outbox.finalStatuses[id],
+        `outbox row ${id} (this run's backstop) must have been processed to SUCCEEDED, not left behind by an ` +
+          `unscoped drain: ${JSON.stringify(outbox.finalStatuses)}`,
+      ).toBe('SUCCEEDED')
+    }
+
+    // Drain whatever the backstop queued (nothing, if idempotency holds) and re-register, so a duplicate is
+    // voided rather than left live in the shared ledger while this assertion reports it.
+    await processPendingXeroSyncViaUi(page)
+    await recoverAndRegister()
+
+    const afterOutbox = await transitSyncRowsForPo(goodsPoId)
+    const afterOutboxIds = [...new Set(
+      afterOutbox.map((r) => r.externalTransactionId).filter((id): id is string => Boolean(id)),
+    )]
+    for (const id of afterOutboxIds) {
+      trackDocument('ManualJournals', id, `X-06 stock-in-transit reval ${runTag(runId)}`)
+    }
+    expect(
+      afterOutboxIds.length,
+      `the outbox backstop re-ran the journal builder and must have posted NOTHING NEW — still exactly one ` +
+        `STOCK_IN_TRANSIT document. Rows after the drain: ${JSON.stringify(afterOutbox)}`,
+    ).toBe(1)
+    expect(
+      afterOutboxIds[0],
+      'the surviving transit document is the SAME one, not a replacement',
+    ).toBe(stockInTransitIds[0])
+    // And the exclusion still holds on the backstop path: no retrospective COGS on transferred-out units.
+    expect(
+      await cogsJournalCountForPo(goodsPoId, boundary),
+      'the outbox backstop must not book the COGS the direct path correctly skipped (6oyu.19.1)',
+    ).toBe(0)
   })
 
   test('X-04: IMS↔Xero tax-rate DRIFT is detected (Setting snapshot + WARNING ActivityLog), clears on reconcile — detect-only, no Xero write', async ({ page }) => {

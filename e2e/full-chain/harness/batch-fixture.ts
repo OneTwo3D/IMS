@@ -55,6 +55,7 @@
 import { Client } from 'pg'
 
 import { assertE2eDatabase } from './db-guard.ts'
+import { trackDocument, type XeroDocKind } from './xero.ts'
 
 /**
  * The batch-candidate anchor — the exact set daily-sync.ts's Groups A1, A2 and B can reach
@@ -108,6 +109,22 @@ export type BatchBaselineResult = {
     orders: number
   }
   cancelledSyncLogs: number
+  /**
+   * Rows this baseline retired that ALREADY CARRIED a Xero id — i.e. Xero accepted the document and the
+   * local status write-back was lost or later failed. Cancelling such a row is still correct (it must not be
+   * revived and reposted against orders we are about to delete), but the DOCUMENT is real and live in the
+   * shared Demo ledger, so the caller must register it for teardown. Blanket-cancelling without surfacing
+   * these hid live journals and skewed the reconciliation sweeps X-02 asserts on (Codex, o3d-lgo.16).
+   */
+  retiredPostedDocuments: RetiredPostedDocument[]
+}
+
+export type RetiredPostedDocument = {
+  type: string
+  referenceId: string
+  externalId: string
+  /** The status the row held BEFORE cancellation — 'PROCESSING' means it was claimed and possibly in flight. */
+  priorStatus: string
 }
 
 /**
@@ -141,6 +158,15 @@ export async function deleteUnjournaledShipmentBaseline(): Promise<BatchBaseline
     // CANCELLED is safe: the drain and the outbox claim both require PENDING/PROCESSING
     // (sync-processor.ts), and the FAILED-reset only touches FAILED — so a cancelled row is
     // inert and cannot be revived. Runs even when there are no candidate orders.
+    //
+    // Capture rows that ALREADY POSTED before retiring them (o3d-lgo.16). A FAILED — or even PENDING — row
+    // CAN carry an externalTransactionId: Xero accepted the POST and the status write-back was lost. That
+    // document is live in the shared ledger, and cancelling its row makes it invisible to every retry and
+    // dashboard, so the ids are returned for the caller to register with trackDocument.
+    const retiredPostedDocuments = await selectPostedRowsAboutToBeRetired(db, {
+      sql: `"referenceType" = 'DailyBatch' AND status IN ('PENDING', 'PROCESSING', 'FAILED')`,
+      params: [],
+    })
     const cancelledBatchLogs = await db.query(
       `UPDATE accounting_sync_logs
           SET status = 'CANCELLED'
@@ -158,10 +184,12 @@ export async function deleteUnjournaledShipmentBaseline(): Promise<BatchBaseline
 
     if (orderIds.length === 0) {
       await db.query('COMMIT')
+      warnRetiredPostedDocuments(retiredPostedDocuments)
       return {
         candidateOrders: 0,
         deleted: { shipmentLines: 0, refundLines: 0, payments: 0, refunds: 0, orderLines: 0, orders: 0 },
         cancelledSyncLogs: cancelledBatchLogs.rowCount ?? 0,
+        retiredPostedDocuments,
       }
     }
 
@@ -178,6 +206,11 @@ export async function deleteUnjournaledShipmentBaseline(): Promise<BatchBaseline
     // family, refundId for CREDIT_NOTE / COGS_REVERSAL / UNEARNED_REV_REVERSAL — Codex r2),
     // never a strict FK, so both id families must be named. Ids are cuids (globally unique),
     // so matching by referenceId alone cannot catch an unrelated document.
+    // Same posted-row capture as above, for the order/refund-scoped family (o3d-lgo.16).
+    retiredPostedDocuments.push(...await selectPostedRowsAboutToBeRetired(db, {
+      sql: `status IN ('PENDING', 'PROCESSING') AND "referenceId" = ANY($1::text[])`,
+      params: [[...orderIds, ...refundIds]],
+    }))
     const cancelled = await db.query(
       `UPDATE accounting_sync_logs
           SET status = 'CANCELLED'
@@ -216,6 +249,7 @@ export async function deleteUnjournaledShipmentBaseline(): Promise<BatchBaseline
     }
 
     await db.query('COMMIT')
+    warnRetiredPostedDocuments(retiredPostedDocuments)
     return {
       candidateOrders: orderIds.length,
       deleted: {
@@ -227,12 +261,60 @@ export async function deleteUnjournaledShipmentBaseline(): Promise<BatchBaseline
         orders: orders.rowCount ?? 0,
       },
       cancelledSyncLogs: (cancelledBatchLogs.rowCount ?? 0) + (cancelled.rowCount ?? 0),
+      retiredPostedDocuments,
     }
   } catch (e) {
     await db.query('ROLLBACK').catch(() => {})
     throw e
   } finally {
     await db.end()
+  }
+}
+
+/**
+ * The rows a pending cancellation is about to retire that ALREADY carry a Xero id.
+ *
+ * Runs INSIDE the baseline's transaction and BEFORE the UPDATE, because after it the prior status is gone.
+ * `where` is a fixed fragment written here in this file, never caller input; params are bound.
+ */
+async function selectPostedRowsAboutToBeRetired(
+  db: Client,
+  where: { sql: string; params: unknown[] },
+): Promise<RetiredPostedDocument[]> {
+  const r = await db.query<{ type: string; referenceId: string; externalTransactionId: string; status: string }>(
+    `SELECT type::text AS type, "referenceId", "externalTransactionId", status
+       FROM accounting_sync_logs
+      WHERE connector = 'xero' AND "externalTransactionId" IS NOT NULL AND (${where.sql})`,
+    where.params,
+  )
+  return r.rows.map((row) => ({
+    type: row.type,
+    referenceId: row.referenceId,
+    externalId: row.externalTransactionId,
+    priorStatus: row.status,
+  }))
+}
+
+/**
+ * Say out loud what was retired despite having posted — a silent cancellation is how a live journal goes
+ * missing. A PROCESSING row is called out separately: it was CLAIMED, so something may have been mid-flight
+ * (the preflight is supposed to block a run while any row is PENDING/PROCESSING, so seeing one here means
+ * that guard was bypassed or a prior run died mid-drain).
+ */
+function warnRetiredPostedDocuments(docs: RetiredPostedDocument[]): void {
+  for (const doc of docs) {
+    console.warn(
+      `[batch-baseline] RETIRED a ${doc.priorStatus} ${doc.type} row that had already posted to Xero ` +
+        `(${doc.externalId}, reference ${doc.referenceId}) — the document is LIVE in the shared ledger and ` +
+        `must be registered for teardown (o3d-lgo.16).`,
+    )
+  }
+  const claimed = docs.filter((d) => d.priorStatus === 'PROCESSING')
+  if (claimed.length) {
+    console.warn(
+      `[batch-baseline] ${claimed.length} of those were PROCESSING (claimed, possibly in flight) — the ` +
+        `preflight should have blocked this run; check for a prior run that died mid-drain.`,
+    )
   }
 }
 
@@ -413,5 +495,72 @@ export async function dailyBatchDoc(
     )
   } finally {
     await db.end()
+  }
+}
+
+/**
+ * The Xero document kind a sync type produces, for teardown registration — or null when the type posts no
+ * standalone voidable document.
+ *
+ * Explicit rather than defaulting to ManualJournals: registering a Xero id under the WRONG kind means
+ * teardown issues a void against the wrong endpoint and the real document survives, which is precisely the
+ * silent-leak failure this mapping exists to prevent. An unmapped type therefore WARNS instead of guessing.
+ * Attachment/PDF/email/note/tax-rate types are deliberately null — they mutate or attach to a document
+ * someone else already registered, so there is nothing separate to void.
+ */
+export function xeroDocKindForSyncType(type: string): XeroDocKind | null {
+  switch (type) {
+    case 'SALES_INVOICE':
+    case 'SALES_INVOICE_UPDATE':
+    case 'PURCHASE_INVOICE':
+    case 'PURCHASE_INVOICE_UPDATE':
+      return 'Invoices'
+    case 'CREDIT_NOTE':
+    case 'PURCHASE_CREDIT_NOTE':
+      return 'CreditNotes'
+    case 'INVOICE_PAYMENT':
+    case 'BILL_PAYMENT':
+      return 'Payments'
+    case 'COGS_JOURNAL':
+    case 'COGS_REVERSAL':
+    case 'INVENTORY_ADJUSTMENT':
+    case 'STOCK_IN_TRANSIT':
+    case 'STOCK_RECEIPT':
+    case 'STOCK_ALLOCATION':
+    case 'UNEARNED_REV_REVERSAL':
+    case 'REALISED_FX_JOURNAL':
+    case 'UNREALISED_FX_JOURNAL':
+    case 'MANUFACTURING_JOURNAL':
+    case 'MANUFACTURING_RECLASS':
+    case 'DAILY_BATCH_REVENUE_DEFERRAL':
+    case 'DAILY_BATCH_INVENTORY_ALLOC':
+    case 'DAILY_BATCH_GROUP_B':
+    case 'DAILY_BATCH_INVENTORY_RECONCILIATION':
+    case 'DAILY_BATCH_COGS_RECONCILIATION':
+    case 'DAILY_BATCH_TRANSIT_RECONCILIATION':
+      return 'ManualJournals'
+    // Ride on a document registered elsewhere (or write nothing voidable): nothing separate to void.
+    case 'BILL_ATTACHMENT':
+    case 'INVOICE_PDF':
+    case 'INVOICE_EMAIL':
+    case 'WC_INVOICE_NOTE':
+    case 'PURCHASE_CREDIT_NOTE_ALLOCATION':
+    case 'TAX_RATE_SYNC':
+      return null
+    default:
+      console.warn(`[batch-baseline] no Xero document kind mapped for sync type ${type} — cannot register it for teardown; add it to xeroDocKindForSyncType.`)
+      return null
+  }
+}
+
+/**
+ * Register every already-posted document the baseline retired, so teardown VOIDS it out of the shared Demo
+ * ledger instead of leaving it live and invisible (o3d-lgo.16). Safe to call unconditionally — the common
+ * case is an empty list, and trackDocument dedupes.
+ */
+export function registerRetiredPostedDocuments(baseline: BatchBaselineResult, label: string): void {
+  for (const doc of baseline.retiredPostedDocuments) {
+    const kind = xeroDocKindForSyncType(doc.type)
+    if (kind) trackDocument(kind, doc.externalId, `${label} retired-but-posted ${doc.type}`)
   }
 }
