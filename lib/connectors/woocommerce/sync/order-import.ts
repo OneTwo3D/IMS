@@ -158,6 +158,29 @@ export function pendingFxQueueWhere(externalOrderId?: string): Prisma.ShoppingSy
   }
 }
 
+/**
+ * The amount to settle the sales invoice for — the GROSS (tax-inclusive) total the customer paid, in the
+ * order currency the invoice is raised in (wcOrder.total). Without this, the payment sync-processor falls
+ * back to the NET line sum (+shipping −discount, no tax), so a taxed invoice is under-settled by its VAT
+ * and never reaches PAID (o3d-c0n). Non-taxed orders are unaffected because net == gross.
+ *
+ * Returns undefined (→ leaves the net fallback in place) when:
+ *  • the order isn't paid (no payment is registered anyway), or
+ *  • prices are tax-INCLUSIVE — those orders have a separate pre-existing invoice-construction bug that
+ *    builds the invoice at the NET total (WC REST line amounts are always net but are sent to Xero
+ *    flagged tax-inclusive), so a gross payment would EXCEED the invoice and Xero would reject it. Kept
+ *    on the (net-but-consistent) fallback until that construction is fixed (o3d-cyn) rather than
+ *    regressing them; the invoice is correctly built at gross only for tax-exclusive orders.
+ */
+export function resolveWcInvoicePaymentAmount(
+  wcOrder: Pick<WcFullOrder, 'date_paid_gmt' | 'total' | 'prices_include_tax'>,
+): number | undefined {
+  if (wcOrder.prices_include_tax) return undefined
+  if (!wcOrder.date_paid_gmt || !wcOrder.total) return undefined
+  const gross = Number(wcOrder.total)
+  return Number.isFinite(gross) && gross > 0 ? gross : undefined
+}
+
 export function buildPendingFxOrderPayload(
   wcOrder: WcFullOrder,
   error: { currency: string; asOf?: Date },
@@ -794,6 +817,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           _registerPayment: !!wcOrder.date_paid_gmt,
           _paymentMethod: wcOrder.payment_method || undefined,
           _paymentDate: wcOrder.date_paid_gmt || undefined,
+          _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder),
         },
       })
     } catch (accountingError) {
