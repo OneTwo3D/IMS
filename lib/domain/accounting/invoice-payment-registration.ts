@@ -22,9 +22,9 @@ export type InvoicePaymentRegistrationRefusal =
   | 'CURRENCY_MISMATCH'
   /** No bank account is mapped for this payment method/currency. */
   | 'NO_BANK_ACCOUNT'
-  /** An existing payment sync records no amount, so "how much does the ledger already hold" is unknown. */
-  | 'UNKNOWN_REGISTERED_AMOUNT'
-  /** Registering this too would send the ledger more than the invoice it settles. */
+  /** A registration for this order is already live in the ledger — only one at a time can be tracked. */
+  | 'LEDGER_HAS_LIVE_PAYMENT'
+  /** This receipt alone is larger than the invoice it settles, so the ledger would refuse it. */
   | 'WOULD_OVERPAY'
 
 export type InvoicePaymentRegistrationDecision =
@@ -61,28 +61,43 @@ export function decideInvoicePaymentRegistration(input: {
   if (input.orderCurrency !== input.paymentCurrency) return { register: false, refusal: 'CURRENCY_MISMATCH' }
   if (!input.bankAccountId) return { register: false, refusal: 'NO_BANK_ACCOUNT' }
 
-  // WHAT THE LEDGER ALREADY HOLDS. An imported order's receipt was registered by the SALES_INVOICE
-  // follow-up without ever creating a local Payment row, so IMS's own payment rows do NOT bound what the
-  // ledger has been told — only the ledger's own sync rows do. Without this, an operator recording "the"
-  // payment on an imported order would register it a SECOND time.
+  // ONE LIVE REGISTRATION PER ORDER, and that is the database's rule, not a policy invented here:
+  // accounting_sync_logs_followup_live_unique is a UNIQUE index on (connector, type, referenceType,
+  // referenceId) for live INVOICE_PAYMENT rows. Queueing a second one does not merely double-pay — it
+  // violates the constraint, and the caller's catch would turn a receipt the operator believed recorded
+  // into an error log nobody reads (Codex, PR #582 round 2).
   //
-  // FAILED and CANCELLED rows hold nothing: the ledger rejected or never saw them, so the invoice is
-  // still outstanding by their amount and that capacity is free again.
+  // It also covers what this guard was written for: an imported order's receipt is registered by the
+  // SALES_INVOICE follow-up WITHOUT ever creating a local Payment row, so IMS's own payment rows do not
+  // bound what the ledger has been told. Refusing on the ledger's own live row does.
+  //
+  // FAILED and CANCELLED rows hold nothing — the ledger rejected them or never saw them — and the index
+  // ignores them too, so they free the slot again.
   const live = input.existing.filter(
     (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED'
     // Our OWN row, if this ever runs twice for one receipt: the idempotency key already makes the second
-    // queue a no-op, so counting it as capacity used would refuse the retry with a false over-pay.
+    // queue a no-op, so treating it as an obstacle would refuse the retry for its own success.
     && (r.paymentId == null || r.paymentId !== input.paymentId),
   )
-
-  // FAIL CLOSED on an unreadable amount: "how much has the ledger been told" IS the guard, and a row we
-  // cannot read makes the answer unknown, not zero.
-  if (live.some((r) => typeof r.amount !== 'number')) {
-    return { register: false, refusal: 'UNKNOWN_REGISTERED_AMOUNT' }
+  if (live.length > 0) {
+    const known = live.filter((r) => typeof r.amount === 'number')
+    return {
+      register: false,
+      refusal: 'LEDGER_HAS_LIVE_PAYMENT',
+      // Absent when a row records no amount: unknown must not read as zero in the operator's message.
+      alreadyRegistered: known.length === live.length
+        ? known.reduce((sum, r) => sum + (r.amount as number), 0)
+        : undefined,
+      ledgerTotal: input.ledgerTotal,
+    }
   }
-  const alreadyRegistered = live.reduce((sum, r) => sum + (r.amount as number), 0)
-  if (alreadyRegistered + input.paymentAmount > input.ledgerTotal + 0.005) {
-    return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered, ledgerTotal: input.ledgerTotal }
+
+  // Nothing is registered, so this receipt stands alone — and if it alone exceeds the invoice, the ledger
+  // would reject it. The live case for this is a gross receipt against an imported tax-inclusive invoice,
+  // which posts at NET (o3d-cyn): refusing names the numbers, where letting it through produces a Xero
+  // rejection an operator has to decode.
+  if (input.paymentAmount > input.ledgerTotal + 0.005) {
+    return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered: 0, ledgerTotal: input.ledgerTotal }
   }
   return { register: true, bankAccountId: input.bankAccountId }
 }

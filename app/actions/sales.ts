@@ -2892,19 +2892,24 @@ async function registerInvoicePaymentWithLedger(params: {
             `Accounting → Payment Account Mapping, then register the payment there.`,
             { amount: params.amount, currency: params.currency, method: params.method, refusal: decision.refusal })
           return
-        case 'UNKNOWN_REGISTERED_AMOUNT':
+        case 'LEDGER_HAS_LIVE_PAYMENT':
           await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but an existing payment sync for this ` +
-            `order records no amount, so IMS cannot tell whether registering this one would double-pay the ` +
-            `invoice. ${tail}`,
-            { amount: params.amount, currency: params.currency, refusal: decision.refusal })
+            `Recorded ${amount} against ${params.orderReference}, but a payment for this order has already ` +
+            `been sent to the accounting connector` +
+            (decision.alreadyRegistered != null ? ` (${params.currency} ${decision.alreadyRegistered.toFixed(2)})` : '') +
+            `, and IMS tracks one registration per order. Registering this one too would pay the invoice ` +
+            `twice, so it was not sent. ${tail}`,
+            {
+              amount: params.amount, currency: params.currency, refusal: decision.refusal,
+              alreadyRegistered: decision.alreadyRegistered, ledgerTotal: decision.ledgerTotal,
+            })
           return
         case 'WOULD_OVERPAY':
           await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but the accounting connector has already ` +
-            `been sent ${params.currency} ${(decision.alreadyRegistered ?? 0).toFixed(2)} of an invoice ` +
-            `total of ${params.currency} ${(decision.ledgerTotal ?? 0).toFixed(2)} — registering this ` +
-            `payment too would over-pay it there. Check the ledger first. ${tail}`,
+            `Recorded ${amount} against ${params.orderReference}, but the invoice the accounting connector ` +
+            `holds is for ${params.currency} ${(decision.ledgerTotal ?? 0).toFixed(2)} — it would refuse a ` +
+            `larger payment. Check the invoice in the ledger: on a tax-inclusive imported order it can be ` +
+            `posted NET of VAT. ${tail}`,
             {
               amount: params.amount, currency: params.currency, refusal: decision.refusal,
               alreadyRegistered: decision.alreadyRegistered, ledgerTotal: decision.ledgerTotal,
@@ -3237,19 +3242,13 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
         },
         select: { id: true, status: true, payload: true },
       })
-      // WHICH row belongs to the payment being deleted. A row queued by addPayment names its Payment row,
-      // so retract exactly that one. Amount matching is the fallback for rows queued before that was
-      // recorded (an imported order's SALES_INVOICE follow-up), and it must never sweep up a row that
-      // names a DIFFERENT payment — two equal part payments would otherwise cancel each other's
-      // registration, deleting a settlement the ledger is still expecting (o3d-lgo.15).
-      const exactLogs = paymentLogs.filter((log) => payloadPaymentId(log.payload) === paymentId)
-      const matchingLogs = exactLogs.length > 0 ? exactLogs : paymentLogs.filter((log) => {
-        if (payloadPaymentId(log.payload) !== null) return false
-        const payload = log.payload as { amount?: unknown; currency?: unknown } | null
-        const amount = typeof payload?.amount === 'number' ? payload.amount : Number(payload?.amount)
-        const currency = typeof payload?.currency === 'string' ? payload.currency : txResult.payment.currency
-        return Math.abs(amount - txResult.payment.amount) <= 0.0001 && currency === txResult.payment.currency
-      })
+      // ONLY the row that NAMES this payment. Matching by amount instead used to retract whichever
+      // registration happened to be for the same figure — and an imported paid order carries a perfectly
+      // legitimate INVOICE_PAYMENT with no local Payment row behind it, so recording and then deleting an
+      // equal receipt would delete the imported order's own registration, or raise a false "reverse this
+      // in the ledger" warning about a payment that had nothing to do with the deletion (Codex, PR #582
+      // round 2). A row that names no payment is nobody's to retract.
+      const matchingLogs = paymentLogs.filter((log) => payloadPaymentId(log.payload) === paymentId)
       const pendingIds = matchingLogs.filter((log) => log.status === 'PENDING').map((log) => log.id)
       if (pendingIds.length > 0) {
         await db.accountingSyncLog.deleteMany({ where: { id: { in: pendingIds } } })

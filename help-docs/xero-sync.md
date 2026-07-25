@@ -509,9 +509,11 @@ A payment recorded on a sales order (**Add Payment**) is registered against the 
 
 - accounting sync is on and the invoice has already posted to Xero;
 - the payment method and currency resolve to a bank account in the mapping above;
-- the ledger has not already been sent enough payments to cover the invoice.
+- no payment for that order has already been sent to Xero, and the receipt is not larger than the invoice Xero holds.
 
-If any of those does not hold, the receipt is still recorded in the IMS, nothing is sent, and a warning naming the order appears in the activity log — the order then shows **NOT SENT TO LEDGER** until it is registered. The last condition matters for imported orders: a paid WooCommerce order registers its payment automatically without creating a payment row in the IMS, so recording "the" payment by hand afterwards would pay the Xero invoice twice. The IMS refuses that rather than doing it silently.
+If any of those does not hold, the receipt is still recorded in the IMS, nothing is sent, and a warning naming the order appears in the activity log — the order then shows **NOT SENT TO LEDGER** until it is registered.
+
+The third condition matters most for imported orders: a paid WooCommerce order registers its payment automatically without creating a payment row in the IMS, so recording "the" payment by hand afterwards would pay the Xero invoice twice. The IMS refuses that rather than doing it silently. It also means only **one** registration per order is sent automatically — record a second part payment and you will be asked to register it in Xero yourself.
 
 Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there.
 

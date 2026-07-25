@@ -63,59 +63,54 @@ test('an imported order whose payment the ledger already holds is NOT paid a sec
     ...base,
     existing: [{ status: 'SYNCED', amount: 100, paymentId: null }],
   })
-  assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY')
+  assert.equal(d.register === false && d.refusal, 'LEDGER_HAS_LIVE_PAYMENT')
   assert.equal(d.register === false && d.alreadyRegistered, 100)
   assert.equal(d.register === false && d.ledgerTotal, 100)
 })
 
-test('a second part payment that fits inside the invoice total is registered', () => {
+test('a SECOND receipt is refused even when it fits inside the invoice total', () => {
+  // Not a policy invented here: accounting_sync_logs_followup_live_unique permits ONE live
+  // INVOICE_PAYMENT per order, so queueing a second violates the constraint. Refusing it visibly beats
+  // letting the insert throw and turning a receipt the operator believed recorded into an error log.
   const d = decideInvoicePaymentRegistration({
     ...base,
     paymentAmount: 60,
     existing: [{ status: 'SYNCED', amount: 40, paymentId: 'pay-old' }],
   })
-  assert.equal(d.register, true)
+  assert.equal(d.register === false && d.refusal, 'LEDGER_HAS_LIVE_PAYMENT')
+  assert.equal(d.register === false && d.alreadyRegistered, 40)
 })
 
-test('a part payment that would tip the ledger past the invoice total is refused', () => {
-  const d = decideInvoicePaymentRegistration({
-    ...base,
-    paymentAmount: 61,
-    existing: [{ status: 'SYNCED', amount: 40, paymentId: 'pay-old' }],
-  })
-  assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY')
-})
-
-test('a payment still in the queue already holds its share of the invoice', () => {
-  // PENDING is not "not sent" — it is on its way, and counting it as free capacity would register the
-  // same money twice the moment both rows drain.
+test('a payment still in the queue holds the slot as firmly as a synced one', () => {
+  // PENDING is not "not sent" — it is on its way, and the unique index counts it.
   for (const status of ['PENDING', 'PROCESSING'] as const) {
     const d = decideInvoicePaymentRegistration({ ...base, existing: [{ status, amount: 100, paymentId: 'pay-old' }] })
-    assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY', status)
+    assert.equal(d.register === false && d.refusal, 'LEDGER_HAS_LIVE_PAYMENT', status)
   }
 })
 
-test('a rejected or cancelled payment frees its capacity again', () => {
-  // The ledger rejected it or never saw it, so the invoice is still outstanding by that amount and a
-  // fresh receipt has room. Treating a FAILED row as money held would block the retry that fixes it.
+test('a rejected or cancelled payment frees the slot again', () => {
+  // The ledger rejected it or never saw it, and the unique index ignores those rows too — so a fresh
+  // receipt has room. Treating a FAILED row as holding the slot would block the retry that fixes it.
   for (const status of ['FAILED', 'CANCELLED'] as const) {
     const d = decideInvoicePaymentRegistration({ ...base, existing: [{ status, amount: 100, paymentId: 'pay-old' }] })
     assert.equal(d.register, true, status)
   }
 })
 
-test('an existing sync with no recorded amount fails CLOSED', () => {
-  // "How much has the ledger already been told" is the whole guard. A row we cannot read makes the answer
-  // unknown, not zero — and guessing zero is exactly how the invoice gets paid twice.
+test('a live row with no recorded amount still blocks, and says nothing about how much', () => {
+  // The slot is taken whether or not the amount is readable — so this fails closed by construction. The
+  // operator message must not invent a figure it does not have.
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [{ status: 'SYNCED', amount: null, paymentId: 'pay-old' }],
   })
-  assert.equal(d.register === false && d.refusal, 'UNKNOWN_REGISTERED_AMOUNT')
+  assert.equal(d.register === false && d.refusal, 'LEDGER_HAS_LIVE_PAYMENT')
+  assert.equal(d.register === false && d.alreadyRegistered, undefined)
 })
 
 test('an unreadable amount on a rejected row does not block a fresh receipt', () => {
-  // Fail-closed applies to money the ledger HOLDS. A rejected row holds nothing, readable or not.
+  // The slot-taken rule applies to rows the ledger HOLDS. A rejected row holds nothing, readable or not.
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [{ status: 'FAILED', amount: null, paymentId: 'pay-old' }],
@@ -124,8 +119,8 @@ test('an unreadable amount on a rejected row does not block a fresh receipt', ()
 })
 
 test('this receipt does not count against itself when the decision is re-run', () => {
-  // The idempotency key already makes a second queue a no-op, so counting our own row as capacity used
-  // would refuse the retry with a false over-pay warning.
+  // The idempotency key already makes a second queue a no-op, so treating our own row as the slot-taker
+  // would refuse the retry for its own success.
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [{ status: 'PENDING', amount: 100, paymentId: 'pay-new' }],
@@ -133,15 +128,16 @@ test('this receipt does not count against itself when the decision is re-run', (
   assert.equal(d.register, true)
 })
 
-test('a tax-inclusive invoice is measured against what the ledger holds, not the gross order total', () => {
-  // The caller passes ledgerTotal from ledgerSalesInvoiceTotalForeign: a tax-inclusive invoice posts at
-  // NET (o3d-cyn), so a gross receipt against it would EXCEED the invoice and Xero would reject the
-  // payment. Refusing here turns a rejected sync into a warning that names the number.
+test('an imported tax-inclusive invoice is measured against what the ledger holds, not the gross total', () => {
+  // The caller passes ledgerTotal from ledgerSalesInvoiceTotalForeign: an IMPORTED tax-inclusive invoice
+  // posts at NET (o3d-cyn), so a gross receipt against it would EXCEED the invoice and Xero would reject
+  // it. Refusing here turns a rejected sync into a warning that names the number. An order raised in IMS
+  // posts at gross and is unaffected.
   const d = decideInvoicePaymentRegistration({ ...base, paymentAmount: 120, ledgerTotal: 100 })
   assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY')
 })
 
 test('sub-penny rounding does not refuse an exact settlement', () => {
-  const d = decideInvoicePaymentRegistration({ ...base, paymentAmount: 60.005, ledgerTotal: 100, existing: [{ status: 'SYNCED', amount: 40, paymentId: 'pay-old' }] })
+  const d = decideInvoicePaymentRegistration({ ...base, paymentAmount: 100.004, ledgerTotal: 100 })
   assert.equal(d.register, true)
 })
