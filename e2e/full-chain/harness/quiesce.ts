@@ -629,7 +629,15 @@ let watchdog: NodeJS.Timeout | null = null
  * the fence makes the fence fail and the release silently do nothing (Codex, PR #560 round 3).
  */
 let renewInFlight: Promise<void> | null = null
-/** When we last PROVED we still own the row. Not when we last tried. */
+/**
+ * When we last PROVED we still own the row, on a MONOTONIC clock.
+ *
+ * Not Date.now(). If the host clock steps backwards (ntp correction, a VM resuming), a wall-clock
+ * leaseProvenAt can sit in the future and the watchdog then never trips — while another host, judging
+ * the same lock by the DATABASE's clock, expires it after the TTL and starts a second run. The two
+ * would be driving the shared store together with the fence silently disarmed (Codex, PR #560 round 7).
+ * performance.now() cannot be moved by anything.
+ */
 let leaseProvenAt = 0
 
 /** Does THIS process hold the quiesce lock? Teardown asks before touching anything shared. */
@@ -740,7 +748,7 @@ function loseLease(reason: string): void {
  * Both timers are unref'd so they can never hold the process open on their own.
  */
 function startHeartbeat(token: LockToken, lock: LockRecord): void {
-  leaseProvenAt = Date.now()
+  leaseProvenAt = performance.now()
 
   heartbeat = setInterval(() => {
     if (renewInFlight) return // serialized: never two renewals racing to write heartbeatAt
@@ -756,8 +764,8 @@ function startHeartbeat(token: LockToken, lock: LockRecord): void {
           pgLockStore(db).writeIfOwned(token, raw), LEASE_RENEW_TIMEOUT_MS, 'the lease renewal write',
         )
         if (owned) {
-          // Monotonic: a late renewal must never move the proof backwards.
-          leaseProvenAt = Math.max(leaseProvenAt, Date.now())
+          // Monotonic in two senses: a monotonic CLOCK, and never moved backwards by a late renewal.
+          leaseProvenAt = Math.max(leaseProvenAt, performance.now())
           if (held) held = { token, raw }
           return
         }
@@ -781,7 +789,7 @@ function startHeartbeat(token: LockToken, lock: LockRecord): void {
   heartbeat.unref()
 
   watchdog = setInterval(() => {
-    const msSinceProven = Date.now() - leaseProvenAt
+    const msSinceProven = performance.now() - leaseProvenAt
     if (leaseVerdict({ ownershipLost: false, msSinceProven }) === 'stop') {
       loseLease(
         `the quiesce lock lease has not been PROVEN for ${Math.round(msSinceProven / 1000)}s — within ` +
@@ -937,8 +945,19 @@ async function releaseInternal(
   // A SERVER-SIDE deadline, not just a local one. Abandoning a promise leaves the query running, and a
   // restore write that resumes after another host has recovered our fence would re-enable stage
   // underneath that run (Codex, PR #560 round 6). statement_timeout makes Postgres cancel it instead.
-  for (const db of [stage, e2e]) {
-    await db.query(`set statement_timeout = ${RESTORE_STATEMENT_TIMEOUT_MS}`).catch(() => {})
+  for (const [name, db] of [['stage', stage], ['e2e', e2e]] as const) {
+    try {
+      await db.query(`set statement_timeout = ${RESTORE_STATEMENT_TIMEOUT_MS}`)
+    } catch (e) {
+      // Swallowing this left the writes UNBOUNDED — the exact condition the timeout exists to prevent,
+      // silently (Codex, PR #560 round 7). Better to restore nothing and say so: the lock stays fenced,
+      // the next run recovers it after the releasing window, and the operator has an accurate error.
+      throw new Error(
+        `Refusing to restore: could not install a statement timeout on the ${name} connection ` +
+          `(${e instanceof Error ? e.message : e}), so a stalled write could outlive this release fence ` +
+          `and land underneath the next run. Nothing was restored; stage is still disabled.`,
+      )
+    }
   }
 
   for (const [key, value] of Object.entries(lock.stageSettings)) {
