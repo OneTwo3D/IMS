@@ -7,12 +7,7 @@ import type {
 } from '@/lib/connectors/wms/types'
 import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
-import {
-  assertMintsoftOrderClient,
-  fetchMintsoftOrderById,
-  MintsoftTenantMismatchError,
-  requireMintsoftClientId,
-} from './orders'
+import { assertMintsoftOrderClient, requireMintsoftClientId } from './orders'
 import { getMintsoftSettings, parseMintsoftPositiveId } from '../settings/schema'
 
 /**
@@ -216,115 +211,48 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
     created = await createOrder(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
   }
 
-  // Did the create report an id we could not verify? Then we must NOT bind it, but
-  // we must not strand it either — the order may well exist.
-  let unverifiedCreatedId: string | null = null
-
+  // A create that unambiguously succeeded binds the id Mintsoft minted for it.
+  //
+  // Deliberately NOT read back first (o3d-bjc.6 / o3d-bjc.8). An earlier revision of
+  // this fix verified the new order with a scoped detail fetch, which sounds strictly
+  // safer but is not: the create has ALREADY happened, so any verification failure
+  // leaves only bad options — bind unverified, or throw and let the sweep re-PUT,
+  // duplicating a real warehouse order (or dead-lettering the link while a live order
+  // stays unlinked and can never be cancelled). Resolving that properly needs a
+  // durable "created but unverified" link state so later sweeps re-verify instead of
+  // re-creating; that is a push-link state-machine change, filed as o3d-bjc.8.
+  //
+  // Nothing is lost in the meantime: this id came from an order Mintsoft just created
+  // under our own API credentials, and every subsequent read and mutation re-proves
+  // ownership through the ClientId-scoped gate, so a wrong binding can never amend,
+  // cancel, comment on or dispatch someone else's order. The cross-client hazard this
+  // issue is actually about is the DEDUPE path below, which SELECTS a pre-existing
+  // order by a collidable order number — that one is now fully scoped and asserted.
   if (created.ok && created.data) {
     const externalOrderId = toStr(created.data.OrderId)
     if (externalOrderId) {
-      // Verify the order we just created really is ours before binding the link
-      // (o3d-bjc.6). A create routed into an unintended client context would
-      // otherwise be trusted purely because it echoed an OrderId.
-      //
-      // A FOREIGN row is FATAL and must stay fatal — but a transport/parse failure
-      // must NOT discard the id Mintsoft just minted, or the sweep records a failed
-      // create and re-PUTs next tick (duplicate warehouse order, or a dead-lettered
-      // link while a live order stays unlinked and uncancellable). Hence the typed
-      // MintsoftTenantMismatchError: only an ownership violation escapes.
-      let createdOrder: RawOrder | null = null
-      try {
-        createdOrder = await fetchMintsoftOrderById(externalOrderId, clientId)
-      } catch (error) {
-        if (error instanceof MintsoftTenantMismatchError) throw error
-        console.warn(
-          `[mintsoft-order-push] could not read back created order ${externalOrderId}: `
-            + `${error instanceof Error ? error.message : String(error)}`,
-        )
+      return {
+        externalOrderId,
+        externalOrderNumber: toStr(created.data.OrderNumber) ?? input.orderNumber,
+        status: 'NEW',
+        courierFallback,
       }
-      if (createdOrder) {
-        return {
-          externalOrderId,
-          externalOrderNumber: toStr(createdOrder.OrderNumber) ?? toStr(created.data.OrderNumber) ?? input.orderNumber,
-          status: 'NEW',
-          courierFallback,
-        }
-      }
-      unverifiedCreatedId = externalOrderId
-      console.warn(
-        `[mintsoft-order-push] created order ${externalOrderId} is not yet readable under ClientId ${clientId} — `
-          + 'trying the scoped reference lookup before binding it unverified',
-      )
     }
   }
 
-  // Duplicate (lost writeback), or a create we couldn't verify by id → resolve the
-  // order that exists. This binds our link to an order we did not just prove is
-  // ours, so the ClientId scope + per-row assertion inside are essential.
-  if (unverifiedCreatedId !== null || (created.message && /already exists/i.test(created.message))) {
-    let existing: RawOrder | null = null
-    try {
-      existing = await findExistingByReference(input, clientId)
-    } catch (error) {
-      // Same rule as above — and when we hold a minted id, a failed search must not
-      // cost us that id either. With no minted id there is nothing to fall back on.
-      if (error instanceof MintsoftTenantMismatchError || unverifiedCreatedId === null) throw error
-      console.warn(
-        `[mintsoft-order-push] reference lookup failed while verifying created order ${unverifiedCreatedId}: `
-          + `${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
+  // Duplicate → reconcile to the order that already exists (lost writeback). THIS is
+  // the branch that binds our link to a pre-existing order chosen by a collidable
+  // number, so the ClientId scope + per-row assertion inside are essential.
+  if (created.message && /already exists/i.test(created.message)) {
+    const existing = await findExistingByReference(input, clientId)
     const externalOrderId = existing ? toStr(existing.ID ?? existing.Id ?? existing.id) : null
     if (existing && externalOrderId) {
-      // IDENTITY, not just tenancy (Codex): on the unverified-create path the search
-      // may legitimately return exactly one OLDER order sharing this collidable
-      // number/reference. Binding that would point the link at the wrong same-client
-      // order — mutating and cancelling IT while the order we just created stays
-      // unlinked and still ships. Only accept the row that IS the minted order.
-      if (unverifiedCreatedId !== null && externalOrderId !== unverifiedCreatedId) {
-        console.warn(
-          `[mintsoft-order-push] reference lookup for created order ${unverifiedCreatedId} matched a DIFFERENT `
-            + `order ${externalOrderId} sharing the number — keeping the minted id`,
-        )
-      } else {
-        return {
-          externalOrderId,
-          externalOrderNumber: toStr(existing.OrderNumber) ?? input.orderNumber,
-          status: 'NEW',
-          courierFallback,
-        }
+      return {
+        externalOrderId,
+        externalOrderNumber: toStr(existing.OrderNumber) ?? input.orderNumber,
+        status: 'NEW',
+        courierFallback,
       }
-    }
-  }
-
-  if (unverifiedCreatedId !== null) {
-    // The order EXISTS — Mintsoft said Success and gave us its id — we just can't
-    // see it yet through either lookup. Bind it rather than throw.
-    //
-    // Throwing here would be the worse failure (Codex): the sweep would record a
-    // failed create with no external id, re-PUT on the next tick, and recovery would
-    // hinge on Mintsoft rejecting that second create with an English "already exists"
-    // message. Otherwise we duplicate a real warehouse order — or dead-letter the
-    // link after five attempts while a live order stays unlinked and can never
-    // receive a hold or cancellation.
-    //
-    // Binding it costs nothing on the tenant boundary: a FOREIGN order is already
-    // fatal above (MintsoftTenantMismatchError always escapes — only a 404 or a
-    // transport failure reaches here), and every later mutation re-proves ownership
-    // through the scoped gate, so a mis-bound link can never amend, cancel or
-    // comment. The cross-client hazard this issue is about lives on the dedupe path,
-    // which SELECTS a pre-existing order by a collidable number — not on an id
-    // Mintsoft just minted for us. And the minted id is the BEST identity available:
-    // it is the order Mintsoft says it created, so it beats a same-number match.
-    console.warn(
-      `[mintsoft-order-push] binding created order ${unverifiedCreatedId} without a read-back — not yet visible `
-        + `under ClientId ${clientId}; every mutation re-verifies ownership before it writes`,
-    )
-    return {
-      externalOrderId: unverifiedCreatedId,
-      externalOrderNumber: toStr(created.data?.OrderNumber) ?? input.orderNumber,
-      status: 'NEW',
-      courierFallback,
     }
   }
 
