@@ -315,7 +315,29 @@ async function handleProductWebhook(payload: unknown) {
         create: { key: 'last_wc_product_sync_at', value: new Date().toISOString() },
         update: { value: new Date().toISOString() },
       })
+    } else if (result.permanent) {
+      // A deterministic mapping conflict (the GTIN or the WC id already belongs to a different IMS
+      // product). Re-delivering this payload re-hits the identical constraint, so the delivery is
+      // ACKNOWLEDGED rather than retried ~24 times into the dead-letter queue — and logged at ERROR
+      // because nothing will import this product until an operator resolves the duplicate (o3d-gtk).
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_product_webhook_rejected',
+        tag: 'sync',
+        level: 'ERROR',
+        description: `WooCommerce product webhook for ${productPayload.sku} hit a permanent mapping conflict; `
+          + 'acknowledged rather than retried — resolve the duplicate barcode/WooCommerce id in IMS',
+        metadata: {
+          externalId: productPayload.id,
+          sku: productPayload.sku,
+          error: result.error ?? 'Unknown product sync error',
+          permanent: true,
+        },
+      })
     } else {
+      // TRANSIENT: a retry can still succeed, so this branch — and only this branch — is the one
+      // o3d-i0y (PR #551) turns into a retryable HTTP 500. Keeping the two apart here is the whole
+      // point of o3d-gtk: without it, i0y's 500 also retries the permanent conflicts above.
       await logActivity({
         entityType: 'SYNC',
         action: 'wc_product_webhook',

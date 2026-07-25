@@ -9,6 +9,7 @@ import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { getSettingValue } from '@/lib/settings-store'
 import { wcFetch, wcPut } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
+import { isPermanentProductSyncConflict } from './product-sync-errors'
 import {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   WC_SETTINGS_VERSION_KEY,
@@ -395,6 +396,10 @@ async function persistMappingIfVersionMatches(
  * No HTTP call may move inside the transaction: it holds row locks, and a slow
  * WooCommerce would hold them for the length of the request.
  *
+ * `permanent: true` on a failure means re-running this identical payload re-hits the identical
+ * conflict, so the caller should acknowledge and report it rather than retry (o3d-gtk; see
+ * product-sync-errors.ts for why only barcode/externalProductId qualify).
+ *
  * NOT COVERED (o3d-mlc7): this function does not participate in the credential-rebind fence
  * described in sync-lock.ts. It takes the per-SKU locks but never WC_SYNC_ADVISORY_LOCK_KEY
  * and never checks `wc_settings_version`, so an import carrying store-A data can resume after
@@ -402,7 +407,9 @@ async function persistMappingIfVersionMatches(
  * ownership guard does not help: it treats a wiped (null) mapping as adoptable, which is the
  * same outcome the previous unconditional update produced. Pre-existing, not introduced here.
  */
-export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ success: boolean; error?: string }> {
+export async function syncWcProductToIms(
+  wcProduct: WcFullProduct,
+): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
   try {
     const sku = asTrimmedString(wcProduct.sku)
     if (!sku) return { success: true } // skip products without SKU
@@ -630,17 +637,20 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
     return { success: true }
   } catch (e) {
+    const permanent = isPermanentProductSyncConflict(e)
     await db.shoppingSyncLog.create({
       data: {
         direction: 'FROM_CONNECTOR',
         status: 'FAILED',
         entityType: 'Product',
         externalId: String(wcProduct.id),
-        errorMessage: String(e),
+        // Prefix the permanent ones so the sync-log view distinguishes "will never succeed,
+        // needs an operator" from "retrying" without re-parsing the Prisma error (o3d-gtk).
+        errorMessage: permanent ? `PERMANENT_CONFLICT: ${String(e)}` : String(e),
         syncedAt: new Date(),
       },
     })
-    return { success: false, error: String(e) }
+    return { success: false, error: String(e), permanent }
   }
 }
 
