@@ -408,3 +408,54 @@ test('transient failure: a non-constraint error is never permanent (o3d-gtk)', a
     txClient.product.create = realCreate
   }
 })
+
+test('a SKU-ownership conflict is permanent — retrying it re-reads the same two claimants (o3d-fsi)', async () => {
+  const { isPermanentProductSyncConflict, WcSkuOwnershipConflictError, isWcSkuOwnershipConflict } = await import(
+    '@/lib/connectors/woocommerce/sync/product-sync-errors'
+  )
+
+  const conflict = new WcSkuOwnershipConflictError({
+    sku: 'SHARED-SKU',
+    claimedByWcId: '999',
+    incomingWcId: '111',
+    imsProductId: 'ims-1',
+  })
+
+  assert.equal(isWcSkuOwnershipConflict(conflict), true)
+  assert.equal(
+    isPermanentProductSyncConflict(conflict),
+    true,
+    'both claimants come from committed state, so a retry reaches the identical conclusion',
+  )
+  // A copy that lost its prototype (re-thrown across a boundary, structured-cloned) must
+  // still classify, or the conflict silently reverts to 24 pointless retries.
+  assert.equal(
+    isPermanentProductSyncConflict({ name: 'WcSkuOwnershipConflictError', message: String(conflict) }),
+    true,
+    'duck-typed copies classify too',
+  )
+})
+
+test('end to end: an import refused for SKU ownership reports permanent (o3d-fsi)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+
+  // WIDGET-1 already belongs to WooCommerce product 999.
+  state.products.push({
+    id: 'ims-other',
+    sku: 'WIDGET-1',
+    name: 'Someone else',
+    barcode: null,
+    externalProductId: BigInt(999),
+    type: 'SIMPLE',
+    lifecycleStatus: 'ACTIVE',
+  })
+
+  const result = await syncWcProductToIms(simpleProduct({ id: 42, sku: 'WIDGET-1' }))
+
+  assert.equal(result.success, false)
+  assert.equal(result.permanent, true, 'a stolen-row refusal must not retry 24 times')
+  assert.match(String(result.error), /already mapped to WooCommerce object 999/)
+  assert.equal(state.products.length, 1, 'the other product was neither rewritten nor duplicated')
+  assert.equal(state.products[0].name, 'Someone else', 'no reparent, no field overwrite')
+})

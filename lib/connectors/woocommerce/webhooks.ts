@@ -316,17 +316,18 @@ async function handleProductWebhook(payload: unknown) {
         update: { value: new Date().toISOString() },
       })
     } else if (result.permanent) {
-      // A deterministic mapping conflict (the GTIN or the WC id already belongs to a different IMS
-      // product). Re-delivering this payload re-hits the identical constraint, so the delivery is
-      // ACKNOWLEDGED rather than retried ~24 times into the dead-letter queue — and logged at ERROR
-      // because nothing will import this product until an operator resolves the duplicate (o3d-gtk).
+      // A deterministic mapping conflict: the GTIN, the WC id, or the SKU itself already belongs
+      // to a different IMS product (o3d-gtk, o3d-fsi). Re-delivering this payload reaches the
+      // identical conclusion, so the delivery is ACKNOWLEDGED rather than retried ~24 times into
+      // the dead-letter queue — and logged at ERROR, because nothing will import this product
+      // until an operator resolves the duplicate. `error` carries which claim collided.
       await logActivity({
         entityType: 'SYNC',
         action: 'wc_product_webhook_rejected',
         tag: 'sync',
         level: 'ERROR',
         description: `WooCommerce product webhook for ${productPayload.sku} hit a permanent mapping conflict; `
-          + 'acknowledged rather than retried — resolve the duplicate barcode/WooCommerce id in IMS',
+          + 'acknowledged rather than retried — resolve the duplicate SKU / barcode / WooCommerce id in IMS',
         metadata: {
           externalId: productPayload.id,
           sku: productPayload.sku,
