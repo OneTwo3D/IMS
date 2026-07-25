@@ -256,6 +256,42 @@ export function mapWcOrderDiscount(couponLines: WcCouponLine[]): {
   }
 }
 
+// Coupon money below this is allocation rounding (Woo splitting a coupon across lines), not a
+// real order-level discount. Half a penny, so it can never round up to a posted 0.01.
+const COUPON_ALLOCATION_TOLERANCE = 0.005
+
+/**
+ * Split a WooCommerce coupon total into the part already carried by the line items and the
+ * residual that belongs in IMS's order-level `discountAmount` slot (o3d-y14).
+ *
+ * Woo allocates cart-coupon money INTO the lines: `line_items[].total` is already
+ * `subtotal` minus that line's share of every coupon, and mapWcLineItems turns that difference
+ * into a per-line `discountAmount`. IMS's ORDER-LEVEL slot means the opposite — a discount that
+ * is NOT in the lines (a native order's `orderDiscountForeign`, which is deducted from the order
+ * total). Populating both with the same coupon made every downstream consumer deduct it twice:
+ * the Xero builder applies the per-line figure as a `DiscountRate` AND appends the order-level
+ * figure as a negative line, so a £90 order posted as £80.
+ *
+ * Both inputs are net of tax on the same basis — Woo keeps `coupon_lines[].discount_tax` and
+ * `line_items[].subtotal_tax`/`total_tax` separate from the amounts compared here.
+ *
+ * The residual is normally exactly zero. A non-zero one means a coupon shape we do not model, so
+ * it is returned as `unallocated` for the caller to log rather than silently dropped — dropping
+ * it would overstate the invoice by money the customer was never charged.
+ */
+export function resolveWcOrderLevelDiscount(input: {
+  couponTotalForeign: DecimalInput
+  lineDiscountTotalForeign: DecimalInput
+}): { orderLevelDiscount: number; unallocated: number } {
+  const couponTotal = roundDecimalNumber(input.couponTotalForeign, 4)
+  const lineDiscountTotal = roundDecimalNumber(input.lineDiscountTotalForeign, 4)
+  const residual = roundDecimalNumber(couponTotal - lineDiscountTotal, 4)
+  // Clamped at zero: per-line markdowns can legitimately exceed the coupon (a sale price plus a
+  // coupon), and a negative order-level discount would post as a POSITIVE invoice line.
+  if (residual <= COUPON_ALLOCATION_TOLERANCE) return { orderLevelDiscount: 0, unallocated: 0 }
+  return { orderLevelDiscount: residual, unallocated: residual }
+}
+
 // ---------------------------------------------------------------------------
 // Shipping mapping
 // ---------------------------------------------------------------------------
