@@ -1,0 +1,403 @@
+import assert from 'node:assert/strict'
+import test, { mock } from 'node:test'
+
+// Unit coverage for the Order/List delta paginator (o3d-bjc). fetchMintsoftOrderList
+// reaches Mintsoft via mintsoftRequest and resolves the deep-link template via
+// getMintsoftSettings — both mocked here so the paginator is testable without HTTP/DB.
+//
+// This file must NOT statically import anything that pulls in the WMS registry
+// (which eagerly constructs the Mintsoft connector → the real orders/client
+// modules), or the mocks below would bind too late. Orders is lazily imported
+// inside each test, after the mocks are registered.
+
+let listCalls: Array<Record<string, string>> = []
+let listResponder: (pageNo: number) => unknown[] = () => []
+let listError: string | null = null
+// Call counters prove the o3d-bjc "resolve once per list, not per row" fix: a
+// multi-row page must not fan out one settings/statuses lookup per order.
+let settingsCalls = 0
+let statusCalls = 0
+// The /api/Order/Statuses body, swappable per test so the o3d-bjc.2.2 fail-closed
+// status-map cases (malformed / empty / unresolvable id) can be exercised.
+const DEFAULT_STATUSES: unknown = [{ ID: 4, Name: 'DESPATCHED' }, { ID: 17, Name: 'PICKED' }]
+let statusResponder: () => unknown = () => DEFAULT_STATUSES
+
+mock.module('@/lib/connectors/mintsoft/settings/schema', {
+  namedExports: {
+    getMintsoftSettings: async () => {
+      settingsCalls += 1
+      return { mintsoft_admin_order_url_template: 'https://wms.example/Order/{id}' }
+    },
+    MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE: 'https://wms.example/Order/{id}',
+    MINTSOFT_SETTING_KEYS: [],
+    parseMintsoftPositiveId: (value: string | null | undefined): number | null => {
+      if (value == null) return null
+      const trimmed = String(value).trim()
+      if (!/^\d+$/.test(trimmed)) return null
+      const parsed = Number.parseInt(trimmed, 10)
+      return Number.isInteger(parsed) && parsed > 0 ? parsed : null
+    },
+  },
+})
+mock.module('@/lib/connectors/mintsoft/api/client', {
+  namedExports: {
+    mintsoftRequest: async (path: string) => {
+      if (path.startsWith('/api/Order/Statuses')) {
+        statusCalls += 1
+        return { data: statusResponder(), status: 200 }
+      }
+      const qs = new URLSearchParams(path.split('?')[1] ?? '')
+      listCalls.push(Object.fromEntries(qs.entries()))
+      if (listError) return { data: null, error: listError, status: 500 }
+      return { data: listResponder(Number(qs.get('PageNo') ?? '1')), status: 200 }
+    },
+  },
+})
+
+async function loadFetch(): Promise<(typeof import('@/lib/connectors/mintsoft/api/orders'))['fetchMintsoftOrderList']> {
+  return (await import('@/lib/connectors/mintsoft/api/orders')).fetchMintsoftOrderList
+}
+
+/** Drop the memoised status map so a test can serve its own /Order/Statuses body. */
+async function resetStatusCache(): Promise<void> {
+  ;(await import('@/lib/connectors/mintsoft/api/orders')).resetMintsoftOrderStatusCacheForTests()
+}
+
+// Every delta is scoped to our ClientId, and every ROW must echo it (fail closed).
+const CLIENT = 5
+// Build a well-formed, in-scope row (carries our ClientId).
+function row(id: number, over: Record<string, unknown> = {}) {
+  return { ID: id, OrderNumber: `N${id}`, OrderStatusId: 4, ClientId: CLIENT, ...over }
+}
+
+test('fetchMintsoftOrderList paginates until a short page and carries the delta params', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  const fullPage = Array.from({ length: 200 }, (_, i) => row(i + 1))
+  listResponder = (pageNo) => (pageNo === 1 ? fullPage : pageNo === 2 ? [row(201), row(202)] : [])
+
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, limit: 200 })
+  assert.equal(out.length, 202)
+  assert.equal(listCalls.length, 2) // stopped on the short 2nd page
+  assert.equal(listCalls[0].SinceLastUpdated, '2026-07-15T12:00:00')
+  assert.equal(listCalls[0].IncludeOrderItems, 'true')
+  assert.equal(listCalls[0].SortOldestFirst, 'true')
+  assert.equal(listCalls[0].Limit, '200')
+  assert.equal(listCalls[0].ClientId, String(CLIENT)) // always scoped
+  assert.equal(listCalls[1].PageNo, '2')
+})
+
+// --- Finding 1: ClientId scoping (fail closed, whole-response) --------------
+
+test('[o3d-bjc] fetchMintsoftOrderList FAILS CLOSED without a clientId (never runs an unscoped cross-client delta)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => []
+  await assert.rejects(
+    // @ts-expect-error — intentionally omitting the now-required clientId
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00' }),
+    /unscoped cross-client delta/,
+  )
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: null }),
+    /requires a ClientId/,
+  )
+  assert.equal(listCalls.length, 0) // never even issued a request
+})
+
+test('[o3d-bjc] fetchMintsoftOrderList always sends ClientId and passes optional Channel/Warehouse filters', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => [] // short (empty) first page → returns immediately
+  await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: 42, warehouseId: 7, channelId: 3, limit: 100 })
+  assert.equal(listCalls[0].ClientId, '42')
+  assert.equal(listCalls[0].WarehouseId, '7')
+  assert.equal(listCalls[0].ChannelId, '3')
+})
+
+test('[o3d-bjc] a row MISSING a ClientId rejects the WHOLE response (fails closed — cannot verify tenant)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  // Second row has no ClientId — unverifiable → the whole delta is rejected so
+  // contract drift can never quietly advance the watermark past unverified rows.
+  listResponder = () => [row(1), { ID: 2, OrderNumber: 'N2', OrderStatusId: 4 }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /has no ClientId/,
+  )
+})
+
+test('[o3d-bjc] a row with a FOREIGN ClientId rejects the WHOLE response (fails closed — never applied to a local link)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  // A foreign row sharing our order number would otherwise be a cross-tenant hazard.
+  listResponder = () => [row(1), row(2, { ClientId: 99 })]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /does not match configured 5/,
+  )
+})
+
+test('fetchMintsoftOrderList throws (not truncates) when the delta overflows the page budget', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  const alwaysFull = Array.from({ length: 10 }, (_, i) => row(i + 1))
+  listResponder = () => alwaysFull // every page full → never short
+
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, limit: 10, maxPages: 3 }),
+    /exceeded 3 pages/,
+  )
+  assert.equal(listCalls.length, 3) // stopped at the budget
+})
+
+test('[o3d-bjc] a multi-row page resolves settings + statuses ONCE, not once per row', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  settingsCalls = 0
+  statusCalls = 0
+  const rows = Array.from({ length: 30 }, (_, i) => row(i + 1))
+  listResponder = (pageNo) => (pageNo === 1 ? rows : []) // 30 < default limit 200 → short first page
+
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out.length, 30)
+  assert.equal(settingsCalls, 1) // once for the whole list, NOT 30x (the pre-fix fan-out)
+  assert.ok(statusCalls <= 1, `statuses fetched at most once (was ${statusCalls})`) // 0 if cache warm, else 1 — never 30
+})
+
+test('[o3d-bjc] a malformed 2xx Order/List body throws (fails closed), not treated as an empty page', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => ({ Message: 'temporarily unavailable' }) as unknown as unknown[]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /expected an array/,
+  )
+
+  listResponder = () => null as unknown as unknown[]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /got null/,
+  )
+})
+
+test('[o3d-bjc] a row missing a valid ID throws (fails closed), not silently dropped', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => [row(1), { OrderNumber: 'N2', OrderStatusId: 4, ClientId: CLIENT }] // 2nd row: no ID
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /missing a valid ID/,
+  )
+})
+
+test('[o3d-bjc] a row missing an order number throws (fails closed)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => [{ ID: 7, OrderStatusId: 4, ClientId: CLIENT }] // no OrderNumber
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /missing an order number/,
+  )
+})
+
+// --- o3d-bjc.2.2: an UNRESOLVED dispatch status must never ride through clean --
+// A lenient status map (empty/malformed) normalises every row to status '' →
+// dispatched:false → a clean `pending`, so the sweep's watermark would advance
+// past orders whose real dispatch state was never determined and a genuinely
+// DESPATCHED order could be aged out of the delta window.
+
+test('[o3d-bjc.2.2] a malformed /Order/Statuses body throws and is NOT cached as an empty map', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => [row(1)]
+
+  await resetStatusCache()
+  statusResponder = () => ({ Message: 'temporarily unavailable' })
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /Order\/Statuses: expected an array/,
+  )
+
+  // An empty list is equally unusable — every OrderStatusId would be unresolvable.
+  statusResponder = () => []
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /returned no statuses/,
+  )
+
+  // An entry without a usable ID/Name is drift, not a status we can skip.
+  statusResponder = () => [{ ID: 4, Name: 'DESPATCHED' }, { Name: 'PICKED' }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /positive-integer ID or a non-empty string Name/,
+  )
+
+  // Nothing above was cached: a healthy body still resolves normally afterwards.
+  statusResponder = () => DEFAULT_STATUSES
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out.length, 1)
+  assert.equal(out[0].status, 'DESPATCHED')
+})
+
+test('[o3d-bjc.2.2] a delta row whose OrderStatusId is unresolvable throws (the watermark is retained)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // OrderStatusId 999 is absent from the status map → dispatch state unknown.
+  listResponder = () => [row(1), row(2, { OrderStatusId: 999 })]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /unresolved OrderStatusId \(999\) and no despatch date/,
+  )
+
+  // A row with NO OrderStatusId at all is the same unknown state.
+  listResponder = () => [row(3, { OrderStatusId: null })]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /unresolved OrderStatusId \(missing\) and no despatch date/,
+  )
+})
+
+test('[o3d-bjc.2.2] the status map rejects COERCIBLE junk (no "4junk" ids, no numeric names, no conflicting duplicates)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  listResponder = () => [row(1)]
+
+  // "4junk" would parseInt to 4 — a plausible id built from drift.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: '4junk', Name: 'DESPATCHED' }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /positive-integer ID or a non-empty string Name/,
+  )
+
+  // A numeric Name would stringify to a truthy but meaningless status.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: 4, Name: 123 }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /positive-integer ID or a non-empty string Name/,
+  )
+
+  // A non-integer id would truncate onto a real status id.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: 4.7, Name: 'DESPATCHED' }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /positive-integer ID or a non-empty string Name/,
+  )
+
+  // A duplicate id with a CONFLICTING name silently overwrote the first entry.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: 4, Name: 'DESPATCHED' }, { ID: 4, Name: 'CANCELLED' }]
+  await assert.rejects(
+    () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+    /ambiguous status map/,
+  )
+
+  // An identical duplicate is harmless and still resolves.
+  await resetStatusCache()
+  statusResponder = () => [{ ID: 4, Name: 'DESPATCHED' }, { ID: 4, Name: 'despatched' }]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out[0].status, 'DESPATCHED')
+})
+
+test('[o3d-bjc.2.2] a malformed or sentinel DespatchDate is NOT proof of despatch', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  // Each of these previously satisfied the unknown-status escape hatch AND
+  // isMintsoftDispatched purely by being non-empty.
+  for (const despatchDate of ['not-a-date', '0001-01-01T00:00:00', 0, '0', '']) {
+    listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: despatchDate })]
+    await assert.rejects(
+      () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+      /unresolved OrderStatusId \(999\) and no despatch date/,
+      `DespatchDate ${JSON.stringify(despatchDate)} must not prove despatch`,
+    )
+  }
+
+  // Trailing junk, calendar rollover, out-of-range time, and an out-of-range zone
+  // offset are all rejected — Date.parse alone accepts every one of them.
+  for (const despatchDate of [
+    '2026-07-15junk', '2026-02-30T09:00:00', '2026-04-31', '2026-07-15T24:00:00',
+    '2026-07-15T09:60:00', '2026-07-15T09:00:00+99:99', '2027-02-29',
+    // Offset range is ±14:00 inclusive, and hour 14 admits only :00.
+    '2026-07-15T09:00:00+14:01', '2026-07-15T09:00:00+14:59', '2026-07-15T09:00:00-14:01',
+    '2026-07-15T09:00:00+15:00', '2026-07-15T09:00:00-15:00', '2026-07-15T09:00:00+',
+  ]) {
+    listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: despatchDate })]
+    await assert.rejects(
+      () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+      /unresolved OrderStatusId \(999\) and no despatch date/,
+      `DespatchDate ${JSON.stringify(despatchDate)} must not prove despatch`,
+    )
+  }
+
+  // …while every REAL Mintsoft form still counts (no shipping regression).
+  for (const despatchDate of [
+    '2026-07-15T09:00:00', '2026-07-15 09:00:00', '2026-07-15', '2026-07-15T09:00',
+    '2026-07-15T09:00:00.1234567', '2026-07-15T09:00:00Z', '2026-07-15T09:00:00+01:00',
+    '2026-07-15t09:00:00', '2028-02-29T09:00:00',
+    // The offset boundary itself is valid in both directions, with and without a colon.
+    '2026-07-15T09:00:00+14:00', '2026-07-15T09:00:00-14:00', '2026-07-15T09:00:00+0100',
+  ]) {
+    listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: despatchDate })]
+    const proven = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+    assert.equal(proven[0].dispatched, true, `DespatchDate ${JSON.stringify(despatchDate)} must prove despatch`)
+  }
+
+  // …and a sentinel date on a KNOWN, non-despatched status must not mark it shipped.
+  listResponder = () => [row(1, { OrderStatusId: 17, DespatchDate: '0001-01-01T00:00:00' })]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out[0].status, 'PICKED')
+  assert.equal(out[0].dispatched, false)
+  assert.deepEqual(out[0].tracking, [])
+})
+
+test('[o3d-bjc.2.2] an unresolvable status is allowed when a DespatchDate proves the goods left', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = null
+  await resetStatusCache()
+  statusResponder = () => DEFAULT_STATUSES
+
+  listResponder = () => [row(1, { OrderStatusId: 999, DespatchDate: '2026-07-15T09:00:00', TrackingNumber: 'TN9' })]
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
+  assert.equal(out.length, 1)
+  assert.equal(out[0].status, '') // status name still unknown…
+  assert.equal(out[0].dispatched, true) // …but the despatch date is authoritative
+})
+
+test('fetchMintsoftOrderList throws on an HTTP error (so the sweep fails safe to reconcile)', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  listCalls = []
+  listError = 'Mintsoft request failed with status 500'
+  try {
+    await assert.rejects(
+      () => fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT }),
+      /Mintsoft request failed/,
+    )
+  } finally {
+    listError = null
+  }
+})

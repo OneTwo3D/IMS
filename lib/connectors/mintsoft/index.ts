@@ -5,10 +5,22 @@ import {
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
-import { fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
+import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
 import { addMintsoftOrderComment, cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
+import { parseMintsoftPositiveId } from './settings/schema'
+import { getSettingValue } from '@/lib/settings-store'
 
 const CONNECTOR = 'Mintsoft'
+
+async function getRequiredMintsoftClientId(): Promise<number> {
+  const clientId = parseMintsoftPositiveId(await getSettingValue('mintsoft_client_id'))
+  if (clientId === null) {
+    throw new Error(
+      'Mintsoft per-order lookup requires mintsoft_client_id — refusing an unscoped cross-client request',
+    )
+  }
+  return clientId
+}
 
 export class MintsoftConnector implements WmsConnector {
   readonly id = 'mintsoft' as const
@@ -79,19 +91,40 @@ export class MintsoftConnector implements WmsConnector {
   }
 
   async fetchOrderStatus(orderNumber: string): Promise<WmsOrderStatus | null> {
-    return fetchMintsoftOrderStatus(orderNumber)
+    return fetchMintsoftOrderStatus(orderNumber, await getRequiredMintsoftClientId())
+  }
+
+  async fetchOrderDelta(sinceIso: string): Promise<WmsOrderStatus[]> {
+    // FAIL CLOSED: the delta MUST be scoped to our own ClientId. Mintsoft is a
+    // shared 3PL tenant, so an unscoped Order/List returns every client's orders
+    // — and matching a foreign row to a local link by order number alone could
+    // mark OUR order shipped off a FOREIGN despatch. Without a valid
+    // mintsoft_client_id we refuse (fetchMintsoftOrderList throws on a null
+    // clientId); the sweep also gates on this so we normally never get here
+    // unscoped. Channel/Warehouse are optional extra scoping filters.
+    const [clientId, channelId, warehouseId] = await Promise.all([
+      getSettingValue('mintsoft_client_id'),
+      getSettingValue('mintsoft_channel_id'),
+      getSettingValue('mintsoft_warehouse_id'),
+    ])
+    return fetchMintsoftOrderList({
+      sinceLastUpdated: sinceIso,
+      clientId: parseMintsoftPositiveId(clientId),
+      channelId: parseMintsoftPositiveId(channelId) ?? undefined,
+      warehouseId: parseMintsoftPositiveId(warehouseId) ?? undefined,
+    })
   }
 
   async probeOrderPresence(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS'> {
-    return probeMintsoftOrderPresence(orderNumber)
+    return probeMintsoftOrderPresence(orderNumber, await getRequiredMintsoftClientId())
   }
 
   async fetchOrderParts(orderNumber: string): Promise<WmsOrderPart[]> {
-    return fetchMintsoftOrderParts(orderNumber)
+    return fetchMintsoftOrderParts(orderNumber, await getRequiredMintsoftClientId())
   }
 
   async fetchOrderPartItems(externalPartId: string): Promise<Array<{ sku: string; qty: number }>> {
-    return fetchMintsoftPartItems(externalPartId)
+    return fetchMintsoftPartItems(externalPartId, await getRequiredMintsoftClientId())
   }
 
   async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
@@ -154,7 +187,7 @@ export {
   mintsoftRequest,
   upsertMintsoftProduct,
 } from './api/client'
-export { fetchMintsoftOrderStatus } from './api/orders'
+export { fetchMintsoftOrderList, fetchMintsoftOrderStatus, normalizeMintsoftOrderRow } from './api/orders'
 export { cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
 export {
   normalizeMintsoftAsn,
@@ -169,4 +202,4 @@ export {
   normalizeMintsoftStockLine,
   normalizeMintsoftWarehouse,
 } from './api/normalizers'
-export { getMintsoftSettings, MINTSOFT_SETTING_KEYS, type MintsoftSettings } from './settings/schema'
+export { getMintsoftSettings, mintsoftDeltaScopeChanged, MINTSOFT_SETTING_KEYS, parseMintsoftPositiveId, type MintsoftSettings } from './settings/schema'

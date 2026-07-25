@@ -17,43 +17,53 @@ test('mergedParts splits a merged survivor and ignores plain/empty numbers', () 
 
 test('pickOrderRow prefers the exact OrderNumber match', () => {
   const rows = [
-    { ID: 1, OrderNumber: '9000' },
-    { ID: 2, OrderNumber: '5001' },
+    { ID: 1, OrderNumber: '9000', ClientId: 5 },
+    { ID: 2, OrderNumber: '5001', ClientId: 5 },
   ]
-  assert.equal(pickOrderRow(rows, '5001')?.ID, 2)
+  assert.equal(pickOrderRow(rows, '5001', 5)?.ID, 2)
 })
 
 test('pickOrderRow returns the primary (lowest Part) for a split order', () => {
   const rows = [
-    { ID: 11, OrderNumber: '5001', Part: 2 },
-    { ID: 10, OrderNumber: '5001', Part: 1 },
-    { ID: 12, OrderNumber: '5001', Part: 3 },
+    { ID: 11, OrderNumber: '5001', Part: 2, ClientId: 5 },
+    { ID: 10, OrderNumber: '5001', Part: 1, ClientId: 5 },
+    { ID: 12, OrderNumber: '5001', Part: 3, ClientId: 5 },
   ]
-  assert.equal(pickOrderRow(rows, '5001')?.ID, 10)
+  assert.equal(pickOrderRow(rows, '5001', 5)?.ID, 10)
 })
 
 test('pickOrderRow falls back to a single merged survivor, but not when ambiguous', () => {
-  const single = [{ ID: 20, OrderNumber: '5001+5002' }]
-  assert.equal(pickOrderRow(single, '5001')?.ID, 20)
+  const single = [{ ID: 20, OrderNumber: '5001+5002', ClientId: 5 }]
+  assert.equal(pickOrderRow(single, '5001', 5)?.ID, 20)
 
   const ambiguous = [
-    { ID: 21, OrderNumber: '5001+5002' },
-    { ID: 22, OrderNumber: '5001+5003' },
+    { ID: 21, OrderNumber: '5001+5002', ClientId: 5 },
+    { ID: 22, OrderNumber: '5001+5003', ClientId: 5 },
   ]
-  assert.equal(pickOrderRow(ambiguous, '5001'), null)
+  assert.equal(pickOrderRow(ambiguous, '5001', 5), null)
 })
 
 test('pickOrderRow sorts split parts even when Part is a string or missing', () => {
   const rows = [
-    { ID: 31, OrderNumber: '5001', Part: '2' },
-    { ID: 30, OrderNumber: '5001' }, // missing Part → treated as 1
+    { ID: 31, OrderNumber: '5001', Part: '2', ClientId: 5 },
+    { ID: 30, OrderNumber: '5001', ClientId: 5 }, // missing Part → treated as 1
   ]
-  assert.equal(pickOrderRow(rows, '5001')?.ID, 30)
+  assert.equal(pickOrderRow(rows, '5001', 5)?.ID, 30)
 })
 
 test('pickOrderRow returns null when nothing matches', () => {
-  assert.equal(pickOrderRow([{ ID: 1, OrderNumber: '9999' }], '5001'), null)
-  assert.equal(pickOrderRow([], '5001'), null)
+  assert.equal(pickOrderRow([{ ID: 1, OrderNumber: '9999', ClientId: 5 }], '5001', 5), null)
+  assert.equal(pickOrderRow([], '5001', 5), null)
+})
+
+test('pickOrderRow never selects a foreign or unverifiable client row', () => {
+  const rows = [
+    { ID: 1, OrderNumber: '5001', ClientId: 99 },
+    { ID: 2, OrderNumber: '5001' },
+    { ID: 3, OrderNumber: '5001', ClientId: 5 },
+  ]
+  assert.equal(pickOrderRow(rows, '5001', 5)?.ID, 3)
+  assert.equal(pickOrderRow(rows.slice(0, 2), '5001', 5), null)
 })
 
 test('buildDeepLink substitutes and encodes {id}; null when the template lacks it', () => {

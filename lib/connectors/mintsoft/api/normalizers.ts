@@ -77,6 +77,30 @@ export function extractMintsoftArrayPayload(value: unknown): unknown[] {
   return []
 }
 
+/**
+ * Like extractMintsoftArrayPayload, but THROWS when the payload is neither a bare
+ * array nor a recognised `{Data|Items|…}` wrapper of one. Used by paginated
+ * fetches (Order/List delta) where a malformed 2xx body — a proxy error object,
+ * schema drift, or null — must fail closed rather than masquerade as a complete
+ * empty page and let the caller advance its watermark past rows it never saw. A
+ * genuine empty array (or empty recognised wrapper) still returns [] without
+ * throwing.
+ */
+export function extractMintsoftArrayPayloadStrict(value: unknown, context: string): unknown[] {
+  if (Array.isArray(value)) return value
+  const record = asRecord(value)
+  if (record) {
+    for (const key of ARRAY_PAYLOAD_KEYS) {
+      if (Array.isArray(record[key])) return record[key] as unknown[]
+    }
+  }
+  const shape = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
+  throw new Error(
+    `Mintsoft ${context}: expected an array (or a recognised {${ARRAY_PAYLOAD_KEYS.join('|')}} wrapper of one) ` +
+      `but got ${shape} — refusing to treat a malformed response as a complete empty page`,
+  )
+}
+
 function extractMintsoftArrayPayloadWithKeys(value: unknown, keys: readonly string[]): unknown[] {
   if (Array.isArray(value)) return value
   const record = asRecord(value)

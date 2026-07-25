@@ -54,6 +54,9 @@ function deps(overrides: Partial<WmsDispatchSweepDeps>): WmsDispatchSweepDeps {
     repointLink: async () => {},
     recordDispatchError: async () => ({ deadLettered: false }),
     clearDispatchFailures: async () => {},
+    // Merge evidence is number-based, so the sweep asks how many links claim a
+    // number before repointing. One claimant per number is the normal case.
+    countLinksByOrderNumber: async (numbers) => new Map(numbers.map((number) => [number, 1])),
     ...overrides,
   }
 }
@@ -222,6 +225,7 @@ test('merge: a merged order repoints its link to the survivor, then dispatches u
       status: 'DESPATCHED',
       dispatched: true,
       isMerged: true,
+      mergedOrderNumbers: ['WC-1001', 'WC-1002'],
       tracking: [tracking({ trackingNumber: 'TN-S', carrier: 'DPD' })],
     }),
     repointLink: async (linkId, to) => { repoints.push({ linkId, to }) },
@@ -243,6 +247,7 @@ test('merge + split: survivor number used to fetch parts; reconciled ATOMICALLY 
       externalOrderNumber: 'WC-1001+WC-1002',
       status: 'PROCESSING',
       isMerged: true,
+      mergedOrderNumbers: ['WC-1001', 'WC-1002'],
       isSplit: true,
       partCount: 2,
     }),
