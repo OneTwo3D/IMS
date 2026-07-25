@@ -5,6 +5,7 @@ import {
   resolveMintsoftAuthMode,
   type MintsoftAuthMode,
 } from '@/lib/connectors/mintsoft/settings/schema'
+import { withMintsoftAuthLock } from '@/lib/connectors/mintsoft/api/auth-lock'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { validateExternalBaseUrl } from '@/lib/security/external-url-safety'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
@@ -350,30 +351,28 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
   }
 
   if (!mintsoftAuthRefreshInFlight) {
-    const tracked = (async () => {
-      const session = await requestMintsoftAuthSession(config.baseUrl, config.username, config.password)
-      // Re-read the mode AFTER the round trip. An operator can switch to
-      // api_key while this request is in flight; the switch clears the cached
-      // token, and persisting ours afterwards would resurrect a rotating token
-      // under a connection that is supposed to be on a fixed key.
-      //
-      // This cannot un-rotate the tenant key — that happened at Mintsoft the
-      // moment the request landed, and no local code can recall it. What it
-      // does is stop the local state from silently disagreeing with the chosen
-      // mode. Closing the window properly needs a durable cross-process lock
-      // around every /api/Auth call and mode transition: filed as follow-up.
-      const modeNow = await getMintsoftApiConfiguration().catch(() => null)
-      if (modeNow?.authMode === 'api_key') {
-        throw new Error(
-          'Mintsoft switched to fixed-key authentication while a credentials refresh was ' +
-          'in flight. Discarding the newly minted token. NOTE: that refresh already ' +
-          'regenerated the tenant API key, so the configured fixed key is now stale — ' +
-          'issue a new key in Mintsoft and update all integrations.',
-        )
+    const tracked = withMintsoftAuthLock('credentials-refresh', async () => {
+      // Re-read the mode INSIDE the lock, before the request. A transition to
+      // fixed-key mode holds this same lease while it tests and commits, so by
+      // the time we get here either it has not started (and it will then wait
+      // for us) or it has finished (and we see api_key and decline). That is
+      // what makes the guarantee hold rather than merely usually hold: the
+      // rotation happens at Mintsoft the instant the request lands, so the only
+      // real fix is never to send it, not to detect it afterwards.
+      const modeNow = await getMintsoftApiConfiguration()
+      if (modeNow.authMode === 'api_key') {
+        if (!modeNow.staticApiKey) {
+          throw new Error(
+            'Mintsoft switched to fixed-key authentication but no key is configured.',
+          )
+        }
+        return modeNow.staticApiKey
       }
+
+      const session = await requestMintsoftAuthSession(modeNow.baseUrl, modeNow.username, modeNow.password)
       await persistMintsoftAuthSession(session.token, session.expiresAt)
       return session.token
-    })()
+    })
     mintsoftAuthRefreshInFlight = tracked
     // Clear the slot once the refresh settles — resolve OR reject — comparing
     // against the exact promise stored so it always nulls out (the earlier
@@ -424,6 +423,19 @@ export async function clearCachedMintsoftTokenForFixedKeyMode(
 ): Promise<void> {
   if (mode !== 'api_key') return
   await invalidateMintsoftAccessToken()
+}
+
+/**
+ * Run an auth-mode transition (test + persist) under the same lease the
+ * credentials refresh takes, so the two can never overlap.
+ *
+ * Entering here waits for any in-flight `/api/Auth` call to finish; while we
+ * hold it, a refresh that wants to start blocks, and when it finally runs it
+ * re-reads the mode and declines. Without this the switch could verify a fixed
+ * key that an already-airborne login was about to invalidate.
+ */
+export async function withMintsoftAuthModeTransition<T>(fn: () => Promise<T>): Promise<T> {
+  return withMintsoftAuthLock('auth-mode-transition', fn)
 }
 
 export function verifyMintsoftWebhookSignature(

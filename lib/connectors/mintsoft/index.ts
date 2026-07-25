@@ -163,6 +163,7 @@ export {
   getMintsoftApiConfiguration,
   getMintsoftConnectionRecord,
   clearCachedMintsoftTokenForFixedKeyMode,
+  withMintsoftAuthModeTransition,
   invalidateMintsoftAccessToken,
   isMintsoftConfigured,
   isMintsoftFixedKeyMode,
