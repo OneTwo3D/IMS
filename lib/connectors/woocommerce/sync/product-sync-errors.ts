@@ -130,10 +130,14 @@ export function assertWcRowNotClaimedByAnotherWcObject(
  *     takes the UPDATE branch, and succeeds. This is exactly the concurrent-create race, and it
  *     is why classifying P2002 wholesale as permanent would DISCARD a legitimate update.
  *     o3d-uh2's advisory locks — which since o3d-fsi cover the parent SKU AND every variation
- *     SKU — remove that race, and the o3d-fsi ownership guard turns the one remaining
- *     cross-object case into an explicit `WcSkuOwnershipConflictError` rather than a P2002. A
- *     P2002 on `sku` reaching here is therefore an unmodelled path, and stays TRANSIENT so it
- *     keeps retrying and stays visible rather than being silently acked.
+ *     SKU — remove that race BETWEEN TWO WC SYNCS, and the o3d-fsi ownership guard turns the
+ *     cross-object case into an explicit `WcSkuOwnershipConflictError` rather than a P2002.
+ *     But the lock is COOPERATIVE and other `Product` writers do not take it: a manual create
+ *     (app/actions/products.ts) or a CSV import landing between the lookup and the create
+ *     still raises this. That is a live, modelled path — o3d-42hw — and it is precisely a
+ *     recoverable race, because the retry finds the committed row and, since a manually
+ *     created row carries no `externalProductId`, the ownership guard ADOPTS it. So `sku`
+ *     stays TRANSIENT: retrying is not merely safe here, it is the fix.
  *
  *   - P2002 on `barcode` / `externalProductId`: the committed row is a DIFFERENT product (a
  *     different SKU). A retry looks the target up by SKU again, misses again, takes the create

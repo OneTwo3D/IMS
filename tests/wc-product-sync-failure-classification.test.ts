@@ -144,10 +144,27 @@ async function runTransaction<T>(fn: (tx: typeof txClient) => Promise<T>): Promi
   }
 }
 
+/**
+ * Stands in for SELECT DISTINCT hashtext(sku) FROM unnest(...). Deterministic per SKU, so
+ * two transactions importing the same SKU still contend on the SAME lock id — which is
+ * what the serialization tests below assert. Ordering itself is covered in the o3d-fsi suite.
+ */
+async function queryLockIds(_strings: TemplateStringsArray, ...values: unknown[]) {
+  const skus = values[0] as string[]
+  const ids = new Map<string, number>()
+  for (const sku of skus) {
+    let hash = 0
+    for (const char of sku) hash = (hash * 31 + char.charCodeAt(0)) | 0
+    ids.set(sku, hash)
+  }
+  return [...new Set(ids.values())].map((lock_id) => ({ lock_id }))
+}
+
 mock.module('@/lib/db', {
   namedExports: {
     db: {
       ...txClient,
+      $queryRaw: queryLockIds,
       $transaction: runTransaction,
     },
   },
