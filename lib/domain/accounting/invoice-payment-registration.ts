@@ -73,6 +73,10 @@ export function decideInvoicePaymentRegistration(input: {
   //
   // FAILED and CANCELLED rows hold nothing — the ledger rejected them or never saw them — and the index
   // ignores them too, so they free the slot again.
+  //
+  // Making the index receipt-scoped, so part payments can each register, is o3d-cjt8: it needs a
+  // migration and a look at existing rows, and until then a refusal an operator can read beats an insert
+  // that throws.
   const live = input.existing.filter(
     (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED'
     // Our OWN row, if this ever runs twice for one receipt: the idempotency key already makes the second
