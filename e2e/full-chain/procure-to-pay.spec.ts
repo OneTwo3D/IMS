@@ -1139,6 +1139,85 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
       if (payExtId) trackDocument('Payments', payExtId, `PP-09 bill payment ${runTag(runId)}`)
     }
   })
+
+  test('PP-11: a bill payment the ledger REJECTS leaves the bill outstanding in Xero, and the PO says so', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // THE REJECTED-PAYMENT FAILURE PATH (o3d-lgo.15), and the inverse of PP-09. markBillPaid marks the bill
+    // paid in IMS and only QUEUES the BILL_PAYMENT. When that sync later fails — a missing scope, a stale
+    // bank-account mapping, any Xero error — Xero never settles the bill and never posts its native
+    // realised FX, while IMS goes on displaying an unconditional green "Paid". Nothing read the payment row
+    // back to qualify the local claim, so the two systems disagreed in silence.
+    //
+    // FAILURE INJECTION, deliberately, because a rejection that depends on a real outage is not a test.
+    // The queued payment's bank account is rewritten to a valid-looking id Xero does not have, and its
+    // retryCount is seeded to one below MAX_RETRIES so the very next drain is TERMINAL. Both halves matter:
+    // a payment still retrying is PROGRESS (AWAITING_LEDGER, no discrepancy) and asserting a rejection
+    // against it would be asserting the wrong state.
+    const sku = taggedSku(runId, 'PP11')
+    const reference = `${runTag(runId)}-PP11`
+    const qty = 2
+    const unitCost = '30.00'
+    const bankCode = '090' // Demo "Business Bank Account" (GBP) — a REAL account, so the dialog behaves normally
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP11`, price: '45.00' })
+
+    const { poId } = await createAndSendPo(page, { sku, qty: String(qty), unitCost })
+    await receiveGoods(page, { expectStatus: 'Received' })
+    await createBill(page, { reference })
+
+    let billId = ''
+    try {
+      await processPendingXeroSyncViaUi(page)
+    } finally {
+      const receiptJournalId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: poId }).catch(() => '')
+      const rec = (await billIdsForPo(poId).catch((): string[] => []))[0]
+      billId = rec ? await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: rec }).catch(() => '') : ''
+      if (receiptJournalId) trackDocument('ManualJournals', receiptJournalId, `PP-11 stock receipt ${runTag(runId)}`)
+      if (billId) trackDocument('Invoices', billId, `PP-11 bill ${runTag(runId)}`)
+    }
+    expect(billId, 'the ACCPAY bill posted to Xero').toBeTruthy()
+
+    const [billRecordId] = await billIdsForPo(poId)
+    const billBefore = await getInvoice(billId)
+    expect(billBefore.Status, 'the bill is authorised (payable), not yet paid').toBe('AUTHORISED')
+    const billTotal = Number(billBefore.Total)
+
+    await openPurchaseOrder(page, poId)
+    await markBillPaidViaUi(page, { bankAccountId: await bankAccountIdForCode(bankCode), reference })
+
+    // The payment is queued but not yet drained — rewrite it into one Xero must refuse.
+    const doomed = await queryRows<{ id: string }>(
+      `update accounting_sync_logs
+          set payload = jsonb_set(payload::jsonb, '{bankAccountId}', '"00000000-0000-0000-0000-00000000dead"'),
+              "retryCount" = 4
+        where connector = 'xero' and type = 'BILL_PAYMENT' and "referenceId" = $1 and status = 'PENDING'
+        returning id`,
+      [billRecordId],
+    )
+    expect(doomed, 'markBillPaid queued exactly one BILL_PAYMENT to sabotage').toHaveLength(1)
+
+    await processPendingXeroSyncViaUi(page)
+
+    // 1. The payment is TERMINALLY rejected — not queued, not retrying.
+    const log = await billPaymentLogStatus(billRecordId)
+    expect(log?.status, 'the payment sync ended FAILED').toBe('FAILED')
+    expect(log?.error, 'the rejection carries the ledger\'s own reason').toBeTruthy()
+
+    // 2. THE LEDGER IS STILL OWED THE MONEY. Read back, not inferred: this is exactly the state the green
+    // "Paid" badge used to paper over.
+    const bill = await getInvoice(billId)
+    expect(bill.Status, 'the payable is still outstanding in Xero').toBe('AUTHORISED')
+    expect(Number(bill.AmountDue), 'the full amount is still due').toBeCloseTo(billTotal, 2)
+    expect(bill.Payments?.length ?? 0, 'no payment reached the ledger').toBe(0)
+
+    // 3. And the PO SAYS SO. IMS really was told the bill was paid, so the badge stays — but it now carries
+    // the ledger's dissent rather than hiding it.
+    await openPurchaseOrder(page, poId)
+    await page.getByRole('button', { name: /^Bills \(\d+\)$/ }).click()
+    await expect(page.getByText('LEDGER REJECTED').first()).toBeVisible({ timeout: 30_000 })
+  })
 })
 
 /** The PurchaseReturn row this PO produced. Its id — not the PO's — keys the return's journal. */

@@ -952,6 +952,25 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const isPaid = so.invoiceNumber != null && invoiceBalance <= 0.01
   const isPartiallyPaid = so.invoiceNumber != null && totalPaid > 0.01 && invoiceBalance > 0.01
 
+  // GREEN MEANS THE LEDGER AGREES (o3d-lgo.15). Everything above is IMS's own view of the money: a
+  // "Paid" badge said only that IMS was told it arrived. Registering the receipt against the accounting
+  // invoice is a separate sync that can fail, be cancelled, or never be queued at all — and this badge
+  // was an unconditional green over all three, so IMS claimed a settlement the ledger had no record of
+  // and nothing anywhere said so.
+  const settlement = so.settlement
+  const settlementSuffix =
+    settlement.status === 'AWAITING_LEDGER' ? ' · awaiting ledger'
+    : settlement.status === 'LEDGER_REJECTED' ? ' · LEDGER REJECTED'
+    : settlement.status === 'NOT_SENT' ? ' · NOT SENT TO LEDGER'
+    : settlement.status === 'PARTIALLY_SETTLED' ? ' · PART PAID IN LEDGER'
+    : ''
+  const settlementTone =
+    settlement.discrepancy
+      ? 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200'
+      : settlement.status === 'AWAITING_LEDGER'
+      ? 'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200'
+      : 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
+
   function handleGenerateInvoice() {
     startTransition(async () => {
       const result = await generateInvoiceNumber(so.id)
@@ -1008,13 +1027,21 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           </span>
         )}
         {isPaid && (
-          <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200">
-            Paid
+          <span
+            className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-sm font-medium ${settlementTone}`}
+            title={settlement.detail}
+          >
+            {settlement.discrepancy && <AlertTriangle className="h-3.5 w-3.5" />}
+            Paid{settlementSuffix}
           </span>
         )}
         {isPartiallyPaid && (
-          <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200">
-            Part. Paid
+          <span
+            className="inline-flex items-center gap-1 rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200"
+            title={settlement.detail}
+          >
+            {settlement.discrepancy && <AlertTriangle className="h-3.5 w-3.5" />}
+            Part. Paid{settlementSuffix}
           </span>
         )}
 
@@ -1395,8 +1422,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             <div className="flex items-center gap-2 text-sm font-medium">
               <FileText className="h-4 w-4 text-muted-foreground" />
               Invoice {so.invoiceNumber}
-              {isPaid && <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200">Paid</span>}
-              {isPartiallyPaid && <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200">Part. Paid</span>}
+              {isPaid && <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${settlementTone}`} title={settlement.detail}>{settlement.discrepancy && <AlertTriangle className="h-3 w-3" />}Paid{settlementSuffix}</span>}
+              {isPartiallyPaid && <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200" title={settlement.detail}>{settlement.discrepancy && <AlertTriangle className="h-3 w-3" />}Part. Paid{settlementSuffix}</span>}
             </div>
             <div className="flex items-center gap-1.5">
               <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowInvoice(true)}>
@@ -1417,6 +1444,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               )}
             </div>
           </div>
+          {settlement.discrepancy && (
+            /* The whole point: say what the LEDGER thinks, in words someone can act on. The Balance
+               figure below is IMS's own arithmetic and will happily read "Settled" while the accounting
+               invoice is still outstanding — that gap is exactly what this line names. */
+            <p className="px-4 pt-2 text-[11px] text-red-700 dark:text-red-300">{settlement.detail}</p>
+          )}
           <div className="px-4 py-3 text-sm grid grid-cols-2 md:grid-cols-4 gap-4">
             <div>
               <span className="text-muted-foreground text-xs">Invoice Date</span>
@@ -1564,7 +1597,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               </div>
               <div>
                 <span className="text-muted-foreground text-xs">Status</span>
-                <p className="font-medium">{isPaid ? 'Paid' : isPartiallyPaid ? 'Partially Paid' : 'Unpaid'}</p>
+                <p className="font-medium">
+                  {isPaid ? 'Paid' : isPartiallyPaid ? 'Partially Paid' : 'Unpaid'}
+                  {settlementSuffix}
+                </p>
               </div>
               <div>
                 <span className="text-muted-foreground text-xs">Customer</span>

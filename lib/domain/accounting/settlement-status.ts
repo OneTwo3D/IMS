@@ -163,3 +163,77 @@ export function settlementStatus(input: {
 export function isSettlementDiscrepancy(v: SettlementVerdict): boolean {
   return v.discrepancy
 }
+
+/**
+ * Reduce EVERY payment sync row for one document to the single row a verdict is derived from.
+ *
+ * A bill carries one payment, so the bill side passes one row. A sales order can carry several — part
+ * payments, a manual receipt on top of an imported one — each its own sync row with its own fate.
+ * Taking only the latest would print a green "Settled" over an earlier payment the ledger rejected.
+ *
+ * PRECEDENCE IS WORST-FIRST, because the question is "does the ledger support what IMS claims?" and one
+ * unposted payment is enough for the answer to be no. That can over-report: a FAILED row later re-queued
+ * as a second SYNCED row still reads as rejected. Over-reporting is the safe direction here — the detail
+ * names the error, and a spurious "chase this" costs a look, while a spurious "Settled" costs a
+ * reconciliation nobody knows to do.
+ */
+export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow | null {
+  if (rows.length === 0) return null
+
+  const synced = rows.filter((r) => r.status === 'SYNCED')
+  // A SYNCED row whose payload carries no amount makes the SUM unknowable, not zero — and a wrong sum
+  // is what decides full settlement from part settlement. Unknown propagates as null, which
+  // settlementStatus reads as "cannot compare" rather than as a shortfall.
+  const amountUnknown = synced.some((r) => typeof r.amount !== 'number')
+  const syncedAmount = amountUnknown ? null : synced.reduce((sum, r) => sum + (r.amount as number), 0)
+
+  const failed = rows.find((r) => r.status === 'FAILED')
+  if (failed) {
+    return { ...failed, amount: syncedAmount }
+  }
+  const cancelled = rows.find((r) => r.status === 'CANCELLED')
+  if (cancelled) {
+    return { ...cancelled, amount: syncedAmount }
+  }
+  const inFlight = rows.filter((r) => r.status === 'PENDING' || r.status === 'PROCESSING')
+  if (inFlight.length > 0) {
+    return {
+      status: inFlight.some((r) => r.status === 'PROCESSING') ? 'PROCESSING' : 'PENDING',
+      externalTransactionId: null,
+      errorMessage: inFlight.find((r) => r.errorMessage)?.errorMessage ?? null,
+      retryCount: inFlight.reduce((max, r) => Math.max(max, r.retryCount ?? 0), 0),
+      amount: syncedAmount,
+    }
+  }
+
+  // All SYNCED. One id that cannot be pointed at makes the WHOLE settlement unverifiable, so the missing
+  // id wins over the ids we do have — settlementStatus turns a SYNCED row with no id into exactly that.
+  const missingId = synced.some((r) => !r.externalTransactionId)
+  return {
+    status: 'SYNCED',
+    externalTransactionId: missingId ? null : synced.map((r) => r.externalTransactionId).join(', '),
+    errorMessage: null,
+    retryCount: synced.reduce((max, r) => Math.max(max, r.retryCount ?? 0), 0),
+    amount: syncedAmount,
+  }
+}
+
+/**
+ * The total the LEDGER's copy of a sales invoice was actually built at, which is what a payment against
+ * it has to match — not necessarily the order total IMS shows.
+ *
+ * On a tax-INCLUSIVE order the two differ: the invoice is constructed at the NET total (WC REST line
+ * amounts are always net but are sent flagged tax-inclusive) — that is o3d-cyn, an invoice-construction
+ * defect with its own issue. A payment that matches the invoice IMS really posted is not a SETTLEMENT
+ * discrepancy, and reporting it as one would send an operator to the payment when the invoice is what is
+ * wrong. Same reasoning as the documentPosted branch above: name the fault people can act on.
+ *
+ * When o3d-cyn lands, tax-inclusive invoices post at gross and this collapses to `totalForeign`.
+ */
+export function ledgerSalesInvoiceTotalForeign(input: {
+  totalForeign: number
+  taxForeign: number
+  pricesIncludeVat: boolean
+}): number {
+  return input.pricesIncludeVat ? input.totalForeign - input.taxForeign : input.totalForeign
+}

@@ -22,12 +22,13 @@ import {
   refundWcOrder, updateWcOrder, wcCreds, type WcCreds,
 } from './harness/wc.ts'
 import {
-  allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, runDailyBatch, runInboxDrain, runWcOrderReconcile, setPostingMode,
+  allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, recordSalesPaymentViaUi, runDailyBatch, runInboxDrain,
+  runWcOrderReconcile, setPostingMode,
 } from './harness/ims.ts'
 import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
 import {
-  expectJournalLine, expectLine, externalIdFor, getCreditNote, getInvoice, getManualJournal, getPayment, trackDocument,
-  type XeroManualJournal,
+  expectJournalLine, expectLine, externalIdFor, getCreditNote, getInvoice, getManualJournal, getPayment, syncLogRowsFor,
+  trackDocument, type XeroManualJournal,
 } from './harness/xero.ts'
 import {
   dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
@@ -1609,6 +1610,179 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       else await writeSetting(PAYMENT_MAP_KEY, priorMap)
     }
   })
+
+  test('OC-21: a receipt recorded BY HAND settles the Xero invoice, and the order reports the ledger agreeing', async ({ page }) => {
+    test.setTimeout(1_800_000)
+
+    // THE MANUAL COUNTERPART OF OC-15, and the positive half of o3d-lgo.15. OC-15 covers an IMPORTED paid
+    // order, whose receipt registers through the SALES_INVOICE follow-up (_registerPayment). A receipt
+    // typed into IMS — a bank transfer against a B2B invoice — had NO path to the ledger at all: addPayment
+    // created the Payment row, the order went green, and Xero went on showing the invoice fully
+    // outstanding, for ever. addPayment now queues the INVOICE_PAYMENT itself.
+    //
+    // The order is created UNPAID on purpose: set_paid=false leaves date_paid_gmt null, so order-import does
+    // NOT set _registerPayment and the follow-up path stays out of the way. Whatever settles this invoice
+    // came from addPayment, which is the claim under test.
+    //
+    // ZERO-RATED line, as OC-15: net == gross, so the receipt matches the invoice exactly and the case does
+    // not depend on o3d-c0n (net-registered payments) or o3d-cyn (tax-inclusive invoices built at net).
+    const sku = taggedSku(runId, 'OC21')
+    const unitPrice = '30.00'
+    const qty = 2
+    const method = 'Bank Transfer' // the Add Payment dialog's own <select> value — the map's lookup key
+    const bankCode = '090' // Demo "Business Bank Account" (GBP)
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+
+    // Per-test, restored in finally — a PERSISTENT map would make every other paid GBP order register a
+    // payment too, and their teardown (which voids the invoice) would then fail: Xero refuses to void an
+    // invoice that carries a payment.
+    const priorMap = await readSetting(PAYMENT_MAP_KEY)
+    await writeSetting(PAYMENT_MAP_KEY, JSON.stringify({ [`${method}:*`]: bankCode }))
+    // The Add Payment button lives in the Invoice panel, which only renders once the order has a LOCAL
+    // invoice number. The rig leaves invoice_trigger unset (manual), so arm it for the run.
+    const priorTrigger = await readSetting(INVOICE_TRIGGER_KEY)
+    await writeSetting(INVOICE_TRIGGER_KEY, 'on_shipped')
+    let imported: { salesOrderId: string } | undefined
+    try {
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC21`, price: unitPrice })
+      await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+      const product = await createWcProduct(creds, runId, { label: 'OC21', price: unitPrice, taxClass: 'zero-rate' })
+      const order = await createWcOrder(creds, runId, {
+        lines: [{ productId: product.id, quantity: qty }],
+        setPaid: false,
+      })
+      expect(Number(order.total), 'the zero-rated order total carries no VAT').toBeCloseTo(Number(unitPrice) * qty, 2)
+
+      imported = await awaitWebhookDelivery(order.id, { creds })
+      await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC21` })
+      try {
+        // The invoice posts first: addPayment refuses to register against a document the ledger has never
+        // seen (DOCUMENT_NOT_POSTED), which is the same ordering markBillPaid requires on the AP side.
+        await processPendingXeroSyncViaUi(page)
+        const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+        const authorised = await getInvoice(invoiceId)
+        expect(authorised.Status, 'the receivable starts out unpaid — nothing has settled it yet').toBe('AUTHORISED')
+        expect(Number(authorised.AmountDue)).toBeCloseTo(Number(order.total), 2)
+
+        await openSalesOrder(page, imported.salesOrderId)
+        await recordSalesPaymentViaUi(page, { method, reference: `${runTag(runId)}-OC21` })
+
+        const invoice = await drainUntilInvoicePaid(page, invoiceId, imported.salesOrderId)
+
+        // THE POINT: a receipt typed into IMS reaches the ledger. Before o3d-lgo.15 this invoice stayed
+        // AUTHORISED for its full amount while IMS displayed a green "Paid" — the two systems disagreeing
+        // with nothing anywhere saying so.
+        expect(invoice.Status, 'the hand-recorded receipt settled the receivable').toBe('PAID')
+        expect(Number(invoice.AmountDue), 'nothing is left outstanding').toBeCloseTo(0, 2)
+        expect(invoice.Payments?.length, 'exactly one payment settles the invoice').toBe(1)
+        const payment = await getPayment(invoice.Payments![0].PaymentID)
+        expect(Number(payment.Amount), 'the payment is for the invoice total').toBeCloseTo(Number(order.total), 2)
+        expect(payment.Account?.Code, 'drawn from the bank account mapped to the method').toBe(bankCode)
+
+        // And IMS says the ledger agrees — the verdict, not just the local paid flag.
+        await openSalesOrder(page, imported.salesOrderId)
+        await expect(page.getByText(/NOT SENT TO LEDGER|LEDGER REJECTED|PART PAID IN LEDGER/)).toHaveCount(0)
+      } finally {
+        // Failure-safe, payment BEFORE invoice: VOID_ORDER deletes Payments first, and Xero refuses to void
+        // an invoice that still carries one.
+        const paymentExtId = await invoicePaymentExternalId(imported.salesOrderId).catch(() => null)
+        if (paymentExtId) trackDocument('Payments', paymentExtId, `OC-21 payment ${runTag(runId)}`)
+        const posted = await awaitPostedExternalId('SALES_INVOICE', imported.salesOrderId, 90_000).catch(() => null)
+        if (posted) trackDocument('Invoices', posted, `OC-21 invoice ${runTag(runId)}`)
+      }
+    } finally {
+      if (priorMap == null) await clearSetting(PAYMENT_MAP_KEY)
+      else await writeSetting(PAYMENT_MAP_KEY, priorMap)
+      if (priorTrigger == null) await clearSetting(INVOICE_TRIGGER_KEY)
+      else await writeSetting(INVOICE_TRIGGER_KEY, priorTrigger)
+    }
+  })
+
+  test('OC-22: a receipt that could NOT be registered leaves the order NOT SENT TO LEDGER, with Xero still owed the money', async ({ page }) => {
+    test.setTimeout(1_800_000)
+
+    // THE ABSENT-PAYMENT FAILURE PATH (o3d-lgo.15). The dangerous state is not a payment that fails loudly
+    // — that leaves a FAILED row someone can retry — but one that was never queued at all: no row, no
+    // retry, nothing to notice, and a green "Paid" over an invoice the ledger still shows outstanding.
+    //
+    // Reached here through the guard's NO_BANK_ACCOUNT refusal: the payment map has no entry for this
+    // method, so there is no account to draw from and addPayment declines rather than guessing one. What
+    // this proves is not the refusal itself (that is unit-tested) but that the refusal is VISIBLE — an
+    // activity record naming it, and a badge on the order that contradicts the green.
+    const sku = taggedSku(runId, 'OC22')
+    const unitPrice = '35.00'
+    const qty = 2
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+
+    // No mapping for this method AT ALL — cleared for the test and restored after, so the absence is the
+    // fixture rather than an accident of rig state.
+    const priorMap = await readSetting(PAYMENT_MAP_KEY)
+    await writeSetting(PAYMENT_MAP_KEY, JSON.stringify({}))
+    const priorTrigger = await readSetting(INVOICE_TRIGGER_KEY)
+    await writeSetting(INVOICE_TRIGGER_KEY, 'on_shipped')
+    let imported: { salesOrderId: string } | undefined
+    try {
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC22`, price: unitPrice })
+      await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+      const product = await createWcProduct(creds, runId, { label: 'OC22', price: unitPrice, taxClass: 'zero-rate' })
+      const order = await createWcOrder(creds, runId, {
+        lines: [{ productId: product.id, quantity: qty }],
+        setPaid: false,
+      })
+
+      imported = await awaitWebhookDelivery(order.id, { creds })
+      await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC22` })
+      try {
+        await processPendingXeroSyncViaUi(page)
+        const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+
+        await openSalesOrder(page, imported.salesOrderId)
+        await recordSalesPaymentViaUi(page, { method: 'Card', reference: `${runTag(runId)}-OC22` })
+
+        // A drain would post a payment if one had been queued — run one so "nothing posted" is a
+        // conclusion rather than a race.
+        await processPendingXeroSyncViaUi(page)
+
+        // 1. NOTHING was queued. Not a FAILED row, not a PENDING one: no row.
+        const rows = await syncLogRowsFor({ type: 'INVOICE_PAYMENT', referenceId: imported.salesOrderId })
+        expect(rows, 'no payment sync was queued for a receipt with no mapped bank account').toHaveLength(0)
+
+        // 2. The refusal is RECORDED, naming the order — the durable signal that survives the page.
+        const warned = await activityActions(imported.salesOrderId)
+        expect(warned, 'the refusal is logged against the order').toContain('invoice_payment_not_registered')
+
+        // 3. THE LEDGER IS STILL OWED THE MONEY. Read back, not inferred: this is the state IMS was
+        // silently contradicting.
+        const invoice = await getInvoice(invoiceId)
+        expect(invoice.Status, 'the receivable is still outstanding in Xero').toBe('AUTHORISED')
+        expect(Number(invoice.AmountDue), 'the full amount is still due').toBeCloseTo(Number(order.total), 2)
+        expect(invoice.Payments?.length ?? 0, 'no payment reached the ledger').toBe(0)
+
+        // 4. And the ORDER SAYS SO. The green "Paid" is still there — IMS really was paid — but it now
+        // carries the ledger's dissent instead of hiding it.
+        await openSalesOrder(page, imported.salesOrderId)
+        await expect(page.getByText('NOT SENT TO LEDGER').first()).toBeVisible({ timeout: 30_000 })
+      } finally {
+        const posted = await awaitPostedExternalId('SALES_INVOICE', imported.salesOrderId, 90_000).catch(() => null)
+        if (posted) trackDocument('Invoices', posted, `OC-22 invoice ${runTag(runId)}`)
+      }
+    } finally {
+      if (priorMap == null) await clearSetting(PAYMENT_MAP_KEY)
+      else await writeSetting(PAYMENT_MAP_KEY, priorMap)
+      if (priorTrigger == null) await clearSetting(INVOICE_TRIGGER_KEY)
+      else await writeSetting(INVOICE_TRIGGER_KEY, priorTrigger)
+    }
+  })
 })
 
 /** A manual journal is balanced iff its signed LineAmounts (debits +, credits −) sum to zero (mirror of X-01). */
@@ -1749,6 +1923,24 @@ async function salesOrderFx(salesOrderId: string): Promise<{
 }
 
 const PAYMENT_MAP_KEY = 'accounting_payment_account_map'
+/** Unset on the rig (invoices are numbered manually); OC-21/22 arm it so the Invoice panel renders. */
+const INVOICE_TRIGGER_KEY = 'invoice_trigger'
+
+/** Every activity-log action recorded against a sales order — the durable record of a silent refusal. */
+async function activityActions(salesOrderId: string): Promise<string[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ action: string }>(
+      `select action from activity_logs where "entityType" = 'SALES_ORDER' and "entityId" = $1`,
+      [salesOrderId],
+    )
+    return r.rows.map((row) => row.action)
+  } finally {
+    await db.end()
+  }
+}
 
 /** Read a settings value, or null if the key is absent. */
 async function readSetting(key: string): Promise<string | null> {

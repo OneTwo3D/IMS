@@ -14,6 +14,8 @@ import {
   queueAccountingSyncTx,
   getAccountingSettings,
   getActiveAccountingConnectorInfo,
+  getPaymentAccountMap,
+  lookupPaymentAccount,
   type AccountingSettings,
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
@@ -54,6 +56,14 @@ import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
+import { decideInvoicePaymentRegistration } from '@/lib/domain/accounting/invoice-payment-registration'
+import {
+  aggregatePaymentSyncRows,
+  ledgerSalesInvoiceTotalForeign,
+  settlementStatus,
+  type PaymentSyncRow,
+  type SettlementVerdict,
+} from '@/lib/domain/accounting/settlement-status'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { releaseReservationsAfterRefund } from '@/lib/domain/sales/post-refund-release'
 import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
@@ -188,6 +198,13 @@ export type SoDetail = SoRow & {
     }[]
   }[]
   payments: PaymentRow[]
+  /**
+   * Whether the LEDGER agrees this order is settled (o3d-lgo.15). paidAt and the local payment rows only
+   * say IMS was told money arrived; registering it against the ledger invoice is a separate sync that can
+   * fail, be cancelled, or never have been queued — and the UI showed an unconditional green "Paid" over
+   * all three.
+   */
+  settlement: SettlementVerdict
 }
 
 export type SoLineInput = {
@@ -653,6 +670,60 @@ export async function getSalesOrders(
   })
 }
 
+/**
+ * Every INVOICE_PAYMENT sync row for one order (o3d-lgo.15) — the ledger's own account of what it was
+ * told about this order's receipts. Scoped to the ACTIVE connector: rows left by a connector that is no
+ * longer in use describe a ledger nobody is reconciling against, and judging today's settlement by them
+ * would report a discrepancy against a system that has been switched off.
+ */
+type InvoicePaymentSyncRow = PaymentSyncRow & {
+  /** The local Payment row this was queued for; null on rows queued before that was recorded. */
+  paymentId: string | null
+}
+
+async function loadInvoicePaymentSyncRows(orderId: string, connector: string | null): Promise<InvoicePaymentSyncRow[]> {
+  if (!connector) return []
+  const rows = await db.accountingSyncLog.findMany({
+    where: { connector, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: orderId },
+    select: { status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true },
+    orderBy: { createdAt: 'desc' },
+  })
+  return rows.map((r) => {
+    const payload = (r.payload && typeof r.payload === 'object' ? r.payload : {}) as Record<string, unknown>
+    return {
+      status: r.status,
+      externalTransactionId: r.externalTransactionId,
+      errorMessage: r.errorMessage,
+      retryCount: r.retryCount,
+      // The amount actually SENT, so a part payment is not mistaken for full settlement.
+      amount: typeof payload.amount === 'number' ? payload.amount : null,
+      paymentId: payloadPaymentId(r.payload),
+    }
+  })
+}
+
+/**
+ * What IMS claims has been RECEIVED against the order invoice, in the order currency — the figure the
+ * ledger has to match.
+ *
+ * Not simply the order total: an order can be part-paid, and a part payment the ledger registered in
+ * full is perfectly consistent. Refund payments are excluded — they settle a credit note, not this
+ * invoice — as are payments in some other currency, which cannot be summed with these.
+ */
+function claimedReceivedForeign(so: {
+  currency: string
+  totalForeign: unknown
+  paidAt: Date | null
+  payments: { refundId: string | null; amount: unknown; currency: string }[]
+}): number {
+  const local = so.payments
+    .filter((p) => !p.refundId && p.currency === so.currency)
+    .reduce((sum, p) => sum + Number(p.amount), 0)
+  // An imported paid order (WooCommerce) has paidAt but NO local payment rows — its receipt was never
+  // recorded as a Payment. Paid-in-full is then the claim, and the order total is its size.
+  return so.paidAt ? Math.max(local, Number(so.totalForeign)) : local
+}
+
 export async function getSalesOrder(id: string): Promise<SoDetail | null> {
   await requireAuth()
   const so = await db.salesOrder.findUnique({
@@ -694,8 +765,35 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
   })
   if (!so) return null
 
+  // THE LEDGER'S OWN VIEW of this order's receipts (o3d-lgo.15). Read alongside the order rather than
+  // per payment row: the verdict is about the order's settlement as a whole, and one rejected payment
+  // among several means the ledger still shows a balance.
+  const activeConnector = await getActiveAccountingConnectorInfo().catch(() => null)
+  const [accountingSyncEnabled, paymentSyncRows] = await Promise.all([
+    getAccountingSettings().then((a) => a.syncEnabled).catch(() => false),
+    loadInvoicePaymentSyncRows(so.id, activeConnector?.id ?? null),
+  ])
+  const claimedForeign = claimedReceivedForeign(so)
+  const settlement = settlementStatus({
+    paidLocally: !!so.paidAt || claimedForeign > 0,
+    syncEnabled: accountingSyncEnabled,
+    documentPosted: !!so.accountingInvoiceId,
+    payment: aggregatePaymentSyncRows(paymentSyncRows),
+    // Compared against what the ledger's copy of the invoice was built at, capped by what IMS actually
+    // claims to have received — a part payment fully registered is settled for its size.
+    totalForeign: Math.min(
+      claimedForeign,
+      ledgerSalesInvoiceTotalForeign({
+        totalForeign: Number(so.totalForeign),
+        taxForeign: Number(so.taxForeign),
+        pricesIncludeVat: so.pricesIncludeVat,
+      }),
+    ),
+  })
+
   return {
     ...mapSoRow(so),
+    settlement,
     billingAddress: so.billingAddress,
     shippingAddress: so.shippingAddress,
     lines: so.lines.map(mapLine),
@@ -2675,6 +2773,177 @@ export type PaymentRow = {
   paidAt: string
 }
 
+/** The local Payment row an INVOICE_PAYMENT was queued for, when the payload records one. */
+function payloadPaymentId(payload: unknown): string | null {
+  const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
+  return typeof p.paymentId === 'string' ? p.paymentId : null
+}
+
+/**
+ * Register a manually-recorded sales receipt against the ledger invoice (o3d-lgo.15).
+ *
+ * An IMPORTED paid order registers its payment through the SALES_INVOICE follow-up (`_registerPayment`).
+ * A receipt entered in IMS had no such path: the Payment row was created, the order went green, and the
+ * ledger was never told — so it went on showing the invoice fully outstanding, for ever. This closes
+ * that, on the same principle as markBillPaid: an operator recording a payment against a posted document
+ * is an instruction to settle it in the ledger too.
+ *
+ * GUARDED, because the ledger may already know. Every refusal below leaves the payment recorded and the
+ * settlement verdict visibly unsettled, which is the safe end: an operator can register it by hand, and
+ * a second payment in a ledger nobody is watching cannot be undone by looking at IMS.
+ *
+ * Never throws — failing to register must not fail the receipt the operator just recorded.
+ */
+async function registerInvoicePaymentWithLedger(params: {
+  orderId: string
+  orderReference: string
+  paymentId: string
+  amount: number
+  currency: string
+  method: string | null
+  reference: string | null
+  paidAt: Date
+}): Promise<void> {
+  const warn = async (action: string, description: string, metadata: Record<string, unknown>) => {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: params.orderId,
+      action,
+      tag: 'accounting',
+      level: 'WARNING',
+      description,
+      metadata: { orderNumber: params.orderReference, paymentId: params.paymentId, ...metadata },
+    }).catch(() => { /* logging must never block the receipt */ })
+  }
+
+  try {
+    const [settings, so, connector] = await Promise.all([
+      getAccountingSettings(),
+      db.salesOrder.findUnique({
+        where: { id: params.orderId },
+        select: { accountingInvoiceId: true, currency: true, totalForeign: true, taxForeign: true, pricesIncludeVat: true },
+      }),
+      getActiveAccountingConnectorInfo().catch(() => null),
+    ])
+    if (!so) return
+
+    const decision = decideInvoicePaymentRegistration({
+      syncEnabled: settings.syncEnabled,
+      accountingInvoiceId: so.accountingInvoiceId,
+      orderCurrency: so.currency,
+      paymentCurrency: params.currency,
+      paymentAmount: params.amount,
+      paymentId: params.paymentId,
+      bankAccountId: settings.syncEnabled && so.accountingInvoiceId
+        ? lookupPaymentAccount(await getPaymentAccountMap(), params.method ?? '', params.currency)
+        : null,
+      existing: settings.syncEnabled && so.accountingInvoiceId
+        ? await loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null)
+        : [],
+      ledgerTotal: ledgerSalesInvoiceTotalForeign({
+        totalForeign: Number(so.totalForeign),
+        taxForeign: Number(so.taxForeign),
+        pricesIncludeVat: so.pricesIncludeVat,
+      }),
+    })
+
+    if (!decision.register) {
+      const amount = `${params.currency} ${params.amount.toFixed(2)}`
+      const tail = `Register it in the accounting connector by hand if it is genuinely owed.`
+      switch (decision.refusal) {
+        // Nothing is expected to post at all, so there is nothing to report.
+        case 'SYNC_DISABLED':
+          return
+        // Not a settlement fault — a payment cannot attach to an invoice the ledger has never seen, and
+        // the DOCUMENT sync is what to chase. But nothing re-registers this receipt when the invoice
+        // finally does post either, so say so once here rather than leave it to reconciliation.
+        case 'DOCUMENT_NOT_POSTED':
+          await warn('invoice_payment_not_registered',
+            `Recorded ${amount} against ${params.orderReference}, but its invoice has not posted to the ` +
+            `accounting connector yet, so the payment could not be registered there. Register it once the ` +
+            `invoice syncs, or record it in the ledger by hand.`,
+            { amount: params.amount, currency: params.currency, refusal: decision.refusal })
+          return
+        // addPayment rejects a currency mismatch, so this only fires if the order currency changed
+        // underneath the receipt. Registering the wrong currency is worse than not registering.
+        case 'CURRENCY_MISMATCH':
+          await warn('invoice_payment_not_registered',
+            `Recorded a ${params.currency} payment against ${params.orderReference}, which is in ` +
+            `${so.currency}. The payment was NOT registered in the accounting connector — register it there by hand.`,
+            { amount: params.amount, currency: params.currency, orderCurrency: so.currency, refusal: decision.refusal })
+          return
+        case 'NO_BANK_ACCOUNT':
+          await warn('invoice_payment_not_registered',
+            `Recorded ${amount} against ${params.orderReference}, but no bank account is mapped for method ` +
+            `"${params.method ?? ''}" / currency "${params.currency}". Add a mapping in Settings → ` +
+            `Accounting → Payment Account Mapping, then register the payment there.`,
+            { amount: params.amount, currency: params.currency, method: params.method, refusal: decision.refusal })
+          return
+        case 'UNKNOWN_REGISTERED_AMOUNT':
+          await warn('invoice_payment_not_registered',
+            `Recorded ${amount} against ${params.orderReference}, but an existing payment sync for this ` +
+            `order records no amount, so IMS cannot tell whether registering this one would double-pay the ` +
+            `invoice. ${tail}`,
+            { amount: params.amount, currency: params.currency, refusal: decision.refusal })
+          return
+        case 'WOULD_OVERPAY':
+          await warn('invoice_payment_not_registered',
+            `Recorded ${amount} against ${params.orderReference}, but the accounting connector has already ` +
+            `been sent ${params.currency} ${(decision.alreadyRegistered ?? 0).toFixed(2)} of an invoice ` +
+            `total of ${params.currency} ${(decision.ledgerTotal ?? 0).toFixed(2)} — registering this ` +
+            `payment too would over-pay it there. Check the ledger first. ${tail}`,
+            {
+              amount: params.amount, currency: params.currency, refusal: decision.refusal,
+              alreadyRegistered: decision.alreadyRegistered, ledgerTotal: decision.ledgerTotal,
+            })
+          return
+      }
+    }
+
+    await queueAccountingSync({
+      type: 'INVOICE_PAYMENT',
+      referenceType: 'SalesOrder',
+      referenceId: params.orderId,
+      payload: {
+        accountingInvoiceId: so.accountingInvoiceId,
+        bankAccountId: decision.bankAccountId,
+        amount: params.amount,
+        currency: params.currency,
+        paymentDate: params.paidAt.toISOString().slice(0, 10),
+        method: params.method ?? '',
+        reference: params.reference ?? undefined,
+        // Which local receipt this is, so deletePayment can retract exactly this row rather than any row
+        // that happens to share its amount.
+        paymentId: params.paymentId,
+      },
+      // Exactly once per recorded receipt, however many times this runs.
+      idempotencyKey: `invoice-payment:payment:${params.paymentId}`,
+    })
+  } catch (e) {
+    // Same shape as markBillPaid's queue failure: the receipt is recorded in IMS with nothing queued to
+    // tell the ledger, so nothing will ever retry and there is no FAILED row to notice — the row was
+    // never written. That is the quietest way the two systems disagree, so it is recorded as an ERROR.
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: params.orderId,
+      action: 'invoice_payment_not_queued',
+      tag: 'accounting',
+      level: 'ERROR',
+      description:
+        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
+        `payment could not be queued for the accounting connector — the ledger still shows the invoice ` +
+        `outstanding and nothing will retry. Re-queue it, or record the payment in the ledger by hand.`,
+      metadata: {
+        orderNumber: params.orderReference,
+        paymentId: params.paymentId,
+        amount: params.amount,
+        currency: params.currency,
+        error: e instanceof Error ? e.message : String(e),
+      },
+    }).catch(() => { /* logging must never block the receipt either */ })
+  }
+}
+
 export async function addPayment(input: {
   orderId: string
   refundId?: string
@@ -2805,6 +3074,19 @@ export async function addPayment(input: {
     })
 
     if (!input.refundId) {
+      await registerInvoicePaymentWithLedger({
+        orderId: input.orderId,
+        orderReference: getSalesOrderReference(txResult.so),
+        paymentId: txResult.paymentId,
+        amount: input.amount,
+        currency: input.currency,
+        method: input.method || null,
+        reference: input.reference || null,
+        paidAt: txResult.paidAt,
+      })
+    }
+
+    if (!input.refundId) {
       try {
         const accountingSettings = await getAccountingSettings()
         const accounts = getRealisedFxAccounts(accountingSettings, 'receivable')
@@ -2929,7 +3211,14 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
         },
         select: { id: true, status: true, payload: true },
       })
-      const matchingLogs = paymentLogs.filter((log) => {
+      // WHICH row belongs to the payment being deleted. A row queued by addPayment names its Payment row,
+      // so retract exactly that one. Amount matching is the fallback for rows queued before that was
+      // recorded (an imported order's SALES_INVOICE follow-up), and it must never sweep up a row that
+      // names a DIFFERENT payment — two equal part payments would otherwise cancel each other's
+      // registration, deleting a settlement the ledger is still expecting (o3d-lgo.15).
+      const exactLogs = paymentLogs.filter((log) => payloadPaymentId(log.payload) === paymentId)
+      const matchingLogs = exactLogs.length > 0 ? exactLogs : paymentLogs.filter((log) => {
+        if (payloadPaymentId(log.payload) !== null) return false
         const payload = log.payload as { amount?: unknown; currency?: unknown } | null
         const amount = typeof payload?.amount === 'number' ? payload.amount : Number(payload?.amount)
         const currency = typeof payload?.currency === 'string' ? payload.currency : txResult.payment.currency

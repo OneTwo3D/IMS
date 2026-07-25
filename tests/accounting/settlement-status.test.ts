@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { settlementStatus, type PaymentSyncRow } from '@/lib/domain/accounting/settlement-status'
+import {
+  aggregatePaymentSyncRows,
+  ledgerSalesInvoiceTotalForeign,
+  settlementStatus,
+  type PaymentSyncRow,
+} from '@/lib/domain/accounting/settlement-status'
 
 /**
  * o3d-lgo.15. markBillPaid marks a bill paid in IMS and only QUEUES the BILL_PAYMENT. That sync can
@@ -146,4 +151,105 @@ test('a rejected payment on an unposted document is still a discrepancy', () => 
     payment: row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'no such invoice' }),
   })
   assert.equal(v.status, 'LEDGER_REJECTED')
+})
+
+// ---------------------------------------------------------------------------
+// Aggregating MANY payment rows (o3d-lgo.15, sales side)
+// ---------------------------------------------------------------------------
+//
+// A bill carries one payment. A sales order can carry several — part payments, a manual receipt on top
+// of an imported one — each its own sync row with its own fate. Reducing them to "the latest" would
+// print a green Settled over an earlier payment the ledger rejected.
+
+test('no payment rows at all is nothing to aggregate', () => {
+  assert.equal(aggregatePaymentSyncRows([]), null)
+})
+
+test('several confirmed payments settle for their SUM, not for the last one', () => {
+  const agg = aggregatePaymentSyncRows([
+    row({ externalTransactionId: 'PAY-1', amount: 40 }),
+    row({ externalTransactionId: 'PAY-2', amount: 60 }),
+  ])!
+  assert.equal(agg.status, 'SYNCED')
+  assert.equal(agg.amount, 100)
+  const v = settlementStatus({ ...base, payment: agg, totalForeign: 100 })
+  assert.equal(v.status, 'SETTLED')
+  assert.equal(v.discrepancy, false)
+})
+
+test('confirmed payments that do not cover the claim are a PART settlement', () => {
+  const agg = aggregatePaymentSyncRows([row({ amount: 40 }), row({ externalTransactionId: 'PAY-2', amount: 20 })])!
+  const v = settlementStatus({ ...base, payment: agg, totalForeign: 100 })
+  assert.equal(v.status, 'PARTIALLY_SETTLED')
+  assert.equal(v.discrepancy, true)
+})
+
+test('one rejected payment outranks any number of confirmed ones', () => {
+  // The question is "does the ledger support what IMS claims", and one unposted payment is enough for
+  // the answer to be no — the ledger still shows that much outstanding.
+  const agg = aggregatePaymentSyncRows([
+    row({ amount: 40 }),
+    row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'bank account not found', amount: null }),
+  ])!
+  assert.equal(agg.status, 'FAILED')
+  assert.equal(agg.errorMessage, 'bank account not found')
+  const v = settlementStatus({ ...base, payment: agg, totalForeign: 100 })
+  assert.equal(v.status, 'LEDGER_REJECTED')
+  assert.equal(v.discrepancy, true)
+})
+
+test('a cancelled payment outranks confirmed ones, but not a rejected one', () => {
+  const cancelled = aggregatePaymentSyncRows([row({ amount: 40 }), row({ status: 'CANCELLED', externalTransactionId: null })])!
+  assert.equal(cancelled.status, 'CANCELLED')
+  const bothBad = aggregatePaymentSyncRows([
+    row({ status: 'CANCELLED', externalTransactionId: null }),
+    row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'rejected' }),
+  ])!
+  assert.equal(bothBad.status, 'FAILED', 'a rejection names an error worth showing; a cancellation does not')
+})
+
+test('a payment still in flight is reported as in flight, and PROCESSING wins over PENDING', () => {
+  const agg = aggregatePaymentSyncRows([
+    row({ status: 'PENDING', externalTransactionId: null, retryCount: 1 }),
+    row({ status: 'PROCESSING', externalTransactionId: null, retryCount: 4 }),
+  ])!
+  assert.equal(agg.status, 'PROCESSING')
+  assert.equal(agg.retryCount, 4, 'the worst retry count is the one worth showing')
+  assert.equal(settlementStatus({ ...base, payment: agg }).discrepancy, false)
+})
+
+test('one unverifiable success makes the WHOLE settlement unverifiable', () => {
+  // A SYNCED row with no ledger payment id cannot be reconciled against anything, and the ids we DO have
+  // do not make up for it — claiming settlement would hide the disagreement this exists to surface.
+  const agg = aggregatePaymentSyncRows([row({ amount: 40 }), row({ externalTransactionId: null, amount: 60 })])!
+  assert.equal(agg.externalTransactionId, null)
+  const v = settlementStatus({ ...base, payment: agg, totalForeign: 100 })
+  assert.equal(v.status, 'AWAITING_LEDGER')
+  assert.equal(v.discrepancy, true)
+})
+
+test('a confirmed payment with no recorded amount makes the SUM unknown, not zero', () => {
+  // Unknown must not read as a shortfall: a wrong sum is what decides full settlement from part
+  // settlement, and inventing 0 for an unreadable payload would report every such order as under-paid.
+  const agg = aggregatePaymentSyncRows([row({ amount: 40 }), row({ externalTransactionId: 'PAY-2', amount: null })])!
+  assert.equal(agg.amount, null)
+  const v = settlementStatus({ ...base, payment: agg, totalForeign: 100 })
+  assert.equal(v.status, 'SETTLED', 'an uncomparable amount cannot be called a part payment')
+})
+
+// ---------------------------------------------------------------------------
+// What the ledger's copy of the invoice was actually built at
+// ---------------------------------------------------------------------------
+
+test('a tax-exclusive invoice posts at the order total', () => {
+  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: false }), 120)
+})
+
+test('a tax-inclusive invoice posts at the NET total (o3d-cyn), which is what a payment must match', () => {
+  // Not a claim that net is correct — o3d-cyn is the defect that builds it that way. But a payment that
+  // matches the invoice IMS really posted is not a SETTLEMENT fault, and reporting it as one would send
+  // an operator to the payment when the invoice is what is wrong.
+  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true }), 100)
+  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows([row({ amount: 100 })])!, totalForeign: 100 })
+  assert.equal(v.status, 'SETTLED')
 })
