@@ -8,9 +8,16 @@
  *
  *   NODE_OPTIONS='--import tsx' node --env-file=.env scripts/restore-stage-connectors.ts --status
  *   NODE_OPTIONS='--import tsx' node --env-file=.env scripts/restore-stage-connectors.ts
+ *   NODE_OPTIONS='--import tsx' node --env-file=.env scripts/restore-stage-connectors.ts --force
  *
  * The next full-chain run would also self-heal (acquire() recovers a stale lock before
  * doing anything else), but that is no use if nobody runs the suite for a week.
+ *
+ * IT REFUSES A LIVE LOCK unless you pass --force. Restoring stage under a running suite
+ * puts both systems on the shared Woo store and Xero Demo org at once — the very fault
+ * this script exists to fix, inflicted deliberately. A lock whose owner is demonstrably
+ * gone is released without ceremony; one that still looks alive, or that cannot be judged,
+ * needs you to say so (o3d-lgo.14).
  *
  * If NO lock is held it also reports stage's current connector state, so it doubles as
  * "is stage actually armed right now?".
@@ -19,6 +26,7 @@ import { Client } from 'pg'
 import { lockRecoveryDecision, release, status } from '../e2e/full-chain/harness/quiesce.ts'
 
 const STATUS_ONLY = process.argv.includes('--status')
+const FORCE = process.argv.includes('--force')
 
 const STAGE_KEYS = [
   'wc_sync_enabled',
@@ -64,13 +72,6 @@ async function main() {
     console.log(`  lease                  : ${lock.heartbeatAt ? `last renewed ${lock.heartbeatAt}` : '(no heartbeat — pre-lease lock)'}`)
     const decision = lockRecoveryDecision(lock)
     console.log(`  verdict                : ${decision.action.toUpperCase()} — ${decision.reason}`)
-    if (decision.action === 'held') {
-      // Forcing past a live lock is the fault this script exists to fix, inflicted deliberately. Say so.
-      console.warn(
-        '\n  WARNING: this lock looks LIVE. Releasing it restores stage underneath a running full-chain suite,\n' +
-          '  and both would then drive the shared Woo store and Xero Demo org at once. Stop that run first.',
-      )
-    }
     if (ageMin > 120) console.warn('  This lock is over 2h old — almost certainly stale.')
   } else {
     console.log('No lock held.')
@@ -84,7 +85,28 @@ async function main() {
     return
   }
 
-  console.log('\nReleasing…')
+  // REFUSE A LIVE LOCK BY DEFAULT. The verdict used to be printed as a warning and then ignored — every
+  // non-status invocation forced. An operator following the documented one-liner during a healthy run
+  // would re-enable stage under it and put both systems on the shared store and org at once, which is the
+  // fault this script exists to fix (Codex, PR #560 round 2). Only a lock whose owner is demonstrably
+  // gone is released without being asked twice.
+  const verdict = lockRecoveryDecision(lock)
+  if (verdict.action !== 'recover' && !FORCE) {
+    console.error(
+      `\nREFUSING to release: ${verdict.reason}.\n` +
+        (verdict.action === 'held'
+          ? 'That is a RUNNING suite. Restoring stage now would have it and the rig driving the shared Woo\n' +
+            'store and Xero Demo org together. Stop the run first — the lock then recovers by itself.\n'
+          : 'The holder cannot be judged from this host (it is another machine, or the lock predates lease\n' +
+            'renewal). It auto-recovers once its lease expires; releasing now might land under a live run.\n') +
+        '\nIf you KNOW the holder is gone, re-run with --force.',
+    )
+    await reportStage()
+    process.exitCode = 1
+    return
+  }
+
+  console.log(FORCE && verdict.action !== 'recover' ? '\nReleasing (--force, against the verdict)…' : '\nReleasing…')
   // force: release() is otherwise a no-op for a process that never acquired (o3d-lgo.14), and this script
   // is by definition run by someone who did not take the lock — that is the whole point of an escape hatch.
   await release({ force: true })

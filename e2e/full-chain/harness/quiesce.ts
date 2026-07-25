@@ -135,6 +135,12 @@ export type LockRecord = {
   heartbeatAt?: string
   /** Diagnostics: the run whose abandoned lock this one took over, if any. */
   recoveredFrom?: string
+  /**
+   * Set while a release is restoring the world from this record. The row deliberately STAYS in place
+   * until the restore finishes, so the lock is never briefly absent: a contender reading it mid-restore
+   * sees a lock rather than an unlocked rig with half-restored stage settings.
+   */
+  releasing?: boolean
 }
 
 /** Just the ownership fields the liveness check reads, so it can be exercised without a whole lock record. */
@@ -492,6 +498,8 @@ export type LockToken = string
  */
 let held: { token: LockToken; raw: string } | null = null
 let heartbeat: NodeJS.Timeout | null = null
+/** The I/O-free timer that enforces the fence even when a renewal never settles. */
+let watchdog: NodeJS.Timeout | null = null
 /** When we last PROVED we still own the row. Not when we last tried. */
 let leaseProvenAt = 0
 
@@ -549,61 +557,107 @@ export function setLeaseLostHandler(fn: (reason: string) => void): (reason: stri
 }
 
 /**
- * Keep the lease alive while the suite runs.
+ * How often the watchdog asks "can we still prove we hold this?" — and the deadline on one renewal's I/O.
  *
- * unref'd so it can never hold the process open on its own, and guarded on our token. Losing the row is
- * not just a reason to skip teardown — see leaseVerdict: the run itself has to stop.
+ * The renewal deadline is well inside the renewal interval so a blackholed connection is abandoned before
+ * the next attempt, rather than piling up.
+ */
+export const LEASE_WATCHDOG_INTERVAL_MS = 5_000
+export const LEASE_RENEW_TIMEOUT_MS = 10_000
+
+/** Reject rather than hang forever. A renewal that has not answered in 10s is not going to. */
+async function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} did not answer within ${ms}ms`)), ms) }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/** Fail-stop. Idempotent: the watchdog and a renewal can reach this at the same moment. */
+function loseLease(reason: string): void {
+  if (!held) return
+  held = null
+  stopHeartbeat()
+  onLeaseLost(reason)
+}
+
+/**
+ * Keep the lease alive while the suite runs — and stop the run when it cannot be kept.
+ *
+ * THE WATCHDOG IS SEPARATE FROM THE RENEWAL ON PURPOSE. Judging the lease inside the renewal means the
+ * judgement only happens when the renewal's I/O settles, so a blackholed connection or query — which has
+ * no deadline of its own — sails straight past the fence: another host recovers the expired row after the
+ * TTL while these workers keep driving the shared Woo store and Xero org (Codex, PR #560 round 2). The
+ * watchdog does no I/O at all. It reads a clock and a variable, so nothing can wedge it.
+ *
+ * Renewals are also SERIALIZED. Overlapping ones can settle out of order and write an older heartbeat
+ * over a newer one, which would age the lease backwards from another host's point of view.
+ *
+ * Both timers are unref'd so they can never hold the process open on their own.
  */
 function startHeartbeat(token: LockToken, lock: LockRecord): void {
   leaseProvenAt = Date.now()
+  let renewInFlight = false
+
   heartbeat = setInterval(() => {
+    if (renewInFlight) return // serialized: never two renewals racing to write heartbeatAt
+    renewInFlight = true
     void (async () => {
       // Its own short-lived connection each time. acquire()'s clients are closed when it returns, and an
       // idle one held open for the whole suite is worse than reconnecting every 30 seconds.
       const db = e2eDb()
-      let ownershipLost = false
       try {
-        await db.connect()
+        await withDeadline(db.connect(), LEASE_RENEW_TIMEOUT_MS, 'the lease renewal connection')
         const renewed: LockRecord = { ...lock, heartbeatAt: new Date().toISOString() }
         const raw = JSON.stringify(renewed)
-        if (await pgLockStore(db).writeIfOwned(token, raw)) {
-          leaseProvenAt = Date.now()
+        const owned = await withDeadline(
+          pgLockStore(db).writeIfOwned(token, raw), LEASE_RENEW_TIMEOUT_MS, 'the lease renewal write',
+        )
+        if (owned) {
+          // Monotonic: a late renewal must never move the proof backwards.
+          leaseProvenAt = Math.max(leaseProvenAt, Date.now())
           if (held) held = { token, raw }
           return
         }
-        ownershipLost = true
         console.error(
           `\n[quiesce] *** LOST THE QUIESCE LOCK *** run ${lock.runId} no longer owns '${LOCK_KEY}' — it was ` +
             `recovered or deleted while this run is still going. Stage settings are now another run's ` +
             `responsibility, so this run will NOT restore them.\n`,
         )
+        loseLease(`the quiesce lock was taken over by another run (${lock.runId} no longer owns it)`)
       } catch (e) {
         // A renewal that fails is not yet a lost lease — there is slack by design — but it is not proof
-        // of ownership either, and the clock below is what decides when the slack runs out.
+        // of ownership either. The watchdog owns the decision about when the slack runs out.
         console.warn(`[quiesce] lease renewal failed (will retry): ${e instanceof Error ? e.message : e}`)
       } finally {
-        await db.end().catch(() => {})
-      }
-
-      const msSinceProven = Date.now() - leaseProvenAt
-      if (leaseVerdict({ ownershipLost, msSinceProven }) === 'stop') {
-        held = null
-        stopHeartbeat()
-        onLeaseLost(
-          ownershipLost
-            ? `the quiesce lock was taken over by another run (${lock.runId} no longer owns it)`
-            : `the quiesce lock lease could not be renewed for ${Math.round(msSinceProven / 1000)}s, ` +
-              `within ${Math.round(LEASE_RENEW_INTERVAL_MS / 1000)}s of the ${Math.round(LEASE_TTL_MS / 1000)}s TTL ` +
-              `at which another run may recover it`,
-        )
+        renewInFlight = false
+        void db.end().catch(() => {})
       }
     })()
   }, LEASE_RENEW_INTERVAL_MS)
   heartbeat.unref()
+
+  watchdog = setInterval(() => {
+    const msSinceProven = Date.now() - leaseProvenAt
+    if (leaseVerdict({ ownershipLost: false, msSinceProven }) === 'stop') {
+      loseLease(
+        `the quiesce lock lease has not been PROVEN for ${Math.round(msSinceProven / 1000)}s — within ` +
+          `${Math.round(LEASE_RENEW_INTERVAL_MS / 1000)}s of the ${Math.round(LEASE_TTL_MS / 1000)}s TTL at ` +
+          `which another run may recover it`,
+      )
+    }
+  }, LEASE_WATCHDOG_INTERVAL_MS)
+  watchdog.unref()
 }
 
 function stopHeartbeat(): void {
   if (heartbeat) { clearInterval(heartbeat); heartbeat = null }
+  if (watchdog) { clearInterval(watchdog); watchdog = null }
 }
 
 /**
@@ -699,7 +753,8 @@ async function releaseInternal(
   e2e: Client,
   stage: Client,
   lock: LockRecord,
-  guard: { store: LockStore; expect: string } | { store: LockStore; token: string },
+  fencedRaw: string,
+  store: LockStore,
 ): Promise<boolean> {
   // Delivery webhooks are PERMANENT and deliberately not touched here (o3d-lgo.10).
   // `createdWebhookIds` is only honoured for locks written by the older create-per-run
@@ -749,9 +804,33 @@ async function releaseInternal(
     }
   }
 
-  return 'token' in guard
-    ? await guard.store.deleteIfOwned(guard.token)
-    : await guard.store.deleteIfUnchanged(guard.expect)
+  // The row has been FENCED to us since before the first mutation above, so this cannot delete anyone
+  // else's lock — it either removes our own fence or finds it already gone.
+  return await store.deleteIfUnchanged(fencedRaw)
+}
+
+/**
+ * Claim the exclusive right to restore, BEFORE restoring anything.
+ *
+ * releaseInternal used to check ownership only at the END: it deleted webhooks and put stage's settings
+ * back, and only then ran the conditional delete. If the row had changed hands in between — a take-over,
+ * or a forced release racing a live heartbeat — the delete failed, but the previous owner's settings had
+ * already been restored underneath the new holder. That is the dual-driver condition the whole lock
+ * exists to prevent, arriving through the exit instead of the entrance (Codex, PR #560 round 2).
+ *
+ * So the row is first compare-and-set into a RELEASING state. Winning that swap is what grants the right
+ * to touch shared state; losing it means the lock is someone else's now and we touch nothing. The fence
+ * stays in place while the restore runs, so the lock is never briefly absent — a contender that reads it
+ * mid-restore sees a live-looking lock and backs off rather than starting a suite against a
+ * half-restored stage.
+ */
+export async function fenceForRelease(
+  store: LockStore,
+  found: { raw: string; lock: LockRecord },
+): Promise<string | null> {
+  const fenced: LockRecord = { ...found.lock, releasing: true, heartbeatAt: new Date().toISOString() }
+  const fencedRaw = JSON.stringify(fenced)
+  return (await store.replaceIfUnchanged(found.raw, fencedRaw)) ? fencedRaw : null
 }
 
 /**
@@ -772,6 +851,11 @@ export async function release(opts: { force?: boolean } = {}): Promise<void> {
     return
   }
 
+  // Before anything else, so a renewal cannot rewrite the row between our read and our fence — which
+  // would make the fence fail and abort a release that is genuinely ours.
+  const ourToken = held?.token ?? null
+  stopHeartbeat()
+
   const e2e = e2eDb(); await e2e.connect()
   const stage = stageDb(); await stage.connect()
   try {
@@ -779,26 +863,7 @@ export async function release(opts: { force?: boolean } = {}): Promise<void> {
     const found = await store.read()
     if (!found) { console.log('[quiesce] no lock row — nothing to release.'); return }
 
-    if (!held) {
-      // force: no token to match, so delete exactly the row we just read and judged. The compare-and-set
-      // is the only thing standing between an operator and a live run here, and it is checked AFTER the
-      // restore — so a failure means stage may now be armed underneath somebody. Say so plainly rather
-      // than printing "released" over it.
-      const dropped = await releaseInternal(e2e, stage, found.lock, { store, expect: found.raw })
-      if (dropped) {
-        console.log('[quiesce] released (forced).')
-      } else {
-        console.error(
-          `\n[quiesce] *** THE LOCK CHANGED HANDS MID-RELEASE *** run ${found.lock.runId}'s row was rewritten ` +
-            `(a heartbeat renewal, or another run taking over) while this forced release was restoring stage. ` +
-            `The row was NOT deleted — but stage settings HAVE been restored, possibly underneath a live run. ` +
-            `Re-check with --status before doing anything else.\n`,
-        )
-      }
-      return
-    }
-
-    if (found.lock.token !== held.token) {
+    if (ourToken && found.lock.token !== ourToken) {
       // Someone else's lock. Restoring from it would put THEIR run's settings back mid-flight.
       console.warn(
         `[quiesce] the lock row belongs to run ${found.lock.runId} (token mismatch), not to this process — ` +
@@ -807,10 +872,22 @@ export async function release(opts: { force?: boolean } = {}): Promise<void> {
       return
     }
 
-    const dropped = await releaseInternal(e2e, stage, found.lock, { store, token: held.token })
-    console.log(dropped ? '[quiesce] released.' : '[quiesce] released; the row had already gone.')
+    // FENCE FIRST, MUTATE SECOND. Winning this compare-and-set is what grants the right to restore
+    // anything; losing it means the row moved on and nothing of ours may be written to the shared world.
+    const fencedRaw = await fenceForRelease(store, found)
+    if (!fencedRaw) {
+      console.warn(
+        `[quiesce] the lock row changed under us between reading it and claiming the release ` +
+          `(run ${found.lock.runId}) — another run has taken it over. NOTHING was restored, which is ` +
+          `correct: its settings are that run's business now.`,
+      )
+      return
+    }
+
+    const dropped = await releaseInternal(e2e, stage, found.lock, fencedRaw, store)
+    const how = ourToken ? '' : ' (forced)'
+    console.log(dropped ? `[quiesce] released${how}.` : `[quiesce] released${how}; the row had already gone.`)
   } finally {
-    stopHeartbeat()
     held = null
     await e2e.end(); await stage.end()
   }

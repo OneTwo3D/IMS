@@ -3,8 +3,9 @@ import { hostname } from 'node:os'
 import test from 'node:test'
 
 import {
-  claimLock, isLockOwnerAlive, leaseVerdict, lockRecoveryDecision,
-  LEASE_FENCE_AFTER_MS, LEASE_RENEW_INTERVAL_MS, LEASE_TTL_MS, LOCK_STALE_AFTER_MS,
+  claimLock, fenceForRelease, isLockOwnerAlive, leaseVerdict, lockRecoveryDecision,
+  LEASE_FENCE_AFTER_MS, LEASE_RENEW_INTERVAL_MS, LEASE_RENEW_TIMEOUT_MS, LEASE_TTL_MS,
+  LEASE_WATCHDOG_INTERVAL_MS, LOCK_STALE_AFTER_MS,
   type LockRecord, type LockStore,
 } from '../../e2e/full-chain/harness/quiesce.ts'
 
@@ -313,4 +314,53 @@ test('the fence trips BEFORE anyone else may recover the lock, never after', () 
   // the lock — the fence would be theatre.
   assert.ok(LEASE_FENCE_AFTER_MS < LEASE_TTL_MS, 'stop before the TTL another run recovers us at')
   assert.ok(LEASE_FENCE_AFTER_MS > LEASE_RENEW_INTERVAL_MS, 'but not so eagerly that one slow renewal kills a run')
+})
+
+test('the watchdog can actually fire in time, and a renewal cannot outlive its own interval', () => {
+  // The fence used to be judged INSIDE the renewal, so a blackholed connection — which had no deadline —
+  // sailed straight past it while the workers carried on (Codex, PR #560 round 2). Two constants make the
+  // fix real: the watchdog does no I/O and ticks far more often than the window it enforces, and one
+  // renewal's I/O is abandoned well before the next one starts, so they cannot pile up.
+  assert.ok(LEASE_WATCHDOG_INTERVAL_MS < LEASE_FENCE_AFTER_MS / 2, 'the watchdog must tick well inside the window it enforces')
+  assert.ok(LEASE_RENEW_TIMEOUT_MS < LEASE_RENEW_INTERVAL_MS, 'a renewal must be abandoned before the next one is due')
+})
+
+// --- releasing is fenced too -------------------------------------------------
+
+test('a release CLAIMS the row before restoring anything', async () => {
+  const mine = lockAt({ token: 'mine', ownerPid: process.pid, ownerHost: hostname() })
+  const s = fakeStore(mine)
+  const found = await s.store.read()
+  assert.ok(found)
+
+  const fencedRaw = await fenceForRelease(s.store, found)
+  assert.ok(fencedRaw, 'the release wins the row')
+  assert.equal(s.current()?.releasing, true, 'and the row stays in place, marked releasing')
+  assert.equal(s.current()?.token, 'mine')
+
+  // The row is still there for the whole restore, so a contender arriving mid-release sees a LOCK rather
+  // than an unlocked rig with half-restored stage settings.
+  assert.equal(lockRecoveryDecision(s.current()!, NOW).action, 'held')
+
+  // And the final delete is guarded on the fenced bytes, so it can only remove our own fence.
+  assert.equal(await s.store.deleteIfUnchanged(fencedRaw), true)
+  assert.equal(s.current(), null)
+})
+
+test('a release that lost the row restores NOTHING', async () => {
+  // releaseInternal used to restore stage and only then check ownership, so a row that changed hands
+  // mid-release left the previous owner's settings applied underneath the new holder — the dual-driver
+  // condition, arriving through the exit instead of the entrance.
+  const mine = lockAt({ token: 'mine', ownerPid: process.pid, ownerHost: hostname() })
+  const s = fakeStore(mine)
+  const found = await s.store.read()
+  assert.ok(found)
+
+  // A take-over lands between our read and our claim.
+  const usurper = lockAt({ token: 'theirs', ownerPid: process.pid, ownerHost: hostname() })
+  s.put(usurper)
+
+  assert.equal(await fenceForRelease(s.store, found), null, 'the claim must fail')
+  assert.equal(s.current()?.token, 'theirs', 'and the new holder’s row is untouched')
+  assert.equal(s.current()?.releasing, undefined, 'not even marked')
 })
