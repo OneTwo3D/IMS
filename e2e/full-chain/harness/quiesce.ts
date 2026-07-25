@@ -285,6 +285,30 @@ export function lockRecoveryDecision(
     return { action: 'recover', reason: `${who} is gone — no live process with its identity on this host` }
   }
 
+  // A RELEASE IN PROGRESS IS NOT AN EXPIRED LEASE. The releaser stops renewing before it fences, so a
+  // fenced row's age grows by design — and recovering it on the lease TTL would let another host take
+  // over while the original is still restoring stage, which would then land underneath the new run
+  // (Codex, PR #560 round 5). A stuck release is judged on the LEGACY window instead: 45 minutes is far
+  // beyond any real release (local settings writes plus, on legacy locks only, a bounded webhook
+  // delete), and still recovers automatically rather than leaving stage disabled until a human notices.
+  if (lock.releasing) {
+    const stuckMs = dbAgeMs ?? nowMs - Date.parse(lock.heartbeatAt ?? lock.takenAt)
+    const how = dbAgeMs !== null ? 'by the database' : "against this host's clock"
+    if (!Number.isFinite(stuckMs)) {
+      return { action: 'wait', reason: `${who} is mid-RELEASE and its age cannot be determined` }
+    }
+    const stuck = `${Math.round(stuckMs / 60_000)}m into a release (measured ${how})`
+    return stuckMs > LOCK_STALE_AFTER_MS
+      ? { action: 'recover', reason: `${who} is ${stuck} — long past any real release, so it is abandoned` }
+      : {
+        action: 'held',
+        reason:
+          `${who} is ${stuck} and still restoring stage. Taking it over now would land its restore ` +
+          `underneath this run. It is recovered automatically after ` +
+          `${Math.round(LOCK_STALE_AFTER_MS / 60_000)}m, or immediately with the escape hatch's --force.`,
+      }
+  }
+
   // Unknowable owner: the lease is the only evidence.
   if (dbAgeMs !== null || lock.heartbeatAt) {
     // The database's own measurement first; the recorded heartbeat is the fallback for a store that
@@ -669,6 +693,8 @@ export function setLeaseLostHandler(fn: (reason: string) => void): (reason: stri
  */
 export const LEASE_WATCHDOG_INTERVAL_MS = 5_000
 export const LEASE_RENEW_TIMEOUT_MS = 10_000
+/** A release's only remote call. Bounded so a stalled Woo cannot hold the fence past recovery. */
+const WEBHOOK_DELETE_TIMEOUT_MS = 15_000
 
 /** Reject rather than hang forever. A renewal that has not answered in 10s is not going to. */
 async function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
@@ -871,13 +897,34 @@ async function releaseInternal(
     const creds = await wcCreds(e2e)
     for (const id of lock.createdWebhookIds) {
       try {
-        await wcRequest(creds, `/webhooks/${id}?force=true`, { method: 'DELETE' })
+        // BOUNDED. This is the only remote call in a release, and an unbounded one is what would let a
+        // release stall past the point where its fence can be recovered — after which its own settings
+        // writes would land underneath a new owner (Codex, PR #560 round 5).
+        await withDeadline(
+          wcRequest(creds, `/webhooks/${id}?force=true`, { method: 'DELETE' }),
+          WEBHOOK_DELETE_TIMEOUT_MS,
+          `deleting legacy webhook ${id}`,
+        )
         console.log(`[quiesce] deleted legacy per-run webhook ${id}`)
       } catch (e) {
         // Keep going: one undeletable hook must not strand stage's settings.
         console.warn(`[quiesce] could not delete webhook ${id}: ${e instanceof Error ? e.message : e}`)
       }
     }
+  }
+
+  // LAST CHECK BEFORE THE FIRST DAMAGING WRITE. Everything above is remote and bounded but not
+  // instant; if our fence was recovered while we were in it, restoring stage now would put this run's
+  // settings underneath whoever holds the lock. The final delete would catch it — but only after the
+  // damage. Cheap to ask, and the answer is the difference between a no-op and a cross-run corruption.
+  const stillOurs = await store.read()
+  if (!stillOurs || stillOurs.raw !== fencedRaw) {
+    console.error(
+      `[quiesce] ABANDONING this release: our fence is gone — the lock was recovered while we were ` +
+        `releasing it. NOTHING was restored, which is correct: stage is now ` +
+        `${stillOurs ? `run ${stillOurs.lock.runId}'s` : "the next run's"} business.`,
+    )
+    return false
   }
 
   for (const [key, value] of Object.entries(lock.stageSettings)) {
@@ -1049,7 +1096,7 @@ export async function status(): Promise<LockRecord | null> {
  * it back to release(), which refuses if anything has changed since. Judging one row and then releasing
  * "whatever is current" lets a contender take the abandoned lock over in between.
  */
-export async function statusRaw(): Promise<{ raw: string; lock: LockRecord } | null> {
+export async function statusRaw(): Promise<{ raw: string; lock: LockRecord; ageMs: number | null } | null> {
   const e2e = e2eDb(); await e2e.connect()
   try { return await pgLockStore(e2e).read() } finally { await e2e.end() }
 }

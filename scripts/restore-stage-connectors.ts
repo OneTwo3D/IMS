@@ -71,7 +71,10 @@ async function main() {
     console.log(`  webhooks created       : ${lock.createdWebhookIds.join(', ') || '(none)'}`)
     console.log(`  owner                  : ${lock.ownerHost ?? '(unrecorded)'} pid ${lock.ownerPid ?? '(unrecorded)'}`)
     console.log(`  lease                  : ${lock.heartbeatAt ? `last renewed ${lock.heartbeatAt}` : '(no heartbeat — pre-lease lock)'}`)
-    const decision = lockRecoveryDecision(lock)
+    // The DATABASE's measure of the row's age, not this host's clock: on another machine a skew
+    // greater than the TTL would classify a freshly renewed live lock as recoverable, and the CAS
+    // that follows would then release it (Codex, PR #560 round 5).
+    const decision = lockRecoveryDecision(lock, Date.now(), current!.ageMs)
     console.log(`  verdict                : ${decision.action.toUpperCase()} — ${decision.reason}`)
     if (ageMin > 120) console.warn('  This lock is over 2h old — almost certainly stale.')
   } else {
@@ -91,7 +94,7 @@ async function main() {
   // would re-enable stage under it and put both systems on the shared store and org at once, which is the
   // fault this script exists to fix (Codex, PR #560 round 2). Only a lock whose owner is demonstrably
   // gone is released without being asked twice.
-  const verdict = lockRecoveryDecision(lock)
+  const verdict = lockRecoveryDecision(lock, Date.now(), current!.ageMs)
   if (verdict.action !== 'recover' && !FORCE) {
     console.error(
       `\nREFUSING to release: ${verdict.reason}.\n` +

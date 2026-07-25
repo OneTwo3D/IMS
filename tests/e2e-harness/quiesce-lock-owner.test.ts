@@ -471,3 +471,31 @@ test('a pre-lease lock is still judged on the LEGACY window, not on row age', ()
   assert.equal(lockRecoveryDecision(legacy, NOW, LEASE_TTL_MS + 5_000).action, 'wait')
   assert.equal(lockRecoveryDecision(legacy, NOW, LOCK_STALE_AFTER_MS + 60_000).action, 'recover')
 })
+
+
+// --- a release in progress is not an expired lease ---------------------------
+
+test('a row mid-RELEASE is not recovered on the lease TTL', () => {
+  // The releaser stops renewing BEFORE it fences, so a fenced row's age grows by design. Recovering it
+  // on the lease TTL would let another host take over while the original is still restoring stage —
+  // and that restore would then land underneath the new run (Codex, PR #560 round 5).
+  const releasing = lockAt({ ownerPid: 1234, ownerHost: 'some-other-box', releasing: true })
+  const d = lockRecoveryDecision(releasing, NOW, LEASE_TTL_MS + 60_000)
+  assert.equal(d.action, 'held')
+  assert.match(d.reason, /still restoring stage/)
+})
+
+test('but a release that never finished IS eventually recovered, not left forever', () => {
+  // The asymmetry that governs this whole file: a held lock means stage stays disabled, which is worse
+  // than any risk of a 45-minute-dead releaser waking up. It recovers by itself rather than waiting for
+  // someone to notice.
+  const releasing = lockAt({ ownerPid: 1234, ownerHost: 'some-other-box', releasing: true })
+  assert.equal(lockRecoveryDecision(releasing, NOW, LOCK_STALE_AFTER_MS + 60_000).action, 'recover')
+})
+
+test('a release by a DEAD same-host process is recovered at once, fence or no fence', () => {
+  // Pid liveness is decisive before any of the lease reasoning, so a crashed releaser does not have to
+  // wait out the legacy window on the host that can see it is gone.
+  const releasing = lockAt({ ownerPid: 4_194_304, ownerHost: hostname(), releasing: true })
+  assert.equal(lockRecoveryDecision(releasing, NOW, 1_000).action, 'recover')
+})
