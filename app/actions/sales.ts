@@ -61,8 +61,11 @@ import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-tran
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
   cancelSalesOrderFulfillmentState,
+  lockSalesOrder,
+  releaseOrderAllocationsInTx,
   updateSalesOrderStatusUnderLock,
 } from '@/lib/domain/sales/allocation-service'
+import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-guard'
 import { queueSalesInvoiceUpdateForExistingAccountingInvoice } from '@/lib/domain/sales/sales-invoice-update-sync'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 
@@ -2462,20 +2465,68 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
 export async function deleteSalesOrder(id: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.create')
-    const so = await db.salesOrder.findUnique({
-      where: { id },
-      select: { orderNumber: true, externalOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } }, _count: { select: { refunds: true, payments: true } } },
-    })
-    if (!so) return { success: false, error: 'Order not found' }
-    if (!['DRAFT', 'PENDING_PAYMENT', 'ALLOCATED'].includes(so.status)) return { success: false, error: 'Only draft, pending payment, or allocated orders can be deleted' }
-    if (so._count.refunds > 0 || so._count.payments > 0) return { success: false, error: 'Cannot delete an order with refunds or payments' }
 
-    // Release allocations
-    const { deallocateOrder } = await import('./allocation')
-    await deallocateOrder(id)
+    // o3d-5r8: read the guards, release the allocations and delete the row under ONE
+    // order-row lock. A hard delete destroys the only IMS handle on anything a posting
+    // worker has put (or is about to put) in an external system, so the deletability
+    // check must serialise with those workers' claims — the accounting queue row, and
+    // the WMS push link the push sweep now claims before it calls the WMS. Checking in
+    // one transaction and deleting in another leaves precisely the window a worker needs
+    // to claim the order between the two.
+    const outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, id)
+      const so = await tx.salesOrder.findUnique({
+        where: { id },
+        select: {
+          orderNumber: true,
+          externalOrderNumber: true,
+          status: true,
+          shipFromWarehouseId: true,
+          revenueDeferredDate: true,
+          inventoryAllocatedDate: true,
+          lines: { select: { productId: true, qty: true } },
+          _count: { select: { refunds: true, payments: true } },
+        },
+      })
+      if (!so) return { error: 'Order not found' }
+      if (!['DRAFT', 'PENDING_PAYMENT', 'ALLOCATED'].includes(so.status)) return { error: 'Only draft, pending payment, or allocated orders can be deleted' }
+      if (so._count.refunds > 0 || so._count.payments > 0) return { error: 'Cannot delete an order with refunds or payments' }
 
-    await db.salesOrderLine.deleteMany({ where: { orderId: id } })
-    await db.salesOrder.delete({ where: { id } })
+      const blocker = await findSalesOrderDeleteBlocker(tx, id, {
+        revenueDeferredDate: so.revenueDeferredDate,
+        inventoryAllocatedDate: so.inventoryAllocatedDate,
+      })
+      if (blocker) return { error: blocker.message }
+
+      const released = await releaseOrderAllocationsInTx(tx, id)
+      await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
+      await tx.salesOrder.delete({ where: { id } })
+      return { so, released }
+    }, { maxWait: 5000, timeout: 20000 })
+
+    if ('error' in outcome) return { success: false, error: outcome.error }
+    const { so, released } = outcome
+
+    // Post-commit side effects: the stock sync mirrors the released reservations to the
+    // storefront. Never fail the (already committed) delete on a sync error.
+    try {
+      const syncTargets = [...new Set(released.allocations.map((alloc) => alloc.productId))]
+      if (syncTargets.length > 0) await enqueueStockSync(syncTargets, 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
+    if (released.clampedReservationCount > 0) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: id,
+        action: 'negative_reserved_qty_clamped',
+        tag: 'inventory',
+        level: 'WARNING',
+        description: `Clamped ${released.clampedReservationCount} negative reservation balance(s) while deleting sales order ${getSalesOrderReference({ id, ...so })}`,
+        metadata: { orderNumber: getSalesOrderReference({ id, ...so }), clampedReservationCount: released.clampedReservationCount },
+      })
+    }
+
     revalidatePath('/sales')
     await logActivity({
       entityType: 'SALES_ORDER',

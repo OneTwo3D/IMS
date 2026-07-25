@@ -1,0 +1,161 @@
+import type { Prisma } from '@/app/generated/prisma/client'
+
+/**
+ * o3d-5r8 — hard-delete safety for sales orders.
+ *
+ * A hard delete removes the ONLY thing in IMS that points at whatever the posting
+ * workers already put (or are about to put) in an external system. Once the order row
+ * is gone there is no order id to reconcile against, no allocation to reverse, and the
+ * back-reference writes fail silently — the external ledger/WMS keeps a document that
+ * IMS can no longer see, let alone reverse.
+ *
+ * The protocol is: every worker that makes a remote call for an order must first CLAIM
+ * that work in a row the deleter can see, taking the order's row lock so the claim and
+ * the delete serialise. The deleter then takes the same lock and refuses while any claim
+ * is live. The two claim rows are:
+ *
+ *  - AccountingSyncLog — written at enqueue time (queueAccountingSync), i.e. strictly
+ *    before any remote call, and stays PENDING → PROCESSING → SYNCED for the whole flight.
+ *    A live row therefore covers both "queued", "in flight" and "already posted".
+ *  - WmsOrderPushLink — until o3d-5r8 the WMS create pass had NO such row before its
+ *    remote call (the link was written only AFTER pushOrder returned), so the push sweep
+ *    now claims the link under the order lock before calling the WMS.
+ *
+ * Daily batches (A1 revenue deferral / A2 inventory allocation) are keyed by
+ * `referenceType='DailyBatch'` and a synthetic `<group>-<date>[-<8 hex digest>]`
+ * referenceId, NOT by order id, so they cannot be found by an order-id lookup. They are
+ * detected here from the order's own stage stamps (revenueDeferredDate /
+ * inventoryAllocatedDate) mapped to the batch reference the daily sync would have used.
+ *
+ * NOTE: this module only REFUSES. It does not reverse anything. Reversal semantics for
+ * an already-posted A2 (so an allocated order can be withdrawn from the ledger rather
+ * than merely protected from deletion) are tracked separately.
+ */
+
+/** Sync-log statuses meaning "queued, in flight, or already in the external ledger". */
+export const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
+
+export type SalesOrderDeleteBlocker = {
+  code:
+    | 'wms_order_push_link'
+    | 'accounting_sync_live'
+    | 'daily_batch_staged'
+  message: string
+}
+
+/**
+ * `YYYY-MM-DD` key for a daily-batch stage stamp. Mirrors the accounting invariant
+ * suite's dateKey so both derive the same batch reference from the same stamp.
+ */
+export function dailyBatchDateKey(value: Date | string | null | undefined): string | null {
+  if (!value) return null
+  const date = typeof value === 'string' ? new Date(value) : value
+  if (Number.isNaN(date.getTime())) return null
+  return date.toISOString().slice(0, 10)
+}
+
+/**
+ * Prisma `where` fragment matching a daily-batch referenceId for one stage date, in both
+ * shapes that exist in the wild: the bare `<group>-<date>` QuickBooks writes and the
+ * digest-suffixed `<group>-<date>-<8 hex>` Xero's buildDailyBatchReferenceId writes.
+ * Returns null when the order was never staged into that batch.
+ */
+export function dailyBatchReferenceWhere(
+  group: 'A1' | 'A2' | 'B',
+  stagedAt: Date | string | null | undefined,
+): Prisma.AccountingSyncLogWhereInput | null {
+  const key = dailyBatchDateKey(stagedAt)
+  if (!key) return null
+  const bare = `${group}-${key}`
+  return { OR: [{ referenceId: bare }, { referenceId: { startsWith: `${bare}-` } }] }
+}
+
+export type SalesOrderDeleteStageStamps = {
+  revenueDeferredDate: Date | null
+  inventoryAllocatedDate: Date | null
+}
+
+/**
+ * Returns the reason a sales order must NOT be hard-deleted, or null when no external
+ * document (or in-flight claim for one) references it.
+ *
+ * MUST be called inside the same transaction that takes the order's row lock and
+ * performs the delete — the whole point is that a worker cannot slip a claim in between
+ * the check and the delete.
+ */
+export async function findSalesOrderDeleteBlocker(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  stamps: SalesOrderDeleteStageStamps,
+): Promise<SalesOrderDeleteBlocker | null> {
+  // 1. WMS. The link row is the push sweep's claim: it exists from immediately before
+  // the remote create until the order is withdrawn, so ANY link means the WMS may hold
+  // (or be about to be handed) this order.
+  const pushLink = await tx.wmsOrderPushLink.findUnique({
+    where: { orderId },
+    select: { state: true, externalOrderNumber: true, externalOrderId: true },
+  })
+  if (pushLink) {
+    const ref = pushLink.externalOrderNumber ?? pushLink.externalOrderId
+    return {
+      code: 'wms_order_push_link',
+      message:
+        `Cannot delete an order that has been claimed for or sent to the warehouse management system ` +
+        `(push state ${pushLink.state}${ref ? `, WMS order ${ref}` : ''}). Cancel the order instead so the WMS order is withdrawn.`,
+    }
+  }
+
+  // 2. Accounting documents keyed by this order (or by one of its shipments).
+  const shipments = await tx.shipment.findMany({ where: { orderId }, select: { id: true } })
+  const shipmentIds = shipments.map((shipment) => shipment.id)
+  const orderKeyed: Prisma.AccountingSyncLogWhereInput[] = [
+    { referenceType: 'SalesOrder', referenceId: orderId },
+  ]
+  if (shipmentIds.length > 0) {
+    orderKeyed.push({ referenceType: 'Shipment', referenceId: { in: shipmentIds } })
+  }
+  const liveDocument = await tx.accountingSyncLog.findFirst({
+    where: { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] }, OR: orderKeyed },
+    select: { id: true, connector: true, type: true, status: true },
+  })
+  if (liveDocument) {
+    return {
+      code: 'accounting_sync_live',
+      message:
+        `Cannot delete an order with accounting documents queued or posted to ${liveDocument.connector} ` +
+        `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired or reversed.`,
+    }
+  }
+
+  // 3. Daily batches. These are DailyBatch-keyed, so they are unreachable by order id —
+  // derive the batch reference from the order's own stage stamps instead. A live batch
+  // log means this order's value is inside a journal that is queued or already in the
+  // ledger, and nothing here can take it back out.
+  const stagedBatches: Array<{ group: 'A1' | 'A2'; type: string; label: string; stagedAt: Date | null }> = [
+    { group: 'A1', type: 'DAILY_BATCH_REVENUE_DEFERRAL', label: 'A1 revenue deferral', stagedAt: stamps.revenueDeferredDate },
+    { group: 'A2', type: 'DAILY_BATCH_INVENTORY_ALLOC', label: 'A2 inventory allocation', stagedAt: stamps.inventoryAllocatedDate },
+  ]
+  for (const batch of stagedBatches) {
+    const referenceWhere = dailyBatchReferenceWhere(batch.group, batch.stagedAt)
+    if (!referenceWhere) continue
+    const liveBatch = await tx.accountingSyncLog.findFirst({
+      where: {
+        status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] },
+        type: batch.type as Prisma.AccountingSyncLogWhereInput['type'],
+        referenceType: 'DailyBatch',
+        ...referenceWhere,
+      },
+      select: { id: true, connector: true, referenceId: true, status: true },
+    })
+    if (!liveBatch) continue
+    return {
+      code: 'daily_batch_staged',
+      message:
+        `Cannot delete an order included in the ${batch.label} daily accounting batch ` +
+        `(${liveBatch.connector} ${liveBatch.referenceId}, ${liveBatch.status}). ` +
+        `The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry.`,
+    }
+  }
+
+  return null
+}

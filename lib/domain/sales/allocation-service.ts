@@ -244,6 +244,56 @@ export async function resetAllocationAccountingIfStaged(
   })
 }
 
+export type ReleasedOrderAllocation = {
+  lineId: string
+  productId: string
+  warehouseId: string
+  qty: number
+}
+
+/**
+ * Release every allocation on an order and give the reserved quantities back, inside a
+ * caller-supplied transaction. Extracted from deallocateOrder (o3d-5r8) so deleteSalesOrder
+ * can run the guard checks, the release and the delete under ONE order-row lock — checking
+ * deletability in one transaction and deleting in another reopens exactly the window a
+ * posting worker needs to claim the order out from under the deleter.
+ *
+ * The caller MUST already hold the order's row lock (lockSalesOrder).
+ *
+ * Throws (via resetAllocationAccountingIfStaged) when a shipment on this order has already
+ * been journaled — those allocations back a posted cost entry and must not be released.
+ */
+export async function releaseOrderAllocationsInTx(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<{ allocations: ReleasedOrderAllocation[]; clampedReservationCount: number }> {
+  await resetAllocationAccountingIfStaged(tx, orderId)
+  const currentAllocs = await tx.orderAllocation.findMany({
+    where: { orderId },
+    select: { lineId: true, productId: true, warehouseId: true, qty: true },
+  })
+  await lockStockLevels(
+    tx,
+    [...new Set(currentAllocs.map((alloc) => alloc.productId))],
+    [...new Set(currentAllocs.map((alloc) => alloc.warehouseId))],
+  )
+
+  const allocations = currentAllocs.map((alloc) => ({
+    lineId: alloc.lineId,
+    productId: alloc.productId,
+    warehouseId: alloc.warehouseId,
+    qty: Number(alloc.qty),
+  }))
+  await applyAllocationReservationDelta(tx, allocations, 'release')
+  const clampedReservations = await tx.stockLevel.updateMany({
+    where: { reservedQty: { lt: 0 } },
+    data: { reservedQty: 0 },
+  })
+  await tx.orderAllocation.deleteMany({ where: { orderId } })
+
+  return { allocations, clampedReservationCount: clampedReservations.count }
+}
+
 export async function updateSalesOrderStatusUnderLock(
   tx: Prisma.TransactionClient,
   input: {

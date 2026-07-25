@@ -45,16 +45,23 @@ type Seed = {
   updatable?: WmsPushUpdateLink[]
   holdable?: WmsPushLinkRef[]
   cancellable?: WmsPushLinkRef[]
+  /** o3d-5r8: false simulates "order deleted / already owned" — the push must be skipped. */
+  claimForCreate?: (orderId: string) => Promise<boolean>
 }
 
 function makePort(seed: Seed) {
   const upserts: Array<{ orderId: string; create: Record<string, unknown>; update: Record<string, unknown> }> = []
   const updates: Array<{ id: string; data: Record<string, unknown> }> = []
   const events: WmsMutationEventInput[] = []
+  const claims: string[] = []
   const port: WmsOrderPushPort = {
     activeBindings: async () => seed.bindings ?? BINDINGS,
     releasableHeldOrders: async () => seed.releasable ?? [],
     createCandidates: async () => seed.createCandidates ?? [],
+    claimForCreate: async (orderId) => {
+      claims.push(orderId)
+      return seed.claimForCreate ? seed.claimForCreate(orderId) : true
+    },
     updatableLinks: async () => seed.updatable ?? [],
     holdableLinks: async () => seed.holdable ?? [],
     cancellableLinks: async () => seed.cancellable ?? [],
@@ -62,7 +69,7 @@ function makePort(seed: Seed) {
     updateLink: async (id, data) => { updates.push({ id, data }) },
     recordEvent: async (event) => { events.push(event) },
   }
-  return { port, upserts, updates, events }
+  return { port, upserts, updates, events, claims }
 }
 
 const okPush = async (): Promise<WmsOrderPushResult> => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' })
@@ -140,6 +147,48 @@ test('create: a candidate whose warehouse is not bound is skipped (no write)', a
   const { port, upserts } = makePort({ createCandidates: [candidate({ shipFromWarehouseId: 'wh-OTHER' })] })
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   assert.equal(r.created, 0)
+  assert.equal(upserts.length, 0)
+})
+
+// --- o3d-5r8: claim-under-lock before the remote create ---
+
+test('create: the order is claimed BEFORE the WMS is called', async () => {
+  const order: string[] = []
+  const { port, claims } = makePort({ createCandidates: [candidate()] })
+  const originalClaim = port.claimForCreate
+  port.claimForCreate = async (orderId, connectorId, ts) => { order.push('claim'); return originalClaim(orderId, connectorId, ts) }
+  const tracked = connector({ pushOrder: async () => { order.push('push'); return { externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' } } })
+  const r = await runWmsOrderPushSweepCore(tracked, 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.deepEqual(claims, ['so-1'])
+  assert.deepEqual(order, ['claim', 'push'])
+})
+
+test('create: a refused claim (order deleted / owned elsewhere) never reaches the WMS', async () => {
+  let pushed = 0
+  const tracked = connector({ pushOrder: async () => { pushed += 1; return { externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' } } })
+  const { port, upserts, events } = makePort({ createCandidates: [candidate()], claimForCreate: async () => false })
+  const r = await runWmsOrderPushSweepCore(tracked, 'mintsoft', port, { now: NOW })
+  assert.equal(pushed, 0)
+  assert.equal(r.created, 0)
+  assert.equal(r.failed, 0)
+  assert.equal(r.deadLettered, 0)
+  // A refused claim is not the order's fault: no link write, no attempt burned, no audit noise.
+  assert.equal(upserts.length, 0)
+  assert.equal(events.length, 0)
+})
+
+test('create: a claim error skips the order without calling the WMS or burning an attempt', async () => {
+  let pushed = 0
+  const tracked = connector({ pushOrder: async () => { pushed += 1; return { externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' } } })
+  const { port, upserts } = makePort({
+    createCandidates: [candidate({ pushAttempts: 4 })],
+    claimForCreate: async () => { throw new Error('db down') },
+  })
+  const r = await runWmsOrderPushSweepCore(tracked, 'mintsoft', port, { now: NOW })
+  assert.equal(pushed, 0)
+  assert.equal(r.created, 0)
+  assert.equal(r.deadLettered, 0)
   assert.equal(upserts.length, 0)
 })
 
