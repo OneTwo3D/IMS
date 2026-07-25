@@ -37,14 +37,16 @@ import { runTag, taggedSku } from './harness/tag.ts'
 import { awaitWebhookDelivery, cleanupWc, createWcOrder, createWcProduct, wcCreds, type WcCreds } from './harness/wc.ts'
 import {
   addManufacturingCostLine, allocateAndShip, applyStockWriteOff, completeProduction, createAndSendPo,
-  createLandedCostPo, createManufacturingOrder, createStockTransfer, dispatchStockTransfer,
+  createBill, createLandedCostPo, createManufacturingOrder, createStockTransfer, dispatchStockTransfer,
   editManufacturingCostLineAmount, openManufacturingOrder, openSalesOrder, processPendingXeroSyncViaUi,
-  receiveGoods, receiveStockTransfer, runDailyBatch, runTaxRateDriftCron, setPostingMode, startProduction,
+  receiveGoods, receiveStockTransfer, runDailyBatch, runFxRevaluation, runTaxRateDriftCron, setPostingMode,
+  startProduction,
 } from './harness/ims.ts'
 import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
+import { deleteFxRate, queryRows, seedFxRateAt } from './harness/fx-fixture.ts'
 import {
-  expectJournalLine, externalIdFor, getInvoice, getManualJournal, getXeroTaxRates,
-  trackDocument, type XeroManualJournal, type XeroTaxRate,
+  billIdsForPo, expectJournalLine, externalIdFor, getInvoice, getManualJournal, getXeroTaxRates,
+  syncLogRowsFor, trackDocument, type XeroManualJournal, type XeroTaxRate,
 } from './harness/xero.ts'
 import {
   dailyBatchBoundary, dailyBatchDoc, deleteUnjournaledShipmentBaseline, postedDailyBatchJournalIds,
@@ -769,35 +771,125 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
     }
   })
 
-  test.fixme(
-    'X-03: period-end UNREALISED_FX_JOURNAL revaluation posts to Xero — BLOCKED by o3d-lgo.6.1 (control leg hits Xero SYSTEM account 610/800)',
-    async () => {
-      // PARKED — do not un-fixme until bd o3d-lgo.6.1 (P1) lands.
-      //
-      // This test would prove the period-end AR/AP FX revaluation (lib/accounting-fx-revaluation.ts,
-      // triggered by GET /api/cron/accounting-fx-revaluation) posts an UNREALISED_FX_JOURNAL to the
-      // Xero Demo ledger. It cannot pass today because of the SAME product defect PP-08 surfaced live
-      // against real Xero: getUn/RealisedFxAccounts() resolves the journal's CONTROL leg to
-      // settings.accountsReceivableAccount / accountsPayableAccount, which on BOTH the e2e rig and
-      // stage are Xero SYSTEM accounts 610 (Accounts Receivable) and 800 (Accounts Payable). Xero
-      // refuses manual-journal lines to system accounts, so pushManualJournal 400s with
-      //   "A validation exception occurred: Account code 800 is not a valid code for this document."
-      // and the journal never posts (the sync log stays PENDING/FAILED). This is a connector DESIGN
-      // decision, not a rig config fix (stage matches the rig), tracked as bd o3d-lgo.6.1 — which
-      // blocks both PP-08 and this X-03. Un-fixme once it lands (target a non-system FX clearing
-      // account, or suppress the FX journal for the Xero connector, which auto-posts realised FX on
-      // settlement anyway).
-      //
-      // The scenario it would drive (UNREALISED_FX_JOURNAL; referenceType 'FxRevaluation'; referenceId
-      // = the valuation date; posted as a Xero ManualJournal): arm sync mode; import an unpaid EUR
-      // sales order (or EUR supplier bill) at a booked rate; seed a divergent GBP→EUR fx_rate
-      // (source 'e2e-fc-seed', swept by global-setup) dated ≤ the valuation date so an unrealised
-      // gain/loss exists; GET /api/cron/accounting-fx-revaluation with the CRON_SECRET bearer; drain
-      // via processPendingXeroSyncViaUi; then read the POSTED journal back from Xero and assert the
-      // FX-gain/loss and control legs. Today the drain fails at the control leg — exactly the defect
-      // o3d-lgo.6.1 must resolve.
-    },
-  )
+  // Was parked behind o3d-lgo.6.1 as "the revaluation posts an UNREALISED_FX_JOURNAL to Xero". That
+  // premise was wrong in the same way PP-08's was: getUnrealisedFxAccounts() resolves the journal's CONTROL
+  // leg to settings.accountsReceivableAccount / accountsPayableAccount — Xero SYSTEM accounts 610/800 on
+  // BOTH the rig and stage — and Xero refuses manual-journal lines to system accounts, so pushManualJournal
+  // 400'd and nothing ever posted. The fix (o3d-lgo.6.1, Jan's call) is SUPPRESS-FOR-XERO: Xero revalues
+  // foreign AR/AP itself, so an IMS journal for the same movement was both illegal and double-counting.
+  //
+  // So this is the period-end mirror of PP-08's assertion: with a genuine unrealised movement to revalue,
+  // the sweep still runs and still BUILDS the journal, and nothing is queued for Xero.
+  test('X-03: the period-end FX revaluation finds a real unrealised movement and SUPPRESSES the UNREALISED_FX_JOURNAL for Xero (o3d-lgo.6.1)', async ({ page }) => {
+    test.setTimeout(900_000)
+
+    // An open (unpaid) FOREIGN payable is the input the revaluation needs: getOpenPayables selects bills
+    // with paidAt null, totalForeign > 0 and a non-base PO currency (lib/accounting-fx-revaluation.ts). A
+    // EUR PO -> receipt -> bill, left unpaid, is the cheapest way to create exactly one.
+    //
+    // Same load-bearing precondition as PP-08/OC-10: with fx_rates EMPTY, createPurchaseOrder THROWS
+    // "Missing … FX rate", so the BOOKED rate must exist before the PO. The unrealised movement then comes
+    // from a SECOND, divergent rate seeded after the bill — buildRevaluationLines values the open payable at
+    // the valuation-date rate and compares it to the booked carrying value.
+    const sku = taggedSku(runId, 'X03')
+    const reference = `${runTag(runId)}-X03`
+    const qty = 4
+    const unitCostEur = '25.00'
+    const bookedRate = 1.15    // 1 GBP = 1.15 EUR when the bill was booked
+    const valuationRate = 1.35 // EUR weaker at period end -> the GBP carrying value of the payable falls
+    // Pin the valuation date rather than defaulting to today: it is the sweep's referenceId, so pinning it
+    // makes the (asserted-absent) journal addressable, and it keeps repeat runs from colliding on the
+    // hasRevaluationForDate() skip.
+    const valuationDate = new Date().toISOString().slice(0, 10)
+
+    await setPostingMode({ sync: true, dailyBatch: false })
+
+    // MIDNIGHT-ANCHORED, not now()-relative — the trap that first failed this test. The sweep resolves each
+    // open balance with `fetchedAt <= asOf` where asOf is the valuation DATE at midnight, so a rate seeded
+    // at now() is ALWAYS after that boundary: the divergent rate is invisible, every balance falls back to
+    // its booked rate, the movement computes to zero and the sweep reports documents: 0 — no journal built,
+    // and the suppression assertion below would have nothing to prove. date_trunc puts the two seeds at
+    // 22:00 and 23:00 the previous day: both inside the boundary, in the intended order, at any run time.
+    const bookedRateId = await seedFxRateAt('EUR', bookedRate, "date_trunc('day', now()) - interval '2 hours'")
+    let valuationRateId = ''
+    try {
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} X03`, price: '60.00' })
+
+      const { poId } = await createAndSendPo(page, {
+        sku, qty: String(qty), unitCost: unitCostEur, currency: 'EUR', fxRate: String(bookedRate),
+      })
+      await receiveGoods(page, { expectStatus: 'Received' })
+      await createBill(page, { reference })
+
+      // Drain so the EUR bill and its base-currency receipt journal reach Xero; register both for teardown
+      // failure-safe (PP-07's pattern) — this test posts real documents even though its subject is one that
+      // must NOT be posted.
+      try {
+        await processPendingXeroSyncViaUi(page)
+      } finally {
+        const receiptJournalId = await externalIdFor({ type: 'STOCK_RECEIPT', referenceId: poId }).catch(() => '')
+        if (receiptJournalId) trackDocument('ManualJournals', receiptJournalId, `X-03 stock receipt ${runTag(runId)}`)
+        const billRecordId = (await billIdsForPo(poId).catch((): string[] => []))[0]
+        const billId = billRecordId
+          ? await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: billRecordId }).catch(() => '')
+          : ''
+        if (billId) trackDocument('Invoices', billId, `X-03 bill ${runTag(runId)}`)
+      }
+
+      const [billRecordId] = await billIdsForPo(poId)
+      const [{ totalForeign, totalBase }] = await queryRows<{ totalForeign: string; totalBase: string }>(
+        `select "totalForeign", "totalBase" from purchase_invoices where id = $1 and "paidAt" is null`, [billRecordId],
+      )
+      // The payable is genuinely OPEN — a paid bill is invisible to getOpenPayables and the sweep would have
+      // nothing to revalue, making the suppression assertion vacuous.
+      expect(Number(totalForeign), 'the EUR bill is open and carries a foreign balance').toBeGreaterThan(0)
+
+      // Now the divergent valuation rate, seeded LATER than the booked one but still inside the valuation
+      // date's midnight boundary (see the anchoring note above), so the sweep resolves THIS rate rather than
+      // the booked one and the movement is material by construction.
+      valuationRateId = await seedFxRateAt('EUR', valuationRate, "date_trunc('day', now()) - interval '1 hour'")
+      const revaluedBase = Number(totalForeign) / valuationRate
+      expect(
+        Math.abs(Number(totalBase) - revaluedBase),
+        'the rate move is a material unrealised movement, so a journal is genuinely warranted',
+      ).toBeGreaterThan(1)
+
+      const result = await runFxRevaluation(page, { valuationDate })
+
+      // The sweep RAN — { skipped } means sync was disarmed or the date was already revalued, either of
+      // which would make the zero-row assertion below meaningless.
+      expect(result.skipped, `the revaluation must actually run: ${JSON.stringify(result)}`).toBeFalsy()
+      expect(result.success, `the revaluation reported failure: ${JSON.stringify(result)}`).toBe(true)
+      // And it found real work: `documents` counts the open foreign documents it revalued, `revalued` counts
+      // the journals it ENQUEUED — incremented after queueAccountingSync returns, so revalued >= 1 proves
+      // the enqueue was ATTEMPTED with lines built. This is what stops "no rows" from passing vacuously.
+      expect(Number(result.documents), 'the sweep revalued at least the open EUR bill').toBeGreaterThanOrEqual(1)
+      expect(Number(result.revalued), 'the sweep built and enqueued at least one revaluation journal').toBeGreaterThanOrEqual(1)
+
+      // THE POINT (o3d-lgo.6.1): the enqueue was attempted and NOTHING was written for Xero. Not a FAILED
+      // row — the defect state, "Account code 800 is not a valid code for this document" — and not a SYNCED
+      // one, which would double-count Xero's own revaluation.
+      const fxRows = await syncLogRowsFor({ type: 'UNREALISED_FX_JOURNAL', referenceId: valuationDate })
+      expect(
+        fxRows,
+        `UNREALISED_FX_JOURNAL must be suppressed for Xero, but ${fxRows.length} sync-log row(s) exist for ` +
+          `valuation date ${valuationDate}: ${JSON.stringify(fxRows)}. A FAILED row means the o3d-lgo.6.1 ` +
+          `defect is back (the control leg targets a SYSTEM AR/AP account); a SYNCED row means IMS is ` +
+          `double-counting Xero's own foreign-balance revaluation.`,
+      ).toEqual([])
+
+      // Failure-safe: if suppression ever regressed into a POSTED journal, register it so teardown voids it
+      // rather than stranding a manual journal in the shared Demo ledger.
+      for (const row of fxRows) {
+        if (row.externalTransactionId) {
+          trackDocument('ManualJournals', row.externalTransactionId, `X-03 UNEXPECTED unrealised FX ${runTag(runId)}`)
+        }
+      }
+    } finally {
+      await deleteFxRate(bookedRateId)
+      if (valuationRateId) await deleteFxRate(valuationRateId)
+    }
+  })
 })
 
 /**
@@ -1185,19 +1277,6 @@ async function seedTransitReconciliationResidue(
         await c.end()
       }
     },
-  }
-}
-
-/** Run a read query and return its rows (X-06 cost-layer/warehouse lookups). */
-async function queryRows<T extends import('pg').QueryResultRow>(sql: string, params: unknown[]): Promise<T[]> {
-  const { Client } = await import('pg')
-  const db = new Client({ connectionString: process.env.DATABASE_URL })
-  await db.connect()
-  try {
-    const r = await db.query<T>(sql, params)
-    return r.rows
-  } finally {
-    await db.end()
   }
 }
 

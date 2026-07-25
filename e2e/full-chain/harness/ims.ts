@@ -616,6 +616,46 @@ export async function runDailyBatch(page: Page): Promise<Record<string, unknown>
   return body
 }
 
+/**
+ * Drive the period-end AR/AP unrealised-FX revaluation cron (GET /api/cron/accounting-fx-revaluation,
+ * CRON_SECRET bearer), optionally for an explicit valuation date.
+ *
+ * `valuationDate` (YYYY-MM-DD) is worth passing: it is the sweep's referenceId, so pinning it makes the
+ * documents a test asserts on addressable, and it side-steps hasRevaluationForDate() skipping the fresh
+ * revaluation when one was already queued for today.
+ *
+ * The returned body is the sweep's own report, and its counts are the assertion surface:
+ *   - `documents` — open foreign AR/AP documents it revalued;
+ *   - `revalued`  — journals it ENQUEUED, incremented after the queueAccountingSync call RETURNS, so it
+ *     counts enqueue attempts rather than rows written — which is exactly what makes it the non-vacuous
+ *     half of X-03's suppression assertion;
+ *   - `reversed`  — prior-period revaluations it reversed.
+ * `{ skipped: true }` means it never really ran (sync disarmed, or already revalued for the date); a
+ * caller asserting on counts must treat that as a failure, not as a zero.
+ *
+ * Rate-limited 1/hour/IP like every cron route; X-03 needs a single call, so it takes no override.
+ */
+export async function runFxRevaluation(
+  page: Page,
+  opts: { valuationDate?: string } = {},
+): Promise<Record<string, unknown>> {
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    throw new Error('CRON_SECRET is not set in the test environment — cannot trigger the FX-revaluation cron route.')
+  }
+  const query = opts.valuationDate ? `?date=${encodeURIComponent(opts.valuationDate)}` : ''
+  const res = await page.request.get(`/api/cron/accounting-fx-revaluation${query}`, {
+    headers: { Authorization: `Bearer ${secret}` },
+  })
+  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
+  if (!res.ok()) {
+    // The route answers 400 with { error } when the FX accounts are unconfigured — a misconfigured rig must
+    // fail loudly here rather than surface later as a puzzling zero count.
+    throw new Error(`FX-revaluation cron HTTP ${res.status()}: ${JSON.stringify(body).slice(0, 300)}`)
+  }
+  return body
+}
+
 /** Detect paid/reversed invoices + bills (the chargeback path). */
 export async function runPaymentPoll(): Promise<unknown> {
   const { pollXeroPayments } = await import('../../../lib/connectors/xero/payment-poller.ts')

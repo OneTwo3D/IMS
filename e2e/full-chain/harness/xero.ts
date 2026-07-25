@@ -321,6 +321,41 @@ export async function externalIdFor(opts: {
   }
 }
 
+/**
+ * EVERY accounting_sync_log row of `type` for `referenceId`, whatever its status — the read-back for
+ * asserting a document was DELIBERATELY NOT QUEUED (suppression), which externalIdFor cannot express:
+ * it waits for a SYNCED row and throws on absence, so it can only prove presence.
+ *
+ * The three states an assertion must distinguish, and why the row list is what separates them:
+ *   - suppressed      -> NO rows at all (the enqueue chokepoint declined it; nothing was ever asked of Xero)
+ *   - queued + failed -> a FAILED row (Xero rejected it — the o3d-lgo.6.1 defect looked exactly like this)
+ *   - queued + posted -> a SYNCED row carrying an externalTransactionId
+ * Asserting only "no POSTED document in Xero" would pass for all three.
+ *
+ * PROVING ABSENCE, NOT RACING IT. The queue is asynchronous, so an empty list can just mean "not yet".
+ * Callers MUST first observe an artifact enqueued by the SAME server action — e.g. PP-08 waits for the
+ * BILL_PAYMENT that markBillPaid queues immediately before its FX-journal decision — so by the time this
+ * is read, the enqueue that would have written the row has already happened, or been declined.
+ */
+export async function syncLogRowsFor(opts: {
+  type: string
+  referenceId: string
+}): Promise<Array<{ status: string; externalTransactionId: string | null; errorMessage: string | null }>> {
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ status: string; externalTransactionId: string | null; errorMessage: string | null }>(
+      `select status, "externalTransactionId", "errorMessage" from accounting_sync_logs
+        where connector = 'xero' and type = $1::"AccountingSyncType" and "referenceId" = $2
+        order by "createdAt" asc`,
+      [opts.type, opts.referenceId],
+    )
+    return r.rows
+  } finally {
+    await db.end()
+  }
+}
+
 // --- assertions --------------------------------------------------------------
 
 /** Assert a line exists on the document with the given account + amount. */

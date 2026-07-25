@@ -137,6 +137,31 @@ export async function isAccountingConnectorConnected(
   return token !== null
 }
 
+/**
+ * Xero auto-posts realised currency gains/losses (and revalues unrealised FX)
+ * itself when a foreign invoice/bill settles, against its own system currency
+ * gain/loss accounts. An IMS-generated manual journal for the same movement
+ * targets the AR/AP CONTROL account (accountsReceivable 610 / accountsPayable
+ * 800), which Xero (a) REJECTS — manual-journal lines cannot post to system
+ * accounts, so the sync log stalls FAILED — and (b) would double-count against
+ * Xero's own posting. So FX gain/loss journals are suppressed for the Xero
+ * connector at the single queue chokepoint every enqueue site routes through
+ * (realised: sales.ts / purchase-orders.ts on payment; unrealised:
+ * accounting-fx-revaluation.ts at period end). QuickBooks is unaffected — its
+ * AP/AR manual-journal rules differ; revisit per o3d-lgo.6.1 if QBO is verified.
+ */
+const FX_GAIN_LOSS_JOURNAL_TYPES: ReadonlySet<AccountingSyncType> = new Set([
+  'REALISED_FX_JOURNAL',
+  'UNREALISED_FX_JOURNAL',
+])
+
+export function isFxGainLossJournalSuppressed(
+  connector: AccountingConnectorInfo['id'],
+  type: AccountingSyncType,
+): boolean {
+  return connector === 'xero' && FX_GAIN_LOSS_JOURNAL_TYPES.has(type)
+}
+
 export async function queueAccountingSync(params: {
   type: AccountingSyncType
   referenceType: string
@@ -146,6 +171,7 @@ export async function queueAccountingSync(params: {
 }): Promise<void> {
   const connector = await getActiveAccountingConnectorId()
   if (!connector) return
+  if (isFxGainLossJournalSuppressed(connector, params.type)) return
 
   switch (connector) {
     case 'xero': {
@@ -227,6 +253,10 @@ export async function queueAccountingSyncTx(
   // a separate settings recheck — avoiding a TOCTOU if the connector/setting flips.
   const context = await getAccountingPostingContext(params.type)
   if (!context) return false
+  // Xero posts FX gain/loss natively; an IMS journal to the AR/AP control
+  // account is rejected + double-counts (see isFxGainLossJournalSuppressed).
+  // Return false: no IMS GL counterpart posts, so callers stay consistent.
+  if (isFxGainLossJournalSuppressed(context.connector, params.type)) return false
 
   const payload = {
     ...params.payload,

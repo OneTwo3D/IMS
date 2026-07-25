@@ -20,9 +20,10 @@ import {
   returnItems, setPostingMode,
 } from './harness/ims.ts'
 import { createInventoryProduct } from '../helpers.ts'
+import { deleteFxRate, queryRows, seedFxRateAt } from './harness/fx-fixture.ts'
 import {
   billIdsForPo, expectJournalLine, expectLine, externalIdFor, externalIdsFor, getCreditNote,
-  getInvoice, getInvoiceAttachments, getManualJournal, getPayment, trackDocument,
+  getInvoice, getInvoiceAttachments, getManualJournal, getPayment, syncLogRowsFor, trackDocument,
 } from './harness/xero.ts'
 import type { XeroInvoice } from './harness/xero.ts'
 
@@ -868,21 +869,21 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     }
   })
 
-  // FIXME (o3d-lgo.6.1): written and verified to reach Xero, but BLOCKED by a real product defect this test
-  // surfaced. markBillPaid queues the REALISED_FX_JOURNAL with its control leg on getRealisedFxAccounts()
-  // .controlAccount = the Accounts Payable account (setting xero_accounts_payable_account = 800 on BOTH the
-  // rig and stage). Xero 800 is a SYSTEM control account (CURRLIAB); Xero refuses manual-journal lines to
-  // system accounts, so pushManualJournal 400s with "Account code '800' is not a valid code for this
-  // document" and the journal never posts. This is not a rig misconfig (stage matches) and was never caught
-  // because no prior e2e test posted an FX journal to real Xero. Same defect on the receivable side
-  // (sales.ts, account 610) and the period-end unrealised revaluation. Enable this test once o3d-lgo.6.1 is
-  // fixed (suppress the Xero MJ, or target a non-system FX clearing account). The BILL_PAYMENT half of this
-  // flow (the EUR bill settling to PAID) does work — it is the FX-journal assertion that is blocked.
+  // This test surfaced o3d-lgo.6.1 and now guards its fix. Originally it asserted a POSTED
+  // REALISED_FX_JOURNAL; that journal's control leg is getRealisedFxAccounts().controlAccount = the Accounts
+  // Payable account (setting xero_accounts_payable_account = 800 on BOTH the rig and stage), and Xero 800 is
+  // a SYSTEM control account (CURRLIAB). Xero refuses manual-journal lines to system accounts, so
+  // pushManualJournal 400'd with "Account code '800' is not a valid code for this document" and the journal
+  // never posted — on the rig AND on stage, unnoticed because no prior e2e test had posted an FX journal to
+  // real Xero. The fix (o3d-lgo.6.1, Jan's call) is SUPPRESS-FOR-XERO: Xero auto-posts realised currency
+  // gains/losses natively when a foreign bill settles, so an IMS journal for the same movement was both
+  // illegal and double-counting.
   //
-  // Verified live 2026-07-23: the run reached "No SYNCED REALISED_FX_JOURNAL … status=PENDING, error=…
-  // Account code '800' is not a valid code for this document." Teardown stayed clean (voided the bill,
-  // receipt journal and payment; the FX journal never posted so there was nothing to void).
-  test.fixme('PP-08: paying a EUR supplier bill at a different settlement rate posts a REALISED_FX_JOURNAL', async ({ page }) => {
+  // So the assertion inverts: with every condition for a material realised FX gain genuinely met, the
+  // BILL_PAYMENT still settles the bill and NO REALISED_FX_JOURNAL is queued AT ALL. "Not queued" is the
+  // claim — a FAILED row would mean the defect is back, and asserting only "no journal in Xero" would pass
+  // for the broken state too (see syncLogRowsFor).
+  test('PP-08: paying a EUR supplier bill at a different settlement rate settles it and SUPPRESSES the REALISED_FX_JOURNAL for Xero (o3d-lgo.6.1)', async ({ page }) => {
     test.setTimeout(900_000)
 
     // The AP mirror of OC-10's FX boundary, but the point is the SETTLEMENT, not the import: a EUR bill
@@ -912,7 +913,14 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
     await setPostingMode({ sync: true, dailyBatch: false })
 
     // Seed the BOOKED rate first (fetchedAt in the past) so the PO can be raised and books at ~1.15.
-    const bookedRateId = await seedFxRateAt('EUR', bookedRate, "now() - interval '2 hours'")
+    // MIDNIGHT-ANCHORED, not now()-relative. resolveSettlementFxRateToBase takes `fetchedAt <= asOf` where
+    // asOf is the payment DATE parsed to midnight, so a rate seeded at now() sits AFTER that boundary
+    // whenever the clock has rolled past midnight since paymentDate was computed — the settlement rate is
+    // then invisible, the booked rate resolves instead, and no FX is realised at all. That is not
+    // hypothetical: this test failed exactly that way on a run that crossed midnight. Anchoring both seeds
+    // to date_trunc('day', now()) puts them at 22:00 and 23:00 the previous day, so they are always <= the
+    // valuation boundary and always in the intended ORDER, whatever time the suite runs.
+    const bookedRateId = await seedFxRateAt('EUR', bookedRate, "date_trunc('day', now()) - interval '2 hours'")
     let settlementRateId = ''
     try {
       await createInventoryProduct(page, { sku, name: `${runTag(runId)} PP08`, price: '60.00' })
@@ -960,49 +968,88 @@ test.describe.serial('@full-chain @xero procure to pay', () => {
 
       // Now seed the SETTLEMENT rate (a LATER fetchedAt than the booked rate) and pay the bill from a EUR
       // bank account (a EUR payment from a EUR account — no cross-currency payment leg to complicate teardown).
-      settlementRateId = await seedFxRateAt('EUR', settlementRate, 'now()')
+      settlementRateId = await seedFxRateAt('EUR', settlementRate, "date_trunc('day', now()) - interval '1 hour'")
       const eurBankId = await bankAccountIdForName('Revolut (EUR)')
 
       await openPurchaseOrder(page, poId)
       await markBillPaidViaUi(page, { bankAccountId: eurBankId, reference, paymentDate })
 
-      // Second drain: BILL_PAYMENT settles the bill and REALISED_FX_JOURNAL posts. Register the payment (so
-      // teardown deletes it before voiding the bill) and the FX journal, failure-safe.
-      let fxJournalId = ''
+      // Second drain: the BILL_PAYMENT settles the bill. Register the payment failure-safe (teardown must
+      // delete it before voiding the bill — Xero refuses to void a bill that has a payment).
       try {
         await processPendingXeroSyncViaUi(page)
-        fxJournalId = await externalIdFor({ type: 'REALISED_FX_JOURNAL', referenceId: billRecordId })
-        trackDocument('ManualJournals', fxJournalId, `PP-08 realised FX ${runTag(runId)}`)
 
-        // THE POINT: the ledger holds a POSTED realised-FX journal that moves EXACTLY the gain between
-        // accounts payable and the realised FX gain/loss account, and balances.
-        const apAccount = await settingValue('xero_accounts_payable_account')
-        const fxAccount = await settingValue('xero_realised_fx_gain_loss_account')
-        const journal = await getManualJournal(fxJournalId)
-        expect(journal.Status, 'the realised-FX journal is in the ledger, not a draft').toBe('POSTED')
-        // Payable GAIN (buildRealisedFxJournal, side 'payable', gainLoss > 0): DR accounts payable (the EUR
-        // liability now costs fewer GBP), CR realised FX gain/loss. The pair, at exactly the computed gain.
-        expectJournalLine(journal.JournalLines, { accountCode: apAccount, debit: expectedGain })
-        expectJournalLine(journal.JournalLines, { accountCode: fxAccount, credit: expectedGain })
-        // And it balances end to end — no third leg smuggled in.
-        const net = journal.JournalLines.reduce((s, l) => s + l.LineAmount, 0)
-        expect(Math.abs(net), 'the realised-FX journal balances').toBeLessThan(0.005)
-
-        // The realised FX is only real because a PAYMENT actually settled the bill: prove the BILL_PAYMENT
-        // landed and drew from the EUR bank account.
+        // ANCHOR — and the reason the suppression assertion below is not a race. markBillPaid queues the
+        // BILL_PAYMENT and then, in the same invocation, makes the FX-journal enqueue decision
+        // (app/actions/purchase-orders.ts). Waiting for the payment to be SYNCED means that decision has
+        // already been taken, so an empty FX-journal row list is an answer, not a "not yet".
         const payExtId = await billPaymentExternalId(billRecordId)
         expect(payExtId, 'the BILL_PAYMENT posted a Xero payment').toBeTruthy()
         trackDocument('Payments', payExtId!, `PP-08 bill payment ${runTag(runId)}`)
         const payment = await getPayment(payExtId!)
         expect(Number(payment.Amount), 'the payment settled the full EUR bill').toBeCloseTo(amountForeign, 2)
+
+        // The settlement is real: Xero holds the bill as PAID with nothing outstanding. This is what makes
+        // Xero post its OWN realised currency gain — the movement the IMS must therefore not duplicate.
+        const paidBill = await getInvoice(billId)
+        expect(paidBill.Status, 'the EUR bill is settled in Xero').toBe('PAID')
+        expect(Number(paidBill.AmountDue), 'nothing outstanding on the settled bill').toBeCloseTo(0, 2)
+
+        // PRECONDITIONS — without these the "no FX journal" assertion below would be vacuous: it would pass
+        // on a fixture where no FX gain arose at all. Each is a condition markBillPaid tests before queuing:
+        //   1. both FX accounts configured (getRealisedFxAccounts returns null otherwise) — settingValue
+        //      throws when a key is unset or empty, so reading them IS the assertion;
+        const apAccount = await settingValue('xero_accounts_payable_account')
+        const fxAccount = await settingValue('xero_realised_fx_gain_loss_account')
+        expect(apAccount && fxAccount, 'realised-FX accounts are configured, so the journal would be built').toBeTruthy()
+        //   2. bill currency != base (asserted above: CurrencyCode EUR on a GBP-base instance);
+        //   3. a settlement rate DIFFERENT from the booked rate resolves as of the payment date —
+        //      resolveSettlementFxRateToBase takes the latest fetchedAt <= asOf, so assert that is the 1.35
+        //      seed and not the 1.15 booking. Without this the payment could have settled at the booked rate
+        //      and realised nothing.
+        // Mirrors resolveSettlementFxRateToBase exactly: latest fetchedAt <= asOf, where asOf is
+        // `new Date(input.paymentDate)` — a bare YYYY-MM-DD, so UTC midnight. Spelling the instant out in
+        // full avoids a ::date cast resolving against the session timezone and quietly shifting the boundary.
+        const resolvableRates = await queryRows<{ rate: string; fetchedAt: string }>(
+          `select rate, "fetchedAt"::text as "fetchedAt" from fx_rates
+            where "fromCurrency" = 'GBP' and "toCurrency" = 'EUR' and "fetchedAt" <= $1::timestamptz
+            order by "fetchedAt" desc`,
+          [`${paymentDate}T00:00:00Z`],
+        )
+        expect(
+          Number(resolvableRates[0]?.rate),
+          `the payment date (${paymentDate}) resolves the SETTLEMENT rate, not the booked one; ` +
+            `rates at or before its midnight boundary: ${JSON.stringify(resolvableRates)}`,
+        ).toBeCloseTo(settlementRate, 4)
+        //   4. and the resulting gain is material (asserted at expectedGain above, > 1 GBP).
+
+        // THE POINT (o3d-lgo.6.1): every condition for a REALISED_FX_JOURNAL is met, and it is still never
+        // QUEUED for Xero. Not "queued and rejected" — the defect state, a FAILED row carrying "Account code
+        // '800' is not a valid code for this document" — and not "queued and posted", which would
+        // double-count Xero's own realised-FX posting. No row at all.
+        const fxRows = await syncLogRowsFor({ type: 'REALISED_FX_JOURNAL', referenceId: billRecordId })
+        expect(
+          fxRows,
+          `REALISED_FX_JOURNAL must be suppressed for Xero, but ${fxRows.length} sync-log row(s) exist: ` +
+            `${JSON.stringify(fxRows)}. A FAILED row means the o3d-lgo.6.1 defect is back (the control leg ` +
+            `targets SYSTEM account ${apAccount}); a SYNCED row means IMS is double-counting Xero's native ` +
+            `currency gain/loss posting.`,
+        ).toEqual([])
       } finally {
         // Failure-safe: if an assertion threw after the payment posted, register it so teardown can delete it
         // before voiding the bill (Xero refuses to void a bill that has a payment).
         const payExtId = await billPaymentExternalId(billRecordId).catch(() => null)
         if (payExtId) trackDocument('Payments', payExtId, `PP-08 bill payment ${runTag(runId)}`)
-        if (!fxJournalId) {
-          const late = await externalIdFor({ type: 'REALISED_FX_JOURNAL', referenceId: billRecordId }).catch(() => '')
-          if (late) trackDocument('ManualJournals', late, `PP-08 realised FX ${runTag(runId)}`)
+        // And if suppression ever regressed into a POSTED journal, register that too — an untracked manual
+        // journal would be stranded in the Demo ledger by a test whose whole point is that it must not exist.
+        // Read the rows directly rather than externalIdFor: that helper WAITS for a SYNCED row, so asking it
+        // for a document expected not to exist would stall the teardown for its whole timeout on every run.
+        const strayRows = await syncLogRowsFor({ type: 'REALISED_FX_JOURNAL', referenceId: billRecordId })
+          .catch((): Array<{ status: string; externalTransactionId: string | null }> => [])
+        for (const row of strayRows) {
+          if (row.externalTransactionId) {
+            trackDocument('ManualJournals', row.externalTransactionId, `PP-08 UNEXPECTED realised FX ${runTag(runId)}`)
+          }
         }
       }
     } finally {
@@ -1133,19 +1180,6 @@ async function freightCreditNoteIdFor(poId: string): Promise<string> {
   return rows[0].id
 }
 
-/** Read rows from this instance. */
-async function queryRows<T extends Record<string, unknown>>(sql: string, params: unknown[]): Promise<T[]> {
-  const { Client } = await import('pg')
-  const db = new Client({ connectionString: process.env.DATABASE_URL })
-  await db.connect()
-  try {
-    const r = await db.query<T>(sql, params)
-    return r.rows
-  } finally {
-    await db.end()
-  }
-}
-
 /** Read a setting from this instance (account codes are per-instance config). */
 async function settingValue(key: string): Promise<string> {
   const { Client } = await import('pg')
@@ -1157,40 +1191,6 @@ async function settingValue(key: string): Promise<string> {
     return r.rows[0].value
   } finally {
     await db.end()
-  }
-}
-
-/**
- * Seed a base(GBP)->foreign FX rate with an explicit `fetchedAt` SQL expression (e.g. "now()" or
- * "now() - interval '2 hours'"), so PP-08 can control the booked vs settlement ordering precisely: the
- * settlement rate is seeded with a LATER fetchedAt than the booked rate. source='e2e-fc-seed' so
- * global-setup's sweepSeededFxRates() clears any residue a crash leaves behind (mirrors OC-10). The
- * fetchedAt expression is a fixed test literal, never external input.
- */
-async function seedFxRateAt(toCurrency: string, rate: number, fetchedAtSql: string): Promise<string> {
-  const { randomUUID } = await import('node:crypto')
-  const id = `e2e-fc-fx-${randomUUID()}`
-  await queryRows(
-    `insert into fx_rates (id, "fromCurrency", "toCurrency", rate, "fetchedAt", source, "manualOverride")
-     values ($1, 'GBP', $2, $3, ${fetchedAtSql}, 'e2e-fc-seed', false)`,
-    [id, toCurrency.toUpperCase(), rate],
-  )
-  return id
-}
-
-/**
- * Remove a seeded FX rate to restore the rig's empty-fx_rates baseline. Never throws (it runs in a finally
- * and must not mask a test result) but is not silent: a residual seeded EUR rate would let a later foreign
- * order/PO book at this artificial rate. global-setup's sweep is the recovery net (mirrors OC-10).
- */
-async function deleteFxRate(id: string): Promise<void> {
-  try {
-    const rows = await queryRows<{ id: string }>(`delete from fx_rates where id = $1 returning id`, [id])
-    if (rows.length !== 1) {
-      console.warn(`[PP-08] deleteFxRate(${id}) removed ${rows.length} row(s), expected 1 — global-setup will sweep it next run`)
-    }
-  } catch (e) {
-    console.warn(`[PP-08] deleteFxRate(${id}) failed: ${e instanceof Error ? e.message : String(e)} — global-setup will sweep it next run`)
   }
 }
 
