@@ -16,7 +16,7 @@
  * "is stage actually armed right now?".
  */
 import { Client } from 'pg'
-import { release, status } from '../e2e/full-chain/harness/quiesce.ts'
+import { lockRecoveryDecision, release, status } from '../e2e/full-chain/harness/quiesce.ts'
 
 const STATUS_ONLY = process.argv.includes('--status')
 
@@ -60,6 +60,17 @@ async function main() {
     console.log(`Lock HELD by run ${lock.runId}, taken ${lock.takenAt} (${ageMin} min ago)`)
     console.log(`  stage settings recorded: ${Object.entries(lock.stageSettings).map(([k, v]) => `${k}=${v ?? '(absent)'}`).join(', ')}`)
     console.log(`  webhooks created       : ${lock.createdWebhookIds.join(', ') || '(none)'}`)
+    console.log(`  owner                  : ${lock.ownerHost ?? '(unrecorded)'} pid ${lock.ownerPid ?? '(unrecorded)'}`)
+    console.log(`  lease                  : ${lock.heartbeatAt ? `last renewed ${lock.heartbeatAt}` : '(no heartbeat — pre-lease lock)'}`)
+    const decision = lockRecoveryDecision(lock)
+    console.log(`  verdict                : ${decision.action.toUpperCase()} — ${decision.reason}`)
+    if (decision.action === 'held') {
+      // Forcing past a live lock is the fault this script exists to fix, inflicted deliberately. Say so.
+      console.warn(
+        '\n  WARNING: this lock looks LIVE. Releasing it restores stage underneath a running full-chain suite,\n' +
+          '  and both would then drive the shared Woo store and Xero Demo org at once. Stop that run first.',
+      )
+    }
     if (ageMin > 120) console.warn('  This lock is over 2h old — almost certainly stale.')
   } else {
     console.log('No lock held.')
@@ -74,7 +85,9 @@ async function main() {
   }
 
   console.log('\nReleasing…')
-  await release()
+  // force: release() is otherwise a no-op for a process that never acquired (o3d-lgo.14), and this script
+  // is by definition run by someone who did not take the lock — that is the whole point of an escape hatch.
+  await release({ force: true })
   await reportStage()
   console.log('\nDone. Re-check that stage resumed importing (its wc-reconcile / accounting-sync crons run every 5 min).')
 }

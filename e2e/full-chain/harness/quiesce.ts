@@ -26,7 +26,32 @@
  * durable (a row in the e2e DB, not process memory) and acquire() RECOVERS a stale one
  * before doing anything else. scripts/restore-stage-connectors.ts is the manual escape
  * hatch.
+ *
+ * MUTUAL EXCLUSION, AND WHY IT IS THREE THINGS AND NOT ONE (o3d-lgo.14). Recovering an
+ * abandoned lock and refusing a live one are the same code path looked at from two sides,
+ * so the protocol has to answer all three of these together or it trades one failure for
+ * another:
+ *
+ *   1. OWNERSHIP. acquire() returns an opaque TOKEN and release() verifies it. A process
+ *      that never acquired releases NOTHING — because Playwright runs globalTeardown even
+ *      when globalSetup throws, so the invocation that was just REFUSED the lock goes on to
+ *      run teardown. Without the token it restores stage and deletes the lock out from under
+ *      the run still using it: refusing to steal the lock at acquire, then stealing it at
+ *      teardown instead.
+ *   2. ATOMICITY. The claim is a single conditional INSERT (ON CONFLICT DO NOTHING) and
+ *      recovery deletes COMPARE-AND-SET on the exact row it judged. Read-then-write lets two
+ *      near-simultaneous invocations both see no row and both write one.
+ *   3. A RENEWED LEASE, not a fixed age. The holder heartbeats while it runs; a lock is only
+ *      abandoned once its heartbeat has stopped for LEASE_TTL_MS. A fixed staleness window
+ *      cannot tell "still running" from "died an hour ago" for a holder on ANOTHER host,
+ *      where pid liveness is unknowable — and this suite is one worker over dozens of tests
+ *      with individual timeouts up to 30 minutes, so a healthy run can outlive any window
+ *      short enough to be useful.
+ *
+ * Same-host pid liveness is kept as a FAST PATH on top of the lease: a crash on this box is
+ * recovered immediately rather than after the TTL.
  */
+import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 
 import { Client } from 'pg'
@@ -84,7 +109,7 @@ export const REQUIRED_WEBHOOK_TOPICS = ['order.created', 'order.updated'] as con
  */
 const E2E_SETTINGS_TO_ENABLE = ['wc_sync_enabled'] as const
 
-type LockRecord = {
+export type LockRecord = {
   takenAt: string
   runId: string
   stageSettings: Record<string, string | null>
@@ -96,6 +121,18 @@ type LockRecord = {
    */
   ownerPid?: number
   ownerHost?: string
+  /**
+   * Opaque proof of ownership. Only the process that minted it may release this lock — see the header:
+   * a refused contender still runs globalTeardown, and without this it would restore stage on the
+   * incumbent's behalf. Optional so a lock written by an older build can still be RECOVERED (release()
+   * refuses to match an absent token, which is the safe direction: recovery goes through acquire()).
+   */
+  token?: string
+  /**
+   * Last renewal. The holder bumps this every LEASE_RENEW_INTERVAL_MS; a lock is abandoned only once it
+   * has stopped. Optional: an older build's lock has none and falls back to LOCK_STALE_AFTER_MS on takenAt.
+   */
+  heartbeatAt?: string
 }
 
 /** Just the ownership fields the liveness check reads, so it can be exercised without a whole lock record. */
@@ -104,10 +141,25 @@ export type LockOwner = { ownerPid?: number; ownerHost?: string }
 /**
  * How long a lock with no provable owner may sit before recovery treats it as abandoned.
  *
- * A full-chain invocation is minutes, and the longest single test sets a 15-minute timeout, so 45 minutes is
- * far beyond any legitimate hold while still recovering automatically from a crash nobody is watching.
+ * LEGACY ONLY: it applies to a lock written before heartbeats existed, which is judged on age alone. A
+ * lock that never renews and is 45 minutes old is abandoned by any reasonable reading; a CURRENT lock is
+ * judged on its lease instead, so a healthy long run is never stolen no matter how long it takes.
  */
 export const LOCK_STALE_AFTER_MS = 45 * 60_000
+
+/** How often the holder renews its lease while the suite runs. */
+export const LEASE_RENEW_INTERVAL_MS = 30_000
+
+/**
+ * How long a lease survives without renewal before the lock counts as abandoned.
+ *
+ * Ten missed renewals. Long enough to ride out a paused event loop, a Xero client sleeping on a
+ * Retry-After, or a stalled connection; short enough that a crashed run on another host is recovered
+ * automatically within minutes instead of blocking the rig for the rest of the day. Note this is
+ * deliberately NOT sized against the suite's duration — a running suite renews, so its own length is
+ * irrelevant. That is the whole point of a lease over a fixed window.
+ */
+export const LEASE_TTL_MS = 10 * LEASE_RENEW_INTERVAL_MS
 
 /**
  * Is the recorded owner still running?
@@ -130,6 +182,57 @@ export function isLockOwnerAlive(lock: LockOwner): boolean | null {
   }
 }
 
+export type RecoveryDecision = {
+  /** 'held' — someone is using it; 'recover' — abandoned, take it over; 'wait' — cannot tell yet. */
+  action: 'held' | 'recover' | 'wait'
+  /** Human explanation, used verbatim in the abort message so the operator knows what to do. */
+  reason: string
+}
+
+/**
+ * Should this lock be taken over, refused, or waited out?
+ *
+ * The order matters. Pid liveness is checked FIRST and is decisive when it answers, because it is the
+ * only signal that distinguishes "hung but running" from "gone": a holder that has stopped renewing but
+ * whose process is still alive must be REFUSED, not recovered — killing it is the operator's call, and
+ * stealing the lock from a process that may still be driving the shared Woo store is precisely the
+ * corruption this exists to prevent. Only when liveness is unknowable (another host, or a lock from an
+ * older build) does the lease decide.
+ */
+export function lockRecoveryDecision(lock: LockRecord, nowMs = Date.now()): RecoveryDecision {
+  const alive = isLockOwnerAlive(lock)
+  const who = `run ${lock.runId}${lock.ownerHost ? ` on ${lock.ownerHost}` : ''}${lock.ownerPid ? ` (pid ${lock.ownerPid})` : ''}`
+
+  if (alive === true) {
+    return { action: 'held', reason: `${who} is a LIVE process on this host` }
+  }
+  if (alive === false) {
+    return { action: 'recover', reason: `${who} is gone — its pid does not exist on this host` }
+  }
+
+  // Unknowable owner: the lease is the only evidence.
+  if (lock.heartbeatAt) {
+    const sinceMs = nowMs - Date.parse(lock.heartbeatAt)
+    if (!Number.isFinite(sinceMs)) {
+      return { action: 'wait', reason: `${who} has an unparseable heartbeat (${lock.heartbeatAt})` }
+    }
+    const since = `${Math.round(sinceMs / 1000)}s since its last renewal`
+    return sinceMs > LEASE_TTL_MS
+      ? { action: 'recover', reason: `${who} stopped renewing its lease — ${since}, past the ${Math.round(LEASE_TTL_MS / 1000)}s TTL` }
+      : { action: 'held', reason: `${who} is renewing its lease — ${since}` }
+  }
+
+  // Legacy lock (pre-heartbeat): age is all there is.
+  const ageMs = nowMs - Date.parse(lock.takenAt)
+  if (!Number.isFinite(ageMs)) {
+    return { action: 'wait', reason: `${who} has no heartbeat and an unparseable takenAt (${lock.takenAt})` }
+  }
+  const age = `${Math.round(ageMs / 60_000)}m old`
+  return ageMs > LOCK_STALE_AFTER_MS
+    ? { action: 'recover', reason: `${who} predates lease renewal and is ${age}, past the ${Math.round(LOCK_STALE_AFTER_MS / 60_000)}m legacy window` }
+    : { action: 'wait', reason: `${who} predates lease renewal, is only ${age}, and has no provable owner on this host` }
+}
+
 function stageDb(): Client {
   const url = process.env.STAGE_DATABASE_URL
   if (!url) throw new Error('STAGE_DATABASE_URL is not set — the quiesce lock cannot reach stage.')
@@ -145,11 +248,30 @@ function e2eDb(): Client {
   return new Client({ connectionString: url })
 }
 
-async function readLock(db: Client): Promise<LockRecord | null> {
-  const r = await db.query<{ value: string }>(`select value from settings where key = $1`, [LOCK_KEY])
-  if (!r.rows.length) return null
+/**
+ * The lock row, as the four operations the protocol actually needs.
+ *
+ * Named as an interface so the claim protocol can be tested against a fake that reproduces the races —
+ * a contender winning between our read and our write, a heartbeat losing its row — without needing two
+ * real processes and a Postgres. The Postgres implementation is the only one used in anger; its
+ * conditional-write semantics ARE the mutual exclusion, so the fake mirrors them exactly.
+ */
+export type LockStore = {
+  /** Claim by conditional insert. false means someone else already holds it. Never overwrites. */
+  claim(raw: string): Promise<boolean>
+  /** The current row, raw text and parsed, or null if unlocked. */
+  read(): Promise<{ raw: string; lock: LockRecord } | null>
+  /** Delete ONLY if the row still reads exactly as `expected` (compare-and-set, for recovery). */
+  deleteIfUnchanged(expected: string): Promise<boolean>
+  /** Delete ONLY if the row still carries `token` (for our own release; the heartbeat rewrites `raw`). */
+  deleteIfOwned(token: string): Promise<boolean>
+  /** Overwrite ONLY if the row still carries `token`. false means we no longer hold the lock. */
+  writeIfOwned(token: string, raw: string): Promise<boolean>
+}
+
+function parseLock(raw: string): LockRecord {
   try {
-    return JSON.parse(r.rows[0].value) as LockRecord
+    return JSON.parse(raw) as LockRecord
   } catch {
     // A corrupt lock must not be silently discarded: it means stage may still be
     // disabled with no record of the originals.
@@ -160,15 +282,99 @@ async function readLock(db: Client): Promise<LockRecord | null> {
   }
 }
 
-async function writeLock(db: Client, lock: LockRecord | null): Promise<void> {
-  if (lock === null) {
-    await db.query(`delete from settings where key = $1`, [LOCK_KEY])
-    return
+/**
+ * The Postgres implementation. `key` is overridable ONLY so the concurrency test can prove the
+ * conditional-write semantics against a real database without writing a bogus quiesce lock into whatever
+ * DATABASE_URL happens to point at.
+ */
+export function pgLockStore(db: Client, key: string = LOCK_KEY): LockStore {
+  return {
+    async claim(raw) {
+      // ON CONFLICT DO NOTHING is the mutual exclusion: exactly one of N concurrent inserts returns a row.
+      const r = await db.query(
+        `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+           on conflict (key) do nothing
+         returning key`,
+        [key, raw],
+      )
+      return r.rowCount === 1
+    },
+    async read() {
+      const r = await db.query<{ value: string }>(`select value from settings where key = $1`, [key])
+      if (!r.rows.length) return null
+      return { raw: r.rows[0].value, lock: parseLock(r.rows[0].value) }
+    },
+    async deleteIfUnchanged(expected) {
+      const r = await db.query(`delete from settings where key = $1 and value = $2`, [key, expected])
+      return r.rowCount === 1
+    },
+    async deleteIfOwned(token) {
+      const r = await db.query(`delete from settings where key = $1 and value::jsonb ->> 'token' = $2`, [key, token])
+      return r.rowCount === 1
+    },
+    async writeIfOwned(token, raw) {
+      const r = await db.query(
+        `update settings set value = $2, "updatedAt" = now()
+          where key = $1 and value::jsonb ->> 'token' = $3`,
+        [key, raw, token],
+      )
+      return r.rowCount === 1
+    },
   }
-  await db.query(
-    `insert into settings (key, value, "updatedAt") values ($1, $2, now())
-       on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
-    [LOCK_KEY, JSON.stringify(lock)],
+}
+
+async function readLock(db: Client): Promise<LockRecord | null> {
+  return (await pgLockStore(db).read())?.lock ?? null
+}
+
+/**
+ * Take the lock row, recovering an abandoned one, refusing a live one.
+ *
+ * `snapshot` produces the record to claim with and is called ONCE PER ATTEMPT on purpose: recovery
+ * restores stage's real settings, so a snapshot taken before that would record the DISABLED values as the
+ * originals and release() would then "restore" stage to off — turning one crashed run into a permanent
+ * outage.
+ *
+ * `recover` restores the world from the abandoned record and must delete the row compare-and-set; it
+ * returns false when another contender got there first, which is not an error — we simply retry.
+ */
+export async function claimLock(
+  store: LockStore,
+  snapshot: () => Promise<LockRecord>,
+  recover: (found: { raw: string; lock: LockRecord }) => Promise<boolean>,
+  opts: { attempts?: number; now?: () => number } = {},
+): Promise<{ raw: string; lock: LockRecord }> {
+  const attempts = opts.attempts ?? 3
+  const now = opts.now ?? Date.now
+  let lastReason = 'unknown'
+
+  for (let i = 0; i < attempts; i++) {
+    const lock = await snapshot()
+    const raw = JSON.stringify(lock)
+    if (await store.claim(raw)) return { raw, lock }
+
+    const found = await store.read()
+    // Gone between the failed claim and the read: someone released it. Try again immediately.
+    if (!found) { lastReason = 'the holder released it as we looked'; continue }
+
+    const decision = lockRecoveryDecision(found.lock, now())
+    lastReason = decision.reason
+    if (decision.action !== 'recover') {
+      throw new Error(
+        `ABORT: the quiesce lock is HELD — ${decision.reason}. The suite shares ONE Woo store and ONE ` +
+          `Xero Demo org, so a second concurrent invocation would corrupt both runs. Wait for it to finish, ` +
+          `or kill that process and re-run (a lock whose owner is gone recovers automatically; one that ` +
+          `stops renewing its lease is recovered ${Math.round(LEASE_TTL_MS / 1000)}s later).`,
+      )
+    }
+
+    console.warn(`[quiesce] recovering an ABANDONED lock — ${decision.reason} — restoring stage before starting.`)
+    await recover(found)
+  }
+
+  throw new Error(
+    `ABORT: could not take the quiesce lock after ${attempts} attempts — it kept changing hands ` +
+      `(last: ${lastReason}). Something else is running the full-chain suite against this rig.`,
   )
 }
 
@@ -233,10 +439,72 @@ async function assertPermanentWebhooks(creds: WcCreds, appUrl: string): Promise<
 
 // --- public API -------------------------------------------------------------
 
-export type QuiesceHandle = { runId: string; deliveryUrlBase: string }
+export type QuiesceHandle = { runId: string; deliveryUrlBase: string; token: LockToken }
+
+/** Opaque proof that THIS process holds the lock. Only its holder may release it. */
+export type LockToken = string
 
 /**
- * Take the lock: recover any stale one, disable stage, create delivery webhooks.
+ * The token this process holds, or null when it holds nothing.
+ *
+ * Module state, so release() defaults to "what we acquired" and a process that never acquired has
+ * nothing to default to — which is exactly the property that stops a refused contender releasing
+ * someone else's lock from globalTeardown.
+ */
+let held: { token: LockToken; raw: string } | null = null
+let heartbeat: NodeJS.Timeout | null = null
+
+/** Does THIS process hold the quiesce lock? Teardown asks before touching anything shared. */
+export function holdsQuiesceLock(): boolean {
+  return held !== null
+}
+
+/**
+ * Keep the lease alive while the suite runs.
+ *
+ * unref'd so it can never hold the process open on its own, and guarded on our token: if the renewal
+ * finds the row gone or owned by someone else we have LOST the lock (recovered from under us), and the
+ * only safe response is to stop pretending we hold it — release() then becomes a no-op rather than
+ * restoring stage on the new owner's behalf.
+ */
+function startHeartbeat(token: LockToken, lock: LockRecord): void {
+  heartbeat = setInterval(() => {
+    void (async () => {
+      // Its own short-lived connection each time. acquire()'s clients are closed when it returns, and an
+      // idle one held open for the whole suite is worse than reconnecting every 30 seconds.
+      const db = e2eDb()
+      try {
+        await db.connect()
+        const renewed: LockRecord = { ...lock, heartbeatAt: new Date().toISOString() }
+        const raw = JSON.stringify(renewed)
+        if (await pgLockStore(db).writeIfOwned(token, raw)) {
+          if (held) held = { token, raw }
+          return
+        }
+        console.error(
+          `\n[quiesce] *** LOST THE QUIESCE LOCK *** run ${lock.runId} no longer owns '${LOCK_KEY}' — it was ` +
+            `recovered or deleted while this run is still going. Stage settings are now another run's ` +
+            `responsibility, so this run will NOT restore them. Results from here are untrustworthy.\n`,
+        )
+        held = null
+        stopHeartbeat()
+      } catch (e) {
+        // A transient database blip must not kill the run; the lease has ten renewals of slack.
+        console.warn(`[quiesce] lease renewal failed (will retry): ${e instanceof Error ? e.message : e}`)
+      } finally {
+        await db.end().catch(() => {})
+      }
+    })()
+  }, LEASE_RENEW_INTERVAL_MS)
+  heartbeat.unref()
+}
+
+function stopHeartbeat(): void {
+  if (heartbeat) { clearInterval(heartbeat); heartbeat = null }
+}
+
+/**
+ * Take the lock: recover an abandoned one, refuse a live one, disable stage, arm this instance.
  * Safe to call when a previous run crashed — that is the point.
  */
 export async function acquire(runId: string): Promise<QuiesceHandle> {
@@ -246,75 +514,52 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
   const e2e = e2eDb(); await e2e.connect()
   const stage = stageDb(); await stage.connect()
   try {
-    // Recover a DEAD lock; refuse to steal a LIVE one.
-    //
-    // This used to recover unconditionally, on the reasoning that a lock present at acquire time must be
-    // stale because stage is still disabled. That is right for the crash it was written for and wrong for a
-    // second concurrent invocation: the newcomer restored the stage settings the first run was still relying
-    // on, and both then drove the one Woo store and the one Xero Demo org at once (o3d-lgo.14). The operating
-    // model has always been one invocation at a time; now it is enforced rather than assumed.
-    const existing = await readLock(e2e)
-    if (existing) {
-      const alive = isLockOwnerAlive(existing)
-      const ageMs = Date.now() - Date.parse(existing.takenAt)
-      const age = Number.isFinite(ageMs) ? `${Math.round(ageMs / 60_000)}m old` : `takenAt unparseable (${existing.takenAt})`
-      if (alive === true) {
-        throw new Error(
-          `ABORT: the quiesce lock is held by a LIVE run — pid ${existing.ownerPid} on ${existing.ownerHost}, ` +
-            `run ${existing.runId}, ${age}. The suite shares ONE Woo store and ONE Xero Demo org, so a second ` +
-            `concurrent invocation would corrupt both runs. Wait for it, or kill that process and re-run ` +
-            `(the lock then recovers automatically).`,
-        )
-      }
-      if (alive === null && Number.isFinite(ageMs) && ageMs < LOCK_STALE_AFTER_MS) {
-        throw new Error(
-          `ABORT: the quiesce lock (run ${existing.runId}, ${age}) has no provable owner` +
-            `${existing.ownerHost ? ` — it was taken on ${existing.ownerHost}, not this host` : ' (written by an older build)'}` +
-            `, and is too recent to assume abandoned. It auto-recovers once it is older than ` +
-            `${Math.round(LOCK_STALE_AFTER_MS / 60_000)}m; if you know the holder is gone, delete the ` +
-            `'${LOCK_KEY}' settings row on the e2e instance (release() restores stage from the record, so ` +
-            `prefer letting it recover).`,
-        )
-      }
-      console.warn(
-        `[quiesce] recovering an ABANDONED lock from ${existing.takenAt} (run ${existing.runId}, ${age}, ` +
-          `${alive === false ? `owner pid ${existing.ownerPid} is gone` : 'no provable owner and past the staleness window'}) ` +
-          `— restoring stage before starting.`,
-      )
-      await releaseInternal(e2e, stage, existing)
-    }
+    const store = pgLockStore(e2e)
+    const token: LockToken = `${runId}:${process.pid}@${hostname()}:${randomUUID()}`
 
-    const prior: Record<string, string | null> = {}
-    for (const key of STAGE_SETTINGS_TO_DISABLE) {
-      const r = await stage.query<{ value: string }>(`select value from settings where key = $1`, [key])
-      prior[key] = r.rows.length ? r.rows[0].value : null
-    }
-    const priorE2e: Record<string, string | null> = {}
-    for (const key of E2E_SETTINGS_TO_ENABLE) {
-      const r = await e2e.query<{ value: string }>(`select value from settings where key = $1`, [key])
-      priorE2e[key] = r.rows.length ? r.rows[0].value : null
+    // Snapshot + claim, once per attempt. The snapshot has to be INSIDE the attempt because a recovery
+    // between attempts changes what the originals are (see claimLock).
+    const snapshot = async (): Promise<LockRecord> => {
+      const prior: Record<string, string | null> = {}
+      for (const key of STAGE_SETTINGS_TO_DISABLE) {
+        const r = await stage.query<{ value: string }>(`select value from settings where key = $1`, [key])
+        prior[key] = r.rows.length ? r.rows[0].value : null
+      }
+      const priorE2e: Record<string, string | null> = {}
+      for (const key of E2E_SETTINGS_TO_ENABLE) {
+        const r = await e2e.query<{ value: string }>(`select value from settings where key = $1`, [key])
+        priorE2e[key] = r.rows.length ? r.rows[0].value : null
+      }
+      const takenAt = new Date().toISOString()
+      return {
+        takenAt,
+        runId,
+        // Owner identity, so the next acquire can tell a live run from a crash (o3d-lgo.14).
+        ownerPid: process.pid,
+        ownerHost: hostname(),
+        token,
+        heartbeatAt: takenAt,
+        stageSettings: prior,
+        e2eSettings: priorE2e,
+        createdWebhookIds: [],
+      }
     }
 
     const creds = await wcCreds(e2e)
 
     // The permanent hooks are a precondition, not something to create here. Assert them
     // rather than silently proceeding: without them nothing is delivered and every test
-    // fails 5 minutes later with a confusing timeout.
+    // fails 5 minutes later with a confusing timeout. Checked BEFORE the claim so a
+    // misconfigured store does not disable stage on its way to failing.
     await assertPermanentWebhooks(creds, appUrl)
 
-    // Write the lock BEFORE mutating anything, so a crash mid-acquire is still
-    // recoverable. Recording `prior` first is what makes release() truthful.
-    const lock: LockRecord = {
-      takenAt: new Date().toISOString(),
-      runId,
-      // Owner identity, so the next acquire can tell a live run from a crash (o3d-lgo.14).
-      ownerPid: process.pid,
-      ownerHost: hostname(),
-      stageSettings: prior,
-      e2eSettings: priorE2e,
-      createdWebhookIds: [],
-    }
-    await writeLock(e2e, lock)
+    // The claim writes the record BEFORE anything is mutated, so a crash mid-acquire is still
+    // recoverable. Recording the originals first is what makes release() truthful.
+    const claimed = await claimLock(store, snapshot, (found) =>
+      releaseInternal(e2e, stage, found.lock, { store, expect: found.raw }),
+    )
+    held = { token, raw: claimed.raw }
+    startHeartbeat(token, claimed.lock)
 
     for (const key of STAGE_SETTINGS_TO_DISABLE) {
       await stage.query(
@@ -334,13 +579,27 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
     }
     console.log(`[quiesce] e2e armed for inbound webhooks: ${E2E_SETTINGS_TO_ENABLE.join(', ')}`)
 
-    return { runId, deliveryUrlBase: `${appUrl.replace(/\/$/, '')}/api/webhooks/shopping/woocommerce` }
+    return { runId, deliveryUrlBase: `${appUrl.replace(/\/$/, '')}/api/webhooks/shopping/woocommerce`, token }
   } finally {
     await e2e.end(); await stage.end()
   }
 }
 
-async function releaseInternal(e2e: Client, stage: Client, lock: LockRecord): Promise<void> {
+/**
+ * Restore the world from a lock record and drop the row.
+ *
+ * `guard` decides WHICH row may be deleted, and there are two callers with different evidence: recovery
+ * knows the exact bytes it judged (`expect`), our own release knows its `token` (the heartbeat has been
+ * rewriting the bytes all run). Deleting unconditionally is what let one run drop another's lock.
+ * Returns false when the row moved on underneath us — the restore is idempotent, so that is a retry,
+ * not a failure.
+ */
+async function releaseInternal(
+  e2e: Client,
+  stage: Client,
+  lock: LockRecord,
+  guard: { store: LockStore; expect: string } | { store: LockStore; token: string },
+): Promise<boolean> {
   // Delivery webhooks are PERMANENT and deliberately not touched here (o3d-lgo.10).
   // `createdWebhookIds` is only honoured for locks written by the older create-per-run
   // design, so an in-flight lock from before that change still cleans up correctly
@@ -389,19 +648,57 @@ async function releaseInternal(e2e: Client, stage: Client, lock: LockRecord): Pr
     }
   }
 
-  await writeLock(e2e, null)
+  return 'token' in guard
+    ? await guard.store.deleteIfOwned(guard.token)
+    : await guard.store.deleteIfUnchanged(guard.expect)
 }
 
-/** Release the lock: delete our webhooks, restore stage, drop the record. */
-export async function release(): Promise<void> {
+/**
+ * Release the lock this process took: restore stage, disarm this instance, drop the record.
+ *
+ * A NO-OP WHEN THIS PROCESS NEVER ACQUIRED, and that is the point rather than an edge case. Playwright
+ * runs globalTeardown even when globalSetup THROWS, so the invocation that acquire() just refused arrives
+ * here next — and the old unconditional release restored stage, cancelled the incumbent's queue and
+ * deleted its lock while that suite was still running (o3d-lgo.14). Refusing to steal the lock at acquire
+ * time is worth nothing if teardown gives it away.
+ *
+ * `force` is the manual escape hatch (scripts/restore-stage-connectors.ts): an operator restoring stage
+ * after a crash legitimately releases a lock this process never took.
+ */
+export async function release(opts: { force?: boolean } = {}): Promise<void> {
+  if (!held && !opts.force) {
+    console.log('[quiesce] this process does not hold the quiesce lock — nothing to release.')
+    return
+  }
+
   const e2e = e2eDb(); await e2e.connect()
   const stage = stageDb(); await stage.connect()
   try {
-    const lock = await readLock(e2e)
-    if (!lock) { console.log('[quiesce] no lock held — nothing to release.'); return }
-    await releaseInternal(e2e, stage, lock)
-    console.log('[quiesce] released.')
+    const store = pgLockStore(e2e)
+    const found = await store.read()
+    if (!found) { console.log('[quiesce] no lock row — nothing to release.'); return }
+
+    if (!held) {
+      // force: no token to match, so delete exactly the row we just read and judged.
+      await releaseInternal(e2e, stage, found.lock, { store, expect: found.raw })
+      console.log('[quiesce] released (forced).')
+      return
+    }
+
+    if (found.lock.token !== held.token) {
+      // Someone else's lock. Restoring from it would put THEIR run's settings back mid-flight.
+      console.warn(
+        `[quiesce] the lock row belongs to run ${found.lock.runId} (token mismatch), not to this process — ` +
+          `leaving it alone. Ours was recovered from under us; see the LOST THE QUIESCE LOCK error above.`,
+      )
+      return
+    }
+
+    const dropped = await releaseInternal(e2e, stage, found.lock, { store, token: held.token })
+    console.log(dropped ? '[quiesce] released.' : '[quiesce] released; the row had already gone.')
   } finally {
+    stopHeartbeat()
+    held = null
     await e2e.end(); await stage.end()
   }
 }

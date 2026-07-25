@@ -8,7 +8,7 @@
  * than in a fixture. A held lock leaves stage disabled and silently not importing.
  */
 import { Client } from 'pg'
-import { release } from './quiesce.ts'
+import { holdsQuiesceLock, release } from './quiesce.ts'
 import { voidTrackedDocuments, findStragglers } from './xero.ts'
 
 /**
@@ -68,6 +68,13 @@ export type TeardownDeps = {
   voidTrackedDocuments: () => Promise<{ voided: number; failed: string[] }>
   findStragglers: () => Promise<string[]>
   release: () => Promise<void>
+  /**
+   * Did THIS process take the quiesce lock? When it did not — acquire() refused it because another run
+   * holds the lock — everything shared here belongs to that other run, and teardown must keep its hands
+   * off (o3d-lgo.14). Playwright runs globalTeardown even when globalSetup throws, so this path is the
+   * normal outcome of a refused second invocation, not an exotic one.
+   */
+  holdsLock: () => boolean
   /** Budgets, overridable so the hang tests do not have to actually wait 90 seconds. */
   budgets?: { voidMs?: number; stragglerMs?: number }
 }
@@ -125,6 +132,15 @@ async function withBudget<T>(work: Promise<T>, ms: number, onTimeout: T): Promis
  */
 export async function runTeardown(deps: TeardownDeps): Promise<void> {
   const problems: string[] = []
+
+  // WE NEVER HELD THE LOCK: another run does, and every shared thing below is ITS state (o3d-lgo.14).
+  // Cancelling "leftover" queued sync logs would cancel that run's in-flight queue; releasing would
+  // restore stage and delete its lock mid-suite. There is nothing of ours to clean up either — a refused
+  // acquire means no test ever ran here — so the whole teardown is correctly a no-op.
+  if (!deps.holdsLock()) {
+    console.log('[full-chain] this invocation never held the quiesce lock — leaving the running suite alone.')
+    return
+  }
 
   // Leave no queued work behind. A failed run can leave a PENDING sync log (e.g. an
   // invoice queued at import but never posted); preflight then blocks the NEXT run over
@@ -211,5 +227,5 @@ export async function runTeardown(deps: TeardownDeps): Promise<void> {
 }
 
 export default async function globalTeardown(): Promise<void> {
-  return runTeardown({ cancelPendingQueue, voidTrackedDocuments, findStragglers, release })
+  return runTeardown({ cancelPendingQueue, voidTrackedDocuments, findStragglers, release, holdsLock: holdsQuiesceLock })
 }
