@@ -117,6 +117,59 @@ export function isDispatchClientScoped(connectorId: string, clientIdRaw: string 
  * count as an error and mark the job PARTIAL rather than let a broken delta hide
  * behind a SUCCEEDED / zero-error job. Pure so it's unit-testable.
  */
+/**
+ * Per-sweep budget for the stable-ID split probe (o3d-bjc.5). Each probe is one
+ * fetchOrderParts + one link query, run only for split groups the cheap indexes
+ * missed, so in practice it fires rarely. The cap exists because a cold window
+ * with many unlinked split groups would otherwise storm Order/Search
+ * sequentially with no bound.
+ */
+export const SPLIT_PROBE_BUDGET_PER_SWEEP = 25
+
+/**
+ * Validate that a WMS part set is ONE coherent split group before anything is
+ * trusted to it.
+ *
+ * Order numbers are not unique — not even within our own client — so a part set
+ * fetched by number can silently be two different splits stapled together. Any
+ * ambiguity here has to mean "do not use it", because the caller goes on to
+ * enumerate links by these ids and then dispatch against them: a wrong group
+ * would push one order's parts onto another's, which is far worse than the
+ * aging-out this probe exists to prevent.
+ *
+ * Returns the part ids when the set is coherent, or null when it is not:
+ *   - no parts at all;
+ *   - a duplicate part NUMBER (two records claiming to be part 2);
+ *   - a duplicate external id;
+ *   - a count that disagrees with the delta row's own partCount;
+ *   - a missing/blank external id on any part.
+ */
+export function coherentSplitPartIds(
+  parts: import('@/lib/connectors/wms/types').WmsOrderPart[],
+  expectedPartCount: number | null,
+): string[] | null {
+  if (!Array.isArray(parts) || parts.length === 0) return null
+
+  const ids = new Set<string>()
+  const numbers = new Set<number>()
+  for (const part of parts) {
+    const id = String(part?.externalId ?? '').trim()
+    const num = Number(part?.partNumber)
+    if (!id || !Number.isInteger(num) || num < 1) return null
+    if (ids.has(id) || numbers.has(num)) return null
+    ids.add(id)
+    numbers.add(num)
+  }
+
+  // The delta row tells us how many parts the split has. A set that disagrees is
+  // either incomplete or contaminated by another split sharing the number.
+  if (expectedPartCount != null && expectedPartCount > 0 && ids.size !== expectedPartCount) {
+    return null
+  }
+
+  return [...ids]
+}
+
 export function resolveDispatchJobOutcome(
   errors: number,
   deltaError: string | null,
@@ -780,6 +833,9 @@ export async function runWmsDispatchSweepCore(
     //    stored on the link;
     //  - merged components (o3d-bjc.2.1): the link still holds the ABSORBED
     //    order's id, which the survivor's row no longer carries at all.
+    // Links reached via the stable-ID split probe (o3d-bjc.5). Tracked so the
+    // processing loop below can tell them apart from a bare number match.
+    const probeDiscovered = new Set<string>()
     const supplementNumbers = new Set<string>(
       [...deltaByNumber.entries()]
         .filter(([, rows]) => rows.length > 1 || rows.some((row) => row.isSplit || (row.partCount ?? 1) > 1))
@@ -794,6 +850,95 @@ export async function runWmsDispatchSweepCore(
           if (!seen.has(candidate.linkId)) {
             deltaCandidates.push(candidate)
             seen.add(candidate.linkId)
+          }
+        }
+        // A RENAMED split is still invisible here (o3d-bjc.5). The supplement
+        // looks up links by the delta row's CURRENT number, but the link stores
+        // the number the split had when we created it — so if Mintsoft renamed
+        // it and only a SIBLING part changed, neither the stable-ID join (wrong
+        // part id) nor this number lookup (wrong number) finds the link, and the
+        // order ages out when the watermark advances.
+        //
+        // Resolve the group's CURRENT part ids from the WMS and enumerate by
+        // those. Coverage is then claimed on STABLE-ID evidence, never on a
+        // number match — which is the constraint that sank the first attempt at
+        // this fix: order numbers are not unique even within our own client, so
+        // "some link has this number" proves nothing about THIS group.
+        if (deps.partsSupported && deps.fetchOrderParts && deps.listActiveByExternalOrderIds) {
+          // A group needs probing only when NOTHING already enumerated a link
+          // for it. Note this is a check for "do I need to spend a probe",
+          // not a claim that coverage is proven — the design's rule that
+          // coverage may only be CLAIMED on stable-ID evidence still holds
+          // below, where an incoherent or unprobed group sets
+          // deltaCoverageComplete = false.
+          //
+          // Both forms count, because a split link legitimately stores a
+          // DIFFERENT part's id than the one that changed: the link's own
+          // number, and any of the group's delta-row ids.
+          const enumeratedNumbers = new Set(
+            deltaCandidates.map((candidate) => candidate.externalOrderNumber).filter(Boolean),
+          )
+          const coveredIds = new Set(
+            deltaCandidates.map((candidate) => candidate.externalOrderId).filter(Boolean) as string[],
+          )
+          let probes = 0
+          for (const [number, rows] of deltaByNumber.entries()) {
+            const splitRow = rows.find((row) => row.isSplit || (row.partCount ?? 1) > 1)
+            if (!splitRow) continue
+            // Already covered by a stable id we hold: nothing to probe.
+            if (enumeratedNumbers.has(number)) continue
+            if (rows.some((row) => coveredIds.has(row.externalOrderId))) continue
+            if (probes >= SPLIT_PROBE_BUDGET_PER_SWEEP) {
+              // Budgeted, and the shortfall is REPORTED rather than silent: the
+              // job goes PARTIAL and the watermark holds, so the remaining
+              // groups are retried instead of aged out.
+              deltaCoverageComplete = false
+              console.warn(
+                `[wms-dispatch-sweep] split probe budget (${SPLIT_PROBE_BUDGET_PER_SWEEP}) ` +
+                  'exhausted; holding the watermark so unprobed split groups are not aged out',
+              )
+              break
+            }
+            probes += 1
+            let parts: import('@/lib/connectors/wms/types').WmsOrderPart[]
+            try {
+              parts = await deps.fetchOrderParts(number)
+            } catch (error) {
+              // Stop on the FIRST failure rather than hammering a degraded
+              // dependency for every remaining group.
+              deltaCoverageComplete = false
+              console.warn(
+                `[wms-dispatch-sweep] split probe for ${number} failed (${String(error)}); ` +
+                  'stopping further probes this sweep and holding the watermark',
+              )
+              break
+            }
+            const partIds = coherentSplitPartIds(parts, splitRow.partCount ?? null)
+            if (!partIds) {
+              // Ambiguous or contaminated group. Do NOT enumerate against it —
+              // hold the watermark and let a later sweep (or an operator) see a
+              // coherent group.
+              deltaCoverageComplete = false
+              console.warn(
+                `[wms-dispatch-sweep] split group for ${number} is not coherent ` +
+                  '(duplicate parts, or a count that disagrees with the delta row); ' +
+                  'refusing to enumerate links against it',
+              )
+              continue
+            }
+            const byPartId = await deps.listActiveByExternalOrderIds(partIds)
+            for (const candidate of byPartId) {
+              // Eligible on STABLE-ID evidence: this link's stored id is one of
+              // the ids the WMS itself lists for this coherent split group. The
+              // processing loop's own eligibility test is number/id-keyed
+              // against the DELTA, which is exactly what a rename defeats — so
+              // record the discovery here rather than let it fall through.
+              probeDiscovered.add(candidate.linkId)
+              if (!seen.has(candidate.linkId)) {
+                deltaCandidates.push(candidate)
+                seen.add(candidate.linkId)
+              }
+            }
           }
         }
       } else {
@@ -831,7 +976,13 @@ export async function runWmsDispatchSweepCore(
       const mergedByNumber = candidateRows?.some(
         (row) => row.isMerged && row.mergedOrderNumbers.includes(candidate.externalOrderNumber),
       ) ?? false
-      if (!idRow && !splitByNumber && !mergedByNumber) continue
+      // probeDiscovered: the split probe matched this link's stored id against
+      // the WMS's own coherent part set for the changed group. A RENAMED split
+      // has neither a matching delta id (the sibling changed) nor a matching
+      // number (the link holds the old one), so without this it is skipped here
+      // and ages out — which is the whole bug.
+      const probed = probeDiscovered.has(candidate.linkId)
+      if (!idRow && !splitByNumber && !mergedByNumber && !probed) continue
       if (!idRow && !candidate.externalOrderId) continue
 
       // Ambiguous merge: the survivor names this number, but nothing ties it to a
