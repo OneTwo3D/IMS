@@ -6,6 +6,7 @@ import {
   selectOrdersNeedingAllocation,
   type CoverageOrder,
 } from '@/lib/fulfillment/order-allocation-coverage'
+import type { SalesOrderStatus } from '@/app/generated/prisma/client'
 
 // Bound the work per tick. A durable keyset cursor (below) advances across ticks so EVERY PROCESSING
 // order is scanned within ceil(total/limit) runs — a stable page of permanent no-stock backorders can't
@@ -17,6 +18,11 @@ const CURSOR_SETTING_KEY = 'reallocation_sweep_cursor'
 // and prevent the wrap — the wrap is guaranteed once the fixed snapshot is exhausted, and rows below the
 // cursor are then picked up on the next cycle (o3d-9lx Codex review).
 const WATERMARK_SETTING_KEY = 'reallocation_sweep_watermark'
+
+// The status the sweep SELECTS on, re-asserted under the order lock (o3d-6ab/o3d-lvcb). It has to
+// match defaultLoadCandidatesPage's `status: 'PROCESSING'`: a wider set here would allow a write the
+// selector never intended, and a narrower one would skip every candidate.
+const REALLOCATION_ELIGIBLE_STATUSES = ['PROCESSING'] as const satisfies readonly SalesOrderStatus[]
 
 // autoAllocateOrder reports these via { success:false, error } for orders that simply can't be covered
 // right now (a genuine backorder) or already have shipments — expected, not a failure to log.
@@ -35,12 +41,16 @@ type AllocResult = {
   error?: string
   allocationCount?: number
   syncProductIds?: string[]
+  /** o3d-6ab: the under-lock status was no longer allocation-eligible; nothing was written. */
+  skipped?: boolean
 }
 
 export type ReallocationSweepResult = {
   scanned: number
   needing: number
   allocated: number
+  /** left PROCESSING between selection and the order lock — a deliberate no-op, not a failure. */
+  skipped: number
   errors: number
   /** true when this tick's keyset page was full — more orders remain for the next tick. */
   hasRemainder: boolean
@@ -60,7 +70,12 @@ export interface ReallocationSweepDeps {
   selectNeedingAllocation: (candidates: SweepCandidate[]) => Promise<SweepCandidate[]>
   autoAllocateOrder: (
     orderId: string,
-    opts: { internalBypassToken: symbol; deferStockSync: boolean; refuseIfShipmentsExist: boolean },
+    opts: {
+      internalBypassToken: symbol
+      deferStockSync: boolean
+      refuseIfShipmentsExist: boolean
+      requireStatusUnderLock: readonly SalesOrderStatus[]
+    },
   ) => Promise<AllocResult>
   enqueueStockSync: (productIds: string[], reason: 'IMS_CHANGE' | 'WC_WEBHOOK' | 'MANUAL') => Promise<unknown>
   logActivity: typeof logActivity
@@ -136,9 +151,20 @@ async function defaultLoadCandidatesPage(
  *
  * The sweep relies on the SAME under-lock allocation semantics as the shipped backorder allocator:
  * allocateSalesOrder re-reads status/refundStatus and nets refunded qty under the order lock, so a
- * concurrently CANCELLED/fully-refunded order is deallocated correctly. The stale-pre-filter edge cases
- * (a PROCESSING->ON_HOLD race under the lock; the selector counting gross vs net-of-refund demand) are
- * pre-existing to autoAllocateOrder/backorder-allocator and tracked as follow-ups (o3d-6ab: under-lock ON_HOLD guard; o3d-jby: net-of-refund selection).
+ * concurrently CANCELLED/fully-refunded order is deallocated correctly. It also passes
+ * requireStatusUnderLock (o3d-6ab), so a candidate that left PROCESSING between selection and the lock
+ * is skipped rather than silently re-reserved.
+ *
+ * That guard and this sweep are only correct TOGETHER (o3d-lvcb), which is why they ship in one change:
+ *   - the guard alone turns a wrong write into a LOST write on the backorder path. A stock receipt is a
+ *     ONE-SHOT replenishment trigger; if allocation skips because the order was briefly ON_HOLD, the
+ *     trigger is consumed and nothing re-runs allocation when the order returns to PROCESSING.
+ *   - this sweep is that missing backstop: it is gated on ALLOCATION state, not on any trigger, so the
+ *     order is re-selected on a later cycle and allocated then.
+ *   - and this sweep WITHOUT the guard would reintroduce the very ON_HOLD race the guard closes.
+ *
+ * The remaining stale-pre-filter edge case (the selector counting gross vs net-of-refund demand) is
+ * pre-existing to autoAllocateOrder/backorder-allocator and tracked as o3d-jby.
  */
 export async function sweepUnallocatedProcessingOrders(
   opts: { limit?: number; deps?: Partial<ReallocationSweepDeps> } = {},
@@ -161,6 +187,7 @@ export async function sweepUnallocatedProcessingOrders(
     scanned: 0,
     needing: 0,
     allocated: 0,
+    skipped: 0,
     errors: 0,
     hasRemainder: false,
     nextCursor: '',
@@ -214,10 +241,20 @@ export async function sweepUnallocatedProcessingOrders(
         internalBypassToken: INTERNAL_ACTION_BYPASS,
         deferStockSync: true,
         refuseIfShipmentsExist: true,
+        // o3d-6ab/o3d-lvcb: candidates are selected as PROCESSING OUTSIDE the order lock. Without
+        // this the sweep would re-reserve stock for an order that moved to ON_HOLD in the window —
+        // exactly the race o3d-6ab exists to close, reintroduced through the sweep's own door.
+        requireStatusUnderLock: REALLOCATION_ELIGIBLE_STATUSES,
       })
       for (const pid of res.syncProductIds ?? []) syncProductIds.add(pid)
       if (res.success && (res.allocationCount ?? 0) > 0) {
         result.allocated += 1
+      } else if (res.skipped) {
+        // The order left PROCESSING between selection and the lock. Nothing was written. It is not
+        // an error and not lost: the sweep is cyclic, so if it returns to PROCESSING while still
+        // under-allocated a later cycle re-selects it. Counted so a persistently skipped order is
+        // visible in telemetry rather than being an invisible no-op (o3d-lvcb).
+        result.skipped += 1
       } else if (res.error && !BENIGN_ALLOC_ERRORS.has(res.error)) {
         result.errors += 1
         await deps.logActivity({

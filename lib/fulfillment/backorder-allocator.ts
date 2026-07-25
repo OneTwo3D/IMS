@@ -32,8 +32,8 @@ export type BackorderSource =
 export async function allocateBackordersForProducts(
   productIds: string[],
   context: { source: BackorderSource; referenceId?: string; referenceLabel?: string },
-): Promise<{ orderIds: string[]; allocated: number; errors: number }> {
-  const result = { orderIds: [] as string[], allocated: 0, errors: 0 }
+): Promise<{ orderIds: string[]; allocated: number; skipped: number; errors: number }> {
+  const result = { orderIds: [] as string[], allocated: 0, skipped: 0, errors: 0 }
   const directIds = [...new Set(productIds.filter(Boolean))]
   if (directIds.length === 0) return result
 
@@ -129,6 +129,14 @@ export async function allocateBackordersForProducts(
       if (res.success && (res.allocationCount ?? 0) > 0) {
         result.allocated += 1
         result.orderIds.push(order.id)
+      } else if (res.skipped) {
+        // The order left the eligible set between selection and the lock. Nothing was written, so
+        // this is neither a success nor a failure — but it DOES consume this one-shot replenishment
+        // trigger, and the status-transition path does not re-run allocation. The periodic
+        // reallocation sweep (o3d-9lx) is what picks the order up once it returns to PROCESSING;
+        // without it this skip would strand the order until an unrelated future stock event
+        // (o3d-lvcb). Counted so a repeatedly-skipped order is visible rather than invisible.
+        result.skipped += 1
       } else if (res.error && !BENIGN_ALLOC_ERRORS.has(res.error)) {
         result.errors += 1
         await logActivity({

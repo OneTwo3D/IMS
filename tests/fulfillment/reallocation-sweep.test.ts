@@ -228,3 +228,75 @@ test('a batch-level failure leaves the cursor unchanged for an idempotent retry 
   // The cursor is persisted only AFTER the batch is handled, so a throw leaves it untouched.
   assert.deepEqual(calls.stateWrites, [])
 })
+
+// --- o3d-lvcb: the sweep and the o3d-6ab under-lock guard are only correct TOGETHER ---
+
+test('the sweep asserts PROCESSING under the order lock, matching what it selected on (o3d-lvcb)', async () => {
+  const seen: Array<readonly string[] | undefined> = []
+  const { deps } = baseDeps({
+    loadCandidatesPage: async () => [order('SO-1')],
+    autoAllocateOrder: async (_id, opts) => {
+      seen.push(opts.requireStatusUnderLock)
+      return { success: true, allocationCount: 1, syncProductIds: [] }
+    },
+  })
+
+  await sweepUnallocatedProcessingOrders({ deps })
+
+  // Without this the sweep reintroduces the very ON_HOLD race o3d-6ab closes: candidates are
+  // selected as PROCESSING outside the lock, so an order held in that window would be re-reserved.
+  assert.deepEqual(seen, [['PROCESSING']], 'the guard must match loadCandidatesPage\'s status filter')
+})
+
+test('a skipped order is counted, not logged as an error, and not counted as allocated (o3d-lvcb)', async () => {
+  const { deps, calls } = baseDeps({
+    loadCandidatesPage: async () => [order('SO-1'), order('SO-2')],
+    autoAllocateOrder: async (orderId) => {
+      calls.alloc.push(orderId)
+      // SO-1 left PROCESSING between selection and the lock: an explicit no-op, error undefined.
+      if (orderId === 'SO-1') return { success: false, skipped: true, allocationCount: 0, syncProductIds: [] }
+      return { success: true, allocationCount: 1, syncProductIds: ['p1'] }
+    },
+  })
+
+  const result = await sweepUnallocatedProcessingOrders({ deps })
+
+  assert.equal(result.skipped, 1, 'the skip is visible in telemetry rather than an invisible no-op')
+  assert.equal(result.allocated, 1, 'a skip is not an allocation')
+  assert.equal(result.errors, 0, 'and it is not a failure')
+  assert.deepEqual(
+    calls.logs.filter((log) => log.level === 'ERROR'),
+    [],
+    'a deliberate skip is never logged at ERROR',
+  )
+})
+
+test('an order skipped on one cycle is re-selected on a later one — the trigger is not consumed (o3d-lvcb)', async () => {
+  // The defect this pairing exists to prevent: a stock receipt is a ONE-SHOT replenishment
+  // trigger. If allocation skips because the order was briefly ON_HOLD, the backorder path
+  // records nothing and no status transition re-runs allocation. The sweep is gated on
+  // ALLOCATION state, not on any trigger, so the order comes back round.
+  let onHold = true
+  const attempts: string[] = []
+  const { deps } = baseDeps({
+    // Cycle-invariant candidate set: the order stays under-allocated either way.
+    loadCandidatesPage: async () => [order('SO-1')],
+    autoAllocateOrder: async (orderId) => {
+      attempts.push(orderId)
+      if (onHold) return { success: false, skipped: true, allocationCount: 0, syncProductIds: [] }
+      return { success: true, allocationCount: 1, syncProductIds: ['p1'] }
+    },
+  })
+
+  const first = await sweepUnallocatedProcessingOrders({ deps })
+  assert.equal(first.skipped, 1)
+  assert.equal(first.allocated, 0, 'nothing allocated while the order was held')
+
+  // The order returns to PROCESSING. No new stock event, no status hook — only the next sweep.
+  onHold = false
+  const second = await sweepUnallocatedProcessingOrders({ deps })
+
+  assert.deepEqual(attempts, ['SO-1', 'SO-1'], 'the sweep re-attempted it without any new trigger')
+  assert.equal(second.allocated, 1, 'and allocated it once it was eligible again')
+  assert.equal(second.skipped, 0)
+})
