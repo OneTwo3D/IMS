@@ -17,7 +17,7 @@ test(
     config({ quiet: true })
     if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
 
-    const { withPaymentWriteLockOrSkip, isLockSkipped } = await import('@/lib/connectors/xero/payment-write-lock')
+    const { withPaymentWriteLockOrSkip, isLockSkipped } = await import('../../lib/connectors/xero/payment-write-lock.ts')
 
     let concurrent = 0
     let maxConcurrent = 0
