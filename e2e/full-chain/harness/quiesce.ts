@@ -695,6 +695,14 @@ export const LEASE_WATCHDOG_INTERVAL_MS = 5_000
 export const LEASE_RENEW_TIMEOUT_MS = 10_000
 /** A release's only remote call. Bounded so a stalled Woo cannot hold the fence past recovery. */
 const WEBHOOK_DELETE_TIMEOUT_MS = 15_000
+/**
+ * Server-side cancellation for the restore writes.
+ *
+ * Far below the window after which a `releasing` row may be recovered, so a stalled query is killed by
+ * Postgres long before anyone could take the fence — and killed, not merely abandoned, so it cannot
+ * resume against a stage that now belongs to another run.
+ */
+const RESTORE_STATEMENT_TIMEOUT_MS = 20_000
 
 /** Reject rather than hang forever. A renewal that has not answered in 10s is not going to. */
 async function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
@@ -919,12 +927,18 @@ async function releaseInternal(
   // damage. Cheap to ask, and the answer is the difference between a no-op and a cross-run corruption.
   const stillOurs = await store.read()
   if (!stillOurs || stillOurs.raw !== fencedRaw) {
-    console.error(
-      `[quiesce] ABANDONING this release: our fence is gone — the lock was recovered while we were ` +
-        `releasing it. NOTHING was restored, which is correct: stage is now ` +
+    throw new Error(
+      `Abandoned this release before it wrote anything: our fence is gone — the lock was recovered ` +
+        `while we were claiming it. NOTHING was restored, which is correct: stage is now ` +
         `${stillOurs ? `run ${stillOurs.lock.runId}'s` : "the next run's"} business.`,
     )
-    return false
+  }
+
+  // A SERVER-SIDE deadline, not just a local one. Abandoning a promise leaves the query running, and a
+  // restore write that resumes after another host has recovered our fence would re-enable stage
+  // underneath that run (Codex, PR #560 round 6). statement_timeout makes Postgres cancel it instead.
+  for (const db of [stage, e2e]) {
+    await db.query(`set statement_timeout = ${RESTORE_STATEMENT_TIMEOUT_MS}`).catch(() => {})
   }
 
   for (const [key, value] of Object.entries(lock.stageSettings)) {
@@ -939,6 +953,18 @@ async function releaseInternal(
       )
       console.log(`[quiesce] stage ${key} restored to ${value}`)
     }
+  }
+
+  // Between the two databases, ask again. The stage writes above are the ones that matter most and are
+  // now done; re-checking here keeps the window in which a lost fence goes unnoticed as short as the
+  // protocol allows without a distributed transaction we cannot have across two databases.
+  const stillOursMidway = await store.read()
+  if (!stillOursMidway || stillOursMidway.raw !== fencedRaw) {
+    throw new Error(
+      `Our release fence was lost MIDWAY: stage HAS been restored from this run's record, this instance ` +
+        `has NOT been disarmed, and the lock row is now ` +
+        `${stillOursMidway ? `run ${stillOursMidway.lock.runId}'s` : 'gone'}. Both instances need checking.`,
+    )
   }
 
   // Put this instance back to disarmed, so nothing imports or posts between runs.
@@ -1023,11 +1049,11 @@ export async function release(opts: { force?: boolean; expectRaw?: string; expec
     // contender take the abandoned lock over in between and have stage restored underneath its running
     // suite — the exact fault this script exists to fix, by a TOCTOU (Codex, PR #560 round 3).
     if (opts.expectRaw && found.raw !== opts.expectRaw) {
-      console.error(
-        `[quiesce] REFUSING to release: the lock row changed since it was judged recoverable — run ` +
-          `${found.lock.runId} holds it now. Nothing was restored. Re-check with --status.`,
+      throw new Error(
+        `Refused to release the quiesce lock: the row changed since it was judged recoverable — run ` +
+          `${found.lock.runId} holds it now. NOTHING was restored, which is correct, but stage is still ` +
+          `disabled as far as this process is concerned. Re-check with --status.`,
       )
-      return
     }
 
     // IDENTITY, EVEN UNDER --force. Forcing overrides the LIVENESS verdict — "I know that holder is
@@ -1036,33 +1062,36 @@ export async function release(opts: { force?: boolean; expectRaw?: string; expec
     // beneath its suite (Codex, PR #560 round 4). Matching on the run id rather than the raw bytes is
     // what lets a heartbeat tick in between without spuriously refusing.
     if (opts.expectRunId && found.lock.runId !== opts.expectRunId) {
-      console.error(
-        `[quiesce] REFUSING to release: you inspected run ${opts.expectRunId}, but run ${found.lock.runId} ` +
-          `holds the lock now — it was taken over between the check and this release. Nothing was ` +
-          `restored. Re-check with --status; forcing overrides the verdict, never the target.`,
+      throw new Error(
+        `Refused to release the quiesce lock: you inspected run ${opts.expectRunId}, but run ` +
+          `${found.lock.runId} holds it now — it was taken over between the check and this release. ` +
+          `NOTHING was restored. Re-check with --status; forcing overrides the verdict, never the target.`,
       )
-      return
     }
 
     if (ourToken && found.lock.token !== ourToken) {
-      // Someone else's lock. Restoring from it would put THEIR run's settings back mid-flight.
-      console.warn(
-        `[quiesce] the lock row belongs to run ${found.lock.runId} (token mismatch), not to this process — ` +
-          `leaving it alone. Ours was recovered from under us; see the LOST THE QUIESCE LOCK error above.`,
+      // Someone else's lock. Restoring from it would put THEIR run's settings back mid-flight. Leaving
+      // it alone is right — but this run must not report a clean finish: its lock was taken from under
+      // it, its results are untrustworthy, and stage is disabled on somebody else's account now.
+      throw new Error(
+        `The quiesce lock now belongs to run ${found.lock.runId}, not to this process — it was recovered ` +
+          `from under this run (see the LOST THE QUIESCE LOCK error above). Nothing was restored, ` +
+          `correctly: stage is that run's responsibility now, and this run's results cannot be trusted.`,
       )
-      return
     }
 
     // FENCE FIRST, MUTATE SECOND. Winning this compare-and-set is what grants the right to restore
     // anything; losing it means the row moved on and nothing of ours may be written to the shared world.
     const fencedRaw = await fenceForRelease(store, found)
     if (!fencedRaw) {
-      console.warn(
-        `[quiesce] the lock row changed under us between reading it and claiming the release ` +
-          `(run ${found.lock.runId}) — another run has taken it over. NOTHING was restored, which is ` +
-          `correct: its settings are that run's business now.`,
+      // Returning quietly here was reported as SUCCESS by both callers — teardown exited green and the
+      // recovery script printed "Done." over an ongoing stage outage (Codex, PR #560 round 6). A release
+      // that did not happen must never read as one.
+      throw new Error(
+        `Could not claim the release of the quiesce lock: the row changed between reading it and ` +
+          `claiming it (run ${found.lock.runId}). NOTHING was restored — correct if another run took it ` +
+          `over, but if nothing else is running then stage is STILL DISABLED. Check with --status.`,
       )
-      return
     }
 
     const dropped = await releaseInternal(e2e, stage, found.lock, fencedRaw, store)
