@@ -3466,9 +3466,47 @@ export async function markBillPaid(
             reference: input.reference ?? undefined,
           },
         })
-      } catch {
-        // Accounting queue errors should never block the main flow.
+      } catch (e) {
+        // Queue errors must not block marking the bill paid — but they must not vanish either. The bill
+        // is now PAID in IMS with nothing queued to tell the ledger, so the ledger will go on showing
+        // the full amount outstanding and nothing will ever retry: there is no FAILED row to notice,
+        // because the row was never written (o3d-lgo.15). This is the quietest way the two systems can
+        // disagree, so it is recorded as an ERROR against the PO with the bill named.
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: invoice.poId,
+          action: 'bill_payment_not_queued',
+          tag: 'purchase',
+          level: 'ERROR',
+          description:
+            `Bill ${invoice.invoiceNumber ?? '(no number)'} was marked PAID in IMS, but the payment could ` +
+            `not be queued for the accounting connector — the ledger still shows it outstanding and ` +
+            `nothing will retry. Re-queue it, or record the payment in the ledger by hand.`,
+          metadata: {
+            invoiceId: invoice.id,
+            reference: invoice.po.reference,
+            accountingInvoiceId: invoice.accountingInvoiceId,
+            amountForeign: paymentAmount,
+            error: e instanceof Error ? e.message : String(e),
+          },
+        }).catch(() => { /* logging must never block the main flow either */ })
       }
+    } else {
+      // Paid in IMS against a bill the ledger has never seen. Not a settlement fault — a payment cannot
+      // attach to an invoice that does not exist there — but it does mean the payment is nobody's job
+      // once the bill finally posts, so say so rather than leaving it to be discovered by reconciliation.
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: invoice.poId,
+        action: 'bill_paid_before_posting',
+        tag: 'purchase',
+        level: 'WARNING',
+        description:
+          `Bill ${invoice.invoiceNumber ?? '(no number)'} was marked PAID before it posted to the ` +
+          `accounting connector, so no payment was queued. Once the bill posts, record the payment ` +
+          `again (or in the ledger directly) — posting the bill does not settle it.`,
+        metadata: { invoiceId: invoice.id, reference: invoice.po.reference, amountForeign: paymentAmount },
+      }).catch(() => {})
     }
 
     try {
