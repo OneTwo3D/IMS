@@ -9,6 +9,43 @@ Mintsoft is the first WMS connector behind the connector-agnostic WMS boundary (
 - `WmsStockSyncMode` decides whether a warehouse is notification-only or allowed to align IMS quantities to Mintsoft.
 - `WmsReturnsMode` controls returns polling/webhook behavior per warehouse.
 
+### Authentication mode
+
+Mintsoft's `POST /api/Auth` does **not** hand out a session token. It **mints a
+new tenant API key and invalidates the previous one** — the key belongs to the
+Mintsoft tenant, not to the caller. Three systems share that tenant:
+
+- this connector
+- the `woocommerce-mintsoft-sync` order sweep + webhook
+- the `woocommerce-mintsoft-shipping-label-sync` label service
+
+So whenever one of them logs in, the other two are silently knocked offline
+until their own refresh cycle runs. Issue **one fixed key** and point all three
+at it.
+
+Set the mode under Integrations → Mintsoft → Edit Mintsoft Connection:
+
+| Mode | Behaviour |
+|---|---|
+| **Username & password** (default) | Logs in and auto-renews the 24-hour key. **Regenerates the tenant key on every renewal.** |
+| **Fixed API key** | Uses the configured key verbatim and **never** calls `/api/Auth` — not on a cache miss, not on expiry, not on a 401. A blank key is a hard error, never a fall back to logging in. |
+
+Storage notes:
+
+- The fixed key lives in its own setting, `mintsoft_static_api_key`. It is
+  deliberately **not** stored in `mintsoft_api_key` — that key is the cache for
+  the rotating 24-hour token, so a credentials-mode refresh would overwrite it.
+- Both are in `SENSITIVE_SETTING_KEYS`, so both are encrypted at rest.
+- Saving the connection clears the cached rotating token, so no stale token
+  survives a switch in either direction.
+- In fixed-key mode the connection test does a read-only authenticated `GET`
+  rather than logging in — the credentials test would otherwise invalidate the
+  very key it is testing.
+
+When switching the estate over, set the key and the mode on **all three**
+systems close together: any system still in credentials mode will regenerate
+the key and break the ones already switched.
+
 ### Connection Test Gate
 
 Mintsoft connector settings cannot be marked active until a **Test Connection** succeeds against the current credential fingerprint. The save form runs the test inline before persisting, so saving with bad credentials is impossible from the UI. The fingerprint (a SHA256 of the credential payload) is written to the activity log on each test, so silent credential rotation is visible in the audit trail. Changing any byte of the credentials invalidates the gate and forces a fresh test before sync resumes.

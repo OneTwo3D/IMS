@@ -1,6 +1,11 @@
 import { createHash, createHmac, timingSafeEqual } from 'crypto'
 import { db } from '@/lib/db'
-import { getMintsoftSettings } from '@/lib/connectors/mintsoft/settings/schema'
+import {
+  getMintsoftSettings,
+  resolveMintsoftAuthMode,
+  type MintsoftAuthMode,
+} from '@/lib/connectors/mintsoft/settings/schema'
+import { withMintsoftAuthLock } from '@/lib/connectors/mintsoft/api/auth-lock'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { validateExternalBaseUrl } from '@/lib/security/external-url-safety'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
@@ -201,6 +206,51 @@ export async function testMintsoftConnectionSettings(
   return { expiresAt: session.expiresAt }
 }
 
+/**
+ * Connection test for FIXED-KEY mode.
+ *
+ * The credentials test above works by logging in — which mints a new tenant key
+ * and invalidates the current one. Running that to "test" a fixed-key
+ * connection would therefore break the very key it is testing, plus the other
+ * two integrations sharing it. So we instead make a cheap authenticated GET
+ * with the fixed key and judge it on the response status (o3d-092).
+ */
+export async function testMintsoftFixedApiKey(
+  baseUrl: string,
+  apiKey: string,
+): Promise<void> {
+  const key = apiKey.trim()
+  if (!key) {
+    throw new Error('No Mintsoft API key configured to test')
+  }
+
+  const normalizedBaseUrl = normalizeMintsoftBaseUrl(baseUrl)
+  if (!normalizedBaseUrl) {
+    throw new Error('Mintsoft base URL is not valid')
+  }
+
+  const response = await connectorFetch(
+    buildMintsoftRequestUrl('/api/Warehouse', normalizedBaseUrl),
+    {
+      method: 'GET',
+      headers: { ...buildMintsoftAuthHeaders(normalizedBaseUrl), 'ms-apikey': key },
+      cache: 'no-store',
+    },
+    { connectorName: 'Mintsoft', allowE2eLocalHttp: true },
+  )
+
+  if (response.status === 401 || response.status === 403) {
+    throw new Error('Mintsoft rejected the API key (HTTP ' + response.status + ')')
+  }
+
+  if (!response.ok) {
+    const body = (await response.text().catch(() => '')).trim()
+    throw new Error(
+      `Mintsoft API key test failed with status ${response.status}${body ? `: ${body.slice(0, 200)}` : ''}`,
+    )
+  }
+}
+
 export async function getMintsoftConnectionRecord() {
   return db.wmsConnection.findFirst({
     where: { connector: 'mintsoft' },
@@ -216,11 +266,30 @@ export async function getMintsoftApiConfiguration() {
 
   return {
     baseUrl: normalizeMintsoftBaseUrl(connection?.baseUrl ?? '') ?? '',
+    // Fails CLOSED on a malformed value. This is on the read path of every
+    // sync, so the tempting move is to swallow it and carry on — but "carry on"
+    // here means username/password, i.e. a login that rotates the tenant key.
+    // A typo cannot be assumed to be absent: mintsoft_auth_mode has an env
+    // fallback (MINTSOFT_AUTH_MODE), so an invalid value can arrive without
+    // ever passing through the validated settings action.
+    authMode: resolveMintsoftAuthMode(settings.mintsoft_auth_mode),
+    staticApiKey: settings.mintsoft_static_api_key.trim(),
     username: settings.mintsoft_username.trim(),
     password: settings.mintsoft_password.trim(),
     webhookSecret: settings.mintsoft_webhook_secret.trim(),
     orderLookupConnector: connection?.orderLookupConnector ?? null,
   }
+}
+
+/**
+ * True when the connector is configured to use a fixed operator-supplied key.
+ * In that mode NOTHING may call /api/Auth: a refresh would mint a new tenant
+ * key and break the woocommerce-mintsoft-sync sweep and the shipping-label
+ * service, which share the same tenant key (o3d-092).
+ */
+export async function isMintsoftFixedKeyMode(): Promise<boolean> {
+  const config = await getMintsoftApiConfiguration()
+  return config.authMode === 'api_key'
 }
 
 export async function invalidateMintsoftAccessToken(): Promise<void> {
@@ -252,6 +321,25 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
     throw new Error('Mintsoft connection is not configured')
   }
 
+  // o3d-092: fixed-key mode short-circuits EVERYTHING below — the freshness
+  // check, the forceRefresh override, and the single-flight login. /api/Auth
+  // mints a new tenant key and invalidates the old one, so a refresh here
+  // would break the woocommerce-mintsoft-sync sweep and the shipping-label
+  // service, which share this tenant's key. Note this deliberately ignores
+  // `forceRefresh`: the 401 retry path sets it, and honouring it would
+  // reintroduce exactly the rotation this mode exists to prevent.
+  if (config.authMode === 'api_key') {
+    if (!config.staticApiKey) {
+      throw new Error(
+        'Mintsoft authentication is set to "Fixed API key" but no key is configured. ' +
+        'Refusing to fall back to username/password: logging in would regenerate the ' +
+        'tenant API key and break the other Mintsoft integrations. Set the key, or ' +
+        'switch the connection back to username/password.',
+      )
+    }
+    return config.staticApiKey
+  }
+
   if (!forceRefresh && isMintsoftAuthTokenFresh(storedToken, connection?.tokenExpiresAt ?? null)) {
     return storedToken as string
   }
@@ -263,11 +351,32 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
   }
 
   if (!mintsoftAuthRefreshInFlight) {
-    const tracked = (async () => {
-      const session = await requestMintsoftAuthSession(config.baseUrl, config.username, config.password)
+    const tracked = withMintsoftAuthLock('credentials-refresh', async ({ assertHeld }) => {
+      // Re-read the mode INSIDE the lock, before the request. A transition to
+      // fixed-key mode holds this same lease while it tests and commits, so by
+      // the time we get here either it has not started (and it will then wait
+      // for us) or it has finished (and we see api_key and decline). That is
+      // what makes the guarantee hold rather than merely usually hold: the
+      // rotation happens at Mintsoft the instant the request lands, so the only
+      // real fix is never to send it, not to detect it afterwards.
+      const modeNow = await getMintsoftApiConfiguration()
+      if (modeNow.authMode === 'api_key') {
+        if (!modeNow.staticApiKey) {
+          throw new Error(
+            'Mintsoft switched to fixed-key authentication but no key is configured.',
+          )
+        }
+        return modeNow.staticApiKey
+      }
+
+      // Fence immediately before the irreversible act. Renewal alone is not
+      // enough: if the lease lapsed, a mode transition may already be running,
+      // and this request would rotate the key out from under it.
+      await assertHeld()
+      const session = await requestMintsoftAuthSession(modeNow.baseUrl, modeNow.username, modeNow.password)
       await persistMintsoftAuthSession(session.token, session.expiresAt)
       return session.token
-    })()
+    })
     mintsoftAuthRefreshInFlight = tracked
     // Clear the slot once the refresh settles — resolve OR reject — comparing
     // against the exact promise stored so it always nulls out (the earlier
@@ -291,13 +400,48 @@ export async function isMintsoftConfigured(): Promise<boolean> {
     getSettingValue(MINTSOFT_AUTH_TOKEN_KEY),
   ])
 
-  return Boolean(
-    config.baseUrl
-      && (
-        ((config.username && config.password))
-        || cachedApiKey
-      ),
-  )
+  if (!config.baseUrl) return false
+
+  // In fixed-key mode the fixed key is the ONLY thing that counts. Falling
+  // back to username/password or to a stale cached token here would report
+  // "configured" for a connection that is about to throw on every call — and
+  // worse, would imply the credentials are still load-bearing when the whole
+  // point is that they are not.
+  if (config.authMode === 'api_key') {
+    return Boolean(config.staticApiKey)
+  }
+
+  return Boolean((config.username && config.password) || cachedApiKey)
+}
+
+/**
+ * Drop the cached rotating token when switching INTO fixed-key mode.
+ *
+ * Without this the settings panel keeps showing a token (and an expiry) that
+ * nothing uses, and a later switch back to credentials mode could hand out a
+ * long-dead key from the cache before its freshness check catches up. The
+ * operator's fixed key lives in a separate setting, so nothing is lost.
+ */
+export async function clearCachedMintsoftTokenForFixedKeyMode(
+  mode: MintsoftAuthMode,
+): Promise<void> {
+  if (mode !== 'api_key') return
+  await invalidateMintsoftAccessToken()
+}
+
+/**
+ * Run an auth-mode transition (test + persist) under the same lease the
+ * credentials refresh takes, so the two can never overlap.
+ *
+ * Entering here waits for any in-flight `/api/Auth` call to finish; while we
+ * hold it, a refresh that wants to start blocks, and when it finally runs it
+ * re-reads the mode and declines. Without this the switch could verify a fixed
+ * key that an already-airborne login was about to invalidate.
+ */
+export async function withMintsoftAuthModeTransition<T>(
+  fn: (ctx: { assertHeld: () => Promise<void> }) => Promise<T>,
+): Promise<T> {
+  return withMintsoftAuthLock('auth-mode-transition', fn)
 }
 
 export function verifyMintsoftWebhookSignature(

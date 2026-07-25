@@ -75,6 +75,8 @@ function buildWebhookRouteDependencies(
     async getMintsoftApiConfiguration() {
       return {
         baseUrl: '',
+        authMode: 'credentials' as const,
+        staticApiKey: '',
         username: '',
         password: '',
         webhookSecret: WEBHOOK_SECRET,

@@ -8,6 +8,8 @@ import {
 
 export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
   mintsoft_api_key: 'MINTSOFT_API_KEY',
+  mintsoft_auth_mode: 'MINTSOFT_AUTH_MODE',
+  mintsoft_static_api_key: 'MINTSOFT_STATIC_API_KEY',
   mintsoft_password: 'MINTSOFT_PASSWORD',
   mintsoft_username: 'MINTSOFT_USERNAME',
   mintsoft_webhook_secret: 'MINTSOFT_WEBHOOK_SECRET',
@@ -28,6 +30,10 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   'backup_sftp_private_key',
   'email_smtp_pass',
   'mintsoft_api_key',
+  // The operator-supplied fixed key (o3d-092). A tenant-wide bearer
+  // credential exactly like the rotating one above, so it gets the same
+  // encryption at rest — omitting it here would silently store it in plaintext.
+  'mintsoft_static_api_key',
   'mintsoft_password',
   'mintsoft_username',
   'mintsoft_webhook_secret',

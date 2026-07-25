@@ -162,11 +162,15 @@ export {
   getMintsoftAccessToken,
   getMintsoftApiConfiguration,
   getMintsoftConnectionRecord,
+  clearCachedMintsoftTokenForFixedKeyMode,
+  withMintsoftAuthModeTransition,
   invalidateMintsoftAccessToken,
   isMintsoftConfigured,
+  isMintsoftFixedKeyMode,
   MINTSOFT_AUTH_TOKEN_KEY,
   normalizeMintsoftBaseUrl,
   testMintsoftConnectionSettings,
+  testMintsoftFixedApiKey,
   validateMintsoftBaseUrl,
   verifyMintsoftWebhookSignature,
 } from './api/auth'
@@ -202,4 +206,16 @@ export {
   normalizeMintsoftStockLine,
   normalizeMintsoftWarehouse,
 } from './api/normalizers'
-export { getMintsoftSettings, mintsoftDeltaScopeChanged, MINTSOFT_SETTING_KEYS, parseMintsoftPositiveId, type MintsoftSettings } from './settings/schema'
+export {
+  getMintsoftSettings,
+  MINTSOFT_AUTH_MODES,
+  mintsoftDeltaScopeChanged,
+  mintsoftHasAuthMaterial,
+  MINTSOFT_SETTING_KEYS,
+  MintsoftAuthModeError,
+  parseMintsoftAuthMode,
+  parseMintsoftPositiveId,
+  resolveMintsoftAuthMode,
+  type MintsoftAuthMode,
+  type MintsoftSettings,
+} from './settings/schema'

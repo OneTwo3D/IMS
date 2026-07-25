@@ -1,7 +1,77 @@
 import { getSettingValues } from '@/lib/settings-store'
 
+/**
+ * How we authenticate to Mintsoft (o3d-092).
+ *
+ * `POST /api/Auth` does NOT hand out a session token — it MINTS A NEW TENANT
+ * API KEY and invalidates the previous one. The key belongs to the Mintsoft
+ * tenant, not to the caller, and three of our systems share that tenant (this
+ * connector, the woocommerce-mintsoft-sync order sweep, and the shipping-label
+ * service). So every login here silently knocks the other two offline until
+ * their own refresh cycle runs.
+ *
+ * `api_key` is therefore a HARD guarantee that /api/Auth is never called — not
+ * on a cache miss, not on expiry, not on a 401.
+ */
+export type MintsoftAuthMode = 'credentials' | 'api_key'
+
+export const MINTSOFT_AUTH_MODES: readonly MintsoftAuthMode[] = ['credentials', 'api_key'] as const
+
+/** Narrow an arbitrary stored/submitted value to a MintsoftAuthMode. */
+export function parseMintsoftAuthMode(value: string | null | undefined): MintsoftAuthMode | null {
+  const trimmed = String(value ?? '').trim().toLowerCase()
+  return (MINTSOFT_AUTH_MODES as readonly string[]).includes(trimmed)
+    ? (trimmed as MintsoftAuthMode)
+    : null
+}
+
+export class MintsoftAuthModeError extends Error {}
+
+/**
+ * Resolve the effective auth mode, failing CLOSED on a malformed value.
+ *
+ * `parseMintsoftAuthMode(x) ?? 'credentials'` is wrong on any path that can
+ * receive operator input, because it cannot tell "absent" from "present but
+ * misspelled" — and mapping a typo like `api-key` onto `credentials` enables
+ * exactly the login this mode exists to forbid. That distinction matters more
+ * than it looks: `mintsoft_auth_mode` has an env fallback
+ * (`MINTSOFT_AUTH_MODE`), so an invalid value can arrive without ever passing
+ * through the validated settings action.
+ *
+ * Absent/blank still means `credentials` — that is the documented default for
+ * an install that has never chosen a mode.
+ */
+export function resolveMintsoftAuthMode(value: string | null | undefined): MintsoftAuthMode {
+  const raw = String(value ?? '').trim()
+  if (!raw) return 'credentials'
+
+  const parsed = parseMintsoftAuthMode(raw)
+  if (!parsed) {
+    throw new MintsoftAuthModeError(
+      `Mintsoft auth mode "${raw}" is not recognised (expected ${MINTSOFT_AUTH_MODES.join(' or ')}). ` +
+      'Refusing to fall back to username/password: logging in would regenerate the tenant ' +
+      'API key and break the other Mintsoft integrations.',
+    )
+  }
+
+  return parsed
+}
+
 export type MintsoftSettings = {
+  /**
+   * The CACHED rotating 24-hour token, not an operator-supplied credential.
+   * `credentials` mode overwrites this on every refresh — which is exactly why
+   * a fixed key must live in `mintsoft_static_api_key` instead.
+   */
   mintsoft_api_key: string
+  /** 'credentials' (default) or 'api_key'. See MintsoftAuthMode. */
+  mintsoft_auth_mode: string
+  /**
+   * The operator-supplied FIXED key, used only in `api_key` mode. Deliberately
+   * a separate slot from `mintsoft_api_key` so a credentials-mode refresh can
+   * never clobber it, and so switching modes back and forth doesn't lose it.
+   */
+  mintsoft_static_api_key: string
   mintsoft_username: string
   mintsoft_password: string
   mintsoft_webhook_secret: string
@@ -25,6 +95,8 @@ export type MintsoftSettings = {
 
 export const MINTSOFT_SETTING_KEYS = [
   'mintsoft_api_key',
+  'mintsoft_auth_mode',
+  'mintsoft_static_api_key',
   'mintsoft_username',
   'mintsoft_password',
   'mintsoft_webhook_secret',
@@ -42,6 +114,10 @@ export const MINTSOFT_DEFAULT_ADMIN_ORDER_URL_TEMPLATE = 'https://app.fulfillabl
 
 const MINTSOFT_DEFAULTS: MintsoftSettings = {
   mintsoft_api_key: '',
+  // Default to today's behaviour so an existing install is untouched until an
+  // operator explicitly opts into the fixed key.
+  mintsoft_auth_mode: 'credentials',
+  mintsoft_static_api_key: '',
   mintsoft_username: '',
   mintsoft_password: '',
   mintsoft_webhook_secret: '',
@@ -98,4 +174,32 @@ export async function getMintsoftSettings(): Promise<MintsoftSettings> {
   }
 
   return result
+}
+
+/**
+ * One mode-aware "is there usable auth material?" predicate, shared by the
+ * dashboard and onboarding status so they cannot drift apart.
+ *
+ * Lives HERE and not in app/actions/mintsoft-sync.ts because that file is
+ * `'use server'`, where every export must be an async server action — a
+ * synchronous export there compiles under tsc but fails `next build`.
+ */
+export function mintsoftHasAuthMaterial(
+  settings: Pick<MintsoftSettings,
+    'mintsoft_auth_mode' | 'mintsoft_static_api_key' | 'mintsoft_api_key' | 'mintsoft_username' | 'mintsoft_password'>,
+): boolean {
+  let mode: MintsoftAuthMode
+  try {
+    mode = resolveMintsoftAuthMode(settings.mintsoft_auth_mode)
+  } catch {
+    // A malformed mode is a broken configuration, not a configured one.
+    return false
+  }
+
+  if (mode === 'api_key') return Boolean(settings.mintsoft_static_api_key.trim())
+
+  return Boolean(
+    settings.mintsoft_api_key.trim()
+      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
+  )
 }

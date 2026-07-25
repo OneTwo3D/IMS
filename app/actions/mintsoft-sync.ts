@@ -13,9 +13,17 @@ import {
   fetchMintsoftAsns,
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
+  MINTSOFT_AUTH_TOKEN_KEY,
   mintsoftDeltaScopeChanged,
+  MintsoftAuthModeError,
+  mintsoftHasAuthMaterial,
+  parseMintsoftAuthMode,
+  resolveMintsoftAuthMode,
   testMintsoftConnectionSettings,
+  testMintsoftFixedApiKey,
   validateMintsoftBaseUrl,
+  withMintsoftAuthModeTransition,
+  type MintsoftAuthMode,
   type MintsoftSettings,
 } from '@/lib/connectors/mintsoft'
 import { inferShoppingOrderLookupConnector } from '@/lib/fulfillment/shopping-order-lookup'
@@ -137,6 +145,14 @@ function normalizeMintsoftAsnStatus(status: string | null | undefined): WmsAsnSt
 export type MintsoftConnectionSettingsMasked = {
   label: string
   baseUrl: string
+  /** 'credentials' | 'api_key' — see MintsoftAuthMode (o3d-092). */
+  authMode: MintsoftAuthMode
+  /** Non-null when the stored/env mode is malformed; save+test are blocked. */
+  authModeError: string | null
+  /** True when MINTSOFT_AUTH_MODE pins the mode; the UI must not offer a change. */
+  authModeEnvPinned: boolean
+  staticApiKey: string
+  staticApiKeyMasked: boolean
   username: string
   password: string
   passwordMasked: boolean
@@ -324,9 +340,149 @@ export type MintsoftBindingInput = {
   alignDownReasonId?: string | null
 }
 
+/**
+ * The effective auth mode for a connection write/test.
+ *
+ * An OMITTED mode preserves whatever is stored — it must never default to
+ * 'credentials'. Not every caller submits the field (the onboarding form did
+ * not), and defaulting would silently downgrade a fixed-key connection back to
+ * credentials, log in, and rotate the tenant key.
+ */
+function resolveConnectionAuthMode(
+  submitted: MintsoftAuthMode | undefined,
+  existingSettings: Pick<MintsoftSettings, 'mintsoft_auth_mode'>,
+): MintsoftAuthMode {
+  // Throws MintsoftAuthModeError on a malformed stored/env value, which the
+  // callers surface as a blocking configuration error. Mapping it to
+  // 'credentials' would let an operator who is merely INVESTIGATING a broken
+  // config trigger a tenant-key rotation by clicking Test Connection.
+  const effective = resolveMintsoftAuthMode(existingSettings.mintsoft_auth_mode)
+
+  // When MINTSOFT_AUTH_MODE is set in the environment it is authoritative at
+  // runtime — getSettingValue prefers the env fallback over the stored row, so
+  // a write here could not change the mode anyway. Letting untrusted form input
+  // take precedence would therefore make save/test act on a mode the runtime
+  // does not use: submit 'credentials' against an env-pinned 'api_key' and the
+  // action calls /api/Auth, rotating the tenant key, while every sync carries
+  // on in fixed-key mode with a now-stale key.
+  const envPinned = Boolean(getActiveSettingEnvOverrides(['mintsoft_auth_mode']).mintsoft_auth_mode)
+  if (envPinned) {
+    if (submitted && submitted !== effective) {
+      throw new MintsoftAuthModeError(
+        `Mintsoft authentication is pinned to "${effective}" by the MINTSOFT_AUTH_MODE ` +
+        'environment variable and cannot be changed here. Update the environment instead.',
+      )
+    }
+    return effective
+  }
+
+  return submitted ?? effective
+}
+
+/**
+ * Persist the auth-bearing settings and drop the cached rotating token.
+ *
+ * Called INSIDE the auth lease so the mode, the key and the cache clear all
+ * land before any competing `/api/Auth` call can start. Splitting the test from
+ * the persist across the lease boundary would leave the window this lease
+ * exists to close (o3d-8u7).
+ *
+ * Module-local rather than exported: this file is `'use server'`, so every
+ * export must be a callable server action.
+ */
+async function persistMintsoftConnectionAuth(values: {
+  authMode: MintsoftAuthMode
+  staticApiKey: string
+  username: string
+  password: string
+  webhookSecret: string
+  connection: {
+    label: string
+    baseUrl: string
+    orderLookupConnector: string | null
+    active: boolean
+  }
+}): Promise<string> {
+  // ONE transaction for the auth settings, the cached-token deletion and the
+  // connection row. These used to be three separate steps with the connection
+  // update running after the lease was released, so a failure there — a
+  // (connector,label) conflict, a transient DB error — committed the new mode
+  // and key against the OLD base URL, leaving the runtime authenticating one
+  // way and pointing somewhere else.
+  return db.$transaction(async (tx) => {
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_auth_mode' },
+      create: { key: 'mintsoft_auth_mode', value: serializeSettingValue('mintsoft_auth_mode', values.authMode) },
+      update: { value: serializeSettingValue('mintsoft_auth_mode', values.authMode) },
+    })
+    // Its OWN slot, never mintsoft_api_key: that key is the cache for the
+    // rotating 24-hour token, so a credentials-mode refresh would overwrite the
+    // operator's fixed key (o3d-092).
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_static_api_key' },
+      create: { key: 'mintsoft_static_api_key', value: serializeSettingValue('mintsoft_static_api_key', values.staticApiKey) },
+      update: { value: serializeSettingValue('mintsoft_static_api_key', values.staticApiKey) },
+    })
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_username' },
+      create: { key: 'mintsoft_username', value: serializeSettingValue('mintsoft_username', values.username) },
+      update: { value: serializeSettingValue('mintsoft_username', values.username) },
+    })
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_password' },
+      create: { key: 'mintsoft_password', value: serializeSettingValue('mintsoft_password', values.password) },
+      update: { value: serializeSettingValue('mintsoft_password', values.password) },
+    })
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_webhook_secret' },
+      create: { key: 'mintsoft_webhook_secret', value: serializeSettingValue('mintsoft_webhook_secret', values.webhookSecret) },
+      update: { value: serializeSettingValue('mintsoft_webhook_secret', values.webhookSecret) },
+    })
+
+    // The cached rotating token dies in the SAME commit. Outside it, a failure
+    // could leave a stale token alongside a newly-written mode.
+    await tx.setting.deleteMany({ where: { key: MINTSOFT_AUTH_TOKEN_KEY } })
+
+    const existing = await tx.wmsConnection.findFirst({
+      where: { connector: 'mintsoft' },
+      orderBy: [{ createdAt: 'asc' }],
+      select: { id: true },
+    })
+
+    const row = existing
+      ? await tx.wmsConnection.update({
+          where: { id: existing.id },
+          data: { ...values.connection, tokenExpiresAt: null, lastAuthAt: null },
+          select: { id: true },
+        })
+      : await tx.wmsConnection.create({
+          data: { connector: 'mintsoft', ...values.connection, tokenExpiresAt: null, lastAuthAt: null },
+          select: { id: true },
+        })
+
+    return row.id
+  })
+}
+
+/** A validation failure, distinct from a failed connection test. */
+class MintsoftConnectionInputError extends Error {}
+
 const MintsoftConnectionInputSchema = z.object({
   label: z.string().max(120).optional(),
   baseUrl: z.string().min(1, 'Base URL is required.'),
+  // o3d-092. 'api_key' is a hard guarantee that /api/Auth is never called:
+  // logging in mints a NEW tenant key and invalidates the old one, knocking
+  // the woocommerce-mintsoft-sync sweep and the shipping-label service (which
+  // share this tenant's key) offline.
+  //
+  // Deliberately NO .default(): an omitted field must PRESERVE the stored mode,
+  // not reset it. Not every caller submits it — the onboarding form does not —
+  // and defaulting to 'credentials' would let re-saving through onboarding
+  // silently downgrade a fixed-key connection, log in with the retained
+  // credentials, and rotate the tenant key. resolveConnectionAuthMode() below
+  // does the preserving.
+  authMode: z.enum(['credentials', 'api_key']).optional(),
+  staticApiKey: z.string().optional().default(''),
   username: z.string().optional().default(''),
   password: z.string().optional().default(''),
   webhookSecret: z.string().optional().default(''),
@@ -383,10 +539,22 @@ function mapMintsoftConnection(
   const username = settings.mintsoft_username
   const password = settings.mintsoft_password
   const webhookSecret = settings.mintsoft_webhook_secret
+  const staticApiKey = settings.mintsoft_static_api_key
 
   return {
     label: connection?.label ?? '',
     baseUrl: connection?.baseUrl ?? '',
+    // A malformed stored/env mode is reported, not silently rendered as
+    // 'credentials' — otherwise the UI would show a safe-looking mode for a
+    // config that actually blocks every save and test.
+    authMode: parseMintsoftAuthMode(settings.mintsoft_auth_mode) ?? 'credentials',
+    authModeError: settings.mintsoft_auth_mode.trim() && !parseMintsoftAuthMode(settings.mintsoft_auth_mode)
+      ? `Mintsoft auth mode "${settings.mintsoft_auth_mode.trim()}" is not recognised. `
+        + 'Saving and testing are blocked until it is set to "credentials" or "api_key".'
+      : null,
+    authModeEnvPinned: Boolean(getActiveSettingEnvOverrides(['mintsoft_auth_mode']).mintsoft_auth_mode),
+    staticApiKey: maskSecret(staticApiKey),
+    staticApiKeyMasked: Boolean(staticApiKey),
     username,
     password: maskSecret(password),
     passwordMasked: Boolean(password),
@@ -394,6 +562,8 @@ function mapMintsoftConnection(
     webhookSecretMasked: Boolean(webhookSecret),
     envOverrides: getActiveSettingEnvOverrides([
       'mintsoft_api_key',
+      'mintsoft_auth_mode',
+      'mintsoft_static_api_key',
       'mintsoft_username',
       'mintsoft_password',
       'mintsoft_webhook_secret',
@@ -1134,10 +1304,11 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
 
   let externalWarehouses: MintsoftExternalWarehouseOption[] = []
   let warehouseLookupError: string | null = null
-  const hasMintsoftAuthMaterial = Boolean(
-    settings.mintsoft_api_key.trim()
-      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
-  )
+  // Mode-aware. A fixed-key connection legitimately has NO username/password and
+  // has its cached rotating token cleared, so the old predicate reported it
+  // unconfigured — which silently skipped warehouse discovery and disabled
+  // product/bundle verification and returns polling on the dashboard.
+  const hasMintsoftAuthMaterial = mintsoftHasAuthMaterial(settings)
 
   if ((connection?.baseUrl ?? '').trim() && hasMintsoftAuthMaterial) {
     const warehouseLookup = await getMintsoftExternalWarehouses(
@@ -1220,10 +1391,11 @@ export async function getMintsoftOnboardingConnectionData(): Promise<MintsoftOnb
     select: { finishedAt: true },
   })
 
-  const hasMintsoftAuthMaterial = Boolean(
-    settings.mintsoft_api_key.trim()
-      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
-  )
+  // Mode-aware. A fixed-key connection legitimately has NO username/password and
+  // has its cached rotating token cleared, so the old predicate reported it
+  // unconfigured — which silently skipped warehouse discovery and disabled
+  // product/bundle verification and returns polling on the dashboard.
+  const hasMintsoftAuthMaterial = mintsoftHasAuthMaterial(settings)
 
   return {
     connection: mapMintsoftConnection(connection, settings, connectionTest),
@@ -1533,15 +1705,17 @@ export async function saveMintsoftConnectionSettings(
   }
   const data = parsedInput.data
 
-  const [existingSettings, pluginState] = await Promise.all([
-    getMintsoftSettings(),
-    getIntegrationPluginState(),
-  ])
+  // NOTE: settings are deliberately NOT read here. Every value the form
+  // "preserves" — the omitted mode, a blank (unchanged) key/password — must be
+  // resolved from a snapshot taken INSIDE the auth lease. Reading them out here
+  // meant a save queued behind a concurrent fixed-key transition would resolve
+  // against the pre-transition state, then acquire the lease and act on it:
+  // call /api/Auth, invalidate the key the other request had just verified, and
+  // commit credentials mode over it. The onboarding form omits authMode, so
+  // this was reachable without anyone doing anything unusual.
+  const pluginState = await getIntegrationPluginState()
   const baseUrlValidation = validateMintsoftBaseUrl(data.baseUrl)
   const baseUrl = baseUrlValidation.ok ? baseUrlValidation.normalizedUrl : null
-  const username = data.username.trim() || existingSettings.mintsoft_username
-  const password = data.password.trim() || existingSettings.mintsoft_password
-  const webhookSecret = data.webhookSecret.trim() || existingSettings.mintsoft_webhook_secret
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
   const requestedOrderLookupConnector = data.orderLookupConnector.trim() as MintsoftOrderLookupConnector | undefined
   const orderLookupConnector = requestedOrderLookupConnector
@@ -1549,14 +1723,6 @@ export async function saveMintsoftConnectionSettings(
 
   if (!baseUrl) {
     return { success: false, error: baseUrlValidation.ok ? 'Enter a valid Mintsoft base URL.' : baseUrlValidation.error }
-  }
-
-  if (!username) {
-    return { success: false, error: 'Mintsoft username is required.' }
-  }
-
-  if (!password) {
-    return { success: false, error: 'Mintsoft password is required.' }
   }
 
   if (orderLookupConnector && !availableOrderLookupConnectors.includes(orderLookupConnector)) {
@@ -1567,79 +1733,88 @@ export async function saveMintsoftConnectionSettings(
     return { success: false, error: 'Choose the shopping connector Mintsoft order numbers belong to before activating the connection.' }
   }
 
-  const testFingerprint = buildMintsoftConnectionFingerprint({
-    baseUrl,
-    username,
-    password,
-    orderLookupConnector,
-  })
+  // Assigned inside the lease, where the connection row is written in the same
+  // transaction as the auth settings (o3d-092 Codex round 3).
+  let connectionId = ''
+  let testFingerprint = ''
   try {
-    await testMintsoftConnectionSettings(baseUrl, username, password)
+    // Under the auth lease (o3d-8u7). Entering it waits for any in-flight
+    // /api/Auth call to drain, and holding it blocks a new one from starting —
+    // so the fixed key we verify here cannot be invalidated by a login that was
+    // already airborne. Everything that depends on the CURRENT stored state —
+    // resolving the omitted mode, the retained secrets, and validating them —
+    // happens inside, against a snapshot taken under the lease.
+    connectionId = await withMintsoftAuthModeTransition(async ({ assertHeld }) => {
+      const settings = await getMintsoftSettings()
+      const authMode = resolveConnectionAuthMode(data.authMode, settings)
+      // Blank keeps the stored value — the form sends '' for an untouched
+      // masked field.
+      const staticApiKey = data.staticApiKey.trim() || settings.mintsoft_static_api_key
+      const username = data.username.trim() || settings.mintsoft_username
+      const password = data.password.trim() || settings.mintsoft_password
+      const webhookSecret = data.webhookSecret.trim() || settings.mintsoft_webhook_secret
+
+      // In fixed-key mode the username/password are not used at all, so
+      // requiring them would force the operator to keep dead credentials on
+      // file — and would imply they are still load-bearing when the whole point
+      // is that we never log in.
+      if (authMode === 'api_key') {
+        if (!staticApiKey) throw new MintsoftConnectionInputError('A Mintsoft API key is required when authentication is set to "Fixed API key".')
+      } else {
+        if (!username) throw new MintsoftConnectionInputError('Mintsoft username is required.')
+        if (!password) throw new MintsoftConnectionInputError('Mintsoft password is required.')
+      }
+
+      testFingerprint = buildMintsoftConnectionFingerprint({ baseUrl, username, password, orderLookupConnector })
+
+      await assertHeld()
+      // The credentials test works BY LOGGING IN, which mints a new tenant key.
+      // Running it to "test" a fixed-key connection would invalidate the very
+      // key being tested (and the other integrations sharing it), so fixed-key
+      // mode gets a read-only authenticated probe instead (o3d-092).
+      if (authMode === 'api_key') {
+        await testMintsoftFixedApiKey(baseUrl, staticApiKey)
+      } else {
+        await testMintsoftConnectionSettings(baseUrl, username, password)
+      }
+
+      // Fence again — the test may have taken a while — then commit the auth
+      // settings AND the connection row in one transaction.
+      await assertHeld()
+      return persistMintsoftConnectionAuth({
+        authMode, staticApiKey, username, password, webhookSecret,
+        connection: {
+          label: data.label?.trim() || DEFAULT_MINTSOFT_CONNECTION_LABEL,
+          baseUrl,
+          orderLookupConnector: orderLookupConnector || null,
+          active: data.active ?? true,
+        },
+      })
+    })
   } catch (error) {
+    const message = error instanceof Error ? error.message : 'Mintsoft connection test failed.'
+    // A bad input or a misconfigured mode is not a failed CONNECTION TEST —
+    // recording it as one would poison the fingerprint gate and make the
+    // connector look unreachable when nothing was ever attempted.
+    if (error instanceof MintsoftConnectionInputError || error instanceof MintsoftAuthModeError) {
+      return { success: false, error: message }
+    }
     await recordIntegrationConnectionTest('mintsoft', {
       success: false,
       fingerprint: testFingerprint,
-      message: error instanceof Error ? error.message : 'Mintsoft connection test failed.',
+      message,
     })
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Mintsoft connection test failed.',
-    }
+    return { success: false, error: message }
   }
 
-  const existingConnection = await db.wmsConnection.findFirst({
-    where: { connector: 'mintsoft' },
-    orderBy: [{ createdAt: 'asc' }],
-    select: { id: true },
-  })
-  const connection = existingConnection
-    ? await db.wmsConnection.update({
-        where: { id: existingConnection.id },
-        data: {
-          label: data.label?.trim() || DEFAULT_MINTSOFT_CONNECTION_LABEL,
-          baseUrl,
-          orderLookupConnector: orderLookupConnector || null,
-          active: data.active ?? true,
-        },
-        select: { id: true },
-      })
-    : await db.wmsConnection.create({
-        data: {
-          connector: 'mintsoft',
-          label: data.label?.trim() || DEFAULT_MINTSOFT_CONNECTION_LABEL,
-          baseUrl,
-          orderLookupConnector: orderLookupConnector || null,
-          active: data.active ?? true,
-        },
-        select: { id: true },
-      })
-
-  await db.$transaction([
-    db.setting.upsert({
-      where: { key: 'mintsoft_username' },
-      create: { key: 'mintsoft_username', value: serializeSettingValue('mintsoft_username', username) },
-      update: { value: serializeSettingValue('mintsoft_username', username) },
-    }),
-    db.setting.upsert({
-      where: { key: 'mintsoft_password' },
-      create: { key: 'mintsoft_password', value: serializeSettingValue('mintsoft_password', password) },
-      update: { value: serializeSettingValue('mintsoft_password', password) },
-    }),
-    db.setting.upsert({
-      where: { key: 'mintsoft_webhook_secret' },
-      create: {
-        key: 'mintsoft_webhook_secret',
-        value: serializeSettingValue('mintsoft_webhook_secret', webhookSecret),
-      },
-      update: { value: serializeSettingValue('mintsoft_webhook_secret', webhookSecret) },
-    }),
-  ])
-  await invalidateMintsoftAccessToken()
+  // The connection row was written inside the lease, in the same transaction
+  // as the auth settings (see persistMintsoftConnectionAuth). Nothing to do
+  // here but invalidate the caches.
   invalidateMintsoftWarehouseLookupCache()
 
   await logActivity({
     entityType: 'SYNC',
-    entityId: connection.id,
+    entityId: connectionId,
     tag: 'sync',
     action: 'mintsoft_connection_updated',
     description: 'Updated Mintsoft connection settings',
@@ -1674,6 +1849,21 @@ export async function testMintsoftConnection(input: unknown): Promise<{ success:
   ])
   const baseUrlValidation = validateMintsoftBaseUrl(data.baseUrl)
   const baseUrl = baseUrlValidation.ok ? baseUrlValidation.normalizedUrl : null
+  // Same mode resolution as the save action. Without this, clicking "Test
+  // Connection" on a fixed-key connection would post to /api/Auth and
+  // regenerate the tenant key — testing the connection by breaking it, and
+  // breaking the other two integrations with it.
+  let authMode: MintsoftAuthMode
+  try {
+    authMode = resolveConnectionAuthMode(data.authMode, existingSettings)
+  } catch (e) {
+    // A malformed or env-pinned mode is a blocking configuration error. Return
+    // it rather than throwing, and — critically — return BEFORE anything can
+    // reach /api/Auth.
+    if (e instanceof MintsoftAuthModeError) return { success: false, error: e.message }
+    throw e
+  }
+  const staticApiKey = data.staticApiKey.trim() || existingSettings.mintsoft_static_api_key
   const username = data.username.trim() || existingSettings.mintsoft_username
   const password = data.password.trim() || existingSettings.mintsoft_password
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
@@ -1684,8 +1874,12 @@ export async function testMintsoftConnection(input: unknown): Promise<{ success:
   if (!baseUrl) {
     return { success: false, error: baseUrlValidation.ok ? 'Enter a valid Mintsoft base URL.' : baseUrlValidation.error }
   }
-  if (!username) return { success: false, error: 'Mintsoft username is required.' }
-  if (!password) return { success: false, error: 'Mintsoft password is required.' }
+  if (authMode === 'api_key') {
+    if (!staticApiKey) return { success: false, error: 'A Mintsoft API key is required when authentication is set to "Fixed API key".' }
+  } else {
+    if (!username) return { success: false, error: 'Mintsoft username is required.' }
+    if (!password) return { success: false, error: 'Mintsoft password is required.' }
+  }
   if (orderLookupConnector && !availableOrderLookupConnectors.includes(orderLookupConnector)) {
     return { success: false, error: 'Choose an enabled shopping connector for order lookup.' }
   }
@@ -1697,7 +1891,31 @@ export async function testMintsoftConnection(input: unknown): Promise<{ success:
     orderLookupConnector,
   })
   try {
-    await testMintsoftConnectionSettings(baseUrl, username, password)
+    await withMintsoftAuthModeTransition(async ({ assertHeld }) => {
+      // Re-read the PERSISTED mode inside the lease and refuse a submitted one
+      // that differs. A standalone test never COMMITS a mode, so honouring a
+      // different one would call /api/Auth — invalidating the active fixed key
+      // — while the runtime stays in api_key mode holding a key that is now
+      // dead. A stale browser tab is enough to trigger that; it needs no
+      // malice. Mode changes go through the save path, which tests and commits
+      // atomically.
+      const persistedMode = resolveMintsoftAuthMode((await getMintsoftSettings()).mintsoft_auth_mode)
+      if (data.authMode && data.authMode !== persistedMode) {
+        throw new MintsoftAuthModeError(
+          `This connection is configured for ${persistedMode === 'api_key' ? '"Fixed API key"' : 'username/password'} `
+          + 'authentication. Save the connection to change that — a test cannot, and testing under the '
+          + 'other mode would regenerate the tenant API key.',
+        )
+      }
+      // Fence immediately before the irreversible act: if the lease lapsed, a
+      // mode transition may already be running.
+      await assertHeld()
+      if (persistedMode === 'api_key') {
+        await testMintsoftFixedApiKey(baseUrl, staticApiKey)
+      } else {
+        await testMintsoftConnectionSettings(baseUrl, username, password)
+      }
+    })
     await recordIntegrationConnectionTest('mintsoft', {
       success: true,
       fingerprint,
