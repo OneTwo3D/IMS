@@ -451,3 +451,67 @@ test('throughput report keeps current queue depth in totals, not historical rows
   assert.equal('queueDepth' in (report.rows[0] as unknown as Record<string, unknown>), false)
   assert.equal(report.totals.queueDepth, '2')
 })
+
+/**
+ * The same orders must report the same total discount whichever way they are grouped (o3d-3gp).
+ *
+ * The two groupings read different fields: customer/channel took only the ORDER-level discount and
+ * product/category only the LINE discounts. That was self-consistent while the WooCommerce importer
+ * wrote a coupon into both — and o3d-y14 correctly stopped it doing that, at which point a coupon order
+ * reported its full discount in one view and nothing in the other. Both now report the whole thing:
+ * the order-level residual plus what the lines carry, allocated across lines the way revenue, tax and
+ * shipping already are.
+ */
+function couponOrderClient(): SalesFulfillmentAnalyticsClient {
+  return {
+    ...unusedClient(),
+    salesOrder: {
+      findMany: async () => [{
+        id: 'order-1',
+        status: SalesOrderStatus.PROCESSING,
+        currency: 'GBP',
+        customerId: 'customer-1',
+        customerName: 'Customer A',
+        customerEmail: 'a@example.com',
+        createdAt: new Date('2026-06-01T12:00:00.000Z'),
+        expectedDelivery: null,
+        paidAt: null,
+        totalForeign: decimal('100'),
+        totalBase: decimal('100'),
+        taxForeign: decimal('0'),
+        taxBase: decimal('0'),
+        shippingForeign: decimal('0'),
+        shippingBase: decimal('0'),
+        // A WooCommerce coupon: GBP10 allocated onto the lines, plus GBP4 Woo left unallocated.
+        discountAmount: decimal('4'),
+        shoppingLinks: [{ connector: 'woocommerce' }],
+        lines: [
+          { id: 'line-1', productId: 'product-1', sku: 'SKU-1', description: 'Widget', qty: decimal('1'), totalForeign: decimal('50'), totalBase: decimal('50'), taxForeign: decimal('0'), taxBase: decimal('0'), discountAmount: decimal('6'), product },
+          { id: 'line-2', productId: 'product-2', sku: 'SKU-2', description: 'Second', qty: decimal('1'), totalForeign: decimal('50'), totalBase: decimal('50'), taxForeign: decimal('0'), taxBase: decimal('0'), discountAmount: decimal('4'), product: { ...product, id: 'product-2', sku: 'SKU-2', name: 'Second' } },
+        ],
+      }],
+    },
+  }
+}
+
+test('sales analytics reports the SAME total discount however the orders are grouped', async () => {
+  const opts = { dateFrom: '2026-06-01', dateTo: '2026-06-01' } as const
+  const ctx = { now: () => new Date('2026-06-01T15:00:00.000Z') }
+
+  const byCustomer = await getSalesAnalyticsReport({ ...opts, groupBy: 'customer' }, { client: couponOrderClient(), ...ctx })
+  const byProduct = await getSalesAnalyticsReport({ ...opts, groupBy: 'product' }, { client: couponOrderClient(), ...ctx })
+
+  // 6 + 4 on the lines, plus the 4 the order still carries.
+  assert.equal(byCustomer.totals.discount, '14')
+  assert.equal(byProduct.totals.discount, byCustomer.totals.discount)
+})
+
+test('the order-level residual is spread across lines, not dumped on one', async () => {
+  const report = await getSalesAnalyticsReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-01', groupBy: 'product' },
+    { client: couponOrderClient(), now: () => new Date('2026-06-01T15:00:00.000Z') },
+  )
+  // Two equal lines, so each takes half of the GBP4 residual on top of its own discount.
+  assert.equal(report.rows.find((r) => r.label.startsWith('SKU-1'))?.discount, '8')
+  assert.equal(report.rows.find((r) => r.label.startsWith('SKU-2'))?.discount, '6')
+})
