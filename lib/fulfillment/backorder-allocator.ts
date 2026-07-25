@@ -177,6 +177,10 @@ export async function allocateBackordersForProducts(
         internalBypassToken: INTERNAL_ACTION_BYPASS,
         deferStockSync: true,
         refuseIfShipmentsExist: true,
+        // o3d-6ab: candidates were selected by status OUTSIDE the order lock. Re-assert it under the
+        // lock so an order that moved to ON_HOLD (or past PROCESSING) in that window is skipped rather
+        // than silently re-reserved. A skip returns no error, so it is counted as neither done nor failed.
+        requireStatusUnderLock: BACKORDER_ELIGIBLE_STATUSES,
       })
       for (const productId of res.syncProductIds ?? []) syncProductIds.add(productId)
       if (res.success && (res.allocationCount ?? 0) > 0) {

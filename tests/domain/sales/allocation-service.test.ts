@@ -988,3 +988,165 @@ test('allocateSalesOrder on a fully-refunded order (refundStatus=FULL) deallocat
   assert.equal(state.stockLevels[0].reservedQty, 0, 'no stock reserved for a fully-refunded order')
   assert.notEqual(state.order.status, 'ALLOCATED', 'a fully-refunded order is not promoted/fulfilled')
 })
+
+// --- o3d-6ab: under-lock ELIGIBILITY guard. The tests above prove the order's OWN state is
+// revalidated under the lock (CANCELLED/FULL refund). These prove the CALLER'S PREMISE is too: batch
+// callers select candidates by status outside the lock, and by the time the lock is granted the order
+// may no longer want allocating at all. requireStatusUnderLock makes that an explicit no-op. ---
+
+const BATCH_ELIGIBLE = ['PROCESSING', 'ALLOCATED'] as const
+
+test('o3d-6ab: PROCESSING→ON_HOLD between selection and the lock is an explicit no-op, not a re-reservation', async () => {
+  // The exact race: the caller selected this order while it was PROCESSING; ON_HOLD committed before
+  // the lock was granted. Without the guard the release/delete/recreate below still runs and re-reserves
+  // stock for a held order (that is what the older "does NOT resume a held order" test documents —
+  // it asserts reservedQty 3). With the guard the whole transaction is a no-op.
+  const state = baseState({ order: { ...baseState().order, status: 'ON_HOLD' } })
+  const client = withStalePreLockStatus(state, 'PROCESSING')
+
+  const result = await allocateSalesOrder(client, {
+    orderId: 'order-1',
+    requireStatusUnderLock: BATCH_ELIGIBLE,
+  })
+
+  assert.equal(result.skipped, true, 'reported as an explicit skip')
+  assert.equal(result.skippedStatus, 'ON_HOLD', 'reports the under-lock status that caused the skip')
+  assert.equal(result.error, undefined, 'a stale premise is NOT an error — callers must not log a failure')
+  assert.equal(result.allocationCount, 0)
+  assert.equal(state.stockLevels[0].reservedQty, 0, 'no stock reserved for the held order')
+  assert.deepEqual(state.allocations, [], 'no allocation rows created')
+  assert.equal(state.order.status, 'ON_HOLD', 'status untouched')
+})
+
+test('o3d-6ab: a skip leaves EXISTING allocations and reservations completely untouched', async () => {
+  // The no-op must be total: it must not release-and-delete either. The held order keeps whatever it
+  // already held until whoever held it decides otherwise.
+  const state = baseState({
+    order: { ...baseState().order, status: 'ON_HOLD' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    requireStatusUnderLock: BATCH_ELIGIBLE,
+  })
+
+  assert.equal(result.skipped, true)
+  assert.equal(state.stockLevels[0].reservedQty, 3, 'existing reservation NOT released')
+  assert.equal(state.allocations?.length, 1, 'existing allocation rows NOT deleted/recreated')
+})
+
+test('o3d-6ab: an order that already advanced past PROCESSING (→PICKING) is skipped', async () => {
+  // Not just ON_HOLD: anything the caller did not select for. A picker is working the order; rebuilding
+  // its allocation under them would churn rows that the pick is already based on.
+  const state = baseState({ order: { ...baseState().order, status: 'PICKING' } })
+  const client = withStalePreLockStatus(state, 'PROCESSING')
+
+  const result = await allocateSalesOrder(client, {
+    orderId: 'order-1',
+    requireStatusUnderLock: BATCH_ELIGIBLE,
+  })
+
+  assert.equal(result.skipped, true)
+  assert.equal(result.skippedStatus, 'PICKING')
+  assert.equal(state.stockLevels[0].reservedQty, 0, 'no re-reservation under the picker')
+})
+
+test('o3d-6ab: a still-eligible order allocates normally with the guard set', async () => {
+  // The guard must not break the common case it is wrapping.
+  const state = baseState()
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    requireStatusUnderLock: BATCH_ELIGIBLE,
+  })
+
+  assert.equal(result.skipped, undefined, 'not skipped')
+  assert.equal(result.success, true)
+  assert.equal(result.allocationCount, 1)
+  assert.equal(state.stockLevels[0].reservedQty, 3)
+  assert.equal(state.order.status, 'ALLOCATED')
+})
+
+test('o3d-6ab: without requireStatusUnderLock the guard is inert (existing callers unchanged)', async () => {
+  // Opt-in only. User/event-driven callers allocate a specific order on purpose and must keep the
+  // pre-existing behaviour, including on a held order.
+  const state = baseState({ order: { ...baseState().order, status: 'ON_HOLD' } })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.skipped, undefined)
+  assert.equal(state.stockLevels[0].reservedQty, 3, 'unchanged pre-o3d-6ab behaviour')
+})
+
+test('o3d-6ab: the guard does NOT suppress the CANCELLED deallocation', async () => {
+  // CANCELLED is not in the eligible set, but it takes the zero-demand path, which RELEASES. Turning
+  // that into a no-op would strand reservations on a cancelled order — strictly worse than the bug.
+  const state = baseState({
+    order: { ...baseState().order, status: 'CANCELLED' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    requireStatusUnderLock: BATCH_ELIGIBLE,
+  })
+
+  assert.equal(result.skipped, undefined, 'deallocation is not skipped')
+  assert.deepEqual(state.allocations, [], 'released and deleted')
+  assert.equal(state.stockLevels[0].reservedQty, 0)
+})
+
+test('o3d-6ab: the guard does NOT suppress the fully-refunded (refundStatus=FULL) deallocation on a HELD order', async () => {
+  // Both conditions at once: an ineligible status AND zero monetary demand. Release still wins.
+  const state = baseState({
+    order: { ...baseState().order, status: 'ON_HOLD', refundStatus: 'FULL' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    requireStatusUnderLock: BATCH_ELIGIBLE,
+  })
+
+  assert.equal(result.skipped, undefined)
+  assert.deepEqual(state.allocations, [], 'a fully-refunded held order still releases')
+  assert.equal(state.stockLevels[0].reservedQty, 0)
+})
+
+test('o3d-6ab: refuseIfShipmentsExist still wins over the guard and reports the refusal', async () => {
+  // Both guards are opt-in and both are no-ops; the shipment refusal is the one that carries an error
+  // string the batch callers already treat as benign, so it must not be masked by a skip.
+  const state = baseState({
+    order: { ...baseState().order, status: 'ON_HOLD' },
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', status: 'PENDING', shipmentJournalDate: null }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    refuseIfShipmentsExist: true,
+    requireStatusUnderLock: BATCH_ELIGIBLE,
+  })
+
+  assert.equal(result.refused, true)
+  assert.equal(result.skipped, undefined)
+  assert.equal(result.error, 'Order has existing shipments; reallocation refused')
+})
+
+test('o3d-6ab: onReconciledInTx does NOT run on a skipped allocation (backstop stays pending)', async () => {
+  // A skip commits nothing, so a durable backstop must NOT be marked resolved — it has to retry once
+  // the order is eligible again.
+  const state = baseState({ order: { ...baseState().order, status: 'ON_HOLD' } })
+  let ran = false
+
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    requireStatusUnderLock: BATCH_ELIGIBLE,
+    onReconciledInTx: async () => { ran = true },
+  })
+
+  assert.equal(result.skipped, true)
+  assert.equal(ran, false, 'the backstop resolve did not run on the no-op path')
+})

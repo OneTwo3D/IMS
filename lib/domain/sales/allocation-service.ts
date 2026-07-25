@@ -40,6 +40,21 @@ export type AllocateSalesOrderInput = {
    * allocation commit and a separate resolve. A throw here rolls the allocation back (the backstop then retries).
    */
   onReconciledInTx?: (tx: Prisma.TransactionClient) => Promise<void>
+  /**
+   * o3d-6ab: the set of statuses the order must STILL be in when the row lock is acquired, for this
+   * allocation to be legitimate. Batch callers (the backorder allocator, the periodic reallocation
+   * sweep) pick candidates by status OUTSIDE the lock; the lock serializes the writes but does not
+   * revalidate the REASON for writing, so an order that moved PROCESSING→ON_HOLD (or →PICKING) in the
+   * selection→lock window would still be released, deleted, recreated and re-reserved. When set and the
+   * under-lock status is not in the set, allocation is an explicit no-op: nothing is written, and the
+   * result is `skipped` — NOT an error (the caller's premise simply expired; another actor now owns the
+   * order). Leave unset for user- and event-driven callers that allocate a specific order on purpose.
+   *
+   * CANCELLED / refundStatus=FULL are deliberately exempt: those already take the zero-demand path
+   * below, which RELEASES reservations. Deallocation is always safe and always wanted, so the guard
+   * must not turn it into a no-op that strands reservations on a cancelled order.
+   */
+  requireStatusUnderLock?: readonly SalesOrderStatus[]
 }
 
 export type AllocateSalesOrderResult = {
@@ -57,6 +72,12 @@ export type AllocateSalesOrderResult = {
   // o3d-67y: true when refuseIfShipmentsExist declined because a shipment exists — the
   // reservation was deliberately left untouched (not a failure, not a reconciliation).
   refused?: boolean
+  // o3d-6ab: true when requireStatusUnderLock was set and the under-lock status was no longer
+  // allocation-eligible. Explicit no-op: nothing was written, nothing was committed, and it is NOT a
+  // failure — `error` is undefined so batch callers don't log it as one.
+  skipped?: boolean
+  // o3d-6ab: the under-lock status that caused the skip, for logging/telemetry.
+  skippedStatus?: SalesOrderStatus
 }
 
 export type AllocationUnallocatedLine = Pick<
@@ -764,7 +785,7 @@ export async function allocateSalesOrder(
         select: { id: true },
       })
       if (shipmentExists) {
-        return { nextAllocations: [], syncProductIds: [], refused: true as const }
+        return { nextAllocations: [], syncProductIds: [], refused: true as const, skippedStatus: null }
       }
     }
 
@@ -777,6 +798,27 @@ export async function allocateSalesOrder(
     // order refunded in full could be re-reserved and promoted. Both are read UNDER the lock, so a
     // refund committing between the payment advance and this allocation is honoured (Codex review #496).
     const zeroDemand = lockedStatus === 'CANCELLED' || locked?.refundStatus === 'FULL'
+
+    // o3d-6ab: revalidate the CALLER'S PREMISE under the lock, not just the order's own state. Batch
+    // callers select candidates by status outside the lock; by the time the lock is granted the order
+    // may have moved to a status that no longer wants (re)allocation — ON_HOLD, or already advanced past
+    // PROCESSING into PICKING/PACKED/SHIPPED. Without this the release/delete/recreate + re-reserve below
+    // still runs, silently re-reserving stock for a held order and churning an order someone else now
+    // owns. Skipped BEFORE the first write (resetAllocationAccountingIfStaged) so the no-op is total.
+    // zeroDemand is exempt on purpose — see requireStatusUnderLock's doc comment: releasing a
+    // cancelled/fully-refunded order's reservations is always correct, so it must not be short-circuited.
+    if (
+      !zeroDemand &&
+      input.requireStatusUnderLock &&
+      !input.requireStatusUnderLock.includes(lockedStatus)
+    ) {
+      return {
+        nextAllocations: [],
+        syncProductIds: [],
+        refused: false as const,
+        skippedStatus: lockedStatus,
+      }
+    }
 
     await resetAllocationAccountingIfStaged(tx, orderId)
     const graph = await loadFulfillmentProductGraph(tx, productIds)
@@ -1011,12 +1053,33 @@ export async function allocateSalesOrder(
       unallocatedQty: report.summary.unallocatedQty,
       backorderLineCount: report.lines.filter((line) => line.unallocatedQty > ALLOCATION_EPSILON && line.backorderEligible).length,
       refused: false as const,
+      skippedStatus: null,
     }
   }
 
   const allocationResult = canRunTransaction(client)
     ? await client.$transaction(runAllocation, ALLOCATION_TX_OPTIONS)
     : await runAllocation(client)
+
+  // o3d-6ab: the under-lock status no longer satisfied requireStatusUnderLock. Nothing was written and
+  // the transaction is a no-op, so this is neither a success nor a failure — `error` stays undefined so
+  // batch callers don't record it as an allocation failure, and logAttempt stays false so it isn't
+  // written to the activity log as an attempt that never happened.
+  if (allocationResult.skippedStatus) {
+    return {
+      success: false,
+      syncProductIds: [],
+      allocationCount: 0,
+      unallocatedLines: [],
+      unallocatedQty: 0,
+      backorderLineCount: 0,
+      orderRef,
+      isShoppingOrder,
+      shipFromWarehouseId: so.shipFromWarehouseId,
+      skipped: true,
+      skippedStatus: allocationResult.skippedStatus,
+    }
+  }
 
   if (allocationResult.refused) {
     return {
