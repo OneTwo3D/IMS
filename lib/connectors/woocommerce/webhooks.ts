@@ -122,9 +122,59 @@ async function advanceWcOrderSyncCursor() {
   })
 }
 
+// o3d-mqz: throttle the "initial import pending" skip WARNING so a live store's order webhook volume
+// can't spam the activity log — one line per hour is enough to make the gap visible.
+export const INITIAL_IMPORT_SKIP_LOG_THROTTLE_MS = 60 * 60 * 1000
+const INITIAL_IMPORT_SKIP_LOG_KEY = 'wc_initial_import_pending_skip_last_logged_at'
+
+/**
+ * Whether a fresh initial-import-pending skip WARNING is due, given when one was last logged (o3d-mqz).
+ * True on no prior log, an unparseable timestamp (fail toward visibility), or once the throttle window
+ * has elapsed. Pure so the throttle is unit-testable without the db/clock.
+ */
+export function shouldLogInitialImportPendingSkip(
+  lastLoggedAtIso: string | null | undefined,
+  nowMs: number,
+): boolean {
+  const lastMs = lastLoggedAtIso ? Date.parse(lastLoggedAtIso) : NaN
+  return !Number.isFinite(lastMs) || nowMs - lastMs >= INITIAL_IMPORT_SKIP_LOG_THROTTLE_MS
+}
+
+/**
+ * Surface the initial-import-pending order-webhook discard (o3d-mqz). The guard below ACKs 200 and drops
+ * every order webhook until wc_initial_import_completed is set, while wc_order_webhook_last_received_at
+ * (ticked BEFORE the guard) keeps updating — so "webhooks arriving" reads healthy while NO order imports.
+ * Emit a throttled WARNING so that silent gap is visible. Never throws — telemetry must not break the ACK.
+ */
+async function logInitialImportPendingSkip(): Promise<void> {
+  try {
+    const last = await db.setting.findUnique({ where: { key: INITIAL_IMPORT_SKIP_LOG_KEY } })
+    if (!shouldLogInitialImportPendingSkip(last?.value, Date.now())) return
+    await db.setting.upsert({
+      where: { key: INITIAL_IMPORT_SKIP_LOG_KEY },
+      create: { key: INITIAL_IMPORT_SKIP_LOG_KEY, value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
+    })
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_order_webhook_skipped_initial_import_pending',
+      tag: 'sync',
+      level: 'WARNING',
+      description: 'WooCommerce order webhooks are arriving but being SKIPPED — the initial order import '
+        + 'has not been run (wc_initial_import_completed is not set), so no orders are importing. Run the '
+        + 'initial import from the Sync page, or ignore if this store is not meant to import Woo orders.',
+      resolveUser: false,
+    })
+  } catch (e) {
+    console.error('o3d-mqz: failed to log initial-import-pending skip', e)
+  }
+}
+
 async function handleOrderWebhook(payload: unknown, topic: string | null) {
   const initialImportDone = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
   if (initialImportDone?.value !== 'true') {
+    // Behaviour unchanged (still ACK 200 — WC's finite retries must not pile up); the skip is now visible.
+    await logInitialImportPendingSkip()
     return NextResponse.json({ ok: true, skipped: 'initial_import_pending' })
   }
 
