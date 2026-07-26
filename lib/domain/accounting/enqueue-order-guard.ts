@@ -17,6 +17,16 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
  * The fix is symmetric with the delete side: take the SAME row lock, in the SAME transaction that
  * creates the sync row, and re-read the order. Then the two serialise — whichever gets the lock
  * first wins, and the loser sees the other's committed outcome instead of a stale snapshot.
+ *
+ * SCOPE — this covers `queueXeroSync` / `queueQuickBooksSync`, which open their OWN transaction.
+ * It does NOT cover `queueAccountingSyncTx`, which writes inside a CALLER's transaction and is
+ * used for order-scoped documents too (`referenceType: 'Shipment'` from cost-layers.ts, and the
+ * refund COGS reversal from app/actions/sales.ts). Guarding that variant is not a matter of
+ * calling this helper from it: those callers may already hold stock-level locks, and
+ * allocation-service establishes the ordering as sales-order FIRST, then stock levels — so taking
+ * the order lock late, inside such a transaction, would invert it and can deadlock against the
+ * allocation path. Closing that half needs the lock taken at the START of each caller's
+ * transaction, which is a per-caller change. Tracked as o3d-3zgy.
  */
 
 /** Reference types whose `referenceId` resolves to a sales order. */
