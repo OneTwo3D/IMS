@@ -1637,10 +1637,15 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     const priorMap = await readSetting(PAYMENT_MAP_KEY)
     await writeSetting(PAYMENT_MAP_KEY, JSON.stringify({ [`${method}:*`]: bankCode }))
     let imported: { salesOrderId: string } | undefined
+    let priorPolling: string | null = null
     try {
       const baseline = await deleteUnjournaledShipmentBaseline()
       registerRetiredPostedDocuments(baseline, 'OC-09')
       await setPostingMode({ sync: true, dailyBatch: true })
+      // The poll route refuses unless polling is armed, and the rig leaves it off between runs so nothing
+      // reaches the shared Demo ledger by accident. Restored in the outer finally.
+      priorPolling = await readSetting(POLLING_KEY)
+      await writeSetting(POLLING_KEY, 'true')
 
       await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC09`, price: unitPrice })
       await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
@@ -1692,7 +1697,7 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
         await deletePaymentInXero(paymentId)
 
         // 1. The poller detects it.
-        await runPaymentPoll()
+        await runPaymentPoll(page)
 
         // paidAt is cleared — the claim 6oyu.6 fixed for WC-linked orders specifically.
         expect(await paidAtSet(imported.salesOrderId), 'a payment gone from Xero must clear paidAt, WC-linked or not').toBe(false)
@@ -1711,7 +1716,7 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
         // 2. IDEMPOTENCY: the poller runs every 15 minutes, so a second pass over the same reversed
         //    order must not raise a second credit note. This is the assertion that would catch a
         //    dedup keyed on something that changes between runs.
-        await runPaymentPoll()
+        await runPaymentPoll(page)
         expect(await refundCountFor(imported.salesOrderId), 'a second poll must not double-reverse').toBe(refundsAfterFirst)
       } finally {
         for (const id of await creditNoteExternalIdsFor(imported.salesOrderId).catch((): string[] => [])) {
@@ -1721,6 +1726,8 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     } finally {
       if (priorMap == null) await clearSetting(PAYMENT_MAP_KEY)
       else await writeSetting(PAYMENT_MAP_KEY, priorMap)
+      if (priorPolling == null) await clearSetting(POLLING_KEY)
+      else await writeSetting(POLLING_KEY, priorPolling)
     }
   })
 
@@ -2329,6 +2336,8 @@ async function creditNoteExternalIdsFor(salesOrderId: string): Promise<string[]>
 }
 
 const PAYMENT_MAP_KEY = 'accounting_payment_account_map'
+/** Off between runs so nothing reaches the shared Demo ledger by accident; OC-09 arms it for its poll. */
+const POLLING_KEY = 'xero_payment_polling_enabled'
 /** Unset on the rig (invoices are numbered manually); OC-21/22 arm it so the Invoice panel renders. */
 const INVOICE_TRIGGER_KEY = 'invoice_trigger'
 

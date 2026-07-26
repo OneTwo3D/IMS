@@ -839,9 +839,29 @@ async function runOutboxDrainInSubprocess(): Promise<{ claimed: number; succeede
 }
 
 /** Detect paid/reversed invoices + bills (the chargeback path). */
-export async function runPaymentPoll(): Promise<unknown> {
-  const { pollXeroPayments } = await import('../../../lib/connectors/xero/payment-poller.ts')
-  return pollXeroPayments()
+export async function runPaymentPoll(page: Page): Promise<Record<string, unknown>> {
+  // THROUGH THE CRON ROUTE, not by importing the poller. The direct import died with "Cannot use import
+  // statement outside a module" the first time anything actually called this (OC-09): payment-poller's
+  // graph pulls the same CJS-only dependency that keeps order-import out of the Playwright process — see
+  // runWcOrderReconcile. Nothing had exercised it before, so the helper had never been proven.
+  //
+  // The route is also the production path: this is exactly what the 15-minute cron does.
+  const secret = process.env.CRON_SECRET
+  if (!secret) throw new Error('CRON_SECRET is not set in the test environment — cannot trigger the payment-poll cron route.')
+  const res = await page.request.get('/api/cron/accounting-payment-poll', {
+    headers: { Authorization: `Bearer ${secret}` },
+  })
+  if (!res.ok()) throw new Error(`accounting-payment-poll cron HTTP ${res.status()}: ${(await res.text()).slice(0, 300)}`)
+  const body = (await res.json()) as Record<string, unknown>
+  // The route answers 200 with {skipped} when polling or sync is off, and a test that reads that as a
+  // successful poll would assert against a poller that never ran.
+  if (body.skipped) {
+    throw new Error(
+      `the payment poll was SKIPPED (${String(body.reason ?? 'unknown reason')}). Arm ` +
+        `xero_payment_polling_enabled and xero_sync_enabled before polling.`,
+    )
+  }
+  return body
 }
 
 /**
