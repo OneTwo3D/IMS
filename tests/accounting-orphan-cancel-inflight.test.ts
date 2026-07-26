@@ -87,3 +87,48 @@ test('the operator SEES the remainder in the banner, not only in the activity lo
   assert.match(src, /\{notice &&/, 'and actually RENDERS it — the step that was missing last time')
   assert.match(src, /block\s*`?\s*\+?\s*`?deleting their orders|deleting their orders/, 'saying what it means for them')
 })
+
+test('retention never deletes a still-PROCESSING row — it is the guard\'s only evidence (o3d-sref)', async () => {
+  // This fix DEPENDS on the row surviving. Retention deleted accounting sync logs by createdAt
+  // alone, so after the six-month default an ambiguous PROCESSING row would be swept away — the
+  // delete guard would lose its only blocker, the order would become hard-deletable, and a document
+  // that may exist in the ledger would be stranded against nothing. The same failure, just delayed.
+  //
+  // There is no externalTransactionId on such a row (the worker died before writing one), so there
+  // is no other durable evidence to fall back on. Age is not a resolution.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'lib/data-retention.ts'), 'utf8')
+
+  const deleteCall = src.slice(src.indexOf('db.accountingSyncLog.deleteMany('))
+  const args = deleteCall.slice(0, deleteCall.indexOf('}),') + 1)
+
+  assert.match(args, /createdAt: \{ lt: cutoff \}/, 'still age-bounded for everything else')
+  assert.match(
+    args,
+    /status: \{ not: 'PROCESSING' \}/,
+    'but a PROCESSING row is never deleted by age — it leaves only by being resolved',
+  )
+})
+
+test('the survivor count includes EVERY PROCESSING row, not just the stale ones (o3d-sref)', async () => {
+  // The update leaves all PROCESSING rows, so the count has to match what actually survived rather
+  // than what was targeted. Counting only stale ones would omit a row claimed moments before the
+  // connector switch, or one that won the PENDING->PROCESSING race against the update — and the
+  // action would then report zero, write no explanation, and clear the banner notice while the
+  // orphan count visibly stayed non-zero. That is the broken-button outcome the count exists to
+  // prevent.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'app/actions/accounting-sync.ts'), 'utf8')
+
+  const countCall = src.slice(src.indexOf('const inFlight = await db.accountingSyncLog.count('))
+  const args = countCall.slice(0, countCall.indexOf('})') + 2)
+
+  assert.match(args, /status: 'PROCESSING'/, 'it counts PROCESSING rows')
+  assert.doesNotMatch(
+    args,
+    /processingStartedAt/,
+    'and does NOT narrow to stale claims — a fresh claim survives too, so it must be reported',
+  )
+})

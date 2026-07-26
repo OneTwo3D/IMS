@@ -129,9 +129,6 @@ export async function getFailedAccountingSyncSummary(): Promise<FailedAccounting
   return { connector, failedCount }
 }
 
-// Match the processor's stale-claim window so an actively-processing row is not
-// clobbered mid-flight by a cancel (audit-H4 review).
-const ORPHAN_CANCEL_STALE_PROCESSING_MS = 15 * 60 * 1000
 
 /**
  * audit-H4: bulk-cancel orphaned live sync rows. Marks them CANCELLED (audit-46ry)
@@ -181,7 +178,6 @@ export async function cancelOrphanedAccountingSyncRows(
   // count will not fall to zero for a connector that was switched off mid-flight. That is honest —
   // they ARE unresolved — and the sweep now reports them so an operator can see why. FAILED
   // dashboards are unaffected: they scan `status = 'FAILED'`, which this never produces.
-  const staleProcessingCutoff = new Date(Date.now() - ORPHAN_CANCEL_STALE_PROCESSING_MS)
   const scope = connector ? { connector } : { connector: { not: activeConnector ?? undefined } }
 
   const reason = `Cancelled: orphaned accounting sync row for ${connector ?? 'a non-active connector'} (no longer the active connector${activeConnector ? ` — now ${activeConnector}` : ''}).`
@@ -193,18 +189,15 @@ export async function cancelOrphanedAccountingSyncRows(
   })
 
   // Counted, not cancelled — so the activity log explains why the orphan count did not reach zero.
+  //
+  // EVERY surviving PROCESSING row is counted, not just the stale ones. The update above leaves them
+  // all, so scoping this count to `stale` would omit a row claimed moments before the connector
+  // switch, or one that won the PENDING->PROCESSING race against the update. The action would then
+  // report zero, write no explanation, and clear the banner notice — while the orphan count visibly
+  // stayed non-zero on refresh. That is the "button reads as broken" outcome this count exists to
+  // prevent, so it must match what actually survived rather than what was targeted.
   const inFlight = await db.accountingSyncLog.count({
-    where: {
-      AND: [
-        scope,
-        {
-          OR: [
-            { status: 'PROCESSING' as const, processingStartedAt: null },
-            { status: 'PROCESSING' as const, processingStartedAt: { lt: staleProcessingCutoff } },
-          ],
-        },
-      ],
-    },
+    where: { AND: [scope, { status: 'PROCESSING' as const }] },
   })
 
   if (result.count > 0 || inFlight > 0) {

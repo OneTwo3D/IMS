@@ -91,7 +91,21 @@ export async function purgeExpiredData(): Promise<{
           },
         },
       }),
-      db.accountingSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
+      db.accountingSyncLog.deleteMany({
+        where: {
+          createdAt: { lt: cutoff },
+          // o3d-sref: NEVER delete a row still PROCESSING. Its claim was taken, so the processor may
+          // have made its remote call and died before recording the result — and that row is the
+          // ONLY evidence the order delete guard has, since no externalTransactionId was ever
+          // written. Deleting it re-opens the exact failure this guard exists to close, just delayed
+          // by the retention period: the order becomes hard-deletable and a document that may exist
+          // in the ledger is stranded against nothing.
+          //
+          // Age is not a resolution. These rows leave only by being resolved — the connector being
+          // re-enabled so the claim is reclaimed and terminalises, or an operator settling it.
+          status: { not: 'PROCESSING' },
+        },
+      }),
     ])
     syncLogsDeleted = wc.count + acct.count
   }
