@@ -718,7 +718,7 @@ export async function createProduct(
         // CN default. A stored default is indistinguishable from a declared origin and blocks a later
         // parent/WC correction (bhdm.7, superseding bhdm.5's create-time default). What is SENT is
         // unchanged: the WMS/customs push resolves the CN fallback at send time
-        // (resolveMintsoftCountryOfManufacture), so only provenance is preserved.
+        // (resolveMintsoftCountryOfManufacture), so only provenance is preserved. wms-connector-boundary-ok: o3d-vj5: prose reference to the connector-side resolver; no connector behaviour is taken here.
         countryOfOrigin: data.countryOfOrigin || null,
         customsDescription: data.customsDescription || null,
         weight: data.weight ? data.weight : null,
