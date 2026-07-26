@@ -162,26 +162,55 @@ export async function cancelOrphanedAccountingSyncRows(
   // PROCESSING rows whose claim has gone stale (audit-H4 review). A mid-flight
   // row is left to finish; it then leaves the live set on its own.
   const staleProcessingCutoff = new Date(Date.now() - ORPHAN_CANCEL_STALE_PROCESSING_MS)
-  const where = {
-    AND: [
-      connector ? { connector } : { connector: { not: activeConnector ?? undefined } },
-      {
-        OR: [
-          { status: 'PENDING' as const },
-          { status: 'PROCESSING' as const, processingStartedAt: null },
-          { status: 'PROCESSING' as const, processingStartedAt: { lt: staleProcessingCutoff } },
-        ],
-      },
-    ],
-  }
+  const scope = connector ? { connector } : { connector: { not: activeConnector ?? undefined } }
 
   const reason = `Cancelled: orphaned accounting sync row for ${connector ?? 'a non-active connector'} (no longer the active connector${activeConnector ? ` — now ${activeConnector}` : ''}).`
-  const result = await db.accountingSyncLog.updateMany({
-    where,
+
+  // o3d-sref: PENDING and PROCESSING are NOT the same thing to retire, and treating them alike is
+  // what stranded external documents.
+  //
+  // A PENDING row is provably PRE-CALL: nothing has been sent, so CANCELLED is the truth and the
+  // delete guard may safely ignore it.
+  //
+  // A stale PROCESSING row is AMBIGUOUS. The claim was taken, which means the processor may already
+  // have made its remote call — the processors post BEFORE persisting SYNCED and the
+  // externalTransactionId — and then died before recording the result. There is no external id to
+  // find, so no amount of evidence-hunting can settle it. Retiring it as plain CANCELLED told the
+  // delete guard the row was deliberately abandoned, the hard delete was permitted, and a late
+  // remote success then wrote a document against an order that no longer existed.
+  //
+  // So it becomes CANCELLED_UNVERIFIED: still out of FAILED dashboards and reconciliation sweeps
+  // (they scan explicit status lists), but the delete guard blocks on it until the connector outcome
+  // is known.
+  const cancelledPending = await db.accountingSyncLog.updateMany({
+    where: { AND: [scope, { status: 'PENDING' as const }] },
     // audit-46ry: CANCELLED (not FAILED) so these abandoned rows are excluded from
     // FAILED-scanning reconciliation/backfill sweeps and error dashboards.
     data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
   })
+
+  const unverifiedReason =
+    `${reason} The claim was already taken, so a remote call may have been sent and its result never ` +
+    `recorded — held as unverified rather than retired, so the order cannot be deleted while an ` +
+    `external document might exist (o3d-sref).`
+  const cancelledProcessing = await db.accountingSyncLog.updateMany({
+    where: {
+      AND: [
+        scope,
+        {
+          OR: [
+            { status: 'PROCESSING' as const, processingStartedAt: null },
+            { status: 'PROCESSING' as const, processingStartedAt: { lt: staleProcessingCutoff } },
+          ],
+        },
+      ],
+    },
+    // processingStartedAt is deliberately KEPT: it is the only record of when the possibly-sent call
+    // was made, which is what reconciliation needs to search the connector for the document.
+    data: { status: 'CANCELLED_UNVERIFIED', errorMessage: unverifiedReason },
+  })
+
+  const result = { count: cancelledPending.count + cancelledProcessing.count }
 
   if (result.count > 0) {
     await logActivity({
@@ -190,7 +219,15 @@ export async function cancelOrphanedAccountingSyncRows(
       tag: 'sync',
       level: 'WARNING',
       description: `Cancelled ${result.count} orphaned accounting sync row(s) for ${connector ?? 'non-active connector(s)'}${activeConnector ? ` (active connector: ${activeConnector})` : ''}.`,
-      metadata: { cancelledCount: result.count, connector: connector ?? null, activeConnector },
+      metadata: {
+        cancelledCount: result.count,
+        connector: connector ?? null,
+        activeConnector,
+        // Split out because they mean different things to an operator: the unverified ones may have
+        // reached the connector and need checking there (o3d-sref).
+        cancelledPending: cancelledPending.count,
+        cancelledUnverified: cancelledProcessing.count,
+      },
     })
   }
 

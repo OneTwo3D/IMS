@@ -18,7 +18,7 @@
 
 /** The payment sync row for one invoice/bill, reduced to what the verdict depends on. */
 export type PaymentSyncRow = {
-  status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED'
+  status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED' | 'CANCELLED_UNVERIFIED'
   externalTransactionId?: string | null
   errorMessage?: string | null
   retryCount?: number
@@ -79,7 +79,12 @@ export function settlementStatus(input: {
     // to surface, just mirrored (Codex, PR #582 round 1). A FAILED or CANCELLED row holds nothing in the
     // ledger, so it is genuinely unpaid on both sides.
     const p = input.payment
-    const heldByLedger = p && (p.status === 'SYNCED' || p.status === 'PROCESSING' || p.status === 'PENDING')
+    // CANCELLED_UNVERIFIED is included: it may be held by the ledger (o3d-sref), and this branch
+    // exists to SURFACE that possibility rather than report a flat unpaid.
+    const heldByLedger = p && (
+      p.status === 'SYNCED' || p.status === 'PROCESSING' || p.status === 'PENDING'
+      || p.status === 'CANCELLED_UNVERIFIED'
+    )
     if (heldByLedger) {
       return {
         status: 'LEDGER_UNMATCHED',
@@ -96,6 +101,11 @@ export function settlementStatus(input: {
   // A payment that already FAILED or was CANCELLED is a fact, and turning sync off does not unmake it.
   // Evaluating the flag first meant an operator disabling an unhealthy connector turned a known
   // outstanding ledger balance into a green badge (Codex, PR #570 round 2).
+  //
+  // CANCELLED_UNVERIFIED is deliberately NOT terminal (o3d-sref): the claim was taken, so the
+  // payment may actually have registered at the connector before the worker died. Calling that
+  // settled-and-done would report a possibly-real ledger movement as a closed matter. Ambiguity
+  // reads as still-outstanding here, which is the direction that cannot mislead.
   const terminal = input.payment && (input.payment.status === 'FAILED' || input.payment.status === 'CANCELLED')
 
   if (!input.syncEnabled && !terminal) {
@@ -193,6 +203,20 @@ export function settlementStatus(input: {
           'The payment sync was cancelled, so the ledger was never told about this settlement and still ' +
           'shows the amount outstanding.',
       }
+    case 'CANCELLED_UNVERIFIED':
+      // NOT the same verdict as CANCELLED (o3d-sref). A CANCELLED row is provably pre-call, so
+      // "the ledger was never told" is true. This row's claim WAS taken, so the payment may or may
+      // not have registered before the worker died, and asserting either way misleads: telling an
+      // operator the ledger was never told invites them to re-send a payment that may already be
+      // there — a double payment.
+      return {
+        status: 'LEDGER_UNMATCHED',
+        discrepancy: true,
+        detail:
+          'The payment sync was abandoned mid-flight, so whether the ledger received this settlement ' +
+          'is UNKNOWN. Check the ledger for the payment before re-sending it — sending again when it ' +
+          'is already there would pay the invoice twice.',
+      }
   }
 }
 
@@ -235,6 +259,8 @@ export function effectivePaymentSyncRows(
   rows: PaymentSyncRow[],
   opts: { livePaymentIds?: ReadonlySet<string> } = {},
 ): PaymentSyncRow[] {
+  // CANCELLED_UNVERIFIED is NOT terminal: its remote call may have landed (o3d-sref), so the row
+  // stays in view rather than being pruned as a settled non-event.
   const isTerminal = (r: PaymentSyncRow) => r.status === 'FAILED' || r.status === 'CANCELLED'
   // Rows the SALES_INVOICE follow-up queued carry no payment id — they belong to the order itself, not
   // to any local receipt, so "was its receipt deleted" cannot be asked of them and they stay.

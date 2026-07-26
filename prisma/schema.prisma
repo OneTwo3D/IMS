@@ -200,6 +200,16 @@ enum AccountingSyncStatus {
   // event-backfill sweeps and FAILED-error dashboards don't treat them as unresolved
   // failures or re-queue the underlying document.
   CANCELLED
+  // o3d-sref: cancelled by the orphan sweep from a PROCESSING claim, so a remote call MAY already
+  // have gone out — the worker died before writing its result, and nothing here can know whether
+  // the request reached the connector. Distinct from CANCELLED, which is only used for a provably
+  // pre-call PENDING row.
+  //
+  // Like CANCELLED it is excluded from FAILED dashboards and reconciliation/backfill sweeps (those
+  // scan explicit status lists), so it does not read as an unresolved failure. UNLIKE CANCELLED, the
+  // order delete guard BLOCKS on it: permitting a hard delete here is what let a late remote success
+  // strand an external document against an order that no longer exists.
+  CANCELLED_UNVERIFIED
 
   @@map("AccountingSyncStatus")
 }

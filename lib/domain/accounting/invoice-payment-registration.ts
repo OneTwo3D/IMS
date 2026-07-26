@@ -33,7 +33,7 @@ export type InvoicePaymentRegistrationDecision =
 
 /** One INVOICE_PAYMENT sync row, reduced to what the decision depends on. */
 export type ExistingInvoicePaymentSync = {
-  status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED'
+  status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED' | 'CANCELLED_UNVERIFIED'
   /** What was sent, in the document currency. Null when the payload did not record it. */
   amount?: number | null
   /** The local Payment row it was queued for; null on rows queued before that was recorded. */
@@ -77,6 +77,10 @@ export function decideInvoicePaymentRegistration(input: {
   // Making the index receipt-scoped, so part payments can each register, is o3d-cjt8: it needs a
   // migration and a look at existing rows, and until then a refusal an operator can read beats an insert
   // that throws.
+  // CANCELLED_UNVERIFIED counts as LIVE (o3d-sref): the claim was taken, so that row may already
+  // have registered its payment at the connector. Excluding it would let a second registration queue
+  // for the same receipt and double-pay the invoice — the exact outcome this obstacle check exists
+  // to prevent. An unverifiable row is an obstacle, not an absence.
   const live = input.existing.filter(
     (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED'
     // Our OWN row, if this ever runs twice for one receipt: the idempotency key already makes the second

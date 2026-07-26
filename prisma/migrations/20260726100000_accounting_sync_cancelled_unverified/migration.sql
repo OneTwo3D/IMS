@@ -1,0 +1,13 @@
+-- o3d-sref: a PROCESSING accounting sync row retired by cancelOrphanedAccountingSyncRows may
+-- ALREADY have sent its remote request — the worker died before writing the result, and nothing can
+-- tell from here whether the connector received it. Retiring it as CANCELLED made the order delete
+-- guard treat it as deliberately abandoned, so a hard delete was permitted and a late remote success
+-- then stranded the external document against an order that no longer existed.
+--
+-- CANCELLED_UNVERIFIED names that ambiguity. Excluded from FAILED dashboards and
+-- reconciliation/backfill sweeps exactly like CANCELLED (they scan explicit status lists), but the
+-- delete guard blocks on it until the connector outcome is known.
+--
+-- Additive and non-breaking: no existing row changes status, and no code path produces this value
+-- until the sweep is updated in the same change.
+ALTER TYPE "AccountingSyncStatus" ADD VALUE IF NOT EXISTS 'CANCELLED_UNVERIFIED';

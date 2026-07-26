@@ -55,7 +55,30 @@ import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep
  * operation, and the blocker message says so. Recording pre-call rejection distinctly — so it
  * can be safely ignored here — is the rest of o3d-ju8t.
  */
-export const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED'] as const
+/**
+ * CANCELLED_UNVERIFIED is here for the same reason FAILED is, one step further along (o3d-sref).
+ *
+ * cancelOrphanedAccountingSyncRows retires a stale PROCESSING claim. The claim having been taken
+ * means the processor may already have made its remote call — they post BEFORE persisting SYNCED and
+ * the externalTransactionId — and then died without recording the result. There is no external id to
+ * find, so no evidence-hunting can settle it, which is why o3d-v7sy's "carries an external id"
+ * widening cannot reach this case.
+ *
+ * It used to be retired as plain CANCELLED, which reads as deliberately abandoned and does NOT
+ * block. The hard delete was permitted, and a late remote success then wrote a document against an
+ * order that no longer existed — precisely what the o3d-5r8 claim protocol exists to prevent,
+ * reached through the orphan sweep instead of a race on the claim.
+ *
+ * Plain CANCELLED still does not block: that value is now only used for a provably PRE-CALL PENDING
+ * row, where "the ledger was never told" is a fact rather than an assumption.
+ */
+export const LIVE_ACCOUNTING_SYNC_STATUSES = [
+  'PENDING',
+  'PROCESSING',
+  'SYNCED',
+  'FAILED',
+  'CANCELLED_UNVERIFIED',
+] as const
 
 export type SalesOrderDeleteBlocker = {
   code:
@@ -237,11 +260,14 @@ export async function findSalesOrderDeleteBlocker(
   // selected, and if the back-reference also failed there is no accountingInvoiceId either. The
   // match is therefore "live status OR carries an external id", whatever the status (o3d-v7sy).
   //
-  // NOT COVERED (o3d-sref): a STALE PROCESSING claim that the orphan sweep retires to CANCELLED
-  // before its worker wrote a result. There is no external id yet, so nothing here can see it,
-  // and a late remote success then strands the document. Closing that needs the orphan sweep to
-  // keep such rows ambiguous rather than retired, and the processors to fence their writeback on
-  // the claim they hold — the guard cannot do it alone.
+  // A stale PROCESSING claim retired by the orphan sweep is now covered (o3d-sref): it becomes
+  // CANCELLED_UNVERIFIED rather than CANCELLED, which is in the live set above, so it blocks. The
+  // guard could not do that alone — it needed the sweep to stop asserting a pre-call retirement it
+  // cannot prove.
+  //
+  // STILL OPEN (o3d-550x): the processors write their result BY ROW ID, unfenced, so a superseded
+  // worker's late reply can overwrite a row a newer claim owns. That is a different failure from
+  // this one and is the same owner-token shape as o3d-38gl on the WMS side.
   const candidateDocuments = await tx.accountingSyncLog.findMany({
     where: {
       OR: orderKeyed,
@@ -260,7 +286,9 @@ export async function findSalesOrderDeleteBlocker(
   // wins, then FAILED (unknown), then in-flight, then queued — most severe remedy first.
   const rank = (row: { status: string; externalTransactionId: string | null }): number => {
     if (row.externalTransactionId || row.status === 'SYNCED') return 0
-    if (row.status === 'FAILED') return 1
+    // Both mean "a document may exist and we cannot tell" — the operator has to look at the ledger
+    // either way, so they rank together, ahead of anything merely in-flight or queued (o3d-sref).
+    if (row.status === 'FAILED' || row.status === 'CANCELLED_UNVERIFIED') return 1
     if (row.status === 'PROCESSING') return 2
     return 3
   }
