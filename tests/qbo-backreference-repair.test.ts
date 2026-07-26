@@ -34,6 +34,12 @@ let syncRows: SyncRow[] = []
 let token: { createdAt: Date } | null = { createdAt: CONNECTED_AT }
 let statusUpdates: Array<{ id: string; data: Record<string, unknown> }> = []
 let createdRows: Array<{ type: string; referenceId: string }> = []
+/**
+ * Every write to a document table, so a test can assert nothing was touched rather than infer it
+ * from a counter. A counter-only assertion cannot distinguish "did not write" from "wrote and did
+ * not count it".
+ */
+let documentWrites: Array<{ table: string; id: string }> = []
 
 function row(over: Partial<SyncRow> = {}): SyncRow {
   return {
@@ -78,13 +84,30 @@ mock.module('@/lib/db', {
       salesOrder: {
         findUnique: async ({ where }: { where: { id: string } }) => orders[where.id] ?? null,
         update: async ({ where, data }: { where: { id: string }; data: { accountingInvoiceId: string } }) => {
+          documentWrites.push({ table: 'salesOrder', id: where.id })
           orders[where.id] = { ...orders[where.id], accountingInvoiceId: data.accountingInvoiceId }
           return {}
         },
       },
-      salesOrderRefund: { findUnique: async () => null, update: async () => ({}) },
-      purchaseInvoice: { findUnique: async () => null, findFirst: async () => null, update: async () => ({}) },
-      supplierCreditNote: { findUnique: async () => null, update: async () => ({}) },
+      salesOrderRefund: {
+        findUnique: async () => null,
+        update: async ({ where }: { where: { id: string } }) => {
+          documentWrites.push({ table: 'salesOrderRefund', id: where.id }); return {}
+        },
+      },
+      purchaseInvoice: {
+        findUnique: async () => null,
+        findFirst: async () => null,
+        update: async ({ where }: { where: { id: string } }) => {
+          documentWrites.push({ table: 'purchaseInvoice', id: where.id }); return {}
+        },
+      },
+      supplierCreditNote: {
+        findUnique: async () => null,
+        update: async ({ where }: { where: { id: string } }) => {
+          documentWrites.push({ table: 'supplierCreditNote', id: where.id }); return {}
+        },
+      },
     },
   },
 })
@@ -94,6 +117,7 @@ mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} 
 async function runSweep() {
   statusUpdates = []
   createdRows = []
+  documentWrites = []
   const { repairQuickBooksBackReferences } = await import('@/lib/connectors/quickbooks/sync-processor')
   return repairQuickBooksBackReferences()
 }
@@ -120,6 +144,8 @@ test('an order that already has its invoice id is left alone (o3d-0g2n)', async 
 
   assert.equal(result.checked, 0, 'nothing needed repair')
   assert.equal(result.repaired, 0)
+  assert.deepEqual(documentWrites, [], 'and no write was issued at all — asserted, not inferred')
+  assert.equal(orders['order-1'].accountingInvoiceId, 'QBO-101', 'the existing id is not disturbed')
 })
 
 test('the sweep NEVER changes a row status or regenerates follow-ups (o3d-0g2n)', async () => {
@@ -154,6 +180,7 @@ test('a FAILED row carrying an external id IS a candidate (o3d-0g2n)', async () 
 
   const result = await runSweep()
   assert.equal(result.repaired, 1, 'FAILED rows are swept, not skipped')
+  assert.deepEqual(documentWrites, [{ table: 'salesOrder', id: 'order-1' }], 'and the write really happened')
 })
 
 test('rows predating the current connection are NOT repaired (o3d-0g2n)', async () => {
@@ -197,6 +224,7 @@ test('a PO with several unlinked sync rows is skipped, not guessed at (o3d-0g2n)
 
   assert.equal(result.skippedAmbiguous, 2, 'both ambiguous rows are skipped')
   assert.equal(result.repaired, 0, 'and neither is attributed by guesswork')
+  assert.deepEqual(documentWrites, [], 'no bill was written — a wrong id is worse than a missing one')
 })
 
 test('the sweep cannot write a type QuickBooks\' own writer would not (o3d-0g2n)', async () => {
@@ -211,4 +239,9 @@ test('the sweep cannot write a type QuickBooks\' own writer would not (o3d-0g2n)
 
   assert.equal(result.checked, 0, 'the type is not a candidate at all')
   assert.equal(result.repaired, 0)
+  assert.deepEqual(
+    documentWrites,
+    [],
+    'and crucially no supplierCreditNote write — the counter alone could not prove that',
+  )
 })
