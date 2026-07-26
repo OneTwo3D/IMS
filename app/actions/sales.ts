@@ -356,7 +356,7 @@ async function refreshDraftOrderFxAtFinalization(
 ): Promise<void> {
   const baseCurrency = await getBaseCurrencyCode()
   await db.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+    await lockSalesOrder(tx, orderId)
     const order = await tx.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -1848,6 +1848,12 @@ async function queueRefundAccountingActions(input: {
       // and then double-count it when a retry posts the real journal (Codex PR #353 F5).
       // Idempotent on the sync key, so initial + retry record exactly once.
       await db.$transaction(async (tx) => {
+        // o3d-3zgy: the order row lock comes FIRST, before anything else this transaction touches.
+        // queueAccountingSyncTx writes inside our transaction so it cannot take the lock itself
+        // (doing so would take it after any stock locks and invert the ordering allocation-service
+        // establishes), which left this enqueue racing a hard delete of the same order — the
+        // o3d-hrak race, still open through this path. Hoisting it here serialises the two.
+        await lockSalesOrder(tx, input.orderId)
         // Record based on the queue's OWN decision (not a separate settings recheck) so
         // a connector/setting flip between the two can't desync queue vs ledger (Codex).
         const queued = await queueAccountingSyncTx(tx, sync)
@@ -2752,7 +2758,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
     // same paid_without_invoice transition. Reading + flipping paidAt under one
     // lock makes exactly one caller see the unpaid→paid transition.
     const locked = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${id} FOR UPDATE`
+      await lockSalesOrder(tx, id)
       const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
@@ -2860,7 +2866,7 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
     const { getNumberingFormats } = await import('./company')
     const numbering = await getNumberingFormats()
     const result = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${id} FOR UPDATE`
+      await lockSalesOrder(tx, id)
       const so = await tx.salesOrder.findUnique({ where: { id }, select: { externalOrderNumber: true, orderNumber: true, invoiceNumber: true } })
       if (!so) throw new Error('Order not found')
       if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
@@ -3066,7 +3072,7 @@ async function registerInvoicePaymentWithLedger(params: {
     // directions: either we find the payment gone and do nothing, or we queue first and the delete finds
     // our row and retracts it.
     const outcome = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${params.orderId} FOR UPDATE`
+      await lockSalesOrder(tx, params.orderId)
       const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
       if (!stillRecorded) return 'receipt-deleted' as const
       const queued = await queueAccountingSyncTx(tx, {
@@ -3142,7 +3148,7 @@ export async function addPayment(input: {
     if (!input.amount || input.amount <= 0) return { success: false, error: 'Amount must be greater than 0' }
     const baseCurrency = await getBaseCurrencyCode()
     const txResult = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
+      await lockSalesOrder(tx, input.orderId)
       const so = await tx.salesOrder.findUnique({
         where: { id: input.orderId },
         select: {
@@ -3339,7 +3345,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
   try {
     await requirePermission('sales.refund')
     const txResult = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+      await lockSalesOrder(tx, orderId)
       const so = await tx.salesOrder.findUnique({
         where: { id: orderId },
         select: {

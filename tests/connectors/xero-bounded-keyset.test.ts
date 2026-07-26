@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  advanceCheckpoint,
+  budgetedFetcher,
   createRequestBudget,
   drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
@@ -359,4 +361,110 @@ test('a whole DRAIN shares one request budget, so nested passes cannot overspend
     `made ${requests} requests, above the ${MAX_REQUESTS_PER_POLL} ceiling`,
   )
   assert.ok(requests > MAX_PAGES, 'the fixture must actually push past a single window\'s worth')
+})
+
+test('the request ledger counts real HTTP attempts, not fetcher invocations (o3d-8f9 r3)', async () => {
+  // The production fetcher retries a 429 internally up to XERO_MAX_RETRIES times, so ONE invocation
+  // can be four tenant API calls. A ledger that debits per invocation would let 200 units stand for
+  // 800 real requests and defeat the ceiling it exists to enforce.
+  const budget = createRequestBudget(10)
+
+  // A transport that makes 3 attempts per invocation.
+  let attempts = 0
+  const inner: InvoiceFetcher = async () => {
+    attempts += 3
+    return { ok: true, status: 200, data: { Invoices: [] } }
+  }
+  const counted = budgetedFetcher(inner, budget, () => attempts)
+
+  budget.spend()
+  await counted('Invoices?page=1', { ifModifiedSince: SINCE })
+  assert.equal(budget.spent(), 3, 'one invocation costing 3 attempts debits 3, not 1')
+
+  budget.spend()
+  await counted('Invoices?page=2', { ifModifiedSince: SINCE })
+  assert.equal(budget.spent(), 6, 'and it keeps accruing per real attempt')
+})
+
+test('a cheaper-than-debited call does not earn budget back (o3d-8f9 r3)', async () => {
+  // settle() only moves upward. The ceiling is a safety bound, not an allowance to be spent down to
+  // the last unit — a transport that short-circuits must not create headroom for more real calls.
+  const budget = createRequestBudget(10)
+  // Never incremented: this transport makes NO real attempts at all.
+  const attempts = 0
+  const inner: InvoiceFetcher = async () => ({ ok: true, status: 200, data: { Invoices: [] } })
+  const counted = budgetedFetcher(inner, budget, () => attempts)
+
+  budget.spend()
+  await counted('Invoices?page=1', { ifModifiedSince: SINCE })
+  assert.equal(budget.spent(), 1, 'a zero-attempt call still costs the unit already debited')
+})
+
+test('a throwing request still consumes the attempts it made (o3d-8f9 r3)', async () => {
+  const budget = createRequestBudget(10)
+  let attempts = 0
+  const inner: InvoiceFetcher = async () => {
+    attempts += 2
+    throw new Error('socket hang up')
+  }
+  const counted = budgetedFetcher(inner, budget, () => attempts)
+
+  budget.spend()
+  await assert.rejects(() => counted('Invoices?page=1', { ifModifiedSince: SINCE }))
+  assert.equal(budget.spent(), 2, 'attempts made before the throw are not free')
+})
+
+test('the checkpoint never moves BACKWARD, even when a chunk ends inside the re-read overlap (o3d-8f9 r3)', async () => {
+  // THE CYCLE. The read floor sits CURSOR_OVERLAP_MS behind the persisted cursor so a record landing
+  // during the previous poll is re-read. That overlap is a QUERY floor, not a checkpoint.
+  //
+  // If the overlap holds more than one chunk — two dense bulk-edit seconds is enough — the first
+  // chunk's `through` lands BEFORE the cursor we started from. Persisting it moves the cursor
+  // backward; the next poll subtracts the overlap from the regressed value, reproduces the same
+  // chunking, and cycles. Codex measured it settling at -44s, -49s, -55s: every poll spent 163-200
+  // requests replaying overlap and never reached either the original checkpoint or newer work.
+  // Payment reconciliation stops dead while burning the tenant's daily allowance.
+  const cursor = new Date('2026-07-17T12:00:00.000Z')
+
+  // A chunk that ends INSIDE the overlap, behind the cursor: processed, but not a checkpoint.
+  assert.equal(
+    advanceCheckpoint(cursor, new Date(cursor.getTime() - 44_000)),
+    null,
+    'a chunk 44s behind the cursor must not be persisted — this is the measured cycle',
+  )
+  assert.equal(advanceCheckpoint(cursor, new Date(cursor.getTime() - 1)), null)
+
+  // Exactly AT the cursor advances nothing either — it would be a no-op write that still lets a
+  // later regression look like progress.
+  assert.equal(advanceCheckpoint(cursor, cursor), null, 'equal is not forward')
+
+  // Only a chunk reaching past the cursor moves it.
+  const forward = new Date(cursor.getTime() + 1)
+  assert.equal(advanceCheckpoint(cursor, forward)?.toISOString(), forward.toISOString())
+})
+
+test('a multi-chunk overlap converges instead of cycling (o3d-8f9 r3)', async () => {
+  // The property the fix actually has to deliver: replaying a dense overlap must still make
+  // progress. Walking several chunks whose `through` values step through the overlap and then past
+  // it must leave the cursor strictly ahead of where it started, never behind at any point.
+  let cursor = new Date('2026-07-17T12:00:00.000Z')
+  const started = cursor
+  const overlapMs = 2 * 60_000
+
+  // Chunks as the drain would hand them over: three inside the overlap, then two beyond it.
+  const throughs = [-55_000, -49_000, -44_000, 30_000, 90_000]
+    .map((offset) => new Date(started.getTime() + offset))
+
+  for (const through of throughs) {
+    const advanced = advanceCheckpoint(cursor, through)
+    if (advanced) cursor = advanced
+    assert.ok(
+      cursor.getTime() >= started.getTime(),
+      `cursor regressed to ${cursor.toISOString()} from ${started.toISOString()}`,
+    )
+  }
+
+  assert.ok(cursor.getTime() > started.getTime(), 'and it ended up strictly ahead — no cycle')
+  assert.equal(cursor.toISOString(), new Date(started.getTime() + 90_000).toISOString())
+  assert.ok(overlapMs > 0)
 })

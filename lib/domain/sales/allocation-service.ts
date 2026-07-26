@@ -231,6 +231,24 @@ function applyRequirementDeltaToAvailableMap(
   }
 }
 
+/**
+ * Which sales orders each open transaction has row-locked (o3d-3zgy).
+ *
+ * Postgres cannot answer this for us: an uncontended `SELECT ... FOR UPDATE` records the lock in the
+ * tuple header, not in `pg_locks`, so there is nothing to query. This registry is therefore an
+ * IN-PROCESS assertion aid, not a distributed guarantee — its job is to make a caller that forgot to
+ * hoist the lock fail loudly instead of silently reopening the delete race.
+ *
+ * Keyed weakly on the transaction client, so entries disappear with the transaction object and
+ * nothing has to clean up on commit or rollback.
+ */
+const ordersLockedByTx = new WeakMap<object, Set<string>>()
+
+/** Has THIS transaction already row-locked this order? See ordersLockedByTx for the caveats. */
+export function hasLockedSalesOrder(tx: Prisma.TransactionClient, orderId: string): boolean {
+  return ordersLockedByTx.get(tx as object)?.has(orderId) ?? false
+}
+
 export async function lockSalesOrder(
   tx: Prisma.TransactionClient,
   orderId: string,
@@ -238,6 +256,10 @@ export async function lockSalesOrder(
   await tx.$queryRaw(
     Prisma.sql`SELECT id FROM "sales_orders" WHERE id = ${orderId} FOR UPDATE`,
   )
+  // Recorded AFTER the lock is actually held, so a failed lock never registers.
+  const locked = ordersLockedByTx.get(tx as object)
+  if (locked) locked.add(orderId)
+  else ordersLockedByTx.set(tx as object, new Set([orderId]))
 }
 
 

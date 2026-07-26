@@ -642,7 +642,7 @@ export async function reconcileOrderAfterShipment(
     .join(', ')
 
   await runInTransaction(client, async (tx) => {
-    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${shipment.orderId} FOR UPDATE`
+    await lockSalesOrder(tx, shipment.orderId)
     const currentOrder = await tx.salesOrder.findUnique({
       where: { id: shipment.orderId },
       select: { status: true },

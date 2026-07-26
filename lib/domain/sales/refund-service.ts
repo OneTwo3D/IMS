@@ -28,6 +28,7 @@ import {
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
@@ -1717,7 +1718,7 @@ export async function createSalesOrderRefund(
         throw new Error(`WooCommerce refund ${input.externalRefundId} is already parked for a different order (${foreignPark.entityId}); refusing to create it here.`)
       }
     }
-    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
+    await lockSalesOrder(tx, input.orderId)
 
     const so = await tx.salesOrder.findUnique({
       where: { id: input.orderId },
