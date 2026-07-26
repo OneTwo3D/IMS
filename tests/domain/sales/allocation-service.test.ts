@@ -1321,25 +1321,65 @@ test('an unchanged set is not refused even when a shipment has been journaled (o
   assert.equal(state.order.inventoryAllocatedDate?.toISOString(), '2026-01-01T00:00:00.000Z')
 })
 
-test('allocationSetsMatch: a nested-KIT quantity matches its own persisted 4dp row (o3d-i4qd)', () => {
-  // Nothing in this service rounds before writing — OrderAllocation.qty is @db.Decimal(12,4) and
-  // the COLUMN does it. A nested KIT expands to an unquantized factor: 0.3332 x 0.3332 per kit
-  // = 0.11102224, persisted as 0.1110.
-  //
-  // Comparing raw would make such a row differ from itself on every single cycle, so the o3d-i5it
-  // short-circuit would never fire for exactly the orders that churn worst — and each rewrite
-  // leaks the ~0.000022 difference into reservedQty as a phantom reservation.
+test('allocationSetsMatch compares EXACTLY — canonicalisation is the caller\'s job (o3d-i4qd)', () => {
+  // allocateSalesOrder rounds the computed set to the column's scale at the point it is produced,
+  // so both sides reaching here are already canonical and the comparison is exact rather than
+  // tolerance-based. Comparing at one scale while mutating reservations at another is exactly the
+  // mismatch that made this check unreliable, so the helper must NOT quietly absorb it.
   const persisted = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.1110') }]
-  const computed = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.11102224') }]
 
-  assert.equal(allocationSetsMatch(persisted, computed), true)
+  assert.equal(
+    allocationSetsMatch(persisted, [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.1110') }]),
+    true,
+    'equal canonical values match',
+  )
+  assert.equal(
+    allocationSetsMatch(persisted, [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.11102224') }]),
+    false,
+    'an uncanonicalised value is NOT silently treated as equal — the caller must round first',
+  )
+  assert.equal(
+    allocationSetsMatch(persisted, [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.1112') }]),
+    false,
+    'and a real difference at the persisted scale is still a change',
+  )
 })
 
-test('allocationSetsMatch: a difference ABOVE the persisted scale is still a change (o3d-i4qd)', () => {
-  // Rounding to the column's scale must not swallow a real difference: 0.1110 vs 0.1112 are
-  // different rows once written, so they must compare as different.
-  const persisted = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.1110') }]
-  const computed = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.11121') }]
+test('the persisted allocation and the reservation move by the SAME canonical amount (o3d-i4qd)', async () => {
+  // The drift this closes: the reservation delta used to be applied from the UNROUNDED computed
+  // value against StockLevel.reservedQty (6dp), while the row recorded round(value, 4). A later
+  // release reads the ROW, so it gave back less than was reserved and the difference accumulated
+  // as a phantom reservation every cycle.
+  //
+  // Asserting they agree is what makes reserve/release symmetric. It also means the unchanged-set
+  // check compares like with like — comparing at 4dp while mutating reservations at 6dp would let
+  // two genuinely different reservations look "unchanged" and skip the adjustment entirely.
+  const state = baseState({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 }],
+  })
 
-  assert.equal(allocationSetsMatch(persisted, computed), false)
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.success, true)
+  const allocatedTotal = (state.allocations ?? []).reduce((sum, row) => sum + Number(row.qty), 0)
+  assert.equal(
+    state.stockLevels[0].reservedQty,
+    allocatedTotal,
+    'reservedQty must equal the sum of the persisted allocation rows, not an unrounded intermediate',
+  )
+})
+
+test('re-running that same allocation is a no-op and does not move reservedQty (o3d-i4qd)', async () => {
+  const state = baseState({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 }],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+  const afterFirst = state.stockLevels[0].reservedQty
+  const rowsAfterFirst = (state.allocations ?? []).map((row) => ({ ...row }))
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(state.stockLevels[0].reservedQty, afterFirst, 'no reservation drift across cycles')
+  assert.deepEqual(state.allocations, rowsAfterFirst, 'and no rewrite')
 })

@@ -689,6 +689,9 @@ export async function validateAllocationIntegrity(
   return null
 }
 
+/** Scale of `OrderAllocation.qty` — `@db.Decimal(12, 4)`. */
+const ALLOCATION_QTY_SCALE = 4
+
 function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
   const merged = new Map<string, AllocationRowInput>()
 
@@ -705,26 +708,18 @@ function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
   return [...merged.values()].filter((row) => row.qty.gt(0))
 }
 
-/** Scale of `OrderAllocation.qty` — `@db.Decimal(12, 4)`. */
-const ALLOCATION_QTY_SCALE = 4
-
 /**
  * Is the freshly computed allocation set identical to what is already persisted (o3d-i5it)?
  *
  * Compared as a SET keyed on (lineId, warehouseId, productId) — the same key mergeAllocationRows
  * dedupes on — because row order is not meaningful and neither side is ordered.
  *
- * The computed quantity is compared at the PERSISTED scale, because that is the only quantity the
- * database can hold. Nothing in this service rounds before writing: the column does it. So a
- * nested KIT whose expanded requirement is unquantized — 0.3332 x 0.3332 = 0.11102224 per kit,
- * stored as 0.1110 — would otherwise differ from its own persisted row on EVERY comparison, the
- * short-circuit would never fire for exactly the orders that churn worst, and the
- * release/reserve cycle would keep leaking the ~0.000022 difference into reservedQty as phantom
- * reservations (o3d-i4qd).
+ * Both sides are at the persisted scale by the time they reach here: the caller canonicalises the
+ * computed set to ALLOCATION_QTY_SCALE, and the column can hold nothing else. So the quantity
+ * comparison is EXACT, not tolerance-based — comparing at one scale while mutating reservations at
+ * another is precisely the mismatch that made this check unreliable (o3d-i4qd).
  *
- * Rounding here changes only what counts as "the same"; it does not change what is written or
- * reserved. Making the expanded requirement itself canonical — so the coverage selector stops
- * reporting such a line as short in the first place — is the rest of o3d-i4qd.
+ * Decimal.eq rather than `===` because two Decimals of equal value can differ in representation.
  */
 export function allocationSetsMatch(
   existing: Array<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>,
@@ -740,7 +735,7 @@ export function allocationSetsMatch(
 
   for (const row of next) {
     const persisted = existingByKey.get(key(row))
-    if (!persisted || !persisted.eq(roundQuantity(row.qty, ALLOCATION_QTY_SCALE))) return false
+    if (!persisted || !persisted.eq(row.qty)) return false
   }
   return true
 }
@@ -1033,7 +1028,22 @@ export async function allocateSalesOrder(
       }
     }
 
+    // Canonicalise ONCE, at the point the set is produced (o3d-i4qd, o3d-i5it).
+    //
+    // OrderAllocation.qty is @db.Decimal(12,4) and nothing here rounded before writing — the
+    // COLUMN did it. But the reservation delta was applied from the UNROUNDED value against
+    // StockLevel.reservedQty, which holds 6dp. So a reserve wrote X while the row recorded
+    // round(X,4), and the later release — which reads the ROW — gave back round(X,4). The
+    // difference leaked into reservedQty as a phantom reservation on every cycle, worst for
+    // nested KITs where the expanded factor is unquantized (0.3332 x 0.3332 = 0.11102224).
+    //
+    // Rounding here makes the row, the reservation delta, the coverage comparison and the
+    // report all speak in the same units, so reserve and release are symmetric and the
+    // unchanged-set check compares like with like. A row that rounds away to zero is not an
+    // allocation at all and is dropped, matching mergeAllocationRows' own qty > 0 filter.
     const nextAllocations = mergeAllocationRows(nextAllocationRows)
+      .map((row) => ({ ...row, qty: roundQuantity(row.qty, ALLOCATION_QTY_SCALE) }))
+      .filter((row) => row.qty.gt(0))
     const existingAllocs = await tx.orderAllocation.findMany({
       where: { orderId },
       select: { lineId: true, productId: true, warehouseId: true, qty: true },
