@@ -1,5 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { WMS_LOOKUP_NOT_FOUND } from '@/lib/domain/wms/order-status-sweep'
+import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
 
 /**
  * o3d-5r8 — hard-delete safety for sales orders.
@@ -183,7 +183,7 @@ export async function findSalesOrderDeleteBlocker(
       lastError: true,
     },
   })
-  if (snapshot && !snapshot.externalOrderId && snapshot.lastError !== WMS_LOOKUP_NOT_FOUND) {
+  if (snapshot && !snapshot.externalOrderId && snapshot.lastError !== WMS_LOOKUP_CONFIRMED_ABSENT) {
     blockers.push({
       code: 'wms_order_status_snapshot',
       message:

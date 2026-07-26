@@ -33,6 +33,21 @@ export type WmsOrderStatusSweepResult = {
 export const WMS_LOOKUP_NOT_FOUND = 'Order not found in WMS'
 
 /**
+ * The marker the delete guard accepts as authoritative absence — deliberately DISTINCT from the
+ * legacy WMS_LOOKUP_NOT_FOUND above (o3d-eu0r).
+ *
+ * Rows written before the presence probe existed recorded EVERY null fetch as the legacy literal,
+ * including AMBIGUOUS ones. Accepting that literal would keep letting a genuine warehouse order be
+ * deleted on the strength of a snapshot that never distinguished the two. A new marker is
+ * unforgeable by old rows: anything still carrying the legacy string is treated as unresolved and
+ * fails closed until the sweep re-resolves it.
+ *
+ * Refreshing is NOT a safe compatibility mechanism on its own — the sweep is optional and
+ * batch-limited, so it may simply not have reached an order before someone tries to delete it.
+ */
+export const WMS_LOOKUP_CONFIRMED_ABSENT = 'Order confirmed absent in WMS (presence-probed)'
+
+/**
  * The lastError written when the lookup could not decide — several WMS orders match this
  * reference (merged/split candidates), so "no single order" is NOT "no order" (o3d-x9nc).
  *
@@ -110,9 +125,29 @@ export async function runWmsOrderStatusSweep(
       //
       // Only on the null path, so a found order costs no extra call. A connector without
       // probeOrderPresence stays on the conservative reading: unresolved, so the guard blocks.
-      let notFoundReason = WMS_LOOKUP_NOT_FOUND
+      //
+      // COST: both current connectors re-run the same underlying search inside the probe —
+      // Mintsoft repeats Order/Search, ShipHero repeats a credit-consuming GraphQL query — so a
+      // batch of missing orders would otherwise double its remote requests every sweep, against a
+      // quota. An order already CONFIRMED absent and still absent has nothing new to learn, so it
+      // is not re-probed; the steady state (a stable set of orders the WMS has never held) costs
+      // one probe each, once, instead of one per sweep.
+      //
+      // The residual is deliberate: the FIRST sweep after an order goes missing still pays for a
+      // probe, which is exactly when the answer is worth having.
+      let notFoundReason: string = WMS_LOOKUP_CONFIRMED_ABSENT
       if (!status) {
-        if (!connector.probeOrderPresence) {
+        const known = await db.wmsOrderStatusSnapshot.findUnique({
+          where: { orderId: order.id },
+          select: { externalOrderId: true, lastError: true },
+        })
+        const alreadyConfirmedAbsent = known
+          && !known.externalOrderId
+          && known.lastError === WMS_LOOKUP_CONFIRMED_ABSENT
+
+        if (alreadyConfirmedAbsent) {
+          // Keep the existing verdict; nothing to re-resolve.
+        } else if (!connector.probeOrderPresence) {
           notFoundReason = 'WMS lookup could not be confirmed — connector cannot probe presence'
         } else {
           try {
