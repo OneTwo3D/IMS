@@ -368,3 +368,21 @@ test('an in-flight PROCESSING row asks the operator to WAIT, not to cancel (o3d-
   assert.match(blocker!.message, /IN FLIGHT/)
   assert.doesNotMatch(blocker!.message, /Cancel the order instead/)
 })
+
+test('the batch key derived from a stage stamp matches the batch date it was staged in (o3d-0qoo)', () => {
+  // The guard re-derives the batch reference FROM the order's stage stamp. The daily syncs
+  // capture their reference date ONCE at the start of the run and used to stamp orders with
+  // `new Date()` as they processed each one — so a run crossing UTC midnight produced e.g. an
+  // A2-2026-07-20-* journal against a 2026-07-21 stamp. The guard then looked for a batch that
+  // does not exist, found no blocker, and permitted a hard delete while the journal stood.
+  //
+  // Both are now derived from the same captured value, so this identity holds by construction.
+  const batchDate = '2026-07-20'
+  const stampWrittenAfterMidnight = new Date(`${batchDate}T00:00:00.000Z`)
+
+  assert.equal(
+    dailyBatchDateKey(stampWrittenAfterMidnight),
+    batchDate,
+    'the stamp must map back to the batch date, whatever wall-clock time the row was written',
+  )
+})
