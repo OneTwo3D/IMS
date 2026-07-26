@@ -27,8 +27,12 @@ test('no money-moving QuickBooks endpoint is posted with the NON-idempotent qboP
   const source = await processorSource()
 
   for (const endpoint of MONEY_MOVING_ENDPOINTS) {
-    // `qboPost<...>('payment'` — the plain variant, which sends no Request-Id.
-    const nonIdempotent = new RegExp(String.raw`\bqboPost\s*<[^>]*>\s*\(\s*'${endpoint}'`)
+    // Matches every call form, not just the one currently written: an explicit generic is
+    // optional and the endpoint may be single- or double-quoted. The original regex required
+    // both, so a later `qboPost("payment", body)` would have slipped straight past it.
+    const nonIdempotent = new RegExp(
+      String.raw`\bqboPost\s*(?:<[^>]*>)?\s*\(\s*['"]${endpoint}['"]`,
+    )
     assert.ok(
       !nonIdempotent.test(source),
       `'${endpoint}' must be posted via qboPostIdempotent — a retried post creates a duplicate `
@@ -41,7 +45,9 @@ test('both money-moving endpoints ARE posted idempotently, and pass a requestId 
   const source = await processorSource()
 
   for (const endpoint of MONEY_MOVING_ENDPOINTS) {
-    const idempotent = new RegExp(String.raw`\bqboPostIdempotent\s*<[^>]*>\s*\(\s*'${endpoint}'`)
+    const idempotent = new RegExp(
+      String.raw`\bqboPostIdempotent\s*(?:<[^>]*>)?\s*\(\s*['"]${endpoint}['"]`,
+    )
     assert.ok(idempotent.test(source), `'${endpoint}' should be posted via qboPostIdempotent`)
   }
 
