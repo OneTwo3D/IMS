@@ -588,6 +588,24 @@ export async function recordSalesPaymentViaUi(
   await expect(dialog).toBeHidden({ timeout: 30_000 })
 }
 
+/**
+ * The accounting invariant report, as an operator sees it (/api/admin/accounting/invariants).
+ *
+ * The reconciliations that FLAG rather than sweep surface here and nowhere else — a material transit or
+ * COGS gap posts no journal by design, so a test that only reads Xero cannot tell "correctly refused to
+ * sweep" from "never ran". Driven through the page's authenticated context, so it exercises the real
+ * admin route rather than calling the domain function in-process.
+ */
+export async function accountingInvariants(
+  page: Page,
+): Promise<{ findings: Array<{ code: string; severity: string; message: string; details?: Record<string, unknown> }> }> {
+  const res = await page.request.get('/api/admin/accounting/invariants')
+  if (!res.ok()) {
+    throw new Error(`accounting invariants HTTP ${res.status()}: ${(await res.text()).slice(0, 300)}`)
+  }
+  return (await res.json()) as { findings: Array<{ code: string; severity: string; message: string; details?: Record<string, unknown> }> }
+}
+
 /** Drive the Xero connector page's "Process pending now". */
 export async function processPendingXeroSyncViaUi(page: Page): Promise<void> {
   await page.goto('/sync?connector=xero')
