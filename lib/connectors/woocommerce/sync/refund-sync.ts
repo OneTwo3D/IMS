@@ -19,6 +19,15 @@ export type WcRefundSyncDependencies = {
   logActivity?: typeof logActivity
 }
 
+/**
+ * o3d-6oyu.18: recorded on the shoppingSyncLog row when a WooCommerce refund is
+ * suppressed because the payment poller had already charged the whole order back.
+ * Doubles as the dedup key — `order.updated` re-runs syncRefundsForOrder, and without
+ * it every subsequent order update would re-log the same warning forever.
+ */
+export const WC_REFUND_SUPPRESSED_BY_CHARGEBACK =
+  'WooCommerce refund suppressed: the order was already charged back by the payment poller — no duplicate credit note raised'
+
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
 }
@@ -216,6 +225,77 @@ export async function syncWcRefund(
         metadata: { externalRefundId: wcRefund.id, parentOrderId: externalOrderId },
         resolveUser: false,
       })
+      return { success: true }
+    }
+
+    // o3d-6oyu.18: the refund transaction refused this credit note because a payment-poller
+    // CHARGEBACK for the same order committed first — the other half of the concurrent
+    // double-reversal race (a Xero payment removal and this WC refund inside one poll cycle).
+    // A chargeback unwinds the WHOLE remaining order, so posting this refund's credit note on
+    // top would double-reverse it. Treat it as handled, NOT as a failure: a FAILED row would
+    // dead-letter into the exceptions inbox and be retried forever against a condition that can
+    // never clear. The reversal itself is not lost — the poller already raised the credit note
+    // and alerted admins; this WARNING records that the Woo-side refund needs reconciling.
+    if (result.conflict === 'prior-chargeback') {
+      const alreadyRecorded = await client.shoppingSyncLog.findFirst({
+        where: {
+          entityType: 'SalesOrder',
+          externalId: String(wcRefund.id),
+          errorMessage: WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
+        },
+        select: { id: true },
+      })
+      // o3d-1sc3: suppressing the duplicate CREDIT NOTE is right; suppressing the STOCK
+      // RETURN is not. A chargeback performs no restock because it assumes the customer kept
+      // the goods — but a Woo refund carrying QUANTITY lines is at least evidence that units
+      // were refunded, and the chargeback path will never account for them. Marking the whole
+      // delivery SYNCED at WARNING therefore buried a possible inventory gap behind a note
+      // about a credit note.
+      //
+      // What this does NOT do, deliberately: assert that goods physically came back, or raise
+      // a WmsReturnsInbox row. WooCommerce's refund line carries a refunded QUANTITY and no
+      // received/restocked signal, so quantity alone cannot prove a physical return — and the
+      // returns inbox is currently scoped to a single WMS connector — its loader, its status
+      // action and its restock action all filter on that one connector — so a row written here
+      // would be invisible and unresolvable. Claiming an actionable record that no screen shows
+      // would be worse than the WARNING it replaced. Generalising that inbox is o3d-92rl;
+      // establishing what actually proves a physical return on the WooCommerce side is o3d-etbf.
+      const refundedUnits = refundLines
+        .filter((line) => line.lineKind === 'sale' && line.qty > 0)
+        .reduce((sum, line) => sum + line.qty, 0)
+
+      if (!alreadyRecorded) {
+        await client.shoppingSyncLog.create({
+          data: {
+            direction: 'FROM_CONNECTOR',
+            status: 'SYNCED',
+            entityType: 'SalesOrder',
+            entityId: so.id,
+            externalId: String(wcRefund.id),
+            errorMessage: WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
+            syncedAt: new Date(),
+          },
+        })
+        const returnedNote = refundedUnits > 0
+          ? ` This refund covered ${refundedUnits} unit(s): the chargeback path performs no restock, so if those units came back they are NOT on hand in IMS. Verify and adjust stock manually.`
+          : ''
+        await writeActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'refund_sync_suppressed_by_chargeback',
+          tag: 'sync',
+          // A quantity-bearing refund may owe an inventory movement nothing else will make,
+          // so it needs action rather than a note. A monetary-only suppression owes nothing.
+          level: refundedUnits > 0 ? 'ERROR' : 'WARNING',
+          description: `WooCommerce refund ${wcRefund.id} on order #${so.externalOrderNumber} was not recorded — the order was already charged back by the payment poller, and a second credit note would double-reverse it. Reconcile the Woo refund manually.${returnedNote} ${result.error ?? ''}`.trim(),
+          metadata: {
+            externalRefundId: wcRefund.id,
+            parentOrderId: externalOrderId,
+            refundedUnits,
+          },
+          resolveUser: false,
+        })
+      }
       return { success: true }
     }
 

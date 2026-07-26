@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { Prisma } from '@/app/generated/prisma/client'
+import {
+  syncWcRefund,
+  WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
+  type WcRefundSyncDependencies,
+} from '@/lib/connectors/woocommerce/sync/refund-sync'
 import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
@@ -89,6 +94,15 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
         async create(args: unknown) {
           syncLogs.push(args)
           return args
+        },
+        // o3d-6oyu.18: the chargeback-suppression path dedups its warning on the marker
+        // message, so `order.updated` re-runs don't re-log it forever.
+        async findFirst(args: { where?: { externalId?: string; errorMessage?: string } }) {
+          const match = (syncLogs as Array<{ data: { externalId?: string; errorMessage?: string } }>).find((log) => (
+            (args.where?.externalId === undefined || log.data.externalId === args.where.externalId) &&
+            (args.where?.errorMessage === undefined || log.data.errorMessage === args.where.errorMessage)
+          ))
+          return match ? { id: 'sync-log-1' } : null
         },
       },
     } as unknown as WcRefundSyncDependencies['db'],
@@ -235,6 +249,51 @@ test('syncWcRefund treats external refund unique conflicts as idempotent races',
   })
 })
 
+test('o3d-6oyu.18: a WC refund refused because the order was already charged back is handled, not dead-lettered', async () => {
+  // The reverse ordering of the concurrent double-reversal race: the payment poller's
+  // chargeback committed first, so the refund transaction refuses this credit note with
+  // conflict: 'prior-chargeback'. A FAILED sync log here would dead-letter the delivery
+  // into the exceptions inbox and retry it forever against a condition that never clears.
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.dependencies.createRefund = async () => ({
+    success: false,
+    conflict: 'prior-chargeback' as const,
+    error: 'Order was already charged back (credit note CN-0009) — a second credit note would double-reverse it; reconcile this refund manually.',
+  })
+
+  const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
+
+  assert.deepEqual(result, { success: true })
+  assert.equal(state.syncLogs.length, 1)
+  const logged = state.syncLogs[0] as { data: { status: string; errorMessage: string } }
+  assert.equal(logged.data.status, 'SYNCED', 'not FAILED — this must not dead-letter')
+  assert.equal(logged.data.errorMessage, WC_REFUND_SUPPRESSED_BY_CHARGEBACK)
+  assert.equal(state.activityLogs.length, 1)
+  const activity = state.activityLogs[0] as { action: string; level: string; description: string }
+  assert.equal(activity.action, 'refund_sync_suppressed_by_chargeback')
+  // o3d-1sc3: this fixture's refund carries a QUANTITY line, so goods came back and an
+  // inventory movement is owed — that is an ERROR needing action, not a WARNING recording
+  // what happened. A monetary-only suppression stays WARNING (covered below).
+  assert.equal(activity.level, 'ERROR', 'operator-visible: stock is owed and not yet back on hand')
+  assert.match(activity.description, /CN-0009/)
+})
+
+test('o3d-6oyu.18: the chargeback-suppression warning is logged once, not on every order.updated re-run', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.dependencies.createRefund = async () => ({
+    success: false,
+    conflict: 'prior-chargeback' as const,
+    error: 'Order was already charged back (credit note CN-0009).',
+  })
+
+  await syncWcRefund(1001, makeRefund(), state.dependencies)
+  await syncWcRefund(1001, makeRefund(), state.dependencies)
+  await syncWcRefund(1001, makeRefund(), state.dependencies)
+
+  assert.equal(state.syncLogs.length, 1)
+  assert.equal(state.activityLogs.length, 1)
+})
+
 test('syncWcRefund links a refund line to its IMS order line via _refunded_item_id, not the refund line id', async () => {
   // REGRESSION (o3d-w2m). WooCommerce mints a NEW order-item id for every refund line,
   // and records the ORDER line it refunds in the _refunded_item_id meta. Measured on a
@@ -289,4 +348,60 @@ test('syncWcRefund falls back to the refund line id when _refunded_item_id is ab
 
   assert.equal(result.success, true, result.error)
   assert.equal(harness.createRefundLines[0].lineId, 'line-1')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-1sc3 — a chargeback suppresses the CREDIT NOTE, never the STOCK RETURN.
+//
+// The chargeback path performs no restock because it assumes the customer kept the
+// goods. A WooCommerce refund carrying QUANTITY lines says the opposite. Marking the
+// whole delivery SYNCED on the strength of the financial conflict therefore absorbed a
+// real inventory movement: stock stayed understated permanently while webhook retries
+// and the exceptions inbox both considered it handled.
+// ---------------------------------------------------------------------------
+
+test('o3d-1sc3: a suppressed refund covering units escalates to ERROR and names the stock owed', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.dependencies.createRefund = async () => ({
+    success: false,
+    conflict: 'prior-chargeback' as const,
+    error: 'Order was already charged back (credit note CN-0009).',
+  })
+
+  const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
+
+  assert.deepEqual(result, { success: true }, 'still not dead-lettered')
+
+  const activity = state.activityLogs[0] as {
+    level: string
+    description: string
+    metadata: Record<string, unknown>
+  }
+  // The chargeback path performs no restock, so a quantity-bearing refund may owe an
+  // inventory movement nothing else will make. That needs action, not a note.
+  assert.equal(activity.level, 'ERROR')
+  assert.equal(activity.metadata.refundedUnits, 1)
+  assert.match(activity.description, /1 unit\(s\)/)
+  assert.match(activity.description, /NOT on hand in IMS/)
+  assert.match(activity.description, /Verify and adjust stock manually/)
+  // It must NOT assert the goods physically came back: a WooCommerce refund line carries a
+  // refunded quantity and no received/restocked signal.
+  assert.doesNotMatch(activity.description, /returns inbox/)
+})
+
+test('o3d-1sc3: a monetary-only suppression stays a WARNING and claims no stock is owed', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.dependencies.createRefund = async () => ({
+    success: false,
+    conflict: 'prior-chargeback' as const,
+    error: 'Order was already charged back (credit note CN-0009).',
+  })
+
+  const monetaryOnly = { ...makeRefund(), line_items: [] }
+  const result = await syncWcRefund(1001, monetaryOnly, state.dependencies)
+
+  assert.deepEqual(result, { success: true })
+  const activity = state.activityLogs[0] as { level: string; description: string }
+  assert.equal(activity.level, 'WARNING', 'nothing returned, nothing owed operationally')
+  assert.doesNotMatch(activity.description, /unit\(s\)/)
 })
