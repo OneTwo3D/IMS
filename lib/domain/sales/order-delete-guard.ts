@@ -60,6 +60,7 @@ export type SalesOrderDeleteBlocker = {
   code:
     | 'wms_order_push_link'
     | 'accounting_sync_live'
+    | 'accounting_document_exists'
     | 'daily_batch_staged'
   message: string
 }
@@ -109,6 +110,26 @@ export async function findSalesOrderDeleteBlocker(
   orderId: string,
   stamps: SalesOrderDeleteStageStamps,
 ): Promise<SalesOrderDeleteBlocker | null> {
+  // 0. Durable external-document markers, checked FIRST because they are the only evidence here
+  // that survives retention (o3d-v7sy). Everything else in this guard reads AccountingSyncLog,
+  // and purgeExpiredData deletes those rows past the retention window (six months by default).
+  // An old order can therefore hold a real invoice in the external ledger, have no retained sync
+  // row, and pass every other check — hard-deleted, stranding the document with no IMS order
+  // behind it. accountingInvoiceId / invoicedAt live on the order itself and are never purged.
+  const invoiced = await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { accountingInvoiceId: true, invoicedAt: true },
+  })
+  if (invoiced?.accountingInvoiceId || invoiced?.invoicedAt) {
+    return {
+      code: 'accounting_document_exists',
+      message:
+        'Cannot delete an order that has been invoiced to the accounting system'
+        + (invoiced.accountingInvoiceId ? ` (invoice ${invoiced.accountingInvoiceId})` : '')
+        + '. Cancel the order instead so the document is credited or reversed.',
+    }
+  }
+
   // 1. WMS. The link row is the push sweep's claim: it exists from immediately before
   // the remote create until the order is withdrawn, so ANY link means the WMS may hold
   // (or be about to be handed) this order.

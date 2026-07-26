@@ -54,8 +54,16 @@ function makeTx(seed: {
   pushLink?: { state: string; externalOrderId: string | null; externalOrderNumber: string | null } | null
   shipments?: string[]
   syncLogs?: SyncLogRow[]
+  /** Durable external-document markers on the order itself — these survive log retention. */
+  order?: { accountingInvoiceId?: string | null; invoicedAt?: Date | null }
 }) {
   return {
+    salesOrder: {
+      findUnique: async () => ({
+        accountingInvoiceId: seed.order?.accountingInvoiceId ?? null,
+        invoicedAt: seed.order?.invoicedAt ?? null,
+      }),
+    },
     wmsOrderPushLink: { findUnique: async () => seed.pushLink ?? null },
     shipment: { findMany: async () => (seed.shipments ?? []).map((id) => ({ id })) },
     accountingSyncLog: {
@@ -266,5 +274,38 @@ test('an A2 batch log of the right date but wrong TYPE does not block', async ()
     'order-1',
     { revenueDeferredDate: null, inventoryAllocatedDate: A2_STAGED_AT },
   )
+  assert.equal(blocker, null)
+})
+
+// --- o3d-v7sy: evidence that survives log retention ---------------------------
+
+test('an order carrying an accounting invoice id blocks, even with no sync logs left', async () => {
+  // Every other check in this guard reads AccountingSyncLog, and purgeExpiredData deletes those
+  // rows past the retention window (six months by default). An old order can therefore hold a
+  // real invoice in the external ledger, have no retained sync row, and pass every other check —
+  // hard-deleted, stranding the document with no IMS order behind it. accountingInvoiceId and
+  // invoicedAt live on the order itself and are never purged.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [], order: { accountingInvoiceId: 'INV-2026-0042' } }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'accounting_document_exists')
+  assert.match(blocker!.message, /INV-2026-0042/)
+})
+
+test('invoicedAt alone blocks, even without an invoice id', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [], order: { invoicedAt: new Date('2025-01-01T00:00:00.000Z') } }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'accounting_document_exists')
+})
+
+test('an order with neither marker nor logs is still deletable', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [] }), 'order-1', STAMPS)
   assert.equal(blocker, null)
 })
