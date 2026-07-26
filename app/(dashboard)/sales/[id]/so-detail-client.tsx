@@ -966,6 +966,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     : settlement.status === 'LEDGER_UNMATCHED' ? ' · PAID IN LEDGER ONLY'
     : settlement.status === 'OVER_SETTLED' ? ' · OVER-PAID IN LEDGER'
     : ''
+  // Neither badge above can speak for an order with no local payment rows, so the verdict needs its own
+  // chip whenever there is something to say: a disagreement, or a payment still on its way.
+  const standaloneSettlement =
+    !isPaid && !isPartiallyPaid && (settlement.discrepancy || settlement.status === 'AWAITING_LEDGER')
   const settlementTone =
     settlement.discrepancy
       ? 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200'
@@ -1046,15 +1050,21 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             Part. Paid{settlementSuffix}
           </span>
         )}
-        {settlement.status === 'LEDGER_UNMATCHED' && (
-          /* The disagreement pointing the other way: nothing is paid here, so neither badge above renders
-             — and without its own chip the state with NO local claim would be the one nobody could see. */
+        {standaloneSettlement && (
+          /*
+            THE VERDICT WHEN NEITHER BADGE ABOVE RENDERS. Both are derived from LOCAL payment rows, and an
+            imported paid order has none — WooCommerce sets paidAt and the receipt is registered straight
+            from the invoice follow-up. So the most common paid order in the system showed no badge, and
+            with it no settlement state: a rejected or unsent payment on exactly those orders would have
+            been invisible, which is the thing this whole change exists to prevent (Codex, PR #582 round 7).
+            LEDGER_UNMATCHED lands here too — nothing is paid locally, by definition.
+          */
           <span
-            className="inline-flex items-center gap-1 rounded-full border px-3 py-1 text-sm font-medium bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200"
+            className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-sm font-medium ${settlementTone}`}
             title={settlement.detail}
           >
-            <AlertTriangle className="h-3.5 w-3.5" />
-            PAID IN LEDGER ONLY
+            {settlement.discrepancy && <AlertTriangle className="h-3.5 w-3.5" />}
+            {settlement.status === 'LEDGER_UNMATCHED' ? 'PAID IN LEDGER ONLY' : `Paid${settlementSuffix}`}
           </span>
         )}
 
