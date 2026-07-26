@@ -24,7 +24,14 @@ import { config } from 'dotenv'
 const SKIP = process.env.RUN_DB_CONCURRENCY_TESTS !== '1'
 // How long the holder keeps the row lock while allocation is already blocked on it. Only needs to
 // exceed the time for allocation's (non-blocking) pre-lock reads to complete.
-const HOLD_MS = Number.parseInt(process.env.O3D_6AB_HOLD_MS ?? '750', 10)
+/**
+ * How long to wait for the allocator to be CONFIRMED blocked on our row lock (o3d-bz8q).
+ *
+ * This is a timeout, not a delay: the barrier below polls pg_locks and proceeds the moment the
+ * wait is observed. It only elapses if the allocator never blocks at all, which is a genuine
+ * failure and must fail the test rather than pass it quietly.
+ */
+const BARRIER_TIMEOUT_MS = Number.parseInt(process.env.O3D_6AB_BARRIER_TIMEOUT_MS ?? '15000', 10)
 const BATCH_ELIGIBLE = ['PROCESSING', 'ALLOCATED'] as const
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -150,6 +157,42 @@ async function destroyFixture(db: TestDb, fixture: Fixture) {
  * Take the sales-order row lock on a dedicated connection, apply `mutate`, keep the transaction OPEN
  * while `whileHeld` starts and blocks on the same row, then COMMIT and return whileHeld's result.
  */
+/**
+ * Block until ANOTHER backend is waiting on the `sales_orders` row lock this connection holds.
+ *
+ * `pg_locks.granted = false` on a tuple/transaction-id lock is Postgres telling us, from its own
+ * bookkeeping, that a second transaction has reached `SELECT ... FOR UPDATE` and is queued behind
+ * us. That is the exact ordering the test needs, and it cannot be faked by timing.
+ *
+ * Throws on timeout — an allocator that never blocks means the race did not happen, and the test
+ * must fail loudly rather than proceed and "pass".
+ */
+async function waitForRowLockWaiter(
+  holder: { query(sql: string, params?: unknown[]): Promise<unknown> },
+  orderId: string,
+): Promise<void> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < BARRIER_TIMEOUT_MS) {
+    const result = await holder.query(
+      `SELECT count(*)::int AS waiting
+         FROM pg_locks blocked
+         JOIN pg_locks blocker
+           ON blocker.transactionid = blocked.transactionid
+          AND blocker.granted
+          AND blocker.pid <> blocked.pid
+        WHERE NOT blocked.granted
+          AND blocker.pid = pg_backend_pid()`,
+    ) as { rows: Array<{ waiting: number }> }
+    if ((result.rows[0]?.waiting ?? 0) > 0) return
+    await sleep(25)
+  }
+  throw new Error(
+    `o3d-bz8q barrier: no backend blocked on the sales_orders row for ${orderId} within `
+    + `${BARRIER_TIMEOUT_MS}ms — the allocator never reached the lock, so the race under test `
+    + 'did not occur and this run proves nothing',
+  )
+}
+
 async function raceUnderRowLock<T>(
   holderPool: TestDeps['holderPool'],
   orderId: string,
@@ -165,7 +208,18 @@ async function raceUnderRowLock<T>(
 
     // Starts, reads the PRE-lock (stale) state under MVCC, then blocks on the row lock we hold.
     const pending = whileHeld()
-    await sleep(HOLD_MS)
+
+    // o3d-bz8q: WAIT FOR THE BLOCK, do not sleep for it. A fixed 750ms sleep proved nothing —
+    // on a slow or loaded database the allocator's initial read could happen AFTER this commit,
+    // so it would observe ON_HOLD directly and the test would pass even if the implementation
+    // only ever checked the PRE-lock status. That is a false positive for precisely the
+    // regression this test exists to catch.
+    //
+    // Polling pg_locks until the allocator is confirmed WAITING on our row makes the ordering a
+    // fact rather than a hope: the stale read has provably already happened, because the
+    // allocator cannot reach the lock without it.
+    await waitForRowLockWaiter(holder, orderId)
+
     await holder.query('COMMIT')
     committed = true
     return await pending
