@@ -1933,6 +1933,19 @@ export async function createSalesOrderRefund(
         // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
         // the stored syncs) reproduces the revenue-only treatment.
         chargeback: input.chargeback ?? false,
+        // o3d-mrwu: born OWING its accounting, cleared only once staging has actually
+        // succeeded. This transaction commits before stageRefundAccountingReversals runs,
+        // so defaulting the flag to false meant a crash in that window left a committed
+        // refund/chargeback row with no queued reversal AND nothing marking it unfinished.
+        // The concurrency guard then reads that row as a completed reversal and refuses the
+        // other source, and the poller reads the false flag as completion and advances —
+        // both acknowledged, no reversal recoverable anywhere.
+        //
+        // Same shape as the defects the o3d-bjc.9 rounds converged on: absent data treated
+        // as a positive fact on an irreversible path. Fail closed instead: a crash leaves
+        // accountingRetryRequired true, which the replay path at `existingChargeback` and
+        // the unresolved-accounting guard both already know how to act on.
+        accountingRetryRequired: Boolean(so.revenueDeferredDate && input.accountingSettings),
       },
       select: { id: true },
     })
@@ -2132,6 +2145,10 @@ export async function createSalesOrderRefund(
         where: { id: txResult.createdRefund.id },
         data: {
           accountingRetrySyncs: refundAccountingSyncsJson(accountingSyncs),
+          // o3d-mrwu: staging succeeded and the syncs are now durable, so the row no longer
+          // owes anything. This is the ONLY place the flag is cleared — everything else
+          // leaves it set, which is what makes a crash recoverable.
+          accountingRetryRequired: false,
           // scjz.71: durably record whether any COGS/unearned reversal was staged
           // (the UNEARNED_REV_REVERSAL sync also carries allocation reversal) so the
           // invariant/reconciliation evidence checks can tell a credit-note-only

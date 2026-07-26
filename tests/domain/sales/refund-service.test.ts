@@ -2573,3 +2573,133 @@ test('recordRefundCogsReversalFromSync ignores non-COGS_REVERSAL syncs', async (
   await recordRefundCogsReversalFromSync(client, unearned, true)
   assert.equal(rows.length, 0)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-mrwu — a refund/chargeback row is born OWING its accounting.
+//
+// The refund transaction COMMITS before stageRefundAccountingReversals runs. While
+// accountingRetryRequired defaulted to false, a crash in that window left a committed
+// row with no queued reversal and nothing marking it unfinished — so the concurrency
+// guard read it as a completed reversal and refused the other source, while the poller
+// read the false flag as completion and advanced. Both acknowledged; no reversal
+// recoverable. The flag now starts true and is cleared ONLY by successful staging.
+// ---------------------------------------------------------------------------
+
+test('a refund that owes accounting is created with accountingRetryRequired set (o3d-mrwu)', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  // Capture the flag as it stood when the row was FIRST written, i.e. at the moment the
+  // transaction would have committed — before staging gets a chance to clear it.
+  let flagAtCreate: unknown
+  const client = createClient(state)
+  const realCreate = client.salesOrderRefund.create.bind(client.salesOrderRefund)
+  client.salesOrderRefund.create = (async (args: { data: Record<string, unknown> }) => {
+    flagAtCreate = args.data.accountingRetryRequired
+    return realCreate(args as never)
+  }) as typeof client.salesOrderRefund.create
+
+  const result = await createSalesOrderRefund(client, {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Payment reversed (chargeback)',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    chargeback: true,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(
+    flagAtCreate,
+    true,
+    'the row must commit already marked as owing accounting — a crash before staging must be visible',
+  )
+  assert.equal(
+    state.refunds[0]?.accountingRetryRequired,
+    false,
+    'and staging succeeding is what clears it',
+  )
+})
+
+test('a crash between commit and staging leaves the reversal recoverable, not silently complete (o3d-mrwu)', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  // Simulate the crash: the refund transaction commits, then the process dies before the
+  // post-commit update that records the staged syncs. The row is left exactly as committed.
+  const client = createClient(state)
+  client.salesOrderRefund.update = (async () => {
+    throw new Error('process died before staging was recorded')
+  }) as typeof client.salesOrderRefund.update
+
+  await createSalesOrderRefund(client, {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Payment reversed (chargeback)',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    chargeback: true,
+  }).catch(() => { /* the crash itself is not what this test asserts */ })
+
+  assert.equal(state.refunds.length, 1, 'the refund row committed')
+  assert.equal(
+    state.refunds[0]?.accountingRetryRequired,
+    true,
+    'it must still be marked as owing accounting — this is what makes the reversal recoverable, '
+      + 'and what stops the guard and the poller both reading it as complete',
+  )
+})
