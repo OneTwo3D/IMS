@@ -347,3 +347,73 @@ test('a PARTIAL refund split across two lines of one order line still classifies
 
   assert.deepEqual(plan.decisions, [{ refundId: 'r1', orderId: 'order-1', basis: 'NET' }])
 })
+
+test('AGGREGATE quantity across repeated links is checked, not just each line (o3d-lvk r4)', async () => {
+  // Two refund lines of 0.6 against a 1-unit source line each pass an INDEPENDENT quantity check
+  // while claiming an impossible 1.2 units between them — and the historical writer permits that
+  // shape, because its own validation is per-line too.
+  //
+  // The damage: the resulting 120 header is EXACTLY what a lawful full-line GROSS refund would be,
+  // so an unprovable NET gets stamped over a reading that is equally consistent.
+  const plan = await planRefundBasisBackfill([{
+    id: 'order-1',
+    lines: [{ id: 'line-1', productId: 'p1', qty: 1, totalBase: 100, taxBase: 20 }],
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 120,
+      lines: [
+        { productId: 'p1', salesOrderLineId: 'line-1', qty: 0.6, totalBase: 60 },
+        { productId: 'p1', salesOrderLineId: 'line-1', qty: 0.6, totalBase: 60 },
+      ],
+    }],
+  }])
+
+  assert.deepEqual(plan.decisions, [], '1.2 units of a 1-unit line is impossible in aggregate')
+  assert.equal(plan.unresolved.length, 1)
+})
+
+test('a LARGE legitimate refund is not rejected by the tolerance (o3d-lvk r4)', async () => {
+  // The over-tightening risk. The historical writer sums unrounded inputs for the header while lines
+  // are stored at four decimal places, so honest drift GROWS with line count. A flat 0.005 cap
+  // rejected anything above roughly 99 value lines — leaving bulk refunds quarantined despite a
+  // provable basis, which would make this backfill useless for exactly the orders that need it.
+  //
+  // 200 uniquely linked NET lines stored as 1.0000, header 200.0080 from 1.00004 inputs.
+  const orderLines = Array.from({ length: 200 }, (_, i) => ({
+    id: `line-${i}`, productId: `p${i}`, qty: 1, totalBase: 1, taxBase: 0.2,
+  }))
+  const refundLines = orderLines.map((line, i) => ({
+    productId: `p${i}`, salesOrderLineId: line.id, qty: 1, totalBase: 1,
+  }))
+
+  const plan = await planRefundBasisBackfill([{
+    id: 'order-1',
+    lines: orderLines,
+    refunds: [{ id: 'r1', totalsBasis: null, totalBase: 200.008, lines: refundLines }],
+  }])
+
+  assert.deepEqual(
+    plan.decisions,
+    [{ refundId: 'r1', orderId: 'order-1', basis: 'NET' }],
+    'legitimate four-decimal storage drift across 200 lines still reconciles',
+  )
+})
+
+test('the tolerance still cannot span a real net/gross gap (o3d-lvk r4)', async () => {
+  // The property the cap exists to preserve, now expressed against the refund's OWN gap: with a 0.2
+  // tax on a 1-unit line the two readings are 0.2 apart, and a header sitting at the gross value
+  // must not reconcile against net lines.
+  const plan = await planRefundBasisBackfill([{
+    id: 'order-1',
+    lines: [{ id: 'line-1', productId: 'p1', qty: 1, totalBase: 1, taxBase: 0.2 }],
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 1.2,                                    // the GROSS reading
+      lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 1 }], // lines say NET
+    }],
+  }])
+
+  assert.deepEqual(plan.decisions, [], 'a header a whole tax-gap away never reconciles')
+})

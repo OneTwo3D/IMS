@@ -214,6 +214,24 @@ export function classifyRefundBasis(
     orderLineCountByProduct.set(orderLine.productId, (orderLineCountByProduct.get(orderLine.productId) ?? 0) + 1)
   }
 
+  // Quantity must be checked in AGGREGATE, not per line. Two refund lines of 0.6 against a 1-unit
+  // source line each pass an independent check while claiming an impossible 1.2 units between them —
+  // and the historical writer permits that shape, because its own validation is per-line too. The
+  // basis comparison then "succeeds" on a total that is equally consistent with a lawful full-line
+  // GROSS refund, so an unprovable NET gets stamped.
+  const claimedQtyByLine = new Map<string, ReturnType<typeof toDecimal>>()
+  for (const refundLine of refundLines) {
+    if (!refundLine.salesOrderLineId) continue
+    const previous = claimedQtyByLine.get(refundLine.salesOrderLineId)
+    const qty = toDecimal(refundLine.qty).abs()
+    claimedQtyByLine.set(refundLine.salesOrderLineId, previous ? previous.add(qty) : qty)
+  }
+  for (const [lineId, claimed] of claimedQtyByLine) {
+    const orderLine = orderLinesById.get(lineId)
+    if (!orderLine) continue // handled per line below
+    if (claimed.gt(toDecimal(orderLine.qty).abs().add(QTY_EPSILON))) return 'UNKNOWN'
+  }
+
   for (const refundLine of refundLines) {
     // EXACTLY zero, not "small". An epsilon here silently exempts sub-cent lines: a proven NET line
     // plus an unlinked 0.005 line would classify NET, and enough such lines hide a material

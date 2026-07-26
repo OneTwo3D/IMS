@@ -17,7 +17,21 @@ import type {
  * lines that carry value; a zero line contributes none, so it must not buy tolerance.
  */
 const HEADER_RECONCILE_EPSILON_PER_LINE = 0.00005
-const HEADER_RECONCILE_MAX_TOLERANCE = 0.005
+
+/**
+ * The cap is expressed as a FRACTION OF THE REFUND'S OWN net/gross separation, not as a fixed
+ * amount.
+ *
+ * A flat cap gets the trade wrong in both directions. Too loose and zero-line padding widens the
+ * window until it spans a real net/gross gap; too tight and it rejects legitimate refunds — a flat
+ * 0.005 rejected anything above roughly 99 value lines, because the historical writer sums unrounded
+ * inputs for the header while lines are stored at four decimal places, so honest drift grows with
+ * line count.
+ *
+ * Bounding by the gap keeps the property that actually matters: the window can never reach the
+ * smallest difference that distinguishes NET from GROSS for THIS refund, however many lines it has.
+ */
+const HEADER_RECONCILE_GAP_FRACTION = 0.25
 
 /**
  * o3d-lvk: stamp `totalsBasis` on refunds written BEFORE the totals_basis migration.
@@ -114,11 +128,25 @@ export async function planRefundBasisBackfill(
         (sum, line) => sum.add(toDecimal(line.totalBase)),
         toDecimal(0),
       )
-      const valueLineCount = refund.lines.filter((line) => !toDecimal(line.totalBase).isZero()).length
-      const tolerance = Math.min(
-        HEADER_RECONCILE_EPSILON_PER_LINE * (valueLineCount + 1),
-        HEADER_RECONCILE_MAX_TOLERANCE,
-      )
+      const valueLines = refund.lines.filter((line) => !toDecimal(line.totalBase).isZero())
+
+      // The smallest net/gross separation among the lines that carry value. For a line, that gap is
+      // its tax scaled to the refunded quantity — the exact distance between the two readings the
+      // classifier had to choose between.
+      let smallestBasisGap = Number.POSITIVE_INFINITY
+      for (const line of valueLines) {
+        const orderLine = line.salesOrderLineId ? orderLinesById.get(line.salesOrderLineId) : undefined
+        if (!orderLine) continue
+        const lineQty = toDecimal(orderLine.qty).abs()
+        if (lineQty.isZero()) continue
+        const gap = toDecimal(orderLine.taxBase).abs().div(lineQty).mul(toDecimal(line.qty).abs()).toNumber()
+        if (gap > 0 && gap < smallestBasisGap) smallestBasisGap = gap
+      }
+
+      const roundingBound = HEADER_RECONCILE_EPSILON_PER_LINE * (valueLines.length + 1)
+      const tolerance = Number.isFinite(smallestBasisGap)
+        ? Math.min(roundingBound, smallestBasisGap * HEADER_RECONCILE_GAP_FRACTION)
+        : roundingBound
       if (toDecimal(refund.totalBase).sub(lineSum).abs().toNumber() > tolerance) {
         unresolved.push({ refundId: refund.id, orderId: order.id })
         continue
