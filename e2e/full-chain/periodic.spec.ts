@@ -40,6 +40,7 @@ import {
   createBill, createLandedCostPo, createManufacturingOrder, createStockTransfer, dispatchStockTransfer,
   drainLandedCostOutboxNow,
   editManufacturingCostLineAmount, openManufacturingOrder, openSalesOrder, processPendingXeroSyncViaUi,
+  accountingInvariants,
   receiveGoods, receiveStockTransfer, runDailyBatch, runFxRevaluation, runTaxRateDriftCron, setPostingMode,
   startProduction,
 } from './harness/ims.ts'
@@ -474,6 +475,95 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
       // Remove the seeded snapshots. The reconciliation sync log + accounting_event for the CHOSEN date
       // are deliberately LEFT as a "date used" marker so the next run in this rolling window picks a fresh
       // date (the sweep is idempotent per date at Xero); teardown voids the Xero document.
+      await seed.cleanup()
+    }
+  })
+
+  test('X-08: a MATERIAL transit gap FLAGS and is never swept, and the coverage watermark stops it false-flagging pre-deploy history', async ({ page }) => {
+    test.setTimeout(600_000)
+
+    // The other half of gate 6oyu.4.1, and the half that matters most. X-02 proves an IMMATERIAL residue
+    // is swept; this proves the scjz.13 trap holds — a gap beyond the sweep limit must be SURFACED, never
+    // quietly journalled away, because sweeping a real discrepancy is how a missing transit posting gets
+    // papered over and disappears.
+    //
+    // Two assertions the ledger alone cannot make. A material gap posts NO journal by design, so "no
+    // DAILY_BATCH_TRANSIT_RECONCILIATION in Xero" is equally consistent with "correctly refused" and
+    // "never ran". The invariant report is where the refusal becomes visible, so both are asserted: the
+    // batch swept nothing AND transit_gl_subledger_mismatch is raised with the delta we seeded.
+    const transitAccount = await settingValue('xero_transit_account')
+    // 5.00 against a 1.00 sweep limit (DEFAULT_GL_SWEEP_LIMIT) — unambiguously material, and far enough
+    // from the boundary that per-posting 2dp rounding in the window cannot drift it back under.
+    const materialGap = 5
+
+    const baseline = await deleteUnjournaledShipmentBaseline()
+    console.log(`[X-08] baseline: deleted ${baseline.candidateOrders} batch-candidate order(s)`)
+    registerRetiredPostedDocuments(baseline, 'X-08')
+    await setPostingMode({ sync: true, dailyBatch: true })
+
+    const seed = await seedTransitReconciliationResidue(transitAccount, materialGap)
+    console.log(`[X-08] seeding a MATERIAL ${materialGap} transit gap for reconciliation date ${seed.dateIso}`)
+    try {
+      const boundary = await dailyBatchBoundary()
+
+      // 1. THE FLAG, before the batch: the reconciliation already classifies this window as a mismatch.
+      //    Asserted first so a batch refused by the hourly quota still leaves the gate's core claim
+      //    proven rather than skipped entirely.
+      const flagged = await accountingInvariants(page)
+      const mismatch = flagged.findings.find((f) => f.code === 'transit_gl_subledger_mismatch')
+      expect(mismatch, `transit_gl_subledger_mismatch was not raised for a ${materialGap} gap; findings: ${flagged.findings.map((f) => f.code).join(', ') || '(none)'}`).toBeTruthy()
+      expect(mismatch!.severity, 'a transit mismatch is critical, not advisory').toBe('critical')
+      expect(Number(mismatch!.details?.delta), 'the flagged delta is the gap we seeded').toBeCloseTo(materialGap, 2)
+      expect(Number(mismatch!.details?.sweepLimit), 'and it is flagged BECAUSE it exceeds the sweep limit').toBeLessThan(materialGap)
+
+      // 2. THE WATERMARK. The ledger is append-only with no pre-deploy history, so a window opening
+      //    before the coverage start date is genuinely unreconcilable — and must degrade to "unavailable"
+      //    rather than flag, or every install would light up red for history that never had a subledger.
+      //    Same seeded gap, watermark moved past the window: the SAME data must stop flagging.
+      const priorWatermark = await settingValue('transit_ledger_coverage_start_date').catch(() => null)
+      const beyond = new Date(Date.UTC(2099, 0, 1)).toISOString().slice(0, 10)
+      await writeSettingRaw('transit_ledger_coverage_start_date', beyond)
+      try {
+        const gated = await accountingInvariants(page)
+        expect(
+          gated.findings.find((f) => f.code === 'transit_gl_subledger_mismatch'),
+          'a window the ledger does not cover must degrade to unavailable, not flag — otherwise pre-deploy history false-flags for ever',
+        ).toBeFalsy()
+      } finally {
+        if (priorWatermark == null) await deleteSettingRaw('transit_ledger_coverage_start_date')
+        else await writeSettingRaw('transit_ledger_coverage_start_date', priorWatermark)
+      }
+
+      // 3. NEVER SWEPT. Run the real batch and prove it posted nothing for this window.
+      let batch: { groupA1: number; groupA2: number; groupB: number; errors: string[]; transitReconciliationSwept?: number | null }
+      try {
+        batch = (await runDailyBatch(page)) as unknown as typeof batch
+      } catch (e) {
+        if (/HTTP 429|rate.?limit/i.test(String(e))) {
+          // Same o3d-lgo.13 mitigation as X-02, and louder here because step 3 is the assertion the
+          // gate names: steps 1-2 have already passed, so this is partial coverage, not none.
+          console.warn('[X-08] SKIPPED the batch half — accounting-daily-batch hourly quota already consumed this invocation (o3d-lgo.13). The FLAG and WATERMARK assertions above did run; the never-swept assertion did not. Re-run X-08 in its own invocation.')
+          test.skip(true, 'accounting-daily-batch hourly quota already consumed this invocation (o3d-lgo.13); run X-08 in its own invocation.')
+        }
+        throw e
+      }
+      expect(batch.errors, `daily batch reported errors: ${batch.errors.join('; ')}`).toEqual([])
+      // THE POINT: nothing was swept. A number here would mean the batch journalled away a real
+      // discrepancy — the exact regression this gate exists to prevent.
+      expect(
+        batch.transitReconciliationSwept ?? 0,
+        'a MATERIAL transit gap must never be swept — it is flagged for a human',
+      ).toBe(0)
+
+      // And no journal reached Xero for it. Registered before asserting, as elsewhere, so a document
+      // that did post is voided by teardown rather than left in the shared ledger.
+      await processPendingXeroSyncViaUi(page)
+      for (const posted of await postedDailyBatchJournalIds(boundary)) {
+        trackDocument('ManualJournals', posted.externalId, `X-08 ${posted.type} ${runTag(runId)}`)
+      }
+      const swept = await syncLogRowsFor({ type: 'DAILY_BATCH_TRANSIT_RECONCILIATION', referenceId: `TRANSITRECON-${seed.dateIso}` })
+      expect(swept, 'no transit reconciliation was queued for a material gap').toHaveLength(0)
+    } finally {
       await seed.cleanup()
     }
   })
@@ -1161,6 +1251,34 @@ async function settledJournalExternalIds(
 function expectBalanced(journal: XeroManualJournal): void {
   const net = journal.JournalLines.reduce((sum, line) => sum + line.LineAmount, 0)
   expect(Math.abs(net), `journal ${journal.ManualJournalID} is unbalanced by ${net}`).toBeLessThan(0.005)
+}
+
+/** Upsert a settings value on THIS instance. Used to move the transit coverage watermark in X-08. */
+async function writeSettingRaw(key: string, value: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(
+      `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+         on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      [key, value],
+    )
+  } finally {
+    await db.end()
+  }
+}
+
+/** Delete a settings row — restores a key that did not exist before the test wrote it. */
+async function deleteSettingRaw(key: string): Promise<void> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    await db.query(`delete from settings where key = $1`, [key])
+  } finally {
+    await db.end()
+  }
 }
 
 async function settingValue(key: string): Promise<string> {
