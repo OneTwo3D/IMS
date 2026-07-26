@@ -580,3 +580,59 @@ test('the PARENT update is guarded the same way (o3d-fsi)', async () => {
     productDelegate.findFirst = realFindFirst
   }
 })
+
+test('a row DELETED mid-import is a transient failure, not an ownership conflict (o3d-fsi)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+
+  state.products.push(imsRow({ id: 'ims-var', sku: 'VAR-1', name: 'Doomed', type: 'VARIANT' }))
+
+  const realFindMany = productDelegate.findMany
+  productDelegate.findMany = async (args) => {
+    const rows = await realFindMany(args)
+    // Deleted after this read: the conditional update will match zero rows for a reason that has
+    // nothing to do with ownership.
+    if (rows.some((row) => row.sku === 'VAR-1')) {
+      const index = state.products.findIndex((row) => row.id === 'ims-var')
+      if (index >= 0) state.products.splice(index, 1)
+    }
+    return rows
+  }
+
+  try {
+    const result = await syncWcProductToIms(variableProduct())
+
+    assert.equal(result.success, false)
+    // Must NOT be an ownership conflict: o3d-gtk classifies those PERMANENT, which would ack the
+    // webhook 200 and strand the product. A deletion race has to keep retrying.
+    assert.doesNotMatch(String(result.error), /already mapped to WooCommerce object/)
+    assert.match(String(result.error), /disappeared while importing it/)
+  } finally {
+    productDelegate.findMany = realFindMany
+  }
+})
+
+test('a later duplicate sibling sees the FIRST sibling\'s applied fields, not stale ones (o3d-fsi)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+
+  // Both variations share a SKU. Only the first carries a description; the second omits it, so it
+  // falls back to `existing.description`. That fallback must read the value the first just wrote,
+  // otherwise the second update reinstates the stale IMS text and the fresh data is lost.
+  const first = wcVariation(111, 'DUP', 'Red')
+  first.description = 'Fresh description from WooCommerce'
+  const second = wcVariation(112, 'DUP', 'Blue')
+  second.description = ''
+  variationPages = { '1': [first, second] }
+
+  state.products.push(imsRow({ id: 'ims-dup', sku: 'DUP', name: 'Old', description: 'STALE' }))
+
+  const result = await syncWcProductToIms(variableProduct())
+
+  assert.equal(result.success, true, `expected success, got: ${result.error}`)
+  assert.equal(
+    findProductBySku('DUP')?.description,
+    'Fresh description from WooCommerce',
+    'the second sibling must not write the pre-import description back',
+  )
+})

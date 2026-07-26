@@ -302,6 +302,37 @@ async function ensureWcSettingsVersionMatches(expectedVersion: string): Promise<
   })
 }
 
+type MappingFailure =
+  | { ok: false; reason: 'version_changed' }
+  | { ok: false; reason: 'mapping_changed' }
+  | { ok: false; reason: 'error'; error: string }
+
+function describeMappingFailure(failure: MappingFailure, sku: string): string {
+  switch (failure.reason) {
+    case 'version_changed':
+      return `WooCommerce settings changed while resolving ${sku}`
+    case 'mapping_changed':
+      // Another writer claimed this product while we were resolving it against WooCommerce. The
+      // push is abandoned rather than overwriting them; the next run reads the winning mapping.
+      return `WooCommerce mapping for ${sku} was claimed by another sync while resolving it`
+    default:
+      return failure.error
+  }
+}
+
+/**
+ * Claim `externalProductId` for a product that had none.
+ *
+ * Both callers reach here only inside `if (!resolvedId)` — i.e. having read a NULL mapping and
+ * then gone to WooCommerce to resolve one. That premise is re-asserted in the write itself
+ * (o3d-fsi): the update matches only while the mapping is still null.
+ *
+ * Without that predicate this is a one-sided race against the import path. If this resolver read
+ * null, then blocked behind `updateProductGuardingOwnership`, Postgres would resume this UPDATE
+ * after the importer committed and overwrite the id the importer just claimed — leaving a row
+ * carrying one WooCommerce object's `parentId`/`type` and another's `externalProductId`. The
+ * importer's guard cannot prevent that on its own; the other writer has to stop overwriting.
+ */
 async function persistMappingIfVersionMatches(
   productId: string,
   externalId: number,
@@ -309,6 +340,7 @@ async function persistMappingIfVersionMatches(
 ): Promise<
   | { ok: true }
   | { ok: false; reason: 'version_changed' }
+  | { ok: false; reason: 'mapping_changed' }
   | { ok: false; reason: 'error'; error: string }
 > {
   try {
@@ -319,10 +351,16 @@ async function persistMappingIfVersionMatches(
       if (currentVersion !== expectedVersion) {
         return { ok: false as const, reason: 'version_changed' as const }
       }
-      await tx.product.update({
-        where: { id: productId },
+      const { count } = await tx.product.updateMany({
+        // Re-affirming the same id is a no-op we still want to succeed; anything else means
+        // another writer claimed this product while we were resolving it.
+        where: {
+          id: productId,
+          OR: [{ externalProductId: null }, { externalProductId: BigInt(externalId) }],
+        },
         data: { externalProductId: BigInt(externalId) },
       })
+      if (count === 0) return { ok: false as const, reason: 'mapping_changed' as const }
       return { ok: true as const }
     })
   } catch (error) {
@@ -676,14 +714,26 @@ async function updateProductGuardingOwnership(
     where: { id: row.id },
     select: { id: true, sku: true, externalProductId: true },
   })
-  if (current) assertWcRowNotClaimedByAnotherWcObject(current, claimants)
 
-  // The row passed the guard on re-read (reassigned again, or deleted) yet the conditional update
-  // still matched nothing. Refuse rather than retry into an unbounded loop: the whole transaction
-  // rolls back and the delivery is retried from the top with a fresh snapshot.
+  // The row is GONE — deleted concurrently, not claimed by anyone. Reporting that as an ownership
+  // conflict would be doubly wrong: the message would tell an operator to resolve a duplicate SKU
+  // that does not exist, and o3d-gtk classifies ownership conflicts as PERMANENT, so the webhook
+  // would be acked 200 and the product left unimported until the daily reconcile. A deletion race
+  // is transient by nature, so it must throw something that keeps retrying.
+  if (!current) {
+    throw new Error(
+      `IMS product ${row.id} (SKU "${row.sku}") disappeared while importing it; retrying`,
+    )
+  }
+
+  assertWcRowNotClaimedByAnotherWcObject(current, claimants)
+
+  // Re-read says the row is writable, yet the conditional update matched nothing — it was
+  // reassigned and reassigned back, or another predicate moved. Refuse rather than retry in a
+  // loop: the transaction rolls back and the delivery is retried from the top.
   throw new WcSkuOwnershipConflictError({
     sku: row.sku,
-    claimedByWcId: current ? String(current.externalProductId ?? 'none') : 'deleted',
+    claimedByWcId: String(current.externalProductId ?? 'none'),
     incomingWcId: [...claimants].map(String).join(', '),
     imsProductId: row.id,
   })
@@ -777,8 +827,10 @@ async function applyVariations(
       if (gtin && !existing.barcode) updateData.barcode = gtin
 
       await updateProductGuardingOwnership(tx, existing, claimants, updateData)
-      // Keep the map's mapping current for a repeated SKU later in this same payload.
-      existingBySku.set(sku, { ...existing, externalProductId: BigInt(v.id) })
+      // Reflect the FULL applied update, not just the new mapping. A later sibling sharing this
+      // SKU builds its `?? existing.x` fallbacks from this row; caching the pre-update values
+      // would write the first sibling's fresh description/image straight back out again.
+      existingBySku.set(sku, { ...existing, ...updateData } as typeof existing)
     } else {
       const created = await tx.product.create({
         data: {
@@ -901,12 +953,7 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
         variationId = matches[0].id
         const persisted = await persistMappingIfVersionMatches(product.id, variationId, syncVersion)
         if (!persisted.ok) {
-          return {
-            success: false,
-            error: persisted.reason === 'version_changed'
-              ? `WooCommerce settings changed while resolving ${product.sku}`
-              : persisted.error,
-          }
+          return { success: false, error: describeMappingFailure(persisted, product.sku) }
         }
       } else {
         const { data, error } = await wcFetch(`/products/${parentWcId}/variations/${variationId}`, {}, creds)
@@ -944,12 +991,7 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
         resolvedId = wcProducts[0].id
         const persisted = await persistMappingIfVersionMatches(product.id, resolvedId, syncVersion)
         if (!persisted.ok) {
-          return {
-            success: false,
-            error: persisted.reason === 'version_changed'
-              ? `WooCommerce settings changed while resolving ${product.sku}`
-              : persisted.error,
-          }
+          return { success: false, error: describeMappingFailure(persisted, product.sku) }
         }
       }
 
