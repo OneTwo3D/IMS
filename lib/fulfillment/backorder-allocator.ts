@@ -2,15 +2,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync } from '@/lib/shopping'
-import {
-  calculateCoverageByLine,
-  requirementsMapToRows,
-  type FulfillmentRequirement,
-} from '@/lib/products/fulfillment-coverage'
-import {
-  expandFulfillmentRequirementsDecimal,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+import { selectOrdersNeedingAllocation } from '@/lib/fulfillment/order-allocation-coverage'
 
 const BACKORDER_ELIGIBLE_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
 
@@ -40,8 +32,8 @@ export type BackorderSource =
 export async function allocateBackordersForProducts(
   productIds: string[],
   context: { source: BackorderSource; referenceId?: string; referenceLabel?: string },
-): Promise<{ orderIds: string[]; allocated: number; errors: number }> {
-  const result = { orderIds: [] as string[], allocated: 0, errors: 0 }
+): Promise<{ orderIds: string[]; allocated: number; skipped: number; errors: number }> {
+  const result = { orderIds: [] as string[], allocated: 0, skipped: 0, errors: 0 }
   const directIds = [...new Set(productIds.filter(Boolean))]
   if (directIds.length === 0) return result
 
@@ -87,69 +79,23 @@ export async function allocateBackordersForProducts(
       id: true,
       orderNumber: true,
       externalOrderNumber: true,
+      // o3d-jby: the shared coverage selector treats FULL as zero demand, matching
+      // allocateSalesOrder. Both callers must supply it or they disagree again.
+      refundStatus: true,
       lines: { select: { id: true, qty: true, productId: true } },
     },
     orderBy: { createdAt: 'asc' },
   })
   if (candidates.length === 0) return result
 
-  const candidateIds = candidates.map((o) => o.id)
-
-  // Build per-line requirements expressed in leaf (component) units so
-  // KIT lines can be compared in kit units below. For SIMPLE/BOM lines
-  // this degenerates to a single requirement of factor 1.
-  const lineProductIds = [
-    ...new Set(
-      candidates.flatMap((order) =>
-        order.lines.map((line) => line.productId).filter((id): id is string => !!id),
-      ),
-    ),
-  ]
-  const graph = await loadFulfillmentProductGraph(db, lineProductIds)
-  const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
-  for (const order of candidates) {
-    for (const line of order.lines) {
-      if (!line.productId) continue
-      requirementsByLine.set(
-        line.id,
-        requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
-      )
-    }
-  }
-
-  // Coverage rows use OrderAllocation only (component units for KIT lines,
-  // BOM/SIMPLE units otherwise). Orders with any Shipment are already
-  // filtered out above, so there are no committed shipment rows to add.
-  const allocRows = await db.orderAllocation.findMany({
-    where: { orderId: { in: candidateIds } },
-    select: { orderId: true, lineId: true, productId: true, qty: true },
-  })
-
-  const coverageRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
-  for (const row of allocRows) {
-    const list = coverageRowsByOrder.get(row.orderId) ?? []
-    list.push({ lineId: row.lineId, productId: row.productId, qty: Number(row.qty) })
-    coverageRowsByOrder.set(row.orderId, list)
-  }
-
-  const needsAllocation = candidates.filter((order) => {
-    const coverageByLine = calculateCoverageByLine(
-      requirementsByLine,
-      coverageRowsByOrder.get(order.id) ?? [],
-    )
-    return order.lines.some((line) => {
-      if (!line.productId) return false
-      // Only retry if at least one of this line's leaf requirements is a
-      // directly-replenished product — otherwise a KIT parent whose
-      // bottleneck component is elsewhere would get its allocation
-      // needlessly rewritten without improving fulfillable qty.
-      const reqs = requirementsByLine.get(line.id) ?? []
-      const touchesReplenished = reqs.some((r) => directIdsSet.has(r.productId))
-      if (!touchesReplenished) return false
-      const coverage = coverageByLine.get(line.id) ?? 0
-      return Number(line.qty) > coverage + 1e-6
-    })
-  })
+  // Keep only orders with outstanding demand on a line whose leaf requirements touch a
+  // directly-replenished product — otherwise a KIT parent whose bottleneck component is elsewhere
+  // would get its allocation needlessly rewritten without improving fulfillable qty. Coverage is the
+  // shared, KIT-aware computation used by the periodic reallocation sweep too (o3d-9lx).
+  const needsAllocation = await selectOrdersNeedingAllocation(
+    candidates,
+    (_line, reqs) => reqs.some((r) => directIdsSet.has(r.productId)),
+  )
   if (needsAllocation.length === 0) return result
 
   const { autoAllocateOrder } = await import('@/app/actions/allocation')
@@ -170,6 +116,7 @@ export async function allocateBackordersForProducts(
     'Order has existing shipments; reallocation refused',
   ])
   const syncProductIds = new Set<string>()
+  const skippedOrders: Array<{ orderId: string; orderRef: string; status: string | null }> = []
   for (const order of needsAllocation) {
     const orderRef = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
     try {
@@ -177,11 +124,24 @@ export async function allocateBackordersForProducts(
         internalBypassToken: INTERNAL_ACTION_BYPASS,
         deferStockSync: true,
         refuseIfShipmentsExist: true,
+        // o3d-6ab: candidates were selected by status OUTSIDE the order lock. Re-assert it under the
+        // lock so an order that moved to ON_HOLD (or past PROCESSING) in that window is skipped rather
+        // than silently re-reserved. A skip returns no error, so it is counted as neither done nor failed.
+        requireStatusUnderLock: BACKORDER_ELIGIBLE_STATUSES,
       })
       for (const productId of res.syncProductIds ?? []) syncProductIds.add(productId)
       if (res.success && (res.allocationCount ?? 0) > 0) {
         result.allocated += 1
         result.orderIds.push(order.id)
+      } else if (res.skipped) {
+        skippedOrders.push({ orderId: order.id, orderRef, status: res.skippedStatus ?? null })
+        // The order left the eligible set between selection and the lock. Nothing was written, so
+        // this is neither a success nor a failure — but it DOES consume this one-shot replenishment
+        // trigger, and the status-transition path does not re-run allocation. The periodic
+        // reallocation sweep (o3d-9lx) is what picks the order up once it returns to PROCESSING;
+        // without it this skip would strand the order until an unrelated future stock event
+        // (o3d-lvcb). Counted so a repeatedly-skipped order is visible rather than invisible.
+        result.skipped += 1
       } else if (res.error && !BENIGN_ALLOC_ERRORS.has(res.error)) {
         result.errors += 1
         await logActivity({
@@ -214,6 +174,28 @@ export async function allocateBackordersForProducts(
     } catch (syncError) {
       console.error(syncError)
     }
+  }
+
+  // Publish the skips rather than only returning them: EVERY production caller awaits this
+  // function without reading its result, so a returned counter is discarded and a repeated
+  // eligibility race would leave no durable trace at all — the opposite of the visibility
+  // o3d-lvcb is claiming. WARNING, not ERROR: the reallocation sweep is expected to recover these,
+  // and a run of them showing up here is the signal that it is not.
+  if (skippedOrders.length > 0) {
+    await logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: context.referenceId ?? context.source,
+      action: 'backorder_allocation_skipped',
+      tag: 'sales',
+      level: 'WARNING',
+      description: `Skipped ${skippedOrders.length} backordered order(s) that left the eligible set before the lock, after ${context.referenceLabel ?? context.source}; the reallocation sweep should pick them up`,
+      metadata: {
+        source: context.source,
+        referenceId: context.referenceId ?? null,
+        skippedCount: skippedOrders.length,
+        skipped: skippedOrders,
+      },
+    })
   }
 
   if (result.allocated > 0) {

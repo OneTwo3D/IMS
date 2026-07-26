@@ -17,6 +17,7 @@ import {
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
   allocateSalesOrder,
@@ -257,6 +258,10 @@ export async function autoAllocateOrder(
     // o3d-67y (Codex r11): resolve a durable backstop INSIDE the allocation tx (committed path only) so a
     // redundant re-allocation can't run in the commit→resolve window. See AllocateSalesOrderInput.onReconciledInTx.
     onReconciledInTx?: (tx: Prisma.TransactionClient) => Promise<void>
+    // o3d-6ab: for BATCH callers that pick candidates by status outside the order lock. Requires the
+    // under-lock status to still be in this set; otherwise allocation is an explicit no-op (skipped:true,
+    // committed:false, no error). See AllocateSalesOrderInput.requireStatusUnderLock.
+    requireStatusUnderLock?: readonly SalesOrderStatus[]
   },
 ): Promise<{
   success: boolean
@@ -277,6 +282,11 @@ export async function autoAllocateOrder(
   // now reconciled. A pre-transaction exit (no eligible warehouse, permission bail) leaves committed FALSE, so
   // a post-refund backstop must NOT treat it as a completed release (Codex review r3).
   committed?: boolean
+  // o3d-6ab: true when requireStatusUnderLock was set and the under-lock status was no longer eligible
+  // (e.g. the order moved PROCESSING→ON_HOLD between the caller's selection and the lock). Explicit
+  // no-op: committed:false, failed:false, no error — callers must count it as neither done nor failed.
+  skipped?: boolean
+  skippedStatus?: SalesOrderStatus
 }> {
   // o3d-67y: distinguish a rolled-back allocation transaction (reservations stale) from a POST-commit throw
   // (revalidate / stock-sync enqueue) that leaves reservations already correct. Only the former is a
@@ -290,12 +300,14 @@ export async function autoAllocateOrder(
       orderId,
       refuseIfShipmentsExist: options?.refuseIfShipmentsExist,
       onReconciledInTx: options?.onReconciledInTx,
+      requireStatusUnderLock: options?.requireStatusUnderLock,
     })
     allocationCommitted = true
 
     if (!allocationResult.logAttempt && !allocationResult.success) {
-      // No runAllocation commit: either an accepted refusal (shipment exists) or a pre-transaction bail
-      // (no eligible warehouse). committed:false so the backstop treats a bail as unreconciled/retryable.
+      // No runAllocation commit: an accepted refusal (shipment exists), a stale-status skip (o3d-6ab), or
+      // a pre-transaction bail (no eligible warehouse). committed:false so the backstop treats a bail as
+      // unreconciled/retryable. A skip carries no `error`, so batch callers don't log it as a failure.
       return {
         success: false,
         error: allocationResult.error,
@@ -305,6 +317,8 @@ export async function autoAllocateOrder(
         unallocatedQty: allocationResult.unallocatedQty,
         backorderLineCount: allocationResult.backorderLineCount,
         refused: allocationResult.refused,
+        skipped: allocationResult.skipped,
+        skippedStatus: allocationResult.skippedStatus,
         committed: false,
       }
     }
