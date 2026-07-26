@@ -211,23 +211,17 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
     created = await createOrder(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
   }
 
-  // A create that unambiguously succeeded binds the id Mintsoft minted for it.
+  // A create that unambiguously succeeded binds the id Mintsoft minted for it —
+  // and says so (o3d-bjc.8). Still deliberately NOT read back HERE: the create has
+  // already happened, so a verification failure at this point leaves only bad
+  // options — bind unverified anyway, or throw and let the sweep re-PUT,
+  // duplicating a real warehouse order (or dead-letter the link while a live order
+  // stays unlinked and can never be cancelled).
   //
-  // Deliberately NOT read back first (o3d-bjc.6 / o3d-bjc.8). An earlier revision of
-  // this fix verified the new order with a scoped detail fetch, which sounds strictly
-  // safer but is not: the create has ALREADY happened, so any verification failure
-  // leaves only bad options — bind unverified, or throw and let the sweep re-PUT,
-  // duplicating a real warehouse order (or dead-lettering the link while a live order
-  // stays unlinked and can never be cancelled). Resolving that properly needs a
-  // durable "created but unverified" link state so later sweeps re-verify instead of
-  // re-creating; that is a push-link state-machine change, filed as o3d-bjc.8.
-  //
-  // Nothing is lost in the meantime: this id came from an order Mintsoft just created
-  // under our own API credentials, and every subsequent read and mutation re-proves
-  // ownership through the ClientId-scoped gate, so a wrong binding can never amend,
-  // cancel, comment on or dispatch someone else's order. The cross-client hazard this
-  // issue is actually about is the DEDUPE path below, which SELECTS a pre-existing
-  // order by a collidable order number — that one is now fully scoped and asserted.
+  // `needsVerification` is the third option. The link is persisted PENDING_VERIFY,
+  // which is not SYNCED (we have not proved it) and not PENDING_CREATE (it must
+  // never be re-pushed); a later sweep runs verifyPushedOrder — a scoped READ, no
+  // mutation — until it resolves one way or the other.
   if (created.ok && created.data) {
     const externalOrderId = toStr(created.data.OrderId)
     if (externalOrderId) {
@@ -236,6 +230,7 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         externalOrderNumber: toStr(created.data.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
         courierFallback,
+        needsVerification: true,
       }
     }
   }
@@ -252,11 +247,95 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
         externalOrderNumber: toStr(existing.OrderNumber) ?? input.orderNumber,
         status: 'NEW',
         courierFallback,
+        // Already proven: findExistingByReference asserts our ClientId on every
+        // row it considers, so this id came from a read, not from trust.
+        needsVerification: false,
       }
     }
   }
 
   throw new Error(created.message ?? 'Mintsoft order push failed')
+}
+
+/**
+ * o3d-bjc.8: prove a minted id is ours, mutating NOTHING.
+ *
+ * Two independent routes, because either alone can be inconclusive: the id
+ * (authoritative when it answers) and then the order NUMBER (which catches the
+ * case where the create landed under an id we did not record correctly).
+ *
+ * Silence is 'unknown', never 'foreign'. A transient read failure that returned
+ * 'foreign' would quarantine a perfectly good order; one that returned 'ours'
+ * would bind an unproven id. Only a row we can positively read as belonging to
+ * someone else is 'foreign'.
+ */
+export async function verifyMintsoftPushedOrder(
+  externalOrderId: string,
+  reference: { orderNumber: string | null; externalReference: string | null },
+): Promise<'ours' | 'foreign' | 'unknown'> {
+  const clientId = await getPushClientId('Mintsoft push verification')
+  const wantNumber = reference.orderNumber?.trim() || null
+  const wantReference = reference.externalReference?.trim() || null
+  // Identity is checked against OUR record, never against anything the create
+  // response said. A create that answered with some other order's id would
+  // otherwise verify perfectly — same tenant, same id — and the link would go
+  // SYNCED pointing at another customer's order while ours stayed orphaned.
+  const identifies = (row: RawOrder): boolean => {
+    const number = toStr(row.OrderNumber)
+    const ref = toStr(row.ExternalOrderReference)
+    if (wantNumber && number === wantNumber) return true
+    if (wantReference && ref === wantReference) return true
+    return false
+  }
+  if (!wantNumber && !wantReference) {
+    // Nothing to check identity against: refuse to claim either way.
+    return 'unknown'
+  }
+
+  // 1. By id. A scoped detail read either returns OUR row or does not.
+  try {
+    const byId = await mintsoftRequest<unknown>(
+      `/api/Order/${encodeURIComponent(externalOrderId)}?ClientId=${clientId}`,
+    )
+    if (!byId.error && byId.data && typeof byId.data === 'object') {
+      const row = byId.data as RawOrder
+      const rowClient = toStr(row.ClientId ?? (row as Record<string, unknown>).clientId)
+      const rowId = toStr(row.ID ?? row.Id ?? row.id)
+      if (rowId && rowId === externalOrderId) {
+        // BOTH have to agree: the tenant AND the order. Tenant alone says only
+        // "we may touch this row", not "this row is the order we created".
+        if (rowClient === String(clientId) && identifies(row)) return 'ours'
+        if (rowClient && rowClient !== String(clientId)) return 'foreign'
+        if (rowClient === String(clientId)) {
+          // Ours to touch, but it is somebody else's ORDER. Not 'foreign' in the
+          // tenant sense, and definitely not 'ours' — the id is wrong, and the
+          // order we created is still out there. Hand it to an operator.
+          return 'foreign'
+        }
+      }
+    }
+  } catch {
+    // Fall through to the reference route: a failed read is not evidence.
+  }
+
+  // 2. By reference. If the create landed but the id we recorded is wrong, our
+  //    own order number still finds it under our own tenant.
+  if (wantNumber) {
+    try {
+      const query = new URLSearchParams({ OrderNumber: wantNumber, ClientId: String(clientId) })
+      const search = await mintsoftRequest<unknown>(`/api/Order/Search?${query.toString()}`)
+      if (!search.error) {
+        const rows = extractMintsoftArrayPayloadStrict(search.data, 'Order/Search (push verify)')
+          .map((row) => assertMintsoftOrderClient(row, clientId, 'Mintsoft Order/Search (push verify)'))
+          .filter(identifies)
+        if (rows.some((row) => toStr(row.ID ?? row.Id ?? row.id) === externalOrderId)) return 'ours'
+      }
+    } catch {
+      // Same rule: no evidence is not counter-evidence.
+    }
+  }
+
+  return 'unknown'
 }
 
 /**

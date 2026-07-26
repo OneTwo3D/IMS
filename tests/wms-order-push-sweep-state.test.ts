@@ -7,6 +7,7 @@ import {
   type WmsPushCandidate,
   type WmsPushLinkRef,
   type WmsPushUpdateLink,
+  type WmsPushVerifyLink,
 } from '../lib/domain/wms/order-push-sweep.ts'
 import type { WmsOrderCancelResult, WmsOrderPushResult, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
@@ -46,6 +47,8 @@ type Seed = {
   updatable?: WmsPushUpdateLink[]
   holdable?: WmsPushLinkRef[]
   cancellable?: WmsPushLinkRef[]
+  /** o3d-bjc.8: links created but not yet proved ours. */
+  verifiable?: WmsPushVerifyLink[]
   /** o3d-5r8: false simulates "order deleted / already owned" — the push must be skipped. */
   claimForCreate?: (orderId: string) => Promise<boolean>
 }
@@ -63,6 +66,7 @@ function makePort(seed: Seed) {
       claims.push(orderId)
       return seed.claimForCreate ? seed.claimForCreate(orderId) : true
     },
+    verifiableLinks: async () => seed.verifiable ?? [],
     updatableLinks: async () => seed.updatable ?? [],
     holdableLinks: async () => seed.holdable ?? [],
     cancellableLinks: async () => seed.cancellable ?? [],
@@ -80,8 +84,13 @@ function connector(overrides: {
   cancelOrder?: () => Promise<WmsOrderCancelResult>
   comments?: Array<{ externalOrderId: string; comment: string }>
   addOrderComment?: () => Promise<void>
+  verifyPushedOrder?: (
+    externalOrderId: string,
+    reference: { orderNumber: string | null; externalReference: string | null },
+  ) => Promise<'ours' | 'foreign' | 'unknown'>
 } = {}) {
   return {
+    verifyPushedOrder: overrides.verifyPushedOrder,
     pushOrder: overrides.pushOrder ?? okPush,
     updateOrder: overrides.updateOrder ?? (async () => ({ updated: true, status: 'NEW' })),
     cancelOrder: overrides.cancelOrder ?? (async () => ({ cancelled: true, status: 'CANCELLED' })),
@@ -482,4 +491,183 @@ test('claim: a link in any OTHER state is never claimable by the create pass (o3
 test('claim: a PENDING_CREATE with no attempt stamp is claimable (o3d-38gl)', () => {
   // A link written by a path that did not stamp it must not be permanently unclaimable.
   assert.equal(shouldGrantCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: null }, new Date()), true)
+})
+
+// --- o3d-bjc.8: created but not yet proved ours -----------------------------
+
+const VERIFY_LINK: WmsPushVerifyLink = {
+  id: 'link-1', orderId: 'so-1', externalOrderId: 'wms-1',
+  orderNumber: 'SO-1', externalReference: 'so-1', verifyAttempts: 0,
+  courierPending: false, shippingService: null,
+}
+
+test('[o3d-bjc.8] a minted-but-unverified id lands PENDING_VERIFY, not SYNCED', async () => {
+  const { port, upserts } = makePort({ createCandidates: [candidate()] })
+  const r = await runWmsOrderPushSweepCore(
+    connector({
+      pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', needsVerification: true }),
+      verifyPushedOrder: async () => 'unknown',
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(r.created, 1)
+  assert.equal(upserts[0].create.state, 'PENDING_VERIFY')
+  assert.equal(upserts[0].create.externalOrderId, 'wms-1', 'the minted id is KEPT — the order exists')
+})
+
+test('[o3d-bjc.8] a connector that cannot verify still gets the old behaviour', async () => {
+  // Otherwise enabling the state machine would park every order a
+  // non-verifying connector creates, forever.
+  const { port, upserts } = makePort({ createCandidates: [candidate()] })
+  await runWmsOrderPushSweepCore(
+    connector({
+      pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', needsVerification: true }),
+      verifyPushedOrder: undefined,
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(upserts[0].create.state, 'SYNCED')
+})
+
+test('[o3d-bjc.8] verification promotes to SYNCED and never re-pushes', async () => {
+  const pushes: number[] = []
+  const { port, updates } = makePort({ verifiable: [VERIFY_LINK] })
+  const r = await runWmsOrderPushSweepCore(
+    connector({
+      pushOrder: async () => { pushes.push(1); return { externalOrderId: 'wms-2', externalOrderNumber: 'WN-2', status: 'NEW' } },
+      verifyPushedOrder: async () => 'ours',
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(r.verified, 1)
+  assert.deepEqual(updates, [{ id: 'link-1', data: { state: 'SYNCED', lastError: null } }])
+  assert.deepEqual(pushes, [], 'the order already exists in the warehouse — a second create ships two parcels')
+})
+
+test('[o3d-bjc.8] an UNKNOWN verdict leaves it PENDING_VERIFY, untouched', async () => {
+  const { port, updates } = makePort({ verifiable: [VERIFY_LINK] })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ verifyPushedOrder: async () => 'unknown' }), 'mintsoft', port, { now: NOW },
+  )
+  assert.equal(r.verified, 0)
+  assert.equal(r.verifyQuarantined, 0)
+  assert.equal(r.verifyUnresolved, 1, 'an unknown is counted, never silent')
+  assert.equal(updates[0].data.state, undefined, 'the STATE is untouched — guessing duplicates or orphans')
+  assert.equal(updates[0].data.attempts, 1, 'but the attempt is stamped, so the batch rotates')
+})
+
+test('[o3d-bjc.8] a verification that THROWS is also just unknown', async () => {
+  const { port, updates } = makePort({ verifiable: [VERIFY_LINK] })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ verifyPushedOrder: async () => { throw new Error('Mintsoft timeout') } }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(r.verified, 0)
+  assert.equal(r.verifyUnresolved, 1)
+  assert.equal(updates[0].data.state, undefined)
+  assert.match(String(updates[0].data.lastError), /timeout/)
+})
+
+test('[o3d-bjc.8] a FOREIGN id is quarantined, and still never re-pushed', async () => {
+  const pushes: number[] = []
+  const { port, updates, events } = makePort({ verifiable: [VERIFY_LINK] })
+  const r = await runWmsOrderPushSweepCore(
+    connector({
+      pushOrder: async () => { pushes.push(1); return { externalOrderId: 'wms-2', externalOrderNumber: 'WN-2', status: 'NEW' } },
+      verifyPushedOrder: async () => 'foreign',
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(r.verifyQuarantined, 1)
+  assert.equal(updates[0].data.state, 'DEAD_LETTER')
+  assert.match(String(updates[0].data.lastError), /another tenant/)
+  assert.deepEqual(pushes, [], 'our create DID happen — a second one would ship the customer two parcels')
+  assert.ok(events.some((e) => e.outcome === 'FAILED' && /another tenant/.test(e.summary ?? '')),
+    'and it reaches the operator rather than being retried silently')
+})
+
+test('[o3d-bjc.8] verification is given OUR identifiers, never the create response\'s', async () => {
+  // A create that answered with some OTHER order of ours would verify perfectly
+  // against itself — same tenant, same id — and the link would go SYNCED
+  // pointing at another customer's order while ours stayed orphaned.
+  const seen: Array<{ id: string; reference: unknown }> = []
+  const { port } = makePort({ verifiable: [VERIFY_LINK] })
+  await runWmsOrderPushSweepCore(
+    connector({
+      verifyPushedOrder: async (externalOrderId, reference) => {
+        seen.push({ id: externalOrderId, reference })
+        return 'ours'
+      },
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.deepEqual(seen, [{ id: 'wms-1', reference: { orderNumber: 'SO-1', externalReference: 'so-1' } }])
+})
+
+test('[o3d-bjc.8] an unknown that never resolves is escalated, not retried forever', async () => {
+  const pushes: number[] = []
+  const { port, updates, events } = makePort({
+    verifiable: [{ ...VERIFY_LINK, verifyAttempts: 4 }],   // one short of the bound
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({
+      pushOrder: async () => { pushes.push(1); return { externalOrderId: 'wms-2', externalOrderNumber: 'WN-2', status: 'NEW' } },
+      verifyPushedOrder: async () => 'unknown',
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(r.verifyQuarantined, 1)
+  assert.equal(updates[0].data.state, 'DEAD_LETTER')
+  assert.match(String(updates[0].data.lastError), /could not be verified after 5 attempts/)
+  assert.deepEqual(pushes, [], 'an order nobody can resolve is an operator decision, not a second create')
+  assert.ok(events.some((e) => e.outcome === 'FAILED'))
+})
+
+test('[o3d-bjc.8] the courier-fallback note waits until the id is proven ours', async () => {
+  // The comment guard proves the row is under our tenant, not that it is OUR
+  // order — so a same-client wrong id would get a misleading IMS note about a
+  // shipping method that has nothing to do with it.
+  type Note = { externalOrderId: string; comment: string }
+  const beforeVerify: Note[] = []
+  const { port } = makePort({ createCandidates: [candidate({ shippingService: 'Royal Mail' })] })
+  await runWmsOrderPushSweepCore(
+    connector({
+      comments: beforeVerify,
+      pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', courierFallback: true, needsVerification: true }),
+      verifyPushedOrder: async () => 'unknown',
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(beforeVerify.length, 0, 'nothing is written to an unproven order')
+
+  // ...and it lands once verification promotes the link.
+  const promoted = makePort({
+    verifiable: [{ ...VERIFY_LINK, courierPending: true, shippingService: 'Royal Mail' }],
+  })
+  const afterVerify: Note[] = []
+  await runWmsOrderPushSweepCore(
+    connector({ comments: afterVerify, verifyPushedOrder: async () => 'ours' }),
+    'mintsoft', promoted.port, { now: NOW },
+  )
+  assert.equal(afterVerify.length, 1)
+  const note = afterVerify[0]!
+  assert.match(note.comment, /Royal Mail/)
+  assert.equal(note.externalOrderId, 'wms-1')
+})
+
+test('[o3d-bjc.8] a create that succeeds after failures gets a FULL verification budget', async () => {
+  // claimForCreate has already created the link, so the update side of the
+  // upsert is what runs — and the verification budget reads that counter.
+  // Carrying four failed create attempts into it would quarantine a live WMS
+  // order on its first transient unknown.
+  const { port, upserts } = makePort({ createCandidates: [candidate({ pushAttempts: 4 })] })
+  await runWmsOrderPushSweepCore(
+    connector({
+      pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', needsVerification: true }),
+      verifyPushedOrder: async () => 'unknown',
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+  assert.equal(upserts[0].update.attempts, 0)
+  assert.equal(upserts[0].create.attempts, 0)
 })

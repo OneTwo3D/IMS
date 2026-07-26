@@ -6,7 +6,7 @@ import {
 } from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
-import { addMintsoftOrderComment, cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
+import { addMintsoftOrderComment, cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
 import { parseMintsoftPositiveId } from './settings/schema'
 import { getSettingValue } from '@/lib/settings-store'
 
@@ -129,6 +129,14 @@ export class MintsoftConnector implements WmsConnector {
 
   async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
     return pushMintsoftOrder(input)
+  }
+
+  /** o3d-bjc.8: prove a minted id is ours. A READ; it mutates nothing. */
+  async verifyPushedOrder(
+    externalOrderId: string,
+    reference: { orderNumber: string | null; externalReference: string | null },
+  ): Promise<'ours' | 'foreign' | 'unknown'> {
+    return verifyMintsoftPushedOrder(externalOrderId, reference)
   }
 
   async updateOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
