@@ -1007,29 +1007,29 @@ export async function repairQuickBooksBackReferences(limit = 200): Promise<BackR
     try {
       await applyBackReference(db, params)
 
-      // The follow-ups (payment, PDF, email, attachment) never ran on the original failed pass, so
-      // they are re-enqueued BEFORE the row is terminalised — exactly as Xero's sweep does.
-      // Mirroring the terminalisation WITHOUT this restoration, which is what the first version of
-      // this function did, erases the retry signal while leaving the payment or PDF permanently
-      // absent: the row reads reconciled and the work is simply gone. hasExistingSyncLog makes the
-      // enqueue idempotent, so a re-run is a no-op.
-      let followUpsRestored = true
-      try {
-        await enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload as SyncPayload, {
-          externalId: row.externalTransactionId,
-          invoiceNumber: params.invoiceNumber,
-        })
-      } catch (followUpError) {
-        followUpsRestored = false
-        console.error('repairQuickBooksBackReferences: follow-up enqueue failed', row.id, followUpError)
-      }
-
-      // Only a row whose follow-ups were actually restored is fully reconciled. If they could not
-      // be, FAILED is RETAINED so the next pass retries rather than declaring success over missing
-      // work.
-      if (row.status === 'FAILED' && followUpsRestored) {
-        await db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', errorMessage: null } })
-      }
+      // DELIBERATELY DOES NOT touch status, and does NOT re-enqueue follow-ups.
+      //
+      // Xero's sweep does both, and mirroring that is what the first two revisions of this function
+      // tried. Review showed the pairing is unsafe here, in two independent ways:
+      //
+      //   - THE RETRY PROMISE WAS UNREACHABLE. Gating "clear FAILED" on the follow-ups succeeding
+      //     looked careful, but once applyBackReference has run, backReferenceIsMissing returns
+      //     false and the row is skipped by the probe above on every later pass. So a row retained
+      //     as FAILED for retry would never be reconsidered — permanently FAILED with its follow-ups
+      //     still missing. The gate promised something the control flow could not deliver.
+      //
+      //   - RE-ENQUEUING A FAILED PAYMENT CAN DOUBLE-PAY. enqueueFollowUps' existence check ignores
+      //     FAILED rows, so it creates a NEW row — and processEntry derives the QuickBooks requestid
+      //     from that row's id. If an earlier INVOICE_PAYMENT reached FAILED after QuickBooks had
+      //     already committed it (response lost, or the local status write failed), the replacement
+      //     carries a DIFFERENT request id and QuickBooks accepts a second payment. Per-entry
+      //     idempotency does not survive regenerating the entry.
+      //
+      // So this sweep does one thing: restore the back-reference, which is the retention-proof
+      // marker the delete guard depends on (o3d-v7sy) and the entire reason it exists. A FAILED row
+      // stays FAILED — visible, still blocking deletion, still retryable by the operator through the
+      // normal path. Restoring follow-ups safely needs deterministic idempotency keys that survive
+      // row regeneration, tracked as o3d-h2wx.
       result.repaired++
       await logActivity({
         entityType: 'SYSTEM',
