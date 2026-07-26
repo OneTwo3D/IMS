@@ -62,7 +62,8 @@ test('FAILED rows carrying an external id are candidates too (o3d-0g2n)', async 
   const { join } = await import('node:path')
   const src = readFileSync(join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8')
   const sweep = src.slice(src.indexOf('export async function repairQuickBooksBackReferences'))
-  const where = sweep.slice(0, sweep.indexOf('})'))
+  const findMany = sweep.slice(sweep.indexOf('db.accountingSyncLog.findMany('))
+  const where = findMany.slice(0, findMany.indexOf('  })'))
 
   assert.match(where, /status: \{ in: \['SYNCED', 'FAILED'\] \}/, 'both statuses are swept')
   assert.match(where, /externalTransactionId: \{ not: null \}/, 'but only rows that actually posted')
@@ -125,4 +126,57 @@ test('the sweep never writes a type QuickBooks\' own writer would not (o3d-0g2n)
   for (const type of ['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE']) {
     assert.match(writerBody, new RegExp(type), `the writer handles ${type}, so repairing it is consistent`)
   }
+})
+
+test('a FAILED row is only terminalised once its follow-ups are restored (o3d-0g2n, review)', async () => {
+  // The defect in the first version of this sweep: I mirrored Xero's FAILED -> SYNCED
+  // terminalisation but dropped the enqueueFollowUps call that JUSTIFIES it.
+  //
+  // A row can reach FAILED after the external post succeeded but the follow-up enqueue (payment,
+  // PDF, email, attachment) threw. Clearing it to SYNCED on the strength of the back-reference alone
+  // erases the retry signal while leaving that payment or PDF permanently absent — the row reads
+  // reconciled and the work is simply gone. Worse than leaving it FAILED, because FAILED at least
+  // says something is wrong.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8')
+  const sweep = src.slice(src.indexOf('export async function repairQuickBooksBackReferences'))
+
+  assert.match(sweep, /await enqueueFollowUps\(/, 'the follow-ups are re-enqueued, as Xero does')
+
+  // And the terminalisation is GATED on that having worked.
+  assert.match(
+    sweep,
+    /row\.status === 'FAILED' && followUpsRestored/,
+    'FAILED is retained when the follow-ups could not be restored, so the next pass retries',
+  )
+
+  // Ordering matters: restore, then terminalise.
+  assert.ok(
+    sweep.indexOf('await enqueueFollowUps(') < sweep.indexOf("row.status === 'FAILED' && followUpsRestored"),
+    'follow-ups are restored BEFORE the row is declared reconciled',
+  )
+})
+
+test('only rows the CURRENT QuickBooks realm could have created are repaired (o3d-0g2n, review)', async () => {
+  // AccountingSyncLog has no realm provenance, and disconnect permits reconnecting to a DIFFERENT
+  // realm while historical rows survive. Repairing those would write a realm-A transaction id onto a
+  // document now operated under realm B — and if that id happens to exist there, later payment and
+  // polling paths act on an unrelated document.
+  //
+  // Without a provenance column, the connection's own age is the cheapest sound proxy: only rows
+  // created since the current token was stored can belong to the current realm. Stamping properly is
+  // o3d-s36z.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8')
+  const sweep = src.slice(src.indexOf('export async function repairQuickBooksBackReferences'))
+
+  assert.match(sweep, /accountingToken\.findUnique/, 'the current connection is consulted')
+  assert.match(sweep, /createdAt: \{ gte: token\.createdAt \}/, 'and bounds which rows are eligible')
+  assert.match(
+    sweep,
+    /if \(!token\) return \{ checked: 0/,
+    'with no connection at all, nothing is repaired rather than everything',
+  )
 })

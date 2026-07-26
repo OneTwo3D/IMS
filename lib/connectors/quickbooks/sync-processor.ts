@@ -917,9 +917,28 @@ async function enqueueFollowUps(
  * every cron cycle.
  */
 export async function repairQuickBooksBackReferences(limit = 200): Promise<BackReferenceRepairResult> {
+  // o3d-0g2n (review): AccountingSyncLog carries no realm provenance, and disconnecting permits
+  // reconnecting to a DIFFERENT QuickBooks realm while historical rows survive. Repairing those
+  // would write a realm-A transaction id onto a document now operated under realm B — which, if that
+  // id happens to exist there, later payment and polling paths would act on an unrelated document.
+  //
+  // Without a provenance column the cheapest sound guard is the connection's own age: only rows
+  // created since the CURRENT token was stored can belong to the current realm. Rows older than it
+  // are left alone rather than guessed at. A reconnect to the SAME realm re-stamps this timestamp
+  // and so defers those repairs, which is the conservative direction — a missed repair is
+  // recoverable, a cross-realm id is not.
+  //
+  // Stamping the rows properly is the real fix, tracked as o3d-s36z.
+  const token = await db.accountingToken.findUnique({
+    where: { connector: 'quickbooks' },
+    select: { createdAt: true },
+  })
+  if (!token) return { checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0 }
+
   const candidates = await db.accountingSyncLog.findMany({
     where: {
       connector: 'quickbooks',
+      createdAt: { gte: token.createdAt },
       // FAILED is included for the same reason Xero includes it: the remote call happens BEFORE the
       // result is written, so a FAILED row carrying an external id posted successfully and then lost
       // its writeback (o3d-ju8t).
@@ -980,8 +999,28 @@ export async function repairQuickBooksBackReferences(limit = 200): Promise<BackR
 
     try {
       await applyBackReference(db, params)
-      // A FAILED row whose back-reference is now applied is fully reconciled.
-      if (row.status === 'FAILED') {
+
+      // The follow-ups (payment, PDF, email, attachment) never ran on the original failed pass, so
+      // they are re-enqueued BEFORE the row is terminalised — exactly as Xero's sweep does.
+      // Mirroring the terminalisation WITHOUT this restoration, which is what the first version of
+      // this function did, erases the retry signal while leaving the payment or PDF permanently
+      // absent: the row reads reconciled and the work is simply gone. hasExistingSyncLog makes the
+      // enqueue idempotent, so a re-run is a no-op.
+      let followUpsRestored = true
+      try {
+        await enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload as SyncPayload, {
+          externalId: row.externalTransactionId,
+          invoiceNumber: params.invoiceNumber,
+        })
+      } catch (followUpError) {
+        followUpsRestored = false
+        console.error('repairQuickBooksBackReferences: follow-up enqueue failed', row.id, followUpError)
+      }
+
+      // Only a row whose follow-ups were actually restored is fully reconciled. If they could not
+      // be, FAILED is RETAINED so the next pass retries rather than declaring success over missing
+      // work.
+      if (row.status === 'FAILED' && followUpsRestored) {
         await db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', errorMessage: null } })
       }
       result.repaired++
