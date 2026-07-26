@@ -705,6 +705,37 @@ function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
   return [...merged.values()].filter((row) => row.qty.gt(0))
 }
 
+/**
+ * Is the freshly computed allocation set identical to what is already persisted (o3d-i5it)?
+ *
+ * Compared as a SET keyed on (lineId, warehouseId, productId) — the same key mergeAllocationRows
+ * dedupes on — because row order is not meaningful and neither side is ordered.
+ *
+ * Quantities are compared with Decimal.eq rather than number equality: OrderAllocation.qty is
+ * persisted at Decimal(12,4), and a computed value that only differs below that precision would
+ * otherwise read as a change on every single cycle and defeat the whole check. (That precision
+ * boundary is its own defect for nested KITs — o3d-i4qd — where the requirement is unquantized;
+ * this comparison is deliberately tolerant of representation, not of a real difference.)
+ */
+export function allocationSetsMatch(
+  existing: Array<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>,
+  next: AllocationRowInput[],
+): boolean {
+  if (existing.length !== next.length) return false
+
+  const key = (row: { lineId: string; warehouseId: string; productId: string }) =>
+    `${row.lineId}|${row.warehouseId}|${row.productId}`
+
+  const existingByKey = new Map(existing.map((row) => [key(row), toDecimal(row.qty)]))
+  if (existingByKey.size !== existing.length) return false // duplicate keys: not a canonical set
+
+  for (const row of next) {
+    const persisted = existingByKey.get(key(row))
+    if (!persisted || !persisted.eq(row.qty)) return false
+  }
+  return true
+}
+
 function collectNonOversellLeafComponents(
   productId: string,
   graph: Map<string, FulfillmentGraphNode>,
@@ -870,7 +901,10 @@ export async function allocateSalesOrder(
       }
     }
 
-    await resetAllocationAccountingIfStaged(tx, orderId)
+    // NOTE: resetAllocationAccountingIfStaged is deliberately NOT called here (o3d-i5it). It used
+    // to run before the allocation was even computed, so a re-run that changed nothing still
+    // cleared inventoryAllocatedDate and the cost snapshots. It now runs only once the computed
+    // set is known to DIFFER from the persisted one — see the unchanged-set check below.
     const graph = await loadFulfillmentProductGraph(tx, productIds)
     const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
     for (const line of so.lines) {
@@ -995,37 +1029,63 @@ export async function allocateSalesOrder(
       where: { orderId },
       select: { lineId: true, productId: true, warehouseId: true, qty: true },
     })
-    await applyAllocationReservationDelta(
-      tx,
-      existingAllocs.map((alloc) => ({
-        productId: alloc.productId,
-        warehouseId: alloc.warehouseId,
-        qty: alloc.qty,
-      })),
-      'release',
-    )
-    await tx.orderAllocation.deleteMany({ where: { orderId } })
 
-    for (const alloc of nextAllocations) {
-      await tx.orderAllocation.create({
-        data: {
-          orderId,
-          lineId: alloc.lineId,
+    // o3d-i5it: when the computed set is identical to the persisted one, write NOTHING.
+    //
+    // The reset + release/delete/recreate/reserve cycle used to run unconditionally. That was
+    // tolerable while a stock event was the only driver. The o3d-9lx sweep rotates every 15
+    // minutes and selects every order with outstanding demand — including permanent partial
+    // backorders that cannot improve because no more stock exists — so each rotation destructively
+    // rewrote them.
+    //
+    // The damaging part is the accounting reset: for an ALLOCATED partial backorder already
+    // processed by Group A2, clearing inventoryAllocatedDate and the cost snapshots lets the next
+    // daily batch stage and post the SAME inventory reclassification again, and AccountingSyncLog
+    // has no uniqueness constraint that would stop the later-dated journal. Duplicate journals, not
+    // merely churn. Redundant storefront syncs and allocation activity came with it.
+    //
+    // Only the WRITES are skipped. The backorder report, the status promotion and the return value
+    // are all still computed from in-memory state, so an unchanged run reports exactly what a
+    // changed one would — callers cannot tell the difference except that nothing moved.
+    const unchanged = allocationSetsMatch(existingAllocs, nextAllocations)
+
+    if (!unchanged) {
+      // Reached only for a real modification, so the accounting reset — and its posted-shipment
+      // guard — applies to an actual allocation change rather than to a no-op re-run.
+      await resetAllocationAccountingIfStaged(tx, orderId)
+
+      await applyAllocationReservationDelta(
+        tx,
+        existingAllocs.map((alloc) => ({
           productId: alloc.productId,
           warehouseId: alloc.warehouseId,
           qty: alloc.qty,
-        },
-      })
+        })),
+        'release',
+      )
+      await tx.orderAllocation.deleteMany({ where: { orderId } })
+
+      for (const alloc of nextAllocations) {
+        await tx.orderAllocation.create({
+          data: {
+            orderId,
+            lineId: alloc.lineId,
+            productId: alloc.productId,
+            warehouseId: alloc.warehouseId,
+            qty: alloc.qty,
+          },
+        })
+      }
+      await applyAllocationReservationDelta(
+        tx,
+        nextAllocations.map((alloc) => ({
+          productId: alloc.productId,
+          warehouseId: alloc.warehouseId,
+          qty: alloc.qty,
+        })),
+        'reserve',
+      )
     }
-    await applyAllocationReservationDelta(
-      tx,
-      nextAllocations.map((alloc) => ({
-        productId: alloc.productId,
-        warehouseId: alloc.warehouseId,
-        qty: alloc.qty,
-      })),
-      'reserve',
-    )
 
     // Promote to ALLOCATED only off the UNDER-LOCK status. Deciding on the stale pre-lock so.status
     // is how a concurrent PROCESSING→ON_HOLD (or →CANCELLED) got resumed to ALLOCATED off a value
@@ -1076,7 +1136,9 @@ export async function allocateSalesOrder(
 
     return {
       nextAllocations,
-      syncProductIds: [...new Set([
+      // Nothing moved on an unchanged run, so nothing to push to the storefront. Emitting these
+      // unconditionally is what produced the endless redundant syncs (o3d-i5it).
+      syncProductIds: unchanged ? [] : [...new Set([
         ...existingAllocs.map((alloc) => alloc.productId),
         ...nextAllocations.map((alloc) => alloc.productId),
       ])],

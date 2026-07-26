@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   allocateSalesOrder,
+  allocationSetsMatch,
   assertReservationReleaseDelta,
   buildAvailableStockMapIncludingOwnReservations,
   buildAvailableStockMap,
@@ -55,6 +56,7 @@ type OrderRow = {
   refundStatus?: string | null
   shipFromWarehouseId: string | null
   inventoryAllocatedDate?: Date | null
+  allocationBatchAmount?: number | null
   lines: OrderLineRow[]
 }
 
@@ -122,8 +124,14 @@ function createClient(state: MemoryState): AllocationServiceClient {
         if (where.id !== state.order.id) return null
         return { ...state.order }
       },
-      update: async ({ data }: { data: { status?: string } }) => {
+      update: async ({ data }: {
+        data: { status?: string; inventoryAllocatedDate?: Date | null; allocationBatchAmount?: number | null }
+      }) => {
         if (data.status) state.order.status = data.status
+        // resetAllocationAccountingIfStaged clears these. The double used to ignore them, which
+        // made any assertion about the A2 stamp vacuous — o3d-i5it turns on exactly that write.
+        if ('inventoryAllocatedDate' in data) state.order.inventoryAllocatedDate = data.inventoryAllocatedDate ?? null
+        if ('allocationBatchAmount' in data) state.order.allocationBatchAmount = data.allocationBatchAmount ?? null
         return state.order
       },
     },
@@ -1149,4 +1157,166 @@ test('o3d-6ab: onReconciledInTx does NOT run on a skipped allocation (backstop s
 
   assert.equal(result.skipped, true)
   assert.equal(ran, false, 'the backstop resolve did not run on the no-op path')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-i5it — re-allocating an UNCHANGED set must write nothing.
+//
+// The reset + release/delete/recreate/reserve cycle used to run unconditionally.
+// With the o3d-9lx sweep rotating every 15 minutes over every order with
+// outstanding demand — including permanent partial backorders that cannot improve —
+// that meant destructively rewriting them forever. Clearing inventoryAllocatedDate
+// and the cost snapshots on an already-processed Group A2 order lets the next daily
+// batch post the SAME inventory reclassification again, and AccountingSyncLog has no
+// uniqueness constraint that would stop the later-dated journal.
+// ---------------------------------------------------------------------------
+
+test('allocationSetsMatch: identical sets match regardless of row order (o3d-i5it)', () => {
+  const persisted = [
+    { lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(2) },
+    { lineId: 'l2', productId: 'p2', warehouseId: 'w1', qty: toDecimal(3) },
+  ]
+  const computed = [
+    { lineId: 'l2', productId: 'p2', warehouseId: 'w1', qty: toDecimal(3) },
+    { lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(2) },
+  ]
+  assert.equal(allocationSetsMatch(persisted, computed), true)
+})
+
+test('allocationSetsMatch: a quantity difference is a change (o3d-i5it)', () => {
+  const persisted = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(2) }]
+  const computed = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(3) }]
+  assert.equal(allocationSetsMatch(persisted, computed), false)
+})
+
+test('allocationSetsMatch: a different warehouse for the same line is a change (o3d-i5it)', () => {
+  const persisted = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(2) }]
+  const computed = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w2', qty: toDecimal(2) }]
+  assert.equal(allocationSetsMatch(persisted, computed), false)
+})
+
+test('allocationSetsMatch: a differing row COUNT is a change in both directions (o3d-i5it)', () => {
+  const one = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(2) }]
+  const two = [
+    { lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(2) },
+    { lineId: 'l2', productId: 'p2', warehouseId: 'w1', qty: toDecimal(1) },
+  ]
+  assert.equal(allocationSetsMatch(one, two), false)
+  assert.equal(allocationSetsMatch(two, one), false)
+})
+
+test('allocationSetsMatch: equal VALUE at different Decimal scale still matches (o3d-i5it)', () => {
+  // OrderAllocation.qty persists at Decimal(12,4). A computed value that differs only in
+  // representation must not read as a change, or the check never fires and the whole
+  // short-circuit is dead code.
+  const persisted = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('2.0000') }]
+  const computed = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(2) }]
+  assert.equal(allocationSetsMatch(persisted, computed), true)
+})
+
+test('allocationSetsMatch: an empty set matches an empty set (o3d-i5it)', () => {
+  // A zero-demand order that already has no allocations must not be rewritten either.
+  assert.equal(allocationSetsMatch([], []), true)
+})
+
+test('allocationSetsMatch: duplicate persisted keys are never treated as canonical (o3d-i5it)', () => {
+  // Two rows on the same (line, warehouse, product) is not a set mergeAllocationRows could
+  // produce. Treating it as a match would leave corrupt data in place forever, so it must
+  // report a change and let the rewrite normalise it.
+  const persisted = [
+    { lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(1) },
+    { lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(1) },
+  ]
+  const computed = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal(2) }]
+  assert.equal(allocationSetsMatch(persisted, computed), false)
+})
+
+test('re-allocating an unchanged set preserves accounting state and emits no syncs (o3d-i5it)', async () => {
+  // A partial backorder that is already fully allocated for the stock that exists: line qty 3,
+  // only 2 units on hand, 2 already allocated and reserved, and Group A2 has already stamped
+  // inventoryAllocatedDate. The sweep re-runs this every 15 minutes and can never improve it.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+    }],
+  })
+  const before = {
+    allocations: (state.allocations ?? []).map((row) => ({ ...row })),
+    reservedQty: state.stockLevels[0].reservedQty,
+    inventoryAllocatedDate: state.order.inventoryAllocatedDate,
+  }
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  // The report is still faithful: 2 of 3 allocated, 1 outstanding.
+  assert.equal(result.allocationCount, 1, 'one allocation row')
+  assert.deepEqual(state.allocations, before.allocations, 'allocations untouched')
+  assert.equal(state.stockLevels[0].reservedQty, before.reservedQty, 'no reservation churn')
+  assert.equal(
+    state.order.inventoryAllocatedDate,
+    before.inventoryAllocatedDate,
+    'inventoryAllocatedDate must SURVIVE — clearing it lets the daily batch re-post the same A2 journal',
+  )
+  assert.deepEqual(result.syncProductIds, [], 'nothing moved, so nothing to push to the storefront')
+})
+
+test('a genuine allocation change still resets accounting state (o3d-i5it)', async () => {
+  // The other side of the same line: more stock has arrived, so the set really does change and
+  // the reset must still run. Skipping it here would leave a stale A2 stamp against new numbers.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 2 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+    }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(state.allocations?.[0].qty, 3, 'the extra unit was allocated')
+  assert.equal(state.order.inventoryAllocatedDate, null, 'a real change still resets the A2 stamp')
+  assert.ok(result.syncProductIds.includes('product-1'), 'and still pushes the storefront update')
+})
+
+test('an unchanged set is not refused even when a shipment has been journaled (o3d-i5it)', async () => {
+  // resetAllocationAccountingIfStaged throws once a shipment is posted to accounting. That guard
+  // exists to refuse MODIFYING allocations — so with nothing to modify there is nothing to refuse.
+  // Previously the sweep hit this on every rotation and counted it as an error forever.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+    }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', shipmentJournalDate: new Date('2026-01-02T00:00:00Z') }],
+  })
+
+  await assert.doesNotReject(() => allocateSalesOrder(createClient(state), { orderId: 'order-1' }))
+  assert.equal(state.order.inventoryAllocatedDate?.toISOString(), '2026-01-01T00:00:00.000Z')
 })
