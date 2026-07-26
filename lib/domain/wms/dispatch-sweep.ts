@@ -6,6 +6,7 @@ import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { isWmsUnresolvableRecordError } from '@/lib/connectors/wms/errors'
+import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
 import { getSettingValue } from '@/lib/settings-store'
@@ -95,6 +96,52 @@ export const DISPATCH_MAX_CONSECUTIVE_FAILURES = 5
 /** Pure dead-letter decision so the threshold semantics are unit-testable. */
 export function shouldDeadLetterDispatch(failureCount: number, deadLetteredAt: Date | null): boolean {
   return failureCount >= DISPATCH_MAX_CONSECUTIVE_FAILURES && !deadLetteredAt
+}
+
+/**
+ * o3d-bjc.9: how many CONSECUTIVE unresolved reads quarantine one link.
+ *
+ * An unresolved read is not a failure — the WMS answered — so it deliberately
+ * does not touch dispatchFailureCount and cannot dead-letter the link. But
+ * "never isolate it" is the other extreme, and that is where this sweep sat: an
+ * order whose record is permanently unreadable never reaches the exception
+ * inbox, keeps passClean false on every tick, and so pins the delta watermark
+ * indefinitely. Once the window clamps, deltaWindowTruncated blocks the advance
+ * and truncation recovery cannot fire either (recovery needs a fully clean,
+ * fully covered pass, which this link fails every time) — the delta stays
+ * degraded on the per-order fallback for as long as the record exists.
+ */
+export const DISPATCH_MAX_CONSECUTIVE_UNRESOLVED = 5
+
+/**
+ * ...and the other side of it: how many links must be unresolved AT ONCE before
+ * the pass is read as connector-wide drift rather than N broken records.
+ *
+ * A vocabulary change, a schema change or a degraded endpoint makes every
+ * record unreadable simultaneously. Quarantining them one at a time would
+ * isolate the whole tenant, each with its own alert, and demand a manual
+ * release after the dependency recovers — the mass-dead-letter outcome an
+ * earlier strike-based attempt produced here, and the reason it was reverted.
+ *
+ * Both a floor AND a ratio, because either alone misfires: the ratio calls a
+ * quiet tick with one failing order systemic; the floor calls three broken
+ * records in a busy tenant systemic. Mirrors the Python sweep's
+ * MINTSOFT_SYSTEMIC_FAILURE_MIN_ORDERS / _RATIO so the two halves of this epic
+ * classify the same event the same way.
+ */
+export const DISPATCH_UNRESOLVED_SYSTEMIC_MIN_LINKS = 3
+export const DISPATCH_UNRESOLVED_SYSTEMIC_RATIO = 0.5
+
+/** How many healthy links to read as a control when the cohort looks systemic. */
+export const DISPATCH_UNRESOLVED_CONTROL_PROBES = 3
+
+/**
+ * Is this pass's unresolved cohort connector-wide drift, or N broken records?
+ * Pure so the threshold semantics are unit-testable without a sweep harness.
+ */
+export function isUnresolvedDriftSystemic(unresolvedLinks: number, linksTouched: number): boolean {
+  if (unresolvedLinks < DISPATCH_UNRESOLVED_SYSTEMIC_MIN_LINKS) return false
+  return unresolvedLinks / Math.max(1, linksTouched) >= DISPATCH_UNRESOLVED_SYSTEMIC_RATIO
 }
 
 /**
@@ -274,6 +321,76 @@ export type WmsDispatchSweepDeps = {
   // so only CONSECUTIVE failures accumulate.
   recordDispatchError(candidate: WmsDispatchCandidate, reason: string): Promise<{ deadLettered: boolean }>
   clearDispatchFailures(linkId: string): Promise<void>
+  /**
+   * o3d-bjc.9: unresolved-record streak, kept SEPARATE from the transport
+   * failure counter above. `recordUnresolvedRead` increments and returns the new
+   * consecutive count; the sweep decides in BULK at the end of the pass whether
+   * that cohort is N broken records (quarantine each) or connector-wide drift
+   * (quarantine none, one incident). `quarantineUnresolved` performs the
+   * isolation; `clearUnresolvedReads` resets the streak on the first resolved
+   * read, exactly as clearDispatchFailures does for errors.
+   *
+   * Optional so a connector or test that predates the quarantine keeps its
+   * previous behaviour (streak never advances, nothing is ever quarantined).
+   */
+  recordUnresolvedRead?(candidate: WmsDispatchCandidate, reason: string): Promise<{ count: number }>
+  quarantineUnresolved?(
+    candidate: WmsDispatchCandidate,
+    reason: string,
+    count: number,
+  ): Promise<{ quarantined: boolean }>
+  clearUnresolvedReads?(linkId: string): Promise<void>
+  /**
+   * Drift state across passes: how many CONSECUTIVE passes were read as
+   * connector-wide, and WHICH links they were.
+   *
+   * The identity matters as much as the count. "Everything we touched was
+   * unreadable" is ambiguous when the only orders that changed are the broken
+   * ones — 3 of 3 looks exactly like a tenant-wide fault, forever, and those
+   * three records would never be isolated while the watermark stayed pinned.
+   * Real drift sweeps in DIFFERENT orders as they change; a stable set of the
+   * same links, pass after pass, is a set of broken records. `cohortKey` is
+   * what lets the two be told apart.
+   *
+   * Persisted because production runs one sweep per tick. The writer reports
+   * whether the value reached disk.
+   */
+  /**
+   * Read a few ACTIVE links that are NOT in the unresolved cohort, to settle the
+   * question the ratio cannot: is the connector broken, or are these records?
+   *
+   * It is the only decisive evidence available. "Everything we touched failed"
+   * is ambiguous when the only orders that changed are the broken ones — and
+   * both readings are dangerous (isolate a healthy tenant / never isolate a
+   * broken record). Costs a couple of reads, and only in the ambiguous case.
+   *
+   * `representative` is the number that resolved AND exercised the SAME
+   * invariant the cohort failed: a complete DISPATCHED record. Merely resolving
+   * is not enough — the completeness guard only rejects records that read as
+   * dispatched, so a connector-wide change that mangles every despatch would
+   * leave pending orders reading perfectly while every dispatched one breaks.
+   * Counting those as healthy evidence is precisely how the breaker would come
+   * to mass-quarantine the tenant it exists to protect.
+   */
+  probeControlLinks?(excludeLinkIds: string[], limit: number): Promise<{
+    probed: number
+    resolved: number
+    representative: number
+  }>
+  getUnresolvedDriftState?(): Promise<{ consecutive: number; cohortKey: string | null; stableFor: number }>
+  saveUnresolvedDriftState?(state: { consecutive: number; cohortKey: string | null; stableFor: number }): Promise<boolean>
+  /**
+   * Alert admins ONCE about connector-wide unresolved drift (deduplicated).
+   * `consecutivePasses` escalates a drift that is not clearing — which is what
+   * a long streak is FOR. It deliberately does not change the verdict: a
+   * still-drifting connector is never converted into per-link quarantine.
+   */
+  reportUnresolvedDrift?(input: {
+    linkCount: number
+    touched: number
+    reason: string
+    consecutivePasses: number
+  }): Promise<void>
   // Inbound Order/List delta (o3d-bjc). Optional so a WMS without a bulk delta
   // (ShipHero) keeps per-order polling exactly as before. fetchDelta returns
   // every order changed since `sinceIso` (already in the tenant timezone) and
@@ -600,6 +717,10 @@ export async function runWmsDispatchSweepCore(
   deltaRowCount: number
   /** Orders whose real dispatch state could not be established this pass. */
   unresolved: number
+  /** o3d-bjc.9: links isolated this pass because their record stayed unreadable. */
+  unresolvedQuarantined: number
+  /** o3d-bjc.9: the unresolved cohort was read as connector drift — nothing isolated. */
+  unresolvedSystemic: boolean
   /** The delta window was clamped and could not cover its held-back backlog. */
   deltaWindowTruncated: boolean
   /** True when the sweep pinned the watermark because it could not prove full coverage. */
@@ -647,6 +768,18 @@ export async function runWmsDispatchSweepCore(
   // Orders the pass could not establish a dispatch state for. Reported so the job
   // goes PARTIAL instead of looking like a clean success.
   let unresolvedCount = 0
+  // o3d-bjc.9: the unresolved cohort, decided in BULK after the loop. Collected
+  // rather than acted on inline because a record-local defect and connector-wide
+  // drift look identical one record at a time — and the two want opposite
+  // remedies (isolate this one / isolate nothing).
+  const unresolvedLinks: Array<{ candidate: WmsDispatchCandidate; reason: string; count: number }> = []
+  // How many links this pass actually decided an outcome for — the denominator
+  // for the drift ratio. counters.totalChecked is not it: it also counts links
+  // the delta served without any outcome decision.
+  let linksDecided = 0
+  let unresolvedQuarantined = 0
+  let unresolvedSystemic = false
+  const quarantinedNumbers = new Set<string>()
   // True when the reconcile pass drained the WHOLE eligible set this tick (a short
   // batch). Every active link was then authoritatively per-order verified, which is
   // the only sound basis for reseeding a watermark whose window had been truncated.
@@ -763,9 +896,10 @@ export async function runWmsDispatchSweepCore(
     // ambiguous order would otherwise dead-letter itself after five sweeps for a
     // condition the operator has to fix in the WMS, not in IMS. It IS counted for
     // the job outcome (below) so it can never hide behind a SUCCEEDED job.
-    if (outcome.action === 'error' || outcome.unresolved) passClean = false
+    if (outcome.action === 'error') passClean = false
     if (outcome.unresolved) unresolvedCount += 1
     counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
+    linksDecided += 1
 
     // 6oyu.2: only CONSECUTIVE errors dead-letter — any RESOLVED non-error outcome
     // resets. An unresolved outcome resets nothing: it is not evidence the link is
@@ -779,9 +913,30 @@ export async function runWmsDispatchSweepCore(
       } else if (!outcome.unresolved) {
         await deps.clearDispatchFailures(candidate.linkId)
       }
+      // o3d-bjc.9: the unresolved streak is its own, and it advances HERE while
+      // the isolate-or-not decision waits for the end of the pass — that is the
+      // only point where a record-local defect and connector-wide drift are
+      // distinguishable. A resolved read (dispatched or a genuine pending)
+      // clears it; an ERROR leaves it alone, because an error says nothing
+      // about whether the record is readable.
+      if (outcome.unresolved) {
+        // NOT counted here. The streak is committed in the bulk decision, AFTER
+        // the cohort is classified: a systemic pass is explicitly not evidence
+        // that any individual record is broken, so spending its quarantine
+        // budget would isolate the stragglers the moment a connector outage
+        // partially recovers — records that would have recovered by themselves.
+        unresolvedLinks.push({ candidate, reason: outcome.reason, count: 0 })
+      } else if (outcome.action !== 'error') {
+        await deps.clearUnresolvedReads?.(candidate.linkId)
+      }
     } catch (bookkeepingError) {
-      // Best-effort: the streak just doesn't move this run.
+      // Best-effort: the streak just doesn't move this run. An unresolved read
+      // whose streak could not be recorded must still hold the cursor, so it is
+      // registered with a count of 0 (below the cap ⇒ never quarantined here).
       console.error('[wms-dispatch-sweep] failure-tracking bookkeeping failed:', bookkeepingError)
+      if (outcome.unresolved && !unresolvedLinks.some((entry) => entry.candidate.linkId === candidate.linkId)) {
+        unresolvedLinks.push({ candidate, reason: outcome.reason, count: 0 })
+      }
     }
 
     logs.push({
@@ -809,6 +964,17 @@ export async function runWmsDispatchSweepCore(
   // then is advancing the watermark safe — otherwise a changed order beyond the
   // reconcile batch would be skipped yet aged out of the next window.
   let deltaCoverageComplete = true
+  // o3d-bjc.9: WHY coverage was incomplete, attributed to the order number that
+  // caused it. A quarantined record must stop pinning the watermark, and the
+  // pass-clean flag is only half of that — an unreadable split row also spoils
+  // COVERAGE, which is a separate gate. Anything we cannot attribute to a
+  // specific order is recorded as UNATTRIBUTABLE and can never be forgiven.
+  const UNATTRIBUTABLE = '\u0000unattributable'
+  const coverageSpoilers = new Set<string>()
+  const holdCoverage = (attribution: string | null | undefined) => {
+    deltaCoverageComplete = false
+    coverageSpoilers.add(attribution || UNATTRIBUTABLE)
+  }
 
   // --- Delta pass: reconcile every active link whose order changed since the
   // watermark. Coverage MUST span the whole delta, not just the reconcile batch.
@@ -825,6 +991,7 @@ export async function runWmsDispatchSweepCore(
       // A full batch means there may be active links we never saw — hold the
       // watermark so an out-of-batch changed order isn't aged out.
       deltaCoverageComplete = batch.length < batchSize
+      if (!deltaCoverageComplete) coverageSpoilers.add(UNATTRIBUTABLE)
       deltaCandidates = batch
     }
 
@@ -897,7 +1064,7 @@ export async function runWmsDispatchSweepCore(
               // Budgeted, and the shortfall is REPORTED rather than silent: the
               // job goes PARTIAL and the watermark holds, so the remaining
               // groups are retried instead of aged out.
-              deltaCoverageComplete = false
+              holdCoverage(null)
               console.warn(
                 `[wms-dispatch-sweep] split probe budget (${SPLIT_PROBE_BUDGET_PER_SWEEP}) ` +
                   'exhausted; holding the watermark so unprobed split groups are not aged out',
@@ -911,7 +1078,7 @@ export async function runWmsDispatchSweepCore(
             } catch (error) {
               // Stop on the FIRST failure rather than hammering a degraded
               // dependency for every remaining group.
-              deltaCoverageComplete = false
+              holdCoverage(number)
               console.warn(
                 `[wms-dispatch-sweep] split probe for ${number} failed (${String(error)}); ` +
                   'stopping further probes this sweep and holding the watermark',
@@ -923,7 +1090,7 @@ export async function runWmsDispatchSweepCore(
               // Ambiguous or contaminated group. Do NOT enumerate against it —
               // hold the watermark and let a later sweep (or an operator) see a
               // coherent group.
-              deltaCoverageComplete = false
+              holdCoverage(number)
               console.warn(
                 `[wms-dispatch-sweep] split group for ${number} is not coherent ` +
                   '(duplicate parts, or a count that disagrees with the delta row); ' +
@@ -948,8 +1115,10 @@ export async function runWmsDispatchSweepCore(
         }
       } else {
         // Stable IDs alone cannot prove split/merge coverage. Keep the watermark
-        // until a later run can enumerate that shared-number group.
-        deltaCoverageComplete = false
+        // until a later run can enumerate that shared-number group — attributed
+        // to the numbers we could not enumerate, so an isolated record can later
+        // release its own hold (o3d-bjc.9) while a genuine gap keeps it.
+        for (const number of supplementNumbers) holdCoverage(number)
       }
     }
 
@@ -998,7 +1167,7 @@ export async function runWmsDispatchSweepCore(
       if (!idRow && mergedByNumber) {
         const claimants = linksPerNumber?.get(candidate.externalOrderNumber) ?? null
         if (claimants === null || claimants > 1) {
-          deltaCoverageComplete = false
+          holdCoverage(candidate.externalOrderNumber)
           counters.totalChecked += 1
           counters.pending += 1
           unresolvedCount += 1
@@ -1012,6 +1181,19 @@ export async function runWmsDispatchSweepCore(
               : `Ambiguous merge: ${claimants} links share order number ${candidate.externalOrderNumber} `
                 + '— refusing to repoint on number evidence alone',
           })
+          // Route it through the SAME bookkeeping as any other unresolved read
+          // (o3d-bjc.9). Left outside it, this branch pinned the watermark on
+          // every pass while never accruing a streak, never reaching the
+          // exception inbox and never being replayable — an invisible permanent
+          // hold, which is precisely the shape the quarantine exists to end.
+          unresolvedLinks.push({
+            candidate,
+            reason: claimants === null
+              ? `Cannot prove order number ${candidate.externalOrderNumber} is unique — merge not repointed`
+              : `Ambiguous merge: ${claimants} links share order number ${candidate.externalOrderNumber}`,
+            count: 0,
+          })
+          linksDecided += 1
           processedLinkIds.add(candidate.linkId)
           continue
         }
@@ -1115,6 +1297,166 @@ export async function runWmsDispatchSweepCore(
     }
   }
 
+  // --- Unresolved cohort: isolate the record, or name the drift (o3d-bjc.9) ---
+  //
+  // Decided ONCE, here, because this is the only point in the pass where the two
+  // are distinguishable. Parking is isolation, and isolation only means anything
+  // when the thing isolated is the exception:
+  //   • a lone unreadable record in a healthy tenant  ⇒ quarantine it, so it
+  //     stops pinning the watermark for everyone else;
+  //   • most of what the pass touched unreadable at once ⇒ connector-wide drift:
+  //     ONE incident, NOTHING quarantined, every link still eligible to recover
+  //     automatically when the dependency does.
+  if (unresolvedLinks.length > 0) {
+    const cohortKey = unresolvedLinks.map((entry) => entry.candidate.linkId).sort().join(',')
+    const prior = (await deps.getUnresolvedDriftState?.()) ?? { consecutive: 0, cohortKey: null, stableFor: 0 }
+    // Reporting only: how long the SAME set has been stuck. It deliberately
+    // does not affect the verdict — see the no-control branch below.
+    const cohortUnchanged = prior.cohortKey === cohortKey
+    const stableFor = cohortUnchanged ? prior.stableFor + 1 : 1
+
+    // Two questions, and both have to be asked:
+    //   1. Is most of what this pass touched unreadable?  (floor + ratio)
+    //   2. Is it the SAME set of records every time?      (cohort identity)
+    // A real connector fault sweeps in different orders as they change. The
+    // same links, pass after pass, are broken records that merely happen to be
+    // the only ones changing — and reading that as drift forever is how three
+    // bad rows pin a tenant's watermark with no exception ever raised.
+    const looksSystemic = isUnresolvedDriftSystemic(unresolvedLinks.length, linksDecided)
+    if (!looksSystemic) {
+      unresolvedSystemic = false
+    } else {
+      // Ask a healthy control before believing it. A cohort can look systemic
+      // simply because the only orders that changed were the broken ones, and
+      // repeated identity cannot settle it either — a genuine fault holds the
+      // watermark, so it re-serves the SAME rows and looks frozen too.
+      let control: { probed: number; resolved: number; representative: number } | null = null
+      try {
+        control = (await deps.probeControlLinks?.(
+          unresolvedLinks.map((entry) => entry.candidate.linkId),
+          DISPATCH_UNRESOLVED_CONTROL_PROBES,
+        )) ?? null
+      } catch (probeError) {
+        // No evidence is not counter-evidence: fall through to the conservative
+        // branch below rather than treating a failed probe as a healthy read.
+        console.warn('[wms-dispatch-sweep] control probe failed:', probeError)
+        control = null
+      }
+      if (control && control.representative > 0) {
+        // Decisive: another order on this connector produced a COMPLETE
+        // dispatched record in the same pass, so the connector can still do the
+        // thing the cohort failed at. These records are the problem.
+        unresolvedSystemic = false
+      } else {
+        // No REPRESENTATIVE control: either nothing else is active, the
+        // connector cannot probe, or the controls we could read were all in a
+        // lifecycle state that never exercises the failing invariant (pending
+        // orders read fine while every despatch is mangled). Cohort STABILITY
+        // proves nothing either — a deterministic
+        // schema break produces the same cohort every pass, all the more so
+        // because holding the watermark re-serves the same rows. Isolating on
+        // that would quarantine the entire tenant for a fault that a single
+        // connector fix would otherwise have cleared automatically, and every
+        // order would then need a manual replay.
+        //
+        // So: stay systemic, keep every link eligible, and escalate. The cost
+        // is a held watermark and a degraded (per-order) delta — recoverable
+        // the moment the connector is fixed. `stableFor` is carried purely so
+        // the incident can say how long this has been going on.
+        unresolvedSystemic = true
+      }
+    }
+
+    const committed = (await deps.saveUnresolvedDriftState?.({
+      consecutive: unresolvedSystemic ? prior.consecutive + 1 : 0,
+      cohortKey,
+      stableFor,
+    })) ?? true
+    if (!committed) {
+      // An observability write failing must NEVER reclassify drift into broken
+      // records — that would quarantine a whole tenant off a transient upsert
+      // error. The pass still holds the watermark and still reports.
+      console.error(
+        '[wms-dispatch-sweep] could not persist the unresolved-drift state — the verdict stands, ' +
+          'but escalation counting and cohort-stability detection are degraded until it writes',
+      )
+    }
+
+    if (unresolvedSystemic) {
+      // Drift holds the cursor: nothing was isolated, so the rows are still owed.
+      passClean = false
+      const sample = unresolvedLinks[0]?.reason ?? 'unresolved WMS record'
+      try {
+        await deps.reportUnresolvedDrift?.({
+          linkCount: unresolvedLinks.length,
+          touched: linksDecided,
+          reason: sample,
+          consecutivePasses: prior.consecutive + 1,
+        })
+      } catch (driftError) {
+        console.error('[wms-dispatch-sweep] unresolved-drift report failed:', driftError)
+      }
+      console.warn(
+        `[wms-dispatch-sweep] ${unresolvedLinks.length}/${linksDecided} links unresolved this pass — ` +
+          `treating as connector drift, quarantining none (${prior.consecutive + 1} consecutive pass(es)): ${sample}`,
+      )
+    } else {
+      for (const entry of unresolvedLinks) {
+        // Committed HERE, so a systemic pass never spends a record's budget.
+        let count = 0
+        try {
+          count = ((await deps.recordUnresolvedRead?.(entry.candidate, entry.reason)) ?? { count: 0 }).count
+        } catch (streakError) {
+          console.error('[wms-dispatch-sweep] unresolved-streak bookkeeping failed:', streakError)
+        }
+        let quarantined = false
+        if (count >= DISPATCH_MAX_CONSECUTIVE_UNRESOLVED) {
+          try {
+            const result = await deps.quarantineUnresolved?.(entry.candidate, entry.reason, count)
+            quarantined = Boolean(result?.quarantined)
+          } catch (quarantineError) {
+            console.error('[wms-dispatch-sweep] quarantine failed:', quarantineError)
+          }
+        }
+        if (quarantined) {
+          unresolvedQuarantined += 1
+          quarantinedNumbers.add(entry.candidate.externalOrderNumber)
+          // Isolated: it no longer speaks for the pass. Holding the cursor for a
+          // link that has just left the candidate set would pin the watermark
+          // for a record nothing will look at again until an operator acts.
+        } else {
+          // Still in play, so the row it could not read is still owed.
+          passClean = false
+        }
+      }
+    }
+  } else if (deps.saveUnresolvedDriftState) {
+    // A pass with nothing unresolved ends any drift: the next occurrence starts
+    // its own count, and its own cohort.
+    const prior = (await deps.getUnresolvedDriftState?.()) ?? { consecutive: 0, cohortKey: null, stableFor: 0 }
+    if (prior.consecutive > 0 || prior.cohortKey !== null) {
+      await deps.saveUnresolvedDriftState({ consecutive: 0, cohortKey: null, stableFor: 0 })
+    }
+  }
+
+  // Coverage is the OTHER half of "stops pinning the watermark" (o3d-bjc.9). An
+  // unreadable record spoils coverage as well as the clean-pass flag — an
+  // incoherent split group, say — so isolating the link while the coverage gate
+  // still holds would leave the watermark exactly where it was. Forgive the
+  // coverage miss only when EVERY reason for it is a record we just quarantined:
+  // one unattributable miss (a spent probe budget, a truncated batch) keeps the
+  // hold, because that is a gap in what we LOOKED at, not a record we isolated.
+  if (!deltaCoverageComplete && quarantinedNumbers.size > 0 && coverageSpoilers.size > 0) {
+    const allForgiven = [...coverageSpoilers].every((number) => quarantinedNumbers.has(number))
+    if (allForgiven) {
+      deltaCoverageComplete = true
+      console.warn(
+        `[wms-dispatch-sweep] delta coverage was incomplete solely because of ${quarantinedNumbers.size} ` +
+          'quarantined record(s) — releasing the watermark now they are isolated',
+      )
+    }
+  }
+
   // Advance the delta cursors only after a fully clean, fully covered pass, so a
   // Mintsoft/WC blip (or a batch-truncated delta pass) can't age a changed row
   // out of the next window before it's applied.
@@ -1157,6 +1499,8 @@ export async function runWmsDispatchSweepCore(
     deltaAuthoritativeRereads,
     deltaRowCount,
     unresolved: unresolvedCount,
+    unresolvedQuarantined,
+    unresolvedSystemic,
     // Surfaced so the wrapper can mark the job PARTIAL: a clamped window means the
     // delta is running degraded and cannot cover its own backlog.
     deltaWindowTruncated,
@@ -1178,6 +1522,9 @@ export type WmsDispatchSweepResult = {
 
 /** Prisma + active-connector wiring of the deps. */
 export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector: WmsConnector): WmsDispatchSweepDeps {
+  // Per-connector so one WMS drifting cannot suppress (or unsuppress) another's
+  // quarantine bound.
+  const unresolvedStreakKey = `wms_dispatch_unresolved_streak:${connectorId}`
   return {
     async listCandidates(limit) {
       const rows = await db.wmsOrderPushLink.findMany({
@@ -1190,6 +1537,10 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           // 6oyu.2: dead-lettered links stop re-erroring every sweep; an operator
           // replays them from the exception inbox once the cause is fixed.
           dispatchDeadLetteredAt: null,
+          // o3d-bjc.9: a QUARANTINED link is out of the sweep for the same reason a
+          // dead-lettered one is — its record cannot be read, so re-polling it every
+          // tick only pins the watermark. It comes back when an operator acts.
+          dispatchUnresolvedAt: null,
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },
         select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
@@ -1218,6 +1569,10 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             externalOrderId: { in: unique.slice(i, i + CHUNK) },
             externalOrderNumber: { not: null },
             dispatchDeadLetteredAt: null,
+            // o3d-bjc.9: a QUARANTINED link is out of the sweep for the same reason a
+            // dead-lettered one is — its record cannot be read, so re-polling it every
+            // tick only pins the watermark. It comes back when an operator acts.
+            dispatchUnresolvedAt: null,
             order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
           },
           select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
@@ -1244,6 +1599,10 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             state: { in: ['SYNCED', 'MERGED'] },
             externalOrderNumber: { in: unique.slice(i, i + CHUNK) },
             dispatchDeadLetteredAt: null,
+            // o3d-bjc.9: a QUARANTINED link is out of the sweep for the same reason a
+            // dead-lettered one is — its record cannot be read, so re-polling it every
+            // tick only pins the watermark. It comes back when an operator acts.
+            dispatchUnresolvedAt: null,
             order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
           },
           select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
@@ -1293,6 +1652,10 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           state: { in: ['SYNCED', 'MERGED'] },
           externalOrderNumber: { not: null },
           dispatchDeadLetteredAt: null,
+          // o3d-bjc.9: a QUARANTINED link is out of the sweep for the same reason a
+          // dead-lettered one is — its record cannot be read, so re-polling it every
+          // tick only pins the watermark. It comes back when an operator acts.
+          dispatchUnresolvedAt: null,
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },
         select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
@@ -1403,6 +1766,11 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           dispatchFailureCount: 0,
           dispatchLastError: null,
           dispatchDeadLetteredAt: null,
+          // ...and so does the unresolved streak (o3d-bjc.9): the record that
+          // could not be read was the OLD order's. The survivor gets a clean slate.
+          dispatchUnresolvedCount: 0,
+          dispatchUnresolvedError: null,
+          dispatchUnresolvedAt: null,
           // The survivor is a DIFFERENT WMS order — reconcile recency resets too.
           reconcileCheckedAt: null,
         },
@@ -1468,6 +1836,226 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       })))
 
       return { deadLettered: true }
+    },
+    // --- o3d-bjc.9: unresolved-record streak + quarantine -------------------
+    async recordUnresolvedRead(candidate, reason) {
+      const link = await db.wmsOrderPushLink.update({
+        where: { id: candidate.linkId },
+        data: { dispatchUnresolvedCount: { increment: 1 }, dispatchUnresolvedError: reason },
+        select: { dispatchUnresolvedCount: true },
+      })
+      return { count: link.dispatchUnresolvedCount }
+    },
+    async clearUnresolvedReads(linkId) {
+      // Only touch rows that actually carry streak state, so the happy path
+      // stays write-free (same shape as clearDispatchFailures).
+      await db.wmsOrderPushLink.updateMany({
+        where: {
+          id: linkId,
+          OR: [
+            { dispatchUnresolvedCount: { gt: 0 } },
+            { dispatchUnresolvedError: { not: null } },
+            { dispatchUnresolvedAt: { not: null } },
+          ],
+        },
+        data: { dispatchUnresolvedCount: 0, dispatchUnresolvedError: null, dispatchUnresolvedAt: null },
+      })
+    },
+    async quarantineUnresolved(candidate, reason, count) {
+      // Compare-and-set, like the dead-letter path: an overlapping sweep whose
+      // read RESOLVED clears the streak between our count and this write, and
+      // that success must veto the quarantine — the count has to still be at the
+      // cap when we commit.
+      const updated = await db.wmsOrderPushLink.updateMany({
+        where: {
+          id: candidate.linkId,
+          dispatchUnresolvedAt: null,
+          dispatchUnresolvedCount: { gte: DISPATCH_MAX_CONSECUTIVE_UNRESOLVED },
+        },
+        data: { dispatchUnresolvedAt: new Date(), dispatchUnresolvedError: reason },
+      })
+      // COMMITTED. Everything below is audit and alerting: if it throws, the row
+      // is already out of the candidate set, and reporting {quarantined:false}
+      // would make the caller hold the watermark for a link it can never see
+      // again — a silently parked order. Failures are logged, never propagated.
+      if (updated.count === 0) return { quarantined: false }
+
+      try {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: candidate.orderId,
+        tag: 'sync',
+        action: 'wms_dispatch_unresolved_quarantined',
+        description: `Dispatch reconciliation quarantined after ${count} consecutive unresolved reads `
+          + `(WMS order ${candidate.externalOrderNumber}): ${reason}`,
+        metadata: {
+          orderId: candidate.orderId,
+          externalOrderNumber: candidate.externalOrderNumber,
+          connector: connectorId,
+          unresolvedCount: count,
+          lastReason: reason,
+        },
+        level: 'WARNING',
+        resolveUser: false,
+      })
+
+      // Individually, not a broadcast: a null userId would expose order details
+      // to READONLY/SUPPLIER users (same reasoning as the dead-letter alert).
+      const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+      await Promise.all(admins.map((admin) => notify({
+        userId: admin.id,
+        type: 'error',
+        title: 'WMS record unreadable',
+        message: `Order ${candidate.externalOrderNumber} cannot be read from the WMS (${count} consecutive `
+          + 'unresolved reads). It has been quarantined so it stops holding the inbound sync back, and '
+          + 'needs attention in the sync exception inbox.',
+        actionUrl: '/sync/exceptions',
+      })))
+      } catch (auditError) {
+        console.error(
+          `[wms-dispatch-sweep] quarantined ${candidate.externalOrderNumber} but could not record/announce it:`,
+          auditError,
+        )
+      }
+
+      return { quarantined: true }
+    },
+    async probeControlLinks(excludeLinkIds, limit) {
+      // Deliberately the SAME eligibility as the sweep's own candidates: a
+      // control drawn from links the sweep would never touch proves nothing
+      // about the reads it actually makes.
+      const rows = await db.wmsOrderPushLink.findMany({
+        where: {
+          connector: connectorId,
+          state: { in: ['SYNCED', 'MERGED'] },
+          externalOrderNumber: { not: null },
+          dispatchDeadLetteredAt: null,
+          dispatchUnresolvedAt: null,
+          id: { notIn: excludeLinkIds },
+          order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+        },
+        select: { externalOrderNumber: true },
+        take: Math.max(0, limit),
+        orderBy: [{ dispatchReconcileCheckedAt: { sort: 'desc', nulls: 'last' } }, { pushedAt: 'desc' }],
+      })
+      let probed = 0
+      let resolved = 0
+      let representative = 0
+      for (const row of rows) {
+        if (!row.externalOrderNumber) continue
+        probed += 1
+        try {
+          // A READ is all we need: whether the connector can answer at all.
+          // Nothing is applied from it, so a control can never write.
+          const status = await (connector.fetchOrderStatus
+            ? connector.fetchOrderStatus(row.externalOrderNumber)
+            : Promise.resolve(null))
+          if (!status) continue
+          resolved += 1
+          // Only a complete DISPATCHED record exercises the invariant the cohort
+          // failed. A pending order resolving proves the endpoint is up, not
+          // that despatch records are still readable — and a connector that
+          // returns a DISPATCHED row has already passed its own completeness
+          // guard (an incomplete despatch raises WmsUnresolvableRecordError
+          // rather than returning).
+          if (!status.dispatched) continue
+          // ...and the SAME PATHS, not just the status endpoint. Unresolved
+          // outcomes also come from split enumeration and part-item reads, so a
+          // connector-wide fetchOrderParts degradation would leave one ordinary
+          // non-split order answering perfectly while every split order breaks.
+          // Treating that as healthy evidence is how the breaker would come to
+          // quarantine the very cohort it exists to protect.
+          if (connector.fetchOrderParts) {
+            const parts = await connector.fetchOrderParts(row.externalOrderNumber)
+            if (connector.fetchOrderPartItems) {
+              const probePart = parts.find((entry) => entry.externalId)
+              if (probePart?.externalId) await connector.fetchOrderPartItems(probePart.externalId)
+            }
+          }
+          representative += 1
+        } catch {
+          // Counted as probed-but-unresolved: that is the evidence we wanted.
+        }
+      }
+      return { probed, resolved, representative }
+    },
+    async getUnresolvedDriftState() {
+      const row = await db.setting.findUnique({ where: { key: unresolvedStreakKey }, select: { value: true } })
+      const empty = { consecutive: 0, cohortKey: null as string | null, stableFor: 0 }
+      if (!row?.value) return empty
+      try {
+        const parsed = JSON.parse(row.value) as Partial<{ consecutive: number; cohortKey: string; stableFor: number }>
+        return {
+          consecutive: Number.isFinite(parsed.consecutive) ? Math.max(0, Number(parsed.consecutive)) : 0,
+          cohortKey: typeof parsed.cohortKey === 'string' ? parsed.cohortKey : null,
+          stableFor: Number.isFinite(parsed.stableFor) ? Math.max(0, Number(parsed.stableFor)) : 0,
+        }
+      } catch {
+        // Unreadable state is NO state: start over rather than infer a cohort
+        // that was never observed.
+        return empty
+      }
+    },
+    async saveUnresolvedDriftState(state) {
+      // Reports whether it REACHED DISK. The verdict never depends on this — an
+      // observability write must not reclassify drift — but escalation counting
+      // and cohort-stability detection do.
+      try {
+        const next = JSON.stringify(state)
+        await db.setting.upsert({
+          where: { key: unresolvedStreakKey },
+          create: { key: unresolvedStreakKey, value: next },
+          update: { value: next },
+        })
+        return true
+      } catch (error) {
+        console.error('[wms-dispatch-sweep] could not persist the unresolved-drift state:', error)
+        return false
+      }
+    },
+    async reportUnresolvedDrift({ linkCount, touched, reason, consecutivePasses }) {
+      // ONE incident for the whole cohort, deduplicated per connector per day:
+      // the point of the circuit breaker is that drift does not produce N alerts.
+      const today = new Date().toISOString().slice(0, 10)
+      const dedupeKey = `wms_dispatch_unresolved_drift:${connectorId}:${today}`
+      const claimed = await db.setting.createMany({
+        data: [{ key: dedupeKey, value: String(linkCount) }],
+        skipDuplicates: true,
+      })
+      if (claimed.count === 0) return
+
+      // The claim is provisional until the alert is actually OUT. Releasing it
+      // on failure is what makes the next pass retry: otherwise one transient
+      // error silences the primary admin alert for the rest of the UTC day,
+      // while inbound sync stays held back the whole time.
+      try {
+      await logActivity({
+        entityType: 'SYSTEM',
+        tag: 'sync',
+        action: 'wms_dispatch_unresolved_drift',
+        description: `${linkCount} of ${touched} WMS links were unresolvable in one dispatch pass `
+          + `(${consecutivePasses} consecutive pass(es)) — treated as connector-wide drift, so none were `
+          + `quarantined: ${reason}`,
+        metadata: { connector: connectorId, linkCount, touched, reason, consecutivePasses },
+        level: 'ERROR',
+        resolveUser: false,
+      })
+
+      const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+      await Promise.all(admins.map((admin) => notify({
+        userId: admin.id,
+        type: 'error',
+        title: 'WMS records unreadable across the board',
+        message: `${linkCount} of ${touched} orders could not be read from the WMS in one pass`
+          + `${consecutivePasses > 1 ? `, for ${consecutivePasses} passes running` : ''}. This looks like a `
+          + 'connector-wide change rather than broken orders, so nothing has been quarantined — they will '
+          + 'recover automatically once it is fixed. Inbound dispatch sync is held back until it is.',
+        actionUrl: '/sync',
+      })))
+      } catch (publishError) {
+        await db.setting.deleteMany({ where: { key: dedupeKey } }).catch(() => {})
+        throw publishError
+      }
     },
     async clearDispatchFailures(linkId) {
       // Only touch rows with failure state — keeps the happy path write-free.
@@ -1552,6 +2140,28 @@ export async function runWmsDispatchSweep(
     deltaTimeZone: deltaTimeZoneSetting || DISPATCH_DELTA_DEFAULT_TIMEZONE,
   }
 
+  // o3d-bjc.9: one sweep per connector at a time. Each run counts a link's
+  // unresolved read once, so overlapping runs would spend the five-pass
+  // quarantine budget on ONE transient incident — the cap is meant to mean
+  // "five passes apart", not "five callers at once". Skip rather than queue:
+  // the holder is doing this work right now.
+  const locked = await withDispatchSweepLockOrSkip(connectorId, () =>
+    runWmsDispatchSweepLocked(connectorId, connector, deps, coreOptions, triggeredBy))
+  if ('lockSkipped' in locked) {
+    return { ...empty, status: 'SKIPPED', skippedReason: 'Another dispatch sweep for this connector is already running' }
+  }
+  return locked
+}
+
+async function runWmsDispatchSweepLocked(
+  connectorId: WmsConnectorId,
+  connector: WmsConnector,
+  deps: WmsDispatchSweepDeps,
+  coreOptions: WmsDispatchSweepCoreOptions,
+  triggeredBy: string,
+): Promise<WmsDispatchSweepResult> {
+  const empty = { jobId: null as string | null, totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
+  void connector
   const startedAt = new Date()
   const job = await db.wmsSyncJob.create({
     data: { connector: connectorId, type: 'DISPATCH_SYNC', status: 'RUNNING', startedAt, triggeredBy },
@@ -1567,6 +2177,7 @@ export async function runWmsDispatchSweep(
     const {
       logs, deltaError, unresolved, deltaWindowTruncated, deltaCoverageIncomplete,
       deltaPreloadServed, deltaAuthoritativeRereads, deltaRowCount,
+      unresolvedQuarantined, unresolvedSystemic,
     } = core
 
     if (logs.length > 0) {
@@ -1648,6 +2259,32 @@ export async function runWmsDispatchSweep(
             deltaRowCount,
             deltaPreloadServed,
             deltaAuthoritativeRereads,
+            connector: connectorId,
+          } as Prisma.InputJsonValue,
+        },
+      })
+    }
+
+    // o3d-bjc.9: both halves of the unresolved decision are recorded, because
+    // "nothing was quarantined" means opposite things depending on which fired —
+    // no cohort at all, or a cohort large enough to be read as drift.
+    if (unresolvedQuarantined > 0 || unresolvedSystemic) {
+      await db.wmsSyncLog.create({
+        data: {
+          jobId: job.id,
+          sku: null,
+          productId: null,
+          action: 'error',
+          reason: unresolvedSystemic
+            ? `${unresolved} link(s) unresolved at once — read as connector-wide drift, so NONE were `
+              + 'quarantined and every link stays eligible to recover automatically'
+            : `${unresolvedQuarantined} link(s) quarantined after ${DISPATCH_MAX_CONSECUTIVE_UNRESOLVED} `
+              + 'consecutive unresolved reads — they no longer hold the delta watermark and need '
+              + 'attention in the sync exception inbox',
+          payload: {
+            unresolved,
+            unresolvedQuarantined,
+            unresolvedSystemic,
             connector: connectorId,
           } as Prisma.InputJsonValue,
         },

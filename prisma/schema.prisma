@@ -2395,6 +2395,17 @@ model WmsOrderPushLink {
   dispatchFailureCount   Int            @default(0)
   dispatchLastError      String?
   dispatchDeadLetteredAt DateTime?
+  /// o3d-bjc.9: CONSECUTIVE unresolved reads — the WMS answered, but its record
+  /// could not be turned into a dispatch state (an unreadable part set, a status
+  /// the vocabulary does not carry). Deliberately NOT dispatchFailureCount: that
+  /// counts transport/apply failures, and folding the two together is what made
+  /// an earlier attempt dead-letter a whole tenant on one schema change. At the
+  /// cap the link is QUARANTINED (dispatchUnresolvedAt set): it leaves the
+  /// candidate set and stops pinning the delta watermark, and surfaces in the
+  /// sync exception inbox. Reset on the first resolved read.
+  dispatchUnresolvedCount Int           @default(0)
+  dispatchUnresolvedError String?
+  dispatchUnresolvedAt    DateTime?
   /// q66in.4.4: when the order reconcile last verified this link against the
   /// WMS — the capped daily sweep rotates least-recently-checked first.
   reconcileCheckedAt     DateTime?
@@ -2414,6 +2425,7 @@ model WmsOrderPushLink {
   @@index([dispatchDeadLetteredAt])
   /// o3d-bjc: supports the dispatch reconcile-pass rotation ordering.
   @@index([connector, dispatchReconcileCheckedAt])
+  @@index([connector, dispatchUnresolvedAt])
   @@map("wms_order_push_links")
 }
 
