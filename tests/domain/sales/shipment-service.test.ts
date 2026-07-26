@@ -55,6 +55,8 @@ type State = {
   lines: OrderLine[]
   allocations: Allocation[]
   refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
+  // Kit/BOM graph: productId -> its component requirements. Absent products are treated as SIMPLE.
+  kits?: Record<string, Array<{ componentId: string; qty: number; sku?: string }>>
   shipments: Shipment[]
   shipmentLines: ShipmentLine[]
   stockLevels: StockLevel[]
@@ -158,11 +160,21 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     product: {
-      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => ({
-        id,
-        type: 'SIMPLE',
-        productComponents: [],
-      })),
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => {
+        const components = state.kits?.[id]
+        if (components && components.length > 0) {
+          return {
+            id,
+            type: 'KIT',
+            productComponents: components.map((component) => ({
+              componentId: component.componentId,
+              qty: component.qty,
+              component: { sku: component.sku ?? component.componentId, type: 'SIMPLE', oversellAllowed: false },
+            })),
+          }
+        }
+        return { id, type: 'SIMPLE', productComponents: [] }
+      }),
     },
     orderAllocation: {
       findMany: async ({ where }: { where: { orderId: string } }) => state.allocations
@@ -638,6 +650,151 @@ test('transitionShipmentStatus rejects multi-warehouse shipment totals above the
   assert.equal(state.costLayers[0].remainingQty, 2)
   assert.equal(state.movements.length, 0)
   assert.equal(state.cogsEntries.length, 0)
+})
+
+test('transitionShipmentStatus keeps the exact cap for SIMPLE products — no row-tolerance over-ship (o3d-odu)', async () => {
+  // A simple product ordered 1.0000 split across two rows as 0.5 + 0.5001 = 1.0001. The per-row
+  // quantisation tolerance must NOT apply to identity (non-kit) expansions, so this real 0.0001 over-ship
+  // is still rejected exactly as the epsilon-only guard did.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 1, sku: 'SKU-1', description: 'Product 1' }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'PICKING', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 0.5 },
+      { id: 'shipment-line-2', shipmentId: 'shipment-2', lineId: 'line-1', productId: 'product-1', qty: 0.5001 },
+    ],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /exceeds ordered quantity/)
+  assert.equal(state.movements.length, 0)
+})
+
+test('transitionShipmentStatus dispatches a KIT order whose component lines sum above the kit qty (o3d-odu)', async () => {
+  // A kit ordered ×1 needs 2 of comp-1 and 3 of comp-2. The shipment therefore has two component lines
+  // (2 + 3 = 5) under the one kit line. The OLD guard summed those 5 against the kit line's own qty (1)
+  // and falsely rejected every kit dispatch; the kit-aware guard compares each component against its
+  // expanded requirement (2 ≤ 2, 3 ≤ 3) and lets it ship.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 2, sku: 'COMP-1' }, { componentId: 'comp-2', qty: 3, sku: 'COMP-2' }] },
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 2 },
+      { id: 'shipment-line-2', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-2', qty: 3 },
+    ],
+    stockLevels: [
+      { productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 },
+      { productId: 'comp-2', warehouseId: 'warehouse-1', quantity: 3, reservedQty: 3 },
+    ],
+    costLayers: [
+      { id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 },
+      { id: 'layer-2', productId: 'comp-2', warehouseId: 'warehouse-1', remainingQty: 3, unitCostBase: 4 },
+    ],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+  assert.equal(state.movements.length, 2) // both components dispatched
+})
+
+test('transitionShipmentStatus dispatches a fractional kit at the Decimal(12,4) rounding boundary (o3d-odu)', async () => {
+  // 0.5 kit × a 0.3333 component = 0.16665, which persists as the shipment qty 0.1667. The requirement
+  // must be quantised to 4dp before comparison, else 0.1667 > 0.16665 falsely rejects a valid dispatch.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.3333, sku: 'COMP-1' }] },
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 0.1667 },
+    ],
+    stockLevels: [{ productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+  assert.equal(state.movements.length, 1)
+})
+
+test('transitionShipmentStatus: fractional kit split across warehouses is a KNOWN residual pending o3d-2uh (o3d-odu)', async () => {
+  // One kit split across two warehouses, 0.3333 component each side: each shipment row persists as 0.1667
+  // (per-row 4dp rounding), summing to 0.3334, just above the once-rounded entitlement round(1 × 0.3333)
+  // = 0.3333. With the exact epsilon-only cap (no per-row slack, so nothing can be over-shipped) this
+  // rare split-fractional case is still rejected. The immutable per-row snapshot that fixes it is o3d-2uh;
+  // the pre-fix code rejected ALL kit dispatches regardless, so this is documented, not a regression.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.3333, sku: 'COMP-1' }] },
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 0.1667 },
+      { id: 'shipment-line-2', shipmentId: 'shipment-2', lineId: 'line-1', productId: 'comp-1', qty: 0.1667 },
+    ],
+    stockLevels: [{ productId: 'comp-1', warehouseId: 'warehouse-2', quantity: 1, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-2', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-2',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false) // documented residual — see o3d-2uh
+  assert.match((result as { error: string }).error, /exceeds ordered quantity/)
+})
+
+test('transitionShipmentStatus still rejects a KIT whose component ships above its expanded requirement (o3d-odu)', async () => {
+  // 3 of comp-1 shipped for a kit that only needs 2 → over the expanded requirement, still rejected.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 2, sku: 'COMP-1' }] },
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 3 },
+    ],
+    stockLevels: [{ productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 3, reservedQty: 3 }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 3, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /exceeds ordered quantity/)
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.movements.length, 0)
 })
 
 test('transitionShipmentStatus fails cleanly when dispatch shipment starts with no lines', async () => {
