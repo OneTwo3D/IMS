@@ -17,7 +17,7 @@ const QUANTITY_TOLERANCE = 1e-6
 
 /**
  * From candidate sales orders (each with its lines), return those that have at least one line with
- * OUTSTANDING allocation demand — the ordered qty exceeds what OrderAllocation rows already cover,
+ * OUTSTANDING allocation demand — the ordered qty NET OF REFUNDS exceeds what OrderAllocation rows cover,
  * computed KIT-aware (component units, via the fulfillment product graph). Fully-allocated orders are
  * excluded so a caller never re-runs allocation on them (which would churn their existing allocations).
  *
@@ -71,6 +71,26 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
     coverageRowsByOrder.set(row.orderId, list)
   }
 
+  // Refunded quantity per ORDER LINE (o3d-jby). allocateSalesOrder defines demand as ordered
+  // MINUS refunded, netted under the order lock; comparing coverage against GROSS qty here made
+  // the two disagree, so a line with 10 ordered, 5 refunded and 5 allocated read as outstanding
+  // forever. Harmless while the only caller was the stock-event backorder allocator; with the
+  // o3d-9lx sweep rotating continuously it became a permanent rewrite loop — every rotation
+  // resetting staged allocation accounting, deleting and recreating identical allocations, and
+  // emitting storefront syncs and activity for an order that was already fully covered.
+  const refundedByLine = new Map<string, number>()
+  const refundLines = await db.salesOrderRefundLine.findMany({
+    where: { refund: { orderId: { in: candidates.map((o) => o.id) } } },
+    select: { salesOrderLineId: true, qty: true },
+  })
+  for (const row of refundLines) {
+    if (!row.salesOrderLineId) continue
+    refundedByLine.set(
+      row.salesOrderLineId,
+      (refundedByLine.get(row.salesOrderLineId) ?? 0) + Number(row.qty),
+    )
+  }
+
   return candidates.filter((order) => {
     const coverageByLine = calculateCoverageByLine(
       requirementsByLine,
@@ -81,7 +101,10 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
       const reqs = requirementsByLine.get(line.id) ?? []
       if (lineNeedsAllocation && !lineNeedsAllocation(line, reqs)) return false
       const coverage = coverageByLine.get(line.id) ?? 0
-      return Number(line.qty) > coverage + QUANTITY_TOLERANCE
+      // Net demand, matching allocateSalesOrder. Clamped at zero: over-refunding a line means
+      // no demand, not negative demand.
+      const netDemand = Math.max(0, Number(line.qty) - (refundedByLine.get(line.id) ?? 0))
+      return netDemand > coverage + QUANTITY_TOLERANCE
     })
   })
 }
