@@ -1755,7 +1755,6 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     const goodsUnitCost = 10
     const freightTotal = 30 // over 3 units, BY_QUANTITY → +£10/unit, doubling the layer cost.
 
-    let imported: { salesOrderId: string } | undefined
     let refundId: string | undefined
     const baseline = await deleteUnjournaledShipmentBaseline()
     registerRetiredPostedDocuments(baseline, 'OC-24')
@@ -1769,7 +1768,7 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
 
     const product = await createWcProduct(creds, runId, { label: 'OC24', price: unitPrice, taxClass: 'zero-rate' })
     const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
-    imported = await awaitWebhookDelivery(order.id, { creds, timeoutMs: 600_000 })
+    const imported = await awaitWebhookDelivery(order.id, { creds, timeoutMs: 600_000 })
     await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
 
     await openSalesOrder(page, imported.salesOrderId)
