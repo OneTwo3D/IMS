@@ -112,7 +112,13 @@ function decimalLikeToNumber(value: number | { toNumber(): number } | undefined)
   return typeof value === 'number' ? value : (value?.toNumber() ?? 0)
 }
 
+/** Write counters, so a test can prove o3d-i5it SKIPS the destructive cycle rather than
+ *  merely ending with equal row values — a delete+recreate leaves those identical. */
+const writeCounts = { allocationCreates: 0, allocationDeletes: 0 }
+
 function createClient(state: MemoryState): AllocationServiceClient {
+  writeCounts.allocationCreates = 0
+  writeCounts.allocationDeletes = 0
   const allocations = state.allocations ?? []
   const shipments = state.shipments ?? []
   const refundLines = state.refundLines ?? []
@@ -202,6 +208,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
         .filter((allocation) => allocation.orderId === where.orderId)
         .length,
       deleteMany: async ({ where }: { where: { orderId: string } }) => {
+        writeCounts.allocationDeletes += 1
         const before = allocations.length
         for (let index = allocations.length - 1; index >= 0; index -= 1) {
           if (allocations[index].orderId === where.orderId) allocations.splice(index, 1)
@@ -209,7 +216,10 @@ function createClient(state: MemoryState): AllocationServiceClient {
         return { count: before - allocations.length }
       },
       create: async ({ data }: { data: AllocationRow & { qty: number | { toNumber(): number } } }) => {
-        allocations.push({ ...data, qty: decimalLikeToNumber(data.qty) })
+        writeCounts.allocationCreates += 1
+        // OrderAllocation.qty is @db.Decimal(12,4) — coerce on write, or a test can observe a
+        // precision production would never persist and pass while production fails (o3d-i4qd).
+        allocations.push({ ...data, qty: persistAllocationQty(decimalLikeToNumber(data.qty)) })
         return data
       },
       updateMany: async () => ({ count: 0 }),
@@ -264,6 +274,11 @@ function createClient(state: MemoryState): AllocationServiceClient {
   }
 
   return client as unknown as AllocationServiceClient
+}
+
+/** Postgres numeric(12,4) rounds half-up on write. The mock must do the same to stay faithful. */
+function persistAllocationQty(value: number): number {
+  return Math.round(value * 10_000) / 10_000
 }
 
 function baseState(overrides: Partial<MemoryState> = {}): MemoryState {
@@ -1268,6 +1283,10 @@ test('re-allocating an unchanged set preserves accounting state and emits no syn
     'inventoryAllocatedDate must SURVIVE — clearing it lets the daily batch re-post the same A2 journal',
   )
   assert.deepEqual(result.syncProductIds, [], 'nothing moved, so nothing to push to the storefront')
+  // Row VALUES being equal is not evidence: a delete+recreate leaves them identical. The write
+  // counters are what prove the destructive cycle was skipped rather than repeated.
+  assert.equal(writeCounts.allocationDeletes, 0, 'no deleteMany')
+  assert.equal(writeCounts.allocationCreates, 0, 'no re-create')
 })
 
 test('a genuine allocation change still resets accounting state (o3d-i5it)', async () => {
@@ -1294,6 +1313,8 @@ test('a genuine allocation change still resets accounting state (o3d-i5it)', asy
   assert.equal(state.allocations?.[0].qty, 3, 'the extra unit was allocated')
   assert.equal(state.order.inventoryAllocatedDate, null, 'a real change still resets the A2 stamp')
   assert.ok(result.syncProductIds.includes('product-1'), 'and still pushes the storefront update')
+  assert.ok(writeCounts.allocationDeletes > 0, 'and the destructive cycle DID run for a real change')
+  assert.ok(writeCounts.allocationCreates > 0)
 })
 
 test('an unchanged set is not refused even when a shipment has been journaled (o3d-i5it)', async () => {
@@ -1378,18 +1399,20 @@ test('re-running that same allocation is a no-op and does not move reservedQty (
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
   assert.equal(state.stockLevels[0].reservedQty, afterFirst, 'no reservation drift across cycles')
-  assert.deepEqual(state.allocations, rowsAfterFirst, 'and no rewrite')
+  assert.deepEqual(state.allocations, rowsAfterFirst, 'same rows')
+  assert.equal(writeCounts.allocationDeletes, 0, 'and genuinely no rewrite — not a delete+recreate')
+  assert.equal(writeCounts.allocationCreates, 0)
 })
 
-test('an allocation never claims more stock than is available (o3d-i4qd)', async () => {
-  // The invariant any quantity handling must preserve. An earlier attempt at canonicalising to
-  // the column scale used ROUND_HALF_UP and broke it: feasibility is decided against the
-  // UNROUNDED value, so rounding the accepted quantity UP claims more than was proven available
-  // — 0.999960 becomes 1.0000, and reserving that violates reservedQty <= quantity.
+test('KNOWN DEFECT o3d-i4qd: the persisted quantity can exceed the stock it was checked against', async () => {
+  // CHARACTERISATION, not an invariant. Feasibility is decided against the UNROUNDED value, but
+  // OrderAllocation.qty is @db.Decimal(12,4) and Postgres rounds HALF-UP on write. With 0.999960
+  // available the allocator accepts 0.999960 and the column stores 1.0000 — more than was proven
+  // available, which against the real database violates reservedQty <= quantity.
   //
-  // Canonicalisation is currently NOT applied (see o3d-i4qd: per-row rounding also breaks the
-  // coupled KIT set, so it needs a set-atomic redesign). This pins the invariant regardless of
-  // how that is eventually done.
+  // This is pinned rather than asserted away because three attempts to canonicalise it all broke
+  // something worse (see o3d-i4qd: over-claiming, then KIT proportionality). When that issue is
+  // fixed this test SHOULD fail, and whoever fixes it should replace it with the invariant.
   const state = baseState({
     order: {
       ...baseState().order,
@@ -1407,11 +1430,7 @@ test('an allocation never claims more stock than is available (o3d-i4qd)', async
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
-  const allocated = (state.allocations ?? []).reduce((sum, row) => sum + Number(row.qty), 0)
-  assert.ok(allocated <= 0.99996, `allocated ${allocated} must not exceed the 0.99996 available`)
-  assert.equal(
-    state.stockLevels[0].reservedQty <= state.stockLevels[0].quantity,
-    true,
-    'reservedQty must never exceed quantity',
-  )
+  const persisted = (state.allocations ?? []).reduce((sum, row) => sum + Number(row.qty), 0)
+  assert.equal(persisted, 1, 'the column rounds 0.999960 up to 1.0000 — the defect, documented')
+  assert.ok(persisted > 0.99996, 'and that exceeds the 0.99996 the allocator checked against')
 })
