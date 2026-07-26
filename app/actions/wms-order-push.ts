@@ -74,6 +74,11 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
       dispatchFailureCount: 0,
       dispatchLastError: null,
       dispatchDeadLetteredAt: null,
+      // ...nor an unresolved-record quarantine (o3d-bjc.9): the unreadable
+      // record belonged to the WMS order this replay is about to replace.
+      dispatchUnresolvedCount: 0,
+      dispatchUnresolvedError: null,
+      dispatchUnresolvedAt: null,
     },
   })
   await logActivity({

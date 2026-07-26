@@ -40,3 +40,65 @@ export function buildDeadReceiptEventReplayData() {
     lastError: null,
   }
 }
+
+/**
+ * o3d-bjc.9: the shape the stuck-dispatch section needs from a push link.
+ * Structural, so the caller's Prisma select stays the source of truth.
+ */
+export type StuckDispatchLink = {
+  orderId: string
+  connector: string
+  externalOrderNumber: string | null
+  dispatchFailureCount: number
+  dispatchLastError: string | null
+  dispatchDeadLetteredAt: Date | null
+  dispatchUnresolvedCount: number
+  dispatchUnresolvedError: string | null
+  dispatchUnresolvedAt: Date | null
+  order: { orderNumber: string | null }
+}
+
+export type StuckDispatchEntry = {
+  orderId: string
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  connector: string
+  failureCount: number
+  reason: string | null
+  deadLetteredAt: string | null
+  kind: 'dead-letter' | 'unresolved'
+}
+
+/**
+ * Merge the two ways a link leaves the dispatch sweep into ONE capped, newest-first
+ * list.
+ *
+ * The merge is not cosmetic. Ordering a single query by dispatchDeadLetteredAt
+ * first puts every dead letter ahead of every unresolved-only row (its marker is
+ * NULL, and nulls sort last), so once there are `limit` dead letters a newly
+ * quarantined record never appears — on the very page its own notification links
+ * to. Sorting on the EFFECTIVE held timestamp is what keeps the newest exception
+ * visible whichever kind it is.
+ */
+export function mergeStuckDispatchRows(links: StuckDispatchLink[], limit: number): StuckDispatchEntry[] {
+  const heldAt = (link: StuckDispatchLink) =>
+    (link.dispatchDeadLetteredAt ?? link.dispatchUnresolvedAt)?.getTime() ?? 0
+  return [...links]
+    .sort((a, b) => heldAt(b) - heldAt(a))
+    .slice(0, Math.max(0, limit))
+    .map((link) => {
+      // A link can carry both markers; the dead-letter is reported because it is
+      // the stronger statement (the reconcile ERRORED, not merely "unreadable").
+      const deadLettered = link.dispatchDeadLetteredAt !== null
+      return {
+        orderId: link.orderId,
+        orderNumber: link.order.orderNumber,
+        externalOrderNumber: link.externalOrderNumber,
+        connector: link.connector,
+        failureCount: deadLettered ? link.dispatchFailureCount : link.dispatchUnresolvedCount,
+        reason: deadLettered ? link.dispatchLastError : link.dispatchUnresolvedError,
+        deadLetteredAt: (deadLettered ? link.dispatchDeadLetteredAt : link.dispatchUnresolvedAt)?.toISOString() ?? null,
+        kind: deadLettered ? ('dead-letter' as const) : ('unresolved' as const),
+      }
+    })
+}

@@ -292,6 +292,9 @@ type LinkWrite = {
   dispatchFailureCount?: number
   dispatchLastError?: string | null
   dispatchDeadLetteredAt?: Date | null
+  dispatchUnresolvedCount?: number
+  dispatchUnresolvedError?: string | null
+  dispatchUnresolvedAt?: Date | null
   reconcileCheckedAt?: Date | null
 }
 
@@ -305,6 +308,11 @@ const RESET_DISPATCH_FAILURES = {
   dispatchFailureCount: 0,
   dispatchLastError: null,
   dispatchDeadLetteredAt: null,
+  // o3d-bjc.9: and the unresolved-record quarantine, for exactly the same
+  // reason — the record that could not be read was the PREVIOUS WMS order's.
+  dispatchUnresolvedCount: 0,
+  dispatchUnresolvedError: null,
+  dispatchUnresolvedAt: null,
   // Same rationale for the reconcile stamp: the recency belonged to the OLD
   // WMS order; the fresh one must rotate to the front of verification.
   reconcileCheckedAt: null,
