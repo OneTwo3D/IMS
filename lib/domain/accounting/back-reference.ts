@@ -61,18 +61,42 @@ export function syncTypeWritesBackReference(type: AccountingSyncType, referenceT
  * caller can mark the sync row for retry — unlike the old inline version, which
  * swallowed the error and left the document silently orphaned.
  */
-export async function applyBackReference(deps: BackReferenceDeps, params: BackReferenceParams): Promise<void> {
+export type ApplyBackReferenceOptions = {
+  /**
+   * REPAIR MODE: write the external-id marker and nothing else (o3d-0g2n).
+   *
+   * The live path is posting an invoice right now, so stamping invoicedAt = now and taking the
+   * invoice number from the payload is correct. A REPAIR is not: it runs an arbitrary time after
+   * the post, so `now` is the repair time, not the invoice date — and writing it can move a sale
+   * into a different VAT / currency-reporting period than the one it was actually invoiced in.
+   * The queued payload's invoiceNumber can also disagree with what the connector actually
+   * assigned, since the live path prefers the number returned by the API.
+   *
+   * A repair therefore restores ONLY accountingInvoiceId, which is the marker the order delete
+   * guard depends on (o3d-v7sy) and the only thing that was provably lost. Recovering the real
+   * document number and posting date needs them persisted at post time, not reconstructed later.
+   */
+  markerOnly?: boolean
+}
+
+export async function applyBackReference(
+  deps: BackReferenceDeps,
+  params: BackReferenceParams,
+  options: ApplyBackReferenceOptions = {},
+): Promise<void> {
   const { type, referenceType, referenceId, externalId, invoiceNumber } = params
   if (!externalId) return
 
   if (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') {
     await deps.salesOrder.update({
       where: { id: referenceId },
-      data: {
-        accountingInvoiceId: externalId,
-        invoiceNumber: invoiceNumber ?? undefined,
-        invoicedAt: new Date(),
-      },
+      data: options.markerOnly
+        ? { accountingInvoiceId: externalId }
+        : {
+          accountingInvoiceId: externalId,
+          invoiceNumber: invoiceNumber ?? undefined,
+          invoicedAt: new Date(),
+        },
     })
   } else if (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') {
     await deps.salesOrderRefund.update({

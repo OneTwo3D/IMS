@@ -1563,7 +1563,7 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
     if (!missing) continue
     result.checked++
     try {
-      await applyBackReference(db, params)
+      await applyBackReference(db, params, { markerOnly: true })
       // The follow-ups (PDF, payment, attachment) never ran on the original
       // failed pass — enqueue them now. hasExistingSyncLog makes this idempotent.
       try {

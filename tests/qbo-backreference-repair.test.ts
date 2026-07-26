@@ -29,7 +29,8 @@ type SyncRow = {
 
 const CONNECTED_AT = new Date('2026-07-01T00:00:00.000Z')
 
-let orders: Record<string, { accountingInvoiceId: string | null }> = {}
+type OrderRow = { accountingInvoiceId: string | null; invoiceNumber?: string | null; invoicedAt?: Date | null }
+let orders: Record<string, OrderRow> = {}
 let syncRows: SyncRow[] = []
 let token: { createdAt: Date } | null = { createdAt: CONNECTED_AT }
 let statusUpdates: Array<{ id: string; data: Record<string, unknown> }> = []
@@ -39,7 +40,7 @@ let createdRows: Array<{ type: string; referenceId: string }> = []
  * from a counter. A counter-only assertion cannot distinguish "did not write" from "wrote and did
  * not count it".
  */
-let documentWrites: Array<{ table: string; id: string }> = []
+let documentWrites: Array<{ table: string; id: string; data: Record<string, unknown> }> = []
 
 function row(over: Partial<SyncRow> = {}): SyncRow {
   return {
@@ -83,29 +84,33 @@ mock.module('@/lib/db', {
       },
       salesOrder: {
         findUnique: async ({ where }: { where: { id: string } }) => orders[where.id] ?? null,
-        update: async ({ where, data }: { where: { id: string }; data: { accountingInvoiceId: string } }) => {
-          documentWrites.push({ table: 'salesOrder', id: where.id })
-          orders[where.id] = { ...orders[where.id], accountingInvoiceId: data.accountingInvoiceId }
+        // The COMPLETE payload is captured and applied. An earlier version recorded only the id
+        // and persisted only accountingInvoiceId — so the tests passed while production also wrote
+        // invoiceNumber and invoicedAt. A double shaped to match what I BELIEVED the code did
+        // cannot falsify that belief.
+        update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+          documentWrites.push({ table: 'salesOrder', id: where.id, data })
+          orders[where.id] = { ...orders[where.id], ...(data as Partial<OrderRow>) }
           return {}
         },
       },
       salesOrderRefund: {
         findUnique: async () => null,
-        update: async ({ where }: { where: { id: string } }) => {
-          documentWrites.push({ table: 'salesOrderRefund', id: where.id }); return {}
+        update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+          documentWrites.push({ table: 'salesOrderRefund', id: where.id, data }); return {}
         },
       },
       purchaseInvoice: {
         findUnique: async () => null,
         findFirst: async () => null,
-        update: async ({ where }: { where: { id: string } }) => {
-          documentWrites.push({ table: 'purchaseInvoice', id: where.id }); return {}
+        update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+          documentWrites.push({ table: 'purchaseInvoice', id: where.id, data }); return {}
         },
       },
       supplierCreditNote: {
         findUnique: async () => null,
-        update: async ({ where }: { where: { id: string } }) => {
-          documentWrites.push({ table: 'supplierCreditNote', id: where.id }); return {}
+        update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+          documentWrites.push({ table: 'supplierCreditNote', id: where.id, data }); return {}
         },
       },
     },
@@ -180,7 +185,8 @@ test('a FAILED row carrying an external id IS a candidate (o3d-0g2n)', async () 
 
   const result = await runSweep()
   assert.equal(result.repaired, 1, 'FAILED rows are swept, not skipped')
-  assert.deepEqual(documentWrites, [{ table: 'salesOrder', id: 'order-1' }], 'and the write really happened')
+  assert.equal(documentWrites.length, 1, 'and the write really happened')
+  assert.equal(documentWrites[0].table, 'salesOrder')
 })
 
 test('rows predating the current connection are NOT repaired (o3d-0g2n)', async () => {
@@ -243,5 +249,44 @@ test('the sweep cannot write a type QuickBooks\' own writer would not (o3d-0g2n)
     documentWrites,
     [],
     'and crucially no supplierCreditNote write — the counter alone could not prove that',
+  )
+})
+
+test('a repair writes ONLY the marker — never invoiceNumber or invoicedAt (o3d-0g2n, review)', async () => {
+  // THE FINDING MY DOUBLE HID. applyBackReference's live path also sets invoiceNumber (from the
+  // QUEUED payload) and invoicedAt = now. For a live post that is right: the invoice is being
+  // created at that moment.
+  //
+  // For a REPAIR it is wrong twice over. The repair runs an arbitrary time after the post, so `now`
+  // is the repair time rather than the invoice date — writing it can move a sale into a DIFFERENT
+  // VAT / currency-reporting period than the one it was invoiced in. And the queued payload's
+  // invoice number can disagree with what QuickBooks actually assigned, since the live path prefers
+  // the number the API returned.
+  //
+  // Only accountingInvoiceId was provably lost, so only it is restored.
+  orders = {
+    'order-1': {
+      accountingInvoiceId: null,
+      invoiceNumber: 'INV-ORIGINAL',
+      invoicedAt: new Date('2026-03-31T23:00:00.000Z'),
+    },
+  }
+  syncRows = [row({ payload: { invoiceNumber: 'INV-FROM-STALE-PAYLOAD' } })]
+  token = { createdAt: CONNECTED_AT }
+
+  await runSweep()
+
+  assert.equal(documentWrites.length, 1)
+  assert.deepEqual(
+    Object.keys(documentWrites[0].data).sort(),
+    ['accountingInvoiceId'],
+    'exactly one field is written — the whole "marker-only" contract, now actually asserted',
+  )
+  assert.equal(orders['order-1'].accountingInvoiceId, 'QBO-101')
+  assert.equal(orders['order-1'].invoiceNumber, 'INV-ORIGINAL', 'the real invoice number survives')
+  assert.deepEqual(
+    orders['order-1'].invoicedAt,
+    new Date('2026-03-31T23:00:00.000Z'),
+    'and the invoice DATE is untouched — a repair must not move a sale between VAT periods',
   )
 })

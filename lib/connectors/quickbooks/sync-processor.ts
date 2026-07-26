@@ -969,18 +969,17 @@ export async function repairQuickBooksBackReferences(limit = 200): Promise<BackR
   }
 
   const result: BackReferenceRepairResult = { checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0 }
+  const ambiguousPos = new Set<string>()
   for (const row of candidates) {
     if (!row.externalTransactionId || !syncTypeWritesBackReference(row.type, row.referenceType)) continue
     if (row.type === 'PURCHASE_INVOICE' && row.referenceType === 'PurchaseOrder' && (poCandidateCounts.get(row.referenceId) ?? 0) > 1) {
       result.skippedAmbiguous++
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'quickbooks_backreference_repair_ambiguous',
-        tag: 'sync',
-        level: 'WARNING',
-        description: `Skipped QuickBooks back-reference repair for PO ${row.referenceId}: multiple bills have unwritten external ids and cannot be attributed automatically. Link them manually.`,
-        metadata: { syncLogId: row.id, referenceId: row.referenceId },
-      })
+      // Collected, not logged per row. An ambiguous PO is never resolved by this sweep, so it is
+      // re-selected on EVERY run — and at a five-minute cron that is 576 identical warnings a day
+      // per ambiguity, which buries actionable alerts rather than raising one. One batched warning
+      // per run instead; the per-run repetition itself is tracked with the rest of the ambiguity
+      // handling in o3d-9kek.
+      ambiguousPos.add(row.referenceId)
       continue
     }
 
@@ -1005,7 +1004,7 @@ export async function repairQuickBooksBackReferences(limit = 200): Promise<BackR
     result.checked++
 
     try {
-      await applyBackReference(db, params)
+      await applyBackReference(db, params, { markerOnly: true })
 
       // DELIBERATELY DOES NOT touch status, and does NOT re-enqueue follow-ups.
       //
@@ -1043,6 +1042,21 @@ export async function repairQuickBooksBackReferences(limit = 200): Promise<BackR
       result.failed++
       console.error('repairQuickBooksBackReferences: repair failed', row.id, repairError)
     }
+  }
+
+
+  if (ambiguousPos.size > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_backreference_repair_ambiguous',
+      tag: 'sync',
+      level: 'WARNING',
+      description:
+        `Skipped QuickBooks back-reference repair for ${ambiguousPos.size} purchase order(s): each has `
+        + `multiple bills with unwritten external ids, which cannot be attributed automatically. Link `
+        + `them manually. POs: ${[...ambiguousPos].join(', ')}`,
+      metadata: { referenceIds: [...ambiguousPos], skippedAmbiguous: result.skippedAmbiguous },
+    })
   }
 
   return result
