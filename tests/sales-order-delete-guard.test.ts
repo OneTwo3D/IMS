@@ -76,6 +76,7 @@ function makeTx(seed: {
     externalOrderNumber: string
     externalOrderId: string
     statusLabel: string
+    lastError?: string | null
   } | null
 }) {
   return {
@@ -494,6 +495,7 @@ test('a PLACEHOLDER snapshot (WMS lookup found nothing) does NOT block (o3d-eu0r
         externalOrderNumber: 'SO-1',
         externalOrderId: '',
         statusLabel: 'Unknown',
+        lastError: 'Order not found in WMS',
       },
     }),
     'order-1',
@@ -562,4 +564,50 @@ test('with only WMS evidence, the WMS remedy is still surfaced (o3d-eu0r)', asyn
   )
 
   assert.equal(blocker?.code, 'wms_order_status_snapshot')
+})
+
+test('a snapshot from a FAILED lookup blocks — absence of an id is not absence of an order (o3d-eu0r)', async () => {
+  // order-status-sweep writes an empty externalOrderId in two situations: an authoritative
+  // not-found, and a lookup that ERRORED. Only the first is safe to delete on. Treating both as
+  // proof-free lets a genuine warehouse order be orphaned whenever the lookup merely failed —
+  // and nothing ever removes the row, so the wrong answer persists.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: null,
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'SO-1',
+        externalOrderId: '',
+        statusLabel: 'Unknown',
+        lastError: 'ETIMEDOUT contacting Mintsoft',
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'wms_order_status_snapshot')
+  assert.match(blocker!.message, /did not complete/)
+  assert.match(blocker!.message, /ETIMEDOUT/)
+})
+
+test('a snapshot with NO error marker at all also fails closed (o3d-eu0r)', async () => {
+  // An unrecognised placeholder shape must not be read as "authoritatively absent".
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: null,
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'SO-1',
+        externalOrderId: '',
+        statusLabel: 'Unknown',
+        lastError: null,
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'wms_order_status_snapshot')
+  assert.match(blocker!.message, /no result recorded/)
 })

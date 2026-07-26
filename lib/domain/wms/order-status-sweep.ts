@@ -23,6 +23,15 @@ export type WmsOrderStatusSweepResult = {
   failed: number
 }
 
+/**
+ * The exact lastError a snapshot carries when an AUTHORITATIVE lookup found no such order.
+ *
+ * Exported because order-delete-guard has to tell that apart from a lookup ERROR, which also
+ * writes an empty externalOrderId — and a shared literal is the only thing stopping the two files
+ * drifting into disagreement about which placeholder means "safe to delete" (o3d-eu0r).
+ */
+export const WMS_LOOKUP_NOT_FOUND = 'Order not found in WMS'
+
 export async function runWmsOrderStatusSweep(
   options?: { batchSize?: number; staleMinutes?: number },
 ): Promise<WmsOrderStatusSweepResult> {
@@ -109,7 +118,7 @@ export async function runWmsOrderStatusSweep(
             deepLinkUrl: null,
             trackingNumber: null,
             carrier: null,
-            lastError: 'Order not found in WMS',
+            lastError: WMS_LOOKUP_NOT_FOUND,
           }
 
       await db.wmsOrderStatusSnapshot.upsert({

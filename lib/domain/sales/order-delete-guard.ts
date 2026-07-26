@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { WMS_LOOKUP_NOT_FOUND } from '@/lib/domain/wms/order-status-sweep'
 
 /**
  * o3d-5r8 — hard-delete safety for sales orders.
@@ -157,15 +158,40 @@ export async function findSalesOrderDeleteBlocker(
   // knows about that this IMS never pushed. Worse, its FK is onDelete: Cascade, so deleting the
   // order silently erases the only local record that the remote order exists.
   //
-  // POSITIVE evidence only. order-status-sweep deliberately upserts a PLACEHOLDER row with an
-  // empty externalOrderId, statusLabel 'Unknown' and lastError 'Order not found in WMS' when an
-  // authoritative lookup finds nothing, and another after a lookup ERROR — and nothing ever
-  // removes those rows. Treating any snapshot as proof would make a storefront-linked order that
-  // never reached the WMS permanently undeletable, while claiming a remote order exists.
+  // order-status-sweep writes an empty externalOrderId in TWO different situations, and only one
+  // of them is safe to delete on:
+  //   - an AUTHORITATIVE lookup that found no such order  -> lastError = WMS_LOOKUP_NOT_FOUND
+  //   - a lookup that ERRORED                             -> lastError = the exception message
+  // Nothing ever removes either row. Blocking on both made an order that never reached the WMS
+  // permanently undeletable; blocking on neither lets a genuine remote order be orphaned when the
+  // lookup merely failed. So: positive evidence blocks, an authoritative MISSING does not, and
+  // anything else — an error, or no marker at all — FAILS CLOSED (o3d-eu0r).
+  //
+  // STILL OPEN (o3d-x9nc): fetchOrderStatus returns null for BOTH "definitively absent" and
+  // "ambiguous" (several merged candidates matching one reference), so both land on the same
+  // WMS_LOOKUP_NOT_FOUND placeholder and an ambiguous result is still read as safe to delete.
+  // Distinguishing them needs a persisted tri-state outcome rather than this lastError literal,
+  // which is a stopgap — two files agreeing on a string, which is why it is exported rather than
+  // duplicated.
   const snapshot = await tx.wmsOrderStatusSnapshot.findUnique({
     where: { orderId },
-    select: { connectorLabel: true, externalOrderNumber: true, externalOrderId: true, statusLabel: true },
+    select: {
+      connectorLabel: true,
+      externalOrderNumber: true,
+      externalOrderId: true,
+      statusLabel: true,
+      lastError: true,
+    },
   })
+  if (snapshot && !snapshot.externalOrderId && snapshot.lastError !== WMS_LOOKUP_NOT_FOUND) {
+    blockers.push({
+      code: 'wms_order_status_snapshot',
+      message:
+        `Cannot delete an order whose ${snapshot.connectorLabel} status lookup did not complete `
+        + `(${snapshot.lastError ?? 'no result recorded'}). Until a lookup authoritatively reports the `
+        + 'order is absent, it may still exist in the warehouse — re-run the status sweep, then retry.',
+    })
+  }
   if (snapshot?.externalOrderId) {
     const ref = snapshot.externalOrderNumber || snapshot.externalOrderId
     blockers.push({
