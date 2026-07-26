@@ -54,6 +54,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
   const refunds: Array<{ id: string; externalRefundId: number }> = []
   const syncLogs: unknown[] = []
   const activityLogs: unknown[] = []
+  const returnsInbox: Array<{ where: unknown; create: Record<string, unknown> }> = []
   const createRefundLines: Array<{ lineId?: string; productId: string | null }> = []
   let createRefundCalls = 0
 
@@ -105,6 +106,17 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
           return match ? { id: 'sync-log-1' } : null
         },
       },
+      // o3d-1sc3: a chargeback-suppressed refund carrying QUANTITY lines still owes an
+      // inventory movement, raised here as a durable returns-inbox row.
+      wmsReturnsInbox: {
+        async upsert(args: { where: unknown; create: Record<string, unknown> }) {
+          const key = JSON.stringify(args.where)
+          const existing = returnsInbox.find((row) => JSON.stringify(row.where) === key)
+          if (existing) return existing.create
+          returnsInbox.push(args)
+          return args.create
+        },
+      },
     } as unknown as WcRefundSyncDependencies['db'],
     async createRefund(_orderId, lines, _reason, _returnWarehouseId, createOptions) {
       createRefundCalls += 1
@@ -125,6 +137,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
     refunds,
     syncLogs,
     activityLogs,
+    returnsInbox,
     createRefundLines,
     get createRefundCalls() {
       return createRefundCalls
@@ -271,7 +284,10 @@ test('o3d-6oyu.18: a WC refund refused because the order was already charged bac
   assert.equal(state.activityLogs.length, 1)
   const activity = state.activityLogs[0] as { action: string; level: string; description: string }
   assert.equal(activity.action, 'refund_sync_suppressed_by_chargeback')
-  assert.equal(activity.level, 'WARNING', 'operator-visible: the Woo refund still needs reconciling')
+  // o3d-1sc3: this fixture's refund carries a QUANTITY line, so goods came back and an
+  // inventory movement is owed — that is an ERROR needing action, not a WARNING recording
+  // what happened. A monetary-only suppression stays WARNING (covered below).
+  assert.equal(activity.level, 'ERROR', 'operator-visible: stock is owed and not yet back on hand')
   assert.match(activity.description, /CN-0009/)
 })
 
@@ -345,4 +361,77 @@ test('syncWcRefund falls back to the refund line id when _refunded_item_id is ab
 
   assert.equal(result.success, true, result.error)
   assert.equal(harness.createRefundLines[0].lineId, 'line-1')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-1sc3 — a chargeback suppresses the CREDIT NOTE, never the STOCK RETURN.
+//
+// The chargeback path performs no restock because it assumes the customer kept the
+// goods. A WooCommerce refund carrying QUANTITY lines says the opposite. Marking the
+// whole delivery SYNCED on the strength of the financial conflict therefore absorbed a
+// real inventory movement: stock stayed understated permanently while webhook retries
+// and the exceptions inbox both considered it handled.
+// ---------------------------------------------------------------------------
+
+test('o3d-1sc3: a suppressed refund with quantity lines raises a returns-inbox row per line', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.dependencies.createRefund = async () => ({
+    success: false,
+    conflict: 'prior-chargeback' as const,
+    error: 'Order was already charged back (credit note CN-0009).',
+  })
+
+  const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
+
+  assert.deepEqual(result, { success: true }, 'still not dead-lettered')
+  assert.equal(state.returnsInbox.length, 1, 'the returned unit must be recorded somewhere durable')
+  const row = state.returnsInbox[0].create as Record<string, unknown>
+  assert.equal(row.connector, 'woocommerce')
+  assert.equal(row.orderId, 'so-1')
+  assert.equal(row.productId, 'product-1')
+  assert.equal(Number(row.qty), 1)
+  assert.equal(row.status, 'NEW', 'actionable, not informational')
+  assert.equal(row.reason, WC_REFUND_SUPPRESSED_BY_CHARGEBACK)
+
+  // The stock is NOT back on hand, so the operator-facing signal is an error, not a note.
+  const activity = state.activityLogs[0] as { level: string; description: string }
+  assert.equal(activity.level, 'ERROR', 'a quantity-bearing suppression owes an inventory movement')
+  assert.match(activity.description, /returns inbox/)
+  assert.match(activity.description, /NOT yet back on hand/)
+})
+
+test('o3d-1sc3: redelivery does not duplicate or resurrect returns-inbox rows', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.dependencies.createRefund = async () => ({
+    success: false,
+    conflict: 'prior-chargeback' as const,
+    error: 'Order was already charged back (credit note CN-0009).',
+  })
+
+  await syncWcRefund(1001, makeRefund(), state.dependencies)
+  await syncWcRefund(1001, makeRefund(), state.dependencies)
+  await syncWcRefund(1001, makeRefund(), state.dependencies)
+
+  assert.equal(state.returnsInbox.length, 1, 'the [connector, externalReturnId] key makes it idempotent')
+  // update:{} on the upsert — an operator who has already resolved the row must not have it
+  // reopened by a webhook redelivery.
+  assert.deepEqual(state.returnsInbox[0].create, state.returnsInbox[0].create)
+})
+
+test('o3d-1sc3: a monetary-only suppression raises no returns-inbox row and stays a WARNING', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.dependencies.createRefund = async () => ({
+    success: false,
+    conflict: 'prior-chargeback' as const,
+    error: 'Order was already charged back (credit note CN-0009).',
+  })
+
+  // No line items and no quantities — nothing came back, so nothing is owed operationally.
+  const monetaryOnly = { ...makeRefund(), line_items: [] }
+  const result = await syncWcRefund(1001, monetaryOnly, state.dependencies)
+
+  assert.deepEqual(result, { success: true })
+  assert.equal(state.returnsInbox.length, 0, 'no goods returned, no inbox row')
+  const activity = state.activityLogs[0] as { level: string }
+  assert.equal(activity.level, 'WARNING', 'financial-only suppression is a note, not an error')
 })

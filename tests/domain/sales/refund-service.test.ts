@@ -2624,7 +2624,7 @@ test('a refund that owes accounting is created with accountingRetryRequired set 
   client.salesOrderRefund.create = (async (args: { data: Record<string, unknown> }) => {
     flagAtCreate = args.data.accountingRetryRequired
     return realCreate(args as never)
-  }) as typeof client.salesOrderRefund.create
+  }) as unknown as typeof client.salesOrderRefund.create
 
   const result = await createSalesOrderRefund(client, {
     orderId: 'order-1',
@@ -2684,7 +2684,7 @@ test('a crash between commit and staging leaves the reversal recoverable, not si
   const client = createClient(state)
   client.salesOrderRefund.update = (async () => {
     throw new Error('process died before staging was recorded')
-  }) as typeof client.salesOrderRefund.update
+  }) as unknown as typeof client.salesOrderRefund.update
 
   await createSalesOrderRefund(client, {
     orderId: 'order-1',
