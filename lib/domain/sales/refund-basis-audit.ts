@@ -204,10 +204,21 @@ export function classifyRefundBasis(
   let sawNet = false
   let sawGross = false
 
+  // A refund line may only be trusted to identify its source when exactly ONE order line carries
+  // that product. With two lines for the same product, a GROSS refund for line A cross-linked to
+  // line B — whose NET happens to equal it — passes a product-equality check and classifies NET on a
+  // coincidence. Product identity narrows the link; it does not prove it.
+  const orderLineCountByProduct = new Map<string, number>()
+  for (const orderLine of orderLinesById.values()) {
+    if (orderLine.productId == null) continue
+    orderLineCountByProduct.set(orderLine.productId, (orderLineCountByProduct.get(orderLine.productId) ?? 0) + 1)
+  }
+
   for (const refundLine of refundLines) {
-    // A ZERO-value line carries no basis either way, so it neither proves nor blocks anything.
-    // Everything else must be positively classified — see below.
-    if (toDecimal(refundLine.totalBase).abs().lte(MONEY_EPSILON)) continue
+    // EXACTLY zero, not "small". An epsilon here silently exempts sub-cent lines: a proven NET line
+    // plus an unlinked 0.005 line would classify NET, and enough such lines hide a material
+    // unclassified amount while the header still reconciles. Dust is still value.
+    if (toDecimal(refundLine.totalBase).isZero()) continue
 
     const orderLine = refundLine.salesOrderLineId ? orderLinesById.get(refundLine.salesOrderLineId) : undefined
 
@@ -219,10 +230,15 @@ export function classifyRefundBasis(
     // false-confidence one, which is the opposite of what this backfill is for.
     if (!orderLine) return 'UNKNOWN'
 
-    // LINKED, but to a DIFFERENT product: the link is not trustworthy evidence. Product A's gross
-    // refund mislinked to product B whose net happens to equal it would classify NET on a
-    // coincidence. Identity must match before the comparison means anything.
-    if ((refundLine.productId ?? null) !== (orderLine.productId ?? null)) return 'UNKNOWN'
+    // The link must be POSITIVELY identified, which needs three things:
+    //
+    //   a real product on both sides — null == null compares equal while establishing nothing;
+    //   the same product on both sides — otherwise the comparison is against an unrelated line;
+    //   that product on exactly ONE order line — otherwise the caller-supplied salesOrderLineId
+    //   could name the wrong one of several and the numbers could agree by coincidence.
+    if (refundLine.productId == null || orderLine.productId == null) return 'UNKNOWN'
+    if (refundLine.productId !== orderLine.productId) return 'UNKNOWN'
+    if ((orderLineCountByProduct.get(orderLine.productId) ?? 0) > 1) return 'UNKNOWN'
 
     const verdict = classifyLinkedRefundLine(refundLine, orderLine)
     // `null` here means the comparison yielded NO evidence (an untaxed line, where net equals

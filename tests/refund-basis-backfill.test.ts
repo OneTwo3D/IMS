@@ -210,3 +210,98 @@ test('a link to a DIFFERENT product is not evidence, even when the numbers agree
 
   assert.deepEqual(plan.decisions, [], 'a mismatched product link proves nothing')
 })
+
+test('a SUB-CENT unlinked sibling still blocks the refund (o3d-lvk r2)', async () => {
+  // The first version exempted lines under a money epsilon, so a proven NET line plus an unlinked
+  // 0.005 line classified NET. Repeat that and a material unclassified amount hides while the header
+  // still reconciles. Dust is still value — only EXACTLY zero is inert.
+  const plan = await planRefundBasisBackfill([order({
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 100.005,
+      lines: [
+        { productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 100 },
+        { productId: null, salesOrderLineId: null, qty: 0, totalBase: 0.005 },
+      ],
+    }],
+  })])
+
+  assert.deepEqual(plan.decisions, [], 'a sub-cent unknown sibling is still an unknown sibling')
+})
+
+test('NEGATIVE dust blocks too — sign does not make a line inert (o3d-lvk r2)', async () => {
+  const plan = await planRefundBasisBackfill([order({
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 99.995,
+      lines: [
+        { productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 100 },
+        { productId: null, salesOrderLineId: null, qty: 0, totalBase: -0.005 },
+      ],
+    }],
+  })])
+
+  assert.deepEqual(plan.decisions, [], 'credit dust is unclassified value like any other')
+})
+
+test('two order lines for the SAME product make the link untrustworthy (o3d-lvk r2)', async () => {
+  // Product equality narrows the link; it does not prove it. With two lines for one product, a GROSS
+  // refund for line A (100 net -> 120 gross) cross-linked to line B whose NET is 120 passes a
+  // product check and classifies NET on a coincidence. The header cannot detect it either, because
+  // the header equals the refund line.
+  const plan = await planRefundBasisBackfill([order({
+    lines: [
+      { id: 'line-a', productId: 'p1', qty: 1, totalBase: 100, taxBase: 20 },
+      { id: 'line-b', productId: 'p1', qty: 1, totalBase: 120, taxBase: 24 },
+    ],
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 120,
+      lines: [{ productId: 'p1', salesOrderLineId: 'line-b', qty: 1, totalBase: 120 }],
+    }],
+  })])
+
+  assert.deepEqual(plan.decisions, [], 'a duplicated product cannot identify its source line')
+})
+
+test('a NULL product on either side is not an identity match (o3d-lvk r2)', async () => {
+  // null === null compares equal while establishing nothing at all.
+  const plan = await planRefundBasisBackfill([order({
+    lines: [{ id: 'line-1', productId: null, qty: 1, totalBase: 100, taxBase: 20 }],
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 100,
+      lines: [{ productId: null, salesOrderLineId: 'line-1', qty: 1, totalBase: 100 }],
+    }],
+  })])
+
+  assert.deepEqual(plan.decisions, [], 'two nulls are not a proven identity')
+})
+
+test('ZERO lines cannot pad the header tolerance into accepting a gross header (o3d-lvk r2)', async () => {
+  // The tolerance counted every line, so padding widened it: a 0.05 net line with a 0.06 header and
+  // 199 zero lines reconciled at 0.01005 — exactly the one-penny net/gross divergence the gate
+  // exists to catch. Rounding error comes from lines that carry value.
+  const zeroLines = Array.from({ length: 199 }, () => ({
+    productId: null, salesOrderLineId: null, qty: 0, totalBase: 0,
+  }))
+
+  const plan = await planRefundBasisBackfill([order({
+    lines: [{ id: 'line-1', productId: 'p1', qty: 1, totalBase: 0.05, taxBase: 0.01 }],
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 0.06,                                     // gross, while the line says net
+      lines: [
+        { productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 0.05 },
+        ...zeroLines,
+      ],
+    }],
+  })])
+
+  assert.deepEqual(plan.decisions, [], 'the header still has to reconcile, however many zero lines pad it')
+})

@@ -8,11 +8,16 @@ import type {
 /**
  * How far the header may sit from the sum of its lines and still count as the same number.
  *
- * Deliberately TIGHT — a few rounding ulps per line, not a proportional slack. A loose tolerance
- * here would let a genuinely divergent header pass as reconciled, and the whole point of the check
- * is that `totalsBasis` describes the header rather than the lines.
+ * Deliberately TIGHT — a few rounding ulps per VALUE-BEARING line, not a proportional slack, and
+ * CAPPED so it can never approach a plausible net/gross gap.
+ *
+ * The cap is the point. Counting every line, zero ones included, let padding widen the window: a
+ * 0.05 net line with a 0.06 header and 199 zero lines reconciled at a tolerance of 0.01005, which is
+ * exactly the one-penny net/gross divergence the gate exists to catch. Rounding error comes from
+ * lines that carry value; a zero line contributes none, so it must not buy tolerance.
  */
 const HEADER_RECONCILE_EPSILON_PER_LINE = 0.00005
+const HEADER_RECONCILE_MAX_TOLERANCE = 0.005
 
 /**
  * o3d-lvk: stamp `totalsBasis` on refunds written BEFORE the totals_basis migration.
@@ -102,10 +107,19 @@ export async function planRefundBasisBackfill(
       // stamping would tell the cumulative ceiling and the status reconciliation to trust a number
       // the lines never justified — so an unreconciled header stays unresolved and keeps failing
       // closed, exactly as the audit's own header path treats it.
-      const lineSum = refund.lines.reduce((sum, line) => sum + toDecimal(line.totalBase).toNumber(), 0)
-      const header = toDecimal(refund.totalBase).toNumber()
-      const tolerance = HEADER_RECONCILE_EPSILON_PER_LINE * (refund.lines.length + 1)
-      if (Math.abs(header - lineSum) > tolerance) {
+      // Summed as Decimal, not float: accumulating 200 line totals in binary floating point
+      // introduces its own drift, which would then be compared against a tolerance meant to measure
+      // the DATA's drift.
+      const lineSum = refund.lines.reduce(
+        (sum, line) => sum.add(toDecimal(line.totalBase)),
+        toDecimal(0),
+      )
+      const valueLineCount = refund.lines.filter((line) => !toDecimal(line.totalBase).isZero()).length
+      const tolerance = Math.min(
+        HEADER_RECONCILE_EPSILON_PER_LINE * (valueLineCount + 1),
+        HEADER_RECONCILE_MAX_TOLERANCE,
+      )
+      if (toDecimal(refund.totalBase).sub(lineSum).abs().toNumber() > tolerance) {
         unresolved.push({ refundId: refund.id, orderId: order.id })
         continue
       }
