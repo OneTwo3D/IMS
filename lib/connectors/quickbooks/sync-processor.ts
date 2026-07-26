@@ -958,21 +958,26 @@ export async function repairQuickBooksBackReferences(limit = 200): Promise<BackR
     take: limit,
   })
 
-  // A PURCHASE_INVOICE row references the PO, not a specific bill. With several bills on one PO the
-  // "latest unlinked bill" heuristic could stamp one bill's id onto another, so those are skipped
-  // for manual attribution rather than guessed at — the same rule Xero's sweep applies (audit-H3).
-  const poCandidateCounts = new Map<string, number>()
-  for (const row of candidates) {
-    if (row.type === 'PURCHASE_INVOICE' && row.referenceType === 'PurchaseOrder') {
-      poCandidateCounts.set(row.referenceId, (poCandidateCounts.get(row.referenceId) ?? 0) + 1)
-    }
-  }
-
   const result: BackReferenceRepairResult = { checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0 }
   const ambiguousPos = new Set<string>()
   for (const row of candidates) {
     if (!row.externalTransactionId || !syncTypeWritesBackReference(row.type, row.referenceType)) continue
-    if (row.type === 'PURCHASE_INVOICE' && row.referenceType === 'PurchaseOrder' && (poCandidateCounts.get(row.referenceId) ?? 0) > 1) {
+    // A PURCHASE_INVOICE row references the PO, not a specific bill, so repairing it means CHOOSING
+    // which bill the external id belongs to — and applyBackReference's fallback is "the newest
+    // unlinked bill for this PO", which is a guess.
+    //
+    // Xero's sweep guards this by counting matching rows, but that count is taken over the CAPPED
+    // PAGE: two rows for one PO straddling the page boundary each see a count of one, pass the
+    // guard, and get attributed by guesswork anyway. Counting globally would fix that particular
+    // hole, and still would not make the choice sound — a PO can have several unlinked bills with
+    // only one sync row visible, e.g. when a bill was created while sync was disabled.
+    //
+    // So this sweep refuses PO-referenced rows OUTRIGHT rather than reproducing a guard that only
+    // narrows the guessing. A wrong external id is worse than a missing one because it looks
+    // correct, and a later bill update would then modify the wrong remote document. These rows are
+    // reported for manual attribution; making them repairable needs an exact bill reference
+    // persisted at post time (o3d-9kek).
+    if (row.type === 'PURCHASE_INVOICE' && row.referenceType === 'PurchaseOrder') {
       result.skippedAmbiguous++
       // Collected, not logged per row. An ambiguous PO is never resolved by this sweep, so it is
       // re-selected on EVERY run — and at a five-minute cron that is 576 identical warnings a day
@@ -1052,9 +1057,10 @@ export async function repairQuickBooksBackReferences(limit = 200): Promise<BackR
       tag: 'sync',
       level: 'WARNING',
       description:
-        `Skipped QuickBooks back-reference repair for ${ambiguousPos.size} purchase order(s): each has `
-        + `multiple bills with unwritten external ids, which cannot be attributed automatically. Link `
-        + `them manually. POs: ${[...ambiguousPos].join(', ')}`,
+        `Skipped QuickBooks back-reference repair for ${ambiguousPos.size} purchase order(s): a `
+        + `PO-referenced sync row names the order, not a specific bill, so which bill the external id `
+        + `belongs to cannot be determined automatically. Link them manually. POs: `
+        + `${[...ambiguousPos].join(', ')}`,
       metadata: { referenceIds: [...ambiguousPos], skippedAmbiguous: result.skippedAmbiguous },
     })
   }

@@ -1563,7 +1563,20 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
     if (!missing) continue
     result.checked++
     try {
-      await applyBackReference(db, params, { markerOnly: true })
+      // o3d-0g2n: deliberately NOT markerOnly, unlike the QuickBooks sweep.
+      //
+      // The two sweeps are no longer the same shape. QuickBooks' does not touch status, so leaving
+      // invoiceNumber/invoicedAt unwritten there is recoverable — the row stays FAILED and visible.
+      // THIS one terminalises FAILED -> SYNCED below, so a marker-only repair would restore the id,
+      // drop the retry signal, and leave invoiceNumber and invoicedAt absent for good. VAT reporting
+      // selects on invoicedAt and invoice reporting on invoiceNumber, so the posted invoice would be
+      // omitted from EVERY period rather than assigned to a wrong one — a worse outcome than the
+      // period-shift markerOnly exists to prevent.
+      //
+      // Fixing this properly means recovering the authoritative number and date from Xero, or
+      // persisting them at post time, and is tracked as o3d-r5pj. Changing Xero's behaviour is out
+      // of scope for a QuickBooks parity PR either way.
+      await applyBackReference(db, params)
       // The follow-ups (PDF, payment, attachment) never ran on the original
       // failed pass — enqueue them now. hasExistingSyncLog makes this idempotent.
       try {

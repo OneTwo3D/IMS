@@ -31,6 +31,7 @@ const CONNECTED_AT = new Date('2026-07-01T00:00:00.000Z')
 
 type OrderRow = { accountingInvoiceId: string | null; invoiceNumber?: string | null; invoicedAt?: Date | null }
 let orders: Record<string, OrderRow> = {}
+let bills: Record<string, { accountingInvoiceId: string | null }> = {}
 let syncRows: SyncRow[] = []
 let token: { createdAt: Date } | null = { createdAt: CONNECTED_AT }
 let statusUpdates: Array<{ id: string; data: Record<string, unknown> }> = []
@@ -101,8 +102,13 @@ mock.module('@/lib/db', {
         },
       },
       purchaseInvoice: {
-        findUnique: async () => null,
-        findFirst: async () => null,
+        // An unlinked bill, so a PurchaseInvoice-referenced row genuinely needs repair and the probe
+        // does not short-circuit — otherwise the "IS repaired" test would pass vacuously.
+        findUnique: async () => bills['bill-1'] ?? null,
+        // Returns an unlinked bill, so a sweep that DID attribute a PO-referenced row would produce
+        // a visible write. Returning null unconditionally — as an earlier version did — made the
+        // "skipped" tests unfalsifiable: they could not tell refusal from a write that found nothing.
+        findFirst: async () => ({ id: 'bill-newest' }),
         update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
           documentWrites.push({ table: 'purchaseInvoice', id: where.id, data }); return {}
         },
@@ -123,6 +129,7 @@ async function runSweep() {
   statusUpdates = []
   createdRows = []
   documentWrites = []
+  bills = bills ?? {}
   const { repairQuickBooksBackReferences } = await import('@/lib/connectors/quickbooks/sync-processor')
   return repairQuickBooksBackReferences()
 }
@@ -216,21 +223,48 @@ test('with no connection at all, nothing is repaired (o3d-0g2n)', async () => {
   token = { createdAt: CONNECTED_AT }
 })
 
-test('a PO with several unlinked sync rows is skipped, not guessed at (o3d-0g2n)', async () => {
-  // A PURCHASE_INVOICE row references the PO, not a specific bill, so with several candidates the
-  // "newest unlinked invoice" fallback could stamp one bill's id onto another. A wrong external id
-  // is worse than a missing one, because it looks correct.
+test('a PO-referenced row is refused OUTRIGHT, even when it looks unambiguous (o3d-0g2n)', async () => {
+  // A PURCHASE_INVOICE row names the PO, not a bill, so repairing it means CHOOSING which bill the
+  // external id belongs to — and the fallback is "the newest unlinked bill", a guess.
+  //
+  // A count-based guard is not enough. Xero's counts matching rows within the CAPPED PAGE, so two
+  // rows for one PO straddling the boundary each see a count of one and are attributed anyway. And
+  // even a global count would not help when a PO has several unlinked bills but only one sync row —
+  // e.g. a bill created while sync was disabled.
+  //
+  // THIS IS THE SINGLE-ROW CASE: it passes every count-based guard, and must still be refused.
   orders = {}
   syncRows = [
     row({ id: 'log-a', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalTransactionId: 'QBO-201' }),
-    row({ id: 'log-b', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalTransactionId: 'QBO-202' }),
   ]
 
   const result = await runSweep()
 
-  assert.equal(result.skippedAmbiguous, 2, 'both ambiguous rows are skipped')
-  assert.equal(result.repaired, 0, 'and neither is attributed by guesswork')
-  assert.deepEqual(documentWrites, [], 'no bill was written — a wrong id is worse than a missing one')
+  assert.equal(result.skippedAmbiguous, 1, 'refused even though nothing looks ambiguous')
+  assert.equal(result.repaired, 0)
+  assert.deepEqual(
+    documentWrites,
+    [],
+    'and no bill was written — the double DOES offer one, so this would show a wrong attribution',
+  )
+})
+
+test('a PURCHASE_INVOICE row naming an actual bill IS repaired (o3d-0g2n)', async () => {
+  // The contrast that keeps the refusal narrow: when the row names the invoice itself there is
+  // nothing to choose, so it repairs normally. Refusing everything would be safe but useless.
+  orders = {}
+  bills = { 'bill-1': { accountingInvoiceId: null } }
+  syncRows = [
+    row({ id: 'log-c', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: 'bill-1', externalTransactionId: 'QBO-301' }),
+  ]
+
+  const result = await runSweep()
+
+  assert.equal(result.skippedAmbiguous, 0, 'an exact bill reference is not ambiguous')
+  assert.equal(result.repaired, 1)
+  assert.equal(documentWrites.length, 1)
+  assert.equal(documentWrites[0].table, 'purchaseInvoice')
+  assert.deepEqual(Object.keys(documentWrites[0].data), ['accountingInvoiceId'])
 })
 
 test('the sweep cannot write a type QuickBooks\' own writer would not (o3d-0g2n)', async () => {
