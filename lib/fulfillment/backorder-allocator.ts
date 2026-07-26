@@ -79,6 +79,9 @@ export async function allocateBackordersForProducts(
       id: true,
       orderNumber: true,
       externalOrderNumber: true,
+      // o3d-jby: the shared coverage selector treats FULL as zero demand, matching
+      // allocateSalesOrder. Both callers must supply it or they disagree again.
+      refundStatus: true,
       lines: { select: { id: true, qty: true, productId: true } },
     },
     orderBy: { createdAt: 'asc' },

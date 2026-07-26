@@ -228,6 +228,9 @@ async function defaultLoadCandidatesPage(
       id: true,
       orderNumber: true,
       externalOrderNumber: true,
+      // o3d-jby: the coverage selector needs this to match allocateSalesOrder, which treats
+      // FULL as unconditional zero demand rather than netting individual refund lines.
+      refundStatus: true,
       lines: { select: { id: true, qty: true, productId: true } },
     },
     orderBy: { id: 'asc' },

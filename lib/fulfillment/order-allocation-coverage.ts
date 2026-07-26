@@ -10,7 +10,17 @@ import {
 } from '@/lib/products/kit-fulfillment'
 
 export type CoverageOrderLine = { id: string; qty: unknown; productId: string | null }
-export type CoverageOrder = { id: string; lines: CoverageOrderLine[] }
+export type CoverageOrder = {
+  id: string
+  lines: CoverageOrderLine[]
+  /**
+   * o3d-jby: allocateSalesOrder treats FULL as UNCONDITIONAL zero demand — no per-line netting
+   * involved. Callers that can supply it must, or a fully-refunded order is selected on every
+   * rotation forever. Optional so a caller that genuinely cannot is not silently wrong; absent
+   * simply means "not known to be fully refunded".
+   */
+  refundStatus?: string | null
+}
 
 // Matches the tolerance the backorder report / allocator use when comparing ordered vs covered qty.
 const QUANTITY_TOLERANCE = 1e-6
@@ -71,6 +81,12 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
     coverageRowsByOrder.set(row.orderId, list)
   }
 
+  // A FULL refund is zero demand outright, matching allocateSalesOrder, which short-circuits on
+  // refundStatus rather than netting lines. Monetary-only, shipping-only and otherwise unlinked
+  // refund lines net NOTHING below, so without this a fully refunded order keeps gross demand
+  // here and is re-selected and rewritten on every rotation (o3d-jby).
+  const fullyRefunded = (order: CoverageOrder) => order.refundStatus === 'FULL'
+
   // Refunded quantity per ORDER LINE (o3d-jby). allocateSalesOrder defines demand as ordered
   // MINUS refunded, netted under the order lock; comparing coverage against GROSS qty here made
   // the two disagree, so a line with 10 ordered, 5 refunded and 5 allocated read as outstanding
@@ -78,20 +94,26 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
   // o3d-9lx sweep rotating continuously it became a permanent rewrite loop — every rotation
   // resetting staged allocation accounting, deleting and recreating identical allocations, and
   // emitting storefront syncs and activity for an order that was already fully covered.
-  const refundedByLine = new Map<string, number>()
+  //
+  // Keyed by (ORDER id, line id), not by line id alone. Nothing in the schema enforces that a
+  // refund line's salesOrderLineId belongs to its refund's order, and createSalesOrderRefund
+  // persists a caller-supplied lineId without checking that ownership — so a mislinked refund on
+  // order A could otherwise cancel demand on order B's line and drop B out of the sweep for good.
+  // Aggregating under the refund's OWN orderId makes a bad link inert instead of contagious.
+  const refundedByOrderLine = new Map<string, number>()
+  const refundKey = (orderId: string, lineId: string) => `${orderId}\u0000${lineId}`
   const refundLines = await db.salesOrderRefundLine.findMany({
     where: { refund: { orderId: { in: candidates.map((o) => o.id) } } },
-    select: { salesOrderLineId: true, qty: true },
+    select: { salesOrderLineId: true, qty: true, refund: { select: { orderId: true } } },
   })
   for (const row of refundLines) {
     if (!row.salesOrderLineId) continue
-    refundedByLine.set(
-      row.salesOrderLineId,
-      (refundedByLine.get(row.salesOrderLineId) ?? 0) + Number(row.qty),
-    )
+    const key = refundKey(row.refund.orderId, row.salesOrderLineId)
+    refundedByOrderLine.set(key, (refundedByOrderLine.get(key) ?? 0) + Number(row.qty))
   }
 
   return candidates.filter((order) => {
+    if (fullyRefunded(order)) return false
     const coverageByLine = calculateCoverageByLine(
       requirementsByLine,
       coverageRowsByOrder.get(order.id) ?? [],
@@ -103,7 +125,10 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
       const coverage = coverageByLine.get(line.id) ?? 0
       // Net demand, matching allocateSalesOrder. Clamped at zero: over-refunding a line means
       // no demand, not negative demand.
-      const netDemand = Math.max(0, Number(line.qty) - (refundedByLine.get(line.id) ?? 0))
+      const netDemand = Math.max(
+        0,
+        Number(line.qty) - (refundedByOrderLine.get(refundKey(order.id, line.id)) ?? 0),
+      )
       return netDemand > coverage + QUANTITY_TOLERANCE
     })
   })

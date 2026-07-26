@@ -15,7 +15,7 @@ mock.module('@/lib/products/kit-fulfillment', {
 })
 
 let allocRows: Array<{ orderId: string; lineId: string; productId: string; qty: number }> = []
-let refundLineRows: Array<{ salesOrderLineId: string | null; qty: number }> = []
+let refundLineRows: Array<{ salesOrderLineId: string | null; qty: number; refund: { orderId: string } }> = []
 
 mock.module('@/lib/db', {
   namedExports: {
@@ -109,7 +109,7 @@ test('a partially refunded line covered on NET demand is excluded (o3d-jby)', as
   // and hand the order back on every sweep rotation — each one resetting staged allocation
   // accounting and rewriting identical allocations.
   allocRows = [{ orderId: 'SO-1', lineId: 'SO-1-l1', productId: 'p1', qty: 5 }]
-  refundLineRows = [{ salesOrderLineId: 'SO-1-l1', qty: 5 }]
+  refundLineRows = [{ salesOrderLineId: 'SO-1-l1', qty: 5, refund: { orderId: 'SO-1' } }]
 
   const needing = await select([order('SO-1', 10)])
 
@@ -121,7 +121,7 @@ test('a partially refunded line still SHORT on net demand is included (o3d-jby)'
   resetRefunds()
   // 10 ordered, 2 refunded, 5 allocated -> net demand 8, still 3 short.
   allocRows = [{ orderId: 'SO-1', lineId: 'SO-1-l1', productId: 'p1', qty: 5 }]
-  refundLineRows = [{ salesOrderLineId: 'SO-1-l1', qty: 2 }]
+  refundLineRows = [{ salesOrderLineId: 'SO-1-l1', qty: 2, refund: { orderId: 'SO-1' } }]
 
   const needing = await select([order('SO-1', 10)])
 
@@ -132,7 +132,7 @@ test('a fully refunded, unallocated line is not selected forever (o3d-jby)', asy
   const select = await load()
   resetRefunds()
   allocRows = []
-  refundLineRows = [{ salesOrderLineId: 'SO-1-l1', qty: 10 }]
+  refundLineRows = [{ salesOrderLineId: 'SO-1-l1', qty: 10, refund: { orderId: 'SO-1' } }]
 
   const needing = await select([order('SO-1', 10)])
 
@@ -143,7 +143,7 @@ test('over-refunding clamps net demand at zero rather than going negative (o3d-j
   const select = await load()
   resetRefunds()
   allocRows = []
-  refundLineRows = [{ salesOrderLineId: 'SO-1-l1', qty: 12 }]
+  refundLineRows = [{ salesOrderLineId: 'SO-1-l1', qty: 12, refund: { orderId: 'SO-1' } }]
 
   const needing = await select([order('SO-1', 10)])
 
@@ -155,9 +155,54 @@ test('refund lines not linked to an order line are ignored (o3d-jby)', async () 
   resetRefunds()
   // A monetary-only refund line carries no salesOrderLineId; it reduces no line's demand.
   allocRows = []
-  refundLineRows = [{ salesOrderLineId: null, qty: 10 }]
+  refundLineRows = [{ salesOrderLineId: null, qty: 10, refund: { orderId: 'SO-1' } }]
 
   const needing = await select([order('SO-1', 10)])
 
   assert.deepEqual(needing.map((o) => o.id), ['SO-1'], 'an unlinked refund line must not cancel demand')
+})
+
+test('a FULL-refunded order is excluded even with no linked refund lines (o3d-jby)', async () => {
+  const select = await load()
+  resetRefunds()
+  // allocateSalesOrder short-circuits on refundStatus rather than netting lines, so a full
+  // MONETARY refund (nothing linked to an order line) is zero demand there. Without the same
+  // short-circuit here, gross demand survived and the order was rewritten every rotation.
+  allocRows = []
+  refundLineRows = []
+
+  const needing = await select([{ ...order('SO-1', 10), refundStatus: 'FULL' }])
+
+  assert.deepEqual(needing.map((o) => o.id), [])
+})
+
+test('a PARTIAL refundStatus still uses per-line netting (o3d-jby)', async () => {
+  const select = await load()
+  resetRefunds()
+  allocRows = []
+  refundLineRows = []
+
+  const needing = await select([{ ...order('SO-1', 10), refundStatus: 'PARTIAL' }])
+
+  assert.deepEqual(needing.map((o) => o.id), ['SO-1'], 'only FULL is unconditional zero demand')
+})
+
+test('a refund linked to ANOTHER order cannot cancel this order\'s demand (o3d-jby)', async () => {
+  const select = await load()
+  resetRefunds()
+  // Nothing in the schema enforces that a refund line's salesOrderLineId belongs to its refund's
+  // order, and createSalesOrderRefund does not validate it. Keyed by line id alone, order A's
+  // mislinked refund would cancel order B's demand and drop B out of the sweep for good.
+  allocRows = []
+  refundLineRows = [
+    { salesOrderLineId: 'SO-2-l1', qty: 10, refund: { orderId: 'SO-1' } },
+  ]
+
+  const needing = await select([order('SO-1', 10), order('SO-2', 10)])
+
+  assert.deepEqual(
+    needing.map((o) => o.id).sort(),
+    ['SO-1', 'SO-2'],
+    'the bad link is inert: it nets against SO-1 (which has no such line) and leaves SO-2 alone',
+  )
 })
