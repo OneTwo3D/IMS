@@ -481,7 +481,7 @@ test('the snapshot falls back to the external id when it has no order number (o3
   assert.match(blocker!.message, /sh-99/)
 })
 
-test('a PLACEHOLDER snapshot (WMS lookup found nothing) does NOT block (o3d-eu0r)', async () => {
+test('a CONFIRMED-ABSENT snapshot does NOT block (o3d-eu0r)', async () => {
   // order-status-sweep deliberately upserts a placeholder with an EMPTY externalOrderId,
   // statusLabel 'Unknown' and lastError 'Order not found in WMS' when an authoritative lookup
   // finds no order — and again after a lookup error. Nothing ever removes those rows. Treating
@@ -495,7 +495,7 @@ test('a PLACEHOLDER snapshot (WMS lookup found nothing) does NOT block (o3d-eu0r
         externalOrderNumber: 'SO-1',
         externalOrderId: '',
         statusLabel: 'Unknown',
-        lastError: 'Order not found in WMS',
+        lastError: 'Order confirmed absent in WMS (presence-probed)',
       },
     }),
     'order-1',
@@ -632,4 +632,27 @@ test('an AMBIGUOUS lookup snapshot blocks — several orders match, so one may b
 
   assert.equal(blocker?.code, 'wms_order_status_snapshot')
   assert.match(blocker!.message, /did not complete/)
+})
+
+test('a LEGACY not-found snapshot DOES block — it never distinguished absent from ambiguous (o3d-eu0r)', async () => {
+  // Rows written before the presence probe recorded every null fetch as this literal, ambiguous
+  // ones included. Accepting it would keep permitting deletion on a snapshot that cannot support
+  // the conclusion. Refreshing is not a safe compatibility mechanism either — the sweep is
+  // optional and batch-limited, so it may not have reached this order.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: null,
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'SO-1',
+        externalOrderId: '',
+        statusLabel: 'Unknown',
+        lastError: 'Order not found in WMS',
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'wms_order_status_snapshot')
 })
