@@ -45,6 +45,8 @@ export type SettlementStatus =
   | 'NOT_APPLICABLE'
   /** NOT paid in IMS, yet the ledger holds a payment for it. The disagreement pointing the other way. */
   | 'LEDGER_UNMATCHED'
+  /** The ledger recorded MORE than IMS claims was received — it is over-paid there. */
+  | 'OVER_SETTLED'
 
 export type SettlementVerdict = {
   status: SettlementStatus
@@ -148,6 +150,20 @@ export function settlementStatus(input: {
             `The ledger recorded a PART payment of ${paid} against a total of ${total} (payment ` +
             `${p.externalTransactionId}), so a balance is still outstanding there while IMS shows this ` +
             `as paid in full.`,
+        }
+      }
+      // OVER-PAYMENT IS ALSO A DISAGREEMENT, and only the shortfall was being checked (Codex, PR #582
+      // round 6). Reachable after a synced receipt is deleted and a SMALLER correction recorded: the
+      // ledger keeps the larger payment, the correction is refused as a second live registration, and
+      // comparing "ledger 100" against "claimed 40" one way round returned a green Settled over an
+      // invoice the ledger has been over-paid on.
+      if (typeof total === 'number' && typeof paid === 'number' && total > 0 && paid > total + 0.005) {
+        return {
+          status: 'OVER_SETTLED',
+          discrepancy: true,
+          detail:
+            `The ledger recorded ${paid} against a settlement of ${total} (payment ` +
+            `${p.externalTransactionId}), so it is OVER-paid there — reverse or adjust the payment in the ledger.`,
         }
       }
       return { status: 'SETTLED', discrepancy: false, detail: `Settled in the ledger (payment ${p.externalTransactionId}).` }

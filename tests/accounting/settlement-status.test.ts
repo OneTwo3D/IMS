@@ -116,7 +116,10 @@ test('a PART payment the ledger accepted is not full settlement', () => {
 test('a payment for the full amount is settled, and sub-penny rounding does not make it partial', () => {
   assert.equal(settlementStatus({ ...base, totalForeign: 1000, payment: row({ amount: 1000 }) }).status, 'SETTLED')
   assert.equal(settlementStatus({ ...base, totalForeign: 1000, payment: row({ amount: 999.999 }) }).status, 'SETTLED')
-  assert.equal(settlementStatus({ ...base, totalForeign: 1000, payment: row({ amount: 1000.5 }) }).status, 'SETTLED')
+  // A REAL excess is no longer swept into SETTLED (see the OVER_SETTLED case below). This line asserted
+  // 1000.5 was settled — as a catch-all for "an excess is not a shortfall", which was true of the
+  // question being asked then and hid an over-paid ledger once the verdict was put on screen.
+  assert.equal(settlementStatus({ ...base, totalForeign: 1000, payment: row({ amount: 1000.5 }) }).status, 'OVER_SETTLED')
 })
 
 test('with no amount recorded, a confirmed payment is still settled rather than guessed at', () => {
@@ -349,4 +352,20 @@ test('with no live-payment set known, nothing is dropped for ownership', () => {
   // The bill side passes rows without payment ids at all; it must behave exactly as before.
   const rows = effectivePaymentSyncRows([row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1' })])
   assert.equal(rows.length, 1)
+})
+
+test('a ledger that recorded MORE than IMS claims is over-paid, not settled', () => {
+  // Only the shortfall was checked, so a larger ledger amount fell through to a green SETTLED. Reachable
+  // after a synced receipt is deleted and a smaller correction recorded: the ledger keeps the larger
+  // payment and the correction is refused as a second live registration.
+  const v = settlementStatus({ ...base, payment: row({ externalTransactionId: 'PAY-1', amount: 100 }), totalForeign: 40 })
+  assert.equal(v.status, 'OVER_SETTLED')
+  assert.equal(v.discrepancy, true)
+  assert.match(v.detail, /OVER-paid/)
+})
+
+test('an exact settlement inside the rounding tolerance is still settled', () => {
+  const v = settlementStatus({ ...base, payment: row({ externalTransactionId: 'PAY-1', amount: 100.004 }), totalForeign: 100 })
+  assert.equal(v.status, 'SETTLED')
+  assert.equal(v.discrepancy, false)
 })

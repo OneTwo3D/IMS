@@ -2732,6 +2732,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           {inv.settlement.status === 'LEDGER_REJECTED' && ' · LEDGER REJECTED'}
                           {inv.settlement.status === 'NOT_SENT' && ' · NOT SENT TO LEDGER'}
                           {inv.settlement.status === 'PARTIALLY_SETTLED' && ' · PART PAID IN LEDGER'}
+                          {inv.settlement.status === 'OVER_SETTLED' && ' · OVER-PAID IN LEDGER'}
                         </span>
                       )}
                       {!inv.paidAt && inv.settlement.status === 'LEDGER_UNMATCHED' && (

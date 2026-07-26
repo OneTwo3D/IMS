@@ -570,12 +570,19 @@ export async function recordSalesPaymentViaUi(
 
   const dialog = page.getByRole('dialog', { name: /Add Payment/i })
   await expect(dialog).toBeVisible({ timeout: 30_000 })
+  // BY ID, and with an explicit timeout on every action. The dialog's <Label>s carry htmlFor (added with
+  // this helper) so getByLabel WOULD resolve — but an id is the same contract markBillPaidViaUi uses, and
+  // it does not silently depend on label text nobody thinks of as an API. The timeout matters more: fill()
+  // takes the CONFIG action timeout, which is unset here and so falls back to the TEST timeout — a locator
+  // that never resolves then eats the full 30 minutes and starves every later test in the file, which is
+  // exactly how this helper first failed.
+  const act = { timeout: 30_000 }
   // The amount defaults to the outstanding balance; only override when a case needs a part payment.
-  if (opts.amount !== undefined) await dialog.getByLabel(/^Amount/).fill(opts.amount)
-  if (opts.method !== undefined) await dialog.locator('select').selectOption({ value: opts.method })
-  if (opts.reference !== undefined) await dialog.getByLabel(/Reference/).fill(opts.reference)
+  if (opts.amount !== undefined) await dialog.locator('#payment-amount').fill(opts.amount, act)
+  if (opts.method !== undefined) await dialog.locator('#payment-method').selectOption({ value: opts.method }, act)
+  if (opts.reference !== undefined) await dialog.locator('#payment-reference').fill(opts.reference, act)
 
-  await dialog.getByRole('button', { name: /^Record Payment$/ }).click()
+  await dialog.getByRole('button', { name: /^Record Payment$/ }).click(act)
   // A refusal inside addPayment (over-balance, cancelled order) keeps the dialog open with an error, so a
   // hidden dialog is the signal the receipt was actually recorded.
   await expect(dialog).toBeHidden({ timeout: 30_000 })

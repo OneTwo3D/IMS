@@ -297,17 +297,17 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
       <div className="space-y-3 text-sm">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div className="space-y-1.5">
-            <Label>Amount ({currency}) *</Label>
-            <Input type="number" min="0.01" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className="h-9 font-mono" />
+            <Label htmlFor="payment-amount">Amount ({currency}) *</Label>
+            <Input id="payment-amount" type="number" min="0.01" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className="h-9 font-mono" />
           </div>
           <div className="space-y-1.5">
-            <Label>Date</Label>
-            <Input type="date" value={paidAt} onChange={(e) => setPaidAt(e.target.value)} className="h-9" />
+            <Label htmlFor="payment-date">Date</Label>
+            <Input id="payment-date" type="date" value={paidAt} onChange={(e) => setPaidAt(e.target.value)} className="h-9" />
           </div>
         </div>
         <div className="space-y-1.5">
-          <Label>Method</Label>
-          <select value={method} onChange={(e) => setMethod(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+          <Label htmlFor="payment-method">Method</Label>
+          <select id="payment-method" value={method} onChange={(e) => setMethod(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
             <option value="">Select…</option>
             <option value="Bank Transfer">Bank Transfer</option>
             <option value="Card">Card</option>
@@ -319,12 +319,12 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
           </select>
         </div>
         <div className="space-y-1.5">
-          <Label>Reference / Transaction ID</Label>
-          <Input value={reference} onChange={(e) => setReference(e.target.value)} placeholder="Optional" className="h-9" />
+          <Label htmlFor="payment-reference">Reference / Transaction ID</Label>
+          <Input id="payment-reference" value={reference} onChange={(e) => setReference(e.target.value)} placeholder="Optional" className="h-9" />
         </div>
         <div className="space-y-1.5">
-          <Label>Notes</Label>
-          <Input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Optional" className="h-9" />
+          <Label htmlFor="payment-notes">Notes</Label>
+          <Input id="payment-notes" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Optional" className="h-9" />
         </div>
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
@@ -964,6 +964,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     : settlement.status === 'NOT_SENT' ? ' · NOT SENT TO LEDGER'
     : settlement.status === 'PARTIALLY_SETTLED' ? ' · PART PAID IN LEDGER'
     : settlement.status === 'LEDGER_UNMATCHED' ? ' · PAID IN LEDGER ONLY'
+    : settlement.status === 'OVER_SETTLED' ? ' · OVER-PAID IN LEDGER'
     : ''
   const settlementTone =
     settlement.discrepancy
