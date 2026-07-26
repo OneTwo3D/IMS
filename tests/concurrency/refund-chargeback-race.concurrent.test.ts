@@ -60,11 +60,32 @@ test(
 
     const suffix = randomUUID()
     let orderId: string | undefined
+    let taxRateId: string | undefined
 
     try {
       // A minimal VAT-INCLUSIVE order: gross total 120 (net 100 + 20 VAT). The gross basis
       // matters — it is why createSalesOrderRefund's refund-total cap does NOT catch this
       // race on its own: the chargeback's NET 100 plus a 10 WC refund still fit under 120.
+      // The order needs a LINE carrying a tax identity, not just an order-level taxRatePercent.
+      // o3d-w00 #5 derives tax uniformity from `so.lines` — every line must share one non-null
+      // accountingTaxType and none may be reverse-charged — and a monetary-only refund is refused
+      // outright unless that holds, because an unattributable amount cannot be posted under a tax
+      // identity the order does not have.
+      //
+      // A lineless order makes that set EMPTY, so `size === 1` is false and every monetary-only
+      // refund fails closed. This fixture was lineless, so once o3d-w00 merged BOTH racers were
+      // refused and the test saw zero credit notes instead of exactly one — failing for a reason
+      // that has nothing to do with the race it exists to pin.
+      taxRateId = (await db.taxRate.create({
+        data: {
+          name: `RACE-VAT-${suffix.slice(0, 6)}`,
+          rate: new Prisma.Decimal('0.2'),
+          accountingTaxType: 'OUTPUT2',
+          reverseCharge: false,
+        },
+        select: { id: true },
+      })).id
+
       const order = await db.salesOrder.create({
         data: {
           orderNumber: `RACE-${suffix.slice(0, 8)}`,
@@ -78,6 +99,19 @@ test(
           totalBase: new Prisma.Decimal('120'),
           pricesIncludeVat: true,
           taxRatePercent: new Prisma.Decimal('0.2'),
+          lines: {
+            create: [{
+              description: 'Race fixture line',
+              qty: new Prisma.Decimal('1'),
+              unitPriceForeign: new Prisma.Decimal('100'),
+              unitPriceBase: new Prisma.Decimal('100'),
+              taxForeign: new Prisma.Decimal('20'),
+              taxBase: new Prisma.Decimal('20'),
+              totalForeign: new Prisma.Decimal('120'),
+              totalBase: new Prisma.Decimal('120'),
+              taxRateId,
+            }],
+          },
         },
         select: { id: true },
       })
@@ -136,7 +170,13 @@ test(
         // backstop is enqueued — nothing else to clean up.
         await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId } } }).catch(() => {})
         await db.salesOrderRefund.deleteMany({ where: { orderId } }).catch(() => {})
+        // Lines first: the order cascade may not cover them, and the tax rate cannot go while a
+        // line still references it.
+        await db.salesOrderLine.deleteMany({ where: { orderId } }).catch(() => {})
         await db.salesOrder.delete({ where: { id: orderId } }).catch(() => {})
+      }
+      if (taxRateId) {
+        await db.taxRate.delete({ where: { id: taxRateId } }).catch(() => {})
       }
       await db.$disconnect()
       await pool.end()
