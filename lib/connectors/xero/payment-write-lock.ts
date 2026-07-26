@@ -17,7 +17,8 @@ import { Pool, type PoolClient } from 'pg'
  * checks out ONE dedicated client and does acquire → run → release all on it, and verifies the
  * release actually happened (Codex review of #496, round 3).
  */
-export const PAYMENT_WRITE_LOCK_KEY = 4_112_208_032
+export { PAYMENT_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { PAYMENT_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 
 export type LockSkipped = { lockSkipped: true }
 export const LOCK_SKIPPED: LockSkipped = { lockSkipped: true }

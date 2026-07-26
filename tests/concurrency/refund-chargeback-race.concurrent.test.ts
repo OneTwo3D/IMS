@@ -55,8 +55,15 @@ test(
 
     // max: 4 — the two contenders must hold connections SIMULTANEOUSLY. A pool of 1 would
     // serialize them at the pool instead of at the database and prove nothing.
-    const pool = new pg.Pool({ connectionString: databaseUrl, max: 4 })
-    const db = new PrismaClient({ adapter: new PrismaPg(pool) })
+    // Config form, not `new PrismaPg(pool)` (o3d-4ajo). The adapter decides
+    // between "this is my pool" and "this is my config" with `instanceof
+    // pg.Pool`, so a second copy of `pg` anywhere in resolution makes it treat
+    // the Pool ITSELF as the config — and the failure surfaces far away, as a
+    // pg startup TypeError about a string argument. The pool is still created:
+    // its `end()` is what closes the connections this test opens.
+    const poolConfig = { connectionString: databaseUrl, max: 4 }
+    const pool = new pg.Pool(poolConfig)
+    const db = new PrismaClient({ adapter: new PrismaPg(poolConfig) })
 
     const suffix = randomUUID()
     let orderId: string | undefined
@@ -143,7 +150,18 @@ test(
         where: { orderId: order.id },
         select: { id: true, chargeback: true, externalRefundId: true },
       })
-      assert.equal(refunds.length, 1, `expected exactly one credit note, got ${refunds.length} — the order was double-reversed`)
+      // Say WHY on failure. "got 0" alone sent an intermittent CI red down a
+      // multi-hour hunt: both racers had been REFUSED, and which refusal it was
+      // is the entire diagnosis (a conflict, a quarantine, a lock timeout).
+      const verdicts = results
+        .map((r, i) => `${i === 0 ? 'chargeback' : 'wc-refund'}=${r.success
+          ? 'created'
+          : `refused(${'conflict' in r && r.conflict ? r.conflict : 'error'}: ${r.success === false ? r.error : ''})`}`)
+        .join(' | ')
+      assert.equal(
+        refunds.length, 1,
+        `expected exactly one credit note, got ${refunds.length} — ${verdicts}`,
+      )
 
       // And the loser failed CLEANLY: a typed `conflict`, never a raw error the operator has
       // to clear and never a dead-lettered sync.

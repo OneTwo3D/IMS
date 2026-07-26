@@ -59,7 +59,8 @@ type JournalLinePayload = {
 }
 type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | 'activityLog'>
 
-const QBO_DAILY_BATCH_LOCK_KEY = 4_112_208_032
+import { QBO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 const QBO_CONNECTOR = 'quickbooks'
 const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -433,10 +434,12 @@ export async function runDailyBatchSync(): Promise<{
   errors: string[]
 }> {
   const result = { groupA1: 0, groupA2: 0, groupB: 0, errors: [] as string[] }
-  const lockRows = await db.$queryRaw<Array<{ locked: boolean }>>`
-    SELECT pg_try_advisory_lock(${QBO_DAILY_BATCH_LOCK_KEY}) AS locked
-  `
-  if (!lockRows[0]?.locked) {
+  // o3d-4ajo: pinned to ONE connection. Taking this through Prisma and releasing
+  // it through Prisma can hit different pooled sockets, so the unlock silently
+  // no-ops and the lock leaks — and this key is shared with refund creation /
+  // the Xero payment jobs, so a leak stalls those too, not just the batch.
+  const batchLock = await acquirePinnedAdvisoryLockOrNull(QBO_DAILY_BATCH_LOCK_KEY)
+  if (!batchLock) {
     result.errors.push('Daily batch already running')
     return result
   }
@@ -456,6 +459,8 @@ export async function runDailyBatchSync(): Promise<{
 
   // --- Group A1: Revenue Deferral ---
   try {
+    // o3d-4ajo: a lost lock means another job can already be running.
+    batchLock.assertHeld('Group A1 (revenue deferral)')
     const orders = await db.salesOrder.findMany({
       where: {
         paidAt: { not: null },
@@ -549,6 +554,8 @@ export async function runDailyBatchSync(): Promise<{
 
   // --- Group A2: Inventory Reclassification ---
   try {
+    // o3d-4ajo: a lost lock means another job can already be running.
+    batchLock.assertHeld('Group A2 (inventory reclassification)')
     const orders = await db.salesOrder.findMany({
       where: {
         revenueDeferredDate: { not: null },
@@ -672,6 +679,8 @@ export async function runDailyBatchSync(): Promise<{
 
   // --- Group B: Shipment Revenue Recognition + COGS ---
   try {
+    // o3d-4ajo: a lost lock means another job can already be running.
+    batchLock.assertHeld('Group B (shipment revenue + COGS)')
     const groupBCount = await db.$transaction(async (tx) => {
       const shipments = await tx.shipment.findMany({
         where: {
@@ -1177,6 +1186,6 @@ export async function runDailyBatchSync(): Promise<{
 
     return result
   } finally {
-    await db.$executeRaw`SELECT pg_advisory_unlock(${QBO_DAILY_BATCH_LOCK_KEY})`
+    await batchLock.release()
   }
 }

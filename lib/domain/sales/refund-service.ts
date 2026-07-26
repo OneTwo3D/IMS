@@ -31,7 +31,8 @@ import { withSavepoint } from '@/lib/db/savepoint'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
-export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
+export { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.

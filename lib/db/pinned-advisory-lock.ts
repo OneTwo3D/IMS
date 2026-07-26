@@ -1,0 +1,126 @@
+import { Pool, type PoolClient } from 'pg'
+
+/**
+ * A SESSION-level advisory lock, held on one pinned connection (o3d-4ajo).
+ *
+ * `pg_try_advisory_lock(k)` lives on the connection that took it. Taking it
+ * through Prisma and releasing it through Prisma is not symmetric: the app's
+ * client runs each statement on an arbitrary pooled connection, so the unlock
+ * can land on a DIFFERENT socket, return false, and leave the original
+ * connection holding the lock until it happens to reset. Nobody notices,
+ * because the unlock's boolean result is normally discarded — and the next run
+ * of that job just reports "already running" forever.
+ *
+ * That is not theoretical for the daily accounting batches: they share the
+ * ACCOUNTING WRITE / PAYMENT WRITE domains with refund creation and the Xero
+ * payment jobs (see lib/db/advisory-locks.ts), so a leaked batch lock does not
+ * merely stall a batch — it stalls refunds, or suppresses payment writes.
+ *
+ * `lib/connectors/xero/payment-write-lock.ts` solved this first for its own
+ * lock; this is the same shape, callable by any job.
+ */
+
+let lockPool: Pool | null = null
+function getLockPool(): Pool {
+  if (!lockPool) {
+    const connectionString = process.env.DATABASE_URL
+    if (!connectionString) throw new Error('DATABASE_URL is required for advisory locks')
+    // Small: these are a handful of low-frequency, long-lived jobs.
+    lockPool = new Pool({ connectionString, max: 4 })
+  }
+  return lockPool
+}
+
+export class AdvisoryLockLostError extends Error {}
+
+export type PinnedAdvisoryLock = {
+  /** Release, verify the release, and return the connection (or destroy it). */
+  release: () => Promise<void>
+  /** True once the pinned connection has failed — the lock is NOT held any more. */
+  readonly lost: boolean
+  /**
+   * Throw if the lock has been lost. Call at each write phase: PostgreSQL frees
+   * a session lock the instant its connection dies, so from that moment another
+   * batch (or a refund) can start while this one is still running. Stopping is
+   * the only safe response — the exclusion this job assumed is gone.
+   */
+  assertHeld: (context?: string) => void
+}
+
+/**
+ * Take `key` on a dedicated connection, or return null if someone else holds it.
+ * The caller MUST call `release()` in a finally.
+ */
+export async function acquirePinnedAdvisoryLockOrNull(key: number): Promise<PinnedAdvisoryLock | null> {
+  const client: PoolClient = await getLockPool().connect()
+  // BEFORE anything else. pg-pool removes its own idle-error listener from a
+  // checked-out client, and this client then sits idle for the whole batch — so
+  // a server restart or socket failure would emit an 'error' with no listener,
+  // which takes the process down. It also means the lock is GONE: Postgres frees
+  // a session lock the moment its connection dies.
+  let lost = false
+  const onError = (error: Error) => {
+    lost = true
+    console.error(`[advisory-lock] pinned connection for ${key} failed — the lock is no longer held:`, error)
+  }
+  client.on('error', onError)
+  let acquired = false
+  try {
+    const rows = await client.query<{ locked: boolean }>(
+      'SELECT pg_try_advisory_lock($1) AS locked',
+      [key],
+    )
+    acquired = Boolean(rows.rows[0]?.locked)
+  } catch (error) {
+    client.removeListener('error', onError)
+    client.release(true)
+    throw error
+  }
+  if (!acquired) {
+    client.removeListener('error', onError)
+    client.release()
+    return null
+  }
+
+  return {
+    get lost() { return lost },
+    assertHeld(context?: string) {
+      if (lost) {
+        throw new AdvisoryLockLostError(
+          `Advisory lock ${key} was lost (its connection failed)${context ? ` before ${context}` : ''} — `
+          + 'another job may already be running, so this one must stop rather than write.',
+        )
+      }
+    },
+    async release() {
+      let destroyed = false
+      if (lost) {
+        // The session is gone; there is nothing to unlock and the connection
+        // must not go back to the pool.
+        client.removeListener('error', onError)
+        client.release(true)
+        return
+      }
+      try {
+        const released = await client.query<{ unlocked: boolean }>(
+          'SELECT pg_advisory_unlock($1) AS unlocked',
+          [key],
+        )
+        if (!released.rows[0]?.unlocked) {
+          // Returning a connection that still holds a session lock would wedge
+          // every job in this domain — including refunds. Destroy it instead:
+          // a closed connection releases its locks unconditionally.
+          console.error(`[advisory-lock] unlock of ${key} returned false — destroying the connection`)
+          client.release(true)
+          destroyed = true
+        }
+      } catch (error) {
+        console.error(`[advisory-lock] unlock of ${key} failed — destroying the connection:`, error)
+        client.release(true)
+        destroyed = true
+      }
+      client.removeListener('error', onError)
+      if (!destroyed) client.release()
+    },
+  }
+}

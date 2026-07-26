@@ -241,7 +241,7 @@ export const DEFERRAL_WARNING_ACTION = 'refund_reservation_release_deferred'
 export const UNMATCHED_WARNING_ACTION = 'refund_reservation_release_unmatched'
 
 // Advisory-lock namespace for the per-refund WARNING dedup (distinct from REFUND_ACCOUNTING_LOCK_KEY).
-const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
+import { REFUND_RELEASE_WARNING_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 
 /** Stable signed-int32 hash of a refund id for the second pg_advisory_xact_lock parameter. */
 function advisoryHash(value: string): number {

@@ -96,11 +96,13 @@ test(
       import('pg'),
       import('@/lib/cost-layers'),
     ])
-    const pool = new pg.Pool({
-      connectionString: databaseUrl,
-      max: 4,
-    })
-    const db = new PrismaClient({ adapter: new PrismaPg(pool) })
+    // Config form, not `new PrismaPg(pool)` (o3d-4ajo) — see the note in
+    // refund-chargeback-race.concurrent.test.ts: the adapter's `instanceof
+    // pg.Pool` check silently treats a Pool from a second copy of `pg` as its
+    // own config, and the failure lands far away as a pg startup TypeError.
+    const poolConfig = { connectionString: databaseUrl, max: 4 }
+    const pool = new pg.Pool(poolConfig)
+    const db = new PrismaClient({ adapter: new PrismaPg(poolConfig) })
 
     const suffix = randomUUID()
     const sku = `QG3-FIFO-${suffix}`
