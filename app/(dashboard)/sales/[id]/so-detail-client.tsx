@@ -297,17 +297,17 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
       <div className="space-y-3 text-sm">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div className="space-y-1.5">
-            <Label>Amount ({currency}) *</Label>
-            <Input type="number" min="0.01" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className="h-9 font-mono" />
+            <Label htmlFor="payment-amount">Amount ({currency}) *</Label>
+            <Input id="payment-amount" type="number" min="0.01" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className="h-9 font-mono" />
           </div>
           <div className="space-y-1.5">
-            <Label>Date</Label>
-            <Input type="date" value={paidAt} onChange={(e) => setPaidAt(e.target.value)} className="h-9" />
+            <Label htmlFor="payment-date">Date</Label>
+            <Input id="payment-date" type="date" value={paidAt} onChange={(e) => setPaidAt(e.target.value)} className="h-9" />
           </div>
         </div>
         <div className="space-y-1.5">
-          <Label>Method</Label>
-          <select value={method} onChange={(e) => setMethod(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+          <Label htmlFor="payment-method">Method</Label>
+          <select id="payment-method" value={method} onChange={(e) => setMethod(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
             <option value="">Select…</option>
             <option value="Bank Transfer">Bank Transfer</option>
             <option value="Card">Card</option>
@@ -319,12 +319,12 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
           </select>
         </div>
         <div className="space-y-1.5">
-          <Label>Reference / Transaction ID</Label>
-          <Input value={reference} onChange={(e) => setReference(e.target.value)} placeholder="Optional" className="h-9" />
+          <Label htmlFor="payment-reference">Reference / Transaction ID</Label>
+          <Input id="payment-reference" value={reference} onChange={(e) => setReference(e.target.value)} placeholder="Optional" className="h-9" />
         </div>
         <div className="space-y-1.5">
-          <Label>Notes</Label>
-          <Input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Optional" className="h-9" />
+          <Label htmlFor="payment-notes">Notes</Label>
+          <Input id="payment-notes" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Optional" className="h-9" />
         </div>
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
@@ -952,6 +952,31 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const isPaid = so.invoiceNumber != null && invoiceBalance <= 0.01
   const isPartiallyPaid = so.invoiceNumber != null && totalPaid > 0.01 && invoiceBalance > 0.01
 
+  // GREEN MEANS THE LEDGER AGREES (o3d-lgo.15). Everything above is IMS's own view of the money: a
+  // "Paid" badge said only that IMS was told it arrived. Registering the receipt against the accounting
+  // invoice is a separate sync that can fail, be cancelled, or never be queued at all — and this badge
+  // was an unconditional green over all three, so IMS claimed a settlement the ledger had no record of
+  // and nothing anywhere said so.
+  const settlement = so.settlement
+  const settlementSuffix =
+    settlement.status === 'AWAITING_LEDGER' ? ' · awaiting ledger'
+    : settlement.status === 'LEDGER_REJECTED' ? ' · LEDGER REJECTED'
+    : settlement.status === 'NOT_SENT' ? ' · NOT SENT TO LEDGER'
+    : settlement.status === 'PARTIALLY_SETTLED' ? ' · PART PAID IN LEDGER'
+    : settlement.status === 'LEDGER_UNMATCHED' ? ' · PAID IN LEDGER ONLY'
+    : settlement.status === 'OVER_SETTLED' ? ' · OVER-PAID IN LEDGER'
+    : ''
+  // Neither badge above can speak for an order with no local payment rows, so the verdict needs its own
+  // chip whenever there is something to say: a disagreement, or a payment still on its way.
+  const standaloneSettlement =
+    !isPaid && !isPartiallyPaid && (settlement.discrepancy || settlement.status === 'AWAITING_LEDGER')
+  const settlementTone =
+    settlement.discrepancy
+      ? 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200'
+      : settlement.status === 'AWAITING_LEDGER'
+      ? 'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200'
+      : 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
+
   function handleGenerateInvoice() {
     startTransition(async () => {
       const result = await generateInvoiceNumber(so.id)
@@ -1008,13 +1033,38 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           </span>
         )}
         {isPaid && (
-          <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200">
-            Paid
+          <span
+            className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-sm font-medium ${settlementTone}`}
+            title={settlement.detail}
+          >
+            {settlement.discrepancy && <AlertTriangle className="h-3.5 w-3.5" />}
+            Paid{settlementSuffix}
           </span>
         )}
         {isPartiallyPaid && (
-          <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200">
-            Part. Paid
+          <span
+            className="inline-flex items-center gap-1 rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200"
+            title={settlement.detail}
+          >
+            {settlement.discrepancy && <AlertTriangle className="h-3.5 w-3.5" />}
+            Part. Paid{settlementSuffix}
+          </span>
+        )}
+        {standaloneSettlement && (
+          /*
+            THE VERDICT WHEN NEITHER BADGE ABOVE RENDERS. Both are derived from LOCAL payment rows, and an
+            imported paid order has none — WooCommerce sets paidAt and the receipt is registered straight
+            from the invoice follow-up. So the most common paid order in the system showed no badge, and
+            with it no settlement state: a rejected or unsent payment on exactly those orders would have
+            been invisible, which is the thing this whole change exists to prevent (Codex, PR #582 round 7).
+            LEDGER_UNMATCHED lands here too — nothing is paid locally, by definition.
+          */
+          <span
+            className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-sm font-medium ${settlementTone}`}
+            title={settlement.detail}
+          >
+            {settlement.discrepancy && <AlertTriangle className="h-3.5 w-3.5" />}
+            {settlement.status === 'LEDGER_UNMATCHED' ? 'PAID IN LEDGER ONLY' : `Paid${settlementSuffix}`}
           </span>
         )}
 
@@ -1395,8 +1445,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             <div className="flex items-center gap-2 text-sm font-medium">
               <FileText className="h-4 w-4 text-muted-foreground" />
               Invoice {so.invoiceNumber}
-              {isPaid && <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200">Paid</span>}
-              {isPartiallyPaid && <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200">Part. Paid</span>}
+              {isPaid && <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${settlementTone}`} title={settlement.detail}>{settlement.discrepancy && <AlertTriangle className="h-3 w-3" />}Paid{settlementSuffix}</span>}
+              {isPartiallyPaid && <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200" title={settlement.detail}>{settlement.discrepancy && <AlertTriangle className="h-3 w-3" />}Part. Paid{settlementSuffix}</span>}
             </div>
             <div className="flex items-center gap-1.5">
               <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowInvoice(true)}>
@@ -1417,6 +1467,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               )}
             </div>
           </div>
+          {settlement.discrepancy && (
+            /* The whole point: say what the LEDGER thinks, in words someone can act on. The Balance
+               figure below is IMS's own arithmetic and will happily read "Settled" while the accounting
+               invoice is still outstanding — that gap is exactly what this line names. */
+            <p className="px-4 pt-2 text-[11px] text-red-700 dark:text-red-300">{settlement.detail}</p>
+          )}
           <div className="px-4 py-3 text-sm grid grid-cols-2 md:grid-cols-4 gap-4">
             <div>
               <span className="text-muted-foreground text-xs">Invoice Date</span>
@@ -1564,7 +1620,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               </div>
               <div>
                 <span className="text-muted-foreground text-xs">Status</span>
-                <p className="font-medium">{isPaid ? 'Paid' : isPartiallyPaid ? 'Partially Paid' : 'Unpaid'}</p>
+                <p className="font-medium">
+                  {isPaid ? 'Paid' : isPartiallyPaid ? 'Partially Paid' : 'Unpaid'}
+                  {settlementSuffix}
+                </p>
               </div>
               <div>
                 <span className="text-muted-foreground text-xs">Customer</span>

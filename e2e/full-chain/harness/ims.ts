@@ -546,6 +546,48 @@ export async function markBillPaidViaUi(
   await expect(page.getByText(/^Paid/).first()).toBeVisible({ timeout: 30_000 })
 }
 
+/**
+ * Record a customer receipt against the open sales order, the way an operator does (o3d-lgo.15).
+ *
+ * The SALES mirror of markBillPaidViaUi, and the only in-app trigger for an INVOICE_PAYMENT that does not
+ * come from an imported paid order: addPayment creates the local Payment row and — since o3d-lgo.15 —
+ * queues the INVOICE_PAYMENT itself, guarded (posted invoice, mapped bank account, and not already
+ * registered). The guard's refusals are what OC-21 exercises, so this helper deliberately does NOT assert
+ * that anything reached the ledger; it asserts only that IMS accepted the receipt.
+ *
+ * `method` is the dialog's <select> VALUE ("Bank Transfer", "Card", …). It is the key the payment-account
+ * map is looked up by ("method:currency"), so a method with no mapping is how a caller reaches the
+ * NO_BANK_ACCOUNT refusal without touching the map itself.
+ */
+export async function recordSalesPaymentViaUi(
+  page: Page,
+  opts: { amount?: string; method?: string; reference?: string },
+): Promise<void> {
+  // The Invoice panel carries the button; it only renders once the order HAS an invoice number.
+  const addPayment = page.getByRole('button', { name: /^Add Payment$/ }).first()
+  await expect(addPayment).toBeVisible({ timeout: 30_000 })
+  await addPayment.click()
+
+  const dialog = page.getByRole('dialog', { name: /Add Payment/i })
+  await expect(dialog).toBeVisible({ timeout: 30_000 })
+  // BY ID, and with an explicit timeout on every action. The dialog's <Label>s carry htmlFor (added with
+  // this helper) so getByLabel WOULD resolve — but an id is the same contract markBillPaidViaUi uses, and
+  // it does not silently depend on label text nobody thinks of as an API. The timeout matters more: fill()
+  // takes the CONFIG action timeout, which is unset here and so falls back to the TEST timeout — a locator
+  // that never resolves then eats the full 30 minutes and starves every later test in the file, which is
+  // exactly how this helper first failed.
+  const act = { timeout: 30_000 }
+  // The amount defaults to the outstanding balance; only override when a case needs a part payment.
+  if (opts.amount !== undefined) await dialog.locator('#payment-amount').fill(opts.amount, act)
+  if (opts.method !== undefined) await dialog.locator('#payment-method').selectOption({ value: opts.method }, act)
+  if (opts.reference !== undefined) await dialog.locator('#payment-reference').fill(opts.reference, act)
+
+  await dialog.getByRole('button', { name: /^Record Payment$/ }).click(act)
+  // A refusal inside addPayment (over-balance, cancelled order) keeps the dialog open with an error, so a
+  // hidden dialog is the signal the receipt was actually recorded.
+  await expect(dialog).toBeHidden({ timeout: 30_000 })
+}
+
 /** Drive the Xero connector page's "Process pending now". */
 export async function processPendingXeroSyncViaUi(page: Page): Promise<void> {
   await page.goto('/sync?connector=xero')
