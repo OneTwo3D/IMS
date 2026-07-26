@@ -14,7 +14,7 @@ import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditMemo } from './credit-notes'
 import { pushJournalEntry } from './journals'
-import { qboPost, qboUploadAttachment, resolveAccountRef } from './api'
+import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
@@ -510,7 +510,11 @@ async function processEntry(
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
       try {
-        const paymentRes = await qboPost<{ Payment: { Id: string } }>('payment', {
+        // o3d-b3gw: idempotent, like every other document this connector posts. Without a
+        // stable Request-Id, a payment that QuickBooks COMMITS but whose response is lost — or
+        // whose local "mark SYNCED" write then fails — is retried and creates a SECOND payment
+        // against the same invoice. That over-settles it and needs a manual reversal.
+        const paymentRes = await qboPostIdempotent<{ Payment: { Id: string } }>('payment', {
           CustomerRef: { value: customerRefId },
           TotalAmt: amount,
           TxnDate: paymentDate,
@@ -519,7 +523,7 @@ async function processEntry(
             Amount: amount,
             LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Invoice' }],
           }],
-        })
+        }, requestId)
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks payment' }
         }
@@ -556,7 +560,9 @@ async function processEntry(
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
       try {
-        const paymentRes = await qboPost<{ BillPayment: { Id: string } }>('billpayment', {
+        // o3d-b3gw: same reasoning as the customer payment above — a lost response must not
+        // become a second bill payment.
+        const paymentRes = await qboPostIdempotent<{ BillPayment: { Id: string } }>('billpayment', {
           VendorRef: { value: vendorRefId },
           TotalAmt: amount,
           TxnDate: paymentDate,
@@ -566,7 +572,7 @@ async function processEntry(
             Amount: amount,
             LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Bill' }],
           }],
-        })
+        }, requestId)
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks bill payment' }
         }
