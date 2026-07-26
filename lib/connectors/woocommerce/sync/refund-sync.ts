@@ -14,12 +14,7 @@ import type { createRefund as createRefundAction } from '@/app/actions/sales'
 type CreateRefundAction = typeof createRefundAction
 
 export type WcRefundSyncDependencies = {
-  // wmsReturnsInbox is here for o3d-1sc3: a chargeback-suppressed refund carrying quantity
-  // lines still owes an inventory movement, which is raised as a returns-inbox row.
-  db?: Pick<
-    typeof db,
-    'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | 'wmsReturnsInbox'
-  >
+  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog'>
   createRefund?: CreateRefundAction
   logActivity?: typeof logActivity
 }
@@ -252,43 +247,22 @@ export async function syncWcRefund(
       })
       // o3d-1sc3: suppressing the duplicate CREDIT NOTE is right; suppressing the STOCK
       // RETURN is not. A chargeback performs no restock because it assumes the customer kept
-      // the goods — but a Woo refund carrying QUANTITY lines says the opposite: goods came
-      // back. Marking the whole delivery SYNCED on the strength of the financial conflict
-      // therefore absorbed a real inventory movement, leaving stock understated permanently
-      // while webhook retries and the exceptions inbox both considered it handled.
+      // the goods — but a Woo refund carrying QUANTITY lines is at least evidence that units
+      // were refunded, and the chargeback path will never account for them. Marking the whole
+      // delivery SYNCED at WARNING therefore buried a possible inventory gap behind a note
+      // about a credit note.
       //
-      // Financial dedupe and operational ingestion are separated here: the credit note stays
-      // suppressed, and each returned line becomes a durable, resolvable WmsReturnsInbox row.
-      // That inbox is the existing home for "stock came back and someone must decide what
-      // happens to it", and its [connector, externalReturnId] unique key makes the write
-      // idempotent across redeliveries.
-      const returnedLines = refundLines.filter((line) => line.lineKind === 'sale' && line.qty > 0)
-
-      for (const [index, line] of returnedLines.entries()) {
-        await client.wmsReturnsInbox.upsert({
-          // One row per returned line, so a multi-line refund cannot collapse into one.
-          where: {
-            connector_externalReturnId: {
-              connector: 'woocommerce',
-              externalReturnId: `wc-refund-${wcRefund.id}-${index}`,
-            },
-          },
-          create: {
-            connector: 'woocommerce',
-            externalReturnId: `wc-refund-${wcRefund.id}-${index}`,
-            orderId: so.id,
-            productId: line.productId ?? null,
-            // sku is left to the product relation: so.lines does not select it, and refetching
-            // per line to duplicate a value the row already reaches via productId is not worth it.
-            qty: line.qty,
-            reason: WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
-            reference: `WC refund ${wcRefund.id}`,
-            status: 'NEW',
-          },
-          // A redelivery must not resurrect a row an operator has already resolved.
-          update: {},
-        })
-      }
+      // What this does NOT do, deliberately: assert that goods physically came back, or raise
+      // a WmsReturnsInbox row. WooCommerce's refund line carries a refunded QUANTITY and no
+      // received/restocked signal, so quantity alone cannot prove a physical return — and the
+      // returns inbox is currently Mintsoft-only (its loader, status action and restock action
+      // all filter connector='mintsoft'), so a row written here would be invisible and
+      // unresolvable. Claiming an actionable record that no screen shows would be worse than
+      // the WARNING it replaced. Generalising that inbox is o3d-92rl; establishing what actually
+      // proves a physical return on the WooCommerce side is o3d-etbf.
+      const refundedUnits = refundLines
+        .filter((line) => line.lineKind === 'sale' && line.qty > 0)
+        .reduce((sum, line) => sum + line.qty, 0)
 
       if (!alreadyRecorded) {
         await client.shoppingSyncLog.create({
@@ -302,22 +276,22 @@ export async function syncWcRefund(
             syncedAt: new Date(),
           },
         })
-        const returnedNote = returnedLines.length > 0
-          ? ` ${returnedLines.length} returned line(s) were raised in the returns inbox for restock review — the chargeback path performs no restock, so this stock is NOT yet back on hand.`
+        const returnedNote = refundedUnits > 0
+          ? ` This refund covered ${refundedUnits} unit(s): the chargeback path performs no restock, so if those units came back they are NOT on hand in IMS. Verify and adjust stock manually.`
           : ''
         await writeActivity({
           entityType: 'SALES_ORDER',
           entityId: so.id,
           action: 'refund_sync_suppressed_by_chargeback',
           tag: 'sync',
-          // Quantity-bearing refunds owe an inventory movement, so they are an ERROR that
-          // needs action, not a WARNING that merely records what happened.
-          level: returnedLines.length > 0 ? 'ERROR' : 'WARNING',
+          // A quantity-bearing refund may owe an inventory movement nothing else will make,
+          // so it needs action rather than a note. A monetary-only suppression owes nothing.
+          level: refundedUnits > 0 ? 'ERROR' : 'WARNING',
           description: `WooCommerce refund ${wcRefund.id} on order #${so.externalOrderNumber} was not recorded — the order was already charged back by the payment poller, and a second credit note would double-reverse it. Reconcile the Woo refund manually.${returnedNote} ${result.error ?? ''}`.trim(),
           metadata: {
             externalRefundId: wcRefund.id,
             parentOrderId: externalOrderId,
-            returnedLineCount: returnedLines.length,
+            refundedUnits,
           },
           resolveUser: false,
         })
