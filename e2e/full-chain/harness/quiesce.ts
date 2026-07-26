@@ -117,6 +117,11 @@ export type LockRecord = {
   e2eSettings: Record<string, string | null>
   createdWebhookIds: number[]
   /**
+   * Woo webhooks aimed at ANOTHER IMS (stage), paused for the run window with the status each had
+   * before. Absent on locks from an older build — release then simply has nothing to restore.
+   */
+  stageWebhooks?: Array<{ id: number; status: string }>
+  /**
    * Owner identity, so a LIVE holder can be told apart from the crash this lock's recovery was built for
    * (o3d-lgo.14). Optional: a lock written by an older build has neither, and is judged on age alone.
    */
@@ -603,6 +608,92 @@ async function assertPermanentWebhooks(creds: WcCreds, appUrl: string): Promise<
   console.log(`[quiesce] permanent delivery webhooks OK (${REQUIRED_WEBHOOK_TOPICS.join(', ')} -> ${host})`)
 }
 
+/**
+ * Woo webhooks that deliver to a DIFFERENT IMS than this one — in practice the stage instance.
+ *
+ * Only our own route is matched (`/api/webhooks/shopping/woocommerce`), which deliberately leaves the
+ * third-party Qoblex/ecartapi hooks alone: this module must not touch those (see the header).
+ */
+export function isStageBoundImsWebhook(deliveryUrl: string, thisHost: string): boolean {
+  // OUR route, so the third-party Qoblex/ecartapi hooks are never candidates however they are named —
+  // this module must not touch those (see the header). And NOT this instance, so the e2e hooks the run
+  // depends on are never paused by the very step that arms them.
+  if (!deliveryUrl.includes('/api/webhooks/shopping/woocommerce')) return false
+  let host: string
+  try {
+    host = new URL(deliveryUrl).host
+  } catch {
+    // An unparseable delivery_url is not something to switch off on a guess.
+    return false
+  }
+  // Host EQUALITY, not substring: "ims-e2e.example.com".includes("ims.example.com") is false, but the
+  // reverse pairing of names is exactly how a substring test silently spares the wrong hook.
+  return host !== thisHost
+}
+
+async function stageBoundImsWebhooks(creds: WcCreds, appUrl: string): Promise<Array<{ id: number; status: string; delivery_url: string }>> {
+  const host = new URL(appUrl).host
+  const hooks = await wcRequest<Array<{ id: number; status: string; delivery_url: string }>>(
+    creds, '/webhooks?per_page=100',
+  )
+  return hooks.filter((h) => isStageBoundImsWebhook(h.delivery_url, host))
+}
+
+/**
+ * PAUSE the stage instance's own delivery webhooks for the run window.
+ *
+ * Disabling stage's IMS settings is not enough. The webhooks live in WOOCOMMERCE, so every order this
+ * suite creates still fans a delivery out at stage — which, quiesced, cannot accept it. Two costs, both
+ * observed on 2026-07-26 (o3d-f737):
+ *
+ *   1. Every failed delivery is retried by Action Scheduler, and those retries queue AHEAD of this
+ *      run's own deliveries on a store whose queue only advances when WP-Cron is nudged. Order
+ *      deliveries that normally land in under a minute went undelivered for twenty, and three
+ *      consecutive OC-22 runs failed on a webhook that was never coming.
+ *   2. WooCommerce DISABLES a webhook after repeated delivery failures. Stage's order.updated hook had
+ *      already been auto-disabled with failure_count 6, and order.created was on its way — so running
+ *      this suite was quietly breaking the stage store's own order sync.
+ *
+ * Paused, not deleted: the status each hook had is recorded in the lock so release restores it, and a
+ * crashed run's recovery inherits that record exactly as it inherits stage's settings.
+ */
+async function pauseStageWebhooks(creds: WcCreds, recorded: Array<{ id: number; status: string }>): Promise<void> {
+  // Only the ACTIVE ones are touched. A hook an operator paused, or that Woo's own failure counter
+  // disabled, is left exactly as found — and its recorded status is what release puts back, so this
+  // never "activates" something that was off.
+  const toPause = recorded.filter((h) => h.status === 'active')
+  for (const hook of toPause) {
+    await withDeadline(
+      wcRequest(creds, `/webhooks/${hook.id}`, { method: 'PUT', body: JSON.stringify({ status: 'paused' }) }),
+      WEBHOOK_DELETE_TIMEOUT_MS,
+      `pausing stage webhook ${hook.id}`,
+    )
+  }
+  if (recorded.length) {
+    console.log(
+      `[quiesce] stage-bound webhooks: paused ${toPause.length ? toPause.map((h) => h.id).join(', ') : 'none'}` +
+        ` (recorded ${recorded.map((h) => `${h.id}=${h.status}`).join(', ')})`,
+    )
+  }
+}
+
+/** Put each stage-bound webhook back to the status the lock recorded. Idempotent. */
+async function restoreStageWebhooks(creds: WcCreds, recorded: Array<{ id: number; status: string }>): Promise<void> {
+  for (const { id, status } of recorded) {
+    try {
+      await withDeadline(
+        wcRequest(creds, `/webhooks/${id}`, { method: 'PUT', body: JSON.stringify({ status }) }),
+        WEBHOOK_DELETE_TIMEOUT_MS,
+        `restoring stage webhook ${id}`,
+      )
+    } catch (e) {
+      // Keep going: one unrestorable hook must not strand stage's SETTINGS, which matter more.
+      console.warn(`[quiesce] could not restore webhook ${id} to "${status}": ${e instanceof Error ? e.message : e}`)
+    }
+  }
+  if (recorded.length) console.log(`[quiesce] stage-bound webhooks restored: ${recorded.map((r) => r.id).join(', ')}`)
+}
+
 // --- public API -------------------------------------------------------------
 
 export type QuiesceHandle = { runId: string; deliveryUrlBase: string; token: LockToken }
@@ -822,6 +913,17 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
 
     // Snapshot + claim, once per attempt. The snapshot has to be INSIDE the attempt because a recovery
     // between attempts changes what the originals are (see claimLock).
+    // Read BEFORE the claim, so the statuses recorded are the ones that existed before this run touched
+    // anything — and so the heartbeat, which rewrites the record from its own captured copy, can never
+    // clobber them (they are in the record it captured). Same reason the settings are read here.
+    const priorStageWebhooks = await stageBoundImsWebhooks(await wcCreds(e2e), appUrl)
+      .then((hooks) => hooks.map((h) => ({ id: h.id, status: h.status })))
+      .catch((e) => {
+        // A store that will not list its webhooks is a store this run cannot quiesce safely: proceeding
+        // would fan failed deliveries at stage all run and, worse, leave nothing to restore.
+        throw new Error(`could not list Woo webhooks to quiesce stage's own delivery hooks: ${e instanceof Error ? e.message : e}`)
+      })
+
     const snapshot = async (): Promise<LockRecord> => {
       const prior: Record<string, string | null> = {}
       for (const key of STAGE_SETTINGS_TO_DISABLE) {
@@ -848,6 +950,7 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
         stageSettings: prior,
         e2eSettings: priorE2e,
         createdWebhookIds: [],
+        stageWebhooks: priorStageWebhooks,
       }
     }
 
@@ -873,6 +976,11 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
       )
     }
     console.log(`[quiesce] stage disabled: ${STAGE_SETTINGS_TO_DISABLE.join(', ')}`)
+
+    // Stage's own webhooks live in WOOCOMMERCE, so disabling its settings does not stop Woo delivering
+    // to it — it only guarantees the delivery FAILS (o3d-f737). The statuses to put back are already in
+    // the claim, written before this mutates anything, so a crash here still restores correctly.
+    await pauseStageWebhooks(creds, claimed.lock.stageWebhooks ?? [])
 
     for (const key of E2E_SETTINGS_TO_ENABLE) {
       await e2e.query(
@@ -909,6 +1017,12 @@ async function releaseInternal(
   // `createdWebhookIds` is only honoured for locks written by the older create-per-run
   // design, so an in-flight lock from before that change still cleans up correctly
   // rather than orphaning its hooks.
+  if (lock.stageWebhooks?.length) {
+    // Before the settings restore: a hook put back while stage is still disabled simply fails once more,
+    // whereas stage re-enabled with its hooks still paused is a store that silently stops importing.
+    const creds = await wcCreds(e2e)
+    await restoreStageWebhooks(creds, lock.stageWebhooks)
+  }
   if (lock.createdWebhookIds?.length) {
     const creds = await wcCreds(e2e)
     for (const id of lock.createdWebhookIds) {
