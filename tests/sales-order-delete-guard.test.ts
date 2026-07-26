@@ -611,3 +611,25 @@ test('a snapshot with NO error marker at all also fails closed (o3d-eu0r)', asyn
   assert.equal(blocker?.code, 'wms_order_status_snapshot')
   assert.match(blocker!.message, /no result recorded/)
 })
+
+test('an AMBIGUOUS lookup snapshot blocks — several orders match, so one may be real (o3d-x9nc)', async () => {
+  // The paired half of the sweep change: the sweep now records ambiguity distinctly, and the
+  // guard must treat anything that is not the authoritative not-found marker as unresolved.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: null,
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'SO-1',
+        externalOrderId: '',
+        statusLabel: 'Unknown',
+        lastError: 'WMS lookup ambiguous — several orders match this reference',
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'wms_order_status_snapshot')
+  assert.match(blocker!.message, /did not complete/)
+})

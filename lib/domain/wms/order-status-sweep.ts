@@ -32,6 +32,21 @@ export type WmsOrderStatusSweepResult = {
  */
 export const WMS_LOOKUP_NOT_FOUND = 'Order not found in WMS'
 
+/**
+ * The lastError written when the lookup could not decide — several WMS orders match this
+ * reference (merged/split candidates), so "no single order" is NOT "no order" (o3d-x9nc).
+ *
+ * Kept distinct from WMS_LOOKUP_NOT_FOUND because the delete guard must fail CLOSED on this:
+ * an ambiguous result means a real warehouse order probably exists, it just cannot be named.
+ */
+export const WMS_LOOKUP_AMBIGUOUS = 'WMS lookup ambiguous — several orders match this reference'
+
+/**
+ * The lookup could not read a status, but a presence probe says the order IS there. A
+ * contradiction rather than an absence, and it blocks deletion for the obvious reason.
+ */
+export const WMS_LOOKUP_PRESENT_NO_STATUS = 'WMS holds this order but its status could not be read'
+
 export async function runWmsOrderStatusSweep(
   options?: { batchSize?: number; staleMinutes?: number },
 ): Promise<WmsOrderStatusSweepResult> {
@@ -87,6 +102,34 @@ export async function runWmsOrderStatusSweep(
       const status = await connector.fetchOrderStatus(reference)
       const tracking = status?.tracking.find((entry) => entry.trackingNumber || entry.carrier)
 
+      // fetchOrderStatus returns null for BOTH "no such order" and "several candidates match"
+      // (merged/split references). Those are opposite conclusions for anything that acts on the
+      // snapshot — the delete guard treats an authoritative MISSING as safe and must fail closed
+      // on AMBIGUOUS — so resolve it with probeOrderPresence, which already reports the
+      // distinction, rather than recording both as not-found (o3d-x9nc).
+      //
+      // Only on the null path, so a found order costs no extra call. A connector without
+      // probeOrderPresence stays on the conservative reading: unresolved, so the guard blocks.
+      let notFoundReason = WMS_LOOKUP_NOT_FOUND
+      if (!status) {
+        if (!connector.probeOrderPresence) {
+          notFoundReason = 'WMS lookup could not be confirmed — connector cannot probe presence'
+        } else {
+          try {
+            const presence = await connector.probeOrderPresence(reference)
+            if (presence === 'AMBIGUOUS') notFoundReason = WMS_LOOKUP_AMBIGUOUS
+            // FOUND after a null fetch is a CONTRADICTION, not ambiguity: the order is there but
+            // its status could not be read. Distinct marker so the reason stays truthful, and it
+            // blocks for the same reason — the warehouse holds this order.
+            else if (presence === 'FOUND') notFoundReason = WMS_LOOKUP_PRESENT_NO_STATUS
+          } catch (probeError) {
+            notFoundReason = `WMS presence probe failed: ${
+              probeError instanceof Error ? probeError.message : String(probeError)
+            }`
+          }
+        }
+      }
+
       const fields = status
         ? {
             connector: connectorId,
@@ -118,7 +161,7 @@ export async function runWmsOrderStatusSweep(
             deepLinkUrl: null,
             trackingNumber: null,
             carrier: null,
-            lastError: WMS_LOOKUP_NOT_FOUND,
+            lastError: notFoundReason,
           }
 
       await db.wmsOrderStatusSnapshot.upsert({
