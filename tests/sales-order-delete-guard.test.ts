@@ -1,5 +1,5 @@
 import test from 'node:test'
-import { startOfUtcDay } from '@/lib/domain/accounting/daily-batch-retention'
+import { recreateJournaledDateFilter, startOfUtcDay } from '@/lib/domain/accounting/daily-batch-retention'
 import assert from 'node:assert/strict'
 
 import {
@@ -461,4 +461,26 @@ test('startOfUtcDay floors a mid-day cutoff to the batch-day marker it is compar
     'flooring includes the whole batch day — only ever widening, which is the safe direction',
   )
   assert.equal(startOfUtcDay(middayCutoff).toISOString(), '2026-07-20T00:00:00.000Z')
+})
+
+test('the RECOVERY cutoff stays exact — flooring it would recreate a purged, already-posted batch (o3d-0qoo)', async () => {
+  // Flooring is right for reconciliation SCANS (a wider window only finds more), but wrong for
+  // RECOVERY. Sync-log retention purges against an exact createdAt, so a floored recovery filter
+  // would include a batch-day stamp whose log has already been purged, see no live log, and
+  // re-queue a journal that is already in the ledger. Duplicate journals are far worse than a
+  // boundary-day batch that recovery declines to recreate.
+  //
+  // The same helper is also applied to shipmentJournalDate, which is a genuine wall-clock
+  // timestamp and must not be floored at all.
+  const cutoff = new Date('2026-01-26T08:00:00.000Z')
+  const filter = await recreateJournaledDateFilter(new Date('2026-07-26T12:00:00.000Z'))
+
+  if ('gte' in filter) {
+    assert.notEqual(
+      filter.gte.toISOString(),
+      startOfUtcDay(cutoff).toISOString(),
+      'the recovery cutoff must NOT be floored to midnight',
+    )
+    assert.notEqual(filter.gte.getUTCHours() === 0 && filter.gte.getUTCMinutes() === 0, true)
+  }
 })

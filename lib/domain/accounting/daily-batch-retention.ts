@@ -41,15 +41,19 @@ export async function recreateRetentionCutoff(now: Date = new Date()): Promise<D
 /** Prisma date filter for recreate's journaled-shipment/order queries: within the
  *  retention window when set ({ gte } also excludes nulls), else any non-null marker.
  *
- *  The cutoff is floored to UTC start-of-day (o3d-0qoo). revenueDeferredDate and
- *  inventoryAllocatedDate are BATCH-DAY markers — the daily syncs stamp them with the batch
- *  date's midnight so they agree with the batch reference — so comparing them against a
- *  mid-day wall-clock cutoff would age a whole batch day out early: an order staged at 23:00
- *  is stamped 00:00 and would fall outside a window that a wall-clock reading includes.
- *  Flooring only ever WIDENS the window, which for a recovery query is the safe direction. */
+ *  The cutoff stays EXACT here, deliberately (o3d-0qoo). Flooring it to UTC start-of-day —
+ *  which is right for reconciliation SCANS — is dangerous for RECOVERY: sync-log retention
+ *  purges against an exact `createdAt`, so a floored filter would include a batch-day stamp
+ *  whose log has already been purged, find no live log, and re-queue an ALREADY POSTED
+ *  journal. Duplicate journals are far worse than a boundary-day batch that recovery declines
+ *  to recreate. This helper is also applied to `shipmentJournalDate`, which is a genuine
+ *  wall-clock timestamp and must not be floored at all.
+ *
+ *  Recovering the boundary day safely needs day-aligned purging, or a durable exact batch
+ *  reference per order — tracked on o3d-v7sy. */
 export async function recreateJournaledDateFilter(now?: Date): Promise<{ gte: Date } | { not: null }> {
   const cutoff = await recreateRetentionCutoff(now)
-  return cutoff ? { gte: startOfUtcDay(cutoff) } : { not: null }
+  return cutoff ? { gte: cutoff } : { not: null }
 }
 
 /** Midnight UTC on the same day as `value`. Batch-day markers are stamped at exactly this. */

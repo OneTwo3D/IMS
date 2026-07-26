@@ -174,6 +174,12 @@ export async function findSalesOrderDeleteBlocker(
   // So the STATUS FILTER cannot come first — a posted-but-cancelled row would not even be
   // selected, and if the back-reference also failed there is no accountingInvoiceId either. The
   // match is therefore "live status OR carries an external id", whatever the status (o3d-v7sy).
+  //
+  // NOT COVERED (o3d-sref): a STALE PROCESSING claim that the orphan sweep retires to CANCELLED
+  // before its worker wrote a result. There is no external id yet, so nothing here can see it,
+  // and a late remote success then strands the document. Closing that needs the orphan sweep to
+  // keep such rows ambiguous rather than retired, and the processors to fence their writeback on
+  // the claim they hold — the guard cannot do it alone.
   const candidateDocuments = await tx.accountingSyncLog.findMany({
     where: {
       OR: orderKeyed,
