@@ -10,7 +10,7 @@
  * closed, which is the safe default — a wrong basis silently changes what a later refund may post.
  *
  * Usage:
- *   tsx scripts/backfill-refund-basis.ts [--dry-run] [--yes] [--allow-production] [--limit N]
+ *   tsx scripts/backfill-refund-basis.ts [--dry-run] [--yes] [--allow-production] [--page-size N]
  *
  * --dry-run reports exactly what a real run would stamp, because the decision is computed by the
  * same pure function the write path uses.
@@ -24,6 +24,7 @@ import {
   planRefundBasisBackfill,
   applyRefundBasisBackfill,
   type RefundBasisBackfillOrder,
+  type RefundBasisBackfillPlan,
 } from '../lib/domain/sales/refund-basis-backfill'
 
 // .env MUST load before lib/db is imported: that module builds its pg Pool from
@@ -48,33 +49,74 @@ async function main() {
   const dryRun = hasFlag('dry-run')
   const assumeYes = hasFlag('yes')
   const allowProduction = hasFlag('allow-production')
-  const limit = numericArg('limit', 5000)
+  // Page SIZE, not a total cap: every page is walked in one invocation, so this only bounds memory.
+  const pageSize = numericArg('page-size', 500)
 
   if (process.env.NODE_ENV === 'production' && !allowProduction) {
     throw new Error('Refusing to run the refund-basis backfill in production without --allow-production')
   }
 
-  // Only orders that HAVE an unstamped refund are worth loading. Anything else cannot change.
-  const orders = await db.salesOrder.findMany({
-    where: { refunds: { some: { totalsBasis: null } } },
-    select: {
-      id: true,
-      lines: { select: { id: true, productId: true, qty: true, totalBase: true, taxBase: true } },
-      refunds: {
-        select: {
-          id: true,
-          totalsBasis: true,
-          lines: { select: { productId: true, salesOrderLineId: true, qty: true, totalBase: true } },
+  // KEYSET pagination over (createdAt, id), advancing whether or not anything was stamped.
+  //
+  // The obvious shape — "take the oldest N orders that still have a NULL basis, rerun for the rest"
+  // — cannot work here, and would have been a silent no-op. UNKNOWN refunds stay NULL BY DESIGN, so
+  // they never leave the filter: if the oldest N orders are unresolved, every rerun returns exactly
+  // the same batch and no later order is ever scanned, while the output cheerfully says to rerun for
+  // the rest. That is the same starvation shape as the accounting back-reference sweeps (o3d-9kek),
+  // and this is a fresh instance of it rather than an inherited one.
+  //
+  // createdAt alone is not unique, so the cursor carries id as a tiebreak; ordering by both makes the
+  // batch boundary stable across runs.
+  const plan: RefundBasisBackfillPlan = { decisions: [], unresolved: [], alreadyStamped: 0 }
+  let cursor: { createdAt: Date; id: string } | null = null
+  let scanned = 0
+  let pages = 0
+
+  for (;;) {
+    const page: Array<{ id: string; createdAt: Date } & RefundBasisBackfillOrder> = await db.salesOrder.findMany({
+      where: {
+        refunds: { some: { totalsBasis: null } },
+        ...(cursor
+          ? {
+            OR: [
+              { createdAt: { gt: cursor.createdAt } },
+              { createdAt: cursor.createdAt, id: { gt: cursor.id } },
+            ],
+          }
+          : {}),
+      },
+      select: {
+        id: true,
+        createdAt: true,
+        lines: { select: { id: true, productId: true, qty: true, totalBase: true, taxBase: true } },
+        refunds: {
+          select: {
+            id: true,
+            totalsBasis: true,
+            totalBase: true,
+            lines: { select: { productId: true, salesOrderLineId: true, qty: true, totalBase: true } },
+          },
         },
       },
-    },
-    orderBy: { createdAt: 'asc' },
-    take: limit,
-  })
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: pageSize,
+    }) as never
 
-  const plan = await planRefundBasisBackfill(orders as unknown as RefundBasisBackfillOrder[])
+    if (page.length === 0) break
 
-  console.log(`orders scanned:            ${orders.length}${orders.length === limit ? ` (LIMIT reached — rerun for the rest)` : ''}`)
+    const pagePlan = await planRefundBasisBackfill(page)
+    plan.decisions.push(...pagePlan.decisions)
+    plan.unresolved.push(...pagePlan.unresolved)
+    plan.alreadyStamped += pagePlan.alreadyStamped
+
+    scanned += page.length
+    pages++
+    const last = page[page.length - 1]
+    cursor = { createdAt: last.createdAt, id: last.id }
+    if (page.length < pageSize) break
+  }
+
+  console.log(`orders scanned:            ${scanned} (in ${pages} page(s) of ${pageSize} — full sweep, no rerun needed)`)
   console.log(`refunds already stamped:   ${plan.alreadyStamped}`)
   console.log(`refunds to stamp:          ${plan.decisions.length}`)
   console.log(`  NET:                     ${plan.decisions.filter((d) => d.basis === 'NET').length}`)

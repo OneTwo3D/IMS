@@ -203,18 +203,39 @@ export function classifyRefundBasis(
 ): RefundStoredBasis {
   let sawNet = false
   let sawGross = false
+
   for (const refundLine of refundLines) {
+    // A ZERO-value line carries no basis either way, so it neither proves nor blocks anything.
+    // Everything else must be positively classified — see below.
+    if (toDecimal(refundLine.totalBase).abs().lte(MONEY_EPSILON)) continue
+
     const orderLine = refundLine.salesOrderLineId ? orderLinesById.get(refundLine.salesOrderLineId) : undefined
-    if (!orderLine) continue
+
+    // UNLINKED, but carrying value: no order line to compare against, so its basis is unknown — and
+    // an unknown sibling makes the WHOLE refund unknown. Skipping it (the first version of this
+    // function did) let a single NET-looking line certify a refund that also contained, say, an
+    // unlinked GROSS monetary amount. Stamping that NET would tell refund-service's net ceiling and
+    // the status reconciliation to trust the whole refund — turning a conservative guard into a
+    // false-confidence one, which is the opposite of what this backfill is for.
+    if (!orderLine) return 'UNKNOWN'
+
+    // LINKED, but to a DIFFERENT product: the link is not trustworthy evidence. Product A's gross
+    // refund mislinked to product B whose net happens to equal it would classify NET on a
+    // coincidence. Identity must match before the comparison means anything.
+    if ((refundLine.productId ?? null) !== (orderLine.productId ?? null)) return 'UNKNOWN'
+
     const verdict = classifyLinkedRefundLine(refundLine, orderLine)
-    if (verdict === 'ambiguous') return 'UNKNOWN'
+    // `null` here means the comparison yielded NO evidence (an untaxed line, where net equals
+    // gross). For a value-carrying line that is still an unproven basis, so it blocks too.
+    if (verdict === null || verdict === 'ambiguous') return 'UNKNOWN'
     if (verdict === 'net') sawNet = true
-    else if (verdict === 'gross') sawGross = true
-    // null = no evidence (untaxed line) — ignore
+    else sawGross = true
   }
+
   if (sawNet && sawGross) return 'UNKNOWN'
   if (sawGross) return 'GROSS'
   if (sawNet) return 'NET'
+  // No value-carrying line at all: nothing was proven, so nothing is claimed.
   return 'UNKNOWN'
 }
 

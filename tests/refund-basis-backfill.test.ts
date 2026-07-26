@@ -29,7 +29,7 @@ function order(over: Partial<RefundBasisBackfillOrder> = {}): RefundBasisBackfil
 
 test('a refund matching the GROSS line total is stamped GROSS (o3d-lvk)', async () => {
   const plan = await planRefundBasisBackfill([order({
-    refunds: [{ id: 'r1', totalsBasis: null, lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }] }],
+    refunds: [{ id: 'r1', totalsBasis: null, totalBase: 120, lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }] }],
   })])
 
   assert.deepEqual(plan.decisions, [{ refundId: 'r1', orderId: 'order-1', basis: 'GROSS' }])
@@ -38,7 +38,7 @@ test('a refund matching the GROSS line total is stamped GROSS (o3d-lvk)', async 
 
 test('a refund matching the NET line total is stamped NET (o3d-lvk)', async () => {
   const plan = await planRefundBasisBackfill([order({
-    refunds: [{ id: 'r1', totalsBasis: null, lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 100 }] }],
+    refunds: [{ id: 'r1', totalsBasis: null, totalBase: 100, lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 100 }] }],
   })])
 
   assert.deepEqual(plan.decisions, [{ refundId: 'r1', orderId: 'order-1', basis: 'NET' }])
@@ -48,7 +48,7 @@ test('a refund with NO evidence is left NULL, not guessed (o3d-lvk)', async () =
   // An unlinked (monetary-only) refund line has no order line to compare against. Guessing here
   // would silently change what a later refund is allowed to post.
   const plan = await planRefundBasisBackfill([order({
-    refunds: [{ id: 'r1', totalsBasis: null, lines: [{ productId: null, salesOrderLineId: null, qty: 0, totalBase: 50 }] }],
+    refunds: [{ id: 'r1', totalsBasis: null, totalBase: 50, lines: [{ productId: null, salesOrderLineId: null, qty: 0, totalBase: 50 }] }],
   })])
 
   assert.deepEqual(plan.decisions, [], 'nothing is stamped')
@@ -66,6 +66,7 @@ test('CONTRADICTORY evidence is left NULL rather than resolved by majority (o3d-
     refunds: [{
       id: 'r1',
       totalsBasis: null,
+      totalBase: 220,
       lines: [
         { productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 },
         { productId: 'p2', salesOrderLineId: 'line-2', qty: 1, totalBase: 100 },
@@ -81,7 +82,7 @@ test('an already-stamped refund is never re-derived (o3d-lvk)', async () => {
   // It was either written by the current code path (authoritative) or by a previous run. Re-deriving
   // could change an answer someone has already acted on.
   const plan = await planRefundBasisBackfill([order({
-    refunds: [{ id: 'r1', totalsBasis: 'NET', lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }] }],
+    refunds: [{ id: 'r1', totalsBasis: 'NET', totalBase: 120, lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }] }],
   })])
 
   assert.deepEqual(plan.decisions, [], 'not restamped even though the evidence says GROSS')
@@ -126,16 +127,86 @@ test('a plan over many orders keeps each order\'s lines separate (o3d-lvk)', asy
     order({
       id: 'order-1',
       lines: [{ id: 'line-1', productId: 'p1', qty: 1, totalBase: 100, taxBase: 20 }],
-      refunds: [{ id: 'r1', totalsBasis: null, lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }] }],
+      refunds: [{ id: 'r1', totalsBasis: null, totalBase: 120, lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }] }],
     }),
     order({
       id: 'order-2',
       lines: [{ id: 'line-2', productId: 'p2', qty: 1, totalBase: 200, taxBase: 40 }],
       // References order-1's line, which this order does not have: no evidence, not a cross-order match.
-      refunds: [{ id: 'r2', totalsBasis: null, lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }] }],
+      refunds: [{ id: 'r2', totalsBasis: null, totalBase: 120, lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }] }],
     }),
   ])
 
   assert.deepEqual(plan.decisions, [{ refundId: 'r1', orderId: 'order-1', basis: 'GROSS' }])
   assert.deepEqual(plan.unresolved, [{ refundId: 'r2', orderId: 'order-2' }])
+})
+
+test('a header that does NOT reconcile with its lines is left NULL (o3d-lvk, review)', async () => {
+  // totalsBasis describes the HEADER — it is what the cumulative refund ceiling and the status
+  // reconciliation consume. The lines can prove a basis while the header disagrees with them, and
+  // the schema does not enforce equality. Stamping then tells those consumers to trust a number the
+  // lines never justified.
+  const plan = await planRefundBasisBackfill([order({
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 200,                     // header
+      lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }], // lines say 120
+    }],
+  })])
+
+  assert.deepEqual(plan.decisions, [], 'a divergent header blocks the stamp')
+  assert.deepEqual(plan.unresolved, [{ refundId: 'r1', orderId: 'order-1' }])
+})
+
+test('rounding-scale header drift still reconciles (o3d-lvk, review)', async () => {
+  // The tolerance must absorb per-line rounding without absorbing a real divergence — otherwise the
+  // check would reject legitimate refunds and this backfill would stamp almost nothing.
+  const plan = await planRefundBasisBackfill([order({
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 120.00004,
+      lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 120 }],
+    }],
+  })])
+
+  assert.deepEqual(plan.decisions, [{ refundId: 'r1', orderId: 'order-1', basis: 'GROSS' }])
+})
+
+test('a value-carrying UNLINKED sibling blocks the whole refund (o3d-lvk, review)', async () => {
+  // The finding that mattered most. A single NET-looking line used to certify a refund that also
+  // contained an unclassified value-carrying line — so a legacy GROSS amount could be stamped NET,
+  // DISABLING the fail-closed guard for that order and permitting a later over-refund.
+  //
+  // A missed stamp costs a quarantine an operator can clear. A wrong stamp costs money nobody sees.
+  const plan = await planRefundBasisBackfill([order({
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 160,
+      lines: [
+        { productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 100 },  // clearly NET
+        { productId: null, salesOrderLineId: null, qty: 0, totalBase: 60 },       // unknown basis
+      ],
+    }],
+  })])
+
+  assert.deepEqual(plan.decisions, [], 'one unknown sibling blocks the whole refund')
+  assert.deepEqual(plan.unresolved, [{ refundId: 'r1', orderId: 'order-1' }])
+})
+
+test('a link to a DIFFERENT product is not evidence, even when the numbers agree (o3d-lvk, review)', async () => {
+  // Product A's refund mislinked to product B whose figures coincide would classify on a
+  // coincidence. Identity must match before the comparison means anything.
+  const plan = await planRefundBasisBackfill([order({
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 100,
+      lines: [{ productId: 'p2', salesOrderLineId: 'line-1', qty: 1, totalBase: 100 }],
+    }],
+  })])
+
+  assert.deepEqual(plan.decisions, [], 'a mismatched product link proves nothing')
 })

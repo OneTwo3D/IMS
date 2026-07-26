@@ -411,11 +411,34 @@ test('classifyRefundBasis stamps a whole refund only on unanimous, unambiguous l
   // Monetary-only / unlinked lines carry no evidence -> UNKNOWN.
   assert.equal(classifyRefundBasis([{ productId: null, salesOrderLineId: null, qty: 0, totalBase: 40 }], orderLines), 'UNKNOWN')
 
-  // A net product line PLUS an unlinked shipping line: the product line classifies it, shipping skipped.
+  // A net product line PLUS a VALUE-CARRYING unlinked line -> UNKNOWN.
+  //
+  // This assertion used to expect NET, on the reasoning that the product line classifies the refund
+  // and the unlinked shipping line can be skipped. That is unsafe: the £5 is unclassified, so if it
+  // was recorded GROSS the stamp tells refund-service's net ceiling to treat £55 as net when part of
+  // it is not. Because a stamped basis DISABLES the fail-closed guard for that order, one unknown
+  // sibling has to block the whole refund — the cost of a missed stamp is a quarantine an operator
+  // can clear, and the cost of a wrong stamp is an over-refund nobody sees.
   assert.equal(classifyRefundBasis([
     { productId: 'product-1', salesOrderLineId: 'line-1', qty: 1, totalBase: 50 },
     { productId: null, salesOrderLineId: null, qty: 0, totalBase: 5 },
+  ], orderLines), 'UNKNOWN')
+
+  // A ZERO-value line is genuinely inert — it proves nothing and blocks nothing.
+  assert.equal(classifyRefundBasis([
+    { productId: 'product-1', salesOrderLineId: 'line-1', qty: 1, totalBase: 50 },
+    { productId: null, salesOrderLineId: null, qty: 0, totalBase: 0 },
   ], orderLines), 'NET')
+
+  // A link to a DIFFERENT product is not evidence, even when the numbers happen to agree: product-1's
+  // net (50) coincides with what a mislinked product-2 refund would look like.
+  const twoProducts = new Map<string, RefundBasisOrderLineRow>([
+    ['line-1', { id: 'line-1', productId: 'product-1', qty: 2, totalBase: 100, taxBase: 20 }],
+  ])
+  assert.equal(classifyRefundBasis(
+    [{ productId: 'product-2', salesOrderLineId: 'line-1', qty: 1, totalBase: 50 }],
+    twoProducts,
+  ), 'UNKNOWN')
 
   // Contradictory linked lines (one net, one gross — impossible from one writer) -> UNKNOWN, fail safe.
   const twoLines = new Map<string, RefundBasisOrderLineRow>([

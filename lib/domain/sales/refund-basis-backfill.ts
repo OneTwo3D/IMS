@@ -1,8 +1,18 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type {
   RefundBasisOrderLineRow,
   RefundBasisRefundLineRow,
 } from './refund-basis-audit'
+
+/**
+ * How far the header may sit from the sum of its lines and still count as the same number.
+ *
+ * Deliberately TIGHT — a few rounding ulps per line, not a proportional slack. A loose tolerance
+ * here would let a genuinely divergent header pass as reconciled, and the whole point of the check
+ * is that `totalsBasis` describes the header rather than the lines.
+ */
+const HEADER_RECONCILE_EPSILON_PER_LINE = 0.00005
 
 /**
  * o3d-lvk: stamp `totalsBasis` on refunds written BEFORE the totals_basis migration.
@@ -23,6 +33,12 @@ import type {
 export type RefundBasisBackfillRefund = {
   id: string
   totalsBasis: string | null
+  /**
+   * The refund HEADER total. `totalsBasis` describes THIS number — it is what the cumulative refund
+   * ceiling and the status reconciliation consume — so a basis proven from the lines may only be
+   * stamped when the header actually agrees with them. The schema does not enforce that equality.
+   */
+  totalBase: DecimalInput
   lines: RefundBasisRefundLineRow[]
 }
 
@@ -77,11 +93,24 @@ export async function planRefundBasisBackfill(
         continue
       }
       const basis = classifyRefundBasis(refund.lines, orderLinesById)
-      if (basis === 'NET' || basis === 'GROSS') {
-        decisions.push({ refundId: refund.id, orderId: order.id, basis })
-      } else {
+      if (basis !== 'NET' && basis !== 'GROSS') {
         unresolved.push({ refundId: refund.id, orderId: order.id })
+        continue
       }
+
+      // The lines proved a basis; the HEADER is what that basis will describe. If the two disagree,
+      // stamping would tell the cumulative ceiling and the status reconciliation to trust a number
+      // the lines never justified — so an unreconciled header stays unresolved and keeps failing
+      // closed, exactly as the audit's own header path treats it.
+      const lineSum = refund.lines.reduce((sum, line) => sum + toDecimal(line.totalBase).toNumber(), 0)
+      const header = toDecimal(refund.totalBase).toNumber()
+      const tolerance = HEADER_RECONCILE_EPSILON_PER_LINE * (refund.lines.length + 1)
+      if (Math.abs(header - lineSum) > tolerance) {
+        unresolved.push({ refundId: refund.id, orderId: order.id })
+        continue
+      }
+
+      decisions.push({ refundId: refund.id, orderId: order.id, basis })
     }
   }
 
