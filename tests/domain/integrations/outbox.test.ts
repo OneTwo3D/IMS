@@ -20,6 +20,7 @@ import {
   parseIntegrationOutboxPayload,
   WcStockSyncOutboxPayloadSchema,
 } from '@/lib/domain/integrations/outbox-registry'
+import { adapterUniqueViolation, legacyUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 type FindManyArgs = {
   where?: MockWhere
@@ -57,15 +58,21 @@ type FindUniqueArgs = {
   where: { id?: string; idempotencyKey?: string }
 }
 
-function uniqueError(target: string[]) {
-  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
-    code: 'P2002',
-    clientVersion: 'test',
-    meta: { target },
+// o3d-5od: the REAL @prisma/adapter-pg shape (no meta.target, quoted column). The previous
+// `uniqueError` built `meta.target`, which production never produces.
+function uniqueError(columns: string[]) {
+  return adapterUniqueViolation(columns, {
+    modelName: 'IntegrationOutbox',
+    constraintName: `integration_outbox_${columns.join('_')}_key`,
   })
 }
 
-function adapterUniqueError() {
+function legacyUniqueError(target: string[]) {
+  return legacyUniqueViolation(target)
+}
+
+/** A P2002 that names no constraint at all — only the modelName fallback can classify it. */
+function bareModelUniqueError() {
   return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
     code: 'P2002',
     clientVersion: 'test',
@@ -95,7 +102,7 @@ function makeRow(overrides: Partial<IntegrationOutboxRow> = {}): IntegrationOutb
 
 function makeClient(
   initialRows: IntegrationOutboxRow[] = [],
-  options: { adapterUniqueMeta?: boolean } = {},
+  options: { uniqueErrorShape?: 'adapter' | 'legacy' | 'bare-model' } = {},
 ) {
   const rows = [...initialRows]
 
@@ -151,7 +158,9 @@ function makeClient(
       async create(args: unknown) {
         const data = (args as CreateArgs).data
         if (rows.some((row) => row.idempotencyKey === data.idempotencyKey)) {
-          throw options.adapterUniqueMeta ? adapterUniqueError() : uniqueError(['idempotencyKey'])
+          if (options.uniqueErrorShape === 'bare-model') throw bareModelUniqueError()
+          if (options.uniqueErrorShape === 'legacy') throw legacyUniqueError(['idempotencyKey'])
+          throw uniqueError(['idempotencyKey'])
         }
         const row = makeRow({
           ...data,
@@ -231,6 +240,53 @@ test('integration outbox enqueue is idempotent by idempotency key', async () => 
   assert.equal(second.id, first.id)
   assert.deepEqual(rows[0].payloadJson, { productId: 'sku-1', reason: 'IMS_CHANGE', force: false, webhookQty: null })
   assert.equal(rows[0].status, INTEGRATION_OUTBOX_STATUS.PENDING)
+})
+
+test('integration outbox enqueue is idempotent under the query-engine meta.target shape too', async () => {
+  const { client, rows } = makeClient([], { uniqueErrorShape: 'legacy' })
+
+  const first = await enqueueIntegrationOutbox({
+    connector: 'woocommerce',
+    operation: 'stock.push',
+    idempotencyKey: 'woocommerce:stock.push:sku-1',
+    payloadJson: { productId: 'sku-1', reason: 'IMS_CHANGE' },
+  }, { client })
+  const second = await enqueueIntegrationOutbox({
+    connector: 'woocommerce',
+    operation: 'stock.push',
+    idempotencyKey: 'woocommerce:stock.push:sku-1',
+    payloadJson: { productId: 'sku-1', reason: 'MANUAL', force: true },
+  }, { client })
+
+  assert.equal(rows.length, 1)
+  assert.equal(second.id, first.id)
+})
+
+// o3d-5od: the pre-fix guard classified EVERY P2002 on IntegrationOutbox as an idempotency-key
+// conflict, because under the pg adapter `meta.target` is always null. Now that the violated
+// column is readable, a different unique violation on the model must propagate.
+test('integration outbox enqueue does not swallow a P2002 on another IntegrationOutbox column', async () => {
+  const { client } = makeClient()
+  const conflicting = adapterUniqueViolation(['connector', 'operation'], {
+    modelName: 'IntegrationOutbox',
+    constraintName: 'integration_outbox_connector_operation_key',
+  })
+  const failing: IntegrationOutboxClient = {
+    integrationOutbox: {
+      ...client.integrationOutbox,
+      async create() { throw conflicting },
+    },
+  }
+
+  await assert.rejects(
+    enqueueIntegrationOutbox({
+      connector: 'woocommerce',
+      operation: 'stock.push',
+      idempotencyKey: 'woocommerce:stock.push:sku-1',
+      payloadJson: { productId: 'sku-1', reason: 'IMS_CHANGE' },
+    }, { client: failing }),
+    (error: unknown) => error === conflicting,
+  )
 })
 
 test('integration outbox validates registered payloads on enqueue', async () => {
@@ -328,14 +384,14 @@ test('integration outbox registry validates Mintsoft booked-in event payloads', 
   )
 })
 
-test('integration outbox enqueue treats adapter unique violations as idempotent', async () => {
+test('integration outbox enqueue treats a P2002 naming no constraint as idempotent', async () => {
   const { client, rows } = makeClient([
     makeRow({
       id: 'existing-job',
       idempotencyKey: 'woocommerce:stock.push:sku-1',
       payloadJson: { productId: 'sku-1', reason: 'IMS_CHANGE', force: false, webhookQty: null },
     }),
-  ], { adapterUniqueMeta: true })
+  ], { uniqueErrorShape: 'bare-model' })
 
   const row = await enqueueIntegrationOutbox({
     connector: 'woocommerce',

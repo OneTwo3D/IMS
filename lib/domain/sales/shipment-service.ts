@@ -18,6 +18,7 @@ import {
 } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { buildStockMovementValueFieldsFromConsumed } from '@/lib/domain/inventory/stock-movement-value'
 import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { withSavepoint } from '@/lib/db/savepoint'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const SHIPMENT_QTY_EPSILON_DECIMAL = new Prisma.Decimal('0.000001')
@@ -391,7 +392,9 @@ export async function transitionShipmentStatus(
         const idempotencyKey = saleDispatchMovementKey(line.id)
         let movement: { id: string } | null = null
         try {
-          movement = await tx.stockMovement.create({
+          // o3d-slrn: the catch below falls through to tx.stockMovement.findUnique on the SAME
+          // client, so the failing insert must be savepointed or that recovery hits a 25P02.
+          movement = await withSavepoint(tx, () => tx.stockMovement.create({
             data: {
               type: 'SALE_DISPATCH',
               productId: line.productId,
@@ -404,7 +407,7 @@ export async function transitionShipmentStatus(
               idempotencyKey,
             },
             select: { id: true },
-          })
+          }))
         } catch (error) {
           if (!isStockMovementIdempotencyConflict(error)) throw error
         }

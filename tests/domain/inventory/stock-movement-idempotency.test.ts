@@ -11,6 +11,7 @@ import {
   wmsPurchaseReceiptMovementKey,
   wmsTransferInMovementKey,
 } from '@/lib/domain/inventory/stock-movement-idempotency'
+import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 test('builds deterministic stock movement idempotency keys for irreversible flows', () => {
   assert.equal(
@@ -152,6 +153,20 @@ function prismaKnownError(code: string, target?: string[] | string) {
     meta: target == null ? undefined : { target },
   })
 }
+
+function adapterMovementConflict(columns: string[]) {
+  return adapterUniqueViolation(columns, {
+    modelName: 'StockMovement',
+    constraintName: `stock_movements_${columns.join('_')}_key`,
+  })
+}
+
+// o3d-5od: the adapter shape is what production raises; `meta.target` never appears under
+// @prisma/adapter-pg. This test only ever covered the latter, so the guard was dead.
+test('detects the real adapter-pg stock movement idempotency conflict', () => {
+  assert.equal(isStockMovementIdempotencyConflict(adapterMovementConflict(['idempotencyKey'])), true)
+  assert.equal(isStockMovementIdempotencyConflict(adapterMovementConflict(['referenceId'])), false)
+})
 
 test('detects only stock movement idempotency unique conflicts', () => {
   assert.equal(isStockMovementIdempotencyConflict(prismaKnownError('P2002', ['idempotencyKey'])), true)

@@ -15,6 +15,7 @@ import {
   type RefundServiceClient,
 } from '@/lib/domain/sales/refund-service'
 import type { AccountingSettings } from '@/lib/accounting'
+import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 type Order = {
   id: string
@@ -39,19 +40,18 @@ type SalesLine = {
   totalBase: number
 }
 
+// o3d-5od: the REAL @prisma/adapter-pg shape (no meta.target, quoted columns).
 function uniqueStockMovementError() {
-  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
-    code: 'P2002',
-    clientVersion: 'test',
-    meta: { target: ['idempotencyKey'] },
+  return adapterUniqueViolation(['idempotencyKey'], {
+    modelName: 'StockMovement',
+    constraintName: 'stock_movements_idempotencyKey_key',
   })
 }
 
 function uniqueStockLevelError() {
-  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
-    code: 'P2002',
-    clientVersion: 'test',
-    meta: { target: ['productId', 'warehouseId'] },
+  return adapterUniqueViolation(['productId', 'warehouseId'], {
+    modelName: 'StockLevel',
+    constraintName: 'stock_levels_productId_warehouseId_key',
   })
 }
 

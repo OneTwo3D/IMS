@@ -21,6 +21,7 @@ import {
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { withSavepoint } from '@/lib/db/savepoint'
 
 // Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
 // The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
@@ -713,7 +714,10 @@ export async function processBookedInEvent(
             const unitCostBase = Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)
             if (receiptLine.stockQtyToAdd > 0) {
               try {
-                await tx.stockMovement.create({
+                // The catch below keeps using `tx`, so the failing insert must not poison it
+                // (o3d-slrn). Without the savepoint the P2002 aborts the transaction and the
+                // `continue` runs straight into a 25P02.
+                await withSavepoint(tx, () => tx.stockMovement.create({
                   data: {
                     type: 'PURCHASE_RECEIPT',
                     productId: poLine.productId,
@@ -728,7 +732,7 @@ export async function processBookedInEvent(
                       receiptEventId: lockedEvent.id,
                     }),
                   },
-                })
+                }))
               } catch (error) {
                 if (!isStockMovementIdempotencyConflict(error)) throw error
                 continue
@@ -908,7 +912,10 @@ export async function processBookedInEvent(
                 toDecimal(0),
               )
               try {
-                await tx.stockMovement.create({
+                // The catch below keeps using `tx`, so the failing insert must not poison it
+                // (o3d-slrn). Without the savepoint the P2002 aborts the transaction and the
+                // `continue` runs straight into a 25P02.
+                await withSavepoint(tx, () => tx.stockMovement.create({
                   data: {
                     type: 'TRANSFER_IN',
                     productId: transferLine.productId,
@@ -924,7 +931,7 @@ export async function processBookedInEvent(
                       receiptEventId: lockedEvent.id,
                     }),
                   },
-                })
+                }))
               } catch (error) {
                 if (!isStockMovementIdempotencyConflict(error)) throw error
                 continue

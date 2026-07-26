@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { isUniqueConstraintViolation } from '@/lib/connectors/xero/sync-processor'
+import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 // audit-42co: a concurrent follow-up enqueue that loses the race against the
 // partial unique index surfaces as a Prisma P2002 and must be swallowed as an
@@ -9,6 +10,14 @@ import { isUniqueConstraintViolation } from '@/lib/connectors/xero/sync-processo
 
 test('recognises a Prisma P2002 unique-violation', () => {
   assert.equal(isUniqueConstraintViolation({ code: 'P2002', meta: { target: ['connector'] } }), true)
+})
+
+// o3d-5od: `meta.target` is NOT the shape production raises — lib/db/index.ts uses
+// @prisma/adapter-pg, which reports the columns under meta.driverAdapterError instead and
+// leaves meta.target undefined. This helper only inspects `code`, so it was never affected,
+// but the fixture above documented a shape that does not occur; pin the real one as well.
+test('recognises the real @prisma/adapter-pg P2002 shape', () => {
+  assert.equal(isUniqueConstraintViolation(adapterUniqueViolation(['connector', 'referenceId'])), true)
 })
 
 test('does NOT swallow other Prisma error codes', () => {

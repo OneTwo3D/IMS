@@ -16,6 +16,7 @@ import {
   copyCostLayerSourceLinesProportionally,
   createCostLayer,
 } from '@/lib/cost-layers'
+import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { planTransferPartialReceipt } from '@/lib/domain/inventory/transfer-partial-receipt'
 import { isStockMovementIdempotencyConflict } from '@/lib/domain/inventory/stock-movement-idempotency'
@@ -27,6 +28,7 @@ import {
   buildStockMovementValueFieldsFromConsumed,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
+import { withSavepoint } from '@/lib/db/savepoint'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -285,10 +287,10 @@ export async function createTransfer(
       } catch (e) {
         // Only retry a unique-constraint (P2002) collision on the `reference`
         // field — don't mask any other (future/nested) unique violation.
-        const err = e as { code?: string; meta?: { target?: unknown } } | null
-        const target = err?.meta?.target
-        const isReferenceCollision = err?.code === 'P2002'
-          && (Array.isArray(target) ? target.includes('reference') : String(target ?? '').includes('reference'))
+        // o3d-5od: this used to read `meta.target`, which the pg driver adapter never
+        // populates, so the auto-reference retry never actually fired and a colliding
+        // generated reference failed the whole action.
+        const isReferenceCollision = uniqueViolationTargetsField(e, 'reference')
         if (useAutoReference && attempt < maxAttempts && isReferenceCollision) continue
         throw e
       }
@@ -662,7 +664,9 @@ async function applyTransferLineReceipt(
     toDecimal(0),
   )
   try {
-    await tx.stockMovement.create({
+    // o3d-slrn: returning { booked: false } leaves the caller continuing on this same tx, so
+    // the failing insert must be savepointed or everything after it hits a 25P02.
+    await withSavepoint(tx, () => tx.stockMovement.create({
       data: {
         type: 'TRANSFER_IN',
         productId,
@@ -677,7 +681,7 @@ async function applyTransferLineReceipt(
         ...(idempotencyKey ? { idempotencyKey } : {}),
         ...buildStockMovementValueFieldsFromTotal({ qty: qtyToReceive, totalValueBase }),
       },
-    })
+    }))
   } catch (error) {
     // Idempotent path only: a duplicate submit/retry already booked this line, so
     // skip the rest of its booking (stock level, layers were applied the first time).

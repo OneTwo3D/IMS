@@ -12,6 +12,7 @@ import {
 } from './accounting-document-event-builder'
 import type { AccountingEventDraft, AccountingEventLine, AccountingEventStatus } from './accounting-event-types'
 import { isIdempotencyKeyUniqueError } from './prisma-errors'
+import { withSavepoint } from '@/lib/db/savepoint'
 
 export type MirroredJournalAccountingSyncType =
   | 'DAILY_BATCH_REVENUE_DEFERRAL'
@@ -226,11 +227,16 @@ export async function mirrorAccountingSyncLogToEvent(
   if (!event) return
 
   try {
-    const created = await client.accountingEvent.create({
-      data: event as never,
-      select: { id: true },
-    })
-    await client.accountingEventLog.create({
+    // o3d-slrn: `client` is the CALLER's transaction and the catch below returns normally, so
+    // the caller carries on issuing queries. Without a savepoint the duplicate-key abort would
+    // roll back the sync log / outbox the caller believes it just queued. Both creates sit inside
+    // one savepoint so the event and its log stay atomic.
+    await withSavepoint(client, async () => {
+      const created = await client.accountingEvent.create({
+        data: event as never,
+        select: { id: true },
+      })
+      await client.accountingEventLog.create({
       data: buildAccountingEventLog({
         accountingEventId: created.id,
         action: 'mirrored_from_sync_log',
@@ -241,7 +247,8 @@ export async function mirrorAccountingSyncLogToEvent(
           referenceType: params.referenceType,
           referenceId: params.referenceId,
         },
-      }) as never,
+        }) as never,
+      })
     })
   } catch (error) {
     if (isIdempotencyKeyUniqueError(error)) return
