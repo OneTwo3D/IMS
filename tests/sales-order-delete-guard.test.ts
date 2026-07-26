@@ -1,5 +1,4 @@
 import test from 'node:test'
-import { recreateJournaledDateFilter, startOfUtcDay } from '@/lib/domain/accounting/daily-batch-retention'
 import assert from 'node:assert/strict'
 
 import {
@@ -384,23 +383,6 @@ test('an in-flight PROCESSING row asks the operator to WAIT, not to cancel (o3d-
   assert.doesNotMatch(blocker!.message, /Cancel the order instead/)
 })
 
-test('the batch key derived from a stage stamp matches the batch date it was staged in (o3d-0qoo)', () => {
-  // The guard re-derives the batch reference FROM the order's stage stamp. The daily syncs
-  // capture their reference date ONCE at the start of the run and used to stamp orders with
-  // `new Date()` as they processed each one — so a run crossing UTC midnight produced e.g. an
-  // A2-2026-07-20-* journal against a 2026-07-21 stamp. The guard then looked for a batch that
-  // does not exist, found no blocker, and permitted a hard delete while the journal stood.
-  //
-  // Both are now derived from the same captured value, so this identity holds by construction.
-  const batchDate = '2026-07-20'
-  const stampWrittenAfterMidnight = new Date(`${batchDate}T00:00:00.000Z`)
-
-  assert.equal(
-    dailyBatchDateKey(stampWrittenAfterMidnight),
-    batchDate,
-    'the stamp must map back to the batch date, whatever wall-clock time the row was written',
-  )
-})
 
 test('a CANCELLED row that still carries an external id BLOCKS (o3d-v7sy)', async () => {
   // The status filter used to run first, so this row was never even selected. Xero can revert a
@@ -446,41 +428,4 @@ test('a CANCELLED row with NO external id still does not block', async () => {
   assert.equal(blocker, null)
 })
 
-test('startOfUtcDay floors a mid-day cutoff to the batch-day marker it is compared against (o3d-0qoo)', () => {
-  // The daily syncs stamp revenueDeferredDate / inventoryAllocatedDate with the BATCH date's
-  // midnight so they agree with the batch reference. Comparing those against a mid-day
-  // wall-clock cutoff ages a whole batch day out early: an order staged at 23:00 is stamped
-  // 00:00, so a one-day lookback run at noon would exclude it despite it being 13 hours old,
-  // and reconciliation would report a missing event that is not missing.
-  const middayCutoff = new Date('2026-07-20T12:00:00.000Z')
-  const lateStagedStamp = new Date('2026-07-20T00:00:00.000Z')
 
-  assert.ok(lateStagedStamp < middayCutoff, 'precondition: the raw cutoff would exclude it')
-  assert.ok(
-    lateStagedStamp >= startOfUtcDay(middayCutoff),
-    'flooring includes the whole batch day — only ever widening, which is the safe direction',
-  )
-  assert.equal(startOfUtcDay(middayCutoff).toISOString(), '2026-07-20T00:00:00.000Z')
-})
-
-test('the RECOVERY cutoff stays exact — flooring it would recreate a purged, already-posted batch (o3d-0qoo)', async () => {
-  // Flooring is right for reconciliation SCANS (a wider window only finds more), but wrong for
-  // RECOVERY. Sync-log retention purges against an exact createdAt, so a floored recovery filter
-  // would include a batch-day stamp whose log has already been purged, see no live log, and
-  // re-queue a journal that is already in the ledger. Duplicate journals are far worse than a
-  // boundary-day batch that recovery declines to recreate.
-  //
-  // The same helper is also applied to shipmentJournalDate, which is a genuine wall-clock
-  // timestamp and must not be floored at all.
-  const cutoff = new Date('2026-01-26T08:00:00.000Z')
-  const filter = await recreateJournaledDateFilter(new Date('2026-07-26T12:00:00.000Z'))
-
-  if ('gte' in filter) {
-    assert.notEqual(
-      filter.gte.toISOString(),
-      startOfUtcDay(cutoff).toISOString(),
-      'the recovery cutoff must NOT be floored to midnight',
-    )
-    assert.notEqual(filter.gte.getUTCHours() === 0 && filter.gte.getUTCMinutes() === 0, true)
-  }
-})

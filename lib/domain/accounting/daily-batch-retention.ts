@@ -39,24 +39,9 @@ export async function recreateRetentionCutoff(now: Date = new Date()): Promise<D
 }
 
 /** Prisma date filter for recreate's journaled-shipment/order queries: within the
- *  retention window when set ({ gte } also excludes nulls), else any non-null marker.
- *
- *  The cutoff stays EXACT here, deliberately (o3d-0qoo). Flooring it to UTC start-of-day —
- *  which is right for reconciliation SCANS — is dangerous for RECOVERY: sync-log retention
- *  purges against an exact `createdAt`, so a floored filter would include a batch-day stamp
- *  whose log has already been purged, find no live log, and re-queue an ALREADY POSTED
- *  journal. Duplicate journals are far worse than a boundary-day batch that recovery declines
- *  to recreate. This helper is also applied to `shipmentJournalDate`, which is a genuine
- *  wall-clock timestamp and must not be floored at all.
- *
- *  Recovering the boundary day safely needs day-aligned purging, or a durable exact batch
- *  reference per order — tracked on o3d-v7sy. */
+ *  retention window when set ({ gte } also excludes nulls), else any non-null marker. */
 export async function recreateJournaledDateFilter(now?: Date): Promise<{ gte: Date } | { not: null }> {
   const cutoff = await recreateRetentionCutoff(now)
   return cutoff ? { gte: cutoff } : { not: null }
 }
 
-/** Midnight UTC on the same day as `value`. Batch-day markers are stamped at exactly this. */
-export function startOfUtcDay(value: Date): Date {
-  return new Date(`${value.toISOString().slice(0, 10)}T00:00:00.000Z`)
-}

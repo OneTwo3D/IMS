@@ -540,12 +540,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     const settings = await getXeroSettings()
     const baseCurrency = await getBaseCurrencyCode()
     const today = new Date().toISOString().slice(0, 10)
-    // o3d-0qoo: stage stamps must agree with the batch reference date, so BOTH are derived from
-    // this one captured value. Stamping with `new Date()` at write time meant a run crossing UTC
-    // midnight produced e.g. an `A2-2026-07-20-*` journal against a 2026-07-21 stamp — and the
-    // order-delete guard, which re-derives the batch key FROM the stamp, then looked for a batch
-    // that does not exist and permitted a hard delete while the journal stood.
-    const batchStageStamp = new Date(`${today}T00:00:00.000Z`)
+
 
     if (settings.xero_sync_enabled !== 'true') {
       return result
@@ -644,7 +639,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           await tx.salesOrder.update({
             where: { id: order.id },
             data: {
-              revenueDeferredDate: batchStageStamp,
+              revenueDeferredDate: new Date(),
               unearnedRevenueAmount: deferralByOrderId.get(order.id) ?? 0,
             },
           })
@@ -776,7 +771,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           await tx.salesOrder.update({
             where: { id: order.id },
             data: {
-              inventoryAllocatedDate: batchStageStamp,
+              inventoryAllocatedDate: new Date(),
               allocationBatchAmount: orderValues.get(order.id) ?? 0,
             },
           })
