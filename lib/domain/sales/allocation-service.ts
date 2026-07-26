@@ -240,42 +240,6 @@ export async function lockSalesOrder(
   )
 }
 
-/**
- * Release an order's allocations and reserved stock inside an EXISTING transaction (o3d-7yf).
- *
- * This is the stock-release CORE shared by deallocateOrder (which adds the ALLOCATED->PROCESSING status
- * transition + logging around it) and deleteSalesOrder (which runs it under the same order-row lock as its
- * eligibility check + delete, so the whole deletion is atomic and no concurrent status transition can slip
- * in). It does NOT lock the order itself — the caller must hold lockSalesOrder(tx, orderId) — and does NOT
- * change the order status, so the caller decides that. Returns the released allocations (for stock-sync
- * enqueue) and the count of negative reservation balances it clamped to zero.
- */
-export async function releaseOrderAllocationsInTx(
-  tx: Prisma.TransactionClient,
-  orderId: string,
-): Promise<{ allocs: Array<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>; clampedReservationCount: number }> {
-  await resetAllocationAccountingIfStaged(tx, orderId)
-  const currentAllocs = await tx.orderAllocation.findMany({
-    where: { orderId },
-    select: { lineId: true, productId: true, warehouseId: true, qty: true },
-  })
-  await lockStockLevels(
-    tx,
-    [...new Set(currentAllocs.map((alloc) => alloc.productId))],
-    [...new Set(currentAllocs.map((alloc) => alloc.warehouseId))],
-  )
-  await applyAllocationReservationDelta(
-    tx,
-    currentAllocs.map((alloc) => ({ productId: alloc.productId, warehouseId: alloc.warehouseId, qty: Number(alloc.qty) })),
-    'release',
-  )
-  const clamped = await tx.stockLevel.updateMany({
-    where: { reservedQty: { lt: 0 } },
-    data: { reservedQty: 0 },
-  })
-  await tx.orderAllocation.deleteMany({ where: { orderId } })
-  return { allocs: currentAllocs, clampedReservationCount: clamped.count }
-}
 
 export async function lockStockLevels(
   tx: Prisma.TransactionClient,

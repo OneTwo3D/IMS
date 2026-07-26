@@ -1264,6 +1264,10 @@ test('o3d-6oyu.18: chargeback commits first → the WC refund is refused as prio
 test('o3d-6oyu.18: an ordinary partial refund on an order with prior NON-chargeback refunds is untouched', async () => {
   // The guard must not turn legitimate stacked partial refunds into conflicts — only a
   // prior CHARGEBACK blocks an ordinary refund.
+  //
+  // totalsBasis MUST be set here (o3d-w00/o3d-n8p): a NULL-basis prior refund is legacy/unknown
+  // and now fails closed on its own, which would make this test pass for the wrong reason — it
+  // would be asserting the basis guard rather than the chargeback guard it is named for.
   const state = reversalRaceState()
   state.refunds.push({
     id: 'refund-wc-1',
@@ -1275,6 +1279,7 @@ test('o3d-6oyu.18: an ordinary partial refund on an order with prior NON-chargeb
     totalBase: 10,
     returnWarehouseId: null,
     chargeback: false,
+    totalsBasis: 'NET',
   })
 
   const result = await createSalesOrderRefund(createClient(state), {
@@ -3011,4 +3016,46 @@ test('a crash between commit and staging leaves the reversal recoverable, not si
     'it must still be marked as owing accounting — this is what makes the reversal recoverable, '
       + 'and what stops the guard and the poller both reading it as complete',
   )
+})
+
+test('o3d-w00/o3d-n8p: a second refund on an order with a LEGACY-basis refund fails closed and quarantines', async () => {
+  // The operationally consequential half of the basis marker, pinned explicitly because it
+  // changes what happens to real money on real orders.
+  //
+  // Every refund written before the totals_basis migration has a NULL basis, and a NULL row's
+  // stored total may be GROSS. Summing it with a new NET total is not sound: a legacy £60 gross
+  // plus a new £60 net passes a 60+60=120 ceiling on a £120 order, yet the new line grosses up to
+  // £72 — £132 of credit against £120 of goods. Converting a legacy mixed-rate gross refund back
+  // to net is undecidable, so there is no safe automatic reconciliation.
+  //
+  // Hence: refuse and park for a human. This means an order carrying a pre-migration refund will
+  // NOT take a second automated refund — it quarantines instead. That is deliberate, and it is
+  // the behaviour someone working the exceptions inbox has to be ready for.
+  const state = reversalRaceState()
+  state.refunds.push({
+    id: 'refund-legacy',
+    orderId: 'order-1',
+    creditNoteNumber: 'CN-0001',
+    externalRefundId: 7001,
+    reason: 'WooCommerce refund',
+    totalForeign: 10,
+    totalBase: 10,
+    returnWarehouseId: null,
+    chargeback: false,
+    // No totalsBasis — exactly what every pre-migration row looks like.
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 10 }],
+    reason: 'WooCommerce refund',
+    externalRefundId: 7002,
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, false, 'a legacy-basis order does not take a second automated refund')
+  assert.equal(result.success === false && result.quarantine, true, 'and it is parked, not merely failed')
+  assert.match(result.success === false ? result.error : '', /legacy\/unknown amount basis/)
+  assert.equal(state.refunds.length, 1, 'no second refund was written')
 })

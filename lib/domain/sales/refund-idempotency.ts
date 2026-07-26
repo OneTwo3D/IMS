@@ -1,3 +1,5 @@
+import { Prisma } from '@/app/generated/prisma/client'
+
 import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 
 /**

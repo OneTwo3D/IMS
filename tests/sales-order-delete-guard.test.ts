@@ -78,9 +78,12 @@ function makeTx(seed: {
     statusLabel: string
     lastError?: string | null
   } | null
+  /** A deliberately parked WooCommerce refund — creates no SalesOrderRefund (o3d-7yf). */
+  parkedRefund?: { id: string } | null
 }) {
   return {
     wmsOrderStatusSnapshot: { findUnique: async () => seed.wmsSnapshot ?? null },
+    shoppingSyncLog: { findFirst: async () => seed.parkedRefund ?? null },
     salesOrder: {
       findUnique: async () => ({
         accountingInvoiceId: seed.order?.accountingInvoiceId ?? null,
@@ -655,4 +658,35 @@ test('a LEGACY not-found snapshot DOES block — it never distinguished absent f
   )
 
   assert.equal(blocker?.code, 'wms_order_status_snapshot')
+})
+
+test('a PARKED WooCommerce refund blocks the delete, and outranks every other blocker (o3d-7yf)', async () => {
+  // A park creates NO SalesOrderRefund, so the caller's `_count.refunds` check cannot see it.
+  // Deleting the order cascades its ShoppingOrderLink and orphans the park, stranding a refund
+  // whose money has already left the business. It outranks the rest because — unlike a WMS push
+  // or queued accounting work — cancelling the order does not resolve it.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: { state: 'SYNCED', externalOrderId: '55', externalOrderNumber: 'WMS-55' },
+      parkedRefund: { id: 'log-1' },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'parked_refund', 'the park is reported ahead of the WMS link')
+  assert.match(blocker!.message, /sync exceptions inbox/)
+})
+
+test('no parked refund leaves the other blockers ranked as before (o3d-7yf)', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: { state: 'SYNCED', externalOrderId: '55', externalOrderNumber: 'WMS-55' },
+      parkedRefund: null,
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'wms_order_push_link')
 })
