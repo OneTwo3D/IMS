@@ -115,18 +115,24 @@ export async function findSalesOrderDeleteBlocker(
   // and purgeExpiredData deletes those rows past the retention window (six months by default).
   // An old order can therefore hold a real invoice in the external ledger, have no retained sync
   // row, and pass every other check — hard-deleted, stranding the document with no IMS order
-  // behind it. accountingInvoiceId / invoicedAt live on the order itself and are never purged.
+  // behind it. accountingInvoiceId lives on the order itself and is never purged.
+  //
+  // accountingInvoiceId ONLY — deliberately NOT invoicedAt. generateInvoiceNumber sets invoicedAt
+  // when it merely assigns a LOCAL invoice number (app/actions/sales.ts ~2680), and that action is
+  // available even with accounting sync disabled. Treating it as external-post evidence would make
+  // an otherwise deletable order with no payments, no sync logs and no accounting document
+  // permanently undeletable.
   const invoiced = await tx.salesOrder.findUnique({
     where: { id: orderId },
-    select: { accountingInvoiceId: true, invoicedAt: true },
+    select: { accountingInvoiceId: true },
   })
-  if (invoiced?.accountingInvoiceId || invoiced?.invoicedAt) {
+  if (invoiced?.accountingInvoiceId) {
     return {
       code: 'accounting_document_exists',
       message:
-        'Cannot delete an order that has been invoiced to the accounting system'
-        + (invoiced.accountingInvoiceId ? ` (invoice ${invoiced.accountingInvoiceId})` : '')
-        + '. Cancel the order instead so the document is credited or reversed.',
+        `Cannot delete an order with an accounting document already posted `
+        + `(invoice ${invoiced.accountingInvoiceId}). It needs an explicit reversal or credit note `
+        + `in the accounting system first — cancelling the order does NOT reverse a posted invoice.`,
     }
   }
 
@@ -163,12 +169,20 @@ export async function findSalesOrderDeleteBlocker(
   if (liveDocument) {
     return {
       code: 'accounting_sync_live',
-      message: liveDocument.status === 'FAILED'
-        ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `
-          + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '
-          + 'so the document may exist in the ledger. Check the connector, then cancel the order or resolve the sync log.'
-        : `Cannot delete an order with accounting documents queued or posted to ${liveDocument.connector} `
-          + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired or reversed.`,
+      // The remedy differs by status, and saying "cancel" for a POSTED document would be wrong:
+      // cancelOrderInvoiceSync retires PENDING / FAILED / stale-PROCESSING rows only and
+      // explicitly leaves SYNCED alone, because a cancel-after-post needs an explicit reversal.
+      // Telling an operator otherwise leaves a live receivable against a CANCELLED order.
+      message: liveDocument.status === 'SYNCED'
+        ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
+          + 'is already POSTED. It needs an explicit reversal or credit note in the accounting system — '
+          + 'cancelling the order does NOT reverse a posted document.'
+        : liveDocument.status === 'FAILED'
+          ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `
+            + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '
+            + 'so the document may exist in the ledger. Check the connector, then resolve the sync log.'
+          : `Cannot delete an order with accounting documents queued to ${liveDocument.connector} `
+            + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired before it posts.`,
     }
   }
 

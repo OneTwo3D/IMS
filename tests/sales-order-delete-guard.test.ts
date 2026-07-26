@@ -295,14 +295,40 @@ test('an order carrying an accounting invoice id blocks, even with no sync logs 
   assert.match(blocker!.message, /INV-2026-0042/)
 })
 
-test('invoicedAt alone blocks, even without an invoice id', async () => {
+test('invoicedAt alone does NOT block — it is a LOCAL invoice number, not an external post', async () => {
+  // generateInvoiceNumber sets invoicedAt when it merely assigns a local invoice number
+  // (app/actions/sales.ts ~2680), and that action is available even with accounting sync
+  // disabled. Treating it as external-post evidence would make an otherwise deletable order
+  // with no payments, no sync logs and no accounting document permanently undeletable.
   const blocker = await findSalesOrderDeleteBlocker(
     makeTx({ syncLogs: [], order: { invoicedAt: new Date('2025-01-01T00:00:00.000Z') } }),
     'order-1',
     STAMPS,
   )
 
-  assert.equal(blocker?.code, 'accounting_document_exists')
+  assert.equal(blocker, null)
+})
+
+test('a POSTED document says it needs a REVERSAL, not a cancel (o3d-v7sy)', async () => {
+  // cancelOrderInvoiceSync retires PENDING / FAILED / stale-PROCESSING rows and explicitly
+  // leaves SYNCED alone, because a cancel-after-post needs an explicit reversal. Telling an
+  // operator to cancel a posted invoice leaves a live receivable against a CANCELLED order.
+  const posted = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [syncLog({ status: 'SYNCED' })] }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(posted?.code, 'accounting_sync_live')
+  assert.match(posted!.message, /explicit reversal or credit note/)
+  assert.match(posted!.message, /does NOT reverse a posted document/)
+
+  // A merely QUEUED document is genuinely retired by cancelling, so that advice stays.
+  const queued = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [syncLog({ status: 'PENDING' })] }),
+    'order-1',
+    STAMPS,
+  )
+  assert.match(queued!.message, /Cancel the order instead/)
 })
 
 test('an order with neither marker nor logs is still deletable', async () => {
