@@ -1,6 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
+import { outstandingPoValueBase } from '@/lib/domain/purchasing/outstanding-po-value'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { getSetting } from '@/app/actions/settings'
 import { requirePermission } from '@/lib/auth/server'
@@ -197,9 +198,15 @@ export async function getDashboardData(
     db.product.findMany({
       select: { id: true, lifecycleStatus: true, stockLevels: { select: { quantity: true, reservedQty: true } } },
     }),
+    // Open POs KPI (o3d-1di): the canonical COMMITTED-incoming set (includes SHIPPED, excludes the
+    // RFQ_SENT/QUOTE_RECEIVED quote pipeline) so this agrees with the incoming card and the
+    // product/replenishment views. Line qty/received drive the outstanding (not whole) value below.
     db.purchaseOrder.findMany({
-      where: { type: 'GOODS', status: { in: ['PO_SENT', 'PARTIALLY_RECEIVED', 'RFQ_SENT'] } },
-      select: { totalBase: true },
+      where: { type: 'GOODS', status: { in: INCOMING_PO_STATUSES } },
+      select: {
+        subtotalBase: true,
+        lines: { select: { qty: true, qtyReceived: true, unitCostBase: true } },
+      },
     }),
     db.salesOrder.findMany({
       where: { status: { in: ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] } },
@@ -281,7 +288,7 @@ export async function getDashboardData(
     activeProducts: products.filter((p) => p.lifecycleStatus === 'ACTIVE').length,
     inventoryValue: r2(inventoryValue),
     openPurchaseOrders: openPOs.length,
-    openPOValue: r2(openPOs.reduce((s, po) => s + Number(po.totalBase), 0)),
+    openPOValue: r2(outstandingPoValueBase(openPOs)),
     pendingSalesOrders: pendingSales.length,
     pendingSalesValue: r2(pendingSales.reduce((s, so) => s + Number(so.totalBase), 0)),
     avgOrderValue: currentOrders.length > 0 ? r2(cur.net / currentOrders.length) : 0,

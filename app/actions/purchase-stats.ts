@@ -2,6 +2,7 @@
 
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { COMMITTED_PURCHASE_ORDER_WHERE, INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 
 // ---------------------------------------------------------------------------
 // Product purchase stats (Products tab)
@@ -36,10 +37,18 @@ export async function getPurchaseProductStats(dateFrom?: string, dateTo?: string
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
   const hasDate = Object.keys(dateFilter).length > 0
 
+  // o3d-27l: only COMMITTED purchase history — a PO that was actually ordered (poSentAt stamped or a
+  // status that proves an order), not the DRAFT/RFQ_SENT/QUOTE_RECEIVED quote pipeline (nor a quote
+  // abandoned straight to CLOSED) and not CANCELLED. So Qty Ordered, spend (totalBase), average cost
+  // and Incoming all share one committed population; Incoming is a clean subset, not a rescoped column.
   const pos = await db.purchaseOrder.findMany({
-    where: { type: 'GOODS', status: { notIn: ['DRAFT', 'CANCELLED'] }, ...(hasDate ? { createdAt: dateFilter } : {}) },
+    where: {
+      type: 'GOODS',
+      ...COMMITTED_PURCHASE_ORDER_WHERE,
+      ...(hasDate ? { createdAt: dateFilter } : {}),
+    },
     select: {
-      id: true, supplierId: true, createdAt: true,
+      id: true, supplierId: true, createdAt: true, status: true,
       supplier: { select: { name: true } },
       lines: {
         select: {
@@ -50,6 +59,7 @@ export async function getPurchaseProductStats(dateFrom?: string, dateTo?: string
       },
     },
   })
+  const incomingStatuses = new Set<string>(INCOMING_PO_STATUSES)
 
   const map = new Map<string, PurchaseProductRow>()
   const suppliersByProduct = new Map<string, Set<string>>()
@@ -74,7 +84,13 @@ export async function getPurchaseProductStats(dateFrom?: string, dateTo?: string
       row.qtyOrdered += Number(l.qty)
       row.qtyReceived += Number(l.qtyReceived)
       row.qtyReturned += Number(l.qtyReturned)
-      row.incomingQty += Math.max(0, Number(l.qty) - Number(l.qtyReceived))
+      // o3d-27l: Incoming is only the not-yet-received balance of a PO that is still INCOMING
+      // (PO_SENT/SHIPPED/PARTIALLY_RECEIVED). A terminal PO — RECEIVED/CLOSED/RETURNED, e.g. one
+      // closed after a short delivery — is committed history but NOT incoming, so it must not carry a
+      // phantom balance here even though its ordered/received qty still counts above.
+      if (incomingStatuses.has(po.status)) {
+        row.incomingQty += Math.max(0, Number(l.qty) - Number(l.qtyReceived))
+      }
       row.totalBase += Number(l.totalBase)
       const landed = Number(l.landedUnitCostBase)
       if (landed > 0) row.landedCostBase += landed * Number(l.qty)
@@ -267,7 +283,9 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
     select: {
       id: true, name: true,
       purchaseOrders: {
-        where: { type: 'GOODS', status: { notIn: ['DRAFT', 'CANCELLED'] } },
+        // o3d-27l/o3d-1di: same committed population as the Products tab, so aging doesn't inflate
+        // Gross/Tax/Total/PO Count with the quote pipeline (and doesn't surface quote-only suppliers).
+        where: { type: 'GOODS', ...COMMITTED_PURCHASE_ORDER_WHERE },
         select: {
           totalBase: true, taxBase: true, directFreightBase: true, poSentAt: true, receivedAt: true,
           invoices: { select: { totalBase: true, invoiceDate: true } },
