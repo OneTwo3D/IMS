@@ -283,10 +283,19 @@ export async function findSalesOrderDeleteBlocker(
             + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '
             + 'so the document may exist in the ledger. Check the connector, then resolve the sync log.'
           : liveDocument.status === 'PROCESSING'
-            // A freshly claimed PROCESSING row is deliberately NOT retired by cancellation — the
-            // remote call may be in flight — so promising a cancel would be wrong here too.
+            // A claimed PROCESSING row is deliberately NOT retired by cancellation — the remote call
+            // may be in flight — so promising a cancel would be wrong here too.
+            //
+            // "Wait for it to settle" is only true while the row's connector is ENABLED. Since
+            // o3d-sref the orphan sweep no longer retires a stale claim, so a row belonging to a
+            // switched-off connector stays PROCESSING indefinitely: no processor runs for it, and
+            // nothing else terminalises it. Telling that operator to wait is advice that provably
+            // cannot work, which is how a blocker becomes a dead end — so both cases are named.
             ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
-              + 'is IN FLIGHT. Wait for it to settle, then delete or reverse depending on the outcome.'
+              + 'is IN FLIGHT. If that connector is still enabled, wait for it to settle, then delete or '
+              + 'reverse depending on the outcome. If it has been switched off, this will NOT settle on '
+              + 'its own — re-enable the connector so the sync is reclaimed and completes, or resolve the '
+              + 'document at the connector directly.'
             : `Cannot delete an order with accounting documents queued to ${liveDocument.connector} `
               + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired before it posts.`,
     })

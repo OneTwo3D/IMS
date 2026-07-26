@@ -132,3 +132,21 @@ test('the survivor count includes EVERY PROCESSING row, not just the stale ones 
     'and does NOT narrow to stale claims — a fresh claim survives too, so it must be reported',
   )
 })
+
+test('the PROCESSING blocker does not tell an operator to wait for something that cannot settle (o3d-sref)', async () => {
+  // Since the sweep no longer retires a stale claim, a row on a switched-off connector stays
+  // PROCESSING indefinitely — no processor runs for it and nothing else terminalises it. The old
+  // message said "wait for it to settle", which for that operator is advice that provably cannot
+  // work: a blocker that becomes a dead end. Both cases must be named, with a real remedy for each.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'lib/domain/sales/order-delete-guard.ts'), 'utf8')
+
+  const processingBranch = src.slice(src.indexOf("liveDocument.status === 'PROCESSING'"))
+  const message = processingBranch.slice(0, processingBranch.indexOf('        : `Cannot delete an order with accounting documents queued'))
+
+  assert.match(message, /still enabled/, 'the still-running case keeps its wait-and-see advice')
+  assert.match(message, /switched off/, 'and the abandoned case is named')
+  assert.match(message, /NOT settle on/, 'saying plainly that waiting will not help')
+  assert.match(message, /re-enable the connector/, 'with a remedy that actually resolves the row')
+})
