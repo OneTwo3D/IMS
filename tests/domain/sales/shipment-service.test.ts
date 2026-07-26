@@ -993,3 +993,38 @@ test('reconcileOrderAfterShipment does not rewrite terminal orders', async () =>
   assert.equal(state.orders[0].trackingNumber, 'EXISTING')
   assert.equal(state.orders[0].shippedAt, shippedAt)
 })
+
+test('transitionShipmentStatus does not reject a fractional KIT on a rounding ulp (o3d-odu)', async () => {
+  // The quantisation half of the guard, which nothing else pins.
+  //
+  // A kit needing 0.3333 of a component, ordered 0.5 kits, entitles 0.5 x 0.3333 = 0.16665 — a
+  // 5-decimal figure. Shipment rows persist at Decimal(12,4), so the row the warehouse actually
+  // writes is 0.1667. Comparing the persisted 0.1667 against the raw 0.16665 puts it 0.00005 over,
+  // which is 50x the 0.000001 epsilon, so an unquantised guard REJECTS a shipment that is exactly
+  // what the kit expansion asked for — the false-reject that made fractional kit dispatch
+  // impossible. Rounding the entitlement to the same 4dp boundary the row lives on makes the two
+  // comparable.
+  //
+  // Verified discriminating: dropping roundQuantity from shippableQty turns this red.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.3333, sku: 'COMP-1' }] },
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      // 0.16665 quantised to the Decimal(12,4) column the row persists in.
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 0.1667 },
+    ],
+    stockLevels: [{ productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 0.1667 }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true, 'a kit shipped at exactly its persisted entitlement must dispatch')
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+})

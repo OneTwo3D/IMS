@@ -221,7 +221,12 @@ async function validateActiveShipmentTotalsWithinOrder(
     const shippedQty = shippedByLeaf.get(key) ?? new Prisma.Decimal(0)
     // Still shippable = ordered − refunded − already-shipped, never below zero. Only the not-yet-shipped
     // planned quantity is checked against it, so a historical post-ship refund doesn't fail the order.
-    let shippableQty = orderedQty.sub(refundedQty).sub(shippedQty)
+    // Quantised to the Decimal(12,4) boundary the shipment rows persist at (o3d-odu), so a single
+    // fractional component (0.5 kit x 0.3333 = 0.16665, persisted 0.1667) isn't rejected by a
+    // rounding ulp — the false-reject that made every fractional kit dispatch fail. Rounded AFTER
+    // the whole subtraction, not per term: rounding three terms separately lets half-ulp errors
+    // compound. Kept exact (epsilon-only) beyond that, so nothing can be over-shipped.
+    let shippableQty = roundQuantity(orderedQty.sub(refundedQty).sub(shippedQty), 4)
     if (shippableQty.lt(0)) shippableQty = new Prisma.Decimal(0)
     if (plannedQty.gt(shippableQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
       if (refundedQty.gt(0)) {
