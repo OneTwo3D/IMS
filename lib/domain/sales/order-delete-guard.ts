@@ -117,6 +117,12 @@ export async function findSalesOrderDeleteBlocker(
   // row, and pass every other check — hard-deleted, stranding the document with no IMS order
   // behind it. accountingInvoiceId lives on the order itself and is never purged.
   //
+  // CAVEAT (o3d-0g2n): this marker is only as reliable as the writeback that sets it. On
+  // QuickBooks, updateBackReference runs after the sync row is SYNCED, swallows its failure, and
+  // has no repair sweep — so a transient failure leaves a real invoice with no accountingInvoiceId.
+  // Until that is fixed, the sync-log checks below are what covers that case, and only until
+  // retention purges them.
+  //
   // accountingInvoiceId ONLY — deliberately NOT invoicedAt. generateInvoiceNumber sets invoicedAt
   // when it merely assigns a LOCAL invoice number (app/actions/sales.ts ~2680), and that action is
   // available even with accounting sync disabled. Treating it as external-post evidence would make
@@ -164,25 +170,36 @@ export async function findSalesOrderDeleteBlocker(
   }
   const liveDocument = await tx.accountingSyncLog.findFirst({
     where: { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] }, OR: orderKeyed },
-    select: { id: true, connector: true, type: true, status: true },
+    // externalTransactionId is the POST evidence, and status alone is not a proxy for it:
+    // Xero reverts an already-posted row to PENDING when follow-up work fails, KEEPING the
+    // external id. Branching on status alone would then tell an operator to cancel a document
+    // that is already in the ledger (o3d-v7sy).
+    select: { id: true, connector: true, type: true, status: true, externalTransactionId: true },
   })
   if (liveDocument) {
     return {
       code: 'accounting_sync_live',
-      // The remedy differs by status, and saying "cancel" for a POSTED document would be wrong:
-      // cancelOrderInvoiceSync retires PENDING / FAILED / stale-PROCESSING rows only and
-      // explicitly leaves SYNCED alone, because a cancel-after-post needs an explicit reversal.
-      // Telling an operator otherwise leaves a live receivable against a CANCELLED order.
-      message: liveDocument.status === 'SYNCED'
+      // The remedy depends on whether the document is ALREADY IN THE LEDGER, which is what
+      // externalTransactionId records — not on status alone. cancelOrderInvoiceSync retires
+      // PENDING / FAILED / stale-PROCESSING rows and explicitly leaves SYNCED alone, because a
+      // cancel-after-post needs an explicit reversal. Telling an operator to cancel a posted
+      // document leaves a live receivable against a CANCELLED order.
+      message: (liveDocument.status === 'SYNCED' || liveDocument.externalTransactionId)
         ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
-          + 'is already POSTED. It needs an explicit reversal or credit note in the accounting system — '
+          + `is already POSTED${liveDocument.externalTransactionId ? ` as ${liveDocument.externalTransactionId}` : ''}. `
+          + 'It needs an explicit reversal or credit note in the accounting system — '
           + 'cancelling the order does NOT reverse a posted document.'
         : liveDocument.status === 'FAILED'
           ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `
             + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '
             + 'so the document may exist in the ledger. Check the connector, then resolve the sync log.'
-          : `Cannot delete an order with accounting documents queued to ${liveDocument.connector} `
-            + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired before it posts.`,
+          : liveDocument.status === 'PROCESSING'
+            // A freshly claimed PROCESSING row is deliberately NOT retired by cancellation — the
+            // remote call may be in flight — so promising a cancel would be wrong here too.
+            ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
+              + 'is IN FLIGHT. Wait for it to settle, then delete or reverse depending on the outcome.'
+            : `Cannot delete an order with accounting documents queued to ${liveDocument.connector} `
+              + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired before it posts.`,
     }
   }
 

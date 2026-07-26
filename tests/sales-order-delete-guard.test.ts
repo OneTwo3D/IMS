@@ -14,6 +14,8 @@ type SyncLogRow = {
   status: string
   referenceType: string
   referenceId: string
+  /** Post evidence. Present once the document exists in the ledger, regardless of status. */
+  externalTransactionId?: string | null
 }
 
 type WhereNode = Record<string, unknown>
@@ -85,6 +87,7 @@ function syncLog(overrides: Partial<SyncLogRow>): SyncLogRow {
     status: 'PENDING',
     referenceType: 'SalesOrder',
     referenceId: 'order-1',
+    externalTransactionId: null,
     ...overrides,
   }
 }
@@ -334,4 +337,34 @@ test('a POSTED document says it needs a REVERSAL, not a cancel (o3d-v7sy)', asyn
 test('an order with neither marker nor logs is still deletable', async () => {
   const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [] }), 'order-1', STAMPS)
   assert.equal(blocker, null)
+})
+
+test('a PENDING row that already carries an external id is treated as POSTED (o3d-v7sy)', async () => {
+  // Status is not a proxy for post evidence. Xero reverts an already-posted row to PENDING when
+  // follow-up work fails, KEEPING externalTransactionId — and cancelOrderInvoiceSync excludes
+  // such rows. Branching on status alone would tell an operator to cancel a document that is
+  // already in the ledger, leaving a live receivable against a CANCELLED order.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [syncLog({ status: 'PENDING', externalTransactionId: 'INV-999' })] }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'accounting_sync_live')
+  assert.match(blocker!.message, /already POSTED as INV-999/)
+  assert.match(blocker!.message, /does NOT reverse a posted document/)
+  assert.doesNotMatch(blocker!.message, /Cancel the order instead/)
+})
+
+test('an in-flight PROCESSING row asks the operator to WAIT, not to cancel (o3d-v7sy)', async () => {
+  // A freshly claimed PROCESSING row is deliberately excluded from cancellation — the remote
+  // call may be in flight — so promising a cancel retires it is wrong here too.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [syncLog({ status: 'PROCESSING' })] }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.match(blocker!.message, /IN FLIGHT/)
+  assert.doesNotMatch(blocker!.message, /Cancel the order instead/)
 })
