@@ -142,7 +142,7 @@ async function defaultReadState(): Promise<SweepCursorState> {
  * Advisory-lock key serializing the read-check-write of the sweep cursor. Distinct from every
  * other key in the codebase; the single-argument (int8) form.
  */
-const SWEEP_CURSOR_LOCK_KEY = 918_273_912
+import { SWEEP_CURSOR_LOCK_KEY } from '@/lib/db/advisory-locks'
 
 /**
  * Persist the cursor ONLY if it still holds the value this run read (o3d-lvcb Codex review).

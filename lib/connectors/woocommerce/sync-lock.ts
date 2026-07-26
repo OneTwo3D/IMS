@@ -28,7 +28,8 @@
  * sides cannot drift out of sync.
  */
 
-export const WC_SYNC_ADVISORY_LOCK_KEY = 918_273_645
+export { WC_SYNC_ADVISORY_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { WC_SYNC_ADVISORY_LOCK_KEY } from '@/lib/db/advisory-locks'
 
 export const WC_SETTINGS_VERSION_KEY = 'wc_settings_version'
 
@@ -74,7 +75,8 @@ export const WC_SETTINGS_VERSION_KEY = 'wc_settings_version'
  * Two-argument (int4, int4) form, so it shares no key space with the
  * single-argument (int8) `WC_SYNC_ADVISORY_LOCK_KEY` above.
  */
-export const WC_PRODUCT_WRITE_LOCK_NAMESPACE = 918_273_646
+export { WC_PRODUCT_WRITE_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { WC_PRODUCT_WRITE_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 
 /**
  * Every SKU one product-write transaction touches, deduplicated (o3d-fsi).

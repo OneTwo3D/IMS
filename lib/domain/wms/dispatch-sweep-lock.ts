@@ -25,7 +25,8 @@ export type DispatchLockSkipped = { lockSkipped: true }
 export const DISPATCH_LOCK_SKIPPED: DispatchLockSkipped = { lockSkipped: true }
 
 /** Namespace for pg_try_advisory_lock(key1, key2) — distinct from other locks. */
-export const DISPATCH_SWEEP_LOCK_NAMESPACE = 0x77_6d_73_64 // 'wmsd'
+export { DISPATCH_SWEEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { DISPATCH_SWEEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 
 /**
  * Stable 32-bit key for a connector id. A hash rather than a registry so a new

@@ -66,7 +66,8 @@ type JournalLinePayload = {
 }
 type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | 'integrationOutbox' | 'activityLog'>
 
-const XERO_DAILY_BATCH_LOCK_KEY = 4_112_208_031
+import { XERO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 const XERO_CONNECTOR = 'xero'
 export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
 export const XERO_DAILY_BATCH_MAX_LIMIT = 5_000
@@ -528,10 +529,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     hasMore: { groupA1: false, groupA2: false, groupB: false },
     errors: [],
   }
-  const lockRows = await db.$queryRaw<Array<{ locked: boolean }>>`
-    SELECT pg_try_advisory_lock(${XERO_DAILY_BATCH_LOCK_KEY}) AS locked
-  `
-  if (!lockRows[0]?.locked) {
+  // o3d-4ajo: pinned to ONE connection. Taking this through Prisma and releasing
+  // it through Prisma can hit different pooled sockets, so the unlock silently
+  // no-ops and the lock leaks — and this key is shared with refund creation /
+  // the Xero payment jobs, so a leak stalls those too, not just the batch.
+  const batchLock = await acquirePinnedAdvisoryLockOrNull(XERO_DAILY_BATCH_LOCK_KEY)
+  if (!batchLock) {
     result.errors.push('Daily batch already running')
     return result
   }
@@ -551,6 +554,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
   // --- Group A1: Revenue Deferral ---
   try {
+    // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
+    // so from that moment another batch — or a refund, which shares this domain
+    // — can start while we are still writing. Stop instead.
+    batchLock.assertHeld('Group A1 (revenue deferral)')
     const orderWindow = takeDailyBatchWindow(await db.salesOrder.findMany({
       where: {
         paidAt: { not: null },
@@ -654,6 +661,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
   // --- Group A2: Inventory Reclassification ---
   try {
+    // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
+    // so from that moment another batch — or a refund, which shares this domain
+    // — can start while we are still writing. Stop instead.
+    batchLock.assertHeld('Group A2 (inventory reclassification)')
     const orderWindow = takeDailyBatchWindow(await db.salesOrder.findMany({
       where: {
         revenueDeferredDate: { not: null },
@@ -786,6 +797,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
   // --- Group B: Shipment Revenue Recognition + COGS ---
   try {
+    // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
+    // so from that moment another batch — or a refund, which shares this domain
+    // — can start while we are still writing. Stop instead.
+    batchLock.assertHeld('Group B (shipment revenue + COGS)')
     const groupBCount = await db.$transaction(async (tx) => {
       const shipmentWindow = takeDailyBatchWindow(await tx.shipment.findMany({
         where: {
@@ -1454,6 +1469,6 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
     return result
   } finally {
-    await db.$executeRaw`SELECT pg_advisory_unlock(${XERO_DAILY_BATCH_LOCK_KEY})`
+    await batchLock.release()
   }
 }
