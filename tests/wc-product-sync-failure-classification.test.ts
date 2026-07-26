@@ -81,6 +81,31 @@ const txClient = {
   product: {
     findFirst: async ({ where }: { where: { sku?: unknown } }) =>
       state.products.find((row) => row.sku === where?.sku) ?? null,
+    findUnique: async ({ where }: { where: { id: string } }) =>
+      state.products.find((row) => row.id === where.id) ?? null,
+    // The ownership-guarded update (o3d-fsi): `id` plus an OR over externalProductId. A zero
+    // count is how production learns the row was reassigned underneath it.
+    updateMany: async ({ where, data }: { where: Row; data: Row }) => {
+      const row = state.products.find((candidate) => candidate.id === where.id)
+      if (!row) return { count: 0 }
+      const or = where.OR as Array<Row> | undefined
+      if (or) {
+        const matches = or.some((clause) => {
+          if ('externalProductId' in clause && clause.externalProductId === null) {
+            return row.externalProductId == null
+          }
+          const inClause = (clause.externalProductId as { in?: bigint[] } | undefined)?.in
+          return Array.isArray(inClause)
+            && row.externalProductId != null
+            && inClause.some((id) => id === row.externalProductId)
+        })
+        if (!matches) return { count: 0 }
+      }
+      assertUnique(data, String(where.id))
+      state.updateCalls++
+      Object.assign(row, data)
+      return { count: 1 }
+    },
     findMany: async ({ where }: { where?: { sku?: { in?: unknown[] } } } = {}) => {
       const wanted = where?.sku?.in
       if (!Array.isArray(wanted)) return state.products.map((row) => ({ ...row }))
