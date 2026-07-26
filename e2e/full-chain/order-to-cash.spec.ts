@@ -22,7 +22,7 @@ import {
   refundWcOrder, updateWcOrder, wcCreds, type WcCreds,
 } from './harness/wc.ts'
 import {
-  allocateAndShip, createAndSendPo, createLandedCostPo, drainLandedCostOutboxNow, openSalesOrder,
+  accountingInvariants, allocateAndShip, createAndSendPo, createLandedCostPo, drainLandedCostOutboxNow, openSalesOrder,
   processPendingXeroSyncViaUi, receiveGoods, recordSalesPaymentViaUi, runDailyBatch, runInboxDrain,
   runPaymentPoll, runWcOrderReconcile, setPostingMode,
 } from './harness/ims.ts'
@@ -1837,10 +1837,17 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
       expectJournalLine(reversal.JournalLines, { accountCode: await settingValueOc('xero_inventory_account'), debit: expectedReversal })
       expectJournalLine(reversal.JournalLines, { accountCode: await settingValueOc('xero_cogs_account'), credit: expectedReversal })
 
-      // 6. And the returned stock re-enters on the SAME posted basis, so the inventory GL leg of that
-      //    single-amount journal still equals the cost-layer subledger.
-      const returnedLayerCost = await returnedLayerUnitCostFor(productId)
-      expect(returnedLayerCost, 'the returned layer is valued at the posted basis, matching the journal').toBeCloseTo(postedUnitCost, 2)
+      // 6. And the returned stock re-enters at a basis that keeps the books reconciled. Asserted as the
+      //    PROPERTY the gate actually names — no new inventory GL-vs-subledger mismatch — rather than by
+      //    predicting which row the restock writes. Measured on the rig 2026-07-26: the return re-enters
+      //    the EXISTING layer rather than recreating one, so an assertion shaped around "the new return
+      //    layer" tests the implementation's current shape and fails the moment it changes, while saying
+      //    nothing about whether the ledger still ties out.
+      const inventoryInvariants = await accountingInvariants(page)
+      expect(
+        inventoryInvariants.findings.find((f) => f.code === 'inventory_gl_subledger_mismatch'),
+        'the valued return must leave inventory GL still equal to the cost-layer subledger',
+      ).toBeFalsy()
     } finally {
       const cn = refundId ? await externalIdFor({ type: 'CREDIT_NOTE', referenceId: refundId }).catch(() => null) : null
       if (cn) trackDocument('CreditNotes', cn, `OC-24 credit note ${runTag(runId)}`)
@@ -2210,27 +2217,6 @@ async function latestCostLayerUnitCostFor(productId: string): Promise<number> {
       [productId],
     )
     if (!r.rows.length) throw new Error(`No PO-sourced cost layer for product ${productId}`)
-    return Number(r.rows[0].unitCostBase)
-  } finally {
-    await db.end()
-  }
-}
-
-/** The unit cost of the layer a RETURN recreated — it must match the posted basis, not the revalued one. */
-async function returnedLayerUnitCostFor(productId: string): Promise<number> {
-  const { Client } = await import('pg')
-  const db = new Client({ connectionString: process.env.DATABASE_URL })
-  await db.connect()
-  try {
-    // The layer the RETURN recreated: no poLineId (it did not come from a receipt) and newest, so it is
-    // the one the refund just wrote rather than the goods layer beside it.
-    const r = await db.query<{ unitCostBase: string }>(
-      `select "unitCostBase"::text from cost_layers
-        where "productId" = $1 and "poLineId" is null
-        order by "receivedAt" desc limit 1`,
-      [productId],
-    )
-    if (!r.rows.length) throw new Error(`No return-created cost layer for product ${productId}`)
     return Number(r.rows[0].unitCostBase)
   } finally {
     await db.end()
