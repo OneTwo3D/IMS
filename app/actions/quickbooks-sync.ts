@@ -315,13 +315,23 @@ export async function triggerQuickBooksSync(): Promise<{ success: boolean; resul
     }
 
     const result = await processPendingQuickBooksSync()
+    // o3d-0g2n: parity with the manual Xero sync, which has repaired back-references since
+    // audit-H3. An operator reaching for "sync now" because something looks wrong is exactly when
+    // an unwritten accountingInvoiceId should get fixed.
+    let backReferenceRepair: unknown
+    try {
+      const { repairQuickBooksBackReferences } = await import('@/lib/connectors/quickbooks/sync-processor')
+      backReferenceRepair = await repairQuickBooksBackReferences()
+    } catch (repairError) {
+      console.error('Manual QuickBooks sync: back-reference repair failed', repairError)
+    }
 
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_manual_sync',
       tag: 'sync',
       description: `Manual QuickBooks sync: ${result.succeeded} synced, ${result.failed} failed`,
-      metadata: result,
+      metadata: { ...result, backReferenceRepair },
     })
 
     revalidatePath('/sync')

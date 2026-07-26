@@ -60,9 +60,19 @@ export async function GET(request: Request) {
     // connector-agnostic (queueAccountingSync routes to the active connector), so
     // they must drain under QuickBooks too, not just Xero.
     const landedCostJournalOutbox = await drainLandedCostJournalOutbox()
-    const { processPendingQuickBooksSync } = await import('@/lib/connectors/quickbooks/sync-processor')
+    const { processPendingQuickBooksSync, repairQuickBooksBackReferences } = await import('@/lib/connectors/quickbooks/sync-processor')
     const result = await processPendingQuickBooksSync()
-    return NextResponse.json({ ...result, landedCostJournalOutbox })
+    // o3d-0g2n: the same repair sweep the Xero branch has run since audit-H3. Its absence here was
+    // load-bearing: updateBackReference runs after the row is SYNCED and swallows its failure, so a
+    // transient failure left a real QuickBooks invoice with no accountingInvoiceId on the order —
+    // and that marker is the ONLY delete-guard evidence surviving retention (o3d-v7sy).
+    let backReferenceRepair: Awaited<ReturnType<typeof repairQuickBooksBackReferences>> | undefined
+    try {
+      backReferenceRepair = await repairQuickBooksBackReferences()
+    } catch (repairError) {
+      console.error('accounting-sync cron: QuickBooks back-reference repair sweep failed', repairError)
+    }
+    return NextResponse.json({ ...result, backReferenceRepair, landedCostJournalOutbox })
   }
 
   return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })

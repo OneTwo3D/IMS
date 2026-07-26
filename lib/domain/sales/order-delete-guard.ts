@@ -128,11 +128,16 @@ export async function findSalesOrderDeleteBlocker(
   // row, and pass every other check — hard-deleted, stranding the document with no IMS order
   // behind it. accountingInvoiceId lives on the order itself and is never purged.
   //
-  // CAVEAT (o3d-0g2n): this marker is only as reliable as the writeback that sets it. On
-  // QuickBooks, updateBackReference runs after the sync row is SYNCED, swallows its failure, and
-  // has no repair sweep — so a transient failure leaves a real invoice with no accountingInvoiceId.
-  // Until that is fixed, the sync-log checks below are what covers that case, and only until
-  // retention purges them.
+  // This marker is only as reliable as the writeback that sets it, and on QuickBooks
+  // updateBackReference still runs AFTER the row is SYNCED and swallows its failure. What changed
+  // (o3d-0g2n) is that a repair sweep now reconciles those rows on every cron cycle and manual
+  // sync, as Xero's has since audit-H3 — so a transient failure is corrected rather than left
+  // permanently, and the marker is restored well inside the retention window.
+  //
+  // RESIDUAL: the sweep repairs from the sync log, so it can only run while that log still exists.
+  // A writeback that fails AND is never swept before retention purges the row (six months) still
+  // leaves an invoice with no marker. Closing that needs retention to stop deleting unreconciled
+  // rows by age — tracked as o3d-nepa.
   //
   // accountingInvoiceId ONLY — deliberately NOT invoicedAt. generateInvoiceNumber sets invoicedAt
   // when it merely assigns a LOCAL invoice number (app/actions/sales.ts ~2680), and that action is

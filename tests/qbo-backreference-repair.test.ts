@@ -1,0 +1,95 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+// o3d-0g2n. o3d-v7sy made the order delete guard check SalesOrder.accountingInvoiceId precisely
+// because it lives on the order row and SURVIVES the retention purge that deletes AccountingSyncLog
+// rows. That only holds if the marker is reliably written — and on QuickBooks it was not.
+//
+// updateBackReference runs AFTER the row is marked SYNCED and swallows its failure into a WARNING.
+// A transient failure therefore left:
+//
+//   - a real invoice in QuickBooks
+//   - a SYNCED row with an externalTransactionId (protective, but only until retention)
+//   - NO accountingInvoiceId on the order — the retention-proof marker missing
+//
+// Once retention deleted the log, an otherwise-eligible order could be hard-deleted while its
+// QuickBooks invoice stood: exactly the hole o3d-v7sy set out to close, reached through the
+// connector that lacked the repair path. Xero has had that sweep since audit-H3.
+
+test('QuickBooks has a back-reference repair sweep, like Xero (o3d-0g2n)', async () => {
+  const qbo = await import('@/lib/connectors/quickbooks/sync-processor')
+  const xero = await import('@/lib/connectors/xero/sync-processor')
+
+  assert.equal(typeof qbo.repairQuickBooksBackReferences, 'function')
+  assert.equal(
+    typeof xero.repairXeroBackReferences,
+    'function',
+    'the Xero counterpart this mirrors still exists — if it is ever removed, revisit both',
+  )
+})
+
+test('the sweep uses the CONNECTOR-AGNOSTIC helpers, not a third copy of the logic (o3d-0g2n)', async () => {
+  // applyBackReference / backReferenceIsMissing already live in lib/domain/accounting, which is what
+  // makes this a parity fix rather than a new mechanism. QuickBooks' WRITER still duplicates that
+  // logic locally (tracked separately) — the sweep must not add a third divergent copy.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8')
+
+  const sweep = src.slice(src.indexOf('export async function repairQuickBooksBackReferences'))
+  assert.match(sweep, /backReferenceIsMissing\(db, params\)/, 'probes via the shared helper')
+  assert.match(sweep, /applyBackReference\(db, params\)/, 'and writes via the shared helper')
+})
+
+test('it probes before writing, so it is safe to run every cycle (o3d-0g2n)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8')
+  const sweep = src.slice(src.indexOf('export async function repairQuickBooksBackReferences'))
+
+  // The probe must gate the write, or a cron-frequency sweep would rewrite every linked document.
+  const probeIndex = sweep.indexOf('backReferenceIsMissing')
+  const skipIndex = sweep.indexOf('if (!missing) continue')
+  const applyIndex = sweep.indexOf('applyBackReference')
+  assert.ok(probeIndex < skipIndex && skipIndex < applyIndex, 'probe, then skip-if-linked, then write')
+})
+
+test('FAILED rows carrying an external id are candidates too (o3d-0g2n)', async () => {
+  // o3d-ju8t: the remote call happens BEFORE the result is written, so a FAILED row with an external
+  // id posted successfully and then lost its writeback. Excluding FAILED would leave exactly the
+  // rows most likely to need repair.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8')
+  const sweep = src.slice(src.indexOf('export async function repairQuickBooksBackReferences'))
+  const where = sweep.slice(0, sweep.indexOf('})'))
+
+  assert.match(where, /status: \{ in: \['SYNCED', 'FAILED'\] \}/, 'both statuses are swept')
+  assert.match(where, /externalTransactionId: \{ not: null \}/, 'but only rows that actually posted')
+  assert.match(where, /connector: 'quickbooks'/, 'scoped to this connector')
+})
+
+test('a multi-bill PO is skipped rather than guessed at (o3d-0g2n)', async () => {
+  // A PURCHASE_INVOICE row references the PO, not a specific bill. With several unlinked bills the
+  // "latest unlinked" heuristic could stamp one bill's id onto another — a wrong external id is
+  // worse than a missing one, because it looks correct. Same rule as Xero's sweep.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8')
+  const sweep = src.slice(src.indexOf('export async function repairQuickBooksBackReferences'))
+
+  assert.match(sweep, /skippedAmbiguous\+\+/, 'ambiguous POs are counted, not repaired')
+  assert.match(sweep, /quickbooks_backreference_repair_ambiguous/, 'and logged for manual attribution')
+})
+
+test('both the cron and the manual sync run it (o3d-0g2n)', async () => {
+  // A sweep nothing calls is not a fix. Xero runs it from both; QuickBooks now does too.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+
+  const cron = readFileSync(join(process.cwd(), 'app/api/cron/accounting-sync/route.ts'), 'utf8')
+  assert.match(cron, /repairQuickBooksBackReferences\(\)/, 'the cron runs it')
+
+  const manual = readFileSync(join(process.cwd(), 'app/actions/quickbooks-sync.ts'), 'utf8')
+  assert.match(manual, /repairQuickBooksBackReferences\(\)/, 'and so does the manual sync')
+})

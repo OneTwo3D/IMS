@@ -16,6 +16,8 @@ import { pushCreditMemo } from './credit-notes'
 import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
+import { applyBackReference, backReferenceIsMissing, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
+import type { BackReferenceRepairResult } from '@/lib/connectors/xero/sync-processor'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
@@ -885,4 +887,117 @@ async function enqueueFollowUps(
       await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId })
     }
   }
+}
+
+
+/**
+ * o3d-0g2n: the QuickBooks counterpart of repairXeroBackReferences. Xero has had this since
+ * audit-H3; QuickBooks never did, and the asymmetry was load-bearing.
+ *
+ * WHY IT MATTERS MORE THAN A MISSING NICETY. o3d-v7sy made the order delete guard check
+ * SalesOrder.accountingInvoiceId specifically because it lives on the order row and SURVIVES the
+ * retention purge that deletes AccountingSyncLog rows. That only holds if the marker is reliably
+ * written. On QuickBooks it is not: updateBackReference runs AFTER the row is marked SYNCED and its
+ * failure is swallowed into a WARNING. A transient failure therefore leaves
+ *
+ *   - a real invoice in QuickBooks,
+ *   - a SYNCED row with an externalTransactionId (protective, but only until retention),
+ *   - and NO accountingInvoiceId on the order — the retention-proof marker missing.
+ *
+ * Once retention deletes the log, an otherwise-eligible order can be hard-deleted while its
+ * QuickBooks invoice stands: exactly the hole o3d-v7sy set out to close, reached through the
+ * connector that lacked the repair path.
+ *
+ * The probe/apply helpers are connector-agnostic already (lib/domain/accounting/back-reference.ts),
+ * which is what makes this a parity fix rather than a new mechanism — Xero routes through them
+ * while the QuickBooks writer duplicates the same logic locally. Converging that writer is a
+ * separate refactor (o3d-i53u); this only adds the missing sweep.
+ *
+ * Idempotent: it probes before writing and skips anything already linked, so it is safe to run
+ * every cron cycle.
+ */
+export async function repairQuickBooksBackReferences(limit = 200): Promise<BackReferenceRepairResult> {
+  const candidates = await db.accountingSyncLog.findMany({
+    where: {
+      connector: 'quickbooks',
+      // FAILED is included for the same reason Xero includes it: the remote call happens BEFORE the
+      // result is written, so a FAILED row carrying an external id posted successfully and then lost
+      // its writeback (o3d-ju8t).
+      status: { in: ['SYNCED', 'FAILED'] },
+      externalTransactionId: { not: null },
+      type: { in: ['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE'] },
+    },
+    select: { id: true, type: true, referenceType: true, referenceId: true, externalTransactionId: true, status: true, payload: true },
+    orderBy: { createdAt: 'asc' },
+    take: limit,
+  })
+
+  // A PURCHASE_INVOICE row references the PO, not a specific bill. With several bills on one PO the
+  // "latest unlinked bill" heuristic could stamp one bill's id onto another, so those are skipped
+  // for manual attribution rather than guessed at — the same rule Xero's sweep applies (audit-H3).
+  const poCandidateCounts = new Map<string, number>()
+  for (const row of candidates) {
+    if (row.type === 'PURCHASE_INVOICE' && row.referenceType === 'PurchaseOrder') {
+      poCandidateCounts.set(row.referenceId, (poCandidateCounts.get(row.referenceId) ?? 0) + 1)
+    }
+  }
+
+  const result: BackReferenceRepairResult = { checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0 }
+  for (const row of candidates) {
+    if (!row.externalTransactionId || !syncTypeWritesBackReference(row.type, row.referenceType)) continue
+    if (row.type === 'PURCHASE_INVOICE' && row.referenceType === 'PurchaseOrder' && (poCandidateCounts.get(row.referenceId) ?? 0) > 1) {
+      result.skippedAmbiguous++
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'quickbooks_backreference_repair_ambiguous',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Skipped QuickBooks back-reference repair for PO ${row.referenceId}: multiple bills have unwritten external ids and cannot be attributed automatically. Link them manually.`,
+        metadata: { syncLogId: row.id, referenceId: row.referenceId },
+      })
+      continue
+    }
+
+    const payload = (row.payload ?? {}) as Record<string, unknown>
+    const params = {
+      type: row.type,
+      referenceType: row.referenceType,
+      referenceId: row.referenceId,
+      externalId: row.externalTransactionId,
+      invoiceNumber: typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : undefined,
+    }
+
+    let missing: boolean
+    try {
+      missing = await backReferenceIsMissing(db, params)
+    } catch (probeError) {
+      console.error('repairQuickBooksBackReferences: probe failed', row.id, probeError)
+      result.failed++
+      continue
+    }
+    if (!missing) continue
+    result.checked++
+
+    try {
+      await applyBackReference(db, params)
+      // A FAILED row whose back-reference is now applied is fully reconciled.
+      if (row.status === 'FAILED') {
+        await db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', errorMessage: null } })
+      }
+      result.repaired++
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'quickbooks_backreference_repaired',
+        tag: 'sync',
+        level: 'INFO',
+        description: `Re-applied missing QuickBooks back-reference for ${row.referenceType} ${row.referenceId} (external id ${row.externalTransactionId}).`,
+        metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
+      })
+    } catch (repairError) {
+      result.failed++
+      console.error('repairQuickBooksBackReferences: repair failed', row.id, repairError)
+    }
+  }
+
+  return result
 }
