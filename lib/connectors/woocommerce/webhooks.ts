@@ -307,6 +307,15 @@ async function handleProductWebhook(payload: unknown) {
     && typeof productPayload.name === 'string'
     && typeof productPayload.status === 'string'
 
+  // Set when the product import fails, so the delivery is RETRIED rather than acknowledged (o3d-i0y).
+  // Every syncWcProductToIms failure is treated as transient/retryable: its find-then-create writes make
+  // even a P2002 potentially a concurrent-create race that a retry resolves, so classifying failures as
+  // permanent risks discarding a legitimate update. Genuine deterministic conflicts simply retry to the
+  // inbox's dead-letter limit (visible, no data loss) — far better than the old 200-ack that stranded the
+  // product forever. Proper permanent/transient classification belongs with the product-write atomicity
+  // fix (o3d-uh2).
+  let productSyncError: string | null = null
+
   if (canSyncProduct) {
     const result = await syncWcProductToIms(productPayload as WcFullProduct)
     if (result.success) {
@@ -336,9 +345,18 @@ async function handleProductWebhook(payload: unknown) {
         },
       })
     } else {
-      // TRANSIENT: a retry can still succeed, so this branch — and only this branch — is the one
-      // o3d-i0y (PR #551) turns into a retryable HTTP 500. Keeping the two apart here is the whole
-      // point of o3d-gtk: without it, i0y's 500 also retries the permanent conflicts above.
+      // TRANSIENT: a retry can still succeed, so this branch — and only this branch — sets
+      // productSyncError and turns the delivery into a retryable HTTP 500 (o3d-i0y). Keeping the
+      // two apart here is the whole point of o3d-gtk: without it, the 500 would also retry the
+      // permanent conflicts above, ~24 times, into the dead-letter queue.
+      //
+      // This branch originally classified P2002 as permanent, then REVERTED it because a P2002 on
+      // `sku` can be a concurrent-create race that a retry resolves — acking it permanent would
+      // discard a legitimate update. It deferred the split to o3d-gtk, "tied to o3d-uh2", pending
+      // atomic writes. Both have since landed, and o3d-gtk's classification keeps `sku` TRANSIENT
+      // for exactly that reason, marking only barcode / externalProductId permanent. So the
+      // precondition this branch was waiting on is satisfied, and the two compose as designed.
+      productSyncError = result.error ?? 'Unknown product sync error'
       await logActivity({
         entityType: 'SYNC',
         action: 'wc_product_webhook',
@@ -348,7 +366,7 @@ async function handleProductWebhook(payload: unknown) {
         metadata: {
           externalId: productPayload.id,
           sku: productPayload.sku,
-          error: result.error ?? 'Unknown product sync error',
+          error: productSyncError,
         },
       })
     }
@@ -368,6 +386,14 @@ async function handleProductWebhook(payload: unknown) {
         payloadKeys: Object.keys(productPayload).sort(),
       },
     })
+  }
+
+  // Return the retryable 500 BEFORE the best-effort stock correction, so an inbox retry of a failed
+  // product import re-attempts the product WITHOUT replaying the forced stock write below (force:true
+  // bypasses the stock dedupe and reopens completed/permanently-failed stock rows). The stock correction
+  // runs only on a product success or a stock-only webhook. Mirrors handleOrderWebhook (o3d-i0y).
+  if (productSyncError) {
+    return NextResponse.json({ ok: false, error: productSyncError }, { status: 500 })
   }
 
   if (typeof productPayload.id === 'number' && Object.prototype.hasOwnProperty.call(productPayload, 'stock_quantity')) {
