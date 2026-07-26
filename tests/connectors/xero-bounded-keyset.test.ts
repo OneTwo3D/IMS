@@ -2,8 +2,12 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  createRequestBudget,
+  drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
   lowerBoundWhere,
+  MAX_PAGES,
+  MAX_REQUESTS_PER_POLL,
   PAGE_SIZE,
   parseXeroDate,
   upperBoundWhere,
@@ -187,7 +191,7 @@ test('a second that will NOT hold still is refused rather than trusted (o3d-8f9)
   const result = await fetchInvoicesModifiedSince(SINCE, get, UPPER)
 
   assert.equal(result.ok, false, 'an unprovable read is never reported as success')
-  assert.match(result.ok === false ? result.error : '', /did not hold still/)
+  assert.match(result.ok === false ? result.error : '', /could not be proven completely read/)
   assert.match(result.ok === false ? result.error : '', /cursor is held/)
 })
 
@@ -251,4 +255,108 @@ test('the keyset bounds compose into one where clause Xero accepts (o3d-8f9)', (
   assert.equal(upper, 'UpdatedDateUTC<DateTime(2026,7,17,12,15,0)')
   // `&&` is Xero's conjunction — `AND` is not accepted.
   assert.equal(`${lower}&&${upper}`.includes('&&'), true)
+})
+
+test('a tie REORDER between pages is caught, not hidden by the dedupe Map (o3d-8f9, Codex r1)', async () => {
+  // The exact interleaving Codex used to break the first version of the verification, and the one
+  // o3d-8f9 itself warned about: "tie permutation between requests can produce both duplicates and
+  // omissions. The dedupe Map hides the duplicates and therefore hides the symptom of the omissions
+  // too."
+  //
+  // 150 rows share one second, so the second is read by offset. Page 1 returns ids 1..100. Before
+  // page 2 the server reorders the tie so id-101 moves INTO the first hundred and id-1 moves out of
+  // it. Page 2 (offset 100..199) therefore returns id-1 again plus 102..150 — 50 rows, a short page,
+  // so it looks complete. Collapsing that into a Map hid the duplicate id-1, and id-101 was never
+  // read. Repeating the same legal reorder on a second pass produced an identical 149-id set, so the
+  // old cross-pass equality check AGREED and the cursor advanced past a lost invoice.
+  //
+  // Detecting the intra-pass duplicate is what makes the omission visible.
+  // The rows sit on SINCE's own second: that is what makes the cursor unable to advance and hands
+  // the second to the offset fallback.
+  const shared = SINCE.getTime()
+  const ids = Array.from({ length: 150 }, (_, i) => `id-${i + 1}`)
+
+  let requests = 0
+  const get: InvoiceFetcher = async (path) => {
+    const query = new URLSearchParams(path.slice(path.indexOf('?') + 1))
+    const page = Number(query.get('page') ?? '1')
+    requests += 1
+    // Every pass reorders identically between its pages — a permutation Xero is free to return,
+    // since a tie has no defined order.
+    const order = page === 1
+      ? ids
+      : [ids[100], ...ids.slice(1, 100), ids[0], ...ids.slice(101)]
+    const slice = order.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+    return { ok: true, status: 200, data: { Invoices: slice.map((id) => inv(id, shared)) } }
+  }
+
+  const result = await fetchInvoicesModifiedSince(SINCE, get, UPPER)
+
+  assert.equal(result.ok, false, 'a reordered tie must never be reported as a complete read')
+  assert.match(result.ok === false ? result.error : '', /two pages of one pass/)
+  assert.ok(requests > 2, 'it retried rather than accepting the first agreeing pair')
+})
+
+test('createRequestBudget stops at its ceiling and says the cursor is held (o3d-8f9, Codex r2)', () => {
+  const budget = createRequestBudget(3)
+  assert.equal(budget.spend(), null)
+  assert.equal(budget.spend(), null)
+  assert.equal(budget.spend(), null)
+  assert.equal(budget.spent(), 3)
+
+  const refused = budget.spend()
+  assert.equal(refused?.status, 'error')
+  assert.match(refused?.error ?? '', /request Xero budget/)
+  assert.match(refused?.error ?? '', /cursor is held/)
+  assert.equal(budget.spent(), 3, 'a refused request is not counted as spent')
+})
+
+test('a whole DRAIN shares one request budget, so nested passes cannot overspend (o3d-8f9, Codex r2)', async () => {
+  // MAX_CHUNKS_PER_POLL bounds chunks and MAX_PAGES bounds pages within a window, but the
+  // saturated-second verification passes are NESTED inside both and used to escape either cap.
+  // Codex costed one poll at over 400 calls against a tenant-wide 1,000/day allowance shared with
+  // every other Xero sync — so payment polling could starve the rest of the system, and itself.
+  //
+  // Here EVERY second is saturated but completable, which is the shape that multiplies requests
+  // without tripping any per-window cap. All of them now draw on ONE per-poll ceiling.
+  let requests = 0
+  const get: InvoiceFetcher = async (path) => {
+    requests += 1
+    const query = new URLSearchParams(path.slice(path.indexOf('?') + 1))
+    const page = Number(query.get('page') ?? '1')
+    const where = whereOf(path)
+    const m = /UpdatedDateUTC>=DateTime\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)/.exec(where)
+    const base = m
+      ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))
+      : SINCE.getTime()
+
+    // The UNBOUNDED probe (no `where`) must overflow, or the drain reads the whole window in one
+    // go and never chunks at all — which is what made the first version of this test vacuous.
+    if (!where) {
+      const rows = Array.from({ length: PAGE_SIZE }, (_, i) => inv(`u${page}-${i}`, SINCE.getTime()))
+      return { ok: true, status: 200, data: { Invoices: rows } }
+    }
+
+    // Inside a BOUNDED window: one full page on page 1, nothing after. Saturated (the page shares
+    // the cursor's own second) but the offset fallback terminates, so the walk keeps stepping
+    // forward a second at a time — the shape that multiplies nested requests.
+    if (page > 1) return { ok: true, status: 200, data: { Invoices: [] } }
+    const rows = Array.from({ length: PAGE_SIZE }, (_, i) => inv(`r${base}-${i}`, base))
+    return { ok: true, status: 200, data: { Invoices: rows } }
+  }
+
+  const result = await drainInvoicesModifiedSince(
+    SINCE,
+    new Date(SINCE.getTime() + 6 * 60 * 60_000),
+    get,
+    async () => 'continue',
+  )
+
+  assert.equal(result.ok, false, 'the drain stops instead of spending without limit')
+  assert.match(result.ok === false ? (result.error ?? '') : '', /request Xero budget/)
+  assert.ok(
+    requests <= MAX_REQUESTS_PER_POLL,
+    `made ${requests} requests, above the ${MAX_REQUESTS_PER_POLL} ceiling`,
+  )
+  assert.ok(requests > MAX_PAGES, 'the fixture must actually push past a single window\'s worth')
 })

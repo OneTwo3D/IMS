@@ -159,8 +159,13 @@ export async function fetchInvoicesModifiedSince(
   since: Date,
   get: InvoiceFetcher,
   upperBound?: Date,
+  /**
+   * Pass the DRAIN's budget so every chunk, page and saturated-second pass in one poll counts
+   * against a single ceiling (o3d-8f9). Omitted, each call gets its own — right for a one-off read.
+   */
+  budget: RequestBudget = createRequestBudget(),
 ): Promise<{ ok: true; invoices: XeroInvoice[] } | { ok: false; error: string }> {
-  const walked = await walkPages(since, upperBound, get)
+  const walked = await walkPages(since, upperBound, get, budget)
   if (walked.status === 'ok') return { ok: true, invoices: walked.invoices }
   if (walked.status === 'error') return { ok: false, error: walked.error }
   return {
@@ -278,6 +283,55 @@ function keysetPath(cursor: Date, upper: Date): string {
  * past them. Failing closed is the whole point.
  */
 /**
+ * The hard ceiling on Xero requests ONE poll may make, across everything (o3d-8f9).
+ *
+ * MAX_CHUNKS_PER_POLL bounds chunks, and MAX_PAGES bounds pages within a window, but neither
+ * bounded the total — and the saturated-second verification multiplies it: a 1,900-row chunk spread
+ * as 100 invoices across 19 seconds costs roughly 97 requests, and four such chunks plus an
+ * overflow probe walk pushes one poll past 400 calls. Xero allows 1,000/day for the whole tenant,
+ * shared with every other Xero sync in the system, so a few backlog polls could starve all of them
+ * — including the payment polling this module exists to do.
+ *
+ * 200 leaves the rest of the daily allowance for everything else. Hitting it is not an error in the
+ * data: it means the backlog is larger than one poll should chew through, so the cursor is held and
+ * the next run continues from the last checkpoint.
+ */
+export const MAX_REQUESTS_PER_POLL = 200
+
+/**
+ * Counts every Xero request a poll makes, including the nested saturated-second passes that
+ * otherwise escape MAX_CHUNKS_PER_POLL and MAX_PAGES entirely (o3d-8f9).
+ *
+ * `spend()` returns an error outcome when the ceiling is reached, so callers stop and hold the
+ * cursor rather than breaching the tenant's allowance mid-walk.
+ */
+export type RequestBudget = {
+  spend: () => { status: 'error'; error: string } | null
+  spent: () => number
+}
+
+export function createRequestBudget(limit: number = MAX_REQUESTS_PER_POLL): RequestBudget {
+  let used = 0
+  return {
+    spend: () => {
+      if (used >= limit) {
+        return {
+          status: 'error' as const,
+          error:
+            `This poll reached its ${limit}-request Xero budget before draining the backlog. The ` +
+            `cursor is held at the last checkpoint and the next poll resumes from there; no payment ` +
+            `state was changed. Xero allows 1,000 calls/day for the whole tenant, so the remainder ` +
+            `is left for other syncs (o3d-8f9).`,
+        }
+      }
+      used += 1
+      return null
+    },
+    spent: () => used,
+  }
+}
+
+/**
  * How many times to re-read a saturated second before giving up on proving it stable (o3d-8f9).
  *
  * Each attempt costs a full pass over that second, so this is deliberately small: a second that
@@ -287,67 +341,122 @@ function keysetPath(cursor: Date, upper: Date): string {
 const SATURATED_SECOND_ATTEMPTS = 3
 
 /**
- * Read every invoice whose UpdatedDateUTC falls inside ONE second, and prove the read was complete.
+ * Read every invoice whose UpdatedDateUTC falls inside ONE second, and prove the read complete.
  *
  * Offset paging is used here because there is no alternative — the keyset has no resolution left
- * inside a single second. That reintroduces the shift hazard, so the result is VERIFIED rather than
- * trusted: the second is read twice and the two passes must agree on the exact ID set. A row that
- * left the window mid-pass (edited, so its timestamp moved above the second) shortens the set and
- * shifts later rows onto pages already read; the second pass then disagrees, and we retry.
+ * inside a single second, and Xero exposes no secondary sort key to break the tie on. That
+ * reintroduces the shift hazard, so the result is VERIFIED rather than trusted.
  *
- * Agreement is not absolute proof — two identical passes could in principle both miss the same row
- * — but a row can only be skipped by a concurrent edit, and an edit that lands identically inside
- * both passes at the same offset is not a case this API can produce: an edit moves a row OUT of the
- * second permanently (its timestamp becomes `now`), so a second pass sees the shortened, stable set
- * and reads it whole.
+ * TWO independent checks, because either alone is insufficient:
+ *
+ * 1. NO DUPLICATE WITHIN A PASS. Under a stable total order, offset pages inside one pass are
+ *    disjoint. So an ID appearing on two pages of the SAME pass is proof the server reordered the
+ *    tie between requests — and a reorder that pushes one row backwards pushes another forwards,
+ *    past the offset we already read. That pass is discarded.
+ *
+ *    This is the check the first version of this function lacked, and Codex broke it with exactly
+ *    the case o3d-8f9 itself warned about: with 150 rows sharing a second, page 1 returns IDs
+ *    1-100; if the tie order then shifts so ID 101 moves into the first hundred and ID 1 out of it,
+ *    page 2 returns ID 1 again plus 102-150 — a short page, so "complete" — and ID 101 was never
+ *    read. Collapsing into a Map HID the duplicate that was the only evidence of the omission, and
+ *    a second pass reordering the same legal way agreed with the first. Detecting the duplicate is
+ *    what makes the omission visible.
+ *
+ * 2. TWO PASSES AGREEING ON THE EXACT ID SET. Duplicate detection catches reordering but not pure
+ *    departure: if a row is edited mid-pass its timestamp leaves this second, everything below it
+ *    shifts left, and the row that was sitting on the page boundary is skipped WITHOUT any
+ *    duplicate appearing. A second pass reads the now-shorter set and disagrees, so we retry. The
+ *    departed row itself is not lost — its timestamp is now at or above the drain's upper bound, so
+ *    the next window returns it.
+ *
+ * Together: a pass with no internal duplicate, ending on a short page, whose ID set a second pass
+ * reproduces exactly, has been read whole. Anything else is retried, and after
+ * SATURATED_SECOND_ATTEMPTS it fails closed with the cursor held.
  */
-async function readSaturatedSecond(second: Date, floor: Date, get: InvoiceFetcher): Promise<WalkOutcome> {
+async function readSaturatedSecond(
+  second: Date,
+  floor: Date,
+  get: InvoiceFetcher,
+  budget: RequestBudget,
+): Promise<WalkOutcome> {
   const windowEnd = new Date(second.getTime() + 1000)
 
-  const readOnce = async (): Promise<WalkOutcome> => {
+  /** A pass discarded because the server reordered the tie under us — not an error, a retry. */
+  type Pass = WalkOutcome | { status: 'unstable'; reason: string }
+
+  const readOnce = async (): Promise<Pass> => {
     const byId = new Map<string, XeroInvoice>()
     for (let page = 1; page <= MAX_PAGES + 1; page++) {
       const where = `${lowerBoundWhere(second)}&&${upperBoundWhere(windowEnd)}`
       const path =
         `Invoices?Statuses=${POLLED_STATUSES.join(',')}&order=${encodeURIComponent(BOUNDED_POLL_ORDER)}` +
         `&page=${page}&pageSize=${PAGE_SIZE}&where=${encodeURIComponent(where)}`
+      const spend = budget.spend()
+      if (spend) return spend
       const res = await get(path, { ifModifiedSince: floor })
       if (!res.ok) return { status: 'error', error: res.error ?? `HTTP ${res.status}` }
       const batch = res.data?.Invoices ?? []
-      for (const invoice of batch) byId.set(invoice.InvoiceID, invoice)
+
+      for (const invoice of batch) {
+        if (byId.has(invoice.InvoiceID)) {
+          return {
+            status: 'unstable',
+            reason:
+              `invoice ${invoice.InvoiceID} was returned on two pages of one pass, so the tie order ` +
+              `moved between requests`,
+          }
+        }
+        byId.set(invoice.InvoiceID, invoice)
+      }
+
       if (batch.length < PAGE_SIZE) return { status: 'ok', invoices: [...byId.values()] }
     }
     return { status: 'overflow' }
   }
 
-  let previous: WalkOutcome | null = null
+  const sameIds = (a: XeroInvoice[], b: XeroInvoice[]): boolean => {
+    if (a.length !== b.length) return false
+    const ids = new Set(a.map((i) => i.InvoiceID))
+    return b.every((i) => ids.has(i.InvoiceID))
+  }
+
+  let previous: XeroInvoice[] | null = null
+  let lastReason = 'the reads did not agree'
   for (let attempt = 1; attempt <= SATURATED_SECOND_ATTEMPTS; attempt++) {
     const pass = await readOnce()
-    if (pass.status !== 'ok') return pass
-
-    if (previous?.status === 'ok') {
-      const before = new Set(previous.invoices.map((i) => i.InvoiceID))
-      const after = pass.invoices.map((i) => i.InvoiceID)
-      if (before.size === after.length && after.every((id) => before.has(id))) return pass
+    if (pass.status === 'error' || pass.status === 'overflow') return pass
+    if (pass.status === 'unstable') {
+      lastReason = pass.reason
+      previous = null // a discarded pass cannot corroborate the next one
+      continue
     }
-    previous = pass
+
+    if (previous && sameIds(previous, pass.invoices)) return pass
+    previous = pass.invoices
   }
 
   return {
     status: 'error',
     error:
-      `The invoices updated at ${second.toISOString()} did not hold still across ` +
-      `${SATURATED_SECOND_ATTEMPTS} reads, so that second cannot be proven complete. More than ` +
-      `${PAGE_SIZE} invoices share it, leaving no finer cursor to page it by. The cursor is held and ` +
-      `no payment state was changed (o3d-8f9).`,
+      `The invoices updated at ${second.toISOString()} could not be proven completely read across ` +
+      `${SATURATED_SECOND_ATTEMPTS} attempts (${lastReason}). More than ${PAGE_SIZE} invoices share ` +
+      `that second and Xero offers no secondary sort key to page it by. The cursor is held and no ` +
+      `payment state was changed (o3d-8f9).`,
   }
 }
 
-async function walkBoundedKeyset(floor: Date, upper: Date, get: InvoiceFetcher): Promise<WalkOutcome> {
+async function walkBoundedKeyset(
+  floor: Date,
+  upper: Date,
+  get: InvoiceFetcher,
+  budget: RequestBudget,
+): Promise<WalkOutcome> {
   const byId = new Map<string, XeroInvoice>()
   let cursor = floor
 
   for (let request = 1; request <= MAX_PAGES + 1; request++) {
+    const spend = budget.spend()
+    if (spend) return spend
     const res = await get(keysetPath(cursor, upper), { ifModifiedSince: floor })
     if (!res.ok) return { status: 'error', error: res.error ?? `HTTP ${res.status}` }
 
@@ -387,7 +496,7 @@ async function walkBoundedKeyset(floor: Date, upper: Date, get: InvoiceFetcher):
       // So read that ONE second exhaustively by offset, and PROVE the read was complete before
       // trusting it (see readSaturatedSecond). Then step the cursor past the whole second, which is
       // now safe precisely because it has been read whole.
-      const second = await readSaturatedSecond(cursor, floor, get)
+      const second = await readSaturatedSecond(cursor, floor, get, budget)
       if (second.status !== 'ok') return second
       for (const invoice of second.invoices) byId.set(invoice.InvoiceID, invoice)
       cursor = new Date(cursor.getTime() + 1000)
@@ -400,10 +509,15 @@ async function walkBoundedKeyset(floor: Date, upper: Date, get: InvoiceFetcher):
 }
 
 /** Page a window to completion, or report that it holds more than the cap. */
-async function walkPages(floor: Date, upper: Date | undefined, get: InvoiceFetcher): Promise<WalkOutcome> {
+async function walkPages(
+  floor: Date,
+  upper: Date | undefined,
+  get: InvoiceFetcher,
+  budget: RequestBudget = createRequestBudget(),
+): Promise<WalkOutcome> {
   // A bounded window pages by keyset — offset paging is unsafe once rows can leave the set through
   // the top. Unbounded keeps the DESC offset walk, where that cannot happen (o3d-8f9).
-  if (upper) return walkBoundedKeyset(floor, upper, get)
+  if (upper) return walkBoundedKeyset(floor, upper, get, budget)
 
   const byId = new Map<string, XeroInvoice>()
 
@@ -411,6 +525,8 @@ async function walkPages(floor: Date, upper: Date | undefined, get: InvoiceFetch
   // tell "there are precisely 2,000" from "there are more than 2,000", and calling the former an
   // overflow would stall a poll that had in fact just finished (#494).
   for (let page = 1; page <= MAX_PAGES + 1; page++) {
+    const spend = budget.spend()
+    if (spend) return spend
     const res = await get(invoicesPath(page, upper), { ifModifiedSince: floor })
     if (!res.ok) return { status: 'error', error: res.error ?? `HTTP ${res.status}` }
 
@@ -438,7 +554,12 @@ async function fitsUnderCap(
   floor: Date,
   upper: Date,
   get: InvoiceFetcher,
+  budget: RequestBudget,
 ): Promise<{ status: 'fits' } | { status: 'overflow' } | { status: 'error'; error: string }> {
+  // Counted like every other request: the narrowing search can issue up to MAX_CHUNK_PROBES of
+  // these, and leaving them off the ledger is how a bound gets quietly exceeded (o3d-8f9).
+  const spend = budget.spend()
+  if (spend) return spend
   const res = await get(invoicesPath(MAX_PAGES + 1, upper), { ifModifiedSince: floor })
   if (!res.ok) return { status: 'error', error: res.error ?? `HTTP ${res.status}` }
   return (res.data?.Invoices ?? []).length === 0 ? { status: 'fits' } : { status: 'overflow' }
@@ -489,11 +610,15 @@ export type DeltaDrainResult =
  * chunk — and every checkpoint this drain can write is at or below windowEnd, so the next poll's
  * window still contains it. The cursor never passes a record it has not read.
  *
- * WHERE IT STILL REFUSES: more than the cap inside ONE SECOND. Both of Xero's date filters are
- * whole-second, so such a window cannot be subdivided, and reading part of it would mean either
- * checkpointing over unread invoices or spinning forever. It drains everything up to that second,
- * then fails loudly with the second named. That is a far narrower cliff than "2,000 in one poll",
- * and unlike the old one it cannot be reached without a genuinely undrainable second.
+ * A SECOND HOLDING MORE THAN ONE PAGE is no longer a refusal (o3d-8f9). Both of Xero's date filters
+ * are whole-second, so such a window cannot be subdivided by cursor — it is instead read
+ * exhaustively by offset and PROVEN complete (readSaturatedSecond) before the cursor steps past it.
+ * It refuses only when that proof fails: the second keeps reordering or shrinking under the reads,
+ * which is genuinely undrainable rather than merely large.
+ *
+ * WHERE IT STILL STOPS SHORT: MAX_REQUESTS_PER_POLL. A backlog big enough to need hundreds of calls
+ * is handed to the next run at the last checkpoint rather than spending the tenant's whole daily
+ * Xero allowance in one poll. That is a pause, not a loss.
  */
 export async function drainInvoicesModifiedSince(
   since: Date,
@@ -501,8 +626,14 @@ export async function drainInvoicesModifiedSince(
   get: InvoiceFetcher,
   onChunk: DeltaChunkHandler,
 ): Promise<DeltaDrainResult> {
+  // ONE budget for the whole poll — the unbounded probe, every chunk, every page, and every
+  // saturated-second verification pass all count against it (o3d-8f9). Without this the nested
+  // passes escaped MAX_CHUNKS_PER_POLL entirely and a backlog poll could consume several hundred
+  // calls out of the tenant's shared 1,000/day.
+  const budget = createRequestBudget()
+
   // The ordinary poll: one unbounded read of the whole window, exactly as before chunking existed.
-  const whole = await walkPages(since, undefined, get)
+  const whole = await walkPages(since, undefined, get, budget)
   if (whole.status === 'error') return { ok: false, error: whole.error, chunks: 0 }
   if (whole.status === 'ok') {
     const decision = await onChunk({ invoices: whole.invoices, through: windowEnd })
@@ -567,7 +698,7 @@ export async function drainInvoicesModifiedSince(
     const width = upperMs - watermark
     const narrower = Math.max(MIN_CHUNK_MS, Math.floor(width / 2))
 
-    const fit = await fitsUnderCap(floor, upper, get)
+    const fit = await fitsUnderCap(floor, upper, get, budget)
     if (fit.status === 'error') return { ok: false, error: fit.error, chunks }
     if (fit.status === 'overflow') {
       if (upperMs <= narrowest) return undividable()
@@ -575,7 +706,7 @@ export async function drainInvoicesModifiedSince(
       continue
     }
 
-    const walked = await walkPages(floor, upper, get)
+    const walked = await walkPages(floor, upper, get, budget)
     if (walked.status === 'error') return { ok: false, error: walked.error, chunks }
     if (walked.status === 'overflow') {
       // The window grew between the sentinel probe and the walk. Narrow and re-ask rather than
