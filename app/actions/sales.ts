@@ -60,6 +60,7 @@ import {
 import { decideInvoicePaymentRegistration } from '@/lib/domain/accounting/invoice-payment-registration'
 import {
   aggregatePaymentSyncRows,
+  effectivePaymentSyncRows,
   ledgerSalesInvoiceTotalForeign,
   settlementStatus,
   type PaymentSyncRow,
@@ -677,10 +678,7 @@ export async function getSalesOrders(
  * longer in use describe a ledger nobody is reconciling against, and judging today's settlement by them
  * would report a discrepancy against a system that has been switched off.
  */
-type InvoicePaymentSyncRow = PaymentSyncRow & {
-  /** The local Payment row this was queued for; null on rows queued before that was recorded. */
-  paymentId: string | null
-}
+type InvoicePaymentSyncRow = PaymentSyncRow & { paymentId: string | null }
 
 async function loadInvoicePaymentSyncRows(orderId: string, connector: string | null): Promise<InvoicePaymentSyncRow[]> {
   if (!connector) return []
@@ -782,7 +780,13 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     paidLocally: !!so.paidAt || claimedForeign > 0,
     syncEnabled: paymentSyncEnabled,
     documentPosted: !!so.accountingInvoiceId,
-    payment: aggregatePaymentSyncRows(paymentSyncRows),
+    // History first: a registration whose receipt was deleted, or one a later success overtook, describes
+    // nothing that is still true — and worst-first would let it alarm over a settled invoice for ever.
+    payment: aggregatePaymentSyncRows(
+      effectivePaymentSyncRows(paymentSyncRows, {
+        livePaymentIds: new Set(so.payments.map((p) => p.id)),
+      }),
+    ),
     // Compared against what the ledger's copy of the invoice was built at, capped by what IMS actually
     // claims to have received — a part payment fully registered is settled for its size.
     totalForeign: Math.min(

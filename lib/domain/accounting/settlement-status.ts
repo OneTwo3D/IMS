@@ -24,6 +24,8 @@ export type PaymentSyncRow = {
   retryCount?: number
   /** What was actually sent to the ledger, in the document's currency. */
   amount?: number | null
+  /** The local Payment row it was queued for; null on rows the order's own invoice follow-up queued. */
+  paymentId?: string | null
 }
 
 export type SettlementStatus =
@@ -196,6 +198,42 @@ export function isSettlementDiscrepancy(v: SettlementVerdict): boolean {
  * names the error, and a spurious "chase this" costs a look, while a spurious "Settled" costs a
  * reconciliation nobody knows to do.
  */
+/**
+ * Drop the payment sync rows that are HISTORY, so a corrected receipt does not alarm for ever.
+ *
+ * Two ways a terminal row outlives what it describes, both introduced by doing the right thing
+ * elsewhere (Codex, PR #582 round 4):
+ *
+ *  1. The RECEIPT IT BELONGED TO WAS DELETED. deletePayment retires a queued registration to CANCELLED
+ *     rather than deleting it — that is what keeps a worker from posting a payment whose only record we
+ *     erased — and leaves FAILED rows alone. Record a receipt, delete it, record a corrected one that
+ *     posts cleanly, and the aggregate's worst-first rule would still read the dead row and report
+ *     NOT_SENT over a perfectly settled invoice.
+ *
+ *  2. A LATER ATTEMPT SUCCEEDED. A failure that a success followed has been overtaken; a failure AFTER
+ *     the last success has not, and must still be reported.
+ *
+ * `rows` must be NEWEST FIRST — that ordering is what "later" means here.
+ */
+export function effectivePaymentSyncRows(
+  rows: PaymentSyncRow[],
+  opts: { livePaymentIds?: ReadonlySet<string> } = {},
+): PaymentSyncRow[] {
+  const isTerminal = (r: PaymentSyncRow) => r.status === 'FAILED' || r.status === 'CANCELLED'
+  // Rows the SALES_INVOICE follow-up queued carry no payment id — they belong to the order itself, not
+  // to any local receipt, so "was its receipt deleted" cannot be asked of them and they stay.
+  const belongsToDeletedReceipt = (r: PaymentSyncRow) =>
+    opts.livePaymentIds != null && r.paymentId != null && !opts.livePaymentIds.has(r.paymentId)
+
+  const newestSuccessIdx = rows.findIndex((r) => r.status === 'SYNCED')
+  return rows.filter((r, i) => {
+    if (!isTerminal(r)) return true
+    if (belongsToDeletedReceipt(r)) return false
+    // Newest-first, so a higher index is OLDER: a terminal row older than the newest success is history.
+    return !(newestSuccessIdx !== -1 && i > newestSuccessIdx)
+  })
+}
+
 export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow | null {
   if (rows.length === 0) return null
 

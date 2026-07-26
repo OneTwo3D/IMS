@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   aggregatePaymentSyncRows,
+  effectivePaymentSyncRows,
   ledgerSalesInvoiceTotalForeign,
   settlementStatus,
   type PaymentSyncRow,
@@ -296,4 +297,56 @@ test('an order with no payment at all is simply unpaid', () => {
   const v = settlementStatus({ ...base, paidLocally: false, payment: null })
   assert.equal(v.status, 'UNPAID')
   assert.equal(v.discrepancy, false)
+})
+
+// ---------------------------------------------------------------------------
+// Rows that describe something no longer true (o3d-lgo.15, Codex round 4)
+// ---------------------------------------------------------------------------
+//
+// Worst-first is right for CURRENT rows and wrong for history. deletePayment retires a queued
+// registration to CANCELLED rather than deleting it, and leaves FAILED rows alone — so without this,
+// correcting a receipt left the order alarming for ever over a perfectly settled invoice.
+
+test('a registration whose receipt was deleted no longer speaks for the order', () => {
+  const live = new Set(['pay-2'])
+  const rows = effectivePaymentSyncRows([
+    row({ status: 'SYNCED', externalTransactionId: 'PAY-2', amount: 100, paymentId: 'pay-2' }),
+    row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1' }),
+  ], { livePaymentIds: live })
+  assert.equal(rows.length, 1)
+  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows(rows), totalForeign: 100 })
+  assert.equal(v.status, 'SETTLED')
+  assert.equal(v.discrepancy, false)
+})
+
+test('a failure a later success overtook is history; one AFTER the last success is not', () => {
+  // Newest first. A failure the ledger has since accepted is over; a failure that came after the last
+  // success is the live state and must still be reported.
+  const overtaken = effectivePaymentSyncRows([
+    row({ status: 'SYNCED', externalTransactionId: 'PAY-9', amount: 100, paymentId: 'pay-1' }),
+    row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'transient', paymentId: 'pay-1' }),
+  ])
+  assert.equal(aggregatePaymentSyncRows(overtaken)!.status, 'SYNCED')
+
+  const stillBroken = effectivePaymentSyncRows([
+    row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'rejected', paymentId: 'pay-2' }),
+    row({ status: 'SYNCED', externalTransactionId: 'PAY-9', amount: 40, paymentId: 'pay-1' }),
+  ])
+  assert.equal(aggregatePaymentSyncRows(stillBroken)!.status, 'FAILED')
+})
+
+test('a row the invoice follow-up queued is never dropped as someone else\'s deleted receipt', () => {
+  // It carries no payment id because it belongs to the ORDER, not to a local receipt — "was its receipt
+  // deleted" cannot be asked of it, and dropping it would hide a real imported-payment failure.
+  const rows = effectivePaymentSyncRows(
+    [row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'no bank account', paymentId: null })],
+    { livePaymentIds: new Set<string>() },
+  )
+  assert.equal(rows.length, 1)
+})
+
+test('with no live-payment set known, nothing is dropped for ownership', () => {
+  // The bill side passes rows without payment ids at all; it must behave exactly as before.
+  const rows = effectivePaymentSyncRows([row({ status: 'CANCELLED', externalTransactionId: null, paymentId: 'pay-1' })])
+  assert.equal(rows.length, 1)
 })
