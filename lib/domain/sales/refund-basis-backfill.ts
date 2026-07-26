@@ -1,0 +1,112 @@
+import type { Prisma } from '@/app/generated/prisma/client'
+import type {
+  RefundBasisOrderLineRow,
+  RefundBasisRefundLineRow,
+} from './refund-basis-audit'
+
+/**
+ * o3d-lvk: stamp `totalsBasis` on refunds written BEFORE the totals_basis migration.
+ *
+ * WHY THIS IS OPERATIONAL, NOT ANALYTICS. o3d-w00's fail-closed shipped in #516: a second refund
+ * on an order whose EARLIER refund has a NULL basis is refused and quarantined, because a legacy
+ * total may be GROSS and summing it with a new NET total can over-refund. Every pre-migration
+ * refund has a NULL basis — so every order that already carried one now quarantines its next
+ * refund. This backfill is what stops that, by establishing the basis where it is PROVABLE.
+ *
+ * CONSERVATIVE BY CONSTRUCTION. classifyRefundBasis stamps NET or GROSS only on unanimous,
+ * unambiguous linked-line evidence and returns UNKNOWN otherwise. An UNKNOWN refund is LEFT NULL
+ * rather than guessed at: a wrong basis silently changes what a later refund is allowed to post,
+ * which is worse than continuing to quarantine. The fail-closed path is the safe default and this
+ * only removes orders from it where the evidence is unambiguous.
+ */
+
+export type RefundBasisBackfillRefund = {
+  id: string
+  totalsBasis: string | null
+  lines: RefundBasisRefundLineRow[]
+}
+
+export type RefundBasisBackfillOrder = {
+  id: string
+  lines: RefundBasisOrderLineRow[]
+  refunds: RefundBasisBackfillRefund[]
+}
+
+export type RefundBasisBackfillDecision = {
+  refundId: string
+  orderId: string
+  basis: 'NET' | 'GROSS'
+}
+
+export type RefundBasisBackfillPlan = {
+  /** Refunds whose basis is provable and will be stamped. */
+  decisions: RefundBasisBackfillDecision[]
+  /** Refunds left NULL because the evidence is not unanimous — they keep failing closed. */
+  unresolved: Array<{ refundId: string; orderId: string }>
+  /** Refunds that already carry a basis; never re-stamped. */
+  alreadyStamped: number
+}
+
+/**
+ * Decide what to stamp, WITHOUT writing. Pure, so the decision can be tested and reviewed
+ * independently of the transaction that applies it — and so `--dry-run` reports exactly what a
+ * real run would do rather than an approximation of it.
+ */
+export async function planRefundBasisBackfill(
+  orders: RefundBasisBackfillOrder[],
+): Promise<RefundBasisBackfillPlan> {
+  // LAZY import, deliberately. refund-basis-audit imports `db` at module level, which builds the pg
+  // Pool from process.env.DATABASE_URL at IMPORT time — so a static import here would construct a
+  // pool before a script's own dotenv call had run, failing with an opaque SASL
+  // "client password must be a string". The classifier itself is pure; only its module's neighbours
+  // touch the database.
+  const { classifyRefundBasis } = await import('./refund-basis-audit')
+
+  const decisions: RefundBasisBackfillDecision[] = []
+  const unresolved: Array<{ refundId: string; orderId: string }> = []
+  let alreadyStamped = 0
+
+  for (const order of orders) {
+    const orderLinesById = new Map(order.lines.map((line) => [line.id, line]))
+    for (const refund of order.refunds) {
+      // Never overwrite an existing basis. A stamped row was either written by the current code
+      // path (authoritative) or by a previous run of this backfill, and re-deriving it could
+      // change an answer someone has already acted on.
+      if (refund.totalsBasis) {
+        alreadyStamped++
+        continue
+      }
+      const basis = classifyRefundBasis(refund.lines, orderLinesById)
+      if (basis === 'NET' || basis === 'GROSS') {
+        decisions.push({ refundId: refund.id, orderId: order.id, basis })
+      } else {
+        unresolved.push({ refundId: refund.id, orderId: order.id })
+      }
+    }
+  }
+
+  return { decisions, unresolved, alreadyStamped }
+}
+
+/**
+ * Apply a plan. Each stamp is conditional on the row STILL having a null basis, so a refund
+ * created or stamped between planning and applying is not overwritten — the same compare-and-set
+ * shape the rest of the codebase uses for claim-like writes.
+ *
+ * Returns how many rows were actually changed, which can be lower than the plan when something
+ * else stamped a row first. That difference is reported rather than hidden.
+ */
+export async function applyRefundBasisBackfill(
+  tx: Prisma.TransactionClient,
+  decisions: RefundBasisBackfillDecision[],
+): Promise<{ stamped: number; skippedRaced: number }> {
+  let stamped = 0
+  for (const decision of decisions) {
+    const result = await tx.salesOrderRefund.updateMany({
+      where: { id: decision.refundId, totalsBasis: null },
+      data: { totalsBasis: decision.basis },
+    })
+    stamped += result.count
+  }
+  return { stamped, skippedRaced: decisions.length - stamped }
+}

@@ -46,7 +46,8 @@
     "e2e:full-chain:preflight": "NODE_OPTIONS='--import tsx' node --env-file=.env scripts/full-chain-preflight.ts",
     "e2e:full-chain:restore": "NODE_OPTIONS='--import tsx' node --env-file=.env scripts/restore-stage-connectors.ts",
     "e2e:headed": "NODE_OPTIONS='--import tsx' playwright test --headed",
-    "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui"
+    "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui",
+    "refunds:basis:backfill": "tsx scripts/backfill-refund-basis.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
