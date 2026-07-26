@@ -283,6 +283,26 @@ function keysetPath(cursor: Date, upper: Date): string {
  * past them. Failing closed is the whole point.
  */
 /**
+ * Decide whether a drained chunk's `through` may become the persisted cursor (o3d-8f9 r3).
+ *
+ * Returns the new cursor, or null when the chunk does not advance it.
+ *
+ * The read floor sits CURSOR_OVERLAP_MS behind the persisted cursor so a record landing during the
+ * previous poll gets re-read. That overlap is a QUERY floor, NOT a checkpoint. If the overlap holds
+ * more than one chunk — two dense bulk-edit seconds is enough — the first chunk's `through` lands
+ * BEFORE the cursor we started from, and persisting it moves the cursor BACKWARD. The next poll then
+ * subtracts the overlap from the regressed value and reproduces the same chunking, so it cycles:
+ * measured settling at -44s, -49s, -55s, every poll replaying overlap and never reaching either the
+ * original checkpoint or newer work, while spending the tenant's whole request budget.
+ *
+ * Monotonic-only advancement keeps the overlap doing its job — the records ARE re-read and
+ * re-processed, idempotently — while making the checkpoint one-way.
+ */
+export function advanceCheckpoint(current: Date, through: Date): Date | null {
+  return through.getTime() > current.getTime() ? through : null
+}
+
+/**
  * The hard ceiling on Xero requests ONE poll may make, across everything (o3d-8f9).
  *
  * MAX_CHUNKS_PER_POLL bounds chunks, and MAX_PAGES bounds pages within a window, but neither
@@ -308,11 +328,26 @@ export const MAX_REQUESTS_PER_POLL = 200
 export type RequestBudget = {
   spend: () => { status: 'error'; error: string } | null
   spent: () => number
+  /**
+   * Reconcile the ledger against what the transport ACTUALLY spent (o3d-8f9 r3).
+   *
+   * `spend()` debits one unit per fetcher invocation, but the production fetcher retries a 429 up
+   * to XERO_MAX_RETRIES times, so one invocation can be four tenant API attempts. Counting
+   * invocations would let 200 ledger units stand for 800 real calls and defeat the ceiling the
+   * ledger exists to enforce. Callers that can observe real attempts settle the difference here.
+   */
+  settle: (actualAttempts: number) => void
 }
 
 export function createRequestBudget(limit: number = MAX_REQUESTS_PER_POLL): RequestBudget {
   let used = 0
   return {
+    settle: (actualAttempts: number) => {
+      // Only ever upward: a transport that made FEWER calls than we debited (a cache hit, a short
+      // circuit) does not earn budget back, because the ceiling is a safety bound, not an allowance
+      // to spend down precisely.
+      if (actualAttempts > used) used = actualAttempts
+    },
     spend: () => {
       if (used >= limit) {
         return {
@@ -508,6 +543,30 @@ async function walkBoundedKeyset(
   return { status: 'overflow' }
 }
 
+/**
+ * Wrap a fetcher so the budget is reconciled against REAL transport attempts after every call
+ * (o3d-8f9 r3). `observeAttempts` returns a monotonic count of HTTP attempts; the delta across one
+ * invocation is what that invocation actually cost the tenant's allowance.
+ *
+ * Without this the ledger counts invocations, and the production fetcher's 429 retries make one
+ * invocation up to XERO_MAX_RETRIES + 1 attempts.
+ */
+export function budgetedFetcher(
+  get: InvoiceFetcher,
+  budget: RequestBudget,
+  observeAttempts: () => number,
+): InvoiceFetcher {
+  return async (path, opts) => {
+    const before = observeAttempts()
+    try {
+      return await get(path, opts)
+    } finally {
+      // In `finally`: a throwing request still consumed its attempts.
+      budget.settle(budget.spent() + Math.max(0, observeAttempts() - before) - 1)
+    }
+  }
+}
+
 /** Page a window to completion, or report that it holds more than the cap. */
 async function walkPages(
   floor: Date,
@@ -625,15 +684,24 @@ export async function drainInvoicesModifiedSince(
   windowEnd: Date,
   get: InvoiceFetcher,
   onChunk: DeltaChunkHandler,
+  /**
+   * Supply a monotonic count of real HTTP attempts (xeroHttpAttemptCount in production) so the
+   * request ceiling bounds tenant API calls rather than fetcher invocations (o3d-8f9 r3). Omitted in
+   * tests whose fetcher makes exactly one call per invocation.
+   */
+  observeAttempts?: () => number,
 ): Promise<DeltaDrainResult> {
   // ONE budget for the whole poll — the unbounded probe, every chunk, every page, and every
   // saturated-second verification pass all count against it (o3d-8f9). Without this the nested
   // passes escaped MAX_CHUNKS_PER_POLL entirely and a backlog poll could consume several hundred
   // calls out of the tenant's shared 1,000/day.
   const budget = createRequestBudget()
+  // Reconcile the ledger against real transport attempts, so a 429 retry inside the fetcher counts
+  // against the ceiling instead of hiding behind one invocation (o3d-8f9 r3).
+  const counted = observeAttempts ? budgetedFetcher(get, budget, observeAttempts) : get
 
   // The ordinary poll: one unbounded read of the whole window, exactly as before chunking existed.
-  const whole = await walkPages(since, undefined, get, budget)
+  const whole = await walkPages(since, undefined, counted, budget)
   if (whole.status === 'error') return { ok: false, error: whole.error, chunks: 0 }
   if (whole.status === 'ok') {
     const decision = await onChunk({ invoices: whole.invoices, through: windowEnd })
@@ -698,7 +766,7 @@ export async function drainInvoicesModifiedSince(
     const width = upperMs - watermark
     const narrower = Math.max(MIN_CHUNK_MS, Math.floor(width / 2))
 
-    const fit = await fitsUnderCap(floor, upper, get, budget)
+    const fit = await fitsUnderCap(floor, upper, counted, budget)
     if (fit.status === 'error') return { ok: false, error: fit.error, chunks }
     if (fit.status === 'overflow') {
       if (upperMs <= narrowest) return undividable()
@@ -706,7 +774,7 @@ export async function drainInvoicesModifiedSince(
       continue
     }
 
-    const walked = await walkPages(floor, upper, get, budget)
+    const walked = await walkPages(floor, upper, counted, budget)
     if (walked.status === 'error') return { ok: false, error: walked.error, chunks }
     if (walked.status === 'overflow') {
       // The window grew between the sentinel probe and the walk. Narrow and re-ask rather than
