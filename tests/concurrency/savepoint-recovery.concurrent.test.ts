@@ -36,7 +36,7 @@ test(
     const { db } = await import('@/lib/db')
     const sku = probeSku('bare')
 
-    let afterCatch: string | null = null
+    const afterCatch: string[] = []
     await db
       .$transaction(async (tx) => {
         await tx.product.create({
@@ -54,12 +54,12 @@ test(
         throw new Error('ROLLBACK PROBE')
       }, TX)
       .catch((error) => {
-        afterCatch = error instanceof Error ? error.message : String(error)
+        afterCatch.push(error instanceof Error ? error.message : String(error))
       })
 
-    assert.ok(afterCatch, 'the transaction must not have completed')
+    assert.equal(afterCatch.length, 1, 'the transaction must not have completed')
     assert.match(
-      afterCatch!,
+      afterCatch[0],
       /current transaction is aborted/,
       'this is the defect: recovery after a caught P2002 hits 25P02, not the rollback we asked for',
     )
@@ -76,7 +76,10 @@ test(
     const { withSavepoint } = await import('@/lib/db/savepoint')
     const sku = probeSku('guarded')
 
-    let recovered: { count: number; foundExisting: boolean } | null = null
+    // Collected into an array rather than a nullable local: TypeScript's control-flow analysis
+    // cannot see an assignment made inside the transaction callback, so a `let x: T | null = null`
+    // narrows to `never` at the assertions below and fails type-check.
+    const recovered: Array<{ count: number; foundExisting: boolean }> = []
     await db
       .$transaction(async (tx) => {
         const first = await tx.product.create({
@@ -97,7 +100,7 @@ test(
         // The whole point: both of these run against a transaction that is still alive.
         const count = await tx.product.count()
         const existing = await tx.product.findUnique({ where: { sku }, select: { id: true } })
-        recovered = { count, foundExisting: existing?.id === first.id }
+        recovered.push({ count, foundExisting: existing?.id === first.id })
 
         throw new Error('ROLLBACK PROBE')
       }, TX)
@@ -106,9 +109,9 @@ test(
         assert.match(message, /ROLLBACK PROBE/, `expected our own rollback, got: ${message}`)
       })
 
-    assert.ok(recovered, 'the recovery block must have run')
-    assert.ok(recovered!.count > 0, 'a query after the caught conflict must succeed')
-    assert.equal(recovered!.foundExisting, true, 'and the idempotent lookup must find the winner')
+    assert.equal(recovered.length, 1, 'the recovery block must have run')
+    assert.ok(recovered[0].count > 0, 'a query after the caught conflict must succeed')
+    assert.equal(recovered[0].foundExisting, true, 'and the idempotent lookup must find the winner')
     await db.$disconnect()
   },
 )
