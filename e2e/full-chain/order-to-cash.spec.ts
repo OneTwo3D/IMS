@@ -1686,7 +1686,10 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
 
         // And IMS says the ledger agrees — the verdict, not just the local paid flag.
         await openSalesOrder(page, imported.salesOrderId)
-        await expect(page.getByText(/NOT SENT TO LEDGER|LEDGER REJECTED|PART PAID IN LEDGER/)).toHaveCount(0)
+        await expect(
+          page.getByText(/NOT SENT TO LEDGER|LEDGER REJECTED|PART PAID IN LEDGER|OVER-PAID IN LEDGER|PAID IN LEDGER ONLY/),
+          'no settlement discrepancy is reported once the ledger has confirmed the payment',
+        ).toHaveCount(0)
       } finally {
         // Failure-safe, payment BEFORE invoice: VOID_ORDER deletes Payments first, and Xero refuses to void
         // an invoice that still carries one.
