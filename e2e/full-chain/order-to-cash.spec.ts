@@ -23,10 +23,11 @@ import {
 } from './harness/wc.ts'
 import {
   allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, recordSalesPaymentViaUi, runDailyBatch, runInboxDrain,
-  runWcOrderReconcile, setPostingMode,
+  runPaymentPoll, runWcOrderReconcile, setPostingMode,
 } from './harness/ims.ts'
 import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
 import {
+  deletePaymentInXero,
   expectJournalLine, expectLine, externalIdFor, getCreditNote, getInvoice, getManualJournal, getPayment, syncLogRowsFor,
   trackDocument, type XeroManualJournal,
 } from './harness/xero.ts'
@@ -1611,6 +1612,117 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     }
   })
 
+  test('OC-09: a payment REMOVED in Xero clears paidAt, unwinds revenue exactly once, and never reverts the order status', async ({ page }) => {
+    test.setTimeout(1_800_000)
+
+    // GATE onetwo3d-ims-6oyu.6.1, which the epic listed as absorbed but never built. 6oyu.6 (PR #480)
+    // extended the reversal poller to WooCommerce-linked orders — before it, payment-reversal detection
+    // filtered `shoppingLinks: { none: {} }`, so the bulk of real volume was excluded and a chargeback on
+    // a WC order silently left paidAt set and revenue recognised.
+    //
+    // The reversal is STAGED IN XERO, not simulated: the recorded payment is DELETED there, which is the
+    // ledger-side event a chargeback produces. A fixture that edited only the IMS side would prove
+    // nothing about the poller's actual job, which is noticing that a payment it recorded is gone.
+    //
+    // BATCH MODE, because the revenue unwind is conditional on revenueDeferredDate — the chargeback
+    // credit note is raised only when Group A1 has recognised revenue. In sync mode the interesting
+    // branch never runs.
+    const sku = taggedSku(runId, 'OC09')
+    const unitPrice = '25.00'
+    const qty = 2
+    const method = 'bacs'
+    const bankCode = '090'
+
+    const priorMap = await readSetting(PAYMENT_MAP_KEY)
+    await writeSetting(PAYMENT_MAP_KEY, JSON.stringify({ [`${method}:*`]: bankCode }))
+    let imported: { salesOrderId: string } | undefined
+    try {
+      const baseline = await deleteUnjournaledShipmentBaseline()
+      registerRetiredPostedDocuments(baseline, 'OC-09')
+      await setPostingMode({ sync: true, dailyBatch: true })
+
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC09`, price: unitPrice })
+      await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+      // Zero-rated, as OC-15/OC-21: net == gross, so the registered payment settles the invoice in full
+      // and the reversal is unambiguous (o3d-c0n/o3d-cyn stay out of it).
+      const product = await createWcProduct(creds, runId, { label: 'OC09', price: unitPrice, taxClass: 'zero-rate' })
+      const order = await createWcOrder(creds, runId, {
+        lines: [{ productId: product.id, quantity: qty }],
+        paymentMethod: method,
+      })
+
+      imported = await awaitWebhookDelivery(order.id, { creds, timeoutMs: 600_000 })
+      await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC09` })
+
+      const batchBoundary = await dailyBatchBoundary()
+      try {
+        // Invoice + payment first, then the batch: A1 needs the accountingInvoiceId, and the payment is
+        // ordering-deferred behind its invoice's CREATE.
+        await processPendingXeroSyncViaUi(page)
+        const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+        trackDocument('Invoices', invoiceId, `OC-09 invoice ${runTag(runId)}`)
+        const invoice = await drainUntilInvoicePaid(page, invoiceId, imported.salesOrderId)
+        expect(invoice.Status, 'the order starts out genuinely PAID in the ledger').toBe('PAID')
+        const paymentId = invoice.Payments![0].PaymentID
+
+        let batch: { groupA1: number; errors: string[] }
+        try {
+          batch = (await runDailyBatch(page)) as unknown as typeof batch
+        } catch (e) {
+          if (/HTTP 429|rate.?limit/i.test(String(e))) {
+            console.warn('[OC-09] SKIPPED — accounting-daily-batch hourly quota already consumed this invocation (o3d-lgo.13). The revenue unwind is conditional on Group A1 having recognised revenue, so without the batch there is nothing to assert. Re-run OC-09 in its own invocation.')
+            test.skip(true, 'accounting-daily-batch hourly quota already consumed this invocation (o3d-lgo.13); run OC-09 in its own invocation.')
+          }
+          throw e
+        }
+        expect(batch.errors, `daily batch reported errors: ${batch.errors.join('; ')}`).toEqual([])
+        for (const posted of await postedDailyBatchJournalIds(batchBoundary)) {
+          trackDocument('ManualJournals', posted.externalId, `OC-09 ${posted.type} ${runTag(runId)}`)
+        }
+        expect(await revenueDeferredDateSet(imported.salesOrderId), 'A1 must have recognised revenue before the reversal, or the unwind branch never runs').toBe(true)
+
+        const statusBefore = await salesOrderStatus(imported.salesOrderId)
+
+        // THE REVERSAL: remove the payment in Xero, exactly as a chargeback does.
+        await deletePaymentInXero(paymentId)
+
+        // 1. The poller detects it.
+        await runPaymentPoll()
+
+        // paidAt is cleared — the claim 6oyu.6 fixed for WC-linked orders specifically.
+        expect(await paidAtSet(imported.salesOrderId), 'a payment gone from Xero must clear paidAt, WC-linked or not').toBe(false)
+
+        // Revenue unwound EXACTLY once.
+        const refundsAfterFirst = await refundCountFor(imported.salesOrderId)
+        expect(refundsAfterFirst, 'the reversal raises exactly one revenue-unwind credit note').toBe(1)
+
+        // The operator is told, and the order is NOT auto-reverted — the deliberate policy in 6oyu.6:
+        // a reversed payment needs a human (dispute it, recall the goods, chase re-payment), and
+        // silently walking a SHIPPED order backwards would be worse than leaving it alone.
+        const actions = await activityActions(imported.salesOrderId)
+        expect(actions, 'the detection is recorded against the order').toContain('payment_reversal_detected')
+        expect(await salesOrderStatus(imported.salesOrderId), 'status must NEVER be auto-reverted').toBe(statusBefore)
+
+        // 2. IDEMPOTENCY: the poller runs every 15 minutes, so a second pass over the same reversed
+        //    order must not raise a second credit note. This is the assertion that would catch a
+        //    dedup keyed on something that changes between runs.
+        await runPaymentPoll()
+        expect(await refundCountFor(imported.salesOrderId), 'a second poll must not double-reverse').toBe(refundsAfterFirst)
+      } finally {
+        for (const id of await creditNoteExternalIdsFor(imported.salesOrderId).catch((): string[] => [])) {
+          trackDocument('CreditNotes', id, `OC-09 chargeback credit note ${runTag(runId)}`)
+        }
+      }
+    } finally {
+      if (priorMap == null) await clearSetting(PAYMENT_MAP_KEY)
+      else await writeSetting(PAYMENT_MAP_KEY, priorMap)
+    }
+  })
+
   test('OC-21: a receipt recorded BY HAND settles the Xero invoice, and the order reports the ledger agreeing', async ({ page }) => {
     test.setTimeout(1_800_000)
 
@@ -1925,6 +2037,84 @@ async function salesOrderFx(salesOrderId: string): Promise<{
     )
     if (!r.rows.length) throw new Error(`No sales_orders row for ${salesOrderId}`)
     return r.rows[0]
+  } finally {
+    await db.end()
+  }
+}
+
+/** Has Group A1 recognised revenue for this order? The branch selector for the reversal's unwind. */
+async function revenueDeferredDateSet(salesOrderId: string): Promise<boolean> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ set: boolean }>(
+      `select ("accounting_revenue_deferred_date" is not null) as set from sales_orders where id = $1`, [salesOrderId],
+    )
+    return r.rows[0]?.set ?? false
+  } finally {
+    await db.end()
+  }
+}
+
+/** Is the order still marked paid locally? */
+async function paidAtSet(salesOrderId: string): Promise<boolean> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ set: boolean }>(
+      `select ("paidAt" is not null) as set from sales_orders where id = $1`, [salesOrderId],
+    )
+    return r.rows[0]?.set ?? false
+  } finally {
+    await db.end()
+  }
+}
+
+/** The order's current status — read either side of a reversal to prove it was not auto-reverted. */
+async function salesOrderStatus(salesOrderId: string): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ status: string }>(`select status from sales_orders where id = $1`, [salesOrderId])
+    if (!r.rows.length) throw new Error(`No sales order ${salesOrderId}`)
+    return r.rows[0].status
+  } finally {
+    await db.end()
+  }
+}
+
+/** How many refunds/credit notes the order carries — "exactly once" is the whole idempotency claim. */
+async function refundCountFor(salesOrderId: string): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ n: string }>(
+      `select count(*)::text as n from sales_order_refunds where "orderId" = $1`, [salesOrderId],
+    )
+    return Number(r.rows[0]?.n ?? 0)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Every posted CREDIT_NOTE external id for the order, so teardown can void what the reversal raised. */
+async function creditNoteExternalIdsFor(salesOrderId: string): Promise<string[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ externalTransactionId: string }>(
+      `select l."externalTransactionId" from accounting_sync_logs l
+         join sales_order_refunds r on r.id = l."referenceId"
+        where l.connector = 'xero' and l.type = 'CREDIT_NOTE'
+          and r."orderId" = $1 and l."externalTransactionId" is not null`,
+      [salesOrderId],
+    )
+    return r.rows.map((row) => row.externalTransactionId)
   } finally {
     await db.end()
   }
