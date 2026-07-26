@@ -21,7 +21,7 @@ import {
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
-import { toDecimal, type DecimalInput, roundQuantity} from '@/lib/domain/math/decimal'
+import { floorQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -1037,13 +1037,33 @@ export async function allocateSalesOrder(
     // difference leaked into reservedQty as a phantom reservation on every cycle, worst for
     // nested KITs where the expanded factor is unquantized (0.3332 x 0.3332 = 0.11102224).
     //
+    // FLOOR, not half-up. An allocation quantity is a CLAIM on stock, and feasibility was decided
+    // against the unrounded value, so rounding UP can claim more than was checked: a 0.999960
+    // residual would become 1.0000 and violate the reservedQty <= quantity constraint, and a
+    // nested KIT's 0.11108889 would become 0.1111 — representing 1.0001 kits, which
+    // validateAllocationIntegrity later rejects at shipment confirmation as over-allocated.
+    // Flooring can only ever claim LESS than was proven available, so it cannot manufacture
+    // either failure; the cost is that such a line reports as slightly short, which is the
+    // remaining half of o3d-i4qd.
+    //
     // Rounding here makes the row, the reservation delta, the coverage comparison and the
     // report all speak in the same units, so reserve and release are symmetric and the
-    // unchanged-set check compares like with like. A row that rounds away to zero is not an
-    // allocation at all and is dropped, matching mergeAllocationRows' own qty > 0 filter.
-    const nextAllocations = mergeAllocationRows(nextAllocationRows)
-      .map((row) => ({ ...row, qty: roundQuantity(row.qty, ALLOCATION_QTY_SCALE) }))
-      .filter((row) => row.qty.gt(0))
+    // unchanged-set check compares like with like.
+    const canonicalAllocations = mergeAllocationRows(nextAllocationRows)
+      .map((row) => ({ ...row, qty: floorQuantity(row.qty, ALLOCATION_QTY_SCALE) }))
+
+    // A positive requirement that floors away is NOT nothing — StockLevel carries 6dp, so the
+    // demand is real but smaller than an OrderAllocation row can represent. It is left out of the
+    // set (so the line reports as unallocated rather than silently satisfied) and surfaced, because
+    // silently dropping it is how a partial allocation disappears without trace.
+    for (const dropped of canonicalAllocations.filter((row) => !row.qty.gt(0))) {
+      console.warn(
+        `[allocation] order ${orderId} line ${dropped.lineId}: component ${dropped.productId} requires `
+        + `less than the ${ALLOCATION_QTY_SCALE}dp OrderAllocation scale can represent; left unallocated`,
+      )
+    }
+
+    const nextAllocations = canonicalAllocations.filter((row) => row.qty.gt(0))
     const existingAllocs = await tx.orderAllocation.findMany({
       where: { orderId },
       select: { lineId: true, productId: true, warehouseId: true, qty: true },

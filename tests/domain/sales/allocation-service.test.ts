@@ -1383,3 +1383,37 @@ test('re-running that same allocation is a no-op and does not move reservedQty (
   assert.equal(state.stockLevels[0].reservedQty, afterFirst, 'no reservation drift across cycles')
   assert.deepEqual(state.allocations, rowsAfterFirst, 'and no rewrite')
 })
+
+test('a sub-unit residual is FLOORED, never rounded up past available stock (o3d-i4qd)', async () => {
+  // Feasibility is decided against the UNROUNDED value, so rounding the accepted quantity UP
+  // claims more than was proven available: 0.999960 becomes 1.0000, and reserving that violates
+  // the reservedQty <= quantity constraint and rolls the whole allocation back. Flooring can only
+  // ever claim less than was checked.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      lines: [{
+        id: 'line-1',
+        productId: 'product-1',
+        qty: 1,
+        sku: 'SKU-1',
+        description: 'Product 1',
+        product: { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false },
+      }],
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 0.99996, reservedQty: 0 }],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const allocated = (state.allocations ?? []).reduce((sum, row) => sum + Number(row.qty), 0)
+  assert.ok(
+    allocated <= 0.99996,
+    `allocated ${allocated} must not exceed the 0.99996 available — rounding up breaks the DB constraint`,
+  )
+  assert.equal(
+    state.stockLevels[0].reservedQty <= state.stockLevels[0].quantity,
+    true,
+    'reservedQty must never exceed quantity',
+  )
+})
