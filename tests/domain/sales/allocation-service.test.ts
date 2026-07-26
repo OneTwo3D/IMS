@@ -1529,3 +1529,58 @@ test('an UNDER-RESERVED order is REPORTED, and the rewrite would not have repair
     'the shortfall persists — this documents that neither path repairs it, which is why o3d-4kfh stays open',
   )
 })
+
+// ---------------------------------------------------------------------------
+// o3d-754w — a zeroDemand deallocation is a SUCCESS, not a backorder failure.
+// ---------------------------------------------------------------------------
+
+test('a CANCELLED order deallocates and reports success, not "No stock available" (o3d-754w)', async () => {
+  // zeroDemand empties the allocation input, but the report used to reconstruct demand from
+  // order qty minus only QUANTITY-linked refund lines. A cancelled order therefore kept its
+  // original demand after a perfectly successful deallocation: every line read as unallocated,
+  // and for a non-oversell product that made the whole call return success:false.
+  const state = baseState({
+    order: { ...baseState().order, status: 'CANCELLED' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 3,
+    }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.success, true, 'deallocating a cancelled order is a success')
+  assert.equal(result.error, undefined, 'and carries no error for callers to log')
+  assert.deepEqual(result.unallocatedLines, [], 'nothing is outstanding on a cancelled order')
+  assert.equal(result.unallocatedQty, 0)
+  assert.deepEqual(state.allocations, [], 'the allocations were released')
+  assert.equal(state.stockLevels[0].reservedQty, 0, 'and so was the reservation')
+})
+
+test('a FULL MONETARY refund deallocates and reports success too (o3d-754w)', async () => {
+  // The harder half: refundStatus FULL with NO quantity-linked refund lines, so per-line netting
+  // subtracts nothing. Only the zeroDemand short-circuit makes this report honestly.
+  const state = baseState({
+    order: { ...baseState().order, status: 'PROCESSING', refundStatus: 'FULL' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 3,
+    }],
+    refundLines: [],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.success, true)
+  assert.notEqual(result.error, 'No stock available for allocation')
+  assert.equal(result.unallocatedQty, 0)
+  assert.deepEqual(state.allocations, [])
+})

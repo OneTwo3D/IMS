@@ -1189,16 +1189,27 @@ export async function allocateSalesOrder(
     const report = buildBackorderReport({
       // Demand is net of refunds here too, so refunded units aren't reported as
       // unallocated/backordered (which would otherwise mark the result unsuccessful).
+      //
+      // zeroDemand short-circuits to 0 (o3d-754w). CANCELLED and refundStatus=FULL are
+      // UNCONDITIONALLY zero demand — that is why `lines` above is emptied for them — but the
+      // per-line netting here only subtracts QUANTITY-linked refund lines. A cancelled order, or
+      // a FULL refund that is monetary-only, therefore kept its original demand in the report
+      // after a perfectly successful DEALLOCATION: every line read as unallocated, and for
+      // non-oversell products canLeaveUnallocated then made the whole call return
+      // success:false / 'No stock available for allocation'. Misleading failure activity on a
+      // correct deallocation, and callers branching on success took the wrong path.
       lines: so.lines.map((line) => ({
         id: line.id,
         orderId: line.orderId,
         productId: line.productId,
         sku: line.sku,
         description: line.description,
-        qty: Prisma.Decimal.max(
-          new Prisma.Decimal(0),
-          toDecimal(line.qty).sub(refundedByLine.get(line.id) ?? new Prisma.Decimal(0)),
-        ).toNumber(),
+        qty: zeroDemand
+          ? 0
+          : Prisma.Decimal.max(
+            new Prisma.Decimal(0),
+            toDecimal(line.qty).sub(refundedByLine.get(line.id) ?? new Prisma.Decimal(0)),
+          ).toNumber(),
         product: line.product,
       })),
       allocations: nextAllocations.map((allocation) => ({
