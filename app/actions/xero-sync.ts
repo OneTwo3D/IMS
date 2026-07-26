@@ -16,6 +16,7 @@ import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
 import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
+import { RETRYABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/sync-retry-statuses'
 import {
   assertIntegrationConnectionTestPassed,
   buildIntegrationConnectionFingerprint,
@@ -454,12 +455,15 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
   }
 }
 
+
+
 export async function retryFailedXeroSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
   try {
     await requireAdmin()
+    const retryable = { in: [...RETRYABLE_ACCOUNTING_SYNC_STATUSES] }
     const where = entryId
-      ? { id: entryId, connector: 'xero', status: 'FAILED' as const }
-      : { connector: 'xero', status: 'FAILED' as const }
+      ? { id: entryId, connector: 'xero', status: retryable }
+      : { connector: 'xero', status: retryable }
     const result = await db.accountingSyncLog.updateMany({
       where,
       data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },

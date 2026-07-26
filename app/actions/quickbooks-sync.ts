@@ -17,6 +17,7 @@ import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
+import { RETRYABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/sync-retry-statuses'
 
 export type { QuickBooksSettings } from '@/lib/connectors/quickbooks/settings'
 
@@ -334,9 +335,14 @@ export async function triggerQuickBooksSync(): Promise<{ success: boolean; resul
 export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
   try {
     await requireAdmin()
+    // Same set as the Xero side, and for the same reason — see
+    // RETRYABLE_ACCOUNTING_SYNC_STATUSES: without CANCELLED_UNVERIFIED an order stuck behind an
+    // unverifiable orphan row would be permanently undeletable, with no operator path to clear it.
+    // The stable per-entry idempotency key (buildQboRequestId) makes the re-post safe (o3d-sref).
+    const retryable = { in: [...RETRYABLE_ACCOUNTING_SYNC_STATUSES] }
     const where = entryId
-      ? { id: entryId, connector: 'quickbooks', status: 'FAILED' as const }
-      : { connector: 'quickbooks', status: 'FAILED' as const }
+      ? { id: entryId, connector: 'quickbooks', status: retryable }
+      : { connector: 'quickbooks', status: retryable }
     const result = await db.accountingSyncLog.updateMany({
       where,
       data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },

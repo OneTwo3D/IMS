@@ -107,3 +107,40 @@ test('an unverified row counts as HELD BY LEDGER when IMS shows unpaid (o3d-sref
   assert.equal(verdict.status, 'LEDGER_UNMATCHED')
   assert.equal(verdict.discrepancy, true)
 })
+
+test('an unverified row HAS an operator path — it is retryable (o3d-sref)', async () => {
+  // The trap this avoids: the orphan sweep produces CANCELLED_UNVERIFIED, the delete guard blocks on
+  // it, and if nothing could clear it an order stuck behind one would be permanently undeletable.
+  // Shipping a fail-closed state with no exit is its own defect.
+  //
+  // Re-queueing is safe rather than a duplicate-post risk: both processors derive their idempotency
+  // key deterministically from the ENTRY ID, so a re-post sends the same key and the connector — the
+  // only party that knows whether the first call landed — settles it.
+  const { RETRYABLE_ACCOUNTING_SYNC_STATUSES } = await import(
+    '@/lib/domain/accounting/sync-retry-statuses'
+  )
+  const retryable: readonly string[] = RETRYABLE_ACCOUNTING_SYNC_STATUSES
+
+  assert.ok(retryable.includes('CANCELLED_UNVERIFIED'), 'it must be clearable by an operator')
+  assert.ok(retryable.includes('FAILED'), 'and the existing FAILED path is unchanged')
+  assert.ok(
+    !retryable.includes('CANCELLED'),
+    'a provably pre-call row was abandoned on purpose and must not be resurrected',
+  )
+  assert.ok(!retryable.includes('SYNCED'), 'nor may a posted document be re-sent')
+})
+
+test('the retryable set lives outside the \'use server\' modules (o3d-sref)', async () => {
+  // A 'use server' file may only export ASYNC functions. A plain const there compiles under tsc but
+  // fails `next build` — which is exactly how o3d-1di reached CI. This pins the constant's home so
+  // the same trap cannot be re-entered by moving it back for convenience.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+
+  for (const file of ['app/actions/xero-sync.ts', 'app/actions/quickbooks-sync.ts']) {
+    const src = readFileSync(join(process.cwd(), file), 'utf8')
+    assert.match(src, /^'use server'/, `${file} is a server-action module`)
+    const syncExports = src.match(/^export (?!async )(?:const|function|let|var|class) /gm) ?? []
+    assert.deepEqual(syncExports, [], `${file} must export only async functions, found ${syncExports}`)
+  }
+})
