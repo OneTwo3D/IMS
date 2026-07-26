@@ -401,7 +401,31 @@ export async function runWmsOrderPushSweepCore(
       if (!externalWarehouseId) continue
 
       const ts = now()
-      // o3d-5r8: claim before the remote call. A claim failure means the order was
+      const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
+
+      // o3d-92fu: BUILD BEFORE CLAIMING. buildPushInput used to run after the claim, so a purely
+      // local validation failure — a line with no SKU, say — left the link as PENDING_CREATE and
+      // eventually DEAD_LETTER, even though pushOrder was never invoked and no remote side effect
+      // was possible. The delete guard blocks on EVERY WMS link and DEAD_LETTER is no longer a
+      // create candidate, so the order became permanently impossible to hard-delete because of a
+      // local data error. Nothing is persisted for this failure now; the order stays deletable and
+      // the audit records why it cannot be pushed.
+      let input: WmsOrderPushInput
+      try {
+        input = buildPushInput(order, externalWarehouseId)
+      } catch (error) {
+        result.failed += 1
+        const message = scrubWmsError(error, 'WMS order payload could not be built')
+        await audit({
+          action: 'order_create', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: order.id, externalId: null,
+          summary: `WMS create skipped for order ${order.orderNumber ?? order.id}: ${message}`,
+          before: beforeCreate,
+          after: { state: beforeCreate.state, attempts: order.pushAttempts, localValidationFailure: true },
+        })
+        continue
+      }
+
+      // o3d-5r8: claim immediately before the remote call. A claim failure means the order was
       // deleted or another worker owns it — skip WITHOUT touching the WMS. A claim
       // error is not the order's fault either, so it is logged and retried next sweep
       // rather than counted against the order's push attempts.
@@ -413,14 +437,11 @@ export async function runWmsOrderPushSweepCore(
       }
       if (!claimed) continue
 
-      const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
       // Hoisted so the catch can tell "remote create failed" from "remote
       // create SUCCEEDED but recording the link failed" (Codex r1) — the audit
       // outcome must mirror the remote mutation, not the local bookkeeping.
-      let input: WmsOrderPushInput | null = null
       let push: Awaited<ReturnType<NonNullable<PushConnector['pushOrder']>>> | null = null
       try {
-        input = buildPushInput(order, externalWarehouseId)
         push = await connector.pushOrder!(input)
         const courierPending = push.courierFallback ?? false
         // Penny-precision guard (G6): record (never block) when the order's own totals

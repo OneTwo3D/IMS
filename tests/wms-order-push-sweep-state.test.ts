@@ -213,13 +213,39 @@ test('create: the 5th consecutive failure dead-letters', async () => {
   assert.equal(upserts[0].update.attempts, 5)
 })
 
-test('create: a line with no SKU dead-paths the order (caught, not silently pushed)', async () => {
+test('create: a line with no SKU is caught locally and persists NO link (o3d-92fu)', async () => {
+  // This test previously asserted the order was dead-lettered. That was the defect: the payload
+  // was built AFTER the claim, so a purely local validation failure left a PENDING_CREATE link
+  // that aged into DEAD_LETTER — and since the delete guard blocks on every WMS link while
+  // DEAD_LETTER is no longer a create candidate, the order became permanently impossible to
+  // hard-delete. pushOrder was never invoked, so no remote side effect was ever possible.
   const { port, upserts } = makePort({
     createCandidates: [candidate({ pushAttempts: 4, lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] })],
   })
+
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
-  assert.equal(r.deadLettered, 1)
-  assert.match(String(upserts[0].update.lastError), /no SKU/i)
+
+  assert.equal(r.failed, 1, 'still counted and still visible')
+  assert.equal(r.deadLettered, 0, 'a local validation error must not dead-letter the order')
+  assert.deepEqual(upserts, [], 'and must not leave a link that blocks hard delete')
+})
+
+test('create: the payload is validated BEFORE the claim is taken (o3d-92fu)', async () => {
+  // Claiming first is what made the failure persistent. Nothing may be claimed for an order
+  // whose payload cannot even be built.
+  const claims: string[] = []
+  const { port } = makePort({
+    createCandidates: [candidate({ lines: [{ sku: null, qty: 1, taxForeign: 0, totalForeign: 10, description: 'x' }] })],
+  })
+  const originalClaim = port.claimForCreate.bind(port)
+  port.claimForCreate = async (orderId: string, connectorId: string, ts: Date) => {
+    claims.push(orderId)
+    return originalClaim(orderId, connectorId, ts)
+  }
+
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+
+  assert.deepEqual(claims, [], 'no claim is taken when the payload cannot be built')
 })
 
 test('release: a HELD link is reset to PENDING_CREATE (external id cleared)', async () => {
