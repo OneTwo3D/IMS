@@ -119,7 +119,9 @@ test('nothing is written without an external id (o3d-0g2n)', async () => {
   const writes: Write[] = []
   await applyBackReference(
     makeDeps(writes),
-    { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1', externalId: undefined },
+    // Cast: the type requires a string, but the runtime guard exists precisely because a row can
+    // reach here without one — and blanking a marker would be worse than skipping the repair.
+    { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1', externalId: undefined as unknown as string },
     { markerOnly: true },
   )
   assert.deepEqual(writes, [], 'no id, no write — a repair must never blank an existing marker')
