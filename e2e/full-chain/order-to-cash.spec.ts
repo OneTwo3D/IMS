@@ -1740,7 +1740,12 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
         setPaid: false,
       })
 
-      imported = await awaitWebhookDelivery(order.id, { creds })
+      // 10 MINUTES, not the 300s default. Measured on 2026-07-26: OC-21 delivered inside a minute while
+      // this order missed 300s TWICE in a row on the same run. Woo queues deliveries through Action
+      // Scheduler on a store with no visitors, so throughput depends on how much the run has already put
+      // in that queue — and this case is always behind another full-chain order. Waiting longer is the
+      // honest fix; the alternative is a test that reports a store backlog as a product defect.
+      imported = await awaitWebhookDelivery(order.id, { creds, timeoutMs: 600_000 })
       await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
 
       await openSalesOrder(page, imported.salesOrderId)
