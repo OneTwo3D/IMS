@@ -113,6 +113,7 @@ export async function allocateBackordersForProducts(
     'Order has existing shipments; reallocation refused',
   ])
   const syncProductIds = new Set<string>()
+  const skippedOrders: Array<{ orderId: string; orderRef: string; status: string | null }> = []
   for (const order of needsAllocation) {
     const orderRef = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
     try {
@@ -130,6 +131,7 @@ export async function allocateBackordersForProducts(
         result.allocated += 1
         result.orderIds.push(order.id)
       } else if (res.skipped) {
+        skippedOrders.push({ orderId: order.id, orderRef, status: res.skippedStatus ?? null })
         // The order left the eligible set between selection and the lock. Nothing was written, so
         // this is neither a success nor a failure — but it DOES consume this one-shot replenishment
         // trigger, and the status-transition path does not re-run allocation. The periodic
@@ -169,6 +171,28 @@ export async function allocateBackordersForProducts(
     } catch (syncError) {
       console.error(syncError)
     }
+  }
+
+  // Publish the skips rather than only returning them: EVERY production caller awaits this
+  // function without reading its result, so a returned counter is discarded and a repeated
+  // eligibility race would leave no durable trace at all — the opposite of the visibility
+  // o3d-lvcb is claiming. WARNING, not ERROR: the reallocation sweep is expected to recover these,
+  // and a run of them showing up here is the signal that it is not.
+  if (skippedOrders.length > 0) {
+    await logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: context.referenceId ?? context.source,
+      action: 'backorder_allocation_skipped',
+      tag: 'sales',
+      level: 'WARNING',
+      description: `Skipped ${skippedOrders.length} backordered order(s) that left the eligible set before the lock, after ${context.referenceLabel ?? context.source}; the reallocation sweep should pick them up`,
+      metadata: {
+        source: context.source,
+        referenceId: context.referenceId ?? null,
+        skippedCount: skippedOrders.length,
+        skipped: skippedOrders,
+      },
+    })
   }
 
   if (result.allocated > 0) {

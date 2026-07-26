@@ -18,6 +18,16 @@ const CURSOR_SETTING_KEY = 'reallocation_sweep_cursor'
 // and prevent the wrap — the wrap is guaranteed once the fixed snapshot is exhausted, and rows below the
 // cursor are then picked up on the next cycle (o3d-9lx Codex review).
 const WATERMARK_SETTING_KEY = 'reallocation_sweep_watermark'
+/**
+ * Monotonic generation, bumped on every successful cursor write (o3d-lvcb Codex review r2).
+ *
+ * Comparing only cursor+watermark is an ABA hole: both are REUSABLE values, so a stalled run can
+ * wake to find the exact tuple it read — after newer runs completed a whole cycle and wrapped back
+ * to it — and its compare-and-swap would pass, persisting a page computed from the old cycle. The
+ * generation never repeats, so "unchanged tuple" and "same generation" are no longer the same
+ * claim.
+ */
+const GENERATION_SETTING_KEY = 'reallocation_sweep_generation'
 
 /**
  * The statuses the sweep selects on, re-asserted under the order lock (o3d-6ab/o3d-lvcb).
@@ -77,7 +87,12 @@ export type ReallocationSweepResult = {
   cursorPersisted: boolean
 }
 
-export type SweepCursorState = { cursor: string; watermark: string }
+export type SweepCursorState = {
+  cursor: string
+  watermark: string
+  /** Monotonic; identifies WHICH write produced this tuple. See GENERATION_SETTING_KEY. */
+  generation: number
+}
 
 export interface ReallocationSweepDeps {
   readState: () => Promise<SweepCursorState>
@@ -105,13 +120,22 @@ export interface ReallocationSweepDeps {
   logActivity: typeof logActivity
 }
 
+function parseGeneration(raw: string | undefined): number {
+  const parsed = Number.parseInt(raw ?? '0', 10)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
 async function defaultReadState(): Promise<SweepCursorState> {
   const rows = await db.setting.findMany({
-    where: { key: { in: [CURSOR_SETTING_KEY, WATERMARK_SETTING_KEY] } },
+    where: { key: { in: [CURSOR_SETTING_KEY, WATERMARK_SETTING_KEY, GENERATION_SETTING_KEY] } },
     select: { key: true, value: true },
   })
   const byKey = new Map(rows.map((r) => [r.key, r.value]))
-  return { cursor: byKey.get(CURSOR_SETTING_KEY) ?? '', watermark: byKey.get(WATERMARK_SETTING_KEY) ?? '' }
+  return {
+    cursor: byKey.get(CURSOR_SETTING_KEY) ?? '',
+    watermark: byKey.get(WATERMARK_SETTING_KEY) ?? '',
+    generation: parseGeneration(byKey.get(GENERATION_SETTING_KEY)),
+  }
 }
 
 /**
@@ -129,6 +153,11 @@ const SWEEP_CURSOR_LOCK_KEY = 918_273_912
  * then repeat and later pages are postponed indefinitely, which is exactly the bounded
  * cursor-cycle guarantee the keyset design exists to provide.
  *
+ * The comparison is on the GENERATION, not on cursor+watermark: those two are reusable values, so
+ * a stalled run could wake to find the very tuple it read after newer runs completed a whole cycle
+ * and wrapped back to it — an ABA pass that would persist a page computed from the old cycle. The
+ * generation never repeats.
+ *
  * Returns false when the state moved: the other run's progress stands and this run simply does
  * not persist. The advisory lock is what makes the compare and the swap one step.
  */
@@ -140,15 +169,19 @@ async function defaultWriteState(
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${SWEEP_CURSOR_LOCK_KEY})`
 
     const rows = await tx.setting.findMany({
-      where: { key: { in: [CURSOR_SETTING_KEY, WATERMARK_SETTING_KEY] } },
+      where: { key: { in: [CURSOR_SETTING_KEY, WATERMARK_SETTING_KEY, GENERATION_SETTING_KEY] } },
       select: { key: true, value: true },
     })
     const byKey = new Map(rows.map((r) => [r.key, r.value]))
-    const currentCursor = byKey.get(CURSOR_SETTING_KEY) ?? ''
-    const currentWatermark = byKey.get(WATERMARK_SETTING_KEY) ?? ''
 
-    if (currentCursor !== expected.cursor || currentWatermark !== expected.watermark) return false
+    // The generation alone decides. cursor/watermark are reusable and therefore ABA-prone; this
+    // is not. They are still compared, as a cheap consistency check on the stored triple.
+    const currentGeneration = parseGeneration(byKey.get(GENERATION_SETTING_KEY))
+    if (currentGeneration !== expected.generation) return false
+    if ((byKey.get(CURSOR_SETTING_KEY) ?? '') !== expected.cursor) return false
+    if ((byKey.get(WATERMARK_SETTING_KEY) ?? '') !== expected.watermark) return false
 
+    const nextGeneration = String(currentGeneration + 1)
     await tx.setting.upsert({
       where: { key: CURSOR_SETTING_KEY },
       create: { key: CURSOR_SETTING_KEY, value: state.cursor },
@@ -158,6 +191,11 @@ async function defaultWriteState(
       where: { key: WATERMARK_SETTING_KEY },
       create: { key: WATERMARK_SETTING_KEY, value: state.watermark },
       update: { value: state.watermark },
+    })
+    await tx.setting.upsert({
+      where: { key: GENERATION_SETTING_KEY },
+      create: { key: GENERATION_SETTING_KEY, value: nextGeneration },
+      update: { value: nextGeneration },
     })
     return true
   })
@@ -219,6 +257,13 @@ async function defaultLoadCandidatesPage(
  *     trigger is consumed and nothing re-runs allocation when the order becomes eligible again.
  *   - this sweep is that missing backstop: it is gated on ALLOCATION state, not on any trigger, so the
  *     order is re-selected on a later cycle and allocated then.
+ *
+ * That backstop covers a skipped order for as long as it stays in REALLOCATION_ELIGIBLE_STATUSES.
+ * It is NOT total: ON_HOLD -> PICKING and ON_HOLD -> PACKING are legal transitions, PICKING only
+ * checks that SOME allocation exists and PACKING checks none, so a partially-allocated skipped
+ * order can leave the recovery set with its trigger already consumed (o3d-c9mi). Widening the set
+ * to PICKING/PACKING is the WRONG fix — fulfilment may already own those allocations — so the
+ * check belongs on the transition, not here.
  *   - and this sweep WITHOUT the guard would reintroduce the very ON_HOLD race the guard closes.
  *
  * The remaining stale-pre-filter edge case (the selector counting gross vs net-of-refund demand) is
@@ -261,7 +306,10 @@ export async function sweepUnallocatedProcessingOrders(
     watermark = await deps.snapshotWatermark()
     if (!watermark) {
       // No eligible orders at all — clear any stale state and finish.
-      result.cursorPersisted = await deps.writeState({ cursor: '', watermark: '' }, state)
+      result.cursorPersisted = await deps.writeState(
+        { cursor: '', watermark: '', generation: state.generation },
+        state,
+      )
       return result
     }
   }
@@ -277,15 +325,15 @@ export async function sweepUnallocatedProcessingOrders(
   // throw/crash leaves the cursor unchanged and the batch is retried idempotently next tick.
   const nextState: SweepCursorState =
     hasRemainder && batch.length > 0
-      ? { cursor: batch[batch.length - 1].id, watermark }
-      : { cursor: '', watermark: '' }
+      ? { cursor: batch[batch.length - 1].id, watermark, generation: state.generation }
+      : { cursor: '', watermark: '', generation: state.generation }
 
   result.scanned = batch.length
   result.hasRemainder = hasRemainder
   result.nextCursor = nextState.cursor
 
   if (batch.length === 0) {
-    result.cursorPersisted = await deps.writeState(nextState, { cursor, watermark: state.watermark })
+    result.cursorPersisted = await deps.writeState(nextState, state)
     return result
   }
 
@@ -365,7 +413,7 @@ export async function sweepUnallocatedProcessingOrders(
   // a timeout) above this point leaves the cursor unchanged, so the unprocessed batch is retried next
   // tick rather than skipped until a full rotation. Per-order allocation failures are caught above and
   // still advance (they're benign/logged), so a single bad order can't wedge the cursor.
-  result.cursorPersisted = await deps.writeState(nextState, { cursor, watermark: state.watermark })
+  result.cursorPersisted = await deps.writeState(nextState, state)
 
   return result
 }
