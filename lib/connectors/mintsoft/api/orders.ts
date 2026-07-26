@@ -666,6 +666,16 @@ export async function fetchMintsoftOrderList(opts: {
   maxPages?: number
   /** Wall-clock budget across ALL pages; defaults to 60s (well under the sweep cadence). */
   deadlineMs?: number
+  /**
+   * Clock for the deadline, injectable so the budget can be tested DETERMINISTICALLY (o3d-dsp).
+   *
+   * With the real clock, asserting the deadline requires racing it against real work: the test
+   * used a 1ms budget, and the outcome then depended on machine load in BOTH directions — on a
+   * fast machine every page completes in under a millisecond and the run hits the PAGE budget
+   * instead, on a loaded one it trips the deadline. That produced spurious failures on unrelated
+   * branches. Production always uses Date.now.
+   */
+  now?: () => number
 }): Promise<WmsOrderStatus[]> {
   const since = opts.sinceLastUpdated.trim()
   if (!since) return []
@@ -700,11 +710,12 @@ export async function fetchMintsoftOrderList(opts: {
   // too, and fail closed: the caller holds its watermark and falls back, exactly as it
   // does for a page overflow.
   const deadlineMs = opts.deadlineMs && opts.deadlineMs > 0 ? Math.trunc(opts.deadlineMs) : 60_000
-  const startedAt = Date.now()
+  const now = opts.now ?? Date.now
+  const startedAt = now()
 
   const collected: RawOrder[] = []
   for (let pageNo = 1; pageNo <= maxPages; pageNo += 1) {
-    if (pageNo > 1 && Date.now() - startedAt > deadlineMs) {
+    if (pageNo > 1 && now() - startedAt > deadlineMs) {
       throw new Error(
         `Mintsoft Order/List delta exceeded its ${deadlineMs}ms budget after ${pageNo - 1} pages `
           + `(since=${since}); refusing to treat a truncated delta as complete`,

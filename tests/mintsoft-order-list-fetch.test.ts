@@ -791,14 +791,28 @@ test('[o3d-9vv] pagination is bounded by a WALL-CLOCK budget, not just a page co
   listResponder = () => full // never short → would otherwise run the full page budget
 
   // 100 sequential requests at the transport timeout is ~50 minutes, far beyond the
-  // 2-minute sweep cadence. A tiny budget proves the deadline is enforced.
+  // 2-minute sweep cadence, so the deadline must stop the walk before the page budget does.
+  //
+  // The clock is INJECTED (o3d-dsp). This previously used a 1ms real budget, which made the
+  // outcome depend on machine load in both directions: on a fast machine every page completed
+  // in under a millisecond and the run reached the PAGE limit instead, producing the wrong
+  // error; under load it tripped the deadline as intended. Driving the clock makes the
+  // assertion exact — the walk stops after EXACTLY one page, not merely "fewer than 100".
+  let clock = 0
   await assert.rejects(
     () => fetchMintsoftOrderList({
-      sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, deadlineMs: 1,
+      sinceLastUpdated: '2026-07-15T12:00:00',
+      clientId: CLIENT,
+      deadlineMs: 5_000,
+      now: () => {
+        const value = clock
+        clock += 4_000 // start=0, first check=4000 (under), second=8000 (over)
+        return value
+      },
     }),
-    /exceeded its 1ms budget after \d+ pages/,
+    /exceeded its 5000ms budget after 2 pages/,
   )
-  assert.ok(listCalls.length < 100, `stopped at the deadline (${listCalls.length}) instead of running the full page budget`)
+  assert.equal(listCalls.length, 2, 'stopped at the deadline, not at the 100-page budget')
 })
 
 test('[o3d-9vv] a re-read row is marked so the sweep can tell it apart from a bulk row', async () => {
