@@ -93,3 +93,36 @@ test('both the cron and the manual sync run it (o3d-0g2n)', async () => {
   const manual = readFileSync(join(process.cwd(), 'app/actions/quickbooks-sync.ts'), 'utf8')
   assert.match(manual, /repairQuickBooksBackReferences\(\)/, 'and so does the manual sync')
 })
+
+test('the sweep never writes a type QuickBooks\' own writer would not (o3d-0g2n)', async () => {
+  // The divergence hazard of reusing the SHARED applyBackReference from a connector whose writer
+  // duplicates that logic: the shared helper handles PURCHASE_CREDIT_NOTE / SupplierCreditNote, and
+  // QuickBooks' updateBackReference does NOT. If the sweep swept that type it would write a
+  // back-reference the normal path never writes — a silent behaviour difference between the repair
+  // path and the live path, which is worse than either behaviour alone.
+  //
+  // It does not: the candidate filter is SALES_INVOICE / CREDIT_NOTE / PURCHASE_INVOICE, the same
+  // three Xero's sweep uses, and every one of them IS handled by the QuickBooks writer.
+  //
+  // (QuickBooks has no PURCHASE_CREDIT_NOTE support at all — processEntry's default branch returns
+  // "Unknown sync type", so such a row fails loudly rather than silently succeeding. Tracked
+  // separately; not something this sweep should paper over.)
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8')
+
+  const sweep = src.slice(src.indexOf('export async function repairQuickBooksBackReferences'))
+  const candidateTypes = sweep.slice(0, sweep.indexOf('})'))
+  assert.doesNotMatch(
+    candidateTypes,
+    /PURCHASE_CREDIT_NOTE/,
+    'sweeping a type the writer cannot handle would make repair and live paths disagree',
+  )
+
+  // And the writer really does handle each type the sweep can act on.
+  const writer = src.slice(src.indexOf('async function updateBackReference'))
+  const writerBody = writer.slice(0, writer.indexOf('\n}'))
+  for (const type of ['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE']) {
+    assert.match(writerBody, new RegExp(type), `the writer handles ${type}, so repairing it is consistent`)
+  }
+})
