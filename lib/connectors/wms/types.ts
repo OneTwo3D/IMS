@@ -243,6 +243,16 @@ export type WmsOrderPushResult = {
   externalOrderId: string
   externalOrderNumber: string | null
   status: string
+  /**
+   * o3d-bjc.8: this id was MINTED by a create we did not read back, so it is
+   * bound on the connector's word alone. The link is persisted PENDING_VERIFY
+   * and a later sweep proves ownership with a scoped read — it must never be
+   * re-pushed, because the order already exists in the warehouse.
+   *
+   * Absent/false means the id came from a read that already proved ownership
+   * (the dedupe path asserts the ClientId on the row it selects).
+   */
+  needsVerification?: boolean
   /** True when the order's shipping service didn't resolve and the WMS fell back to a
    *  default courier — the warehouse should verify the courier before despatch. */
   courierFallback?: boolean
@@ -301,6 +311,24 @@ export interface WmsConnector {
   fetchOrderPartItems?(externalPartId: string): Promise<Array<{ sku: string; qty: number }>>
   /** Push (create) an order into the WMS for fulfilment; idempotent on re-push. */
   pushOrder?(input: WmsOrderPushInput): Promise<WmsOrderPushResult>
+  /**
+   * o3d-bjc.8: prove that a minted id really is ours, without mutating anything.
+   *
+   * `reference` is OUR record of the order — never anything the create response
+   * said. Tenant agreement alone only means "we may touch this row"; identity
+   * agreement is what says "this row IS the order we created".
+   *
+   *   'ours'    — a scoped read found it, under our tenant AND our reference.
+   *   'foreign' — it exists and is NOT ours. Quarantine; never re-push (the
+   *               order we created is still out there under some id).
+   *   'unknown' — we could not tell (transient failure, or nothing found yet).
+   *               Stay PENDING_VERIFY and try again; guessing either way is how
+   *               a real warehouse order gets duplicated or orphaned.
+   */
+  verifyPushedOrder?(
+    externalOrderId: string,
+    reference: { orderNumber: string | null; externalReference: string | null },
+  ): Promise<'ours' | 'foreign' | 'unknown'>
   /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */

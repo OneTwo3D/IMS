@@ -2388,6 +2388,12 @@ model WmsOrderStatusSnapshot {
 // to the WMS order after a successful create. Connector-agnostic.
 enum WmsOrderPushState {
   PENDING_CREATE
+  /// o3d-bjc.8: the WMS create SUCCEEDED and minted an id, but we have not yet
+  /// proved that id is ours. Distinct from SYNCED because it must never be
+  /// re-PUT — a second create would duplicate a real warehouse order — and
+  /// distinct from PENDING_CREATE for the same reason. The sweep retries only
+  /// the ClientId-scoped VERIFICATION until it resolves.
+  PENDING_VERIFY
   SYNCED
   PENDING_CANCEL
   CANCELLED

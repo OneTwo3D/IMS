@@ -69,6 +69,12 @@ const DEFAULT_BATCH_SIZE = 25
 export type WmsOrderPushSweepResult = {
   skipped?: string
   created: number
+  /** o3d-bjc.8: links promoted from PENDING_VERIFY to SYNCED this sweep. */
+  verified: number
+  /** o3d-bjc.8: links quarantined by verification (foreign, or unresolvable past the bound). */
+  verifyQuarantined: number
+  /** o3d-bjc.8: links still awaiting a verdict — counted so an unknown is not silent. */
+  verifyUnresolved: number
   updated: number
   cancelled: number
   held: number
@@ -270,7 +276,7 @@ function refundedQtyByLine(order: { refunds?: Array<{ lines: Array<{ salesOrderL
 // tested with an in-memory fake (see tests/wms-order-push-sweep-state.test.ts),
 // mirroring the repository pattern used by the shopping webhook inbox.
 
-type PushState = 'PENDING_CREATE' | 'SYNCED' | 'PENDING_CANCEL' | 'CANCELLED' | 'DEAD_LETTER' | 'HELD'
+type PushState = 'PENDING_CREATE' | 'PENDING_VERIFY' | 'SYNCED' | 'PENDING_CANCEL' | 'CANCELLED' | 'DEAD_LETTER' | 'HELD'
 type LinkWrite = {
   connector?: string
   externalOrderId?: string | null
@@ -315,6 +321,24 @@ const RESET_DISPATCH_FAILURES = {
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
 export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
 export type WmsPushLinkRef = { id: string; orderId: string; externalOrderId: string | null }
+/**
+ * o3d-bjc.8: a PENDING_VERIFY link, carrying OUR identifiers.
+ *
+ * `orderNumber` and `externalReference` (the sales-order id we send as
+ * ExternalOrderReference) come from the local record, never from the create
+ * response — an id the WMS handed back for some OTHER order of ours would
+ * otherwise verify against itself and the link would go SYNCED pointing at
+ * another customer's order.
+ */
+export type WmsPushVerifyLink = WmsPushLinkRef & {
+  orderNumber: string | null
+  externalReference: string
+  /** Verification attempts already spent — the bound on how long "unknown" may last. */
+  verifyAttempts: number
+  /** A courier-fallback note held back until the id is proven ours. */
+  courierPending: boolean
+  shippingService: string | null
+}
 
 export interface WmsOrderPushPort {
   activeBindings(connector: string): Promise<Array<{ warehouseId: string; externalWarehouseId: string }>>
@@ -341,6 +365,13 @@ export interface WmsOrderPushPort {
    */
   claimForCreate(orderId: string, connector: string, attemptedAt: Date): Promise<boolean>
   /** SYNCED links for ready orders changed since the last push (updatedAt > pushedAt). */
+  /**
+   * o3d-bjc.8: links whose WMS order was created but never proved ours. They are
+   * NOT create candidates (re-pushing would duplicate a real warehouse order)
+   * and NOT updatable (we will not amend an order we cannot prove we own) —
+   * only the scoped verification is retried.
+   */
+  verifiableLinks?(connector: string, limit: number): Promise<WmsPushVerifyLink[]>
   updatableLinks(connector: string, limit: number): Promise<WmsPushUpdateLink[]>
   /** SYNCED links whose order is ON_HOLD. */
   holdableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
@@ -368,7 +399,7 @@ function pushIntentSummary(input: WmsOrderPushInput) {
   }
 }
 
-type PushConnector = Pick<WmsConnector, 'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment'>
+type PushConnector = Pick<WmsConnector, 'pushOrder' | 'updateOrder' | 'cancelOrder' | 'addOrderComment' | 'verifyPushedOrder'>
 
 /**
  * Testable core of the order-push sweep — operates purely on the injected
@@ -381,7 +412,7 @@ export async function runWmsOrderPushSweepCore(
   port: WmsOrderPushPort,
   options?: { batchSize?: number; now?: () => Date },
 ): Promise<WmsOrderPushSweepResult> {
-  const result: WmsOrderPushSweepResult = { created: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0 }
+  const result: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0 }
   if (!connector.pushOrder) return { ...result, skipped: 'Active WMS connector has no order-push support' }
 
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE
@@ -470,6 +501,14 @@ export async function runWmsOrderPushSweepCore(
         input = buildPushInput(order, externalWarehouseId)
         push = await connector.pushOrder!(input)
         const courierPending = push.courierFallback ?? false
+        // o3d-bjc.8: an id the connector MINTED but has not proved is ours is
+        // not SYNCED. It is also emphatically not PENDING_CREATE — the order
+        // exists in the warehouse now, and re-pushing would duplicate it — so
+        // it gets its own state, and only the scoped verification is retried.
+        // A connector that cannot verify (no verifyPushedOrder) keeps the old
+        // behaviour rather than parking every order it creates.
+        const createdState: PushState =
+          push.needsVerification && connector.verifyPushedOrder ? 'PENDING_VERIFY' : 'SYNCED'
         // Penny-precision guard (G6): record (never block) when the order's own totals
         // don't reconcile to the penny, so an operator can investigate a mis-totalled order.
         const driftPence = orderTotalDriftPence(order)
@@ -479,19 +518,32 @@ export async function runWmsOrderPushSweepCore(
         }
         await port.upsertByOrder(
           order.id,
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, totalMismatchPence },
-          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: 'SYNCED', lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, totalMismatchPence },
+          // attempts: 0 on BOTH sides (o3d-bjc.8). claimForCreate has usually
+          // created the link already, so the update side is what runs — and the
+          // verification budget reads this counter. Left carrying four failed
+          // create attempts, a create that finally succeeded would be
+          // quarantined on its FIRST transient unknown, putting a live WMS order
+          // outside the update, cancel and dispatch passes.
+          { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
         result.created += 1
         await audit({
           action: 'order_create', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
-          summary: `Order ${order.orderNumber ?? order.id} created in WMS as ${push.externalOrderNumber ?? push.externalOrderId}`,
+          summary: `Order ${order.orderNumber ?? order.id} created in WMS as ${push.externalOrderNumber ?? push.externalOrderId}`
+            + (createdState === 'PENDING_VERIFY' ? ' (pending ownership verification)' : ''),
           before: beforeCreate,
-          after: { state: 'SYNCED', externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, courierPending, totalMismatchPence, intent: pushIntentSummary(input) },
+          after: { state: createdState, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, courierPending, totalMismatchPence, intent: pushIntentSummary(input) },
         })
         // Courier-pending (G6c): the shipping service didn't resolve and the WMS used a
         // default courier — flag it on the WMS order so the warehouse verifies before despatch.
-        if (courierPending) {
+        //
+        // Not while the id is unproven (o3d-bjc.8): the comment guard proves only
+        // that the row is under our tenant, not that it is OUR ORDER, so a
+        // same-client wrong-id would receive a misleading IMS note about a
+        // shipping method that has nothing to do with it. The verify pass posts
+        // it once the link is promoted.
+        if (courierPending && createdState === 'SYNCED') {
           await postConflictComment(
             push.externalOrderId,
             `IMS: shipping method '${order.shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`,
@@ -519,6 +571,101 @@ export async function runWmsOrderPushSweepCore(
             : { state, attempts },
           error: message,
         })
+      }
+    }
+  }
+
+  // --- Verify pass: prove a created-but-unverified link before anything else ---
+  //
+  // FIRST, and deliberately: a PENDING_VERIFY link is excluded from the create
+  // and update passes, so until it resolves the order is doing nothing. It also
+  // must never be re-pushed — the order already exists in the warehouse — so
+  // the only thing retried here is a scoped READ.
+  if (connector.verifyPushedOrder && port.verifiableLinks) {
+    for (const link of await port.verifiableLinks(connectorId, batchSize)) {
+      if (!link.externalOrderId) continue
+      const verifyTs = now()
+      let verdict: 'ours' | 'foreign' | 'unknown' = 'unknown'
+      let verifyError: string | null = null
+      try {
+        verdict = await connector.verifyPushedOrder(link.externalOrderId, {
+          orderNumber: link.orderNumber,
+          externalReference: link.externalReference,
+        })
+      } catch (error) {
+        // No evidence is not counter-evidence: stay PENDING_VERIFY and retry.
+        verifyError = scrubWmsError(error, 'WMS push verification failed')
+        console.error('[wms-order-push] verification failed', link.orderId, verifyError)
+      }
+      if (verdict === 'ours') {
+        await port.updateLink(link.id, { state: 'SYNCED', lastError: null })
+        result.verified += 1
+        // The courier-pending note was held back until the id was proven.
+        if (link.courierPending) {
+          await postConflictComment(
+            link.externalOrderId,
+            `IMS: shipping method '${link.shippingService ?? '—'}' did not map to a WMS courier, so a default courier was used. Please verify the courier before despatch.`,
+            link.orderId,
+          )
+        }
+        await audit({
+          action: 'order_create', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: link.orderId,
+          externalId: link.externalOrderId,
+          summary: `WMS order ${link.externalOrderId} verified as ours (${link.orderNumber ?? link.orderId}) — link promoted to SYNCED`,
+          before: { state: 'PENDING_VERIFY', externalOrderId: link.externalOrderId },
+          after: { state: 'SYNCED', externalOrderId: link.externalOrderId },
+        })
+      } else if (verdict === 'foreign') {
+        // Quarantine, and do NOT re-push. Two facts are both true: this id is
+        // not ours, and our create DID happen — so somewhere there is a real
+        // order we can no longer address. Creating a second one would ship the
+        // customer two parcels; that call belongs to an operator.
+        const message = `WMS order ${link.externalOrderId} belongs to another tenant — link quarantined, NOT re-pushed`
+        await port.updateLink(link.id, { state: 'DEAD_LETTER', lastError: message })
+        result.verifyQuarantined += 1
+        result.deadLettered += 1
+        await audit({
+          action: 'order_create', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId,
+          externalId: link.externalOrderId,
+          summary: message,
+          before: { state: 'PENDING_VERIFY', externalOrderId: link.externalOrderId },
+          after: { state: 'DEAD_LETTER' },
+          error: message,
+        })
+      } else {
+        // 'unknown' → still PENDING_VERIFY on purpose: guessing either way
+        // duplicates a real order or orphans one. But it is COUNTED, and the
+        // attempt is stamped — otherwise the batch is re-selected from the same
+        // permanently-unknown head every sweep and newer links never get a turn.
+        const attempts = link.verifyAttempts + 1
+        const exhausted = attempts >= MAX_ATTEMPTS
+        if (exhausted) {
+          // Still no answer after the bound. An order nobody can resolve is an
+          // operator's decision, not a reason to keep quietly retrying while its
+          // WMS order sits outside every other pass. Escalated, never re-pushed.
+          const message = `WMS order ${link.externalOrderId} could not be verified after ${attempts} attempts`
+            + `${verifyError ? ` (${verifyError})` : ''} — quarantined for manual check, NOT re-pushed`
+          await port.updateLink(link.id, {
+            state: 'DEAD_LETTER', attempts, lastError: message, lastAttemptAt: verifyTs,
+          })
+          result.verifyQuarantined += 1
+          result.deadLettered += 1
+          await audit({
+            action: 'order_create', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.orderId,
+            externalId: link.externalOrderId,
+            summary: message,
+            before: { state: 'PENDING_VERIFY', externalOrderId: link.externalOrderId, attempts: link.verifyAttempts },
+            after: { state: 'DEAD_LETTER', attempts },
+            error: message,
+          })
+        } else {
+          await port.updateLink(link.id, {
+            attempts,
+            lastAttemptAt: verifyTs,
+            lastError: verifyError ?? `WMS order ${link.externalOrderId} not yet verified as ours`,
+          })
+          result.verifyUnresolved += 1
+        }
       }
     }
   }
@@ -714,6 +861,33 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         return true
       })
     },
+    async verifiableLinks(connector, limit) {
+      const rows = await db.wmsOrderPushLink.findMany({
+        where: { connector, state: 'PENDING_VERIFY', externalOrderId: { not: null } },
+        select: {
+          id: true, orderId: true, externalOrderId: true, attempts: true, courierPending: true,
+          order: { select: { orderNumber: true, shippingService: true } },
+        },
+        take: limit,
+        // Least-recently-ATTEMPTED first (o3d-bjc.8). An `unknown` verdict leaves
+        // the row otherwise untouched, so a pushedAt ordering would re-select the
+        // same permanently-unknown head batch every sweep and no newer link would
+        // ever be verified — its live WMS order then stays out of the update,
+        // dispatch and reconcile paths indefinitely.
+        orderBy: [{ lastAttemptAt: { sort: 'asc', nulls: 'first' } }, { pushedAt: 'asc' }],
+      })
+      return rows.map((row) => ({
+        id: row.id,
+        orderId: row.orderId,
+        externalOrderId: row.externalOrderId,
+        orderNumber: row.order?.orderNumber ?? null,
+        // What buildPushInput sends as ExternalOrderReference.
+        externalReference: row.orderId,
+        verifyAttempts: row.attempts,
+        courierPending: row.courierPending,
+        shippingService: row.order?.shippingService ?? null,
+      }))
+    },
     async updatableLinks(connector, limit) {
       // "order changed since push" is a two-column comparison Prisma can't express.
       const dueRows = await db.$queryRaw<Array<{ id: string }>>`
@@ -736,6 +910,15 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         select: { id: true, externalOrderId: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true } } },
       })
     },
+    // o3d-bjc.8: PENDING_VERIFY is deliberately NOT cancellable or holdable.
+    // The tempting argument is urgency — a cancelled order must not ship — but
+    // the mechanism does not survive it: in the very case this state exists for
+    // (the create landed under an id we did not record correctly) the scoped
+    // lookup for that wrong id 404s, which cancelMintsoftOrder reports as
+    // NOT_FOUND and the sweep records as a successful cancellation. IMS would
+    // then show CANCELLED while the real order stayed live and shipped. The
+    // verify pass runs FIRST, so a resolvable link is SYNCED within the same
+    // tick; one that will not resolve is escalated to an operator instead.
     holdableLinks: (connector, limit) =>
       db.wmsOrderPushLink.findMany({
         where: { connector, state: 'SYNCED', externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
@@ -774,7 +957,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
 export async function runWmsOrderPushSweep(
   options?: { batchSize?: number },
 ): Promise<WmsOrderPushSweepResult> {
-  const empty: WmsOrderPushSweepResult = { created: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0 }
+  const empty: WmsOrderPushSweepResult = { created: 0, verified: 0, verifyQuarantined: 0, verifyUnresolved: 0, updated: 0, cancelled: 0, held: 0, released: 0, failed: 0, deadLettered: 0 }
 
   const state = await getIntegrationPluginState()
   const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])

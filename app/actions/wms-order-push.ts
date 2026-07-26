@@ -42,10 +42,24 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
   await requirePermission('sync')
   const link = await db.wmsOrderPushLink.findUnique({
     where: { orderId: salesOrderId },
-    select: { id: true, state: true },
+    select: { id: true, state: true, externalOrderId: true },
   })
   if (!link) return { success: false, error: 'No WMS push record for this order.' }
   if (link.state !== 'DEAD_LETTER') return { success: false, error: 'Only dead-lettered pushes can be re-queued.' }
+  // o3d-bjc.8: a dead letter that still carries an external id is not a failed
+  // create — it is an order that EXISTS in the WMS and could not be verified as
+  // ours (or was found to be someone else's). Re-queueing it means creating a
+  // SECOND warehouse order, which is exactly the duplicate fulfilment the
+  // PENDING_VERIFY state exists to prevent. That call needs a human who has
+  // looked at the WMS.
+  if (link.externalOrderId) {
+    return {
+      success: false,
+      error: `This order is already linked to WMS order ${link.externalOrderId}, which could not be verified. `
+        + 'Re-queueing would create a second warehouse order. Check the WMS first: if that order is ours, '
+        + 'the link is already correct; if it is not, clear the link before re-pushing.',
+    }
+  }
 
   // Re-queue for the next sweep. The sweep's eligibility (ready + paid + bound)
   // still applies, so a no-longer-eligible order simply won't re-push.
