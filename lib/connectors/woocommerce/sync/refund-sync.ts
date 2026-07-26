@@ -255,11 +255,11 @@ export async function syncWcRefund(
       // What this does NOT do, deliberately: assert that goods physically came back, or raise
       // a WmsReturnsInbox row. WooCommerce's refund line carries a refunded QUANTITY and no
       // received/restocked signal, so quantity alone cannot prove a physical return — and the
-      // returns inbox is currently Mintsoft-only (its loader, status action and restock action
-      // all filter connector='mintsoft'), so a row written here would be invisible and
-      // unresolvable. Claiming an actionable record that no screen shows would be worse than
-      // the WARNING it replaced. Generalising that inbox is o3d-92rl; establishing what actually
-      // proves a physical return on the WooCommerce side is o3d-etbf.
+      // returns inbox is currently scoped to a single WMS connector — its loader, its status
+      // action and its restock action all filter on that one connector — so a row written here
+      // would be invisible and unresolvable. Claiming an actionable record that no screen shows
+      // would be worse than the WARNING it replaced. Generalising that inbox is o3d-92rl;
+      // establishing what actually proves a physical return on the WooCommerce side is o3d-etbf.
       const refundedUnits = refundLines
         .filter((line) => line.lineKind === 'sale' && line.qty > 0)
         .reduce((sum, line) => sum + line.qty, 0)
