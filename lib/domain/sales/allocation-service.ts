@@ -21,7 +21,7 @@ import {
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
-import { floorQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -689,9 +689,6 @@ export async function validateAllocationIntegrity(
   return null
 }
 
-/** Scale of `OrderAllocation.qty` — `@db.Decimal(12, 4)`. */
-const ALLOCATION_QTY_SCALE = 4
-
 function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
   const merged = new Map<string, AllocationRowInput>()
 
@@ -714,10 +711,14 @@ function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
  * Compared as a SET keyed on (lineId, warehouseId, productId) — the same key mergeAllocationRows
  * dedupes on — because row order is not meaningful and neither side is ordered.
  *
- * Both sides are at the persisted scale by the time they reach here: the caller canonicalises the
- * computed set to ALLOCATION_QTY_SCALE, and the column can hold nothing else. So the quantity
- * comparison is EXACT, not tolerance-based — comparing at one scale while mutating reservations at
- * another is precisely the mismatch that made this check unreliable (o3d-i4qd).
+ * The quantity comparison is EXACT — Decimal.eq, not a tolerance. Comparing at one scale while
+ * mutating reservations at another is precisely the mismatch that made an earlier version of this
+ * check unreliable, so it must not quietly absorb a difference (o3d-i4qd).
+ *
+ * The consequence is that a computed quantity the column cannot represent exactly — a nested KIT's
+ * 0.11102224 against its persisted 0.1110 — reports as a CHANGE, so the short-circuit does not fire
+ * and that order keeps being rewritten. That is the pre-existing behaviour and is tracked as
+ * o3d-i4qd; the fix belongs in how the set is canonicalised, not in loosening this comparison.
  *
  * Decimal.eq rather than `===` because two Decimals of equal value can differ in representation.
  */
@@ -1028,42 +1029,30 @@ export async function allocateSalesOrder(
       }
     }
 
-    // Canonicalise ONCE, at the point the set is produced (o3d-i4qd, o3d-i5it).
+    // NOT canonicalised to the persisted scale here — three attempts at that failed, and the
+    // reasons are worth keeping (o3d-i4qd):
     //
-    // OrderAllocation.qty is @db.Decimal(12,4) and nothing here rounded before writing — the
-    // COLUMN did it. But the reservation delta was applied from the UNROUNDED value against
-    // StockLevel.reservedQty, which holds 6dp. So a reserve wrote X while the row recorded
-    // round(X,4), and the later release — which reads the ROW — gave back round(X,4). The
-    // difference leaked into reservedQty as a phantom reservation on every cycle, worst for
-    // nested KITs where the expanded factor is unquantized (0.3332 x 0.3332 = 0.11102224).
+    //   - ROUND_HALF_UP rounds UP, but feasibility was decided against the UNROUNDED value, so
+    //     the row can claim more than was proven available: a 0.999960 residual becomes 1.0000
+    //     and violates the reservedQty <= quantity constraint.
+    //   - flooring each row INDEPENDENTLY breaks the KIT invariant. Components of one kit are a
+    //     COUPLED, proportional set, and validateAllocationIntegrity enforces that to 1e-6.
+    //     Flooring 0.11108889 -> 0.1110 while 0.3333 stays exact makes the two disagree about
+    //     how many kits they represent, and shipment confirmation then refuses the order with
+    //     "must keep bundle components in matching quantities". Excluding a sub-scale component
+    //     while keeping its siblings is the same corruption by another route.
     //
-    // FLOOR, not half-up. An allocation quantity is a CLAIM on stock, and feasibility was decided
-    // against the unrounded value, so rounding UP can claim more than was checked: a 0.999960
-    // residual would become 1.0000 and violate the reservedQty <= quantity constraint, and a
-    // nested KIT's 0.11108889 would become 0.1111 — representing 1.0001 kits, which
-    // validateAllocationIntegrity later rejects at shipment confirmation as over-allocated.
-    // Flooring can only ever claim LESS than was proven available, so it cannot manufacture
-    // either failure; the cost is that such a line reports as slightly short, which is the
-    // remaining half of o3d-i4qd.
+    // Doing it correctly means canonicalising each (line, warehouse) fulfilment set ATOMICALLY:
+    // derive one representable coverage, regenerate every component from it, verify integrity
+    // BEFORE persisting, and drop the whole set — reserving none of it — if no proportional
+    // representation exists. That is o3d-i4qd, and it is a redesign rather than a rounding call.
     //
-    // Rounding here makes the row, the reservation delta, the coverage comparison and the
-    // report all speak in the same units, so reserve and release are symmetric and the
-    // unchanged-set check compares like with like.
-    const canonicalAllocations = mergeAllocationRows(nextAllocationRows)
-      .map((row) => ({ ...row, qty: floorQuantity(row.qty, ALLOCATION_QTY_SCALE) }))
-
-    // A positive requirement that floors away is NOT nothing — StockLevel carries 6dp, so the
-    // demand is real but smaller than an OrderAllocation row can represent. It is left out of the
-    // set (so the line reports as unallocated rather than silently satisfied) and surfaced, because
-    // silently dropping it is how a partial allocation disappears without trace.
-    for (const dropped of canonicalAllocations.filter((row) => !row.qty.gt(0))) {
-      console.warn(
-        `[allocation] order ${orderId} line ${dropped.lineId}: component ${dropped.productId} requires `
-        + `less than the ${ALLOCATION_QTY_SCALE}dp OrderAllocation scale can represent; left unallocated`,
-      )
-    }
-
-    const nextAllocations = canonicalAllocations.filter((row) => row.qty.gt(0))
+    // Leaving it unrounded is the PRE-EXISTING behaviour: the column rounds on write, so the
+    // reservation drift o3d-i4qd describes remains, and the unchanged-set check below simply does
+    // not fire for a nested KIT whose expanded factor is unrepresentable. Both are unchanged from
+    // before this branch — no new breakage, and the short-circuit still fires for every ordinary
+    // line, which is the overwhelming majority.
+    const nextAllocations = mergeAllocationRows(nextAllocationRows)
     const existingAllocs = await tx.orderAllocation.findMany({
       where: { orderId },
       select: { lineId: true, productId: true, warehouseId: true, qty: true },

@@ -1321,11 +1321,12 @@ test('an unchanged set is not refused even when a shipment has been journaled (o
   assert.equal(state.order.inventoryAllocatedDate?.toISOString(), '2026-01-01T00:00:00.000Z')
 })
 
-test('allocationSetsMatch compares EXACTLY — canonicalisation is the caller\'s job (o3d-i4qd)', () => {
-  // allocateSalesOrder rounds the computed set to the column's scale at the point it is produced,
-  // so both sides reaching here are already canonical and the comparison is exact rather than
-  // tolerance-based. Comparing at one scale while mutating reservations at another is exactly the
-  // mismatch that made this check unreliable, so the helper must NOT quietly absorb it.
+test('allocationSetsMatch compares EXACTLY and absorbs no scale mismatch (o3d-i4qd)', () => {
+  // The helper must not paper over a value the column cannot represent. Comparing at one scale
+  // while reservations move at another is what made an earlier version of this check unreliable.
+  // The consequence is deliberate: a nested-KIT quantity reports as a CHANGE and the short-circuit
+  // does not fire for it, which is the pre-existing behaviour tracked as o3d-i4qd — the fix
+  // belongs in how the set is canonicalised, not in loosening this comparison.
   const persisted = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.1110') }]
 
   assert.equal(
@@ -1336,7 +1337,7 @@ test('allocationSetsMatch compares EXACTLY — canonicalisation is the caller\'s
   assert.equal(
     allocationSetsMatch(persisted, [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.11102224') }]),
     false,
-    'an uncanonicalised value is NOT silently treated as equal — the caller must round first',
+    'a value the column cannot represent exactly is NOT silently treated as equal',
   )
   assert.equal(
     allocationSetsMatch(persisted, [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.1112') }]),
@@ -1345,15 +1346,11 @@ test('allocationSetsMatch compares EXACTLY — canonicalisation is the caller\'s
   )
 })
 
-test('the persisted allocation and the reservation move by the SAME canonical amount (o3d-i4qd)', async () => {
-  // The drift this closes: the reservation delta used to be applied from the UNROUNDED computed
-  // value against StockLevel.reservedQty (6dp), while the row recorded round(value, 4). A later
-  // release reads the ROW, so it gave back less than was reserved and the difference accumulated
-  // as a phantom reservation every cycle.
-  //
-  // Asserting they agree is what makes reserve/release symmetric. It also means the unchanged-set
-  // check compares like with like — comparing at 4dp while mutating reservations at 6dp would let
-  // two genuinely different reservations look "unchanged" and skip the adjustment entirely.
+test('the persisted allocation and the reservation move by the same amount', async () => {
+  // Reserve and release must agree, or reservedQty drifts. NOTE this double does not model the
+  // column's 4dp rounding, so it cannot reproduce the real o3d-i4qd drift (reserve writes the
+  // unrounded value, the row stores 4dp, and the later release reads the ROW). It pins the
+  // in-memory symmetry only; the persisted-scale half needs a real database.
   const state = baseState({
     stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 }],
   })
@@ -1384,11 +1381,15 @@ test('re-running that same allocation is a no-op and does not move reservedQty (
   assert.deepEqual(state.allocations, rowsAfterFirst, 'and no rewrite')
 })
 
-test('a sub-unit residual is FLOORED, never rounded up past available stock (o3d-i4qd)', async () => {
-  // Feasibility is decided against the UNROUNDED value, so rounding the accepted quantity UP
-  // claims more than was proven available: 0.999960 becomes 1.0000, and reserving that violates
-  // the reservedQty <= quantity constraint and rolls the whole allocation back. Flooring can only
-  // ever claim less than was checked.
+test('an allocation never claims more stock than is available (o3d-i4qd)', async () => {
+  // The invariant any quantity handling must preserve. An earlier attempt at canonicalising to
+  // the column scale used ROUND_HALF_UP and broke it: feasibility is decided against the
+  // UNROUNDED value, so rounding the accepted quantity UP claims more than was proven available
+  // — 0.999960 becomes 1.0000, and reserving that violates reservedQty <= quantity.
+  //
+  // Canonicalisation is currently NOT applied (see o3d-i4qd: per-row rounding also breaks the
+  // coupled KIT set, so it needs a set-atomic redesign). This pins the invariant regardless of
+  // how that is eventually done.
   const state = baseState({
     order: {
       ...baseState().order,
@@ -1407,10 +1408,7 @@ test('a sub-unit residual is FLOORED, never rounded up past available stock (o3d
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
   const allocated = (state.allocations ?? []).reduce((sum, row) => sum + Number(row.qty), 0)
-  assert.ok(
-    allocated <= 0.99996,
-    `allocated ${allocated} must not exceed the 0.99996 available — rounding up breaks the DB constraint`,
-  )
+  assert.ok(allocated <= 0.99996, `allocated ${allocated} must not exceed the 0.99996 available`)
   assert.equal(
     state.stockLevels[0].reservedQty <= state.stockLevels[0].quantity,
     true,
