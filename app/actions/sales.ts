@@ -2930,11 +2930,11 @@ async function registerInvoicePaymentWithLedger(params: {
     // deletePayment takes the same per-order lock, so serialising on it closes the window in both
     // directions: either we find the payment gone and do nothing, or we queue first and the delete finds
     // our row and retracts it.
-    await db.$transaction(async (tx) => {
+    const outcome = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${params.orderId} FOR UPDATE`
       const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
-      if (!stillRecorded) return
-      await queueAccountingSyncTx(tx, {
+      if (!stillRecorded) return 'receipt-deleted' as const
+      const queued = await queueAccountingSyncTx(tx, {
         type: 'INVOICE_PAYMENT',
         referenceType: 'SalesOrder',
         referenceId: params.orderId,
@@ -2953,7 +2953,20 @@ async function registerInvoicePaymentWithLedger(params: {
         // Exactly once per recorded receipt, however many times this runs.
         idempotencyKey: `invoice-payment:payment:${params.paymentId}`,
       })
+      return queued ? ('queued' as const) : ('context-changed' as const)
     }, STOCK_TX_OPTIONS)
+
+    // queueAccountingSyncTx RE-READS the posting context and returns false when it has since changed —
+    // the connector switched off, or INVOICE_PAYMENT posting disabled, between the check above and the
+    // write. Ignoring that boolean left the receipt accepted locally with no sync row, no warning and
+    // nothing to retry: the silent loss this whole issue is about (Codex, PR #582 round 8).
+    if (outcome === 'context-changed') {
+      await warn('invoice_payment_not_registered',
+        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but ` +
+        `accounting sync for payments was switched off while it was being queued, so nothing was sent. ` +
+        `Re-enable it and register the payment, or record it in the ledger by hand.`,
+        { amount: params.amount, currency: params.currency, refusal: 'POSTING_CONTEXT_CHANGED' })
+    }
   } catch (e) {
     // Same shape as markBillPaid's queue failure: the receipt is recorded in IMS with nothing queued to
     // tell the ledger, so nothing will ever retry and there is no FAILED row to notice — the row was
