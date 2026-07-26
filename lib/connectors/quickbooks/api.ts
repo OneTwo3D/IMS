@@ -174,11 +174,32 @@ export async function qboPost<T = unknown>(path: string, body: unknown): Promise
   return qboFetch<T>('POST', path, body)
 }
 
+/**
+ * Intuit's documented maximum for a non-batch `requestid`. Duplicated here rather than imported
+ * from the sync processor so this module stays free of that dependency; the processor exports the
+ * same constant and a test pins the two together.
+ */
+const REQUEST_ID_MAX_LENGTH = 50
+
 export async function qboPostIdempotent<T = unknown>(
   path: string,
   body: unknown,
   requestId: string,
 ): Promise<QboResponse<T>> {
+  // Fail BEFORE the POST, never silently. An over-length requestid is either rejected by Intuit
+  // (error 2130) or ignored — and if it is ignored, the post goes through with NO idempotency while
+  // the caller believes it is protected, which is how a duplicate document reaches the ledger
+  // (o3d-nmar). A loud failure here is recoverable; a silent duplicate invoice is not.
+  if (requestId.length === 0 || requestId.length > REQUEST_ID_MAX_LENGTH) {
+    return {
+      ok: false,
+      status: 0,
+      error:
+        `Refusing to POST ${path} with a ${requestId.length}-character requestid: Intuit allows at ` +
+        `most ${REQUEST_ID_MAX_LENGTH}, and an out-of-range value may be ignored, leaving the post ` +
+        `with no idempotency protection at all (o3d-nmar).`,
+    }
+  }
   return qboFetch<T>('POST', path, body, { requestId })
 }
 

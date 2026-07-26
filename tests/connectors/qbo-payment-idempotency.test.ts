@@ -65,3 +65,55 @@ test('both money-moving endpoints ARE posted idempotently, and pass a requestId 
     `expected each money-moving post to pass requestId; found ${idempotentCalls.length}`,
   )
 })
+
+test('the requestid fits Intuit\'s documented 50-character maximum (o3d-nmar)', async () => {
+  // A full SHA-256 hex digest is 64 characters and this builder has ALWAYS sent one — not just on
+  // the payment path, but on invoices, bills and credit notes via qboPostIdempotent. Intuit
+  // documents 50 as the maximum for a non-batch requestid, with error 2130 for an invalid format.
+  //
+  // Over-length is the dangerous case precisely because we cannot tell from here which way Intuit
+  // resolves it: if the parameter is ignored rather than rejected, the post succeeds with NO
+  // idempotency while the caller believes it is protected.
+  const { buildQboRequestId, QBO_REQUEST_ID_MAX_LENGTH } = await import(
+    '@/lib/connectors/quickbooks/sync-processor'
+  )
+
+  const id = buildQboRequestId('entry-1|PAYMENT|order-1|{"amount":10}')
+
+  assert.ok(
+    id.length <= QBO_REQUEST_ID_MAX_LENGTH,
+    `requestid is ${id.length} characters, above Intuit's ${QBO_REQUEST_ID_MAX_LENGTH} limit`,
+  )
+  assert.match(id, /^[0-9a-f]+$/, 'still a plain hex digest — no characters needing escaping')
+  // Enough entropy that a collision is not a real concern: 32 hex chars = 128 bits.
+  assert.ok(id.length >= 32, 'kept wide enough that distinct documents cannot collide')
+})
+
+test('the same source still yields the same requestid — truncation keeps it deterministic (o3d-nmar)', async () => {
+  const { buildQboRequestId } = await import('@/lib/connectors/quickbooks/sync-processor')
+
+  const source = 'entry-7|SALES_INVOICE|order-9|{"total":123.45}'
+  assert.equal(buildQboRequestId(source), buildQboRequestId(source), 'a retry must reuse the key')
+  assert.notEqual(
+    buildQboRequestId(source),
+    buildQboRequestId(`${source} `),
+    'and a different document must not collide onto it',
+  )
+})
+
+test('qboPostIdempotent refuses an out-of-range requestid instead of posting blind (o3d-nmar)', async () => {
+  // The backstop: if anything ever widens the builder again, the POST fails loudly rather than
+  // going through with idempotency silently disabled. A loud failure is recoverable; a duplicate
+  // invoice on the ledger is not.
+  const { qboPostIdempotent } = await import('@/lib/connectors/quickbooks/api')
+
+  const tooLong = 'a'.repeat(64)
+  const result = await qboPostIdempotent('invoice', { Line: [] }, tooLong)
+
+  assert.equal(result.ok, false, 'an over-length id must not reach Intuit')
+  assert.match(result.error ?? '', /64-character requestid/)
+  assert.match(result.error ?? '', /no idempotency protection/)
+
+  const empty = await qboPostIdempotent('invoice', { Line: [] }, '')
+  assert.equal(empty.ok, false, 'and neither must an empty one')
+})
