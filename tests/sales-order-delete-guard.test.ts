@@ -70,8 +70,16 @@ function makeTx(seed: {
   syncLogs?: SyncLogRow[]
   /** Durable external-document markers on the order itself — these survive log retention. */
   order?: { accountingInvoiceId?: string | null; invoicedAt?: Date | null }
+  /** Independent WMS evidence: a status snapshot can exist with no push link. */
+  wmsSnapshot?: {
+    connectorLabel: string
+    externalOrderNumber: string
+    externalOrderId: string
+    statusLabel: string
+  } | null
 }) {
   return {
+    wmsOrderStatusSnapshot: { findUnique: async () => seed.wmsSnapshot ?? null },
     salesOrder: {
       findUnique: async () => ({
         accountingInvoiceId: seed.order?.accountingInvoiceId ?? null,
@@ -429,3 +437,45 @@ test('a CANCELLED row with NO external id still does not block', async () => {
 })
 
 
+
+test('a WMS status snapshot blocks even with NO push link (o3d-eu0r)', async () => {
+  // WmsOrderStatusSnapshot is populated by looking storefront-linked orders up in the WMS, so it
+  // can carry a confirmed externalOrderId for an order this IMS never pushed. Its FK is
+  // onDelete: Cascade, so deleting would silently erase the only local record that the remote
+  // order exists — leaving a live warehouse order nothing in IMS points at.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: null,
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'WMS-4321',
+        externalOrderId: '4321',
+        statusLabel: 'Processing',
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'wms_order_status_snapshot')
+  assert.match(blocker!.message, /WMS-4321/)
+  assert.match(blocker!.message, /erase the only local record/)
+})
+
+test('the snapshot falls back to the external id when it has no order number (o3d-eu0r)', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: null,
+      wmsSnapshot: {
+        connectorLabel: 'ShipHero',
+        externalOrderNumber: '',
+        externalOrderId: 'sh-99',
+        statusLabel: 'Allocated',
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.match(blocker!.message, /sh-99/)
+})

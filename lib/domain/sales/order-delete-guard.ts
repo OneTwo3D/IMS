@@ -59,6 +59,7 @@ export const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED',
 export type SalesOrderDeleteBlocker = {
   code:
     | 'wms_order_push_link'
+    | 'wms_order_status_snapshot'
     | 'accounting_sync_live'
     | 'accounting_document_exists'
     | 'daily_batch_staged'
@@ -142,7 +143,27 @@ export async function findSalesOrderDeleteBlocker(
     }
   }
 
-  // 1. WMS. The link row is the push sweep's claim: it exists from immediately before
+  // 1a. A WMS status snapshot is independent evidence that the warehouse holds this order
+  // (o3d-eu0r). WmsOrderStatusSnapshot is populated by looking storefront-linked orders up in
+  // the WMS, so it can carry a confirmed externalOrderId with NO push link — an order the WMS
+  // knows about that this IMS never pushed. Worse, its FK is onDelete: Cascade, so deleting the
+  // order silently erases the only local record that the remote order exists.
+  const snapshot = await tx.wmsOrderStatusSnapshot.findUnique({
+    where: { orderId },
+    select: { connectorLabel: true, externalOrderNumber: true, externalOrderId: true, statusLabel: true },
+  })
+  if (snapshot) {
+    const ref = snapshot.externalOrderNumber || snapshot.externalOrderId
+    return {
+      code: 'wms_order_status_snapshot',
+      message:
+        `Cannot delete an order the warehouse management system already holds `
+        + `(${snapshot.connectorLabel} order ${ref}, ${snapshot.statusLabel}). Cancel the order instead `
+        + 'so the WMS order is withdrawn — deleting would erase the only local record of it.',
+    }
+  }
+
+  // 1b. WMS push link. The link row is the push sweep's claim: it exists from immediately before
   // the remote create until the order is withdrawn, so ANY link means the WMS may hold
   // (or be about to be handed) this order.
   const pushLink = await tx.wmsOrderPushLink.findUnique({
