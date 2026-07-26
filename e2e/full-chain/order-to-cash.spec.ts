@@ -1839,7 +1839,7 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
 
       // 6. And the returned stock re-enters on the SAME posted basis, so the inventory GL leg of that
       //    single-amount journal still equals the cost-layer subledger.
-      const returnedLayerCost = await returnedLayerUnitCostFor(productId, refundId)
+      const returnedLayerCost = await returnedLayerUnitCostFor(productId)
       expect(returnedLayerCost, 'the returned layer is valued at the posted basis, matching the journal').toBeCloseTo(postedUnitCost, 2)
     } finally {
       const cn = refundId ? await externalIdFor({ type: 'CREDIT_NOTE', referenceId: refundId }).catch(() => null) : null
@@ -2177,11 +2177,13 @@ async function postedCogsUnitCostFor(salesOrderId: string): Promise<number> {
   const db = new Client({ connectionString: process.env.DATABASE_URL })
   await db.connect()
   try {
+    // CogsEntry has no shipment link of its own — it hangs off the StockMovement, and the SALE_DISPATCH
+    // movement is what carries referenceType/referenceId back to the order.
     const r = await db.query<{ unit: string }>(
       `select (sum(c."totalCostBase") / nullif(sum(c.qty), 0))::text as unit
          from cogs_entries c
-         join shipments s on s.id = c."shipmentId"
-        where s."orderId" = $1`,
+         join stock_movements m on m.id = c."movementId"
+        where m."referenceType" = 'SalesOrder' and m."referenceId" = $1`,
       [salesOrderId],
     )
     const unit = Number(r.rows[0]?.unit)
@@ -2198,13 +2200,16 @@ async function latestCostLayerUnitCostFor(productId: string): Promise<number> {
   const db = new Client({ connectionString: process.env.DATABASE_URL })
   await db.connect()
   try {
+    // The layer the goods PO created — the one a landed cost revalues. CostLayer has no source
+    // discriminator column; poLineId is what distinguishes a received-from-PO layer from one a return
+    // recreated.
     const r = await db.query<{ unitCostBase: string }>(
       `select "unitCostBase"::text from cost_layers
-        where "productId" = $1 and "sourceType" <> 'RETURN'
-        order by "createdAt" desc limit 1`,
+        where "productId" = $1 and "poLineId" is not null
+        order by "receivedAt" desc limit 1`,
       [productId],
     )
-    if (!r.rows.length) throw new Error(`No cost layer for product ${productId}`)
+    if (!r.rows.length) throw new Error(`No PO-sourced cost layer for product ${productId}`)
     return Number(r.rows[0].unitCostBase)
   } finally {
     await db.end()
@@ -2212,18 +2217,20 @@ async function latestCostLayerUnitCostFor(productId: string): Promise<number> {
 }
 
 /** The unit cost of the layer a RETURN recreated — it must match the posted basis, not the revalued one. */
-async function returnedLayerUnitCostFor(productId: string, refundId: string): Promise<number> {
+async function returnedLayerUnitCostFor(productId: string): Promise<number> {
   const { Client } = await import('pg')
   const db = new Client({ connectionString: process.env.DATABASE_URL })
   await db.connect()
   try {
+    // The layer the RETURN recreated: no poLineId (it did not come from a receipt) and newest, so it is
+    // the one the refund just wrote rather than the goods layer beside it.
     const r = await db.query<{ unitCostBase: string }>(
       `select "unitCostBase"::text from cost_layers
-        where "productId" = $1 and ("sourceType" = 'RETURN' or "sourceId" = $2)
-        order by "createdAt" desc limit 1`,
-      [productId, refundId],
+        where "productId" = $1 and "poLineId" is null
+        order by "receivedAt" desc limit 1`,
+      [productId],
     )
-    if (!r.rows.length) throw new Error(`No returned cost layer for product ${productId} / refund ${refundId}`)
+    if (!r.rows.length) throw new Error(`No return-created cost layer for product ${productId}`)
     return Number(r.rows[0].unitCostBase)
   } finally {
     await db.end()
