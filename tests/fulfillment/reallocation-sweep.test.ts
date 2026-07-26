@@ -37,9 +37,13 @@ function baseDeps(over: Deps = {}) {
   let state: SweepCursorState = { cursor: '', watermark: '' }
   const deps: Deps = {
     readState: async () => state,
-    writeState: async (s) => {
+    // Mirrors the production compare-and-swap: persist only while the stored state is
+    // unchanged, and report which happened.
+    writeState: async (s, expected) => {
+      if (state.cursor !== expected.cursor || state.watermark !== expected.watermark) return false
       state = s
       calls.stateWrites.push(s)
+      return true
     },
     snapshotWatermark: async () => {
       calls.snapshots += 1
@@ -193,8 +197,10 @@ test('a stable first page of benign backorders does not starve a later eligible 
   const attempted: string[] = []
   const deps: Deps = {
     readState: async () => state,
-    writeState: async (s) => {
+    writeState: async (s, expected) => {
+      if (state.cursor !== expected.cursor || state.watermark !== expected.watermark) return false
       state = s
+      return true
     },
     snapshotWatermark: async () => 'SO-3',
     loadCandidatesPage: async (cur) => pages[cur] ?? [],
@@ -231,7 +237,7 @@ test('a batch-level failure leaves the cursor unchanged for an idempotent retry 
 
 // --- o3d-lvcb: the sweep and the o3d-6ab under-lock guard are only correct TOGETHER ---
 
-test('the sweep asserts PROCESSING under the order lock, matching what it selected on (o3d-lvcb)', async () => {
+test('the sweep re-asserts its own eligible set under the order lock (o3d-lvcb)', async () => {
   const seen: Array<readonly string[] | undefined> = []
   const { deps } = baseDeps({
     loadCandidatesPage: async () => [order('SO-1')],
@@ -244,8 +250,67 @@ test('the sweep asserts PROCESSING under the order lock, matching what it select
   await sweepUnallocatedProcessingOrders({ deps })
 
   // Without this the sweep reintroduces the very ON_HOLD race o3d-6ab closes: candidates are
-  // selected as PROCESSING outside the lock, so an order held in that window would be re-reserved.
-  assert.deepEqual(seen, [['PROCESSING']], 'the guard must match loadCandidatesPage\'s status filter')
+  // selected outside the lock, so an order held in that window would be re-reserved.
+  //
+  // ALLOCATED matters as much as PROCESSING. The replenishment allocator selects both, and a skip
+  // there consumes a one-shot stock trigger; ON_HOLD -> ALLOCATED is a legal transition, so a sweep
+  // scanning only PROCESSING would leave an order returned to ALLOCATED outside its own backstop.
+  assert.deepEqual(
+    seen,
+    [['PROCESSING', 'ALLOCATED']],
+    'the guard must match the sweep\'s selection AND the replenishment allocator\'s eligible set',
+  )
+})
+
+test('an order skipped while ALLOCATED is still re-selected by the sweep (o3d-lvcb)', async () => {
+  // The status-set hole: the replenishment allocator treats ALLOCATED as eligible, so an ALLOCATED
+  // order can skip and burn its trigger. If the sweep did not scan ALLOCATED, that shortfall would
+  // be stranded permanently.
+  let held = true
+  const attempts: string[] = []
+  const { deps } = baseDeps({
+    loadCandidatesPage: async () => [order('SO-ALLOC')],
+    autoAllocateOrder: async (orderId) => {
+      attempts.push(orderId)
+      if (held) return { success: false, skipped: true, allocationCount: 0, syncProductIds: [] }
+      return { success: true, allocationCount: 1, syncProductIds: [] }
+    },
+  })
+
+  const first = await sweepUnallocatedProcessingOrders({ deps })
+  assert.equal(first.skipped, 1)
+
+  held = false
+  const second = await sweepUnallocatedProcessingOrders({ deps })
+
+  assert.deepEqual(attempts, ['SO-ALLOC', 'SO-ALLOC'])
+  assert.equal(second.allocated, 1, 'recovered without any new stock trigger')
+})
+
+test('a concurrent run that already advanced the cursor is not overwritten (o3d-lvcb)', async () => {
+  // No lease guards the sweep — the cron rate limit is not mutual exclusion. A slow run finishing
+  // after a newer one used to overwrite the newer cursor with its own stale value, repeating pages
+  // and postponing later ones indefinitely. The compare-and-swap makes the stale write a no-op.
+  let stored: SweepCursorState = { cursor: 'SO-5', watermark: 'WM' }
+  const writes: SweepCursorState[] = []
+  const { deps } = baseDeps({
+    readState: async () => ({ cursor: 'SO-5', watermark: 'WM' }),
+    loadCandidatesPage: async () => [order('SO-6'), order('SO-7'), order('SO-8')],
+    selectNeedingAllocation: async () => [],
+    writeState: async (next, expected) => {
+      // A newer run advanced the cursor while this one was processing its batch.
+      stored = { cursor: 'SO-99', watermark: 'WM' }
+      if (stored.cursor !== expected.cursor || stored.watermark !== expected.watermark) return false
+      writes.push(next)
+      return true
+    },
+  })
+
+  const result = await sweepUnallocatedProcessingOrders({ limit: 2, deps })
+
+  assert.equal(result.cursorPersisted, false, 'the stale write is reported as discarded')
+  assert.deepEqual(writes, [], 'and nothing was written')
+  assert.equal(stored.cursor, 'SO-99', 'the newer run\'s progress stands')
 })
 
 test('a skipped order is counted, not logged as an error, and not counted as allocated (o3d-lvcb)', async () => {
