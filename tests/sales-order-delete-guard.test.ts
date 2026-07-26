@@ -145,15 +145,31 @@ test('an in-flight (PROCESSING) and an already-posted (SYNCED) invoice both bloc
   }
 })
 
-test('FAILED and CANCELLED sync rows do not block — nothing of theirs is in the ledger', async () => {
-  for (const status of ['FAILED', 'CANCELLED']) {
-    const blocker = await findSalesOrderDeleteBlocker(
-      makeTx({ syncLogs: [syncLog({ status })] }),
-      'order-1',
-      STAMPS,
-    )
-    assert.equal(blocker, null, status)
-  }
+test('a CANCELLED sync row does not block — it was deliberately retired', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [syncLog({ status: 'CANCELLED' })] }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker, null)
+})
+
+test('a FAILED sync row DOES block — it is not proof nothing was posted (o3d-ju8t)', async () => {
+  // This test previously asserted the opposite. The accounting processors make the remote call
+  // BEFORE persisting SYNCED and the externalTransactionId, and an exception in that persistence
+  // window is caught and can later terminalise the row as FAILED — with a real document sitting
+  // in the ledger. So FAILED spans "rejected before any remote mutation" and "document exists,
+  // writeback failed", and nothing durable tells them apart. Permitting an irreversible delete on
+  // that basis reads absence of a success marker as a positive fact about the external system.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [syncLog({ status: 'FAILED' })] }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'accounting_sync_live')
+  assert.match(blocker!.message, /does not prove nothing was posted/)
+  assert.match(blocker!.message, /may exist in the ledger/)
 })
 
 test('a live sync row for a DIFFERENT order does not block', async () => {

@@ -32,8 +32,29 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * than merely protected from deletion) are tracked separately.
  */
 
-/** Sync-log statuses meaning "queued, in flight, or already in the external ledger". */
-export const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
+/**
+ * Sync-log statuses that must block an irreversible delete.
+ *
+ * PENDING / PROCESSING / SYNCED are "queued, in flight, or already in the external ledger" —
+ * obviously blocking.
+ *
+ * FAILED is here too (o3d-ju8t), because it does NOT mean "nothing was posted". The accounting
+ * processors make the REMOTE CALL BEFORE persisting SYNCED and the externalTransactionId: see
+ * lib/connectors/xero/sync-processor.ts, where processEntry posts and only then opens the
+ * transaction that records the result. An exception in that persistence window is caught and the
+ * same row can later terminalise as FAILED — with a real document sitting in the ledger.
+ *
+ * So FAILED spans two genuinely different situations, "rejected before any remote mutation" and
+ * "remote document exists, writeback failed", and nothing durable distinguishes them today.
+ * Treating it as proof of the first is reading absence of a success marker as a positive fact
+ * about the external system, on a path that cannot be undone. It fails closed instead.
+ *
+ * The cost is that an order whose accounting genuinely failed pre-call cannot be hard-deleted
+ * until someone resolves the row. That is the right side to err on for an irreversible
+ * operation, and the blocker message says so. Recording pre-call rejection distinctly — so it
+ * can be safely ignored here — is the rest of o3d-ju8t.
+ */
+export const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED'] as const
 
 export type SalesOrderDeleteBlocker = {
   code:
@@ -121,9 +142,12 @@ export async function findSalesOrderDeleteBlocker(
   if (liveDocument) {
     return {
       code: 'accounting_sync_live',
-      message:
-        `Cannot delete an order with accounting documents queued or posted to ${liveDocument.connector} ` +
-        `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired or reversed.`,
+      message: liveDocument.status === 'FAILED'
+        ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `
+          + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '
+          + 'so the document may exist in the ledger. Check the connector, then cancel the order or resolve the sync log.'
+        : `Cannot delete an order with accounting documents queued or posted to ${liveDocument.connector} `
+          + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired or reversed.`,
     }
   }
 
