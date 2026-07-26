@@ -471,6 +471,21 @@ async function statusesFor(kind: string, ids: string[]): Promise<Map<string, str
  * ~6. Xero accepts an array on these endpoints and reports per-document problems inline when
  * asked not to summarise them.
  */
+/**
+ * DELETE a payment in Xero — the ledger-side event a chargeback or a mistaken receipt produces.
+ *
+ * There is no VOIDED payment in Xero; removal is `Status: DELETED` (the same call teardown makes before
+ * it can void an invoice). OC-09 uses this to stage a REAL payment reversal rather than a simulated one:
+ * the poller's whole job is noticing that a payment it recorded is no longer there, and a fixture that
+ * only edits the IMS side would prove nothing about that.
+ */
+export async function deletePaymentInXero(paymentId: string): Promise<void> {
+  const res = await xeroPost('Payments?summarizeErrors=false', {
+    Payments: [{ PaymentID: paymentId, Status: 'DELETED' }],
+  })
+  if (!res.ok) throw new Error(`Xero DELETE Payments/${paymentId} failed: ${res.error ?? 'unknown error'}`)
+}
+
 export async function voidTrackedDocuments(): Promise<{ voided: number; failed: string[] }> {
   const failed: string[] = []
   let voided = 0

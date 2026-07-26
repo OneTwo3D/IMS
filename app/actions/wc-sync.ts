@@ -363,6 +363,28 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     const isRebind =
       validatedUrl.normalizedUrl !== prevUrl || effectiveKey !== prevKey || effectiveSecret !== prevSecret
 
+    // o3d-7yf finding 2: a store-CHANGING rebind (the URL now points at a DIFFERENT WooCommerce store,
+    // not just rotated keys) must not proceed while unresolved refund parks exist. Order links + parks
+    // carry the OLD store's externalOrderId with no store-identity binding, so retrying a park after the
+    // switch would fetch the NEW store by that id — stranding it (id absent) or MISAPPLYING a different
+    // store's refund to the old IMS order. Block until the operator resolves them. (Full fix — bind links/
+    // parks to an immutable store identity + reject a retry on mismatch — remains tracked in o3d-7yf.)
+    const storeUrlChanging = prevUrl !== '' && validatedUrl.normalizedUrl !== prevUrl
+    if (storeUrlChanging) {
+      const parkedCount = await tx.shoppingSyncLog.count({
+        where: {
+          connector: 'woocommerce',
+          direction: 'FROM_CONNECTOR',
+          entityType: 'SalesOrder',
+          status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+          entityId: { not: null },
+        },
+      })
+      if (parkedCount > 0) {
+        return { blocked: true as const, parkedCount }
+      }
+    }
+
     await tx.setting.upsert({
       where: { key: 'wc_url' },
       create: { key: 'wc_url', value: validatedUrl.normalizedUrl },
@@ -411,6 +433,15 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     })
     return { isRebind, wipedMappings: wiped.count }
   })
+
+  if ('blocked' in saveOutcome && saveOutcome.blocked) {
+    return {
+      success: false,
+      wipedMappings: 0,
+      error: `Cannot change the WooCommerce store URL while ${saveOutcome.parkedCount} unresolved refund(s) are parked for review. They are bound to the current store — resolve them in the sync exceptions inbox first, or they would be stranded or misapplied against a different store.`,
+      code: 'unresolved_refund_parks',
+    }
+  }
 
   await logActivity({
     entityType: 'SETTING',
@@ -653,6 +684,15 @@ export async function getShoppingStatusMappings(): Promise<StatusMappingRow[]> {
 
 export async function upsertShoppingStatusMapping(externalStatus: string, imsStatus: string): Promise<{ success: boolean }> {
   await requireAdmin()
+  // o3d-gz6: never let a WooCommerce status map to SHIPPED. SHIPPED must reflect a REAL dispatch (a
+  // shipment row), not a storefront status — importWcOrder writes this mapping straight into
+  // SalesOrder.status, so a WC->SHIPPED mapping mints "false-SHIPPED" orders (SHIPPED with no shipment)
+  // that then can't be cancelled. Reject it at the persistence boundary; the UI also omits it.
+  if (imsStatus === 'SHIPPED') {
+    throw new Error(
+      'A WooCommerce status cannot map to SHIPPED — SHIPPED is set only by a real dispatch, not a '
+      + 'storefront status (o3d-gz6).')
+  }
   await db.shoppingStatusMapping.upsert({
     where: {
       connector_externalStatus: {

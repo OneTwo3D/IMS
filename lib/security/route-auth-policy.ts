@@ -162,6 +162,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Archives exhausted EOL products after stock and incoming supply are depleted; guarded by verifyCron.',
   },
+  '/api/cron/reallocation-sweep': {
+    access: 'cron-secret',
+    reason: 'Re-runs allocation for eligible orders left with outstanding demand; guarded by verifyCron.',
+  },
   '/api/cron/recompute-product-lead-times': {
     access: 'cron-secret',
     reason: 'Recomputes Product.observedLeadTimeDays (P95 from PO receipts) for the reorder report; guarded by verifyCron.',

@@ -1,5 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { WMS_LOOKUP_NOT_FOUND } from '@/lib/domain/wms/order-status-sweep'
+import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
 
 /**
  * o3d-5r8 — hard-delete safety for sales orders.
@@ -64,6 +64,7 @@ export type SalesOrderDeleteBlocker = {
     | 'accounting_sync_live'
     | 'accounting_document_exists'
     | 'daily_batch_staged'
+    | 'parked_refund'
   message: string
 }
 
@@ -183,7 +184,7 @@ export async function findSalesOrderDeleteBlocker(
       lastError: true,
     },
   })
-  if (snapshot && !snapshot.externalOrderId && snapshot.lastError !== WMS_LOOKUP_NOT_FOUND) {
+  if (snapshot && !snapshot.externalOrderId && snapshot.lastError !== WMS_LOOKUP_CONFIRMED_ABSENT) {
     blockers.push({
       code: 'wms_order_status_snapshot',
       message:
@@ -282,10 +283,23 @@ export async function findSalesOrderDeleteBlocker(
             + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '
             + 'so the document may exist in the ledger. Check the connector, then resolve the sync log.'
           : liveDocument.status === 'PROCESSING'
-            // A freshly claimed PROCESSING row is deliberately NOT retired by cancellation — the
-            // remote call may be in flight — so promising a cancel would be wrong here too.
+            // A claimed PROCESSING row is deliberately NOT retired by cancellation — the remote call
+            // may be in flight — so promising a cancel would be wrong here too.
+            //
+            // "Wait for it to settle" is only true while the row's connector is ENABLED. Since
+            // o3d-sref the orphan sweep no longer retires a stale claim, so a row belonging to a
+            // switched-off connector stays PROCESSING indefinitely: no processor runs for it, and
+            // nothing else terminalises it. Telling that operator to wait is advice that provably
+            // cannot work, which is how a blocker becomes a dead end — so both cases are named.
             ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
-              + 'is IN FLIGHT. Wait for it to settle, then delete or reverse depending on the outcome.'
+              + `is IN FLIGHT. If ${liveDocument.connector} is still the active accounting connector, wait `
+              + 'for it to settle, then delete or reverse depending on the outcome. If it has been '
+              + 'switched off, this will NOT settle on its own: it can only be reclaimed by making '
+              + `${liveDocument.connector} the EXCLUSIVELY active connector again — enabling it alongside `
+              + 'another one is not enough, because only one accounting connector is ever dispatched to. '
+              + 'If that is not possible, this order cannot currently be deleted (o3d-osl8): check the '
+              + 'ledger for the document, because whether it exists decides whether deleting the order '
+              + 'would strand it.'
             : `Cannot delete an order with accounting documents queued to ${liveDocument.connector} `
               + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired before it posts.`,
     })
@@ -321,6 +335,35 @@ export async function findSalesOrderDeleteBlocker(
     })
   }
 
+  // o3d-7yf / o3d-iup: a deliberately PARKED WooCommerce refund — a monetary-only refund the order
+  // cannot tax uniformly, or a PENDING/FAILED amount mismatch — creates NO SalesOrderRefund, so the
+  // caller's `_count.refunds` check cannot see it. Deleting the order cascades its
+  // ShoppingOrderLink and orphans the park, so retryRefundSyncPark can never resolve the WC link,
+  // stranding a refund whose money has already left the business.
+  //
+  // This runs on `tx`, inside the same order-row lock as every other blocker (o3d-5r8). Reading it
+  // on the unlocked client would reopen exactly the window that lock exists to close: a park
+  // written between the check and the delete would be missed.
+  //
+  // entityId scoping already excludes the entity-less missing-FX rows.
+  const parkedRefund = await tx.shoppingSyncLog.findFirst({
+    where: {
+      connector: 'woocommerce',
+      direction: 'FROM_CONNECTOR',
+      entityType: 'SalesOrder',
+      entityId: orderId,
+      status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+    },
+    select: { id: true },
+  })
+  if (parkedRefund) {
+    blockers.push({
+      code: 'parked_refund',
+      message: 'This order has an unresolved WooCommerce refund parked for review; resolve it in the '
+        + 'sync exceptions inbox before deleting the order.',
+    })
+  }
+
   if (blockers.length === 0) return null
 
   // Most binding remedy first. A posted document needs a finance reversal; an ambiguous FAILED
@@ -328,6 +371,9 @@ export async function findSalesOrderDeleteBlocker(
   // Only once none of those apply is "cancel the order" the right advice — so WMS evidence and
   // merely-queued accounting work rank last, because cancelling genuinely resolves them.
   const REMEDY_ORDER: SalesOrderDeleteBlocker['code'][] = [
+    // A parked refund outranks everything: the money has ALREADY left the business, and unlike
+    // the others, cancelling the order does not resolve it (o3d-7yf/o3d-iup).
+    'parked_refund',
     'accounting_document_exists',
     'daily_batch_staged',
     'accounting_sync_live',

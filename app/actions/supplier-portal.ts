@@ -8,6 +8,7 @@ import { checkRateLimit } from '@/lib/rate-limit'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { assertSupplierOwnsResource, SupplierPortalAccessError } from '@/lib/security/supplier-portal-boundary'
+import { applyHeaderOrderDiscount, resolveHeaderOrderDiscountForeign } from '@/lib/domain/purchasing/order-discount'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
@@ -285,7 +286,10 @@ export async function submitSupplierQuote(
       `
       const lockedPo = await tx.purchaseOrder.findFirst({
         where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
-        select: { id: true, supplierId: true, reference: true, currency: true, fxRateToBase: true },
+        select: {
+          id: true, supplierId: true, reference: true, currency: true, fxRateToBase: true,
+          discountStr: true, discountAmount: true, pricesIncludeVat: true,
+        },
       })
       if (!lockedPo) throw new Error('RFQ not found or not accessible')
       assertSupplierOwnsResource(ctx, lockedPo)
@@ -322,12 +326,41 @@ export async function submitSupplierQuote(
         where: { poId },
         select: { totalForeign: true, totalBase: true, taxForeign: true, taxBase: true },
       })
-      const subtotalForeign = updatedLines.reduce((sum, line) => sum.add(line.totalForeign), toDecimal(0))
-      const subtotalBase = updatedLines.reduce((sum, line) => sum.add(line.totalBase), toDecimal(0))
-      const taxForeign = updatedLines.reduce((sum, line) => sum.add(line.taxForeign), toDecimal(0))
-      const taxBase = updatedLines.reduce((sum, line) => sum.add(line.taxBase), toDecimal(0))
+      const grossSubtotalForeign = updatedLines.reduce((sum, line) => sum.add(line.totalForeign), toDecimal(0))
+      const grossSubtotalBase = updatedLines.reduce((sum, line) => sum.add(line.totalBase), toDecimal(0))
+      const grossTaxForeign = updatedLines.reduce((sum, line) => sum.add(line.taxForeign), toDecimal(0))
+      const grossTaxBase = updatedLines.reduce((sum, line) => sum.add(line.taxBase), toDecimal(0))
       const shippingForeign = toDecimal(safeData.shippingCost)
       const shippingBase = shippingForeign.div(effectiveFxRate)
+
+      // o3d-lx1: reapply the RFQ's header discount to the requoted subtotal instead of leaving
+      // discountAmount orphaned (which overstated subtotalBase/totalBase). A percentage discount
+      // (discountStr like "10%") scales with the new prices; a fixed amount is kept (capped). The same
+      // net/VAT split as createPurchaseOrder is applied so subtotalBase/taxBase/totalBase stay consistent.
+      // Reapply in the SAME VAT convention the PO was created in (persisted per o3d-lx1), so a FIXED
+      // inclusive-VAT discount is treated as gross — not re-grossed-up as if it were net. Existing RFQs
+      // predating the column default to false (net), the typical purchase-order convention.
+      const inclVat = lockedPo.pricesIncludeVat
+      const orderDiscountForeign = resolveHeaderOrderDiscountForeign({
+        discountStr: lockedPo.discountStr,
+        originalDiscountForeign: Number(lockedPo.discountAmount ?? 0),
+        subtotalForeign: grossSubtotalForeign.toNumber(),
+        taxForeign: grossTaxForeign.toNumber(),
+        inclVat,
+      })
+      const netted = applyHeaderOrderDiscount({
+        subtotalForeign: grossSubtotalForeign.toNumber(),
+        subtotalBase: grossSubtotalBase.toNumber(),
+        taxForeign: grossTaxForeign.toNumber(),
+        taxBase: grossTaxBase.toNumber(),
+        orderDiscountForeign,
+        inclVat,
+        fxRate: effectiveFxRate.toNumber(),
+      })
+      const subtotalForeign = toDecimal(netted.subtotalForeign)
+      const subtotalBase = toDecimal(netted.subtotalBase)
+      const taxForeign = toDecimal(netted.taxForeign)
+      const taxBase = toDecimal(netted.taxBase)
 
       const updated = await tx.purchaseOrder.updateMany({
         where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
@@ -340,6 +373,7 @@ export async function submitSupplierQuote(
           totalBase: roundDecimalString(subtotalBase.add(taxBase).add(shippingBase), 4),
           directFreightForeign: roundDecimalString(shippingForeign, 4),
           directFreightBase: roundDecimalString(shippingBase, 4),
+          discountAmount: roundDecimalString(toDecimal(orderDiscountForeign), 4),
           supplierRef,
           expectedDelivery: safeData.expectedDelivery ? new Date(safeData.expectedDelivery) : null,
           notes: safeData.shippingMethod ? `Shipping: ${safeData.shippingMethod}` : undefined,

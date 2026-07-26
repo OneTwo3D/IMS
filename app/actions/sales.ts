@@ -356,7 +356,7 @@ async function refreshDraftOrderFxAtFinalization(
 ): Promise<void> {
   const baseCurrency = await getBaseCurrencyCode()
   await db.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+    await lockSalesOrder(tx, orderId)
     const order = await tx.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -1499,6 +1499,23 @@ export async function applySalesOrderStatusTransition(
         cancelSalesOrderFulfillmentState(tx, { orderId: id, data, bypass: bypassPermission })
       ), STOCK_TX_OPTIONS)
       previousStatusForLog = cancellation.previousStatus
+      if (cancellation.repairedFalseShipped) {
+        // o3d-gz6: the order was SHIPPED with no dispatch evidence (a configurable WC status mapping
+        // wrote SHIPPED without a real shipment). We repaired the false status so this cancel could
+        // proceed instead of dead-lettering forever — surface the data anomaly for review.
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: id,
+          action: 'false_shipped_status_repaired',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Order ${getSalesOrderReference(so)} was SHIPPED with no dispatch evidence; repaired the false status to allow cancellation (o3d-gz6)`,
+          metadata: {
+            orderNumber: getSalesOrderReference(so),
+            releasedAllocations: cancellation.releasedAllocationCount,
+          },
+        })
+      }
       if (cancellation.deletedShipmentCount > 0) {
         await logActivity({
           entityType: 'SALES_ORDER',
@@ -1807,8 +1824,16 @@ async function queueRefundAccountingActions(input: {
           : line.lineKind === 'discount'
             ? (settings.discountAccount || settings.salesAccount)
             : settings.salesAccount,
-        taxType: (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined) ?? fallbackCnTaxType,
+        // Post under the tax identity SNAPSHOTTED at refund creation (o3d-w00) — the rate the invoice
+        // actually validated — instead of re-predicting it from the order default here, which mis-taxed
+        // deactivated-rate/reverse-charge/mixed-rate refunds. Fall back to the old prediction only for
+        // legacy rows with no snapshot (created before the column existed).
+        taxType: line.accountingTaxType
+          ?? (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined)
+          ?? fallbackCnTaxType,
       })),
+      // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
+      // that had a gross amount — is now netted at source, so this correctly grosses every line up.
       lineAmountsIncludeTax: false,
       currencyRateToBase: Number(input.refundFxRate) || undefined,
     },
@@ -1823,6 +1848,12 @@ async function queueRefundAccountingActions(input: {
       // and then double-count it when a retry posts the real journal (Codex PR #353 F5).
       // Idempotent on the sync key, so initial + retry record exactly once.
       await db.$transaction(async (tx) => {
+        // o3d-3zgy: the order row lock comes FIRST, before anything else this transaction touches.
+        // queueAccountingSyncTx writes inside our transaction so it cannot take the lock itself
+        // (doing so would take it after any stock locks and invert the ordering allocation-service
+        // establishes), which left this enqueue racing a hard delete of the same order — the
+        // o3d-hrak race, still open through this path. Hoisting it here serialises the two.
+        await lockSalesOrder(tx, input.orderId)
         // Record based on the queue's OWN decision (not a separate settings recheck) so
         // a connector/setting flip between the two can't desync queue vs ledger (Codex).
         const queued = await queueAccountingSyncTx(tx, sync)
@@ -1861,6 +1892,12 @@ async function loadRefundAccountingQueueInput(
           unitPriceBase: true,
           totalForeign: true,
           totalBase: true,
+          // Snapshot resolved at creation (o3d-w00). Selecting them here means an accounting RETRY posts
+          // under the SAME tax identity and to the SAME account as the first attempt, instead of
+          // re-predicting the tax type and re-inferring the kind (which mis-posted monetary refunds).
+          lineKind: true,
+          accountingTaxType: true,
+          reverseCharge: true,
         },
       },
     },
@@ -1883,13 +1920,16 @@ async function loadRefundAccountingQueueInput(
       unitPriceBase: decimalToNumber(line.unitPriceBase),
       totalForeign: decimalToNumber(line.totalForeign),
       totalBase: decimalToNumber(line.totalBase),
-      // lineKind isn't persisted: a null-product line is shipping, UNLESS its total is
-      // negative — that's the mirrored order-discount line, which must reload as
-      // 'discount' so an accounting RETRY re-posts it to the discount account (not
-      // shipping). Matches the replay reconstruction in refund-service.
-      lineKind: line.productId
-        ? 'sale'
-        : (decimalToNumber(line.totalBase) < 0 ? 'discount' : 'shipping'),
+      // Prefer the PERSISTED kind (o3d-w00 #4). Only a legacy row (created before the column existed)
+      // carries NULL, and for those we keep the historical inference: a null-product line is shipping
+      // UNLESS its total is negative — the mirrored order-discount line, which must reload as 'discount'
+      // so a retry re-posts it to the discount account. New monetary-only 'sale' lines no longer get
+      // mis-reconstructed as 'shipping'.
+      lineKind: (line.lineKind as 'sale' | 'shipping' | 'discount' | null) ?? (
+        line.productId ? 'sale' : (decimalToNumber(line.totalBase) < 0 ? 'discount' : 'shipping')
+      ),
+      accountingTaxType: line.accountingTaxType,
+      reverseCharge: line.reverseCharge,
     })),
     accountingSyncs,
   }
@@ -1924,14 +1964,32 @@ export async function createRefund(
   reason: string,
   returnWarehouseId?: string,
   options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
-  // o3d-6oyu.18: `conflict` is set when the refund transaction refused this credit note
-  // because the OTHER reversal path (WC refund webhook vs payment-poller chargeback) had
-  // already committed one for this order. It is a no-op the caller must not retry, not a
-  // failure — see RefundCreationConflict.
-): Promise<{ success: boolean; error?: string; warning?: string; conflict?: RefundCreationConflict }> {
+  // Two independent outcomes ride alongside `error`:
+  //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
+  //                OTHER reversal path (WC refund webhook vs payment-poller chargeback) had
+  //                already committed one for this order. A no-op the caller must not retry.
+  //   `quarantine` (o3d-w00) — the refund is monetary-only and the order cannot be taxed
+  //                uniformly, so it was parked for a human rather than posted on a guess.
+): Promise<{
+  success: boolean
+  error?: string
+  warning?: string
+  conflict?: RefundCreationConflict
+  quarantine?: true
+}> {
   try {
-    if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+    const isInternal = options?.internalBypassToken === INTERNAL_ACTION_BYPASS
+    if (!isInternal) {
       await requirePermission('sales.refund')
+    }
+    // o3d-n8p (Codex): chargeback and externalRefundId are provenance-bearing and have material effects —
+    // chargeback suppresses restock + COGS reversal, and externalRefundId occupies the globally unique Woo
+    // replay key. They must come only from the trusted internal entry points (Woo sync, chargeback poller),
+    // which supply the unforgeable internal capability. Reject them from a public/manual caller so a
+    // network client with sales.refund can't forge a chargeback or squat a replay key (and so the derived
+    // `source` is trustworthy).
+    if (!isInternal && (options?.chargeback || options?.externalRefundId != null)) {
+      return { success: false, error: 'chargeback and externalRefundId may only be set by internal sync callers' }
     }
 
     const { getNumberingFormats } = await import('./company')
@@ -2187,6 +2245,13 @@ export async function createRefund(
     return { success: true, warning: accountingWarning }
   } catch (e) {
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
+      // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the
+      // winning refund could belong to a different order. Only report idempotent success when the existing
+      // refund is on THIS order; otherwise the loser would be marked synced while its refund lives elsewhere.
+      const winner = await db.salesOrderRefund.findFirst({ where: { externalRefundId: options.externalRefundId }, select: { orderId: true } })
+      if (winner && winner.orderId !== orderId) {
+        return { success: false, error: `A refund with external id ${options.externalRefundId} already exists on a different order; refusing to dedupe it here.` }
+      }
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: orderId,
@@ -2693,7 +2758,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
     // same paid_without_invoice transition. Reading + flipping paidAt under one
     // lock makes exactly one caller see the unpaid→paid transition.
     const locked = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${id} FOR UPDATE`
+      await lockSalesOrder(tx, id)
       const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
@@ -2801,7 +2866,7 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
     const { getNumberingFormats } = await import('./company')
     const numbering = await getNumberingFormats()
     const result = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${id} FOR UPDATE`
+      await lockSalesOrder(tx, id)
       const so = await tx.salesOrder.findUnique({ where: { id }, select: { externalOrderNumber: true, orderNumber: true, invoiceNumber: true } })
       if (!so) throw new Error('Order not found')
       if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
@@ -3007,7 +3072,7 @@ async function registerInvoicePaymentWithLedger(params: {
     // directions: either we find the payment gone and do nothing, or we queue first and the delete finds
     // our row and retracts it.
     const outcome = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${params.orderId} FOR UPDATE`
+      await lockSalesOrder(tx, params.orderId)
       const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
       if (!stillRecorded) return 'receipt-deleted' as const
       const queued = await queueAccountingSyncTx(tx, {
@@ -3083,7 +3148,7 @@ export async function addPayment(input: {
     if (!input.amount || input.amount <= 0) return { success: false, error: 'Amount must be greater than 0' }
     const baseCurrency = await getBaseCurrencyCode()
     const txResult = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
+      await lockSalesOrder(tx, input.orderId)
       const so = await tx.salesOrder.findUnique({
         where: { id: input.orderId },
         select: {
@@ -3280,7 +3345,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
   try {
     await requirePermission('sales.refund')
     const txResult = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+      await lockSalesOrder(tx, orderId)
       const so = await tx.salesOrder.findUnique({
         where: { id: orderId },
         select: {

@@ -92,4 +92,14 @@ registerCronJobs([
     defaultSchedule: '*/15 * * * *',
     defaultEnabled: true,
   },
+  {
+    slug: 'reallocation-sweep',
+    settingKey: 'reallocation_sweep',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Reallocation Sweep',
+    description: 'Re-runs allocation for PROCESSING orders left with outstanding demand — e.g. a paid order whose allocation failed transiently in a payment poller and would otherwise never be retried (o3d-9lx).',
+    defaultSchedule: '*/15 * * * *',
+    defaultEnabled: true,
+  },
 ])

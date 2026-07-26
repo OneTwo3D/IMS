@@ -78,9 +78,12 @@ function makeTx(seed: {
     statusLabel: string
     lastError?: string | null
   } | null
+  /** A deliberately parked WooCommerce refund — creates no SalesOrderRefund (o3d-7yf). */
+  parkedRefund?: { id: string } | null
 }) {
   return {
     wmsOrderStatusSnapshot: { findUnique: async () => seed.wmsSnapshot ?? null },
+    shoppingSyncLog: { findFirst: async () => seed.parkedRefund ?? null },
     salesOrder: {
       findUnique: async () => ({
         accountingInvoiceId: seed.order?.accountingInvoiceId ?? null,
@@ -481,7 +484,7 @@ test('the snapshot falls back to the external id when it has no order number (o3
   assert.match(blocker!.message, /sh-99/)
 })
 
-test('a PLACEHOLDER snapshot (WMS lookup found nothing) does NOT block (o3d-eu0r)', async () => {
+test('a CONFIRMED-ABSENT snapshot does NOT block (o3d-eu0r)', async () => {
   // order-status-sweep deliberately upserts a placeholder with an EMPTY externalOrderId,
   // statusLabel 'Unknown' and lastError 'Order not found in WMS' when an authoritative lookup
   // finds no order — and again after a lookup error. Nothing ever removes those rows. Treating
@@ -495,7 +498,7 @@ test('a PLACEHOLDER snapshot (WMS lookup found nothing) does NOT block (o3d-eu0r
         externalOrderNumber: 'SO-1',
         externalOrderId: '',
         statusLabel: 'Unknown',
-        lastError: 'Order not found in WMS',
+        lastError: 'Order confirmed absent in WMS (presence-probed)',
       },
     }),
     'order-1',
@@ -632,4 +635,58 @@ test('an AMBIGUOUS lookup snapshot blocks — several orders match, so one may b
 
   assert.equal(blocker?.code, 'wms_order_status_snapshot')
   assert.match(blocker!.message, /did not complete/)
+})
+
+test('a LEGACY not-found snapshot DOES block — it never distinguished absent from ambiguous (o3d-eu0r)', async () => {
+  // Rows written before the presence probe recorded every null fetch as this literal, ambiguous
+  // ones included. Accepting it would keep permitting deletion on a snapshot that cannot support
+  // the conclusion. Refreshing is not a safe compatibility mechanism either — the sweep is
+  // optional and batch-limited, so it may not have reached this order.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: null,
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'SO-1',
+        externalOrderId: '',
+        statusLabel: 'Unknown',
+        lastError: 'Order not found in WMS',
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'wms_order_status_snapshot')
+})
+
+test('a PARKED WooCommerce refund blocks the delete, and outranks every other blocker (o3d-7yf)', async () => {
+  // A park creates NO SalesOrderRefund, so the caller's `_count.refunds` check cannot see it.
+  // Deleting the order cascades its ShoppingOrderLink and orphans the park, stranding a refund
+  // whose money has already left the business. It outranks the rest because — unlike a WMS push
+  // or queued accounting work — cancelling the order does not resolve it.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: { state: 'SYNCED', externalOrderId: '55', externalOrderNumber: 'WMS-55' },
+      parkedRefund: { id: 'log-1' },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'parked_refund', 'the park is reported ahead of the WMS link')
+  assert.match(blocker!.message, /sync exceptions inbox/)
+})
+
+test('no parked refund leaves the other blockers ranked as before (o3d-7yf)', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: { state: 'SYNCED', externalOrderId: '55', externalOrderNumber: 'WMS-55' },
+      parkedRefund: null,
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'wms_order_push_link')
 })

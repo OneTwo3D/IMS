@@ -15,6 +15,7 @@ import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer } f
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
+import { applyHeaderOrderDiscount } from '@/lib/domain/purchasing/order-discount'
 import {
   resolvedTaxRateFromProfile,
   taxRateProfileSelect,
@@ -1105,31 +1106,22 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
     // books consistent we split it proportionally across net subtotal and
     // line tax, so the per-line taxRate totals each drop by the same
     // percentage. The user input string is stored for re-display only.
+    // Order-level discount, split proportionally across net subtotal and line tax (shared with
+    // submitSupplierQuote via applyHeaderOrderDiscount so a requote reduces the totals the same way).
     const orderDiscountForeignInput = Math.max(0, input.orderDiscountForeign ?? 0)
-    let orderDiscountNetForeign = 0
-    let orderDiscountNetBase = 0
-    let orderDiscountVatForeign = 0
-    let orderDiscountVatBase = 0
-    if (orderDiscountForeignInput > 0 && subtotalForeign > 0) {
-      // The user enters the discount in the same tax convention as unit
-      // costs. Convert to net + vat using the overall line blend:
-      //   netFrac = subtotalForeign / (subtotalForeign + totalTaxForeign)
-      const grossBase = subtotalForeign + totalTaxForeign
-      const netFrac = grossBase > 0 ? subtotalForeign / grossBase : 1
-      // When prices are entered incl. VAT the input is a gross amount; when
-      // excl. VAT the input is a net amount. Translate to net+vat either
-      // way so both sides of the ledger reduce.
-      const grossDisc = inclVat ? orderDiscountForeignInput : orderDiscountForeignInput / Math.max(netFrac, 0.000001)
-      const cappedGrossDisc = Math.min(grossDisc, grossBase)
-      orderDiscountNetForeign = Math.round(cappedGrossDisc * netFrac * 10000) / 10000
-      orderDiscountVatForeign = Math.round((cappedGrossDisc - orderDiscountNetForeign) * 10000) / 10000
-      orderDiscountNetBase = Math.round((orderDiscountNetForeign / fxRate) * 10000) / 10000
-      orderDiscountVatBase = Math.round((orderDiscountVatForeign / fxRate) * 10000) / 10000
-      subtotalForeign = Math.max(0, subtotalForeign - orderDiscountNetForeign)
-      subtotalBase = Math.max(0, subtotalBase - orderDiscountNetBase)
-      totalTaxForeign = Math.max(0, totalTaxForeign - orderDiscountVatForeign)
-      totalTaxBase = Math.max(0, totalTaxBase - orderDiscountVatBase)
-    }
+    const discounted = applyHeaderOrderDiscount({
+      subtotalForeign,
+      subtotalBase,
+      taxForeign: totalTaxForeign,
+      taxBase: totalTaxBase,
+      orderDiscountForeign: orderDiscountForeignInput,
+      inclVat,
+      fxRate,
+    })
+    subtotalForeign = discounted.subtotalForeign
+    subtotalBase = discounted.subtotalBase
+    totalTaxForeign = discounted.taxForeign
+    totalTaxBase = discounted.taxBase
 
     // Additional costs (shipping, fees, etc.) → directFreight fields
     let directFreightForeign = 0
@@ -1185,6 +1177,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         subtotalBase,
         taxRateName: input.taxRateName || null,
         taxRatePercent: vatRate > 0 ? vatRate : null,
+        pricesIncludeVat: inclVat,
         taxForeign: totalTaxForeign,
         taxBase: totalTaxBase,
         totalForeign: grandTotalForeign,
@@ -1409,22 +1402,19 @@ export async function updatePurchaseOrder(
       // BEFORE additional-cost VAT is folded in so the discount only
       // scales the line portion of the order.
       const orderDiscountForeignInput = Math.max(0, input.orderDiscountForeign ?? 0)
-      if (orderDiscountForeignInput > 0 && subtotalForeign > 0) {
-        const grossBase = subtotalForeign + totalTaxForeign
-        const netFrac = grossBase > 0 ? subtotalForeign / grossBase : 1
-        const grossDisc = inclVat
-          ? orderDiscountForeignInput
-          : orderDiscountForeignInput / Math.max(netFrac, 0.000001)
-        const cappedGrossDisc = Math.min(grossDisc, grossBase)
-        const orderDiscountNetForeign = Math.round(cappedGrossDisc * netFrac * 10000) / 10000
-        const orderDiscountVatForeign = Math.round((cappedGrossDisc - orderDiscountNetForeign) * 10000) / 10000
-        const orderDiscountNetBase = Math.round((orderDiscountNetForeign / fxRate) * 10000) / 10000
-        const orderDiscountVatBase = Math.round((orderDiscountVatForeign / fxRate) * 10000) / 10000
-        subtotalForeign = Math.max(0, subtotalForeign - orderDiscountNetForeign)
-        subtotalBase = Math.max(0, subtotalBase - orderDiscountNetBase)
-        totalTaxForeign = Math.max(0, totalTaxForeign - orderDiscountVatForeign)
-        totalTaxBase = Math.max(0, totalTaxBase - orderDiscountVatBase)
-      }
+      const editDiscounted = applyHeaderOrderDiscount({
+        subtotalForeign,
+        subtotalBase,
+        taxForeign: totalTaxForeign,
+        taxBase: totalTaxBase,
+        orderDiscountForeign: orderDiscountForeignInput,
+        inclVat,
+        fxRate,
+      })
+      subtotalForeign = editDiscounted.subtotalForeign
+      subtotalBase = editDiscounted.subtotalBase
+      totalTaxForeign = editDiscounted.taxForeign
+      totalTaxBase = editDiscounted.taxBase
       updates.discountStr = input.orderDiscountStr ?? null
       updates.discountAmount = orderDiscountForeignInput
 
@@ -1482,6 +1472,10 @@ export async function updatePurchaseOrder(
       updates.taxBase = totalTaxBase
       updates.totalForeign = subtotalForeign + totalTaxForeign + currentDirectFreightForeign
       updates.totalBase = subtotalBase + totalTaxBase + currentDirectFreightBase
+      // Persist the VAT convention actually used to recompute these totals + the header discount, so a
+      // later supplier requote reapplies the discount in the same convention (o3d-lx1). Kept aligned with
+      // the recalculation: an edit that recomputes as net stores false, inclusive stores true.
+      updates.pricesIncludeVat = inclVat
     }
 
     const po = rateOnlyFxRefresh

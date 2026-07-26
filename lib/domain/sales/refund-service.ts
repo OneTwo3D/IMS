@@ -1,6 +1,7 @@
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import type { AccountingSettings } from '@/lib/accounting'
+import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import {
   parseCostLayerSnapshot,
@@ -27,6 +28,7 @@ import {
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
@@ -216,6 +218,47 @@ export type CreatedRefundLine = {
   totalForeign: number
   totalBase: number
   lineKind: 'sale' | 'shipping' | 'discount'
+  // The VAT identity resolved at refund creation (o3d-w00). NULL for legacy rows created before the
+  // snapshot existed; the credit-note poster falls back to its prior prediction only then.
+  accountingTaxType?: string | null
+  reverseCharge?: boolean | null
+}
+
+// Reconstruct a CreatedRefundLine from a PERSISTED refund line for an idempotent replay (o3d-w00 #4).
+// Prefer the persisted lineKind + tax snapshot so a duplicate delivery posts identically to the first
+// attempt, instead of re-inferring the kind (which turned a monetary-only 'sale' line into 'shipping')
+// and re-predicting the tax type. Fall back to the historical inference ONLY for legacy rows whose
+// lineKind is NULL, keeping the same base (salesOrderLineId) the replay sites used before.
+function reconstructReplayLine(line: {
+  id: string
+  salesOrderLineId: string | null
+  productId: string | null
+  description: string
+  qty: Prisma.Decimal
+  unitPriceForeign: Prisma.Decimal
+  unitPriceBase: Prisma.Decimal
+  totalForeign: Prisma.Decimal
+  totalBase: Prisma.Decimal
+  lineKind: string | null
+  accountingTaxType: string | null
+  reverseCharge: boolean | null
+}): CreatedRefundLine {
+  const totalBase = refundBoundaryNumber(line.totalBase)
+  return {
+    id: line.id,
+    lineId: line.salesOrderLineId ?? null,
+    productId: line.productId,
+    description: line.description,
+    qty: refundBoundaryNumber(line.qty),
+    unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
+    unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
+    totalForeign: refundBoundaryNumber(line.totalForeign),
+    totalBase,
+    lineKind: (line.lineKind as 'sale' | 'shipping' | 'discount' | null)
+      ?? (line.salesOrderLineId != null ? 'sale' : (totalBase < 0 ? 'discount' : 'shipping')),
+    accountingTaxType: line.accountingTaxType,
+    reverseCharge: line.reverseCharge,
+  }
 }
 
 export type RefundAccountingSyncRequest = {
@@ -243,7 +286,7 @@ export type RefundAccountingSyncRequest = {
 export type RefundCreationConflict = 'prior-refund' | 'prior-chargeback'
 
 export type CreateSalesOrderRefundResult =
-  | { success: false; error: string; conflict?: RefundCreationConflict }
+  | { success: false; error: string; conflict?: RefundCreationConflict; quarantine?: true }
   | {
       success: true
       orderId: string
@@ -1644,7 +1687,38 @@ export async function createSalesOrderRefund(
   const totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
   const txResult = await runInTransaction(client, async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REFUND_ACCOUNTING_LOCK_KEY})`
-    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
+    // o3d-ee9: serialize this refund CREATE against the park CREATE for the SAME external refund id
+    // (upsertRefundPark takes the same per-refund advisory lock). The global lock above + the order row lock
+    // below do NOT cover the cross-order case — a refund committing on order A while a park commits on order B
+    // take different order locks and would not conflict, leaving a refund on A and a stale actionable park on
+    // B. This per-refund key closes that window; held until commit, so the park path re-reads the committed
+    // refund. Taken BEFORE the order row lock, matching upsertRefundPark's order, so the two cannot deadlock.
+    if (input.externalRefundId != null) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${input.externalRefundId}`}))`
+
+      // o3d-ee9 (park-first ordering): under the per-refund lock, refuse to create a refund whose external id
+      // is already parked as an actionable WooCommerce refund for a DIFFERENT order. Otherwise order B could
+      // win the lock, write its park, and commit; then order A creates its refund here without noticing —
+      // leaving order A's refund AND order B's stale actionable park (which blocks B's deletion/rebind and
+      // shows a phantom exception). A WC refund id maps to one order, so a foreign park is a genuine anomaly:
+      // fail closed and surface it rather than silently create contradictory state. (Same-order actionable
+      // parks are resolved atomically after the refund row is created, below.)
+      const foreignPark = await tx.shoppingSyncLog.findFirst({
+        where: {
+          connector: 'woocommerce',
+          direction: 'FROM_CONNECTOR',
+          entityType: 'SalesOrder',
+          externalId: String(input.externalRefundId),
+          entityId: { not: input.orderId }, // Prisma `not` also excludes NULL, so this is "another order".
+          status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+        },
+        select: { entityId: true },
+      })
+      if (foreignPark) {
+        throw new Error(`WooCommerce refund ${input.externalRefundId} is already parked for a different order (${foreignPark.entityId}); refusing to create it here.`)
+      }
+    }
+    await lockSalesOrder(tx, input.orderId)
 
     const so = await tx.salesOrder.findUnique({
       where: { id: input.orderId },
@@ -1663,7 +1737,17 @@ export async function createSalesOrderRefund(
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
         allocationBatchAmount: true,
-        lines: { select: { id: true, productId: true, qty: true } },
+        // taxRateName -> the order-default tax type; per-line taxRate -> each line's own identity. Both
+        // are needed to snapshot the SAME tax type the invoice resolved, at creation time (o3d-w00).
+        taxRateName: true,
+        lines: {
+          select: {
+            id: true,
+            productId: true,
+            qty: true,
+            taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
+          },
+        },
         shipments: {
           where: { status: 'SHIPPED' },
           select: { id: true },
@@ -1673,6 +1757,55 @@ export async function createSalesOrderRefund(
     if (!so) return { error: 'Order not found' } as const
 
     const fxRate = refundBoundaryNumber(so.fxRateToBase) || 1
+
+    // Snapshot each refund line's VAT identity at creation, resolved EXACTLY as the invoice did
+    // (o3d-w00). Store the resolved connector tax type so the credit note posts under the rate that was
+    // actually validated, instead of re-predicting it from the order default at post time — which
+    // mis-taxed deactivated-rate, reverse-charged and mixed-rate refunds.
+    const orderDefaultTaxType = so.taxRateName
+      ? (await tx.taxRate.findFirst({
+          where: { name: so.taxRateName, active: true },
+          select: { accountingTaxType: true },
+        }))?.accountingTaxType ?? null
+      : null
+    const salesLineTaxById = new Map(so.lines.map((line) => [line.id, line.taxRate]))
+    const reverseChargeSalesTaxType = input.accountingSettings?.reverseChargeSalesTaxType
+
+    // Order tax uniformity, resolved from the LINES via the relation (active-independent, so a rate
+    // deactivated after the sale still counts) — o3d-w00 #5. The order is uniformly taxed when every line
+    // shares one non-null connector tax type and none is reverse-charged. Only then can a monetary-only
+    // (unlinked, un-attributable) SALE amount be posted under a single identity without mis-allocating.
+    const orderBaseTaxTypes = new Set(so.lines.map((line) => line.taxRate?.accountingTaxType ?? null))
+    const orderHasReverseCharge = so.lines.some((line) => line.taxRate?.reverseCharge)
+    const orderUniformlyTaxed = orderBaseTaxTypes.size === 1 && !orderBaseTaxTypes.has(null) && !orderHasReverseCharge
+    const orderSingleSafeTaxType = orderUniformlyTaxed ? ([...orderBaseTaxTypes][0] as string) : null
+
+    const resolveRefundLineTaxIdentity = (
+      lineId: string | null | undefined,
+      lineKind: 'sale' | 'shipping' | 'discount',
+    ) => {
+      // A line-linked refund carries its OWN rate (read via the relation, so a rate deactivated after the
+      // sale still resolves).
+      const linked = lineId ? salesLineTaxById.get(lineId) : undefined
+      if (linked) {
+        return {
+          accountingTaxType: resolveSalesLineTaxType({
+            baseTaxType: linked.accountingTaxType ?? orderDefaultTaxType,
+            reverseCharge: linked.reverseCharge,
+            reverseChargeSalesTaxType,
+          }) ?? null,
+          reverseCharge: linked.reverseCharge ?? null,
+        }
+      }
+      // Unlinked. A monetary-only SALE line uses the order's single safe identity — guaranteed present,
+      // since a non-uniform order with such a line is REFUSED below (o3d-w00 #2/#5). Shipping/discount
+      // lines keep the order-default treatment, consistent with how the invoice posts them (even on a
+      // mixed-rate order the invoice posts shipping under the order default), so they are not gated.
+      if (lineKind === 'sale') {
+        return { accountingTaxType: orderSingleSafeTaxType, reverseCharge: false }
+      }
+      return { accountingTaxType: orderDefaultTaxType, reverseCharge: null }
+    }
 
     // External refund deliveries provide a stable replay key. Manual refunds
     // intentionally rely on the operator UI's double-submit guard instead of
@@ -1698,6 +1831,11 @@ export async function createSalesOrderRefund(
               unitPriceBase: true,
               totalForeign: true,
               totalBase: true,
+              // The persisted kind + tax snapshot (o3d-w00 #4) so a duplicate external delivery replays
+              // the SAME posting the first attempt did, not a re-inferred one.
+              lineKind: true,
+              accountingTaxType: true,
+              reverseCharge: true,
             },
           },
         },
@@ -1709,20 +1847,7 @@ export async function createSalesOrderRefund(
           fxRate,
           replayTotalBase: refundBoundaryNumber(existingExternalRefund.totalBase),
           createdRefund: { id: existingExternalRefund.id },
-          createdRefundLines: existingExternalRefund.lines.map((line) => ({
-            id: line.id,
-            lineId: line.salesOrderLineId ?? null,
-            productId: line.productId,
-            description: line.description,
-            qty: refundBoundaryNumber(line.qty),
-            unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
-            unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
-            totalForeign: refundBoundaryNumber(line.totalForeign),
-            totalBase: refundBoundaryNumber(line.totalBase),
-            lineKind: line.salesOrderLineId != null
-              ? 'sale' as const
-              : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
-          })),
+          createdRefundLines: existingExternalRefund.lines.map(reconstructReplayLine),
           creditNoteNumber: existingExternalRefund.creditNoteNumber ?? '',
           newStatus: so.refundStatus === 'FULL' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
         }
@@ -1753,6 +1878,10 @@ export async function createSalesOrderRefund(
               unitPriceBase: true,
               totalForeign: true,
               totalBase: true,
+              // Persisted kind + tax snapshot (o3d-w00 #4) so a chargeback replay posts identically.
+              lineKind: true,
+              accountingTaxType: true,
+              reverseCharge: true,
             },
           },
         },
@@ -1772,20 +1901,7 @@ export async function createSalesOrderRefund(
           fxRate,
           replayTotalBase: refundBoundaryNumber(existingChargeback.totalBase),
           createdRefund: { id: existingChargeback.id },
-          createdRefundLines: existingChargeback.lines.map((line) => ({
-            id: line.id,
-            lineId: line.salesOrderLineId ?? null,
-            productId: line.productId,
-            description: line.description,
-            qty: refundBoundaryNumber(line.qty),
-            unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
-            unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
-            totalForeign: refundBoundaryNumber(line.totalForeign),
-            totalBase: refundBoundaryNumber(line.totalBase),
-            lineKind: line.salesOrderLineId != null
-              ? 'sale' as const
-              : (refundBoundaryNumber(line.totalBase) < 0 ? 'discount' as const : 'shipping' as const),
-          })),
+          createdRefundLines: existingChargeback.lines.map(reconstructReplayLine),
           creditNoteNumber: existingChargeback.creditNoteNumber ?? '',
           newStatus: so.refundStatus === 'FULL' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
         }
@@ -1852,9 +1968,29 @@ export async function createSalesOrderRefund(
       return { error: 'Cannot return refunded stock before the order has shipped' } as const
     }
 
+    // o3d-w00 #2/#5 + o3d-iup: fail closed on a monetary-only (unlinked) SALE line the order can't tax
+    // uniformly. Such a line is an un-attributable goods amount; posting it under one header rate would
+    // mis-allocate the credit note on a mixed-rate / reverse-charged / deactivated-rate order (e.g.
+    // £100@20% + £100@0% posted entirely at 20%). Refuse and PARK it (the caller quarantines) rather than
+    // silently mis-tax it. Shipping/discount unlinked lines are exempt — the invoice posts them under the
+    // order default too, so a refund matching that is consistent.
+    const hasUnlinkedSaleLine = refundLines.some(
+      (refundLine) => refundLine.lineId == null && refundLine.lineKind !== 'shipping' && refundLine.lineKind !== 'discount',
+    )
+    if (hasUnlinkedSaleLine && !orderUniformlyTaxed) {
+      return {
+        error:
+          'This refund is monetary-only (not itemised) but the order is not uniformly taxed, so its VAT ' +
+          'cannot be determined automatically. It has been parked for manual resolution: do NOT issue ' +
+          'another refund — record it in the IMS against the specific lines / tax rates it covers' +
+          (input.externalRefundId != null ? `, quoting refund id ${input.externalRefundId}.` : '.'),
+        quarantine: true as const,
+      } as const
+    }
+
     const existingRefunds = await tx.salesOrderRefund.findMany({
       where: { orderId: input.orderId },
-      select: { totalBase: true, accountingRetryRequired: true },
+      select: { totalBase: true, accountingRetryRequired: true, totalsBasis: true },
     })
     // scjz.22: block a NEW refund while a prior refund on this order still has
     // unresolved accounting (accountingRetryRequired). A refund whose accounting
@@ -1870,10 +2006,29 @@ export async function createSalesOrderRefund(
       return { error: 'A previous refund on this order has unresolved accounting and must be retried before another refund can be created.' } as const
     }
     const previouslyRefunded = existingRefunds.reduce((sum, refund) => sum + refundBoundaryNumber(refund.totalBase), 0)
+    // o3d-w00 / o3d-n8p (Codex): the NET ceiling is only sound when EVERY existing refund on this order
+    // stores NET totals (totalsBasis='NET'). A NULL-basis row is legacy/unknown — its stored total may be
+    // GROSS, and it can't be summed with new NET totals safely: a gross ceiling would let the grossed-up
+    // new credit note over-refund (e.g. a legacy £60 gross + a new £60 net passes 60+60=120 on a £120
+    // order, yet the new line grosses to £72 -> £132 of credit), and converting a legacy mixed-rate gross
+    // refund to net is undecidable. So FAIL CLOSED: block a further automated refund and require manual
+    // reconciliation rather than risk an over-refund or a premature FULL. Orders with no prior refunds, or
+    // only NET ones, take the correct net ceiling below.
+    const allExistingRefundsNet = existingRefunds.every((refund) => refund.totalsBasis === 'NET')
+    if (!allExistingRefundsNet) {
+      return {
+        error:
+          'This order has an earlier refund recorded on a legacy/unknown amount basis, which cannot be ' +
+          'safely reconciled with a new refund automatically. Reconcile the order manually before creating ' +
+          'another refund.',
+        quarantine: true as const,
+      } as const
+    }
+    const netOrderTotal = Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase))
     // audit-M-o2c: cumulative refunded must not exceed the order total, with a
     // fixed rounding epsilon (not a 0.1% relative slack, which on a large order
     // is pounds of headroom) so N partial refunds can't creep over.
-    if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, refundBoundaryNumber(so.totalBase))) {
+    if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, netOrderTotal)) {
       return { error: 'Refund total would exceed order total' } as const
     }
 
@@ -1921,6 +2076,14 @@ export async function createSalesOrderRefund(
       prefix: input.creditNotePrefix,
     })
 
+    // o3d-n8p: the WRITER stamps what the stored totals mean and where the refund came from — derived from
+    // the call context here, not taken from a caller option. Every refund created on this path stores NET
+    // totals. source lets the audit/classification be a lookup instead of a reconstruction.
+    const refundSource = input.chargeback
+      ? 'CHARGEBACK_POLLER'
+      : input.externalRefundId != null
+        ? 'WOO_SYNC'
+        : 'MANUAL_UI'
     const createdRefund = await tx.salesOrderRefund.create({
       data: {
         orderId: input.orderId,
@@ -1929,6 +2092,8 @@ export async function createSalesOrderRefund(
         reason: input.reason || null,
         totalForeign,
         totalBase,
+        totalsBasis: 'NET',
+        source: refundSource,
         returnWarehouseId: effectiveReturnWarehouseId || null,
         // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
         // the stored syncs) reproduces the revenue-only treatment.
@@ -1950,11 +2115,35 @@ export async function createSalesOrderRefund(
       select: { id: true },
     })
 
+    // o3d-ee9: the refund has now landed for THIS order, so resolve any actionable same-order WooCommerce
+    // park for the same external id atomically (in the same tx, under the per-refund + order locks). Without
+    // this, a park written by an earlier refused delivery of this refund could linger as an exception even
+    // though the refund succeeded. Cross-order parks were already refused above; QUARANTINED is operator-gated.
+    if (input.externalRefundId != null) {
+      await tx.shoppingSyncLog.updateMany({
+        where: {
+          connector: 'woocommerce',
+          direction: 'FROM_CONNECTOR',
+          entityType: 'SalesOrder',
+          externalId: String(input.externalRefundId),
+          entityId: input.orderId,
+          status: { in: ['PENDING', 'FAILED'] },
+        },
+        data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },
+      })
+    }
+
     const createdRefundLines: CreatedRefundLine[] = []
     for (const refundLine of refundLines) {
       const lineTotalForeign = refundLine.totalForeign != null
         ? Math.round(refundLine.totalForeign * 10000) / 10000
         : Math.round(refundLine.totalBase * fxRate * 10000) / 10000
+      // Normalize once and PERSIST it (o3d-w00 #4) so an accounting retry posts to the same account
+      // without re-inferring the kind from productId/amount sign. Kind also drives the unlinked tax
+      // identity (a monetary SALE line uses the order's single safe type; shipping/discount the default).
+      const lineKind: 'sale' | 'shipping' | 'discount' =
+        refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
+      const taxIdentity = resolveRefundLineTaxIdentity(refundLine.lineId, lineKind)
       const createdLine = await tx.salesOrderRefundLine.create({
         data: {
           refundId: createdRefund.id,
@@ -1966,6 +2155,9 @@ export async function createSalesOrderRefund(
           unitPriceBase: refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : 0,
           totalForeign: lineTotalForeign,
           totalBase: refundLine.totalBase,
+          accountingTaxType: taxIdentity.accountingTaxType,
+          reverseCharge: taxIdentity.reverseCharge,
+          lineKind,
         },
         select: {
           id: true,
@@ -1977,6 +2169,8 @@ export async function createSalesOrderRefund(
           unitPriceBase: true,
           totalForeign: true,
           totalBase: true,
+          accountingTaxType: true,
+          reverseCharge: true,
         },
       })
       createdRefundLines.push({
@@ -1989,7 +2183,9 @@ export async function createSalesOrderRefund(
         unitPriceBase: refundBoundaryNumber(createdLine.unitPriceBase),
         totalForeign: refundBoundaryNumber(createdLine.totalForeign),
         totalBase: refundBoundaryNumber(createdLine.totalBase),
-        lineKind: refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale',
+        lineKind,
+        accountingTaxType: createdLine.accountingTaxType,
+        reverseCharge: createdLine.reverseCharge,
       })
     }
 
@@ -2001,9 +2197,13 @@ export async function createSalesOrderRefund(
     // order total — comparing against the gross so.totalBase would leave a full
     // revenue unwind stuck at PARTIALLY_REFUNDED on taxable orders. Non-taxable
     // orders have taxBase 0, so this is identical to the gross basis for them.
-    const orderTotal = input.chargeback
-      ? Math.max(0, refundBoundaryNumber(so.totalBase) - refundBoundaryNumber(so.taxBase))
-      : refundBoundaryNumber(so.totalBase)
+    // Refund totals are NET for every caller (o3d-w00 gave the WooCommerce monetary-only refund a net
+    // contract like the others), so compare against the NET order total. Using the gross so.totalBase
+    // left a full refund of a taxable order stuck at PARTIALLY_REFUNDED. Non-taxable orders have taxBase
+    // 0, so this is identical to the gross basis for them. Safe to use the net total unconditionally here:
+    // an order with any legacy/unknown-basis refund was already blocked above (o3d-n8p), so at this point
+    // every refund on the order is NET-basis.
+    const orderTotal = netOrderTotal
     // `newStatus` is the refund *classification* (drives the accounting reversal
     // treatment), NOT the order's lifecycle status — refund state is now the
     // orthogonal refundStatus dimension.
@@ -2094,13 +2294,26 @@ export async function createSalesOrderRefund(
     throw error
   })
 
-  // o3d-6oyu.18: a cross-path conflict is reported BEFORE the generic error path and carries
-  // `conflict`, so callers can tell "the other path already reversed this order" (a no-op the
-  // caller must never retry) from "the refund failed" (which the poller retries by holding paidAt).
+  // Two INDEPENDENT discriminators ride on the failure result, and a caller may see either:
+  //
+  //   `conflict`   (o3d-6oyu.18) — the other path already reversed this order. A no-op the caller
+  //                must never retry. Reported BEFORE the generic error path.
+  //   `quarantine` (o3d-w00 #2/#5) — the refund is monetary-only and the order cannot be taxed
+  //                uniformly, so it is parked for a human rather than posted on a guess.
+  //
+  // They are not mutually exclusive in principle, so the conflict branch is checked first (it is
+  // the stronger statement: there is nothing left to refund) and quarantine is carried through on
+  // the generic path.
   if ('conflict' in txResult) {
     return { success: false, error: txResult.conflictError, conflict: txResult.conflict }
   }
-  if ('error' in txResult) return { success: false, error: txResult.error ?? 'Refund failed' }
+  if ('error' in txResult) {
+    return {
+      success: false,
+      error: txResult.error ?? 'Refund failed',
+      ...('quarantine' in txResult && txResult.quarantine ? { quarantine: true as const } : {}),
+    }
+  }
 
   const refundOrderRef = getSalesOrderReference(txResult.so)
   if ('replay' in txResult) {
@@ -2254,6 +2467,8 @@ export async function retrySalesOrderRefundAccounting(
               unitPriceBase: true,
               totalForeign: true,
               totalBase: true,
+              accountingTaxType: true,
+              reverseCharge: true,
             },
           },
         },
@@ -2298,6 +2513,8 @@ export async function retrySalesOrderRefundAccounting(
         totalForeign: refundBoundaryNumber(line.totalForeign),
         totalBase: refundBoundaryNumber(line.totalBase),
         lineKind: line.productId ? 'sale' : 'shipping',
+        accountingTaxType: line.accountingTaxType,
+        reverseCharge: line.reverseCharge,
       }))
       // Refund classification comes from the orthogonal refundStatus now (the lifecycle
       // status is no longer set to REFUNDED on a full refund).

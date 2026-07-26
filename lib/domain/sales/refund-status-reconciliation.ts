@@ -31,11 +31,13 @@ export type RefundStatusOrderRow = {
   status: string
   refundStatus: string
   totalBase: DecimalInput
+  taxBase?: DecimalInput
   refunds: Array<{
     id: string
     creditNoteNumber: string | null
     totalBase: DecimalInput
     refundedAt: Date | string
+    totalsBasis?: string | null
   }>
 }
 
@@ -68,9 +70,19 @@ function buildSummary(findings: RefundStatusReconciliationFinding[]): RefundStat
 }
 
 // Refund disposition implied by the refund records (null = no refunds = NONE).
-function expectedRefundDisposition(order: RefundStatusOrderRow): 'FULL' | 'PARTIAL' | null {
+function expectedRefundDisposition(order: RefundStatusOrderRow): 'FULL' | 'PARTIAL' | 'UNKNOWN' | null {
   if (order.refunds.length === 0) return null
-  const orderTotal = toDecimal(order.totalBase)
+  // Refund totals are stored NET (o3d-w00), so compare against the NET order total (totalBase - taxBase)
+  // — the same basis createSalesOrderRefund now classifies on. A gross basis reported a fully-refunded
+  // taxable order as PARTIAL and raised a false mismatch finding. But mirror createSalesOrderRefund's
+  // o3d-n8p fail-safe: the net total is only sound when EVERY refund is NET-basis. If any refund is
+  // legacy/unknown (NULL basis), its stored total may be GROSS and can't be summed with NET totals
+  // safely — return null (unknown disposition) so this order is NOT flagged as a false mismatch, rather
+  // than asserting FULL/PARTIAL against a mixed-unit sum.
+  const allRefundsNet = order.refunds.every((refund) => refund.totalsBasis === 'NET')
+  if (!allRefundsNet) return 'UNKNOWN'
+  const netOrderTotal = toDecimal(order.totalBase).sub(toDecimal(order.taxBase ?? 0))
+  const orderTotal = netOrderTotal.lt(0) ? toDecimal(0) : netOrderTotal
   const refundedTotal = order.refunds.reduce((sum, refund) => sum.add(toDecimal(refund.totalBase)), toDecimal(0))
 
   if (orderTotal.lte(0)) {
@@ -103,6 +115,50 @@ export function evaluateRefundStatusReconciliationRows(
     const label = orderLabel(order)
     const refundTotalBase = order.refunds.reduce((sum, refund) => sum.add(toDecimal(refund.totalBase)), toDecimal(0))
     const refundIds = order.refunds.map((refund) => refund.id)
+
+    // o3d-n8p: a legacy/unknown amount-basis refund can't be classified FULL vs PARTIAL (the sum mixes
+    // units). But don't SUPPRESS everything: a positive refund with refundStatus=NONE is invalid
+    // regardless of basis, so still flag that as critical; otherwise surface an explicit UNKNOWN finding
+    // for manual review rather than guessing or going silent.
+    if (expectedDisposition === 'UNKNOWN') {
+      // Test the basis-INDEPENDENT invariant without summing incomparable amounts: any single positive
+      // refund row means the order can't legitimately be NONE. Summing the aggregate would let a +50
+      // legacy refund and a -50 correction net to 0 and downgrade a real NONE corruption to a warning.
+      if (order.refundStatus === 'NONE' && order.refunds.some((refund) => toDecimal(refund.totalBase).gt(0))) {
+        findings.push({
+          severity: 'critical',
+          code: 'sales_order_refund_status_mismatch',
+          orderId: order.id,
+          refundId: refundIds[0],
+          message: `Sales order ${label} has ${refundIds.length} refund row(s) but refundStatus is NONE`,
+          details: {
+            status: order.status,
+            refundStatus: order.refundStatus,
+            expectedDisposition: 'UNKNOWN',
+            totalBase: toDecimal(order.totalBase).toString(),
+            refundedTotalBase: refundTotalBase.toString(),
+            refundIds,
+            creditNoteNumbers: order.refunds.map((refund) => refund.creditNoteNumber).filter(Boolean),
+          },
+        })
+      } else {
+        findings.push({
+          severity: 'warning',
+          code: 'sales_order_refund_status_unknown_basis',
+          orderId: order.id,
+          refundId: refundIds[0],
+          message: `Sales order ${label} has refunds on a legacy/unknown amount basis; FULL vs PARTIAL cannot be auto-verified`,
+          details: {
+            status: order.status,
+            refundStatus: order.refundStatus,
+            totalBase: toDecimal(order.totalBase).toString(),
+            refundedTotalBase: refundTotalBase.toString(),
+            refundIds,
+          },
+        })
+      }
+      continue
+    }
 
     if (!expectedDisposition && order.refundStatus !== 'NONE') {
       findings.push({
@@ -165,6 +221,7 @@ export async function collectRefundStatusReconciliationRows(
       status: true,
       refundStatus: true,
       totalBase: true,
+      taxBase: true,
       refunds: {
         orderBy: { refundedAt: 'asc' },
         select: {
@@ -172,6 +229,7 @@ export async function collectRefundStatusReconciliationRows(
           creditNoteNumber: true,
           totalBase: true,
           refundedAt: true,
+          totalsBasis: true,
         },
       },
     },

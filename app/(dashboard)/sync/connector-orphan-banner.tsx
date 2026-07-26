@@ -22,6 +22,13 @@ export function ConnectorOrphanBanner({ summary }: { summary: ConnectorOrphanSum
   const router = useRouter()
   const [pending, startTransition] = useTransition()
   const [error, setError] = useState<string | null>(null)
+  /**
+   * o3d-sref: rows the cancel could not retire, because their claim had already been taken and a
+   * request may have reached the connector. Shown HERE rather than only in the activity log — the
+   * orphan count will not fall to zero for those rows, and a button that visibly does nothing with
+   * no explanation reads as broken.
+   */
+  const [notice, setNotice] = useState<string | null>(null)
 
   // The server summary is the source of truth: router.refresh() re-fetches it
   // after a cancel, so the banner hides (or shows the remainder) on its own.
@@ -29,9 +36,17 @@ export function ConnectorOrphanBanner({ summary }: { summary: ConnectorOrphanSum
 
   function handleCancel(connector?: string) {
     setError(null)
+    setNotice(null)
     startTransition(async () => {
       const result = await cancelOrphanedAccountingSyncRows(connector)
       if (result.success) {
+        const inFlight = result.inFlightNotCancelled ?? 0
+        setNotice(inFlight > 0
+          ? `${inFlight} row(s) could not be cancelled: their sync was already in flight when the `
+            + `connector was switched off, so a request may have reached it and been lost. Check that `
+            + `connector for the document(s) — these rows stay listed here, and continue to block `
+            + `deleting their orders, until they are resolved.`
+          : null)
         router.refresh()
       } else {
         setError(result.error ?? 'Failed to cancel orphaned rows.')
@@ -67,6 +82,7 @@ export function ConnectorOrphanBanner({ summary }: { summary: ConnectorOrphanSum
             </Button>
           )}
           {error && <p className="text-xs text-destructive">{error}</p>}
+          {notice && <p className="text-xs font-medium">{notice}</p>}
         </div>
       </div>
     </div>

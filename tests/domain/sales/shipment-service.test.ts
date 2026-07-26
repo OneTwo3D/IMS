@@ -55,6 +55,8 @@ type State = {
   lines: OrderLine[]
   allocations: Allocation[]
   refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
+  // Kit/BOM graph: productId -> its component requirements. Absent products are treated as SIMPLE.
+  kits?: Record<string, Array<{ componentId: string; qty: number; sku?: string }>>
   shipments: Shipment[]
   shipmentLines: ShipmentLine[]
   stockLevels: StockLevel[]
@@ -158,11 +160,21 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     product: {
-      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => ({
-        id,
-        type: 'SIMPLE',
-        productComponents: [],
-      })),
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => {
+        const components = state.kits?.[id]
+        if (components && components.length > 0) {
+          return {
+            id,
+            type: 'KIT',
+            productComponents: components.map((component) => ({
+              componentId: component.componentId,
+              qty: component.qty,
+              component: { sku: component.sku ?? component.componentId, type: 'SIMPLE', oversellAllowed: false },
+            })),
+          }
+        }
+        return { id, type: 'SIMPLE', productComponents: [] }
+      }),
     },
     orderAllocation: {
       findMany: async ({ where }: { where: { orderId: string } }) => state.allocations
@@ -265,7 +277,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         .map((line) => {
           if (select?.shipment) {
             const shipment = state.shipments.find((row) => row.id === line.shipmentId)!
-            return { lineId: line.lineId, productId: line.productId, qty: line.qty, shipment: { warehouseId: shipment.warehouseId } }
+            return { lineId: line.lineId, productId: line.productId, qty: line.qty, shipment: { warehouseId: shipment.warehouseId, status: shipment.status } }
           }
           if (select?.costLayerSnapshot) return { lineId: line.lineId, costLayerSnapshot: line.costLayerSnapshot }
           return { lineId: line.lineId, productId: line.productId, qty: line.qty }
@@ -640,6 +652,122 @@ test('transitionShipmentStatus rejects multi-warehouse shipment totals above the
   assert.equal(state.cogsEntries.length, 0)
 })
 
+test('transitionShipmentStatus refuses to dispatch refunded units on a shipment built before the refund (o3d-339)', async () => {
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 2, sku: 'SKU-1', description: 'Product 1' }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 },
+    ],
+    // 1 of the 2 ordered units was refunded AFTER this shipment was packed; the shipment was not rebuilt.
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'product-1', qty: 1 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /packed before the refund/)
+  // Nothing dispatched: status unchanged, no stock decrement, no COGS.
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+})
+
+test('transitionShipmentStatus dispatches a shipment whose quantity is within ordered minus refunds (o3d-339)', async () => {
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 2, sku: 'SKU-1', description: 'Product 1' }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    // Only the 1 non-refunded unit is on the shipment (it was rebuilt / built after the refund).
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 1 },
+    ],
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'product-1', qty: 1 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+  assert.equal(state.movements.length, 1) // the single still-owed unit dispatched
+})
+
+test('transitionShipmentStatus nets refunds at KIT leaf level so fractional components cannot over-dispatch (o3d-339)', async () => {
+  // A kit needs 0.1 of comp-1 per kit. Two kits ordered → 0.2 comp-1 packed. One kit is refunded →
+  // 0.1 comp-1 refunded, so only 0.1 comp-1 remains shippable. A LINE-level cap (ordered 2 − refunded 1
+  // = 1 kit) would wrongly pass the 0.2 component shipment; the leaf-level cap (0.2 − 0.1 = 0.1) rejects
+  // it, catching the refunded fractional component.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 2, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.1, sku: 'COMP-1' }] },
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 0.2 },
+    ],
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'kit-1', qty: 1 }],
+    stockLevels: [{ productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /packed before the refund/)
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.movements.length, 0)
+})
+
+test('transitionShipmentStatus lets an unrelated line dispatch after another line was shipped then refunded (o3d-339)', async () => {
+  // Line A shipped in full, THEN refunded (a post-delivery return). Its already-SHIPPED qty now exceeds
+  // ordered-minus-refunded — but that is historical and must not wedge dispatching the still-owed line B.
+  const state = baseState({
+    lines: [
+      { id: 'line-a', orderId: 'order-1', productId: 'product-a', qty: 2, sku: 'SKU-A', description: 'Product A' },
+      { id: 'line-b', orderId: 'order-1', productId: 'product-b', qty: 1, sku: 'SKU-B', description: 'Product B' },
+    ],
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-a', shipmentId: 'shipment-a', lineId: 'line-a', productId: 'product-a', qty: 2 },
+      { id: 'shipment-line-b', shipmentId: 'shipment-b', lineId: 'line-b', productId: 'product-b', qty: 1 },
+    ],
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-a', productId: 'product-a', qty: 2 }],
+    stockLevels: [{ productId: 'product-b', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-b', productId: 'product-b', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[1].status, 'SHIPPED') // line B dispatched, not wedged by line A's refund
+  assert.equal(state.movements.length, 1)
+})
+
 test('transitionShipmentStatus fails cleanly when dispatch shipment starts with no lines', async () => {
   const state = baseState({
     shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
@@ -864,4 +992,39 @@ test('reconcileOrderAfterShipment does not rewrite terminal orders', async () =>
   assert.equal(state.orders[0].status, 'COMPLETED')
   assert.equal(state.orders[0].trackingNumber, 'EXISTING')
   assert.equal(state.orders[0].shippedAt, shippedAt)
+})
+
+test('transitionShipmentStatus does not reject a fractional KIT on a rounding ulp (o3d-odu)', async () => {
+  // The quantisation half of the guard, which nothing else pins.
+  //
+  // A kit needing 0.3333 of a component, ordered 0.5 kits, entitles 0.5 x 0.3333 = 0.16665 — a
+  // 5-decimal figure. Shipment rows persist at Decimal(12,4), so the row the warehouse actually
+  // writes is 0.1667. Comparing the persisted 0.1667 against the raw 0.16665 puts it 0.00005 over,
+  // which is 50x the 0.000001 epsilon, so an unquantised guard REJECTS a shipment that is exactly
+  // what the kit expansion asked for — the false-reject that made fractional kit dispatch
+  // impossible. Rounding the entitlement to the same 4dp boundary the row lives on makes the two
+  // comparable.
+  //
+  // Verified discriminating: dropping roundQuantity from shippableQty turns this red.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.3333, sku: 'COMP-1' }] },
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      // 0.16665 quantised to the Decimal(12,4) column the row persists in.
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 0.1667 },
+    ],
+    stockLevels: [{ productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 0.1667 }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true, 'a kit shipped at exactly its persisted entitlement must dispatch')
+  assert.equal(state.shipments[0].status, 'SHIPPED')
 })

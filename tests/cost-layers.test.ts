@@ -231,6 +231,13 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
     referenceType: 'Shipment',
     referenceId: 'shipment-1',
     idempotencyKey: 'shipment-cogs-revalue:shipment-1:layer-1:20:27.5',
+    // o3d-3zgy: this enqueue is order-scoped (a Shipment resolves through to its sales order) but
+    // CANNOT hoist the order row lock — it runs inside a landed-cost transaction that discovers the
+    // affected shipments mid-flight, after stock locks are held, so locking the order there inverts
+    // the lockSalesOrder-then-lockStockLevels ordering and can deadlock. The gap is declared in code
+    // rather than left silent, and asserted here so it cannot be dropped or quietly spread.
+    unlockedOrderScopeReason:
+      'landed-cost revaluation discovers affected shipments mid-transaction, after stock locks (o3d-zpa7)',
     payload: {
       date: new Date().toISOString().slice(0, 10),
       reference: 'Shipment COGS revaluation: shipment-1',

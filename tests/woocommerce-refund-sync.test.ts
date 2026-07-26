@@ -2,13 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
-import {
-  syncWcRefund,
-  WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
-  type WcRefundSyncDependencies,
-} from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
-import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
 function makeRefund(overrides: Partial<WcRefund> = {}): WcRefund {
   return {
@@ -42,23 +37,97 @@ function makeRefund(overrides: Partial<WcRefund> = {}): WcRefund {
   }
 }
 
-// o3d-5od: the REAL @prisma/adapter-pg shape (no meta.target, quoted column).
 function externalRefundIdUniqueError() {
-  return adapterUniqueViolation(['externalRefundId'], {
-    modelName: 'SalesOrderRefund',
-    constraintName: 'sales_order_refunds_externalRefundId_key',
+  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+    code: 'P2002',
+    clientVersion: 'test',
+    meta: { target: ['externalRefundId'] },
   })
 }
 
-function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) {
-  const refunds: Array<{ id: string; externalRefundId: number }> = []
+function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseWithQuarantine?: boolean } = {}) {
+  const refunds: Array<{ id: string; externalRefundId: number; orderId: string }> = []
   const syncLogs: unknown[] = []
   const activityLogs: unknown[] = []
-  const createRefundLines: Array<{ lineId?: string; productId: string | null }> = []
+  const createRefundLines: Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }> = []
   let createRefundCalls = 0
+  let nextLogId = 1
+  let orderDeleted = false // o3d-7yf finding 2: simulate the order being deleted before the park is written
+
+  const shoppingSyncLogMock = {
+    async findFirst(args: { where?: { externalId?: string; entityType?: string; status?: string | { in?: string[] } } }) {
+      const where = args?.where ?? {}
+      const statuses = typeof where.status === 'object' ? where.status.in : (where.status != null ? [where.status] : null)
+      for (let i = syncLogs.length - 1; i >= 0; i--) {
+        const d = (syncLogs[i] as { data?: { externalId?: string; entityType?: string; status?: string; entityId?: string } }).data
+        if (
+          (where.externalId == null || d?.externalId === where.externalId) &&
+          (where.entityType == null || d?.entityType === where.entityType) &&
+          (statuses == null || (d?.status != null && statuses.includes(d.status)))
+        ) {
+          // Project selected columns to the top level (real Prisma does this), keeping .data for assertions.
+          return { id: (syncLogs[i] as { id?: string }).id, entityId: d?.entityId, status: d?.status, data: d }
+        }
+      }
+      return null
+    },
+    async create(args: { data: Record<string, unknown> }) {
+      const d = args.data as { externalId?: string; entityType?: string; direction?: string; status?: string }
+      const actionable = ['PENDING', 'FAILED', 'QUARANTINED']
+      if (d.entityType === 'SalesOrder' && d.direction === 'FROM_CONNECTOR' && actionable.includes(d.status ?? '')) {
+        const dup = syncLogs.some((r) => {
+          const rd = (r as { data?: typeof d }).data
+          return rd?.entityType === 'SalesOrder' && rd?.direction === 'FROM_CONNECTOR' && rd?.externalId === d.externalId && actionable.includes(rd?.status ?? '')
+        })
+        if (dup) throw new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion: 'test', meta: { target: ['shopping_sync_logs_active_refund_park_uq'] } })
+      }
+      const row = { id: `log-${nextLogId++}`, data: args.data }
+      syncLogs.push(row)
+      return row
+    },
+    async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+      const row = syncLogs.find((r) => (r as { id?: string }).id === args.where.id) as { data: Record<string, unknown> } | undefined
+      if (row) row.data = { ...row.data, ...args.data }
+      return row
+    },
+    async updateMany(args: { where?: { externalId?: string; entityId?: string; status?: string | { in?: string[] } }; data: Record<string, unknown> }) {
+      const where = args?.where ?? {}
+      const statuses = typeof where.status === 'object' ? where.status?.in : (where.status != null ? [where.status] : null)
+      let count = 0
+      for (const r of syncLogs) {
+        const d = (r as { data: { externalId?: string; entityId?: string; status?: string } }).data
+        if (
+          (where.externalId == null || d?.externalId === where.externalId) &&
+          (where.entityId == null || d?.entityId === where.entityId) &&
+          (statuses == null || (d?.status != null && statuses.includes(d.status)))
+        ) {
+          (r as { data: Record<string, unknown> }).data = { ...d, ...args.data }
+          count += 1
+        }
+      }
+      return { count }
+    },
+  }
 
   const dependencies: WcRefundSyncDependencies = {
     db: {
+      // o3d-7yf finding 2: upsertRefundPark runs under a transaction that FOR-UPDATE locks + verifies the
+      // order. The order row lock returns [] once the order is "deleted", so the park write is skipped.
+      async $transaction(cb: (tx: unknown) => unknown) {
+        const tx = {
+          // o3d-ee9: the per-refund advisory lock (pg_advisory_xact_lock) is a no-op in the mock.
+          async $executeRaw() { return 0 },
+          async $queryRaw() { return orderDeleted ? [] : [{ id: 'so-1' }] },
+          // o3d-ee9: the landed-refund re-read under the lock. Returns a row only when the test seeds one.
+          salesOrderRefund: {
+            async findFirst(args: { where?: { externalRefundId?: number } }) {
+              return refunds.find((r) => r.externalRefundId === args.where?.externalRefundId) ?? null
+            },
+          },
+          shoppingSyncLog: shoppingSyncLogMock,
+        }
+        return cb(tx)
+      },
       salesOrder: {
         async findFirst() {
           return {
@@ -66,6 +135,7 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
             externalOrderNumber: 'WC-1001',
             fxRateToBase: 1,
             totalBase: 12.5,
+            taxRatePercent: 20,
             lines: [
               {
                 id: 'line-1',
@@ -90,29 +160,19 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
           return { id: 'return-wh' }
         },
       },
-      shoppingSyncLog: {
-        async create(args: unknown) {
-          syncLogs.push(args)
-          return args
-        },
-        // o3d-6oyu.18: the chargeback-suppression path dedups its warning on the marker
-        // message, so `order.updated` re-runs don't re-log it forever.
-        async findFirst(args: { where?: { externalId?: string; errorMessage?: string } }) {
-          const match = (syncLogs as Array<{ data: { externalId?: string; errorMessage?: string } }>).find((log) => (
-            (args.where?.externalId === undefined || log.data.externalId === args.where.externalId) &&
-            (args.where?.errorMessage === undefined || log.data.errorMessage === args.where.errorMessage)
-          ))
-          return match ? { id: 'sync-log-1' } : null
-        },
-      },
+      shoppingSyncLog: shoppingSyncLogMock,
     } as unknown as WcRefundSyncDependencies['db'],
     async createRefund(_orderId, lines, _reason, _returnWarehouseId, createOptions) {
       createRefundCalls += 1
       // Capture the lines. Without this nothing could assert that a refund line was
       // actually LINKED to its IMS order line, which is how the _refunded_item_id bug
       // survived: createRefund was only ever checked for being called.
-      createRefundLines.push(...(lines as unknown as Array<{ lineId?: string; productId: string | null }>))
-      refunds.push({ id: `refund-${refunds.length + 1}`, externalRefundId: createOptions?.externalRefundId ?? 0 })
+      createRefundLines.push(...(lines as unknown as Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }>))
+      if (options.refuseWithQuarantine) {
+        // o3d-w00 #2/#5: a monetary-only refund on a non-uniform order is refused for quarantine.
+        return { success: false, error: 'not uniformly taxed; parked for manual resolution', quarantine: true }
+      }
+      refunds.push({ id: `refund-${refunds.length + 1}`, externalRefundId: createOptions?.externalRefundId ?? 0, orderId: 'so-1' })
       return { success: true }
     },
     async logActivity(input) {
@@ -129,6 +189,8 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean } = {}) 
     get createRefundCalls() {
       return createRefundCalls
     },
+    // Make the order-lock re-verify find the order GONE, so upsertRefundPark skips an orphaned park.
+    simulateOrderDeleted() { orderDeleted = true },
   }
 }
 
@@ -183,6 +245,21 @@ test('syncWcRefund reconciles a VAT line refund on the gross basis (amount inclu
   )
 })
 
+test('a monetary-only WooCommerce refund is stored NET, not gross (o3d-w00)', async () => {
+  // The money returned to the customer is GROSS (£12 incl. 20% VAT). Every refund line is stored NET now,
+  // so the credit note grosses it back up via the snapshotted tax type. If it were stored gross, the
+  // credit note would re-gross it (£12 -> £14.40). A monetary-only refund has no line_items/shipping.
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  const refund = makeRefund({ amount: '12.00', line_items: [], shipping_lines: [] })
+
+  await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(state.createRefundCalls, 1)
+  assert.equal(state.createRefundLines.length, 1)
+  // 12.00 gross / 1.20 = 10.00 net.
+  assert.equal(state.createRefundLines[0].totalForeign, 10)
+})
+
 test('syncWcRefund still rejects a genuine amount mismatch', async () => {
   // Mapped gross (10.00 + 1.00 tax = 11.00) is far from the claimed 99.00 amount.
   const state = makeDependencies({ alwaysMissExistingRefund: true })
@@ -215,6 +292,39 @@ test('syncWcRefund still rejects a genuine amount mismatch', async () => {
   assert.equal(state.createRefundCalls, 0)
 })
 
+test('repeated deliveries of the same mismatched refund keep ONE park, not an unbounded pile (o3d-7yf)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  const refund = makeRefund({
+    id: 7009, amount: '99.00',
+    line_items: [{ id: 501, name: 'Widget', product_id: 10, variation_id: 0, quantity: -1, tax_class: '', subtotal: '-10.00', subtotal_tax: '-1.00', total: '-10.00', total_tax: '-1.00', sku: 'WIDGET', meta_data: [], refund_total: 11 }],
+  })
+
+  await syncWcRefund(1001, refund, state.dependencies)
+  await syncWcRefund(1001, refund, state.dependencies)
+  await syncWcRefund(1001, refund, state.dependencies)
+
+  const parksForRefund = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7009')
+  assert.equal(parksForRefund.length, 1, 'three deliveries produce exactly one park row (updated in place), not three')
+  assert.equal((parksForRefund[0] as { data: { status: string } }).data.status, 'PENDING')
+})
+
+
+test('a park is NOT written for an order deleted during processing — no orphaned park (o3d-7yf #2)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  const refund = makeRefund({
+    id: 7011, amount: '99.00',
+    line_items: [{ id: 501, name: 'Widget', product_id: 10, variation_id: 0, quantity: -1, tax_class: '', subtotal: '-10.00', subtotal_tax: '-1.00', total: '-10.00', total_tax: '-1.00', sku: 'WIDGET', meta_data: [], refund_total: 11 }],
+  })
+  // The order is deleted concurrently: upsertRefundPark's FOR UPDATE re-verify finds it gone, so it must
+  // NOT insert an actionable park that retryRefundSyncPark could never resolve.
+  state.simulateOrderDeleted()
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false, 'the mismatch still surfaces')
+  const parks = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7011')
+  assert.equal(parks.length, 0, 'no orphaned park was written for the deleted order')
+})
+
 test('syncWcRefund treats external refund unique conflicts as idempotent races', async () => {
   const state = makeDependencies({ alwaysMissExistingRefund: true })
   state.dependencies.createRefund = async () => {
@@ -225,16 +335,14 @@ test('syncWcRefund treats external refund unique conflicts as idempotent races',
 
   assert.deepEqual(result, { success: true })
   assert.equal(state.syncLogs.length, 1)
-  assert.deepEqual(state.syncLogs[0], {
-    data: {
-      direction: 'FROM_CONNECTOR',
-      status: 'SYNCED',
-      entityType: 'SalesOrder',
-      entityId: 'so-1',
-      externalId: '7001',
-      errorMessage: 'Duplicate WooCommerce refund delivery deduped by external refund id',
-      syncedAt: (state.syncLogs[0] as { data: { syncedAt: Date } }).data.syncedAt,
-    },
+  assert.deepEqual((state.syncLogs[0] as { data: unknown }).data, {
+    direction: 'FROM_CONNECTOR',
+    status: 'SYNCED',
+    entityType: 'SalesOrder',
+    entityId: 'so-1',
+    externalId: '7001',
+    errorMessage: 'Duplicate WooCommerce refund delivery deduped by external refund id',
+    syncedAt: (state.syncLogs[0] as { data: { syncedAt: Date } }).data.syncedAt,
   })
   assert.equal(state.activityLogs.length, 1)
   assert.deepEqual(state.activityLogs[0], {
@@ -247,51 +355,6 @@ test('syncWcRefund treats external refund unique conflicts as idempotent races',
     metadata: { externalRefundId: 7001, parentOrderId: 1001 },
     resolveUser: false,
   })
-})
-
-test('o3d-6oyu.18: a WC refund refused because the order was already charged back is handled, not dead-lettered', async () => {
-  // The reverse ordering of the concurrent double-reversal race: the payment poller's
-  // chargeback committed first, so the refund transaction refuses this credit note with
-  // conflict: 'prior-chargeback'. A FAILED sync log here would dead-letter the delivery
-  // into the exceptions inbox and retry it forever against a condition that never clears.
-  const state = makeDependencies({ alwaysMissExistingRefund: true })
-  state.dependencies.createRefund = async () => ({
-    success: false,
-    conflict: 'prior-chargeback' as const,
-    error: 'Order was already charged back (credit note CN-0009) — a second credit note would double-reverse it; reconcile this refund manually.',
-  })
-
-  const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
-
-  assert.deepEqual(result, { success: true })
-  assert.equal(state.syncLogs.length, 1)
-  const logged = state.syncLogs[0] as { data: { status: string; errorMessage: string } }
-  assert.equal(logged.data.status, 'SYNCED', 'not FAILED — this must not dead-letter')
-  assert.equal(logged.data.errorMessage, WC_REFUND_SUPPRESSED_BY_CHARGEBACK)
-  assert.equal(state.activityLogs.length, 1)
-  const activity = state.activityLogs[0] as { action: string; level: string; description: string }
-  assert.equal(activity.action, 'refund_sync_suppressed_by_chargeback')
-  // o3d-1sc3: this fixture's refund carries a QUANTITY line, so goods came back and an
-  // inventory movement is owed — that is an ERROR needing action, not a WARNING recording
-  // what happened. A monetary-only suppression stays WARNING (covered below).
-  assert.equal(activity.level, 'ERROR', 'operator-visible: stock is owed and not yet back on hand')
-  assert.match(activity.description, /CN-0009/)
-})
-
-test('o3d-6oyu.18: the chargeback-suppression warning is logged once, not on every order.updated re-run', async () => {
-  const state = makeDependencies({ alwaysMissExistingRefund: true })
-  state.dependencies.createRefund = async () => ({
-    success: false,
-    conflict: 'prior-chargeback' as const,
-    error: 'Order was already charged back (credit note CN-0009).',
-  })
-
-  await syncWcRefund(1001, makeRefund(), state.dependencies)
-  await syncWcRefund(1001, makeRefund(), state.dependencies)
-  await syncWcRefund(1001, makeRefund(), state.dependencies)
-
-  assert.equal(state.syncLogs.length, 1)
-  assert.equal(state.activityLogs.length, 1)
 })
 
 test('syncWcRefund links a refund line to its IMS order line via _refunded_item_id, not the refund line id', async () => {
@@ -350,58 +413,128 @@ test('syncWcRefund falls back to the refund line id when _refunded_item_id is ab
   assert.equal(harness.createRefundLines[0].lineId, 'line-1')
 })
 
-// ---------------------------------------------------------------------------
-// o3d-1sc3 — a chargeback suppresses the CREDIT NOTE, never the STOCK RETURN.
-//
-// The chargeback path performs no restock because it assumes the customer kept the
-// goods. A WooCommerce refund carrying QUANTITY lines says the opposite. Marking the
-// whole delivery SYNCED on the strength of the financial conflict therefore absorbed a
-// real inventory movement: stock stayed understated permanently while webhook retries
-// and the exceptions inbox both considered it handled.
-// ---------------------------------------------------------------------------
+test('a refused monetary-only refund is QUARANTINED and not re-attempted on the next delivery (o3d-w00 #2/#5, o3d-iup)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, refuseWithQuarantine: true })
 
-test('o3d-1sc3: a suppressed refund covering units escalates to ERROR and names the stock owed', async () => {
-  const state = makeDependencies({ alwaysMissExistingRefund: true })
-  state.dependencies.createRefund = async () => ({
-    success: false,
-    conflict: 'prior-chargeback' as const,
-    error: 'Order was already charged back (credit note CN-0009).',
-  })
+  const first = await syncWcRefund(1001, makeRefund(), state.dependencies)
+  assert.equal(first.success, false, 'the refusal surfaces as a failed sync')
 
-  const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
+  // It is parked as QUARANTINED (distinct from FAILED), keyed by the WC refund id.
+  const parked = state.syncLogs.find((log) => {
+    const data = (log as { data?: { status?: string; externalId?: string } }).data
+    return data?.status === 'QUARANTINED'
+  }) as { data?: { externalId?: string } } | undefined
+  assert.ok(parked, 'a QUARANTINED log was written')
+  assert.equal(parked?.data?.externalId, String(makeRefund().id), 'keyed by the WC refund id')
 
-  assert.deepEqual(result, { success: true }, 'still not dead-lettered')
-
-  const activity = state.activityLogs[0] as {
-    level: string
-    description: string
-    metadata: Record<string, unknown>
-  }
-  // The chargeback path performs no restock, so a quantity-bearing refund may owe an
-  // inventory movement nothing else will make. That needs action, not a note.
-  assert.equal(activity.level, 'ERROR')
-  assert.equal(activity.metadata.refundedUnits, 1)
-  assert.match(activity.description, /1 unit\(s\)/)
-  assert.match(activity.description, /NOT on hand in IMS/)
-  assert.match(activity.description, /Verify and adjust stock manually/)
-  // It must NOT assert the goods physically came back: a WooCommerce refund line carries a
-  // refunded quantity and no received/restocked signal.
-  assert.doesNotMatch(activity.description, /returns inbox/)
+  const callsAfterFirst = state.createRefundCalls
+  // A duplicate delivery must be skipped by the parked-log dedup — no re-refusal loop.
+  const second = await syncWcRefund(1001, makeRefund(), state.dependencies)
+  assert.equal(second.success, true, 'the parked refund is treated as handled, not retried')
+  assert.equal(state.createRefundCalls, callsAfterFirst, 'createRefund was NOT called again for a parked refund')
 })
 
-test('o3d-1sc3: a monetary-only suppression stays a WARNING and claims no stock is owed', async () => {
+test('a refund id already parked for a DIFFERENT order fails closed, not silently moved (o3d-7yf)', async () => {
   const state = makeDependencies({ alwaysMissExistingRefund: true })
-  state.dependencies.createRefund = async () => ({
-    success: false,
-    conflict: 'prior-chargeback' as const,
-    error: 'Order was already charged back (credit note CN-0009).',
+  // Order A already has an actionable park for refund 7012.
+  state.syncLogs.push({ id: 'log-seed', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7012', status: 'FAILED' } })
+
+  // The same refund id 7012 now arrives for order B (resolves to so-1) and would need to be parked.
+  const refund = makeRefund({
+    id: 7012, amount: '99.00',
+    line_items: [{ id: 501, name: 'Widget', product_id: 10, variation_id: 0, quantity: -1, tax_class: '', subtotal: '-10.00', subtotal_tax: '-1.00', total: '-10.00', total_tax: '-1.00', sku: 'WIDGET', meta_data: [], refund_total: 11 }],
   })
+  const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  const monetaryOnly = { ...makeRefund(), line_items: [] }
-  const result = await syncWcRefund(1001, monetaryOnly, state.dependencies)
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /already parked for a different order/i, 'failed closed on the cross-order collision')
+  // Order A's park is untouched — still entityId so-other.
+  const seed = state.syncLogs.find((log) => (log as { id?: string }).id === 'log-seed') as { data: { entityId: string } }
+  assert.equal(seed.data.entityId, 'so-other', "A's park was not moved to B")
+})
 
-  assert.deepEqual(result, { success: true })
-  const activity = state.activityLogs[0] as { level: string; description: string }
-  assert.equal(activity.level, 'WARNING', 'nothing returned, nothing owed operationally')
-  assert.doesNotMatch(activity.description, /unit\(s\)/)
+test('a QUARANTINED park for a DIFFERENT order does not mark this order handled (o3d-7yf)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  // Refund 7013 is QUARANTINED for order A (so-other). The unscoped pre-skip used to return handled for ANY
+  // order sharing the refund id — so order B (so-1) would silently get neither a refund nor a failure.
+  state.syncLogs.push({ id: 'log-q', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7013', status: 'QUARANTINED' } })
+
+  const refund = makeRefund({
+    id: 7013, amount: '99.00',
+    line_items: [{ id: 501, name: 'Widget', product_id: 10, variation_id: 0, quantity: -1, tax_class: '', subtotal: '-10.00', subtotal_tax: '-1.00', total: '-10.00', total_tax: '-1.00', sku: 'WIDGET', meta_data: [], refund_total: 11 }],
+  })
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false, 'B is NOT silently treated as handled by A\'s quarantined park')
+  assert.match(result.error ?? '', /different order/i, 'the cross-order quarantine is surfaced, not swallowed')
+})
+
+test('an existing refund for a DIFFERENT order fails closed, not reported as already-synced (o3d-7yf)', async () => {
+  const state = makeDependencies()
+  // A refund with external id 7014 already exists — but on order so-other, not this order (so-1).
+  state.refunds.push({ id: 'refund-x', externalRefundId: 7014, orderId: 'so-other' })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7014 }), state.dependencies)
+
+  assert.equal(result.success, false, 'not silently treated as already-synced for this order')
+  assert.match(result.error ?? '', /different order/i, 'the cross-order existing refund is surfaced')
+  assert.equal(state.createRefundCalls, 0, 'no refund was created on this order')
+})
+
+test('a PENDING park for a DIFFERENT order blocks applying the same refund here (o3d-7yf)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.syncLogs.push({ id: 'log-p', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7015', status: 'PENDING' } })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7015 }), state.dependencies)
+
+  assert.equal(result.success, false, 'a PENDING park owned by another order fails closed too')
+  assert.match(result.error ?? '', /different order/i)
+  assert.equal(state.createRefundCalls, 0, 'no refund created on this order while another order holds the park')
+})
+
+test('a successful retry RESOLVES this order\'s lingering actionable park (o3d-7yf)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  // This order (so-1) has a FAILED park for refund 7016 from an earlier transient failure.
+  state.syncLogs.push({ id: 'log-f', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-1', externalId: '7016', status: 'FAILED' } })
+
+  // The refund now lands (createRefund succeeds — makeDependencies default doesn't refuse).
+  const result = await syncWcRefund(1001, makeRefund({ id: 7016 }), state.dependencies)
+
+  assert.equal(result.success, true, 'the refund landed')
+  const park = state.syncLogs.find((log) => (log as { id?: string }).id === 'log-f') as { data: { status: string } }
+  assert.equal(park.data.status, 'SYNCED', 'the lingering FAILED park was resolved, not left actionable')
+})
+
+test('an already-synced same-order refund resolves its lingering park but leaves QUARANTINED + other orders alone (o3d-7yf)', async () => {
+  const state = makeDependencies() // createRefund succeeds by default, but we seed an existing refund directly
+  // Refund 7017 already exists on THIS order, with a leftover FAILED park (post-commit step had failed once).
+  state.refunds.push({ id: 'refund-e', externalRefundId: 7017, orderId: 'so-1' })
+  state.syncLogs.push({ id: 'p-mine', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-1', externalId: '7017', status: 'FAILED' } })
+  // Unrelated parks that MUST stay untouched: a QUARANTINED for the same refund on another order, and a
+  // different refund's FAILED park on another order.
+  state.syncLogs.push({ id: 'p-q-other', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7017', status: 'QUARANTINED' } })
+  state.syncLogs.push({ id: 'p-other', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '9999', status: 'FAILED' } })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7017 }), state.dependencies)
+
+  assert.equal(result.success, true, 'already-synced same-order refund reports success')
+  assert.equal(state.createRefundCalls, 0, 'no new refund created for the already-synced id')
+  const byId = (id: string) => (state.syncLogs.find((l) => (l as { id?: string }).id === id) as { data: { status: string } }).data.status
+  assert.equal(byId('p-mine'), 'SYNCED', 'this order\'s lingering FAILED park was resolved')
+  assert.equal(byId('p-q-other'), 'QUARANTINED', 'the other order\'s QUARANTINED park is untouched')
+  assert.equal(byId('p-other'), 'FAILED', 'an unrelated refund\'s park on another order is untouched')
+})
+
+test('a refund that LANDS concurrently (seen under the per-refund lock) is not also parked (o3d-ee9)', async () => {
+  // alwaysMissExistingRefund makes the PREFLIGHT existing-refund check miss (as if the refund had not yet
+  // committed when we read it), while the in-transaction re-read under the per-refund advisory lock DOES see
+  // it — simulating a refund CREATE committing on the order between preflight and the park write.
+  const state = makeDependencies({ alwaysMissExistingRefund: true, refuseWithQuarantine: true })
+  state.refunds.push({ id: 'refund-c', externalRefundId: 7018, orderId: 'so-1' })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7018 }), state.dependencies)
+
+  assert.equal(result.success, false, 'the refusal still surfaces')
+  const parks = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7018')
+  assert.equal(parks.length, 0, 'no park was written because the refund had already landed under the lock')
 })

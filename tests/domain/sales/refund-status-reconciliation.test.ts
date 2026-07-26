@@ -11,7 +11,7 @@ import {
 const REFUNDED_AT = new Date('2026-01-01T12:00:00.000Z')
 
 function order(overrides: Partial<RefundStatusOrderRow> = {}): RefundStatusOrderRow {
-  return {
+  const row: RefundStatusOrderRow = {
     id: 'order-1',
     orderNumber: 'SO-1',
     externalOrderNumber: null,
@@ -21,6 +21,10 @@ function order(overrides: Partial<RefundStatusOrderRow> = {}): RefundStatusOrder
     refunds: [],
     ...overrides,
   }
+  // Default refunds to NET basis (the post-o3d-n8p norm); a test marks a legacy refund with
+  // totalsBasis: null explicitly to exercise the mixed-basis fallback.
+  row.refunds = row.refunds.map((refund) => ({ totalsBasis: 'NET' as const, ...refund }))
+  return row
 }
 
 test('clean refund disposition rows produce no findings', () => {
@@ -171,6 +175,7 @@ test('refund disposition reconciliation reports source row cap and caps collecte
       status: true,
       refundStatus: true,
       totalBase: true,
+      taxBase: true,
       refunds: {
         orderBy: { refundedAt: 'asc' },
         select: {
@@ -178,8 +183,71 @@ test('refund disposition reconciliation reports source row cap and caps collecte
           creditNoteNumber: true,
           totalBase: true,
           refundedAt: true,
+          totalsBasis: true,
         },
       },
     },
   }])
+})
+
+test('a fully-refunded taxable order with only NET refunds is FULL; a legacy GROSS refund falls back to the gross basis (o3d-w00 #3 / o3d-n8p)', () => {
+  // NET-basis: gross 120, tax 20, net 100; a net-100 refund is a FULL refund vs the net total.
+  const netFindings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-net', orderNumber: 'SO-NET', refundStatus: 'FULL', totalBase: '120.00', taxBase: '20.00',
+        refunds: [{ id: 'r-net', creditNoteNumber: 'CN-NET', totalBase: '100.00', refundedAt: REFUNDED_AT, totalsBasis: 'NET' }],
+      }),
+    ],
+  })
+  assert.deepEqual(netFindings, [], 'a full net refund of a taxable order reconciles as FULL')
+
+  // Legacy refund (null basis) with a plausible status (FULL/PARTIAL): the sum mixes units so FULL vs
+  // PARTIAL is unknowable — surface an explicit UNKNOWN warning for manual review, NOT a false mismatch.
+  const legacyFindings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-legacy', orderNumber: 'SO-LEGACY', refundStatus: 'FULL', totalBase: '120.00', taxBase: '20.00',
+        refunds: [{ id: 'r-legacy', creditNoteNumber: 'CN-LEGACY', totalBase: '100.00', refundedAt: REFUNDED_AT, totalsBasis: null }],
+      }),
+    ],
+  })
+  assert.equal(legacyFindings.length, 1)
+  assert.equal(legacyFindings[0]?.code, 'sales_order_refund_status_unknown_basis')
+  assert.equal(legacyFindings[0]?.severity, 'warning')
+
+  // Basis-INDEPENDENT corruption: a positive refund with refundStatus=NONE is wrong regardless of basis —
+  // still flagged critical even on an unknown basis (must not be suppressed by the UNKNOWN skip).
+  const noneFindings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-none', orderNumber: 'SO-NONE', refundStatus: 'NONE', totalBase: '120.00', taxBase: '20.00',
+        refunds: [{ id: 'r-none', creditNoteNumber: 'CN-NONE', totalBase: '50.00', refundedAt: REFUNDED_AT, totalsBasis: null }],
+      }),
+    ],
+  })
+  assert.equal(noneFindings.length, 1)
+  assert.equal(noneFindings[0]?.code, 'sales_order_refund_status_mismatch')
+  assert.equal(noneFindings[0]?.severity, 'critical')
+
+  // A positive legacy refund + a negative correction sum to ZERO, but a positive refund row still exists
+  // with refundStatus=NONE — must stay CRITICAL, not be downgraded to a warning by the aggregate == 0.
+  const nettedNoneFindings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-netted', orderNumber: 'SO-NETTED', refundStatus: 'NONE', totalBase: '120.00', taxBase: '20.00',
+        refunds: [
+          { id: 'r-pos', creditNoteNumber: 'CN-POS', totalBase: '50.00', refundedAt: REFUNDED_AT, totalsBasis: null },
+          { id: 'r-neg', creditNoteNumber: 'CN-NEG', totalBase: '-50.00', refundedAt: REFUNDED_AT, totalsBasis: null },
+        ],
+      }),
+    ],
+  })
+  assert.equal(nettedNoneFindings.length, 1)
+  assert.equal(nettedNoneFindings[0]?.code, 'sales_order_refund_status_mismatch')
+  assert.equal(nettedNoneFindings[0]?.severity, 'critical')
 })

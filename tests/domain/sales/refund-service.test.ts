@@ -25,12 +25,16 @@ type Order = {
   refundStatus?: string
   fxRateToBase: number
   totalBase: number
+  taxBase?: number
+  taxRatePercent?: number
+  taxRateName?: string | null
   revenueDeferredDate: Date | null
   unearnedRevenueAmount: number | null
   inventoryAllocatedDate: Date | null
   allocationBatchAmount: number | null
 }
 
+type LineTaxRate = { accountingTaxType: string | null; reverseCharge: boolean | null }
 type SalesLine = {
   id: string
   orderId: string
@@ -38,6 +42,7 @@ type SalesLine = {
   description: string
   qty: number
   totalBase: number
+  taxRate?: LineTaxRate | null
 }
 
 // o3d-5od: the REAL @prisma/adapter-pg shape (no meta.target, quoted columns).
@@ -69,6 +74,8 @@ type Refund = {
   accountingRetryRequired?: boolean
   accountingWarning?: string | null
   accountingRetrySyncs?: unknown
+  totalsBasis?: string | null
+  source?: string | null
 }
 
 type RefundLine = {
@@ -83,6 +90,9 @@ type RefundLine = {
   totalForeign: number
   totalBase: number
   costLayerSnapshot?: unknown
+  accountingTaxType?: string | null
+  reverseCharge?: boolean | null
+  lineKind?: string | null
 }
 
 type State = {
@@ -90,6 +100,9 @@ type State = {
   lines: SalesLine[]
   refunds: Refund[]
   refundLines: RefundLine[]
+  // o3d-ee9: actionable WooCommerce refund parks, so createSalesOrderRefund's under-lock park check is testable.
+  shoppingSyncLogs?: Array<{ id: string; connector: string; direction: string; entityType: string; entityId: string | null; externalId: string; status: string }>
+
   shipments: Array<{
     id: string
     orderId: string
@@ -127,6 +140,7 @@ type State = {
   activityLogs: unknown[]
   cogsSubledgerMovements: unknown[]
   settings: Record<string, string>
+  taxRates?: Array<{ name: string; accountingTaxType: string | null; active?: boolean }>
   executeRawCalls: number
   nextRefundId: number
   nextRefundLineId: number
@@ -178,7 +192,7 @@ const accountingSettings: AccountingSettings = {
 }
 
 function baseState(overrides: Partial<State> = {}): State {
-  return {
+  const state: State = {
     orders: [{
       id: 'order-1',
       externalOrderNumber: null,
@@ -210,12 +224,17 @@ function baseState(overrides: Partial<State> = {}): State {
     activityLogs: [],
     cogsSubledgerMovements: [],
     settings: {},
+    taxRates: [],
     executeRawCalls: 0,
     nextRefundId: 1,
     nextRefundLineId: 1,
     nextCostLayerId: 1,
     ...overrides,
   }
+  // Default seeded existing refunds to NET basis (the post-o3d-n8p norm); a test that exercises the
+  // legacy/unknown-basis block pushes a refund with totalsBasis omitted AFTER baseState().
+  state.refunds = state.refunds.map((refund) => ({ totalsBasis: 'NET' as const, ...refund }))
+  return state
 }
 
 function createClient(state: State): RefundServiceClient {
@@ -229,6 +248,38 @@ function createClient(state: State): RefundServiceClient {
       state.executeRawCalls += 1
       return 0
     },
+    shoppingSyncLog: {
+      // o3d-ee9: the under-lock park queries in createSalesOrderRefund.
+      findFirst: async ({ where }: { where: { externalId?: string; entityId?: { not?: string }; status?: { in?: string[] } } }) => {
+        const notOrder = where.entityId?.not
+        const statuses = where.status?.in
+        const match = (state.shoppingSyncLogs ?? []).find((log) =>
+          log.connector === 'woocommerce' &&
+          log.direction === 'FROM_CONNECTOR' &&
+          log.entityType === 'SalesOrder' &&
+          (where.externalId == null || log.externalId === where.externalId) &&
+          // Prisma `not` excludes NULL too, so a "different order" match requires a non-null, non-`notOrder` id.
+          (notOrder == null || (log.entityId != null && log.entityId !== notOrder)) &&
+          (statuses == null || statuses.includes(log.status)))
+        return match ? { entityId: match.entityId } : null
+      },
+      updateMany: async ({ where, data }: { where: { externalId?: string; entityId?: string; status?: { in?: string[] } }; data: { status?: string } }) => {
+        const statuses = where.status?.in
+        let count = 0
+        for (const log of state.shoppingSyncLogs ?? []) {
+          if (
+            log.connector === 'woocommerce' && log.direction === 'FROM_CONNECTOR' && log.entityType === 'SalesOrder' &&
+            (where.externalId == null || log.externalId === where.externalId) &&
+            (where.entityId == null || log.entityId === where.entityId) &&
+            (statuses == null || statuses.includes(log.status))
+          ) {
+            if (data.status != null) log.status = data.status
+            count += 1
+          }
+        }
+        return { count }
+      },
+    },
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => {
       const snapshot = cloneTestStateValue(state)
       try {
@@ -240,6 +291,13 @@ function createClient(state: State): RefundServiceClient {
         }
         throw error
       }
+    },
+    taxRate: {
+      findFirst: async ({ where }: { where: { name?: string; active?: boolean } }) => {
+        const match = (state.taxRates ?? []).find((rate) =>
+          rate.name === where.name && (where.active ? rate.active !== false : true))
+        return match ? { accountingTaxType: match.accountingTaxType } : null
+      },
     },
     setting: {
       findUnique: async ({ where }: { where: { key: string } }) => {
@@ -280,7 +338,7 @@ function createClient(state: State): RefundServiceClient {
             ...order,
             lines: state.lines
               .filter((line) => line.orderId === order.id)
-              .map((line) => ({ id: line.id, productId: line.productId, qty: line.qty })),
+              .map((line) => ({ id: line.id, productId: line.productId, qty: line.qty, taxRate: line.taxRate ?? null })),
             shipments: state.shipments
               .filter((row) => row.orderId === order.id && row.status === 'SHIPPED')
               .map((row) => ({ id: row.id })),
@@ -363,7 +421,11 @@ function createClient(state: State): RefundServiceClient {
         }
         return state.refunds
           .filter((refund) => where.orderId == null || refund.orderId === where.orderId)
-          .map((refund) => ({ totalBase: refund.totalBase }))
+          .map((refund) => ({
+            totalBase: refund.totalBase,
+            accountingRetryRequired: refund.accountingRetryRequired ?? false,
+            totalsBasis: refund.totalsBasis ?? null,
+          }))
       },
       create: async ({ data }: { data: Omit<Refund, 'id'> }) => {
         const refund = {
@@ -541,6 +603,228 @@ test('createSalesOrderRefund dual-writes refundStatus=FULL on a full refund', as
   assert.equal(result.success, true)
   assert.equal(state.orders[0].status, 'SHIPPED') // lifecycle status is left untouched
   assert.equal(state.orders[0].refundStatus, 'FULL')
+})
+
+test('a full NET refund of a TAXABLE order reaches refundStatus=FULL, not stuck at PARTIAL (o3d-w00)', async () => {
+  // Order: gross 120, tax 20, net 100. Refund lines are stored NET, so a full refund is net 100. Against
+  // the GROSS 120 it stuck at PARTIAL forever; against the NET 100 it correctly reaches FULL.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 20, taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Full return',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL', 'a full net refund of a taxable order is FULL, not stuck PARTIAL')
+})
+
+test('a new refund is stamped totalsBasis=NET and a writer-derived source (o3d-n8p)', async () => {
+  const state = baseState()
+  await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Return', creditNotePrefix: 'CN-',
+  })
+  assert.equal(state.refunds[0].totalsBasis, 'NET', 'stored totals are marked NET')
+  assert.equal(state.refunds[0].source, 'MANUAL_UI', 'no externalRefundId / chargeback => manual')
+
+  const woo = baseState()
+  await createSalesOrderRefund(createClient(woo), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Return', creditNotePrefix: 'CN-', externalRefundId: 4242,
+  })
+  assert.equal(woo.refunds[0].source, 'WOO_SYNC', 'externalRefundId => woo sync')
+})
+
+test('createSalesOrderRefund fails closed when the refund id is parked for a DIFFERENT order (o3d-ee9 park-first)', async () => {
+  // Park-first race: order B refused this refund id and wrote a park; order A must NOT silently create its
+  // refund and leave B's actionable park stranded. Under the per-refund lock the create refuses.
+  const state = baseState({
+    shoppingSyncLogs: [{ id: 'p1', connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'order-OTHER', externalId: '4242', status: 'FAILED' }],
+  })
+  await assert.rejects(
+    createSalesOrderRefund(createClient(state), {
+      orderId: 'order-1',
+      lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+      reason: 'Return', creditNotePrefix: 'CN-', externalRefundId: 4242,
+    }),
+    /parked for a different order/,
+  )
+  assert.equal(state.refunds.length, 0, 'no refund created for the cross-order-parked id')
+  assert.equal(state.shoppingSyncLogs?.[0].status, 'FAILED', "the other order's park is untouched")
+})
+
+test('createSalesOrderRefund resolves a SAME-order park atomically when the refund lands (o3d-ee9)', async () => {
+  // An earlier refused delivery of this refund parked it on THIS order; once the refund is created the park
+  // must be resolved in the same transaction, not left lingering as an exception.
+  const state = baseState({
+    shoppingSyncLogs: [{ id: 'p2', connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'order-1', externalId: '4242', status: 'FAILED' }],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Return', creditNotePrefix: 'CN-', externalRefundId: 4242,
+  })
+  assert.equal(result.success, true, 'the same-order refund is created')
+  assert.equal(state.refunds.length, 1)
+  assert.equal(state.shoppingSyncLogs?.[0].status, 'SYNCED', "this order's park was resolved atomically")
+})
+
+test('a later refund on an order with a legacy/unknown-basis refund is BLOCKED for manual reconciliation, never over-refunded (o3d-w00 #3 / o3d-n8p)', async () => {
+  // A legacy refund stored 100 (basis unknown/GROSS). Summing it with new NET totals against any single
+  // ceiling can either over-refund (gross ceiling grosses the new line up) or mark FULL early (net
+  // ceiling). Conversion is undecidable, so createSalesOrderRefund fails closed and refuses.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 20, taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+  })
+  state.refunds.push({
+    id: 'legacy-refund', orderId: 'order-1', creditNoteNumber: 'CN-legacy', externalRefundId: null,
+    reason: 'legacy', totalForeign: 100, totalBase: 100, returnWarehouseId: null, // totalsBasis omitted => legacy/unknown
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 15 }],
+    reason: 'Small extra refund', creditNotePrefix: 'CN-',
+  })
+  assert.equal(result.success, false, 'blocked rather than risk an over-refund / premature FULL')
+  assert.equal(result.success === false && result.quarantine, true, 'routed to manual reconciliation')
+  assert.equal(state.refundLines.length, 0, 'nothing created')
+})
+
+test('a refund line SNAPSHOTS the resolved tax identity at creation (o3d-w00)', async () => {
+  // The linked sales line carries its own rate; the snapshot must capture that connector tax type so the
+  // credit note posts under it instead of re-predicting from the order default at post time.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 20, taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+  })
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Return',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(state.refundLines[0].accountingTaxType, 'OUTPUT2', 'the resolved tax type is snapshotted')
+  assert.equal(state.refundLines[0].reverseCharge, false)
+})
+
+test('a monetary-only refund PERSISTS lineKind=sale so a retry does not re-post it as shipping (o3d-w00 #4)', async () => {
+  // A WooCommerce monetary-only refund is a null-product 'sale' line with a POSITIVE total. The retry
+  // loader used to re-infer the kind from productId/sign (null product + positive total => 'shipping'),
+  // sending the credit-note revenue to the shipping account on a retry. Persisting the kind fixes that.
+  // The order is uniformly taxed so the monetary refund is allowed (mixed-rate orders are refused below).
+  const state = baseState()
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Goodwill refund', qty: 0, totalBase: 30, lineKind: 'sale' }],
+    reason: 'Goodwill',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+  const persisted = state.refundLines.find((line) => line.description === 'Goodwill refund')
+  assert.ok(persisted, 'the monetary-only line was created')
+  assert.equal(persisted?.productId, null, 'it is a null-product line (would infer as shipping)')
+  assert.ok(persisted && persisted.totalBase > 0, 'with a positive total (would infer as shipping, not discount)')
+  assert.equal(persisted?.lineKind, 'sale', 'the resolved kind is persisted, not left to be re-inferred on retry')
+})
+
+test('a mirrored order-discount refund line persists lineKind=discount (o3d-w00 #4)', async () => {
+  // A discount line is exempt from the uniform-tax gate (it uses the order default, like the invoice).
+  const state = baseState()
+  await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Order discount', qty: 0, totalBase: 10, lineKind: 'discount' }],
+    reason: 'Discount reversal',
+    creditNotePrefix: 'CN-',
+  })
+
+  const persisted = state.refundLines.find((line) => line.description === 'Order discount')
+  assert.equal(persisted?.lineKind, 'discount', 'a discount line persists its kind')
+})
+
+test('a monetary-only refund on a MIXED-rate order is REFUSED and quarantined (o3d-w00 #2/#5)', async () => {
+  // Two order lines at different tax identities -> not uniform. A monetary-only SALE amount can't be
+  // attributed, so it must be refused (fail closed) and flagged for quarantine, not posted under one rate.
+  const state = baseState()
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  state.lines.push({
+    id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50,
+    taxRate: { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: false },
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 40, lineKind: 'sale' }],
+    reason: 'Partial monetary refund',
+    externalRefundId: 9001,
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, false, 'a monetary refund on a mixed-rate order is refused')
+  assert.equal(result.success === false && result.quarantine, true, 'and flagged for quarantine')
+  assert.match(result.success === false ? result.error : '', /not itemised|not uniformly taxed/i)
+  assert.equal(state.refundLines.length, 0, 'nothing was created')
+})
+
+test('a monetary-only refund on a REVERSE-CHARGE order is REFUSED (o3d-w00 #2/#5)', async () => {
+  const state = baseState()
+  state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 40, lineKind: 'sale' }],
+    reason: 'Monetary refund',
+    creditNotePrefix: 'CN-',
+  })
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.quarantine, true)
+})
+
+test('a monetary-only refund on a UNIFORM order posts under the single safe identity, even if the default rate is deactivated (o3d-w00 #5)', async () => {
+  // The order default rate is inactive, so the old order-default lookup (active=true) resolved NULL; the
+  // identity must instead come from the line relation, which still carries the type.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: false }],
+  })
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 40, lineKind: 'sale' }],
+    reason: 'Monetary refund',
+    creditNotePrefix: 'CN-',
+  })
+  assert.equal(result.success, true, 'a uniform order allows the monetary refund even with a deactivated default')
+  const line = state.refundLines.find((l) => l.description === 'Monetary refund')
+  assert.equal(line?.accountingTaxType, 'OUTPUT2', 'posted under the single safe identity from the line relation')
+})
+
+test('a reverse-charge line snapshots the SWAPPED tax type (o3d-w00)', async () => {
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, taxRatePercent: 0, taxRateName: 'RC' }],
+    taxRates: [{ name: 'RC', accountingTaxType: 'ZERORATEDOUTPUT', active: true }],
+    settings: { reverse_charge_sales_tax_type: 'REVERSECHARGE' },
+  })
+  state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }
+  await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Return',
+    creditNotePrefix: 'CN-',
+    accountingSettings: { ...accountingSettings, reverseChargeSalesTaxType: 'REVERSECHARGE' },
+  })
+
+  assert.equal(state.refundLines[0].accountingTaxType, 'REVERSECHARGE', 'reverse-charge swap is captured in the snapshot')
+  assert.equal(state.refundLines[0].reverseCharge, true)
 })
 
 test('createSalesOrderRefund converts refund totals from base to foreign currency', async () => {
@@ -980,6 +1264,10 @@ test('o3d-6oyu.18: chargeback commits first → the WC refund is refused as prio
 test('o3d-6oyu.18: an ordinary partial refund on an order with prior NON-chargeback refunds is untouched', async () => {
   // The guard must not turn legitimate stacked partial refunds into conflicts — only a
   // prior CHARGEBACK blocks an ordinary refund.
+  //
+  // totalsBasis MUST be set here (o3d-w00/o3d-n8p): a NULL-basis prior refund is legacy/unknown
+  // and now fails closed on its own, which would make this test pass for the wrong reason — it
+  // would be asserting the basis guard rather than the chargeback guard it is named for.
   const state = reversalRaceState()
   state.refunds.push({
     id: 'refund-wc-1',
@@ -991,6 +1279,7 @@ test('o3d-6oyu.18: an ordinary partial refund on an order with prior NON-chargeb
     totalBase: 10,
     returnWarehouseId: null,
     chargeback: false,
+    totalsBasis: 'NET',
   })
 
   const result = await createSalesOrderRefund(createClient(state), {
@@ -1143,6 +1432,31 @@ test('createSalesOrderRefund replays external refunds without duplicate stock si
   assert.equal(state.refunds.length, refundCount)
   assert.equal(state.refundLines.length, refundLineCount)
   assert.equal(state.stockLevels[0]?.quantity, stockQty)
+})
+
+test('replaying a monetary-only external refund reconstructs lineKind=sale from the snapshot, not shipping (o3d-w00 #4)', async () => {
+  // A duplicate WooCommerce delivery hits the external-refund replay query, which used to re-infer the
+  // kind from salesOrderLineId (null => shipping) — re-posting a monetary 'sale' as shipping. It must now
+  // reconstruct from the PERSISTED lineKind instead.
+  const state = baseState()
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false } // uniform: monetary refund allowed
+  const input = {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Goodwill refund', qty: 0, totalBase: 30, lineKind: 'sale' as const }],
+    reason: 'Goodwill',
+    externalRefundId: 55555,
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  }
+  const first = await createSalesOrderRefund(createClient(state), input)
+  assert.equal(first.success, true)
+
+  const replay = await createSalesOrderRefund(createClient(state), input)
+  assert.equal(replay.success, true)
+  const line = replay.success ? replay.createdRefundLines.find((l) => l.description === 'Goodwill refund') : undefined
+  assert.ok(line, 'the monetary-only line is present in the replay')
+  assert.equal(line?.productId, null, 'null-product line (the shape that inferred as shipping)')
+  assert.equal(line?.lineKind, 'sale', 'the replay uses the persisted kind, not the shipping inference')
 })
 
 test('createSalesOrderRefund reconstructs legacy shipment snapshots from COGS entries', async () => {
@@ -2702,4 +3016,46 @@ test('a crash between commit and staging leaves the reversal recoverable, not si
     'it must still be marked as owing accounting — this is what makes the reversal recoverable, '
       + 'and what stops the guard and the poller both reading it as complete',
   )
+})
+
+test('o3d-w00/o3d-n8p: a second refund on an order with a LEGACY-basis refund fails closed and quarantines', async () => {
+  // The operationally consequential half of the basis marker, pinned explicitly because it
+  // changes what happens to real money on real orders.
+  //
+  // Every refund written before the totals_basis migration has a NULL basis, and a NULL row's
+  // stored total may be GROSS. Summing it with a new NET total is not sound: a legacy £60 gross
+  // plus a new £60 net passes a 60+60=120 ceiling on a £120 order, yet the new line grosses up to
+  // £72 — £132 of credit against £120 of goods. Converting a legacy mixed-rate gross refund back
+  // to net is undecidable, so there is no safe automatic reconciliation.
+  //
+  // Hence: refuse and park for a human. This means an order carrying a pre-migration refund will
+  // NOT take a second automated refund — it quarantines instead. That is deliberate, and it is
+  // the behaviour someone working the exceptions inbox has to be ready for.
+  const state = reversalRaceState()
+  state.refunds.push({
+    id: 'refund-legacy',
+    orderId: 'order-1',
+    creditNoteNumber: 'CN-0001',
+    externalRefundId: 7001,
+    reason: 'WooCommerce refund',
+    totalForeign: 10,
+    totalBase: 10,
+    returnWarehouseId: null,
+    chargeback: false,
+    // No totalsBasis — exactly what every pre-migration row looks like.
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 10 }],
+    reason: 'WooCommerce refund',
+    externalRefundId: 7002,
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, false, 'a legacy-basis order does not take a second automated refund')
+  assert.equal(result.success === false && result.quarantine, true, 'and it is parked, not merely failed')
+  assert.match(result.success === false ? result.error : '', /legacy\/unknown amount basis/)
+  assert.equal(state.refunds.length, 1, 'no second refund was written')
 })

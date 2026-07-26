@@ -22,11 +22,13 @@ import {
   refundWcOrder, updateWcOrder, wcCreds, type WcCreds,
 } from './harness/wc.ts'
 import {
-  allocateAndShip, openSalesOrder, processPendingXeroSyncViaUi, recordSalesPaymentViaUi, runDailyBatch, runInboxDrain,
-  runWcOrderReconcile, setPostingMode,
+  accountingInvariants, allocateAndShip, createAndSendPo, createLandedCostPo, drainLandedCostOutboxNow, openSalesOrder,
+  processPendingXeroSyncViaUi, receiveGoods, recordSalesPaymentViaUi, runDailyBatch, runInboxDrain,
+  runPaymentPoll, runWcOrderReconcile, setPostingMode,
 } from './harness/ims.ts'
 import { addStockAdjustment, configureProductComponents, createInventoryProduct, openInventoryProduct } from '../helpers.ts'
 import {
+  deletePaymentInXero,
   expectJournalLine, expectLine, externalIdFor, getCreditNote, getInvoice, getManualJournal, getPayment, syncLogRowsFor,
   trackDocument, type XeroManualJournal,
 } from './harness/xero.ts'
@@ -1611,6 +1613,251 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     }
   })
 
+  test('OC-09: a payment REMOVED in Xero clears paidAt, unwinds revenue exactly once, and never reverts the order status', async ({ page }) => {
+    test.setTimeout(1_800_000)
+
+    // GATE onetwo3d-ims-6oyu.6.1, which the epic listed as absorbed but never built. 6oyu.6 (PR #480)
+    // extended the reversal poller to WooCommerce-linked orders — before it, payment-reversal detection
+    // filtered `shoppingLinks: { none: {} }`, so the bulk of real volume was excluded and a chargeback on
+    // a WC order silently left paidAt set and revenue recognised.
+    //
+    // The reversal is STAGED IN XERO, not simulated: the recorded payment is DELETED there, which is the
+    // ledger-side event a chargeback produces. A fixture that edited only the IMS side would prove
+    // nothing about the poller's actual job, which is noticing that a payment it recorded is gone.
+    //
+    // BATCH MODE, because the revenue unwind is conditional on revenueDeferredDate — the chargeback
+    // credit note is raised only when Group A1 has recognised revenue. In sync mode the interesting
+    // branch never runs.
+    const sku = taggedSku(runId, 'OC09')
+    const unitPrice = '25.00'
+    const qty = 2
+    const method = 'bacs'
+    const bankCode = '090'
+
+    const priorMap = await readSetting(PAYMENT_MAP_KEY)
+    await writeSetting(PAYMENT_MAP_KEY, JSON.stringify({ [`${method}:*`]: bankCode }))
+    let imported: { salesOrderId: string } | undefined
+    let priorPolling: string | null = null
+    try {
+      const baseline = await deleteUnjournaledShipmentBaseline()
+      registerRetiredPostedDocuments(baseline, 'OC-09')
+      await setPostingMode({ sync: true, dailyBatch: true })
+      // The poll route refuses unless polling is armed, and the rig leaves it off between runs so nothing
+      // reaches the shared Demo ledger by accident. Restored in the outer finally.
+      priorPolling = await readSetting(POLLING_KEY)
+      await writeSetting(POLLING_KEY, 'true')
+
+      await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC09`, price: unitPrice })
+      await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
+
+      // Zero-rated, as OC-15/OC-21: net == gross, so the registered payment settles the invoice in full
+      // and the reversal is unambiguous (o3d-c0n/o3d-cyn stay out of it).
+      const product = await createWcProduct(creds, runId, { label: 'OC09', price: unitPrice, taxClass: 'zero-rate' })
+      const order = await createWcOrder(creds, runId, {
+        lines: [{ productId: product.id, quantity: qty }],
+        paymentMethod: method,
+      })
+
+      imported = await awaitWebhookDelivery(order.id, { creds, timeoutMs: 600_000 })
+      await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+      await openSalesOrder(page, imported.salesOrderId)
+      await allocateAndShip(page, { tracking: `${runTag(runId)}-OC09` })
+
+      const batchBoundary = await dailyBatchBoundary()
+      try {
+        // Invoice + payment first, then the batch: A1 needs the accountingInvoiceId, and the payment is
+        // ordering-deferred behind its invoice's CREATE.
+        await processPendingXeroSyncViaUi(page)
+        const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+        trackDocument('Invoices', invoiceId, `OC-09 invoice ${runTag(runId)}`)
+        const invoice = await drainUntilInvoicePaid(page, invoiceId, imported.salesOrderId)
+        expect(invoice.Status, 'the order starts out genuinely PAID in the ledger').toBe('PAID')
+        const paymentId = invoice.Payments![0].PaymentID
+
+        let batch: { groupA1: number; errors: string[] }
+        try {
+          batch = (await runDailyBatch(page)) as unknown as typeof batch
+        } catch (e) {
+          if (/HTTP 429|rate.?limit/i.test(String(e))) {
+            console.warn('[OC-09] SKIPPED — accounting-daily-batch hourly quota already consumed this invocation (o3d-lgo.13). The revenue unwind is conditional on Group A1 having recognised revenue, so without the batch there is nothing to assert. Re-run OC-09 in its own invocation.')
+            test.skip(true, 'accounting-daily-batch hourly quota already consumed this invocation (o3d-lgo.13); run OC-09 in its own invocation.')
+          }
+          throw e
+        }
+        expect(batch.errors, `daily batch reported errors: ${batch.errors.join('; ')}`).toEqual([])
+        for (const posted of await postedDailyBatchJournalIds(batchBoundary)) {
+          trackDocument('ManualJournals', posted.externalId, `OC-09 ${posted.type} ${runTag(runId)}`)
+        }
+        expect(await revenueDeferredDateSet(imported.salesOrderId), 'A1 must have recognised revenue before the reversal, or the unwind branch never runs').toBe(true)
+
+        const statusBefore = await salesOrderStatus(imported.salesOrderId)
+
+        // THE REVERSAL: remove the payment in Xero, exactly as a chargeback does.
+        await deletePaymentInXero(paymentId)
+
+        // 1. The poller detects it.
+        await runPaymentPoll(page)
+
+        // paidAt is cleared — the claim 6oyu.6 fixed for WC-linked orders specifically.
+        expect(await paidAtSet(imported.salesOrderId), 'a payment gone from Xero must clear paidAt, WC-linked or not').toBe(false)
+
+        // Revenue unwound EXACTLY once.
+        const refundsAfterFirst = await refundCountFor(imported.salesOrderId)
+        expect(refundsAfterFirst, 'the reversal raises exactly one revenue-unwind credit note').toBe(1)
+
+        // The operator is told, and the order is NOT auto-reverted — the deliberate policy in 6oyu.6:
+        // a reversed payment needs a human (dispute it, recall the goods, chase re-payment), and
+        // silently walking a SHIPPED order backwards would be worse than leaving it alone.
+        const actions = await activityActions(imported.salesOrderId)
+        expect(actions, 'the detection is recorded against the order').toContain('payment_reversal_detected')
+        expect(await salesOrderStatus(imported.salesOrderId), 'status must NEVER be auto-reverted').toBe(statusBefore)
+
+        // 2. IDEMPOTENCY: the poller runs every 15 minutes, so a second pass over the same reversed
+        //    order must not raise a second credit note. This is the assertion that would catch a
+        //    dedup keyed on something that changes between runs.
+        await runPaymentPoll(page)
+        expect(await refundCountFor(imported.salesOrderId), 'a second poll must not double-reverse').toBe(refundsAfterFirst)
+      } finally {
+        for (const id of await creditNoteExternalIdsFor(imported.salesOrderId).catch((): string[] => [])) {
+          trackDocument('CreditNotes', id, `OC-09 chargeback credit note ${runTag(runId)}`)
+        }
+      }
+    } finally {
+      if (priorMap == null) await clearSetting(PAYMENT_MAP_KEY)
+      else await writeSetting(PAYMENT_MAP_KEY, priorMap)
+      if (priorPolling == null) await clearSetting(POLLING_KEY)
+      else await writeSetting(POLLING_KEY, priorPolling)
+    }
+  })
+
+  test('OC-24: a post-dispatch landed cost does NOT change what a refund reverses — COGS unwinds at the ORIGINALLY-POSTED basis', async ({ page }) => {
+    test.setTimeout(1_800_000)
+
+    // GATE onetwo3d-ims-6oyu.5.1, which the epic listed as absorbed by OC-05/OC-07 but which neither
+    // case actually exercises: both refund against stock whose layer cost never moved, so "originally
+    // posted" and "current layer" are the same number and the distinction under test is invisible.
+    //
+    // 6oyu.5 made the reversal read the IMMUTABLE CogsEntry rows written at dispatch instead of the
+    // shipment cost snapshot — because landed-cost revaluation MUTATES that snapshot (and
+    // Shipment.cogsBatchAmount) in place to the CURRENT layer cost. Without it, a retrospective freight
+    // bill after dispatch would silently change what a later refund reverses, so the revaluation delta
+    // would be unwound along with the sale instead of staying in COGS where the 2026-07-12 finance
+    // decision put it.
+    //
+    // The numbers are chosen so the two bases CANNOT coincide: goods at £10/unit, then £30 of freight
+    // spread across 3 units → £20/unit current layer cost. A reversal at £10 is the posted basis; a
+    // reversal at £20 is the bug.
+    const sku = taggedSku(runId, 'OC24')
+    const unitPrice = '40.00'
+    const qty = 3
+    const refundQty = 1
+    const goodsUnitCost = 10
+    const freightTotal = 30 // over 3 units, BY_QUANTITY → +£10/unit, doubling the layer cost.
+
+    let refundId: string | undefined
+    const baseline = await deleteUnjournaledShipmentBaseline()
+    registerRetiredPostedDocuments(baseline, 'OC-24')
+    await setPostingMode({ sync: true, dailyBatch: true })
+
+    // 1. Stock from a REAL PO receipt, not a stock adjustment: a landed cost attaches to a goods PO, and
+    //    the whole case depends on revaluing the layer those shipped units came from.
+    await createInventoryProduct(page, { sku, name: `${runTag(runId)} OC24`, price: unitPrice })
+    const { poId, poReference } = await createAndSendPo(page, { sku, qty: String(qty), unitCost: goodsUnitCost.toFixed(2) })
+    await receiveGoods(page, { expectStatus: 'Received' })
+
+    const product = await createWcProduct(creds, runId, { label: 'OC24', price: unitPrice, taxClass: 'zero-rate' })
+    const order = await createWcOrder(creds, runId, { lines: [{ productId: product.id, quantity: qty }] })
+    const imported = await awaitWebhookDelivery(order.id, { creds, timeoutMs: 600_000 })
+    await awaitWebhookEventProcessed(order.id, creds, { requireAllProcessed: true })
+
+    await openSalesOrder(page, imported.salesOrderId)
+    await allocateAndShip(page, { tracking: `${runTag(runId)}-OC24` })
+
+    const batchBoundary = await dailyBatchBoundary()
+    try {
+      await processPendingXeroSyncViaUi(page)
+      const invoiceId = await externalIdFor({ type: 'SALES_INVOICE', referenceId: imported.salesOrderId })
+      trackDocument('Invoices', invoiceId, `OC-24 invoice ${runTag(runId)}`)
+
+      // 2. Journal the dispatch. This writes the CogsEntry rows at £10 — the immutable posted basis the
+      //    reversal must later read, and the branch selector for a VALUED return (OC-08's precondition).
+      let batch: { groupB: number; errors: string[] }
+      try {
+        batch = (await runDailyBatch(page)) as unknown as typeof batch
+      } catch (e) {
+        if (/HTTP 429|rate.?limit/i.test(String(e))) {
+          console.warn('[OC-24] SKIPPED — accounting-daily-batch hourly quota already consumed this invocation (o3d-lgo.13). The posted basis only exists once the dispatch is journaled, so there is nothing to assert without the batch. Re-run OC-24 in its own invocation.')
+          test.skip(true, 'accounting-daily-batch hourly quota already consumed this invocation (o3d-lgo.13); run OC-24 in its own invocation.')
+        }
+        throw e
+      }
+      expect(batch.errors, `daily batch reported errors: ${batch.errors.join('; ')}`).toEqual([])
+      for (const posted of await postedDailyBatchJournalIds(batchBoundary)) {
+        trackDocument('ManualJournals', posted.externalId, `OC-24 ${posted.type} ${runTag(runId)}`)
+      }
+      expect(await shipmentJournalDateSet(imported.salesOrderId), 'the dispatch must be journaled before the refund').toBe(true)
+
+      const productId = await productIdBySku(sku)
+      const postedUnitCost = await postedCogsUnitCostFor(imported.salesOrderId)
+      expect(postedUnitCost, 'the dispatch posted COGS at the goods cost').toBeCloseTo(goodsUnitCost, 2)
+
+      // 3. THE REVALUATION, retrospectively and AFTER dispatch: a freight bill linked to the goods PO.
+      //    This rewrites the cost layer — and, deliberately, the shipment snapshot with it.
+      await createLandedCostPo(page, { goodsPoReference: poReference, amount: freightTotal.toFixed(2), description: 'OC-24 freight' })
+      await drainLandedCostOutboxNow(new Date(Date.now() - 60_000).toISOString())
+      const revaluedLayerCost = await latestCostLayerUnitCostFor(productId)
+      expect(
+        revaluedLayerCost,
+        'the landed cost must actually move the layer, or this test cannot tell the two bases apart',
+      ).toBeGreaterThan(postedUnitCost + 0.005)
+
+      // 4. Refund one unit WITH restock, so the valued return + COGS_REVERSAL branch runs.
+      const wcOrder = await getWcOrder(creds, order.id)
+      const lineId = wcOrder.line_items?.[0]?.id
+      const refundAmount = (Number(unitPrice) * refundQty).toFixed(2)
+      await refundWcOrder(creds, order.id, {
+        amount: refundAmount,
+        reason: `${runTag(runId)} OC-24 post-revaluation return`,
+        lineItems: [{ id: lineId!, quantity: refundQty, refund_total: refundAmount }],
+      })
+      refundId = await awaitRefund(imported.salesOrderId)
+      await processPendingXeroSyncViaUi(page)
+
+      // 5. THE POINT, read back out of Xero: the reversal is for the POSTED basis (£10), not the
+      //    revalued layer cost (£20). Reversing at the revalued cost would hand the refunded unit its
+      //    share of freight back out of COGS — money that belongs to the units actually sold.
+      const reversalId = await externalIdFor({ type: 'COGS_REVERSAL', referenceId: refundId })
+      trackDocument('ManualJournals', reversalId, `OC-24 COGS reversal ${runTag(runId)}`)
+      const reversal = await getManualJournal(reversalId)
+      expect(reversal.Status).toBe('POSTED')
+      expectBalanced(reversal)
+      const expectedReversal = postedUnitCost * refundQty
+      expectJournalLine(reversal.JournalLines, { accountCode: await settingValueOc('xero_inventory_account'), debit: expectedReversal })
+      expectJournalLine(reversal.JournalLines, { accountCode: await settingValueOc('xero_cogs_account'), credit: expectedReversal })
+
+      // 6. And the returned stock re-enters at a basis that keeps the books reconciled. Asserted as the
+      //    PROPERTY the gate actually names — no new inventory GL-vs-subledger mismatch — rather than by
+      //    predicting which row the restock writes. Measured on the rig 2026-07-26: the return re-enters
+      //    the EXISTING layer rather than recreating one, so an assertion shaped around "the new return
+      //    layer" tests the implementation's current shape and fails the moment it changes, while saying
+      //    nothing about whether the ledger still ties out.
+      const inventoryInvariants = await accountingInvariants(page)
+      expect(
+        inventoryInvariants.findings.find((f) => f.code === 'inventory_gl_subledger_mismatch'),
+        'the valued return must leave inventory GL still equal to the cost-layer subledger',
+      ).toBeFalsy()
+    } finally {
+      const cn = refundId ? await externalIdFor({ type: 'CREDIT_NOTE', referenceId: refundId }).catch(() => null) : null
+      if (cn) trackDocument('CreditNotes', cn, `OC-24 credit note ${runTag(runId)}`)
+      const billIds = await billIdsForPoOc(poId).catch((): string[] => [])
+      for (const b of billIds) {
+        const ext = await externalIdFor({ type: 'PURCHASE_INVOICE', referenceId: b }).catch(() => null)
+        if (ext) trackDocument('Invoices', ext, `OC-24 bill ${runTag(runId)}`)
+      }
+    }
+  })
+
   test('OC-21: a receipt recorded BY HAND settles the Xero invoice, and the order reports the ledger agreeing', async ({ page }) => {
     test.setTimeout(1_800_000)
 
@@ -1930,7 +2177,159 @@ async function salesOrderFx(salesOrderId: string): Promise<{
   }
 }
 
+/** The ORIGINALLY-POSTED per-unit COGS for an order's dispatch — the immutable CogsEntry basis (6oyu.5). */
+async function postedCogsUnitCostFor(salesOrderId: string): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    // CogsEntry has no shipment link of its own — it hangs off the StockMovement, and the SALE_DISPATCH
+    // movement is what carries referenceType/referenceId back to the order.
+    const r = await db.query<{ unit: string }>(
+      `select (sum(c."totalCostBase") / nullif(sum(c.qty), 0))::text as unit
+         from cogs_entries c
+         join stock_movements m on m.id = c."movementId"
+        where m."referenceType" = 'SalesOrder' and m."referenceId" = $1`,
+      [salesOrderId],
+    )
+    const unit = Number(r.rows[0]?.unit)
+    if (!Number.isFinite(unit)) throw new Error(`No CogsEntry rows for order ${salesOrderId} — the dispatch was never journaled.`)
+    return unit
+  } finally {
+    await db.end()
+  }
+}
+
+/** The CURRENT unit cost of the product's live inbound cost layer — what a landed cost revalues. */
+async function latestCostLayerUnitCostFor(productId: string): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    // The layer the goods PO created — the one a landed cost revalues. CostLayer has no source
+    // discriminator column; poLineId is what distinguishes a received-from-PO layer from one a return
+    // recreated.
+    const r = await db.query<{ unitCostBase: string }>(
+      `select "unitCostBase"::text from cost_layers
+        where "productId" = $1 and "poLineId" is not null
+        order by "receivedAt" desc limit 1`,
+      [productId],
+    )
+    if (!r.rows.length) throw new Error(`No PO-sourced cost layer for product ${productId}`)
+    return Number(r.rows[0].unitCostBase)
+  } finally {
+    await db.end()
+  }
+}
+
+/** A settings value on this instance (OC-24 reads the inventory/COGS account codes to assert lines). */
+async function settingValueOc(key: string): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ value: string }>(`select value from settings where key = $1`, [key])
+    if (!r.rows.length || !r.rows[0].value) throw new Error(`Setting ${key} is not configured on this instance.`)
+    return r.rows[0].value
+  } finally {
+    await db.end()
+  }
+}
+
+/** The PurchaseInvoice ids raised against a PO — so OC-24's teardown can void the bills it created. */
+async function billIdsForPoOc(poId: string): Promise<string[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ id: string }>(`select id from purchase_invoices where "poId" = $1`, [poId])
+    return r.rows.map((row) => row.id)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Has Group A1 recognised revenue for this order? The branch selector for the reversal's unwind. */
+async function revenueDeferredDateSet(salesOrderId: string): Promise<boolean> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ set: boolean }>(
+      `select ("accounting_revenue_deferred_date" is not null) as set from sales_orders where id = $1`, [salesOrderId],
+    )
+    return r.rows[0]?.set ?? false
+  } finally {
+    await db.end()
+  }
+}
+
+/** Is the order still marked paid locally? */
+async function paidAtSet(salesOrderId: string): Promise<boolean> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ set: boolean }>(
+      `select ("paidAt" is not null) as set from sales_orders where id = $1`, [salesOrderId],
+    )
+    return r.rows[0]?.set ?? false
+  } finally {
+    await db.end()
+  }
+}
+
+/** The order's current status — read either side of a reversal to prove it was not auto-reverted. */
+async function salesOrderStatus(salesOrderId: string): Promise<string> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ status: string }>(`select status from sales_orders where id = $1`, [salesOrderId])
+    if (!r.rows.length) throw new Error(`No sales order ${salesOrderId}`)
+    return r.rows[0].status
+  } finally {
+    await db.end()
+  }
+}
+
+/** How many refunds/credit notes the order carries — "exactly once" is the whole idempotency claim. */
+async function refundCountFor(salesOrderId: string): Promise<number> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ n: string }>(
+      `select count(*)::text as n from sales_order_refunds where "orderId" = $1`, [salesOrderId],
+    )
+    return Number(r.rows[0]?.n ?? 0)
+  } finally {
+    await db.end()
+  }
+}
+
+/** Every posted CREDIT_NOTE external id for the order, so teardown can void what the reversal raised. */
+async function creditNoteExternalIdsFor(salesOrderId: string): Promise<string[]> {
+  const { Client } = await import('pg')
+  const db = new Client({ connectionString: process.env.DATABASE_URL })
+  await db.connect()
+  try {
+    const r = await db.query<{ externalTransactionId: string }>(
+      `select l."externalTransactionId" from accounting_sync_logs l
+         join sales_order_refunds r on r.id = l."referenceId"
+        where l.connector = 'xero' and l.type = 'CREDIT_NOTE'
+          and r."orderId" = $1 and l."externalTransactionId" is not null`,
+      [salesOrderId],
+    )
+    return r.rows.map((row) => row.externalTransactionId)
+  } finally {
+    await db.end()
+  }
+}
+
 const PAYMENT_MAP_KEY = 'accounting_payment_account_map'
+/** Off between runs so nothing reaches the shared Demo ledger by accident; OC-09 arms it for its poll. */
+const POLLING_KEY = 'xero_payment_polling_enabled'
 /** Unset on the rig (invoices are numbered manually); OC-21/22 arm it so the Invoice panel renders. */
 const INVOICE_TRIGGER_KEY = 'invoice_trigger'
 

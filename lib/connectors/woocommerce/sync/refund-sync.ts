@@ -2,6 +2,7 @@
  * WooCommerce → IMS refund sync.
  */
 
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
@@ -14,7 +15,7 @@ import type { createRefund as createRefundAction } from '@/app/actions/sales'
 type CreateRefundAction = typeof createRefundAction
 
 export type WcRefundSyncDependencies = {
-  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog'>
+  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | '$transaction'>
   createRefund?: CreateRefundAction
   logActivity?: typeof logActivity
 }
@@ -41,6 +42,97 @@ function parseDecimalAbs(value: string | number | null | undefined) {
   return decimal.lt(0) ? decimal.neg() : decimal
 }
 
+// o3d-7yf: when a refund finally lands (a successful retry or a verified same-order dedup), RESOLVE this
+// order's lingering actionable park instead of only appending a separate SYNCED log. The partial unique
+// index excludes SYNCED rows, so a fresh SYNCED log never collides with — nor clears — the old PENDING/
+// FAILED park; left alone it keeps counting in the exception inbox, blocks deletion/rebind, and evades
+// retention forever. Scoped to THIS order + refund. QUARANTINED is left untouched: it is an operator-gated
+// refusal that never reaches a successful auto-sync (the preflight returns it as handled first).
+async function resolveActionableParks(
+  client: Pick<typeof db, 'shoppingSyncLog'>,
+  soId: string,
+  externalId: string,
+): Promise<void> {
+  await client.shoppingSyncLog.updateMany({
+    where: {
+      connector: 'woocommerce',
+      direction: 'FROM_CONNECTOR',
+      entityType: 'SalesOrder',
+      externalId,
+      entityId: soId,
+      status: { in: ['PENDING', 'FAILED'] },
+    },
+    data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },
+  })
+}
+
+// o3d-7yf: record a refund park deduplicated by externalId. Repeated deliveries of the same unresolved
+// WooCommerce refund (an amount mismatch re-imported every sweep, a still-failing retry) must keep ONE
+// current row, not append a fresh one each time — unbounded copies would grow the table and crowd real
+// QUARANTINED refunds out of the 50-row exception inbox. Updates the existing actionable park in place.
+async function upsertRefundPark(
+  client: Pick<typeof db, '$transaction'>,
+  input: { soId: string; externalId: string; status: 'PENDING' | 'FAILED' | 'QUARANTINED'; errorMessage: string; payload?: unknown },
+): Promise<void> {
+  // Match the partial unique index shopping_sync_logs_active_refund_park_uq EXACTLY (connector, direction,
+  // entityType, actionable status, externalId, and entityId NOT NULL) so this can never pick up an
+  // order-import failure log (same connector/type but no entityId) that happens to share an externalId.
+  const parkWhere: Prisma.ShoppingSyncLogWhereInput = {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    entityType: 'SalesOrder',
+    externalId: input.externalId,
+    entityId: { not: null },
+    status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+  }
+  const data = {
+    connector: 'woocommerce' as const,
+    direction: 'FROM_CONNECTOR' as const,
+    status: input.status,
+    entityType: 'SalesOrder',
+    entityId: input.soId,
+    externalId: input.externalId,
+    errorMessage: input.errorMessage,
+    syncedAt: new Date(),
+    ...(input.payload !== undefined ? { payload: input.payload as never } : {}),
+  }
+  // o3d-7yf finding 2: create/update the park under the SAME order row lock deleteSalesOrder takes
+  // (lockSalesOrder = SELECT ... FOR UPDATE). A refund sweep could otherwise read the order, deletion
+  // observe no park, and the sweep then insert an actionable park after the check/delete — orphaning it.
+  // Under the lock we re-verify the order still exists; if it was deleted, we do NOT write an orphaned
+  // park (the refund is for a gone order — surfaced by the caller's earlier resolve failing next time).
+  await client.$transaction(async (tx) => {
+    // o3d-ee9: take the per-refund advisory lock FIRST (before the order row lock — matching
+    // createSalesOrderRefund's order so the two can't deadlock). This serializes the park write against a
+    // concurrent refund CREATE for the same refund id on ANY order, closing the window where a refund could
+    // commit on order A while a stale actionable park is written for order B.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${input.externalId}`}))`
+    // Under that lock, re-read whether the refund has now LANDED (on any order). If a SalesOrderRefund exists
+    // for this external id, a park (which asserts the refund is unresolved) would be contradictory — skip it.
+    const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: Number(input.externalId) }, select: { id: true } })
+    if (landed) return
+
+    const rows = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE id = ${input.soId} FOR UPDATE`
+    if (rows.length === 0) return
+
+    // The order row lock SERIALIZES every park write for this refund's order, so the findFirst reliably
+    // sees an already-committed park and no two deliveries can race the create. (The partial unique index
+    // shopping_sync_logs_active_refund_park_uq stays as a DB backstop.)
+    const existing = await tx.shoppingSyncLog.findFirst({ where: parkWhere, orderBy: { createdAt: 'desc' }, select: { id: true, entityId: true } })
+    if (existing) {
+      if (existing.entityId !== input.soId) {
+        // The index is keyed by (connector, externalId), so an actionable park for this refund id on a
+        // DIFFERENT order is a genuine anomaly (a WC refund id maps to one order). Fail CLOSED — never
+        // move A's durable refund evidence onto B's row, which would let A be deleted and mis-block B.
+        throw new Error(`WooCommerce refund ${input.externalId} is already parked for a different order (${existing.entityId}); refusing to move it.`)
+      }
+      await tx.shoppingSyncLog.update({ where: { id: existing.id }, data })
+    } else {
+      await tx.shoppingSyncLog.create({ data })
+    }
+  })
+}
+
 export async function syncWcRefund(
   externalOrderId: number,
   wcRefund: WcRefund,
@@ -64,14 +156,50 @@ export async function syncWcRefund(
         externalOrderNumber: true,
         fxRateToBase: true,
         totalBase: true,
+        taxRatePercent: true,
         lines: { select: { id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true } },
       },
     })
     if (!so) return { success: false, error: `IMS order not found for WC order ${externalOrderId}` }
 
-    // Check if already processed
-    const existing = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id } })
-    if (existing) return { success: true } // already synced
+    // Check if already processed. externalRefundId is GLOBALLY unique, so a matching refund may belong to
+    // ANOTHER order — o3d-7yf: verify ownership. Same order => idempotent success; different order => fail
+    // closed rather than silently reporting "handled" and leaving THIS order without its refund.
+    const existing = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
+    if (existing) {
+      if (existing.orderId === so.id) {
+        // Already synced. A prior delivery may have committed the refund but then failed a post-commit step
+        // and written a FAILED park — every later delivery lands here, so resolve that lingering park now
+        // rather than leaving it actionable forever (inbox / deletion+rebind guard / retention exemption).
+        await resolveActionableParks(client, so.id, String(wcRefund.id))
+        return { success: true }
+      }
+      return { success: false, error: `WooCommerce refund ${wcRefund.id} already exists on a different order (${existing.orderId}); refusing to apply it here.` }
+    }
+
+    // o3d-iup: a refund we deliberately PARKED (a monetary-only refund the order can't tax uniformly)
+    // creates no SalesOrderRefund, so without this guard the sweep would re-import and re-refuse it every
+    // run. o3d-7yf: check EVERY actionable park (the index keeps at most one per externalId), scoped by
+    // order. A park for refund X on a DIFFERENT order fails closed (never apply X to two orders). This
+    // order's QUARANTINED park is "handled" (awaiting operator resolution — not retryable); a PENDING/FAILED
+    // park is this order's own retryable state, so fall through and let the sync re-attempt it.
+    const parked = await client.shoppingSyncLog.findFirst({
+      where: {
+        connector: 'woocommerce',
+        direction: 'FROM_CONNECTOR',
+        entityType: 'SalesOrder',
+        externalId: String(wcRefund.id),
+        entityId: { not: null },
+        status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+      },
+      select: { entityId: true, status: true },
+    })
+    if (parked && parked.entityId !== so.id) {
+      return { success: false, error: `WooCommerce refund ${wcRefund.id} is already parked for a different order (${parked.entityId}); refusing to process it for this order.` }
+    }
+    if (parked && parked.status === 'QUARANTINED') {
+      return { success: true } // this order's quarantined park — handled, not retryable
+    }
 
     const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
     const refundAmountForeign = parseDecimalAbs(wcRefund.amount)
@@ -147,14 +275,19 @@ export async function syncWcRefund(
     }
 
     if (refundLines.length === 0) {
-      // Monetary-only refund (no line items / shipping to break down): treat the
-      // whole gross amount as a single line. Its gross equals wcRefund.amount.
+      // Monetary-only refund (no line items / shipping to break down): the money returned to the customer
+      // is GROSS (tax-inclusive), but every refund line is stored NET (o3d-w00) — the credit note grosses
+      // it back up via the snapshotted tax type. So convert the gross refund to net using the order's VAT
+      // rate here; a non-taxable order (rate 0) leaves it unchanged. The gross accumulator below stays
+      // GROSS, because the amount-mismatch reconciliation checks against wcRefund.amount which is gross.
+      const vatRate = toDecimal(so.taxRatePercent ?? 0).div(100)
+      const netForeign = toDecimal(refundAmountForeign).div(toDecimal(1).add(vatRate))
       refundLines.push({
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',
         qty: 0,
-        totalForeign: roundDecimalNumber(refundAmountForeign, 4),
-        totalBase: divideRoundedNumber(refundAmountForeign, fxRate, 4),
+        totalForeign: roundDecimalNumber(netForeign, 4),
+        totalBase: divideRoundedNumber(netForeign, fxRate, 4),
         lineKind: 'sale',
       })
       mappedGrossForeign = refundAmountForeign
@@ -163,16 +296,12 @@ export async function syncWcRefund(
     const mappedGrossRounded = roundDecimalNumber(mappedGrossForeign, 4)
     if (refundLines.length > 0 && toDecimal(mappedGrossRounded).sub(refundAmountForeign).abs().gt(0.01)) {
       const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${toDecimal(mappedGrossRounded).toFixed(2)} but refund total is ${refundAmountForeign.toDecimalPlaces(2).toFixed(2)}`
-      await client.shoppingSyncLog.create({
-        data: {
-          direction: 'FROM_CONNECTOR',
-          status: 'PENDING',
-          entityType: 'SalesOrder',
-          entityId: so.id,
-          externalId: String(wcRefund.id),
-          payload: wcRefund as never,
-          errorMessage: error,
-        },
+      await upsertRefundPark(client, {
+        soId: so.id,
+        externalId: String(wcRefund.id),
+        status: 'PENDING',
+        errorMessage: error,
+        payload: wcRefund,
       })
       return {
         success: false,
@@ -204,6 +333,13 @@ export async function syncWcRefund(
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error
+      // o3d-7yf: the unique violation may be a CROSS-ORDER race — the refund that won the externalRefundId
+      // could belong to another order. Verify ownership before recording a SYNCED dedup log for THIS order;
+      // otherwise the loser is falsely marked synced while its refund lives on a different order.
+      const winner = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
+      if (winner && winner.orderId !== so.id) {
+        return { success: false, error: `WooCommerce refund ${wcRefund.id} was concurrently created on a different order (${winner.orderId}); refusing to mark it synced here.` }
+      }
       await client.shoppingSyncLog.create({
         data: {
           direction: 'FROM_CONNECTOR',
@@ -215,6 +351,8 @@ export async function syncWcRefund(
           syncedAt: new Date(),
         },
       })
+      // The verified same-order refund exists — resolve any lingering actionable park for it too.
+      await resolveActionableParks(client, so.id, String(wcRefund.id))
       await writeActivity({
         entityType: 'SALES_ORDER',
         entityId: so.id,
@@ -300,16 +438,16 @@ export async function syncWcRefund(
     }
 
     if (!result.success) {
-      await client.shoppingSyncLog.create({
-        data: {
-          direction: 'FROM_CONNECTOR',
-          status: 'FAILED',
-          entityType: 'SalesOrder',
-          entityId: so.id,
-          externalId: String(wcRefund.id),
-          errorMessage: result.error,
-          syncedAt: new Date(),
-        },
+      // o3d-iup: a deliberate refusal (result.quarantine) is PARKED, not a transient failure — record it
+      // as QUARANTINED so the sweep dedup skips it (no per-sweep re-refusal loop) and FAILED dashboards
+      // don't treat it as retryable. The refusal message already tells the operator to resolve it in IMS
+      // and not to issue another Woo refund.
+      const quarantined = result.quarantine === true
+      await upsertRefundPark(client, {
+        soId: so.id,
+        externalId: String(wcRefund.id),
+        status: quarantined ? 'QUARANTINED' : 'FAILED',
+        errorMessage: result.error ?? 'refund sync failed',
       })
       return { success: false, error: result.error }
     }
@@ -324,6 +462,8 @@ export async function syncWcRefund(
         syncedAt: new Date(),
       },
     })
+    // A same-order PENDING/FAILED park intentionally fell through to this retry — now that it landed, clear it.
+    await resolveActionableParks(client, so.id, String(wcRefund.id))
 
     await writeActivity({
       entityType: 'SALES_ORDER',
@@ -368,10 +508,10 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<numb
   let synced = 0
 
   for (const refund of refunds) {
-    // Check if already synced
-    const exists = await db.salesOrderRefund.findFirst({ where: { externalRefundId: refund.id } })
-    if (exists) continue
-
+    // o3d-7yf: BOTH the already-synced check and the parked-refund skip live in syncWcRefund now, scoped to
+    // the resolved IMS order id. An externalId-only pre-skip HERE (the sweep has only the WC order id) would
+    // repeat the cross-order leak — a refund/park owned by another order would wrongly skip this one.
+    // syncWcRefund is idempotent for an already-synced or parked refund, so it is the single scoped authority.
     const result = await syncWcRefund(externalOrderId, refund)
     if (result.success) synced++
   }

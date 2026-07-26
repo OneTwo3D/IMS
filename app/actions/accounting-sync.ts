@@ -129,9 +129,6 @@ export async function getFailedAccountingSyncSummary(): Promise<FailedAccounting
   return { connector, failedCount }
 }
 
-// Match the processor's stale-claim window so an actively-processing row is not
-// clobbered mid-flight by a cancel (audit-H4 review).
-const ORPHAN_CANCEL_STALE_PROCESSING_MS = 15 * 60 * 1000
 
 /**
  * audit-H4: bulk-cancel orphaned live sync rows. Marks them CANCELLED (audit-46ry)
@@ -144,7 +141,7 @@ const ORPHAN_CANCEL_STALE_PROCESSING_MS = 15 * 60 * 1000
  */
 export async function cancelOrphanedAccountingSyncRows(
   connector?: string,
-): Promise<{ success: boolean; cancelled: number; error?: string }> {
+): Promise<{ success: boolean; cancelled: number; error?: string; inFlightNotCancelled?: number }> {
   await requirePermission('settings')
   const activeConnector = await getActiveConnector()
   // Never cancel the active connector's own queue.
@@ -158,44 +155,90 @@ export async function cancelOrphanedAccountingSyncRows(
     return { success: false, cancelled: 0, error: 'No active accounting connector — specify which connector’s orphaned rows to cancel.' }
   }
 
-  // Don't clobber a row a processor is actively working: only PENDING rows and
-  // PROCESSING rows whose claim has gone stale (audit-H4 review). A mid-flight
-  // row is left to finish; it then leaves the live set on its own.
-  const staleProcessingCutoff = new Date(Date.now() - ORPHAN_CANCEL_STALE_PROCESSING_MS)
-  const where = {
-    AND: [
-      connector ? { connector } : { connector: { not: activeConnector ?? undefined } },
-      {
-        OR: [
-          { status: 'PENDING' as const },
-          { status: 'PROCESSING' as const, processingStartedAt: null },
-          { status: 'PROCESSING' as const, processingStartedAt: { lt: staleProcessingCutoff } },
-        ],
-      },
-    ],
-  }
+  // o3d-sref: ONLY PENDING rows are cancelled. A PROCESSING row — stale claim or not — is left
+  // exactly as it is.
+  //
+  // The two are not the same fact. A PENDING row is provably PRE-CALL: nothing was sent, so
+  // "the ledger was never told" is true and retiring it asserts nothing that might be false.
+  //
+  // A PROCESSING row had its claim TAKEN, which means the processor may already have made its remote
+  // call — they post BEFORE persisting SYNCED and the externalTransactionId — and then died without
+  // recording the result. There is no external id to find, so nothing can settle it from here.
+  // Retiring it as CANCELLED told the order delete guard the row was deliberately abandoned, the hard
+  // delete was permitted, and a late remote success then wrote a document against an order that no
+  // longer existed. Exactly what the o3d-5r8 claim protocol prevents, reached through this sweep
+  // instead of a race on the claim.
+  //
+  // Leaving it PROCESSING is the whole fix: PROCESSING is already in LIVE_ACCOUNTING_SYNC_STATUSES,
+  // so the delete guard blocks on it with no new state to introduce, propagate, retain, index or
+  // surface. A previous attempt at this (PR #590) added a persisted ambiguity flag and needed a
+  // coherent design across five subsystems to be correct; this needs none.
+  //
+  // THE COST, deliberately accepted: these rows stay in the live set, so the cross-connector orphan
+  // count will not fall to zero for a connector that was switched off mid-flight. That is honest —
+  // they ARE unresolved — and the sweep now reports them so an operator can see why. FAILED
+  // dashboards are unaffected: they scan `status = 'FAILED'`, which this never produces.
+  const scope = connector ? { connector } : { connector: { not: activeConnector ?? undefined } }
 
   const reason = `Cancelled: orphaned accounting sync row for ${connector ?? 'a non-active connector'} (no longer the active connector${activeConnector ? ` — now ${activeConnector}` : ''}).`
   const result = await db.accountingSyncLog.updateMany({
-    where,
+    where: { AND: [scope, { status: 'PENDING' as const }] },
     // audit-46ry: CANCELLED (not FAILED) so these abandoned rows are excluded from
     // FAILED-scanning reconciliation/backfill sweeps and error dashboards.
     data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
   })
 
-  if (result.count > 0) {
+  // Counted, not cancelled — so the activity log explains why the orphan count did not reach zero.
+  //
+  // EVERY surviving PROCESSING row is counted, not just the stale ones. The update above leaves them
+  // all, so scoping this count to `stale` would omit a row claimed moments before the connector
+  // switch, or one that won the PENDING->PROCESSING race against the update. The action would then
+  // report zero, write no explanation, and clear the banner notice — while the orphan count visibly
+  // stayed non-zero on refresh. That is the "button reads as broken" outcome this count exists to
+  // prevent, so it must match what actually survived rather than what was targeted.
+  //
+  // The scope is RE-DERIVED here rather than reusing the one the update ran under. activeConnector
+  // was sampled before the update, so if another administrator activates the target connector in
+  // between, the stale scope would count rows that now belong to the ACTIVE connector — and the
+  // response and the permanent activity log would describe live, healthy work as switched-off and
+  // possibly lost, while the refreshed banner correctly excluded it. Contradictory accounting
+  // evidence is worse than a slightly stale count, so this reads the current state.
+  const activeNow = await getActiveConnector()
+  const stillOrphaned = connector
+    ? (connector === activeNow ? null : { connector })
+    : { connector: { not: activeNow ?? undefined } }
+
+  const inFlight = stillOrphaned === null
+    ? 0
+    : await db.accountingSyncLog.count({
+      where: { AND: [stillOrphaned, { status: 'PROCESSING' as const }] },
+    })
+
+  if (result.count > 0 || inFlight > 0) {
     await logActivity({
       entityType: 'SYSTEM',
       action: 'accounting_sync_orphans_cancelled',
       tag: 'sync',
       level: 'WARNING',
-      description: `Cancelled ${result.count} orphaned accounting sync row(s) for ${connector ?? 'non-active connector(s)'}${activeConnector ? ` (active connector: ${activeConnector})` : ''}.`,
-      metadata: { cancelledCount: result.count, connector: connector ?? null, activeConnector },
+      description: inFlight > 0
+        ? `Cancelled ${result.count} orphaned accounting sync row(s) for ${connector ?? 'non-active connector(s)'}${activeConnector ? ` (active connector: ${activeConnector})` : ''}. `
+          + `${inFlight} row(s) were NOT cancelled: their claim had already been taken, so a request may `
+          + `have reached the connector and been lost. Check ${connector ?? 'that connector'} for the `
+          + `document(s); these rows stay in the orphan count and continue to block deleting their `
+          + `orders until resolved (o3d-sref).`
+        : `Cancelled ${result.count} orphaned accounting sync row(s) for ${connector ?? 'non-active connector(s)'}${activeConnector ? ` (active connector: ${activeConnector})` : ''}.`,
+      metadata: {
+        cancelledCount: result.count,
+        connector: connector ?? null,
+        activeConnector,
+        // Separate because the remedy differs: these need a human to look at the connector.
+        inFlightNotCancelled: inFlight,
+      },
     })
   }
 
   revalidatePath('/sync')
-  return { success: true, cancelled: result.count }
+  return { success: true, cancelled: result.count, inFlightNotCancelled: inFlight }
 }
 
 export async function getAccountingIntegrationConnector() {

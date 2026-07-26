@@ -81,6 +81,17 @@ export function formatCountryDisplay(input: string | null | undefined): string {
   return input.trim()
 }
 
+/**
+ * The country the WMS/customs push falls back to when a product's origin is UNSET — it mirrors the
+ * `countryOfOrigin ?? DEFAULT_COUNTRY_OF_ORIGIN` fallback in the product sync. Rendered in the UI (o3d-vj5,
+ * option a: display-time resolution) so an unset origin DISPLAYS the same value that is actually SENT,
+ * without persisting a fallback (which would be indistinguishable from a real origin — the provenance
+ * problem bhdm.7 avoided). e.g. "China (CN)".
+ */
+export function defaultCountryOfOriginLabel(): string {
+  return `${countryName(DEFAULT_COUNTRY_OF_ORIGIN)} (${DEFAULT_COUNTRY_OF_ORIGIN})`
+}
+
 /** Convert ISO-2 country code to emoji flag (Regional Indicator Symbol pairs). */
 export function countryFlag(code: string | null | undefined): string {
   if (!code || code.length !== 2) return ''

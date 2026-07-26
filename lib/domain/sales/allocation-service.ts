@@ -40,6 +40,21 @@ export type AllocateSalesOrderInput = {
    * allocation commit and a separate resolve. A throw here rolls the allocation back (the backstop then retries).
    */
   onReconciledInTx?: (tx: Prisma.TransactionClient) => Promise<void>
+  /**
+   * o3d-6ab: the set of statuses the order must STILL be in when the row lock is acquired, for this
+   * allocation to be legitimate. Batch callers (the backorder allocator, the periodic reallocation
+   * sweep) pick candidates by status OUTSIDE the lock; the lock serializes the writes but does not
+   * revalidate the REASON for writing, so an order that moved PROCESSING→ON_HOLD (or →PICKING) in the
+   * selection→lock window would still be released, deleted, recreated and re-reserved. When set and the
+   * under-lock status is not in the set, allocation is an explicit no-op: nothing is written, and the
+   * result is `skipped` — NOT an error (the caller's premise simply expired; another actor now owns the
+   * order). Leave unset for user- and event-driven callers that allocate a specific order on purpose.
+   *
+   * CANCELLED / refundStatus=FULL are deliberately exempt: those already take the zero-demand path
+   * below, which RELEASES reservations. Deallocation is always safe and always wanted, so the guard
+   * must not turn it into a no-op that strands reservations on a cancelled order.
+   */
+  requireStatusUnderLock?: readonly SalesOrderStatus[]
 }
 
 export type AllocateSalesOrderResult = {
@@ -57,6 +72,12 @@ export type AllocateSalesOrderResult = {
   // o3d-67y: true when refuseIfShipmentsExist declined because a shipment exists — the
   // reservation was deliberately left untouched (not a failure, not a reconciliation).
   refused?: boolean
+  // o3d-6ab: true when requireStatusUnderLock was set and the under-lock status was no longer
+  // allocation-eligible. Explicit no-op: nothing was written, nothing was committed, and it is NOT a
+  // failure — `error` is undefined so batch callers don't log it as one.
+  skipped?: boolean
+  // o3d-6ab: the under-lock status that caused the skip, for logging/telemetry.
+  skippedStatus?: SalesOrderStatus
 }
 
 export type AllocationUnallocatedLine = Pick<
@@ -142,6 +163,46 @@ export function buildAvailableStockMapIncludingOwnReservations(
   return stockMap
 }
 
+/**
+ * (product, warehouse) scopes where this order's OWN allocation rows exceed what is actually
+ * reserved against them (o3d-4kfh).
+ *
+ * `buildAvailableStockMapIncludingOwnReservations` adds an order's allocations back into
+ * available stock so a recomputation is not fighting its own reservations — and it does that
+ * unconditionally, even when reservedQty has already fallen BELOW those rows. It warns, but the
+ * warning fed nothing.
+ *
+ * Detection only. The unconditional release/delete/recreate/reserve cycle does NOT repair such a
+ * row — it releases this order's own quantity and reserves the same quantity straight back, which
+ * nets to zero against the discrepancy. So neither allocating nor short-circuiting fixes it, and
+ * forcing a rewrite would only reintroduce churn.
+ *
+ * The consequence is real: stock this order believes it holds is available to another one, so a
+ * second order can allocate it and a dispatch can fail. Repairing it means recomputing reservedQty
+ * from every live reservation source for the scope — a stock-integrity change beyond this path,
+ * tracked on o3d-4kfh. This makes the condition loud in the meantime.
+ */
+export function findUnderReservedScopes(
+  stockRows: Array<{ productId: string; warehouseId: string; reservedQty: DecimalInput }>,
+  ownRows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
+): Array<{ productId: string; warehouseId: string }> {
+  const ownByScope = new Map<string, Prisma.Decimal>()
+  for (const row of ownRows) {
+    const key = `${row.productId}:${row.warehouseId}`
+    ownByScope.set(key, (ownByScope.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)))
+  }
+
+  const scopes: Array<{ productId: string; warehouseId: string }> = []
+  for (const row of stockRows) {
+    const ownQty = ownByScope.get(`${row.productId}:${row.warehouseId}`)
+    if (!ownQty) continue
+    if (ownQty.gt(toDecimal(row.reservedQty).add(ALLOCATION_EPSILON_DECIMAL))) {
+      scopes.push({ productId: row.productId, warehouseId: row.warehouseId })
+    }
+  }
+  return scopes
+}
+
 function cloneAvailableStockMap(
   stockMap: DecimalStockMap,
 ): DecimalStockMap {
@@ -170,6 +231,24 @@ function applyRequirementDeltaToAvailableMap(
   }
 }
 
+/**
+ * Which sales orders each open transaction has row-locked (o3d-3zgy).
+ *
+ * Postgres cannot answer this for us: an uncontended `SELECT ... FOR UPDATE` records the lock in the
+ * tuple header, not in `pg_locks`, so there is nothing to query. This registry is therefore an
+ * IN-PROCESS assertion aid, not a distributed guarantee — its job is to make a caller that forgot to
+ * hoist the lock fail loudly instead of silently reopening the delete race.
+ *
+ * Keyed weakly on the transaction client, so entries disappear with the transaction object and
+ * nothing has to clean up on commit or rollback.
+ */
+const ordersLockedByTx = new WeakMap<object, Set<string>>()
+
+/** Has THIS transaction already row-locked this order? See ordersLockedByTx for the caveats. */
+export function hasLockedSalesOrder(tx: Prisma.TransactionClient, orderId: string): boolean {
+  return ordersLockedByTx.get(tx as object)?.has(orderId) ?? false
+}
+
 export async function lockSalesOrder(
   tx: Prisma.TransactionClient,
   orderId: string,
@@ -177,7 +256,12 @@ export async function lockSalesOrder(
   await tx.$queryRaw(
     Prisma.sql`SELECT id FROM "sales_orders" WHERE id = ${orderId} FOR UPDATE`,
   )
+  // Recorded AFTER the lock is actually held, so a failed lock never registers.
+  const locked = ordersLockedByTx.get(tx as object)
+  if (locked) locked.add(orderId)
+  else ordersLockedByTx.set(tx as object, new Set([orderId]))
 }
+
 
 export async function lockStockLevels(
   tx: Prisma.TransactionClient,
@@ -447,6 +531,9 @@ export async function cancelSalesOrderFulfillmentState(
   releasedAllocationCount: number
   deletedShipmentCount: number
   releasedReservationScopes: ReservationScope[]
+  // o3d-gz6: true when the order was SHIPPED with no dispatch evidence and its status was repaired to a
+  // pre-ship state so this cancel could proceed. The caller should audit it.
+  repairedFalseShipped: boolean
 }> {
   await lockSalesOrder(tx, input.orderId)
   const lockedOrder = await tx.salesOrder.findUnique({
@@ -475,24 +562,36 @@ export async function cancelSalesOrderFulfillmentState(
     select: { id: true },
   })
 
+  // The status used to validate the CANCELLED transition. Normally the order's real status; for a
+  // FALSE-SHIPPED order (o3d-gz6, below) it is repaired to the correct pre-ship state.
+  let effectiveStatus: string = lockedOrder.status
+  let repairedFalseShipped = false
+
   if (lockedOrder.status === 'SHIPPED') {
-    // Only irreversible once something actually shipped. A SHIPPED status with NO dispatch evidence is a
-    // data inconsistency rather than a terminal fact, so it is NOT marked permanent.
-    //
-    // KNOWN GAP (o3d-gz6), unchanged by o3d-bx9: such an order also cannot currently self-heal, because
-    // importWcOrder's existing-order path refreshes addresses/notes/paidAt but never status, and nothing
-    // re-runs a status sync. So a Woo cancel of a falsely-SHIPPED order still exhausts its retries — as
-    // it did before this change. Deciding to let that cancel through would release fulfilment state on an
-    // order the IMS believes shipped, which is a product call, not a classification one.
-    const message = 'Cannot cancel a shipped order — process a refund instead'
-    throw dispatchedShipment ? new PermanentStatusTransitionError(message) : new Error(message)
+    if (dispatchedShipment) {
+      // Genuinely dispatched — an irreversible fact. Cancelling would release reservations and delete
+      // pending shipments while the dispatched shipment's recognised COGS + revenue stay in the ledger
+      // with no reversal. Refuse permanently: process a refund instead.
+      throw new PermanentStatusTransitionError(
+        'Cannot cancel a shipped order — process a refund instead')
+    }
+    // FALSE-SHIPPED (o3d-gz6): the SHIPPED status came from the configurable WooCommerce status mapping
+    // (importWcOrder writes it straight into status), NOT a real dispatch — there is no SHIPPED/journaled
+    // shipment. The status is therefore unreliable, so REPAIR it to its correct pre-ship state and let
+    // the Woo cancellation proceed to release fulfilment and reach CANCELLED, instead of the shipped-order
+    // guard refusing it forever (the event exhausted its retries and dead-lettered). An order carrying
+    // allocations is canonically ALLOCATED (allocation flow), else PROCESSING; both legally transition to
+    // CANCELLED. The anomaly is surfaced via repairedFalseShipped so the caller can audit it.
+    const allocCount = await tx.orderAllocation.count({ where: { orderId: input.orderId } })
+    effectiveStatus = allocCount > 0 ? 'ALLOCATED' : 'PROCESSING'
+    repairedFalseShipped = true
   }
 
   if (dispatchedShipment) {
     throw new PermanentStatusTransitionError('Cannot cancel an order with a dispatched shipment — process a refund instead')
   }
 
-  const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, 'CANCELLED', {
+  const transition = validateManualSalesOrderStatusTransition(effectiveStatus, 'CANCELLED', {
     bypass: input.bypass,
   })
   if (!transition.success) throw new Error(transition.error)
@@ -550,6 +649,7 @@ export async function cancelSalesOrderFulfillmentState(
     releasedAllocationCount: currentAllocs.length,
     deletedShipmentCount: deletedShipments.count,
     releasedReservationScopes,
+    repairedFalseShipped,
   }
 }
 
@@ -684,6 +784,42 @@ function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
   return [...merged.values()].filter((row) => row.qty.gt(0))
 }
 
+/**
+ * Is the freshly computed allocation set identical to what is already persisted (o3d-i5it)?
+ *
+ * Compared as a SET keyed on (lineId, warehouseId, productId) — the same key mergeAllocationRows
+ * dedupes on — because row order is not meaningful and neither side is ordered.
+ *
+ * The quantity comparison is EXACT — Decimal.eq, not a tolerance. Comparing at one scale while
+ * mutating reservations at another is precisely the mismatch that made an earlier version of this
+ * check unreliable, so it must not quietly absorb a difference (o3d-i4qd).
+ *
+ * The consequence is that a computed quantity the column cannot represent exactly — a nested KIT's
+ * 0.11102224 against its persisted 0.1110 — reports as a CHANGE, so the short-circuit does not fire
+ * and that order keeps being rewritten. That is the pre-existing behaviour and is tracked as
+ * o3d-i4qd; the fix belongs in how the set is canonicalised, not in loosening this comparison.
+ *
+ * Decimal.eq rather than `===` because two Decimals of equal value can differ in representation.
+ */
+export function allocationSetsMatch(
+  existing: Array<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>,
+  next: AllocationRowInput[],
+): boolean {
+  if (existing.length !== next.length) return false
+
+  const key = (row: { lineId: string; warehouseId: string; productId: string }) =>
+    `${row.lineId}|${row.warehouseId}|${row.productId}`
+
+  const existingByKey = new Map(existing.map((row) => [key(row), toDecimal(row.qty)]))
+  if (existingByKey.size !== existing.length) return false // duplicate keys: not a canonical set
+
+  for (const row of next) {
+    const persisted = existingByKey.get(key(row))
+    if (!persisted || !persisted.eq(row.qty)) return false
+  }
+  return true
+}
+
 function collectNonOversellLeafComponents(
   productId: string,
   graph: Map<string, FulfillmentGraphNode>,
@@ -814,7 +950,7 @@ export async function allocateSalesOrder(
         select: { id: true },
       })
       if (shipmentExists) {
-        return { nextAllocations: [], syncProductIds: [], refused: true as const }
+        return { nextAllocations: [], syncProductIds: [], refused: true as const, skippedStatus: null }
       }
     }
 
@@ -828,7 +964,31 @@ export async function allocateSalesOrder(
     // refund committing between the payment advance and this allocation is honoured (Codex review #496).
     const zeroDemand = lockedStatus === 'CANCELLED' || locked?.refundStatus === 'FULL'
 
-    await resetAllocationAccountingIfStaged(tx, orderId)
+    // o3d-6ab: revalidate the CALLER'S PREMISE under the lock, not just the order's own state. Batch
+    // callers select candidates by status outside the lock; by the time the lock is granted the order
+    // may have moved to a status that no longer wants (re)allocation — ON_HOLD, or already advanced past
+    // PROCESSING into PICKING/PACKED/SHIPPED. Without this the release/delete/recreate + re-reserve below
+    // still runs, silently re-reserving stock for a held order and churning an order someone else now
+    // owns. Skipped BEFORE the first write (resetAllocationAccountingIfStaged) so the no-op is total.
+    // zeroDemand is exempt on purpose — see requireStatusUnderLock's doc comment: releasing a
+    // cancelled/fully-refunded order's reservations is always correct, so it must not be short-circuited.
+    if (
+      !zeroDemand &&
+      input.requireStatusUnderLock &&
+      !input.requireStatusUnderLock.includes(lockedStatus)
+    ) {
+      return {
+        nextAllocations: [],
+        syncProductIds: [],
+        refused: false as const,
+        skippedStatus: lockedStatus,
+      }
+    }
+
+    // NOTE: resetAllocationAccountingIfStaged is deliberately NOT called here (o3d-i5it). It used
+    // to run before the allocation was even computed, so a re-run that changed nothing still
+    // cleared inventoryAllocatedDate and the cost snapshots. It now runs only once the computed
+    // set is known to DIFFER from the persisted one — see the unchanged-set check below.
     const graph = await loadFulfillmentProductGraph(tx, productIds)
     const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
     for (const line of so.lines) {
@@ -948,42 +1108,112 @@ export async function allocateSalesOrder(
       }
     }
 
+    // NOT canonicalised to the persisted scale here — three attempts at that failed, and the
+    // reasons are worth keeping (o3d-i4qd):
+    //
+    //   - ROUND_HALF_UP rounds UP, but feasibility was decided against the UNROUNDED value, so
+    //     the row can claim more than was proven available: a 0.999960 residual becomes 1.0000
+    //     and violates the reservedQty <= quantity constraint.
+    //   - flooring each row INDEPENDENTLY breaks the KIT invariant. Components of one kit are a
+    //     COUPLED, proportional set, and validateAllocationIntegrity enforces that to 1e-6.
+    //     Flooring 0.11108889 -> 0.1110 while 0.3333 stays exact makes the two disagree about
+    //     how many kits they represent, and shipment confirmation then refuses the order with
+    //     "must keep bundle components in matching quantities". Excluding a sub-scale component
+    //     while keeping its siblings is the same corruption by another route.
+    //
+    // Doing it correctly means canonicalising each (line, warehouse) fulfilment set ATOMICALLY:
+    // derive one representable coverage, regenerate every component from it, verify integrity
+    // BEFORE persisting, and drop the whole set — reserving none of it — if no proportional
+    // representation exists. That is o3d-i4qd, and it is a redesign rather than a rounding call.
+    //
+    // Leaving it unrounded is the PRE-EXISTING behaviour: the column rounds on write, so the
+    // reservation drift o3d-i4qd describes remains, and the unchanged-set check below simply does
+    // not fire for a nested KIT whose expanded factor is unrepresentable. Both are unchanged from
+    // before this branch — no new breakage, and the short-circuit still fires for every ordinary
+    // line, which is the overwhelming majority.
     const nextAllocations = mergeAllocationRows(nextAllocationRows)
     const existingAllocs = await tx.orderAllocation.findMany({
       where: { orderId },
       select: { lineId: true, productId: true, warehouseId: true, qty: true },
     })
-    await applyAllocationReservationDelta(
-      tx,
-      existingAllocs.map((alloc) => ({
-        productId: alloc.productId,
-        warehouseId: alloc.warehouseId,
-        qty: alloc.qty,
-      })),
-      'release',
-    )
-    await tx.orderAllocation.deleteMany({ where: { orderId } })
 
-    for (const alloc of nextAllocations) {
-      await tx.orderAllocation.create({
-        data: {
-          orderId,
-          lineId: alloc.lineId,
+    // o3d-i5it: when the computed set is identical to the persisted one, write NOTHING.
+    //
+    // The reset + release/delete/recreate/reserve cycle used to run unconditionally. That was
+    // tolerable while a stock event was the only driver. The o3d-9lx sweep rotates every 15
+    // minutes and selects every order with outstanding demand — including permanent partial
+    // backorders that cannot improve because no more stock exists — so each rotation destructively
+    // rewrote them.
+    //
+    // The damaging part is the accounting reset: for an ALLOCATED partial backorder already
+    // processed by Group A2, clearing inventoryAllocatedDate and the cost snapshots lets the next
+    // daily batch stage and post the SAME inventory reclassification again, and AccountingSyncLog
+    // has no uniqueness constraint that would stop the later-dated journal. Duplicate journals, not
+    // merely churn. Redundant storefront syncs and allocation activity came with it.
+    //
+    // Only the WRITES are skipped. The backorder report, the status promotion and the return value
+    // are all still computed from in-memory state, so an unchanged run reports exactly what a
+    // changed one would — callers cannot tell the difference except that nothing moved.
+    // o3d-4kfh: surface an existing reservedQty shortfall, but do NOT force a rewrite for it.
+    //
+    // I first assumed the unconditional cycle repaired such a row as a side effect, and that
+    // skipping it was therefore a regression. It does not: the cycle RELEASES this order's own
+    // quantity and then RESERVES the same quantity back, which is a no-op on the discrepancy —
+    // release 2 from a reservedQty of 0 and re-reserve 2 ends exactly where it started. Forcing
+    // the rewrite would reintroduce the perpetual churn o3d-i5it removed and fix nothing.
+    //
+    // Real reconciliation means recomputing reservedQty from every live reservation source for
+    // the scope, which is a stock-integrity change well beyond this path. Until then the
+    // condition is at least LOUD instead of a bare console warning nothing reads (o3d-4kfh).
+    const underReserved = findUnderReservedScopes(stockLevels, ownAllocations)
+    if (underReserved.length > 0) {
+      console.error(
+        `[allocation-service] order ${orderId}: reservedQty is BELOW this order's own allocations for `
+        + `${underReserved.map((scope) => `${scope.productId}@${scope.warehouseId}`).join(', ')} — `
+        + 'stock this order believes it holds is available to another. Neither allocating nor '
+        + 'short-circuiting repairs this; it needs reservation reconciliation (o3d-4kfh).',
+      )
+    }
+
+    const unchanged = allocationSetsMatch(existingAllocs, nextAllocations)
+
+    if (!unchanged) {
+      // Reached only for a real modification, so the accounting reset — and its posted-shipment
+      // guard — applies to an actual allocation change rather than to a no-op re-run.
+      await resetAllocationAccountingIfStaged(tx, orderId)
+
+      await applyAllocationReservationDelta(
+        tx,
+        existingAllocs.map((alloc) => ({
           productId: alloc.productId,
           warehouseId: alloc.warehouseId,
           qty: alloc.qty,
-        },
-      })
+        })),
+        'release',
+      )
+      await tx.orderAllocation.deleteMany({ where: { orderId } })
+
+      for (const alloc of nextAllocations) {
+        await tx.orderAllocation.create({
+          data: {
+            orderId,
+            lineId: alloc.lineId,
+            productId: alloc.productId,
+            warehouseId: alloc.warehouseId,
+            qty: alloc.qty,
+          },
+        })
+      }
+      await applyAllocationReservationDelta(
+        tx,
+        nextAllocations.map((alloc) => ({
+          productId: alloc.productId,
+          warehouseId: alloc.warehouseId,
+          qty: alloc.qty,
+        })),
+        'reserve',
+      )
     }
-    await applyAllocationReservationDelta(
-      tx,
-      nextAllocations.map((alloc) => ({
-        productId: alloc.productId,
-        warehouseId: alloc.warehouseId,
-        qty: alloc.qty,
-      })),
-      'reserve',
-    )
 
     // Promote to ALLOCATED only off the UNDER-LOCK status. Deciding on the stale pre-lock so.status
     // is how a concurrent PROCESSING→ON_HOLD (or →CANCELLED) got resumed to ALLOCATED off a value
@@ -998,16 +1228,27 @@ export async function allocateSalesOrder(
     const report = buildBackorderReport({
       // Demand is net of refunds here too, so refunded units aren't reported as
       // unallocated/backordered (which would otherwise mark the result unsuccessful).
+      //
+      // zeroDemand short-circuits to 0 (o3d-754w). CANCELLED and refundStatus=FULL are
+      // UNCONDITIONALLY zero demand — that is why `lines` above is emptied for them — but the
+      // per-line netting here only subtracts QUANTITY-linked refund lines. A cancelled order, or
+      // a FULL refund that is monetary-only, therefore kept its original demand in the report
+      // after a perfectly successful DEALLOCATION: every line read as unallocated, and for
+      // non-oversell products canLeaveUnallocated then made the whole call return
+      // success:false / 'No stock available for allocation'. Misleading failure activity on a
+      // correct deallocation, and callers branching on success took the wrong path.
       lines: so.lines.map((line) => ({
         id: line.id,
         orderId: line.orderId,
         productId: line.productId,
         sku: line.sku,
         description: line.description,
-        qty: Prisma.Decimal.max(
-          new Prisma.Decimal(0),
-          toDecimal(line.qty).sub(refundedByLine.get(line.id) ?? new Prisma.Decimal(0)),
-        ).toNumber(),
+        qty: zeroDemand
+          ? 0
+          : Prisma.Decimal.max(
+            new Prisma.Decimal(0),
+            toDecimal(line.qty).sub(refundedByLine.get(line.id) ?? new Prisma.Decimal(0)),
+          ).toNumber(),
         product: line.product,
       })),
       allocations: nextAllocations.map((allocation) => ({
@@ -1034,7 +1275,9 @@ export async function allocateSalesOrder(
 
     return {
       nextAllocations,
-      syncProductIds: [...new Set([
+      // Nothing moved on an unchanged run, so nothing to push to the storefront. Emitting these
+      // unconditionally is what produced the endless redundant syncs (o3d-i5it).
+      syncProductIds: unchanged ? [] : [...new Set([
         ...existingAllocs.map((alloc) => alloc.productId),
         ...nextAllocations.map((alloc) => alloc.productId),
       ])],
@@ -1061,12 +1304,33 @@ export async function allocateSalesOrder(
       unallocatedQty: report.summary.unallocatedQty,
       backorderLineCount: report.lines.filter((line) => line.unallocatedQty > ALLOCATION_EPSILON && line.backorderEligible).length,
       refused: false as const,
+      skippedStatus: null,
     }
   }
 
   const allocationResult = canRunTransaction(client)
     ? await client.$transaction(runAllocation, ALLOCATION_TX_OPTIONS)
     : await runAllocation(client)
+
+  // o3d-6ab: the under-lock status no longer satisfied requireStatusUnderLock. Nothing was written and
+  // the transaction is a no-op, so this is neither a success nor a failure — `error` stays undefined so
+  // batch callers don't record it as an allocation failure, and logAttempt stays false so it isn't
+  // written to the activity log as an attempt that never happened.
+  if (allocationResult.skippedStatus) {
+    return {
+      success: false,
+      syncProductIds: [],
+      allocationCount: 0,
+      unallocatedLines: [],
+      unallocatedQty: 0,
+      backorderLineCount: 0,
+      orderRef,
+      isShoppingOrder,
+      shipFromWarehouseId: so.shipFromWarehouseId,
+      skipped: true,
+      skippedStatus: allocationResult.skippedStatus,
+    }
+  }
 
   if (allocationResult.refused) {
     return {

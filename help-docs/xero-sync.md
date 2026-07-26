@@ -350,9 +350,17 @@ the last successful poll, using the `If-Modified-Since` header. The poll advance
 when it succeeds, and deliberately re-reads the last couple of minutes each time, so a payment can
 be seen twice but never skipped — acting on one twice is a no-op.
 
-If a poll ever reports *"Refusing to truncate"* in the activity log, more than 2,000 invoices
-changed in one window (usually a bulk operation in Xero). Nothing is lost: the cursor is held and
-the poll retries. If it persists, the cursor is probably stuck far in the past.
+**Very large windows drain in pieces.** If more than 2,000 invoices changed since the last poll —
+usually a bulk operation in Xero, or a cursor left far in the past — the window is too big to read in
+one go. Rather than give up, the poll splits it into bounded time slices, processes them oldest-first
+and saves its position after each one, up to four slices per run. The activity log records
+*"processed N bounded chunk(s) of an oversized delta"* and the remainder is picked up by the next
+poll, so a backlog clears itself over the following runs with nothing skipped.
+
+The one case it cannot split is more than 2,000 invoices carrying the **same second** of
+`UpdatedDateUTC`, because Xero's date filters only go down to whole seconds. Everything before that
+second is processed and saved; the poll then stops with an error naming the timestamp, so no invoice
+is ever stepped over unread. That needs a look at what happened in Xero at that moment.
 
 ### Payment Reconciliation (backlog sweep)
 

@@ -4,6 +4,8 @@
 
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
+import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
 
 export type AccountingSettings = {
   syncEnabled: boolean
@@ -244,8 +246,44 @@ export async function queueAccountingSyncTx(
     referenceId: string
     payload: Record<string, unknown>
     idempotencyKey?: string
+    /**
+     * Acknowledge that this call site CANNOT hoist the sales-order row lock, with the reason
+     * (o3d-3zgy). Only for paths where hoisting is structurally impossible today — passing it keeps
+     * the o3d-hrak delete race open for that path, so it must be justified and tracked.
+     *
+     * The default is enforcement: any NEW order-scoped caller that forgets to lock fails loudly
+     * rather than silently reopening the race. Grep this name to find every acknowledged gap.
+     */
+    unlockedOrderScopeReason?: string
   },
 ): Promise<boolean> {
+  // o3d-3zgy: this is the enqueue path that writes inside a CALLER's transaction, so — unlike
+  // queueXeroSync / queueQuickBooksSync, which open their own — it cannot take the sales-order row
+  // lock itself. Taking it here would take it LATE, inside a transaction that may already hold
+  // stock-level locks (cost-layers runs during shipment confirmation), inverting the
+  // lockSalesOrder-then-lockStockLevels ordering allocation-service establishes and risking a
+  // deadlock against the allocation path. Trading a rare race for a routine hang is not a fix.
+  //
+  // So the CALLER must hoist the lock, and this asserts they did. See the ordersLockedByTx caveats:
+  // it is an in-process check, not a distributed guarantee, and its purpose is to turn a forgotten
+  // hoist into a loud failure instead of a silently reopened delete race.
+  const orderScope = await resolveAccountingEnqueueOrderScope(tx, params)
+  if (orderScope.scope === 'order') {
+    if (!hasLockedSalesOrder(tx, orderScope.orderId) && !params.unlockedOrderScopeReason) {
+      throw new Error(
+        `queueAccountingSyncTx was called for ${params.referenceType} ${params.referenceId} ` +
+        `(sales order ${orderScope.orderId}) without that order's row lock. Call ` +
+        `lockSalesOrder(tx, orderId) at the START of the enclosing transaction — before any ` +
+        `stock-level lock — so the enqueue serialises against a hard delete (o3d-3zgy). If hoisting ` +
+        `is structurally impossible here, pass unlockedOrderScopeReason to acknowledge the gap.`,
+      )
+    }
+  } else if (orderScope.scope === 'deleted') {
+    // The order went away before this enqueue: writing the sync row would orphan it against a
+    // reference nothing can resolve, which is the o3d-hrak race the lock exists to close.
+    return false
+  }
+
   // Returns whether a GL counterpart for this posting exists or will post: false when
   // the type won't post (no active/enabled connector), true when it was queued or is
   // already queued. Callers that must stay consistent with the queue decision (e.g. the

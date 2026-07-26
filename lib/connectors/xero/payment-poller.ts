@@ -20,8 +20,14 @@
  *
  * So this is a correctness fix that happens to be ~6x cheaper: 6 calls/run (~576/day against a
  * 1,000/day cap) became 1 (~96/day).
+ *
+ * That one GET reads a window that can be too big to page through. It is no longer refused outright:
+ * an oversized window is DRAINED in bounded chunks with the cursor checkpointed per chunk (o3d-zdh),
+ * so a bulk edit in Xero costs a few extra polls instead of stalling payment detection until someone
+ * notices. See drainInvoicesModifiedSince for the boundary rules that keep chunking lossless.
  */
 
+import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
 import { logActivity } from '@/lib/activity-log'
@@ -32,9 +38,11 @@ import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
 import {
+  advanceCheckpoint,
   CURSOR_OVERLAP_MS,
-  fetchInvoicesModifiedSince,
+  drainInvoicesModifiedSince,
   idsWhere,
+  type XeroInvoice,
   type XeroInvoicesResponse,
 } from './invoice-delta'
 
@@ -65,64 +73,18 @@ async function notifyReversalAdmins(order: DetectedReversalOrder, wcHandled: boo
 type PollResult = { salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[]; skipped?: string }
 
 /**
- * Serialized with the daily backlog reconcile (o3d-2s8): both write paidAt from a Xero read, so they
- * must not interleave, or one could act on a state the other has already invalidated. If the reconcile
- * holds the write lock, this poll cycle skips and retries in 15 minutes — a skipped cycle is harmless
- * (the next one catches up), whereas a concurrent write is not.
+ * The four passes, run over ONE slice of the delta.
+ *
+ * Lifted out of the poll body because an oversized window is no longer read whole: it is drained in
+ * bounded chunks, each one processed and checkpointed before the next is read (o3d-zdh). Every pass
+ * is idempotent, which is what makes both the chunk overlap and CURSOR_OVERLAP_MS free — the forward
+ * passes only consider paidAt:null and the reversal passes only paidAt:not-null, so re-seeing an
+ * invoice already reconciled does nothing.
+ *
+ * Errors are pushed onto `result` rather than thrown: the caller reads that to decide whether this
+ * chunk may be checkpointed.
  */
-export async function pollXeroPayments(): Promise<PollResult> {
-  const outcome = await withPaymentWriteLockOrSkip(() => pollXeroPaymentsLocked())
-  if (isLockSkipped(outcome)) {
-    return { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [], skipped: 'backlog reconcile held the payment-write lock' }
-  }
-  return outcome
-}
-
-async function pollXeroPaymentsLocked(): Promise<PollResult> {
-  const result = { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [] as string[] }
-
-  // Read last poll timestamp. Parsed defensively: the cursor is a free-text Setting, and an
-  // unparseable one (hand-edited, truncated) would otherwise reach toISOString() and throw
-  // RangeError straight out of here — the cron route does not wrap this call, so that is a 500
-  // rather than a recorded error. Falling back to the same 24h default as a missing cursor keeps a
-  // corrupt value degrading instead of breaking.
-  const lastPollSetting = await db.setting.findUnique({ where: { key: 'xero_last_payment_poll' } })
-  const defaultLastPoll = new Date(Date.now() - 24 * 60 * 60 * 1000)
-  const parsedLastPoll = lastPollSetting?.value ? new Date(lastPollSetting.value) : defaultLastPoll
-  const lastPollDate = Number.isFinite(parsedLastPoll.getTime()) ? parsedLastPoll : defaultLastPoll
-  if (lastPollDate !== parsedLastPoll) {
-    console.warn(
-      `[xero] xero_last_payment_poll is not a readable date (${JSON.stringify(lastPollSetting?.value)}); ` +
-      `falling back to the last 24h.`,
-    )
-  }
-  const lastPoll = lastPollDate.toISOString()
-
-  // Stamped BEFORE the fetch, not after the passes: anything modified while this poll is running
-  // must fall inside the NEXT window, not be skipped by a cursor set to the time we happened to
-  // finish. Paired with CURSOR_OVERLAP_MS below.
-  const pollStartedAt = new Date()
-  const since = new Date(lastPollDate.getTime() - CURSOR_OVERLAP_MS)
-
-  // --- One delta fetch for all four passes ---
-  const fetched = await fetchInvoicesModifiedSince(since, (path, opts) =>
-    xeroGet<XeroInvoicesResponse>(path, opts),
-  )
-  if (!fetched.ok) {
-    result.errors.push(`Xero invoice fetch failed: ${fetched.error}`)
-    await logActivity({
-      entityType: 'SYSTEM',
-      action: 'xero_payment_poll_cursor_held',
-      tag: 'sync',
-      level: 'WARNING',
-      description: `Xero payment poll fetched no invoices: ${fetched.error}`,
-      metadata: result,
-      resolveUser: false,
-    })
-    return result
-  }
-
-  const changed = fetched.invoices
+async function processDeltaChunk(changed: XeroInvoice[], result: PollResult, windowStart: Date): Promise<void> {
   const paidSalesIds = idsWhere(changed, 'ACCREC', ['PAID'])
   const reversedSalesIds = idsWhere(changed, 'ACCREC', ['AUTHORISED', 'VOIDED'])
   const voidedSalesIds = idsWhere(changed, 'ACCREC', ['VOIDED'])
@@ -218,7 +180,6 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true },
     })
     if (paidOrders.length > 0) {
-      const windowStart = new Date(lastPoll)
       for (const order of detectPaymentReversals(paidOrders, reversedSalesIds)) {
         // A VOIDED invoice has already had its AR/revenue reversed by Xero, so a
         // separate credit note would double-reverse — only auto-chargeback an
@@ -338,23 +299,126 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   } catch (e) {
     result.errors.push(`Bills reversal polling error: ${String(e)}`)
   }
+}
 
-  if (result.errors.length === 0) {
-    // pollStartedAt, NOT now(): the passes above take real time, and anything Xero changed while
-    // they ran must land in the next window instead of falling into the gap. CURSOR_OVERLAP_MS
-    // then re-reads the boundary anyway, so the cost of being slightly early is one no-op.
-    await db.setting.upsert({
-      where: { key: 'xero_last_payment_poll' },
-      create: { key: 'xero_last_payment_poll', value: pollStartedAt.toISOString() },
-      update: { value: pollStartedAt.toISOString() },
-    })
-  } else {
+/**
+ * Serialized with the daily backlog reconcile (o3d-2s8): both write paidAt from a Xero read, so they
+ * must not interleave, or one could act on a state the other has already invalidated. If the reconcile
+ * holds the write lock, this poll cycle skips and retries in 15 minutes — a skipped cycle is harmless
+ * (the next one catches up), whereas a concurrent write is not.
+ */
+export async function pollXeroPayments(): Promise<PollResult> {
+  const outcome = await withPaymentWriteLockOrSkip(() => pollXeroPaymentsLocked())
+  if (isLockSkipped(outcome)) {
+    return { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [], skipped: 'backlog reconcile held the payment-write lock' }
+  }
+  return outcome
+}
+
+async function pollXeroPaymentsLocked(): Promise<PollResult> {
+  const result = { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [] as string[] }
+
+  // Read last poll timestamp. Parsed defensively: the cursor is a free-text Setting, and an
+  // unparseable one (hand-edited, truncated) would otherwise reach toISOString() and throw
+  // RangeError straight out of here — the cron route does not wrap this call, so that is a 500
+  // rather than a recorded error. Falling back to the same 24h default as a missing cursor keeps a
+  // corrupt value degrading instead of breaking.
+  const lastPollSetting = await db.setting.findUnique({ where: { key: 'xero_last_payment_poll' } })
+  const defaultLastPoll = new Date(Date.now() - 24 * 60 * 60 * 1000)
+  const parsedLastPoll = lastPollSetting?.value ? new Date(lastPollSetting.value) : defaultLastPoll
+  const lastPollDate = Number.isFinite(parsedLastPoll.getTime()) ? parsedLastPoll : defaultLastPoll
+  if (lastPollDate !== parsedLastPoll) {
+    console.warn(
+      `[xero] xero_last_payment_poll is not a readable date (${JSON.stringify(lastPollSetting?.value)}); ` +
+      `falling back to the last 24h.`,
+    )
+  }
+  // Stamped BEFORE the fetch, not after the passes: anything modified while this poll is running
+  // must fall inside the NEXT window, not be skipped by a cursor set to the time we happened to
+  // finish. Paired with CURSOR_OVERLAP_MS below.
+  const pollStartedAt = new Date()
+  const since = new Date(lastPollDate.getTime() - CURSOR_OVERLAP_MS)
+
+  // --- One delta read for all four passes, drained in bounded chunks if it is oversized ---
+  //
+  // The cursor moves per CHUNK, not per poll (o3d-zdh). A normal poll is still one unbounded request
+  // and one chunk ending at pollStartedAt — identical to before. An oversized window is carved up
+  // instead of refused, and each piece is checkpointed as soon as its passes complete, so a failure
+  // partway through costs one chunk rather than the whole backlog and the next poll resumes from
+  // where this one stopped instead of re-asking the same impossible question.
+  //
+  // `through` is the cursor value, NOT pollStartedAt: it is the exclusive upper bound of the slice
+  // actually processed. Writing anything later would step over invoices this poll never read.
+  //
+  // AND NEVER EARLIER THAN THE CURSOR WE STARTED FROM (o3d-8f9 r3). The read floor is deliberately
+  // CURSOR_OVERLAP_MS behind the persisted cursor so a record landing during the previous poll is
+  // re-read; that overlap is a QUERY floor, not a checkpoint. If the overlap itself holds more than
+  // one chunk — a couple of dense bulk-edit seconds is enough — the first chunk's `through` lands
+  // BEFORE lastPollDate, and persisting it moves the cursor BACKWARD. The next poll then subtracts
+  // the overlap from the regressed value and reproduces the same chunking, so it cycles: Codex
+  // measured it settling at -44s, -49s, -55s, each poll spending 163-200 requests replaying overlap
+  // and never reaching either the original checkpoint or newer work. Payment reconciliation stops
+  // dead while burning the tenant's daily Xero allowance.
+  //
+  // Clamping to a monotonic maximum keeps the overlap doing its job (the records ARE re-read and
+  // re-processed, idempotently) while making the checkpoint one-way.
+  let checkpoint = lastPollDate
+  const drain = await drainInvoicesModifiedSince(
+    since,
+    pollStartedAt,
+    (path, opts) => xeroGet<XeroInvoicesResponse>(path, opts),  // budget-reconciled inside the drain
+    async ({ invoices, through }) => {
+      const errorsBefore = result.errors.length
+      await processDeltaChunk(invoices, result, lastPollDate)
+      // A pass that errored may have left work undone inside this chunk, so the chunk is not
+      // checkpointed and the drain stops here — the same "hold the cursor on error" rule as before,
+      // now applied per chunk instead of per poll.
+      if (result.errors.length > errorsBefore) return 'stop'
+
+      // A chunk inside the re-read overlap advances nothing: its work is done and recorded, but the
+      // cursor stays where it was. Only a chunk that reaches past the old cursor moves it.
+      const advanced = advanceCheckpoint(checkpoint, through)
+      if (!advanced) return 'continue'
+      checkpoint = advanced
+
+      await db.setting.upsert({
+        where: { key: 'xero_last_payment_poll' },
+        create: { key: 'xero_last_payment_poll', value: through.toISOString() },
+        update: { value: through.toISOString() },
+      })
+      return 'continue'
+    },
+    // Real HTTP attempts, not fetcher invocations: xeroGet retries a 429 internally, so one
+    // invocation can be several tenant API calls (o3d-8f9 r3).
+    xeroHttpAttemptCount,
+  )
+
+  if (!drain.ok) result.errors.push(`Xero invoice fetch failed: ${drain.error}`)
+
+  if (result.errors.length > 0) {
     await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_payment_poll_cursor_held',
       tag: 'sync',
       level: 'WARNING',
-      description: 'Xero payment poll cursor was not advanced because polling returned errors',
+      description:
+        `Xero payment poll stopped with errors after ${drain.chunks} chunk(s); the cursor is held at ` +
+        `the last chunk that completed. ${result.errors.join(' | ')}`,
+      metadata: result,
+      resolveUser: false,
+    })
+  } else if (drain.ok && !drain.complete) {
+    // Not an error: the backlog is being drained, progress is checkpointed, and the next scheduled
+    // poll continues it. Logged as a WARNING anyway because an operator should know a bulk change
+    // in Xero is taking several polls to work through.
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_payment_poll_backlog_draining',
+      tag: 'sync',
+      level: 'WARNING',
+      description:
+        `Xero payment poll processed ${drain.chunks} bounded chunk(s) of an oversized delta and ` +
+        `checkpointed each; the remainder resumes on the next poll.`,
       metadata: result,
       resolveUser: false,
     })

@@ -42,9 +42,12 @@ type Props = {
 // Refund state is the orthogonal refundStatus now, not a lifecycle status — a WC
 // 'refunded' order maps to a lifecycle status and its refund flows through the refund
 // records. So REFUNDED/PARTIALLY_REFUNDED are not offered as mapping targets.
+// SHIPPED is also excluded (o3d-gz6): it must reflect a REAL dispatch (a shipment row), not a
+// storefront status — mapping a WC status straight into SalesOrder.status=SHIPPED mints
+// "false-SHIPPED" orders that then can't be cancelled. The server action rejects it too.
 const IMS_STATUSES = [
   'DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING',
-  'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED',
+  'COMPLETED', 'DELIVERED', 'CANCELLED',
 ]
 
 const WC_STATUSES = ['pending', 'failed', 'on-hold', 'processing', 'completed', 'cancelled', 'refunded']
