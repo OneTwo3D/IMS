@@ -508,6 +508,9 @@ export async function cancelSalesOrderFulfillmentState(
   releasedAllocationCount: number
   deletedShipmentCount: number
   releasedReservationScopes: ReservationScope[]
+  // o3d-gz6: true when the order was SHIPPED with no dispatch evidence and its status was repaired to a
+  // pre-ship state so this cancel could proceed. The caller should audit it.
+  repairedFalseShipped: boolean
 }> {
   await lockSalesOrder(tx, input.orderId)
   const lockedOrder = await tx.salesOrder.findUnique({
@@ -536,24 +539,36 @@ export async function cancelSalesOrderFulfillmentState(
     select: { id: true },
   })
 
+  // The status used to validate the CANCELLED transition. Normally the order's real status; for a
+  // FALSE-SHIPPED order (o3d-gz6, below) it is repaired to the correct pre-ship state.
+  let effectiveStatus: string = lockedOrder.status
+  let repairedFalseShipped = false
+
   if (lockedOrder.status === 'SHIPPED') {
-    // Only irreversible once something actually shipped. A SHIPPED status with NO dispatch evidence is a
-    // data inconsistency rather than a terminal fact, so it is NOT marked permanent.
-    //
-    // KNOWN GAP (o3d-gz6), unchanged by o3d-bx9: such an order also cannot currently self-heal, because
-    // importWcOrder's existing-order path refreshes addresses/notes/paidAt but never status, and nothing
-    // re-runs a status sync. So a Woo cancel of a falsely-SHIPPED order still exhausts its retries — as
-    // it did before this change. Deciding to let that cancel through would release fulfilment state on an
-    // order the IMS believes shipped, which is a product call, not a classification one.
-    const message = 'Cannot cancel a shipped order — process a refund instead'
-    throw dispatchedShipment ? new PermanentStatusTransitionError(message) : new Error(message)
+    if (dispatchedShipment) {
+      // Genuinely dispatched — an irreversible fact. Cancelling would release reservations and delete
+      // pending shipments while the dispatched shipment's recognised COGS + revenue stay in the ledger
+      // with no reversal. Refuse permanently: process a refund instead.
+      throw new PermanentStatusTransitionError(
+        'Cannot cancel a shipped order — process a refund instead')
+    }
+    // FALSE-SHIPPED (o3d-gz6): the SHIPPED status came from the configurable WooCommerce status mapping
+    // (importWcOrder writes it straight into status), NOT a real dispatch — there is no SHIPPED/journaled
+    // shipment. The status is therefore unreliable, so REPAIR it to its correct pre-ship state and let
+    // the Woo cancellation proceed to release fulfilment and reach CANCELLED, instead of the shipped-order
+    // guard refusing it forever (the event exhausted its retries and dead-lettered). An order carrying
+    // allocations is canonically ALLOCATED (allocation flow), else PROCESSING; both legally transition to
+    // CANCELLED. The anomaly is surfaced via repairedFalseShipped so the caller can audit it.
+    const allocCount = await tx.orderAllocation.count({ where: { orderId: input.orderId } })
+    effectiveStatus = allocCount > 0 ? 'ALLOCATED' : 'PROCESSING'
+    repairedFalseShipped = true
   }
 
   if (dispatchedShipment) {
     throw new PermanentStatusTransitionError('Cannot cancel an order with a dispatched shipment — process a refund instead')
   }
 
-  const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, 'CANCELLED', {
+  const transition = validateManualSalesOrderStatusTransition(effectiveStatus, 'CANCELLED', {
     bypass: input.bypass,
   })
   if (!transition.success) throw new Error(transition.error)
@@ -611,6 +626,7 @@ export async function cancelSalesOrderFulfillmentState(
     releasedAllocationCount: currentAllocs.length,
     deletedShipmentCount: deletedShipments.count,
     releasedReservationScopes,
+    repairedFalseShipped,
   }
 }
 

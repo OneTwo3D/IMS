@@ -653,6 +653,15 @@ export async function getShoppingStatusMappings(): Promise<StatusMappingRow[]> {
 
 export async function upsertShoppingStatusMapping(externalStatus: string, imsStatus: string): Promise<{ success: boolean }> {
   await requireAdmin()
+  // o3d-gz6: never let a WooCommerce status map to SHIPPED. SHIPPED must reflect a REAL dispatch (a
+  // shipment row), not a storefront status — importWcOrder writes this mapping straight into
+  // SalesOrder.status, so a WC->SHIPPED mapping mints "false-SHIPPED" orders (SHIPPED with no shipment)
+  // that then can't be cancelled. Reject it at the persistence boundary; the UI also omits it.
+  if (imsStatus === 'SHIPPED') {
+    throw new Error(
+      'A WooCommerce status cannot map to SHIPPED — SHIPPED is set only by a real dispatch, not a '
+      + 'storefront status (o3d-gz6).')
+  }
   await db.shoppingStatusMapping.upsert({
     where: {
       connector_externalStatus: {
