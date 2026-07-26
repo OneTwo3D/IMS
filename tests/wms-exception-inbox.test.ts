@@ -29,3 +29,61 @@ test('buildDeadReceiptEventReplayData restarts the retry ladder without touching
     assert.equal(forbidden in data, false, `${forbidden} must not be reset by a replay`)
   }
 })
+
+// --- o3d-bjc.9: quarantined links must be visible in the inbox --------------
+
+type StuckDispatchLink = import('../lib/domain/wms/exception-inbox.ts').StuckDispatchLink
+
+function stuckLink(partial: Partial<StuckDispatchLink> & { orderId: string }): StuckDispatchLink {
+  return {
+    connector: 'mintsoft',
+    externalOrderNumber: `WMS-${partial.orderId}`,
+    dispatchFailureCount: 0,
+    dispatchLastError: null,
+    dispatchDeadLetteredAt: null,
+    dispatchUnresolvedCount: 0,
+    dispatchUnresolvedError: null,
+    dispatchUnresolvedAt: null,
+    order: { orderNumber: `SO-${partial.orderId}` },
+    ...partial,
+  }
+}
+
+test('[o3d-bjc.9] a NEW quarantine is not buried under a full page of older dead letters', () => {
+  // The failure this pins: ordering by dispatchDeadLetteredAt first puts every
+  // dead letter ahead of every unresolved-only row (nulls last), so a full page
+  // of dead letters hides the quarantine on the page its own alert links to.
+  const older = Array.from({ length: 50 }, (_, i) => stuckLink({
+    orderId: `dl-${i}`,
+    dispatchFailureCount: 5,
+    dispatchLastError: 'apply failed',
+    dispatchDeadLetteredAt: new Date(`2026-07-0${1 + (i % 9)}T00:00:00Z`),
+  }))
+  const fresh = stuckLink({
+    orderId: 'q-1',
+    dispatchUnresolvedCount: 5,
+    dispatchUnresolvedError: 'no parts visible',
+    dispatchUnresolvedAt: new Date('2026-07-25T12:00:00Z'),
+  })
+
+  const rows = inbox.mergeStuckDispatchRows([...older, fresh], 50)
+  assert.equal(rows.length, 50)
+  assert.equal(rows[0]?.orderId, 'q-1', 'the newest exception leads, whichever kind it is')
+  assert.equal(rows[0]?.kind, 'unresolved')
+  assert.equal(rows[0]?.failureCount, 5, 'the UNRESOLVED streak is what counts for a quarantine')
+  assert.equal(rows[0]?.reason, 'no parts visible')
+})
+
+test('[o3d-bjc.9] a link carrying BOTH markers is reported as the dead-letter', () => {
+  const rows = inbox.mergeStuckDispatchRows([stuckLink({
+    orderId: 'both',
+    dispatchFailureCount: 5,
+    dispatchLastError: 'apply failed',
+    dispatchDeadLetteredAt: new Date('2026-07-20T00:00:00Z'),
+    dispatchUnresolvedCount: 5,
+    dispatchUnresolvedError: 'no parts visible',
+    dispatchUnresolvedAt: new Date('2026-07-19T00:00:00Z'),
+  })], 50)
+  assert.equal(rows[0]?.kind, 'dead-letter')
+  assert.equal(rows[0]?.reason, 'apply failed', 'the stronger statement wins — an ERROR, not just unreadable')
+})

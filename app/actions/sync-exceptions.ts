@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { mergeStuckDispatchRows } from '@/lib/domain/wms/exception-inbox'
 import { logActivity } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
@@ -90,6 +91,14 @@ export type StuckDispatchRow = {
   failureCount: number
   reason: string | null
   deadLetteredAt: string | null
+  /**
+   * o3d-bjc.9: WHY the link left the sweep. 'dead-letter' — the reconcile kept
+   * ERRORING (transport, apply). 'unresolved' — the WMS answered but its record
+   * could not be turned into a dispatch state, so the link was quarantined to
+   * stop it pinning the delta watermark. Different causes, same remedy here:
+   * fix it in the WMS, then replay.
+   */
+  kind: 'dead-letter' | 'unresolved'
 }
 
 export type OrderReconcileDriftRow = {
@@ -166,9 +175,20 @@ const REFUND_PARK_WHERE = {
 // Scoped to the sweep's own candidate states (Codex r4): a link that later goes
 // HELD/CANCELLED/push-DEAD_LETTER is no longer a dispatch question — those
 // surface through their own flows — so it must not linger here as an exception.
-const STUCK_DISPATCH_WHERE = {
-  dispatchDeadLetteredAt: { not: null },
+// o3d-bjc.9: a QUARANTINED link belongs here for the same reason a dead-lettered
+// one does — it has left the sweep and only an operator can bring it back. It was
+// missing, and the quarantine notification points at this page, so the advertised
+// workflow simply did not exist for it.
+const STUCK_DISPATCH_STATES = {
   state: { in: ['SYNCED' as const, 'MERGED' as const] },
+}
+
+const STUCK_DISPATCH_WHERE = {
+  ...STUCK_DISPATCH_STATES,
+  OR: [
+    { dispatchDeadLetteredAt: { not: null } },
+    { dispatchUnresolvedAt: { not: null } },
+  ],
 }
 
 function countStuckDispatches(): Promise<number> {
@@ -176,30 +196,42 @@ function countStuckDispatches(): Promise<number> {
 }
 
 async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
-  const links = await db.wmsOrderPushLink.findMany({
-    where: STUCK_DISPATCH_WHERE,
-    orderBy: { dispatchDeadLetteredAt: 'desc' },
-    take: SECTION_LIMIT,
-    select: {
-      orderId: true,
-      connector: true,
-      externalOrderNumber: true,
-      dispatchFailureCount: true,
-      dispatchLastError: true,
-      dispatchDeadLetteredAt: true,
-      order: { select: { orderNumber: true } },
-    },
-  })
+  // Two queries, each capped, then merged and re-capped on the EFFECTIVE held
+  // timestamp. A single ordered query cannot do this: sorting by
+  // dispatchDeadLetteredAt first puts every dead letter ahead of every
+  // unresolved-only row (nulls last), so 50 existing dead letters would hide
+  // every new quarantine from the page its own notification links to.
+  const select = {
+    orderId: true,
+    connector: true,
+    externalOrderNumber: true,
+    dispatchFailureCount: true,
+    dispatchLastError: true,
+    dispatchDeadLetteredAt: true,
+    dispatchUnresolvedCount: true,
+    dispatchUnresolvedError: true,
+    dispatchUnresolvedAt: true,
+    order: { select: { orderNumber: true } },
+  } as const
 
-  return links.map((link) => ({
-    orderId: link.orderId,
-    orderNumber: link.order.orderNumber,
-    externalOrderNumber: link.externalOrderNumber,
-    connector: link.connector,
-    failureCount: link.dispatchFailureCount,
-    reason: link.dispatchLastError,
-    deadLetteredAt: link.dispatchDeadLetteredAt?.toISOString() ?? null,
-  }))
+  const [deadLettered, quarantined] = await Promise.all([
+    db.wmsOrderPushLink.findMany({
+      where: { ...STUCK_DISPATCH_STATES, dispatchDeadLetteredAt: { not: null } },
+      orderBy: { dispatchDeadLetteredAt: 'desc' },
+      take: SECTION_LIMIT,
+      select,
+    }),
+    db.wmsOrderPushLink.findMany({
+      // Dead-lettered rows are reported by the query above (the dead-letter is
+      // the stronger statement), so exclude them here rather than de-duplicating.
+      where: { ...STUCK_DISPATCH_STATES, dispatchUnresolvedAt: { not: null }, dispatchDeadLetteredAt: null },
+      orderBy: { dispatchUnresolvedAt: 'desc' },
+      take: SECTION_LIMIT,
+      select,
+    }),
+  ])
+
+  return mergeStuckDispatchRows([...deadLettered, ...quarantined], SECTION_LIMIT)
 }
 
 /**
@@ -638,19 +670,33 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
 }
 
 /**
- * Replay a dead-lettered dispatch reconciliation: clear the dead-letter marker
- * and failure streak so the next dispatch sweep retries the order. Use after
- * fixing the underlying cause (typically the order's IMS stock position).
+ * Replay a dispatch reconciliation the sweep gave up on: clear the marker and
+ * the streak so the next sweep retries the order. Use after fixing the
+ * underlying cause — typically the order's IMS stock position (dead-letter), or
+ * the WMS record itself (o3d-bjc.9 quarantine).
  */
 export async function replayStuckDispatch(orderId: string): Promise<MutationResult> {
   try {
     const session = await requireFreshPermission('sync')
     const updated = await db.wmsOrderPushLink.updateMany({
-      where: { orderId, dispatchDeadLetteredAt: { not: null } },
-      data: { dispatchDeadLetteredAt: null, dispatchFailureCount: 0, dispatchLastError: null },
+      where: {
+        orderId,
+        OR: [{ dispatchDeadLetteredAt: { not: null } }, { dispatchUnresolvedAt: { not: null } }],
+      },
+      // BOTH streaks: a link can hold an unresolved quarantine and a dead-letter
+      // at once, and replaying one while the other still excludes it from the
+      // candidate set would report success and change nothing.
+      data: {
+        dispatchDeadLetteredAt: null,
+        dispatchFailureCount: 0,
+        dispatchLastError: null,
+        dispatchUnresolvedAt: null,
+        dispatchUnresolvedCount: 0,
+        dispatchUnresolvedError: null,
+      },
     })
     if (updated.count === 0) {
-      return { success: false, error: 'The dispatch is no longer dead-lettered (already replayed).' }
+      return { success: false, error: 'The dispatch is no longer held back (already replayed).' }
     }
     await logActivity({
       entityType: 'SALES_ORDER',

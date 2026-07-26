@@ -7,6 +7,7 @@ import {
   isDispatchClientScoped,
   coherentSplitPartIds,
   SPLIT_PROBE_BUDGET_PER_SWEEP,
+  isUnresolvedDriftSystemic,
 } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsDispatchSweepDeps, WmsDispatchCandidate } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsOrderStatus, WmsOrderTracking, WmsOrderPart } from '../lib/connectors/wms/types.ts'
@@ -1492,4 +1493,448 @@ test('[o3d-bjc.5] a failing probe stops immediately and holds the watermark', as
 test('[o3d-bjc.5] the probe budget is bounded', () => {
   assert.ok(SPLIT_PROBE_BUDGET_PER_SWEEP > 0 && SPLIT_PROBE_BUDGET_PER_SWEEP <= 100,
     'a cold window with many unlinked split groups must not storm the WMS')
+})
+
+// --- o3d-bjc.9: quarantine the record, circuit-break the drift --------------
+// The two extremes are both wrong. NEVER isolating means one permanently
+// unreadable record pins the delta watermark forever and never reaches the
+// exception inbox; ALWAYS isolating means a vocabulary or schema change
+// quarantines the whole tenant, each with its own alert, needing a manual
+// release after the dependency recovers. These pin the line between them.
+
+/** A link whose record the WMS answers for but cannot be resolved into a state. */
+function unresolvableLink(n: number) {
+  return candidate({ linkId: `L-${n}`, orderId: `O-${n}`, externalOrderNumber: `WC-${1000 + n}`, externalOrderId: `M-${n}` })
+}
+
+/** A split delta row with no parts visible — the sweep's canonical "unresolved". */
+function unresolvableRow(n: number) {
+  return status({
+    externalOrderId: `M-${n}`,
+    externalOrderNumber: `WC-${1000 + n}`,
+    status: 'DESPATCHED',
+    dispatched: true,
+    isSplit: true,
+    partCount: 2,
+  })
+}
+
+type QuarantineHarness = {
+  streaks: Map<string, number>
+  quarantined: string[]
+  cleared: string[]
+  drifts: Array<{ linkCount: number; touched: number }>
+  drift: { consecutive: number; cohortKey: string | null; stableFor: number }
+  saved: Array<{ watermark?: string; lastReconcile?: string }>
+}
+
+function quarantineDeps(links: WmsDispatchCandidate[], h: QuarantineHarness, overrides: Partial<WmsDispatchSweepDeps> = {}) {
+  const live = () => links.filter((link) => !h.quarantined.includes(link.linkId))
+  return deps({
+    listCandidates: async () => live(),
+    listActiveByExternalOrderIds: async (ids) => live().filter((link) => ids.includes(link.externalOrderId ?? '')),
+    listActiveByOrderNumbers: async (numbers) => live().filter((link) => numbers.includes(link.externalOrderNumber)),
+    fetchDelta: async () => live().map((link) => unresolvableRow(Number(link.linkId.slice(2)))),
+    fetchOrderParts: async () => [],
+    getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+    saveDeltaState: async (state) => { h.saved.push(state) },
+    recordUnresolvedRead: async (c) => {
+      const next = (h.streaks.get(c.linkId) ?? 0) + 1
+      h.streaks.set(c.linkId, next)
+      return { count: next }
+    },
+    clearUnresolvedReads: async (linkId) => { h.cleared.push(linkId); h.streaks.set(linkId, 0) },
+    quarantineUnresolved: async (c) => { h.quarantined.push(c.linkId); return { quarantined: true } },
+    // No control links by default: the harness's whole active set IS the cohort.
+    probeControlLinks: async () => ({ probed: 0, resolved: 0, representative: 0 }),
+    getUnresolvedDriftState: async () => h.drift,
+    saveUnresolvedDriftState: async (state) => { h.drift = state; return true },
+    reportUnresolvedDrift: async (input) => { h.drifts.push({ linkCount: input.linkCount, touched: input.touched }) },
+    ...overrides,
+  })
+}
+
+function harness(): QuarantineHarness {
+  return {
+    streaks: new Map(), quarantined: [], cleared: [], drifts: [],
+    drift: { consecutive: 0, cohortKey: null, stableFor: 0 }, saved: [],
+  }
+}
+
+test('[o3d-bjc.9] ONE permanently unreadable record is isolated after a bounded number of passes — and releases the watermark', async () => {
+  const h = harness()
+  // Three links: one unreadable, two healthy — so the cohort is well under the
+  // systemic floor and this is unambiguously a record-local defect.
+  const broken = unresolvableLink(1)
+  const healthy = [unresolvableLink(2), unresolvableLink(3)]
+  const linksFor = () => [broken, ...healthy]
+
+  const run = () => runWmsDispatchSweepCore(
+    quarantineDeps(linksFor(), h, {
+      // Only L-1's row is unresolvable; the others despatch cleanly.
+      fetchDelta: async () => linksFor()
+        .filter((link) => !h.quarantined.includes(link.linkId))
+        .map((link) => (link.linkId === 'L-1'
+          ? unresolvableRow(1)
+          : status({
+              externalOrderId: link.externalOrderId!,
+              externalOrderNumber: link.externalOrderNumber,
+              status: 'DESPATCHED',
+              dispatched: true,
+              tracking: [tracking({ trackingNumber: `TRK-${link.linkId}` })],
+            }))),
+    }),
+    { now: NOW },
+  )
+
+  // Passes 1-4: still in play, so the watermark stays held — the row it could
+  // not read is still owed.
+  for (let pass = 1; pass <= 4; pass += 1) {
+    const result = await run()
+    assert.equal(result.unresolvedQuarantined, 0, `pass ${pass} must not isolate yet`)
+    assert.equal(h.quarantined.length, 0, `pass ${pass} must not isolate yet`)
+    assert.deepEqual(h.saved.at(-1)?.watermark, undefined, `pass ${pass} holds the watermark`)
+  }
+
+  // Pass 5 reaches the bound: isolate THAT record, and only that record.
+  const fifth = await run()
+  assert.equal(fifth.unresolvedQuarantined, 1)
+  assert.deepEqual(h.quarantined, ['L-1'])
+  assert.equal(fifth.unresolvedSystemic, false)
+  assert.ok(h.saved.at(-1)?.watermark, 'the isolated record no longer holds the watermark')
+
+  // ...and it stays out: the next pass never sees it again.
+  const sixth = await run()
+  assert.equal(sixth.unresolved, 0, 'a quarantined link leaves the candidate set')
+  assert.deepEqual(h.quarantined, ['L-1'], 'and is not re-quarantined every tick')
+})
+
+test('[o3d-bjc.9] connector-wide drift quarantines NOTHING and raises ONE incident', async () => {
+  const h = harness()
+  const links = [1, 2, 3, 4].map(unresolvableLink)   // every link unreadable at once
+  const result = await runWmsDispatchSweepCore(quarantineDeps(links, h), { now: NOW })
+
+  assert.equal(result.unresolvedSystemic, true)
+  assert.equal(result.unresolvedQuarantined, 0, 'drift must not quarantine the tenant one record at a time')
+  assert.deepEqual(h.quarantined, [])
+  assert.deepEqual(h.drifts, [{ linkCount: 4, touched: 4 }], 'exactly one incident for the cohort')
+  assert.deepEqual(h.saved, [], 'drift holds the watermark: the rows are still owed')
+  assert.equal(h.drift.consecutive, 1, 'the drift is counted, so a sustained one can escalate')
+  assert.equal(h.drift.cohortKey, 'L-1,L-2,L-3,L-4', 'and WHO it was, so a frozen cohort can be told from real drift')
+})
+
+test('[o3d-bjc.9] a lone broken record in a BUSY tenant is still isolated (the ratio must not excuse it)', async () => {
+  const h = harness()
+  h.streaks.set('L-1', 4)                            // one read away from the cap
+  const broken = unresolvableLink(1)
+  const healthy = [2, 3, 4, 5, 6].map(unresolvableLink)
+  const links = [broken, ...healthy]
+  const result = await runWmsDispatchSweepCore(
+    quarantineDeps(links, h, {
+      fetchDelta: async () => links
+        .filter((link) => !h.quarantined.includes(link.linkId))
+        .map((link) => (link.linkId === 'L-1'
+          ? unresolvableRow(1)
+          : status({
+              externalOrderId: link.externalOrderId!,
+              externalOrderNumber: link.externalOrderNumber,
+              status: 'DESPATCHED',
+              dispatched: true,
+              tracking: [tracking({ trackingNumber: 'TRK' })],
+            }))),
+    }),
+    { now: NOW },
+  )
+  assert.equal(result.unresolvedSystemic, false, '1 of 6 is not drift')
+  assert.deepEqual(h.quarantined, ['L-1'])
+})
+
+test('[o3d-bjc.9] sustained drift is ESCALATED, never converted into mass quarantine', async () => {
+  const h = harness()
+  h.drift = { consecutive: 12, cohortKey: null, stableFor: 1 }   // drifting for a long time
+  const links = [1, 2, 3, 4].map(unresolvableLink)
+  links.forEach((link) => h.streaks.set(link.linkId, 40))   // each far past its own cap
+  const result = await runWmsDispatchSweepCore(quarantineDeps(links, h), { now: NOW })
+
+  // A pass counter expiring is not evidence that N records are individually
+  // broken. Isolating the cohort on it would need a manual replay per order,
+  // instead of every link recovering by itself the moment the connector does.
+  assert.equal(result.unresolvedSystemic, true)
+  assert.equal(result.unresolvedQuarantined, 0)
+  assert.deepEqual(h.quarantined, [])
+  assert.equal(h.drift.consecutive, 13, 'the streak keeps counting so the incident can escalate')
+})
+
+test('[o3d-bjc.9] a failed streak WRITE must not reclassify drift into broken records', async () => {
+  const h = harness()
+  const links = [1, 2, 3, 4].map(unresolvableLink)
+  links.forEach((link) => h.streaks.set(link.linkId, 4))   // all at their own cap
+  const result = await runWmsDispatchSweepCore(
+    quarantineDeps(links, h, { saveUnresolvedDriftState: async () => false }),
+    { now: NOW },
+  )
+  // The streak is an observability write. Letting it flip the verdict would
+  // quarantine the whole tenant off one transient Setting upsert failure.
+  assert.equal(result.unresolvedSystemic, true)
+  assert.equal(result.unresolvedQuarantined, 0)
+  assert.deepEqual(h.quarantined, [])
+})
+
+test('[o3d-bjc.9] a drift incident carries how long it has been drifting', async () => {
+  const h = harness()
+  h.drift = { consecutive: 2, cohortKey: null, stableFor: 1 }
+  const links = [1, 2, 3, 4].map(unresolvableLink)
+  const passes: number[] = []
+  await runWmsDispatchSweepCore(
+    quarantineDeps(links, h, {
+      reportUnresolvedDrift: async (input) => { passes.push(input.consecutivePasses) },
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(passes, [3])
+})
+
+test('[o3d-bjc.9] the FIRST resolved read clears the streak', async () => {
+  const h = harness()
+  h.streaks.set('L-1', 4)
+  const link = unresolvableLink(1)
+  await runWmsDispatchSweepCore(
+    quarantineDeps([link], h, {
+      fetchDelta: async () => [status({
+        externalOrderId: 'M-1',
+        externalOrderNumber: 'WC-1001',
+        status: 'DESPATCHED',
+        dispatched: true,
+        tracking: [tracking({ trackingNumber: 'TRK-1' })],
+      })],
+    }),
+    { now: NOW },
+  )
+  assert.deepEqual(h.cleared, ['L-1'])
+  assert.equal(h.streaks.get('L-1'), 0, 'only CONSECUTIVE unresolved reads count toward isolation')
+  assert.deepEqual(h.quarantined, [])
+})
+
+test('[o3d-bjc.9] the drift classifier needs BOTH a floor and a ratio', async () => {
+  // Two unresolved links is under the floor however small the tenant...
+  assert.equal(isUnresolvedDriftSystemic(2, 2), false)
+  // ...three of four is drift...
+  assert.equal(isUnresolvedDriftSystemic(3, 4), true)
+  // ...but three of a hundred is three broken records.
+  assert.equal(isUnresolvedDriftSystemic(3, 100), false)
+})
+
+test('[o3d-bjc.9] the core counts one unresolved read per PASS — which is why the sweep must be serialized', async () => {
+  // Each pass counts a link once, so five OVERLAPPING passes of a single
+  // transient incident would walk the streak to the cap and park the link — the
+  // cap is meant to mean "five passes apart", not "five callers at once".
+  // Nothing in the core can tell the difference, so runWmsDispatchSweep holds a
+  // per-connector advisory lock and skips a concurrent run.
+  const h = harness()
+  const link = unresolvableLink(1)
+  await Promise.all([1, 2, 3, 4, 5].map(() =>
+    runWmsDispatchSweepCore(quarantineDeps([link], h), { now: NOW })))
+  assert.equal(h.streaks.get('L-1'), 5, 'five passes, five counts — the lock is what makes them five REAL passes')
+})
+
+test('[o3d-bjc.9] the dispatch lock key is stable per connector and distinct across them', async () => {
+  const { dispatchSweepLockKey } = await import('../lib/domain/wms/dispatch-sweep-lock.ts')
+  assert.equal(dispatchSweepLockKey('mintsoft'), dispatchSweepLockKey('mintsoft'))
+  assert.notEqual(dispatchSweepLockKey('mintsoft'), dispatchSweepLockKey('shiphero'))
+  // int4: pg advisory-lock keys are signed 32-bit.
+  for (const id of ['mintsoft', 'shiphero', 'a-very-long-connector-identifier']) {
+    const key = dispatchSweepLockKey(id)
+    assert.ok(Number.isSafeInteger(key) && key >= -(2 ** 31) && key < 2 ** 31, id)
+  }
+})
+
+test('[o3d-bjc.9] with NO healthy control, a stable cohort stays drift — the tenant is never mass-isolated', async () => {
+  // A deterministic schema break produces the same cohort every pass — all the
+  // more so because holding the watermark re-serves the same rows. Reading that
+  // stability as "these records are broken" would quarantine the entire active
+  // set for a fault one connector fix would have cleared, and every order would
+  // then need a manual replay. Held watermark + a loud incident is the
+  // recoverable failure; mass isolation is not.
+  const h = harness()
+  const links = [1, 2, 3].map(unresolvableLink)          // the whole active set
+  const run = () => runWmsDispatchSweepCore(
+    quarantineDeps(links, h, { probeControlLinks: async () => ({ probed: 0, resolved: 0, representative: 0 }) }),
+    { now: NOW },
+  )
+  for (let pass = 0; pass < 8; pass += 1) {
+    const result = await run()
+    assert.equal(result.unresolvedSystemic, true, `pass ${pass} must stay drift`)
+    assert.equal(result.unresolvedQuarantined, 0)
+  }
+  assert.deepEqual(h.quarantined, [])
+  assert.deepEqual([...h.streaks.values()].filter((n) => n > 0), [], 'no per-link budget is spent either')
+  assert.equal(h.drift.stableFor, 8, 'how long it has been stuck is still recorded, for the escalation')
+  assert.deepEqual(h.saved, [], 'and the rows stay owed')
+})
+
+test('[o3d-bjc.9] a REAL outage (a rotating cohort) never spends any record\'s budget', async () => {
+  // What actually distinguishes a connector fault from broken records is that
+  // the fault sweeps in DIFFERENT orders as they change, while broken records
+  // are the same ids every time. Partial recovery is where "increment first,
+  // classify later" bites: the outage would have driven every counter to the
+  // cap, so the moment recovery leaves one lagging record it is isolated
+  // immediately — despite being about to recover on its own.
+  const h = harness()
+  const all = [1, 2, 3, 4, 5, 6].map(unresolvableLink)
+  let changed = all.slice(0, 4)          // which orders changed this pass
+  let broken = new Set(all.map((link) => link.linkId))
+  const run = () => runWmsDispatchSweepCore(
+    quarantineDeps(all, h, {
+      listActiveByExternalOrderIds: async (ids) => changed.filter((link) => ids.includes(link.externalOrderId ?? '')),
+      fetchDelta: async () => changed
+        .filter((link) => !h.quarantined.includes(link.linkId))
+        .map((link) => (broken.has(link.linkId)
+          ? unresolvableRow(Number(link.linkId.slice(2)))
+          : status({
+              externalOrderId: link.externalOrderId!,
+              externalOrderNumber: link.externalOrderNumber,
+              status: 'DESPATCHED',
+              dispatched: true,
+              tracking: [tracking({ trackingNumber: 'TRK' })],
+            }))),
+    }),
+    { now: NOW },
+  )
+
+  // Six passes of a full outage, a different slice of the tenant each time.
+  for (let pass = 0; pass < 6; pass += 1) {
+    changed = [all[pass % 3], all[(pass + 1) % 6], all[(pass + 2) % 6], all[(pass + 3) % 6]]
+    const result = await run()
+    assert.equal(result.unresolvedSystemic, true, `pass ${pass} is drift, not records`)
+  }
+  assert.deepEqual(h.quarantined, [])
+  assert.deepEqual([...h.streaks.values()].filter((n) => n > 0), [],
+    'a systemic pass is not evidence about any individual record')
+
+  // The dependency comes back for all but one straggler.
+  broken = new Set(['L-6'])
+  changed = all
+  const recovering = await run()
+  assert.equal(recovering.unresolvedSystemic, false, '1 of 6 is not drift')
+  assert.deepEqual(h.quarantined, [], 'the straggler starts its OWN budget at one, not at the cap')
+  assert.equal(h.streaks.get('L-6'), 1)
+})
+
+test('[o3d-bjc.9] a healthy CONTROL read proves the cohort is record-local, however systemic the ratio looks', async () => {
+  // The ratio cannot settle this on its own: "3 of the 3 orders that changed
+  // were unreadable" is what a broken trio and a broken connector both look
+  // like. A control link that reads cleanly is decisive — the connector answers,
+  // so these records are the problem.
+  const h = harness()
+  const links = [1, 2, 3].map(unresolvableLink)
+  links.forEach((link) => h.streaks.set(link.linkId, 4))
+  const excluded: string[][] = []
+  const result = await runWmsDispatchSweepCore(
+    quarantineDeps(links, h, {
+      probeControlLinks: async (exclude) => { excluded.push(exclude); return { probed: 3, resolved: 3, representative: 3 } },
+    }),
+    { now: NOW },
+  )
+  assert.equal(result.unresolvedSystemic, false)
+  assert.deepEqual(h.quarantined.sort(), ['L-1', 'L-2', 'L-3'])
+  assert.deepEqual(excluded[0]?.sort(), ['L-1', 'L-2', 'L-3'], 'the cohort itself can never be its own control')
+})
+
+test('[o3d-bjc.9] controls that ALSO fail keep it drift, however long it lasts', async () => {
+  const h = harness()
+  const links = [1, 2, 3].map(unresolvableLink)
+  links.forEach((link) => h.streaks.set(link.linkId, 40))
+  const run = () => runWmsDispatchSweepCore(
+    quarantineDeps(links, h, { probeControlLinks: async () => ({ probed: 3, resolved: 0, representative: 0 }) }),
+    { now: NOW },
+  )
+  // Same cohort every pass — identity alone would have called this local by now.
+  for (let pass = 0; pass < 5; pass += 1) {
+    const result = await run()
+    assert.equal(result.unresolvedSystemic, true, `pass ${pass}`)
+  }
+  assert.deepEqual(h.quarantined, [], 'nothing else on the connector reads either — never isolate the tenant')
+})
+
+test('[o3d-bjc.9] a failed control probe is not counter-evidence', async () => {
+  const h = harness()
+  const links = [1, 2, 3].map(unresolvableLink)
+  links.forEach((link) => h.streaks.set(link.linkId, 4))
+  const result = await runWmsDispatchSweepCore(
+    quarantineDeps(links, h, {
+      probeControlLinks: async () => { throw new Error('connector down') },
+    }),
+    { now: NOW },
+  )
+  // No evidence ≠ evidence of health. It falls back to the conservative branch.
+  assert.equal(result.unresolvedSystemic, true)
+  assert.deepEqual(h.quarantined, [])
+})
+
+test('[o3d-bjc.9] an ambiguous merge accrues a streak and is eventually replayable', async () => {
+  // It used to hold the watermark on every pass while accruing nothing: no
+  // streak, no exception-inbox row, no replay — an invisible permanent hold.
+  const h = harness()
+  const link = candidate({ linkId: 'L-9', orderId: 'O-9', externalOrderNumber: 'WC-1009', externalOrderId: 'M-9' })
+  const survivor = status({
+    externalOrderId: 'M-99',
+    externalOrderNumber: 'WC-1009+WC-1010',
+    isMerged: true,
+    mergedOrderNumbers: ['WC-1009', 'WC-1010'],
+  })
+  const run = () => runWmsDispatchSweepCore(
+    quarantineDeps([link], h, {
+      fetchDelta: async () => [survivor],
+      listActiveByExternalOrderIds: async () => [],
+      listActiveByOrderNumbers: async () => (h.quarantined.includes('L-9') ? [] : [link]),
+      // Two links claim the number ⇒ the repoint is refused as ambiguous.
+      countLinksByOrderNumber: async (numbers) => new Map(numbers.map((number) => [number, 2])),
+      probeControlLinks: async () => ({ probed: 2, resolved: 2, representative: 2 }),
+    }),
+    { now: NOW },
+  )
+  for (let pass = 0; pass < 5; pass += 1) await run()
+  assert.deepEqual(h.quarantined, ['L-9'], 'it reaches the exception inbox instead of pinning the cursor forever')
+})
+
+test('[o3d-bjc.9] controls that RESOLVE but are not dispatched prove nothing', async () => {
+  // The completeness guard only rejects records that read as DISPATCHED, so a
+  // connector-wide change that mangles every despatch leaves pending orders
+  // reading perfectly. Counting those as healthy evidence is exactly how the
+  // breaker would come to quarantine the tenant it exists to protect.
+  const h = harness()
+  const links = [1, 2, 3].map(unresolvableLink)
+  links.forEach((link) => h.streaks.set(link.linkId, 4))   // all one read from the cap
+  const result = await runWmsDispatchSweepCore(
+    quarantineDeps(links, h, {
+      // Three pending controls read fine; none of them exercises the invariant
+      // every dispatched record is failing.
+      probeControlLinks: async () => ({ probed: 3, resolved: 3, representative: 0 }),
+    }),
+    { now: NOW },
+  )
+  assert.equal(result.unresolvedSystemic, true)
+  assert.deepEqual(h.quarantined, [])
+  assert.deepEqual([...h.streaks.values()], [4, 4, 4], 'and no budget is spent on them')
+})
+
+test('[o3d-bjc.9] a PARTS-path outage is not excused by a healthy non-split control', async () => {
+  // Unresolved outcomes come from split enumeration and part-item reads too, so
+  // a connector-wide fetchOrderParts degradation leaves an ordinary non-split
+  // order answering perfectly while every split order breaks. The control has
+  // to walk the same paths, or that one clean status read quarantines the whole
+  // split cohort five passes later.
+  const h = harness()
+  const links = [1, 2, 3].map(unresolvableLink)
+  links.forEach((link) => h.streaks.set(link.linkId, 4))
+  const result = await runWmsDispatchSweepCore(
+    quarantineDeps(links, h, {
+      // The probe walked status AND parts; parts is what is down, so nothing
+      // qualifies as representative.
+      probeControlLinks: async () => ({ probed: 3, resolved: 3, representative: 0 }),
+    }),
+    { now: NOW },
+  )
+  assert.equal(result.unresolvedSystemic, true)
+  assert.deepEqual(h.quarantined, [])
 })

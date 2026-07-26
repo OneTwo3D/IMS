@@ -368,6 +368,8 @@ export function createPrismaReconcileDeps(connectorId: WmsConnectorId, connector
           // Orders already past dispatch don't need existence verification, and
           // dispatch-dead-lettered links are already surfaced exceptions.
           dispatchDeadLetteredAt: null,
+          // o3d-bjc.9: a quarantined link is a surfaced exception too.
+          dispatchUnresolvedAt: null,
           // ON_HOLD/CANCELLED/fully-refunded orders on SYNCED links belong to
           // check C (their WMS order OUGHT to be cancelled), not here.
           order: {
@@ -677,6 +679,7 @@ export async function runWmsOrderReconcileSweep(
         OR: [
           { order: { wmsOrderPush: { isNot: { state: { in: ['SYNCED', 'MERGED'] } } } } },
           { order: { wmsOrderPush: { is: { dispatchDeadLetteredAt: { not: null } } } } },
+          { order: { wmsOrderPush: { is: { dispatchUnresolvedAt: { not: null } } } } },
           { order: { status: { in: ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED', 'ON_HOLD'] } } },
           { order: { refundStatus: 'FULL' } },
         ],

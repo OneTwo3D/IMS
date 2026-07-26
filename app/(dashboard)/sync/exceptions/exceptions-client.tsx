@@ -312,9 +312,10 @@ export function ExceptionsClient({ data }: Props) {
               <TableRow>
                 <TableHead>Order</TableHead>
                 <TableHead>WMS order</TableHead>
-                <TableHead>Failures</TableHead>
+                <TableHead>Why</TableHead>
+                <TableHead>Attempts</TableHead>
                 <TableHead>Error</TableHead>
-                <TableHead>Dead-lettered</TableHead>
+                <TableHead>Held since</TableHead>
                 <TableHead className="text-right">Action</TableHead>
               </TableRow>
             </TableHeader>
@@ -325,6 +326,15 @@ export function ExceptionsClient({ data }: Props) {
                     <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
                   </TableCell>
                   <TableCell className="text-xs font-mono">{row.externalOrderNumber ?? '—'}</TableCell>
+                  <TableCell className="text-xs">
+                    {row.kind === 'unresolved' ? (
+                      <span title="The WMS answered, but its record could not be read as a dispatch state. Quarantined so it stops holding the inbound sync back.">
+                        Unreadable record
+                      </span>
+                    ) : (
+                      <span title="The reconcile kept failing (transport, or applying it to IMS).">Dead-lettered</span>
+                    )}
+                  </TableCell>
                   <TableCell className="text-xs">{row.failureCount}</TableCell>
                   <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.reason ?? ''}>{row.reason ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.deadLetteredAt ? formatDateTime(row.deadLetteredAt) : '—'}</TableCell>
