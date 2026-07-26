@@ -163,6 +163,46 @@ export function buildAvailableStockMapIncludingOwnReservations(
   return stockMap
 }
 
+/**
+ * (product, warehouse) scopes where this order's OWN allocation rows exceed what is actually
+ * reserved against them (o3d-4kfh).
+ *
+ * `buildAvailableStockMapIncludingOwnReservations` adds an order's allocations back into
+ * available stock so a recomputation is not fighting its own reservations — and it does that
+ * unconditionally, even when reservedQty has already fallen BELOW those rows. It warns, but the
+ * warning fed nothing.
+ *
+ * Detection only. The unconditional release/delete/recreate/reserve cycle does NOT repair such a
+ * row — it releases this order's own quantity and reserves the same quantity straight back, which
+ * nets to zero against the discrepancy. So neither allocating nor short-circuiting fixes it, and
+ * forcing a rewrite would only reintroduce churn.
+ *
+ * The consequence is real: stock this order believes it holds is available to another one, so a
+ * second order can allocate it and a dispatch can fail. Repairing it means recomputing reservedQty
+ * from every live reservation source for the scope — a stock-integrity change beyond this path,
+ * tracked on o3d-4kfh. This makes the condition loud in the meantime.
+ */
+export function findUnderReservedScopes(
+  stockRows: Array<{ productId: string; warehouseId: string; reservedQty: DecimalInput }>,
+  ownRows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
+): Array<{ productId: string; warehouseId: string }> {
+  const ownByScope = new Map<string, Prisma.Decimal>()
+  for (const row of ownRows) {
+    const key = `${row.productId}:${row.warehouseId}`
+    ownByScope.set(key, (ownByScope.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)))
+  }
+
+  const scopes: Array<{ productId: string; warehouseId: string }> = []
+  for (const row of stockRows) {
+    const ownQty = ownByScope.get(`${row.productId}:${row.warehouseId}`)
+    if (!ownQty) continue
+    if (ownQty.gt(toDecimal(row.reservedQty).add(ALLOCATION_EPSILON_DECIMAL))) {
+      scopes.push({ productId: row.productId, warehouseId: row.warehouseId })
+    }
+  }
+  return scopes
+}
+
 function cloneAvailableStockMap(
   stockMap: DecimalStockMap,
 ): DecimalStockMap {
@@ -1075,6 +1115,27 @@ export async function allocateSalesOrder(
     // Only the WRITES are skipped. The backorder report, the status promotion and the return value
     // are all still computed from in-memory state, so an unchanged run reports exactly what a
     // changed one would — callers cannot tell the difference except that nothing moved.
+    // o3d-4kfh: surface an existing reservedQty shortfall, but do NOT force a rewrite for it.
+    //
+    // I first assumed the unconditional cycle repaired such a row as a side effect, and that
+    // skipping it was therefore a regression. It does not: the cycle RELEASES this order's own
+    // quantity and then RESERVES the same quantity back, which is a no-op on the discrepancy —
+    // release 2 from a reservedQty of 0 and re-reserve 2 ends exactly where it started. Forcing
+    // the rewrite would reintroduce the perpetual churn o3d-i5it removed and fix nothing.
+    //
+    // Real reconciliation means recomputing reservedQty from every live reservation source for
+    // the scope, which is a stock-integrity change well beyond this path. Until then the
+    // condition is at least LOUD instead of a bare console warning nothing reads (o3d-4kfh).
+    const underReserved = findUnderReservedScopes(stockLevels, ownAllocations)
+    if (underReserved.length > 0) {
+      console.error(
+        `[allocation-service] order ${orderId}: reservedQty is BELOW this order's own allocations for `
+        + `${underReserved.map((scope) => `${scope.productId}@${scope.warehouseId}`).join(', ')} — `
+        + 'stock this order believes it holds is available to another. Neither allocating nor '
+        + 'short-circuiting repairs this; it needs reservation reconciliation (o3d-4kfh).',
+      )
+    }
+
     const unchanged = allocationSetsMatch(existingAllocs, nextAllocations)
 
     if (!unchanged) {

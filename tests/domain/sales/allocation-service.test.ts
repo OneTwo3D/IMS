@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   allocateSalesOrder,
   allocationSetsMatch,
+  findUnderReservedScopes,
   assertReservationReleaseDelta,
   buildAvailableStockMapIncludingOwnReservations,
   buildAvailableStockMap,
@@ -1433,4 +1434,98 @@ test('KNOWN DEFECT o3d-i4qd: the persisted quantity can exceed the stock it was 
   const persisted = (state.allocations ?? []).reduce((sum, row) => sum + Number(row.qty), 0)
   assert.equal(persisted, 1, 'the column rounds 0.999960 up to 1.0000 — the defect, documented')
   assert.ok(persisted > 0.99996, 'and that exceeds the 0.99996 the allocator checked against')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh — allocation-row equality is not evidence the RESERVATIONS are right.
+// ---------------------------------------------------------------------------
+
+test('findUnderReservedScopes flags a scope whose reservedQty is below the order own rows (o3d-4kfh)', () => {
+  const scopes = findUnderReservedScopes(
+    [{ productId: 'p1', warehouseId: 'w1', reservedQty: 0 }],
+    [{ productId: 'p1', warehouseId: 'w1', qty: 2 }],
+  )
+  assert.deepEqual(scopes, [{ productId: 'p1', warehouseId: 'w1' }])
+})
+
+test('findUnderReservedScopes ignores a consistent scope, and one this order does not touch (o3d-4kfh)', () => {
+  assert.deepEqual(
+    findUnderReservedScopes(
+      [{ productId: 'p1', warehouseId: 'w1', reservedQty: 2 }],
+      [{ productId: 'p1', warehouseId: 'w1', qty: 2 }],
+    ),
+    [],
+    'reserved exactly covers the rows',
+  )
+  assert.deepEqual(
+    findUnderReservedScopes(
+      [{ productId: 'p9', warehouseId: 'w1', reservedQty: 0 }],
+      [{ productId: 'p1', warehouseId: 'w1', qty: 2 }],
+    ),
+    [],
+    'a scope with none of this order\'s allocations is not its problem',
+  )
+})
+
+test('findUnderReservedScopes tolerates float noise rather than flagging it (o3d-4kfh)', () => {
+  // reservedQty carries 6dp; a sub-epsilon difference is representation, not a real shortfall,
+  // and flagging it would force a rewrite on every cycle — reintroducing the churn o3d-i5it fixed.
+  assert.deepEqual(
+    findUnderReservedScopes(
+      [{ productId: 'p1', warehouseId: 'w1', reservedQty: 1.999999 }],
+      [{ productId: 'p1', warehouseId: 'w1', qty: 2 }],
+    ),
+    [],
+  )
+})
+
+test('an UNDER-RESERVED order is REPORTED, and the rewrite would not have repaired it (o3d-4kfh)', async () => {
+  // I first assumed the unconditional cycle repaired this as a side effect, so skipping it was a
+  // regression. It does not. The cycle releases this order's own quantity and reserves the same
+  // quantity back — release 2 from a reservedQty of 0, re-reserve 2, and you are exactly where
+  // you started. Forcing a rewrite here would reintroduce the churn o3d-i5it removed and fix
+  // nothing, so the condition is reported loudly instead.
+  //
+  // Line 2, stock 2, allocated 2 — the computed set is IDENTICAL, so only reservedQty is wrong.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      lines: [{
+        id: 'line-1',
+        productId: 'product-1',
+        qty: 2,
+        sku: 'SKU-1',
+        description: 'Product 1',
+        product: { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false },
+      }],
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 0 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+    }],
+  })
+
+  const errors: string[] = []
+  const realError = console.error
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')) }
+  try {
+    await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+  } finally {
+    console.error = realError
+  }
+
+  assert.equal(errors.length, 1, 'the shortfall is reported')
+  assert.match(errors[0], /reservedQty is BELOW/)
+  assert.match(errors[0], /needs reservation reconciliation/)
+  assert.equal(writeCounts.allocationDeletes, 0, 'and it does NOT trigger a pointless rewrite')
+  assert.equal(
+    state.stockLevels[0].reservedQty,
+    0,
+    'the shortfall persists — this documents that neither path repairs it, which is why o3d-4kfh stays open',
+  )
 })
