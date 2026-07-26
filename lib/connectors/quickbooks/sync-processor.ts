@@ -924,9 +924,16 @@ export async function repairQuickBooksBackReferences(limit = 200): Promise<BackR
   //
   // Without a provenance column the cheapest sound guard is the connection's own age: only rows
   // created since the CURRENT token was stored can belong to the current realm. Rows older than it
-  // are left alone rather than guessed at. A reconnect to the SAME realm re-stamps this timestamp
-  // and so defers those repairs, which is the conservative direction — a missed repair is
-  // recoverable, a cross-realm id is not.
+  // are left alone rather than guessed at. The token row is UPSERTED on refresh and only DELETED on
+  // disconnect, so createdAt tracks the connection rather than the last refresh — which is what
+  // makes it usable here at all.
+  //
+  // BE CLEAR ABOUT THE COST: a reconnect to the SAME realm also resets this timestamp, and those
+  // older rows then become PERMANENTLY ineligible for repair — not merely deferred. Operators
+  // reconnect whenever tokens break, so this is reachable. The trade is deliberate: a missed repair
+  // leaves the order blocked by the sync-log checks (visible, recoverable until retention), while a
+  // cross-realm id silently links a document to an unrelated remote record and is not recoverable
+  // at all. Removing the cost, rather than accepting it, needs real provenance — o3d-s36z.
   //
   // Stamping the rows properly is the real fix, tracked as o3d-s36z.
   const token = await db.accountingToken.findUnique({
