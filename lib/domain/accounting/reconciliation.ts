@@ -3,6 +3,7 @@ import { toJsonInputValue } from '@/lib/db/json-input'
 // decimal-boundary-ok: report-only (accounting reconciliation finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isMirrorableAccountingSyncType } from './accounting-event-mirror'
+import { startOfUtcDay } from './daily-batch-retention'
 
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
 export type AccountingReconciliationRunStatus = 'COMPLETED' | 'FAILED' | 'PARTIAL'
@@ -649,12 +650,19 @@ export async function collectAccountingReconciliationRows(
     options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
     options.toDate,
   )
+  // updatedAt and the rest stay on the exact wall-clock cutoff; only the batch-day stage
+  // stamps are compared against the floored one.
+  const stageFromDate = startOfUtcDay(fromDate)
   const [salesOrders, shipments, refunds, syncLogs, accountingEvents] = await Promise.all([
     client.salesOrder.findMany({
       where: {
         OR: [
-          { revenueDeferredDate: { gte: fromDate } },
-          { inventoryAllocatedDate: { gte: fromDate } },
+          // Batch-day markers, so the cutoff is floored to that day's midnight (o3d-0qoo).
+          // The daily syncs stamp these with the BATCH date so they agree with the batch
+          // reference; comparing them to a mid-day wall-clock cutoff would drop an order
+          // staged late on the boundary day and report it as a missing event.
+          { revenueDeferredDate: { gte: stageFromDate } },
+          { inventoryAllocatedDate: { gte: stageFromDate } },
           { status: { in: [...TERMINAL_SALES_ORDER_STATUSES] }, updatedAt: { gte: fromDate } },
           // Refund state is orthogonal to the lifecycle status now, so a recently
           // refunded order may sit in a non-terminal status (e.g. PROCESSING). Always

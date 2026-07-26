@@ -39,8 +39,20 @@ export async function recreateRetentionCutoff(now: Date = new Date()): Promise<D
 }
 
 /** Prisma date filter for recreate's journaled-shipment/order queries: within the
- *  retention window when set ({ gte } also excludes nulls), else any non-null marker. */
+ *  retention window when set ({ gte } also excludes nulls), else any non-null marker.
+ *
+ *  The cutoff is floored to UTC start-of-day (o3d-0qoo). revenueDeferredDate and
+ *  inventoryAllocatedDate are BATCH-DAY markers — the daily syncs stamp them with the batch
+ *  date's midnight so they agree with the batch reference — so comparing them against a
+ *  mid-day wall-clock cutoff would age a whole batch day out early: an order staged at 23:00
+ *  is stamped 00:00 and would fall outside a window that a wall-clock reading includes.
+ *  Flooring only ever WIDENS the window, which for a recovery query is the safe direction. */
 export async function recreateJournaledDateFilter(now?: Date): Promise<{ gte: Date } | { not: null }> {
   const cutoff = await recreateRetentionCutoff(now)
-  return cutoff ? { gte: cutoff } : { not: null }
+  return cutoff ? { gte: startOfUtcDay(cutoff) } : { not: null }
+}
+
+/** Midnight UTC on the same day as `value`. Batch-day markers are stamped at exactly this. */
+export function startOfUtcDay(value: Date): Date {
+  return new Date(`${value.toISOString().slice(0, 10)}T00:00:00.000Z`)
 }

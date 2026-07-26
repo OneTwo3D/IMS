@@ -168,14 +168,35 @@ export async function findSalesOrderDeleteBlocker(
   if (shipmentIds.length > 0) {
     orderKeyed.push({ referenceType: 'Shipment', referenceId: { in: shipmentIds } })
   }
-  const liveDocument = await tx.accountingSyncLog.findFirst({
-    where: { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] }, OR: orderKeyed },
-    // externalTransactionId is the POST evidence, and status alone is not a proxy for it:
-    // Xero reverts an already-posted row to PENDING when follow-up work fails, KEEPING the
-    // external id. Branching on status alone would then tell an operator to cancel a document
-    // that is already in the ledger (o3d-v7sy).
+  // externalTransactionId is the POST evidence, and status is not a proxy for it: Xero reverts an
+  // already-posted row to PENDING when follow-up work fails, KEEPING the external id, and
+  // cancelOrphanedAccountingSyncRows can then move that row to CANCELLED without clearing it.
+  // So the STATUS FILTER cannot come first — a posted-but-cancelled row would not even be
+  // selected, and if the back-reference also failed there is no accountingInvoiceId either. The
+  // match is therefore "live status OR carries an external id", whatever the status (o3d-v7sy).
+  const candidateDocuments = await tx.accountingSyncLog.findMany({
+    where: {
+      OR: orderKeyed,
+      AND: [{
+        OR: [
+          { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] } },
+          { externalTransactionId: { not: null } },
+        ],
+      }],
+    },
     select: { id: true, connector: true, type: true, status: true, externalTransactionId: true },
   })
+
+  // Order matters: with several rows, findFirst could return a merely QUEUED one ahead of a
+  // POSTED one and advise cancelling a document that is already in the ledger. Posted evidence
+  // wins, then FAILED (unknown), then in-flight, then queued — most severe remedy first.
+  const rank = (row: { status: string; externalTransactionId: string | null }): number => {
+    if (row.externalTransactionId || row.status === 'SYNCED') return 0
+    if (row.status === 'FAILED') return 1
+    if (row.status === 'PROCESSING') return 2
+    return 3
+  }
+  const liveDocument = [...candidateDocuments].sort((a, b) => rank(a) - rank(b))[0] ?? null
   if (liveDocument) {
     return {
       code: 'accounting_sync_live',

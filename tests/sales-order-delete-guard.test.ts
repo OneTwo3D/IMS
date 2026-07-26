@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { startOfUtcDay } from '@/lib/domain/accounting/daily-batch-retention'
 import assert from 'node:assert/strict'
 
 import {
@@ -33,6 +34,11 @@ function matches(row: SyncLogRow, where: WhereNode): boolean {
       if (!branches.some((branch) => matches(row, branch))) return false
       continue
     }
+    if (key === 'AND') {
+      const branches = condition as WhereNode[]
+      if (!branches.every((branch) => matches(row, branch))) return false
+      continue
+    }
     const value = (row as unknown as Record<string, unknown>)[key]
     if (condition !== null && typeof condition === 'object') {
       const operators = condition as Record<string, unknown>
@@ -41,6 +47,13 @@ function matches(row: SyncLogRow, where: WhereNode): boolean {
           if (!(operand as unknown[]).includes(value)) return false
         } else if (operator === 'startsWith') {
           if (typeof value !== 'string' || !value.startsWith(operand as string)) return false
+        } else if (operator === 'not') {
+          // Only `{ not: null }` is emitted — "carries an external id, whatever its status".
+          if (operand === null) {
+            if (value === null || value === undefined) return false
+          } else if (value === operand) {
+            return false
+          }
         } else {
           throw new Error(`unsupported operator in test evaluator: ${operator}`)
         }
@@ -71,6 +84,8 @@ function makeTx(seed: {
     accountingSyncLog: {
       findFirst: async ({ where }: { where: WhereNode }) =>
         (seed.syncLogs ?? []).find((row) => matches(row, where)) ?? null,
+      findMany: async ({ where }: { where: WhereNode }) =>
+        (seed.syncLogs ?? []).filter((row) => matches(row, where)),
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any
@@ -385,4 +400,65 @@ test('the batch key derived from a stage stamp matches the batch date it was sta
     batchDate,
     'the stamp must map back to the batch date, whatever wall-clock time the row was written',
   )
+})
+
+test('a CANCELLED row that still carries an external id BLOCKS (o3d-v7sy)', async () => {
+  // The status filter used to run first, so this row was never even selected. Xero can revert a
+  // posted row to PENDING when the back-reference fails, keeping the external id, and
+  // cancelOrphanedAccountingSyncRows then moves it to CANCELLED without clearing that id. If the
+  // back-reference failed there is no accountingInvoiceId either — so nothing would have blocked,
+  // and the posted invoice would have been stranded.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [syncLog({ status: 'CANCELLED', externalTransactionId: 'INV-777' })] }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'accounting_sync_live')
+  assert.match(blocker!.message, /already POSTED as INV-777/)
+})
+
+test('a POSTED row wins over a QUEUED one when both exist (o3d-v7sy)', async () => {
+  // findFirst could return whichever row the database happened to yield, so a queued row could
+  // mask a posted one and the operator would be told to cancel a document already in the ledger.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [
+        syncLog({ id: 'log-queued', status: 'PENDING', type: 'COGS_JOURNAL' }),
+        syncLog({ id: 'log-posted', status: 'SYNCED', externalTransactionId: 'INV-888' }),
+      ],
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.match(blocker!.message, /already POSTED as INV-888/, 'the most severe remedy wins')
+  assert.doesNotMatch(blocker!.message, /Cancel the order instead/)
+})
+
+test('a CANCELLED row with NO external id still does not block', async () => {
+  // The widened match must not turn every retired row into a blocker.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [syncLog({ status: 'CANCELLED' })] }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker, null)
+})
+
+test('startOfUtcDay floors a mid-day cutoff to the batch-day marker it is compared against (o3d-0qoo)', () => {
+  // The daily syncs stamp revenueDeferredDate / inventoryAllocatedDate with the BATCH date's
+  // midnight so they agree with the batch reference. Comparing those against a mid-day
+  // wall-clock cutoff ages a whole batch day out early: an order staged at 23:00 is stamped
+  // 00:00, so a one-day lookback run at noon would exclude it despite it being 13 hours old,
+  // and reconciliation would report a missing event that is not missing.
+  const middayCutoff = new Date('2026-07-20T12:00:00.000Z')
+  const lateStagedStamp = new Date('2026-07-20T00:00:00.000Z')
+
+  assert.ok(lateStagedStamp < middayCutoff, 'precondition: the raw cutoff would exclude it')
+  assert.ok(
+    lateStagedStamp >= startOfUtcDay(middayCutoff),
+    'flooring includes the whole batch day — only ever widening, which is the safe direction',
+  )
+  assert.equal(startOfUtcDay(middayCutoff).toISOString(), '2026-07-20T00:00:00.000Z')
 })
