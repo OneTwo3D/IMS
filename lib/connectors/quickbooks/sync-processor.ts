@@ -139,7 +139,20 @@ async function hasExistingSyncLog(
       type,
       referenceType,
       referenceId,
-      status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+      // o3d-sref: an UNVERIFIED row counts as live here, and this is the duplicate-payment path.
+      //
+      // Both connectors derive their remote idempotency key from the ROW ID. So if a retired
+      // possibly-sent row does not block, a repeated follow-up enqueue creates a NEW row with a NEW
+      // id and therefore a NEW key — and registers a SECOND payment even though the original may
+      // have succeeded. The partial unique index carries the same predicate, so the database
+      // enforces it too.
+      //
+      // This hazard PREDATES the flag: a plain CANCELLED row has always been re-enqueueable this
+      // way. It is closed here because the flag is the first thing that makes the case identifiable.
+      OR: [
+        { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
+        { remoteEffectUnverified: true },
+      ],
     },
   })
   return count > 0

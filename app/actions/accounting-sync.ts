@@ -110,6 +110,15 @@ export type FailedAccountingSyncSummary = {
   connector: string | null
   /** Terminally-FAILED rows (retries exhausted) on the active connector. */
   failedCount: number
+  /**
+   * o3d-sref: rows retired while their claim was already taken, so a remote call may have landed and
+   * nobody has accounted for it. Counted SEPARATELY from failedCount because the remedy differs — a
+   * FAILED row can simply be retried, whereas these need someone to look at the ledger first — and
+   * counted at all because without it these rows are invisible: they are CANCELLED, so every
+   * FAILED-scanning dashboard and reconciliation sweep correctly skips them, and an order blocked
+   * behind one would give no clue where to look.
+   */
+  unverifiedCount: number
 }
 
 /**
@@ -122,11 +131,12 @@ export type FailedAccountingSyncSummary = {
 export async function getFailedAccountingSyncSummary(): Promise<FailedAccountingSyncSummary> {
   await requireAuth()
   const connector = await getActiveConnector()
-  if (!connector) return { connector: null, failedCount: 0 }
-  const failedCount = await db.accountingSyncLog.count({
-    where: { connector, status: 'FAILED' },
-  })
-  return { connector, failedCount }
+  if (!connector) return { connector: null, failedCount: 0, unverifiedCount: 0 }
+  const [failedCount, unverifiedCount] = await Promise.all([
+    db.accountingSyncLog.count({ where: { connector, status: 'FAILED' } }),
+    db.accountingSyncLog.count({ where: { connector, remoteEffectUnverified: true } }),
+  ])
+  return { connector, failedCount, unverifiedCount }
 }
 
 // Match the processor's stale-claim window so an actively-processing row is not
@@ -186,7 +196,9 @@ export async function cancelOrphanedAccountingSyncRows(
     where: { AND: [scope, { status: 'PENDING' as const }] },
     // audit-46ry: CANCELLED (not FAILED) so these abandoned rows are excluded from
     // FAILED-scanning reconciliation/backfill sweeps and error dashboards.
-    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
+    // remoteEffectUnverified: false explicitly — a PENDING row is provably pre-call, and a row that
+    // had been flagged and returned to PENDING must not carry the old doubt forward.
+    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null, remoteEffectUnverified: false },
   })
 
   const unverifiedReason =
@@ -205,9 +217,11 @@ export async function cancelOrphanedAccountingSyncRows(
         },
       ],
     },
+    // Status stays CANCELLED so every existing consumer behaves exactly as before; the ambiguity
+    // rides on remoteEffectUnverified, which only the paths that deliberately opt in will read.
     // processingStartedAt is deliberately KEPT: it is the only record of when the possibly-sent call
     // was made, which is what reconciliation needs to search the connector for the document.
-    data: { status: 'CANCELLED_UNVERIFIED', errorMessage: unverifiedReason },
+    data: { status: 'CANCELLED', errorMessage: unverifiedReason, remoteEffectUnverified: true },
   })
 
   const result = { count: cancelledPending.count + cancelledProcessing.count }

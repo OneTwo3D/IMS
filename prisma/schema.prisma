@@ -200,16 +200,6 @@ enum AccountingSyncStatus {
   // event-backfill sweeps and FAILED-error dashboards don't treat them as unresolved
   // failures or re-queue the underlying document.
   CANCELLED
-  // o3d-sref: cancelled by the orphan sweep from a PROCESSING claim, so a remote call MAY already
-  // have gone out — the worker died before writing its result, and nothing here can know whether
-  // the request reached the connector. Distinct from CANCELLED, which is only used for a provably
-  // pre-call PENDING row.
-  //
-  // Like CANCELLED it is excluded from FAILED dashboards and reconciliation/backfill sweeps (those
-  // scan explicit status lists), so it does not read as an unresolved failure. UNLIKE CANCELLED, the
-  // order delete guard BLOCKS on it: permitting a hard delete here is what let a late remote success
-  // strand an external document against an order that no longer exists.
-  CANCELLED_UNVERIFIED
 
   @@map("AccountingSyncStatus")
 }
@@ -2039,6 +2029,18 @@ model AccountingSyncLog {
   referenceType         String // "PurchaseOrder", "CogsEntry", "SalesOrder", etc.
   referenceId           String
   externalTransactionId String?
+  /**
+   * o3d-sref: this row was retired while its claim was already TAKEN, so the processor may have made
+   * its remote call before dying — they post BEFORE persisting SYNCED and externalTransactionId — and
+   * there is no id to find either way.
+   *
+   * A FLAG rather than a new AccountingSyncStatus member on purpose. Eighteen call sites enumerate
+   * `['PENDING','PROCESSING','SYNCED']` (plus a partial unique index), and several more switch on
+   * status without exhaustiveness, so adding an enum member forces a correct judgement at every one
+   * of them and fails silently — by falling through — wherever one is missed. A flag changes nothing
+   * until a site opts in, which makes each opt-in a deliberate, reviewable decision.
+   */
+  remoteEffectUnverified Boolean @default(false)
   payload               Json? // what was sent
   errorMessage          String?
   retryCount            Int                  @default(0)

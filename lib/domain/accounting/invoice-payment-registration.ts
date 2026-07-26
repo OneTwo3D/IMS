@@ -33,7 +33,9 @@ export type InvoicePaymentRegistrationDecision =
 
 /** One INVOICE_PAYMENT sync row, reduced to what the decision depends on. */
 export type ExistingInvoicePaymentSync = {
-  status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED' | 'CANCELLED_UNVERIFIED'
+  status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED'
+  /** o3d-sref: retired with its claim taken, so the payment may already be registered. */
+  remoteEffectUnverified?: boolean
   /** What was sent, in the document currency. Null when the payload did not record it. */
   amount?: number | null
   /** The local Payment row it was queued for; null on rows queued before that was recorded. */
@@ -77,12 +79,15 @@ export function decideInvoicePaymentRegistration(input: {
   // Making the index receipt-scoped, so part payments can each register, is o3d-cjt8: it needs a
   // migration and a look at existing rows, and until then a refusal an operator can read beats an insert
   // that throws.
-  // CANCELLED_UNVERIFIED counts as LIVE (o3d-sref): the claim was taken, so that row may already
-  // have registered its payment at the connector. Excluding it would let a second registration queue
-  // for the same receipt and double-pay the invoice — the exact outcome this obstacle check exists
-  // to prevent. An unverifiable row is an obstacle, not an absence.
+  // An UNVERIFIED row counts as LIVE (o3d-sref): the claim was taken, so it may already have
+  // registered its payment. Excluding it would let a second registration queue for the same receipt
+  // and double-pay the invoice — the exact outcome this obstacle check exists to prevent. An
+  // unverifiable row is an obstacle, not an absence.
   const live = input.existing.filter(
-    (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED'
+    // NOTE the parentheses: `&&` binds tighter than `||`, so without them the own-row exclusion below
+    // would attach only to the unverified disjunct and stop applying to the ordinary path — which is
+    // exactly the bug the "does not count against itself" test caught.
+    (r) => ((r.status !== 'FAILED' && r.status !== 'CANCELLED') || r.remoteEffectUnverified === true)
     // Our OWN row, if this ever runs twice for one receipt: the idempotency key already makes the second
     // queue a no-op, so treating it as an obstacle would refuse the retry for its own success.
     && (r.paymentId == null || r.paymentId !== input.paymentId),

@@ -55,30 +55,7 @@ import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep
  * operation, and the blocker message says so. Recording pre-call rejection distinctly — so it
  * can be safely ignored here — is the rest of o3d-ju8t.
  */
-/**
- * CANCELLED_UNVERIFIED is here for the same reason FAILED is, one step further along (o3d-sref).
- *
- * cancelOrphanedAccountingSyncRows retires a stale PROCESSING claim. The claim having been taken
- * means the processor may already have made its remote call — they post BEFORE persisting SYNCED and
- * the externalTransactionId — and then died without recording the result. There is no external id to
- * find, so no evidence-hunting can settle it, which is why o3d-v7sy's "carries an external id"
- * widening cannot reach this case.
- *
- * It used to be retired as plain CANCELLED, which reads as deliberately abandoned and does NOT
- * block. The hard delete was permitted, and a late remote success then wrote a document against an
- * order that no longer existed — precisely what the o3d-5r8 claim protocol exists to prevent,
- * reached through the orphan sweep instead of a race on the claim.
- *
- * Plain CANCELLED still does not block: that value is now only used for a provably PRE-CALL PENDING
- * row, where "the ledger was never told" is a fact rather than an assumption.
- */
-export const LIVE_ACCOUNTING_SYNC_STATUSES = [
-  'PENDING',
-  'PROCESSING',
-  'SYNCED',
-  'FAILED',
-  'CANCELLED_UNVERIFIED',
-] as const
+export const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED'] as const
 
 export type SalesOrderDeleteBlocker = {
   code:
@@ -275,20 +252,32 @@ export async function findSalesOrderDeleteBlocker(
         OR: [
           { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] } },
           { externalTransactionId: { not: null } },
+          // o3d-sref: retired while its claim was taken, so the processor may have made its remote
+          // call before dying. There is no external id yet — which is exactly why o3d-v7sy's
+          // "carries an external id" widening cannot reach this case — and the status is CANCELLED,
+          // which reads as deliberately abandoned. Neither of the two conditions above can see it.
+          { remoteEffectUnverified: true },
         ],
       }],
     },
-    select: { id: true, connector: true, type: true, status: true, externalTransactionId: true },
+    select: {
+      id: true, connector: true, type: true, status: true, externalTransactionId: true,
+      remoteEffectUnverified: true,
+    },
   })
 
   // Order matters: with several rows, findFirst could return a merely QUEUED one ahead of a
   // POSTED one and advise cancelling a document that is already in the ledger. Posted evidence
   // wins, then FAILED (unknown), then in-flight, then queued — most severe remedy first.
-  const rank = (row: { status: string; externalTransactionId: string | null }): number => {
+  const rank = (row: {
+    status: string
+    externalTransactionId: string | null
+    remoteEffectUnverified?: boolean
+  }): number => {
     if (row.externalTransactionId || row.status === 'SYNCED') return 0
     // Both mean "a document may exist and we cannot tell" — the operator has to look at the ledger
     // either way, so they rank together, ahead of anything merely in-flight or queued (o3d-sref).
-    if (row.status === 'FAILED' || row.status === 'CANCELLED_UNVERIFIED') return 1
+    if (row.status === 'FAILED' || row.remoteEffectUnverified) return 1
     if (row.status === 'PROCESSING') return 2
     return 3
   }
@@ -301,7 +290,16 @@ export async function findSalesOrderDeleteBlocker(
       // PENDING / FAILED / stale-PROCESSING rows and explicitly leaves SYNCED alone, because a
       // cancel-after-post needs an explicit reversal. Telling an operator to cancel a posted
       // document leaves a live receivable against a CANCELLED order.
-      message: (liveDocument.status === 'SYNCED' || liveDocument.externalTransactionId)
+      // o3d-sref: an unverified row gets its OWN message. The generic advice below is "cancel the
+      // order instead", which cannot clear this state — the row is already CANCELLED. Telling an
+      // operator to do something that provably will not work is how a blocker becomes a dead end.
+      message: liveDocument.remoteEffectUnverified
+        ? `Cannot delete this order: a ${liveDocument.connector} ${liveDocument.type} sync was abandoned `
+          + `while in flight, so whether the document reached the ledger is UNKNOWN and deleting the `
+          + `order would strand it. Check the ledger for the document, then retry this sync entry from `
+          + `the sync page — the retry re-sends it under the same idempotency key, so it resolves to `
+          + `the existing document if one was created and creates it if not.`
+        : (liveDocument.status === 'SYNCED' || liveDocument.externalTransactionId)
         ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
           + `is already POSTED${liveDocument.externalTransactionId ? ` as ${liveDocument.externalTransactionId}` : ''}. `
           + 'It needs an explicit reversal or credit note in the accounting system — '

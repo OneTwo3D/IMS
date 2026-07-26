@@ -17,7 +17,7 @@ import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
-import { RETRYABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/sync-retry-statuses'
+import { accountingSyncRetryWhere } from '@/lib/domain/accounting/sync-retry-statuses'
 
 export type { QuickBooksSettings } from '@/lib/connectors/quickbooks/settings'
 
@@ -339,13 +339,13 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
     // RETRYABLE_ACCOUNTING_SYNC_STATUSES: without CANCELLED_UNVERIFIED an order stuck behind an
     // unverifiable orphan row would be permanently undeletable, with no operator path to clear it.
     // The stable per-entry idempotency key (buildQboRequestId) makes the re-post safe (o3d-sref).
-    const retryable = { in: [...RETRYABLE_ACCOUNTING_SYNC_STATUSES] }
-    const where = entryId
-      ? { id: entryId, connector: 'quickbooks', status: retryable }
-      : { connector: 'quickbooks', status: retryable }
+    // FAILED, or a row retired while its claim was taken (o3d-sref) — see
+    // accountingSyncRetryWhere for why the unverified ones must be reachable at all.
+    const where = accountingSyncRetryWhere('quickbooks', entryId)
     const result = await db.accountingSyncLog.updateMany({
       where,
-      data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
+      // The doubt is cleared as the row goes back into the queue: the re-post settles it.
+      data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null, remoteEffectUnverified: false },
     })
     await logActivity({
       entityType: 'SYSTEM',
