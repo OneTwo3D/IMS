@@ -26,6 +26,7 @@ import {
 } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
+import { withSavepoint } from '@/lib/db/savepoint'
 
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
@@ -736,7 +737,9 @@ async function createReturnInboundMovementAndCostLayersTx(
   },
 ): Promise<'created' | 'duplicate'> {
   try {
-    await tx.stockMovement.create({
+    // o3d-slrn: returning 'duplicate' leaves the CALLER continuing on this same tx, so the
+    // failing insert must be savepointed or everything after it hits a 25P02.
+    await withSavepoint(tx, () => tx.stockMovement.create({
       data: {
         type: 'RETURN_INBOUND',
         productId: params.movementRow.productId,
@@ -751,7 +754,7 @@ async function createReturnInboundMovementAndCostLayersTx(
         referenceId: params.referenceId,
         ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
       },
-    })
+    }))
   } catch (error) {
     if (!isStockMovementIdempotencyConflict(error)) throw error
     return 'duplicate'

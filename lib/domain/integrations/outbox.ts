@@ -5,6 +5,7 @@ import {
   uniqueViolationTargetsField,
 } from '@/lib/db/prisma-unique-violation'
 import { parseIntegrationOutboxPayload } from '@/lib/domain/integrations/outbox-registry'
+import { withSavepoint } from '@/lib/db/savepoint'
 
 export const INTEGRATION_OUTBOX_STATUS = {
   PENDING: 'PENDING',
@@ -323,7 +324,11 @@ export async function enqueueIntegrationOutbox(
     payloadJson: input.payloadJson,
   })
   try {
-    return await client.integrationOutbox.create({
+    // o3d-slrn: this is called with a TRANSACTION client by scheduleXeroAccountingOutbox and
+    // friends, and the catch below queries the same client to return the existing row. This path
+    // was already firing before o3d-5od via the old modelName fallback, so it is the one instance
+    // of this bug that has been live in production.
+    return await withSavepoint(client, () => client.integrationOutbox.create({
       data: {
         connector: input.connector,
         operation: input.operation,
@@ -336,7 +341,7 @@ export async function enqueueIntegrationOutbox(
         lockedAt: null,
         lockedBy: null,
       },
-    })
+    }))
   } catch (error) {
     if (!isIdempotencyKeyConflict(error)) throw error
     const existing = await client.integrationOutbox.findUnique({

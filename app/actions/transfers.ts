@@ -28,6 +28,7 @@ import {
   buildStockMovementValueFieldsFromConsumed,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
+import { withSavepoint } from '@/lib/db/savepoint'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -663,7 +664,9 @@ async function applyTransferLineReceipt(
     toDecimal(0),
   )
   try {
-    await tx.stockMovement.create({
+    // o3d-slrn: returning { booked: false } leaves the caller continuing on this same tx, so
+    // the failing insert must be savepointed or everything after it hits a 25P02.
+    await withSavepoint(tx, () => tx.stockMovement.create({
       data: {
         type: 'TRANSFER_IN',
         productId,
@@ -678,7 +681,7 @@ async function applyTransferLineReceipt(
         ...(idempotencyKey ? { idempotencyKey } : {}),
         ...buildStockMovementValueFieldsFromTotal({ qty: qtyToReceive, totalValueBase }),
       },
-    })
+    }))
   } catch (error) {
     // Idempotent path only: a duplicate submit/retry already booked this line, so
     // skip the rest of its booking (stock level, layers were applied the first time).
