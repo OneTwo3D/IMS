@@ -111,6 +111,14 @@ export async function findSalesOrderDeleteBlocker(
   orderId: string,
   stamps: SalesOrderDeleteStageStamps,
 ): Promise<SalesOrderDeleteBlocker | null> {
+  // Blockers are COLLECTED, not returned on first hit (o3d-eu0r r2). Several can apply at once —
+  // a WMS snapshot alongside a PROCESSING or FAILED accounting row is ordinary — and the remedies
+  // are NOT interchangeable. Returning the WMS one first told an operator to cancel while an
+  // accounting call was still in flight or its outcome unknown, which is exactly how a cancelled
+  // IMS order ends up with a live invoice in the ledger. They are ranked below by how severe the
+  // required remedy is, so the operator is always told the most binding thing first.
+  const blockers: SalesOrderDeleteBlocker[] = []
+
   // 0. Durable external-document markers, checked FIRST because they are the only evidence here
   // that survives retention (o3d-v7sy). Everything else in this guard reads AccountingSyncLog,
   // and purgeExpiredData deletes those rows past the retention window (six months by default).
@@ -134,13 +142,13 @@ export async function findSalesOrderDeleteBlocker(
     select: { accountingInvoiceId: true },
   })
   if (invoiced?.accountingInvoiceId) {
-    return {
+    blockers.push({
       code: 'accounting_document_exists',
       message:
         `Cannot delete an order with an accounting document already posted `
         + `(invoice ${invoiced.accountingInvoiceId}). It needs an explicit reversal or credit note `
         + `in the accounting system first — cancelling the order does NOT reverse a posted invoice.`,
-    }
+    })
   }
 
   // 1a. A WMS status snapshot is independent evidence that the warehouse holds this order
@@ -148,19 +156,25 @@ export async function findSalesOrderDeleteBlocker(
   // the WMS, so it can carry a confirmed externalOrderId with NO push link — an order the WMS
   // knows about that this IMS never pushed. Worse, its FK is onDelete: Cascade, so deleting the
   // order silently erases the only local record that the remote order exists.
+  //
+  // POSITIVE evidence only. order-status-sweep deliberately upserts a PLACEHOLDER row with an
+  // empty externalOrderId, statusLabel 'Unknown' and lastError 'Order not found in WMS' when an
+  // authoritative lookup finds nothing, and another after a lookup ERROR — and nothing ever
+  // removes those rows. Treating any snapshot as proof would make a storefront-linked order that
+  // never reached the WMS permanently undeletable, while claiming a remote order exists.
   const snapshot = await tx.wmsOrderStatusSnapshot.findUnique({
     where: { orderId },
     select: { connectorLabel: true, externalOrderNumber: true, externalOrderId: true, statusLabel: true },
   })
-  if (snapshot) {
+  if (snapshot?.externalOrderId) {
     const ref = snapshot.externalOrderNumber || snapshot.externalOrderId
-    return {
+    blockers.push({
       code: 'wms_order_status_snapshot',
       message:
         `Cannot delete an order the warehouse management system already holds `
         + `(${snapshot.connectorLabel} order ${ref}, ${snapshot.statusLabel}). Cancel the order instead `
         + 'so the WMS order is withdrawn — deleting would erase the only local record of it.',
-    }
+    })
   }
 
   // 1b. WMS push link. The link row is the push sweep's claim: it exists from immediately before
@@ -172,12 +186,12 @@ export async function findSalesOrderDeleteBlocker(
   })
   if (pushLink) {
     const ref = pushLink.externalOrderNumber ?? pushLink.externalOrderId
-    return {
+    blockers.push({
       code: 'wms_order_push_link',
       message:
         `Cannot delete an order that has been claimed for or sent to the warehouse management system ` +
         `(push state ${pushLink.state}${ref ? `, WMS order ${ref}` : ''}). Cancel the order instead so the WMS order is withdrawn.`,
-    }
+    })
   }
 
   // 2. Accounting documents keyed by this order (or by one of its shipments).
@@ -225,7 +239,7 @@ export async function findSalesOrderDeleteBlocker(
   }
   const liveDocument = [...candidateDocuments].sort((a, b) => rank(a) - rank(b))[0] ?? null
   if (liveDocument) {
-    return {
+    blockers.push({
       code: 'accounting_sync_live',
       // The remedy depends on whether the document is ALREADY IN THE LEDGER, which is what
       // externalTransactionId records — not on status alone. cancelOrderInvoiceSync retires
@@ -248,7 +262,7 @@ export async function findSalesOrderDeleteBlocker(
               + 'is IN FLIGHT. Wait for it to settle, then delete or reverse depending on the outcome.'
             : `Cannot delete an order with accounting documents queued to ${liveDocument.connector} `
               + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired before it posts.`,
-    }
+    })
   }
 
   // 3. Daily batches. These are DailyBatch-keyed, so they are unreachable by order id —
@@ -272,14 +286,31 @@ export async function findSalesOrderDeleteBlocker(
       select: { id: true, connector: true, referenceId: true, status: true },
     })
     if (!liveBatch) continue
-    return {
+    blockers.push({
       code: 'daily_batch_staged',
       message:
         `Cannot delete an order included in the ${batch.label} daily accounting batch ` +
         `(${liveBatch.connector} ${liveBatch.referenceId}, ${liveBatch.status}). ` +
         `The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry.`,
-    }
+    })
   }
 
-  return null
+  if (blockers.length === 0) return null
+
+  // Most binding remedy first. A posted document needs a finance reversal; an ambiguous FAILED
+  // one needs the connector checked before anything else is done; an in-flight one needs waiting.
+  // Only once none of those apply is "cancel the order" the right advice — so WMS evidence and
+  // merely-queued accounting work rank last, because cancelling genuinely resolves them.
+  const REMEDY_ORDER: SalesOrderDeleteBlocker['code'][] = [
+    'accounting_document_exists',
+    'daily_batch_staged',
+    'accounting_sync_live',
+    'wms_order_status_snapshot',
+    'wms_order_push_link',
+  ]
+  const severity = (blocker: SalesOrderDeleteBlocker) => {
+    const index = REMEDY_ORDER.indexOf(blocker.code)
+    return index === -1 ? REMEDY_ORDER.length : index
+  }
+  return [...blockers].sort((a, b) => severity(a) - severity(b))[0]
 }

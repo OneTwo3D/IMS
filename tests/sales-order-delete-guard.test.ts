@@ -479,3 +479,87 @@ test('the snapshot falls back to the external id when it has no order number (o3
 
   assert.match(blocker!.message, /sh-99/)
 })
+
+test('a PLACEHOLDER snapshot (WMS lookup found nothing) does NOT block (o3d-eu0r)', async () => {
+  // order-status-sweep deliberately upserts a placeholder with an EMPTY externalOrderId,
+  // statusLabel 'Unknown' and lastError 'Order not found in WMS' when an authoritative lookup
+  // finds no order — and again after a lookup error. Nothing ever removes those rows. Treating
+  // any snapshot as proof would make a storefront-linked order that never reached the WMS
+  // permanently undeletable, while the refusal claimed a remote order exists.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: null,
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'SO-1',
+        externalOrderId: '',
+        statusLabel: 'Unknown',
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker, null, 'positive evidence only — an empty externalOrderId proves nothing')
+})
+
+test('an in-flight accounting document outranks WMS evidence (o3d-eu0r)', async () => {
+  // Several blockers can apply at once, and their remedies are NOT interchangeable. Returning
+  // the WMS one first told the operator to cancel while an accounting call was still in flight —
+  // which is exactly how a cancelled IMS order ends up with a live invoice in the ledger.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'WMS-1',
+        externalOrderId: '1',
+        statusLabel: 'Processing',
+      },
+      syncLogs: [syncLog({ status: 'PROCESSING' })],
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'accounting_sync_live')
+  assert.match(blocker!.message, /IN FLIGHT/)
+})
+
+test('a POSTED accounting document outranks everything else (o3d-eu0r)', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: { state: 'SYNCED', externalOrderId: 'w-1', externalOrderNumber: 'WMS-1' },
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'WMS-1',
+        externalOrderId: '1',
+        statusLabel: 'Processing',
+      },
+      order: { accountingInvoiceId: 'INV-1' },
+      syncLogs: [syncLog({ status: 'PENDING' })],
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'accounting_document_exists', 'a finance reversal is the most binding remedy')
+})
+
+test('with only WMS evidence, the WMS remedy is still surfaced (o3d-eu0r)', async () => {
+  // Ranking must not bury the only applicable blocker.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: null,
+      wmsSnapshot: {
+        connectorLabel: 'Mintsoft',
+        externalOrderNumber: 'WMS-7',
+        externalOrderId: '7',
+        statusLabel: 'Processing',
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+
+  assert.equal(blocker?.code, 'wms_order_status_snapshot')
+})
