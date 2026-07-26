@@ -196,9 +196,23 @@ export async function cancelOrphanedAccountingSyncRows(
   // report zero, write no explanation, and clear the banner notice — while the orphan count visibly
   // stayed non-zero on refresh. That is the "button reads as broken" outcome this count exists to
   // prevent, so it must match what actually survived rather than what was targeted.
-  const inFlight = await db.accountingSyncLog.count({
-    where: { AND: [scope, { status: 'PROCESSING' as const }] },
-  })
+  //
+  // The scope is RE-DERIVED here rather than reusing the one the update ran under. activeConnector
+  // was sampled before the update, so if another administrator activates the target connector in
+  // between, the stale scope would count rows that now belong to the ACTIVE connector — and the
+  // response and the permanent activity log would describe live, healthy work as switched-off and
+  // possibly lost, while the refreshed banner correctly excluded it. Contradictory accounting
+  // evidence is worse than a slightly stale count, so this reads the current state.
+  const activeNow = await getActiveConnector()
+  const stillOrphaned = connector
+    ? (connector === activeNow ? null : { connector })
+    : { connector: { not: activeNow ?? undefined } }
+
+  const inFlight = stillOrphaned === null
+    ? 0
+    : await db.accountingSyncLog.count({
+      where: { AND: [stillOrphaned, { status: 'PROCESSING' as const }] },
+    })
 
   if (result.count > 0 || inFlight > 0) {
     await logActivity({

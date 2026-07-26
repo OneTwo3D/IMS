@@ -292,12 +292,14 @@ export async function findSalesOrderDeleteBlocker(
             // nothing else terminalises it. Telling that operator to wait is advice that provably
             // cannot work, which is how a blocker becomes a dead end — so both cases are named.
             ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
-              + 'is IN FLIGHT. If that connector is still enabled, wait for it to settle, then delete or '
-              + 'reverse depending on the outcome. If it has been switched off, this will NOT settle on '
-              + 'its own — re-enabling the connector lets the sync be reclaimed and complete. If that '
-              + 'connector is gone for good, this order cannot currently be deleted (o3d-osl8): check '
-              + 'the ledger for the document, because whether it exists decides whether deleting the '
-              + 'order would strand it.'
+              + `is IN FLIGHT. If ${liveDocument.connector} is still the active accounting connector, wait `
+              + 'for it to settle, then delete or reverse depending on the outcome. If it has been '
+              + 'switched off, this will NOT settle on its own: it can only be reclaimed by making '
+              + `${liveDocument.connector} the EXCLUSIVELY active connector again — enabling it alongside `
+              + 'another one is not enough, because only one accounting connector is ever dispatched to. '
+              + 'If that is not possible, this order cannot currently be deleted (o3d-osl8): check the '
+              + 'ledger for the document, because whether it exists decides whether deleting the order '
+              + 'would strand it.'
             : `Cannot delete an order with accounting documents queued to ${liveDocument.connector} `
               + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired before it posts.`,
     })

@@ -99,8 +99,8 @@ test('the survivor count includes EVERY PROCESSING row, not just the stale ones 
   const { join } = await import('node:path')
   const src = readFileSync(join(process.cwd(), 'app/actions/accounting-sync.ts'), 'utf8')
 
-  const countCall = src.slice(src.indexOf('const inFlight = await db.accountingSyncLog.count('))
-  const args = countCall.slice(0, countCall.indexOf('})') + 2)
+  const countCall = src.slice(src.indexOf('const inFlight = stillOrphaned === null'))
+  const args = countCall.slice(0, countCall.indexOf('    })') + 6)
 
   assert.match(args, /status: 'PROCESSING'/, 'it counts PROCESSING rows')
   assert.doesNotMatch(
@@ -122,13 +122,61 @@ test('the PROCESSING blocker does not tell an operator to wait for something tha
   const processingBranch = src.slice(src.indexOf("liveDocument.status === 'PROCESSING'"))
   const message = processingBranch.slice(0, processingBranch.indexOf('        : `Cannot delete an order with accounting documents queued'))
 
-  assert.match(message, /still enabled/, 'the still-running case keeps its wait-and-see advice')
+  assert.match(message, /still the active accounting connector/, 'the still-running case keeps its wait-and-see advice')
   assert.match(message, /switched off/, 'and the abandoned case is named')
   assert.match(message, /NOT settle on/, 'saying plainly that waiting will not help')
-  assert.match(message, /re-enabling the connector/, 'with a remedy that actually resolves the row')
+  assert.match(message, /EXCLUSIVELY active/, 'and the remedy states the exclusivity it actually requires')
   // And it must not overpromise: if that connector is gone for good, re-enabling is impossible and
   // the honest answer is that the order cannot currently be deleted (o3d-osl8). Claiming a remedy
   // that may not exist is the same dead end in a politer form.
-  assert.match(message, /gone for good/, 'the unresolvable case is named too')
+  assert.match(message, /not possible/, 'the unresolvable case is named too')
   assert.match(message, /cannot currently be deleted/, 'rather than implying a remedy always exists')
+})
+
+test('the recovery advice requires EXCLUSIVE activation, because dispatch is single-connector (o3d-sref)', async () => {
+  // getActiveAccountingConnectorId returns 'xero' if the Xero plugin is enabled and only then falls
+  // through to 'quickbooks' (lib/accounting.ts). The settings UI permits BOTH to be enabled, so
+  // "re-enable QuickBooks" is not a remedy while Xero is on: nothing ever dispatches to QuickBooks,
+  // the row stays PROCESSING, and the order stays blocked.
+  //
+  // Advice that works only under a condition it does not state is the same dead end as advice that
+  // cannot work at all — the operator follows it, nothing happens, and there is no next step.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+
+  const guard = readFileSync(join(process.cwd(), 'lib/domain/sales/order-delete-guard.ts'), 'utf8')
+  const branch = guard.slice(guard.indexOf("liveDocument.status === 'PROCESSING'"))
+  const message = branch.slice(0, branch.indexOf('        : `Cannot delete an order with accounting documents queued'))
+
+  assert.match(message, /EXCLUSIVELY active/, 'exclusivity is stated, not assumed')
+  assert.match(message, /not enough/, 'and the both-enabled case is called out explicitly')
+
+  // Pin the premise: if dispatch ever became multi-connector, this advice would need revisiting.
+  const accounting = readFileSync(join(process.cwd(), 'lib/accounting.ts'), 'utf8')
+  assert.match(
+    accounting,
+    /if \(await isIntegrationPluginEnabled\('xero'\)\) return 'xero'/,
+    'dispatch is still single-connector and xero-first — the reason exclusivity is required',
+  )
+})
+
+test('the survivor count re-derives its scope instead of reusing a pre-update sample (o3d-sref)', async () => {
+  // activeConnector is sampled before the update. If another administrator activates the target
+  // connector in between, a stale scope would count rows that now belong to the ACTIVE connector —
+  // and the response plus the PERMANENT activity log would describe live, healthy work as
+  // switched-off and possibly lost, while the refreshed banner correctly excluded it. Contradictory
+  // accounting evidence is worse than a slightly stale count.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'app/actions/accounting-sync.ts'), 'utf8')
+
+  const countSection = src.slice(src.indexOf('const activeNow = await getActiveConnector()'))
+  const upToCount = countSection.slice(0, countSection.indexOf('})') + 2)
+
+  assert.match(upToCount, /stillOrphaned/, 'the count uses a freshly derived orphan scope')
+  assert.match(
+    upToCount,
+    /connector === activeNow \? null/,
+    'and reports zero when the target connector has become active — it is no longer orphaned',
+  )
 })
