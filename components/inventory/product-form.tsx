@@ -15,7 +15,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import type { ProductFormState } from '@/app/actions/products'
-import { COUNTRY_LIST, toIsoCountryCode } from '@/lib/countries'
+import { COUNTRY_LIST, defaultCountryOfOriginLabel, toIsoCountryCode } from '@/lib/countries'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
 type VariableProduct = { id: string; sku: string; name: string }
@@ -382,12 +382,20 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
             {fields.countryOfOrigin && !toIsoCountryCode(fields.countryOfOrigin) ? (
               <option value={fields.countryOfOrigin}>{fields.countryOfOrigin} (invalid — choose a country)</option>
             ) : (
-              <option value="">— Select —</option>
+              // o3d-vj5 (option a): show that an UNSET origin is not blank downstream — customs/WMS send
+              // the default. Display-time only; nothing is persisted, so a later real origin still wins.
+              <option value="">— Not set (customs/WMS send {defaultCountryOfOriginLabel()}) —</option>
             )}
             {COUNTRY_LIST.map((c) => (
               <option key={c.code} value={c.code}>{c.name}</option>
             ))}
           </Select>
+          {!fields.countryOfOrigin && (
+            <p className="text-[11px] text-muted-foreground leading-tight">
+              Leave blank to send the default ({defaultCountryOfOriginLabel()}) to customs/WMS; set a
+              country to declare the true origin.
+            </p>
+          )}
         </div>
       </div>
 
