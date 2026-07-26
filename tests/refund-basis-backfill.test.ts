@@ -305,3 +305,45 @@ test('ZERO lines cannot pad the header tolerance into accepting a gross header (
 
   assert.deepEqual(plan.decisions, [], 'the header still has to reconcile, however many zero lines pad it')
 })
+
+test('a refund line claiming MORE units than its source line is not evidence (o3d-lvk r3)', async () => {
+  // Found by probing the guard rather than by review. Both the net and gross expectations scale
+  // LINEARLY with quantity, so a refund of 5 units against a 1-unit line matches the net
+  // extrapolation exactly (100/1 x 5 = 500) and classifies NET. The arithmetic agrees while the row
+  // is impossible — a refund cannot return more units than were ever sold on that line, so the link
+  // is corrupt or mis-attributed and its basis is not established.
+  const plan = await planRefundBasisBackfill([{
+    id: 'order-1',
+    lines: [{ id: 'line-1', productId: 'p1', qty: 1, totalBase: 100, taxBase: 20 }],
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 500,
+      lines: [{ productId: 'p1', salesOrderLineId: 'line-1', qty: 5, totalBase: 500 }],
+    }],
+  }])
+
+  assert.deepEqual(plan.decisions, [], 'an impossible quantity is not proof of a basis')
+  assert.equal(plan.unresolved.length, 1)
+})
+
+test('a PARTIAL refund split across two lines of one order line still classifies (o3d-lvk r3)', async () => {
+  // The contrast that keeps the qty rule narrow: two 1-unit refund lines against a 2-unit order
+  // line are each legitimate and unanimous, so the refund classifies. Rejecting this would make the
+  // rule over-tight.
+  const plan = await planRefundBasisBackfill([{
+    id: 'order-1',
+    lines: [{ id: 'line-1', productId: 'p1', qty: 2, totalBase: 100, taxBase: 20 }],
+    refunds: [{
+      id: 'r1',
+      totalsBasis: null,
+      totalBase: 100,
+      lines: [
+        { productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 50 },
+        { productId: 'p1', salesOrderLineId: 'line-1', qty: 1, totalBase: 50 },
+      ],
+    }],
+  }])
+
+  assert.deepEqual(plan.decisions, [{ refundId: 'r1', orderId: 'order-1', basis: 'NET' }])
+})

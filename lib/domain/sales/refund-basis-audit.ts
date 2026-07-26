@@ -240,6 +240,15 @@ export function classifyRefundBasis(
     if (refundLine.productId !== orderLine.productId) return 'UNKNOWN'
     if ((orderLineCountByProduct.get(orderLine.productId) ?? 0) > 1) return 'UNKNOWN'
 
+    // A refund line cannot legitimately return MORE units than its source line ever sold. When it
+    // claims to, the link is corrupt or mis-attributed — and the basis comparison still "succeeds",
+    // because both the net and gross expectations scale linearly with quantity, so an impossible
+    // qty of 5 against a 1-unit line matches the net extrapolation perfectly. The arithmetic agrees
+    // while the row does not make sense, which is exactly the shape that should not be trusted.
+    if (toDecimal(refundLine.qty).abs().gt(toDecimal(orderLine.qty).abs().add(QTY_EPSILON))) {
+      return 'UNKNOWN'
+    }
+
     const verdict = classifyLinkedRefundLine(refundLine, orderLine)
     // `null` here means the comparison yielded NO evidence (an untaxed line, where net equals
     // gross). For a value-carrying line that is still an unproven basis, so it blocks too.
