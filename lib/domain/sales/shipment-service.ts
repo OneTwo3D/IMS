@@ -129,32 +129,46 @@ async function validateActiveShipmentTotalsWithinOrder(
   // plan, so this check intentionally includes PICKING/PACKED rows as well as
   // SHIPPED rows. That makes concurrent dispatches race-safe for total-qty
   // validation: both transactions see the same active planned shipment set.
-  const [orderLines, activeShipmentLines] = await Promise.all([
+  const [orderLines, activeShipmentLines, refundLines] = await Promise.all([
     client.salesOrderLine.findMany({
       where: { orderId },
       select: { id: true, productId: true, qty: true, sku: true, description: true },
     }),
     client.shipmentLine.findMany({
       where: { shipment: { orderId, status: { not: 'PENDING' } } },
-      select: { lineId: true, productId: true, qty: true },
+      select: { lineId: true, productId: true, qty: true, shipment: { select: { status: true } } },
+    }),
+    // o3d-339: refunded units must never be dispatched. A PENDING shipment built BEFORE a refund lands
+    // is not rebuilt on refund — releaseReservationsAfterRefund refuses the reservation release while a
+    // shipment exists (post-refund-release.ts) and defers — so without netting refunds here that stale,
+    // now-PACKED shipment could ship goods the customer was refunded for. confirmSalesOrderShipments
+    // already nets refunds at BUILD time; this is the dispatch-time backstop for a shipment that
+    // predates the refund. Runs under the order lock (transitionShipmentStatus), so a concurrent refund
+    // is serialized.
+    client.salesOrderRefundLine.findMany({
+      where: { refund: { orderId } },
+      select: { salesOrderLineId: true, productId: true, qty: true },
     }),
   ])
 
-  // Shipment lines are LEAF-product rows: a KIT order line expands to its component products, so a kit
-  // line has several shipment lines (one per component) under the same lineId, each in COMPONENT units.
-  // Summing them against the kit line's OWN qty (kit units) always over-counts and falsely rejects every
-  // kit dispatch (o3d-odu). Instead compare in leaf-product units keyed by (orderLineId, productId): the
-  // per-leaf entitlement is the order line qty expanded through the kit/BOM graph (the same expansion
-  // confirmSalesOrderShipments uses), quantised to the Decimal(12,4) persistence boundary. Simple
-  // products are the identity expansion, so their behaviour and the reject message are unchanged. The
-  // base is the ORDER LINE qty — immutable across the fulfilment lifecycle — NOT the current allocations
-  // (which the reallocation workflow shrinks to the remainder after a partial shipment). Residual: the
-  // kit COMPOSITION can be edited mid-fulfilment, drifting this entitlement — tracked systemically in
-  // o3d-2uh (an immutable per-order fulfilment snapshot); the current code rejects ALL kit dispatches,
-  // so this is strictly better.
-  const productIds = [...new Set(
-    orderLines.map((line) => line.productId).filter((id): id is string => !!id),
-  )]
+  // Shipment lines are LEAF-product rows: a kit order line expands to its component products, so a kit
+  // line can have several shipment lines (one per component) under the same lineId. All quantities must
+  // therefore be compared in leaf-product units keyed by (orderLineId, productId) — expand each order
+  // line's ordered qty AND each refund's refunded qty through the kit/BOM graph, exactly as
+  // confirmSalesOrderShipments nets refunds at build time. Comparing component shipment qty against
+  // parent-kit ordered/refunded qty would let a fractional-component kit slip refunded units past the
+  // cap (e.g. two kits needing 0.1 of a component ship 0.2, but a per-kit cap of 1 would pass it).
+  //
+  // NB: this expands ordered/refunded qty through the CURRENT kit graph, matching the existing
+  // build-time refund netting (confirmSalesOrderShipments) and the allocation path — the codebase has
+  // no immutable per-order BOM snapshot, so a kit re-composed BETWEEN packing and dispatch can drift
+  // this cap. Fixing that uniformly (persist a per-order-line fulfillment snapshot, or lock kit edits
+  // while orders are in flight) is systemic and tracked separately; this guard is a strict improvement
+  // over shipping every refunded unit and shares the same live-graph assumption already in force.
+  const productIds = [...new Set([
+    ...orderLines.map((line) => line.productId).filter((id): id is string => !!id),
+    ...refundLines.map((refundLine) => refundLine.productId).filter((id): id is string => !!id),
+  ])]
   const graph = productIds.length > 0 ? await loadFulfillmentProductGraph(client, productIds) : new Map()
 
   const lineLabelById = new Map<string, string>()
@@ -168,27 +182,59 @@ async function validateActiveShipmentTotalsWithinOrder(
     }
   }
 
-  const activeByLeaf = new Map<string, { lineId: string; activeQty: Prisma.Decimal }>()
-  for (const shipmentLine of activeShipmentLines) {
-    const key = `${shipmentLine.lineId}|${shipmentLine.productId}`
-    const entry = activeByLeaf.get(key) ?? { lineId: shipmentLine.lineId, activeQty: new Prisma.Decimal(0) }
-    entry.activeQty = entry.activeQty.add(toDecimal(shipmentLine.qty))
-    activeByLeaf.set(key, entry)
+  const refundedByLeaf = new Map<string, Prisma.Decimal>()
+  for (const refundLine of refundLines) {
+    // An unmatched external refund (no order line / no product) can't be attributed to a leaf — skip it.
+    if (!refundLine.salesOrderLineId || !refundLine.productId) continue
+    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(refundLine.productId, toDecimal(refundLine.qty), graph)) {
+      const key = `${refundLine.salesOrderLineId}|${componentId}`
+      refundedByLeaf.set(key, (refundedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
+    }
   }
 
-  for (const [key, { lineId, activeQty }] of activeByLeaf) {
+  // Split active leaf qty into ALREADY-SHIPPED (historical, cannot be un-shipped) and STILL-PLANNED
+  // (PICKING/PACKED — what a dispatch is about to send). A POST-shipment refund (a return) legitimately
+  // pushes already-shipped qty above ordered-minus-refunded; counting SHIPPED rows in the dispatch cap
+  // would then wedge every future dispatch on the order (line A shipped-then-refunded fails the recheck,
+  // blocking an unrelated PACKED line B). So only the still-planned qty is capped, against what remains
+  // to ship after refunds AND after what already shipped (o3d-339).
+  const shippedByLeaf = new Map<string, Prisma.Decimal>()
+  const plannedByLeaf = new Map<string, { lineId: string; plannedQty: Prisma.Decimal }>()
+  for (const shipmentLine of activeShipmentLines) {
+    const key = `${shipmentLine.lineId}|${shipmentLine.productId}`
+    if (shipmentLine.shipment.status === 'SHIPPED') {
+      shippedByLeaf.set(key, (shippedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)))
+    } else {
+      const entry = plannedByLeaf.get(key) ?? { lineId: shipmentLine.lineId, plannedQty: new Prisma.Decimal(0) }
+      entry.plannedQty = entry.plannedQty.add(toDecimal(shipmentLine.qty))
+      plannedByLeaf.set(key, entry)
+    }
+  }
+
+  for (const [key, { lineId, plannedQty }] of plannedByLeaf) {
     const label = lineLabelById.get(lineId)
     if (!label) {
       return `Shipment line ${lineId} no longer belongs to this order. Reload and retry.`
     }
-    // Quantise the entitlement to the Decimal(12,4) boundary the shipment rows persist at, so a single
-    // fractional component (0.5 kit × 0.3333 = 0.16665, persisted 0.1667) isn't rejected by a rounding
-    // ulp. Kept exact (epsilon-only) — no per-row slack — so nothing can be over-shipped. Residual: a
-    // fractional-component kit SPLIT across warehouses sums per-row-rounded rows (0.1667+0.1667=0.3334)
-    // slightly above the once-rounded entitlement (0.3333) and is rejected; that rare case needs the
-    // immutable per-row snapshot (o3d-2uh), and the pre-fix code rejects ALL kit dispatches regardless.
-    const orderedQty = roundQuantity(orderedByLeaf.get(key) ?? new Prisma.Decimal(0), 4)
-    if (activeQty.gt(orderedQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
+    const orderedQty = orderedByLeaf.get(key) ?? new Prisma.Decimal(0)
+    const refundedQty = refundedByLeaf.get(key) ?? new Prisma.Decimal(0)
+    const shippedQty = shippedByLeaf.get(key) ?? new Prisma.Decimal(0)
+    // Still shippable = ordered − refunded − already-shipped, never below zero. Only the not-yet-shipped
+    // planned quantity is checked against it, so a historical post-ship refund doesn't fail the order.
+    // Quantised to the Decimal(12,4) boundary the shipment rows persist at (o3d-odu), so a single
+    // fractional component (0.5 kit x 0.3333 = 0.16665, persisted 0.1667) isn't rejected by a
+    // rounding ulp — the false-reject that made every fractional kit dispatch fail. Rounded AFTER
+    // the whole subtraction, not per term: rounding three terms separately lets half-ulp errors
+    // compound. Kept exact (epsilon-only) beyond that, so nothing can be over-shipped.
+    let shippableQty = roundQuantity(orderedQty.sub(refundedQty).sub(shippedQty), 4)
+    if (shippableQty.lt(0)) shippableQty = new Prisma.Decimal(0)
+    if (plannedQty.gt(shippableQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
+      if (refundedQty.gt(0)) {
+        // A PACKED shipment can't be rebuilt via confirmSalesOrderShipments (it only replaces PENDING
+        // shipments) — this was packed before the refund, so it needs an operator to unpack/cancel and
+        // rebuild it to the reduced quantity (tracked as the o3d-339 recovery follow-up).
+        return `Shipment for line ${label} would ship more than remains after refunds — it was packed before the refund landed. Unpack or cancel this shipment and rebuild it to exclude the refunded units.`
+      }
       return `Shipment quantity for line ${label} exceeds ordered quantity. Reload and retry.`
     }
   }
