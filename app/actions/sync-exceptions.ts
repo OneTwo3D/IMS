@@ -143,7 +143,10 @@ const REFUND_PARK_WHERE = {
   connector: 'woocommerce',
   direction: 'FROM_CONNECTOR' as const,
   entityType: 'SalesOrder',
-  status: { in: ['PENDING' as const, 'FAILED' as const] },
+  // QUARANTINED (o3d-w00 #2/#5 / o3d-iup): a monetary-only refund deliberately parked because the order
+  // isn't uniformly taxed. It has no SalesOrderRefund and the sweep skips it, so the exception inbox is
+  // the ONLY way an operator sees and recovers it — it must appear here alongside PENDING/FAILED.
+  status: { in: ['PENDING' as const, 'FAILED' as const, 'QUARANTINED' as const] },
   entityId: { not: null },
   OR: [
     { payload: { equals: Prisma.DbNull } },
@@ -553,30 +556,58 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
       return { success: false, error: 'The order has no WooCommerce link, so its refunds cannot be re-fetched.' }
     }
 
+    // o3d-w00 #2/#5 / o3d-iup: a QUARANTINED park makes the sweep dedup skip this refund. An explicit
+    // operator retry must let the re-fetch re-attempt it — but we must NOT delete the park before the
+    // fallible fetch, or a fetch error / a refund missing from the response would leave nothing behind and
+    // strand the refund. Instead TRANSITION the quarantine to PENDING atomically: the row stays durable
+    // and visible in the inbox, and PENDING is not skipped by the dedup, so the re-fetch re-attempts it.
+    // The refund then lands (post-processing marks it SYNCED), or re-parks as a fresh QUARANTINED (the
+    // duplicate-dedup below keeps exactly one), or — if the fetch fails — remains a visible PENDING park to
+    // retry again. Scoped to this refund's externalId.
+    // o3d-7yf: every refund lookup and park transition here MUST be scoped to THIS park's order
+    // (entityId = row.entityId). externalRefundId is globally unique and the park index is keyed by
+    // (connector, externalId), so an externalId-only query would let another order's refund resolve — and
+    // erase — this order's park (and its deletion/rebind guard).
+    if (row.externalId && row.entityId) {
+      await db.shoppingSyncLog.updateMany({
+        where: { ...REFUND_PARK_WHERE, externalId: row.externalId, entityId: row.entityId, status: 'QUARANTINED' },
+        data: { status: 'PENDING' },
+      })
+    }
+
     await syncRefundsForOrder(Number(orderLink.externalOrderId))
 
     const refundLanded = row.externalId
       ? await db.salesOrderRefund.findFirst({
-          where: { externalRefundId: Number(row.externalId) },
+          where: { externalRefundId: Number(row.externalId), orderId: row.entityId },
           select: { id: true },
         })
       : null
 
     if (refundLanded) {
       // Codex r6: repeated webhook deliveries can have parked the SAME refund
-      // several times — resolve every park row for this refund, not just the
+      // several times — resolve every park row for this refund AND this order, not just the
       // clicked one, so stale duplicates don't linger as actionable exceptions.
       await db.shoppingSyncLog.updateMany({
-        where: row.externalId ? { ...REFUND_PARK_WHERE, externalId: row.externalId } : { id: row.id },
+        where: row.externalId ? { ...REFUND_PARK_WHERE, externalId: row.externalId, entityId: row.entityId } : { id: row.id },
         data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },
       })
     } else if (row.externalId) {
+      // o3d-7yf: the refund did not land for THIS order. If a refund with this id exists on ANOTHER order,
+      // this is a cross-order anomaly — fail closed WITHOUT resolving the clicked park with a foreign refund.
+      const foreignRefund = await db.salesOrderRefund.findFirst({
+        where: { externalRefundId: Number(row.externalId), orderId: { not: row.entityId } },
+        select: { orderId: true },
+      })
+      if (foreignRefund) {
+        return { success: false, error: `Refund ${row.externalId} belongs to a different order (${foreignRefund.orderId}); this park cannot be resolved by it.` }
+      }
       // Codex P2: a still-failing retry re-parks the SAME refund as a fresh row
-      // (refund-sync always creates). Keep only the newest park per refund —
+      // (refund-sync always creates). Keep only the newest park per refund+order —
       // delete the older duplicates so the inbox shows one actionable row with
       // the current error instead of accumulating copies on every retry.
       const parks = await db.shoppingSyncLog.findMany({
-        where: { ...REFUND_PARK_WHERE, externalId: row.externalId },
+        where: { ...REFUND_PARK_WHERE, externalId: row.externalId, entityId: row.entityId },
         orderBy: { createdAt: 'desc' },
         select: { id: true },
       })

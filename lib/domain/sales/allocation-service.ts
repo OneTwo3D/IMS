@@ -240,6 +240,7 @@ export async function lockSalesOrder(
   )
 }
 
+
 export async function lockStockLevels(
   tx: Prisma.TransactionClient,
   productIds: string[],

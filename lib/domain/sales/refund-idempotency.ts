@@ -1,3 +1,5 @@
+import { Prisma } from '@/app/generated/prisma/client'
+
 import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 
 /**
@@ -14,4 +16,9 @@ import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
  */
 export function isExternalRefundIdUniqueConflict(error: unknown): boolean {
   return uniqueViolationTargetsField(error, 'externalRefundId')
+}
+
+/** Any Prisma unique-constraint violation (P2002), regardless of which index. (o3d-7yf) */
+export function isUniqueConstraintViolation(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
 }

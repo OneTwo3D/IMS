@@ -64,6 +64,7 @@ export type SalesOrderDeleteBlocker = {
     | 'accounting_sync_live'
     | 'accounting_document_exists'
     | 'daily_batch_staged'
+    | 'parked_refund'
   message: string
 }
 
@@ -321,6 +322,35 @@ export async function findSalesOrderDeleteBlocker(
     })
   }
 
+  // o3d-7yf / o3d-iup: a deliberately PARKED WooCommerce refund — a monetary-only refund the order
+  // cannot tax uniformly, or a PENDING/FAILED amount mismatch — creates NO SalesOrderRefund, so the
+  // caller's `_count.refunds` check cannot see it. Deleting the order cascades its
+  // ShoppingOrderLink and orphans the park, so retryRefundSyncPark can never resolve the WC link,
+  // stranding a refund whose money has already left the business.
+  //
+  // This runs on `tx`, inside the same order-row lock as every other blocker (o3d-5r8). Reading it
+  // on the unlocked client would reopen exactly the window that lock exists to close: a park
+  // written between the check and the delete would be missed.
+  //
+  // entityId scoping already excludes the entity-less missing-FX rows.
+  const parkedRefund = await tx.shoppingSyncLog.findFirst({
+    where: {
+      connector: 'woocommerce',
+      direction: 'FROM_CONNECTOR',
+      entityType: 'SalesOrder',
+      entityId: orderId,
+      status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+    },
+    select: { id: true },
+  })
+  if (parkedRefund) {
+    blockers.push({
+      code: 'parked_refund',
+      message: 'This order has an unresolved WooCommerce refund parked for review; resolve it in the '
+        + 'sync exceptions inbox before deleting the order.',
+    })
+  }
+
   if (blockers.length === 0) return null
 
   // Most binding remedy first. A posted document needs a finance reversal; an ambiguous FAILED
@@ -328,6 +358,9 @@ export async function findSalesOrderDeleteBlocker(
   // Only once none of those apply is "cancel the order" the right advice — so WMS evidence and
   // merely-queued accounting work rank last, because cancelling genuinely resolves them.
   const REMEDY_ORDER: SalesOrderDeleteBlocker['code'][] = [
+    // A parked refund outranks everything: the money has ALREADY left the business, and unlike
+    // the others, cancelling the order does not resolve it (o3d-7yf/o3d-iup).
+    'parked_refund',
     'accounting_document_exists',
     'daily_batch_staged',
     'accounting_sync_live',

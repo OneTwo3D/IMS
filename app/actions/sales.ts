@@ -1824,8 +1824,16 @@ async function queueRefundAccountingActions(input: {
           : line.lineKind === 'discount'
             ? (settings.discountAccount || settings.salesAccount)
             : settings.salesAccount,
-        taxType: (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined) ?? fallbackCnTaxType,
+        // Post under the tax identity SNAPSHOTTED at refund creation (o3d-w00) — the rate the invoice
+        // actually validated — instead of re-predicting it from the order default here, which mis-taxed
+        // deactivated-rate/reverse-charge/mixed-rate refunds. Fall back to the old prediction only for
+        // legacy rows with no snapshot (created before the column existed).
+        taxType: line.accountingTaxType
+          ?? (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined)
+          ?? fallbackCnTaxType,
       })),
+      // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
+      // that had a gross amount — is now netted at source, so this correctly grosses every line up.
       lineAmountsIncludeTax: false,
       currencyRateToBase: Number(input.refundFxRate) || undefined,
     },
@@ -1878,6 +1886,12 @@ async function loadRefundAccountingQueueInput(
           unitPriceBase: true,
           totalForeign: true,
           totalBase: true,
+          // Snapshot resolved at creation (o3d-w00). Selecting them here means an accounting RETRY posts
+          // under the SAME tax identity and to the SAME account as the first attempt, instead of
+          // re-predicting the tax type and re-inferring the kind (which mis-posted monetary refunds).
+          lineKind: true,
+          accountingTaxType: true,
+          reverseCharge: true,
         },
       },
     },
@@ -1900,13 +1914,16 @@ async function loadRefundAccountingQueueInput(
       unitPriceBase: decimalToNumber(line.unitPriceBase),
       totalForeign: decimalToNumber(line.totalForeign),
       totalBase: decimalToNumber(line.totalBase),
-      // lineKind isn't persisted: a null-product line is shipping, UNLESS its total is
-      // negative — that's the mirrored order-discount line, which must reload as
-      // 'discount' so an accounting RETRY re-posts it to the discount account (not
-      // shipping). Matches the replay reconstruction in refund-service.
-      lineKind: line.productId
-        ? 'sale'
-        : (decimalToNumber(line.totalBase) < 0 ? 'discount' : 'shipping'),
+      // Prefer the PERSISTED kind (o3d-w00 #4). Only a legacy row (created before the column existed)
+      // carries NULL, and for those we keep the historical inference: a null-product line is shipping
+      // UNLESS its total is negative — the mirrored order-discount line, which must reload as 'discount'
+      // so a retry re-posts it to the discount account. New monetary-only 'sale' lines no longer get
+      // mis-reconstructed as 'shipping'.
+      lineKind: (line.lineKind as 'sale' | 'shipping' | 'discount' | null) ?? (
+        line.productId ? 'sale' : (decimalToNumber(line.totalBase) < 0 ? 'discount' : 'shipping')
+      ),
+      accountingTaxType: line.accountingTaxType,
+      reverseCharge: line.reverseCharge,
     })),
     accountingSyncs,
   }
@@ -1941,14 +1958,32 @@ export async function createRefund(
   reason: string,
   returnWarehouseId?: string,
   options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
-  // o3d-6oyu.18: `conflict` is set when the refund transaction refused this credit note
-  // because the OTHER reversal path (WC refund webhook vs payment-poller chargeback) had
-  // already committed one for this order. It is a no-op the caller must not retry, not a
-  // failure — see RefundCreationConflict.
-): Promise<{ success: boolean; error?: string; warning?: string; conflict?: RefundCreationConflict }> {
+  // Two independent outcomes ride alongside `error`:
+  //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
+  //                OTHER reversal path (WC refund webhook vs payment-poller chargeback) had
+  //                already committed one for this order. A no-op the caller must not retry.
+  //   `quarantine` (o3d-w00) — the refund is monetary-only and the order cannot be taxed
+  //                uniformly, so it was parked for a human rather than posted on a guess.
+): Promise<{
+  success: boolean
+  error?: string
+  warning?: string
+  conflict?: RefundCreationConflict
+  quarantine?: true
+}> {
   try {
-    if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+    const isInternal = options?.internalBypassToken === INTERNAL_ACTION_BYPASS
+    if (!isInternal) {
       await requirePermission('sales.refund')
+    }
+    // o3d-n8p (Codex): chargeback and externalRefundId are provenance-bearing and have material effects —
+    // chargeback suppresses restock + COGS reversal, and externalRefundId occupies the globally unique Woo
+    // replay key. They must come only from the trusted internal entry points (Woo sync, chargeback poller),
+    // which supply the unforgeable internal capability. Reject them from a public/manual caller so a
+    // network client with sales.refund can't forge a chargeback or squat a replay key (and so the derived
+    // `source` is trustworthy).
+    if (!isInternal && (options?.chargeback || options?.externalRefundId != null)) {
+      return { success: false, error: 'chargeback and externalRefundId may only be set by internal sync callers' }
     }
 
     const { getNumberingFormats } = await import('./company')
@@ -2204,6 +2239,13 @@ export async function createRefund(
     return { success: true, warning: accountingWarning }
   } catch (e) {
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
+      // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the
+      // winning refund could belong to a different order. Only report idempotent success when the existing
+      // refund is on THIS order; otherwise the loser would be marked synced while its refund lives elsewhere.
+      const winner = await db.salesOrderRefund.findFirst({ where: { externalRefundId: options.externalRefundId }, select: { orderId: true } })
+      if (winner && winner.orderId !== orderId) {
+        return { success: false, error: `A refund with external id ${options.externalRefundId} already exists on a different order; refusing to dedupe it here.` }
+      }
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: orderId,
