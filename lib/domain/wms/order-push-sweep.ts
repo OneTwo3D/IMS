@@ -25,6 +25,45 @@ const READY_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
  *  is what distinguishes "pull it from the WMS" from "goods already gone". */
 const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED'] as const
 const MAX_ATTEMPTS = 5
+
+/**
+ * How long a create claim is exclusive (o3d-38gl).
+ *
+ * PENDING_CREATE is a STATE, not a claim: it cannot distinguish "I just took this" from
+ * "another worker took this and is still talking to the WMS". Worker A wrote PENDING_CREATE and
+ * committed; worker B then acquired the order lock, saw PENDING_CREATE, passed the check and
+ * also called pushOrder. Worst on ShipHero, where preflight and create are separate operations
+ * and partner_order_id is not unique — two winners can create and then fulfil DUPLICATE
+ * warehouse orders.
+ *
+ * `lastAttemptAt` is already stamped on every claim, so it doubles as the lease with no schema
+ * change: a claim is refused while another worker's stamp is still fresh. Long enough to cover
+ * the slowest plausible pushOrder round trip, short enough that a crashed worker's order is
+ * retried in minutes rather than stranded.
+ *
+ * This is a LEASE, not an owner token: after it expires a crashed worker's in-flight request
+ * could still overlap a retry. Closing that needs a token recorded on the link and required when
+ * the outcome is written — see o3d-38gl.
+ */
+const CREATE_CLAIM_LEASE_MS = 5 * 60 * 1000
+
+/**
+ * May this worker take the create claim? Pure so the rule can be tested without a database —
+ * the claim itself needs the order row lock, which a unit test cannot express.
+ *
+ * `null` existing = never pushed, claim it. A non-PENDING_CREATE state means someone else owns
+ * the link (SYNCED, CANCELLED, DEAD_LETTER, HELD) and this pass has no business touching it.
+ */
+export function shouldGrantCreateClaim(
+  existing: { state: string; lastAttemptAt: Date | null } | null,
+  attemptedAt: Date,
+  leaseMs: number = CREATE_CLAIM_LEASE_MS,
+): boolean {
+  if (!existing) return true
+  if (existing.state !== 'PENDING_CREATE') return false
+  if (!existing.lastAttemptAt) return true
+  return attemptedAt.getTime() - existing.lastAttemptAt.getTime() >= leaseMs
+}
 const DEFAULT_BATCH_SIZE = 25
 
 export type WmsOrderPushSweepResult = {
@@ -652,8 +691,13 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         // delete mutually exclusive rather than merely racing.
         const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
         if (locked.length === 0) return false
-        const existing = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { state: true } })
-        if (existing && existing.state !== 'PENDING_CREATE') return false
+        const existing = await tx.wmsOrderPushLink.findUnique({
+          where: { orderId },
+          select: { state: true, lastAttemptAt: true },
+        })
+        // o3d-38gl: refuses while another worker's claim is still fresh. Without the lease,
+        // PENDING_CREATE is merely a state that every waiting worker passes, and they all push.
+        if (!shouldGrantCreateClaim(existing, attemptedAt)) return false
         await tx.wmsOrderPushLink.upsert({
           where: { orderId },
           create: { orderId, connector, state: 'PENDING_CREATE', lastAttemptAt: attemptedAt },

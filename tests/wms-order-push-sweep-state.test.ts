@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   runWmsOrderPushSweepCore,
+  shouldGrantCreateClaim,
   type WmsOrderPushPort,
   type WmsPushCandidate,
   type WmsPushLinkRef,
@@ -436,4 +437,49 @@ test('audit: remote cancel succeeds but the link write fails → SUCCEEDED with 
   assert.ok(event)
   assert.equal(event.outcome, 'SUCCEEDED')
   assert.equal((event.after as { linkPersistFailed?: boolean }).linkPersistFailed, true)
+})
+
+// --- o3d-38gl: PENDING_CREATE is a lease, not merely a state ------------------
+
+test('claim: a link that has never been pushed is claimable (o3d-38gl)', () => {
+  assert.equal(shouldGrantCreateClaim(null, new Date('2026-07-20T12:00:00Z')), true)
+})
+
+test('claim: a FRESH PENDING_CREATE is refused — another worker holds it (o3d-38gl)', () => {
+  // The defect: worker A wrote PENDING_CREATE and committed; worker B then acquired the order
+  // lock, saw PENDING_CREATE, passed the check and also called pushOrder. Worst on ShipHero,
+  // where preflight and create are separate and partner_order_id is not unique — two winners
+  // can create and then fulfil DUPLICATE warehouse orders.
+  const held = { state: 'PENDING_CREATE', lastAttemptAt: new Date('2026-07-20T12:00:00Z') }
+  assert.equal(
+    shouldGrantCreateClaim(held, new Date('2026-07-20T12:00:30Z')),
+    false,
+    '30 seconds later the first worker is still talking to the WMS',
+  )
+})
+
+test('claim: an EXPIRED PENDING_CREATE is reclaimable — a crashed worker must not strand it (o3d-38gl)', () => {
+  const stale = { state: 'PENDING_CREATE', lastAttemptAt: new Date('2026-07-20T12:00:00Z') }
+  assert.equal(shouldGrantCreateClaim(stale, new Date('2026-07-20T12:06:00Z')), true)
+})
+
+test('claim: the lease boundary is inclusive, so a claim cannot wedge forever (o3d-38gl)', () => {
+  const at = new Date('2026-07-20T12:00:00Z')
+  const link = { state: 'PENDING_CREATE', lastAttemptAt: at }
+  assert.equal(shouldGrantCreateClaim(link, new Date(at.getTime() + 1000), 1000), true)
+})
+
+test('claim: a link in any OTHER state is never claimable by the create pass (o3d-38gl)', () => {
+  for (const state of ['SYNCED', 'CANCELLED', 'DEAD_LETTER', 'HELD', 'PENDING_CANCEL']) {
+    assert.equal(
+      shouldGrantCreateClaim({ state, lastAttemptAt: null }, new Date()),
+      false,
+      `${state} belongs to another pass`,
+    )
+  }
+})
+
+test('claim: a PENDING_CREATE with no attempt stamp is claimable (o3d-38gl)', () => {
+  // A link written by a path that did not stamp it must not be permanently unclaimable.
+  assert.equal(shouldGrantCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: null }, new Date()), true)
 })
