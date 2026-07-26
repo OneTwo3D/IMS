@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { outstandingPoValueBase } from '@/app/actions/dashboard'
+import { outstandingPoValueBase } from '@/lib/domain/purchasing/outstanding-po-value'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 
 // o3d-1di: the 'Open POs' KPI must value only the OUTSTANDING (not-yet-received) portion of each
