@@ -24,6 +24,7 @@ import {
   buildAvailableStockMap,
   lockSalesOrder,
   lockStockLevels,
+  releaseOrderAllocationsInTx,
   resetAllocationAccountingIfStaged,
   validateAllocationIntegrity,
   type AllocationUnallocatedLine,
@@ -600,32 +601,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
 
     const deallocationResult = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
-      await resetAllocationAccountingIfStaged(tx, orderId)
-      const currentAllocs = await tx.orderAllocation.findMany({
-        where: { orderId },
-        select: { lineId: true, productId: true, warehouseId: true, qty: true },
-      })
-      const leafProductIds = [...new Set(currentAllocs.map((alloc) => alloc.productId))]
-      await lockStockLevels(
-        tx,
-        leafProductIds,
-        [...new Set(currentAllocs.map((alloc) => alloc.warehouseId))],
-      )
-
-      await applyAllocationReservationDelta(
-        tx,
-        currentAllocs.map((alloc) => ({
-          productId: alloc.productId,
-          warehouseId: alloc.warehouseId,
-          qty: Number(alloc.qty),
-        })),
-        'release',
-      )
-      const clampedReservations = await tx.stockLevel.updateMany({
-        where: { reservedQty: { lt: 0 } },
-        data: { reservedQty: 0 },
-      })
-      await tx.orderAllocation.deleteMany({ where: { orderId } })
+      const released = await releaseOrderAllocationsInTx(tx, orderId)
 
       if (so.status === 'ALLOCATED') {
         const activeShipmentCount = await tx.shipment.count({
@@ -638,7 +614,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         }
       }
 
-      return { allocs: currentAllocs, clampedReservationCount: clampedReservations.count }
+      return { allocs: released.allocations, clampedReservationCount: released.clampedReservationCount }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/sales')

@@ -446,6 +446,7 @@ export async function runDailyBatchSync(): Promise<{
     const baseCurrency = await getBaseCurrencyCode()
     const today = new Date().toISOString().slice(0, 10)
 
+
     if (settings.quickbooks_sync_enabled !== 'true') {
       return result
     }

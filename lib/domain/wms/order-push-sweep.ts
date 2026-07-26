@@ -25,6 +25,45 @@ const READY_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
  *  is what distinguishes "pull it from the WMS" from "goods already gone". */
 const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED'] as const
 const MAX_ATTEMPTS = 5
+
+/**
+ * How long a create claim is exclusive (o3d-38gl).
+ *
+ * PENDING_CREATE is a STATE, not a claim: it cannot distinguish "I just took this" from
+ * "another worker took this and is still talking to the WMS". Worker A wrote PENDING_CREATE and
+ * committed; worker B then acquired the order lock, saw PENDING_CREATE, passed the check and
+ * also called pushOrder. Worst on ShipHero, where preflight and create are separate operations
+ * and partner_order_id is not unique — two winners can create and then fulfil DUPLICATE
+ * warehouse orders.
+ *
+ * `lastAttemptAt` is already stamped on every claim, so it doubles as the lease with no schema
+ * change: a claim is refused while another worker's stamp is still fresh. Long enough to cover
+ * the slowest plausible pushOrder round trip, short enough that a crashed worker's order is
+ * retried in minutes rather than stranded.
+ *
+ * This is a LEASE, not an owner token: after it expires a crashed worker's in-flight request
+ * could still overlap a retry. Closing that needs a token recorded on the link and required when
+ * the outcome is written — see o3d-38gl.
+ */
+const CREATE_CLAIM_LEASE_MS = 5 * 60 * 1000
+
+/**
+ * May this worker take the create claim? Pure so the rule can be tested without a database —
+ * the claim itself needs the order row lock, which a unit test cannot express.
+ *
+ * `null` existing = never pushed, claim it. A non-PENDING_CREATE state means someone else owns
+ * the link (SYNCED, CANCELLED, DEAD_LETTER, HELD) and this pass has no business touching it.
+ */
+export function shouldGrantCreateClaim(
+  existing: { state: string; lastAttemptAt: Date | null } | null,
+  attemptedAt: Date,
+  leaseMs: number = CREATE_CLAIM_LEASE_MS,
+): boolean {
+  if (!existing) return true
+  if (existing.state !== 'PENDING_CREATE') return false
+  if (!existing.lastAttemptAt) return true
+  return attemptedAt.getTime() - existing.lastAttemptAt.getTime() >= leaseMs
+}
 const DEFAULT_BATCH_SIZE = 25
 
 export type WmsOrderPushSweepResult = {
@@ -275,6 +314,24 @@ export interface WmsOrderPushPort {
   releasableHeldOrders(connector: string, limit: number): Promise<WmsPushLinkRef[]>
   /** Ready+paid orders for bound warehouses with no link or a PENDING_CREATE link. */
   createCandidates(connector: string, boundWarehouseIds: string[], limit: number): Promise<WmsPushCandidate[]>
+  /**
+   * o3d-5r8 — claim a candidate for the remote create, under the order's row lock.
+   *
+   * The create pass used to call the WMS with NOTHING in IMS recording that a remote
+   * create was in flight: the WmsOrderPushLink was written only AFTER pushOrder returned.
+   * A concurrent hard delete (deleteSalesOrder) could therefore remove the order while the
+   * create was on the wire, the link write would then fail on the missing order, and the
+   * WMS would be left holding an order IMS has no record of.
+   *
+   * Claiming writes the PENDING_CREATE link BEFORE the remote call, under the same row
+   * lock deleteSalesOrder takes — so the deleter either sees the link and refuses, or
+   * commits first and this claim finds the order gone and returns false.
+   *
+   * Returns false when the order no longer exists or already has a non-PENDING_CREATE
+   * link (another worker got there first); the caller must then skip the candidate
+   * without calling the WMS.
+   */
+  claimForCreate(orderId: string, connector: string, attemptedAt: Date): Promise<boolean>
   /** SYNCED links for ready orders changed since the last push (updatedAt > pushedAt). */
   updatableLinks(connector: string, limit: number): Promise<WmsPushUpdateLink[]>
   /** SYNCED links whose order is ON_HOLD. */
@@ -383,6 +440,18 @@ export async function runWmsOrderPushSweepCore(
       if (!externalWarehouseId) continue
 
       const ts = now()
+      // o3d-5r8: claim before the remote call. A claim failure means the order was
+      // deleted or another worker owns it — skip WITHOUT touching the WMS. A claim
+      // error is not the order's fault either, so it is logged and retried next sweep
+      // rather than counted against the order's push attempts.
+      let claimed = false
+      try {
+        claimed = await port.claimForCreate(order.id, connectorId, ts)
+      } catch (error) {
+        console.error('[wms-order-push] create claim failed', order.id, error)
+      }
+      if (!claimed) continue
+
       const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
       // Hoisted so the catch can tell "remote create failed" from "remote
       // create SUCCEEDED but recording the link failed" (Codex r1) — the audit
@@ -615,6 +684,27 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         orderBy: { updatedAt: 'asc' },
       })
       return rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
+    },
+    async claimForCreate(orderId, connector, attemptedAt) {
+      return db.$transaction(async (tx) => {
+        // Same row lock deleteSalesOrder takes — this is what makes the claim and the
+        // delete mutually exclusive rather than merely racing.
+        const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+        if (locked.length === 0) return false
+        const existing = await tx.wmsOrderPushLink.findUnique({
+          where: { orderId },
+          select: { state: true, lastAttemptAt: true },
+        })
+        // o3d-38gl: refuses while another worker's claim is still fresh. Without the lease,
+        // PENDING_CREATE is merely a state that every waiting worker passes, and they all push.
+        if (!shouldGrantCreateClaim(existing, attemptedAt)) return false
+        await tx.wmsOrderPushLink.upsert({
+          where: { orderId },
+          create: { orderId, connector, state: 'PENDING_CREATE', lastAttemptAt: attemptedAt },
+          update: { lastAttemptAt: attemptedAt },
+        })
+        return true
+      })
     },
     async updatableLinks(connector, limit) {
       // "order changed since push" is a two-column comparison Prisma can't express.

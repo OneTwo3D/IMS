@@ -541,6 +541,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     const baseCurrency = await getBaseCurrencyCode()
     const today = new Date().toISOString().slice(0, 10)
 
+
     if (settings.xero_sync_enabled !== 'true') {
       return result
     }

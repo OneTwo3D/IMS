@@ -9,6 +9,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getXeroSettings, type XeroSettings } from './settings'
 import { scheduleXeroAccountingOutbox } from './outbox'
+import { lockOrderForAccountingEnqueue } from '@/lib/domain/accounting/enqueue-order-guard'
 
 /** Map sync type enum → setting key for per-type enable/disable */
 const SYNC_TYPE_SETTING: Record<string, keyof XeroSettings> = {
@@ -67,6 +68,22 @@ export async function queueXeroSync(params: {
   try {
     let mirrorErrorMessage: string | null = null
     await db.$transaction(async (tx) => {
+      // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
+      // checks for live accounting work; without taking the SAME lock here, a poster holding a
+      // pre-delete snapshot can insert its PENDING row after that check and commit after the
+      // order is gone — and the worker then posts a real document for an order that no longer
+      // exists. AccountingSyncLog has no FK to SalesOrder, so nothing else objects.
+      const lockedOrderId = await lockOrderForAccountingEnqueue(tx, {
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+      })
+      if (lockedOrderId === null) {
+        console.warn(
+          `[accounting-queue] skipping ${params.type} for deleted ${params.referenceType} ${params.referenceId}`,
+        )
+        return
+      }
+
       const log = await tx.accountingSyncLog.create({
         data: {
           connector: 'xero',

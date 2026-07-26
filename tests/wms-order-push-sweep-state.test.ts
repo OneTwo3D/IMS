@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   runWmsOrderPushSweepCore,
+  shouldGrantCreateClaim,
   type WmsOrderPushPort,
   type WmsPushCandidate,
   type WmsPushLinkRef,
@@ -45,16 +46,23 @@ type Seed = {
   updatable?: WmsPushUpdateLink[]
   holdable?: WmsPushLinkRef[]
   cancellable?: WmsPushLinkRef[]
+  /** o3d-5r8: false simulates "order deleted / already owned" — the push must be skipped. */
+  claimForCreate?: (orderId: string) => Promise<boolean>
 }
 
 function makePort(seed: Seed) {
   const upserts: Array<{ orderId: string; create: Record<string, unknown>; update: Record<string, unknown> }> = []
   const updates: Array<{ id: string; data: Record<string, unknown> }> = []
   const events: WmsMutationEventInput[] = []
+  const claims: string[] = []
   const port: WmsOrderPushPort = {
     activeBindings: async () => seed.bindings ?? BINDINGS,
     releasableHeldOrders: async () => seed.releasable ?? [],
     createCandidates: async () => seed.createCandidates ?? [],
+    claimForCreate: async (orderId) => {
+      claims.push(orderId)
+      return seed.claimForCreate ? seed.claimForCreate(orderId) : true
+    },
     updatableLinks: async () => seed.updatable ?? [],
     holdableLinks: async () => seed.holdable ?? [],
     cancellableLinks: async () => seed.cancellable ?? [],
@@ -62,7 +70,7 @@ function makePort(seed: Seed) {
     updateLink: async (id, data) => { updates.push({ id, data }) },
     recordEvent: async (event) => { events.push(event) },
   }
-  return { port, upserts, updates, events }
+  return { port, upserts, updates, events, claims }
 }
 
 const okPush = async (): Promise<WmsOrderPushResult> => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' })
@@ -140,6 +148,48 @@ test('create: a candidate whose warehouse is not bound is skipped (no write)', a
   const { port, upserts } = makePort({ createCandidates: [candidate({ shipFromWarehouseId: 'wh-OTHER' })] })
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   assert.equal(r.created, 0)
+  assert.equal(upserts.length, 0)
+})
+
+// --- o3d-5r8: claim-under-lock before the remote create ---
+
+test('create: the order is claimed BEFORE the WMS is called', async () => {
+  const order: string[] = []
+  const { port, claims } = makePort({ createCandidates: [candidate()] })
+  const originalClaim = port.claimForCreate
+  port.claimForCreate = async (orderId, connectorId, ts) => { order.push('claim'); return originalClaim(orderId, connectorId, ts) }
+  const tracked = connector({ pushOrder: async () => { order.push('push'); return { externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' } } })
+  const r = await runWmsOrderPushSweepCore(tracked, 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.deepEqual(claims, ['so-1'])
+  assert.deepEqual(order, ['claim', 'push'])
+})
+
+test('create: a refused claim (order deleted / owned elsewhere) never reaches the WMS', async () => {
+  let pushed = 0
+  const tracked = connector({ pushOrder: async () => { pushed += 1; return { externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' } } })
+  const { port, upserts, events } = makePort({ createCandidates: [candidate()], claimForCreate: async () => false })
+  const r = await runWmsOrderPushSweepCore(tracked, 'mintsoft', port, { now: NOW })
+  assert.equal(pushed, 0)
+  assert.equal(r.created, 0)
+  assert.equal(r.failed, 0)
+  assert.equal(r.deadLettered, 0)
+  // A refused claim is not the order's fault: no link write, no attempt burned, no audit noise.
+  assert.equal(upserts.length, 0)
+  assert.equal(events.length, 0)
+})
+
+test('create: a claim error skips the order without calling the WMS or burning an attempt', async () => {
+  let pushed = 0
+  const tracked = connector({ pushOrder: async () => { pushed += 1; return { externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' } } })
+  const { port, upserts } = makePort({
+    createCandidates: [candidate({ pushAttempts: 4 })],
+    claimForCreate: async () => { throw new Error('db down') },
+  })
+  const r = await runWmsOrderPushSweepCore(tracked, 'mintsoft', port, { now: NOW })
+  assert.equal(pushed, 0)
+  assert.equal(r.created, 0)
+  assert.equal(r.deadLettered, 0)
   assert.equal(upserts.length, 0)
 })
 
@@ -387,4 +437,49 @@ test('audit: remote cancel succeeds but the link write fails → SUCCEEDED with 
   assert.ok(event)
   assert.equal(event.outcome, 'SUCCEEDED')
   assert.equal((event.after as { linkPersistFailed?: boolean }).linkPersistFailed, true)
+})
+
+// --- o3d-38gl: PENDING_CREATE is a lease, not merely a state ------------------
+
+test('claim: a link that has never been pushed is claimable (o3d-38gl)', () => {
+  assert.equal(shouldGrantCreateClaim(null, new Date('2026-07-20T12:00:00Z')), true)
+})
+
+test('claim: a FRESH PENDING_CREATE is refused — another worker holds it (o3d-38gl)', () => {
+  // The defect: worker A wrote PENDING_CREATE and committed; worker B then acquired the order
+  // lock, saw PENDING_CREATE, passed the check and also called pushOrder. Worst on ShipHero,
+  // where preflight and create are separate and partner_order_id is not unique — two winners
+  // can create and then fulfil DUPLICATE warehouse orders.
+  const held = { state: 'PENDING_CREATE', lastAttemptAt: new Date('2026-07-20T12:00:00Z') }
+  assert.equal(
+    shouldGrantCreateClaim(held, new Date('2026-07-20T12:00:30Z')),
+    false,
+    '30 seconds later the first worker is still talking to the WMS',
+  )
+})
+
+test('claim: an EXPIRED PENDING_CREATE is reclaimable — a crashed worker must not strand it (o3d-38gl)', () => {
+  const stale = { state: 'PENDING_CREATE', lastAttemptAt: new Date('2026-07-20T12:00:00Z') }
+  assert.equal(shouldGrantCreateClaim(stale, new Date('2026-07-20T12:06:00Z')), true)
+})
+
+test('claim: the lease boundary is inclusive, so a claim cannot wedge forever (o3d-38gl)', () => {
+  const at = new Date('2026-07-20T12:00:00Z')
+  const link = { state: 'PENDING_CREATE', lastAttemptAt: at }
+  assert.equal(shouldGrantCreateClaim(link, new Date(at.getTime() + 1000), 1000), true)
+})
+
+test('claim: a link in any OTHER state is never claimable by the create pass (o3d-38gl)', () => {
+  for (const state of ['SYNCED', 'CANCELLED', 'DEAD_LETTER', 'HELD', 'PENDING_CANCEL']) {
+    assert.equal(
+      shouldGrantCreateClaim({ state, lastAttemptAt: null }, new Date()),
+      false,
+      `${state} belongs to another pass`,
+    )
+  }
+})
+
+test('claim: a PENDING_CREATE with no attempt stamp is claimable (o3d-38gl)', () => {
+  // A link written by a path that did not stamp it must not be permanently unclaimable.
+  assert.equal(shouldGrantCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: null }, new Date()), true)
 })

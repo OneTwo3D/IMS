@@ -44,3 +44,4 @@ export async function recreateJournaledDateFilter(now?: Date): Promise<{ gte: Da
   const cutoff = await recreateRetentionCutoff(now)
   return cutoff ? { gte: cutoff } : { not: null }
 }
+

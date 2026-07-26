@@ -256,3 +256,29 @@ PDFs use your company branding (logo, colours, and footer) as configured in Sett
 - **Clone an order** to quickly create a new order based on an existing one
 - **Update notes** to add internal comments or special instructions to any order
 - **Email documents** directly via SMTP with PDF attachments (sales order or invoice)
+
+### Deleting an order (and when you can't)
+
+Delete is a **hard** delete: the order row and its lines are removed outright, so nothing would be left in IMS pointing at anything an external system may already hold. It is therefore only available for orders that have never reached one, and IMS refuses it when any of the following are true:
+
+- the order is not `DRAFT`, `PENDING_PAYMENT` or `ALLOCATED`;
+- it has refunds or payments;
+- it has been **claimed for or sent to the WMS** (a push link exists in any state);
+- it carries an **accounting invoice id**, which means an invoice was posted for it — this survives even after the sync logs age out of retention;
+- an **accounting document for it is queued, in flight, failed or already posted** — a `PENDING`/`PROCESSING`/`SYNCED`/`FAILED` sync log for the order or one of its shipments;
+- it is included in a **daily accounting batch** that is queued or posted — the A1 revenue deferral or the A2 inventory allocation. Those journals are keyed by batch date, not by order, so they cannot be un-posted from the order screen; finance has to reverse the batch entry.
+
+**The right remedy depends on the blocker — cancelling is NOT always correct.** The refusal message says which case you are in:
+
+| Blocker | What to do |
+| --- | --- |
+| Queued document (`PENDING`, no external id) | **Cancel** the order. Cancelling retires the still-queued invoice before it posts and propagates a cancellation to the WMS. |
+| In-flight document (`PROCESSING`) | **Wait** for it to settle, then delete or reverse depending on the outcome. A freshly claimed row is deliberately not retired by cancelling, because the remote call may already be on its way. |
+| Posted document (`SYNCED`, or any row carrying an external id) | **Finance-led reversal or credit note** in the accounting system. Cancelling the order does *not* reverse a posted invoice — it would leave a live receivable and recognised revenue against a cancelled order. |
+| Failed document (`FAILED`) | **Check the connector first.** A failed sync does not prove nothing was posted: the remote call happens before the result is written back, so the document may exist. Resolve the sync log once you know which it was. |
+| Daily batch | **Finance reverses the batch entry.** It is keyed by batch date, not by order. |
+| WMS push link | **Cancel** the order, which withdraws the WMS order. |
+
+Deleting in any of these cases would strand the external document with nothing in IMS referencing it. Drafts, which never queue an accounting invoice, stay freely deletable.
+
+The check, the allocation release and the delete all run under a single lock on the order row, and the posting workers claim their work under that same lock before making a remote call — so no worker can start posting an order in the window between the check and the delete.
