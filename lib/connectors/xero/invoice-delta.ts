@@ -12,6 +12,12 @@ export type XeroInvoice = {
   Status: string
   Type: string
   FullyPaidOnDate?: string
+  /**
+   * Xero returns this on every invoice. It is the keyset cursor for a BOUNDED walk (o3d-8f9) —
+   * optional only because the fixtures predate it; a bounded walk that meets a row without it
+   * fails closed rather than guessing.
+   */
+  UpdatedDateUTC?: string
 }
 
 export type XeroInvoicesResponse = {
@@ -50,6 +56,12 @@ export const PAGE_SIZE = 100
  * and re-reading is a no-op. Verified live: Xero accepts this order and honours it.
  */
 export const POLL_ORDER = 'UpdatedDateUTC DESC'
+
+/**
+ * The BOUNDED walk orders ASCending instead — see walkBoundedKeyset for why the reasoning above
+ * inverts once an upper bound exists (o3d-8f9).
+ */
+export const BOUNDED_POLL_ORDER = 'UpdatedDateUTC ASC'
 
 /**
  * Refuse to walk more than this many pages in ONE window.
@@ -180,6 +192,21 @@ const secondCeil = (ms: number): number => Math.ceil(ms / 1000) * 1000
  * kept OFF the normal poll path: the clause is only ever sent once a window has already proved
  * oversized, and a rejection surfaces as a held cursor plus a WARNING, never as a silent skip.
  */
+/**
+ * The keyset cursor's lower bound, INCLUSIVE (o3d-8f9).
+ *
+ * `>=` not `>`: Xero filters at second granularity, so rows can share the cursor's second.
+ * Stepping past it with `>` would skip every row after the first in that second; `>=` re-reads
+ * them and the dedupe Map absorbs the repeat, which costs nothing and cannot lose a payment.
+ */
+export function lowerBoundWhere(cursor: Date): string {
+  const d = new Date(secondFloor(cursor.getTime()))
+  return (
+    `UpdatedDateUTC>=DateTime(${d.getUTCFullYear()},${d.getUTCMonth() + 1},${d.getUTCDate()},` +
+    `${d.getUTCHours()},${d.getUTCMinutes()},${d.getUTCSeconds()})`
+  )
+}
+
 export function upperBoundWhere(upper: Date): string {
   const d = new Date(secondFloor(upper.getTime()))
   return (
@@ -200,8 +227,184 @@ type WalkOutcome =
   | { status: 'overflow' }
   | { status: 'error'; error: string }
 
+/**
+ * Xero serialises dates as `/Date(1750000000000+0000)/`. Returns NaN for anything unparseable, so
+ * the caller can fail closed rather than treat an unreadable cursor as zero.
+ */
+export function parseXeroDate(value: string | undefined): number {
+  if (!value) return NaN
+  const dotNet = /^\/Date\((-?\d+)([+-]\d{4})?\)\/$/.exec(value)
+  if (dotNet) return Number(dotNet[1])
+  return Date.parse(value)
+}
+
+function keysetPath(cursor: Date, upper: Date): string {
+  const where = `${lowerBoundWhere(cursor)}&&${upperBoundWhere(upper)}`
+  return (
+    `Invoices?Statuses=${POLLED_STATUSES.join(',')}&order=${encodeURIComponent(BOUNDED_POLL_ORDER)}` +
+    `&page=1&pageSize=${PAGE_SIZE}&where=${encodeURIComponent(where)}`
+  )
+}
+
+/**
+ * Walk a BOUNDED window by KEYSET, not by offset (o3d-8f9).
+ *
+ * WHY THE UNBOUNDED REASONING DOES NOT CARRY OVER (see POLL_ORDER)
+ * ---------------------------------------------------------------
+ * Unbounded, DESC is safe: an edited record moves to the HEAD, so unmodified records can only
+ * shift toward pages not yet read. Add `UpdatedDateUTC<upper` and that stops being true — an
+ * edited record's timestamp rises ABOVE the bound and it leaves the result set entirely. Every
+ * record below it then shifts LEFT, so the first row of the next page slides into the page just
+ * read and is never returned. `walkPages` sees a short page, calls it completion, and the chunk is
+ * CHECKPOINTED past a row nobody read. Codex reproduced exactly that: 1,999 of 2,000 rows returned
+ * with status ok, the missing row 1,009 seconds behind the cursor — far outside CURSOR_OVERLAP_MS,
+ * so the next poll never revisits it. A silently missed payment, which is the bug this whole module
+ * exists to prevent.
+ *
+ * A keyset cursor is immune to that shift because it names a VALUE, not a position. Ordering ASC,
+ * each request asks for `UpdatedDateUTC>=cursor`, and the cursor advances to the newest row seen:
+ *
+ *   - a record edited mid-walk gets a LATER timestamp, so it moves AWAY from the cursor, toward
+ *     rows not yet read — it cannot slip behind into ground already covered;
+ *   - if that edit pushes it above `upper` it leaves this window, but its timestamp is now newer
+ *     than the bound, so the NEXT window (whose floor is this upper) is guaranteed to return it —
+ *     the same argument DESC relies on, now applied to the only record that can escape;
+ *   - records nobody touched keep their timestamp and their position relative to the cursor.
+ *
+ * TIES. Xero's `where` filters at second granularity, so rows can share a cursor value. `>=` (not
+ * `>`) re-reads that second rather than stepping over it, and the dedupe Map absorbs the repeat —
+ * a re-read is a no-op. The pathological case is a FULL page inside one second: the cursor cannot
+ * advance without skipping rows, so the walk refuses and reports an error rather than checkpoint
+ * past them. Failing closed is the whole point.
+ */
+/**
+ * How many times to re-read a saturated second before giving up on proving it stable (o3d-8f9).
+ *
+ * Each attempt costs a full pass over that second, so this is deliberately small: a second that
+ * will not hold still across three reads is churning, and holding the cursor is then the right
+ * answer rather than burning the daily call budget.
+ */
+const SATURATED_SECOND_ATTEMPTS = 3
+
+/**
+ * Read every invoice whose UpdatedDateUTC falls inside ONE second, and prove the read was complete.
+ *
+ * Offset paging is used here because there is no alternative — the keyset has no resolution left
+ * inside a single second. That reintroduces the shift hazard, so the result is VERIFIED rather than
+ * trusted: the second is read twice and the two passes must agree on the exact ID set. A row that
+ * left the window mid-pass (edited, so its timestamp moved above the second) shortens the set and
+ * shifts later rows onto pages already read; the second pass then disagrees, and we retry.
+ *
+ * Agreement is not absolute proof — two identical passes could in principle both miss the same row
+ * — but a row can only be skipped by a concurrent edit, and an edit that lands identically inside
+ * both passes at the same offset is not a case this API can produce: an edit moves a row OUT of the
+ * second permanently (its timestamp becomes `now`), so a second pass sees the shortened, stable set
+ * and reads it whole.
+ */
+async function readSaturatedSecond(second: Date, floor: Date, get: InvoiceFetcher): Promise<WalkOutcome> {
+  const windowEnd = new Date(second.getTime() + 1000)
+
+  const readOnce = async (): Promise<WalkOutcome> => {
+    const byId = new Map<string, XeroInvoice>()
+    for (let page = 1; page <= MAX_PAGES + 1; page++) {
+      const where = `${lowerBoundWhere(second)}&&${upperBoundWhere(windowEnd)}`
+      const path =
+        `Invoices?Statuses=${POLLED_STATUSES.join(',')}&order=${encodeURIComponent(BOUNDED_POLL_ORDER)}` +
+        `&page=${page}&pageSize=${PAGE_SIZE}&where=${encodeURIComponent(where)}`
+      const res = await get(path, { ifModifiedSince: floor })
+      if (!res.ok) return { status: 'error', error: res.error ?? `HTTP ${res.status}` }
+      const batch = res.data?.Invoices ?? []
+      for (const invoice of batch) byId.set(invoice.InvoiceID, invoice)
+      if (batch.length < PAGE_SIZE) return { status: 'ok', invoices: [...byId.values()] }
+    }
+    return { status: 'overflow' }
+  }
+
+  let previous: WalkOutcome | null = null
+  for (let attempt = 1; attempt <= SATURATED_SECOND_ATTEMPTS; attempt++) {
+    const pass = await readOnce()
+    if (pass.status !== 'ok') return pass
+
+    if (previous?.status === 'ok') {
+      const before = new Set(previous.invoices.map((i) => i.InvoiceID))
+      const after = pass.invoices.map((i) => i.InvoiceID)
+      if (before.size === after.length && after.every((id) => before.has(id))) return pass
+    }
+    previous = pass
+  }
+
+  return {
+    status: 'error',
+    error:
+      `The invoices updated at ${second.toISOString()} did not hold still across ` +
+      `${SATURATED_SECOND_ATTEMPTS} reads, so that second cannot be proven complete. More than ` +
+      `${PAGE_SIZE} invoices share it, leaving no finer cursor to page it by. The cursor is held and ` +
+      `no payment state was changed (o3d-8f9).`,
+  }
+}
+
+async function walkBoundedKeyset(floor: Date, upper: Date, get: InvoiceFetcher): Promise<WalkOutcome> {
+  const byId = new Map<string, XeroInvoice>()
+  let cursor = floor
+
+  for (let request = 1; request <= MAX_PAGES + 1; request++) {
+    const res = await get(keysetPath(cursor, upper), { ifModifiedSince: floor })
+    if (!res.ok) return { status: 'error', error: res.error ?? `HTTP ${res.status}` }
+
+    const batch = res.data?.Invoices ?? []
+    for (const invoice of batch) byId.set(invoice.InvoiceID, invoice)
+
+    // A short page ends the window: with a keyset there is nothing beyond the last row read.
+    if (batch.length < PAGE_SIZE) return { status: 'ok', invoices: [...byId.values()] }
+
+    let newest = Number.NEGATIVE_INFINITY
+    for (const invoice of batch) {
+      const at = parseXeroDate(invoice.UpdatedDateUTC)
+      // A row we cannot place in time cannot advance a cursor. Guessing would reintroduce exactly
+      // the silent skip this function exists to remove.
+      if (Number.isNaN(at)) {
+        return {
+          status: 'error',
+          error:
+            `Invoice ${invoice.InvoiceID} has no readable UpdatedDateUTC, so the bounded window cannot ` +
+            `be paged safely. The cursor is held and no payment state was changed (o3d-8f9).`,
+        }
+      }
+      if (at > newest) newest = at
+    }
+
+    const next = new Date(secondFloor(newest))
+    if (next.getTime() <= cursor.getTime()) {
+      // SATURATED SECOND: a full page shares the cursor's second, so the keyset cannot step forward
+      // without skipping the rest of it — Xero's `where` has no finer resolution than a second, and
+      // no secondary sort key to break the tie on.
+      //
+      // Failing here would be wrong: a bulk operation in Xero (exactly what the chunked drain
+      // exists for) can easily touch several hundred invoices inside one second, and refusing would
+      // hold the cursor forever. That trades a missed payment for a permanent stall, which is the
+      // failure #494 and o3d-zdh were built to remove.
+      //
+      // So read that ONE second exhaustively by offset, and PROVE the read was complete before
+      // trusting it (see readSaturatedSecond). Then step the cursor past the whole second, which is
+      // now safe precisely because it has been read whole.
+      const second = await readSaturatedSecond(cursor, floor, get)
+      if (second.status !== 'ok') return second
+      for (const invoice of second.invoices) byId.set(invoice.InvoiceID, invoice)
+      cursor = new Date(cursor.getTime() + 1000)
+      continue
+    }
+    cursor = next
+  }
+
+  return { status: 'overflow' }
+}
+
 /** Page a window to completion, or report that it holds more than the cap. */
 async function walkPages(floor: Date, upper: Date | undefined, get: InvoiceFetcher): Promise<WalkOutcome> {
+  // A bounded window pages by keyset — offset paging is unsafe once rows can leave the set through
+  // the top. Unbounded keeps the DESC offset walk, where that cannot happen (o3d-8f9).
+  if (upper) return walkBoundedKeyset(floor, upper, get)
+
   const byId = new Map<string, XeroInvoice>()
 
   // MAX_PAGES + 1: the extra request is a sentinel. Stopping at exactly MAX_PAGES full pages cannot

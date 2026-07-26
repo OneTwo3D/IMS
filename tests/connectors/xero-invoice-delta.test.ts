@@ -227,12 +227,26 @@ function row(id: string, whenMs: number): Row {
   return { InvoiceID: id, Type: 'ACCREC', Status: 'PAID', UpdatedDateUTC: at(whenMs) }
 }
 
-/** Parse `UpdatedDateUTC<DateTime(y,m,d,h,mi,s)` back into epoch ms. */
-function parseUpperBound(where: string): number {
-  const m = /^UpdatedDateUTC<DateTime\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)$/.exec(where)
-  assert.ok(m, `unrecognised where clause: ${where}`)
+/** Parse a `DateTime(y,m,d,h,mi,s)` term back into epoch ms. */
+function parseDateTime(m: RegExpExecArray): number {
   const [y, mo, d, h, mi, s] = m.slice(1).map(Number)
   return Date.UTC(y, mo - 1, d, h, mi, s)
+}
+
+/**
+ * Parse the bounds out of a `where` clause.
+ *
+ * A BOUNDED walk now sends both an inclusive keyset lower bound and the strict upper bound, joined
+ * by Xero's `&&` (o3d-8f9) — this used to accept only the upper term alone.
+ */
+function parseBounds(where: string): { lower: number | null; upper: number } {
+  const upperMatch = /UpdatedDateUTC<DateTime\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)/.exec(where)
+  assert.ok(upperMatch, `unrecognised where clause: ${where}`)
+  const lowerMatch = /UpdatedDateUTC>=DateTime\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)/.exec(where)
+  return {
+    lower: lowerMatch ? parseDateTime(lowerMatch) : null,
+    upper: parseDateTime(upperMatch),
+  }
 }
 
 /**
@@ -254,14 +268,23 @@ function fakeTenant(rows: Row[]): { get: InvoiceFetcher; paths: string[] } {
     const page = Number(query.get('page'))
     const pageSize = Number(query.get('pageSize'))
     const where = query.get('where')
-    const upper = where === null ? null : parseUpperBound(where)
+    const bounds = where === null ? null : parseBounds(where)
     const floor = Math.floor(opts.ifModifiedSince.getTime() / 1000) * 1000
+    // The bounded walk orders ASC and drives position from the keyset lower bound; the unbounded
+    // walk still orders DESC off the offset (o3d-8f9). Honour whichever the caller asked for, so
+    // the fake cannot flatter either strategy.
+    const ascending = (query.get('order') ?? '').includes('ASC')
     const matched = rows
       .filter((r) => {
         const t = Date.parse(r.UpdatedDateUTC)
-        return t > floor && (upper === null || t < upper)
+        if (t <= floor) return false
+        if (bounds === null) return true
+        if (bounds.lower !== null && t < bounds.lower) return false
+        return t < bounds.upper
       })
-      .sort((a, b) => Date.parse(b.UpdatedDateUTC) - Date.parse(a.UpdatedDateUTC))
+      .sort((a, b) => ascending
+        ? Date.parse(a.UpdatedDateUTC) - Date.parse(b.UpdatedDateUTC)
+        : Date.parse(b.UpdatedDateUTC) - Date.parse(a.UpdatedDateUTC))
     return { ok: true, status: 200, data: { Invoices: matched.slice((page - 1) * pageSize, page * pageSize) } }
   }
   return { get, paths }
