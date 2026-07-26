@@ -97,8 +97,26 @@ async function waitForBudget(tenantId: string): Promise<{ ok: true } | { ok: fal
   }
 }
 
+/**
+ * Total HTTP attempts this process has made against Xero, across all tenants (o3d-8f9 r3).
+ *
+ * The delta of this counter across a call is the only honest measure of what a request COST: the
+ * retry loop can issue up to XERO_MAX_RETRIES + 1 attempts for one caller invocation, so a ledger
+ * that counts invocations understates real usage by up to 4x. The poll budget reads this so its
+ * ceiling bounds tenant API attempts rather than function calls.
+ *
+ * Monotonic and never reset — callers take differences, so wraparound is not a concern at this scale.
+ */
+let xeroHttpAttempts = 0
+
+/** See xeroHttpAttempts. */
+export function xeroHttpAttemptCount(): number {
+  return xeroHttpAttempts
+}
+
 function noteRequest(tenantId: string) {
   const now = Date.now()
+  xeroHttpAttempts += 1
   pushRequestTimestamp(minuteBuckets, tenantId, now, 60_000)
   pushRequestTimestamp(dayBuckets, tenantId, now, 86_400_000)
 }

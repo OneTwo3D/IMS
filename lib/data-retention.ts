@@ -91,6 +91,20 @@ export async function purgeExpiredData(): Promise<{
           },
         },
       }),
+      // o3d-sref / o3d-nepa: this deletes by AGE ALONE, and that is a KNOWN, PRE-EXISTING gap in
+      // the order delete guard's evidence — not one introduced here.
+      //
+      // A row that is unresolved (PROCESSING with a taken claim, or FAILED, which o3d-ju8t
+      // established does NOT prove nothing was posted) is the guard's only evidence that a document
+      // may exist in the ledger, since no externalTransactionId was ever written. Deleting it by age
+      // makes the order hard-deletable again.
+      //
+      // An earlier revision of this branch exempted PROCESSING rows from deletion. That was
+      // REVERTED: it retains the full row — payload included, holding customer names, emails and
+      // financial lines — indefinitely, which contradicts the retention period the settings UI
+      // promises, and every connector switch would strand more. Doing it properly needs a compacted
+      // tombstone carrying only what the guard reads, which is tracked in o3d-nepa rather than
+      // bolted on here.
       db.accountingSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
     ])
     syncLogsDeleted = wc.count + acct.count

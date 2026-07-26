@@ -14,7 +14,7 @@ import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditMemo } from './credit-notes'
 import { pushJournalEntry } from './journals'
-import { qboPost, qboUploadAttachment, resolveAccountRef } from './api'
+import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
@@ -51,8 +51,37 @@ type ProcessResult = {
 
 type SyncPayload = Record<string, unknown>
 
-function buildQboRequestId(source: string): string {
-  return createHash('sha256').update(source).digest('hex')
+/**
+ * Intuit documents a 50-CHARACTER MAXIMUM for a non-batch `requestid`, and error 2130 for an invalid
+ * format. A full SHA-256 hex digest is 64, so the value this has always sent was over-length
+ * (o3d-nmar) — and invoices, bills and credit notes have used this same builder via
+ * qboPostIdempotent all along, not just the payment path o3d-b3gw adds.
+ *
+ * 32 hex characters = 128 bits, which is far beyond what idempotency needs: the id only has to be
+ * unique among documents this system posts, and a 128-bit digest collision is not a scenario worth
+ * defending against. It leaves 18 characters of headroom under the documented limit.
+ *
+ * ON CHANGING AN IDEMPOTENCY KEY, deliberately. One of these was true before, and we could not tell
+ * which without asking Intuit:
+ *
+ *   (a) Intuit tolerated over-length ids, and dedup worked. Then this change alters the key, and a
+ *       request that SUCCEEDED at Intuit but whose response we lost would, if retried across the
+ *       deploy, post a second time. That window is narrow: we only retry when we did not record
+ *       success, and the retry has to straddle the deploy.
+ *   (b) Intuit ignored the parameter when over-length. Then NO post has ever been idempotent, and
+ *       there is no dedup to lose — this makes it work for the first time.
+ *   (c) Intuit rejected it with 2130. Then idempotent posting was failing outright and would be
+ *       loudly visible.
+ *
+ * Under (b) or (c) this is a strict improvement with nothing to regress. Under (a) it trades a
+ * narrow one-deploy window for actually satisfying the documented contract. Staying over-length is
+ * not the safe option — it is the one where we keep believing in protection we may not have.
+ */
+export const QBO_REQUEST_ID_MAX_LENGTH = 50
+const QBO_REQUEST_ID_HEX_CHARS = 32
+
+export function buildQboRequestId(source: string): string {
+  return createHash('sha256').update(source).digest('hex').slice(0, QBO_REQUEST_ID_HEX_CHARS)
 }
 
 function getIdempotencySource(
@@ -510,7 +539,11 @@ async function processEntry(
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
       try {
-        const paymentRes = await qboPost<{ Payment: { Id: string } }>('payment', {
+        // o3d-b3gw: idempotent, like every other document this connector posts. Without a
+        // stable Request-Id, a payment that QuickBooks COMMITS but whose response is lost — or
+        // whose local "mark SYNCED" write then fails — is retried and creates a SECOND payment
+        // against the same invoice. That over-settles it and needs a manual reversal.
+        const paymentRes = await qboPostIdempotent<{ Payment: { Id: string } }>('payment', {
           CustomerRef: { value: customerRefId },
           TotalAmt: amount,
           TxnDate: paymentDate,
@@ -519,7 +552,7 @@ async function processEntry(
             Amount: amount,
             LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Invoice' }],
           }],
-        })
+        }, requestId)
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks payment' }
         }
@@ -556,7 +589,9 @@ async function processEntry(
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
       try {
-        const paymentRes = await qboPost<{ BillPayment: { Id: string } }>('billpayment', {
+        // o3d-b3gw: same reasoning as the customer payment above — a lost response must not
+        // become a second bill payment.
+        const paymentRes = await qboPostIdempotent<{ BillPayment: { Id: string } }>('billpayment', {
           VendorRef: { value: vendorRefId },
           TotalAmt: amount,
           TxnDate: paymentDate,
@@ -566,7 +601,7 @@ async function processEntry(
             Amount: amount,
             LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Bill' }],
           }],
-        })
+        }, requestId)
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks bill payment' }
         }

@@ -13,6 +13,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
 export const DISPATCH_EMAIL_SETTING_KEY = 'dispatch_email_enabled'
 export const DISPATCH_EMAIL_KIND = 'SHIPMENT_DISPATCHED'
@@ -59,7 +60,7 @@ export async function queueDispatchEmailIfEligible(orderId: string): Promise<{ q
     if (setting?.value !== 'true') return { queued: false, reason: 'disabled' }
 
     const outcome = await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+      await lockSalesOrder(tx, orderId)
       const order = await tx.salesOrder.findUnique({
         where: { id: orderId },
         select: {

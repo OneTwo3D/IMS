@@ -27,6 +27,7 @@
  * notices. See drainInvoicesModifiedSince for the boundary rules that keep chunking lossless.
  */
 
+import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
 import { logActivity } from '@/lib/activity-log'
@@ -37,6 +38,7 @@ import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
 import {
+  advanceCheckpoint,
   CURSOR_OVERLAP_MS,
   drainInvoicesModifiedSince,
   idsWhere,
@@ -347,10 +349,24 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   //
   // `through` is the cursor value, NOT pollStartedAt: it is the exclusive upper bound of the slice
   // actually processed. Writing anything later would step over invoices this poll never read.
+  //
+  // AND NEVER EARLIER THAN THE CURSOR WE STARTED FROM (o3d-8f9 r3). The read floor is deliberately
+  // CURSOR_OVERLAP_MS behind the persisted cursor so a record landing during the previous poll is
+  // re-read; that overlap is a QUERY floor, not a checkpoint. If the overlap itself holds more than
+  // one chunk — a couple of dense bulk-edit seconds is enough — the first chunk's `through` lands
+  // BEFORE lastPollDate, and persisting it moves the cursor BACKWARD. The next poll then subtracts
+  // the overlap from the regressed value and reproduces the same chunking, so it cycles: Codex
+  // measured it settling at -44s, -49s, -55s, each poll spending 163-200 requests replaying overlap
+  // and never reaching either the original checkpoint or newer work. Payment reconciliation stops
+  // dead while burning the tenant's daily Xero allowance.
+  //
+  // Clamping to a monotonic maximum keeps the overlap doing its job (the records ARE re-read and
+  // re-processed, idempotently) while making the checkpoint one-way.
+  let checkpoint = lastPollDate
   const drain = await drainInvoicesModifiedSince(
     since,
     pollStartedAt,
-    (path, opts) => xeroGet<XeroInvoicesResponse>(path, opts),
+    (path, opts) => xeroGet<XeroInvoicesResponse>(path, opts),  // budget-reconciled inside the drain
     async ({ invoices, through }) => {
       const errorsBefore = result.errors.length
       await processDeltaChunk(invoices, result, lastPollDate)
@@ -358,6 +374,13 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       // checkpointed and the drain stops here — the same "hold the cursor on error" rule as before,
       // now applied per chunk instead of per poll.
       if (result.errors.length > errorsBefore) return 'stop'
+
+      // A chunk inside the re-read overlap advances nothing: its work is done and recorded, but the
+      // cursor stays where it was. Only a chunk that reaches past the old cursor moves it.
+      const advanced = advanceCheckpoint(checkpoint, through)
+      if (!advanced) return 'continue'
+      checkpoint = advanced
+
       await db.setting.upsert({
         where: { key: 'xero_last_payment_poll' },
         create: { key: 'xero_last_payment_poll', value: through.toISOString() },
@@ -365,6 +388,9 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       })
       return 'continue'
     },
+    // Real HTTP attempts, not fetcher invocations: xeroGet retries a 429 internally, so one
+    // invocation can be several tenant API calls (o3d-8f9 r3).
+    xeroHttpAttemptCount,
   )
 
   if (!drain.ok) result.errors.push(`Xero invoice fetch failed: ${drain.error}`)

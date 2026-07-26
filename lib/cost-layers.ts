@@ -130,6 +130,16 @@ async function queueShipmentCogsRevaluationSync(
     referenceId: input.shipmentId,
     idempotencyKey: revaluationIdempotencyKey,
     payload,
+    // o3d-3zgy: the ONE acknowledged gap. This runs inside a purchasing/manufacturing landed-cost
+    // transaction (propagateLandedCostToOutputs -> refreshShipmentCogsForCostLayerChange), which
+    // discovers the affected shipments — and therefore their sales orders — by querying
+    // costLayerSnapshot MID-transaction, after cost-layer and stock rows are already locked. Taking
+    // the sales-order lock at that point inverts the lockSalesOrder-then-lockStockLevels ordering
+    // allocation-service establishes and can deadlock against the allocation path, trading a rare
+    // race for a routine hang. Closing it properly means restructuring that transaction to resolve
+    // and lock the affected orders up front — tracked as o3d-zpa7.
+    unlockedOrderScopeReason:
+      'landed-cost revaluation discovers affected shipments mid-transaction, after stock locks (o3d-zpa7)',
   })
   // khdw: record the net COGS-account movement of this revaluation (reverse old +
   // repost new → net debit = newCogs − oldCogs, both 2dp) in the COGS subledger
