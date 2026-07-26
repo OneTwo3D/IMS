@@ -184,6 +184,104 @@ export function classifyLinkedRefundLine(
   return 'ambiguous'
 }
 
+export type RefundStoredBasis = 'NET' | 'GROSS' | 'UNKNOWN'
+
+/**
+ * Classify a whole refund's stored basis from arithmetic evidence across its LINKED lines (o3d-lvk: the
+ * o3d-n8p historical backfill). Conservative — stamp NET or GROSS only when the linked-line evidence is
+ * unanimous and unambiguous, so a backfill NEVER mislabels a refund that money-adjacent logic then trusts:
+ *  - Unlinked lines (monetary-only / shipping / discount) carry no per-line evidence and are skipped; a
+ *    refund made ENTIRELY of them yields UNKNOWN.
+ *  - A single ambiguous linked line (net and gross windows overlap) yields UNKNOWN.
+ *  - Contradictory linked lines (one net, one gross — impossible from a single writer) yield UNKNOWN.
+ * Everything a single writer produced classifies to that writer's basis; anything unprovable stays UNKNOWN
+ * and the reports/guards must treat it as unknown rather than guessing.
+ */
+export function classifyRefundBasis(
+  refundLines: RefundBasisRefundLineRow[],
+  orderLinesById: Map<string, RefundBasisOrderLineRow>,
+): RefundStoredBasis {
+  let sawNet = false
+  let sawGross = false
+
+  // A refund line may only be trusted to identify its source when exactly ONE order line carries
+  // that product. With two lines for the same product, a GROSS refund for line A cross-linked to
+  // line B — whose NET happens to equal it — passes a product-equality check and classifies NET on a
+  // coincidence. Product identity narrows the link; it does not prove it.
+  const orderLineCountByProduct = new Map<string, number>()
+  for (const orderLine of orderLinesById.values()) {
+    if (orderLine.productId == null) continue
+    orderLineCountByProduct.set(orderLine.productId, (orderLineCountByProduct.get(orderLine.productId) ?? 0) + 1)
+  }
+
+  // Quantity must be checked in AGGREGATE, not per line. Two refund lines of 0.6 against a 1-unit
+  // source line each pass an independent check while claiming an impossible 1.2 units between them —
+  // and the historical writer permits that shape, because its own validation is per-line too. The
+  // basis comparison then "succeeds" on a total that is equally consistent with a lawful full-line
+  // GROSS refund, so an unprovable NET gets stamped.
+  const claimedQtyByLine = new Map<string, ReturnType<typeof toDecimal>>()
+  for (const refundLine of refundLines) {
+    if (!refundLine.salesOrderLineId) continue
+    const previous = claimedQtyByLine.get(refundLine.salesOrderLineId)
+    const qty = toDecimal(refundLine.qty).abs()
+    claimedQtyByLine.set(refundLine.salesOrderLineId, previous ? previous.add(qty) : qty)
+  }
+  for (const [lineId, claimed] of claimedQtyByLine) {
+    const orderLine = orderLinesById.get(lineId)
+    if (!orderLine) continue // handled per line below
+    if (claimed.gt(toDecimal(orderLine.qty).abs().add(QTY_EPSILON))) return 'UNKNOWN'
+  }
+
+  for (const refundLine of refundLines) {
+    // EXACTLY zero, not "small". An epsilon here silently exempts sub-cent lines: a proven NET line
+    // plus an unlinked 0.005 line would classify NET, and enough such lines hide a material
+    // unclassified amount while the header still reconciles. Dust is still value.
+    if (toDecimal(refundLine.totalBase).isZero()) continue
+
+    const orderLine = refundLine.salesOrderLineId ? orderLinesById.get(refundLine.salesOrderLineId) : undefined
+
+    // UNLINKED, but carrying value: no order line to compare against, so its basis is unknown — and
+    // an unknown sibling makes the WHOLE refund unknown. Skipping it (the first version of this
+    // function did) let a single NET-looking line certify a refund that also contained, say, an
+    // unlinked GROSS monetary amount. Stamping that NET would tell refund-service's net ceiling and
+    // the status reconciliation to trust the whole refund — turning a conservative guard into a
+    // false-confidence one, which is the opposite of what this backfill is for.
+    if (!orderLine) return 'UNKNOWN'
+
+    // The link must be POSITIVELY identified, which needs three things:
+    //
+    //   a real product on both sides — null == null compares equal while establishing nothing;
+    //   the same product on both sides — otherwise the comparison is against an unrelated line;
+    //   that product on exactly ONE order line — otherwise the caller-supplied salesOrderLineId
+    //   could name the wrong one of several and the numbers could agree by coincidence.
+    if (refundLine.productId == null || orderLine.productId == null) return 'UNKNOWN'
+    if (refundLine.productId !== orderLine.productId) return 'UNKNOWN'
+    if ((orderLineCountByProduct.get(orderLine.productId) ?? 0) > 1) return 'UNKNOWN'
+
+    // A refund line cannot legitimately return MORE units than its source line ever sold. When it
+    // claims to, the link is corrupt or mis-attributed — and the basis comparison still "succeeds",
+    // because both the net and gross expectations scale linearly with quantity, so an impossible
+    // qty of 5 against a 1-unit line matches the net extrapolation perfectly. The arithmetic agrees
+    // while the row does not make sense, which is exactly the shape that should not be trusted.
+    if (toDecimal(refundLine.qty).abs().gt(toDecimal(orderLine.qty).abs().add(QTY_EPSILON))) {
+      return 'UNKNOWN'
+    }
+
+    const verdict = classifyLinkedRefundLine(refundLine, orderLine)
+    // `null` here means the comparison yielded NO evidence (an untaxed line, where net equals
+    // gross). For a value-carrying line that is still an unproven basis, so it blocks too.
+    if (verdict === null || verdict === 'ambiguous') return 'UNKNOWN'
+    if (verdict === 'net') sawNet = true
+    else sawGross = true
+  }
+
+  if (sawNet && sawGross) return 'UNKNOWN'
+  if (sawGross) return 'GROSS'
+  if (sawNet) return 'NET'
+  // No value-carrying line at all: nothing was proven, so nothing is claimed.
+  return 'UNKNOWN'
+}
+
 export function evaluateRefundBasisRows(rows: RefundBasisRows): RefundBasisFinding[] {
   const findings: RefundBasisFinding[] = []
 
