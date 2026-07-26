@@ -394,6 +394,13 @@ async function persistMappingIfVersionMatches(
  *
  * No HTTP call may move inside the transaction: it holds row locks, and a slow
  * WooCommerce would hold them for the length of the request.
+ *
+ * NOT COVERED (o3d-mlc7): this function does not participate in the credential-rebind fence
+ * described in sync-lock.ts. It takes the per-SKU locks but never WC_SYNC_ADVISORY_LOCK_KEY
+ * and never checks `wc_settings_version`, so an import carrying store-A data can resume after
+ * a rebind/reset and repopulate store-A external ids against store-B credentials. The o3d-fsi
+ * ownership guard does not help: it treats a wiped (null) mapping as adoptable, which is the
+ * same outcome the previous unconditional update produced. Pre-existing, not introduced here.
  */
 export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ success: boolean; error?: string }> {
   try {
