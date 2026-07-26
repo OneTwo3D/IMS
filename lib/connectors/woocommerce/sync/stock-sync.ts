@@ -158,6 +158,9 @@ async function snapshotSyncContext(): Promise<{
  *                                reset mid-run; caller must abort the
  *                                whole sync to avoid further stale
  *                                writes
+ *   - reason:'mapping_changed' — another writer claimed this product while we were
+ *                                resolving it against WooCommerce (o3d-fsi). The write is
+ *                                abandoned rather than overwriting the winner.
  *   - reason:'error'           — db.update failed (most commonly a
  *                                unique-constraint collision on
  *                                externalProductId — two IMS products
@@ -170,6 +173,7 @@ async function persistMappingIfVersionMatches(
 ): Promise<
   | { ok: true }
   | { ok: false; reason: 'version_changed' }
+  | { ok: false; reason: 'mapping_changed' }
   | { ok: false; reason: 'error'; error: string }
 > {
   try {
@@ -180,10 +184,20 @@ async function persistMappingIfVersionMatches(
       if (current !== expectedVersion) {
         return { ok: false as const, reason: 'version_changed' as const }
       }
-      await tx.product.update({
-        where: { id: productId },
+      // o3d-fsi: conditional, not blind. This resolver reads a NULL mapping, goes to
+      // WooCommerce, and only then writes. If it blocks behind the product import in that
+      // window, Postgres resumes it AFTER the import commits and a `where: { id }` update
+      // would replace the mapping the import just claimed — leaving a row with one WC
+      // object's type/parentId and another's externalProductId. This path does not hold the
+      // import's SKU lock, so the predicate is what makes it safe.
+      const { count } = await tx.product.updateMany({
+        where: {
+          id: productId,
+          OR: [{ externalProductId: null }, { externalProductId: BigInt(externalId) }],
+        },
         data: { externalProductId: BigInt(externalId) },
       })
+      if (count === 0) return { ok: false as const, reason: 'mapping_changed' as const }
       return { ok: true as const }
     })
   } catch (e) {
@@ -229,10 +243,15 @@ async function invalidateMappingIfVersionMatches(
         }
       }
 
-      await tx.product.update({
-        where: { id: entry.productId },
+      // o3d-fsi: the read above established the premise; clearing has to re-assert it, or a
+      // mapping claimed between the two is wiped.
+      const cleared = await tx.product.updateMany({
+        where: { id: entry.productId, externalProductId: BigInt(entry.externalId) },
         data: { externalProductId: null },
       })
+      if (cleared.count === 0) {
+        return { status: 'mapping_changed' as const, currentWcId: null }
+      }
       return {
         status: 'cleared' as const,
         log: {
@@ -367,10 +386,14 @@ async function invalidateMappingInLockedTx(
     }
   }
 
-  await tx.product.update({
-    where: { id: entry.productId },
+  // o3d-fsi: same re-assertion as above — the read is a snapshot, the write must be conditional.
+  const cleared = await tx.product.updateMany({
+    where: { id: entry.productId, externalProductId: BigInt(entry.externalId) },
     data: { externalProductId: null },
   })
+  if (cleared.count === 0) {
+    return { status: 'mapping_changed', currentWcId: null }
+  }
   return {
     status: 'cleared',
     log: {
@@ -841,6 +864,13 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
           `WooCommerce credentials were rebound while resolving SKUs — aborted before persisting ${p.sku} (IMS ${p.id}) to avoid writing an old-store id`,
         )
         break
+      } else if (outcome.reason === 'mapping_changed') {
+        // o3d-fsi: the product import (or another resolver) claimed this row while we were
+        // resolving it. Their mapping is the newer truth, so leave it alone. Not an error —
+        // this run simply does not use a target it no longer owns.
+        result.errors.push(
+          `WooCommerce mapping for ${p.sku} (IMS ${p.id}) was claimed by another sync while resolving it; left as-is`,
+        )
       } else {
         result.errors.push(
           `externalProductId collision: could not persist ${target.externalId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,

@@ -604,7 +604,8 @@ test('a row DELETED mid-import is a transient failure, not an ownership conflict
 
     assert.equal(result.success, false)
     // Must NOT be an ownership conflict: o3d-gtk classifies those PERMANENT, which would ack the
-    // webhook 200 and strand the product. A deletion race has to keep retrying.
+    // webhook and strand the product for good. Staying transient is what lets o3d-i0y (PR #551)
+    // retry it once that lands.
     assert.doesNotMatch(String(result.error), /already mapped to WooCommerce object/)
     assert.match(String(result.error), /disappeared while importing it/)
   } finally {

@@ -717,9 +717,13 @@ async function updateProductGuardingOwnership(
 
   // The row is GONE — deleted concurrently, not claimed by anyone. Reporting that as an ownership
   // conflict would be doubly wrong: the message would tell an operator to resolve a duplicate SKU
-  // that does not exist, and o3d-gtk classifies ownership conflicts as PERMANENT, so the webhook
-  // would be acked 200 and the product left unimported until the daily reconcile. A deletion race
-  // is transient by nature, so it must throw something that keeps retrying.
+  // that does not exist, and o3d-gtk classifies ownership conflicts as PERMANENT.
+  //
+  // Throwing a plain error instead puts this in the TRANSIENT bucket, which is where a deletion
+  // race belongs. Be precise about what that buys today: the product webhook currently returns
+  // HTTP 200 for transient failures too, so nothing retries yet either way — o3d-i0y (PR #551) is
+  // what turns the transient branch into a retryable 5xx. This classification is what makes the
+  // case retry once that lands, and stops it being permanently acked in the meantime.
   if (!current) {
     throw new Error(
       `IMS product ${row.id} (SKU "${row.sku}") disappeared while importing it; retrying`,
