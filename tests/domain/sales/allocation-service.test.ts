@@ -1320,3 +1320,26 @@ test('an unchanged set is not refused even when a shipment has been journaled (o
   await assert.doesNotReject(() => allocateSalesOrder(createClient(state), { orderId: 'order-1' }))
   assert.equal(state.order.inventoryAllocatedDate?.toISOString(), '2026-01-01T00:00:00.000Z')
 })
+
+test('allocationSetsMatch: a nested-KIT quantity matches its own persisted 4dp row (o3d-i4qd)', () => {
+  // Nothing in this service rounds before writing — OrderAllocation.qty is @db.Decimal(12,4) and
+  // the COLUMN does it. A nested KIT expands to an unquantized factor: 0.3332 x 0.3332 per kit
+  // = 0.11102224, persisted as 0.1110.
+  //
+  // Comparing raw would make such a row differ from itself on every single cycle, so the o3d-i5it
+  // short-circuit would never fire for exactly the orders that churn worst — and each rewrite
+  // leaks the ~0.000022 difference into reservedQty as a phantom reservation.
+  const persisted = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.1110') }]
+  const computed = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.11102224') }]
+
+  assert.equal(allocationSetsMatch(persisted, computed), true)
+})
+
+test('allocationSetsMatch: a difference ABOVE the persisted scale is still a change (o3d-i4qd)', () => {
+  // Rounding to the column's scale must not swallow a real difference: 0.1110 vs 0.1112 are
+  // different rows once written, so they must compare as different.
+  const persisted = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.1110') }]
+  const computed = [{ lineId: 'l1', productId: 'p1', warehouseId: 'w1', qty: toDecimal('0.11121') }]
+
+  assert.equal(allocationSetsMatch(persisted, computed), false)
+})

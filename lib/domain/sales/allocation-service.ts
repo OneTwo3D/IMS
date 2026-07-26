@@ -21,7 +21,7 @@ import {
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
-import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { toDecimal, type DecimalInput, roundQuantity} from '@/lib/domain/math/decimal'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -705,17 +705,26 @@ function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
   return [...merged.values()].filter((row) => row.qty.gt(0))
 }
 
+/** Scale of `OrderAllocation.qty` — `@db.Decimal(12, 4)`. */
+const ALLOCATION_QTY_SCALE = 4
+
 /**
  * Is the freshly computed allocation set identical to what is already persisted (o3d-i5it)?
  *
  * Compared as a SET keyed on (lineId, warehouseId, productId) — the same key mergeAllocationRows
  * dedupes on — because row order is not meaningful and neither side is ordered.
  *
- * Quantities are compared with Decimal.eq rather than number equality: OrderAllocation.qty is
- * persisted at Decimal(12,4), and a computed value that only differs below that precision would
- * otherwise read as a change on every single cycle and defeat the whole check. (That precision
- * boundary is its own defect for nested KITs — o3d-i4qd — where the requirement is unquantized;
- * this comparison is deliberately tolerant of representation, not of a real difference.)
+ * The computed quantity is compared at the PERSISTED scale, because that is the only quantity the
+ * database can hold. Nothing in this service rounds before writing: the column does it. So a
+ * nested KIT whose expanded requirement is unquantized — 0.3332 x 0.3332 = 0.11102224 per kit,
+ * stored as 0.1110 — would otherwise differ from its own persisted row on EVERY comparison, the
+ * short-circuit would never fire for exactly the orders that churn worst, and the
+ * release/reserve cycle would keep leaking the ~0.000022 difference into reservedQty as phantom
+ * reservations (o3d-i4qd).
+ *
+ * Rounding here changes only what counts as "the same"; it does not change what is written or
+ * reserved. Making the expanded requirement itself canonical — so the coverage selector stops
+ * reporting such a line as short in the first place — is the rest of o3d-i4qd.
  */
 export function allocationSetsMatch(
   existing: Array<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>,
@@ -731,7 +740,7 @@ export function allocationSetsMatch(
 
   for (const row of next) {
     const persisted = existingByKey.get(key(row))
-    if (!persisted || !persisted.eq(row.qty)) return false
+    if (!persisted || !persisted.eq(roundQuantity(row.qty, ALLOCATION_QTY_SCALE))) return false
   }
   return true
 }
