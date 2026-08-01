@@ -35,6 +35,9 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getSettingValues } from '@/lib/settings-store'
+import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
+import { canTransitionSalesOrder } from '@/lib/domain/workflows/sales-order-state'
+import type { SalesOrderStatus } from '@/app/generated/prisma/enums'
 import type { WcFullOrder } from './types'
 
 /** Settings keys, so a store that renames the plugin's statuses can follow. */
@@ -218,12 +221,18 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
   if (claim === null) return { success: false, error: `Sales order ${orderId} not found`, permanent: true }
 
   if (claim.skip === 'post-dispatch') {
+    // Clear any marker left by a racing earlier attempt. Leaving it makes every
+    // later ordinary webhook (`completed`, `delivered`) classify as
+    // rejected-held and short-circuit the status mapping, stranding the IMS
+    // lifecycle behind the storefront until somebody notices.
+    await clearStaleMarker(orderId)
     await note(orderId, wcOrder, 'wc_withdrawal_after_dispatch', 'WARNING',
       `Customer filed an EU withdrawal request, but the order is already ${claim.status}. `
       + 'The goods have gone, so this is a RETURN, not a hold — handle it as one. No IMS status change was made.')
     return { success: true }
   }
   if (claim.skip === 'cancelled') {
+    await clearStaleMarker(orderId)
     await note(orderId, wcOrder, 'wc_withdrawal_already_cancelled', 'INFO',
       'Customer filed an EU withdrawal request on an order that is already cancelled — nothing to do.')
     return { success: true }
@@ -231,15 +240,24 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
   if (claim.skip === 'already-held') return { success: true }
 
   const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
-  // skipPermissionCheck, NOT internalBypassToken. The bypass skips the
-  // lifecycle state machine as well as the permission check, and that guard is
-  // exactly what stops a delayed `submitted` delivery dragging a genuinely
-  // SHIPPED or already-CANCELLED order backwards to ON_HOLD — it runs against
-  // the live row inside the transition, which no check of ours out here can.
-  // SHIPPED/COMPLETED/DELIVERED and CANCELLED have no ON_HOLD target.
+  // The state-machine check is made HERE, explicitly, and the transition then
+  // uses the unforgeable symbol token.
+  //
+  // `skipPermissionCheck` is a plain boolean on a module-wide `'use server'`
+  // export, so it crosses the RPC boundary and a client could send it —
+  // passing it would have this flow depend on a forgeable authorization
+  // bypass. The symbol cannot be serialized, so it is not forgeable. See
+  // o3d-43oz for the pre-existing exposure itself.
+  if (!canTransitionSalesOrder(claim.status as SalesOrderStatus, 'ON_HOLD')) {
+    await note(orderId, wcOrder, 'wc_withdrawal_hold_not_permitted', 'WARNING',
+      `Customer filed an EU withdrawal request, but the order moved to ${claim.status} `
+      + 'before the hold could be applied. No status change was made — handle this by hand.')
+    return { success: true }
+  }
+
   const result = await applySalesOrderStatusTransition(orderId, 'ON_HOLD' as never, undefined, {
     pushStatusToWooCommerce: false,
-    skipPermissionCheck: true,
+    internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
   })
 
   await note(orderId, wcOrder,
@@ -257,6 +275,7 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
   if (claim === null) return { success: false, error: `Sales order ${orderId} not found`, permanent: true }
 
   if (POST_DISPATCH.has(claim.status)) {
+    await clearStaleMarker(orderId)
     await note(orderId, wcOrder, 'wc_withdrawal_approved_after_dispatch', 'WARNING',
       `EU withdrawal request approved, but the order is already ${claim.status}. `
       + 'Cancelling would falsify the lifecycle against real dispatch evidence — handle this as a RETURN.')
@@ -270,11 +289,16 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
   }
 
   const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
-  // As above: the state machine refuses CANCELLED from a dispatched or
-  // already-cancelled order, which is what makes a concurrent delivery safe.
+  if (!canTransitionSalesOrder(claim.status as SalesOrderStatus, 'CANCELLED')) {
+    await note(orderId, wcOrder, 'wc_withdrawal_cancel_not_permitted', 'WARNING',
+      `EU withdrawal request approved, but the order moved to ${claim.status} before it could be `
+      + 'cancelled. No status change was made — handle this by hand.')
+    return { success: true }
+  }
+
   const result = await applySalesOrderStatusTransition(orderId, 'CANCELLED' as never, undefined, {
     pushStatusToWooCommerce: false,
-    skipPermissionCheck: true,
+    internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
   })
 
   // Clear the marker only on success. Clearing it regardless would drop the
@@ -290,6 +314,18 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
       ? 'EU withdrawal request approved — order cancelled; the WMS push sweep will cancel it at the warehouse.'
       : `EU withdrawal request approved but the IMS cancellation failed: ${result.error}. The order is NOT cancelled; this will be retried.`)
   return result
+}
+
+/**
+ * Drop a marker that has outlived its meaning, i.e. the order reached a
+ * terminal state anyway. Leaving it set keeps blocking the WMS passes AND
+ * makes every later ordinary webhook classify as `rejected-held`.
+ */
+async function clearStaleMarker(orderId: string): Promise<void> {
+  await db.salesOrder.updateMany({
+    where: { id: orderId, withdrawalHoldAt: { not: null } },
+    data: { withdrawalHoldAt: null },
+  })
 }
 
 async function note(
