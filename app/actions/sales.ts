@@ -139,6 +139,8 @@ export type SoRow = {
   externalOrderDate: string | null
   status: SoStatus
   refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
+  /// o3d-e1yb [wdraw]: set while an EU withdrawal request holds this order.
+  withdrawalHoldAt: string | null
   currency: string
   fxRateToBase: number
   customerName: string | null
@@ -412,6 +414,7 @@ const SO_SELECT = {
   orderNumber: true,
   status: true,
   refundStatus: true,
+  withdrawalHoldAt: true,
   currency: true,
   fxRateToBase: true,
   customerName: true,
@@ -472,6 +475,7 @@ function mapSoRow(so: {
   orderNumber: string | null
   status: string
   refundStatus: string
+  withdrawalHoldAt: Date | null
   currency: string
   fxRateToBase: unknown
   customerName: string | null
@@ -561,6 +565,7 @@ function mapSoRow(so: {
     externalOrderDate: so.externalCreatedAt?.toISOString() ?? null,
     status: so.status as SoStatus,
     refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
+    withdrawalHoldAt: so.withdrawalHoldAt ? so.withdrawalHoldAt.toISOString() : null,
     currency: so.currency,
     fxRateToBase: Number(so.fxRateToBase),
     customerName: so.customerName,

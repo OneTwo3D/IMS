@@ -846,6 +846,12 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           status: { in: [...READY_STATUSES] },
           paidAt: { not: null },
           refundStatus: { not: 'FULL' },
+          // o3d-e1yb [wdraw]: never push an order the customer has asked to
+          // withdraw. The marker is written before the ON_HOLD transition, so
+          // it also covers the window where the marker landed but the
+          // transition failed — without this, such an order is still a
+          // PROCESSING/paid candidate and enters fulfilment anyway.
+          withdrawalHoldAt: null,
           shipFromWarehouseId: { in: boundWarehouseIds },
           OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
         },
@@ -861,6 +867,15 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         // delete mutually exclusive rather than merely racing.
         const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
         if (locked.length === 0) return false
+        // o3d-e1yb [wdraw]: re-check UNDER THE LOCK. The candidate query ran
+        // earlier, and a withdrawal request can land between the two — the
+        // marker is written under this same lock, so checking it here is what
+        // makes the two mutually exclusive rather than merely racing.
+        const fresh = await tx.salesOrder.findUnique({
+          where: { id: orderId },
+          select: { withdrawalHoldAt: true },
+        })
+        if (fresh?.withdrawalHoldAt) return false
         const existing = await tx.wmsOrderPushLink.findUnique({
           where: { orderId },
           select: { state: true, lastAttemptAt: true },

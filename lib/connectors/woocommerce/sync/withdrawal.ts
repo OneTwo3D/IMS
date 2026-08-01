@@ -46,12 +46,28 @@ export const WDRAW_APPROVED_STATUS_KEY = 'wc_withdrawal_approved_status'
 export const DEFAULT_WDRAW_SUBMITTED_STATUS = 'pending-wdraw'
 export const DEFAULT_WDRAW_APPROVED_STATUS = 'withdrawn'
 
+export type WithdrawalKind =
+  | 'not-a-withdrawal'
+  | 'submitted'
+  | 'approved'
+  | 'already-held'
+  | 'rejected-held'
+
 export type WithdrawalOutcome =
   | { kind: 'not-a-withdrawal' }
-  | { kind: 'submitted'; handled: true }
-  | { kind: 'approved'; handled: true }
-  | { kind: 'already-held'; handled: true }
-  | { kind: 'rejected-held'; handled: true }
+  // `handled` means the caller must not fall through to its status mapping.
+  // `result` is the transition's own outcome and MUST be propagated: a
+  // handled-but-failed withdrawal that acknowledged the webhook would leave
+  // the order fulfillable with only a warning log, and no delivery would ever
+  // retry it.
+  | { kind: Exclude<WithdrawalKind, 'not-a-withdrawal'>; handled: true; result: TransitionResult }
+
+export type TransitionResult = { success: boolean; error?: string; permanent?: boolean }
+
+/** Lifecycle states where the goods have gone. A withdrawal is then a RETURN,
+ *  not a hold or a cancellation, and forcing either would falsify the
+ *  lifecycle against real dispatch evidence. */
+const POST_DISPATCH: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
 export function normaliseStatus(status: unknown): string {
   const s = String(status ?? '').trim().toLowerCase()
@@ -84,7 +100,7 @@ export function classifyWithdrawalStatus(
   wcStatus: unknown,
   statuses: { submitted: string; approved: string },
   hasHold: boolean,
-): WithdrawalOutcome['kind'] {
+): WithdrawalKind {
   const status = normaliseStatus(wcStatus)
   // Approved is checked FIRST. If a store ever configured the two to the same
   // slug, cancelling is the safer reading of an ambiguous configuration than
@@ -105,16 +121,14 @@ export async function handleWcWithdrawalStatus(
   const statuses = await getWithdrawalStatuses()
   const kind = classifyWithdrawalStatus(wcOrder.status, statuses, Boolean(order.withdrawalHoldAt))
 
-  if (kind === 'already-held') return { kind, handled: true }
+  if (kind === 'already-held') return { kind, handled: true, result: { success: true } }
 
   if (kind === 'submitted') {
-    await applyWithdrawalHold(order.id, wcOrder)
-    return { kind, handled: true }
+    return { kind, handled: true, result: await applyWithdrawalHold(order.id, wcOrder) }
   }
 
   if (kind === 'approved') {
-    await applyWithdrawalApproval(order.id, wcOrder)
-    return { kind, handled: true }
+    return { kind, handled: true, result: await applyWithdrawalApproval(order.id, wcOrder) }
   }
 
   if (kind === 'rejected-held') {
@@ -132,62 +146,131 @@ export async function handleWcWithdrawalStatus(
       metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status, withdrawalHoldAt: order.withdrawalHoldAt },
       resolveUser: false,
     })
-    return { kind, handled: true }
+    return { kind, handled: true, result: { success: true } }
   }
 
   return { kind: 'not-a-withdrawal' }
 }
 
-async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promise<void> {
+/**
+ * Claim the order row and re-read its CURRENT state.
+ *
+ * The internal bypass disables the lifecycle state-machine guard, so nothing
+ * else stops a delayed `submitted` delivery dragging a CANCELLED or genuinely
+ * SHIPPED order backwards to ON_HOLD, or an older submission overwriting a
+ * concurrent approval's CANCELLED. Serialising on the same row lock the WMS
+ * create claim takes is what makes these mutually exclusive rather than
+ * merely racing.
+ */
+async function withOrderLock<T>(orderId: string, fn: (current: { status: string; withdrawalHoldAt: Date | null }) => Promise<T>): Promise<T | null> {
+  return db.$transaction(async (tx) => {
+    const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+    if (locked.length === 0) return null
+    const current = await tx.salesOrder.findUnique({
+      where: { id: orderId },
+      select: { status: true, withdrawalHoldAt: true },
+    })
+    if (!current) return null
+    return fn(current)
+  })
+}
+
+async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
+  const claim = await withOrderLock(orderId, async (current) => {
+    if (POST_DISPATCH.has(current.status)) return { skip: 'post-dispatch' as const, status: current.status }
+    if (current.status === 'CANCELLED') return { skip: 'cancelled' as const, status: current.status }
+    if (current.withdrawalHoldAt) return { skip: 'already-held' as const, status: current.status }
+    // Mark the hold INSIDE the lock and BEFORE the transition. If the
+    // transition then fails the marker still blocks the WMS create and the
+    // release pass, which is the safe direction; and a concurrent delivery
+    // that takes the lock next sees `already-held`.
+    await db.salesOrder.update({ where: { id: orderId }, data: { withdrawalHoldAt: new Date() } })
+    return { skip: null, status: current.status }
+  })
+
+  if (claim === null) return { success: false, error: `Sales order ${orderId} not found`, permanent: true }
+
+  if (claim.skip === 'post-dispatch') {
+    await note(orderId, wcOrder, 'wc_withdrawal_after_dispatch', 'WARNING',
+      `Customer filed an EU withdrawal request, but the order is already ${claim.status}. `
+      + 'The goods have gone, so this is a RETURN, not a hold — handle it as one. No IMS status change was made.')
+    return { success: true }
+  }
+  if (claim.skip === 'cancelled') {
+    await note(orderId, wcOrder, 'wc_withdrawal_already_cancelled', 'INFO',
+      'Customer filed an EU withdrawal request on an order that is already cancelled — nothing to do.')
+    return { success: true }
+  }
+  if (claim.skip === 'already-held') return { success: true }
+
   const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
-
-  // Mark the hold BEFORE the transition. If the transition succeeds and this
-  // write had not happened, the very next inbound status would look like an
-  // ordinary hold and release it.
-  await db.salesOrder.update({ where: { id: orderId }, data: { withdrawalHoldAt: new Date() } })
-
   const result = await applySalesOrderStatusTransition(orderId, 'ON_HOLD' as never, undefined, {
     pushStatusToWooCommerce: false,
     internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
   })
 
-  await logActivity({
-    entityType: 'SALES_ORDER',
-    entityId: orderId,
-    action: result.success ? 'wc_withdrawal_hold_applied' : 'wc_withdrawal_hold_failed',
-    tag: 'sync',
-    level: result.success ? 'INFO' : 'WARNING',
-    description: result.success
+  await note(orderId, wcOrder,
+    result.success ? 'wc_withdrawal_hold_applied' : 'wc_withdrawal_hold_failed',
+    result.success ? 'INFO' : 'WARNING',
+    result.success
       ? 'Customer filed an EU withdrawal request — order placed ON HOLD; the WMS push sweep will pull it back from the warehouse.'
-      : `Customer filed an EU withdrawal request but the IMS hold could not be applied: ${result.error}. The order is NOT stopped.`,
-    metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status },
-    resolveUser: false,
-  })
+      : `Customer filed an EU withdrawal request but the IMS hold could not be applied: ${result.error}. `
+        + 'The withdrawal marker IS set, so the order will not be pushed to the warehouse, but its status is wrong — this will be retried.')
+  return result
 }
 
-async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): Promise<void> {
-  const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
+async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
+  const claim = await withOrderLock(orderId, async (current) => ({ status: current.status }))
+  if (claim === null) return { success: false, error: `Sales order ${orderId} not found`, permanent: true }
 
+  if (POST_DISPATCH.has(claim.status)) {
+    await note(orderId, wcOrder, 'wc_withdrawal_approved_after_dispatch', 'WARNING',
+      `EU withdrawal request approved, but the order is already ${claim.status}. `
+      + 'Cancelling would falsify the lifecycle against real dispatch evidence — handle this as a RETURN.')
+    return { success: true }
+  }
+  if (claim.status === 'CANCELLED') {
+    // Already where we want it. Clear the marker so the order is not left
+    // blocked by a hold that no longer means anything.
+    await db.salesOrder.update({ where: { id: orderId }, data: { withdrawalHoldAt: null } })
+    return { success: true }
+  }
+
+  const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
   const result = await applySalesOrderStatusTransition(orderId, 'CANCELLED' as never, undefined, {
     pushStatusToWooCommerce: false,
     internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
   })
 
   // Clear the marker only on success. Clearing it regardless would drop the
-  // release block while the order was still ON_HOLD and uncancelled.
+  // create/release block while the order was still uncancelled.
   if (result.success) {
     await db.salesOrder.update({ where: { id: orderId }, data: { withdrawalHoldAt: null } })
   }
 
+  await note(orderId, wcOrder,
+    result.success ? 'wc_withdrawal_approved' : 'wc_withdrawal_approval_failed',
+    result.success ? 'INFO' : 'WARNING',
+    result.success
+      ? 'EU withdrawal request approved — order cancelled; the WMS push sweep will cancel it at the warehouse.'
+      : `EU withdrawal request approved but the IMS cancellation failed: ${result.error}. The order is NOT cancelled; this will be retried.`)
+  return result
+}
+
+async function note(
+  orderId: string,
+  wcOrder: WcFullOrder,
+  action: string,
+  level: 'INFO' | 'WARNING',
+  description: string,
+): Promise<void> {
   await logActivity({
     entityType: 'SALES_ORDER',
     entityId: orderId,
-    action: result.success ? 'wc_withdrawal_approved' : 'wc_withdrawal_approval_failed',
+    action,
     tag: 'sync',
-    level: result.success ? 'INFO' : 'WARNING',
-    description: result.success
-      ? 'EU withdrawal request approved — order cancelled; the WMS push sweep will cancel it at the warehouse.'
-      : `EU withdrawal request approved but the IMS cancellation failed: ${result.error}. The order is NOT cancelled.`,
+    level,
+    description,
     metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status },
     resolveUser: false,
   })
