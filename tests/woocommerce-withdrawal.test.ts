@@ -170,3 +170,35 @@ test('both tokens are symbols, so they cannot cross the Server Action boundary',
     assert.equal(JSON.parse(JSON.stringify({ tok })).tok, undefined)
   }
 })
+
+// --- an approved withdrawal is TERMINAL ------------------------------------
+// The hold marker is cleared once the order is cancelled, so without a
+// separate durable fact a delayed PRE-approval `processing` delivery sees no
+// marker, falls through to the ordinary status mapping (which uses the FULL
+// transition bypass), and forces the cancelled order back to PROCESSING —
+// making its WMS link releasable and sending withdrawn goods to the warehouse.
+
+test('a delayed ordinary status after approval is refused', () => {
+  for (const s of ['processing', 'on-hold', 'pending', 'completed', 'wc-processing']) {
+    assert.equal(
+      classifyWithdrawalStatus(s, DEFAULTS, /* hasHold */ false, /* wasApproved */ true),
+      'approved-terminal', s,
+    )
+  }
+})
+
+test('approval remains terminal even if a hold marker is somehow present', () => {
+  assert.equal(classifyWithdrawalStatus('processing', DEFAULTS, true, true), 'approved-terminal')
+})
+
+test('a redelivered approval after approval is still just an approval', () => {
+  // Idempotent: it must not be swallowed as terminal, or a retried delivery
+  // could never repair a cancellation that had failed.
+  assert.equal(classifyWithdrawalStatus('withdrawn', DEFAULTS, false, true), 'approved')
+  assert.equal(classifyWithdrawalStatus('wc-withdrawn', DEFAULTS, false, true), 'approved')
+})
+
+test('without an approval, ordinary statuses behave exactly as before', () => {
+  assert.equal(classifyWithdrawalStatus('processing', DEFAULTS, false, false), 'not-a-withdrawal')
+  assert.equal(classifyWithdrawalStatus('processing', DEFAULTS, true, false), 'rejected-held')
+})

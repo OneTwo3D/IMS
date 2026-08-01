@@ -29,7 +29,12 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
         },
       },
       select: {
-        order: { select: { id: true, externalOrderNumber: true, status: true, withdrawalHoldAt: true } },
+        order: {
+          select: {
+            id: true, externalOrderNumber: true, status: true,
+            withdrawalHoldAt: true, withdrawalApprovedAt: true,
+          },
+        },
       },
     })
     const so = link?.order ?? null

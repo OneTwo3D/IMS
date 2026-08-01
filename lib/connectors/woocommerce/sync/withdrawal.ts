@@ -52,6 +52,9 @@ export type WithdrawalKind =
   | 'approved'
   | 'already-held'
   | 'rejected-held'
+  /** The withdrawal was approved and the order cancelled. That is terminal:
+   *  no later storefront status may move it. */
+  | 'approved-terminal'
 
 export type WithdrawalOutcome =
   | { kind: 'not-a-withdrawal' }
@@ -100,8 +103,16 @@ export function classifyWithdrawalStatus(
   wcStatus: unknown,
   statuses: { submitted: string; approved: string },
   hasHold: boolean,
+  wasApproved = false,
 ): WithdrawalKind {
   const status = normaliseStatus(wcStatus)
+  // An approved withdrawal is TERMINAL and outranks everything below. The hold
+  // marker is cleared once the order is cancelled, so without this a delayed
+  // pre-approval `processing` delivery sees no marker, falls through to the
+  // ordinary status mapping — which uses the FULL transition bypass — and
+  // forces the cancelled order back to PROCESSING. Its WMS link then becomes
+  // releasable and withdrawn goods go back to the warehouse.
+  if (wasApproved && status !== normaliseStatus(statuses.approved)) return 'approved-terminal'
   // Approved is checked FIRST. If a store ever configured the two to the same
   // slug, cancelling is the safer reading of an ambiguous configuration than
   // holding — and it keeps the branch order independent of hasHold.
@@ -116,10 +127,26 @@ export function classifyWithdrawalStatus(
 
 export async function handleWcWithdrawalStatus(
   wcOrder: WcFullOrder,
-  order: { id: string; status: string; externalOrderNumber: string | null; withdrawalHoldAt: Date | null },
+  order: {
+    id: string
+    status: string
+    externalOrderNumber: string | null
+    withdrawalHoldAt: Date | null
+    withdrawalApprovedAt: Date | null
+  },
 ): Promise<WithdrawalOutcome> {
   const statuses = await getWithdrawalStatuses()
-  const kind = classifyWithdrawalStatus(wcOrder.status, statuses, Boolean(order.withdrawalHoldAt))
+  const kind = classifyWithdrawalStatus(
+    wcOrder.status, statuses,
+    Boolean(order.withdrawalHoldAt), Boolean(order.withdrawalApprovedAt),
+  )
+
+  if (kind === 'approved-terminal') {
+    await note(order.id, wcOrder, 'wc_withdrawal_post_approval_status_ignored', 'INFO',
+      `Ignored WooCommerce status "${wcOrder.status}" — this order's EU withdrawal request was `
+      + 'approved and the order cancelled, so no later storefront status may move it.')
+    return { kind, handled: true, result: { success: true } }
+  }
 
   if (kind === 'already-held') {
     // NOT simply success. The marker is written before the transition, so a
@@ -280,8 +307,9 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
     return { success: true }
   }
   if (claim.status === 'CANCELLED') {
-    // Already where we want it. Clear the marker so the order is not left
-    // blocked by a hold that no longer means anything.
+    // Already where we want it. Record the approval and clear the marker, so
+    // the order is not left blocked by a hold that no longer means anything.
+    await db.salesOrder.update({ where: { id: orderId }, data: { withdrawalApprovedAt: new Date() } })
     await clearStaleMarker(orderId, claim.marker)
     return { success: true }
   }
@@ -297,6 +325,9 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
   // Clear the marker only on success. Clearing it regardless would drop the
   // create/release block while the order was still uncancelled.
   if (result.success) {
+    // Record the durable fact BEFORE clearing the active hold, so there is no
+    // window in which the order has neither.
+    await db.salesOrder.update({ where: { id: orderId }, data: { withdrawalApprovedAt: new Date() } })
     await clearStaleMarker(orderId, claim.marker)
   }
 

@@ -1558,6 +1558,14 @@ model SalesOrder {
   /// an operator releases the hold by hand. Automatic release is deliberately not
   /// implemented; see lib/connectors/woocommerce/sync/withdrawal.ts.
   withdrawalHoldAt  DateTime?
+  /// o3d-e1yb [wdraw]: set when an EU withdrawal request was APPROVED and the order
+  /// cancelled. Deliberately separate from `withdrawalHoldAt`, which is cleared at that
+  /// point: the hold is over, but the fact is permanent. A delayed pre-approval
+  /// storefront webhook would otherwise see no marker, fall through to the ordinary
+  /// status mapping — which uses the full transition bypass — and force the cancelled
+  /// order back to PROCESSING, making its WMS link releasable and re-sending withdrawn
+  /// goods to the warehouse.
+  withdrawalApprovedAt DateTime?
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 
