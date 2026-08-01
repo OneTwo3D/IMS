@@ -3514,7 +3514,16 @@ export async function releaseWithdrawalHold(id: string, note?: string) {
   if (!so) return { success: false, error: 'Order not found' }
   if (!so.withdrawalHoldAt) return { success: false, error: 'This order is not under a withdrawal hold' }
 
-  await db.salesOrder.update({ where: { id }, data: { withdrawalHoldAt: null } })
+  // Conditional on the value we observed: a concurrent withdrawal delivery
+  // could have replaced the hold between the read and this write, and clearing
+  // THAT one would release an order whose customer has just asked to stop it.
+  const cleared = await db.salesOrder.updateMany({
+    where: { id, withdrawalHoldAt: so.withdrawalHoldAt },
+    data: { withdrawalHoldAt: null },
+  })
+  if (cleared.count === 0) {
+    return { success: false, error: 'The withdrawal hold changed while you were looking at it — reload and try again' }
+  }
 
   await logActivity({
     entityType: 'SALES_ORDER',

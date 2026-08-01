@@ -35,7 +35,6 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getSettingValues } from '@/lib/settings-store'
-import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import type { WcFullOrder } from './types'
 
 /** Settings keys, so a store that renames the plugin's statuses can follow. */
@@ -121,7 +120,15 @@ export async function handleWcWithdrawalStatus(
   const statuses = await getWithdrawalStatuses()
   const kind = classifyWithdrawalStatus(wcOrder.status, statuses, Boolean(order.withdrawalHoldAt))
 
-  if (kind === 'already-held') return { kind, handled: true, result: { success: true } }
+  if (kind === 'already-held') {
+    // NOT simply success. The marker is written before the transition, so a
+    // hold whose ON_HOLD transition failed leaves exactly this state — and
+    // treating it as done means no redelivery ever repairs the status. The
+    // order would sit blocked from the warehouse (safe) but with a lifecycle
+    // that lies about it, and nothing would say so. Re-run the hold, which is
+    // idempotent: it re-reads under the lock and no-ops when already ON_HOLD.
+    return { kind, handled: true, result: await applyWithdrawalHold(order.id, wcOrder) }
+  }
 
   if (kind === 'submitted') {
     return { kind, handled: true, result: await applyWithdrawalHold(order.id, wcOrder) }
@@ -162,7 +169,12 @@ export async function handleWcWithdrawalStatus(
  * create claim takes is what makes these mutually exclusive rather than
  * merely racing.
  */
-async function withOrderLock<T>(orderId: string, fn: (current: { status: string; withdrawalHoldAt: Date | null }) => Promise<T>): Promise<T | null> {
+type TxClient = Parameters<Parameters<typeof db.$transaction>[0]>[0]
+
+async function withOrderLock<T>(
+  orderId: string,
+  fn: (current: { status: string; withdrawalHoldAt: Date | null }, tx: TxClient) => Promise<T>,
+): Promise<T | null> {
   return db.$transaction(async (tx) => {
     const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
     if (locked.length === 0) return null
@@ -171,20 +183,35 @@ async function withOrderLock<T>(orderId: string, fn: (current: { status: string;
       select: { status: true, withdrawalHoldAt: true },
     })
     if (!current) return null
-    return fn(current)
+    // `tx`, never the global client: a write to this row through `db` would
+    // wait on the FOR UPDATE lock that this very transaction holds and cannot
+    // release until the callback returns — a self-deadlock that stalls every
+    // submitted withdrawal until the statement times out.
+    return fn(current, tx)
   })
 }
 
 async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
-  const claim = await withOrderLock(orderId, async (current) => {
+  const claim = await withOrderLock(orderId, async (current, tx) => {
     if (POST_DISPATCH.has(current.status)) return { skip: 'post-dispatch' as const, status: current.status }
     if (current.status === 'CANCELLED') return { skip: 'cancelled' as const, status: current.status }
-    if (current.withdrawalHoldAt) return { skip: 'already-held' as const, status: current.status }
+    // An existing marker is NOT a reason to stop: the transition may have
+    // failed after it was written. Only an order already IN the target state
+    // is genuinely nothing to do.
+    if (current.withdrawalHoldAt && current.status === 'ON_HOLD') {
+      return { skip: 'already-held' as const, status: current.status }
+    }
+    if (current.withdrawalHoldAt) return { skip: null, status: current.status }
     // Mark the hold INSIDE the lock and BEFORE the transition. If the
     // transition then fails the marker still blocks the WMS create and the
-    // release pass, which is the safe direction; and a concurrent delivery
-    // that takes the lock next sees `already-held`.
-    await db.salesOrder.update({ where: { id: orderId }, data: { withdrawalHoldAt: new Date() } })
+    // release pass, which is the safe direction.
+    //
+    // Only stamp it once: a repair run must not keep pushing the "held since"
+    // timestamp forward, or the operator loses how long the order has been
+    // stuck.
+    if (!current.withdrawalHoldAt) {
+      await tx.salesOrder.update({ where: { id: orderId }, data: { withdrawalHoldAt: new Date() } })
+    }
     return { skip: null, status: current.status }
   })
 
@@ -204,9 +231,15 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
   if (claim.skip === 'already-held') return { success: true }
 
   const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
+  // skipPermissionCheck, NOT internalBypassToken. The bypass skips the
+  // lifecycle state machine as well as the permission check, and that guard is
+  // exactly what stops a delayed `submitted` delivery dragging a genuinely
+  // SHIPPED or already-CANCELLED order backwards to ON_HOLD — it runs against
+  // the live row inside the transition, which no check of ours out here can.
+  // SHIPPED/COMPLETED/DELIVERED and CANCELLED have no ON_HOLD target.
   const result = await applySalesOrderStatusTransition(orderId, 'ON_HOLD' as never, undefined, {
     pushStatusToWooCommerce: false,
-    internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
+    skipPermissionCheck: true,
   })
 
   await note(orderId, wcOrder,
@@ -237,9 +270,11 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
   }
 
   const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
+  // As above: the state machine refuses CANCELLED from a dispatched or
+  // already-cancelled order, which is what makes a concurrent delivery safe.
   const result = await applySalesOrderStatusTransition(orderId, 'CANCELLED' as never, undefined, {
     pushStatusToWooCommerce: false,
-    internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
+    skipPermissionCheck: true,
   })
 
   // Clear the marker only on success. Clearing it regardless would drop the

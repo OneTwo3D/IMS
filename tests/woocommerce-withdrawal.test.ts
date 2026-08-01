@@ -108,3 +108,42 @@ test('a misconfiguration mapping both to one slug resolves to the safer branch',
   assert.equal(classifyWithdrawalStatus('withdrawn', same, false), 'approved')
   assert.equal(classifyWithdrawalStatus('withdrawn', same, true), 'approved')
 })
+
+// --- ordering, via the real lifecycle state machine -------------------------
+// The handler no longer uses the blanket transition bypass, so the state
+// machine is what makes concurrent deliveries safe. These pin that the
+// machine actually refuses the transitions the withdrawal paths rely on it
+// refusing — if a future edit widens SALES_ORDER_TRANSITIONS, the withdrawal
+// races reopen silently and these fail.
+
+import { canTransitionSalesOrder } from '../lib/domain/workflows/sales-order-state.ts'
+
+test('a dispatched order cannot be dragged back to ON_HOLD', () => {
+  // A delayed `submitted` delivery arriving after dispatch.
+  for (const from of ['SHIPPED', 'COMPLETED', 'DELIVERED'] as const) {
+    assert.equal(canTransitionSalesOrder(from, 'ON_HOLD'), false, from)
+  }
+})
+
+test('a cancelled order cannot be re-held or re-cancelled', () => {
+  // An older `submitted` losing the race to a concurrent approval.
+  assert.equal(canTransitionSalesOrder('CANCELLED', 'ON_HOLD'), false)
+  assert.equal(canTransitionSalesOrder('CANCELLED', 'CANCELLED'), false)
+})
+
+test('the transitions the withdrawal paths DO need are permitted', () => {
+  for (const from of ['PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] as const) {
+    assert.equal(canTransitionSalesOrder(from, 'ON_HOLD'), true, from)
+    assert.equal(canTransitionSalesOrder(from, 'CANCELLED'), true, from)
+  }
+  // Approval after a hold.
+  assert.equal(canTransitionSalesOrder('ON_HOLD', 'CANCELLED'), true)
+  // Operator release: back into fulfilment after the hold is cleared.
+  assert.equal(canTransitionSalesOrder('ON_HOLD', 'PROCESSING'), true)
+})
+
+test('a dispatched order cannot be cancelled either, so approval must not try', () => {
+  for (const from of ['SHIPPED', 'COMPLETED', 'DELIVERED'] as const) {
+    assert.equal(canTransitionSalesOrder(from, 'CANCELLED'), false, from)
+  }
+})
