@@ -835,6 +835,10 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
             // status change would put the goods back on the pick line.
             // An operator clears withdrawalHoldAt to release.
             withdrawalHoldAt: null,
+            // ...and an APPROVED withdrawal is terminal: the hold is cleared
+            // once the order is cancelled, so the approval fact is what keeps
+            // it out of the warehouse from then on.
+            withdrawalApprovedAt: null,
           },
         },
         select: { id: true, orderId: true, externalOrderId: true },
@@ -852,6 +856,10 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           // transition failed — without this, such an order is still a
           // PROCESSING/paid candidate and enters fulfilment anyway.
           withdrawalHoldAt: null,
+          // A DIRECT approval (the submitted webhook never arrived) records
+          // only the approval fact until its cancellation finishes, so
+          // checking the hold alone would let the order be pushed in between.
+          withdrawalApprovedAt: null,
           shipFromWarehouseId: { in: boundWarehouseIds },
           OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
         },
@@ -873,9 +881,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         // makes the two mutually exclusive rather than merely racing.
         const fresh = await tx.salesOrder.findUnique({
           where: { id: orderId },
-          select: { withdrawalHoldAt: true },
+          select: { withdrawalHoldAt: true, withdrawalApprovedAt: true },
         })
-        if (fresh?.withdrawalHoldAt) return false
+        if (fresh?.withdrawalHoldAt || fresh?.withdrawalApprovedAt) return false
         const existing = await tx.wmsOrderPushLink.findUnique({
           where: { orderId },
           select: { state: true, lastAttemptAt: true },

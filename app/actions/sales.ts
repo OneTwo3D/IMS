@@ -1466,6 +1466,9 @@ export async function applySalesOrderStatusTransition(
         paidAt: true,
         invoiceNumber: true,
         currency: true,
+        // o3d-e1yb [wdraw]: read here so the guard below runs against the row
+        // this transition itself read, not a caller's earlier snapshot.
+        withdrawalApprovedAt: true,
         // b8i6.1: detect a shopping order via ANY connector (not just WooCommerce)
         // so a Shopify-linked order also gets its IMS status pushed back.
         shoppingLinks: { select: { id: true }, take: 1 },
@@ -1480,6 +1483,21 @@ export async function applySalesOrderStatusTransition(
     // archived-but-shipped order could never auto-reach DELIVERED.
     if (so.archived && !bypassPermission && !authOnly && !options?.skipPermissionCheck) {
       return { success: false, error: 'This order is archived; unarchive it before changing its status.' }
+    }
+
+    // o3d-e1yb [wdraw]: an APPROVED withdrawal is terminal. The inbound status
+    // handler already refuses ordinary storefront statuses for such an order,
+    // but that check reads an unlocked snapshot: an ordinary event can be
+    // classified before a concurrent approval commits and then apply its
+    // full-bypass mapping afterwards, overwriting CANCELLED with PROCESSING and
+    // making the order warehouse-eligible again. Enforcing it HERE is what
+    // makes it atomic with the status write.
+    if (so.withdrawalApprovedAt && targetStatus !== 'CANCELLED') {
+      return {
+        success: false,
+        permanent: true,
+        error: 'This order\u2019s EU withdrawal request was approved and the order cancelled; its status cannot be changed.',
+      }
     }
 
     const transition = validateManualSalesOrderStatusTransition(so.status, targetStatus, {

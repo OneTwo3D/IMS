@@ -1051,21 +1051,55 @@ export async function syncNewWcOrders(
     const orders = data as WcFullOrder[]
 
     for (const order of orders) {
+      const isWithdrawal = order.status === wdraw.submitted || order.status === wdraw.approved
+
+      // o3d-e1yb: a withdrawal-status order that IMS has never seen must not be
+      // imported first. importWcOrder would create it with the ordinary mapping
+      // — PROCESSING — which auto-allocates stock and can queue its accounting
+      // invoice, and only then would the withdrawal be applied. A failure in
+      // between leaves a customer-withdrawn, paid order eligible for the WMS
+      // sweep. Surface it instead; there is nothing to hold that we did not
+      // just create.
+      if (isWithdrawal) {
+        const existing = await db.shoppingOrderLink.findUnique({
+          where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(order.id) } },
+          select: { id: true },
+        })
+        if (!existing) {
+          result.skipped++
+          await logActivity({
+            entityType: 'SYNC', action: 'wc_withdrawal_order_not_imported', tag: 'sync', level: 'WARNING',
+            description: `WooCommerce order #${order.number} is in withdrawal status "${order.status}" and has `
+              + 'never been imported. It was NOT created, because importing it would allocate stock for an '
+              + 'order the customer has asked to withdraw. Review it by hand.',
+            metadata: { externalOrderId: order.id, wcStatus: order.status },
+          })
+          continue
+        }
+      }
+
       const importResult = await importWcOrder(order)
       if (importResult.success) {
-        // importWcOrder does NOT change the lifecycle status of an existing
-        // order, so on its own it can never apply a missed withdrawal. Run the
-        // status sync too, which is where the withdrawal handler lives.
-        // (o3d-e1yb — without this the backstop above fetches the orders and
-        // then does nothing with them.)
-        try {
-          const { syncWcOrderStatus } = await import('./order-status')
-          const statusResult = await syncWcOrderStatus(order)
-          if (!statusResult.success && statusResult.error) {
-            result.errors.push(`syncWcOrderStatus #${order.id}: ${statusResult.error}`)
+        // The backstop for a withdrawal whose webhook never arrived.
+        // importWcOrder does NOT change an existing order's lifecycle status,
+        // so on its own it can never apply one.
+        //
+        // Scoped to the withdrawal slugs ONLY. Calling this for ordinary
+        // statuses would apply the mapped status through the full transition
+        // bypass, dragging an order IMS had deliberately advanced to
+        // ALLOCATED/PICKING/PACKING back to PROCESSING — the webhook path
+        // suppresses status echoes for exactly that reason, and this path has
+        // no equivalent.
+        if (isWithdrawal) {
+          try {
+            const { syncWcOrderStatus } = await import('./order-status')
+            const statusResult = await syncWcOrderStatus(order)
+            if (!statusResult.success && statusResult.error) {
+              result.errors.push(`syncWcOrderStatus #${order.id}: ${statusResult.error}`)
+            }
+          } catch (e) {
+            result.errors.push(`syncWcOrderStatus #${order.id}: ${String(e)}`)
           }
-        } catch (e) {
-          result.errors.push(`syncWcOrderStatus #${order.id}: ${String(e)}`)
         }
         if (mode !== 'poll') {
           await syncRefundsForOrder(order.id)
