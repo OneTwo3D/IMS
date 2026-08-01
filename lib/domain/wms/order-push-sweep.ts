@@ -821,7 +821,22 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       }),
     releasableHeldOrders: (connector, limit) =>
       db.wmsOrderPushLink.findMany({
-        where: { connector, state: 'HELD', order: { status: { in: [...READY_STATUSES] }, paidAt: { not: null }, refundStatus: { not: 'FULL' } } },
+        where: {
+          connector,
+          state: 'HELD',
+          order: {
+            status: { in: [...READY_STATUSES] },
+            paidAt: { not: null },
+            refundStatus: { not: 'FULL' },
+            // o3d-e1yb [wdraw]: never auto-release a hold placed for an EU
+            // withdrawal request. Releasing re-pushes the order to the
+            // warehouse, and a rejected withdrawal returns the storefront
+            // order to a ready status — so without this a customer-facing
+            // status change would put the goods back on the pick line.
+            // An operator clears withdrawalHoldAt to release.
+            withdrawalHoldAt: null,
+          },
+        },
         select: { id: true, orderId: true, externalOrderId: true },
         take: limit,
       }),

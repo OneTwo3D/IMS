@@ -3485,3 +3485,45 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
     return { success: false, error: String(e) }
   }
 }
+
+/**
+ * Release a hold placed by an EU right-of-withdrawal request (o3d-e1yb).
+ *
+ * Deliberately an OPERATOR action. A rejected withdrawal returns the
+ * storefront order to a ready status, and letting that release the hold by
+ * itself would put goods back on the pick line off a customer-facing status
+ * change — so `withdrawalHoldAt` blocks both the inbound status sync and the
+ * WMS release pass until a person clears it here.
+ *
+ * Clearing the marker is all this does. The order stays ON_HOLD and the
+ * ordinary release path (moving it back to Processing) then applies, which
+ * keeps this action reversible and keeps one code path for re-pushing.
+ */
+export async function releaseWithdrawalHold(id: string, note?: string) {
+  const session = await requirePermission('sales.process')
+
+  const so = await db.salesOrder.findUnique({
+    where: { id },
+    select: { id: true, orderNumber: true, status: true, withdrawalHoldAt: true },
+  })
+  if (!so) return { success: false, error: 'Order not found' }
+  if (!so.withdrawalHoldAt) return { success: false, error: 'This order is not under a withdrawal hold' }
+
+  await db.salesOrder.update({ where: { id }, data: { withdrawalHoldAt: null } })
+
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: id,
+    action: 'withdrawal_hold_released',
+    tag: 'sales',
+    level: 'INFO',
+    description:
+      `Withdrawal hold released by ${session.user.email ?? session.user.id}`
+      + `${note ? `: ${note}` : ''}. The order remains ON HOLD — move it back to Processing to re-push it to the warehouse.`,
+    metadata: { heldSince: so.withdrawalHoldAt, note: note ?? null },
+  })
+
+  revalidatePath(`/sales/${id}`)
+  revalidatePath('/sales')
+  return { success: true }
+}

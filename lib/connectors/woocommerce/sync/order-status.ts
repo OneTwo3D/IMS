@@ -29,11 +29,20 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
         },
       },
       select: {
-        order: { select: { id: true, externalOrderNumber: true, status: true } },
+        order: { select: { id: true, externalOrderNumber: true, status: true, withdrawalHoldAt: true } },
       },
     })
     const so = link?.order ?? null
     if (!so) return { success: false, error: `Order not found for WC #${wcOrder.id}` }
+
+    // EU right-of-withdrawal (o3d-e1yb). Runs BEFORE the status mapping: the
+    // withdrawal statuses have no mapping and would simply be ignored, and —
+    // more importantly — a REJECTION arrives as an ordinary status like
+    // `processing`, which the mapping would happily apply and thereby let the
+    // WMS release pass re-push an order the customer had asked to stop.
+    const { handleWcWithdrawalStatus } = await import('./withdrawal')
+    const withdrawal = await handleWcWithdrawalStatus(wcOrder, so)
+    if (withdrawal.kind !== 'not-a-withdrawal') return { success: true }
 
     // Resolve IMS status
     const mapping = await db.shoppingStatusMapping.findUnique({
