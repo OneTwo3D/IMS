@@ -201,14 +201,17 @@ type TxClient = Parameters<Parameters<typeof db.$transaction>[0]>[0]
 
 async function withOrderLock<T>(
   orderId: string,
-  fn: (current: { status: string; withdrawalHoldAt: Date | null }, tx: TxClient) => Promise<T>,
+  fn: (
+    current: { status: string; withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null },
+    tx: TxClient,
+  ) => Promise<T>,
 ): Promise<T | null> {
   return db.$transaction(async (tx) => {
     const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
     if (locked.length === 0) return null
     const current = await tx.salesOrder.findUnique({
       where: { id: orderId },
-      select: { status: true, withdrawalHoldAt: true },
+      select: { status: true, withdrawalHoldAt: true, withdrawalApprovedAt: true },
     })
     if (!current) return null
     // `tx`, never the global client: a write to this row through `db` would
@@ -294,9 +297,18 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
 }
 
 async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
-  const claim = await withOrderLock(orderId, async (current) => ({
-    status: current.status, marker: current.withdrawalHoldAt,
-  }))
+  // Record the approval INSIDE the lock and BEFORE the cancellation, the same
+  // way the hold marker is written. If the cancellation then fails or the
+  // process dies, the order is left uncancelled but PROTECTED: the terminal
+  // guard refuses every ordinary status, so nothing can resurrect it, and a
+  // redelivered approval (which the guard deliberately lets through) retries
+  // the cancellation. Writing it AFTER left a window with neither marker.
+  const claim = await withOrderLock(orderId, async (current, tx) => {
+    if (!current.withdrawalApprovedAt) {
+      await tx.salesOrder.update({ where: { id: orderId }, data: { withdrawalApprovedAt: new Date() } })
+    }
+    return { status: current.status, marker: current.withdrawalHoldAt }
+  })
   if (claim === null) return { success: false, error: `Sales order ${orderId} not found`, permanent: true }
 
   if (POST_DISPATCH.has(claim.status)) {
@@ -307,9 +319,9 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
     return { success: true }
   }
   if (claim.status === 'CANCELLED') {
-    // Already where we want it. Record the approval and clear the marker, so
-    // the order is not left blocked by a hold that no longer means anything.
-    await db.salesOrder.update({ where: { id: orderId }, data: { withdrawalApprovedAt: new Date() } })
+    // Already where we want it. Clear the hold so the order is not left
+    // blocked by one that no longer means anything; the approval fact was
+    // recorded under the lock above.
     await clearStaleMarker(orderId, claim.marker)
     return { success: true }
   }
@@ -325,9 +337,6 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
   // Clear the marker only on success. Clearing it regardless would drop the
   // create/release block while the order was still uncancelled.
   if (result.success) {
-    // Record the durable fact BEFORE clearing the active hold, so there is no
-    // window in which the order has neither.
-    await db.salesOrder.update({ where: { id: orderId }, data: { withdrawalApprovedAt: new Date() } })
     await clearStaleMarker(orderId, claim.marker)
   }
 

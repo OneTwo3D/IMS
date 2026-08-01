@@ -1015,6 +1015,16 @@ export async function syncNewWcOrders(
   if (mode !== 'poll' && !statuses.includes('completed')) {
     statuses = [...statuses, 'completed']
   }
+  // o3d-e1yb [wdraw]: ALWAYS include the withdrawal statuses, in every mode.
+  // This is the only backstop for a withdrawal whose webhook never arrived,
+  // and a withdrawal that is never seen means an order the customer asked to
+  // stop carries on to the warehouse. They are deliberately not left to the
+  // operator-configured `wc_sync_order_statuses`.
+  const { getWithdrawalStatuses } = await import('./withdrawal')
+  const wdraw = await getWithdrawalStatuses()
+  for (const s of [wdraw.submitted, wdraw.approved]) {
+    if (s && !statuses.includes(s)) statuses = [...statuses, s]
+  }
 
   // After a transaction reset or on a fresh install, there is nothing local to
   // reconcile against. Ignore any stale cursor and force a full import.
@@ -1043,6 +1053,20 @@ export async function syncNewWcOrders(
     for (const order of orders) {
       const importResult = await importWcOrder(order)
       if (importResult.success) {
+        // importWcOrder does NOT change the lifecycle status of an existing
+        // order, so on its own it can never apply a missed withdrawal. Run the
+        // status sync too, which is where the withdrawal handler lives.
+        // (o3d-e1yb — without this the backstop above fetches the orders and
+        // then does nothing with them.)
+        try {
+          const { syncWcOrderStatus } = await import('./order-status')
+          const statusResult = await syncWcOrderStatus(order)
+          if (!statusResult.success && statusResult.error) {
+            result.errors.push(`syncWcOrderStatus #${order.id}: ${statusResult.error}`)
+          }
+        } catch (e) {
+          result.errors.push(`syncWcOrderStatus #${order.id}: ${String(e)}`)
+        }
         if (mode !== 'poll') {
           await syncRefundsForOrder(order.id)
         }
