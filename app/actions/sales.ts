@@ -31,7 +31,7 @@ import {
   taxRateProfileSelect,
   type ResolvedTaxRate,
 } from '@/lib/tax/resolve-rate'
-import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
+import { INTERNAL_STATUS_TRANSITION_BYPASS, INTERNAL_STATUS_TRANSITION_AUTH_ONLY } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { decimalToNumber } from '@/lib/decimal'
@@ -1444,8 +1444,13 @@ export async function applySalesOrderStatusTransition(
     // permission check (for sessionless internal callers such as the delivery
     // cron) while the state-machine guard still runs, so a stale transition
     // (e.g. an order cancelled after the poll's SHIPPED query) is still rejected.
+    // Two distinct capabilities. The full bypass skips the state machine too;
+    // the auth-only token does NOT, so a sessionless caller cannot force an
+    // invalid transition. Both are symbols and therefore unforgeable across
+    // the Server Action boundary. (o3d-e1yb)
     const bypassPermission = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_BYPASS
-    if (!bypassPermission && !options?.skipPermissionCheck) {
+    const authOnly = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_AUTH_ONLY
+    if (!bypassPermission && !authOnly && !options?.skipPermissionCheck) {
       await requirePermission('sales.process')
     }
     const so = await db.salesOrder.findUnique({
@@ -1473,7 +1478,7 @@ export async function applySalesOrderStatusTransition(
     // (internalBypassToken) and the sessionless delivery cron (skipPermissionCheck)
     // are carrier/source-of-truth signals, so they bypass this guard — otherwise an
     // archived-but-shipped order could never auto-reach DELIVERED.
-    if (so.archived && !bypassPermission && !options?.skipPermissionCheck) {
+    if (so.archived && !bypassPermission && !authOnly && !options?.skipPermissionCheck) {
       return { success: false, error: 'This order is archived; unarchive it before changing its status.' }
     }
 

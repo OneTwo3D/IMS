@@ -110,10 +110,11 @@ test('a misconfiguration mapping both to one slug resolves to the safer branch',
 })
 
 // --- ordering, via the real lifecycle state machine -------------------------
-// The handler no longer uses the blanket transition bypass, so the state
-// machine is what makes concurrent deliveries safe. These pin that the
-// machine actually refuses the transitions the withdrawal paths rely on it
-// refusing — if a future edit widens SALES_ORDER_TRANSITIONS, the withdrawal
+// The handler passes INTERNAL_STATUS_TRANSITION_AUTH_ONLY, which skips the
+// permission check but NOT the state machine — so the machine runs against the
+// row the transition reads under its own lock, and is what actually makes
+// concurrent deliveries safe. These pin the transitions the withdrawal paths
+// rely on it refusing: if a future edit widens SALES_ORDER_TRANSITIONS, the
 // races reopen silently and these fail.
 
 import { canTransitionSalesOrder } from '../lib/domain/workflows/sales-order-state.ts'
@@ -145,5 +146,27 @@ test('the transitions the withdrawal paths DO need are permitted', () => {
 test('a dispatched order cannot be cancelled either, so approval must not try', () => {
   for (const from of ['SHIPPED', 'COMPLETED', 'DELIVERED'] as const) {
     assert.equal(canTransitionSalesOrder(from, 'CANCELLED'), false, from)
+  }
+})
+
+// --- the capability tokens are distinct and unforgeable --------------------
+
+import {
+  INTERNAL_STATUS_TRANSITION_AUTH_ONLY,
+  INTERNAL_STATUS_TRANSITION_BYPASS,
+} from '../lib/sales/status-transition-bypass.ts'
+
+test('the auth-only token is a distinct symbol from the full bypass', () => {
+  // Distinct, or the withdrawal flow would silently regain the ability to
+  // force an invalid transition.
+  assert.notEqual(INTERNAL_STATUS_TRANSITION_AUTH_ONLY, INTERNAL_STATUS_TRANSITION_BYPASS)
+})
+
+test('both tokens are symbols, so they cannot cross the Server Action boundary', () => {
+  // A boolean option on a module-wide 'use server' export is forgeable by any
+  // client; a symbol cannot be serialized. See o3d-43oz.
+  for (const tok of [INTERNAL_STATUS_TRANSITION_AUTH_ONLY, INTERNAL_STATUS_TRANSITION_BYPASS]) {
+    assert.equal(typeof tok, 'symbol')
+    assert.equal(JSON.parse(JSON.stringify({ tok })).tok, undefined)
   }
 })
