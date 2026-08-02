@@ -265,10 +265,23 @@ test('an unresolved suppression is distinguishable from a clean skip', async () 
   assert.equal(e.name, 'WithdrawalSuppressionUnresolved')
 })
 
-test('the unlinked-ingest lock namespace is registered and distinct', async () => {
-  const m = await import('../lib/db/advisory-locks')
-  const ns = m.TWO_INT_ADVISORY_LOCK_NAMESPACES
-  const values = Object.values(ns)
-  assert.equal(new Set(values).size, values.length, 'two features silently sharing a namespace would serialize on ids that mean different things')
-  assert.ok(Object.hasOwn(ns, 'WC_UNLINKED_INGEST_LOCK_NAMESPACE'))
+test('an unresolved suppression is not a skip', async () => {
+  // A skip is a RESOLVED decision and lets the poll advance its cursor. An
+  // unresolved one must not, or the order falls behind the cursor and this
+  // backstop never sees the withdrawal it exists to catch.
+  const src = await import('node:fs').then((fs) =>
+    fs.readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8'))
+  const block = src.slice(src.indexOf('if (unresolved) {'), src.indexOf('const importResult = await importWcOrder(order)'))
+  assert.ok(block.includes('result.errors.push'), 'unresolved must record an error, not a skip')
+  assert.ok(!block.includes('result.skipped++'), 'unresolved must not count as a skip')
+})
+
+test('the withdrawal ingest guard holds no transaction across the import', async () => {
+  // Pinning a pooled connection to hold an advisory lock while the import
+  // needs another connection deadlocks the pool against itself under load.
+  // The convergence is a post-import compensation instead.
+  const src = await import('node:fs').then((fs) =>
+    fs.readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8'))
+  assert.ok(!src.includes('pg_try_advisory_xact_lock'), 'no lock may wrap the import')
+  assert.ok(src.includes('reconcileSuppressionAfterImport'))
 })

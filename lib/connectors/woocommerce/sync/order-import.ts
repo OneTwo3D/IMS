@@ -1062,40 +1062,36 @@ export async function syncNewWcOrders(
       // just create.
       // Shared with both webhook topics, so the rule cannot drift between
       // ingestion paths.
-      const { shouldSkipUnlinkedWithdrawalImport, withUnlinkedIngestLock } = await import('./withdrawal')
-      // Serialized per external order (o3d-d82p): a concurrent webhook worker
-      // must not import this order between our check and our import, nor we
-      // between theirs. `busy` skips this order for now — the next poll picks
-      // it up, by which time the other worker has finished.
-      // The import runs INSIDE the lock: releasing between the decision and
-      // the import restores the very interleaving this prevents.
-      type IngestDecision =
-        | { kind: 'skip' }
-        | { kind: 'busy' }
-        | { kind: 'unresolved' }
-        | { kind: 'proceed'; imported: Awaited<ReturnType<typeof importWcOrder>> }
-      const decision = await withUnlinkedIngestLock<IngestDecision>(
-        String(order.id),
-        async () => {
-          try {
-            if (await shouldSkipUnlinkedWithdrawalImport(order)) return { kind: 'skip' as const }
-          } catch (e) {
-            const { WithdrawalSuppressionUnresolved } = await import('./withdrawal')
-            // The poll runs again shortly; leaving the order for the next pass
-            // is the safe direction, and the activity log already flagged it.
-            if (e instanceof WithdrawalSuppressionUnresolved) return { kind: 'unresolved' as const }
-            throw e
-          }
-          return { kind: 'proceed' as const, imported: await importWcOrder(order) }
-        },
-        () => ({ kind: 'busy' as const }),
-      )
-      if (decision.kind !== 'proceed') {
-        result.skipped++
+      const {
+        shouldSkipUnlinkedWithdrawalImport, reconcileSuppressionAfterImport,
+        WithdrawalSuppressionUnresolved, isWcOrderLinked,
+      } = await import('./withdrawal')
+      const wasUnlinked = !(await isWcOrderLinked(String(order.id)))
+      let unresolved = false
+      try {
+        if (await shouldSkipUnlinkedWithdrawalImport(order)) {
+          result.skipped++
+          continue
+        }
+      } catch (e) {
+        if (!(e instanceof WithdrawalSuppressionUnresolved)) throw e
+        unresolved = true
+      }
+      if (unresolved) {
+        // NOT a skip. A skip is a resolved decision and lets this run advance
+        // its modified-after cursor, which would leave the order behind the
+        // cursor and possibly never handled — and this poll is the backstop
+        // for exactly the withdrawal whose webhook went missing.
+        result.errors.push(
+          `WooCommerce order #${order.number}: a withdrawal suppression could not be resolved; left for the next run`,
+        )
         continue
       }
 
-      const importResult = decision.imported
+      const importResult = await importWcOrder(order)
+      // A concurrent worker may have recorded the withdrawal between the check
+      // above and this import (o3d-d82p).
+      if (importResult.success && wasUnlinked) await reconcileSuppressionAfterImport(order)
       if (importResult.success) {
         // The backstop for a withdrawal whose webhook never arrived.
         // importWcOrder does NOT change an existing order's lifecycle status,

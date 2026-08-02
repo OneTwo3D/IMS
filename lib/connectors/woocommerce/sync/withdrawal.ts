@@ -33,7 +33,6 @@
  */
 
 import { db } from '@/lib/db'
-import { WC_UNLINKED_INGEST_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { logActivity } from '@/lib/activity-log'
 import { getSettingValues } from '@/lib/settings-store'
 import { INTERNAL_STATUS_TRANSITION_AUTH_ONLY } from '@/lib/sales/status-transition-bypass'
@@ -181,6 +180,15 @@ export async function handleWcWithdrawalStatus(
         + `status change. Release the order by hand once you are satisfied.`,
       metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status, withdrawalHoldAt: order.withdrawalHoldAt },
       resolveUser: false,
+    })
+    // Record the ordinary status as HANDLED (o3d-6x66). Without this the last
+    // handled status stays on the submitted slug forever, so a customer who
+    // submits AGAIN compares equal, the generation never advances, and an
+    // operator holding the old generation can release the newer request. The
+    // hold itself is deliberately retained; only the marker moves on.
+    await db.salesOrder.update({
+      where: { id: order.id },
+      data: { withdrawalLastWcStatus: normaliseStatus(wcOrder.status) },
     })
     return { kind, handled: true, result: { success: true } }
   }
@@ -464,38 +472,50 @@ export class WithdrawalSuppressionUnresolved extends Error {
 }
 
 /**
- * Serialize the whole unlinked-ingestion decision for ONE external order
- * (o3d-d82p, Codex r1).
+ * A suppression may have been written by a CONCURRENT worker between our
+ * "is it suppressed?" check and the import that followed it (o3d-d82p).
  *
- * The suppression lookup and the import that follows it are separate
- * operations. Two inbox workers handling a withdrawal event and a STALE
- * ordinary event for the same order can interleave: the ordinary worker sees
- * neither a link nor a suppression row and imports as PROCESSING, and only
- * then does the withdrawal worker write the suppression. Stock is allocated
- * for goods the customer has asked to withdraw, and no withdrawal state is
- * ever applied to the order that was just created.
+ * Deliberately a compensation rather than a lock. Holding a Prisma interactive
+ * transaction across the import — the obvious fix — pins one pooled connection
+ * purely to hold the lock while the import needs another, so enough concurrent
+ * imports deadlock the pool against itself. Converging afterwards costs one
+ * query on a path that only runs for orders we just created, and reaches the
+ * same end state: the order exists but is held and marked, so the WMS sweep
+ * will not touch it.
  *
- * Try-lock rather than wait: if another worker holds this order, whatever it
- * is doing supersedes us, and `busy` is returned so the caller can retry the
- * event rather than act on a decision that is about to be stale. Never blocks
- * an inbox worker behind another one.
+ * Call after a SUCCESSFUL import of a previously unlinked order.
  */
-export async function withUnlinkedIngestLock<T>(
-  externalOrderId: string,
-  fn: () => Promise<T>,
-  onBusy: () => T,
-): Promise<T> {
-  // Advisory-lock ids are 32-bit; hash the external id into that space.
-  let key = 0
-  for (let i = 0; i < externalOrderId.length; i++) {
-    key = (Math.imul(key, 31) + externalOrderId.charCodeAt(i)) | 0
-  }
-  return db.$transaction(async (tx) => {
-    const rows = await tx.$queryRaw<Array<{ locked: boolean }>>`
-      SELECT pg_try_advisory_xact_lock(${WC_UNLINKED_INGEST_LOCK_NAMESPACE}::int, ${key}::int) AS locked`
-    if (!rows[0]?.locked) return onBusy()
-    return fn()
-  }, { timeout: 120_000 })
+export async function isWcOrderLinked(externalOrderId: string): Promise<boolean> {
+  const link = await db.shoppingOrderLink.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { id: true },
+  })
+  return Boolean(link)
+}
+
+export async function reconcileSuppressionAfterImport(wcOrder: WcFullOrder): Promise<void> {
+  const externalOrderId = String(wcOrder.id)
+  const suppressed = await db.wcWithdrawalSuppression.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { wcStatus: true },
+  })
+  if (!suppressed) return
+
+  const link = await db.shoppingOrderLink.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { orderId: true },
+  })
+  if (!link?.orderId) return
+
+  await logActivity({
+    entityType: 'SYNC', action: 'wc_withdrawal_suppression_raced_import', tag: 'sync', level: 'WARNING',
+    description:
+      `WooCommerce order #${wcOrder.number} was imported at the same moment a withdrawal request was `
+      + `recorded for it ("${suppressed.wcStatus}"). Applying the hold to the order that was just created.`,
+    metadata: { externalOrderId: wcOrder.id, suppressedStatus: suppressed.wcStatus },
+    resolveUser: false,
+  })
+  await applyWithdrawalHold(link.orderId, wcOrder)
 }
 
 export async function shouldSkipUnlinkedWithdrawalImport(

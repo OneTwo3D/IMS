@@ -700,6 +700,37 @@ export async function runWmsOrderPushSweepCore(
         console.error('[wms-order-push] verification failed', link.orderId, verifyError)
       }
       if (verdict === 'ours') {
+        // o3d-6x66: the id is now proved ours — which is precisely the moment a
+        // raced-withdrawal create was left waiting for. Do NOT just promote and
+        // clear lastError: the hold and cancel passes select by LIFECYCLE
+        // status (ON_HOLD / CANCELLED), and the withdrawal markers are
+        // committed BEFORE those transitions, so a transition that failed
+        // leaves a verified, active WMS order that neither pass picks up —
+        // with the explicit warning erased. Re-read the markers first.
+        const held = await port.readWithdrawalState?.(link.orderId)
+        if (held && (held.withdrawalHoldAt || held.withdrawalApprovedAt)) {
+          const approved = Boolean(held.withdrawalApprovedAt)
+          let pulled = false
+          try {
+            const cancel = await connector.cancelOrder?.(link.externalOrderId)
+            pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND'))
+          } catch (e) {
+            console.error(`[wms-order-push] verified-then-withdrawn cancel failed for ${link.orderId}: ${scrubWmsError(e, 'cancel failed')}`)
+          }
+          await port.updateLink(link.id, pulled
+            ? { state: approved ? 'CANCELLED' : 'HELD', cancelledAt: new Date(), lastError: null, reconcileCheckedAt: null }
+            : { state: 'SYNCED', lastError: 'Verified ours, but the customer has withdrawn this order and it could not be cancelled — cancel it in the WMS by hand' })
+          if (pulled) { if (approved) result.cancelled += 1; else result.held += 1 } else result.failed += 1
+          await audit({
+            action: approved ? 'order_cancel' : 'order_hold', outcome: pulled ? 'SUCCEEDED' : 'FAILED',
+            entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+            summary: pulled
+              ? 'Ownership verified for an order the customer had withdrawn in the meantime; cancelled at the WMS'
+              : 'Ownership verified for an order the customer had withdrawn, but it could NOT be cancelled — cancel it in the WMS by hand',
+            error: pulled ? undefined : 'verified-then-withdrawn, remote cancel failed',
+          })
+          continue
+        }
         await port.updateLink(link.id, { state: 'SYNCED', lastError: null })
         result.verified += 1
         // The courier-pending note was held back until the id was proven.
