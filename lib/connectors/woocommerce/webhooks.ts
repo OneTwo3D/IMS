@@ -213,6 +213,15 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   // Failures a stable business rule caused. Re-delivering the identical payload re-hits the identical
   // rule, so these are acknowledged rather than retried into the dead-letter queue (o3d-bx9).
   const permanentFailures: string[] = []
+  // o3d-e1yb [wdraw]: never create an order the customer has already withdrawn.
+  // Checked for BOTH topics: a missed order.created means the first event IMS
+  // ever sees for an order can be a withdrawal update.
+  const { shouldSkipUnlinkedWithdrawalImport } = await import('./sync/withdrawal')
+  if ((topic === 'order.created' || topic === 'order.updated')
+      && await shouldSkipUnlinkedWithdrawalImport(wcOrder)) {
+    return NextResponse.json({ ok: true, skipped: 'unlinked-withdrawal' })
+  }
+
   if (topic === 'order.created') {
     const importResult = await importWcOrder(wcOrder)
     if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)

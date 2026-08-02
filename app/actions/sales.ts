@@ -1602,6 +1602,24 @@ export async function applySalesOrderStatusTransition(
           data,
           bypass: bypassPermission,
           beforeUpdate: async ({ tx: lockedTx }) => {
+            // o3d-e1yb [wdraw]: enforce the terminal-approval fact HERE, under
+            // the row lock, immediately before the write. The pre-flight check
+            // above reads an unlocked snapshot, so an ordinary storefront
+            // event can read null, pause while a concurrent approval records
+            // the fact and cancels the order, then acquire this lock and use
+            // the full bypass to overwrite CANCELLED with PROCESSING — the
+            // exact resurrection this guard exists to prevent.
+            if (targetStatus !== 'CANCELLED') {
+              const fresh = await lockedTx.salesOrder.findUnique({
+                where: { id },
+                select: { withdrawalApprovedAt: true },
+              })
+              if (fresh?.withdrawalApprovedAt) {
+                throw new Error(
+                  'This order\u2019s EU withdrawal request was approved and the order cancelled; its status cannot be changed.',
+                )
+              }
+            }
             if (targetStatus === 'PICKING') {
               const allocCount = await lockedTx.orderAllocation.count({ where: { orderId: id } })
               if (allocCount === 0) {

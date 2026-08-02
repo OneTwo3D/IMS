@@ -1060,22 +1060,12 @@ export async function syncNewWcOrders(
       // between leaves a customer-withdrawn, paid order eligible for the WMS
       // sweep. Surface it instead; there is nothing to hold that we did not
       // just create.
-      if (isWithdrawal) {
-        const existing = await db.shoppingOrderLink.findUnique({
-          where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(order.id) } },
-          select: { id: true },
-        })
-        if (!existing) {
-          result.skipped++
-          await logActivity({
-            entityType: 'SYNC', action: 'wc_withdrawal_order_not_imported', tag: 'sync', level: 'WARNING',
-            description: `WooCommerce order #${order.number} is in withdrawal status "${order.status}" and has `
-              + 'never been imported. It was NOT created, because importing it would allocate stock for an '
-              + 'order the customer has asked to withdraw. Review it by hand.',
-            metadata: { externalOrderId: order.id, wcStatus: order.status },
-          })
-          continue
-        }
+      // Shared with both webhook topics, so the rule cannot drift between
+      // ingestion paths.
+      const { shouldSkipUnlinkedWithdrawalImport } = await import('./withdrawal')
+      if (await shouldSkipUnlinkedWithdrawalImport(order)) {
+        result.skipped++
+        continue
       }
 
       const importResult = await importWcOrder(order)

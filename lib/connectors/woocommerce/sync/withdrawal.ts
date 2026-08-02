@@ -297,14 +297,21 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
 }
 
 async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
-  // Record the approval INSIDE the lock and BEFORE the cancellation, the same
-  // way the hold marker is written. If the cancellation then fails or the
-  // process dies, the order is left uncancelled but PROTECTED: the terminal
-  // guard refuses every ordinary status, so nothing can resurrect it, and a
-  // redelivered approval (which the guard deliberately lets through) retries
-  // the cancellation. Writing it AFTER left a window with neither marker.
+  // Decide AND record inside the lock, but record only when we are actually
+  // going to cancel.
+  //
+  // The approval fact makes the order terminal — applySalesOrderStatusTransition
+  // refuses every target but CANCELLED once it is set. Writing it
+  // unconditionally therefore froze a DISPATCHED order, which this path
+  // deliberately does NOT cancel (it is a return): the delivery cron could
+  // then never move it SHIPPED -> DELIVERED.
+  //
+  // Recorded BEFORE the cancellation for the crash window: if the cancellation
+  // then fails, the order is left uncancelled but PROTECTED, and a redelivered
+  // approval — which the terminal guard deliberately lets through — retries it.
   const claim = await withOrderLock(orderId, async (current, tx) => {
-    if (!current.withdrawalApprovedAt) {
+    const terminal = POST_DISPATCH.has(current.status) || current.status === 'CANCELLED'
+    if (!terminal && !current.withdrawalApprovedAt) {
       await tx.salesOrder.update({ where: { id: orderId }, data: { withdrawalApprovedAt: new Date() } })
     }
     return { status: current.status, marker: current.withdrawalHoldAt }
@@ -319,9 +326,13 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
     return { success: true }
   }
   if (claim.status === 'CANCELLED') {
-    // Already where we want it. Clear the hold so the order is not left
-    // blocked by one that no longer means anything; the approval fact was
-    // recorded under the lock above.
+    // Already where we want it. Record the approval — a cancelled order has
+    // nothing left to freeze — and clear the hold so it is not left blocked by
+    // one that no longer means anything.
+    await db.salesOrder.updateMany({
+      where: { id: orderId, withdrawalApprovedAt: null, status: 'CANCELLED' },
+      data: { withdrawalApprovedAt: new Date() },
+    })
     await clearStaleMarker(orderId, claim.marker)
     return { success: true }
   }
@@ -388,4 +399,47 @@ async function note(
     metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status },
     resolveUser: false,
   })
+}
+
+/**
+ * Should this WooCommerce payload be imported at all?
+ *
+ * An order in a withdrawal status that IMS has never seen must NOT be created
+ * by the ordinary import path: with no status mapping for the custom slug,
+ * importWcOrder creates it as PROCESSING, which allocates stock and can queue
+ * its accounting invoice — for an order the customer has asked to withdraw.
+ * A crash before the withdrawal handler runs then leaves it warehouse-eligible.
+ *
+ * Shared by EVERY ingestion path (both webhook topics, polling, reconcile),
+ * because a missed `order.created` means the first event IMS ever sees for an
+ * order can be a withdrawal update.
+ *
+ * Returns true when the caller should skip the import and surface it instead.
+ */
+export async function shouldSkipUnlinkedWithdrawalImport(
+  wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
+): Promise<boolean> {
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const status = normaliseStatus(wcOrder.status)
+  if (status !== submitted && status !== approved) return false
+
+  const existing = await db.shoppingOrderLink.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } },
+    select: { id: true },
+  })
+  if (existing) return false
+
+  await logActivity({
+    entityType: 'SYNC',
+    action: 'wc_withdrawal_order_not_imported',
+    tag: 'sync',
+    level: 'WARNING',
+    description:
+      `WooCommerce order #${wcOrder.number} is in withdrawal status "${wcOrder.status}" and has never `
+      + 'been imported. It was NOT created, because importing it would allocate stock for an order the '
+      + 'customer has asked to withdraw. Review it by hand.',
+    metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status },
+    resolveUser: false,
+  })
+  return true
 }

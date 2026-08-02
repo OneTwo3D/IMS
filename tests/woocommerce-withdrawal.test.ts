@@ -117,7 +117,7 @@ test('a misconfiguration mapping both to one slug resolves to the safer branch',
 // rely on it refusing: if a future edit widens SALES_ORDER_TRANSITIONS, the
 // races reopen silently and these fail.
 
-import { canTransitionSalesOrder } from '../lib/domain/workflows/sales-order-state.ts'
+import { SALES_ORDER_TRANSITIONS, canTransitionSalesOrder } from '../lib/domain/workflows/sales-order-state.ts'
 
 test('a dispatched order cannot be dragged back to ON_HOLD', () => {
   // A delayed `submitted` delivery arriving after dispatch.
@@ -201,4 +201,22 @@ test('a redelivered approval after approval is still just an approval', () => {
 test('without an approval, ordinary statuses behave exactly as before', () => {
   assert.equal(classifyWithdrawalStatus('processing', DEFAULTS, false, false), 'not-a-withdrawal')
   assert.equal(classifyWithdrawalStatus('processing', DEFAULTS, true, false), 'rejected-held')
+})
+
+// --- the terminal guard must not freeze a dispatched order -----------------
+// applySalesOrderStatusTransition refuses every target but CANCELLED once
+// withdrawalApprovedAt is set. A DISPATCHED order is deliberately not
+// cancelled by an approval (it is a return), so recording the fact for one
+// would leave the delivery cron unable to move it SHIPPED -> DELIVERED ever
+// again. These pin the lifecycle facts that decision rests on.
+
+test('a dispatched order still has somewhere to go, so it must not be frozen', () => {
+  assert.equal(canTransitionSalesOrder('SHIPPED', 'DELIVERED'), true)
+  assert.equal(canTransitionSalesOrder('SHIPPED', 'COMPLETED'), true)
+  assert.equal(canTransitionSalesOrder('COMPLETED', 'DELIVERED'), true)
+})
+
+test('a cancelled order has nowhere left to go, so freezing it costs nothing', () => {
+  assert.deepEqual([...SALES_ORDER_TRANSITIONS.CANCELLED], [])
+  assert.deepEqual([...SALES_ORDER_TRANSITIONS.DELIVERED], [])
 })
