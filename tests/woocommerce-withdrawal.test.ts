@@ -560,25 +560,60 @@ test('a terminal approval is confirmed against the live status first', async () 
   // order unrecoverably.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
-  const fn = src.slice(src.indexOf("if (kind === 'approved') {"))
-  const body = fn.slice(0, fn.indexOf('\n  }\n'))
-  assert.ok(body.includes('readLiveWcStatus'), 'must confirm against live status')
+  const fn = src.slice(src.indexOf('async function applyConfirmedWithdrawalApproval'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
   assert.ok(body.indexOf('readLiveWcStatus') < body.indexOf('applyWithdrawalApproval'),
     'the confirmation must precede the terminal transition')
   assert.ok(body.includes('live === null'), 'an unreadable status must not cancel')
+  assert.ok(body.includes("live !== approved"), 'a superseded approval must not cancel')
 })
 
-test('the tombstone sweeper fetches by ID, not through a status filter', async () => {
+test('the tombstone sweeper fetches by ID and IMPORTS the recovered order', async () => {
   // Every other route to a tombstone needs ANOTHER event for that order. A
   // withdrawal rejected back to a status the poll does not query (e.g.
-  // `pending` under the default `processing` config) appears in no ingress.
+  // `pending` under the default `processing` config) appears in no ingress —
+  // and resolving the tombstone without importing would delete its only
+  // durable retry signal and strand the order permanently.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   const fn = src.slice(src.indexOf('export async function sweepWithdrawalSuppressions'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
   assert.ok(body.includes('wcWithdrawalSuppression.findMany'), 'must enumerate tombstones directly')
-  assert.ok(body.includes('resolveSuppression'), 'must reuse the ordinary decision path, not a parallel one')
+  assert.ok(body.includes('readLiveWcOrder'), 'must fetch the full order by id')
+  assert.ok(body.includes('importWcOrderGuarded'), 'must import through the ordinary guarded path')
   assert.ok(body.includes('claimedAt: { lt: staleBefore }'), 'must reclaim expired leases')
+})
+
+test('the withdrawal sweep is actually SCHEDULED, not just authorized', async () => {
+  // Route-auth registration authorizes requests; it does not create them.
+  const { readFileSync } = await import('node:fs')
+  const jobs = readFileSync('lib/cron-jobs/woocommerce.ts', 'utf8')
+  assert.ok(jobs.includes("slug: 'wc-withdrawal-sweep'"), 'the backstop must be in the cron registry')
+  assert.ok(/wc-withdrawal-sweep[\s\S]{0,600}defaultSchedule: '\*\/15 \* \* \* \*'/.test(jobs))
+  assert.ok(/wc-withdrawal-sweep[\s\S]{0,600}defaultEnabled: true/.test(jobs))
+})
+
+test('every approval site goes through the live-confirmed helper', async () => {
+  // A second, unconfirmed approval path is exactly how this hole reopened
+  // after it was first closed: the initial-import linked path still cancelled
+  // straight from a payload that WooCommerce had already superseded.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const lines = src.split('\n')
+  const raw = lines
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => /\bapplyWithdrawalApproval\(/.test(l)
+      && !/async function applyWithdrawalApproval/.test(l))
+  // Permitted: inside applyConfirmedWithdrawalApproval, and inside
+  // reconcileSuppressionAfterImport which has just read the live status itself.
+  const confirmedAt = src.indexOf('async function applyConfirmedWithdrawalApproval')
+  const reconcileAt = src.indexOf('export async function reconcileSuppressionAfterImport')
+  for (const { l, i } of raw) {
+    const pos = lines.slice(0, i).join('\n').length
+    const inConfirmed = pos > confirmedAt && pos < src.indexOf('\n}\n', confirmedAt)
+    const inReconcile = pos > reconcileAt && pos < src.indexOf('\n}\n', reconcileAt)
+    assert.ok(inConfirmed || inReconcile, `unconfirmed terminal approval at line ${i + 1}: ${l.trim()}`)
+  }
 })
 
 test('the withdrawal sweep cron is registered in the route auth policy', async () => {

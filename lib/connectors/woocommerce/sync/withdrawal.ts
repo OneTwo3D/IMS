@@ -172,27 +172,7 @@ export async function handleWcWithdrawalStatus(
     // order on that basis is unrecoverable through this path. Confirm against
     // the live storefront first; one API call, only on approval events.
     // (Codex r10)
-    const { approved } = await getWithdrawalStatuses()
-    const live = await readLiveWcStatus(String(wcOrder.id))
-    if (live === null) {
-      // Fail closed on the CANCELLATION, not on the order: do not act, and do
-      // not acknowledge either, so the delivery is retried.
-      return {
-        kind,
-        handled: true,
-        result: {
-          success: false,
-          error: 'Could not confirm the withdrawal approval against WooCommerce; not cancelling on an unverified payload',
-        },
-      }
-    }
-    if (live !== approved) {
-      await note(order.id, wcOrder, 'wc_withdrawal_stale_approval_ignored', 'WARNING',
-        `A withdrawal-approved event arrived for this order, but WooCommerce now reports "${live}" — `
-        + 'the request was rejected after that event was sent. The order was NOT cancelled.')
-      return { kind, handled: true, result: { success: true } }
-    }
-    return { kind, handled: true, result: await applyWithdrawalApproval(order.id, wcOrder) }
+    return { kind, handled: true, result: await applyConfirmedWithdrawalApproval(order.id, wcOrder) }
   }
 
   if (kind === 'rejected-held') {
@@ -646,7 +626,7 @@ type SuppressionClaim = { token: string; wcStatus: string; revision: number }
  * can hide it. Unresolved reads stay put and are retried next run.
  */
 export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
-  scanned: number; resolved: number; stillWithdrawn: number; unresolved: number
+  scanned: number; imported: number; stillWithdrawn: number; unresolved: number
 }> {
   const staleBefore = new Date(Date.now() - SUPPRESSION_LEASE_MS)
   const rows = await db.wcWithdrawalSuppression.findMany({
@@ -656,38 +636,51 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
     },
     orderBy: { createdAt: 'asc' },
     take: Math.min(Math.max(limit, 1), 250),
-    select: { externalOrderId: true, wcStatus: true },
+    select: { externalOrderId: true },
   })
 
-  const result = { scanned: rows.length, resolved: 0, stillWithdrawn: 0, unresolved: 0 }
+  const result = { scanned: rows.length, imported: 0, stillWithdrawn: 0, unresolved: 0 }
+  const { importWcOrder } = await import('./order-import')
   for (const row of rows) {
-    const stub = { id: Number(row.externalOrderId), number: row.externalOrderId, status: row.wcStatus }
+    // Fetch the FULL order by id — no status filter, no modified cursor — then
+    // put it through the ordinary guarded importer. Resolving the tombstone
+    // without importing would delete the order's only durable retry signal and
+    // strand it permanently: that is the whole scenario this sweep exists for.
+    const live = await readLiveWcOrder(row.externalOrderId)
+    if (!live) {
+      result.unresolved++
+      continue
+    }
     try {
-      // Reuses the ordinary decision path, so the sweep cannot drift from it.
-      const stillSuppressed = await resolveSuppression(stub, row.externalOrderId)
-      if (stillSuppressed) result.stillWithdrawn++
-      else result.resolved++
+      const guarded = await importWcOrderGuarded(live, () => importWcOrder(live))
+      if (guarded.outcome === 'skipped-withdrawal') result.stillWithdrawn++
+      else if (guarded.outcome === 'unresolved') result.unresolved++
+      else if (guarded.result.success && !guarded.compensationFailed) result.imported++
+      else result.unresolved++
     } catch (e) {
-      if (e instanceof WithdrawalSuppressionUnresolved) result.unresolved++
-      else {
-        result.unresolved++
-        console.error(`[wc-withdrawal-sweep] ${row.externalOrderId}: ${e instanceof Error ? e.message : String(e)}`)
-      }
+      result.unresolved++
+      console.error(`[wc-withdrawal-sweep] ${row.externalOrderId}: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
   return result
 }
 
-/** The live storefront status, or null when it cannot be read. */
-async function readLiveWcStatus(externalOrderId: string): Promise<string | null> {
+/** The live order, or null when it cannot be read. */
+async function readLiveWcOrder(externalOrderId: string): Promise<WcFullOrder | null> {
   try {
     const { wcFetch } = await import('../api')
     const { data, error } = await wcFetch(`/orders/${externalOrderId}`)
     if (error || !data || typeof data !== 'object' || !('status' in data)) return null
-    return normaliseStatus((data as { status?: unknown }).status)
+    return data as WcFullOrder
   } catch {
     return null
   }
+}
+
+/** The live storefront status, or null when it cannot be read. */
+async function readLiveWcStatus(externalOrderId: string): Promise<string | null> {
+  const order = await readLiveWcOrder(externalOrderId)
+  return order ? normaliseStatus(order.status) : null
 }
 
 async function claimSuppression(
@@ -773,6 +766,42 @@ export async function recordWithdrawalSuppressionIfWithdrawn(
  * still-running job is linked, and that job never revisits it, so recording a
  * tombstone alone would leave a paid PROCESSING order fulfillable.
  */
+/**
+ * Apply a withdrawal APPROVAL only after confirming it against the live
+ * storefront (Codex r10/r11).
+ *
+ * Approval is terminal: it sets withdrawalApprovedAt, cancels the order, and
+ * makes every later storefront status ignored. The inbox does not guarantee
+ * ordering, so a delayed `withdrawn` payload can arrive after WooCommerce has
+ * already rejected the request — and cancelling a valid order on that basis is
+ * unrecoverable through this path.
+ *
+ * Shared by EVERY approval site. A second, unconfirmed approval path is exactly
+ * how this hole reopened after it was first closed.
+ */
+async function applyConfirmedWithdrawalApproval(
+  orderId: string,
+  wcOrder: WcFullOrder,
+): Promise<TransitionResult> {
+  const { approved } = await getWithdrawalStatuses()
+  const live = await readLiveWcStatus(String(wcOrder.id))
+  if (live === null) {
+    // Fail closed on the CANCELLATION, not on the order: do not act, and do not
+    // acknowledge either, so the delivery is retried.
+    return {
+      success: false,
+      error: 'Could not confirm the withdrawal approval against WooCommerce; not cancelling on an unverified payload',
+    }
+  }
+  if (live !== approved) {
+    await note(orderId, wcOrder, 'wc_withdrawal_stale_approval_ignored', 'WARNING',
+      `A withdrawal-approved event arrived for this order, but WooCommerce now reports "${live}" — `
+      + 'the request was rejected after that event was sent. The order was NOT cancelled.')
+    return { success: true }
+  }
+  return applyWithdrawalApproval(orderId, wcOrder)
+}
+
 export async function applyWithdrawalToLinkedOrder(
   wcOrder: WcFullOrder,
 ): Promise<boolean> {
@@ -787,7 +816,7 @@ export async function applyWithdrawalToLinkedOrder(
   if (!link?.orderId) return false
 
   const result = status === approved
-    ? await applyWithdrawalApproval(link.orderId, wcOrder)
+    ? await applyConfirmedWithdrawalApproval(link.orderId, wcOrder)
     : await applyWithdrawalHold(link.orderId, wcOrder)
   // A failure must not read as "handled": the caller falls back to the
   // tombstone, so the withdrawal is retried by the next ingress path.
@@ -857,6 +886,7 @@ export async function reconcileSuppressionAfterImport(
   }
 
   const isApproval = live === approved
+  // Already decided from the live status a moment ago, so no second read.
   const result = isApproval
     ? await applyWithdrawalApproval(link.orderId, wcOrder)
     : await applyWithdrawalHold(link.orderId, wcOrder)
