@@ -3289,6 +3289,14 @@ model WcWithdrawalSuppression {
   /// SUPPRESSION_LEASE_MS is reclaimable, so a crashed worker cannot pin it.
   claimToken      String?
   claimedAt       DateTime?
+  /// When the storefront was FIRST observed to have rejected this withdrawal.
+  /// The row is not retired on that single observation: a resubmission landing
+  /// between the live read and the delete, whose webhook is then missed, would
+  /// be erased along with the only durable signal — and the WMS create path
+  /// checks only the IMS markers, so it could push the order. The tombstone is
+  /// retired once rejection has held across SUPPRESSION_QUIESCENCE_MS, which
+  /// the by-ID sweep keeps re-verifying.
+  clearPendingSince DateTime?
 
   @@id([connector, externalOrderId])
   @@map("wc_withdrawal_suppressions")

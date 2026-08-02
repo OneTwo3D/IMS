@@ -615,6 +615,18 @@ export async function importWcOrderGuarded<R extends { success: boolean }>(
  */
 const SUPPRESSION_LEASE_MS = 5 * 60_000
 
+/**
+ * How long a rejection must HOLD before the tombstone is retired.
+ *
+ * A single live read is not enough (Codex r14): a resubmission landing between
+ * that read and the delete, whose webhook is then missed, is erased along with
+ * the only durable signal — and the WMS create path checks only the IMS
+ * markers, so its sweep could push the now-withdrawn order. Spanning two
+ * by-ID sweep passes means a missed resubmission is found within minutes
+ * instead of waiting for the daily reconciliation.
+ */
+const SUPPRESSION_QUIESCENCE_MS = 30 * 60_000
+
 type SuppressionClaim = { token: string; wcStatus: string; revision: number }
 
 /**
@@ -741,6 +753,31 @@ async function claimSuppression(
   return { token, wcStatus: row.wcStatus, revision: row.revision }
 }
 
+/**
+ * Retire a tombstone whose rejection has HELD for the quiescence window.
+ *
+ * The first rejection observation only starts the clock and returns false —
+ * the order still imports (it was rejected), but the durable signal survives so
+ * the sweep keeps re-checking it. Returns true once the row is actually gone.
+ */
+async function retireIfQuiescent(externalOrderId: string, claim: SuppressionClaim): Promise<boolean> {
+  const row = await db.wcWithdrawalSuppression.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { clearPendingSince: true },
+  })
+  const since = row?.clearPendingSince
+  if (!since) {
+    await db.wcWithdrawalSuppression.updateMany({
+      where: { connector: 'woocommerce', externalOrderId, claimToken: claim.token },
+      data: { clearPendingSince: new Date() },
+    })
+    return false
+  }
+  if (Date.now() - since.getTime() < SUPPRESSION_QUIESCENCE_MS) return false
+  await consumeSuppression(externalOrderId, claim)
+  return true
+}
+
 /** Give the claim back, leaving the row — and whatever status it now carries — intact. */
 async function releaseSuppression(externalOrderId: string, token: string): Promise<void> {
   await db.wcWithdrawalSuppression.updateMany({
@@ -783,7 +820,12 @@ export async function recordWithdrawalSuppressionIfWithdrawn(
     // whatever is actually true — including this change. Bumping the revision
     // is enough, because consumeSuppression is conditional on it, so the
     // claimant releases rather than deleting a request it never evaluated.
-    update: { wcStatus: status, revision: { increment: 1 }, lastCheckedAt: new Date() },
+    // clearPendingSince resets: a NEW withdrawal restarts the quiescence clock,
+    // so a request recorded during a pending clear is never retired by it.
+    update: {
+      wcStatus: status, revision: { increment: 1 }, lastCheckedAt: new Date(),
+      clearPendingSince: null,
+    },
   })
   return true
 }
@@ -910,8 +952,12 @@ export async function reconcileSuppressionAfterImport(
   }
 
   if (live !== submitted && live !== approved) {
-    // The storefront says the request was rejected. Nothing to apply; retire it.
-    await consumeSuppression(externalOrderId, claim)
+    // The storefront says the request was rejected — but do NOT retire the row
+    // on one observation. Start (or check) the quiescence clock instead; the
+    // by-ID sweep re-verifies until it elapses, so a resubmission whose webhook
+    // was missed is still caught while the tombstone exists to catch it.
+    const retired = await retireIfQuiescent(externalOrderId, claim)
+    if (!retired) await releaseSuppression(externalOrderId, claim.token)
     return { handled: false, failed: false }
   }
 

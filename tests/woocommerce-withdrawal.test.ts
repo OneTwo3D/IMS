@@ -690,3 +690,36 @@ test('the sweep honours the WooCommerce kill switches', async () => {
   assert.ok(route.includes("'wc_sync_enabled'"))
   assert.ok(route.indexOf('wc_sync_enabled') < route.indexOf('sweepWithdrawalSuppressions()'))
 })
+
+test('a rejection must HOLD before the tombstone is retired', () => {
+  // One live read is not enough: a resubmission landing between that read and
+  // the delete, whose webhook is then missed, is erased along with the only
+  // durable signal — and the WMS create path checks only the IMS markers, so
+  // its sweep could push the now-withdrawn order.
+  const QUIESCENCE = 30 * 60_000
+  const retires = (since: Date | null, now: number) =>
+    since !== null && now - since.getTime() >= QUIESCENCE
+  const t0 = new Date('2026-08-02T10:00:00Z')
+  assert.equal(retires(null, t0.getTime()), false, 'the first observation only starts the clock')
+  assert.equal(retires(t0, t0.getTime() + 60_000), false, 'still inside the window')
+  assert.equal(retires(t0, t0.getTime() + QUIESCENCE), true, 'held long enough across sweep passes')
+})
+
+test('a new withdrawal resets a pending clear', async () => {
+  // Otherwise a request recorded during the quiescence window is retired by a
+  // clock that was started before it existed.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function recordWithdrawalSuppressionIfWithdrawn'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('clearPendingSince: null'))
+})
+
+test('consumeSuppression is reached only through the quiescence gate', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const callers = [...src.matchAll(/^\s*(?:await |return )?consumeSuppression\(/gm)]
+  assert.equal(callers.length, 1, 'exactly one call site')
+  const at = src.indexOf('consumeSuppression(externalOrderId, claim)', src.indexOf('async function retireIfQuiescent'))
+  assert.ok(at > 0, 'and it is inside retireIfQuiescent')
+})
