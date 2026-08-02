@@ -1062,13 +1062,40 @@ export async function syncNewWcOrders(
       // just create.
       // Shared with both webhook topics, so the rule cannot drift between
       // ingestion paths.
-      const { shouldSkipUnlinkedWithdrawalImport } = await import('./withdrawal')
-      if (await shouldSkipUnlinkedWithdrawalImport(order)) {
+      const { shouldSkipUnlinkedWithdrawalImport, withUnlinkedIngestLock } = await import('./withdrawal')
+      // Serialized per external order (o3d-d82p): a concurrent webhook worker
+      // must not import this order between our check and our import, nor we
+      // between theirs. `busy` skips this order for now — the next poll picks
+      // it up, by which time the other worker has finished.
+      // The import runs INSIDE the lock: releasing between the decision and
+      // the import restores the very interleaving this prevents.
+      type IngestDecision =
+        | { kind: 'skip' }
+        | { kind: 'busy' }
+        | { kind: 'unresolved' }
+        | { kind: 'proceed'; imported: Awaited<ReturnType<typeof importWcOrder>> }
+      const decision = await withUnlinkedIngestLock<IngestDecision>(
+        String(order.id),
+        async () => {
+          try {
+            if (await shouldSkipUnlinkedWithdrawalImport(order)) return { kind: 'skip' as const }
+          } catch (e) {
+            const { WithdrawalSuppressionUnresolved } = await import('./withdrawal')
+            // The poll runs again shortly; leaving the order for the next pass
+            // is the safe direction, and the activity log already flagged it.
+            if (e instanceof WithdrawalSuppressionUnresolved) return { kind: 'unresolved' as const }
+            throw e
+          }
+          return { kind: 'proceed' as const, imported: await importWcOrder(order) }
+        },
+        () => ({ kind: 'busy' as const }),
+      )
+      if (decision.kind !== 'proceed') {
         result.skipped++
         continue
       }
 
-      const importResult = await importWcOrder(order)
+      const importResult = decision.imported
       if (importResult.success) {
         // The backstop for a withdrawal whose webhook never arrived.
         // importWcOrder does NOT change an existing order's lifecycle status,

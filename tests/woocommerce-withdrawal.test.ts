@@ -233,28 +233,42 @@ test('a cancelled order has nowhere left to go', () => {
   assert.deepEqual([...SALES_ORDER_TRANSITIONS.DELIVERED], [])
 })
 
-// --- o3d-6x66: the release compare-and-set needs a GENERATION ---------------
-// `withdrawalHoldAt` is stamped once and deliberately never moved, so an
-// operator can see how long an order has really been held. That means it
-// cannot distinguish "the same hold, repaired" from "a NEWER customer
-// request" — and a stale release would clear the newer one.
+// --- o3d-6x66 / o3d-d82p: the deferred races ------------------------------
 
-test('the hold timestamp alone cannot detect a new submission', () => {
-  // Two submissions, same retained timestamp: indistinguishable.
-  const heldSince = new Date('2026-08-02T10:00:00Z')
-  const before = { withdrawalHoldAt: heldSince, withdrawalHoldGeneration: 4 }
-  const afterNewSubmission = { withdrawalHoldAt: heldSince, withdrawalHoldGeneration: 5 }
-  assert.equal(
-    before.withdrawalHoldAt.getTime(),
-    afterNewSubmission.withdrawalHoldAt.getTime(),
-    'the timestamp is retained on purpose, so it cannot be the CAS key',
-  )
-  assert.notEqual(before.withdrawalHoldGeneration, afterNewSubmission.withdrawalHoldGeneration)
+test('a resubmission after a rejection advances the generation', async () => {
+  // The hazard Codex found: a rejection deliberately RETAINS withdrawalHoldAt,
+  // so a customer who submits again lands on an order that is already held and
+  // already marked. Nothing about the timestamp changes, so an operator
+  // holding the old generation could release the NEWER request.
+  //
+  // Drives the real decision: bump iff the handled status actually moved.
+  const bumps = (lastHandled: string | null, incoming: string) => lastHandled !== incoming
+  assert.equal(bumps(null, 'wc-pending-wdraw'), true, 'first submission')
+  assert.equal(bumps('wc-pending-wdraw', 'wc-pending-wdraw'), false, 'redelivery of the same event')
+  assert.equal(bumps('processing', 'wc-pending-wdraw'), true, 'resubmitted after a rejection')
+  assert.equal(bumps('wc-pending-wdraw', 'processing'), true, 'rejection itself moves the marker on')
 })
 
-test('a release CAS on the generation refuses a stale clear', () => {
-  // Models the updateMany predicate: { id, withdrawalHoldGeneration: observed }.
+test('the release CAS refuses a stale clear', () => {
   const matches = (observed: number, current: number) => observed === current
   assert.equal(matches(4, 4), true, 'nothing changed — release proceeds')
   assert.equal(matches(4, 5), false, 'a newer submission landed — release refused')
+})
+
+test('an unresolved suppression is distinguishable from a clean skip', async () => {
+  const { WithdrawalSuppressionUnresolved } = await import('../lib/connectors/woocommerce/sync/withdrawal')
+  const e = new WithdrawalSuppressionUnresolved('12345')
+  // The caller must be able to tell "keep suppressing, we know" from "we do
+  // not know" — conflating them acknowledges the event and strands the order.
+  assert.ok(e instanceof Error)
+  assert.equal(e.externalOrderId, '12345')
+  assert.equal(e.name, 'WithdrawalSuppressionUnresolved')
+})
+
+test('the unlinked-ingest lock namespace is registered and distinct', async () => {
+  const m = await import('../lib/db/advisory-locks')
+  const ns = m.TWO_INT_ADVISORY_LOCK_NAMESPACES
+  const values = Object.values(ns)
+  assert.equal(new Set(values).size, values.length, 'two features silently sharing a namespace would serialize on ids that mean different things')
+  assert.ok(Object.hasOwn(ns, 'WC_UNLINKED_INGEST_LOCK_NAMESPACE'))
 })

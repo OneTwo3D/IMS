@@ -216,16 +216,61 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   // o3d-e1yb [wdraw]: never create an order the customer has already withdrawn.
   // Checked for BOTH topics: a missed order.created means the first event IMS
   // ever sees for an order can be a withdrawal update.
-  const { shouldSkipUnlinkedWithdrawalImport } = await import('./sync/withdrawal')
-  if ((topic === 'order.created' || topic === 'order.updated')
-      && await shouldSkipUnlinkedWithdrawalImport(wcOrder)) {
-    return NextResponse.json({ ok: true, skipped: 'unlinked-withdrawal' })
+  const { shouldSkipUnlinkedWithdrawalImport, withUnlinkedIngestLock } = await import('./sync/withdrawal')
+  if (topic === 'order.created' || topic === 'order.updated') {
+    // The decision and the import that follows it must not interleave with
+    // another worker handling the SAME order, or a stale ordinary event can
+    // import an order a concurrent withdrawal event is about to suppress
+    // (o3d-d82p). `busy` means another worker owns this order right now, so
+    // fail the delivery and let the inbox redeliver rather than acting on a
+    // decision that is already going stale.
+    //
+    // The IMPORT runs inside the lock too, not just the decision. Releasing
+    // between them restores the exact interleaving this is here to prevent:
+    // we decide "proceed", the withdrawal worker writes the suppression, and
+    // we import anyway.
+    type IngestDecision =
+      | { kind: 'skip' }
+      | { kind: 'busy' }
+      | { kind: 'unresolved' }
+      | { kind: 'proceed'; imported: Awaited<ReturnType<typeof importWcOrder>> | null }
+    const decision = await withUnlinkedIngestLock<IngestDecision>(
+      String(wcOrder.id),
+      async () => {
+        try {
+          if (await shouldSkipUnlinkedWithdrawalImport(wcOrder)) return { kind: 'skip' as const }
+        } catch (e) {
+          const { WithdrawalSuppressionUnresolved } = await import('./sync/withdrawal')
+          if (e instanceof WithdrawalSuppressionUnresolved) return { kind: 'unresolved' as const }
+          throw e
+        }
+        if (topic !== 'order.created') return { kind: 'proceed' as const, imported: null }
+        return { kind: 'proceed' as const, imported: await importWcOrder(wcOrder) }
+      },
+      () => ({ kind: 'busy' as const }),
+    )
+    if (decision.kind === 'unresolved') {
+      // Fail the delivery so WooCommerce redelivers. Acknowledging would burn
+      // the only ordinary event this order may ever send, leaving it
+      // permanently unimported behind a suppression we could not resolve.
+      return NextResponse.json(
+        { ok: false, error: 'Could not resolve a withdrawal suppression; redeliver' },
+        { status: 503 },
+      )
+    }
+    if (decision.kind === 'skip') return NextResponse.json({ ok: true, skipped: 'unlinked-withdrawal' })
+    if (decision.kind === 'busy') {
+      return NextResponse.json(
+        { ok: false, error: 'Another worker is handling this order; redeliver' },
+        { status: 409 },
+      )
+    }
+    if (decision.imported && !decision.imported.success) {
+      failures.push(`importWcOrder: ${decision.imported.error ?? 'unknown error'}`)
+    }
   }
 
-  if (topic === 'order.created') {
-    const importResult = await importWcOrder(wcOrder)
-    if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
-  } else if (topic === 'order.updated') {
+  if (topic === 'order.updated') {
     // An echo makes the STATUS untrustworthy — nothing else (o3d-uxv).
     //
     // This used to `return` here, discarding the whole webhook. That silently lost real

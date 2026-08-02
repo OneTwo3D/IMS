@@ -532,41 +532,104 @@ export async function runWmsOrderPushSweepCore(
           // outside the update, cancel and dispatch passes.
           { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
-        result.created += 1
-
         // o3d-6x66: the claim's withdrawal re-check committed BEFORE this
         // remote push, so a withdrawal landing in between still gets its order
-        // created in the warehouse. Usually the hold pass then pulls it back,
-        // but an ambiguous remote result, a verification delay or a
-        // link-persistence failure can leave a live warehouse order outside
-        // holdableLinks entirely. Re-read now that we know the external id, and
-        // stop it here rather than hoping a later pass notices.
-        const raced = await port.readWithdrawalState?.(order.id)
+        // created in the warehouse. Usually the hold pass pulls it back, but an
+        // ambiguous remote result, a verification delay or a link-persistence
+        // failure can leave a live warehouse order outside holdableLinks
+        // entirely. Re-read now that we know the external id.
+        //
+        // Isolated in its own try: this runs AFTER the external id was
+        // persisted, and the create path's generic catch rewrites the link to
+        // PENDING_CREATE — which for a link that already has an id means the
+        // next sweep creates a DUPLICATE warehouse order, or (with a marker
+        // set) drops it out of both createCandidates and holdableLinks
+        // entirely. A compensation failure must never do that.
+        let raced: { withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null } | null = null
+        try {
+          raced = (await port.readWithdrawalState?.(order.id)) ?? null
+        } catch (e) {
+          console.error(`[wms-order-push] post-create withdrawal re-check failed for ${order.id}: ${scrubWmsError(e, 'read failed')}`)
+          raced = { withdrawalHoldAt: new Date(), withdrawalApprovedAt: null } // fail closed
+        }
+
         if (raced && (raced.withdrawalHoldAt || raced.withdrawalApprovedAt)) {
-          let pulled = false
+          const approved = Boolean(raced.withdrawalApprovedAt)
           try {
+            // NEVER cancel an id we have not proved is ours. PENDING_VERIFY
+            // means exactly that, and this file already documents that a wrong
+            // id can answer NOT_FOUND while the real warehouse order stays
+            // live — so "cancelled" there would be a lie that lets a withdrawn
+            // order dispatch. Escalate instead; the verify pass promotes the
+            // link and the ordinary hold/cancel pass then acts on it.
+            if (createdState === 'PENDING_VERIFY') {
+              await port.updateLinkByOrder?.(order.id, {
+                lastError: 'Created in the WMS just as a withdrawal request landed, and the id is not yet '
+                  + 'proved ours — NOT cancelled. Verify the order in the WMS and cancel it by hand.',
+                lastAttemptAt: ts,
+              })
+              result.failed += 1
+              await audit({
+                action: approved ? 'order_cancel' : 'order_hold', outcome: 'FAILED',
+                entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
+                summary: 'Order was created in the WMS just as a withdrawal request landed, but its id is '
+                  + 'unverified so it was NOT cancelled — handle it in the WMS by hand',
+                before: beforeCreate,
+                after: { state: createdState, externalOrderId: push.externalOrderId },
+                error: 'raced withdrawal on an unverified id',
+              })
+              continue
+            }
+
             const cancel = await connector.cancelOrder?.(push.externalOrderId)
-            pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND'))
+            const pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND'))
+            if (pulled) {
+              // CANCELLED for an approved withdrawal — there is nothing to
+              // release later. HELD only for a submitted one, which an
+              // operator may still reject.
+              const state: PushState = approved ? 'CANCELLED' : 'HELD'
+              await port.updateLinkByOrder?.(order.id, {
+                state, cancelledAt: ts, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null,
+              })
+              if (approved) result.cancelled += 1
+              else result.held += 1
+              await audit({
+                action: approved ? 'order_cancel' : 'order_hold', outcome: 'SUCCEEDED',
+                entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
+                summary: `Order was created in the WMS just as a withdrawal request landed; pulled straight back and parked ${state}`,
+                before: beforeCreate,
+                after: { state, externalOrderId: push.externalOrderId },
+              })
+            } else {
+              await port.updateLinkByOrder?.(order.id, {
+                lastError: 'Created in the WMS just as a withdrawal request landed and could not be pulled '
+                  + `back (WMS status ${cancel?.status ?? 'unknown'}) — cancel it in the WMS by hand.`,
+                lastAttemptAt: ts,
+              })
+              result.failed += 1
+              await audit({
+                action: approved ? 'order_cancel' : 'order_hold', outcome: 'FAILED',
+                entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
+                summary: 'Order was created in the WMS just as a withdrawal request landed and could NOT be '
+                  + 'pulled back — cancel it in the WMS by hand',
+                before: beforeCreate,
+                after: { state: createdState, externalOrderId: push.externalOrderId, wmsStatus: cancel?.status },
+                error: 'raced withdrawal, remote cancel refused',
+              })
+            }
           } catch (e) {
-            console.error(`[wms-order-push] could not pull back raced create for ${order.id}: ${scrubWmsError(e, 'cancel failed')}`)
+            const message = scrubWmsError(e, 'raced-withdrawal compensation failed')
+            console.error(`[wms-order-push] ${order.id}: ${message}`)
+            result.failed += 1
+            await port.updateLinkByOrder?.(order.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
           }
-          await port.updateLinkByOrder?.(order.id, pulled
-            ? { state: 'HELD', cancelledAt: ts, lastError: null, reconcileCheckedAt: null }
-            : { lastError: 'Created in the WMS just as a withdrawal request landed, and could not be pulled back — cancel it in the WMS by hand' })
-          result.held += pulled ? 1 : 0
-          await audit({
-            action: 'order_hold', outcome: pulled ? 'SUCCEEDED' : 'FAILED',
-            entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
-            summary: pulled
-              ? 'Order was created in the WMS just as a withdrawal request landed; pulled straight back and parked HELD'
-              : 'Order was created in the WMS just as a withdrawal request landed and could NOT be pulled back — cancel it in the WMS by hand',
-            before: beforeCreate,
-            after: { state: pulled ? 'HELD' : createdState, externalOrderId: push.externalOrderId },
-            error: pulled ? undefined : 'raced withdrawal, remote cancel failed',
-          })
+          // Deliberately NOT counted as `created`: the order existed at the
+          // WMS for a moment, but this run's outcome is a hold, a cancel or a
+          // failure, and counting both would misreport the sweep.
           continue
         }
 
+        result.created += 1
         await audit({
           action: 'order_create', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
           summary: `Order ${order.orderNumber ?? order.id} created in WMS as ${push.externalOrderNumber ?? push.externalOrderId}`

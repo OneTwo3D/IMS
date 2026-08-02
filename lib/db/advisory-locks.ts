@@ -99,8 +99,21 @@ export const DISPATCH_SWEEP_LOCK_NAMESPACE = 0x77_6d_73_64 // 'wmsd'
 /** Per-refund dedup of the reservation-release warning. */
 export const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
 
+/**
+ * Per-external-order serialization of UNLINKED WooCommerce ingestion (o3d-d82p).
+ *
+ * The withdrawal-suppression decision and the import that follows it are
+ * separate operations. Two inbox workers handling the withdrawal event and a
+ * stale ordinary event for the SAME order can interleave so that the ordinary
+ * worker sees neither a link nor a suppression row and imports the order,
+ * before the withdrawal worker writes the suppression — leaving a
+ * warehouse-eligible order with no withdrawal state applied.
+ */
+export const WC_UNLINKED_INGEST_LOCK_NAMESPACE = 0x77_63_75_69 // 'wcui'
+
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
+  WC_UNLINKED_INGEST_LOCK_NAMESPACE,
 } as const

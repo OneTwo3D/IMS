@@ -5,6 +5,11 @@
 -- server: no table rewrite, and existing rows correctly read as generation 0.
 ALTER TABLE "sales_orders" ADD COLUMN "withdrawalHoldGeneration" INTEGER NOT NULL DEFAULT 0;
 
+-- Nullable: pre-existing holds have no handled-status history, and NULL
+-- correctly reads as "unknown", which makes the next submitted event count as
+-- new rather than silently deduplicating it.
+ALTER TABLE "sales_orders" ADD COLUMN "withdrawalLastWcStatus" TEXT;
+
 -- o3d-d82p: durable memory of an unlinked withdrawal import we refused, so a
 -- STALE order.created arriving afterwards cannot import the order anyway.
 CREATE TABLE "wc_withdrawal_suppressions" (

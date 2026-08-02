@@ -33,6 +33,7 @@
  */
 
 import { db } from '@/lib/db'
+import { WC_UNLINKED_INGEST_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { logActivity } from '@/lib/activity-log'
 import { getSettingValues } from '@/lib/settings-store'
 import { INTERNAL_STATUS_TRANSITION_AUTH_ONLY } from '@/lib/sales/status-transition-bypass'
@@ -202,7 +203,12 @@ type TxClient = Parameters<Parameters<typeof db.$transaction>[0]>[0]
 async function withOrderLock<T>(
   orderId: string,
   fn: (
-    current: { status: string; withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null },
+    current: {
+      status: string
+      withdrawalHoldAt: Date | null
+      withdrawalApprovedAt: Date | null
+      withdrawalLastWcStatus: string | null
+    },
     tx: TxClient,
   ) => Promise<T>,
 ): Promise<T | null> {
@@ -211,7 +217,9 @@ async function withOrderLock<T>(
     if (locked.length === 0) return null
     const current = await tx.salesOrder.findUnique({
       where: { id: orderId },
-      select: { status: true, withdrawalHoldAt: true, withdrawalApprovedAt: true },
+      select: {
+        status: true, withdrawalHoldAt: true, withdrawalApprovedAt: true, withdrawalLastWcStatus: true,
+      },
     })
     if (!current) return null
     // `tx`, never the global client: a write to this row through `db` would
@@ -223,7 +231,24 @@ async function withOrderLock<T>(
 }
 
 async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
+  const incomingStatus = normaliseStatus(wcOrder.status)
   const claim = await withOrderLock(orderId, async (current, tx) => {
+    // Is this a genuinely NEW customer submission, or a redelivery of the one
+    // we already handled? The retained `withdrawalHoldAt` cannot tell us: a
+    // rejection deliberately leaves it in place, so a customer who submits
+    // again lands on an order that is ALREADY held and marked. The handled
+    // status can: it only reads `submitted` once the slug has moved away and
+    // back. (o3d-6x66, Codex r1)
+    const isNewSubmission = current.withdrawalLastWcStatus !== incomingStatus
+    if (isNewSubmission) {
+      await tx.salesOrder.update({
+        where: { id: orderId },
+        data: {
+          withdrawalHoldGeneration: { increment: 1 },
+          withdrawalLastWcStatus: incomingStatus,
+        },
+      })
+    }
     if (POST_DISPATCH.has(current.status)) {
       return { skip: 'post-dispatch' as const, status: current.status, marker: current.withdrawalHoldAt }
     }
@@ -250,9 +275,11 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
       // hold, repaired" from "a newer customer request". The generation can:
       // it advances only for a newly handled submission, and the operator
       // release compares it. (o3d-6x66)
+      // The generation was already advanced above when this is a new
+      // submission; here we only stamp when the hold began.
       await tx.salesOrder.update({
         where: { id: orderId },
-        data: { withdrawalHoldAt: new Date(), withdrawalHoldGeneration: { increment: 1 } },
+        data: { withdrawalHoldAt: new Date() },
       })
     }
     return { skip: null, status: current.status, marker: current.withdrawalHoldAt }
@@ -420,6 +447,57 @@ async function note(
  *
  * Returns true when the caller should skip the import and surface it instead.
  */
+/**
+ * The live WooCommerce status of a suppressed order could not be read, so we
+ * cannot tell whether the withdrawal still stands.
+ *
+ * Thrown rather than returned: "keep suppressing" and "we do not know" must
+ * not be the same value to the caller. Returning `true` here would look like a
+ * clean skip, the inbox would acknowledge the event, and if that was the only
+ * ordinary event for the order it would never be imported at all.
+ */
+export class WithdrawalSuppressionUnresolved extends Error {
+  constructor(public readonly externalOrderId: string) {
+    super(`Could not read the live WooCommerce status for suppressed order ${externalOrderId}`)
+    this.name = 'WithdrawalSuppressionUnresolved'
+  }
+}
+
+/**
+ * Serialize the whole unlinked-ingestion decision for ONE external order
+ * (o3d-d82p, Codex r1).
+ *
+ * The suppression lookup and the import that follows it are separate
+ * operations. Two inbox workers handling a withdrawal event and a STALE
+ * ordinary event for the same order can interleave: the ordinary worker sees
+ * neither a link nor a suppression row and imports as PROCESSING, and only
+ * then does the withdrawal worker write the suppression. Stock is allocated
+ * for goods the customer has asked to withdraw, and no withdrawal state is
+ * ever applied to the order that was just created.
+ *
+ * Try-lock rather than wait: if another worker holds this order, whatever it
+ * is doing supersedes us, and `busy` is returned so the caller can retry the
+ * event rather than act on a decision that is about to be stale. Never blocks
+ * an inbox worker behind another one.
+ */
+export async function withUnlinkedIngestLock<T>(
+  externalOrderId: string,
+  fn: () => Promise<T>,
+  onBusy: () => T,
+): Promise<T> {
+  // Advisory-lock ids are 32-bit; hash the external id into that space.
+  let key = 0
+  for (let i = 0; i < externalOrderId.length; i++) {
+    key = (Math.imul(key, 31) + externalOrderId.charCodeAt(i)) | 0
+  }
+  return db.$transaction(async (tx) => {
+    const rows = await tx.$queryRaw<Array<{ locked: boolean }>>`
+      SELECT pg_try_advisory_xact_lock(${WC_UNLINKED_INGEST_LOCK_NAMESPACE}::int, ${key}::int) AS locked`
+    if (!rows[0]?.locked) return onBusy()
+    return fn()
+  }, { timeout: 120_000 })
+}
+
 export async function shouldSkipUnlinkedWithdrawalImport(
   wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
 ): Promise<boolean> {
@@ -501,6 +579,15 @@ async function resolveSuppression(
   }
 
   if (!live) {
+    // Fail CLOSED on the import, but do NOT let the refusal be silent and
+    // final: record the attempt so the recheck is visible and an operator has
+    // something to act on. The caller turns this into a RETRYABLE outcome, so
+    // the inbox redelivers rather than consuming the only ordinary event and
+    // stranding the order unimported. (o3d-d82p, Codex r1)
+    await db.wcWithdrawalSuppression.update({
+      where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+      data: { lastCheckedAt: new Date() },
+    }).catch(() => {})
     await logActivity({
       entityType: 'SYNC', action: 'wc_withdrawal_suppression_unresolved', tag: 'sync', level: 'WARNING',
       description:
@@ -508,9 +595,9 @@ async function resolveSuppression(
         + `refused as a withdrawal ("${suppressedStatus}"). The live status could not be read, so the import `
         + 'is still refused — importing could allocate stock for a withdrawn order.',
       metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status, suppressedStatus },
-      resolveUser: false,
+      resolveUser: true,
     })
-    return true
+    throw new WithdrawalSuppressionUnresolved(externalOrderId)
   }
 
   if (live === submitted || live === approved) return true // still withdrawn

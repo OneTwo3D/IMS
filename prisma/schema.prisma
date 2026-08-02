@@ -1573,6 +1573,13 @@ model SalesOrder {
   /// request". Releasing compares this instead, so a stale release cannot clear
   /// a hold that now represents a newer request.
   withdrawalHoldGeneration Int @default(0)
+  /// The withdrawal-related WooCommerce status last HANDLED for this order.
+  /// Distinguishes a redelivery of the same event (same slug — do not bump the
+  /// generation) from a genuinely NEW customer submission after a rejection
+  /// (the slug moved away and back). Without it a resubmission arriving while
+  /// a retained hold is still in place advances nothing, and an operator
+  /// holding a stale generation could release the newer request.
+  withdrawalLastWcStatus String?
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 
