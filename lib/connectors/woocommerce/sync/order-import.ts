@@ -992,7 +992,15 @@ export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ at
       continue
     }
     const importResult = guarded.result
-    if (importResult.success) {
+    if (importResult.success && guarded.compensationFailed) {
+      // importWcOrder already marked this queue row SYNCED, so there is no
+      // pending row left to carry the retry. Count it as failed and say why —
+      // the tombstone survives, so the next webhook or poll finishes the job.
+      result.failed++
+      console.error(
+        `[wc-fx-retry] order ${queuedOrder.id} imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
+      )
+    } else if (importResult.success) {
       result.imported++
     } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh')) {
       result.stillPending++

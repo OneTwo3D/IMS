@@ -544,7 +544,6 @@ export async function importWcOrderGuarded<R extends { success: boolean }>(
   | { outcome: 'unresolved' }
   | { outcome: 'imported'; result: R; suppressionHandled: boolean; compensationFailed: boolean }
 > {
-  const wasUnlinked = !(await isWcOrderLinked(String(wcOrder.id)))
   try {
     if (await shouldSkipUnlinkedWithdrawalImport(wcOrder)) return { outcome: 'skipped-withdrawal' }
   } catch (e) {
@@ -553,7 +552,12 @@ export async function importWcOrderGuarded<R extends { success: boolean }>(
   }
 
   const result = await runImport()
-  const compensation = result.success && wasUnlinked
+  // NOT gated on wasUnlinked. The tombstone is the durable record that a
+  // withdrawal still needs applying, and it survives a failed transition — so
+  // a redelivery, a later poll or the FX retry must all be able to finish the
+  // job even though the order is linked by then. Gating on wasUnlinked made
+  // the "retryable" failure consumed by one ineffective retry. (Codex r6)
+  const compensation = result.success
     ? await reconcileSuppressionAfterImport(wcOrder)
     : { handled: false, failed: false }
   // Two separate facts. `suppressionHandled` says "do not sync the stale
@@ -591,13 +595,35 @@ export async function recordWithdrawalSuppressionIfWithdrawn(
   return true
 }
 
-export async function isWcOrderLinked(externalOrderId: string): Promise<boolean> {
+/**
+ * Apply a withdrawal to an order that is ALREADY linked, returning false when
+ * there is nothing to do (not a withdrawal status, or no link yet).
+ *
+ * Used by the initial-import gate: an order imported earlier in the same
+ * still-running job is linked, and that job never revisits it, so recording a
+ * tombstone alone would leave a paid PROCESSING order fulfillable.
+ */
+export async function applyWithdrawalToLinkedOrder(
+  wcOrder: WcFullOrder,
+): Promise<boolean> {
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const status = normaliseStatus(wcOrder.status)
+  if (status !== submitted && status !== approved) return false
+
   const link = await db.shoppingOrderLink.findUnique({
-    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-    select: { id: true },
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } },
+    select: { orderId: true },
   })
-  return Boolean(link)
+  if (!link?.orderId) return false
+
+  const result = status === approved
+    ? await applyWithdrawalApproval(link.orderId, wcOrder)
+    : await applyWithdrawalHold(link.orderId, wcOrder)
+  // A failure must not read as "handled": the caller falls back to the
+  // tombstone, so the withdrawal is retried by the next ingress path.
+  return result.success
 }
+
 
 export async function reconcileSuppressionAfterImport(
   wcOrder: WcFullOrder,
@@ -605,7 +631,7 @@ export async function reconcileSuppressionAfterImport(
   const externalOrderId = String(wcOrder.id)
   const suppressed = await db.wcWithdrawalSuppression.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-    select: { wcStatus: true },
+    select: { wcStatus: true, revision: true },
   })
   if (!suppressed) return { handled: false, failed: false }
 
@@ -642,6 +668,16 @@ export async function reconcileSuppressionAfterImport(
     metadata: { externalOrderId: wcOrder.id, suppressedStatus: suppressed.wcStatus },
     resolveUser: !result.success,
   })
+
+  // Clear the tombstone ONLY once the transition has landed. While it stands,
+  // every ingress path retries the withdrawal — which is the whole point of
+  // recording it. Revision-CAS'd so a newer withdrawal recorded while we were
+  // transitioning is not thrown away.
+  if (result.success) {
+    await db.wcWithdrawalSuppression.deleteMany({
+      where: { connector: 'woocommerce', externalOrderId, revision: suppressed.revision },
+    })
+  }
   return { handled: true, failed: !result.success }
 }
 

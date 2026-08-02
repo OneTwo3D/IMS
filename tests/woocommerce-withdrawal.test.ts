@@ -322,6 +322,47 @@ test('the guarded wrapper imports BEFORE it compensates', async () => {
   assert.ok(body.indexOf('runImport()') < body.indexOf('reconcileSuppressionAfterImport'))
 })
 
+test('compensation is retried for an order that is already LINKED', async () => {
+  // The first raced import can fail its transition and correctly return 500.
+  // On redelivery the order IS linked — gating compensation on "was unlinked"
+  // made that retry a no-op, so the retryable failure was consumed by one
+  // ineffective attempt and the order stayed live and withdrawn.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function importWcOrderGuarded'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+    .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!body.includes('wasUnlinked'), 'compensation must not be gated on the order having been unlinked')
+})
+
+test('the tombstone survives a failed transition and is cleared only on success', async () => {
+  // The tombstone IS the durable retry signal. Clearing it on failure loses
+  // the withdrawal; never clearing it retries a completed one forever.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  const del = body.indexOf('wcWithdrawalSuppression.deleteMany')
+  assert.ok(del > 0, 'the tombstone must be cleared once the transition lands')
+  assert.ok(body.lastIndexOf('if (result.success) {', del) > 0, 'and only then')
+  assert.ok(body.slice(del, del + 260).includes('revision: suppressed.revision'), 'CAS on the revision')
+})
+
+test('the initial-import gate applies to a linked order and never swallows a failure', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/webhooks.ts', 'utf8')
+  const gate = src.slice(
+    src.indexOf("initialImportDone?.value !== 'true'"),
+    src.indexOf("skipped: 'initial_import_pending'"),
+  )
+  // An order imported earlier in the same still-running job is already linked
+  // and the job never revisits it, so a tombstone alone leaves it fulfillable.
+  assert.ok(gate.includes('applyWithdrawalToLinkedOrder'))
+  // Returning 200 after a failed write marks the event processed and recreates
+  // the lost-withdrawal race this guard exists to close.
+  assert.ok(gate.includes('status: 503'), 'a failed tombstone write must be retryable')
+})
+
 test('a delayed rejection cannot overwrite a newer resubmission', () => {
   // The inbox does not guarantee per-order ordering. Without a version, a
   // rejection still in flight overwrites the marker a NEWER resubmission

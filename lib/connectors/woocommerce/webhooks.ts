@@ -181,11 +181,25 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     // poll cursor past the change. The tombstone is what the initial-import
     // loop consults, so it must exist before that loop reaches the order.
     if (topic === 'order.created' || topic === 'order.updated') {
-      const { recordWithdrawalSuppressionIfWithdrawn } = await import('./sync/withdrawal')
+      const {
+        recordWithdrawalSuppressionIfWithdrawn, applyWithdrawalToLinkedOrder,
+      } = await import('./sync/withdrawal')
       try {
-        await recordWithdrawalSuppressionIfWithdrawn(payload as WcFullOrder)
+        // An order imported EARLIER in this same still-running job is already
+        // linked, and the job never revisits it — a tombstone alone would just
+        // sit there while a paid PROCESSING order stayed fulfillable. Apply the
+        // withdrawal to it directly.
+        const applied = await applyWithdrawalToLinkedOrder(payload as WcFullOrder)
+        if (!applied) await recordWithdrawalSuppressionIfWithdrawn(payload as WcFullOrder)
       } catch (e) {
+        // Do NOT swallow this. Returning 200 marks the event processed, and a
+        // transient database failure here recreates the exact lost-withdrawal
+        // race this guard exists to close.
         console.error('o3d-d82p: failed to record a withdrawal during initial import', e)
+        return NextResponse.json(
+          { ok: false, error: 'Could not record the withdrawal; redeliver' },
+          { status: 503 },
+        )
       }
     }
     // Behaviour unchanged (still ACK 200 — WC's finite retries must not pile up); the skip is now visible.
