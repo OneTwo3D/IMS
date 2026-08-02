@@ -297,21 +297,21 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
 }
 
 async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
-  // Decide AND record inside the lock, but record only when we are actually
-  // going to cancel.
-  //
-  // The approval fact makes the order terminal — applySalesOrderStatusTransition
-  // refuses every target but CANCELLED once it is set. Writing it
-  // unconditionally therefore froze a DISPATCHED order, which this path
-  // deliberately does NOT cancel (it is a return): the delivery cron could
-  // then never move it SHIPPED -> DELIVERED.
+  // Decide AND record inside the lock.
   //
   // Recorded BEFORE the cancellation for the crash window: if the cancellation
   // then fails, the order is left uncancelled but PROTECTED, and a redelivered
   // approval — which the terminal guard deliberately lets through — retries it.
   const claim = await withOrderLock(orderId, async (current, tx) => {
-    const terminal = POST_DISPATCH.has(current.status) || current.status === 'CANCELLED'
-    if (!terminal && !current.withdrawalApprovedAt) {
+    // Recorded for EVERY branch, and always inside the lock. The terminal
+    // branches below release the lock and then return, so a fact written
+    // afterwards leaves a window in which a delayed ordinary webhook can take
+    // the lock and force PROCESSING through the full bypass.
+    //
+    // Safe for post-dispatch now that the locked guard permits whatever the
+    // state machine permits from the current status: a return can still reach
+    // COMPLETED/DELIVERED, only backward moves are refused.
+    if (!current.withdrawalApprovedAt) {
       await tx.salesOrder.update({ where: { id: orderId }, data: { withdrawalApprovedAt: new Date() } })
     }
     return { status: current.status, marker: current.withdrawalHoldAt }
@@ -326,13 +326,9 @@ async function applyWithdrawalApproval(orderId: string, wcOrder: WcFullOrder): P
     return { success: true }
   }
   if (claim.status === 'CANCELLED') {
-    // Already where we want it. Record the approval — a cancelled order has
-    // nothing left to freeze — and clear the hold so it is not left blocked by
-    // one that no longer means anything.
-    await db.salesOrder.updateMany({
-      where: { id: orderId, withdrawalApprovedAt: null, status: 'CANCELLED' },
-      data: { withdrawalApprovedAt: new Date() },
-    })
+    // Already where we want it; the approval fact was recorded under the lock
+    // above. Clear the hold so the order is not left blocked by one that no
+    // longer means anything.
     await clearStaleMarker(orderId, claim.marker)
     return { success: true }
   }

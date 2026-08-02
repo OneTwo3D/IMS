@@ -210,13 +210,25 @@ test('without an approval, ordinary statuses behave exactly as before', () => {
 // would leave the delivery cron unable to move it SHIPPED -> DELIVERED ever
 // again. These pin the lifecycle facts that decision rests on.
 
-test('a dispatched order still has somewhere to go, so it must not be frozen', () => {
+// The locked guard permits exactly what the state machine permits from the
+// CURRENT status, so these two properties are what make it correct: a return
+// can finish, and nothing can be forced backwards.
+
+test('an approved-after-dispatch return can still finish', () => {
   assert.equal(canTransitionSalesOrder('SHIPPED', 'DELIVERED'), true)
   assert.equal(canTransitionSalesOrder('SHIPPED', 'COMPLETED'), true)
   assert.equal(canTransitionSalesOrder('COMPLETED', 'DELIVERED'), true)
 })
 
-test('a cancelled order has nowhere left to go, so freezing it costs nothing', () => {
+test('nothing the guard must refuse is machine-legal', () => {
+  // The exact resurrections the full bypass would otherwise force.
+  assert.equal(canTransitionSalesOrder('CANCELLED', 'PROCESSING'), false)
+  assert.equal(canTransitionSalesOrder('SHIPPED', 'PROCESSING'), false)
+  assert.equal(canTransitionSalesOrder('COMPLETED', 'PROCESSING'), false)
+  assert.equal(canTransitionSalesOrder('DELIVERED', 'PROCESSING'), false)
+})
+
+test('a cancelled order has nowhere left to go', () => {
   assert.deepEqual([...SALES_ORDER_TRANSITIONS.CANCELLED], [])
   assert.deepEqual([...SALES_ORDER_TRANSITIONS.DELIVERED], [])
 })

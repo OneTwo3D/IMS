@@ -70,7 +70,8 @@ import {
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { releaseReservationsAfterRefund } from '@/lib/domain/sales/post-refund-release'
 import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
-import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
+import { PermanentStatusTransitionError, isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
+import { canTransitionSalesOrder } from '@/lib/domain/workflows/sales-order-state'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
   cancelSalesOrderFulfillmentState,
@@ -1492,11 +1493,14 @@ export async function applySalesOrderStatusTransition(
     // full-bypass mapping afterwards, overwriting CANCELLED with PROCESSING and
     // making the order warehouse-eligible again. Enforcing it HERE is what
     // makes it atomic with the status write.
-    if (so.withdrawalApprovedAt && targetStatus !== 'CANCELLED') {
+    // Cheap early-out only; the authoritative check is under the row lock in
+    // beforeUpdate below. Same rule, so the two cannot disagree.
+    if (so.withdrawalApprovedAt && targetStatus !== 'CANCELLED'
+        && !canTransitionSalesOrder(so.status as SoStatus, targetStatus)) {
       return {
         success: false,
         permanent: true,
-        error: 'This order\u2019s EU withdrawal request was approved and the order cancelled; its status cannot be changed.',
+        error: 'This order\u2019s EU withdrawal request was approved; its status cannot be moved backwards.',
       }
     }
 
@@ -1612,11 +1616,22 @@ export async function applySalesOrderStatusTransition(
             if (targetStatus !== 'CANCELLED') {
               const fresh = await lockedTx.salesOrder.findUnique({
                 where: { id },
-                select: { withdrawalApprovedAt: true },
+                select: { withdrawalApprovedAt: true, status: true },
               })
-              if (fresh?.withdrawalApprovedAt) {
-                throw new Error(
-                  'This order\u2019s EU withdrawal request was approved and the order cancelled; its status cannot be changed.',
+              // Permit only what the state machine itself would permit from
+              // the CURRENT status. That allows a post-dispatch return to
+              // finish (SHIPPED -> COMPLETED/DELIVERED) while refusing every
+              // backward, bypassed move — CANCELLED -> PROCESSING and
+              // SHIPPED -> PROCESSING are both machine-illegal, and the full
+              // bypass is exactly what would otherwise force them.
+              if (fresh?.withdrawalApprovedAt
+                  && !canTransitionSalesOrder(fresh.status as SoStatus, targetStatus)) {
+                // PermanentStatusTransitionError, not a plain Error: a generic
+                // throw is classified TRANSIENT, so the webhook inbox would
+                // retry a business rule that can never pass and could
+                // dead-letter on a final-attempt race.
+                throw new PermanentStatusTransitionError(
+                  'This order\u2019s EU withdrawal request was approved; its status cannot be moved backwards.',
                 )
               }
             }
