@@ -93,15 +93,7 @@ function isSerializableType(checker, type) {
   })
 }
 
-function functionLikeOf(decl) {
-  if (!decl) return null
-  if (ts.isFunctionDeclaration(decl) || ts.isFunctionExpression(decl) || ts.isArrowFunction(decl)) return decl
-  if (ts.isVariableDeclaration(decl) && decl.initializer) {
-    const init = decl.initializer
-    if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) return init
-  }
-  return null
-}
+
 
 export function runGuard({ tsconfig = 'tsconfig.json', root = process.cwd(), scanRoots = DEFAULT_SCAN_ROOTS } = {}) {
   const configPath = join(root, tsconfig)
@@ -132,33 +124,86 @@ export function runGuard({ tsconfig = 'tsconfig.json', root = process.cwd(), sca
       violations.push(`${relative(root, sf.fileName)}:${line + 1}: ${label}`)
     }
 
-    const inspectFunction = (fn) => {
-      for (const p of fn.parameters) {
-        // getTypeAtLocation resolves imports, aliases, Pick/Omit, generics and
-        // types inferred from a default value — everything a syntax-only walk
-        // could not see.
-        let type
-        try { type = checker.getTypeAtLocation(p) } catch { continue }
-        if (!type) continue
+    /**
+     * Does the function owning this parameter read a bypass-named key off it?
+     * Covers both `opts.skipAuth` and `opts['skipAuth']`.
+     */
+    const readsBypassKey = (paramNode) => {
+      if (!paramNode || !ts.isParameter(paramNode)) return false
+      const name = ts.isIdentifier(paramNode.name) ? paramNode.name.text : null
+      if (!name) return false
+      const fn = paramNode.parent
+      if (!fn || !fn.body) return false
+      let found = false
+      const scan = (n) => {
+        if (found) return
+        if (ts.isPropertyAccessExpression(n)
+            && ts.isIdentifier(n.expression) && n.expression.text === name
+            && AUTH_BYPASS_NAME.test(n.name.text)) { found = true; return }
+        if (ts.isElementAccessExpression(n)
+            && ts.isIdentifier(n.expression) && n.expression.text === name
+            && n.argumentExpression && ts.isStringLiteralLike(n.argumentExpression)
+            && AUTH_BYPASS_NAME.test(n.argumentExpression.text)) { found = true; return }
+        ts.forEachChild(n, scan)
+      }
+      scan(fn.body)
+      return found
+    }
+
+    /** Inspect one resolved parameter type for a forgeable bypass. */
+    const inspectParamType = (type, at) => {
+      if (!type) return
         // An OPTIONAL parameter is `T | undefined`, and getPropertiesOfType on
         // a union returns only the properties common to every member — so
         // `undefined` erases them all and the guard silently sees nothing.
         // Strip nullish members and inspect each remaining constituent.
-        const constituents = (type.isUnion() ? type.types : [type])
-          .filter((t) => !(t.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void)))
-        for (const constituent of constituents) {
-          for (const prop of checker.getPropertiesOfType(constituent)) {
-            if (!AUTH_BYPASS_NAME.test(prop.getName())) continue
-            const decl = prop.valueDeclaration ?? prop.declarations?.[0]
-            let propType
-            try { propType = checker.getTypeOfSymbolAtLocation(prop, decl ?? p) } catch { continue }
-            if (!propType || !isSerializableType(checker, propType)) continue
-            // Report at the declaration when it is in this file, so the waiver
-            // comment sits next to the offending property; otherwise at the
-            // parameter, which is the thing this file controls.
-            const at = decl && decl.getSourceFile() === sf ? decl : p
-            report(at, `serializable auth bypass \`${prop.getName()}\``)
-          }
+      const constituents = (type.isUnion() ? type.types : [type])
+        .filter((t) => !(t.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void)))
+      for (const constituent of constituents) {
+        // A higher-order wrapper like `(...a: A) => Promise<R>` presents ONE
+        // rest parameter whose type is the tuple of the real parameters, so
+        // the actual options object is an element of it, not a property.
+        if (checker.isTupleType?.(constituent)) {
+          for (const el of checker.getTypeArguments(constituent)) inspectParamType(el, at)
+          continue
+        }
+        for (const prop of checker.getPropertiesOfType(constituent)) {
+          if (!AUTH_BYPASS_NAME.test(prop.getName())) continue
+          const decl = prop.valueDeclaration ?? prop.declarations?.[0]
+          let propType
+          try { propType = checker.getTypeOfSymbolAtLocation(prop, decl ?? at) } catch { continue }
+          if (!propType || !isSerializableType(checker, propType)) continue
+          // Report at the declaration when it is in this file, so the waiver
+          // sits next to the offending property; otherwise at the parameter,
+          // which is the thing this file controls.
+          const where = decl && decl.getSourceFile() === sf ? decl : at
+          report(where, `serializable auth bypass \`${prop.getName()}\``)
+        }
+        // An index signature erases the NAMED properties, so
+        // `Record<string, boolean>` would otherwise pass silently even though
+        // `options.skipPermissionCheck` is a valid, client-sendable read.
+        //
+        // But flagging EVERY such bag is pure noise — `Record<string, string>`
+        // settings maps are ordinary and legitimate. So only flag when the
+        // function actually READS a bypass-named key off that parameter.
+        const idx = checker.getIndexInfoOfType?.(constituent, ts.IndexKind.String)
+        if (idx?.type && isSerializableType(checker, idx.type) && readsBypassKey(at)) {
+          report(at, 'auth-bypass key read from an index-signature options bag '
+            + '— a client can send it under any name')
+        }
+      }
+    }
+
+    /** Every parameter of every call signature of a resolved function type. */
+    const inspectSignatures = (type, at) => {
+      if (!type) return
+      for (const sig of checker.getSignaturesOfType(type, ts.SignatureKind.Call)) {
+        for (const paramSym of sig.getParameters()) {
+          const pdecl = paramSym.valueDeclaration ?? paramSym.declarations?.[0]
+          let ptype
+          try { ptype = checker.getTypeOfSymbolAtLocation(paramSym, pdecl ?? at) } catch { continue }
+          const where = pdecl && pdecl.getSourceFile() === sf ? pdecl : at
+          inspectParamType(ptype, where)
         }
       }
     }
@@ -168,11 +213,19 @@ export function runGuard({ tsconfig = 'tsconfig.json', root = process.cwd(), sca
       const moduleSymbol = checker.getSymbolAtLocation(sf)
       const exports = moduleSymbol ? checker.getExportsOfModule(moduleSymbol) : []
       for (const ex of exports) {
-        const target = ex.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(ex) : ex
-        for (const d of target.declarations ?? []) {
-          const fn = functionLikeOf(d)
-          if (fn) inspectFunction(fn)
-        }
+        let target = ex
+        try {
+          if (ex.flags & ts.SymbolFlags.Alias) target = checker.getAliasedSymbol(ex)
+        } catch { /* unresolvable re-export; fall back to the alias itself */ }
+        const at = target.valueDeclaration ?? target.declarations?.[0] ?? ex.declarations?.[0]
+        if (!at) continue
+        // By TYPE, not by syntax. Next.js accepts an action produced by a
+        // higher-order function — `export const a = withAudit(async (o) => …)`
+        // — and a declaration-shape check skips those entirely, which is a
+        // realistic route straight back to the original vulnerability.
+        let type
+        try { type = checker.getTypeOfSymbolAtLocation(target, at) } catch { continue }
+        inspectSignatures(type, at)
       }
     }
 
@@ -180,7 +233,11 @@ export function runGuard({ tsconfig = 'tsconfig.json', root = process.cwd(), sca
     const visit = (node) => {
       const isFn = ts.isFunctionDeclaration(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node)
       if (isFn && node.body && ts.isBlock(node.body) && hasUseServerDirective(node.body.statements)) {
-        inspectFunction(node)
+        for (const p of node.parameters) {
+          let ptype
+          try { ptype = checker.getTypeAtLocation(p) } catch { continue }
+          inspectParamType(ptype, p)
+        }
       }
       ts.forEachChild(node, visit)
     }

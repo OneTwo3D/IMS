@@ -23,7 +23,7 @@ function flagged(file: string): boolean {
 
 test('every bad fixture is flagged', () => {
   const bad = readdirSync(join(process.cwd(), FIXTURES, 'bad')).filter((f) => f.endsWith('.ts'))
-  assert.ok(bad.length >= 8, `expected the bad fixtures to still be present, found ${bad.length}`)
+  assert.ok(bad.length >= 11, `expected the bad fixtures to still be present, found ${bad.length}`)
   for (const f of bad) {
     assert.ok(flagged(`bad/${f}`), `guard MISSED bad/${f} — a forgeable auth bypass would ship:\n${violations.join('\n')}`)
   }
@@ -31,7 +31,7 @@ test('every bad fixture is flagged', () => {
 
 test('no good fixture is flagged', () => {
   const good = readdirSync(join(process.cwd(), FIXTURES, 'good')).filter((f) => f.endsWith('.ts'))
-  assert.ok(good.length >= 6, `expected the good fixtures to still be present, found ${good.length}`)
+  assert.ok(good.length >= 8, `expected the good fixtures to still be present, found ${good.length}`)
   for (const f of good) {
     assert.equal(flagged(`good/${f}`), false, `guard FALSE-POSITIVED on good/${f}:\n${violations.join('\n')}`)
   }
@@ -51,6 +51,21 @@ test('a private helper in a use-server module is not treated as an action', () =
 
 test('a symbol capability is never flagged', () => {
   assert.equal(flagged('good/symbol-capability.ts'), false)
+  assert.equal(flagged('good/higher-order-clean.ts'), false)
+})
+
+test('a higher-order-wrapped action is inspected', () => {
+  // Next accepts these; a declaration-shape check skipped them entirely,
+  // which is a realistic route straight back to the vulnerability.
+  assert.ok(flagged('bad/higher-order-wrapped.ts'))
+})
+
+test('an index-signature bag is flagged only when a bypass key is READ', () => {
+  // Flagging every Record<string, …> parameter is pure noise: several real
+  // actions legitimately take settings maps.
+  assert.ok(flagged('bad/index-signature.ts'))
+  assert.ok(flagged('bad/index-signature-element-access.ts'))
+  assert.equal(flagged('good/index-signature-not-read.ts'), false)
 })
 
 test('the production tree is clean', () => {
