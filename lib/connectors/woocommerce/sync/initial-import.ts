@@ -164,7 +164,22 @@ async function runInitialImport(progress: InitialImportProgress) {
           continue
         }
 
-        const importResult = await importWcOrder(order, { useWcDateAsCreatedAt: true })
+        // Guarded (o3d-d82p): this loop works from a PAGE SNAPSHOT, and an
+        // order can move to a withdrawal status between the page fetch and its
+        // turn here. Ordinary webhooks are acknowledged as
+        // initial_import_pending during this mode, so nothing else would catch
+        // it — the order would land as paid PROCESSING with no marker and stay
+        // warehouse-eligible until the next reconciliation.
+        const { importWcOrderGuarded } = await import('./withdrawal')
+        const guarded = await importWcOrderGuarded(
+          order,
+          () => importWcOrder(order, { useWcDateAsCreatedAt: true }),
+        )
+        if (guarded.outcome !== 'imported') {
+          progress.activeOrdersSkipped++
+          continue
+        }
+        const importResult = guarded.result
         if (importResult.success && importResult.orderId) {
           progress.activeOrdersImported++
         } else if (importResult.success) {

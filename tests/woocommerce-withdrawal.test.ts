@@ -269,9 +269,11 @@ test('an unresolved suppression is not a skip', async () => {
   // A skip is a RESOLVED decision and lets the poll advance its cursor. An
   // unresolved one must not, or the order falls behind the cursor and this
   // backstop never sees the withdrawal it exists to catch.
-  const src = await import('node:fs').then((fs) =>
-    fs.readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8'))
-  const block = src.slice(src.indexOf('if (unresolved) {'), src.indexOf('const importResult = await importWcOrder(order)'))
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
+  const start = src.indexOf("if (guarded.outcome === 'unresolved') {")
+  assert.ok(start > 0, 'the poll must handle an unresolved suppression explicitly')
+  const block = src.slice(start, src.indexOf('}', src.indexOf('continue', start)))
   assert.ok(block.includes('result.errors.push'), 'unresolved must record an error, not a skip')
   assert.ok(!block.includes('result.skipped++'), 'unresolved must not count as a skip')
 })
@@ -279,11 +281,43 @@ test('an unresolved suppression is not a skip', async () => {
 test('the withdrawal ingest guard holds no transaction across the import', async () => {
   // Pinning a pooled connection to hold an advisory lock while the import
   // needs another connection deadlocks the pool against itself under load.
-  // The convergence is a post-import compensation instead.
-  const src = await import('node:fs').then((fs) =>
-    fs.readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8'))
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   assert.ok(!src.includes('pg_try_advisory_xact_lock'), 'no lock may wrap the import')
-  assert.ok(src.includes('reconcileSuppressionAfterImport'))
+})
+
+test('every importWcOrder caller goes through the guarded wrapper', async () => {
+  // The FX retry queue and the initial import each open-coded the import with
+  // no suppression check and no compensation, so an order withdrawn while it
+  // sat in the queue came back as paid PROCESSING with no marker and stayed
+  // warehouse-eligible until the next reconciliation. A new ingress path that
+  // forgets the wrapper reopens exactly that.
+  const { readFileSync, readdirSync, statSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const walk = (dir: string): string[] => readdirSync(dir).flatMap((f) => {
+    const full = join(dir, f)
+    return statSync(full).isDirectory() ? walk(full) : full.endsWith('.ts') ? [full] : []
+  })
+  const offenders: string[] = []
+  for (const file of [...walk('lib'), ...walk('app')]) {
+    const src = readFileSync(file, 'utf8')
+    src.split('\n').forEach((line, i) => {
+      if (!/\bimportWcOrder\(/.test(line)) return
+      if (/importWcOrderGuarded|function importWcOrder|=> importWcOrder\(/.test(line)) return
+      offenders.push(`${file}:${i + 1}`)
+    })
+  }
+  assert.deepEqual(offenders, [], 'these call importWcOrder directly, bypassing the withdrawal guard')
+})
+
+test('the guarded wrapper imports BEFORE it compensates', async () => {
+  // Compensation needs the ShoppingOrderLink the import creates; running it
+  // first is a guaranteed no-op that reads like protection.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function importWcOrderGuarded'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.indexOf('runImport()') < body.indexOf('reconcileSuppressionAfterImport'))
 })
 
 test('a delayed rejection cannot overwrite a newer resubmission', () => {

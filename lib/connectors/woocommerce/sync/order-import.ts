@@ -962,7 +962,24 @@ export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ at
       result.failed++
       continue
     }
-    const importResult = await importWcOrder(row.payload.order, { pendingFxRetryLogId: row.id })
+    // Guarded (o3d-d82p): an order can be withdrawn while it sits in this
+    // queue waiting for an FX rate. The webhook records the suppression and
+    // acknowledges, and this retry would then import the STALE processing
+    // snapshot with no marker, leaving it warehouse-eligible until the next
+    // reconciliation — not a millisecond window.
+    const queuedOrder = row.payload.order
+    const { importWcOrderGuarded } = await import('./withdrawal')
+    const guarded = await importWcOrderGuarded(
+      queuedOrder,
+      () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id }),
+    )
+    if (guarded.outcome !== 'imported') {
+      // Leave the queue row alone: skipped-withdrawal and unresolved both mean
+      // "not now", and the next run re-evaluates against live state.
+      result.stillPending++
+      continue
+    }
+    const importResult = guarded.result
     if (importResult.success) {
       result.imported++
     } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh')) {
@@ -1062,22 +1079,13 @@ export async function syncNewWcOrders(
       // just create.
       // Shared with both webhook topics, so the rule cannot drift between
       // ingestion paths.
-      const {
-        shouldSkipUnlinkedWithdrawalImport, reconcileSuppressionAfterImport,
-        WithdrawalSuppressionUnresolved, isWcOrderLinked,
-      } = await import('./withdrawal')
-      const wasUnlinked = !(await isWcOrderLinked(String(order.id)))
-      let unresolved = false
-      try {
-        if (await shouldSkipUnlinkedWithdrawalImport(order)) {
-          result.skipped++
-          continue
-        }
-      } catch (e) {
-        if (!(e instanceof WithdrawalSuppressionUnresolved)) throw e
-        unresolved = true
+      const { importWcOrderGuarded } = await import('./withdrawal')
+      const guarded = await importWcOrderGuarded(order, () => importWcOrder(order))
+      if (guarded.outcome === 'skipped-withdrawal') {
+        result.skipped++
+        continue
       }
-      if (unresolved) {
+      if (guarded.outcome === 'unresolved') {
         // NOT a skip. A skip is a resolved decision and lets this run advance
         // its modified-after cursor, which would leave the order behind the
         // cursor and possibly never handled — and this poll is the backstop
@@ -1087,11 +1095,15 @@ export async function syncNewWcOrders(
         )
         continue
       }
-
-      const importResult = await importWcOrder(order)
-      // A concurrent worker may have recorded the withdrawal between the check
-      // above and this import (o3d-d82p).
-      if (importResult.success && wasUnlinked) await reconcileSuppressionAfterImport(order)
+      const importResult = guarded.result
+      if (guarded.suppressionHandled) {
+        // A withdrawal transition was just applied; do not sync this stale
+        // ordinary status over it — that classifies as rejected-held and
+        // invites an operator to release a live withdrawal.
+        if (importResult.orderId) result.synced++
+        else result.skipped++
+        continue
+      }
       if (importResult.success) {
         // The backstop for a withdrawal whose webhook never arrived.
         // importWcOrder does NOT change an existing order's lifecycle status,

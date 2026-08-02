@@ -216,38 +216,36 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   // o3d-e1yb [wdraw]: never create an order the customer has already withdrawn.
   // Checked for BOTH topics: a missed order.created means the first event IMS
   // ever sees for an order can be a withdrawal update.
-  const {
-    shouldSkipUnlinkedWithdrawalImport, reconcileSuppressionAfterImport, WithdrawalSuppressionUnresolved, isWcOrderLinked,
-  } = await import('./sync/withdrawal')
-  let wasUnlinked = false
+  const { importWcOrderGuarded } = await import('./sync/withdrawal')
+  // Every ingress path goes through the same wrapper, so no topic can omit the
+  // suppression check or the post-import compensation (o3d-d82p).
+  let suppressionHandled = false
   if (topic === 'order.created' || topic === 'order.updated') {
-    wasUnlinked = !(await isWcOrderLinked(String(wcOrder.id)))
-    try {
-      if (await shouldSkipUnlinkedWithdrawalImport(wcOrder)) {
-        return NextResponse.json({ ok: true, skipped: 'unlinked-withdrawal' })
-      }
-    } catch (e) {
-      if (e instanceof WithdrawalSuppressionUnresolved) {
-        // 503, not 409: the shared inbox classifies only 408/429/5xx as
-        // retryable, so anything else is DEAD-LETTERED on the first attempt —
-        // which for an order whose only ordinary event this may be means it is
-        // never imported at all.
-        return NextResponse.json(
-          { ok: false, error: 'Could not resolve a withdrawal suppression; redeliver' },
-          { status: 503 },
-        )
-      }
-      throw e
+    const guarded = await importWcOrderGuarded(
+      wcOrder,
+      () => importWcOrder(wcOrder),
+    )
+    if (guarded.outcome === 'skipped-withdrawal') {
+      return NextResponse.json({ ok: true, skipped: 'unlinked-withdrawal' })
+    }
+    if (guarded.outcome === 'unresolved') {
+      // 503, not 409: the shared inbox classifies only 408/429/5xx as
+      // retryable, so anything else is DEAD-LETTERED on the first attempt —
+      // which for an order whose only ordinary event this may be means it is
+      // never imported at all.
+      return NextResponse.json(
+        { ok: false, error: 'Could not resolve a withdrawal suppression; redeliver' },
+        { status: 503 },
+      )
+    }
+    suppressionHandled = guarded.suppressionHandled
+    if (!guarded.result.success) {
+      failures.push(`importWcOrder: ${guarded.result.error ?? 'unknown error'}`)
     }
   }
 
-  if (topic === 'order.created') {
-    const importResult = await importWcOrder(wcOrder)
-    if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
-    // A concurrent worker may have recorded the withdrawal between the check
-    // above and this import (o3d-d82p).
-    else if (wasUnlinked) await reconcileSuppressionAfterImport(wcOrder)
-  } else if (topic === 'order.updated') {
+  if (topic === 'order.updated') {
+
 
     // An echo makes the STATUS untrustworthy — nothing else (o3d-uxv).
     //
@@ -265,14 +263,6 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     // status (order-import.ts:324). syncRefundsForOrder is idempotent and keyed on the
     // WC refund id. Neither writes back to WooCommerce, so skipping the status sync
     // alone keeps the loop/clobber protection intact while letting genuine changes land.
-    // Same convergence as order.created: a concurrent worker may have recorded
-    // the withdrawal between the check above and this import (o3d-d82p). This
-    // MUST run before status/refund processing and before acknowledging, or a
-    // stale ordinary update creates a paid PROCESSING order carrying neither
-    // marker — which is exactly what the WMS candidate and claim checks look
-    // for, so it would ship.
-    if (wasUnlinked) await reconcileSuppressionAfterImport(wcOrder)
-
     const suppressed = await shouldSuppressWcOrderWebhookEcho(wcOrder)
     if (suppressed.suppress) {
       await logActivity({
@@ -290,9 +280,15 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       })
     }
 
-    const importResult = await importWcOrder(wcOrder)
-    if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
-    if (!suppressed.suppress) {
+    // The import already ran through importWcOrderGuarded above, so the
+    // suppression check and the post-import compensation cannot be skipped.
+    //
+    // suppressionHandled means a withdrawal transition was just applied to
+    // this order. Do NOT then sync the STALE ordinary status over it: that
+    // classifies as rejected-held and invites an operator to release a live
+    // withdrawal. Refunds still process — they are keyed on the WC refund id
+    // and are unaffected by the hold.
+    if (!suppressed.suppress && !suppressionHandled) {
       const statusResult = await syncWcOrderStatus(wcOrder)
       if (!statusResult.success) {
         const detail = `syncWcOrderStatus: ${statusResult.error ?? 'unknown error'}`

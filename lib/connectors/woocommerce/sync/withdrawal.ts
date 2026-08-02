@@ -519,6 +519,46 @@ function wcEventTimestamp(wcOrder: WcFullOrder): Date | null {
   return Number.isNaN(d.getTime()) ? null : d
 }
 
+/**
+ * The ONE safe way to import a WooCommerce order that may be unlinked.
+ *
+ * Every ingress path — the two webhook topics, the poll, the pending-FX retry
+ * queue and the initial import — has to do the same three things in the same
+ * order, and each one that open-codes them is a way to lose a withdrawal.
+ * The FX retry and the initial import each did exactly that: they imported a
+ * possibly-stale snapshot with no suppression check and no compensation, so an
+ * order withdrawn while it sat in the queue came back as a paid PROCESSING
+ * order with no marker, and stayed warehouse-eligible until the next
+ * reconciliation. That is not a millisecond window. (o3d-d82p, Codex r4)
+ *
+ * `suppressionHandled` tells the caller a withdrawal transition was just
+ * applied, so it can skip synchronising the STALE payload's ordinary status
+ * over the hold it just created — which would otherwise classify as
+ * rejected-held and invite an operator to release a live withdrawal.
+ */
+export async function importWcOrderGuarded<R extends { success: boolean }>(
+  wcOrder: WcFullOrder,
+  runImport: () => Promise<R>,
+): Promise<
+  | { outcome: 'skipped-withdrawal' }
+  | { outcome: 'unresolved' }
+  | { outcome: 'imported'; result: R; suppressionHandled: boolean }
+> {
+  const wasUnlinked = !(await isWcOrderLinked(String(wcOrder.id)))
+  try {
+    if (await shouldSkipUnlinkedWithdrawalImport(wcOrder)) return { outcome: 'skipped-withdrawal' }
+  } catch (e) {
+    if (e instanceof WithdrawalSuppressionUnresolved) return { outcome: 'unresolved' }
+    throw e
+  }
+
+  const result = await runImport()
+  const suppressionHandled = result.success && wasUnlinked
+    ? await reconcileSuppressionAfterImport(wcOrder)
+    : false
+  return { outcome: 'imported', result, suppressionHandled }
+}
+
 export async function isWcOrderLinked(externalOrderId: string): Promise<boolean> {
   const link = await db.shoppingOrderLink.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
@@ -527,19 +567,19 @@ export async function isWcOrderLinked(externalOrderId: string): Promise<boolean>
   return Boolean(link)
 }
 
-export async function reconcileSuppressionAfterImport(wcOrder: WcFullOrder): Promise<void> {
+export async function reconcileSuppressionAfterImport(wcOrder: WcFullOrder): Promise<boolean> {
   const externalOrderId = String(wcOrder.id)
   const suppressed = await db.wcWithdrawalSuppression.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     select: { wcStatus: true },
   })
-  if (!suppressed) return
+  if (!suppressed) return false
 
   const link = await db.shoppingOrderLink.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     select: { orderId: true },
   })
-  if (!link?.orderId) return
+  if (!link?.orderId) return false
 
   // Transition FIRST, log after. The order is fulfillable from the moment it
   // was created until its marker lands, and the WMS sweep selects on exactly
@@ -568,6 +608,7 @@ export async function reconcileSuppressionAfterImport(wcOrder: WcFullOrder): Pro
     metadata: { externalOrderId: wcOrder.id, suppressedStatus: suppressed.wcStatus },
     resolveUser: !result.success,
   })
+  return true
 }
 
 export async function shouldSkipUnlinkedWithdrawalImport(
