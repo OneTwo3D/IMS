@@ -3305,6 +3305,12 @@ model WcWithdrawalSuppression {
   /// fencing on it, and the by-ID sweep keeps re-verifying it, so a
   /// resubmission in that gap is still found. Hard-deleted after the grace.
   retiredAt       DateTime?
+  /// A retired row is proved-safe only for a short, explicit window, set by a
+  /// by-ID WooCommerce read taken as part of the WMS create-claim protocol.
+  /// The row is never auto-deleted: any external read followed by a local
+  /// delete is time-of-check-to-time-of-use, so the check has to sit next to
+  /// the push instead of ending monitoring permanently.
+  verifiedSafeUntil DateTime?
 
   @@id([connector, externalOrderId])
   @@map("wc_withdrawal_suppressions")

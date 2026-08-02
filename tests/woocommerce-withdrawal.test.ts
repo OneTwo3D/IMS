@@ -514,9 +514,9 @@ test('retiring a suppression goes through the claim, never a bare write', async 
   const retireOnly = src.slice(src.indexOf('async function retireSuppression'))
   const guarded = retireOnly.slice(0, retireOnly.indexOf('\n}\n'))
   assert.ok(guarded.includes('claimToken: claim.token'))
-  // No other site may remove a suppression row.
+  // Nothing may remove a suppression row at all.
   const deletes = [...src.matchAll(/wcWithdrawalSuppression\.delete/g)].length
-  assert.equal(deletes, 1, 'only the grace-elapsed purge may hard-delete')
+  assert.equal(deletes, 0, 'retired rows persist; the decision moves to the push boundary')
 })
 
 test('a failed compensation is reported separately from being handled', async () => {
@@ -715,42 +715,54 @@ test('a new withdrawal resets a pending clear', async () => {
   assert.ok(body.includes('clearPendingSince: null'))
 })
 
-test('retirement is a soft delete, and the fence outlives it', async () => {
-  // Deleting outright ended the fulfilment fence at the same instant as the
-  // decision to end it, so a resubmission landing between the final live read
-  // and the delete — with its webhook missed — left a warehouse-eligible order
-  // with neither marker nor row.
+test('a suppression row is never auto-deleted', async () => {
+  // Any external read followed by a local delete is time-of-check-to-time-of-
+  // use: the customer can resubmit between the two, and if that webhook is
+  // missed the fence is gone for good. Both a bulk purge and a per-row
+  // live-read-gated delete failed this way.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const deletes = [...src.matchAll(/wcWithdrawalSuppression\.delete/g)].length
+  assert.equal(deletes, 0, 'retired rows must persist; the decision moves to the push boundary')
+
   const fn = src.slice(src.indexOf('async function retireSuppression'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
-  assert.ok(body.includes('retiredAt: new Date()'), 'retirement must be a soft delete')
-  assert.ok(!body.includes('deleteMany'), 'it must not remove the row')
-
-  // Exactly one hard delete, and it sits behind a live read that just proved
-  // the order is not withdrawn. A bulk purge of grace-expired rows deleted
-  // rows it had never verified — including rows outside the sweep batch, which
-  // were therefore never re-checked at all.
-  const deletes = [...src.matchAll(/wcWithdrawalSuppression\.delete/g)].length
-  assert.equal(deletes, 1, 'one hard-delete site only')
-  const sweep = src.slice(src.indexOf('export async function sweepWithdrawalSuppressions'))
-  const body2 = sweep.slice(0, sweep.indexOf('\n}\n'))
-  assert.ok(body2.indexOf('readLiveWcOrder') < body2.indexOf('wcWithdrawalSuppression.deleteMany'),
-    'the fence may only be dropped behind a confirming live read')
-  assert.ok(body2.includes('retiredAt: row.retiredAt'), 'and only if it has not changed since')
+  assert.ok(body.includes('retiredAt: new Date()'), 'retirement is a soft mark')
 })
 
-test('a retired row still fences the WMS claim but does not block import', async () => {
+test('the push boundary re-verifies a retired fence, fail-closed', async () => {
+  // The IMS markers describe what IMS has been TOLD. A withdrawal the
+  // storefront knows about but no webhook delivered is exactly the case that
+  // ships goods a customer asked to withdraw.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function verifyWithdrawalFenceForPush'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('if (!row) return true'), 'no history, nothing to check')
+  assert.ok(body.includes('if (!row.retiredAt) return false'), 'a live row refuses outright')
+  assert.ok(body.includes('if (!live) return false'), 'unreadable must refuse, not guess')
+  assert.ok(body.includes('recordWithdrawalSuppressionIfWithdrawn'), 'withdrawn again revives the fence')
+  assert.ok(body.includes('verifiedSafeUntil'), 'a pass vouches only for a short window')
+})
+
+test('the WMS create path checks the fence before claiming, and again under the lock', async () => {
   const { readFileSync } = await import('node:fs')
   const wms = readFileSync('lib/domain/wms/order-push-sweep.ts', 'utf8')
-  const fn = wms.slice(wms.indexOf('async claimForCreate('))
-  const body = fn.slice(0, fn.indexOf('\n    },'))
-  // The fence must NOT filter on retiredAt — a retired row inside its grace
-  // is exactly what keeps the order unpushable.
-  const fence = body.slice(body.indexOf('wcWithdrawalSuppression'))
-  assert.ok(!fence.slice(0, 400).includes('retiredAt'), 'the fence covers retired rows too')
+  // Before the claim: the by-ID WooCommerce read cannot happen inside the claim
+  // transaction, which holds a row lock.
+  assert.ok(wms.includes('port.verifyWithdrawalFence'), 'via the port, so it is substitutable in tests')
+  assert.ok(wms.indexOf('port.verifyWithdrawalFence') < wms.indexOf('claimForCreate(order.id'))
+  assert.ok(/fenceOk = false[\s\S]{0,200}if \(!fenceOk\) continue/.test(wms), 'a failed check must fail closed')
 
-  // Import, by contrast, must not be blocked by the row it was retired to allow.
+  // And under the lock: the window the read vouched for is re-checked there.
+  const claim = wms.slice(wms.indexOf('async claimForCreate('))
+  const body = claim.slice(0, claim.indexOf('\n    },'))
+  assert.ok(body.includes('!suppressed.retiredAt) return false'))
+  assert.ok(body.includes('verifiedSafeUntil'))
+})
+
+test('a retired row does not block the import it was retired to allow', async () => {
+  const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   assert.ok(src.includes('if (!suppressed || suppressed.retiredAt) return { suppress: false }'))
 })

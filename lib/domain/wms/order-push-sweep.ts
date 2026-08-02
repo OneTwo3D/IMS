@@ -382,6 +382,10 @@ export interface WmsOrderPushPort {
    *  not yet in hand at that point). Optional so existing test ports keep
    *  compiling; when absent, the compensation simply does not run. */
   readWithdrawalState?(orderId: string): Promise<{ withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null } | null>
+  /** o3d-d82p: the storefront-side withdrawal fence, checked immediately
+   *  before the claim. Optional so existing test ports keep compiling; when
+   *  absent the fence simply does not apply. */
+  verifyWithdrawalFence?(orderId: string): Promise<boolean>
   updateLinkByOrder?(orderId: string, data: LinkWrite): Promise<void>
   updateLink(id: string, data: LinkWrite): Promise<void>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
@@ -488,6 +492,22 @@ export async function runWmsOrderPushSweepCore(
       // deleted or another worker owns it — skip WITHOUT touching the WMS. A claim
       // error is not the order's fault either, so it is logged and retried next sweep
       // rather than counted against the order's push attempts.
+      // o3d-d82p: the withdrawal fence, checked immediately before the claim.
+      //
+      // A by-ID WooCommerce read cannot happen inside the claim transaction —
+      // that would hold a row lock across an HTTP call — so it happens here and
+      // vouches for the order for a short window that claimForCreate then
+      // re-checks under the lock. Fails closed: an unreadable storefront, or a
+      // withdrawal it knows about that no webhook delivered, skips the order.
+      let fenceOk = true
+      try {
+        fenceOk = (await port.verifyWithdrawalFence?.(order.id)) ?? true
+      } catch (e) {
+        console.error(`[wms-order-push] withdrawal fence check failed for ${order.id}: ${scrubWmsError(e, 'fence check failed')}`)
+        fenceOk = false
+      }
+      if (!fenceOk) continue
+
       let claimed = false
       try {
         claimed = await port.claimForCreate(order.id, connectorId, ts)
@@ -1046,9 +1066,15 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
             where: {
               connector_externalOrderId: { connector: 'woocommerce', externalOrderId: link.externalOrderId },
             },
-            select: { externalOrderId: true },
+            select: { retiredAt: true, verifiedSafeUntil: true },
           })
-          if (suppressed) return false
+          if (suppressed) {
+            // A live row refuses outright. A RETIRED one is allowed only inside
+            // the short window a by-ID WooCommerce read just vouched for —
+            // verifyWithdrawalFenceForPush sets it immediately before this.
+            if (!suppressed.retiredAt) return false
+            if (!suppressed.verifiedSafeUntil || suppressed.verifiedSafeUntil <= new Date()) return false
+          }
         }
 
         const existing = await tx.wmsOrderPushLink.findUnique({
@@ -1149,6 +1175,10 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         select: { id: true, orderId: true, externalOrderId: true },
         take: limit,
       }),
+    async verifyWithdrawalFence(orderId) {
+      const { verifyWithdrawalFenceForPush } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+      return verifyWithdrawalFenceForPush(orderId)
+    },
     async readWithdrawalState(orderId) {
       return db.salesOrder.findUnique({
         where: { id: orderId },

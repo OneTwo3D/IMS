@@ -639,6 +639,14 @@ const SUPPRESSION_QUIESCENCE_MS = 30 * 60_000
  */
 const SUPPRESSION_RETIRE_GRACE_MS = 30 * 60_000
 
+/**
+ * How long a by-ID WooCommerce read may vouch for a retired suppression.
+ *
+ * Short on purpose: it is the window between proving the order is not
+ * withdrawn and actually pushing it to the warehouse.
+ */
+const SUPPRESSION_SAFE_WINDOW_MS = 2 * 60_000
+
 type SuppressionClaim = { token: string; wcStatus: string; revision: number }
 
 /**
@@ -714,22 +722,12 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
       const revived = await recordWithdrawalSuppressionIfWithdrawn(live)
       if (revived) { result.stillWithdrawn++; continue }
 
-      // Not withdrawn. The fence may now be dropped — but ONLY here, behind
-      // the live read that just proved it, and one row at a time.
-      //
-      // A bulk purge of grace-expired rows was worse than the race it tidied
-      // up (Codex r17): it deleted rows it had never verified, including rows
-      // outside this batch that were therefore never re-checked at all, so a
-      // resubmission whose webhook was missed simply lost its fence.
-      if (Date.now() - row.retiredAt.getTime() >= SUPPRESSION_RETIRE_GRACE_MS) {
-        await db.wcWithdrawalSuppression.deleteMany({
-          where: {
-            connector: 'woocommerce',
-            externalOrderId: row.externalOrderId,
-            retiredAt: row.retiredAt, // unchanged since we read it
-          },
-        })
-      }
+      // Not withdrawn — and the row is NOT deleted. Any external read followed
+      // by a local delete is time-of-check-to-time-of-use: the customer can
+      // resubmit between the two, and if that webhook is missed the fence is
+      // gone for good (Codex r18). So retired rows persist, and the decision
+      // that actually matters — may this order be pushed? — is taken next to
+      // the push instead, by verifyWithdrawalFenceForPush.
       continue
     }
 
@@ -745,6 +743,55 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
     }
   }
   return result
+}
+
+/**
+ * May this order be pushed to the warehouse, as far as WooCommerce withdrawals
+ * are concerned? Called by the WMS create sweep BEFORE it claims the order.
+ *
+ * Fails CLOSED. This is the fulfilment boundary: the IMS markers describe what
+ * IMS has been told, and a withdrawal the storefront knows about but no webhook
+ * delivered is exactly the case that ships goods a customer asked to withdraw.
+ *
+ * - no suppression row at all -> nothing to check
+ * - a LIVE (unretired) row -> refuse outright
+ * - a RETIRED row -> refuse unless a by-ID read within the last
+ *   SUPPRESSION_SAFE_WINDOW_MS proved the storefront is not withdrawn. The read
+ *   happens here, moments before the push, rather than being cached in a
+ *   deleted row minutes or hours earlier.
+ */
+export async function verifyWithdrawalFenceForPush(salesOrderId: string): Promise<boolean> {
+  const link = await db.shoppingOrderLink.findFirst({
+    where: { orderId: salesOrderId, connector: 'woocommerce' },
+    select: { externalOrderId: true },
+  })
+  if (!link) return true // not a WooCommerce order
+  const externalOrderId = link.externalOrderId
+
+  const row = await db.wcWithdrawalSuppression.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { retiredAt: true, verifiedSafeUntil: true },
+  })
+  if (!row) return true
+  if (!row.retiredAt) return false
+  if (row.verifiedSafeUntil && row.verifiedSafeUntil > new Date()) return true
+
+  const live = await readLiveWcOrder(externalOrderId)
+  if (!live) return false // unreadable: refuse rather than guess
+
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const status = normaliseStatus(live.status)
+  if (status === submitted || status === approved) {
+    // Withdrawn again, and no webhook told us. Revive the fence.
+    await recordWithdrawalSuppressionIfWithdrawn(live)
+    return false
+  }
+
+  await db.wcWithdrawalSuppression.updateMany({
+    where: { connector: 'woocommerce', externalOrderId, retiredAt: row.retiredAt },
+    data: { verifiedSafeUntil: new Date(Date.now() + SUPPRESSION_SAFE_WINDOW_MS) },
+  })
+  return true
 }
 
 /** The live order, or null when it cannot be read. */
@@ -877,7 +924,7 @@ export async function recordWithdrawalSuppressionIfWithdrawn(
     update: {
       wcStatus: status, revision: { increment: 1 }, lastCheckedAt: new Date(),
       // Revive a retired row: a new withdrawal is live again.
-      clearPendingSince: null, retiredAt: null,
+      clearPendingSince: null, retiredAt: null, verifiedSafeUntil: null,
     },
   })
   return true
