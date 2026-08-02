@@ -727,11 +727,17 @@ test('retirement is a soft delete, and the fence outlives it', async () => {
   assert.ok(body.includes('retiredAt: new Date()'), 'retirement must be a soft delete')
   assert.ok(!body.includes('deleteMany'), 'it must not remove the row')
 
-  // The only hard delete is the grace-elapsed purge.
+  // Exactly one hard delete, and it sits behind a live read that just proved
+  // the order is not withdrawn. A bulk purge of grace-expired rows deleted
+  // rows it had never verified — including rows outside the sweep batch, which
+  // were therefore never re-checked at all.
   const deletes = [...src.matchAll(/wcWithdrawalSuppression\.delete/g)].length
-  assert.equal(deletes, 1, 'purgeRetiredSuppressions must be the only hard delete')
-  const purge = src.slice(src.indexOf('async function purgeRetiredSuppressions'))
-  assert.ok(purge.slice(0, 400).includes('SUPPRESSION_RETIRE_GRACE_MS'))
+  assert.equal(deletes, 1, 'one hard-delete site only')
+  const sweep = src.slice(src.indexOf('export async function sweepWithdrawalSuppressions'))
+  const body2 = sweep.slice(0, sweep.indexOf('\n}\n'))
+  assert.ok(body2.indexOf('readLiveWcOrder') < body2.indexOf('wcWithdrawalSuppression.deleteMany'),
+    'the fence may only be dropped behind a confirming live read')
+  assert.ok(body2.includes('retiredAt: row.retiredAt'), 'and only if it has not changed since')
 })
 
 test('a retired row still fences the WMS claim but does not block import', async () => {

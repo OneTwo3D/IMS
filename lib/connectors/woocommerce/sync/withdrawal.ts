@@ -686,7 +686,6 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
     select: { externalOrderId: true, retiredAt: true },
   })
 
-  await purgeRetiredSuppressions()
   const result = { scanned: rows.length, imported: 0, stillWithdrawn: 0, unresolved: 0 }
   const { importWcOrder } = await import('./order-import')
   for (const row of rows) {
@@ -707,13 +706,30 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
       continue
     }
 
-    // A RETIRED row is in its fence grace: it exists only so a resubmission
-    // that landed around the retirement decision is still caught. Re-verify
-    // and revive it if the storefront now says withdrawn; otherwise leave it
-    // to be purged. It must not be re-imported every pass.
+    // A RETIRED row is inside its fence grace: it exists only so a
+    // resubmission that landed around the retirement decision is still caught.
+    // Re-verify against the live status we just read, and revive it if the
+    // storefront now says withdrawn. It must not be re-imported every pass.
     if (row.retiredAt) {
       const revived = await recordWithdrawalSuppressionIfWithdrawn(live)
-      if (revived) result.stillWithdrawn++
+      if (revived) { result.stillWithdrawn++; continue }
+
+      // Not withdrawn. The fence may now be dropped — but ONLY here, behind
+      // the live read that just proved it, and one row at a time.
+      //
+      // A bulk purge of grace-expired rows was worse than the race it tidied
+      // up (Codex r17): it deleted rows it had never verified, including rows
+      // outside this batch that were therefore never re-checked at all, so a
+      // resubmission whose webhook was missed simply lost its fence.
+      if (Date.now() - row.retiredAt.getTime() >= SUPPRESSION_RETIRE_GRACE_MS) {
+        await db.wcWithdrawalSuppression.deleteMany({
+          where: {
+            connector: 'woocommerce',
+            externalOrderId: row.externalOrderId,
+            retiredAt: row.retiredAt, // unchanged since we read it
+          },
+        })
+      }
       continue
     }
 
@@ -838,13 +854,6 @@ async function retireSuppression(externalOrderId: string, claim: SuppressionClai
   if (retired.count === 0) await releaseSuppression(externalOrderId, claim.token)
 }
 
-/** Hard-delete rows whose fence grace has elapsed. Housekeeping only. */
-async function purgeRetiredSuppressions(): Promise<number> {
-  const { count } = await db.wcWithdrawalSuppression.deleteMany({
-    where: { connector: 'woocommerce', retiredAt: { lt: new Date(Date.now() - SUPPRESSION_RETIRE_GRACE_MS) } },
-  })
-  return count
-}
 
 export async function recordWithdrawalSuppressionIfWithdrawn(
   wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
