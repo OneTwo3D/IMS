@@ -3576,16 +3576,21 @@ export async function releaseWithdrawalHold(id: string, note?: string) {
 
   const so = await db.salesOrder.findUnique({
     where: { id },
-    select: { id: true, orderNumber: true, status: true, withdrawalHoldAt: true },
+    select: {
+      id: true, orderNumber: true, status: true,
+      withdrawalHoldAt: true, withdrawalHoldGeneration: true,
+    },
   })
   if (!so) return { success: false, error: 'Order not found' }
   if (!so.withdrawalHoldAt) return { success: false, error: 'This order is not under a withdrawal hold' }
 
-  // Conditional on the value we observed: a concurrent withdrawal delivery
-  // could have replaced the hold between the read and this write, and clearing
-  // THAT one would release an order whose customer has just asked to stop it.
+  // Conditional on the GENERATION observed, not the timestamp (o3d-6x66).
+  // A repair or redelivery run deliberately retains the original
+  // `withdrawalHoldAt`, so comparing that cannot tell a new customer request
+  // from the same hold — and a stale release would clear a hold the customer
+  // has only just asked for. The generation advances per new submission.
   const cleared = await db.salesOrder.updateMany({
-    where: { id, withdrawalHoldAt: so.withdrawalHoldAt },
+    where: { id, withdrawalHoldGeneration: so.withdrawalHoldGeneration, withdrawalHoldAt: { not: null } },
     data: { withdrawalHoldAt: null },
   })
   if (cleared.count === 0) {

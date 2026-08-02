@@ -378,6 +378,11 @@ export interface WmsOrderPushPort {
   /** SYNCED links whose order is CANCELLED in IMS. */
   cancellableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
   upsertByOrder(orderId: string, create: LinkWrite & { connector: string }, update: LinkWrite): Promise<void>
+  /** o3d-6x66: post-create withdrawal re-check, keyed by ORDER (the link id is
+   *  not yet in hand at that point). Optional so existing test ports keep
+   *  compiling; when absent, the compensation simply does not run. */
+  readWithdrawalState?(orderId: string): Promise<{ withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null } | null>
+  updateLinkByOrder?(orderId: string, data: LinkWrite): Promise<void>
   updateLink(id: string, data: LinkWrite): Promise<void>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
   recordEvent(event: WmsMutationEventInput): Promise<void>
@@ -528,6 +533,40 @@ export async function runWmsOrderPushSweepCore(
           { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
         result.created += 1
+
+        // o3d-6x66: the claim's withdrawal re-check committed BEFORE this
+        // remote push, so a withdrawal landing in between still gets its order
+        // created in the warehouse. Usually the hold pass then pulls it back,
+        // but an ambiguous remote result, a verification delay or a
+        // link-persistence failure can leave a live warehouse order outside
+        // holdableLinks entirely. Re-read now that we know the external id, and
+        // stop it here rather than hoping a later pass notices.
+        const raced = await port.readWithdrawalState?.(order.id)
+        if (raced && (raced.withdrawalHoldAt || raced.withdrawalApprovedAt)) {
+          let pulled = false
+          try {
+            const cancel = await connector.cancelOrder?.(push.externalOrderId)
+            pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND'))
+          } catch (e) {
+            console.error(`[wms-order-push] could not pull back raced create for ${order.id}: ${scrubWmsError(e, 'cancel failed')}`)
+          }
+          await port.updateLinkByOrder?.(order.id, pulled
+            ? { state: 'HELD', cancelledAt: ts, lastError: null, reconcileCheckedAt: null }
+            : { lastError: 'Created in the WMS just as a withdrawal request landed, and could not be pulled back — cancel it in the WMS by hand' })
+          result.held += pulled ? 1 : 0
+          await audit({
+            action: 'order_hold', outcome: pulled ? 'SUCCEEDED' : 'FAILED',
+            entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
+            summary: pulled
+              ? 'Order was created in the WMS just as a withdrawal request landed; pulled straight back and parked HELD'
+              : 'Order was created in the WMS just as a withdrawal request landed and could NOT be pulled back — cancel it in the WMS by hand',
+            before: beforeCreate,
+            after: { state: pulled ? 'HELD' : createdState, externalOrderId: push.externalOrderId },
+            error: pulled ? undefined : 'raced withdrawal, remote cancel failed',
+          })
+          continue
+        }
+
         await audit({
           action: 'order_create', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
           summary: `Order ${order.orderNumber ?? order.id} created in WMS as ${push.externalOrderNumber ?? push.externalOrderId}`
@@ -982,6 +1021,15 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         select: { id: true, orderId: true, externalOrderId: true },
         take: limit,
       }),
+    async readWithdrawalState(orderId) {
+      return db.salesOrder.findUnique({
+        where: { id: orderId },
+        select: { withdrawalHoldAt: true, withdrawalApprovedAt: true },
+      })
+    },
+    async updateLinkByOrder(orderId, data) {
+      await db.wmsOrderPushLink.updateMany({ where: { orderId }, data })
+    },
     async upsertByOrder(orderId, create, update) {
       await db.wmsOrderPushLink.upsert({ where: { orderId }, create: { orderId, ...create }, update })
     },

@@ -245,7 +245,15 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
     // timestamp forward, or the operator loses how long the order has been
     // stuck.
     if (!current.withdrawalHoldAt) {
-      await tx.salesOrder.update({ where: { id: orderId }, data: { withdrawalHoldAt: new Date() } })
+      // heldSince is stamped once and never moved (an operator needs to see
+      // how long the order has REALLY been held), so it cannot tell "the same
+      // hold, repaired" from "a newer customer request". The generation can:
+      // it advances only for a newly handled submission, and the operator
+      // release compares it. (o3d-6x66)
+      await tx.salesOrder.update({
+        where: { id: orderId },
+        data: { withdrawalHoldAt: new Date(), withdrawalHoldGeneration: { increment: 1 } },
+      })
     }
     return { skip: null, status: current.status, marker: current.withdrawalHoldAt }
   })
@@ -417,13 +425,37 @@ export async function shouldSkipUnlinkedWithdrawalImport(
 ): Promise<boolean> {
   const { submitted, approved } = await getWithdrawalStatuses()
   const status = normaliseStatus(wcOrder.status)
-  if (status !== submitted && status !== approved) return false
+  const externalOrderId = String(wcOrder.id)
 
   const existing = await db.shoppingOrderLink.findUnique({
-    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } },
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     select: { id: true },
   })
   if (existing) return false
+
+  const isWithdrawal = status === submitted || status === approved
+
+  if (!isWithdrawal) {
+    // o3d-d82p: the payload in front of us is an ORDINARY status — but the
+    // inbox does not guarantee per-order ordering, so this can be a STALE
+    // `order.created` arriving after we already refused a withdrawal for the
+    // same order. Without the tombstone it would sail straight past this
+    // guard and import the order as PROCESSING, allocating stock.
+    const suppressed = await db.wcWithdrawalSuppression.findUnique({
+      where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+      select: { wcStatus: true },
+    })
+    if (!suppressed) return false
+    return resolveSuppression(wcOrder, externalOrderId, suppressed.wcStatus)
+  }
+
+  // Remember the refusal durably, so a stale ordinary payload arriving later
+  // cannot import the order behind our back.
+  await db.wcWithdrawalSuppression.upsert({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    create: { connector: 'woocommerce', externalOrderId, wcStatus: status },
+    update: { wcStatus: status, lastCheckedAt: new Date() },
+  })
 
   await logActivity({
     entityType: 'SYNC',
@@ -438,4 +470,63 @@ export async function shouldSkipUnlinkedWithdrawalImport(
     resolveUser: false,
   })
   return true
+}
+
+/**
+ * A suppressed order has turned up again carrying an ordinary status. Decide
+ * from the LIVE storefront state, not from this possibly-stale payload.
+ *
+ * One extra API call, and only ever for an order we already refused — never on
+ * the ordinary new-order path.
+ *
+ * Fails CLOSED: if the live status cannot be read we keep suppressing, because
+ * importing would allocate stock for goods the customer may still have
+ * withdrawn.
+ */
+async function resolveSuppression(
+  wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
+  externalOrderId: string,
+  suppressedStatus: string,
+): Promise<boolean> {
+  const { submitted, approved } = await getWithdrawalStatuses()
+  let live: string | null = null
+  try {
+    const { wcFetch } = await import('../api')
+    const { data, error } = await wcFetch(`/orders/${externalOrderId}`)
+    if (!error && data && typeof data === 'object' && 'status' in data) {
+      live = normaliseStatus((data as { status?: unknown }).status)
+    }
+  } catch {
+    live = null
+  }
+
+  if (!live) {
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_withdrawal_suppression_unresolved', tag: 'sync', level: 'WARNING',
+      description:
+        `WooCommerce order #${wcOrder.number} arrived with status "${wcOrder.status}" but was previously `
+        + `refused as a withdrawal ("${suppressedStatus}"). The live status could not be read, so the import `
+        + 'is still refused — importing could allocate stock for a withdrawn order.',
+      metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status, suppressedStatus },
+      resolveUser: false,
+    })
+    return true
+  }
+
+  if (live === submitted || live === approved) return true // still withdrawn
+
+  // The request was rejected: the storefront has genuinely moved on. Let it
+  // import, and forget the refusal.
+  await db.wcWithdrawalSuppression.delete({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+  }).catch(() => {})
+  await logActivity({
+    entityType: 'SYNC', action: 'wc_withdrawal_suppression_cleared', tag: 'sync', level: 'INFO',
+    description:
+      `WooCommerce order #${wcOrder.number} was previously refused as a withdrawal ("${suppressedStatus}"), `
+      + `but its live status is now "${live}" — the request was rejected. Importing normally.`,
+    metadata: { externalOrderId: wcOrder.id, liveStatus: live, suppressedStatus },
+    resolveUser: false,
+  })
+  return false
 }

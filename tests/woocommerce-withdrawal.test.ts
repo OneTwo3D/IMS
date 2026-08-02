@@ -232,3 +232,29 @@ test('a cancelled order has nowhere left to go', () => {
   assert.deepEqual([...SALES_ORDER_TRANSITIONS.CANCELLED], [])
   assert.deepEqual([...SALES_ORDER_TRANSITIONS.DELIVERED], [])
 })
+
+// --- o3d-6x66: the release compare-and-set needs a GENERATION ---------------
+// `withdrawalHoldAt` is stamped once and deliberately never moved, so an
+// operator can see how long an order has really been held. That means it
+// cannot distinguish "the same hold, repaired" from "a NEWER customer
+// request" — and a stale release would clear the newer one.
+
+test('the hold timestamp alone cannot detect a new submission', () => {
+  // Two submissions, same retained timestamp: indistinguishable.
+  const heldSince = new Date('2026-08-02T10:00:00Z')
+  const before = { withdrawalHoldAt: heldSince, withdrawalHoldGeneration: 4 }
+  const afterNewSubmission = { withdrawalHoldAt: heldSince, withdrawalHoldGeneration: 5 }
+  assert.equal(
+    before.withdrawalHoldAt.getTime(),
+    afterNewSubmission.withdrawalHoldAt.getTime(),
+    'the timestamp is retained on purpose, so it cannot be the CAS key',
+  )
+  assert.notEqual(before.withdrawalHoldGeneration, afterNewSubmission.withdrawalHoldGeneration)
+})
+
+test('a release CAS on the generation refuses a stale clear', () => {
+  // Models the updateMany predicate: { id, withdrawalHoldGeneration: observed }.
+  const matches = (observed: number, current: number) => observed === current
+  assert.equal(matches(4, 4), true, 'nothing changed — release proceeds')
+  assert.equal(matches(4, 5), false, 'a newer submission landed — release refused')
+})

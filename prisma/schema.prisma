@@ -1566,6 +1566,13 @@ model SalesOrder {
   /// order back to PROCESSING, making its WMS link releasable and re-sending withdrawn
   /// goods to the warehouse.
   withdrawalApprovedAt DateTime?
+  /// o3d-6x66: monotonic counter, bumped once per NEWLY handled withdrawal
+  /// submission. `withdrawalHoldAt` deliberately does NOT move on a repair or
+  /// redelivery run — an operator needs to see how long an order has really
+  /// been held — so it cannot distinguish "the same hold" from "a new customer
+  /// request". Releasing compares this instead, so a stale release cannot clear
+  /// a hold that now represents a newer request.
+  withdrawalHoldGeneration Int @default(0)
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 
@@ -3239,4 +3246,26 @@ model ShipmentLine {
 
   @@index([costLayerSnapshot(ops: JsonbOps)], type: Gin, map: "shipment_lines_costLayerSnapshot_gin_idx")
   @@map("shipment_lines")
+}
+
+/// o3d-d82p: an unlinked WooCommerce order seen in a withdrawal status.
+///
+/// The import guard refuses to CREATE such an order — doing so would allocate
+/// stock for goods the customer has asked to withdraw. But the webhook inbox
+/// does not guarantee per-order ordering, so a STALE `order.created` carrying
+/// `processing` can arrive afterwards and sail past a guard that only inspects
+/// the payload in front of it. This row is the durable memory of the refusal.
+///
+/// Cleared only once the live storefront status proves the request was
+/// rejected, at which point the order imports normally.
+model WcWithdrawalSuppression {
+  connector       String
+  externalOrderId String
+  /// The withdrawal status observed when the import was refused.
+  wcStatus        String
+  createdAt       DateTime @default(now())
+  lastCheckedAt   DateTime?
+
+  @@id([connector, externalOrderId])
+  @@map("wc_withdrawal_suppressions")
 }
