@@ -3277,6 +3277,11 @@ model WcWithdrawalSuppression {
   wcStatus        String
   createdAt       DateTime @default(now())
   lastCheckedAt   DateTime?
+  /// Bumped on every re-record. The resolver reads the live storefront status
+  /// and then deletes this row; without a revision, a NEWER withdrawal landing
+  /// in that gap is deleted by the stale worker and the order imports unmarked.
+  /// The delete is conditional on the revision observed before the live fetch.
+  revision        Int      @default(0)
 
   @@id([connector, externalOrderId])
   @@map("wc_withdrawal_suppressions")

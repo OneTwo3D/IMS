@@ -973,9 +973,21 @@ export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ at
       queuedOrder,
       () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id }),
     )
-    if (guarded.outcome !== 'imported') {
-      // Leave the queue row alone: skipped-withdrawal and unresolved both mean
-      // "not now", and the next run re-evaluates against live state.
+    if (guarded.outcome === 'skipped-withdrawal') {
+      // TERMINAL, not pending. This queue selects the oldest fixed prefix, so a
+      // row whose order is withdrawn would sit at the head forever and, once
+      // `limit` of them accumulate, every FX refresh would retry only those and
+      // never reach newer orders whose rates are now available — stranding
+      // unrelated paid orders unimported.
+      await markPendingFxRetryLogFailed(
+        row.id,
+        'The customer withdrew this order while it waited for an FX rate, so it was not imported',
+      )
+      result.failed++
+      continue
+    }
+    if (guarded.outcome === 'unresolved') {
+      // Genuinely transient (WooCommerce unreachable): stays pending.
       result.stillPending++
       continue
     }
@@ -1096,6 +1108,11 @@ export async function syncNewWcOrders(
         continue
       }
       const importResult = guarded.result
+      if (guarded.compensationFailed) {
+        result.errors.push(
+          `WooCommerce order #${order.number}: imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
+        )
+      }
       if (guarded.suppressionHandled) {
         // A withdrawal transition was just applied; do not sync this stale
         // ordinary status over it — that classifies as rejected-held and

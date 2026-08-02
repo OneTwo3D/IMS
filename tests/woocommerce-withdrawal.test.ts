@@ -271,9 +271,11 @@ test('an unresolved suppression is not a skip', async () => {
   // backstop never sees the withdrawal it exists to catch.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
-  const start = src.indexOf("if (guarded.outcome === 'unresolved') {")
+  // The POLL loop's handler (the FX queue has its own, which legitimately
+  // leaves the row pending rather than recording a run error).
+  const start = src.lastIndexOf("if (guarded.outcome === 'unresolved') {")
   assert.ok(start > 0, 'the poll must handle an unresolved suppression explicitly')
-  const block = src.slice(start, src.indexOf('}', src.indexOf('continue', start)))
+  const block = src.slice(start, src.indexOf('continue', start))
   assert.ok(block.includes('result.errors.push'), 'unresolved must record an error, not a skip')
   assert.ok(!block.includes('result.skipped++'), 'unresolved must not count as a skip')
 })
@@ -354,4 +356,50 @@ test('a raced APPROVED suppression cancels rather than holds', async () => {
   assert.ok(body.includes('applyWithdrawalApproval'), 'must route the approved slug to approval')
   assert.ok(body.indexOf('applyWithdrawalApproval') < body.indexOf('logActivity'),
     'the transition must land before the awaited logging, which widens the fulfillable window')
+})
+
+test('a withdrawal arriving during initial import is still recorded', async () => {
+  // Initial import ACKs and DROPS order webhooks. An order that moves to a
+  // withdrawal status after its page was fetched therefore has nothing else to
+  // catch it, and initial-import completion sets the poll cursor past the
+  // change. The tombstone must be written even though nothing is imported yet.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/webhooks.ts', 'utf8')
+  const gate = src.slice(
+    src.indexOf("initialImportDone?.value !== 'true'"),
+    src.indexOf("skipped: 'initial_import_pending'"),
+  )
+  assert.ok(gate.includes('recordWithdrawalSuppressionIfWithdrawn'),
+    'the gate must record a withdrawal before dropping the event')
+})
+
+test('clearing a suppression is conditional on the observed revision', async () => {
+  // A newer withdrawal can land between the live status read and the delete;
+  // deleting it there lets the stale worker import a just-withdrawn order.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async function resolveSuppression'))
+  assert.ok(fn.includes('revision: observedRevision'), 'the delete must CAS on the revision')
+  assert.ok(!/\.delete\(\{\s*where: \{ connector_externalOrderId/.test(fn),
+    'no unconditional delete may remain')
+})
+
+test('a failed compensation is reported separately from being handled', async () => {
+  // "Do not sync the stale status over what we applied" and "the transition
+  // landed" are different facts. Conflating them acknowledges a delivery whose
+  // withdrawal never applied, leaving a live withdrawn order.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  assert.ok(src.includes('compensationFailed'))
+  assert.ok(src.includes('{ handled: true, failed: !result.success }'))
+})
+
+test('a withdrawn FX-queue row is terminal, not left pending', async () => {
+  // The queue selects the oldest fixed prefix; permanently-deferred rows at the
+  // head starve every newer order whose FX rate has since arrived.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
+  const block = src.slice(src.indexOf("if (guarded.outcome === 'skipped-withdrawal')"))
+  assert.ok(block.slice(0, 900).includes('markPendingFxRetryLogFailed'),
+    'a withdrawn row must be terminalized so it cannot monopolize the batch')
 })

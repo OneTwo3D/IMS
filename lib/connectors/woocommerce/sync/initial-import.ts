@@ -180,6 +180,11 @@ async function runInitialImport(progress: InitialImportProgress) {
           continue
         }
         const importResult = guarded.result
+        if (guarded.compensationFailed) {
+          progress.errors.push(
+            `WooCommerce order #${order.number}: imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
+          )
+        }
         if (importResult.success && importResult.orderId) {
           progress.activeOrdersImported++
         } else if (importResult.success) {

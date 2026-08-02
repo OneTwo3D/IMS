@@ -542,7 +542,7 @@ export async function importWcOrderGuarded<R extends { success: boolean }>(
 ): Promise<
   | { outcome: 'skipped-withdrawal' }
   | { outcome: 'unresolved' }
-  | { outcome: 'imported'; result: R; suppressionHandled: boolean }
+  | { outcome: 'imported'; result: R; suppressionHandled: boolean; compensationFailed: boolean }
 > {
   const wasUnlinked = !(await isWcOrderLinked(String(wcOrder.id)))
   try {
@@ -553,10 +553,42 @@ export async function importWcOrderGuarded<R extends { success: boolean }>(
   }
 
   const result = await runImport()
-  const suppressionHandled = result.success && wasUnlinked
+  const compensation = result.success && wasUnlinked
     ? await reconcileSuppressionAfterImport(wcOrder)
-    : false
-  return { outcome: 'imported', result, suppressionHandled }
+    : { handled: false, failed: false }
+  // Two separate facts. `suppressionHandled` says "do not sync the stale
+  // ordinary status over what we just applied" and holds even on failure.
+  // `compensationFailed` says the withdrawal transition did NOT land, so the
+  // caller must make the delivery retryable — acknowledging it would leave the
+  // IMS lifecycle wrong until an independent reconciliation.
+  return {
+    outcome: 'imported',
+    result,
+    suppressionHandled: compensation.handled,
+    compensationFailed: compensation.failed,
+  }
+}
+
+/**
+ * Record the withdrawal tombstone for an order we are NOT importing.
+ *
+ * Split out so the initial-import gate can call it while it is dropping the
+ * order webhook itself: the tombstone is what the initial-import loop consults,
+ * so it has to exist even though nothing is being imported yet.
+ */
+export async function recordWithdrawalSuppressionIfWithdrawn(
+  wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
+): Promise<boolean> {
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const status = normaliseStatus(wcOrder.status)
+  if (status !== submitted && status !== approved) return false
+  const externalOrderId = String(wcOrder.id)
+  await db.wcWithdrawalSuppression.upsert({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    create: { connector: 'woocommerce', externalOrderId, wcStatus: status },
+    update: { wcStatus: status, revision: { increment: 1 }, lastCheckedAt: new Date() },
+  })
+  return true
 }
 
 export async function isWcOrderLinked(externalOrderId: string): Promise<boolean> {
@@ -567,19 +599,21 @@ export async function isWcOrderLinked(externalOrderId: string): Promise<boolean>
   return Boolean(link)
 }
 
-export async function reconcileSuppressionAfterImport(wcOrder: WcFullOrder): Promise<boolean> {
+export async function reconcileSuppressionAfterImport(
+  wcOrder: WcFullOrder,
+): Promise<{ handled: boolean; failed: boolean }> {
   const externalOrderId = String(wcOrder.id)
   const suppressed = await db.wcWithdrawalSuppression.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     select: { wcStatus: true },
   })
-  if (!suppressed) return false
+  if (!suppressed) return { handled: false, failed: false }
 
   const link = await db.shoppingOrderLink.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     select: { orderId: true },
   })
-  if (!link?.orderId) return false
+  if (!link?.orderId) return { handled: false, failed: false }
 
   // Transition FIRST, log after. The order is fulfillable from the moment it
   // was created until its marker lands, and the WMS sweep selects on exactly
@@ -608,7 +642,7 @@ export async function reconcileSuppressionAfterImport(wcOrder: WcFullOrder): Pro
     metadata: { externalOrderId: wcOrder.id, suppressedStatus: suppressed.wcStatus },
     resolveUser: !result.success,
   })
-  return true
+  return { handled: true, failed: !result.success }
 }
 
 export async function shouldSkipUnlinkedWithdrawalImport(
@@ -634,19 +668,15 @@ export async function shouldSkipUnlinkedWithdrawalImport(
     // guard and import the order as PROCESSING, allocating stock.
     const suppressed = await db.wcWithdrawalSuppression.findUnique({
       where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-      select: { wcStatus: true },
+      select: { wcStatus: true, revision: true },
     })
     if (!suppressed) return false
-    return resolveSuppression(wcOrder, externalOrderId, suppressed.wcStatus)
+    return resolveSuppression(wcOrder, externalOrderId, suppressed.wcStatus, suppressed.revision)
   }
 
   // Remember the refusal durably, so a stale ordinary payload arriving later
   // cannot import the order behind our back.
-  await db.wcWithdrawalSuppression.upsert({
-    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-    create: { connector: 'woocommerce', externalOrderId, wcStatus: status },
-    update: { wcStatus: status, lastCheckedAt: new Date() },
-  })
+  await recordWithdrawalSuppressionIfWithdrawn(wcOrder)
 
   await logActivity({
     entityType: 'SYNC',
@@ -678,6 +708,7 @@ async function resolveSuppression(
   wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
   externalOrderId: string,
   suppressedStatus: string,
+  observedRevision: number,
 ): Promise<boolean> {
   const { submitted, approved } = await getWithdrawalStatuses()
   let live: string | null = null
@@ -717,9 +748,23 @@ async function resolveSuppression(
 
   // The request was rejected: the storefront has genuinely moved on. Let it
   // import, and forget the refusal.
-  await db.wcWithdrawalSuppression.delete({
-    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-  }).catch(() => {})
+  // Compare-and-swap on the revision observed BEFORE the live fetch. A newer
+  // withdrawal can land in that gap, and deleting it here would let this stale
+  // ordinary worker import an order that has just been withdrawn again.
+  const cleared = await db.wcWithdrawalSuppression.deleteMany({
+    where: { connector: 'woocommerce', externalOrderId, revision: observedRevision },
+  })
+  if (cleared.count === 0) {
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_withdrawal_suppression_superseded', tag: 'sync', level: 'WARNING',
+      description:
+        `WooCommerce order #${wcOrder.number} looked resolved ("${live}"), but a NEWER withdrawal was `
+        + 'recorded while we were checking. Keeping the order suppressed.',
+      metadata: { externalOrderId: wcOrder.id, liveStatus: live, suppressedStatus },
+      resolveUser: false,
+    })
+    return true
+  }
   await logActivity({
     entityType: 'SYNC', action: 'wc_withdrawal_suppression_cleared', tag: 'sync', level: 'INFO',
     description:

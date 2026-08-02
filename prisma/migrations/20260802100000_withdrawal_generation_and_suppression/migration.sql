@@ -19,5 +19,6 @@ CREATE TABLE "wc_withdrawal_suppressions" (
   "wcStatus"        TEXT NOT NULL,
   "createdAt"       TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "lastCheckedAt"   TIMESTAMP(3),
+  "revision"        INTEGER NOT NULL DEFAULT 0,
   CONSTRAINT "wc_withdrawal_suppressions_pkey" PRIMARY KEY ("connector", "externalOrderId")
 );
