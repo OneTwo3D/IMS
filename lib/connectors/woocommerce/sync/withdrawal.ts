@@ -774,6 +774,16 @@ async function retireIfQuiescent(externalOrderId: string, claim: SuppressionClai
     return false
   }
   if (Date.now() - since.getTime() < SUPPRESSION_QUIESCENCE_MS) return false
+
+  // One last live read immediately before the delete. Quiescence proves the
+  // rejection is OLD, not that nothing arrived since the read that started this
+  // pass — and once the row is gone there are no further by-ID checks.
+  // (Codex r15.) The WMS create claim also fences on this row, so the residual
+  // read-to-delete gap cannot dispatch an order even if it loses this check.
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const finalLive = await readLiveWcStatus(externalOrderId)
+  if (finalLive === null || finalLive === submitted || finalLive === approved) return false
+
   await consumeSuppression(externalOrderId, claim)
   return true
 }

@@ -1017,6 +1017,32 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           select: { withdrawalHoldAt: true, withdrawalApprovedAt: true },
         })
         if (fresh?.withdrawalHoldAt || fresh?.withdrawalApprovedAt) return false
+
+        // o3d-d82p: a live WooCommerce withdrawal SUPPRESSION is a fulfilment
+        // fence in its own right, not just an ingestion guard.
+        //
+        // The IMS markers are written by the withdrawal handler, so an order
+        // whose withdrawal is known to the storefront but has not yet been
+        // applied here — a missed or delayed webhook, an import that raced a
+        // resubmission — carries neither marker. This sweep runs every 10
+        // minutes and the withdrawal sweep every 15, so checking only the
+        // markers leaves a window in which a withdrawn order is pushed to the
+        // warehouse. The tombstone is the durable record that the storefront
+        // knows something we may not, so refuse the claim while it exists.
+        const link = await tx.shoppingOrderLink.findFirst({
+          where: { orderId, connector: 'woocommerce' },
+          select: { externalOrderId: true },
+        })
+        if (link) {
+          const suppressed = await tx.wcWithdrawalSuppression.findUnique({
+            where: {
+              connector_externalOrderId: { connector: 'woocommerce', externalOrderId: link.externalOrderId },
+            },
+            select: { externalOrderId: true },
+          })
+          if (suppressed) return false
+        }
+
         const existing = await tx.wmsOrderPushLink.findUnique({
           where: { orderId },
           select: { state: true, lastAttemptAt: true },

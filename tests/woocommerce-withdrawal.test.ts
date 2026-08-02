@@ -723,3 +723,34 @@ test('consumeSuppression is reached only through the quiescence gate', async () 
   const at = src.indexOf('consumeSuppression(externalOrderId, claim)', src.indexOf('async function retireIfQuiescent'))
   assert.ok(at > 0, 'and it is inside retireIfQuiescent')
 })
+
+test('a live suppression fences the WMS create claim', async () => {
+  // The IMS markers are written by the withdrawal handler, so an order whose
+  // withdrawal the STOREFRONT knows about but IMS has not yet applied — a
+  // missed webhook, an import that raced a resubmission — carries neither
+  // marker. The WMS sweep runs every 10 minutes and the withdrawal sweep every
+  // 15, so checking only the markers leaves a window to push a withdrawn order.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/domain/wms/order-push-sweep.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async claimForCreate('))
+  const body = fn.slice(0, fn.indexOf('\n    },'))
+  assert.ok(body.includes('wcWithdrawalSuppression'), 'the claim must fence on a live suppression')
+  assert.ok(body.indexOf('wcWithdrawalSuppression') < body.indexOf('wmsOrderPushLink.upsert'),
+    'the fence must precede granting the claim')
+  // Inside the same row-lock transaction as the marker re-check, or it is
+  // merely racing rather than mutually exclusive.
+  assert.ok(body.includes('FOR UPDATE'))
+  assert.ok(body.indexOf('FOR UPDATE') < body.indexOf('wcWithdrawalSuppression'))
+})
+
+test('retirement re-reads live immediately before deleting', async () => {
+  // Quiescence proves the rejection is OLD, not that nothing arrived since the
+  // read that started this pass — and once the row is gone there are no
+  // further by-ID checks at all.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async function retireIfQuiescent'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.indexOf('readLiveWcStatus') < body.indexOf('consumeSuppression'))
+  assert.ok(body.includes('finalLive === null'), 'an unreadable final status must not retire it')
+})
