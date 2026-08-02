@@ -553,14 +553,25 @@ export async function importWcOrderGuarded<R extends { success: boolean }>(
   | { outcome: 'unresolved' }
   | { outcome: 'imported'; result: R; suppressionHandled: boolean; compensationFailed: boolean }
 > {
+  let decision: SuppressionDecision
   try {
-    if (await shouldSkipUnlinkedWithdrawalImport(wcOrder)) return { outcome: 'skipped-withdrawal' }
+    decision = await shouldSkipUnlinkedWithdrawalImport(wcOrder)
   } catch (e) {
     if (e instanceof WithdrawalSuppressionUnresolved) return { outcome: 'unresolved' }
     throw e
   }
+  if (decision.suppress) return { outcome: 'skipped-withdrawal' }
 
   const result = await runImport()
+
+  // The rejected-withdrawal claim is retired ONLY once the import has actually
+  // landed. Consuming it inside the resolver meant a failed or throwing import
+  // destroyed the order's only durable retry signal. (Codex r12)
+  if (decision.pendingConsume) {
+    if (result.success) await consumeSuppression(String(wcOrder.id), decision.pendingConsume)
+    else await releaseSuppression(String(wcOrder.id), decision.pendingConsume.token)
+  }
+
   // NOT gated on wasUnlinked. The tombstone is the durable record that a
   // withdrawal still needs applying, and it survives a failed transition — so
   // a redelivery, a later poll or the FX retry must all be able to finish the
@@ -634,7 +645,12 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
       connector: 'woocommerce',
       OR: [{ claimToken: null }, { claimedAt: { lt: staleBefore } }],
     },
-    orderBy: { createdAt: 'asc' },
+    // Oldest-CHECKED first, not oldest-created (Codex r12). A fixed
+    // createdAt prefix of rows that stay withdrawn or stay unreadable is
+    // re-selected on every run forever, so nothing past the first batch is
+    // ever looked at again. lastCheckedAt is stamped for EVERY outcome below,
+    // so the queue always rotates.
+    orderBy: [{ lastCheckedAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
     take: Math.min(Math.max(limit, 1), 250),
     select: { externalOrderId: true },
   })
@@ -646,6 +662,13 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
     // put it through the ordinary guarded importer. Resolving the tombstone
     // without importing would delete the order's only durable retry signal and
     // strand it permanently: that is the whole scenario this sweep exists for.
+    // Stamp the attempt BEFORE doing the work, so a row that throws or times
+    // out still rotates to the back of the queue instead of blocking it.
+    await db.wcWithdrawalSuppression.updateMany({
+      where: { connector: 'woocommerce', externalOrderId: row.externalOrderId },
+      data: { lastCheckedAt: new Date() },
+    }).catch(() => {})
+
     const live = await readLiveWcOrder(row.externalOrderId)
     if (!live) {
       result.unresolved++
@@ -913,7 +936,7 @@ export async function reconcileSuppressionAfterImport(
 
 export async function shouldSkipUnlinkedWithdrawalImport(
   wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
-): Promise<boolean> {
+): Promise<SuppressionDecision> {
   const { submitted, approved } = await getWithdrawalStatuses()
   const status = normaliseStatus(wcOrder.status)
   const externalOrderId = String(wcOrder.id)
@@ -922,7 +945,7 @@ export async function shouldSkipUnlinkedWithdrawalImport(
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     select: { id: true },
   })
-  if (existing) return false
+  if (existing) return { suppress: false }
 
   const isWithdrawal = status === submitted || status === approved
 
@@ -936,7 +959,7 @@ export async function shouldSkipUnlinkedWithdrawalImport(
       where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
       select: { wcStatus: true },
     })
-    if (!suppressed) return false
+    if (!suppressed) return { suppress: false }
     return resolveSuppression(wcOrder, externalOrderId)
   }
 
@@ -956,7 +979,7 @@ export async function shouldSkipUnlinkedWithdrawalImport(
     metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status },
     resolveUser: false,
   })
-  return true
+  return { suppress: true }
 }
 
 /**
@@ -970,14 +993,16 @@ export async function shouldSkipUnlinkedWithdrawalImport(
  * importing would allocate stock for goods the customer may still have
  * withdrawn.
  */
+type SuppressionDecision = { suppress: true } | { suppress: false; pendingConsume?: SuppressionClaim }
+
 async function resolveSuppression(
   wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
   externalOrderId: string,
-): Promise<boolean> {
+): Promise<SuppressionDecision> {
   // Claim BEFORE reading the live status. Deciding first and claiming after
   // only serializes the workers; it does not make the freshest decision win.
   const claim = await claimSuppression(externalOrderId)
-  if (claim === 'absent') return false
+  if (claim === 'absent') return { suppress: false }
   if (claim === 'busy') {
     // Another worker owns this withdrawal RIGHT NOW — but "owned" is not
     // "finished", and returning a clean skip would let the caller acknowledge
@@ -1010,29 +1035,14 @@ async function resolveSuppression(
 
   if (live === submitted || live === approved) {
     await releaseSuppression(externalOrderId, claim.token)
-    return true // still withdrawn
+    return { suppress: true } // still withdrawn
   }
 
-  // The request was rejected: retire it under the claim we hold. Conditional on
-  // the revision too, so a NEWER withdrawal recorded while we were checking is
-  // not discarded — it simply stays, and the next ingress path acts on it.
-  await consumeSuppression(externalOrderId, claim)
-  const survived = await db.wcWithdrawalSuppression.findUnique({
-    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-    select: { revision: true },
-  })
-  if (survived) {
-    await logActivity({
-      entityType: 'SYNC', action: 'wc_withdrawal_suppression_superseded', tag: 'sync', level: 'WARNING',
-      description:
-        `WooCommerce order #${wcOrder.number} looked resolved ("${live}"), but a NEWER withdrawal was `
-        + 'recorded while we were checking. Keeping the order suppressed.',
-      metadata: { externalOrderId: wcOrder.id, liveStatus: live, suppressedStatus: claim.wcStatus },
-      resolveUser: false,
-    })
-    return true
-  }
-
+  // The request was rejected. Do NOT retire the tombstone here: the import has
+  // not happened yet, and if it fails or throws the only durable retry signal
+  // would already be gone — recreating the stranded-order failure for statuses
+  // outside the poll filter. Hand the CLAIM back to the caller, which consumes
+  // it after a successful import and releases it otherwise. (Codex r12)
   await logActivity({
     entityType: 'SYNC', action: 'wc_withdrawal_suppression_cleared', tag: 'sync', level: 'INFO',
     description:
@@ -1041,5 +1051,5 @@ async function resolveSuppression(
     metadata: { externalOrderId: wcOrder.id, liveStatus: live, suppressedStatus: claim.wcStatus },
     resolveUser: false,
   })
-  return false
+  return { suppress: false, pendingConsume: claim }
 }

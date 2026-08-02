@@ -621,3 +621,53 @@ test('the withdrawal sweep cron is registered in the route auth policy', async (
   const policy = readFileSync('lib/security/route-auth-policy.ts', 'utf8')
   assert.ok(policy.includes("'/api/cron/wc-withdrawal-sweep'"), 'an unregistered cron route fails the boundary guard')
 })
+
+test('the tombstone is consumed only AFTER the import succeeds', async () => {
+  // Consuming inside the resolver meant a failed or throwing import destroyed
+  // the order's only durable retry signal — recreating the stranded-order
+  // failure for statuses outside the poll filter.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const resolver = src.slice(src.indexOf('async function resolveSuppression'))
+  const rBody = resolver.slice(0, resolver.indexOf('\n}\n'))
+  assert.ok(!rBody.includes('consumeSuppression'), 'the resolver must not retire the tombstone itself')
+  assert.ok(rBody.includes('pendingConsume'), 'it must hand the claim to the caller')
+
+  const wrapper = src.slice(src.indexOf('export async function importWcOrderGuarded'))
+  const wBody = wrapper.slice(0, wrapper.indexOf('\n}\n'))
+  assert.ok(wBody.indexOf('runImport()') < wBody.indexOf('consumeSuppression'))
+  assert.ok(/result\.success[\s\S]{0,200}consumeSuppression[\s\S]{0,200}releaseSuppression/.test(wBody),
+    'success consumes, failure releases')
+})
+
+test('the sweep rotates and cannot be starved by a permanent prefix', async () => {
+  // Always taking the oldest 50 by immutable createdAt means a prefix of rows
+  // that stay withdrawn or stay unreadable is re-selected forever, so nothing
+  // past the first batch is ever checked again.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function sweepWithdrawalSuppressions'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes("lastCheckedAt: { sort: 'asc', nulls: 'first' }"), 'oldest-checked first')
+  const stamp = body.indexOf('lastCheckedAt: new Date()')
+  const work = body.indexOf('readLiveWcOrder')
+  assert.ok(stamp > 0 && stamp < work, 'the attempt must be stamped before the work, so a throw still rotates')
+})
+
+test('fresh installs schedule the withdrawal sweep', async () => {
+  // The application registry is only consulted when an operator regenerates
+  // the managed crontab; install.sh has its own hard-coded bootstrap list.
+  const { readFileSync } = await import('node:fs')
+  const install = readFileSync('scripts/install.sh', 'utf8')
+  assert.ok(install.includes('wc-withdrawal-sweep'), 'the installer bootstrap must include the backstop')
+})
+
+test('the sweep honours the WooCommerce kill switches', async () => {
+  // It calls the WooCommerce API and can import orders, so a stale crontab
+  // must not keep it running while sync is deliberately paused.
+  const { readFileSync } = await import('node:fs')
+  const route = readFileSync('app/api/cron/wc-withdrawal-sweep/route.ts', 'utf8')
+  assert.ok(route.includes("isIntegrationPluginEnabled('woocommerce')"))
+  assert.ok(route.includes("'wc_sync_enabled'"))
+  assert.ok(route.indexOf('wc_sync_enabled') < route.indexOf('sweepWithdrawalSuppressions()'))
+})
