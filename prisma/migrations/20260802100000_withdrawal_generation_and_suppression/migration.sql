@@ -9,6 +9,7 @@ ALTER TABLE "sales_orders" ADD COLUMN "withdrawalHoldGeneration" INTEGER NOT NUL
 -- correctly reads as "unknown", which makes the next submitted event count as
 -- new rather than silently deduplicating it.
 ALTER TABLE "sales_orders" ADD COLUMN "withdrawalLastWcStatus" TEXT;
+ALTER TABLE "sales_orders" ADD COLUMN "withdrawalLastWcEventAt" TIMESTAMP(3);
 
 -- o3d-d82p: durable memory of an unlinked withdrawal import we refused, so a
 -- STALE order.created arriving afterwards cannot import the order anyway.

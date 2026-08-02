@@ -1580,6 +1580,11 @@ model SalesOrder {
   /// a retained hold is still in place advances nothing, and an operator
   /// holding a stale generation could release the newer request.
   withdrawalLastWcStatus String?
+  /// `date_modified_gmt` of the withdrawal event last handled. The inbox does
+  /// not guarantee per-order ordering, so a DELAYED rejection can arrive after
+  /// a newer resubmission; without a version it would overwrite the newer
+  /// state and leave the generation stale. Older events are ignored.
+  withdrawalLastWcEventAt DateTime?
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 

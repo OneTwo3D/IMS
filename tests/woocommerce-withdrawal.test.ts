@@ -285,3 +285,39 @@ test('the withdrawal ingest guard holds no transaction across the import', async
   assert.ok(!src.includes('pg_try_advisory_xact_lock'), 'no lock may wrap the import')
   assert.ok(src.includes('reconcileSuppressionAfterImport'))
 })
+
+test('a delayed rejection cannot overwrite a newer resubmission', () => {
+  // The inbox does not guarantee per-order ordering. Without a version, a
+  // rejection still in flight overwrites the marker a NEWER resubmission
+  // already advanced, and the resubmission is silently un-recorded.
+  const stale = (eventAt: Date | null, lastAt: Date | null) =>
+    Boolean(eventAt && lastAt && eventAt <= lastAt)
+  const t1 = new Date('2026-08-02T10:00:00Z')
+  const t2 = new Date('2026-08-02T10:05:00Z')
+  assert.equal(stale(t1, t2), true, 'the delayed rejection is older — ignored')
+  assert.equal(stale(t2, t1), false, 'a genuinely newer event applies')
+  assert.equal(stale(null, t1), false, 'no timestamp — fall back to applying it')
+})
+
+test('a resubmission bumps the generation even when the status reads the same', () => {
+  // Starting from lastStatus=submitted with a rejection still in flight, the
+  // status comparison alone says "redelivery" and never advances.
+  const bumps = (lastStatus: string | null, incoming: string, lastAt: Date | null, at: Date | null) =>
+    lastStatus !== incoming || Boolean(at && (lastAt === null || at > lastAt))
+  const t1 = new Date('2026-08-02T10:00:00Z')
+  const t2 = new Date('2026-08-02T10:05:00Z')
+  assert.equal(bumps('wc-pending-wdraw', 'wc-pending-wdraw', t1, t1), false, 'true redelivery')
+  assert.equal(bumps('wc-pending-wdraw', 'wc-pending-wdraw', t1, t2), true, 'newer submission, same slug')
+})
+
+test('a raced APPROVED suppression cancels rather than holds', async () => {
+  // Holding would leave the order merely releasable ON_HOLD, and an operator
+  // could hand an approved-withdrawn order back to fulfilment.
+  const src = await import('node:fs').then((fs) =>
+    fs.readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8'))
+  const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('applyWithdrawalApproval'), 'must route the approved slug to approval')
+  assert.ok(body.indexOf('applyWithdrawalApproval') < body.indexOf('logActivity'),
+    'the transition must land before the awaited logging, which widens the fulfillable window')
+})

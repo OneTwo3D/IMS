@@ -265,6 +265,14 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
     // status (order-import.ts:324). syncRefundsForOrder is idempotent and keyed on the
     // WC refund id. Neither writes back to WooCommerce, so skipping the status sync
     // alone keeps the loop/clobber protection intact while letting genuine changes land.
+    // Same convergence as order.created: a concurrent worker may have recorded
+    // the withdrawal between the check above and this import (o3d-d82p). This
+    // MUST run before status/refund processing and before acknowledging, or a
+    // stale ordinary update creates a paid PROCESSING order carrying neither
+    // marker — which is exactly what the WMS candidate and claim checks look
+    // for, so it would ship.
+    if (wasUnlinked) await reconcileSuppressionAfterImport(wcOrder)
+
     const suppressed = await shouldSuppressWcOrderWebhookEcho(wcOrder)
     if (suppressed.suppress) {
       await logActivity({

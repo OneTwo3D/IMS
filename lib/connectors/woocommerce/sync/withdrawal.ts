@@ -186,9 +186,22 @@ export async function handleWcWithdrawalStatus(
     // submits AGAIN compares equal, the generation never advances, and an
     // operator holding the old generation can release the newer request. The
     // hold itself is deliberately retained; only the marker moves on.
-    await db.salesOrder.update({
-      where: { id: order.id },
-      data: { withdrawalLastWcStatus: normaliseStatus(wcOrder.status) },
+    //
+    // Under the ORDER LOCK and guarded by the event version: a delayed
+    // rejection must not overwrite the marker a NEWER resubmission already
+    // advanced, or the resubmission is silently un-recorded.
+    const rejectionAt = wcEventTimestamp(wcOrder)
+    await withOrderLock(order.id, async (current, tx) => {
+      if (rejectionAt && current.withdrawalLastWcEventAt && rejectionAt <= current.withdrawalLastWcEventAt) {
+        return // a newer event already landed; this rejection is stale
+      }
+      await tx.salesOrder.update({
+        where: { id: order.id },
+        data: {
+          withdrawalLastWcStatus: normaliseStatus(wcOrder.status),
+          ...(rejectionAt ? { withdrawalLastWcEventAt: rejectionAt } : {}),
+        },
+      })
     })
     return { kind, handled: true, result: { success: true } }
   }
@@ -216,6 +229,7 @@ async function withOrderLock<T>(
       withdrawalHoldAt: Date | null
       withdrawalApprovedAt: Date | null
       withdrawalLastWcStatus: string | null
+      withdrawalLastWcEventAt: Date | null
     },
     tx: TxClient,
   ) => Promise<T>,
@@ -226,7 +240,8 @@ async function withOrderLock<T>(
     const current = await tx.salesOrder.findUnique({
       where: { id: orderId },
       select: {
-        status: true, withdrawalHoldAt: true, withdrawalApprovedAt: true, withdrawalLastWcStatus: true,
+        status: true, withdrawalHoldAt: true, withdrawalApprovedAt: true,
+        withdrawalLastWcStatus: true, withdrawalLastWcEventAt: true,
       },
     })
     if (!current) return null
@@ -240,6 +255,7 @@ async function withOrderLock<T>(
 
 async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
   const incomingStatus = normaliseStatus(wcOrder.status)
+  const eventAt = wcEventTimestamp(wcOrder)
   const claim = await withOrderLock(orderId, async (current, tx) => {
     // Is this a genuinely NEW customer submission, or a redelivery of the one
     // we already handled? The retained `withdrawalHoldAt` cannot tell us: a
@@ -247,13 +263,23 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
     // again lands on an order that is ALREADY held and marked. The handled
     // status can: it only reads `submitted` once the slug has moved away and
     // back. (o3d-6x66, Codex r1)
-    const isNewSubmission = current.withdrawalLastWcStatus !== incomingStatus
+    // Two things make an event "new": the handled status moved, OR this
+    // submitted event is strictly NEWER than the one we last handled. The
+    // second case matters because the inbox does not guarantee per-order
+    // ordering — a delayed rejection can still be in flight, so a resubmission
+    // can arrive while the handled status still reads `submitted`. Comparing
+    // status alone would treat it as a redelivery and never advance the
+    // generation, leaving a stale operator release able to clear it.
+    const isNewer = eventAt !== null
+      && (current.withdrawalLastWcEventAt === null || eventAt > current.withdrawalLastWcEventAt)
+    const isNewSubmission = current.withdrawalLastWcStatus !== incomingStatus || isNewer
     if (isNewSubmission) {
       await tx.salesOrder.update({
         where: { id: orderId },
         data: {
           withdrawalHoldGeneration: { increment: 1 },
           withdrawalLastWcStatus: incomingStatus,
+          ...(eventAt ? { withdrawalLastWcEventAt: eventAt } : {}),
         },
       })
     }
@@ -485,6 +511,14 @@ export class WithdrawalSuppressionUnresolved extends Error {
  *
  * Call after a SUCCESSFUL import of a previously unlinked order.
  */
+/** `date_modified_gmt` as a Date, or null when WooCommerce sent nothing usable. */
+function wcEventTimestamp(wcOrder: WcFullOrder): Date | null {
+  const raw = wcOrder.date_modified_gmt || wcOrder.date_modified
+  if (!raw) return null
+  const d = new Date(/Z|[+-]\d\d:?\d\d$/.test(raw) ? raw : `${raw}Z`)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
 export async function isWcOrderLinked(externalOrderId: string): Promise<boolean> {
   const link = await db.shoppingOrderLink.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
@@ -507,15 +541,33 @@ export async function reconcileSuppressionAfterImport(wcOrder: WcFullOrder): Pro
   })
   if (!link?.orderId) return
 
+  // Transition FIRST, log after. The order is fulfillable from the moment it
+  // was created until its marker lands, and the WMS sweep selects on exactly
+  // that marker — so every awaited call before the transition widens the
+  // window for a sweep to claim and push it.
+  //
+  // Route by the SUPPRESSED status, not the stale payload that triggered this
+  // import. If the raced request was APPROVED, holding would leave the order
+  // merely releasable ON_HOLD instead of terminally cancelled, and an operator
+  // could hand an approved-withdrawn order back to fulfilment.
+  const { approved } = await getWithdrawalStatuses()
+  const result = suppressed.wcStatus === approved
+    ? await applyWithdrawalApproval(link.orderId, wcOrder)
+    : await applyWithdrawalHold(link.orderId, wcOrder)
+
   await logActivity({
-    entityType: 'SYNC', action: 'wc_withdrawal_suppression_raced_import', tag: 'sync', level: 'WARNING',
+    entityType: 'SYNC', action: 'wc_withdrawal_suppression_raced_import', tag: 'sync',
+    level: result.success ? 'WARNING' : 'ERROR',
     description:
       `WooCommerce order #${wcOrder.number} was imported at the same moment a withdrawal request was `
-      + `recorded for it ("${suppressed.wcStatus}"). Applying the hold to the order that was just created.`,
+      + `recorded for it ("${suppressed.wcStatus}"). `
+      + (result.success
+        ? `The ${suppressed.wcStatus === approved ? 'cancellation' : 'hold'} was applied to the order that was just created.`
+        : `Applying the ${suppressed.wcStatus === approved ? 'cancellation' : 'hold'} FAILED (${result.error ?? 'unknown'}) — `
+          + 'this order is live and withdrawn. Handle it by hand now.'),
     metadata: { externalOrderId: wcOrder.id, suppressedStatus: suppressed.wcStatus },
-    resolveUser: false,
+    resolveUser: !result.success,
   })
-  await applyWithdrawalHold(link.orderId, wcOrder)
 }
 
 export async function shouldSkipUnlinkedWithdrawalImport(
