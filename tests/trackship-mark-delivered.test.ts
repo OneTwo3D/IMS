@@ -1,3 +1,4 @@
+import { INTERNAL_STATUS_TRANSITION_AUTH_ONLY } from '../lib/sales/status-transition-bypass.ts'
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { markOrderDelivered } from '@/lib/trackship'
@@ -6,7 +7,7 @@ type TransitionCall = {
   id: string
   targetStatus: string
   extra?: { trackingNumber?: string; shipFromWarehouseId?: string }
-  options?: { skipPermissionCheck?: boolean }
+  options?: { internalBypassToken?: symbol }
 }
 
 function makeDeps(transitionResult: { success: boolean; error?: string }) {
@@ -16,7 +17,7 @@ function makeDeps(transitionResult: { success: boolean; error?: string }) {
       id: string,
       targetStatus: 'DELIVERED',
       extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
-      options?: { skipPermissionCheck?: boolean },
+      options?: { internalBypassToken?: symbol },
     ) => {
       calls.transition.push({ id, targetStatus, extra, options })
       return transitionResult
@@ -37,9 +38,13 @@ test('routes delivery through the transition path skipping only permission (not 
   const call = calls.transition[0]
   assert.equal(call.id, 'so-1')
   assert.equal(call.targetStatus, 'DELIVERED')
-  // skipPermissionCheck skips only the permission gate — the state-machine
+  // AUTH_ONLY skips only the permission gate — the state-machine
   // guard still runs, so a since-cancelled order is rejected (success:false).
-  assert.equal(call.options?.skipPermissionCheck, true)
+  // A SYMBOL, not a boolean: the transition is a Server Action, so a boolean
+  // option crosses the RPC boundary and any client could send it to bypass
+  // authorization outright (o3d-43oz).
+  assert.equal(call.options?.internalBypassToken, INTERNAL_STATUS_TRANSITION_AUTH_ONLY)
+  assert.equal(typeof call.options?.internalBypassToken, 'symbol')
   // Logs the successful delivery.
   assert.equal(calls.logs.length, 1)
   assert.equal(calls.logs[0].action, 'delivered')

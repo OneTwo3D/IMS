@@ -1434,24 +1434,34 @@ export async function applySalesOrderStatusTransition(
   id: string,
   targetStatus: SoStatus,
   extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
-  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol; skipPermissionCheck?: boolean },
+  // NB: no boolean authorization bypass. This action is exported from a
+  // module-wide 'use server' file, so Next.js makes it directly POST-callable
+  // and every option here crosses the RPC boundary. A `skipPermissionCheck?:
+  // boolean` used to live here, and a client could simply send it to suppress
+  // requirePermission('sales.process') — then drive any state-machine-legal
+  // transition, including CANCELLED from PROCESSING/ALLOCATED/PICKING/PACKING,
+  // which releases reservations and deletes pending shipments. Symbols cannot
+  // be serialized, so the capability tokens are not forgeable. (o3d-43oz)
+  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol },
   // `permanent: true` marks a failure a stable business rule refused, so a caller driving this from a
   // retrying transport (the Woo webhook inbox) can acknowledge it instead of retrying forever (o3d-bx9).
 ): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
   try {
-    // internalBypassToken skips BOTH the permission check and the state-machine
-    // guard — used by external systems (WooCommerce) that may legitimately force
-    // a mapped status. skipPermissionCheck is narrower: it skips ONLY the
-    // permission check (for sessionless internal callers such as the delivery
-    // cron) while the state-machine guard still runs, so a stale transition
-    // (e.g. an order cancelled after the poll's SHIPPED query) is still rejected.
+    // INTERNAL_STATUS_TRANSITION_BYPASS skips BOTH the permission check and the
+    // state-machine guard — for external systems (WooCommerce) that may
+    // legitimately force a mapped status.
+    // INTERNAL_STATUS_TRANSITION_AUTH_ONLY is narrower: it skips ONLY the
+    // permission check, for sessionless internal callers such as the delivery
+    // cron, while the state-machine guard still runs — so a stale transition
+    // (e.g. an order cancelled after the poll's SHIPPED query) is still
+    // rejected. Both are symbols, hence unforgeable across the RPC boundary.
     // Two distinct capabilities. The full bypass skips the state machine too;
     // the auth-only token does NOT, so a sessionless caller cannot force an
     // invalid transition. Both are symbols and therefore unforgeable across
     // the Server Action boundary. (o3d-e1yb)
     const bypassPermission = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_BYPASS
     const authOnly = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_AUTH_ONLY
-    if (!bypassPermission && !authOnly && !options?.skipPermissionCheck) {
+    if (!bypassPermission && !authOnly) {
       await requirePermission('sales.process')
     }
     const so = await db.salesOrder.findUnique({
@@ -1479,10 +1489,11 @@ export async function applySalesOrderStatusTransition(
     if (!so) return { success: false, error: 'Order not found' }
     // audit-M-o2c: an archived order is filed away — block MANUAL status edits.
     // Automated data-pushes still apply: the WooCommerce force-sync
-    // (internalBypassToken) and the sessionless delivery cron (skipPermissionCheck)
-    // are carrier/source-of-truth signals, so they bypass this guard — otherwise an
-    // archived-but-shipped order could never auto-reach DELIVERED.
-    if (so.archived && !bypassPermission && !authOnly && !options?.skipPermissionCheck) {
+    // (INTERNAL_STATUS_TRANSITION_BYPASS) and the sessionless delivery cron
+    // (INTERNAL_STATUS_TRANSITION_AUTH_ONLY) are carrier/source-of-truth signals,
+    // so they bypass this guard — otherwise an archived-but-shipped order could
+    // never auto-reach DELIVERED.
+    if (so.archived && !bypassPermission && !authOnly) {
       return { success: false, error: 'This order is archived; unarchive it before changing its status.' }
     }
 
