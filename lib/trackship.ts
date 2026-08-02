@@ -9,6 +9,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getOrderDeliveryStatus } from '@/lib/shopping'
+import { INTERNAL_STATUS_TRANSITION_AUTH_ONLY } from '@/lib/sales/status-transition-bypass'
 
 // ---------------------------------------------------------------------------
 // TrackShip API (direct)
@@ -81,7 +82,7 @@ type MarkDeliveredDeps = {
     id: string,
     targetStatus: 'DELIVERED',
     extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
-    options?: { skipPermissionCheck?: boolean },
+    options?: { internalBypassToken?: symbol },
   ) => Promise<{ success: boolean; error?: string }>
   log: typeof logActivity
 }
@@ -95,17 +96,23 @@ type MarkDeliveredDeps = {
  * query and now is rejected, not silently overwritten — and runs the same side
  * effects a manual DELIVERED transition does (status_changed log, WooCommerce
  * status push, cache revalidation). The cron has no session, so it passes
- * skipPermissionCheck to skip ONLY the sales.process permission check; the
- * state-machine guard still runs (unlike the WooCommerce bypass token, which
- * skips both). Dependency-injected so the routing + skip-on-reject behaviour
- * is unit-testable without the DB or external API.
+ * INTERNAL_STATUS_TRANSITION_AUTH_ONLY to skip ONLY the sales.process
+ * permission check; the state-machine guard still runs (unlike the WooCommerce
+ * bypass token, which skips both).
+ *
+ * A symbol, not the `skipPermissionCheck: true` boolean this used to send: the
+ * transition is a Server Action, so a boolean option crosses the RPC boundary
+ * and any client could send it to bypass authorization outright (o3d-43oz).
+ *
+ * Dependency-injected so the routing + skip-on-reject behaviour is
+ * unit-testable without the DB or external API.
  */
 export async function markOrderDelivered(
   target: DeliveredTarget,
   deps: MarkDeliveredDeps,
 ): Promise<{ delivered: boolean }> {
   const result = await deps.transition(target.id, 'DELIVERED', undefined, {
-    skipPermissionCheck: true,
+    internalBypassToken: INTERNAL_STATUS_TRANSITION_AUTH_ONLY,
   })
   if (result.success) {
     await deps.log({
