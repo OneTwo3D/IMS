@@ -29,11 +29,29 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
         },
       },
       select: {
-        order: { select: { id: true, externalOrderNumber: true, status: true } },
+        order: {
+          select: {
+            id: true, externalOrderNumber: true, status: true,
+            withdrawalHoldAt: true, withdrawalApprovedAt: true,
+          },
+        },
       },
     })
     const so = link?.order ?? null
     if (!so) return { success: false, error: `Order not found for WC #${wcOrder.id}` }
+
+    // EU right-of-withdrawal (o3d-e1yb). Runs BEFORE the status mapping: the
+    // withdrawal statuses have no mapping and would simply be ignored, and —
+    // more importantly — a REJECTION arrives as an ordinary status like
+    // `processing`, which the mapping would happily apply and thereby let the
+    // WMS release pass re-push an order the customer had asked to stop.
+    const { handleWcWithdrawalStatus } = await import('./withdrawal')
+    const withdrawal = await handleWcWithdrawalStatus(wcOrder, so)
+    // Propagate the transition's OWN result. Returning a blanket success would
+    // acknowledge the webhook for a hold or cancellation that never landed,
+    // and no later delivery would retry it: an identical redelivery classifies
+    // as already-held and does nothing.
+    if (withdrawal.kind !== 'not-a-withdrawal') return withdrawal.result
 
     // Resolve IMS status
     const mapping = await db.shoppingStatusMapping.findUnique({

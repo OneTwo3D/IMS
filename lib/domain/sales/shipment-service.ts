@@ -425,6 +425,26 @@ export async function transitionShipmentStatus(
         Prisma.sql`SELECT id FROM "shipments" WHERE id = ${shipmentId} FOR UPDATE`,
       )
 
+      // o3d-e1yb [wdraw]: the LAST line of defence for an approved EU
+      // withdrawal, and the only one that is atomic with the irreversible act.
+      //
+      // Guards further up (the status transition, the WooCommerce completion
+      // flow) are all check-then-act across separate transactions: an approval
+      // committing after their read and before this dispatch would still
+      // consume stock, and the approval retry would then see dispatch evidence
+      // and permanently convert the withdrawal into a return. Checking HERE,
+      // under the order lock the approval also takes, is what makes them
+      // mutually exclusive. It covers the manual shipment paths too.
+      const withdrawn = await tx.salesOrder.findUnique({
+        where: { id: shipment.orderId },
+        select: { withdrawalApprovedAt: true },
+      })
+      if (withdrawn?.withdrawalApprovedAt) {
+        throw new Error(
+          'This order\u2019s EU withdrawal request was approved; its shipments cannot be dispatched.',
+        )
+      }
+
       const lockedShipment = await loadShipmentTransitionContext(tx, shipmentId)
       if (!lockedShipment) throw new Error('Shipment not found')
       if (lockedShipment.status !== shipment.status) {

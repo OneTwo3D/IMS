@@ -1547,6 +1547,25 @@ model SalesOrder {
   // by the refund service; the legacy PARTIALLY_REFUNDED/REFUNDED `status` values are
   // being retired in favour of this field (epic: orthogonal refund status).
   refundStatus      RefundDisposition @default(NONE)
+  /// o3d-e1yb [wdraw]: set when this order is ON_HOLD because the customer filed an EU
+  /// right-of-withdrawal request in the storefront. It marks the hold as
+  /// withdrawal-originated, which does two things nothing else does:
+  ///   - an inbound storefront status change is REFUSED while it is set (a rejected
+  ///     withdrawal returns the WooCommerce order to `processing`, and applying that
+  ///     would let the WMS release pass re-push the order), and
+  ///   - the WMS push sweep's release pass skips the link.
+  /// Cleared when the withdrawal is approved (the order is cancelled instead) or when
+  /// an operator releases the hold by hand. Automatic release is deliberately not
+  /// implemented; see lib/connectors/woocommerce/sync/withdrawal.ts.
+  withdrawalHoldAt  DateTime?
+  /// o3d-e1yb [wdraw]: set when an EU withdrawal request was APPROVED and the order
+  /// cancelled. Deliberately separate from `withdrawalHoldAt`, which is cleared at that
+  /// point: the hold is over, but the fact is permanent. A delayed pre-approval
+  /// storefront webhook would otherwise see no marker, fall through to the ordinary
+  /// status mapping — which uses the full transition bypass — and force the cancelled
+  /// order back to PROCESSING, making its WMS link releasable and re-sending withdrawn
+  /// goods to the warehouse.
+  withdrawalApprovedAt DateTime?
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 

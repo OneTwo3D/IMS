@@ -18,7 +18,7 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuIte
 import {
   updateSalesOrderStatus, createRefund, retryRefundAccounting, cloneSalesOrder, deleteSalesOrder,
   updateSalesOrderNotes, generateInvoiceNumber,
-  addPayment, deletePayment,
+  addPayment, deletePayment, releaseWithdrawalHold,
   type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
 import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
@@ -1068,7 +1068,47 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           </span>
         )}
 
+        {/* o3d-e1yb [wdraw]: a hold placed by an EU withdrawal request. It blocks
+            the inbound storefront status sync AND the WMS release pass, so
+            without this control the order stays held forever once the customer's
+            request is rejected. Deliberately an operator decision: releasing
+            re-pushes the goods to the warehouse. */}
+        {so.withdrawalHoldAt && (
+          <span
+            className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-3 py-1 text-sm font-medium text-amber-700 dark:text-amber-400"
+            title={`The customer filed an EU right-of-withdrawal request on ${new Date(so.withdrawalHoldAt).toLocaleString()}. This order will not be sent to or released back to the warehouse until the hold is released.`}
+          >
+            <AlertTriangle className="h-3.5 w-3.5" />
+            Withdrawal hold
+          </span>
+        )}
+
         <div className="flex items-center gap-1.5 ml-auto flex-wrap">
+          {/* Withdrawal hold release — before the workflow actions, because
+              while it is set the workflow cannot move the order anyway. */}
+          {so.withdrawalHoldAt && hasPermission(currentUserRole, 'sales.process') && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={isPending}
+              onClick={() => {
+                if (!confirm(
+                  'Release the withdrawal hold?\n\n'
+                  + 'Only do this if the customer\u2019s withdrawal request was rejected or resolved. '
+                  + 'The order stays On Hold; moving it back to Processing then re-sends it to the warehouse.',
+                )) return
+                setError('')
+                startTransition(async () => {
+                  const res = await releaseWithdrawalHold(so.id)
+                  if (!res.success) { setError(res.error ?? 'Could not release the withdrawal hold'); return }
+                  router.refresh()
+                })
+              }}
+            >
+              Release withdrawal hold
+            </Button>
+          )}
+
           {/* Workflow */}
           {nextActions.map((a) => (
             <Button key={a.target} size="sm" onClick={() => handleStatusChange(a.target)} disabled={isPending}>

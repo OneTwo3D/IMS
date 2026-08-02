@@ -31,7 +31,7 @@ import {
   taxRateProfileSelect,
   type ResolvedTaxRate,
 } from '@/lib/tax/resolve-rate'
-import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
+import { INTERNAL_STATUS_TRANSITION_BYPASS, INTERNAL_STATUS_TRANSITION_AUTH_ONLY } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { decimalToNumber } from '@/lib/decimal'
@@ -70,7 +70,8 @@ import {
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { releaseReservationsAfterRefund } from '@/lib/domain/sales/post-refund-release'
 import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
-import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
+import { PermanentStatusTransitionError, isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
+import { canTransitionSalesOrder } from '@/lib/domain/workflows/sales-order-state'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
   cancelSalesOrderFulfillmentState,
@@ -139,6 +140,8 @@ export type SoRow = {
   externalOrderDate: string | null
   status: SoStatus
   refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
+  /// o3d-e1yb [wdraw]: set while an EU withdrawal request holds this order.
+  withdrawalHoldAt: string | null
   currency: string
   fxRateToBase: number
   customerName: string | null
@@ -412,6 +415,7 @@ const SO_SELECT = {
   orderNumber: true,
   status: true,
   refundStatus: true,
+  withdrawalHoldAt: true,
   currency: true,
   fxRateToBase: true,
   customerName: true,
@@ -472,6 +476,7 @@ function mapSoRow(so: {
   orderNumber: string | null
   status: string
   refundStatus: string
+  withdrawalHoldAt: Date | null
   currency: string
   fxRateToBase: unknown
   customerName: string | null
@@ -561,6 +566,7 @@ function mapSoRow(so: {
     externalOrderDate: so.externalCreatedAt?.toISOString() ?? null,
     status: so.status as SoStatus,
     refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
+    withdrawalHoldAt: so.withdrawalHoldAt ? so.withdrawalHoldAt.toISOString() : null,
     currency: so.currency,
     fxRateToBase: Number(so.fxRateToBase),
     customerName: so.customerName,
@@ -1439,8 +1445,13 @@ export async function applySalesOrderStatusTransition(
     // permission check (for sessionless internal callers such as the delivery
     // cron) while the state-machine guard still runs, so a stale transition
     // (e.g. an order cancelled after the poll's SHIPPED query) is still rejected.
+    // Two distinct capabilities. The full bypass skips the state machine too;
+    // the auth-only token does NOT, so a sessionless caller cannot force an
+    // invalid transition. Both are symbols and therefore unforgeable across
+    // the Server Action boundary. (o3d-e1yb)
     const bypassPermission = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_BYPASS
-    if (!bypassPermission && !options?.skipPermissionCheck) {
+    const authOnly = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_AUTH_ONLY
+    if (!bypassPermission && !authOnly && !options?.skipPermissionCheck) {
       await requirePermission('sales.process')
     }
     const so = await db.salesOrder.findUnique({
@@ -1456,6 +1467,9 @@ export async function applySalesOrderStatusTransition(
         paidAt: true,
         invoiceNumber: true,
         currency: true,
+        // o3d-e1yb [wdraw]: read here so the guard below runs against the row
+        // this transition itself read, not a caller's earlier snapshot.
+        withdrawalApprovedAt: true,
         // b8i6.1: detect a shopping order via ANY connector (not just WooCommerce)
         // so a Shopify-linked order also gets its IMS status pushed back.
         shoppingLinks: { select: { id: true }, take: 1 },
@@ -1468,8 +1482,26 @@ export async function applySalesOrderStatusTransition(
     // (internalBypassToken) and the sessionless delivery cron (skipPermissionCheck)
     // are carrier/source-of-truth signals, so they bypass this guard — otherwise an
     // archived-but-shipped order could never auto-reach DELIVERED.
-    if (so.archived && !bypassPermission && !options?.skipPermissionCheck) {
+    if (so.archived && !bypassPermission && !authOnly && !options?.skipPermissionCheck) {
       return { success: false, error: 'This order is archived; unarchive it before changing its status.' }
+    }
+
+    // o3d-e1yb [wdraw]: an APPROVED withdrawal is terminal. The inbound status
+    // handler already refuses ordinary storefront statuses for such an order,
+    // but that check reads an unlocked snapshot: an ordinary event can be
+    // classified before a concurrent approval commits and then apply its
+    // full-bypass mapping afterwards, overwriting CANCELLED with PROCESSING and
+    // making the order warehouse-eligible again. Enforcing it HERE is what
+    // makes it atomic with the status write.
+    // Cheap early-out only; the authoritative check is under the row lock in
+    // beforeUpdate below. Same rule, so the two cannot disagree.
+    if (so.withdrawalApprovedAt && targetStatus !== 'CANCELLED'
+        && !canTransitionSalesOrder(so.status as SoStatus, targetStatus)) {
+      return {
+        success: false,
+        permanent: true,
+        error: 'This order\u2019s EU withdrawal request was approved; its status cannot be moved backwards.',
+      }
     }
 
     const transition = validateManualSalesOrderStatusTransition(so.status, targetStatus, {
@@ -1574,6 +1606,35 @@ export async function applySalesOrderStatusTransition(
           data,
           bypass: bypassPermission,
           beforeUpdate: async ({ tx: lockedTx }) => {
+            // o3d-e1yb [wdraw]: enforce the terminal-approval fact HERE, under
+            // the row lock, immediately before the write. The pre-flight check
+            // above reads an unlocked snapshot, so an ordinary storefront
+            // event can read null, pause while a concurrent approval records
+            // the fact and cancels the order, then acquire this lock and use
+            // the full bypass to overwrite CANCELLED with PROCESSING — the
+            // exact resurrection this guard exists to prevent.
+            if (targetStatus !== 'CANCELLED') {
+              const fresh = await lockedTx.salesOrder.findUnique({
+                where: { id },
+                select: { withdrawalApprovedAt: true, status: true },
+              })
+              // Permit only what the state machine itself would permit from
+              // the CURRENT status. That allows a post-dispatch return to
+              // finish (SHIPPED -> COMPLETED/DELIVERED) while refusing every
+              // backward, bypassed move — CANCELLED -> PROCESSING and
+              // SHIPPED -> PROCESSING are both machine-illegal, and the full
+              // bypass is exactly what would otherwise force them.
+              if (fresh?.withdrawalApprovedAt
+                  && !canTransitionSalesOrder(fresh.status as SoStatus, targetStatus)) {
+                // PermanentStatusTransitionError, not a plain Error: a generic
+                // throw is classified TRANSIENT, so the webhook inbox would
+                // retry a business rule that can never pass and could
+                // dead-letter on a final-attempt race.
+                throw new PermanentStatusTransitionError(
+                  'This order\u2019s EU withdrawal request was approved; its status cannot be moved backwards.',
+                )
+              }
+            }
             if (targetStatus === 'PICKING') {
               const allocCount = await lockedTx.orderAllocation.count({ where: { orderId: id } })
               if (allocCount === 0) {
@@ -3484,4 +3545,55 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
     })
     return { success: false, error: String(e) }
   }
+}
+
+/**
+ * Release a hold placed by an EU right-of-withdrawal request (o3d-e1yb).
+ *
+ * Deliberately an OPERATOR action. A rejected withdrawal returns the
+ * storefront order to a ready status, and letting that release the hold by
+ * itself would put goods back on the pick line off a customer-facing status
+ * change — so `withdrawalHoldAt` blocks both the inbound status sync and the
+ * WMS release pass until a person clears it here.
+ *
+ * Clearing the marker is all this does. The order stays ON_HOLD and the
+ * ordinary release path (moving it back to Processing) then applies, which
+ * keeps this action reversible and keeps one code path for re-pushing.
+ */
+export async function releaseWithdrawalHold(id: string, note?: string) {
+  const session = await requirePermission('sales.process')
+
+  const so = await db.salesOrder.findUnique({
+    where: { id },
+    select: { id: true, orderNumber: true, status: true, withdrawalHoldAt: true },
+  })
+  if (!so) return { success: false, error: 'Order not found' }
+  if (!so.withdrawalHoldAt) return { success: false, error: 'This order is not under a withdrawal hold' }
+
+  // Conditional on the value we observed: a concurrent withdrawal delivery
+  // could have replaced the hold between the read and this write, and clearing
+  // THAT one would release an order whose customer has just asked to stop it.
+  const cleared = await db.salesOrder.updateMany({
+    where: { id, withdrawalHoldAt: so.withdrawalHoldAt },
+    data: { withdrawalHoldAt: null },
+  })
+  if (cleared.count === 0) {
+    return { success: false, error: 'The withdrawal hold changed while you were looking at it — reload and try again' }
+  }
+
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: id,
+    action: 'withdrawal_hold_released',
+    tag: 'sales',
+    level: 'INFO',
+    description:
+      `Withdrawal hold released by ${session.user.email ?? session.user.id}`
+      + `${note ? `: ${note}` : ''}. The order remains ON HOLD — move it back to Processing to re-push it to the warehouse.`,
+    metadata: { heldSince: so.withdrawalHoldAt, note: note ?? null },
+  })
+
+  revalidatePath(`/sales/${id}`)
+  revalidatePath('/sales')
+  return { success: true }
 }

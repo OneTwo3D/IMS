@@ -821,7 +821,26 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       }),
     releasableHeldOrders: (connector, limit) =>
       db.wmsOrderPushLink.findMany({
-        where: { connector, state: 'HELD', order: { status: { in: [...READY_STATUSES] }, paidAt: { not: null }, refundStatus: { not: 'FULL' } } },
+        where: {
+          connector,
+          state: 'HELD',
+          order: {
+            status: { in: [...READY_STATUSES] },
+            paidAt: { not: null },
+            refundStatus: { not: 'FULL' },
+            // o3d-e1yb [wdraw]: never auto-release a hold placed for an EU
+            // withdrawal request. Releasing re-pushes the order to the
+            // warehouse, and a rejected withdrawal returns the storefront
+            // order to a ready status — so without this a customer-facing
+            // status change would put the goods back on the pick line.
+            // An operator clears withdrawalHoldAt to release.
+            withdrawalHoldAt: null,
+            // ...and an APPROVED withdrawal is terminal: the hold is cleared
+            // once the order is cancelled, so the approval fact is what keeps
+            // it out of the warehouse from then on.
+            withdrawalApprovedAt: null,
+          },
+        },
         select: { id: true, orderId: true, externalOrderId: true },
         take: limit,
       }),
@@ -831,6 +850,16 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           status: { in: [...READY_STATUSES] },
           paidAt: { not: null },
           refundStatus: { not: 'FULL' },
+          // o3d-e1yb [wdraw]: never push an order the customer has asked to
+          // withdraw. The marker is written before the ON_HOLD transition, so
+          // it also covers the window where the marker landed but the
+          // transition failed — without this, such an order is still a
+          // PROCESSING/paid candidate and enters fulfilment anyway.
+          withdrawalHoldAt: null,
+          // A DIRECT approval (the submitted webhook never arrived) records
+          // only the approval fact until its cancellation finishes, so
+          // checking the hold alone would let the order be pushed in between.
+          withdrawalApprovedAt: null,
           shipFromWarehouseId: { in: boundWarehouseIds },
           OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' } }],
         },
@@ -846,6 +875,15 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         // delete mutually exclusive rather than merely racing.
         const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
         if (locked.length === 0) return false
+        // o3d-e1yb [wdraw]: re-check UNDER THE LOCK. The candidate query ran
+        // earlier, and a withdrawal request can land between the two — the
+        // marker is written under this same lock, so checking it here is what
+        // makes the two mutually exclusive rather than merely racing.
+        const fresh = await tx.salesOrder.findUnique({
+          where: { id: orderId },
+          select: { withdrawalHoldAt: true, withdrawalApprovedAt: true },
+        })
+        if (fresh?.withdrawalHoldAt || fresh?.withdrawalApprovedAt) return false
         const existing = await tx.wmsOrderPushLink.findUnique({
           where: { orderId },
           select: { state: true, lastAttemptAt: true },
