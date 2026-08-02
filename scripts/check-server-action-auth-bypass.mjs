@@ -23,74 +23,53 @@
  * supplied by server-side code that imports it. See
  * lib/sales/status-transition-bypass.ts.
  *
- * Implemented on the TypeScript AST rather than line regexes, because a
- * regex version silently missed the shapes that matter: a directive after a
- * long prologue, a per-function directive, an options type declared as an
- * imported or local alias, and a parameter split across lines. A security
- * control that reports success while missing a bypass is worse than none.
+ * Uses a full `ts.Program` and the TypeChecker, not the syntax tree alone.
+ * A syntax-only version could only resolve type references declared in the
+ * SAME file, so an imported `TransitionOptions`, a `Pick`/`Omit`, an
+ * instantiated generic, or a type inferred from a default value all slipped
+ * through silently — each of which can recreate the original bypass while CI
+ * reports success. The checker resolves all of them to their effective
+ * properties.
  *
- * What it checks: for every exported function reachable over RPC, every
- * parameter's type — following locally-declared type aliases and interfaces —
- * for a property whose NAME reads like an authorization bypass and whose TYPE
- * is serializable. Behaviour flags (`force`, `allowCache`, `skipLog`, …) are
- * deliberately not matched; they do not gate a permission check, and a guard
- * that cries wolf gets waived into uselessness.
+ * Scope: for a module-wide directive, only EXPORTED functions are inspected —
+ * a private helper is not remotely callable, and failing CI on one would just
+ * teach people to add waivers. A function carrying its own `use server`
+ * directive is inspected regardless of export, because that directive is what
+ * exposes it.
+ *
+ * Behaviour flags (`force`, `allowCache`, `skipLog`, …) are deliberately not
+ * matched; they do not gate a permission check.
  *
  * Waiver: `// server-action-auth-bypass-ok: <ticket>: <reason>` on the
  * property's line or the line above.
+ *
+ * Fixtures live in tests/fixtures/server-action-auth-bypass/ and are exercised
+ * by tests/server-action-auth-bypass-guard.test.ts.
  *
  * Run via `npm run check:server-action-auth-bypass`; invoked by
  * `npm run check:all`.
  */
 
-import { readdirSync, readFileSync, statSync } from 'node:fs'
-import { extname, join, relative } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { join, relative, sep } from 'node:path'
 import { createRequire } from 'node:module'
 
 const ts = createRequire(import.meta.url)('typescript')
 
-const ROOT = process.cwd()
-const SCAN_ROOTS = ['app', 'lib', 'components']
-const EXTS = new Set(['.ts', '.tsx'])
-const SKIP_DIRS = new Set(['node_modules', '.next', 'generated', 'dist', 'build'])
+const DEFAULT_SCAN_ROOTS = ['app', 'lib', 'components']
 
 /**
  * Property names that gate AUTHORIZATION rather than behaviour.
- * Matched case-insensitively on the whole name.
+ * Matched whole and case-insensitively.
  */
-const AUTH_BYPASS_NAME = /^(skipPermissionCheck|skipPermissions?|skipAuthz?|skipAuthorization|skipAuthentication|bypassPermissions?|bypassAuthz?|bypassAuthorization|allowUnauthenticated|allowAnonymous|asSystem|asAdmin|isInternal|internalCall|trusted|isTrusted)$/i
-
-/** Types a client can actually send. A `symbol` is what we want instead. */
-const SERIALIZABLE_KINDS = new Set([
-  ts.SyntaxKind.BooleanKeyword,
-  ts.SyntaxKind.StringKeyword,
-  ts.SyntaxKind.NumberKeyword,
-  ts.SyntaxKind.TrueKeyword,
-  ts.SyntaxKind.FalseKeyword,
-  ts.SyntaxKind.AnyKeyword,
-  ts.SyntaxKind.UnknownKeyword,
-])
+const AUTH_BYPASS_NAME = /^(skipPermissionChecks?|skipPermissions?|skipAuthz?|skipAuthorization|skipAuthentication|bypassPermissions?|bypassAuthz?|bypassAuthorization|allowUnauthenticated|allowAnonymous|asSystem|asAdmin|isInternal|internalCall|trusted|isTrusted)$/i
 
 const WAIVER = /server-action-auth-bypass-ok:/
 
-function walk(dir, out = []) {
-  let entries
-  try { entries = readdirSync(dir) } catch { return out }
-  for (const entry of entries) {
-    if (SKIP_DIRS.has(entry)) continue
-    const full = join(dir, entry)
-    let st
-    try { st = statSync(full) } catch { continue }
-    if (st.isDirectory()) walk(full, out)
-    else if (EXTS.has(extname(entry))) out.push(full)
-  }
-  return out
-}
-
-/** A real `'use server'` directive prologue entry — not a string that merely says so. */
+/** A real `'use server'` prologue entry — not a string that merely says so. */
 function hasUseServerDirective(statements) {
   for (const st of statements) {
-    if (!ts.isExpressionStatement(st)) break // prologue ends at the first non-directive
+    if (!ts.isExpressionStatement(st)) break // the prologue ends here
     const e = st.expression
     if (!ts.isStringLiteral(e) && !ts.isNoSubstitutionTemplateLiteral(e)) break
     if (e.text === 'use server') return true
@@ -98,109 +77,135 @@ function hasUseServerDirective(statements) {
   return false
 }
 
-function isSerializableType(node) {
-  if (!node) return false
-  if (SERIALIZABLE_KINDS.has(node.kind)) return true
-  if (ts.isLiteralTypeNode(node)) return SERIALIZABLE_KINDS.has(node.literal.kind)
-  // `boolean | undefined`, `true | false`, …: serializable if ANY member is.
-  if (ts.isUnionTypeNode(node)) return node.types.some(isSerializableType)
-  return false
+/** Can a client actually send a value of this type? A `symbol` cannot. */
+function isSerializableType(checker, type) {
+  const parts = type.isUnion() ? type.types : [type]
+  return parts.some((t) => {
+    // `undefined`/`null` members of an optional property say nothing either way.
+    if (t.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Never)) return false
+    if (t.flags & (ts.TypeFlags.ESSymbol | ts.TypeFlags.UniqueESSymbol)) return false
+    return Boolean(t.flags & (
+      ts.TypeFlags.Boolean | ts.TypeFlags.BooleanLike | ts.TypeFlags.BooleanLiteral
+      | ts.TypeFlags.String | ts.TypeFlags.StringLike | ts.TypeFlags.StringLiteral
+      | ts.TypeFlags.Number | ts.TypeFlags.NumberLike | ts.TypeFlags.NumberLiteral
+      | ts.TypeFlags.Any | ts.TypeFlags.Unknown
+    ))
+  })
 }
 
-const violations = []
+function functionLikeOf(decl) {
+  if (!decl) return null
+  if (ts.isFunctionDeclaration(decl) || ts.isFunctionExpression(decl) || ts.isArrowFunction(decl)) return decl
+  if (ts.isVariableDeclaration(decl) && decl.initializer) {
+    const init = decl.initializer
+    if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) return init
+  }
+  return null
+}
 
-for (const root of SCAN_ROOTS) {
-  for (const file of walk(join(ROOT, root))) {
-    const source = readFileSync(file, 'utf8')
+export function runGuard({ tsconfig = 'tsconfig.json', root = process.cwd(), scanRoots = DEFAULT_SCAN_ROOTS } = {}) {
+  const configPath = join(root, tsconfig)
+  const parsed = ts.parseJsonConfigFileContent(
+    ts.readConfigFile(configPath, ts.sys.readFile).config,
+    ts.sys,
+    root,
+  )
+  const program = ts.createProgram(parsed.fileNames, { ...parsed.options, noEmit: true })
+  const checker = program.getTypeChecker()
+
+  const prefixes = scanRoots.map((r) => join(root, r) + sep)
+  const violations = []
+
+  for (const sf of program.getSourceFiles()) {
+    if (sf.isDeclarationFile) continue
+    if (!prefixes.some((p) => sf.fileName.startsWith(p))) continue
+    const source = sf.getFullText()
     if (!source.includes('use server')) continue
 
-    const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
     const moduleWide = hasUseServerDirective(sf.statements)
-
-    // Locally declared option types, so an aliased parameter type still resolves.
-    const localTypes = new Map()
-    const collectTypes = (node) => {
-      if (ts.isTypeAliasDeclaration(node)) localTypes.set(node.name.text, node.type)
-      else if (ts.isInterfaceDeclaration(node)) localTypes.set(node.name.text, node)
-      ts.forEachChild(node, collectTypes)
-    }
-    collectTypes(sf)
-
     const lines = source.split('\n')
+
     const report = (node, label) => {
       const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf))
       const text = lines[line] ?? ''
       if (WAIVER.test(text) || (line > 0 && WAIVER.test(lines[line - 1]))) return
-      violations.push(`${relative(ROOT, file)}:${line + 1}: ${label}`)
-    }
-
-    /** Inspect a type node's members for a serializable auth-bypass property. */
-    const inspectType = (typeNode, seen = new Set()) => {
-      if (!typeNode) return
-      if (ts.isTypeReferenceNode(typeNode)) {
-        const name = typeNode.typeName.getText(sf)
-        if (seen.has(name)) return
-        seen.add(name)
-        const resolved = localTypes.get(name)
-        if (resolved) inspectType(resolved, seen)
-        return
-      }
-      if (ts.isUnionTypeNode(typeNode) || ts.isIntersectionTypeNode(typeNode)) {
-        typeNode.types.forEach((t) => inspectType(t, seen))
-        return
-      }
-      const members = ts.isTypeLiteralNode(typeNode) || ts.isInterfaceDeclaration(typeNode)
-        ? typeNode.members
-        : null
-      if (!members) return
-      for (const m of members) {
-        if (!ts.isPropertySignature(m) || !m.name) continue
-        const propName = m.name.getText(sf).replace(/['"]/g, '')
-        if (!AUTH_BYPASS_NAME.test(propName)) continue
-        if (!isSerializableType(m.type)) continue
-        report(m, `serializable auth bypass \`${propName}\``)
-      }
+      violations.push(`${relative(root, sf.fileName)}:${line + 1}: ${label}`)
     }
 
     const inspectFunction = (fn) => {
       for (const p of fn.parameters) {
-        // A destructured parameter still carries its type annotation.
-        inspectType(p.type)
-        // `{ skipPermissionCheck = false }` with no annotation: flag the name.
-        if (!p.type && ts.isObjectBindingPattern(p.name)) {
-          for (const el of p.name.elements) {
-            const n = el.propertyName?.getText(sf) ?? el.name.getText(sf)
-            if (AUTH_BYPASS_NAME.test(n)) report(el, `untyped auth-bypass binding \`${n}\``)
+        // getTypeAtLocation resolves imports, aliases, Pick/Omit, generics and
+        // types inferred from a default value — everything a syntax-only walk
+        // could not see.
+        let type
+        try { type = checker.getTypeAtLocation(p) } catch { continue }
+        if (!type) continue
+        // An OPTIONAL parameter is `T | undefined`, and getPropertiesOfType on
+        // a union returns only the properties common to every member — so
+        // `undefined` erases them all and the guard silently sees nothing.
+        // Strip nullish members and inspect each remaining constituent.
+        const constituents = (type.isUnion() ? type.types : [type])
+          .filter((t) => !(t.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void)))
+        for (const constituent of constituents) {
+          for (const prop of checker.getPropertiesOfType(constituent)) {
+            if (!AUTH_BYPASS_NAME.test(prop.getName())) continue
+            const decl = prop.valueDeclaration ?? prop.declarations?.[0]
+            let propType
+            try { propType = checker.getTypeOfSymbolAtLocation(prop, decl ?? p) } catch { continue }
+            if (!propType || !isSerializableType(checker, propType)) continue
+            // Report at the declaration when it is in this file, so the waiver
+            // comment sits next to the offending property; otherwise at the
+            // parameter, which is the thing this file controls.
+            const at = decl && decl.getSourceFile() === sf ? decl : p
+            report(at, `serializable auth bypass \`${prop.getName()}\``)
           }
         }
       }
     }
 
+    /** Module-wide: only exported functions are reachable over RPC. */
+    if (moduleWide) {
+      const moduleSymbol = checker.getSymbolAtLocation(sf)
+      const exports = moduleSymbol ? checker.getExportsOfModule(moduleSymbol) : []
+      for (const ex of exports) {
+        const target = ex.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(ex) : ex
+        for (const d of target.declarations ?? []) {
+          const fn = functionLikeOf(d)
+          if (fn) inspectFunction(fn)
+        }
+      }
+    }
+
+    /** A per-function directive exposes that function whether exported or not. */
     const visit = (node) => {
       const isFn = ts.isFunctionDeclaration(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node)
-      if (isFn) {
-        const perFunction = node.body && ts.isBlock(node.body)
-          ? hasUseServerDirective(node.body.statements)
-          : false
-        if (moduleWide || perFunction) inspectFunction(node)
+      if (isFn && node.body && ts.isBlock(node.body) && hasUseServerDirective(node.body.statements)) {
+        inspectFunction(node)
       }
       ts.forEachChild(node, visit)
     }
     visit(sf)
   }
+
+  return [...new Set(violations)].sort()
 }
 
-if (violations.length > 0) {
-  console.error(
-    'Server Action authorization-bypass violation: a serializable option that '
-    + 'gates a permission check is directly POST-callable by any client.\n'
-    + 'Use an unforgeable capability instead — a `symbol` cannot cross the '
-    + 'Server Action boundary. See lib/sales/status-transition-bypass.ts and o3d-43oz.\n'
-    + 'If this is genuinely not an auth gate, add a waiver:\n'
-    + '// server-action-auth-bypass-ok: <ticket>: <reason>\n',
-  )
-  for (const v of violations) console.error(`  ${v}`)
-  process.exit(1)
+// Run as a script (not when imported by the fixture test).
+if (process.argv[1] && process.argv[1].endsWith('check-server-action-auth-bypass.mjs')) {
+  const violations = runGuard()
+  if (violations.length > 0) {
+    console.error(
+      'Server Action authorization-bypass violation: a serializable option that '
+      + 'gates a permission check is directly POST-callable by any client.\n'
+      + 'Use an unforgeable capability instead — a `symbol` cannot cross the '
+      + 'Server Action boundary. See lib/sales/status-transition-bypass.ts and o3d-43oz.\n'
+      + 'If this is genuinely not an auth gate, add a waiver:\n'
+      + '// server-action-auth-bypass-ok: <ticket>: <reason>\n',
+    )
+    for (const v of violations) console.error(`  ${v}`)
+    process.exit(1)
+  }
+  console.log('Server Action auth-bypass check passed.')
 }
 
-console.log('Server Action auth-bypass check passed.')
+export { readFileSync }
