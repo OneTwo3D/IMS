@@ -355,8 +355,8 @@ test('both the resolver and compensation claim BEFORE deciding', async () => {
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   for (const [fnName, decision] of [
-    ['async function resolveSuppression', 'wcFetch'],
-    ['export async function reconcileSuppressionAfterImport', 'applyWithdrawalApproval'],
+    ['async function resolveSuppression', 'readLiveWcStatus'],
+    ['export async function reconcileSuppressionAfterImport', 'readLiveWcStatus'],
   ] as const) {
     const fn = src.slice(src.indexOf(fnName))
     const body = fn.slice(0, fn.indexOf('\n}\n'))
@@ -389,14 +389,51 @@ test('consuming a tombstone is conditional on the revision as well as the token'
   assert.ok(body.includes('releaseSuppression'), 'a superseded row must be released, not orphaned')
 })
 
-test('a newer withdrawal payload supersedes the tombstone status', () => {
-  // A newer APPROVAL arriving over a surviving submitted tombstone must cancel,
-  // not re-apply the old hold and then be skipped as already handled.
-  const pick = (payload: string, tomb: string, submitted: string, approved: string) =>
-    payload === approved || payload === submitted ? payload : tomb
-  assert.equal(pick('wc-withdrawn', 'wc-pending-wdraw', 'wc-pending-wdraw', 'wc-withdrawn'), 'wc-withdrawn')
-  assert.equal(pick('processing', 'wc-withdrawn', 'wc-pending-wdraw', 'wc-withdrawn'), 'wc-withdrawn',
-    'an ordinary payload must not weaken an approved tombstone')
+test('the decision comes from the LIVE status, not a remembered snapshot', async () => {
+  // Both the tombstone's status and the triggering payload are snapshots, and
+  // the inbox guarantees neither ordering nor uniqueness — so every review
+  // round found another interleaving where a stale snapshot outranked a
+  // fresher one (an old approval cancelling a rejected order; a delayed
+  // `submitted` downgrading an approval to a releasable hold). Two workers
+  // reading the same LIVE status cannot disagree, however they interleave.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  for (const fnName of ['export async function reconcileSuppressionAfterImport', 'async function resolveSuppression']) {
+    const fn = src.slice(src.indexOf(fnName))
+    const body = fn.slice(0, fn.indexOf('\n}\n'))
+    assert.ok(body.includes('readLiveWcStatus'), `${fnName} must read the live status`)
+    assert.ok(body.indexOf('claimSuppression') < body.indexOf('readLiveWcStatus'),
+      `${fnName} must claim before reading live state`)
+  }
+  const reconcile = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const body = reconcile.slice(0, reconcile.indexOf('\n}\n'))
+  assert.ok(!body.includes('claim.wcStatus ==='), 'the remembered status must not drive the transition')
+})
+
+test('recording a newer withdrawal does not evict an active lease', async () => {
+  // It is given no event version, so it cannot prove it is newer; evicting on
+  // that basis let an out-of-order redelivery displace a worker mid-decision.
+  // Bumping the revision suffices, because consuming is conditional on it.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function recordWithdrawalSuppressionIfWithdrawn'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+    .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!body.includes('claimToken: null'), 'must not clear another worker\'s lease')
+  assert.ok(body.includes('revision: { increment: 1 }'))
+})
+
+test('a lost claim is unresolved, never a clean skip', async () => {
+  // "Owned by someone else" is not "finished". A clean skip lets the caller
+  // acknowledge what may be the only ordinary event the order ever sends, so
+  // if the owner dies nothing retries.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async function resolveSuppression'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  const lost = body.indexOf('if (!claim) {')
+  assert.ok(lost > 0)
+  assert.ok(body.slice(lost, lost + 600).includes('WithdrawalSuppressionUnresolved'))
 })
 
 test('the initial-import gate applies to a linked order and never swallows a failure', async () => {
@@ -438,15 +475,19 @@ test('a resubmission bumps the generation even when the status reads the same', 
   assert.equal(bumps('wc-pending-wdraw', 'wc-pending-wdraw', t1, t2), true, 'newer submission, same slug')
 })
 
-test('a raced APPROVED suppression cancels rather than holds', async () => {
+test('a raced APPROVED withdrawal cancels rather than holds', async () => {
   // Holding would leave the order merely releasable ON_HOLD, and an operator
-  // could hand an approved-withdrawn order back to fulfilment.
-  const src = await import('node:fs').then((fs) =>
-    fs.readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8'))
+  // could hand an approved-withdrawn order back to fulfilment. Decided from
+  // the live status now, so no snapshot can downgrade it.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
-  assert.ok(body.includes('applyWithdrawalApproval'), 'must route the approved slug to approval')
-  assert.ok(body.indexOf('applyWithdrawalApproval') < body.indexOf('logActivity'),
+  assert.ok(body.includes('const isApproval = live === approved'), 'approval is decided by live truth')
+  assert.ok(body.includes('applyWithdrawalApproval'))
+  // Against the LAST logActivity: the fail-closed branch logs before any
+  // transition, which is correct — nothing was applied there.
+  assert.ok(body.indexOf('applyWithdrawalApproval') < body.lastIndexOf('logActivity'),
     'the transition must land before the awaited logging, which widens the fulfillable window')
 })
 
