@@ -3297,6 +3297,14 @@ model WcWithdrawalSuppression {
   /// retired once rejection has held across SUPPRESSION_QUIESCENCE_MS, which
   /// the by-ID sweep keeps re-verifying.
   clearPendingSince DateTime?
+  /// Soft retirement. Deleting outright ended the fulfilment fence at the same
+  /// instant as the decision to end it, so a resubmission landing between the
+  /// final live read and the delete — with its webhook missed — left a
+  /// warehouse-eligible order with no marker and no row. The row survives for
+  /// SUPPRESSION_RETIRE_GRACE_MS after retirement: the WMS create claim keeps
+  /// fencing on it, and the by-ID sweep keeps re-verifying it, so a
+  /// resubmission in that gap is still found. Hard-deleted after the grace.
+  retiredAt       DateTime?
 
   @@id([connector, externalOrderId])
   @@map("wc_withdrawal_suppressions")

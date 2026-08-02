@@ -627,6 +627,18 @@ const SUPPRESSION_LEASE_MS = 5 * 60_000
  */
 const SUPPRESSION_QUIESCENCE_MS = 30 * 60_000
 
+/**
+ * How long a RETIRED suppression keeps fencing fulfilment.
+ *
+ * Deleting outright ended the fence at the same instant as the decision to end
+ * it, so a resubmission landing between the final live read and the delete —
+ * with its webhook missed — left a warehouse-eligible order carrying neither
+ * marker nor row (Codex r16). Retirement is a soft delete instead: the WMS
+ * create claim keeps fencing, and the sweep keeps re-verifying, until the
+ * grace elapses.
+ */
+const SUPPRESSION_RETIRE_GRACE_MS = 30 * 60_000
+
 type SuppressionClaim = { token: string; wcStatus: string; revision: number }
 
 /**
@@ -671,9 +683,10 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
     // so the queue always rotates.
     orderBy: [{ lastCheckedAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
     take: Math.min(Math.max(limit, 1), 250),
-    select: { externalOrderId: true },
+    select: { externalOrderId: true, retiredAt: true },
   })
 
+  await purgeRetiredSuppressions()
   const result = { scanned: rows.length, imported: 0, stillWithdrawn: 0, unresolved: 0 }
   const { importWcOrder } = await import('./order-import')
   for (const row of rows) {
@@ -693,6 +706,17 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
       result.unresolved++
       continue
     }
+
+    // A RETIRED row is in its fence grace: it exists only so a resubmission
+    // that landed around the retirement decision is still caught. Re-verify
+    // and revive it if the storefront now says withdrawn; otherwise leave it
+    // to be purged. It must not be re-imported every pass.
+    if (row.retiredAt) {
+      const revived = await recordWithdrawalSuppressionIfWithdrawn(live)
+      if (revived) result.stillWithdrawn++
+      continue
+    }
+
     try {
       const guarded = await importWcOrderGuarded(live, () => importWcOrder(live))
       if (guarded.outcome === 'skipped-withdrawal') result.stillWithdrawn++
@@ -784,7 +808,7 @@ async function retireIfQuiescent(externalOrderId: string, claim: SuppressionClai
   const finalLive = await readLiveWcStatus(externalOrderId)
   if (finalLive === null || finalLive === submitted || finalLive === approved) return false
 
-  await consumeSuppression(externalOrderId, claim)
+  await retireSuppression(externalOrderId, claim)
   return true
 }
 
@@ -804,13 +828,22 @@ async function releaseSuppression(externalOrderId: string, token: string): Promi
  * would discard it. In that case the row simply stays, and the next ingress
  * path picks the new one up.
  */
-async function consumeSuppression(externalOrderId: string, claim: SuppressionClaim): Promise<void> {
-  const deleted = await db.wcWithdrawalSuppression.deleteMany({
+async function retireSuppression(externalOrderId: string, claim: SuppressionClaim): Promise<void> {
+  const retired = await db.wcWithdrawalSuppression.updateMany({
     where: {
       connector: 'woocommerce', externalOrderId, claimToken: claim.token, revision: claim.revision,
     },
+    data: { retiredAt: new Date(), claimToken: null, claimedAt: null },
   })
-  if (deleted.count === 0) await releaseSuppression(externalOrderId, claim.token)
+  if (retired.count === 0) await releaseSuppression(externalOrderId, claim.token)
+}
+
+/** Hard-delete rows whose fence grace has elapsed. Housekeeping only. */
+async function purgeRetiredSuppressions(): Promise<number> {
+  const { count } = await db.wcWithdrawalSuppression.deleteMany({
+    where: { connector: 'woocommerce', retiredAt: { lt: new Date(Date.now() - SUPPRESSION_RETIRE_GRACE_MS) } },
+  })
+  return count
 }
 
 export async function recordWithdrawalSuppressionIfWithdrawn(
@@ -834,7 +867,8 @@ export async function recordWithdrawalSuppressionIfWithdrawn(
     // so a request recorded during a pending clear is never retired by it.
     update: {
       wcStatus: status, revision: { increment: 1 }, lastCheckedAt: new Date(),
-      clearPendingSince: null,
+      // Revive a retired row: a new withdrawal is live again.
+      clearPendingSince: null, retiredAt: null,
     },
   })
   return true
@@ -977,7 +1011,7 @@ export async function reconcileSuppressionAfterImport(
     ? await applyWithdrawalApproval(link.orderId, wcOrder)
     : await applyWithdrawalHold(link.orderId, wcOrder)
 
-  if (result.success) await consumeSuppression(externalOrderId, claim)
+  if (result.success) await retireSuppression(externalOrderId, claim)
   else await releaseSuppression(externalOrderId, claim.token)
 
   await logActivity({
@@ -1020,9 +1054,11 @@ export async function shouldSkipUnlinkedWithdrawalImport(
     // guard and import the order as PROCESSING, allocating stock.
     const suppressed = await db.wcWithdrawalSuppression.findUnique({
       where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-      select: { wcStatus: true },
+      select: { wcStatus: true, retiredAt: true },
     })
-    if (!suppressed) return { suppress: false }
+    // A RETIRED row still fences fulfilment, but it must not block the import
+    // it was retired in order to allow.
+    if (!suppressed || suppressed.retiredAt) return { suppress: false }
     return resolveSuppression(wcOrder, externalOrderId)
   }
 

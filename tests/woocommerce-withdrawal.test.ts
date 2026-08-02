@@ -378,12 +378,12 @@ test('a failed transition releases the lease without rewriting the status', asyn
   assert.ok(!body.includes('wcStatus:'), 'releasing must not touch the recorded status')
 })
 
-test('consuming a tombstone is conditional on the revision as well as the token', async () => {
+test('retiring a tombstone is conditional on the revision as well as the token', async () => {
   // A NEWER withdrawal recorded while the claim was held is a different
   // request; deleting it would discard it.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
-  const fn = src.slice(src.indexOf('async function consumeSuppression'))
+  const fn = src.slice(src.indexOf('async function retireSuppression'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
   assert.ok(body.includes('claimToken: claim.token') && body.includes('revision: claim.revision'))
   assert.ok(body.includes('releaseSuppression'), 'a superseded row must be released, not orphaned')
@@ -506,17 +506,17 @@ test('a withdrawal arriving during initial import is still recorded', async () =
     'the gate must record a withdrawal before dropping the event')
 })
 
-test('clearing a suppression goes through the claim, never a bare delete', async () => {
+test('retiring a suppression goes through the claim, never a bare write', async () => {
   // Every retirement must be conditional on the lease token AND the revision,
   // so a newer withdrawal recorded meanwhile is never discarded.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
-  const consumeOnly = src.slice(src.indexOf('async function consumeSuppression'))
-  const guarded = consumeOnly.slice(0, consumeOnly.indexOf('\n}\n'))
+  const retireOnly = src.slice(src.indexOf('async function retireSuppression'))
+  const guarded = retireOnly.slice(0, retireOnly.indexOf('\n}\n'))
   assert.ok(guarded.includes('claimToken: claim.token'))
-  // No other site may delete a suppression row.
+  // No other site may remove a suppression row.
   const deletes = [...src.matchAll(/wcWithdrawalSuppression\.delete/g)].length
-  assert.equal(deletes, 1, 'consumeSuppression must be the only place a tombstone is removed')
+  assert.equal(deletes, 1, 'only the grace-elapsed purge may hard-delete')
 })
 
 test('a failed compensation is reported separately from being handled', async () => {
@@ -632,12 +632,12 @@ test('there is exactly ONE post-import decision point', async () => {
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   const resolver = src.slice(src.indexOf('async function resolveSuppression'))
   const rBody = resolver.slice(0, resolver.indexOf('\n}\n'))
-  assert.ok(!rBody.includes('consumeSuppression'), 'the resolver must not retire the tombstone')
+  assert.ok(!rBody.includes('retireSuppression'), 'the resolver must not retire the tombstone')
 
   const wrapper = src.slice(src.indexOf('export async function importWcOrderGuarded'))
   const wBody = wrapper.slice(0, wrapper.indexOf('\n}\n'))
-  assert.ok(!wBody.includes('consumeSuppression'),
-    'the wrapper must not consume on the pre-import read either')
+  assert.ok(!wBody.includes('retireSuppression'),
+    'the wrapper must not retire on the pre-import read either')
   assert.ok(wBody.includes('releaseSuppression'))
   assert.ok(wBody.indexOf('releaseSuppression') < wBody.indexOf('reconcileSuppressionAfterImport'),
     'release, then let reconcile re-read live and decide')
@@ -645,7 +645,7 @@ test('there is exactly ONE post-import decision point', async () => {
   // reconcile is the only consumer, and it reads live status first.
   const rec = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
   const recBody = rec.slice(0, rec.indexOf('\n}\n'))
-  assert.ok(recBody.indexOf('readLiveWcStatus') < recBody.indexOf('consumeSuppression'))
+  assert.ok(recBody.indexOf('readLiveWcStatus') < recBody.indexOf('retireSuppression'))
 })
 
 test('the sweep persists a cron run and fails loudly on unresolved rows', async () => {
@@ -715,13 +715,46 @@ test('a new withdrawal resets a pending clear', async () => {
   assert.ok(body.includes('clearPendingSince: null'))
 })
 
-test('consumeSuppression is reached only through the quiescence gate', async () => {
+test('retirement is a soft delete, and the fence outlives it', async () => {
+  // Deleting outright ended the fulfilment fence at the same instant as the
+  // decision to end it, so a resubmission landing between the final live read
+  // and the delete — with its webhook missed — left a warehouse-eligible order
+  // with neither marker nor row.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
-  const callers = [...src.matchAll(/^\s*(?:await |return )?consumeSuppression\(/gm)]
-  assert.equal(callers.length, 1, 'exactly one call site')
-  const at = src.indexOf('consumeSuppression(externalOrderId, claim)', src.indexOf('async function retireIfQuiescent'))
-  assert.ok(at > 0, 'and it is inside retireIfQuiescent')
+  const fn = src.slice(src.indexOf('async function retireSuppression'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('retiredAt: new Date()'), 'retirement must be a soft delete')
+  assert.ok(!body.includes('deleteMany'), 'it must not remove the row')
+
+  // The only hard delete is the grace-elapsed purge.
+  const deletes = [...src.matchAll(/wcWithdrawalSuppression\.delete/g)].length
+  assert.equal(deletes, 1, 'purgeRetiredSuppressions must be the only hard delete')
+  const purge = src.slice(src.indexOf('async function purgeRetiredSuppressions'))
+  assert.ok(purge.slice(0, 400).includes('SUPPRESSION_RETIRE_GRACE_MS'))
+})
+
+test('a retired row still fences the WMS claim but does not block import', async () => {
+  const { readFileSync } = await import('node:fs')
+  const wms = readFileSync('lib/domain/wms/order-push-sweep.ts', 'utf8')
+  const fn = wms.slice(wms.indexOf('async claimForCreate('))
+  const body = fn.slice(0, fn.indexOf('\n    },'))
+  // The fence must NOT filter on retiredAt — a retired row inside its grace
+  // is exactly what keeps the order unpushable.
+  const fence = body.slice(body.indexOf('wcWithdrawalSuppression'))
+  assert.ok(!fence.slice(0, 400).includes('retiredAt'), 'the fence covers retired rows too')
+
+  // Import, by contrast, must not be blocked by the row it was retired to allow.
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  assert.ok(src.includes('if (!suppressed || suppressed.retiredAt) return { suppress: false }'))
+})
+
+test('a new withdrawal revives a retired row', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function recordWithdrawalSuppressionIfWithdrawn'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('retiredAt: null'), 'a live request must un-retire the row')
 })
 
 test('a live suppression fences the WMS create claim', async () => {
@@ -743,7 +776,7 @@ test('a live suppression fences the WMS create claim', async () => {
   assert.ok(body.indexOf('FOR UPDATE') < body.indexOf('wcWithdrawalSuppression'))
 })
 
-test('retirement re-reads live immediately before deleting', async () => {
+test('retirement re-reads live immediately before retiring', async () => {
   // Quiescence proves the rejection is OLD, not that nothing arrived since the
   // read that started this pass — and once the row is gone there are no
   // further by-ID checks at all.
@@ -751,6 +784,6 @@ test('retirement re-reads live immediately before deleting', async () => {
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   const fn = src.slice(src.indexOf('async function retireIfQuiescent'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
-  assert.ok(body.indexOf('readLiveWcStatus') < body.indexOf('consumeSuppression'))
+  assert.ok(body.indexOf('readLiveWcStatus') < body.indexOf('retireSuppression'))
   assert.ok(body.includes('finalLive === null'), 'an unreadable final status must not retire it')
 })

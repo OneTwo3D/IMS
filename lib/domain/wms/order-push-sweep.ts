@@ -1029,6 +1029,14 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         // markers leaves a window in which a withdrawn order is pushed to the
         // warehouse. The tombstone is the durable record that the storefront
         // knows something we may not, so refuse the claim while it exists.
+        //
+        // Deliberately includes a RETIRED (soft-deleted) row inside its fence
+        // grace. Retirement and the end of the fence must not be the same
+        // instant, or a resubmission landing between the final live read and
+        // the retirement — with its webhook missed — leaves the order
+        // immediately pushable. The cost is that a legitimately rejected
+        // withdrawal delays the WMS push by up to the grace window; that is
+        // the intended trade.
         const link = await tx.shoppingOrderLink.findFirst({
           where: { orderId, connector: 'woocommerce' },
           select: { externalOrderId: true },
