@@ -622,22 +622,41 @@ test('the withdrawal sweep cron is registered in the route auth policy', async (
   assert.ok(policy.includes("'/api/cron/wc-withdrawal-sweep'"), 'an unregistered cron route fails the boundary guard')
 })
 
-test('the tombstone is consumed only AFTER the import succeeds', async () => {
-  // Consuming inside the resolver meant a failed or throwing import destroyed
-  // the order's only durable retry signal — recreating the stranded-order
-  // failure for statuses outside the poll filter.
+test('there is exactly ONE post-import decision point', async () => {
+  // The resolver's "the request was rejected" read happens BEFORE the import.
+  // Consuming on that read deletes the only durable signal if the customer
+  // resubmits (or is approved) while the import runs and that webhook is
+  // missed — which is precisely the failure mode this sweep exists to cover.
+  // So the resolver releases, and reconcile re-reads live and decides.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   const resolver = src.slice(src.indexOf('async function resolveSuppression'))
   const rBody = resolver.slice(0, resolver.indexOf('\n}\n'))
-  assert.ok(!rBody.includes('consumeSuppression'), 'the resolver must not retire the tombstone itself')
-  assert.ok(rBody.includes('pendingConsume'), 'it must hand the claim to the caller')
+  assert.ok(!rBody.includes('consumeSuppression'), 'the resolver must not retire the tombstone')
 
   const wrapper = src.slice(src.indexOf('export async function importWcOrderGuarded'))
   const wBody = wrapper.slice(0, wrapper.indexOf('\n}\n'))
-  assert.ok(wBody.indexOf('runImport()') < wBody.indexOf('consumeSuppression'))
-  assert.ok(/result\.success[\s\S]{0,200}consumeSuppression[\s\S]{0,200}releaseSuppression/.test(wBody),
-    'success consumes, failure releases')
+  assert.ok(!wBody.includes('consumeSuppression'),
+    'the wrapper must not consume on the pre-import read either')
+  assert.ok(wBody.includes('releaseSuppression'))
+  assert.ok(wBody.indexOf('releaseSuppression') < wBody.indexOf('reconcileSuppressionAfterImport'),
+    'release, then let reconcile re-read live and decide')
+
+  // reconcile is the only consumer, and it reads live status first.
+  const rec = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const recBody = rec.slice(0, rec.indexOf('\n}\n'))
+  assert.ok(recBody.indexOf('readLiveWcStatus') < recBody.indexOf('consumeSuppression'))
+})
+
+test('the sweep persists a cron run and fails loudly on unresolved rows', async () => {
+  // The installer invokes cron with `curl -o /dev/null`, so a bare JSON body
+  // is discarded — a broken WooCommerce credential would leave suppressed
+  // orders unimported indefinitely while the job kept reporting 200.
+  const { readFileSync } = await import('node:fs')
+  const route = readFileSync('app/api/cron/wc-withdrawal-sweep/route.ts', 'utf8')
+  assert.ok(route.includes('runCronWithLogging'), 'the run must be persisted')
+  assert.ok(route.includes('sweep.unresolved > 0'), 'unresolved rows must not report success')
+  assert.ok(route.includes('throw new Error'), 'and must surface as a failed run')
 })
 
 test('the sweep rotates and cannot be starved by a permanent prefix', async () => {

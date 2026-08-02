@@ -564,12 +564,19 @@ export async function importWcOrderGuarded<R extends { success: boolean }>(
 
   const result = await runImport()
 
-  // The rejected-withdrawal claim is retired ONLY once the import has actually
-  // landed. Consuming it inside the resolver meant a failed or throwing import
-  // destroyed the order's only durable retry signal. (Codex r12)
+  // Hand the claim back — never consume it here (Codex r13).
+  //
+  // The resolver's "the request was rejected" read happened BEFORE the import.
+  // If the customer resubmits or is approved while the import is running and
+  // that webhook is missed, consuming on the strength of that pre-import read
+  // deletes the only durable signal for a withdrawal that is now live again.
+  //
+  // So there is exactly ONE post-import decision point: reconcile below claims
+  // the row itself, re-reads the live status, and either applies the
+  // withdrawal or consumes the tombstone. Fresh truth, one place, no second
+  // read to keep in step with the first.
   if (decision.pendingConsume) {
-    if (result.success) await consumeSuppression(String(wcOrder.id), decision.pendingConsume)
-    else await releaseSuppression(String(wcOrder.id), decision.pendingConsume.token)
+    await releaseSuppression(String(wcOrder.id), decision.pendingConsume.token)
   }
 
   // NOT gated on wasUnlinked. The tombstone is the durable record that a
