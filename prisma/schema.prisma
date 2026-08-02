@@ -3282,6 +3282,13 @@ model WcWithdrawalSuppression {
   /// in that gap is deleted by the stale worker and the order imports unmarked.
   /// The delete is conditional on the revision observed before the live fetch.
   revision        Int      @default(0)
+  /// Lease held by the worker currently acting on this withdrawal. The row
+  /// STAYS while claimed, so it keeps suppressing imports — deleting it to
+  /// claim it opened a window where neither the claimant nor anyone else
+  /// treated the order as withdrawn. Self-heals: a lease older than
+  /// SUPPRESSION_LEASE_MS is reclaimable, so a crashed worker cannot pin it.
+  claimToken      String?
+  claimedAt       DateTime?
 
   @@id([connector, externalOrderId])
   @@map("wc_withdrawal_suppressions")

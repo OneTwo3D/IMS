@@ -20,5 +20,7 @@ CREATE TABLE "wc_withdrawal_suppressions" (
   "createdAt"       TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "lastCheckedAt"   TIMESTAMP(3),
   "revision"        INTEGER NOT NULL DEFAULT 0,
+  "claimToken"      TEXT,
+  "claimedAt"       TIMESTAMP(3),
   CONSTRAINT "wc_withdrawal_suppressions_pkey" PRIMARY KEY ("connector", "externalOrderId")
 );

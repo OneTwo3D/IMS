@@ -32,6 +32,8 @@
  *   - the sweep's release pass skips the link.
  */
 
+import { randomUUID } from 'node:crypto'
+
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getSettingValues } from '@/lib/settings-store'
@@ -580,6 +582,76 @@ export async function importWcOrderGuarded<R extends { success: boolean }>(
  * order webhook itself: the tombstone is what the initial-import loop consults,
  * so it has to exist even though nothing is being imported yet.
  */
+
+/**
+ * How long a withdrawal claim may be held before another worker may take it.
+ * A crashed claimant must not pin a withdrawal forever; a live one must not be
+ * overtaken mid-transition.
+ */
+const SUPPRESSION_LEASE_MS = 5 * 60_000
+
+type SuppressionClaim = { token: string; wcStatus: string; revision: number }
+
+/**
+ * Take ownership of a withdrawal tombstone WITHOUT removing it (Codex r8).
+ *
+ * Claiming by DELETE was wrong twice over: the row stopped suppressing while
+ * the claimant worked, and restoring it after a failure overwrote whatever a
+ * concurrent worker had recorded in the meantime — so an acknowledged APPROVAL
+ * could be replaced by an older `submitted` and later retried as a mere hold.
+ *
+ * Both the resolver and the compensation path must hold this BEFORE they make
+ * any live-state or lifecycle decision, or the freshest decision does not
+ * necessarily win: the resolver could observe a rejection while a compensation
+ * was already cancelling on a stale approved tombstone.
+ */
+async function claimSuppression(externalOrderId: string): Promise<SuppressionClaim | null> {
+  const row = await db.wcWithdrawalSuppression.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { wcStatus: true, revision: true },
+  })
+  if (!row) return null
+
+  const token = randomUUID()
+  const staleBefore = new Date(Date.now() - SUPPRESSION_LEASE_MS)
+  const claimed = await db.wcWithdrawalSuppression.updateMany({
+    where: {
+      connector: 'woocommerce',
+      externalOrderId,
+      revision: row.revision,
+      OR: [{ claimToken: null }, { claimedAt: { lt: staleBefore } }],
+    },
+    data: { claimToken: token, claimedAt: new Date() },
+  })
+  if (claimed.count === 0) return null
+  return { token, wcStatus: row.wcStatus, revision: row.revision }
+}
+
+/** Give the claim back, leaving the row — and whatever status it now carries — intact. */
+async function releaseSuppression(externalOrderId: string, token: string): Promise<void> {
+  await db.wcWithdrawalSuppression.updateMany({
+    where: { connector: 'woocommerce', externalOrderId, claimToken: token },
+    data: { claimToken: null, claimedAt: null },
+  })
+}
+
+/**
+ * Retire a withdrawal we have finished with.
+ *
+ * Conditional on the revision as well as the token: if a NEWER withdrawal was
+ * recorded while we held the claim, that is a different request and deleting it
+ * would discard it. In that case the row simply stays, and the next ingress
+ * path picks the new one up.
+ */
+async function consumeSuppression(externalOrderId: string, claim: SuppressionClaim): Promise<void> {
+  const deleted = await db.wcWithdrawalSuppression.deleteMany({
+    where: {
+      connector: 'woocommerce', externalOrderId, claimToken: claim.token, revision: claim.revision,
+    },
+  })
+  if (deleted.count === 0) await releaseSuppression(externalOrderId, claim.token)
+}
+
 export async function recordWithdrawalSuppressionIfWithdrawn(
   wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
 ): Promise<boolean> {
@@ -590,7 +662,12 @@ export async function recordWithdrawalSuppressionIfWithdrawn(
   await db.wcWithdrawalSuppression.upsert({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     create: { connector: 'woocommerce', externalOrderId, wcStatus: status },
-    update: { wcStatus: status, revision: { increment: 1 }, lastCheckedAt: new Date() },
+    // Clear any lease: this is a NEWER request, so whoever was working the old
+    // one no longer owns it. Their token+revision guards then no-op.
+    update: {
+      wcStatus: status, revision: { increment: 1 }, lastCheckedAt: new Date(),
+      claimToken: null, claimedAt: null,
+    },
   })
   return true
 }
@@ -629,12 +706,6 @@ export async function reconcileSuppressionAfterImport(
   wcOrder: WcFullOrder,
 ): Promise<{ handled: boolean; failed: boolean }> {
   const externalOrderId = String(wcOrder.id)
-  const suppressed = await db.wcWithdrawalSuppression.findUnique({
-    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-    select: { wcStatus: true, revision: true },
-  })
-  if (!suppressed) return { handled: false, failed: false }
-
   const link = await db.shoppingOrderLink.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     select: { orderId: true },
@@ -644,19 +715,12 @@ export async function reconcileSuppressionAfterImport(
   const { submitted, approved } = await getWithdrawalStatuses()
   const payloadStatus = normaliseStatus(wcOrder.status)
 
-  // CLAIM the tombstone before transitioning, not after (Codex r7).
-  //
-  // Deleting afterwards let a stale tombstone drive the wrong lifecycle: a
-  // rejection resolver could clear the row while this call was mid-transition,
-  // and an old APPROVED tombstone would still cancel an order whose request had
-  // just been rejected — after which withdrawalApprovedAt makes the rejection
-  // terminally ignored. Claiming first makes the decision and the row one
-  // atomic step: lose the CAS and someone else owns this withdrawal, so we do
-  // nothing and report NOT handled rather than acting on state we no longer own.
-  const claimed = await db.wcWithdrawalSuppression.deleteMany({
-    where: { connector: 'woocommerce', externalOrderId, revision: suppressed.revision },
-  })
-  if (claimed.count === 0) return { handled: false, failed: false }
+  // Take the LEASE before deciding anything. The row stays, so the order keeps
+  // being treated as withdrawn while we work, and a lost claim means another
+  // worker owns this withdrawal — we do nothing and report NOT handled rather
+  // than acting on state we no longer own.
+  const claim = await claimSuppression(externalOrderId)
+  if (!claim) return { handled: false, failed: false }
 
   // Prefer the CURRENT payload when it is itself a withdrawal status: it is by
   // definition at least as fresh as the tombstone. Otherwise a newer APPROVAL
@@ -664,23 +728,19 @@ export async function reconcileSuppressionAfterImport(
   // applied and its own approval skipped as "already handled".
   const effectiveStatus = payloadStatus === approved || payloadStatus === submitted
     ? payloadStatus
-    : suppressed.wcStatus
+    : claim.wcStatus
   const isApproval = effectiveStatus === approved
 
   const result = isApproval
     ? await applyWithdrawalApproval(link.orderId, wcOrder)
     : await applyWithdrawalHold(link.orderId, wcOrder)
 
-  // The claim consumed the retry signal, so a failure has to put it back or the
-  // withdrawal is lost. Re-record at a NEW revision so a concurrent resolver
-  // cannot clear it with a revision it read before this.
-  if (!result.success) {
-    await db.wcWithdrawalSuppression.upsert({
-      where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-      create: { connector: 'woocommerce', externalOrderId, wcStatus: effectiveStatus, revision: 1 },
-      update: { wcStatus: effectiveStatus, revision: { increment: 1 }, lastCheckedAt: new Date() },
-    })
-  }
+  // Success retires the request; failure hands the lease back with the row —
+  // and whatever status a concurrent worker may have recorded on it — intact.
+  // Deleting and re-creating would overwrite a newer approval with this older
+  // snapshot, and it would later be retried as a hold rather than a cancel.
+  if (result.success) await consumeSuppression(externalOrderId, claim)
+  else await releaseSuppression(externalOrderId, claim.token)
 
   await logActivity({
     entityType: 'SYNC', action: 'wc_withdrawal_suppression_raced_import', tag: 'sync',
@@ -694,7 +754,7 @@ export async function reconcileSuppressionAfterImport(
           + 'this order is live and withdrawn. Handle it by hand now.'),
     metadata: {
       externalOrderId: wcOrder.id,
-      suppressedStatus: suppressed.wcStatus,
+      suppressedStatus: claim.wcStatus,
       effectiveStatus,
       payloadStatus,
     },
@@ -727,10 +787,10 @@ export async function shouldSkipUnlinkedWithdrawalImport(
     // guard and import the order as PROCESSING, allocating stock.
     const suppressed = await db.wcWithdrawalSuppression.findUnique({
       where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-      select: { wcStatus: true, revision: true },
+      select: { wcStatus: true },
     })
     if (!suppressed) return false
-    return resolveSuppression(wcOrder, externalOrderId, suppressed.wcStatus, suppressed.revision)
+    return resolveSuppression(wcOrder, externalOrderId)
   }
 
   // Remember the refusal durably, so a stale ordinary payload arriving later
@@ -766,9 +826,20 @@ export async function shouldSkipUnlinkedWithdrawalImport(
 async function resolveSuppression(
   wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
   externalOrderId: string,
-  suppressedStatus: string,
-  observedRevision: number,
 ): Promise<boolean> {
+  // Claim BEFORE reading the live status (Codex r8). Deciding first and
+  // claiming afterwards let a compensation cancel on a stale APPROVED
+  // tombstone while this resolver was already looking at the rejection that
+  // superseded it — and withdrawalApprovedAt then makes that cancellation
+  // terminal. Whoever owns the row makes the decision.
+  const claim = await claimSuppression(externalOrderId)
+  if (!claim) {
+    // Another worker owns this withdrawal right now. Keep suppressing: acting
+    // on a request we do not own is exactly what this ordering prevents.
+    return true
+  }
+  const suppressedStatus = claim.wcStatus
+
   const { submitted, approved } = await getWithdrawalStatuses()
   let live: string | null = null
   try {
@@ -787,10 +858,11 @@ async function resolveSuppression(
     // something to act on. The caller turns this into a RETRYABLE outcome, so
     // the inbox redelivers rather than consuming the only ordinary event and
     // stranding the order unimported. (o3d-d82p, Codex r1)
-    await db.wcWithdrawalSuppression.update({
-      where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    await db.wcWithdrawalSuppression.updateMany({
+      where: { connector: 'woocommerce', externalOrderId, claimToken: claim.token },
       data: { lastCheckedAt: new Date() },
     }).catch(() => {})
+    await releaseSuppression(externalOrderId, claim.token)
     await logActivity({
       entityType: 'SYNC', action: 'wc_withdrawal_suppression_unresolved', tag: 'sync', level: 'WARNING',
       description:
@@ -803,23 +875,30 @@ async function resolveSuppression(
     throw new WithdrawalSuppressionUnresolved(externalOrderId)
   }
 
-  if (live === submitted || live === approved) return true // still withdrawn
+  if (live === submitted || live === approved) {
+    await releaseSuppression(externalOrderId, claim.token)
+    return true // still withdrawn
+  }
 
   // The request was rejected: the storefront has genuinely moved on. Let it
   // import, and forget the refusal.
-  // Compare-and-swap on the revision observed BEFORE the live fetch. A newer
-  // withdrawal can land in that gap, and deleting it here would let this stale
-  // ordinary worker import an order that has just been withdrawn again.
-  const cleared = await db.wcWithdrawalSuppression.deleteMany({
-    where: { connector: 'woocommerce', externalOrderId, revision: observedRevision },
+  // The request was rejected: retire it under the claim we already hold.
+  // consumeSuppression is conditional on the revision too, so a NEWER
+  // withdrawal recorded while we were checking is not thrown away — it simply
+  // stays, and the next ingress path acts on it.
+  const before = claim.revision
+  await consumeSuppression(externalOrderId, claim)
+  const survived = await db.wcWithdrawalSuppression.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { revision: true },
   })
-  if (cleared.count === 0) {
+  if (survived) {
     await logActivity({
       entityType: 'SYNC', action: 'wc_withdrawal_suppression_superseded', tag: 'sync', level: 'WARNING',
       description:
         `WooCommerce order #${wcOrder.number} looked resolved ("${live}"), but a NEWER withdrawal was `
         + 'recorded while we were checking. Keeping the order suppressed.',
-      metadata: { externalOrderId: wcOrder.id, liveStatus: live, suppressedStatus },
+      metadata: { externalOrderId: wcOrder.id, liveStatus: live, suppressedStatus, priorRevision: before },
       resolveUser: false,
     })
     return true

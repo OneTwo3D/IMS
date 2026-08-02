@@ -335,33 +335,58 @@ test('compensation is retried for an order that is already LINKED', async () => 
   assert.ok(!body.includes('wasUnlinked'), 'compensation must not be gated on the order having been unlinked')
 })
 
-test('the tombstone is CLAIMED before the transition, not after', async () => {
-  // Deleting afterwards let a stale tombstone drive the wrong lifecycle: a
-  // rejection resolver could clear the row mid-transition and an old APPROVED
-  // tombstone would still cancel a now-rejected order — after which
-  // withdrawalApprovedAt makes the rejection terminally ignored.
+test('the tombstone is LEASED, not deleted, to claim it', async () => {
+  // Deleting to claim stopped the row suppressing while the claimant worked,
+  // and restoring it after a failure overwrote whatever a concurrent worker
+  // had recorded — so an acknowledged APPROVAL could be replaced by an older
+  // `submitted` and later retried as a mere hold.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
-  const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
-  const body = fn.slice(0, fn.indexOf('\n}\n'))
-  const claim = body.indexOf('deleteMany')
-  const transition = body.indexOf('applyWithdrawalApproval')
-  assert.ok(claim > 0 && transition > 0)
-  assert.ok(claim < transition, 'the CAS claim must precede any lifecycle transition')
-  assert.ok(body.includes('claimed.count === 0'), 'a lost CAS must not report handled')
+  const claim = src.slice(src.indexOf('async function claimSuppression'))
+  const body = claim.slice(0, claim.indexOf('\n}\n'))
+  assert.ok(body.includes('updateMany'), 'the claim must leave the row in place')
+  assert.ok(!body.includes('deleteMany'), 'claiming must not delete the row')
+  assert.ok(body.includes('claimedAt: { lt: staleBefore }'), 'a crashed claimant must not pin it forever')
 })
 
-test('a failed transition puts the retry signal back at a NEW revision', async () => {
-  // The claim consumed the tombstone, so a failure that did not restore it
-  // would lose the withdrawal outright.
+test('both the resolver and compensation claim BEFORE deciding', async () => {
+  // Claim ordering serializes the workers; deciding first and claiming after
+  // let a stale approval beat an already-observed rejection.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
-  const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  for (const [fnName, decision] of [
+    ['async function resolveSuppression', 'wcFetch'],
+    ['export async function reconcileSuppressionAfterImport', 'applyWithdrawalApproval'],
+  ] as const) {
+    const fn = src.slice(src.indexOf(fnName))
+    const body = fn.slice(0, fn.indexOf('\n}\n'))
+    assert.ok(body.indexOf('claimSuppression') > 0, `${fnName} must claim`)
+    assert.ok(body.indexOf('claimSuppression') < body.indexOf(decision),
+      `${fnName} must claim before it decides`)
+    assert.ok(body.includes('if (!claim)'), `${fnName} must handle a lost claim`)
+  }
+})
+
+test('a failed transition releases the lease without rewriting the status', async () => {
+  // Re-creating the row would overwrite a newer approval with this older
+  // snapshot, which would then be retried as a hold rather than a cancel.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const rel = src.slice(src.indexOf('async function releaseSuppression'))
+  const body = rel.slice(0, rel.indexOf('\n}\n'))
+  assert.ok(body.includes('claimToken: null'))
+  assert.ok(!body.includes('wcStatus:'), 'releasing must not touch the recorded status')
+})
+
+test('consuming a tombstone is conditional on the revision as well as the token', async () => {
+  // A NEWER withdrawal recorded while the claim was held is a different
+  // request; deleting it would discard it.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async function consumeSuppression'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
-  const restore = body.indexOf('if (!result.success) {')
-  assert.ok(restore > 0)
-  assert.ok(body.slice(restore, restore + 500).includes('revision: { increment: 1 }'),
-    'restoring at the same revision would let a stale resolver clear it')
+  assert.ok(body.includes('claimToken: claim.token') && body.includes('revision: claim.revision'))
+  assert.ok(body.includes('releaseSuppression'), 'a superseded row must be released, not orphaned')
 })
 
 test('a newer withdrawal payload supersedes the tombstone status', () => {
@@ -440,15 +465,17 @@ test('a withdrawal arriving during initial import is still recorded', async () =
     'the gate must record a withdrawal before dropping the event')
 })
 
-test('clearing a suppression is conditional on the observed revision', async () => {
-  // A newer withdrawal can land between the live status read and the delete;
-  // deleting it there lets the stale worker import a just-withdrawn order.
+test('clearing a suppression goes through the claim, never a bare delete', async () => {
+  // Every retirement must be conditional on the lease token AND the revision,
+  // so a newer withdrawal recorded meanwhile is never discarded.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
-  const fn = src.slice(src.indexOf('async function resolveSuppression'))
-  assert.ok(fn.includes('revision: observedRevision'), 'the delete must CAS on the revision')
-  assert.ok(!/\.delete\(\{\s*where: \{ connector_externalOrderId/.test(fn),
-    'no unconditional delete may remain')
+  const consumeOnly = src.slice(src.indexOf('async function consumeSuppression'))
+  const guarded = consumeOnly.slice(0, consumeOnly.indexOf('\n}\n'))
+  assert.ok(guarded.includes('claimToken: claim.token'))
+  // No other site may delete a suppression row.
+  const deletes = [...src.matchAll(/wcWithdrawalSuppression\.delete/g)].length
+  assert.equal(deletes, 1, 'consumeSuppression must be the only place a tombstone is removed')
 })
 
 test('a failed compensation is reported separately from being handled', async () => {
