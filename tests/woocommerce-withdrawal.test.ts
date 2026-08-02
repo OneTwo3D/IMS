@@ -335,17 +335,43 @@ test('compensation is retried for an order that is already LINKED', async () => 
   assert.ok(!body.includes('wasUnlinked'), 'compensation must not be gated on the order having been unlinked')
 })
 
-test('the tombstone survives a failed transition and is cleared only on success', async () => {
-  // The tombstone IS the durable retry signal. Clearing it on failure loses
-  // the withdrawal; never clearing it retries a completed one forever.
+test('the tombstone is CLAIMED before the transition, not after', async () => {
+  // Deleting afterwards let a stale tombstone drive the wrong lifecycle: a
+  // rejection resolver could clear the row mid-transition and an old APPROVED
+  // tombstone would still cancel a now-rejected order — after which
+  // withdrawalApprovedAt makes the rejection terminally ignored.
   const { readFileSync } = await import('node:fs')
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
-  const del = body.indexOf('wcWithdrawalSuppression.deleteMany')
-  assert.ok(del > 0, 'the tombstone must be cleared once the transition lands')
-  assert.ok(body.lastIndexOf('if (result.success) {', del) > 0, 'and only then')
-  assert.ok(body.slice(del, del + 260).includes('revision: suppressed.revision'), 'CAS on the revision')
+  const claim = body.indexOf('deleteMany')
+  const transition = body.indexOf('applyWithdrawalApproval')
+  assert.ok(claim > 0 && transition > 0)
+  assert.ok(claim < transition, 'the CAS claim must precede any lifecycle transition')
+  assert.ok(body.includes('claimed.count === 0'), 'a lost CAS must not report handled')
+})
+
+test('a failed transition puts the retry signal back at a NEW revision', async () => {
+  // The claim consumed the tombstone, so a failure that did not restore it
+  // would lose the withdrawal outright.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  const restore = body.indexOf('if (!result.success) {')
+  assert.ok(restore > 0)
+  assert.ok(body.slice(restore, restore + 500).includes('revision: { increment: 1 }'),
+    'restoring at the same revision would let a stale resolver clear it')
+})
+
+test('a newer withdrawal payload supersedes the tombstone status', () => {
+  // A newer APPROVAL arriving over a surviving submitted tombstone must cancel,
+  // not re-apply the old hold and then be skipped as already handled.
+  const pick = (payload: string, tomb: string, submitted: string, approved: string) =>
+    payload === approved || payload === submitted ? payload : tomb
+  assert.equal(pick('wc-withdrawn', 'wc-pending-wdraw', 'wc-pending-wdraw', 'wc-withdrawn'), 'wc-withdrawn')
+  assert.equal(pick('processing', 'wc-withdrawn', 'wc-pending-wdraw', 'wc-withdrawn'), 'wc-withdrawn',
+    'an ordinary payload must not weaken an approved tombstone')
 })
 
 test('the initial-import gate applies to a linked order and never swallows a failure', async () => {

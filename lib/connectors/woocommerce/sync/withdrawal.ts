@@ -641,43 +641,66 @@ export async function reconcileSuppressionAfterImport(
   })
   if (!link?.orderId) return { handled: false, failed: false }
 
-  // Transition FIRST, log after. The order is fulfillable from the moment it
-  // was created until its marker lands, and the WMS sweep selects on exactly
-  // that marker — so every awaited call before the transition widens the
-  // window for a sweep to claim and push it.
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const payloadStatus = normaliseStatus(wcOrder.status)
+
+  // CLAIM the tombstone before transitioning, not after (Codex r7).
   //
-  // Route by the SUPPRESSED status, not the stale payload that triggered this
-  // import. If the raced request was APPROVED, holding would leave the order
-  // merely releasable ON_HOLD instead of terminally cancelled, and an operator
-  // could hand an approved-withdrawn order back to fulfilment.
-  const { approved } = await getWithdrawalStatuses()
-  const result = suppressed.wcStatus === approved
+  // Deleting afterwards let a stale tombstone drive the wrong lifecycle: a
+  // rejection resolver could clear the row while this call was mid-transition,
+  // and an old APPROVED tombstone would still cancel an order whose request had
+  // just been rejected — after which withdrawalApprovedAt makes the rejection
+  // terminally ignored. Claiming first makes the decision and the row one
+  // atomic step: lose the CAS and someone else owns this withdrawal, so we do
+  // nothing and report NOT handled rather than acting on state we no longer own.
+  const claimed = await db.wcWithdrawalSuppression.deleteMany({
+    where: { connector: 'woocommerce', externalOrderId, revision: suppressed.revision },
+  })
+  if (claimed.count === 0) return { handled: false, failed: false }
+
+  // Prefer the CURRENT payload when it is itself a withdrawal status: it is by
+  // definition at least as fresh as the tombstone. Otherwise a newer APPROVAL
+  // arriving over a surviving submitted tombstone would have the old hold
+  // applied and its own approval skipped as "already handled".
+  const effectiveStatus = payloadStatus === approved || payloadStatus === submitted
+    ? payloadStatus
+    : suppressed.wcStatus
+  const isApproval = effectiveStatus === approved
+
+  const result = isApproval
     ? await applyWithdrawalApproval(link.orderId, wcOrder)
     : await applyWithdrawalHold(link.orderId, wcOrder)
+
+  // The claim consumed the retry signal, so a failure has to put it back or the
+  // withdrawal is lost. Re-record at a NEW revision so a concurrent resolver
+  // cannot clear it with a revision it read before this.
+  if (!result.success) {
+    await db.wcWithdrawalSuppression.upsert({
+      where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+      create: { connector: 'woocommerce', externalOrderId, wcStatus: effectiveStatus, revision: 1 },
+      update: { wcStatus: effectiveStatus, revision: { increment: 1 }, lastCheckedAt: new Date() },
+    })
+  }
 
   await logActivity({
     entityType: 'SYNC', action: 'wc_withdrawal_suppression_raced_import', tag: 'sync',
     level: result.success ? 'WARNING' : 'ERROR',
     description:
       `WooCommerce order #${wcOrder.number} was imported at the same moment a withdrawal request was `
-      + `recorded for it ("${suppressed.wcStatus}"). `
+      + `recorded for it ("${effectiveStatus}"). `
       + (result.success
-        ? `The ${suppressed.wcStatus === approved ? 'cancellation' : 'hold'} was applied to the order that was just created.`
-        : `Applying the ${suppressed.wcStatus === approved ? 'cancellation' : 'hold'} FAILED (${result.error ?? 'unknown'}) — `
+        ? `The ${isApproval ? 'cancellation' : 'hold'} was applied to the order that was just created.`
+        : `Applying the ${isApproval ? 'cancellation' : 'hold'} FAILED (${result.error ?? 'unknown'}) — `
           + 'this order is live and withdrawn. Handle it by hand now.'),
-    metadata: { externalOrderId: wcOrder.id, suppressedStatus: suppressed.wcStatus },
+    metadata: {
+      externalOrderId: wcOrder.id,
+      suppressedStatus: suppressed.wcStatus,
+      effectiveStatus,
+      payloadStatus,
+    },
     resolveUser: !result.success,
   })
 
-  // Clear the tombstone ONLY once the transition has landed. While it stands,
-  // every ingress path retries the withdrawal — which is the whole point of
-  // recording it. Revision-CAS'd so a newer withdrawal recorded while we were
-  // transitioning is not thrown away.
-  if (result.success) {
-    await db.wcWithdrawalSuppression.deleteMany({
-      where: { connector: 'woocommerce', externalOrderId, revision: suppressed.revision },
-    })
-  }
   return { handled: true, failed: !result.success }
 }
 
