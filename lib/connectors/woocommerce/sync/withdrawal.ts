@@ -770,12 +770,15 @@ export async function verifyWithdrawalFenceForPush(salesOrderId: string): Promis
 
   const row = await db.wcWithdrawalSuppression.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
-    select: { retiredAt: true, verifiedSafeUntil: true },
+    select: { retiredAt: true },
   })
   if (!row) return true
   if (!row.retiredAt) return false
-  if (row.verifiedSafeUntil && row.verifiedSafeUntil > new Date()) return true
 
+  // No TTL shortcut. A time window is a reusable cache: once one worker stamped
+  // it, any other attempt could skip the live read for the rest of it, and a
+  // resubmission inside that window stayed pushable (Codex r19). Every attempt
+  // takes its own read and mints its own single-use proof.
   const live = await readLiveWcOrder(externalOrderId)
   if (!live) return false // unreadable: refuse rather than guess
 
@@ -789,7 +792,10 @@ export async function verifyWithdrawalFenceForPush(salesOrderId: string): Promis
 
   await db.wcWithdrawalSuppression.updateMany({
     where: { connector: 'woocommerce', externalOrderId, retiredAt: row.retiredAt },
-    data: { verifiedSafeUntil: new Date(Date.now() + SUPPRESSION_SAFE_WINDOW_MS) },
+    data: {
+      pushProofToken: randomUUID(),
+      verifiedSafeUntil: new Date(Date.now() + SUPPRESSION_SAFE_WINDOW_MS),
+    },
   })
   return true
 }
@@ -924,7 +930,9 @@ export async function recordWithdrawalSuppressionIfWithdrawn(
     update: {
       wcStatus: status, revision: { increment: 1 }, lastCheckedAt: new Date(),
       // Revive a retired row: a new withdrawal is live again.
-      clearPendingSince: null, retiredAt: null, verifiedSafeUntil: null,
+      clearPendingSince: null, retiredAt: null,
+      // Invalidate any proof in flight: it was taken before this request.
+      pushProofToken: null, verifiedSafeUntil: null,
     },
   })
   return true

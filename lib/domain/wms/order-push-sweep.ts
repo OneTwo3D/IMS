@@ -1066,14 +1066,25 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
             where: {
               connector_externalOrderId: { connector: 'woocommerce', externalOrderId: link.externalOrderId },
             },
-            select: { retiredAt: true, verifiedSafeUntil: true },
+            select: { retiredAt: true, pushProofToken: true, verifiedSafeUntil: true },
           })
           if (suppressed) {
-            // A live row refuses outright. A RETIRED one is allowed only inside
-            // the short window a by-ID WooCommerce read just vouched for —
-            // verifyWithdrawalFenceForPush sets it immediately before this.
+            // A live row refuses outright. A RETIRED one is allowed only on a
+            // single-use proof minted by the by-ID WooCommerce read taken
+            // immediately before this claim — CONSUMED here under the lock, so
+            // no other attempt can ride on it.
             if (!suppressed.retiredAt) return false
+            if (!suppressed.pushProofToken) return false
             if (!suppressed.verifiedSafeUntil || suppressed.verifiedSafeUntil <= new Date()) return false
+            const consumed = await tx.wcWithdrawalSuppression.updateMany({
+              where: {
+                connector: 'woocommerce',
+                externalOrderId: link.externalOrderId,
+                pushProofToken: suppressed.pushProofToken,
+              },
+              data: { pushProofToken: null, verifiedSafeUntil: null },
+            })
+            if (consumed.count === 0) return false
           }
         }
 

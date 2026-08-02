@@ -742,7 +742,8 @@ test('the push boundary re-verifies a retired fence, fail-closed', async () => {
   assert.ok(body.includes('if (!row.retiredAt) return false'), 'a live row refuses outright')
   assert.ok(body.includes('if (!live) return false'), 'unreadable must refuse, not guess')
   assert.ok(body.includes('recordWithdrawalSuppressionIfWithdrawn'), 'withdrawn again revives the fence')
-  assert.ok(body.includes('verifiedSafeUntil'), 'a pass vouches only for a short window')
+  assert.ok(body.includes('pushProofToken: randomUUID()'), 'each attempt mints its own single-use proof')
+  assert.ok(!body.includes('verifiedSafeUntil >'), 'no TTL shortcut: a window is a reusable cache')
 })
 
 test('the WMS create path checks the fence before claiming, and again under the lock', async () => {
@@ -758,7 +759,10 @@ test('the WMS create path checks the fence before claiming, and again under the 
   const claim = wms.slice(wms.indexOf('async claimForCreate('))
   const body = claim.slice(0, claim.indexOf('\n    },'))
   assert.ok(body.includes('!suppressed.retiredAt) return false'))
-  assert.ok(body.includes('verifiedSafeUntil'))
+  // The proof is CONSUMED under the lock, so a second attempt cannot ride on
+  // the read another worker took.
+  assert.ok(body.includes('pushProofToken: null'))
+  assert.ok(body.includes('consumed.count === 0) return false'))
 })
 
 test('a retired row does not block the import it was retired to allow', async () => {

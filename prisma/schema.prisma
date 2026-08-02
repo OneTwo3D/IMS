@@ -3310,6 +3310,10 @@ model WcWithdrawalSuppression {
   /// The row is never auto-deleted: any external read followed by a local
   /// delete is time-of-check-to-time-of-use, so the check has to sit next to
   /// the push instead of ending monitoring permanently.
+  /// SINGLE-USE proof, not a cache. A time window would let a second attempt
+  /// reuse another worker's read, so this token is consumed by the claim that
+  /// it authorised; any other attempt must take its own live read.
+  pushProofToken  String?
   verifiedSafeUntil DateTime?
 
   @@id([connector, externalOrderId])
