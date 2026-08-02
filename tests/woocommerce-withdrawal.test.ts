@@ -363,7 +363,7 @@ test('both the resolver and compensation claim BEFORE deciding', async () => {
     assert.ok(body.indexOf('claimSuppression') > 0, `${fnName} must claim`)
     assert.ok(body.indexOf('claimSuppression') < body.indexOf(decision),
       `${fnName} must claim before it decides`)
-    assert.ok(body.includes('if (!claim)'), `${fnName} must handle a lost claim`)
+    assert.ok(body.includes("claim === 'busy'"), `${fnName} must handle a lost claim`)
   }
 })
 
@@ -431,9 +431,9 @@ test('a lost claim is unresolved, never a clean skip', async () => {
   const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
   const fn = src.slice(src.indexOf('async function resolveSuppression'))
   const body = fn.slice(0, fn.indexOf('\n}\n'))
-  const lost = body.indexOf('if (!claim) {')
-  assert.ok(lost > 0)
-  assert.ok(body.slice(lost, lost + 600).includes('WithdrawalSuppressionUnresolved'))
+  const lost = body.indexOf("if (claim === 'busy') {")
+  assert.ok(lost > 0, 'a busy claim must be handled explicitly')
+  assert.ok(body.slice(lost, lost + 700).includes('WithdrawalSuppressionUnresolved'))
 })
 
 test('the initial-import gate applies to a linked order and never swallows a failure', async () => {
@@ -537,4 +537,52 @@ test('a withdrawn FX-queue row is terminal, not left pending', async () => {
   const block = src.slice(src.indexOf("if (guarded.outcome === 'skipped-withdrawal')"))
   assert.ok(block.slice(0, 900).includes('markPendingFxRetryLogFailed'),
     'a withdrawn row must be terminalized so it cannot monopolize the batch')
+})
+
+test('a busy lease is reported unfinished, never as absent', async () => {
+  // Conflating them let a caller acknowledge its delivery and sync a stale
+  // ordinary status while another worker was mid-transition — and if that
+  // worker then died, nothing retried.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  assert.ok(src.includes("return 'busy'") && src.includes("return 'absent'"),
+    'claimSuppression must distinguish the two')
+  const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes("if (claim === 'absent') return { handled: false, failed: false }"))
+  assert.ok(/claim === 'busy'[\s\S]{0,400}failed: true/.test(body), 'busy must report unfinished')
+})
+
+test('a terminal approval is confirmed against the live status first', async () => {
+  // Approval sets withdrawalApprovedAt, cancels the order and makes every
+  // later storefront status ignored. A delayed `withdrawn` payload arriving
+  // after WooCommerce rejected the request would otherwise cancel a valid
+  // order unrecoverably.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf("if (kind === 'approved') {"))
+  const body = fn.slice(0, fn.indexOf('\n  }\n'))
+  assert.ok(body.includes('readLiveWcStatus'), 'must confirm against live status')
+  assert.ok(body.indexOf('readLiveWcStatus') < body.indexOf('applyWithdrawalApproval'),
+    'the confirmation must precede the terminal transition')
+  assert.ok(body.includes('live === null'), 'an unreadable status must not cancel')
+})
+
+test('the tombstone sweeper fetches by ID, not through a status filter', async () => {
+  // Every other route to a tombstone needs ANOTHER event for that order. A
+  // withdrawal rejected back to a status the poll does not query (e.g.
+  // `pending` under the default `processing` config) appears in no ingress.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function sweepWithdrawalSuppressions'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('wcWithdrawalSuppression.findMany'), 'must enumerate tombstones directly')
+  assert.ok(body.includes('resolveSuppression'), 'must reuse the ordinary decision path, not a parallel one')
+  assert.ok(body.includes('claimedAt: { lt: staleBefore }'), 'must reclaim expired leases')
+})
+
+test('the withdrawal sweep cron is registered in the route auth policy', async () => {
+  const { readFileSync } = await import('node:fs')
+  const policy = readFileSync('lib/security/route-auth-policy.ts', 'utf8')
+  assert.ok(policy.includes("'/api/cron/wc-withdrawal-sweep'"), 'an unregistered cron route fails the boundary guard')
 })

@@ -165,6 +165,33 @@ export async function handleWcWithdrawalStatus(
   }
 
   if (kind === 'approved') {
+    // Approval is TERMINAL: it sets withdrawalApprovedAt, cancels the order,
+    // and makes every later storefront status ignored. The inbox does not
+    // guarantee ordering, so a delayed `withdrawn` payload can arrive after
+    // WooCommerce has already rejected the request — and cancelling a valid
+    // order on that basis is unrecoverable through this path. Confirm against
+    // the live storefront first; one API call, only on approval events.
+    // (Codex r10)
+    const { approved } = await getWithdrawalStatuses()
+    const live = await readLiveWcStatus(String(wcOrder.id))
+    if (live === null) {
+      // Fail closed on the CANCELLATION, not on the order: do not act, and do
+      // not acknowledge either, so the delivery is retried.
+      return {
+        kind,
+        handled: true,
+        result: {
+          success: false,
+          error: 'Could not confirm the withdrawal approval against WooCommerce; not cancelling on an unverified payload',
+        },
+      }
+    }
+    if (live !== approved) {
+      await note(order.id, wcOrder, 'wc_withdrawal_stale_approval_ignored', 'WARNING',
+        `A withdrawal-approved event arrived for this order, but WooCommerce now reports "${live}" — `
+        + 'the request was rejected after that event was sent. The order was NOT cancelled.')
+      return { kind, handled: true, result: { success: true } }
+    }
     return { kind, handled: true, result: await applyWithdrawalApproval(order.id, wcOrder) }
   }
 
@@ -605,6 +632,52 @@ type SuppressionClaim = { token: string; wcStatus: string; revision: number }
  * necessarily win: the resolver could observe a rejection while a compensation
  * was already cancelling on a stale approved tombstone.
  */
+/**
+ * Sweep withdrawal tombstones that nothing else will reach (o3d-d82p).
+ *
+ * Every other route to a tombstone depends on ANOTHER event arriving for that
+ * order. But the poll queries only the operator-configured statuses plus
+ * `completed` and the two withdrawal slugs — so an order whose withdrawal was
+ * REJECTED back to, say, `pending` or `on-hold` under the default `processing`
+ * configuration appears in no ingress at all, and its tombstone and its
+ * unimported order sit there indefinitely.
+ *
+ * Fetches each suppressed order BY ID, so no status filter or modified cursor
+ * can hide it. Unresolved reads stay put and are retried next run.
+ */
+export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
+  scanned: number; resolved: number; stillWithdrawn: number; unresolved: number
+}> {
+  const staleBefore = new Date(Date.now() - SUPPRESSION_LEASE_MS)
+  const rows = await db.wcWithdrawalSuppression.findMany({
+    where: {
+      connector: 'woocommerce',
+      OR: [{ claimToken: null }, { claimedAt: { lt: staleBefore } }],
+    },
+    orderBy: { createdAt: 'asc' },
+    take: Math.min(Math.max(limit, 1), 250),
+    select: { externalOrderId: true, wcStatus: true },
+  })
+
+  const result = { scanned: rows.length, resolved: 0, stillWithdrawn: 0, unresolved: 0 }
+  for (const row of rows) {
+    const stub = { id: Number(row.externalOrderId), number: row.externalOrderId, status: row.wcStatus }
+    try {
+      // Reuses the ordinary decision path, so the sweep cannot drift from it.
+      const stillSuppressed = await resolveSuppression(stub, row.externalOrderId)
+      if (stillSuppressed) result.stillWithdrawn++
+      else result.resolved++
+    } catch (e) {
+      if (e instanceof WithdrawalSuppressionUnresolved) result.unresolved++
+      else {
+        result.unresolved++
+        console.error(`[wc-withdrawal-sweep] ${row.externalOrderId}: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+  }
+  return result
+}
+
 /** The live storefront status, or null when it cannot be read. */
 async function readLiveWcStatus(externalOrderId: string): Promise<string | null> {
   try {
@@ -617,12 +690,14 @@ async function readLiveWcStatus(externalOrderId: string): Promise<string | null>
   }
 }
 
-async function claimSuppression(externalOrderId: string): Promise<SuppressionClaim | null> {
+async function claimSuppression(
+  externalOrderId: string,
+): Promise<SuppressionClaim | 'absent' | 'busy'> {
   const row = await db.wcWithdrawalSuppression.findUnique({
     where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     select: { wcStatus: true, revision: true },
   })
-  if (!row) return null
+  if (!row) return 'absent'
 
   const token = randomUUID()
   const staleBefore = new Date(Date.now() - SUPPRESSION_LEASE_MS)
@@ -635,7 +710,11 @@ async function claimSuppression(externalOrderId: string): Promise<SuppressionCla
     },
     data: { claimToken: token, claimedAt: new Date() },
   })
-  if (claimed.count === 0) return null
+  // 'busy' is emphatically NOT 'absent'. Conflating them let a caller
+  // acknowledge its delivery and sync a stale ordinary status while another
+  // worker was still mid-transition — and if that worker then died, nothing
+  // retried. (Codex r10)
+  if (claimed.count === 0) return 'busy'
   return { token, wcStatus: row.wcStatus, revision: row.revision }
 }
 
@@ -746,7 +825,13 @@ export async function reconcileSuppressionAfterImport(
   if (!link?.orderId) return { handled: false, failed: false }
 
   const claim = await claimSuppression(externalOrderId)
-  if (!claim) return { handled: false, failed: false }
+  if (claim === 'absent') return { handled: false, failed: false }
+  if (claim === 'busy') {
+    // Another worker owns this withdrawal and has NOT finished. Report it
+    // unfinished so the caller retries and does not sync its stale status over
+    // a transition that is still in flight.
+    return { handled: true, failed: true }
+  }
 
   const { submitted, approved } = await getWithdrawalStatuses()
   const live = await readLiveWcStatus(externalOrderId)
@@ -862,7 +947,8 @@ async function resolveSuppression(
   // Claim BEFORE reading the live status. Deciding first and claiming after
   // only serializes the workers; it does not make the freshest decision win.
   const claim = await claimSuppression(externalOrderId)
-  if (!claim) {
+  if (claim === 'absent') return false
+  if (claim === 'busy') {
     // Another worker owns this withdrawal RIGHT NOW — but "owned" is not
     // "finished", and returning a clean skip would let the caller acknowledge
     // what may be the only ordinary event this order ever sends. If the owner
