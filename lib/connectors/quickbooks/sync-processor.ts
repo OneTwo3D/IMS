@@ -17,7 +17,7 @@ import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
-import { failureProvesNoRemoteCall, planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
@@ -170,13 +170,9 @@ async function enqueueFollowUpSyncLog(
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: QBO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true, errorMessage: true },
+    select: { id: true, payload: true },
   })
-  const failedRows = failedLogs.map((row) => ({
-    id: row.id,
-    payload: row.payload,
-    provenNotPosted: failureProvesNoRemoteCall(row.errorMessage),
-  }))
+  const failedRows = failedLogs.map((row) => ({ id: row.id, payload: row.payload }))
   const plan = planFollowUpEnqueue({
     connector: QBO_CONNECTOR,
     type,

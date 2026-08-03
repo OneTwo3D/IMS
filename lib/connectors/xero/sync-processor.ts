@@ -18,7 +18,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { applyBackReference, backReferenceIsMissing, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
-import { failureProvesNoRemoteCall, planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -294,13 +294,9 @@ async function enqueueFollowUpSyncLog(
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true, errorMessage: true },
+    select: { id: true, payload: true },
   })
-  const failedRows = failedLogs.map((row) => ({
-    id: row.id,
-    payload: row.payload,
-    provenNotPosted: failureProvesNoRemoteCall(row.errorMessage),
-  }))
+  const failedRows = failedLogs.map((row) => ({ id: row.id, payload: row.payload }))
   const plan = planFollowUpEnqueue({
     connector: XERO_CONNECTOR,
     type,

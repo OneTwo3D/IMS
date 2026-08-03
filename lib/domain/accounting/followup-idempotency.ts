@@ -152,15 +152,6 @@ export type FollowUpEnqueuePlan =
 export type FailedFollowUpRow = {
   id: string
   payload: unknown
-  /**
-   * True when this row's recorded failure PROVES no remote call was made — the connector
-   * rejected it locally, before any HTTP request. Such a row carries no ambiguity: there
-   * is nothing it could have committed, so neither its token nor its body needs pinning.
-   *
-   * The default is false, which is the safe reading: o3d-ju8t established that FAILED on
-   * its own does NOT prove nothing was posted.
-   */
-  provenNotPosted?: boolean
 }
 
 export type FollowUpEnqueueInput = FollowUpIdentity & {
@@ -168,34 +159,6 @@ export type FollowUpEnqueueInput = FollowUpIdentity & {
   liveRowExists: boolean
   /** Every surviving FAILED row for this scope, newest first. */
   failedRows: FailedFollowUpRow[]
-}
-
-/**
- * Failures BOTH connectors raise from their own validation, before any HTTP request is
- * built. A row that failed this way provably did not post, so it carries no ambiguity —
- * neither its token nor its body needs pinning, and the recomputed request is free to go
- * out. Without this, a payment whose bank account was mis-mapped would have its invalid
- * body pinned forever and could never be corrected (Codex review, r2 #3).
- *
- * Matched on message shape rather than a flag because that is the evidence the rows
- * already carry; the patterns are anchored, and the tests pin the exact strings both
- * connectors emit so a reworded message breaks loudly instead of silently widening the
- * "safe to rotate" set. Anything unrecognised stays ambiguous, which is the safe default:
- * o3d-ju8t established that FAILED alone does NOT prove nothing was posted.
- */
-const PRE_CALL_FAILURE_PATTERNS = [
-  // "Missing <what> for <SYNC_TYPE>", optionally followed by an explanatory clause —
-  // e.g. "Missing customer reference for INVOICE_PAYMENT — customer has no QuickBooks
-  // contact ID". Anchored on the SCREAMING_CASE sync type so a remote message that merely
-  // opens with "Missing" does not qualify.
-  /^Missing .+ for [A-Z][A-Z_]+(?:\s|$)/,
-  /^Bank account .+ not found in synced [A-Za-z ]+ chart of accounts$/,
-]
-
-export function failureProvesNoRemoteCall(errorMessage: string | null | undefined): boolean {
-  if (typeof errorMessage !== 'string') return false
-  const message = errorMessage.trim()
-  return PRE_CALL_FAILURE_PATTERNS.some((pattern) => pattern.test(message))
 }
 
 /** Fields whose value defines the remote request, so a divergence is worth reporting. */
@@ -248,14 +211,20 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   const freshAnchors = anchorsOf(input.payload)
   const moneyMoving = isMoneyMovingFollowUp(input.type)
 
-  // Narrow the history to attempts that carry REAL ambiguity, in two steps. Both matter:
-  // treating every FAILED row as dangerous strands legitimate work (Codex review, r2 #2/#3).
+  // Narrow the history to attempts that could have committed THIS document. An attempt
+  // against a DIFFERENT external document cannot have posted the one we are about to
+  // (Codex review, r2 #2 — the earlier refusal fired on row COUNT alone and so blocked a
+  // legitimate payment against a replacement invoice, permanently).
   //
-  //  1. A failure the connector raised BEFORE any HTTP call proves nothing was posted, so
-  //     it has no token worth preserving and no body worth pinning.
-  //  2. An attempt against a DIFFERENT external document cannot have committed this one.
-  const ambiguous = input.failedRows.filter((row) => !row.provenNotPosted)
-  const couldHaveCommitted = ambiguous.filter((row) => couldHaveCommittedThis(asPayload(row.payload), freshAnchors))
+  // An earlier revision ALSO excluded rows whose errorMessage looked like a pre-call
+  // validation failure, on the grounds that such an attempt provably never posted. That was
+  // REMOVED: errorMessage carries no provenance. Both connectors overwrite `HTTP nnn` with
+  // the remote system's own message (quickbooks/api.ts, xero/api.ts), so a remote reply
+  // reading "Missing account for PAYMENT" was indistinguishable from our own validation and
+  // would have rotated the token of a request that may well have committed (Codex r3
+  // blocker A). Inferring "no call was made" from free text is not sound, and the safe
+  // reading is the one o3d-ju8t already established: FAILED does not prove nothing posted.
+  const couldHaveCommitted = input.failedRows.filter((row) => couldHaveCommittedThis(asPayload(row.payload), freshAnchors))
 
   // Pre-fix behaviour created a REPLACEMENT row after every failure, and FAILED rows are
   // outside the live-follow-up unique index, so a scope can hold several — each with its own
@@ -318,11 +287,16 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   const freshPayload = withFollowUpIdempotencyKey(input)
   if (rowToReuse) {
     const stored = asPayload(rowToReuse.payload)
+    // A new-format row already carries a key derived from scope + anchors. If the recomputed
+    // key comes out identical, the remote token has not actually changed and reporting
+    // `rotated` would tell an operator something untrue (Codex review, r3 #F).
+    const storedKey = readFollowUpIdempotencyKey(stored)
+    const unchanged = storedKey !== undefined && storedKey === readFollowUpIdempotencyKey(freshPayload)
     return {
       action: 'reuse',
       syncLogId: rowToReuse.id,
       payload: freshPayload,
-      tokenDisposition: 'rotated',
+      tokenDisposition: unchanged ? 'pinned' : 'rotated',
       bodyDisposition: 'fresh',
       divergedFields: stored ? divergedRequestFields(stored, input.payload) : [],
     }
