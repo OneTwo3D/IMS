@@ -294,3 +294,65 @@ test('the settings lock is taken BEFORE any per-SKU lock (o3d-mlc7)', async () =
     )
   }
 })
+
+test('the category mirror cache does not serve the previous store\'s tree (o3d-mlc7)', async () => {
+  // Same class of leak as the mapping writes, one layer up. The mirror is cached per
+  // process on a 5-minute TTL keyed only on time, so after a rebind an import running under
+  // store-B credentials would resolve store-A categories and link them onto store-B
+  // products. Keying the cache on the settings version too is what stops that.
+  const { ensureWcCategoryTreeMirrored } = await import('@/lib/connectors/woocommerce/sync/category-mirror')
+  resetState()
+
+  const storeA = { url: 'https://a.example.com', key: 'ck_a', secret: 'cs_a' }
+  const storeB = { url: 'https://b.example.com', key: 'ck_b', secret: 'cs_b' }
+
+  await ensureWcCategoryTreeMirrored(storeA, '1')
+  const fetchesAfterFirst = state.fetchCreds.length
+
+  // Same version: the cache is doing its job, no refetch.
+  await ensureWcCategoryTreeMirrored(storeA, '1')
+  assert.equal(state.fetchCreds.length, fetchesAfterFirst, 'an unchanged version must still be served from cache')
+
+  // Version moved — a rebind happened, so the cached tree belongs to the old store.
+  await ensureWcCategoryTreeMirrored(storeB, '2')
+  assert.ok(
+    state.fetchCreds.length > fetchesAfterFirst,
+    'a bumped settings version must invalidate the cached tree rather than serving the old store\'s categories',
+  )
+})
+
+test('a payload fetched BEFORE a rebind is refused, even though the snapshot looks stable (o3d-mlc7)', async () => {
+  // Codex's scenario, and the one an inside-only snapshot cannot see: the parent payload
+  // arrives already fetched. A bulk page pulled from store A, then a rebind, then this
+  // import — every read it makes itself is consistently store-B, and the write-time check
+  // compares store-B against store-B and passes. Only the version the payload was FETCHED
+  // under exposes the mismatch.
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  settingsVersion = '2' // the rebind already happened; the payload predates it
+
+  const result = await syncWcProductToIms(variableProduct(), '1')
+
+  assert.equal(result.success, false, 'a payload from the previous store must not be imported')
+  assert.equal(state.products.length, 0, 'no store-A parent data may be written under store-B settings')
+  assert.notEqual(result.permanent, true, 'a stale payload is retryable — it will be re-fetched')
+})
+
+test('a payload fetched under the CURRENT version imports normally (o3d-mlc7)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+
+  const result = await syncWcProductToIms(variableProduct(), '1')
+
+  assert.equal(result.success, true, `expected success, got ${result.error}`)
+  assert.ok(state.products.some((row) => row.sku === 'PARENT-SKU'))
+})
+
+test('an omitted observedVersion keeps the old contract for callers that cannot supply one (o3d-mlc7)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+
+  const result = await syncWcProductToIms(variableProduct())
+
+  assert.equal(result.success, true, 'callers without a fetch-time version must still work')
+})

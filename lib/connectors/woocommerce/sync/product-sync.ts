@@ -422,6 +422,16 @@ async function persistMappingIfVersionMatches(
  */
 export async function syncWcProductToIms(
   wcProduct: WcFullProduct,
+  /**
+   * The `wc_settings_version` that was current when THIS PAYLOAD was obtained.
+   *
+   * The payload arrives already fetched, so snapshotting inside this function only fences
+   * the variations and the write — a parent page pulled from store A before a rebind would
+   * still be written under store-B settings that look perfectly stable from in here (Codex
+   * review). Callers that fetched the payload themselves pass the version they fetched it
+   * under; a mismatch means the payload is stale and none of it may be written.
+   */
+  observedVersion?: string,
 ): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
   try {
     const sku = asTrimmedString(wcProduct.sku)
@@ -431,6 +441,13 @@ export async function syncWcProductToIms(
     // the advisory lock, before a single remote read. Taking them separately would let a
     // rebind slip between the two and pin credentials to the wrong version.
     const { creds: pinnedCreds, syncVersion } = await snapshotProductSyncContext()
+
+    // The payload predates this snapshot. If the version moved in between, it describes the
+    // previous store and nothing in it may be written — the same refusal as the write-time
+    // check, applied to the one input this function did not fetch itself.
+    if (observedVersion !== undefined && observedVersion !== syncVersion) {
+      throw new WcSettingsVersionChangedError(observedVersion, syncVersion)
+    }
 
     // --- Shared field extraction ---
     const description = stripHtml(wcProduct.short_description || wcProduct.description || '')
@@ -464,7 +481,7 @@ export async function syncWcProductToIms(
     const wcCategories = Array.isArray(wcProduct.categories) ? wcProduct.categories : []
     let imsCategoryId: string | null | undefined
     if (wcCategories.length > 0) {
-      const mirror = await ensureWcCategoryTreeMirrored(pinnedCreds)
+      const mirror = await ensureWcCategoryTreeMirrored(pinnedCreds, syncVersion)
       if (mirror) imsCategoryId = resolveImsCategoryId(wcCategories, wcProduct.meta_data, mirror)
     }
 
@@ -1144,7 +1161,11 @@ export async function syncAllWcProducts(
     }
     if (modifiedAfter) params.modified_after = modifiedAfter
 
-    const { data, totalPages: tp, totalItems, error } = await wcFetch('/products', params)
+    // Snapshot BEFORE the page fetch, so the version travels with the payload it describes
+    // (o3d-mlc7). Fetching first and snapshotting per-product cannot see a rebind that
+    // landed between the two.
+    const { creds: pageCreds, syncVersion: pageVersion } = await snapshotProductSyncContext()
+    const { data, totalPages: tp, totalItems, error } = await wcFetch('/products', params, pageCreds)
     if (error) {
       result.errors.push(error)
       await reportProgress(`Failed to fetch WooCommerce products: ${error}`)
@@ -1169,7 +1190,7 @@ export async function syncAllWcProducts(
         )
         continue
       }
-      const r = await syncWcProductToIms(product)
+      const r = await syncWcProductToIms(product, pageVersion)
       processedProducts++
       if (r.success) result.synced++
       else result.errors.push(`SKU ${product.sku}: ${r.error}`)
