@@ -159,8 +159,8 @@ async function enqueueFollowUpSyncLog(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-  /** Bounds the single re-plan below, so a pathological race cannot recurse forever. */
-  replanned = false,
+  /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
+  attempt = 0,
 ): Promise<void> {
   const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. The QuickBooks Request-Id is
@@ -224,11 +224,11 @@ async function enqueueFollowUpSyncLog(
           referenceType,
           referenceId,
           plan,
-          replanned,
+          attempt,
           // plan.payload carries the PINNED token, and withFollowUpIdempotencyKey never
           // overwrites one — so a row created by the re-plan posts under the same remote
           // key as the row that vanished. That is what makes losing the row survivable.
-          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, true),
+          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
         })
         return
       }

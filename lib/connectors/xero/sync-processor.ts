@@ -281,8 +281,8 @@ async function enqueueFollowUpSyncLog(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-  /** Bounds the single re-plan below, so a pathological race cannot recurse forever. */
-  replanned = false,
+  /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
+  attempt = 0,
 ): Promise<void> {
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
@@ -372,11 +372,11 @@ async function enqueueFollowUpSyncLog(
         referenceType,
         referenceId,
         plan,
-        replanned,
+        attempt,
         // plan.payload carries the PINNED token, and withFollowUpIdempotencyKey never
           // overwrites one — so a row created by the re-plan posts under the same remote
           // key as the row that vanished. That is what makes losing the row survivable.
-          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, true),
+          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
       })
       return
     }

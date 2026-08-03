@@ -242,17 +242,27 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // reading is the one o3d-ju8t already established: FAILED does not prove nothing posted.
   const couldHaveCommitted = input.failedRows.filter((row) => couldHaveCommittedThis(asPayload(row.payload), freshAnchors))
 
+  // A token this call is ALREADY carrying is authoritative. The lost-CAS path re-plans with
+  // the previous plan's payload, so `carried` is a token we have already committed to
+  // posting under. Letting a newly-appeared FAILED row's token displace it would rotate away
+  // from a request that may have committed -- the whole hazard, reintroduced by the recovery
+  // path (Codex review, r5 #1).
+  const carried = readFollowUpIdempotencyKey(input.payload)
+
   // Pre-fix behaviour created a REPLACEMENT row after every failure, and FAILED rows are
-  // outside the live-follow-up unique index, so a scope can hold several — each with its own
-  // token, since a row without a stamped key derives from its own id. When more than one
-  // could have committed THIS document, any of them might be the one that did, and picking
-  // the newest is a guess. For money movement a guess is not good enough (Codex r1 #4).
-  if (couldHaveCommitted.length > 1 && moneyMoving) {
+  // outside the live-follow-up unique index, so a scope can hold several. What makes that
+  // dangerous is not the row COUNT but the number of DISTINCT tokens they posted under: if
+  // several rows share one token, whichever committed committed under that same token, and
+  // pinning it is unambiguous. Refusing on count alone stranded exactly that case -- reruns
+  // of one QuickBooks receipt all carry `invoice-payment:payment:<id>` (Codex r5 #3).
+  const candidateTokens = new Set(couldHaveCommitted.map((row) => row.effectiveToken))
+  if (carried) candidateTokens.add(carried)
+  if (candidateTokens.size > 1 && moneyMoving) {
     return {
       action: 'refuse',
-      reason: `${couldHaveCommitted.length} FAILED ${input.type} rows for this reference each targeted this same `
-        + 'document under a different idempotency token. Any one of them may have committed remotely, so an '
-        + 'automatic retry could duplicate it. Reconcile them in the ledger and resolve the rows manually.',
+      reason: `${candidateTokens.size} different idempotency tokens have been used for ${input.type} against this `
+        + 'reference and document. Any one of them may have committed remotely, so an automatic retry could '
+        + 'duplicate it. Reconcile them in the ledger and resolve the rows manually.',
     }
   }
 
@@ -269,9 +279,11 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     // and nothing has to be refused to keep it safe.
     const stored = asPayload(pinnable.payload)
     const divergedFields = stored ? divergedRequestFields(stored, input.payload) : []
+    // `carried` wins when present -- see above. Otherwise the row's own effective token.
+    const pinnedToken = carried ?? pinnable.effectiveToken
     const pin = (body: FollowUpPayload): FollowUpPayload => ({
       ...body,
-      [FOLLOW_UP_IDEMPOTENCY_KEY]: pinnable.effectiveToken,
+      [FOLLOW_UP_IDEMPOTENCY_KEY]: pinnedToken,
     })
 
     // For money movement the BODY is pinned with the token. Posting a recomputed amount
@@ -313,6 +325,8 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     // key comes out identical, the remote token has not actually changed and reporting
     // `rotated` would tell an operator something untrue (Codex review, r3 #F).
     const storedKey = readFollowUpIdempotencyKey(stored)
+    // withFollowUpIdempotencyKey leaves a carried token alone, so `freshPayload` still holds
+    // it here; comparing against it is what reports the disposition truthfully.
     const unchanged = storedKey !== undefined && storedKey === readFollowUpIdempotencyKey(freshPayload)
     return {
       action: 'reuse',

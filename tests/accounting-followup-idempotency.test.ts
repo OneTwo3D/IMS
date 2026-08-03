@@ -495,3 +495,61 @@ test('two racing workers that both lose the CAS converge on ONE token (o3d-h2wx)
   const tokens = workers.map((plan) => (plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : null))
   assert.deepEqual(tokens, ['log-legacy', 'log-legacy'])
 })
+
+test('a token already being carried is authoritative over a newly-appeared row (o3d-h2wx)', () => {
+  // Codex r5 #1: the pin assignment was unconditional, so on a re-plan a FAILED row that
+  // appeared in the meantime would displace the token we had already committed to posting
+  // under. If the carried token's request had committed, that is a duplicate payment.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'carried-token' }],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'carried-token')
+})
+
+test('a carried token that CONFLICTS with a surviving row refuses rather than picking one (o3d-h2wx)', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried-token' },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'a-different-token' }],
+  })
+  assert.equal(plan.action, 'refuse')
+})
+
+test('ambiguity is counted in DISTINCT TOKENS, not rows (o3d-h2wx)', () => {
+  // Codex r5 #3: refusing on row count stranded a case that is not ambiguous at all.
+  // Reruns of one QuickBooks receipt all carry `invoice-payment:payment:<id>`, and FAILED
+  // rows do not occupy the live slot, so several rows can share one effective token —
+  // whichever committed, committed under that token, so pinning it is unambiguous.
+  const sharedToken = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'invoice-payment:payment:p1' },
+    ],
+  })
+  assert.equal(sharedToken.action, 'reuse')
+  assert.equal(
+    sharedToken.action === 'reuse' ? sharedToken.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined,
+    'invoice-payment:payment:p1',
+  )
+
+  // Genuinely distinct tokens still refuse — that is the case nothing can disambiguate.
+  const distinct = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-new' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old' },
+    ],
+  })
+  assert.equal(distinct.action, 'refuse')
+  assert.match(distinct.action === 'refuse' ? distinct.reason : '', /different idempotency tokens/i)
+})

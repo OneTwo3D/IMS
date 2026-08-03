@@ -55,10 +55,29 @@ export async function logFollowUpRevival(
   })
 }
 
+/**
+ * How many times a lost compare-and-set may be re-planned. Each attempt re-reads state, so
+ * exhausting this means something is contending for the row on every single pass.
+ */
+export const MAX_FOLLOW_UP_REVIVAL_ATTEMPTS = 3
+
+/**
+ * Handles a revival whose compare-and-set matched no row: another run revived it first, or
+ * retention hard-deleted it between the read and the write (o3d-nepa).
+ *
+ * Re-planning is safe here BECAUSE the token is carried on the payload rather than held in
+ * the row id — the caller re-plans with `plan.payload`, and a carried token is authoritative
+ * in the planner, so whatever row the re-plan lands on posts under the same remote key.
+ *
+ * If every attempt is lost, this THROWS rather than returning. An earlier revision logged a
+ * warning and returned, which silently dropped the follow-up: `logActivity` swallows its own
+ * write failures, so the loss could be invisible (Codex review, r5 #2). Throwing hands it to
+ * the connector's existing failure handling, which records it against the entry and retries.
+ */
 export async function resolveLostFollowUpRevival(
-  context: RevivalContext & { replanned: boolean; retry: () => Promise<void> },
+  context: RevivalContext & { attempt: number; retry: () => Promise<void> },
 ): Promise<void> {
-  const { connector, type, referenceType, referenceId, plan, replanned, retry } = context
+  const { connector, type, referenceType, referenceId, plan, attempt, retry } = context
 
   // Another run revived it first. That revival carries the same pinned token — the planner
   // stamps it onto the payload rather than leaving it implicit in the row id — so it is the
@@ -74,20 +93,13 @@ export async function resolveLostFollowUpRevival(
   })
   if (live > 0) return
 
-  if (!replanned) {
+  if (attempt + 1 < MAX_FOLLOW_UP_REVIVAL_ATTEMPTS) {
     await retry()
     return
   }
 
-  // Two consecutive lost races. Bounded on purpose, but not silent — something else is
-  // contending for this row and the follow-up has not been enqueued.
-  await logActivity({
-    entityType: 'SYSTEM',
-    action: `${connector}_followup_revival_abandoned`,
-    tag: 'sync',
-    level: 'WARNING',
-    description: `Gave up reviving ${connector} ${type} for ${referenceType} ${referenceId} after two lost races; `
-      + 'no follow-up row was enqueued by this run.',
-    metadata: { type, referenceType, referenceId, syncLogId: plan.syncLogId },
-  })
+  throw new Error(
+    `Could not enqueue ${connector} ${type} for ${referenceType} ${referenceId}: lost the revival race on all `
+    + `${MAX_FOLLOW_UP_REVIVAL_ATTEMPTS} attempts and no live row exists (last candidate ${plan.syncLogId}).`,
+  )
 }
