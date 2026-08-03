@@ -1661,13 +1661,27 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
       await applyBackReference(db, params)
       // The follow-ups (PDF, payment, attachment) never ran on the original
       // failed pass — enqueue them now. hasExistingSyncLog makes this idempotent.
+      let followUpsEnqueued = true
       try {
         await enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, { externalId: row.externalTransactionId, invoiceNumber: params.invoiceNumber })
       } catch (followUpError) {
+        followUpsEnqueued = false
         console.error('repairXeroBackReferences: follow-up enqueue failed', row.id, followUpError)
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_backreference_followup_deferred',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Applied the Xero back-reference for ${row.referenceType} ${row.referenceId} but could not `
+            + `enqueue its follow-ups: ${String(followUpError)}. The row stays FAILED so the next sweep retries them.`,
+          metadata: { syncLogId: row.id, referenceType: row.referenceType, referenceId: row.referenceId },
+        })
       }
-      // A FAILED row whose back-reference is now applied is fully reconciled.
-      if (row.status === 'FAILED') {
+      // A FAILED row whose back-reference is now applied is fully reconciled — but ONLY if
+      // its follow-ups were actually enqueued. Marking it SYNCED regardless retired the one
+      // source that would retry them, so a transient enqueue failure lost the payment or PDF
+      // permanently (Codex review, r6). Leaving it FAILED is what makes the retry durable.
+      if (row.status === 'FAILED' && followUpsEnqueued) {
         await db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', errorMessage: null } })
       }
       result.repaired++

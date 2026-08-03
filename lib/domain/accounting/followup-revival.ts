@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import type { FollowUpEnqueuePlan } from './followup-idempotency'
+import { readFollowUpIdempotencyKey, type FollowUpEnqueuePlan } from './followup-idempotency'
 
 /**
  * o3d-h2wx — the I/O half of the follow-up revival rule, shared by both accounting
@@ -78,11 +78,12 @@ export async function resolveLostFollowUpRevival(
   context: RevivalContext & { attempt: number; retry: () => Promise<void> },
 ): Promise<void> {
   const { connector, type, referenceType, referenceId, plan, attempt, retry } = context
+  const pinnedToken = readFollowUpIdempotencyKey(plan.payload)
 
-  // Another run revived it first. That revival carries the same pinned token — the planner
-  // stamps it onto the payload rather than leaving it implicit in the row id — so it is the
-  // outcome we wanted and there is nothing left to do.
-  const live = await db.accountingSyncLog.count({
+  // Another run got there first. That is only the outcome we wanted if the row it left
+  // behind carries OUR token: counting live rows without comparing tokens would accept a
+  // row posting under a different key while ours may already have committed (Codex r6).
+  const live = await db.accountingSyncLog.findMany({
     where: {
       connector,
       type: type as never,
@@ -90,8 +91,19 @@ export async function resolveLostFollowUpRevival(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
+    select: { id: true, payload: true },
   })
-  if (live > 0) return
+  if (live.some((row) => readFollowUpIdempotencyKey(row.payload) === pinnedToken)) return
+  if (live.length > 0) {
+    // A live row owns this scope but under a different token. Retrying cannot help — the
+    // unique index gives it the slot — and silently accepting it would be the duplicate we
+    // are guarding against, so surface it instead of guessing.
+    throw new Error(
+      `Cannot enqueue ${connector} ${type} for ${referenceType} ${referenceId}: a live follow-up already owns this `
+      + `reference under a different idempotency token (rows ${live.map((row) => row.id).join(', ')}; expected `
+      + `${pinnedToken ?? 'none'}). Reconcile in the ledger before retrying.`,
+    )
+  }
 
   if (attempt + 1 < MAX_FOLLOW_UP_REVIVAL_ATTEMPTS) {
     await retry()

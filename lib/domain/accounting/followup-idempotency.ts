@@ -266,7 +266,14 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     }
   }
 
-  const pinnable = couldHaveCommitted[0]
+  // When several rows share the pinned token, the OLDEST is the one to pin the body from.
+  // A shared token means the remote system deduplicates them, so whichever attempt reached
+  // it FIRST is the request that stands — pinning a newer row's materially different body
+  // (amount, bank account, date) would record a settlement the ledger never made (Codex r6).
+  // failedRows arrive newest-first, so the oldest match is the last one.
+  const pinnedTokenValue = carried ?? couldHaveCommitted[0]?.effectiveToken
+  const sameToken = couldHaveCommitted.filter((row) => row.effectiveToken === pinnedTokenValue)
+  const pinnable = sameToken[sameToken.length - 1] ?? couldHaveCommitted[0]
   if (pinnable) {
     // The token is pinned backwards, and pinned EXPLICITLY: the row's effective token is
     // stamped onto the payload rather than left implicit in the row id.
@@ -279,11 +286,9 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     // and nothing has to be refused to keep it safe.
     const stored = asPayload(pinnable.payload)
     const divergedFields = stored ? divergedRequestFields(stored, input.payload) : []
-    // `carried` wins when present -- see above. Otherwise the row's own effective token.
-    const pinnedToken = carried ?? pinnable.effectiveToken
     const pin = (body: FollowUpPayload): FollowUpPayload => ({
       ...body,
-      [FOLLOW_UP_IDEMPOTENCY_KEY]: pinnedToken,
+      [FOLLOW_UP_IDEMPOTENCY_KEY]: pinnedTokenValue ?? pinnable.effectiveToken,
     })
 
     // For money movement the BODY is pinned with the token. Posting a recomputed amount

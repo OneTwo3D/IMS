@@ -553,3 +553,38 @@ test('ambiguity is counted in DISTINCT TOKENS, not rows (o3d-h2wx)', () => {
   assert.equal(distinct.action, 'refuse')
   assert.match(distinct.action === 'refuse' ? distinct.reason : '', /different idempotency tokens/i)
 })
+
+test('rows sharing one token pin the OLDEST body, not the newest (o3d-h2wx)', () => {
+  // Codex r6: a shared token means the remote system deduplicates the attempts, so whichever
+  // reached it FIRST is the request that stands. Pinning a newer row's materially different
+  // body would record a settlement the ledger never made.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 200 },
+    liveRowExists: false,
+    // newest first, as both connectors order them
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 150 }, effectiveToken: 'shared' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'shared' },
+    ],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
+  assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 120)
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'shared')
+})
+
+test('a carried token selects the row that used it, not merely the newest (o3d-h2wx)', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    type: 'INVOICE_PDF',
+    payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'carried' },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'carried' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'carried' },
+    ],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'carried')
+})

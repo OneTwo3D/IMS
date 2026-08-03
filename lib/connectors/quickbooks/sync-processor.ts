@@ -382,12 +382,19 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
         } catch (followUpError) {
+          // ERROR, not WARNING: the external post is committed and this entry is about to be
+          // marked succeeded, so nothing will drive these follow-ups again. A payment or PDF
+          // that never got enqueued is silently missing until someone notices, and at WARNING
+          // nobody does (Codex review, r6).
           await logActivity({
             entityType: 'SYSTEM',
             action: 'quickbooks_followup_error',
             tag: 'sync',
-            level: 'WARNING',
-            description: `QuickBooks sync entry ${entry.id} posted successfully but follow-up work failed: ${String(followUpError)}`,
+            level: 'ERROR',
+            description: `QuickBooks sync entry ${entry.id} posted successfully but its follow-up work was NOT `
+              + `enqueued: ${String(followUpError)}. The document is in QuickBooks; its payment, PDF or email `
+              + 'follow-ups need to be re-driven manually.',
+            metadata: { syncLogId: entry.id, type: entry.type, referenceType: entry.referenceType, referenceId: entry.referenceId },
           })
         }
 
