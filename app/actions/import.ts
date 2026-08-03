@@ -429,10 +429,15 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           updateData.categoryId = effectiveCategoryId
         }
 
+        // Declared out here because the in-run cache below reads it, outside this block.
+        // Carried as the transaction's RETURN value rather than a closure assignment, which
+        // TypeScript cannot narrow through.
+        type EffectiveStructure = { type: ProductType; parentId: string | null }
+        type RenameOutcome = { conflict: 'moved' | 'taken' | 'structure' } | { conflict: null; structure: EffectiveStructure }
+        let effectiveStructure: EffectiveStructure | null = null
         if (!preview) {
           let resolvedCategoryId: string | null = null
-          let renameConflict: 'moved' | 'taken' | 'structure' | null = null
-          renameConflict = await db.$transaction(async (tx) => {
+          const outcome: RenameOutcome = await db.$transaction(async (tx) => {
             // o3d-42hw: this row can RENAME an existing product, which frees one sku and
             // claims another, so it belongs in the write protocol exactly as the create does.
             // Both skus are locked; the helper collapses them when the sku is unchanged.
@@ -445,13 +450,13 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               where: { id: existingProduct.id },
               select: { sku: true, type: true, parentId: true },
             })
-            if (!current) return 'moved' as const
+            if (!current) return { conflict: 'moved' as const }
 
             // The lock set was chosen for the snapshot's sku. It still covers this product
             // when a concurrent writer merely performed the rename this row wanted anyway —
             // both skus are held either way — so that case proceeds rather than dropping the
             // row's other updates. Any other move means the locks are against the wrong thing.
-            if (current.sku !== existingProduct.sku && current.sku !== sku) return 'moved' as const
+            if (current.sku !== existingProduct.sku && current.sku !== sku) return { conflict: 'moved' as const }
 
             // The destination sku may have been taken since the pre-transaction check.
             if (sku !== existingProduct.sku) {
@@ -459,7 +464,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 where: { sku, NOT: { id: existingProduct.id } },
                 select: { id: true },
               })
-              if (taken) return 'taken' as const
+              if (taken) return { conflict: 'taken' as const }
             }
 
             // Re-validated under the locks, against tx: `structureValidation` was decided
@@ -478,7 +483,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               parentId: (updateData.parentId as string | null | undefined) ?? current.parentId,
               client: tx,
             })
-            if (!revalidated.ok) return 'structure' as const
+            if (!revalidated.ok) return { conflict: 'structure' as const }
 
             if (categoryName) {
               resolvedCategoryId = await resolveImportedCategoryId(categoryName, tx)
@@ -496,18 +501,28 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             if (revalidated.clearComponents) {
               await tx.productComponent.deleteMany({ where: { productId: existingProduct.id } })
             }
-            return null
+            // The structure this row ACTUALLY committed, for the in-run cache below. The
+            // locked defaults can preserve a concurrent type/parent, so the pre-lock values
+            // no longer describe the row (Codex review, r3).
+            return {
+              conflict: null,
+              structure: {
+                type: (updateData.type as ProductType | undefined) ?? current.type,
+                parentId: revalidated.normalizedParentId,
+              },
+            }
           })
           // Returned, never thrown: this loop has no per-row catch, so a throw would discard
           // every remaining row over one contended product.
-          if (renameConflict) {
+          if (outcome.conflict) {
             result.errors.push(
               `Row ${lineNum} (${sku}): another writer changed this product while the import was running `
-              + `(${renameConflict}) — re-run to pick it up`,
+              + `(${outcome.conflict}) — re-run to pick it up`,
             )
             result.skipped++
             continue
           }
+          effectiveStructure = outcome.structure
           rememberImportedCategoryId(categoryName, resolvedCategoryId)
           if (categoryName) effectiveCategoryId = resolvedCategoryId
         }
@@ -528,8 +543,12 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           sku,
           barcode: barcode ?? previousBarcode,
           mpn: mpn ?? existingProduct.mpn,
-          type: ((updateData.type as ProductType | undefined) ?? existingProduct.type),
-          parentId: structureValidation.normalizedParentId,
+          // Prefer what the locked transaction actually committed. Caching the pre-lock
+          // values let a LATER row for this same product preflight against structure that
+          // was never written (Codex review, r3). Preview has no transaction, so it keeps
+          // the projected values.
+          type: effectiveStructure?.type ?? ((updateData.type as ProductType | undefined) ?? existingProduct.type),
+          parentId: effectiveStructure ? effectiveStructure.parentId : structureValidation.normalizedParentId,
           categoryId: effectiveCategoryId,
           lifecycleStatus,
         })

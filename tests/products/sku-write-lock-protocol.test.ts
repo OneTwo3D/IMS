@@ -117,7 +117,7 @@ test('the CSV rename path re-validates structure under its locks (o3d-42hw)', as
     !body.includes('structureValidation.'),
     'the rename transaction must not read the pre-transaction validation — it is stale by construction',
   )
-  assert.match(body, /return 'moved' as const/, 'a lock set chosen against a stale sku must abandon')
+  assert.match(body, /conflict: 'moved' as const/, 'a lock set chosen against a stale sku must abandon')
 })
 
 test('every writer locks BEFORE the read it relies on (o3d-42hw)', async () => {
@@ -242,4 +242,22 @@ test('a concurrent writer performing THIS row\'s rename does not drop the row (o
     /current\.sku !== existingProduct\.sku && current\.sku !== sku/,
     'a move TO this row\'s target sku must not be treated as a lost lock set',
   )
+})
+
+test('the in-run cache records what the locked transaction COMMITTED (o3d-42hw)', async () => {
+  // The importer caches each product it touches so later rows in the same CSV can preflight
+  // against it. Caching the PRE-LOCK projection meant a later row could validate against
+  // structure that was never written — the locked defaults may preserve a concurrent
+  // type/parent, so the projected values no longer describe the row (Codex review, r3).
+  const source = await readFile(IMPORT_ACTIONS, 'utf8')
+  const cacheAt = source.indexOf('productById.set(existingProduct.id, {')
+  assert.notEqual(cacheAt, -1, 'the in-run product cache must still exist')
+  const cache = source.slice(cacheAt, cacheAt + 800)
+
+  assert.match(cache, /effectiveStructure\?\.type/, 'the cached type must prefer what was committed')
+  assert.match(cache, /effectiveStructure \? effectiveStructure\.parentId/, 'the cached parent must prefer what was committed')
+
+  // Preview runs no transaction, so it legitimately keeps the projected values — the
+  // fallbacks must survive.
+  assert.match(cache, /structureValidation\.normalizedParentId/, 'preview must still fall back to the projection')
 })
