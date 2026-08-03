@@ -13,6 +13,19 @@ registerCronJobs([
     legacyEnabledKey: 'cron_wc_sync_enabled',
   },
   {
+    slug: 'wc-withdrawal-sweep',
+    settingKey: 'wc_withdrawal_sweep',
+    module: 'woocommerce',
+    moduleLabel: 'WooCommerce',
+    label: 'WooCommerce Withdrawal Sweep',
+    description:
+      'Re-checks orders refused as EU withdrawal requests against the live storefront status, by order ID. '
+      + 'The only route that does not depend on another webhook or poll reaching the order, so a request '
+      + 'rejected back to a status the poll does not query is still imported.',
+    defaultSchedule: '*/15 * * * *',
+    defaultEnabled: true,
+  },
+  {
     slug: 'shopping-webhook-inbox',
     settingKey: 'shopping_webhook_inbox',
     module: 'woocommerce',

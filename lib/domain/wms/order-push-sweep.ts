@@ -378,6 +378,15 @@ export interface WmsOrderPushPort {
   /** SYNCED links whose order is CANCELLED in IMS. */
   cancellableLinks(connector: string, limit: number): Promise<WmsPushLinkRef[]>
   upsertByOrder(orderId: string, create: LinkWrite & { connector: string }, update: LinkWrite): Promise<void>
+  /** o3d-6x66: post-create withdrawal re-check, keyed by ORDER (the link id is
+   *  not yet in hand at that point). Optional so existing test ports keep
+   *  compiling; when absent, the compensation simply does not run. */
+  readWithdrawalState?(orderId: string): Promise<{ withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null } | null>
+  /** o3d-d82p: the storefront-side withdrawal fence, checked immediately
+   *  before the claim. Optional so existing test ports keep compiling; when
+   *  absent the fence simply does not apply. */
+  verifyWithdrawalFence?(orderId: string): Promise<boolean>
+  updateLinkByOrder?(orderId: string, data: LinkWrite): Promise<void>
   updateLink(id: string, data: LinkWrite): Promise<void>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
   recordEvent(event: WmsMutationEventInput): Promise<void>
@@ -483,6 +492,22 @@ export async function runWmsOrderPushSweepCore(
       // deleted or another worker owns it — skip WITHOUT touching the WMS. A claim
       // error is not the order's fault either, so it is logged and retried next sweep
       // rather than counted against the order's push attempts.
+      // o3d-d82p: the withdrawal fence, checked immediately before the claim.
+      //
+      // A by-ID WooCommerce read cannot happen inside the claim transaction —
+      // that would hold a row lock across an HTTP call — so it happens here and
+      // vouches for the order for a short window that claimForCreate then
+      // re-checks under the lock. Fails closed: an unreadable storefront, or a
+      // withdrawal it knows about that no webhook delivered, skips the order.
+      let fenceOk = true
+      try {
+        fenceOk = (await port.verifyWithdrawalFence?.(order.id)) ?? true
+      } catch (e) {
+        console.error(`[wms-order-push] withdrawal fence check failed for ${order.id}: ${scrubWmsError(e, 'fence check failed')}`)
+        fenceOk = false
+      }
+      if (!fenceOk) continue
+
       let claimed = false
       try {
         claimed = await port.claimForCreate(order.id, connectorId, ts)
@@ -527,6 +552,103 @@ export async function runWmsOrderPushSweepCore(
           // outside the update, cancel and dispatch passes.
           { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: null, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, totalMismatchPence, ...RESET_DISPATCH_FAILURES },
         )
+        // o3d-6x66: the claim's withdrawal re-check committed BEFORE this
+        // remote push, so a withdrawal landing in between still gets its order
+        // created in the warehouse. Usually the hold pass pulls it back, but an
+        // ambiguous remote result, a verification delay or a link-persistence
+        // failure can leave a live warehouse order outside holdableLinks
+        // entirely. Re-read now that we know the external id.
+        //
+        // Isolated in its own try: this runs AFTER the external id was
+        // persisted, and the create path's generic catch rewrites the link to
+        // PENDING_CREATE — which for a link that already has an id means the
+        // next sweep creates a DUPLICATE warehouse order, or (with a marker
+        // set) drops it out of both createCandidates and holdableLinks
+        // entirely. A compensation failure must never do that.
+        let raced: { withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null } | null = null
+        try {
+          raced = (await port.readWithdrawalState?.(order.id)) ?? null
+        } catch (e) {
+          console.error(`[wms-order-push] post-create withdrawal re-check failed for ${order.id}: ${scrubWmsError(e, 'read failed')}`)
+          raced = { withdrawalHoldAt: new Date(), withdrawalApprovedAt: null } // fail closed
+        }
+
+        if (raced && (raced.withdrawalHoldAt || raced.withdrawalApprovedAt)) {
+          const approved = Boolean(raced.withdrawalApprovedAt)
+          try {
+            // NEVER cancel an id we have not proved is ours. PENDING_VERIFY
+            // means exactly that, and this file already documents that a wrong
+            // id can answer NOT_FOUND while the real warehouse order stays
+            // live — so "cancelled" there would be a lie that lets a withdrawn
+            // order dispatch. Escalate instead; the verify pass promotes the
+            // link and the ordinary hold/cancel pass then acts on it.
+            if (createdState === 'PENDING_VERIFY') {
+              await port.updateLinkByOrder?.(order.id, {
+                lastError: 'Created in the WMS just as a withdrawal request landed, and the id is not yet '
+                  + 'proved ours — NOT cancelled. Verify the order in the WMS and cancel it by hand.',
+                lastAttemptAt: ts,
+              })
+              result.failed += 1
+              await audit({
+                action: approved ? 'order_cancel' : 'order_hold', outcome: 'FAILED',
+                entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
+                summary: 'Order was created in the WMS just as a withdrawal request landed, but its id is '
+                  + 'unverified so it was NOT cancelled — handle it in the WMS by hand',
+                before: beforeCreate,
+                after: { state: createdState, externalOrderId: push.externalOrderId },
+                error: 'raced withdrawal on an unverified id',
+              })
+              continue
+            }
+
+            const cancel = await connector.cancelOrder?.(push.externalOrderId)
+            const pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND'))
+            if (pulled) {
+              // CANCELLED for an approved withdrawal — there is nothing to
+              // release later. HELD only for a submitted one, which an
+              // operator may still reject.
+              const state: PushState = approved ? 'CANCELLED' : 'HELD'
+              await port.updateLinkByOrder?.(order.id, {
+                state, cancelledAt: ts, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null,
+              })
+              if (approved) result.cancelled += 1
+              else result.held += 1
+              await audit({
+                action: approved ? 'order_cancel' : 'order_hold', outcome: 'SUCCEEDED',
+                entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
+                summary: `Order was created in the WMS just as a withdrawal request landed; pulled straight back and parked ${state}`,
+                before: beforeCreate,
+                after: { state, externalOrderId: push.externalOrderId },
+              })
+            } else {
+              await port.updateLinkByOrder?.(order.id, {
+                lastError: 'Created in the WMS just as a withdrawal request landed and could not be pulled '
+                  + `back (WMS status ${cancel?.status ?? 'unknown'}) — cancel it in the WMS by hand.`,
+                lastAttemptAt: ts,
+              })
+              result.failed += 1
+              await audit({
+                action: approved ? 'order_cancel' : 'order_hold', outcome: 'FAILED',
+                entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
+                summary: 'Order was created in the WMS just as a withdrawal request landed and could NOT be '
+                  + 'pulled back — cancel it in the WMS by hand',
+                before: beforeCreate,
+                after: { state: createdState, externalOrderId: push.externalOrderId, wmsStatus: cancel?.status },
+                error: 'raced withdrawal, remote cancel refused',
+              })
+            }
+          } catch (e) {
+            const message = scrubWmsError(e, 'raced-withdrawal compensation failed')
+            console.error(`[wms-order-push] ${order.id}: ${message}`)
+            result.failed += 1
+            await port.updateLinkByOrder?.(order.id, { lastError: message, lastAttemptAt: ts }).catch(() => {})
+          }
+          // Deliberately NOT counted as `created`: the order existed at the
+          // WMS for a moment, but this run's outcome is a hold, a cancel or a
+          // failure, and counting both would misreport the sweep.
+          continue
+        }
+
         result.created += 1
         await audit({
           action: 'order_create', outcome: 'SUCCEEDED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push.externalOrderId,
@@ -598,6 +720,37 @@ export async function runWmsOrderPushSweepCore(
         console.error('[wms-order-push] verification failed', link.orderId, verifyError)
       }
       if (verdict === 'ours') {
+        // o3d-6x66: the id is now proved ours — which is precisely the moment a
+        // raced-withdrawal create was left waiting for. Do NOT just promote and
+        // clear lastError: the hold and cancel passes select by LIFECYCLE
+        // status (ON_HOLD / CANCELLED), and the withdrawal markers are
+        // committed BEFORE those transitions, so a transition that failed
+        // leaves a verified, active WMS order that neither pass picks up —
+        // with the explicit warning erased. Re-read the markers first.
+        const held = await port.readWithdrawalState?.(link.orderId)
+        if (held && (held.withdrawalHoldAt || held.withdrawalApprovedAt)) {
+          const approved = Boolean(held.withdrawalApprovedAt)
+          let pulled = false
+          try {
+            const cancel = await connector.cancelOrder?.(link.externalOrderId)
+            pulled = Boolean(cancel && (cancel.cancelled || cancel.status === 'NOT_FOUND'))
+          } catch (e) {
+            console.error(`[wms-order-push] verified-then-withdrawn cancel failed for ${link.orderId}: ${scrubWmsError(e, 'cancel failed')}`)
+          }
+          await port.updateLink(link.id, pulled
+            ? { state: approved ? 'CANCELLED' : 'HELD', cancelledAt: new Date(), lastError: null, reconcileCheckedAt: null }
+            : { state: 'SYNCED', lastError: 'Verified ours, but the customer has withdrawn this order and it could not be cancelled — cancel it in the WMS by hand' })
+          if (pulled) { if (approved) result.cancelled += 1; else result.held += 1 } else result.failed += 1
+          await audit({
+            action: approved ? 'order_cancel' : 'order_hold', outcome: pulled ? 'SUCCEEDED' : 'FAILED',
+            entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
+            summary: pulled
+              ? 'Ownership verified for an order the customer had withdrawn in the meantime; cancelled at the WMS'
+              : 'Ownership verified for an order the customer had withdrawn, but it could NOT be cancelled — cancel it in the WMS by hand',
+            error: pulled ? undefined : 'verified-then-withdrawn, remote cancel failed',
+          })
+          continue
+        }
         await port.updateLink(link.id, { state: 'SYNCED', lastError: null })
         result.verified += 1
         // The courier-pending note was held back until the id was proven.
@@ -884,6 +1037,57 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           select: { withdrawalHoldAt: true, withdrawalApprovedAt: true },
         })
         if (fresh?.withdrawalHoldAt || fresh?.withdrawalApprovedAt) return false
+
+        // o3d-d82p: a live WooCommerce withdrawal SUPPRESSION is a fulfilment
+        // fence in its own right, not just an ingestion guard.
+        //
+        // The IMS markers are written by the withdrawal handler, so an order
+        // whose withdrawal is known to the storefront but has not yet been
+        // applied here — a missed or delayed webhook, an import that raced a
+        // resubmission — carries neither marker. This sweep runs every 10
+        // minutes and the withdrawal sweep every 15, so checking only the
+        // markers leaves a window in which a withdrawn order is pushed to the
+        // warehouse. The tombstone is the durable record that the storefront
+        // knows something we may not, so refuse the claim while it exists.
+        //
+        // Deliberately includes a RETIRED (soft-deleted) row inside its fence
+        // grace. Retirement and the end of the fence must not be the same
+        // instant, or a resubmission landing between the final live read and
+        // the retirement — with its webhook missed — leaves the order
+        // immediately pushable. The cost is that a legitimately rejected
+        // withdrawal delays the WMS push by up to the grace window; that is
+        // the intended trade.
+        const link = await tx.shoppingOrderLink.findFirst({
+          where: { orderId, connector: 'woocommerce' },
+          select: { externalOrderId: true },
+        })
+        if (link) {
+          const suppressed = await tx.wcWithdrawalSuppression.findUnique({
+            where: {
+              connector_externalOrderId: { connector: 'woocommerce', externalOrderId: link.externalOrderId },
+            },
+            select: { retiredAt: true, pushProofToken: true, verifiedSafeUntil: true },
+          })
+          if (suppressed) {
+            // A live row refuses outright. A RETIRED one is allowed only on a
+            // single-use proof minted by the by-ID WooCommerce read taken
+            // immediately before this claim — CONSUMED here under the lock, so
+            // no other attempt can ride on it.
+            if (!suppressed.retiredAt) return false
+            if (!suppressed.pushProofToken) return false
+            if (!suppressed.verifiedSafeUntil || suppressed.verifiedSafeUntil <= new Date()) return false
+            const consumed = await tx.wcWithdrawalSuppression.updateMany({
+              where: {
+                connector: 'woocommerce',
+                externalOrderId: link.externalOrderId,
+                pushProofToken: suppressed.pushProofToken,
+              },
+              data: { pushProofToken: null, verifiedSafeUntil: null },
+            })
+            if (consumed.count === 0) return false
+          }
+        }
+
         const existing = await tx.wmsOrderPushLink.findUnique({
           where: { orderId },
           select: { state: true, lastAttemptAt: true },
@@ -982,6 +1186,19 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         select: { id: true, orderId: true, externalOrderId: true },
         take: limit,
       }),
+    async verifyWithdrawalFence(orderId) {
+      const { verifyWithdrawalFenceForPush } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+      return verifyWithdrawalFenceForPush(orderId)
+    },
+    async readWithdrawalState(orderId) {
+      return db.salesOrder.findUnique({
+        where: { id: orderId },
+        select: { withdrawalHoldAt: true, withdrawalApprovedAt: true },
+      })
+    },
+    async updateLinkByOrder(orderId, data) {
+      await db.wmsOrderPushLink.updateMany({ where: { orderId }, data })
+    },
     async upsertByOrder(orderId, create, update) {
       await db.wmsOrderPushLink.upsert({ where: { orderId }, create: { orderId, ...create }, update })
     },

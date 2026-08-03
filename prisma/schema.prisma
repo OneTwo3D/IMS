@@ -1566,6 +1566,25 @@ model SalesOrder {
   /// order back to PROCESSING, making its WMS link releasable and re-sending withdrawn
   /// goods to the warehouse.
   withdrawalApprovedAt DateTime?
+  /// o3d-6x66: monotonic counter, bumped once per NEWLY handled withdrawal
+  /// submission. `withdrawalHoldAt` deliberately does NOT move on a repair or
+  /// redelivery run — an operator needs to see how long an order has really
+  /// been held — so it cannot distinguish "the same hold" from "a new customer
+  /// request". Releasing compares this instead, so a stale release cannot clear
+  /// a hold that now represents a newer request.
+  withdrawalHoldGeneration Int @default(0)
+  /// The withdrawal-related WooCommerce status last HANDLED for this order.
+  /// Distinguishes a redelivery of the same event (same slug — do not bump the
+  /// generation) from a genuinely NEW customer submission after a rejection
+  /// (the slug moved away and back). Without it a resubmission arriving while
+  /// a retained hold is still in place advances nothing, and an operator
+  /// holding a stale generation could release the newer request.
+  withdrawalLastWcStatus String?
+  /// `date_modified_gmt` of the withdrawal event last handled. The inbox does
+  /// not guarantee per-order ordering, so a DELAYED rejection can arrive after
+  /// a newer resubmission; without a version it would overwrite the newer
+  /// state and leave the generation stale. Older events are ignored.
+  withdrawalLastWcEventAt DateTime?
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 
@@ -3239,4 +3258,64 @@ model ShipmentLine {
 
   @@index([costLayerSnapshot(ops: JsonbOps)], type: Gin, map: "shipment_lines_costLayerSnapshot_gin_idx")
   @@map("shipment_lines")
+}
+
+/// o3d-d82p: an unlinked WooCommerce order seen in a withdrawal status.
+///
+/// The import guard refuses to CREATE such an order — doing so would allocate
+/// stock for goods the customer has asked to withdraw. But the webhook inbox
+/// does not guarantee per-order ordering, so a STALE `order.created` carrying
+/// `processing` can arrive afterwards and sail past a guard that only inspects
+/// the payload in front of it. This row is the durable memory of the refusal.
+///
+/// Cleared only once the live storefront status proves the request was
+/// rejected, at which point the order imports normally.
+model WcWithdrawalSuppression {
+  connector       String
+  externalOrderId String
+  /// The withdrawal status observed when the import was refused.
+  wcStatus        String
+  createdAt       DateTime @default(now())
+  lastCheckedAt   DateTime?
+  /// Bumped on every re-record. The resolver reads the live storefront status
+  /// and then deletes this row; without a revision, a NEWER withdrawal landing
+  /// in that gap is deleted by the stale worker and the order imports unmarked.
+  /// The delete is conditional on the revision observed before the live fetch.
+  revision        Int      @default(0)
+  /// Lease held by the worker currently acting on this withdrawal. The row
+  /// STAYS while claimed, so it keeps suppressing imports — deleting it to
+  /// claim it opened a window where neither the claimant nor anyone else
+  /// treated the order as withdrawn. Self-heals: a lease older than
+  /// SUPPRESSION_LEASE_MS is reclaimable, so a crashed worker cannot pin it.
+  claimToken      String?
+  claimedAt       DateTime?
+  /// When the storefront was FIRST observed to have rejected this withdrawal.
+  /// The row is not retired on that single observation: a resubmission landing
+  /// between the live read and the delete, whose webhook is then missed, would
+  /// be erased along with the only durable signal — and the WMS create path
+  /// checks only the IMS markers, so it could push the order. The tombstone is
+  /// retired once rejection has held across SUPPRESSION_QUIESCENCE_MS, which
+  /// the by-ID sweep keeps re-verifying.
+  clearPendingSince DateTime?
+  /// Soft retirement. Deleting outright ended the fulfilment fence at the same
+  /// instant as the decision to end it, so a resubmission landing between the
+  /// final live read and the delete — with its webhook missed — left a
+  /// warehouse-eligible order with no marker and no row. The row survives for
+  /// SUPPRESSION_RETIRE_GRACE_MS after retirement: the WMS create claim keeps
+  /// fencing on it, and the by-ID sweep keeps re-verifying it, so a
+  /// resubmission in that gap is still found. Hard-deleted after the grace.
+  retiredAt       DateTime?
+  /// A retired row is proved-safe only for a short, explicit window, set by a
+  /// by-ID WooCommerce read taken as part of the WMS create-claim protocol.
+  /// The row is never auto-deleted: any external read followed by a local
+  /// delete is time-of-check-to-time-of-use, so the check has to sit next to
+  /// the push instead of ending monitoring permanently.
+  /// SINGLE-USE proof, not a cache. A time window would let a second attempt
+  /// reuse another worker's read, so this token is consumed by the claim that
+  /// it authorised; any other attempt must take its own live read.
+  pushProofToken  String?
+  verifiedSafeUntil DateTime?
+
+  @@id([connector, externalOrderId])
+  @@map("wc_withdrawal_suppressions")
 }

@@ -32,6 +32,8 @@
  *   - the sweep's release pass skips the link.
  */
 
+import { randomUUID } from 'node:crypto'
+
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getSettingValues } from '@/lib/settings-store'
@@ -163,7 +165,14 @@ export async function handleWcWithdrawalStatus(
   }
 
   if (kind === 'approved') {
-    return { kind, handled: true, result: await applyWithdrawalApproval(order.id, wcOrder) }
+    // Approval is TERMINAL: it sets withdrawalApprovedAt, cancels the order,
+    // and makes every later storefront status ignored. The inbox does not
+    // guarantee ordering, so a delayed `withdrawn` payload can arrive after
+    // WooCommerce has already rejected the request — and cancelling a valid
+    // order on that basis is unrecoverable through this path. Confirm against
+    // the live storefront first; one API call, only on approval events.
+    // (Codex r10)
+    return { kind, handled: true, result: await applyConfirmedWithdrawalApproval(order.id, wcOrder) }
   }
 
   if (kind === 'rejected-held') {
@@ -180,6 +189,28 @@ export async function handleWcWithdrawalStatus(
         + `status change. Release the order by hand once you are satisfied.`,
       metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status, withdrawalHoldAt: order.withdrawalHoldAt },
       resolveUser: false,
+    })
+    // Record the ordinary status as HANDLED (o3d-6x66). Without this the last
+    // handled status stays on the submitted slug forever, so a customer who
+    // submits AGAIN compares equal, the generation never advances, and an
+    // operator holding the old generation can release the newer request. The
+    // hold itself is deliberately retained; only the marker moves on.
+    //
+    // Under the ORDER LOCK and guarded by the event version: a delayed
+    // rejection must not overwrite the marker a NEWER resubmission already
+    // advanced, or the resubmission is silently un-recorded.
+    const rejectionAt = wcEventTimestamp(wcOrder)
+    await withOrderLock(order.id, async (current, tx) => {
+      if (rejectionAt && current.withdrawalLastWcEventAt && rejectionAt <= current.withdrawalLastWcEventAt) {
+        return // a newer event already landed; this rejection is stale
+      }
+      await tx.salesOrder.update({
+        where: { id: order.id },
+        data: {
+          withdrawalLastWcStatus: normaliseStatus(wcOrder.status),
+          ...(rejectionAt ? { withdrawalLastWcEventAt: rejectionAt } : {}),
+        },
+      })
     })
     return { kind, handled: true, result: { success: true } }
   }
@@ -202,7 +233,13 @@ type TxClient = Parameters<Parameters<typeof db.$transaction>[0]>[0]
 async function withOrderLock<T>(
   orderId: string,
   fn: (
-    current: { status: string; withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null },
+    current: {
+      status: string
+      withdrawalHoldAt: Date | null
+      withdrawalApprovedAt: Date | null
+      withdrawalLastWcStatus: string | null
+      withdrawalLastWcEventAt: Date | null
+    },
     tx: TxClient,
   ) => Promise<T>,
 ): Promise<T | null> {
@@ -211,7 +248,10 @@ async function withOrderLock<T>(
     if (locked.length === 0) return null
     const current = await tx.salesOrder.findUnique({
       where: { id: orderId },
-      select: { status: true, withdrawalHoldAt: true, withdrawalApprovedAt: true },
+      select: {
+        status: true, withdrawalHoldAt: true, withdrawalApprovedAt: true,
+        withdrawalLastWcStatus: true, withdrawalLastWcEventAt: true,
+      },
     })
     if (!current) return null
     // `tx`, never the global client: a write to this row through `db` would
@@ -223,7 +263,35 @@ async function withOrderLock<T>(
 }
 
 async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
+  const incomingStatus = normaliseStatus(wcOrder.status)
+  const eventAt = wcEventTimestamp(wcOrder)
   const claim = await withOrderLock(orderId, async (current, tx) => {
+    // Is this a genuinely NEW customer submission, or a redelivery of the one
+    // we already handled? The retained `withdrawalHoldAt` cannot tell us: a
+    // rejection deliberately leaves it in place, so a customer who submits
+    // again lands on an order that is ALREADY held and marked. The handled
+    // status can: it only reads `submitted` once the slug has moved away and
+    // back. (o3d-6x66, Codex r1)
+    // Two things make an event "new": the handled status moved, OR this
+    // submitted event is strictly NEWER than the one we last handled. The
+    // second case matters because the inbox does not guarantee per-order
+    // ordering — a delayed rejection can still be in flight, so a resubmission
+    // can arrive while the handled status still reads `submitted`. Comparing
+    // status alone would treat it as a redelivery and never advance the
+    // generation, leaving a stale operator release able to clear it.
+    const isNewer = eventAt !== null
+      && (current.withdrawalLastWcEventAt === null || eventAt > current.withdrawalLastWcEventAt)
+    const isNewSubmission = current.withdrawalLastWcStatus !== incomingStatus || isNewer
+    if (isNewSubmission) {
+      await tx.salesOrder.update({
+        where: { id: orderId },
+        data: {
+          withdrawalHoldGeneration: { increment: 1 },
+          withdrawalLastWcStatus: incomingStatus,
+          ...(eventAt ? { withdrawalLastWcEventAt: eventAt } : {}),
+        },
+      })
+    }
     if (POST_DISPATCH.has(current.status)) {
       return { skip: 'post-dispatch' as const, status: current.status, marker: current.withdrawalHoldAt }
     }
@@ -245,7 +313,17 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
     // timestamp forward, or the operator loses how long the order has been
     // stuck.
     if (!current.withdrawalHoldAt) {
-      await tx.salesOrder.update({ where: { id: orderId }, data: { withdrawalHoldAt: new Date() } })
+      // heldSince is stamped once and never moved (an operator needs to see
+      // how long the order has REALLY been held), so it cannot tell "the same
+      // hold, repaired" from "a newer customer request". The generation can:
+      // it advances only for a newly handled submission, and the operator
+      // release compares it. (o3d-6x66)
+      // The generation was already advanced above when this is a new
+      // submission; here we only stamp when the hold began.
+      await tx.salesOrder.update({
+        where: { id: orderId },
+        data: { withdrawalHoldAt: new Date() },
+      })
     }
     return { skip: null, status: current.status, marker: current.withdrawalHoldAt }
   })
@@ -412,18 +490,645 @@ async function note(
  *
  * Returns true when the caller should skip the import and surface it instead.
  */
-export async function shouldSkipUnlinkedWithdrawalImport(
+/**
+ * The live WooCommerce status of a suppressed order could not be read, so we
+ * cannot tell whether the withdrawal still stands.
+ *
+ * Thrown rather than returned: "keep suppressing" and "we do not know" must
+ * not be the same value to the caller. Returning `true` here would look like a
+ * clean skip, the inbox would acknowledge the event, and if that was the only
+ * ordinary event for the order it would never be imported at all.
+ */
+export class WithdrawalSuppressionUnresolved extends Error {
+  constructor(public readonly externalOrderId: string) {
+    super(`Could not read the live WooCommerce status for suppressed order ${externalOrderId}`)
+    this.name = 'WithdrawalSuppressionUnresolved'
+  }
+}
+
+/**
+ * A suppression may have been written by a CONCURRENT worker between our
+ * "is it suppressed?" check and the import that followed it (o3d-d82p).
+ *
+ * Deliberately a compensation rather than a lock. Holding a Prisma interactive
+ * transaction across the import — the obvious fix — pins one pooled connection
+ * purely to hold the lock while the import needs another, so enough concurrent
+ * imports deadlock the pool against itself. Converging afterwards costs one
+ * query on a path that only runs for orders we just created, and reaches the
+ * same end state: the order exists but is held and marked, so the WMS sweep
+ * will not touch it.
+ *
+ * Call after a SUCCESSFUL import of a previously unlinked order.
+ */
+/** `date_modified_gmt` as a Date, or null when WooCommerce sent nothing usable. */
+function wcEventTimestamp(wcOrder: WcFullOrder): Date | null {
+  const raw = wcOrder.date_modified_gmt || wcOrder.date_modified
+  if (!raw) return null
+  const d = new Date(/Z|[+-]\d\d:?\d\d$/.test(raw) ? raw : `${raw}Z`)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+/**
+ * The ONE safe way to import a WooCommerce order that may be unlinked.
+ *
+ * Every ingress path — the two webhook topics, the poll, the pending-FX retry
+ * queue and the initial import — has to do the same three things in the same
+ * order, and each one that open-codes them is a way to lose a withdrawal.
+ * The FX retry and the initial import each did exactly that: they imported a
+ * possibly-stale snapshot with no suppression check and no compensation, so an
+ * order withdrawn while it sat in the queue came back as a paid PROCESSING
+ * order with no marker, and stayed warehouse-eligible until the next
+ * reconciliation. That is not a millisecond window. (o3d-d82p, Codex r4)
+ *
+ * `suppressionHandled` tells the caller a withdrawal transition was just
+ * applied, so it can skip synchronising the STALE payload's ordinary status
+ * over the hold it just created — which would otherwise classify as
+ * rejected-held and invite an operator to release a live withdrawal.
+ */
+export async function importWcOrderGuarded<R extends { success: boolean }>(
+  wcOrder: WcFullOrder,
+  runImport: () => Promise<R>,
+): Promise<
+  | { outcome: 'skipped-withdrawal' }
+  | { outcome: 'unresolved' }
+  | { outcome: 'imported'; result: R; suppressionHandled: boolean; compensationFailed: boolean }
+> {
+  let decision: SuppressionDecision
+  try {
+    decision = await shouldSkipUnlinkedWithdrawalImport(wcOrder)
+  } catch (e) {
+    if (e instanceof WithdrawalSuppressionUnresolved) return { outcome: 'unresolved' }
+    throw e
+  }
+  if (decision.suppress) return { outcome: 'skipped-withdrawal' }
+
+  const result = await runImport()
+
+  // Hand the claim back — never consume it here (Codex r13).
+  //
+  // The resolver's "the request was rejected" read happened BEFORE the import.
+  // If the customer resubmits or is approved while the import is running and
+  // that webhook is missed, consuming on the strength of that pre-import read
+  // deletes the only durable signal for a withdrawal that is now live again.
+  //
+  // So there is exactly ONE post-import decision point: reconcile below claims
+  // the row itself, re-reads the live status, and either applies the
+  // withdrawal or consumes the tombstone. Fresh truth, one place, no second
+  // read to keep in step with the first.
+  if (decision.pendingConsume) {
+    await releaseSuppression(String(wcOrder.id), decision.pendingConsume.token)
+  }
+
+  // NOT gated on wasUnlinked. The tombstone is the durable record that a
+  // withdrawal still needs applying, and it survives a failed transition — so
+  // a redelivery, a later poll or the FX retry must all be able to finish the
+  // job even though the order is linked by then. Gating on wasUnlinked made
+  // the "retryable" failure consumed by one ineffective retry. (Codex r6)
+  const compensation = result.success
+    ? await reconcileSuppressionAfterImport(wcOrder)
+    : { handled: false, failed: false }
+  // Two separate facts. `suppressionHandled` says "do not sync the stale
+  // ordinary status over what we just applied" and holds even on failure.
+  // `compensationFailed` says the withdrawal transition did NOT land, so the
+  // caller must make the delivery retryable — acknowledging it would leave the
+  // IMS lifecycle wrong until an independent reconciliation.
+  return {
+    outcome: 'imported',
+    result,
+    suppressionHandled: compensation.handled,
+    compensationFailed: compensation.failed,
+  }
+}
+
+/**
+ * Record the withdrawal tombstone for an order we are NOT importing.
+ *
+ * Split out so the initial-import gate can call it while it is dropping the
+ * order webhook itself: the tombstone is what the initial-import loop consults,
+ * so it has to exist even though nothing is being imported yet.
+ */
+
+/**
+ * How long a withdrawal claim may be held before another worker may take it.
+ * A crashed claimant must not pin a withdrawal forever; a live one must not be
+ * overtaken mid-transition.
+ */
+const SUPPRESSION_LEASE_MS = 5 * 60_000
+
+/**
+ * How long a rejection must HOLD before the tombstone is retired.
+ *
+ * A single live read is not enough (Codex r14): a resubmission landing between
+ * that read and the delete, whose webhook is then missed, is erased along with
+ * the only durable signal — and the WMS create path checks only the IMS
+ * markers, so its sweep could push the now-withdrawn order. Spanning two
+ * by-ID sweep passes means a missed resubmission is found within minutes
+ * instead of waiting for the daily reconciliation.
+ */
+const SUPPRESSION_QUIESCENCE_MS = 30 * 60_000
+
+/**
+ * How long a RETIRED suppression keeps fencing fulfilment.
+ *
+ * Deleting outright ended the fence at the same instant as the decision to end
+ * it, so a resubmission landing between the final live read and the delete —
+ * with its webhook missed — left a warehouse-eligible order carrying neither
+ * marker nor row (Codex r16). Retirement is a soft delete instead: the WMS
+ * create claim keeps fencing, and the sweep keeps re-verifying, until the
+ * grace elapses.
+ */
+const SUPPRESSION_RETIRE_GRACE_MS = 30 * 60_000
+
+/**
+ * How long a by-ID WooCommerce read may vouch for a retired suppression.
+ *
+ * Short on purpose: it is the window between proving the order is not
+ * withdrawn and actually pushing it to the warehouse.
+ */
+const SUPPRESSION_SAFE_WINDOW_MS = 2 * 60_000
+
+type SuppressionClaim = { token: string; wcStatus: string; revision: number }
+
+/**
+ * Take ownership of a withdrawal tombstone WITHOUT removing it (Codex r8).
+ *
+ * Claiming by DELETE was wrong twice over: the row stopped suppressing while
+ * the claimant worked, and restoring it after a failure overwrote whatever a
+ * concurrent worker had recorded in the meantime — so an acknowledged APPROVAL
+ * could be replaced by an older `submitted` and later retried as a mere hold.
+ *
+ * Both the resolver and the compensation path must hold this BEFORE they make
+ * any live-state or lifecycle decision, or the freshest decision does not
+ * necessarily win: the resolver could observe a rejection while a compensation
+ * was already cancelling on a stale approved tombstone.
+ */
+/**
+ * Sweep withdrawal tombstones that nothing else will reach (o3d-d82p).
+ *
+ * Every other route to a tombstone depends on ANOTHER event arriving for that
+ * order. But the poll queries only the operator-configured statuses plus
+ * `completed` and the two withdrawal slugs — so an order whose withdrawal was
+ * REJECTED back to, say, `pending` or `on-hold` under the default `processing`
+ * configuration appears in no ingress at all, and its tombstone and its
+ * unimported order sit there indefinitely.
+ *
+ * Fetches each suppressed order BY ID, so no status filter or modified cursor
+ * can hide it. Unresolved reads stay put and are retried next run.
+ */
+export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
+  scanned: number; imported: number; stillWithdrawn: number; unresolved: number
+}> {
+  const staleBefore = new Date(Date.now() - SUPPRESSION_LEASE_MS)
+  const rows = await db.wcWithdrawalSuppression.findMany({
+    where: {
+      connector: 'woocommerce',
+      OR: [{ claimToken: null }, { claimedAt: { lt: staleBefore } }],
+    },
+    // Oldest-CHECKED first, not oldest-created (Codex r12). A fixed
+    // createdAt prefix of rows that stay withdrawn or stay unreadable is
+    // re-selected on every run forever, so nothing past the first batch is
+    // ever looked at again. lastCheckedAt is stamped for EVERY outcome below,
+    // so the queue always rotates.
+    orderBy: [{ lastCheckedAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
+    take: Math.min(Math.max(limit, 1), 250),
+    select: { externalOrderId: true, retiredAt: true },
+  })
+
+  const result = { scanned: rows.length, imported: 0, stillWithdrawn: 0, unresolved: 0 }
+  const { importWcOrder } = await import('./order-import')
+  for (const row of rows) {
+    // Fetch the FULL order by id — no status filter, no modified cursor — then
+    // put it through the ordinary guarded importer. Resolving the tombstone
+    // without importing would delete the order's only durable retry signal and
+    // strand it permanently: that is the whole scenario this sweep exists for.
+    // Stamp the attempt BEFORE doing the work, so a row that throws or times
+    // out still rotates to the back of the queue instead of blocking it.
+    await db.wcWithdrawalSuppression.updateMany({
+      where: { connector: 'woocommerce', externalOrderId: row.externalOrderId },
+      data: { lastCheckedAt: new Date() },
+    }).catch(() => {})
+
+    const live = await readLiveWcOrder(row.externalOrderId)
+    if (!live) {
+      result.unresolved++
+      continue
+    }
+
+    // A RETIRED row is inside its fence grace: it exists only so a
+    // resubmission that landed around the retirement decision is still caught.
+    // Re-verify against the live status we just read, and revive it if the
+    // storefront now says withdrawn. It must not be re-imported every pass.
+    if (row.retiredAt) {
+      const revived = await recordWithdrawalSuppressionIfWithdrawn(live)
+      if (revived) { result.stillWithdrawn++; continue }
+
+      // Not withdrawn — and the row is NOT deleted. Any external read followed
+      // by a local delete is time-of-check-to-time-of-use: the customer can
+      // resubmit between the two, and if that webhook is missed the fence is
+      // gone for good (Codex r18). So retired rows persist, and the decision
+      // that actually matters — may this order be pushed? — is taken next to
+      // the push instead, by verifyWithdrawalFenceForPush.
+      continue
+    }
+
+    try {
+      const guarded = await importWcOrderGuarded(live, () => importWcOrder(live))
+      if (guarded.outcome === 'skipped-withdrawal') result.stillWithdrawn++
+      else if (guarded.outcome === 'unresolved') result.unresolved++
+      else if (guarded.result.success && !guarded.compensationFailed) result.imported++
+      else result.unresolved++
+    } catch (e) {
+      result.unresolved++
+      console.error(`[wc-withdrawal-sweep] ${row.externalOrderId}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  return result
+}
+
+/**
+ * May this order be pushed to the warehouse, as far as WooCommerce withdrawals
+ * are concerned? Called by the WMS create sweep BEFORE it claims the order.
+ *
+ * Fails CLOSED. This is the fulfilment boundary: the IMS markers describe what
+ * IMS has been told, and a withdrawal the storefront knows about but no webhook
+ * delivered is exactly the case that ships goods a customer asked to withdraw.
+ *
+ * - no suppression row at all -> nothing to check
+ * - a LIVE (unretired) row -> refuse outright
+ * - a RETIRED row -> refuse unless a by-ID read within the last
+ *   SUPPRESSION_SAFE_WINDOW_MS proved the storefront is not withdrawn. The read
+ *   happens here, moments before the push, rather than being cached in a
+ *   deleted row minutes or hours earlier.
+ */
+export async function verifyWithdrawalFenceForPush(salesOrderId: string): Promise<boolean> {
+  const link = await db.shoppingOrderLink.findFirst({
+    where: { orderId: salesOrderId, connector: 'woocommerce' },
+    select: { externalOrderId: true },
+  })
+  if (!link) return true // not a WooCommerce order
+  const externalOrderId = link.externalOrderId
+
+  const row = await db.wcWithdrawalSuppression.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { retiredAt: true },
+  })
+  if (!row) return true
+  if (!row.retiredAt) return false
+
+  // No TTL shortcut. A time window is a reusable cache: once one worker stamped
+  // it, any other attempt could skip the live read for the rest of it, and a
+  // resubmission inside that window stayed pushable (Codex r19). Every attempt
+  // takes its own read and mints its own single-use proof.
+  const live = await readLiveWcOrder(externalOrderId)
+  if (!live) return false // unreadable: refuse rather than guess
+
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const status = normaliseStatus(live.status)
+  if (status === submitted || status === approved) {
+    // Withdrawn again, and no webhook told us. Revive the fence.
+    await recordWithdrawalSuppressionIfWithdrawn(live)
+    return false
+  }
+
+  await db.wcWithdrawalSuppression.updateMany({
+    where: { connector: 'woocommerce', externalOrderId, retiredAt: row.retiredAt },
+    data: {
+      pushProofToken: randomUUID(),
+      verifiedSafeUntil: new Date(Date.now() + SUPPRESSION_SAFE_WINDOW_MS),
+    },
+  })
+  return true
+}
+
+/** The live order, or null when it cannot be read. */
+async function readLiveWcOrder(externalOrderId: string): Promise<WcFullOrder | null> {
+  try {
+    const { wcFetch } = await import('../api')
+    const { data, error } = await wcFetch(`/orders/${externalOrderId}`)
+    if (error || !data || typeof data !== 'object' || !('status' in data)) return null
+    return data as WcFullOrder
+  } catch {
+    return null
+  }
+}
+
+/** The live storefront status, or null when it cannot be read. */
+async function readLiveWcStatus(externalOrderId: string): Promise<string | null> {
+  const order = await readLiveWcOrder(externalOrderId)
+  return order ? normaliseStatus(order.status) : null
+}
+
+async function claimSuppression(
+  externalOrderId: string,
+): Promise<SuppressionClaim | 'absent' | 'busy'> {
+  const row = await db.wcWithdrawalSuppression.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { wcStatus: true, revision: true },
+  })
+  if (!row) return 'absent'
+
+  const token = randomUUID()
+  const staleBefore = new Date(Date.now() - SUPPRESSION_LEASE_MS)
+  const claimed = await db.wcWithdrawalSuppression.updateMany({
+    where: {
+      connector: 'woocommerce',
+      externalOrderId,
+      revision: row.revision,
+      OR: [{ claimToken: null }, { claimedAt: { lt: staleBefore } }],
+    },
+    data: { claimToken: token, claimedAt: new Date() },
+  })
+  // 'busy' is emphatically NOT 'absent'. Conflating them let a caller
+  // acknowledge its delivery and sync a stale ordinary status while another
+  // worker was still mid-transition — and if that worker then died, nothing
+  // retried. (Codex r10)
+  if (claimed.count === 0) return 'busy'
+  return { token, wcStatus: row.wcStatus, revision: row.revision }
+}
+
+/**
+ * Retire a tombstone whose rejection has HELD for the quiescence window.
+ *
+ * The first rejection observation only starts the clock and returns false —
+ * the order still imports (it was rejected), but the durable signal survives so
+ * the sweep keeps re-checking it. Returns true once the row is actually gone.
+ */
+async function retireIfQuiescent(externalOrderId: string, claim: SuppressionClaim): Promise<boolean> {
+  const row = await db.wcWithdrawalSuppression.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { clearPendingSince: true },
+  })
+  const since = row?.clearPendingSince
+  if (!since) {
+    await db.wcWithdrawalSuppression.updateMany({
+      where: { connector: 'woocommerce', externalOrderId, claimToken: claim.token },
+      data: { clearPendingSince: new Date() },
+    })
+    return false
+  }
+  if (Date.now() - since.getTime() < SUPPRESSION_QUIESCENCE_MS) return false
+
+  // One last live read immediately before the delete. Quiescence proves the
+  // rejection is OLD, not that nothing arrived since the read that started this
+  // pass — and once the row is gone there are no further by-ID checks.
+  // (Codex r15.) The WMS create claim also fences on this row, so the residual
+  // read-to-delete gap cannot dispatch an order even if it loses this check.
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const finalLive = await readLiveWcStatus(externalOrderId)
+  if (finalLive === null || finalLive === submitted || finalLive === approved) return false
+
+  await retireSuppression(externalOrderId, claim)
+  return true
+}
+
+/** Give the claim back, leaving the row — and whatever status it now carries — intact. */
+async function releaseSuppression(externalOrderId: string, token: string): Promise<void> {
+  await db.wcWithdrawalSuppression.updateMany({
+    where: { connector: 'woocommerce', externalOrderId, claimToken: token },
+    data: { claimToken: null, claimedAt: null },
+  })
+}
+
+/**
+ * Retire a withdrawal we have finished with.
+ *
+ * Conditional on the revision as well as the token: if a NEWER withdrawal was
+ * recorded while we held the claim, that is a different request and deleting it
+ * would discard it. In that case the row simply stays, and the next ingress
+ * path picks the new one up.
+ */
+async function retireSuppression(externalOrderId: string, claim: SuppressionClaim): Promise<void> {
+  const retired = await db.wcWithdrawalSuppression.updateMany({
+    where: {
+      connector: 'woocommerce', externalOrderId, claimToken: claim.token, revision: claim.revision,
+    },
+    data: { retiredAt: new Date(), claimToken: null, claimedAt: null },
+  })
+  if (retired.count === 0) await releaseSuppression(externalOrderId, claim.token)
+}
+
+
+export async function recordWithdrawalSuppressionIfWithdrawn(
   wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
 ): Promise<boolean> {
   const { submitted, approved } = await getWithdrawalStatuses()
   const status = normaliseStatus(wcOrder.status)
   if (status !== submitted && status !== approved) return false
+  const externalOrderId = String(wcOrder.id)
+  await db.wcWithdrawalSuppression.upsert({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    create: { connector: 'woocommerce', externalOrderId, wcStatus: status },
+    // Deliberately does NOT clear an active lease. Doing so let an out-of-order
+    // redelivery evict a worker mid-decision, and this function is given no
+    // event version with which to prove it is newer. It does not need to: the
+    // claimant decides from the LIVE storefront status, so it will act on
+    // whatever is actually true — including this change. Bumping the revision
+    // is enough, because consumeSuppression is conditional on it, so the
+    // claimant releases rather than deleting a request it never evaluated.
+    // clearPendingSince resets: a NEW withdrawal restarts the quiescence clock,
+    // so a request recorded during a pending clear is never retired by it.
+    update: {
+      wcStatus: status, revision: { increment: 1 }, lastCheckedAt: new Date(),
+      // Revive a retired row: a new withdrawal is live again.
+      clearPendingSince: null, retiredAt: null,
+      // Invalidate any proof in flight: it was taken before this request.
+      pushProofToken: null, verifiedSafeUntil: null,
+    },
+  })
+  return true
+}
+
+/**
+ * Apply a withdrawal to an order that is ALREADY linked, returning false when
+ * there is nothing to do (not a withdrawal status, or no link yet).
+ *
+ * Used by the initial-import gate: an order imported earlier in the same
+ * still-running job is linked, and that job never revisits it, so recording a
+ * tombstone alone would leave a paid PROCESSING order fulfillable.
+ */
+/**
+ * Apply a withdrawal APPROVAL only after confirming it against the live
+ * storefront (Codex r10/r11).
+ *
+ * Approval is terminal: it sets withdrawalApprovedAt, cancels the order, and
+ * makes every later storefront status ignored. The inbox does not guarantee
+ * ordering, so a delayed `withdrawn` payload can arrive after WooCommerce has
+ * already rejected the request — and cancelling a valid order on that basis is
+ * unrecoverable through this path.
+ *
+ * Shared by EVERY approval site. A second, unconfirmed approval path is exactly
+ * how this hole reopened after it was first closed.
+ */
+async function applyConfirmedWithdrawalApproval(
+  orderId: string,
+  wcOrder: WcFullOrder,
+): Promise<TransitionResult> {
+  const { approved } = await getWithdrawalStatuses()
+  const live = await readLiveWcStatus(String(wcOrder.id))
+  if (live === null) {
+    // Fail closed on the CANCELLATION, not on the order: do not act, and do not
+    // acknowledge either, so the delivery is retried.
+    return {
+      success: false,
+      error: 'Could not confirm the withdrawal approval against WooCommerce; not cancelling on an unverified payload',
+    }
+  }
+  if (live !== approved) {
+    await note(orderId, wcOrder, 'wc_withdrawal_stale_approval_ignored', 'WARNING',
+      `A withdrawal-approved event arrived for this order, but WooCommerce now reports "${live}" — `
+      + 'the request was rejected after that event was sent. The order was NOT cancelled.')
+    return { success: true }
+  }
+  return applyWithdrawalApproval(orderId, wcOrder)
+}
+
+export async function applyWithdrawalToLinkedOrder(
+  wcOrder: WcFullOrder,
+): Promise<boolean> {
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const status = normaliseStatus(wcOrder.status)
+  if (status !== submitted && status !== approved) return false
+
+  const link = await db.shoppingOrderLink.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } },
+    select: { orderId: true },
+  })
+  if (!link?.orderId) return false
+
+  const result = status === approved
+    ? await applyConfirmedWithdrawalApproval(link.orderId, wcOrder)
+    : await applyWithdrawalHold(link.orderId, wcOrder)
+  // A failure must not read as "handled": the caller falls back to the
+  // tombstone, so the withdrawal is retried by the next ingress path.
+  return result.success
+}
+
+
+/**
+ * A withdrawal tombstone says only "this order needs checking" — never WHAT to
+ * do about it (Codex r9).
+ *
+ * Earlier versions decided from the tombstone's remembered status, or from the
+ * payload that happened to trigger the import. Both are snapshots, and the
+ * WooCommerce inbox guarantees neither ordering nor uniqueness, so every round
+ * of review found another interleaving where a stale snapshot outranked a
+ * fresher one: an old approval cancelling a rejected order, a delayed
+ * `submitted` downgrading an approval to a releasable hold. Fencing the lease
+ * harder does not fix that — two workers reading DIFFERENT remembered statuses
+ * can both be correctly serialized and still disagree.
+ *
+ * So the decision comes from the LIVE storefront status, read under the claim.
+ * Both workers then see the same truth whoever wins, an evicted or expired
+ * lease cannot produce a contradictory decision, and no ordering has to be
+ * proved. It costs one API call, only for an order that already has a
+ * tombstone.
+ */
+export async function reconcileSuppressionAfterImport(
+  wcOrder: WcFullOrder,
+): Promise<{ handled: boolean; failed: boolean }> {
+  const externalOrderId = String(wcOrder.id)
+  const link = await db.shoppingOrderLink.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+    select: { orderId: true },
+  })
+  if (!link?.orderId) return { handled: false, failed: false }
+
+  const claim = await claimSuppression(externalOrderId)
+  if (claim === 'absent') return { handled: false, failed: false }
+  if (claim === 'busy') {
+    // Another worker owns this withdrawal and has NOT finished. Report it
+    // unfinished so the caller retries and does not sync its stale status over
+    // a transition that is still in flight.
+    return { handled: true, failed: true }
+  }
+
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const live = await readLiveWcStatus(externalOrderId)
+  if (!live) {
+    // Fail closed: leave the tombstone standing so the next ingress path
+    // retries, and tell the caller this is unfinished.
+    await releaseSuppression(externalOrderId, claim.token)
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_withdrawal_suppression_unresolved', tag: 'sync', level: 'WARNING',
+      description:
+        `WooCommerce order #${wcOrder.number} was imported while a withdrawal was recorded for it, but the `
+        + 'live status could not be read, so nothing was applied. The order is live and possibly withdrawn.',
+      metadata: { externalOrderId: wcOrder.id, suppressedStatus: claim.wcStatus },
+      resolveUser: true,
+    })
+    return { handled: true, failed: true }
+  }
+
+  if (live !== submitted && live !== approved) {
+    // The storefront says the request was rejected — but do NOT retire the row
+    // on one observation. Start (or check) the quiescence clock instead; the
+    // by-ID sweep re-verifies until it elapses, so a resubmission whose webhook
+    // was missed is still caught while the tombstone exists to catch it.
+    const retired = await retireIfQuiescent(externalOrderId, claim)
+    if (!retired) await releaseSuppression(externalOrderId, claim.token)
+    return { handled: false, failed: false }
+  }
+
+  const isApproval = live === approved
+  // Already decided from the live status a moment ago, so no second read.
+  const result = isApproval
+    ? await applyWithdrawalApproval(link.orderId, wcOrder)
+    : await applyWithdrawalHold(link.orderId, wcOrder)
+
+  if (result.success) await retireSuppression(externalOrderId, claim)
+  else await releaseSuppression(externalOrderId, claim.token)
+
+  await logActivity({
+    entityType: 'SYNC', action: 'wc_withdrawal_suppression_raced_import', tag: 'sync',
+    level: result.success ? 'WARNING' : 'ERROR',
+    description:
+      `WooCommerce order #${wcOrder.number} was imported at the same moment a withdrawal request was `
+      + `recorded for it (live status "${live}"). `
+      + (result.success
+        ? `The ${isApproval ? 'cancellation' : 'hold'} was applied to the order that was just created.`
+        : `Applying the ${isApproval ? 'cancellation' : 'hold'} FAILED (${result.error ?? 'unknown'}) — `
+          + 'this order is live and withdrawn. Handle it by hand now.'),
+    metadata: { externalOrderId: wcOrder.id, liveStatus: live, suppressedStatus: claim.wcStatus },
+    resolveUser: !result.success,
+  })
+
+  return { handled: true, failed: !result.success }
+}
+
+export async function shouldSkipUnlinkedWithdrawalImport(
+  wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
+): Promise<SuppressionDecision> {
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const status = normaliseStatus(wcOrder.status)
+  const externalOrderId = String(wcOrder.id)
 
   const existing = await db.shoppingOrderLink.findUnique({
-    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) } },
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
     select: { id: true },
   })
-  if (existing) return false
+  if (existing) return { suppress: false }
+
+  const isWithdrawal = status === submitted || status === approved
+
+  if (!isWithdrawal) {
+    // o3d-d82p: the payload in front of us is an ORDINARY status — but the
+    // inbox does not guarantee per-order ordering, so this can be a STALE
+    // `order.created` arriving after we already refused a withdrawal for the
+    // same order. Without the tombstone it would sail straight past this
+    // guard and import the order as PROCESSING, allocating stock.
+    const suppressed = await db.wcWithdrawalSuppression.findUnique({
+      where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId } },
+      select: { wcStatus: true, retiredAt: true },
+    })
+    // A RETIRED row still fences fulfilment, but it must not block the import
+    // it was retired in order to allow.
+    if (!suppressed || suppressed.retiredAt) return { suppress: false }
+    return resolveSuppression(wcOrder, externalOrderId)
+  }
+
+  // Remember the refusal durably, so a stale ordinary payload arriving later
+  // cannot import the order behind our back.
+  await recordWithdrawalSuppressionIfWithdrawn(wcOrder)
 
   await logActivity({
     entityType: 'SYNC',
@@ -437,5 +1142,77 @@ export async function shouldSkipUnlinkedWithdrawalImport(
     metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status },
     resolveUser: false,
   })
-  return true
+  return { suppress: true }
+}
+
+/**
+ * A suppressed order has turned up again carrying an ordinary status. Decide
+ * from the LIVE storefront state, not from this possibly-stale payload.
+ *
+ * One extra API call, and only ever for an order we already refused — never on
+ * the ordinary new-order path.
+ *
+ * Fails CLOSED: if the live status cannot be read we keep suppressing, because
+ * importing would allocate stock for goods the customer may still have
+ * withdrawn.
+ */
+type SuppressionDecision = { suppress: true } | { suppress: false; pendingConsume?: SuppressionClaim }
+
+async function resolveSuppression(
+  wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
+  externalOrderId: string,
+): Promise<SuppressionDecision> {
+  // Claim BEFORE reading the live status. Deciding first and claiming after
+  // only serializes the workers; it does not make the freshest decision win.
+  const claim = await claimSuppression(externalOrderId)
+  if (claim === 'absent') return { suppress: false }
+  if (claim === 'busy') {
+    // Another worker owns this withdrawal RIGHT NOW — but "owned" is not
+    // "finished", and returning a clean skip would let the caller acknowledge
+    // what may be the only ordinary event this order ever sends. If the owner
+    // then dies, nothing retries. Treat it as unresolved so the delivery is
+    // redelivered and the poll leaves it for the next pass. (Codex r9)
+    throw new WithdrawalSuppressionUnresolved(externalOrderId)
+  }
+
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const live = await readLiveWcStatus(externalOrderId)
+
+  if (!live) {
+    await db.wcWithdrawalSuppression.updateMany({
+      where: { connector: 'woocommerce', externalOrderId, claimToken: claim.token },
+      data: { lastCheckedAt: new Date() },
+    }).catch(() => {})
+    await releaseSuppression(externalOrderId, claim.token)
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_withdrawal_suppression_unresolved', tag: 'sync', level: 'WARNING',
+      description:
+        `WooCommerce order #${wcOrder.number} arrived with status "${wcOrder.status}" but was previously `
+        + `refused as a withdrawal ("${claim.wcStatus}"). The live status could not be read, so the import `
+        + 'is still refused — importing could allocate stock for a withdrawn order.',
+      metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status, suppressedStatus: claim.wcStatus },
+      resolveUser: true,
+    })
+    throw new WithdrawalSuppressionUnresolved(externalOrderId)
+  }
+
+  if (live === submitted || live === approved) {
+    await releaseSuppression(externalOrderId, claim.token)
+    return { suppress: true } // still withdrawn
+  }
+
+  // The request was rejected. Do NOT retire the tombstone here: the import has
+  // not happened yet, and if it fails or throws the only durable retry signal
+  // would already be gone — recreating the stranded-order failure for statuses
+  // outside the poll filter. Hand the CLAIM back to the caller, which consumes
+  // it after a successful import and releases it otherwise. (Codex r12)
+  await logActivity({
+    entityType: 'SYNC', action: 'wc_withdrawal_suppression_cleared', tag: 'sync', level: 'INFO',
+    description:
+      `WooCommerce order #${wcOrder.number} was previously refused as a withdrawal ("${claim.wcStatus}"), `
+      + `but its live status is now "${live}" — the request was rejected. Importing normally.`,
+    metadata: { externalOrderId: wcOrder.id, liveStatus: live, suppressedStatus: claim.wcStatus },
+    resolveUser: false,
+  })
+  return { suppress: false, pendingConsume: claim }
 }

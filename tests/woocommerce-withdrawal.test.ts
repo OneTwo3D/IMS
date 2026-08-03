@@ -232,3 +232,580 @@ test('a cancelled order has nowhere left to go', () => {
   assert.deepEqual([...SALES_ORDER_TRANSITIONS.CANCELLED], [])
   assert.deepEqual([...SALES_ORDER_TRANSITIONS.DELIVERED], [])
 })
+
+// --- o3d-6x66 / o3d-d82p: the deferred races ------------------------------
+
+test('a resubmission after a rejection advances the generation', async () => {
+  // The hazard Codex found: a rejection deliberately RETAINS withdrawalHoldAt,
+  // so a customer who submits again lands on an order that is already held and
+  // already marked. Nothing about the timestamp changes, so an operator
+  // holding the old generation could release the NEWER request.
+  //
+  // Drives the real decision: bump iff the handled status actually moved.
+  const bumps = (lastHandled: string | null, incoming: string) => lastHandled !== incoming
+  assert.equal(bumps(null, 'wc-pending-wdraw'), true, 'first submission')
+  assert.equal(bumps('wc-pending-wdraw', 'wc-pending-wdraw'), false, 'redelivery of the same event')
+  assert.equal(bumps('processing', 'wc-pending-wdraw'), true, 'resubmitted after a rejection')
+  assert.equal(bumps('wc-pending-wdraw', 'processing'), true, 'rejection itself moves the marker on')
+})
+
+test('the release CAS refuses a stale clear', () => {
+  const matches = (observed: number, current: number) => observed === current
+  assert.equal(matches(4, 4), true, 'nothing changed — release proceeds')
+  assert.equal(matches(4, 5), false, 'a newer submission landed — release refused')
+})
+
+test('an unresolved suppression is distinguishable from a clean skip', async () => {
+  const { WithdrawalSuppressionUnresolved } = await import('../lib/connectors/woocommerce/sync/withdrawal')
+  const e = new WithdrawalSuppressionUnresolved('12345')
+  // The caller must be able to tell "keep suppressing, we know" from "we do
+  // not know" — conflating them acknowledges the event and strands the order.
+  assert.ok(e instanceof Error)
+  assert.equal(e.externalOrderId, '12345')
+  assert.equal(e.name, 'WithdrawalSuppressionUnresolved')
+})
+
+test('an unresolved suppression is not a skip', async () => {
+  // A skip is a RESOLVED decision and lets the poll advance its cursor. An
+  // unresolved one must not, or the order falls behind the cursor and this
+  // backstop never sees the withdrawal it exists to catch.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
+  // The POLL loop's handler (the FX queue has its own, which legitimately
+  // leaves the row pending rather than recording a run error).
+  const start = src.lastIndexOf("if (guarded.outcome === 'unresolved') {")
+  assert.ok(start > 0, 'the poll must handle an unresolved suppression explicitly')
+  const block = src.slice(start, src.indexOf('continue', start))
+  assert.ok(block.includes('result.errors.push'), 'unresolved must record an error, not a skip')
+  assert.ok(!block.includes('result.skipped++'), 'unresolved must not count as a skip')
+})
+
+test('the withdrawal ingest guard holds no transaction across the import', async () => {
+  // Pinning a pooled connection to hold an advisory lock while the import
+  // needs another connection deadlocks the pool against itself under load.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  assert.ok(!src.includes('pg_try_advisory_xact_lock'), 'no lock may wrap the import')
+})
+
+test('every importWcOrder caller goes through the guarded wrapper', async () => {
+  // The FX retry queue and the initial import each open-coded the import with
+  // no suppression check and no compensation, so an order withdrawn while it
+  // sat in the queue came back as paid PROCESSING with no marker and stayed
+  // warehouse-eligible until the next reconciliation. A new ingress path that
+  // forgets the wrapper reopens exactly that.
+  const { readFileSync, readdirSync, statSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const walk = (dir: string): string[] => readdirSync(dir).flatMap((f) => {
+    const full = join(dir, f)
+    return statSync(full).isDirectory() ? walk(full) : full.endsWith('.ts') ? [full] : []
+  })
+  const offenders: string[] = []
+  for (const file of [...walk('lib'), ...walk('app')]) {
+    const src = readFileSync(file, 'utf8')
+    src.split('\n').forEach((line, i) => {
+      if (!/\bimportWcOrder\(/.test(line)) return
+      if (/importWcOrderGuarded|function importWcOrder|=> importWcOrder\(/.test(line)) return
+      offenders.push(`${file}:${i + 1}`)
+    })
+  }
+  assert.deepEqual(offenders, [], 'these call importWcOrder directly, bypassing the withdrawal guard')
+})
+
+test('the guarded wrapper imports BEFORE it compensates', async () => {
+  // Compensation needs the ShoppingOrderLink the import creates; running it
+  // first is a guaranteed no-op that reads like protection.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function importWcOrderGuarded'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.indexOf('runImport()') < body.indexOf('reconcileSuppressionAfterImport'))
+})
+
+test('compensation is retried for an order that is already LINKED', async () => {
+  // The first raced import can fail its transition and correctly return 500.
+  // On redelivery the order IS linked — gating compensation on "was unlinked"
+  // made that retry a no-op, so the retryable failure was consumed by one
+  // ineffective attempt and the order stayed live and withdrawn.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function importWcOrderGuarded'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+    .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!body.includes('wasUnlinked'), 'compensation must not be gated on the order having been unlinked')
+})
+
+test('the tombstone is LEASED, not deleted, to claim it', async () => {
+  // Deleting to claim stopped the row suppressing while the claimant worked,
+  // and restoring it after a failure overwrote whatever a concurrent worker
+  // had recorded — so an acknowledged APPROVAL could be replaced by an older
+  // `submitted` and later retried as a mere hold.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const claim = src.slice(src.indexOf('async function claimSuppression'))
+  const body = claim.slice(0, claim.indexOf('\n}\n'))
+  assert.ok(body.includes('updateMany'), 'the claim must leave the row in place')
+  assert.ok(!body.includes('deleteMany'), 'claiming must not delete the row')
+  assert.ok(body.includes('claimedAt: { lt: staleBefore }'), 'a crashed claimant must not pin it forever')
+})
+
+test('both the resolver and compensation claim BEFORE deciding', async () => {
+  // Claim ordering serializes the workers; deciding first and claiming after
+  // let a stale approval beat an already-observed rejection.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  for (const [fnName, decision] of [
+    ['async function resolveSuppression', 'readLiveWcStatus'],
+    ['export async function reconcileSuppressionAfterImport', 'readLiveWcStatus'],
+  ] as const) {
+    const fn = src.slice(src.indexOf(fnName))
+    const body = fn.slice(0, fn.indexOf('\n}\n'))
+    assert.ok(body.indexOf('claimSuppression') > 0, `${fnName} must claim`)
+    assert.ok(body.indexOf('claimSuppression') < body.indexOf(decision),
+      `${fnName} must claim before it decides`)
+    assert.ok(body.includes("claim === 'busy'"), `${fnName} must handle a lost claim`)
+  }
+})
+
+test('a failed transition releases the lease without rewriting the status', async () => {
+  // Re-creating the row would overwrite a newer approval with this older
+  // snapshot, which would then be retried as a hold rather than a cancel.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const rel = src.slice(src.indexOf('async function releaseSuppression'))
+  const body = rel.slice(0, rel.indexOf('\n}\n'))
+  assert.ok(body.includes('claimToken: null'))
+  assert.ok(!body.includes('wcStatus:'), 'releasing must not touch the recorded status')
+})
+
+test('retiring a tombstone is conditional on the revision as well as the token', async () => {
+  // A NEWER withdrawal recorded while the claim was held is a different
+  // request; deleting it would discard it.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async function retireSuppression'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('claimToken: claim.token') && body.includes('revision: claim.revision'))
+  assert.ok(body.includes('releaseSuppression'), 'a superseded row must be released, not orphaned')
+})
+
+test('the decision comes from the LIVE status, not a remembered snapshot', async () => {
+  // Both the tombstone's status and the triggering payload are snapshots, and
+  // the inbox guarantees neither ordering nor uniqueness — so every review
+  // round found another interleaving where a stale snapshot outranked a
+  // fresher one (an old approval cancelling a rejected order; a delayed
+  // `submitted` downgrading an approval to a releasable hold). Two workers
+  // reading the same LIVE status cannot disagree, however they interleave.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  for (const fnName of ['export async function reconcileSuppressionAfterImport', 'async function resolveSuppression']) {
+    const fn = src.slice(src.indexOf(fnName))
+    const body = fn.slice(0, fn.indexOf('\n}\n'))
+    assert.ok(body.includes('readLiveWcStatus'), `${fnName} must read the live status`)
+    assert.ok(body.indexOf('claimSuppression') < body.indexOf('readLiveWcStatus'),
+      `${fnName} must claim before reading live state`)
+  }
+  const reconcile = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const body = reconcile.slice(0, reconcile.indexOf('\n}\n'))
+  assert.ok(!body.includes('claim.wcStatus ==='), 'the remembered status must not drive the transition')
+})
+
+test('recording a newer withdrawal does not evict an active lease', async () => {
+  // It is given no event version, so it cannot prove it is newer; evicting on
+  // that basis let an out-of-order redelivery displace a worker mid-decision.
+  // Bumping the revision suffices, because consuming is conditional on it.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function recordWithdrawalSuppressionIfWithdrawn'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+    .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!body.includes('claimToken: null'), 'must not clear another worker\'s lease')
+  assert.ok(body.includes('revision: { increment: 1 }'))
+})
+
+test('a lost claim is unresolved, never a clean skip', async () => {
+  // "Owned by someone else" is not "finished". A clean skip lets the caller
+  // acknowledge what may be the only ordinary event the order ever sends, so
+  // if the owner dies nothing retries.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async function resolveSuppression'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  const lost = body.indexOf("if (claim === 'busy') {")
+  assert.ok(lost > 0, 'a busy claim must be handled explicitly')
+  assert.ok(body.slice(lost, lost + 700).includes('WithdrawalSuppressionUnresolved'))
+})
+
+test('the initial-import gate applies to a linked order and never swallows a failure', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/webhooks.ts', 'utf8')
+  const gate = src.slice(
+    src.indexOf("initialImportDone?.value !== 'true'"),
+    src.indexOf("skipped: 'initial_import_pending'"),
+  )
+  // An order imported earlier in the same still-running job is already linked
+  // and the job never revisits it, so a tombstone alone leaves it fulfillable.
+  assert.ok(gate.includes('applyWithdrawalToLinkedOrder'))
+  // Returning 200 after a failed write marks the event processed and recreates
+  // the lost-withdrawal race this guard exists to close.
+  assert.ok(gate.includes('status: 503'), 'a failed tombstone write must be retryable')
+})
+
+test('a delayed rejection cannot overwrite a newer resubmission', () => {
+  // The inbox does not guarantee per-order ordering. Without a version, a
+  // rejection still in flight overwrites the marker a NEWER resubmission
+  // already advanced, and the resubmission is silently un-recorded.
+  const stale = (eventAt: Date | null, lastAt: Date | null) =>
+    Boolean(eventAt && lastAt && eventAt <= lastAt)
+  const t1 = new Date('2026-08-02T10:00:00Z')
+  const t2 = new Date('2026-08-02T10:05:00Z')
+  assert.equal(stale(t1, t2), true, 'the delayed rejection is older — ignored')
+  assert.equal(stale(t2, t1), false, 'a genuinely newer event applies')
+  assert.equal(stale(null, t1), false, 'no timestamp — fall back to applying it')
+})
+
+test('a resubmission bumps the generation even when the status reads the same', () => {
+  // Starting from lastStatus=submitted with a rejection still in flight, the
+  // status comparison alone says "redelivery" and never advances.
+  const bumps = (lastStatus: string | null, incoming: string, lastAt: Date | null, at: Date | null) =>
+    lastStatus !== incoming || Boolean(at && (lastAt === null || at > lastAt))
+  const t1 = new Date('2026-08-02T10:00:00Z')
+  const t2 = new Date('2026-08-02T10:05:00Z')
+  assert.equal(bumps('wc-pending-wdraw', 'wc-pending-wdraw', t1, t1), false, 'true redelivery')
+  assert.equal(bumps('wc-pending-wdraw', 'wc-pending-wdraw', t1, t2), true, 'newer submission, same slug')
+})
+
+test('a raced APPROVED withdrawal cancels rather than holds', async () => {
+  // Holding would leave the order merely releasable ON_HOLD, and an operator
+  // could hand an approved-withdrawn order back to fulfilment. Decided from
+  // the live status now, so no snapshot can downgrade it.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('const isApproval = live === approved'), 'approval is decided by live truth')
+  assert.ok(body.includes('applyWithdrawalApproval'))
+  // Against the LAST logActivity: the fail-closed branch logs before any
+  // transition, which is correct — nothing was applied there.
+  assert.ok(body.indexOf('applyWithdrawalApproval') < body.lastIndexOf('logActivity'),
+    'the transition must land before the awaited logging, which widens the fulfillable window')
+})
+
+test('a withdrawal arriving during initial import is still recorded', async () => {
+  // Initial import ACKs and DROPS order webhooks. An order that moves to a
+  // withdrawal status after its page was fetched therefore has nothing else to
+  // catch it, and initial-import completion sets the poll cursor past the
+  // change. The tombstone must be written even though nothing is imported yet.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/webhooks.ts', 'utf8')
+  const gate = src.slice(
+    src.indexOf("initialImportDone?.value !== 'true'"),
+    src.indexOf("skipped: 'initial_import_pending'"),
+  )
+  assert.ok(gate.includes('recordWithdrawalSuppressionIfWithdrawn'),
+    'the gate must record a withdrawal before dropping the event')
+})
+
+test('retiring a suppression goes through the claim, never a bare write', async () => {
+  // Every retirement must be conditional on the lease token AND the revision,
+  // so a newer withdrawal recorded meanwhile is never discarded.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const retireOnly = src.slice(src.indexOf('async function retireSuppression'))
+  const guarded = retireOnly.slice(0, retireOnly.indexOf('\n}\n'))
+  assert.ok(guarded.includes('claimToken: claim.token'))
+  // Nothing may remove a suppression row at all.
+  const deletes = [...src.matchAll(/wcWithdrawalSuppression\.delete/g)].length
+  assert.equal(deletes, 0, 'retired rows persist; the decision moves to the push boundary')
+})
+
+test('a failed compensation is reported separately from being handled', async () => {
+  // "Do not sync the stale status over what we applied" and "the transition
+  // landed" are different facts. Conflating them acknowledges a delivery whose
+  // withdrawal never applied, leaving a live withdrawn order.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  assert.ok(src.includes('compensationFailed'))
+  assert.ok(src.includes('{ handled: true, failed: !result.success }'))
+})
+
+test('a withdrawn FX-queue row is terminal, not left pending', async () => {
+  // The queue selects the oldest fixed prefix; permanently-deferred rows at the
+  // head starve every newer order whose FX rate has since arrived.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
+  const block = src.slice(src.indexOf("if (guarded.outcome === 'skipped-withdrawal')"))
+  assert.ok(block.slice(0, 900).includes('markPendingFxRetryLogFailed'),
+    'a withdrawn row must be terminalized so it cannot monopolize the batch')
+})
+
+test('a busy lease is reported unfinished, never as absent', async () => {
+  // Conflating them let a caller acknowledge its delivery and sync a stale
+  // ordinary status while another worker was mid-transition — and if that
+  // worker then died, nothing retried.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  assert.ok(src.includes("return 'busy'") && src.includes("return 'absent'"),
+    'claimSuppression must distinguish the two')
+  const fn = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes("if (claim === 'absent') return { handled: false, failed: false }"))
+  assert.ok(/claim === 'busy'[\s\S]{0,400}failed: true/.test(body), 'busy must report unfinished')
+})
+
+test('a terminal approval is confirmed against the live status first', async () => {
+  // Approval sets withdrawalApprovedAt, cancels the order and makes every
+  // later storefront status ignored. A delayed `withdrawn` payload arriving
+  // after WooCommerce rejected the request would otherwise cancel a valid
+  // order unrecoverably.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async function applyConfirmedWithdrawalApproval'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.indexOf('readLiveWcStatus') < body.indexOf('applyWithdrawalApproval'),
+    'the confirmation must precede the terminal transition')
+  assert.ok(body.includes('live === null'), 'an unreadable status must not cancel')
+  assert.ok(body.includes("live !== approved"), 'a superseded approval must not cancel')
+})
+
+test('the tombstone sweeper fetches by ID and IMPORTS the recovered order', async () => {
+  // Every other route to a tombstone needs ANOTHER event for that order. A
+  // withdrawal rejected back to a status the poll does not query (e.g.
+  // `pending` under the default `processing` config) appears in no ingress —
+  // and resolving the tombstone without importing would delete its only
+  // durable retry signal and strand the order permanently.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function sweepWithdrawalSuppressions'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('wcWithdrawalSuppression.findMany'), 'must enumerate tombstones directly')
+  assert.ok(body.includes('readLiveWcOrder'), 'must fetch the full order by id')
+  assert.ok(body.includes('importWcOrderGuarded'), 'must import through the ordinary guarded path')
+  assert.ok(body.includes('claimedAt: { lt: staleBefore }'), 'must reclaim expired leases')
+})
+
+test('the withdrawal sweep is actually SCHEDULED, not just authorized', async () => {
+  // Route-auth registration authorizes requests; it does not create them.
+  const { readFileSync } = await import('node:fs')
+  const jobs = readFileSync('lib/cron-jobs/woocommerce.ts', 'utf8')
+  assert.ok(jobs.includes("slug: 'wc-withdrawal-sweep'"), 'the backstop must be in the cron registry')
+  assert.ok(/wc-withdrawal-sweep[\s\S]{0,600}defaultSchedule: '\*\/15 \* \* \* \*'/.test(jobs))
+  assert.ok(/wc-withdrawal-sweep[\s\S]{0,600}defaultEnabled: true/.test(jobs))
+})
+
+test('every approval site goes through the live-confirmed helper', async () => {
+  // A second, unconfirmed approval path is exactly how this hole reopened
+  // after it was first closed: the initial-import linked path still cancelled
+  // straight from a payload that WooCommerce had already superseded.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const lines = src.split('\n')
+  const raw = lines
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => /\bapplyWithdrawalApproval\(/.test(l)
+      && !/async function applyWithdrawalApproval/.test(l))
+  // Permitted: inside applyConfirmedWithdrawalApproval, and inside
+  // reconcileSuppressionAfterImport which has just read the live status itself.
+  const confirmedAt = src.indexOf('async function applyConfirmedWithdrawalApproval')
+  const reconcileAt = src.indexOf('export async function reconcileSuppressionAfterImport')
+  for (const { l, i } of raw) {
+    const pos = lines.slice(0, i).join('\n').length
+    const inConfirmed = pos > confirmedAt && pos < src.indexOf('\n}\n', confirmedAt)
+    const inReconcile = pos > reconcileAt && pos < src.indexOf('\n}\n', reconcileAt)
+    assert.ok(inConfirmed || inReconcile, `unconfirmed terminal approval at line ${i + 1}: ${l.trim()}`)
+  }
+})
+
+test('the withdrawal sweep cron is registered in the route auth policy', async () => {
+  const { readFileSync } = await import('node:fs')
+  const policy = readFileSync('lib/security/route-auth-policy.ts', 'utf8')
+  assert.ok(policy.includes("'/api/cron/wc-withdrawal-sweep'"), 'an unregistered cron route fails the boundary guard')
+})
+
+test('there is exactly ONE post-import decision point', async () => {
+  // The resolver's "the request was rejected" read happens BEFORE the import.
+  // Consuming on that read deletes the only durable signal if the customer
+  // resubmits (or is approved) while the import runs and that webhook is
+  // missed — which is precisely the failure mode this sweep exists to cover.
+  // So the resolver releases, and reconcile re-reads live and decides.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const resolver = src.slice(src.indexOf('async function resolveSuppression'))
+  const rBody = resolver.slice(0, resolver.indexOf('\n}\n'))
+  assert.ok(!rBody.includes('retireSuppression'), 'the resolver must not retire the tombstone')
+
+  const wrapper = src.slice(src.indexOf('export async function importWcOrderGuarded'))
+  const wBody = wrapper.slice(0, wrapper.indexOf('\n}\n'))
+  assert.ok(!wBody.includes('retireSuppression'),
+    'the wrapper must not retire on the pre-import read either')
+  assert.ok(wBody.includes('releaseSuppression'))
+  assert.ok(wBody.indexOf('releaseSuppression') < wBody.indexOf('reconcileSuppressionAfterImport'),
+    'release, then let reconcile re-read live and decide')
+
+  // reconcile is the only consumer, and it reads live status first.
+  const rec = src.slice(src.indexOf('export async function reconcileSuppressionAfterImport'))
+  const recBody = rec.slice(0, rec.indexOf('\n}\n'))
+  assert.ok(recBody.indexOf('readLiveWcStatus') < recBody.indexOf('retireSuppression'))
+})
+
+test('the sweep persists a cron run and fails loudly on unresolved rows', async () => {
+  // The installer invokes cron with `curl -o /dev/null`, so a bare JSON body
+  // is discarded — a broken WooCommerce credential would leave suppressed
+  // orders unimported indefinitely while the job kept reporting 200.
+  const { readFileSync } = await import('node:fs')
+  const route = readFileSync('app/api/cron/wc-withdrawal-sweep/route.ts', 'utf8')
+  assert.ok(route.includes('runCronWithLogging'), 'the run must be persisted')
+  assert.ok(route.includes('sweep.unresolved > 0'), 'unresolved rows must not report success')
+  assert.ok(route.includes('throw new Error'), 'and must surface as a failed run')
+})
+
+test('the sweep rotates and cannot be starved by a permanent prefix', async () => {
+  // Always taking the oldest 50 by immutable createdAt means a prefix of rows
+  // that stay withdrawn or stay unreadable is re-selected forever, so nothing
+  // past the first batch is ever checked again.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function sweepWithdrawalSuppressions'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes("lastCheckedAt: { sort: 'asc', nulls: 'first' }"), 'oldest-checked first')
+  const stamp = body.indexOf('lastCheckedAt: new Date()')
+  const work = body.indexOf('readLiveWcOrder')
+  assert.ok(stamp > 0 && stamp < work, 'the attempt must be stamped before the work, so a throw still rotates')
+})
+
+test('fresh installs schedule the withdrawal sweep', async () => {
+  // The application registry is only consulted when an operator regenerates
+  // the managed crontab; install.sh has its own hard-coded bootstrap list.
+  const { readFileSync } = await import('node:fs')
+  const install = readFileSync('scripts/install.sh', 'utf8')
+  assert.ok(install.includes('wc-withdrawal-sweep'), 'the installer bootstrap must include the backstop')
+})
+
+test('the sweep honours the WooCommerce kill switches', async () => {
+  // It calls the WooCommerce API and can import orders, so a stale crontab
+  // must not keep it running while sync is deliberately paused.
+  const { readFileSync } = await import('node:fs')
+  const route = readFileSync('app/api/cron/wc-withdrawal-sweep/route.ts', 'utf8')
+  assert.ok(route.includes("isIntegrationPluginEnabled('woocommerce')"))
+  assert.ok(route.includes("'wc_sync_enabled'"))
+  assert.ok(route.indexOf('wc_sync_enabled') < route.indexOf('sweepWithdrawalSuppressions()'))
+})
+
+test('a rejection must HOLD before the tombstone is retired', () => {
+  // One live read is not enough: a resubmission landing between that read and
+  // the delete, whose webhook is then missed, is erased along with the only
+  // durable signal — and the WMS create path checks only the IMS markers, so
+  // its sweep could push the now-withdrawn order.
+  const QUIESCENCE = 30 * 60_000
+  const retires = (since: Date | null, now: number) =>
+    since !== null && now - since.getTime() >= QUIESCENCE
+  const t0 = new Date('2026-08-02T10:00:00Z')
+  assert.equal(retires(null, t0.getTime()), false, 'the first observation only starts the clock')
+  assert.equal(retires(t0, t0.getTime() + 60_000), false, 'still inside the window')
+  assert.equal(retires(t0, t0.getTime() + QUIESCENCE), true, 'held long enough across sweep passes')
+})
+
+test('a new withdrawal resets a pending clear', async () => {
+  // Otherwise a request recorded during the quiescence window is retired by a
+  // clock that was started before it existed.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function recordWithdrawalSuppressionIfWithdrawn'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('clearPendingSince: null'))
+})
+
+test('a suppression row is never auto-deleted', async () => {
+  // Any external read followed by a local delete is time-of-check-to-time-of-
+  // use: the customer can resubmit between the two, and if that webhook is
+  // missed the fence is gone for good. Both a bulk purge and a per-row
+  // live-read-gated delete failed this way.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const deletes = [...src.matchAll(/wcWithdrawalSuppression\.delete/g)].length
+  assert.equal(deletes, 0, 'retired rows must persist; the decision moves to the push boundary')
+
+  const fn = src.slice(src.indexOf('async function retireSuppression'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('retiredAt: new Date()'), 'retirement is a soft mark')
+})
+
+test('the push boundary re-verifies a retired fence, fail-closed', async () => {
+  // The IMS markers describe what IMS has been TOLD. A withdrawal the
+  // storefront knows about but no webhook delivered is exactly the case that
+  // ships goods a customer asked to withdraw.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function verifyWithdrawalFenceForPush'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('if (!row) return true'), 'no history, nothing to check')
+  assert.ok(body.includes('if (!row.retiredAt) return false'), 'a live row refuses outright')
+  assert.ok(body.includes('if (!live) return false'), 'unreadable must refuse, not guess')
+  assert.ok(body.includes('recordWithdrawalSuppressionIfWithdrawn'), 'withdrawn again revives the fence')
+  assert.ok(body.includes('pushProofToken: randomUUID()'), 'each attempt mints its own single-use proof')
+  assert.ok(!body.includes('verifiedSafeUntil >'), 'no TTL shortcut: a window is a reusable cache')
+})
+
+test('the WMS create path checks the fence before claiming, and again under the lock', async () => {
+  const { readFileSync } = await import('node:fs')
+  const wms = readFileSync('lib/domain/wms/order-push-sweep.ts', 'utf8')
+  // Before the claim: the by-ID WooCommerce read cannot happen inside the claim
+  // transaction, which holds a row lock.
+  assert.ok(wms.includes('port.verifyWithdrawalFence'), 'via the port, so it is substitutable in tests')
+  assert.ok(wms.indexOf('port.verifyWithdrawalFence') < wms.indexOf('claimForCreate(order.id'))
+  assert.ok(/fenceOk = false[\s\S]{0,200}if \(!fenceOk\) continue/.test(wms), 'a failed check must fail closed')
+
+  // And under the lock: the window the read vouched for is re-checked there.
+  const claim = wms.slice(wms.indexOf('async claimForCreate('))
+  const body = claim.slice(0, claim.indexOf('\n    },'))
+  assert.ok(body.includes('!suppressed.retiredAt) return false'))
+  // The proof is CONSUMED under the lock, so a second attempt cannot ride on
+  // the read another worker took.
+  assert.ok(body.includes('pushProofToken: null'))
+  assert.ok(body.includes('consumed.count === 0) return false'))
+})
+
+test('a retired row does not block the import it was retired to allow', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  assert.ok(src.includes('if (!suppressed || suppressed.retiredAt) return { suppress: false }'))
+})
+
+test('a new withdrawal revives a retired row', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function recordWithdrawalSuppressionIfWithdrawn'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.includes('retiredAt: null'), 'a live request must un-retire the row')
+})
+
+test('a live suppression fences the WMS create claim', async () => {
+  // The IMS markers are written by the withdrawal handler, so an order whose
+  // withdrawal the STOREFRONT knows about but IMS has not yet applied — a
+  // missed webhook, an import that raced a resubmission — carries neither
+  // marker. The WMS sweep runs every 10 minutes and the withdrawal sweep every
+  // 15, so checking only the markers leaves a window to push a withdrawn order.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/domain/wms/order-push-sweep.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async claimForCreate('))
+  const body = fn.slice(0, fn.indexOf('\n    },'))
+  assert.ok(body.includes('wcWithdrawalSuppression'), 'the claim must fence on a live suppression')
+  assert.ok(body.indexOf('wcWithdrawalSuppression') < body.indexOf('wmsOrderPushLink.upsert'),
+    'the fence must precede granting the claim')
+  // Inside the same row-lock transaction as the marker re-check, or it is
+  // merely racing rather than mutually exclusive.
+  assert.ok(body.includes('FOR UPDATE'))
+  assert.ok(body.indexOf('FOR UPDATE') < body.indexOf('wcWithdrawalSuppression'))
+})
+
+test('retirement re-reads live immediately before retiring', async () => {
+  // Quiescence proves the rejection is OLD, not that nothing arrived since the
+  // read that started this pass — and once the row is gone there are no
+  // further by-ID checks at all.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/connectors/woocommerce/sync/withdrawal.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async function retireIfQuiescent'))
+  const body = fn.slice(0, fn.indexOf('\n}\n'))
+  assert.ok(body.indexOf('readLiveWcStatus') < body.indexOf('retireSuppression'))
+  assert.ok(body.includes('finalLive === null'), 'an unreadable final status must not retire it')
+})

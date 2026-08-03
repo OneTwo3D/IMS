@@ -173,6 +173,35 @@ async function logInitialImportPendingSkip(): Promise<void> {
 async function handleOrderWebhook(payload: unknown, topic: string | null) {
   const initialImportDone = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
   if (initialImportDone?.value !== 'true') {
+    // A WITHDRAWAL is still recorded, even though the order itself is not
+    // imported yet (o3d-d82p). Initial import works from page snapshots, so an
+    // order that moves to a withdrawal status after its page was fetched has
+    // nothing else to catch it: dropping this event let it land as paid
+    // PROCESSING with no marker, and initial-import completion then sets the
+    // poll cursor past the change. The tombstone is what the initial-import
+    // loop consults, so it must exist before that loop reaches the order.
+    if (topic === 'order.created' || topic === 'order.updated') {
+      const {
+        recordWithdrawalSuppressionIfWithdrawn, applyWithdrawalToLinkedOrder,
+      } = await import('./sync/withdrawal')
+      try {
+        // An order imported EARLIER in this same still-running job is already
+        // linked, and the job never revisits it — a tombstone alone would just
+        // sit there while a paid PROCESSING order stayed fulfillable. Apply the
+        // withdrawal to it directly.
+        const applied = await applyWithdrawalToLinkedOrder(payload as WcFullOrder)
+        if (!applied) await recordWithdrawalSuppressionIfWithdrawn(payload as WcFullOrder)
+      } catch (e) {
+        // Do NOT swallow this. Returning 200 marks the event processed, and a
+        // transient database failure here recreates the exact lost-withdrawal
+        // race this guard exists to close.
+        console.error('o3d-d82p: failed to record a withdrawal during initial import', e)
+        return NextResponse.json(
+          { ok: false, error: 'Could not record the withdrawal; redeliver' },
+          { status: 503 },
+        )
+      }
+    }
     // Behaviour unchanged (still ACK 200 — WC's finite retries must not pile up); the skip is now visible.
     await logInitialImportPendingSkip()
     return NextResponse.json({ ok: true, skipped: 'initial_import_pending' })
@@ -216,16 +245,43 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   // o3d-e1yb [wdraw]: never create an order the customer has already withdrawn.
   // Checked for BOTH topics: a missed order.created means the first event IMS
   // ever sees for an order can be a withdrawal update.
-  const { shouldSkipUnlinkedWithdrawalImport } = await import('./sync/withdrawal')
-  if ((topic === 'order.created' || topic === 'order.updated')
-      && await shouldSkipUnlinkedWithdrawalImport(wcOrder)) {
-    return NextResponse.json({ ok: true, skipped: 'unlinked-withdrawal' })
+  const { importWcOrderGuarded } = await import('./sync/withdrawal')
+  // Every ingress path goes through the same wrapper, so no topic can omit the
+  // suppression check or the post-import compensation (o3d-d82p).
+  let suppressionHandled = false
+  if (topic === 'order.created' || topic === 'order.updated') {
+    const guarded = await importWcOrderGuarded(
+      wcOrder,
+      () => importWcOrder(wcOrder),
+    )
+    if (guarded.outcome === 'skipped-withdrawal') {
+      return NextResponse.json({ ok: true, skipped: 'unlinked-withdrawal' })
+    }
+    if (guarded.outcome === 'unresolved') {
+      // 503, not 409: the shared inbox classifies only 408/429/5xx as
+      // retryable, so anything else is DEAD-LETTERED on the first attempt —
+      // which for an order whose only ordinary event this may be means it is
+      // never imported at all.
+      return NextResponse.json(
+        { ok: false, error: 'Could not resolve a withdrawal suppression; redeliver' },
+        { status: 503 },
+      )
+    }
+    suppressionHandled = guarded.suppressionHandled
+    if (guarded.compensationFailed) {
+      // The order is imported and LIVE but its withdrawal transition did not
+      // land. Acknowledging would leave the IMS lifecycle wrong until an
+      // independent reconciliation, so fail the delivery and let WC redeliver.
+      failures.push('withdrawal compensation failed for a raced import — the order is live and withdrawn')
+    }
+    if (!guarded.result.success) {
+      failures.push(`importWcOrder: ${guarded.result.error ?? 'unknown error'}`)
+    }
   }
 
-  if (topic === 'order.created') {
-    const importResult = await importWcOrder(wcOrder)
-    if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
-  } else if (topic === 'order.updated') {
+  if (topic === 'order.updated') {
+
+
     // An echo makes the STATUS untrustworthy — nothing else (o3d-uxv).
     //
     // This used to `return` here, discarding the whole webhook. That silently lost real
@@ -259,9 +315,15 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       })
     }
 
-    const importResult = await importWcOrder(wcOrder)
-    if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
-    if (!suppressed.suppress) {
+    // The import already ran through importWcOrderGuarded above, so the
+    // suppression check and the post-import compensation cannot be skipped.
+    //
+    // suppressionHandled means a withdrawal transition was just applied to
+    // this order. Do NOT then sync the STALE ordinary status over it: that
+    // classifies as rejected-held and invites an operator to release a live
+    // withdrawal. Refunds still process — they are keyed on the WC refund id
+    // and are unaffected by the hold.
+    if (!suppressed.suppress && !suppressionHandled) {
       const statusResult = await syncWcOrderStatus(wcOrder)
       if (!statusResult.success) {
         const detail = `syncWcOrderStatus: ${statusResult.error ?? 'unknown error'}`

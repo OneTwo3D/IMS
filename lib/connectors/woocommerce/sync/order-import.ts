@@ -962,8 +962,45 @@ export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ at
       result.failed++
       continue
     }
-    const importResult = await importWcOrder(row.payload.order, { pendingFxRetryLogId: row.id })
-    if (importResult.success) {
+    // Guarded (o3d-d82p): an order can be withdrawn while it sits in this
+    // queue waiting for an FX rate. The webhook records the suppression and
+    // acknowledges, and this retry would then import the STALE processing
+    // snapshot with no marker, leaving it warehouse-eligible until the next
+    // reconciliation — not a millisecond window.
+    const queuedOrder = row.payload.order
+    const { importWcOrderGuarded } = await import('./withdrawal')
+    const guarded = await importWcOrderGuarded(
+      queuedOrder,
+      () => importWcOrder(queuedOrder, { pendingFxRetryLogId: row.id }),
+    )
+    if (guarded.outcome === 'skipped-withdrawal') {
+      // TERMINAL, not pending. This queue selects the oldest fixed prefix, so a
+      // row whose order is withdrawn would sit at the head forever and, once
+      // `limit` of them accumulate, every FX refresh would retry only those and
+      // never reach newer orders whose rates are now available — stranding
+      // unrelated paid orders unimported.
+      await markPendingFxRetryLogFailed(
+        row.id,
+        'The customer withdrew this order while it waited for an FX rate, so it was not imported',
+      )
+      result.failed++
+      continue
+    }
+    if (guarded.outcome === 'unresolved') {
+      // Genuinely transient (WooCommerce unreachable): stays pending.
+      result.stillPending++
+      continue
+    }
+    const importResult = guarded.result
+    if (importResult.success && guarded.compensationFailed) {
+      // importWcOrder already marked this queue row SYNCED, so there is no
+      // pending row left to carry the retry. Count it as failed and say why —
+      // the tombstone survives, so the next webhook or poll finishes the job.
+      result.failed++
+      console.error(
+        `[wc-fx-retry] order ${queuedOrder.id} imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
+      )
+    } else if (importResult.success) {
       result.imported++
     } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh')) {
       result.stillPending++
@@ -1062,13 +1099,36 @@ export async function syncNewWcOrders(
       // just create.
       // Shared with both webhook topics, so the rule cannot drift between
       // ingestion paths.
-      const { shouldSkipUnlinkedWithdrawalImport } = await import('./withdrawal')
-      if (await shouldSkipUnlinkedWithdrawalImport(order)) {
+      const { importWcOrderGuarded } = await import('./withdrawal')
+      const guarded = await importWcOrderGuarded(order, () => importWcOrder(order))
+      if (guarded.outcome === 'skipped-withdrawal') {
         result.skipped++
         continue
       }
-
-      const importResult = await importWcOrder(order)
+      if (guarded.outcome === 'unresolved') {
+        // NOT a skip. A skip is a resolved decision and lets this run advance
+        // its modified-after cursor, which would leave the order behind the
+        // cursor and possibly never handled — and this poll is the backstop
+        // for exactly the withdrawal whose webhook went missing.
+        result.errors.push(
+          `WooCommerce order #${order.number}: a withdrawal suppression could not be resolved; left for the next run`,
+        )
+        continue
+      }
+      const importResult = guarded.result
+      if (guarded.compensationFailed) {
+        result.errors.push(
+          `WooCommerce order #${order.number}: imported, but applying the customer's withdrawal FAILED — the order is live and withdrawn`,
+        )
+      }
+      if (guarded.suppressionHandled) {
+        // A withdrawal transition was just applied; do not sync this stale
+        // ordinary status over it — that classifies as rejected-held and
+        // invites an operator to release a live withdrawal.
+        if (importResult.orderId) result.synced++
+        else result.skipped++
+        continue
+      }
       if (importResult.success) {
         // The backstop for a withdrawal whose webhook never arrived.
         // importWcOrder does NOT change an existing order's lifecycle status,
