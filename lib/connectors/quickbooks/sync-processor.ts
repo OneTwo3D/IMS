@@ -17,6 +17,8 @@ import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
+import { planFollowUpEnqueue } from '@/lib/domain/accounting/followup-idempotency'
+import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -151,17 +153,60 @@ async function enqueueFollowUpSyncLog(
   referenceId: string,
   payload: SyncPayload,
 ): Promise<void> {
-  if (await hasExistingSyncLog(type, referenceType, referenceId)) return
-  await db.accountingSyncLog.create({
-    data: {
-      connector: QBO_CONNECTOR,
-      type,
-      status: 'PENDING',
-      referenceType,
-      referenceId,
-      payload: payload as never,
-    },
+  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
+  // o3d-h2wx: a FAILED row is REUSED rather than replaced. The QuickBooks Request-Id is
+  // derived from the entry id, so a replacement row posts the retry under a request id
+  // Intuit has never seen — and if the failed attempt had actually committed, a SECOND
+  // payment lands on the invoice.
+  const failedRow = liveRowExists ? null : await db.accountingSyncLog.findFirst({
+    where: { connector: QBO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true, payload: true },
   })
+  const plan = planFollowUpEnqueue({
+    connector: QBO_CONNECTOR,
+    type,
+    referenceType,
+    referenceId,
+    payload,
+    liveRowExists,
+    failedRow,
+  })
+  if (plan.action === 'skip') return
+
+  try {
+    if (plan.action === 'reuse') {
+      // Fenced on status: if another run revived the same row first, this updates nothing
+      // rather than resetting a claim it does not own.
+      await db.accountingSyncLog.updateMany({
+        where: { id: plan.syncLogId, status: 'FAILED' },
+        data: {
+          status: 'PENDING',
+          payload: plan.payload as never,
+          retryCount: 0,
+          errorMessage: null,
+          processingStartedAt: null,
+        },
+      })
+      return
+    }
+    await db.accountingSyncLog.create({
+      data: {
+        connector: QBO_CONNECTOR,
+        type,
+        status: 'PENDING',
+        referenceType,
+        referenceId,
+        payload: plan.payload as never,
+      },
+    })
+  } catch (error) {
+    // A concurrent run won the same live follow-up — the partial unique index
+    // (accounting_sync_logs_followup_live_unique) rejected ours. That row already exists,
+    // so this enqueue is an idempotent no-op; anything else is a real failure.
+    if (isUniqueConstraintViolation(error)) return
+    throw error
+  }
 }
 
 export async function processPendingQuickBooksSync(): Promise<ProcessResult> {

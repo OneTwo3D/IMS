@@ -18,6 +18,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { applyBackReference, backReferenceIsMissing, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
+import { planFollowUpEnqueue } from '@/lib/domain/accounting/followup-idempotency'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
@@ -269,9 +270,51 @@ async function enqueueFollowUpSyncLog(
 ): Promise<void> {
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
-  if (await hasExistingSyncLog(type, referenceType, referenceId)) return
+  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
+  // o3d-h2wx: a FAILED row is REUSED rather than replaced. Xero's Idempotency-Key is
+  // derived from the entry id, so creating a replacement row would post the retry under a
+  // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
+  // payment lands on the invoice.
+  const failedRow = liveRowExists ? null : await db.accountingSyncLog.findFirst({
+    where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true, payload: true },
+  })
+  const plan = planFollowUpEnqueue({
+    connector: XERO_CONNECTOR,
+    type,
+    referenceType,
+    referenceId,
+    payload,
+    liveRowExists,
+    failedRow,
+  })
+  if (plan.action === 'skip') return
+
   try {
     await db.$transaction(async (tx) => {
+      if (plan.action === 'reuse') {
+        // Fenced on status: if another run revived the same row first, this updates
+        // nothing rather than resetting a claim it does not own.
+        const revived = await tx.accountingSyncLog.updateMany({
+          where: { id: plan.syncLogId, status: 'FAILED' },
+          data: {
+            status: 'PENDING',
+            payload: plan.payload as never,
+            retryCount: 0,
+            errorMessage: null,
+            processingStartedAt: null,
+          },
+        })
+        if (revived.count === 0) return
+        await scheduleXeroAccountingOutbox(tx, {
+          accountingSyncLogId: plan.syncLogId,
+          // The original outbox job for this row is spent (SUCCEEDED or exhausted), so
+          // the revived entry needs a fresh attempt budget or it would never be picked up.
+          resetAttempts: true,
+        })
+        return
+      }
       const log = await tx.accountingSyncLog.create({
         data: {
           connector: XERO_CONNECTOR,
@@ -279,7 +322,7 @@ async function enqueueFollowUpSyncLog(
           status: 'PENDING',
           referenceType,
           referenceId,
-          payload: payload as never,
+          payload: plan.payload as never,
         },
       })
       await scheduleXeroAccountingOutbox(tx, {
@@ -1247,7 +1290,7 @@ async function processEntry(
           Account: { AccountID: account.externalAccountId },
           Date: paymentDate,
           Amount: amount,
-        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'invoice-payment') })
+        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'invoice-payment', payload) })
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
         }
@@ -1348,7 +1391,7 @@ async function processEntry(
           Date: paymentDate,
           Amount: amount,
           Reference: (payload.reference as string | undefined) ?? undefined,
-        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'bill-payment') })
+        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'bill-payment', payload) })
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
         }
@@ -1410,7 +1453,7 @@ async function processEntry(
       }
       const result = await allocatePurchaseCreditNote(
         { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
-        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note-allocation') },
+        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note-allocation', payload) },
       )
       // No externalId to back-reference — the allocation is a sub-resource of the
       // credit note, not a standalone document.
