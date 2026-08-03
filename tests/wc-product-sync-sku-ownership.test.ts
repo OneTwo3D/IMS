@@ -154,7 +154,14 @@ const txClient = {
       return data
     },
   },
-  setting: { upsert: async () => ({}), findUnique: async () => null },
+  setting: {
+    upsert: async () => ({}),
+    // The credential-rebind fence (o3d-mlc7) snapshots settings before any remote read.
+    // No rows => credentials null and version '0', which findUnique agrees with, so the
+    // fence is a no-op here and these suites keep testing what they say they test.
+    findMany: async () => [],
+    findUnique: async () => null,
+  },
   // Records the lock ID argument of each pg_advisory_xact_lock call, in order.
   $executeRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
     state.advisoryLocks.push(Number(values[values.length - 1]))
@@ -339,6 +346,18 @@ test('a row claimed by a DIFFERENT WC object is refused, naming both claimants (
 
 // --- end-to-end through syncWcProductToIms ----------------------------------
 
+/**
+ * The per-SKU locks only. The credential-rebind fence (o3d-mlc7) also takes
+ * WC_SYNC_ADVISORY_LOCK_KEY — once when it snapshots settings, once as the write
+ * transaction's first statement — and that key is not part of the per-SKU protocol these
+ * assertions are about. Its presence and its ordering relative to the per-SKU locks are
+ * covered by tests/wc-product-import-rebind-fence.test.ts.
+ */
+const WC_SYNC_ADVISORY_LOCK_KEY = 918_273_645
+function perSkuLocks(): number[] {
+  return state.advisoryLocks.filter((lock) => lock !== WC_SYNC_ADVISORY_LOCK_KEY)
+}
+
 test('every SKU written is locked, in sorted order, before the first lookup (o3d-fsi)', async () => {
   const syncWcProductToIms = await loadSync()
   resetState()
@@ -347,7 +366,7 @@ test('every SKU written is locked, in sorted order, before the first lookup (o3d
 
   assert.equal(result.success, true, `sync should succeed, got: ${result.error}`)
   assert.deepEqual(
-    state.advisoryLocks,
+    perSkuLocks(),
     [fakeHashtext('PARENT-SKU'), fakeHashtext('VAR-1'), fakeHashtext('VAR-2')].sort((a, b) => a - b),
     'the parent SKU alone is not enough: every variant SKU is locked too, ascending by lock id',
   )
@@ -362,7 +381,7 @@ test('lock ids are acquired ascending even when SKU order disagrees (o3d-fsi)', 
   const result = await syncWcProductToIms(variableProduct())
 
   assert.equal(result.success, true, `sync should succeed, got: ${result.error}`)
-  assert.deepEqual(state.advisoryLocks, [10, 20, 9000], 'ordered by lock id, not by SKU')
+  assert.deepEqual(perSkuLocks(), [10, 20, 9000], 'ordered by lock id, not by SKU')
 })
 
 test('a variant SKU owned by ANOTHER WC object is refused, not reparented (o3d-fsi)', async () => {
@@ -477,7 +496,7 @@ test('one SKU repeated across variations of the SAME parent stays tolerated (o3d
   assert.equal(state.products.filter((row) => row.sku === 'DUP').length, 1, 'one row, not two')
   assert.equal(findProductBySku('DUP')?.externalProductId, BigInt(112), 'last variation wins, as before')
   assert.deepEqual(
-    state.advisoryLocks,
+    perSkuLocks(),
     [fakeHashtext('DUP'), fakeHashtext('PARENT-SKU')].sort((a, b) => a - b),
     'the repeated SKU is locked once',
   )

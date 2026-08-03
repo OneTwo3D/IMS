@@ -235,3 +235,33 @@ export function isPermanentProductSyncConflict(error: unknown): boolean {
   const match = typeof rawMessage === 'string' ? PERMANENT_CONSTRAINT_NAME_PATTERN.exec(rawMessage) : null
   return match !== null
 }
+
+/**
+ * Thrown when `wc_settings_version` moved between an import's remote reads and its write
+ * transaction (o3d-mlc7) — proof that credentials were rebound, or the product-id cache
+ * reset, while this import was in flight.
+ *
+ * Everything the import is holding describes the OLD store, so none of it may be written:
+ * writing it would repopulate store-A external ids on top of a freshly wiped mapping,
+ * defeating the wipe and pointing later stock/product operations at unrelated remote
+ * objects.
+ *
+ * Deliberately NOT a permanent conflict. Nothing is wrong with the product — the run was
+ * simply overtaken — so the caller records FAILED without the PERMANENT_CONFLICT prefix and
+ * the reconcile re-imports it against the new credentials.
+ */
+export class WcSettingsVersionChangedError extends Error {
+  readonly expectedVersion: string
+  readonly currentVersion: string
+
+  constructor(expectedVersion: string, currentVersion: string) {
+    super(
+      `WooCommerce settings changed mid-import (version ${expectedVersion} -> ${currentVersion}): ` +
+        'the credentials or product-id cache were replaced while this product was being read, so the ' +
+        'data in hand belongs to the previous store and was not written. It will be re-imported.',
+    )
+    this.name = 'WcSettingsVersionChangedError'
+    this.expectedVersion = expectedVersion
+    this.currentVersion = currentVersion
+  }
+}

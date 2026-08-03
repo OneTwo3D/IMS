@@ -19,6 +19,7 @@ import {
 } from '../sync-lock'
 import {
   assertWcRowNotClaimedByAnotherWcObject,
+  WcSettingsVersionChangedError,
   WcSkuOwnershipConflictError,
 } from './product-sync-errors'
 import { validateWooCommerceBaseUrl } from '../url-safety'
@@ -400,12 +401,24 @@ async function persistMappingIfVersionMatches(
  * conflict, so the caller should acknowledge and report it rather than retry (o3d-gtk; see
  * product-sync-errors.ts for why only barcode/externalProductId qualify).
  *
- * NOT COVERED (o3d-mlc7): this function does not participate in the credential-rebind fence
- * described in sync-lock.ts. It takes the per-SKU locks but never WC_SYNC_ADVISORY_LOCK_KEY
- * and never checks `wc_settings_version`, so an import carrying store-A data can resume after
- * a rebind/reset and repopulate store-A external ids against store-B credentials. The o3d-fsi
- * ownership guard does not help: it treats a wiped (null) mapping as adoptable, which is the
- * same outcome the previous unconditional update produced. Pre-existing, not introduced here.
+ * CREDENTIAL-REBIND FENCE (o3d-mlc7). This function now participates in the two-part fence
+ * described in sync-lock.ts, which it previously sat outside: it took the per-SKU locks but
+ * never WC_SYNC_ADVISORY_LOCK_KEY and never read `wc_settings_version`, so an import carrying
+ * store-A data could resume after a rebind/reset and repopulate store-A external ids against
+ * store-B credentials. The o3d-fsi ownership guard does not help — it treats a wiped (null)
+ * mapping as adoptable, which is exactly what the wipe produces.
+ *
+ * Four things make that race impossible, and they have to happen in this order:
+ *
+ *   1. Snapshot the credentials AND the settings version together, under the advisory lock,
+ *      BEFORE any remote read.
+ *   2. Use those PINNED credentials for every remote read — the variations pages and the
+ *      category tree — so one import cannot mix store-A parent data with store-B variations.
+ *   3. Take WC_SYNC_ADVISORY_LOCK_KEY as the write transaction's FIRST statement, before the
+ *      per-SKU lock ids. A fixed order between the two lock families is what stops them
+ *      deadlocking against each other.
+ *   4. Re-read the version inside that transaction and abandon the import if it moved — the
+ *      same contract stock sync already honours.
  */
 export async function syncWcProductToIms(
   wcProduct: WcFullProduct,
@@ -413,6 +426,11 @@ export async function syncWcProductToIms(
   try {
     const sku = asTrimmedString(wcProduct.sku)
     if (!sku) return { success: true } // skip products without SKU
+
+    // Fence step 1 (o3d-mlc7): credentials and settings version snapshotted TOGETHER under
+    // the advisory lock, before a single remote read. Taking them separately would let a
+    // rebind slip between the two and pin credentials to the wrong version.
+    const { creds: pinnedCreds, syncVersion } = await snapshotProductSyncContext()
 
     // --- Shared field extraction ---
     const description = stripHtml(wcProduct.short_description || wcProduct.description || '')
@@ -446,14 +464,14 @@ export async function syncWcProductToIms(
     const wcCategories = Array.isArray(wcProduct.categories) ? wcProduct.categories : []
     let imsCategoryId: string | null | undefined
     if (wcCategories.length > 0) {
-      const mirror = await ensureWcCategoryTreeMirrored()
+      const mirror = await ensureWcCategoryTreeMirrored(pinnedCreds)
       if (mirror) imsCategoryId = resolveImsCategoryId(wcCategories, wcProduct.meta_data, mirror)
     }
 
     // --- Remote reads: ALL of them, before anything is written (o3d-uh2) ---
     // A variations page that fails throws from here, leaving the catalog untouched.
     const isVariable = wcProduct.type === 'variable' && wcProduct.variations?.length > 0
-    const variations = isVariable ? await fetchAllWcVariations(wcProduct.id) : []
+    const variations = isVariable ? await fetchAllWcVariations(wcProduct.id, pinnedCreds) : []
 
     const variationAttrs = Array.isArray(wcProduct.attributes)
       ? wcProduct.attributes.filter((a) => a.variation)
@@ -475,6 +493,20 @@ export async function syncWcProductToIms(
     // --- Local writes: all of them, in ONE transaction ---
     const { syncedProductId, syncedSku, tradeChanges, wasUpdate } = await db.$transaction(
       async (tx: Prisma.TransactionClient) => {
+        // Fence step 3 (o3d-mlc7): the settings lock comes FIRST, before any per-SKU lock.
+        // Both families are taken inside this transaction, so a fixed order between them is
+        // what keeps them from deadlocking against each other.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+
+        // Fence step 4: with that lock held, the version cannot move under us. If it moved
+        // while we were reading WooCommerce, everything in hand describes the OLD store and
+        // must not be written — abandon rather than repopulate a wiped mapping.
+        const versionRow = await tx.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY } })
+        const currentVersion = versionRow?.value ?? '0'
+        if (currentVersion !== syncVersion) {
+          throw new WcSettingsVersionChangedError(syncVersion, currentVersion)
+        }
+
         // Serialize concurrent syncs touching ANY of these SKUs so the find-then-create
         // below cannot race another WC sync into a P2002, and so two parents sharing a
         // variation SKU cannot both take the create branch (o3d-uh2, o3d-fsi).
@@ -671,15 +703,21 @@ export async function syncWcProductToIms(
  * parent sync then records FAILED, writes no SYNCED log, and neither the webhook
  * nor the bulk cursor advances, so the reconcile re-attempts.
  */
-async function fetchAllWcVariations(wcParentId: number): Promise<WcVariation[]> {
+async function fetchAllWcVariations(
+  wcParentId: number,
+  creds: ConnectorCredentials | null,
+): Promise<WcVariation[]> {
   const all: WcVariation[] = []
   let page = 1
   let totalPages = 1
 
   while (page <= totalPages) {
+    // PINNED credentials, not ambient (o3d-mlc7): resolving them per page let a rebind
+    // mid-import pair store-A parent data with store-B variations in one transaction.
     const { data, totalPages: tp, error } = await wcFetch(
       `/products/${wcParentId}/variations`,
       { per_page: '100', page: String(page) },
+      creds,
     )
     if (error) {
       throw new Error(

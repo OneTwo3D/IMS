@@ -134,7 +134,14 @@ const txClient = {
       return data
     },
   },
-  setting: { upsert: async () => ({}), findUnique: async () => null },
+  setting: {
+    upsert: async () => ({}),
+    // The credential-rebind fence (o3d-mlc7) snapshots settings before any remote read.
+    // No rows => credentials null and version '0', which findUnique agrees with, so the
+    // fence is a no-op here and these suites keep testing what they say they test.
+    findMany: async () => [],
+    findUnique: async () => null,
+  },
   $executeRaw: async () => 1,
 }
 
@@ -307,8 +314,13 @@ test('create race: two workers importing the same SKU serialize on the advisory 
   assert.equal(state.products.length, 1, 'exactly one product row for one SKU')
   assert.equal(state.createCalls, 1, 'the second worker must take the UPDATE branch, not a second create')
   assert.equal(state.updateCalls, 1, 'and its payload must actually be applied')
-  assert.equal(state.lockOrder.length, 2, 'both write transactions take the per-SKU advisory lock')
-  assert.equal(state.lockOrder[0], state.lockOrder[1], 'and they contend on the SAME key')
+  // The credential-rebind fence (o3d-mlc7) also takes WC_SYNC_ADVISORY_LOCK_KEY — once to
+  // snapshot settings, once inside the write transaction — so filter to the per-SKU keys
+  // this assertion is actually about. That the settings lock is taken, and taken first, is
+  // covered by tests/wc-product-import-rebind-fence.test.ts.
+  const perSkuLockOrder = state.lockOrder.filter((key) => key !== String(918_273_645))
+  assert.equal(perSkuLockOrder.length, 2, 'both write transactions take the per-SKU advisory lock')
+  assert.equal(perSkuLockOrder[0], perSkuLockOrder[1], 'and they contend on the SAME key')
 })
 
 test('create race: a SKU P2002 that slips past the lock is TRANSIENT, and the retry UPDATES rather than discarding (o3d-gtk)', async () => {
