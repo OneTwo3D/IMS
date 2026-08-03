@@ -126,20 +126,76 @@ export function withFollowUpIdempotencyKey(identity: FollowUpIdentity): FollowUp
   return { ...identity.payload, [FOLLOW_UP_IDEMPOTENCY_KEY]: buildFollowUpIdempotencySource(identity) }
 }
 
+/**
+ * Whether the remote token this attempt will carry is the one a previous attempt used
+ * (`pinned`) or a newly derived one (`rotated`). Rotating is only ever safe when no
+ * surviving attempt could have committed the thing we are about to post — the caller
+ * reports which happened, and treats losing a PINNED row as a hard stop.
+ */
+export type TokenDisposition = 'pinned' | 'rotated'
+
 export type FollowUpEnqueuePlan =
   | { action: 'skip' }
   /** An ambiguous history that must not be auto-reposted; the caller warns and stops. */
   | { action: 'refuse'; reason: string }
-  | { action: 'reuse'; syncLogId: string; payload: FollowUpPayload; divergedFields: string[] }
+  | {
+      action: 'reuse'
+      syncLogId: string
+      payload: FollowUpPayload
+      tokenDisposition: TokenDisposition
+      /** `pinned` = the stored request body was kept; `fresh` = the recomputed one is used. */
+      bodyDisposition: 'pinned' | 'fresh'
+      divergedFields: string[]
+    }
   | { action: 'create'; payload: FollowUpPayload }
 
-export type FailedFollowUpRow = { id: string; payload: unknown; createdAt?: Date | null }
+export type FailedFollowUpRow = {
+  id: string
+  payload: unknown
+  /**
+   * True when this row's recorded failure PROVES no remote call was made — the connector
+   * rejected it locally, before any HTTP request. Such a row carries no ambiguity: there
+   * is nothing it could have committed, so neither its token nor its body needs pinning.
+   *
+   * The default is false, which is the safe reading: o3d-ju8t established that FAILED on
+   * its own does NOT prove nothing was posted.
+   */
+  provenNotPosted?: boolean
+}
 
 export type FollowUpEnqueueInput = FollowUpIdentity & {
   /** A PENDING / PROCESSING / SYNCED row already owns this follow-up. */
   liveRowExists: boolean
   /** Every surviving FAILED row for this scope, newest first. */
   failedRows: FailedFollowUpRow[]
+}
+
+/**
+ * Failures BOTH connectors raise from their own validation, before any HTTP request is
+ * built. A row that failed this way provably did not post, so it carries no ambiguity —
+ * neither its token nor its body needs pinning, and the recomputed request is free to go
+ * out. Without this, a payment whose bank account was mis-mapped would have its invalid
+ * body pinned forever and could never be corrected (Codex review, r2 #3).
+ *
+ * Matched on message shape rather than a flag because that is the evidence the rows
+ * already carry; the patterns are anchored, and the tests pin the exact strings both
+ * connectors emit so a reworded message breaks loudly instead of silently widening the
+ * "safe to rotate" set. Anything unrecognised stays ambiguous, which is the safe default:
+ * o3d-ju8t established that FAILED alone does NOT prove nothing was posted.
+ */
+const PRE_CALL_FAILURE_PATTERNS = [
+  // "Missing <what> for <SYNC_TYPE>", optionally followed by an explanatory clause —
+  // e.g. "Missing customer reference for INVOICE_PAYMENT — customer has no QuickBooks
+  // contact ID". Anchored on the SCREAMING_CASE sync type so a remote message that merely
+  // opens with "Missing" does not qualify.
+  /^Missing .+ for [A-Z][A-Z_]+(?:\s|$)/,
+  /^Bank account .+ not found in synced [A-Za-z ]+ chart of accounts$/,
+]
+
+export function failureProvesNoRemoteCall(errorMessage: string | null | undefined): boolean {
+  if (typeof errorMessage !== 'string') return false
+  const message = errorMessage.trim()
+  return PRE_CALL_FAILURE_PATTERNS.some((pattern) => pattern.test(message))
 }
 
 /** Fields whose value defines the remote request, so a divergence is worth reporting. */
@@ -166,69 +222,110 @@ function divergedRequestFields(stored: FollowUpPayload, fresh: FollowUpPayload):
 }
 
 /**
+ * True when a surviving attempt could plausibly have committed the very thing we are about
+ * to post — i.e. it targeted the SAME external document.
+ *
+ * An attempt with no recorded anchors at all is treated as MATCHING. We cannot tell what it
+ * targeted, and for money movement "unknown" has to read as "possibly this one"; assuming
+ * otherwise would rotate the token on exactly the legacy rows least able to survive it.
+ */
+function couldHaveCommittedThis(stored: FollowUpPayload | null, freshAnchors: string[]): boolean {
+  if (stored === null) return true
+  const storedAnchors = anchorsOf(stored)
+  if (storedAnchors.every((anchor) => anchor === '')) return true
+  // Compared element-wise rather than by joining: an anchor value containing whatever
+  // separator was chosen would otherwise make two different targets look identical.
+  return storedAnchors.every((anchor, index) => anchor === freshAnchors[index])
+}
+
+/**
  * Pure enqueue decision, so the row-id-preservation rule is testable without a database.
  * The caller does the I/O implied by the returned plan.
  */
 export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueuePlan {
   if (input.liveRowExists) return { action: 'skip' }
 
-  const failedRows = input.failedRows
-  if (failedRows.length === 0) return { action: 'create', payload: withFollowUpIdempotencyKey(input) }
+  const freshAnchors = anchorsOf(input.payload)
+  const moneyMoving = isMoneyMovingFollowUp(input.type)
+
+  // Narrow the history to attempts that carry REAL ambiguity, in two steps. Both matter:
+  // treating every FAILED row as dangerous strands legitimate work (Codex review, r2 #2/#3).
+  //
+  //  1. A failure the connector raised BEFORE any HTTP call proves nothing was posted, so
+  //     it has no token worth preserving and no body worth pinning.
+  //  2. An attempt against a DIFFERENT external document cannot have committed this one.
+  const ambiguous = input.failedRows.filter((row) => !row.provenNotPosted)
+  const couldHaveCommitted = ambiguous.filter((row) => couldHaveCommittedThis(asPayload(row.payload), freshAnchors))
 
   // Pre-fix behaviour created a REPLACEMENT row after every failure, and FAILED rows are
-  // outside the live-follow-up unique index, so a scope can already hold several — each
-  // with its own token, since a row without a stamped key derives from its own id. Any of
-  // them may be the one that ambiguously committed, and picking the newest is a guess. For
-  // money movement a guess is not good enough: refuse and let an operator settle it
-  // (Codex review, r1 #4).
-  if (failedRows.length > 1 && isMoneyMovingFollowUp(input.type)) {
+  // outside the live-follow-up unique index, so a scope can hold several — each with its own
+  // token, since a row without a stamped key derives from its own id. When more than one
+  // could have committed THIS document, any of them might be the one that did, and picking
+  // the newest is a guess. For money movement a guess is not good enough (Codex r1 #4).
+  if (couldHaveCommitted.length > 1 && moneyMoving) {
     return {
       action: 'refuse',
-      reason: `${failedRows.length} FAILED ${input.type} rows exist for this reference, each posted under a `
-        + 'different idempotency token. Any one of them may have committed remotely, so an automatic '
-        + 'retry could duplicate it. Reconcile them in the ledger and resolve the rows manually.',
+      reason: `${couldHaveCommitted.length} FAILED ${input.type} rows for this reference each targeted this same `
+        + 'document under a different idempotency token. Any one of them may have committed remotely, so an '
+        + 'automatic retry could duplicate it. Reconcile them in the ledger and resolve the rows manually.',
     }
   }
 
-  const failedRow = failedRows[0]!
-  const stored = asPayload(failedRow.payload)
-  const storedKey = readFollowUpIdempotencyKey(stored)
+  const pinnable = couldHaveCommitted[0]
+  if (pinnable) {
+    // The token is pinned backwards, either explicitly via the stored key or implicitly via
+    // the preserved row id.
+    const stored = asPayload(pinnable.payload)
+    const storedKey = readFollowUpIdempotencyKey(stored)
+    const divergedFields = stored ? divergedRequestFields(stored, input.payload) : []
 
-  // A different target document means the failed attempt cannot have committed the thing
-  // we are about to post, so its token must NOT be carried forward — that would make the
-  // remote system hand back the OLD document and we would record a settlement that never
-  // happened. Stamp a fresh anchored key instead (Codex review, r1 #2).
-  // Compared element-wise rather than by joining: an anchor value containing whatever
-  // separator was chosen would otherwise make two different targets look identical.
-  const freshAnchors = anchorsOf(input.payload)
-  const targetChanged = stored !== null
-    && anchorsOf(stored).some((anchor, index) => anchor !== freshAnchors[index])
-  if (targetChanged) {
+    // For money movement the BODY is pinned with the token. Posting a recomputed amount
+    // under a token the remote system has already seen returns the ORIGINAL payment, and we
+    // would record a settlement for an amount never posted — local evidence that disagrees
+    // with the ledger (Codex r1 #3). A genuinely invalid body is not stranded by this: the
+    // connector proves such failures pre-call, which drops the row out of `ambiguous` above
+    // and lets the recomputed request through (Codex r2 #3).
+    if (stored && moneyMoving) {
+      return {
+        action: 'reuse',
+        syncLogId: pinnable.id,
+        payload: stored,
+        tokenDisposition: 'pinned',
+        bodyDisposition: 'pinned',
+        divergedFields,
+      }
+    }
+
+    // Non-money follow-ups (PDF, email, note, attachment) are safe to re-drive with fresh
+    // inputs. Carry the stored key if it has one; stamp NOTHING if it does not, because the
+    // preserved row id already IS its stable token and stamping would rotate it.
+    const { [FOLLOW_UP_IDEMPOTENCY_KEY]: _discarded, ...rest } = input.payload
+    const payload: FollowUpPayload = storedKey ? { ...rest, [FOLLOW_UP_IDEMPOTENCY_KEY]: storedKey } : rest
     return {
       action: 'reuse',
-      syncLogId: failedRow.id,
-      payload: withFollowUpIdempotencyKey(input),
-      divergedFields: divergedRequestFields(stored, input.payload),
+      syncLogId: pinnable.id,
+      payload,
+      tokenDisposition: 'pinned',
+      bodyDisposition: 'fresh',
+      divergedFields,
     }
   }
 
-  // Same target: the token is pinned backwards, either explicitly or implicitly via the
-  // preserved row id.
-  //
-  // For a money-moving follow-up the BODY is pinned with it. Posting a recomputed amount
-  // under a token the remote system has already seen would return the ORIGINAL payment and
-  // we would record a settlement for an amount never posted — local evidence that disagrees
-  // with the ledger (Codex review, r1 #3). The divergence is reported so an operator can
-  // see a genuine correction was suppressed.
-  const divergedFields = stored ? divergedRequestFields(stored, input.payload) : []
-  if (stored && isMoneyMovingFollowUp(input.type)) {
-    return { action: 'reuse', syncLogId: failedRow.id, payload: stored, divergedFields }
+  // Nothing surviving could have committed this document, so the recomputed request goes out
+  // under a freshly derived token. Reuse a spent row when one exists rather than accumulating
+  // replacements; its id no longer carries the token, so reuse is bookkeeping, not safety.
+  const rowToReuse = input.failedRows[0]
+  const freshPayload = withFollowUpIdempotencyKey(input)
+  if (rowToReuse) {
+    const stored = asPayload(rowToReuse.payload)
+    return {
+      action: 'reuse',
+      syncLogId: rowToReuse.id,
+      payload: freshPayload,
+      tokenDisposition: 'rotated',
+      bodyDisposition: 'fresh',
+      divergedFields: stored ? divergedRequestFields(stored, input.payload) : [],
+    }
   }
-
-  // Non-money follow-ups (PDF, email, note, attachment) are safe to re-drive with fresh
-  // inputs. Carry the stored key if it has one; stamp NOTHING if it does not, because the
-  // preserved row id already IS its stable token and stamping would rotate it.
-  const { [FOLLOW_UP_IDEMPOTENCY_KEY]: _discarded, ...rest } = input.payload
-  const payload: FollowUpPayload = storedKey ? { ...rest, [FOLLOW_UP_IDEMPOTENCY_KEY]: storedKey } : rest
-  return { action: 'reuse', syncLogId: failedRow.id, payload, divergedFields }
+  return { action: 'create', payload: freshPayload }
 }

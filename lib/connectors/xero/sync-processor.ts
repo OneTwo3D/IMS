@@ -18,7 +18,8 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { applyBackReference, backReferenceIsMissing, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
-import { isMoneyMovingFollowUp, planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { failureProvesNoRemoteCall, planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
@@ -290,11 +291,16 @@ async function enqueueFollowUpSyncLog(
   // derived from the entry id, so creating a replacement row would post the retry under a
   // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
   // payment lands on the invoice.
-  const failedRows = liveRowExists ? [] : await db.accountingSyncLog.findMany({
+  const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true, createdAt: true },
+    select: { id: true, payload: true, errorMessage: true },
   })
+  const failedRows = failedLogs.map((row) => ({
+    id: row.id,
+    payload: row.payload,
+    provenNotPosted: failureProvesNoRemoteCall(row.errorMessage),
+  }))
   const plan = planFollowUpEnqueue({
     connector: XERO_CONNECTOR,
     type,
@@ -316,18 +322,6 @@ async function enqueueFollowUpSyncLog(
     })
     return
   }
-  if (plan.action === 'reuse' && plan.divergedFields.length > 0) {
-    await logActivity({
-      entityType: 'SYSTEM',
-      action: 'xero_followup_reuse_diverged',
-      tag: 'sync',
-      level: 'WARNING',
-      description: `Reviving Xero ${type} for ${referenceType} ${referenceId} under its original idempotency token; `
-        + `recomputed ${plan.divergedFields.join(', ')} ${isMoneyMovingFollowUp(type) ? 'was suppressed' : 'was applied'}.`,
-      metadata: { type, referenceType, referenceId, syncLogId: plan.syncLogId, divergedFields: plan.divergedFields },
-    })
-  }
-
   try {
     const outcome = await db.$transaction(async (tx) => {
       if (plan.action === 'reuse') {
@@ -344,7 +338,7 @@ async function enqueueFollowUpSyncLog(
             processingStartedAt: null,
           },
         })
-        if (revived.count === 0) return 'row-gone' as const
+        if (revived.count === 0) return 'cas-lost' as const
         await scheduleXeroAccountingOutbox(tx, {
           accountingSyncLogId: plan.syncLogId,
           // Explicit 0 rather than resetAttempts: a PROCESSING outbox row honours only an
@@ -369,12 +363,19 @@ async function enqueueFollowUpSyncLog(
       })
       return 'done' as const
     })
-    if (outcome === 'row-gone' && !replanned) {
-      // The row we planned to revive is no longer FAILED — another run revived it, or
-      // retention deleted it between the read and the update (o3d-nepa). Re-plan once
-      // against the current state so the follow-up is neither dropped nor duplicated.
-      await enqueueFollowUpSyncLog(type, referenceType, referenceId, payload, true)
+    if (outcome === 'cas-lost' && plan.action === 'reuse') {
+      await resolveLostFollowUpRevival({
+        connector: XERO_CONNECTOR,
+        type,
+        referenceType,
+        referenceId,
+        plan,
+        replanned,
+        retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, payload, true),
+      })
+      return
     }
+    if (plan.action === 'reuse') await logFollowUpRevival(XERO_CONNECTOR, type, referenceType, referenceId, plan)
   } catch (error) {
     // A concurrent run created the same live follow-up first — the unique index
     // rejected ours. That row (and its outbox job) already exist, so this enqueue
@@ -1902,7 +1903,10 @@ async function enqueuePurchaseCreditNoteFollowUps(
     creditNoteId: syncResult.externalId,
     accountingInvoiceId: allocateToInvoiceId,
     amount: allocateAmount,
-    date: payload.date as string | undefined,
+    // Resolved HERE rather than left undefined for processEntry to fill from the wall
+    // clock. An unset date made the allocation body differ on every execution, so a
+    // retry of a pinned request was no longer the same request (Codex review, r2 #3).
+    date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
     sourceEntryId: entryId,
   })
 }

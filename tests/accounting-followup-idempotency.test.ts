@@ -8,6 +8,7 @@ import {
   buildFollowUpIdempotencySource,
   planFollowUpEnqueue,
   readFollowUpIdempotencyKey,
+  failureProvesNoRemoteCall,
   withFollowUpIdempotencyKey,
 } from '@/lib/domain/accounting/followup-idempotency'
 
@@ -302,4 +303,143 @@ test('Xero money-moving branches must NOT start reading the generic _idempotency
       )
     }
   }
+})
+
+/**
+ * Round 3, from Codex r2. Three of the four new defects came from treating every FAILED row
+ * as equally dangerous. The evidence that separates them is already on the row: a failure
+ * the connector raised from its OWN validation never reached the network.
+ */
+
+const PRE_CALL_MESSAGES = [
+  'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT',
+  'Missing creditNoteId, accountingInvoiceId, or amount for PURCHASE_CREDIT_NOTE_ALLOCATION',
+  'Bank account bank-1 not found in synced Xero chart of accounts',
+]
+
+test('a pre-call failure is recognised, and an ambiguous one is NOT (o3d-h2wx)', () => {
+  for (const message of PRE_CALL_MESSAGES) {
+    assert.ok(failureProvesNoRemoteCall(message), `${message} is raised before any HTTP call`)
+  }
+  // Anything the remote system said, or anything unrecognised, stays ambiguous — o3d-ju8t
+  // established that FAILED alone does not prove nothing was posted.
+  for (const message of [
+    'HTTP 400',
+    'Failed to post Xero payment',
+    'ECONNRESET',
+    'Missing something',
+    null,
+    undefined,
+    '',
+  ]) {
+    assert.equal(failureProvesNoRemoteCall(message), false, `${message} must stay ambiguous`)
+  }
+})
+
+test('both connectors\' literal pre-call messages are the ones the matcher recognises (o3d-h2wx)', async () => {
+  // Pins the coupling: if either connector rewords a message, this breaks loudly rather
+  // than silently narrowing (a stranded payment) or widening (a rotated token) the set.
+  const sources = await Promise.all([
+    readFile(XERO_PROCESSOR, 'utf8'),
+    readFile(path.join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8'),
+  ])
+  const combined = sources.join('\n')
+  const emitted = [...combined.matchAll(/error: (?:`|')(Missing [^`']+|Bank account [^`']+)(?:`|')/g)]
+    .map((match) => match[1]!.replace(/\$\{[^}]+\}/g, 'x'))
+  assert.ok(emitted.length >= 8, `expected the connectors' validation messages; found ${emitted.length}`)
+  for (const message of emitted) {
+    assert.ok(
+      failureProvesNoRemoteCall(message),
+      `"${message}" is raised before any remote call but the matcher does not recognise it, so a `
+        + 'correctable request would be pinned to its invalid body forever',
+    )
+  }
+})
+
+test('a provably pre-call failure lets the CORRECTED body through (o3d-h2wx)', () => {
+  // Codex r2 #3: a payment whose bank account was mis-mapped failed before any HTTP call.
+  // Pinning that body would restore the invalid account on every retry, forever.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-new' },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'log-old',
+      payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-deleted' },
+      provenNotPosted: true,
+    }],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.payload.bankAccountId : undefined, 'bank-new')
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'rotated')
+  assert.equal(plan.action === 'reuse' ? plan.bodyDisposition : undefined, 'fresh')
+})
+
+test('several FAILED rows do NOT refuse when none of them targeted this document (o3d-h2wx)', () => {
+  // Codex r2 #2: the refusal fired on row COUNT alone, so two failures against a deleted
+  // invoice blocked a legitimate payment against its replacement, permanently.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-new', amount: 120 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-old', amount: 120 } },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-old', amount: 120 } },
+    ],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'rotated')
+  assert.equal(plan.action === 'reuse' ? plan.payload.accountingInvoiceId : undefined, 'inv-new')
+})
+
+test('several FAILED rows do NOT refuse when only one of them is ambiguous (o3d-h2wx)', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-precall', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, provenNotPosted: true },
+      { id: 'log-ambiguous', payload: { accountingInvoiceId: 'inv-9', amount: 110 } },
+    ],
+  })
+  assert.equal(plan.action, 'reuse')
+  // The ambiguous one is what must be pinned, not merely the newest.
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-ambiguous')
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
+  assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 110)
+})
+
+test('a FAILED row with no recorded target counts as possibly-this-one (o3d-h2wx)', () => {
+  // "Unknown target" must read as "possibly this one" for money: assuming otherwise would
+  // rotate the token on exactly the legacy rows least able to survive it.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-legacy', payload: { amount: 120 } }],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
+})
+
+test('a same-target money reuse reports pinned/pinned, so the log cannot lie (o3d-h2wx)', () => {
+  // Codex r2 #4: the warning was hard-coded to "original token, change suppressed" and so
+  // described the exact opposite of what the target-changed path did.
+  const pinned = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 150 },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 } }],
+  })
+  assert.equal(pinned.action === 'reuse' ? pinned.tokenDisposition : undefined, 'pinned')
+  assert.equal(pinned.action === 'reuse' ? pinned.bodyDisposition : undefined, 'pinned')
+
+  const rotated = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', amount: 120 },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 } }],
+  })
+  assert.equal(rotated.action === 'reuse' ? rotated.tokenDisposition : undefined, 'rotated')
+  assert.equal(rotated.action === 'reuse' ? rotated.bodyDisposition : undefined, 'fresh')
 })

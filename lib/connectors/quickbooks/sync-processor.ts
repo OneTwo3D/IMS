@@ -17,7 +17,8 @@ import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
-import { isMoneyMovingFollowUp, planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { failureProvesNoRemoteCall, planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
@@ -166,11 +167,16 @@ async function enqueueFollowUpSyncLog(
   // derived from the entry id, so a replacement row posts the retry under a request id
   // Intuit has never seen — and if the failed attempt had actually committed, a SECOND
   // payment lands on the invoice.
-  const failedRows = liveRowExists ? [] : await db.accountingSyncLog.findMany({
+  const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: QBO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true, createdAt: true },
+    select: { id: true, payload: true, errorMessage: true },
   })
+  const failedRows = failedLogs.map((row) => ({
+    id: row.id,
+    payload: row.payload,
+    provenNotPosted: failureProvesNoRemoteCall(row.errorMessage),
+  }))
   const plan = planFollowUpEnqueue({
     connector: QBO_CONNECTOR,
     type,
@@ -192,18 +198,6 @@ async function enqueueFollowUpSyncLog(
     })
     return
   }
-  if (plan.action === 'reuse' && plan.divergedFields.length > 0) {
-    await logActivity({
-      entityType: 'SYSTEM',
-      action: 'quickbooks_followup_reuse_diverged',
-      tag: 'sync',
-      level: 'WARNING',
-      description: `Reviving QuickBooks ${type} for ${referenceType} ${referenceId} under its original request id; `
-        + `recomputed ${plan.divergedFields.join(', ')} ${isMoneyMovingFollowUp(type) ? 'was suppressed' : 'was applied'}.`,
-      metadata: { type, referenceType, referenceId, syncLogId: plan.syncLogId, divergedFields: plan.divergedFields },
-    })
-  }
-
   try {
     if (plan.action === 'reuse') {
       // Fenced on status: if another run revived the same row first — or retention deleted
@@ -219,11 +213,19 @@ async function enqueueFollowUpSyncLog(
           processingStartedAt: null,
         },
       })
-      // Re-plan once against the current state so the follow-up is neither dropped nor
-      // duplicated when the row we chose vanished under us.
-      if (revived.count === 0 && !replanned) {
-        await enqueueFollowUpSyncLog(type, referenceType, referenceId, payload, true)
+      if (revived.count === 0) {
+        await resolveLostFollowUpRevival({
+          connector: QBO_CONNECTOR,
+          type,
+          referenceType,
+          referenceId,
+          plan,
+          replanned,
+          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, payload, true),
+        })
+        return
       }
+      await logFollowUpRevival(QBO_CONNECTOR, type, referenceType, referenceId, plan)
       return
     }
     await db.accountingSyncLog.create({
