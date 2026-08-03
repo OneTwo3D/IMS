@@ -187,16 +187,37 @@ export type FollowUpEnqueueInput = FollowUpIdentity & {
  * committed, but an incomplete oldest cannot have, and pinning it would strand the payment
  * behind a request that can never succeed (Codex review, r7 #3).
  */
-const REQUIRED_BODY_FIELDS: Record<string, readonly string[]> = {
-  INVOICE_PAYMENT: ['accountingInvoiceId', 'bankAccountId', 'amount'],
-  PURCHASE_CREDIT_NOTE_ALLOCATION: ['creditNoteId', 'accountingInvoiceId', 'amount'],
+const REQUIRED_BODY_FIELDS: Record<string, readonly { field: string; kind: 'id' | 'amount' }[]> = {
+  INVOICE_PAYMENT: [
+    { field: 'accountingInvoiceId', kind: 'id' },
+    { field: 'bankAccountId', kind: 'id' },
+    { field: 'amount', kind: 'amount' },
+  ],
+  PURCHASE_CREDIT_NOTE_ALLOCATION: [
+    { field: 'creditNoteId', kind: 'id' },
+    { field: 'accountingInvoiceId', kind: 'id' },
+    { field: 'amount', kind: 'amount' },
+  ],
+}
+
+/**
+ * Mirrors the connectors' guards EXACTLY, which are not uniform:
+ *
+ *   if (!accountingInvoiceId || !bankAccountId || amount == null)
+ *
+ * An id is rejected when FALSY, so an empty string counts as missing — but an amount is only
+ * rejected when null/undefined, so a legitimate zero must NOT. Getting either wrong here
+ * misreads whether an attempt could have posted.
+ */
+function fieldIsPresent(value: unknown, kind: 'id' | 'amount'): boolean {
+  return kind === 'amount' ? value !== undefined && value !== null : Boolean(value)
 }
 
 function bodyCouldHaveReachedTheLedger(type: string, stored: FollowUpPayload | null): boolean {
   const required = REQUIRED_BODY_FIELDS[type]
   if (!required) return true
   if (stored === null) return true
-  return required.every((field) => stored[field] !== undefined && stored[field] !== null)
+  return required.every(({ field, kind }) => fieldIsPresent(stored[field], kind))
 }
 
 /** Fields whose value defines the remote request, so a divergence is worth reporting. */

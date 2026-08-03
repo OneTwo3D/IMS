@@ -1679,6 +1679,9 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
     // since there is nothing to apply.
     const followUpsOnly = !missing && row.status === 'FAILED'
     if (!missing && !followUpsOnly) continue
+    // Counted as CHECKED either way, but a follow-ups-only pass is not a repair: nothing was
+    // re-applied, so it must not inflate `repaired` or claim a back-reference fix that did
+    // not happen (Codex review, r8).
     result.checked++
     try {
       if (!followUpsOnly) await applyBackReference(db, params)
@@ -1706,6 +1709,23 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
       // permanently (Codex review, r6). Leaving it FAILED is what makes the retry durable.
       if (row.status === 'FAILED' && followUpsEnqueued) {
         await db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', errorMessage: null } })
+      }
+      if (followUpsOnly) {
+        // Nothing was repaired — this pass existed only to retry the follow-ups. Reporting it
+        // as a repair would overstate what the sweep did, and the INFO line below would claim
+        // a re-application that never occurred.
+        if (followUpsEnqueued) {
+          await logActivity({
+            entityType: 'SYSTEM',
+            action: 'xero_backreference_followups_recovered',
+            tag: 'sync',
+            level: 'INFO',
+            description: `Enqueued the outstanding Xero follow-ups for ${row.referenceType} ${row.referenceId}; its `
+              + 'back-reference was already applied by an earlier pass.',
+            metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
+          })
+        }
+        continue
       }
       result.repaired++
       await logActivity({

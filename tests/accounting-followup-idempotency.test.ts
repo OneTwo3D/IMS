@@ -640,3 +640,30 @@ test('completeness only applies to money-moving types (o3d-h2wx)', () => {
   })
   assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
 })
+
+test('completeness mirrors the connectors\' guards: falsy ids missing, zero amount valid (o3d-h2wx)', () => {
+  // The guards are `!accountingInvoiceId || !bankAccountId || amount == null`, which are not
+  // uniform: an id is rejected when FALSY (so '' counts as missing) but an amount only when
+  // null/undefined (so a legitimate zero must NOT). Getting either wrong misreads whether an
+  // attempt could have posted (Codex review, r8).
+  const withBodies = (older: Record<string, unknown>) => planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 }, effectiveToken: 'shared' },
+      { id: 'log-old', payload: older, effectiveToken: 'shared' },
+    ],
+  })
+
+  // A zero amount is a real request — the oldest must still win.
+  const zero = withBodies({ accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 0 })
+  assert.equal(zero.action === 'reuse' ? zero.syncLogId : undefined, 'log-old')
+
+  // An empty-string id is rejected pre-call, so that body provably never posted.
+  const blankId = withBodies({ accountingInvoiceId: '', bankAccountId: 'bank-1', amount: 120 })
+  assert.equal(blankId.action === 'reuse' ? blankId.syncLogId : undefined, 'log-new')
+
+  const blankBank = withBodies({ accountingInvoiceId: 'inv-9', bankAccountId: '', amount: 120 })
+  assert.equal(blankBank.action === 'reuse' ? blankBank.syncLogId : undefined, 'log-new')
+})
