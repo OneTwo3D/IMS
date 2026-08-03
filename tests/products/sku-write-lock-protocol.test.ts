@@ -59,24 +59,35 @@ test('an empty or blank SKU set takes no locks at all', async () => {
  * because the invariant has to hold for writers added later too, and because the failure
  * mode — lock present but acquired too late — is invisible in a passing behavioural test.
  */
+/**
+ * Every Product.sku create-or-rename site, and how many acquisitions each FILE must show.
+ *
+ * Counting matters. An earlier version of this test asserted only that each file mentioned
+ * the helper once, so deleting the variant lock, the editor lock, or leaving the CSV rename
+ * path unprotected all still passed — which is exactly how the CSV rename got missed in the
+ * first place (Codex review).
+ */
 const WRITERS = [
-  { file: PRODUCTS_ACTIONS, label: 'manual product create' },
-  { file: PRODUCTS_ACTIONS, label: 'product editor' },
-  { file: PRODUCTS_ACTIONS, label: 'variant generation' },
-  { file: IMPORT_ACTIONS, label: 'CSV import' },
+  {
+    file: PRODUCTS_ACTIONS,
+    sites: ['manual product create', 'product editor', 'variant generation'],
+  },
+  {
+    file: IMPORT_ACTIONS,
+    sites: ['CSV create', 'CSV rename/update'],
+  },
 ]
 
 test('every Product.sku writer takes the write lock (o3d-42hw)', async () => {
-  const sources = new Map<string, string>()
-  for (const { file } of WRITERS) {
-    if (!sources.has(file)) sources.set(file, await readFile(file, 'utf8'))
-  }
-
-  for (const [file, source] of sources) {
-    assert.match(
-      source,
-      /lockProductSkusForWrite\(/,
-      `${path.basename(file)} creates or renames Product.sku and must join the write protocol`,
+  for (const { file, sites } of WRITERS) {
+    const source = await readFile(file, 'utf8')
+    // Call sites only — the import statement at the top of the file is not a writer.
+    const acquisitions = source.match(/lockProductSkusForWrite\(tx,/g) ?? []
+    assert.equal(
+      acquisitions.length,
+      sites.length,
+      `${path.basename(file)} has ${sites.length} Product.sku create/rename sites `
+        + `(${sites.join('; ')}) and must take the lock in each: found ${acquisitions.length}`,
     )
   }
 
@@ -89,6 +100,24 @@ test('every Product.sku writer takes the write lock (o3d-42hw)', async () => {
     /pg_advisory_xact_lock\(\$\{WC_PRODUCT_WRITE_LOCK_NAMESPACE\}::int4/,
     'the WC sync must stay on the shared namespace, or it serializes against nothing',
   )
+})
+
+test('the CSV rename path re-validates structure under its locks (o3d-42hw)', async () => {
+  // It can rename an existing product AND writes type/parentId unconditionally, so it has
+  // both halves of the defect the editor had.
+  const source = await readFile(IMPORT_ACTIONS, 'utf8')
+  const renameAt = source.indexOf('lockProductSkusForWrite(tx, [sku, existingProduct.sku])')
+  assert.notEqual(renameAt, -1, 'the CSV rename must lock BOTH the old and the new sku')
+  const body = source.slice(renameAt, renameAt + 2600)
+
+  assert.match(body, /validateProductStructureChange\(/, 'the rename must re-validate under the locks')
+  assert.match(body, /client: tx/, 'the re-validation must run against tx, or it re-reads pre-lock state')
+  assert.match(body, /revalidated\.normalizedParentId/, 'the write must use the re-validated result')
+  assert.ok(
+    !body.includes('structureValidation.'),
+    'the rename transaction must not read the pre-transaction validation — it is stale by construction',
+  )
+  assert.match(body, /return 'moved' as const/, 'a lock set chosen against a stale sku must abandon')
 })
 
 test('every writer locks BEFORE the read it relies on (o3d-42hw)', async () => {
@@ -110,7 +139,10 @@ test('every writer locks BEFORE the read it relies on (o3d-42hw)', async () => {
   // Editor: lock, then the re-validation, then the update.
   const editStart = source.indexOf('updatedCategoryChange = await db.$transaction')
   assert.notEqual(editStart, -1, 'the editor transaction must still exist')
-  const editBody = source.slice(editStart, editStart + 2000)
+  // Window sized generously on purpose: too tight and indexOf returns -1, which trips the
+  // existence assertion rather than silently passing — but widening beats re-tuning it on
+  // every edit.
+  const editBody = source.slice(editStart, editStart + 3200)
   const editLockAt = editBody.indexOf('lockProductSkusForWrite')
   const revalidateAt = editBody.indexOf('validateProductStructureChange')
   assert.ok(editLockAt !== -1 && revalidateAt !== -1, 'the editor must lock and re-validate')
@@ -137,15 +169,37 @@ test('the CSV import skips a contended row instead of aborting the run (o3d-42hw
   // This loop has no per-row catch, so a throw would discard every remaining row over one
   // contended SKU.
   const source = await readFile(IMPORT_ACTIONS, 'utf8')
-  // The CALL site, not the import statement at the top of the file — searching for the bare
-  // name found the import and sliced 600 characters of unrelated imports.
-  const lockAt = source.indexOf('lockProductSkusForWrite(tx,')
-  assert.notEqual(lockAt, -1, 'the CSV import must take the write lock')
+  // The CREATE site specifically. The bare helper name matches the import statement at the
+  // top of the file, and `(tx,` now matches the RENAME site first — both windowed the wrong
+  // region and asserted nothing about the create.
+  const lockAt = source.indexOf('lockProductSkusForWrite(tx, [sku])')
+  assert.notEqual(lockAt, -1, 'the CSV create must take the write lock')
   const body = source.slice(lockAt, lockAt + 600)
   assert.match(body, /if \(taken\) return null/, 'a contended row must return, not throw')
   assert.match(
     source,
     /another writer created this SKU while the import was running/,
     'the skipped row must be reported to the operator rather than silently dropped',
+  )
+})
+
+test('the editor VERIFIES its lock set once the locks are held (o3d-42hw)', async () => {
+  // Which locks to take depends on the product's current sku, and reading that is itself
+  // unprotected. A concurrent rename between the read and the acquisition leaves the editor
+  // holding the lock for a sku the product no longer has — locked, but against the wrong
+  // thing, which reads as fully protected. It cannot be fixed by moving the read after the
+  // first acquisition: ascending-id order is what keeps the multi-lock case deadlock-free.
+  const source = await readFile(PRODUCTS_ACTIONS, 'utf8')
+  const editStart = source.indexOf('updatedCategoryChange = await db.$transaction')
+  const editBody = source.slice(editStart, editStart + 2400)
+
+  const lockAt = editBody.indexOf('lockProductSkusForWrite')
+  const verifyAt = editBody.indexOf('skuUnderLock')
+  assert.notEqual(verifyAt, -1, 'the editor must re-read its sku once the locks are held')
+  assert.ok(lockAt < verifyAt, 'the verification must happen AFTER the locks, or it verifies nothing')
+  assert.match(
+    editBody.slice(verifyAt, verifyAt + 400),
+    /ProductStructureChangedError/,
+    'a lock set chosen against a stale sku must abandon the attempt, not proceed on a guess',
   )
 })

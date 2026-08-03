@@ -878,10 +878,22 @@ export async function updateProduct(
   try {
     updatedCategoryChange = await db.$transaction(async (tx) => {
     // o3d-42hw. BOTH skus: a rename frees the old one and claims the new one, so a writer
-    // racing on either must serialize with this. Taken first, before any read this
-    // transaction relies on.
+    // racing on either must serialize with this.
+    //
+    // The catch is that WHICH locks to take depends on the current sku, and reading it is
+    // itself unprotected — a concurrent rename between that read and the acquisition leaves
+    // us holding the lock for a sku this product no longer has. Acquiring in ascending id
+    // order is what keeps the multi-lock case deadlock-free, so the read cannot simply move
+    // after the first acquisition. Instead the choice is VERIFIED once the locks are held:
+    // if the sku moved, the lock set is wrong and this attempt is abandoned rather than
+    // proceeding on a guess.
     const skuBefore = await tx.product.findUnique({ where: { id }, select: { sku: true } })
     await lockProductSkusForWrite(tx, [data.sku, ...(skuBefore?.sku ? [skuBefore.sku] : [])])
+
+    const skuUnderLock = await tx.product.findUnique({ where: { id }, select: { sku: true } })
+    if ((skuUnderLock?.sku ?? null) !== (skuBefore?.sku ?? null)) {
+      throw new ProductStructureChangedError('Another writer renamed this product while it was being saved.')
+    }
 
     // Re-checked under the lock. The pre-transaction check is a fast path for the common
     // case; on its own it let a concurrent create take this SKU in between.
