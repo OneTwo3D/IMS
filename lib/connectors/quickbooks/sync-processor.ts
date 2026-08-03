@@ -17,7 +17,7 @@ import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
-import { planFollowUpEnqueue } from '@/lib/domain/accounting/followup-idempotency'
+import { isMoneyMovingFollowUp, planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
@@ -92,6 +92,12 @@ function getIdempotencySource(
   referenceId: string,
   payload: SyncPayload,
 ): string {
+  // o3d-h2wx: a follow-up stamped with the stable token derives from THAT, so regenerating
+  // its row cannot rotate the Request-Id. Ordered above `_idempotencyKey` — which is the
+  // generic queue's, set by callers this module does not own — because only the follow-up
+  // token is guaranteed to be identical across a re-enqueue.
+  const followUpKey = readFollowUpIdempotencyKey(payload)
+  if (followUpKey) return followUpKey
   if (typeof payload._idempotencyKey === 'string') return payload._idempotencyKey
   return type.startsWith('DAILY_BATCH_') ? `${type}:${referenceId}` : entryId
 }
@@ -152,16 +158,18 @@ async function enqueueFollowUpSyncLog(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  /** Bounds the single re-plan below, so a pathological race cannot recurse forever. */
+  replanned = false,
 ): Promise<void> {
   const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. The QuickBooks Request-Id is
   // derived from the entry id, so a replacement row posts the retry under a request id
   // Intuit has never seen — and if the failed attempt had actually committed, a SECOND
   // payment lands on the invoice.
-  const failedRow = liveRowExists ? null : await db.accountingSyncLog.findFirst({
+  const failedRows = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: QBO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true },
+    select: { id: true, payload: true, createdAt: true },
   })
   const plan = planFollowUpEnqueue({
     connector: QBO_CONNECTOR,
@@ -170,15 +178,38 @@ async function enqueueFollowUpSyncLog(
     referenceId,
     payload,
     liveRowExists,
-    failedRow,
+    failedRows,
   })
   if (plan.action === 'skip') return
+  if (plan.action === 'refuse') {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: ${plan.reason}`,
+      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+    })
+    return
+  }
+  if (plan.action === 'reuse' && plan.divergedFields.length > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_followup_reuse_diverged',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Reviving QuickBooks ${type} for ${referenceType} ${referenceId} under its original request id; `
+        + `recomputed ${plan.divergedFields.join(', ')} ${isMoneyMovingFollowUp(type) ? 'was suppressed' : 'was applied'}.`,
+      metadata: { type, referenceType, referenceId, syncLogId: plan.syncLogId, divergedFields: plan.divergedFields },
+    })
+  }
 
   try {
     if (plan.action === 'reuse') {
-      // Fenced on status: if another run revived the same row first, this updates nothing
-      // rather than resetting a claim it does not own.
-      await db.accountingSyncLog.updateMany({
+      // Fenced on status: if another run revived the same row first — or retention deleted
+      // it between the read and here (o3d-nepa) — this updates nothing rather than
+      // resetting a claim it does not own.
+      const revived = await db.accountingSyncLog.updateMany({
         where: { id: plan.syncLogId, status: 'FAILED' },
         data: {
           status: 'PENDING',
@@ -188,6 +219,11 @@ async function enqueueFollowUpSyncLog(
           processingStartedAt: null,
         },
       })
+      // Re-plan once against the current state so the follow-up is neither dropped nor
+      // duplicated when the row we chose vanished under us.
+      if (revived.count === 0 && !replanned) {
+        await enqueueFollowUpSyncLog(type, referenceType, referenceId, payload, true)
+      }
       return
     }
     await db.accountingSyncLog.create({

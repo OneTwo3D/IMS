@@ -18,7 +18,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { applyBackReference, backReferenceIsMissing, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
-import { planFollowUpEnqueue } from '@/lib/domain/accounting/followup-idempotency'
+import { isMoneyMovingFollowUp, planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
@@ -93,6 +93,19 @@ export function buildXeroIdempotencyKey(entryId: string, operation: string, payl
   const key = `ims-${operation}-${entryId}`
   if (key.length <= XERO_IDEMPOTENCY_KEY_MAX_LENGTH) return key
   return `ims-${operation}-${createHash('sha256').update(entryId).digest('hex')}`
+}
+
+/**
+ * o3d-h2wx: the source a money-moving follow-up's Idempotency-Key is built from. Prefers
+ * the stable follow-up token when this row carries one, so the key survives the row being
+ * regenerated; otherwise the entry id, exactly as before.
+ *
+ * Deliberately does NOT consult the generic `payload._idempotencyKey`. These branches have
+ * always ignored it, and starting to read it would change the key of every manual-receipt
+ * payment already in flight at deploy time — creating the double-post window this closes.
+ */
+function followUpIdempotencySource(entryId: string, payload: SyncPayload): string {
+  return readFollowUpIdempotencyKey(payload) ?? entryId
 }
 
 function getRateLimitBackoffMs(retryCount: number, message: string): number {
@@ -267,6 +280,8 @@ async function enqueueFollowUpSyncLog(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  /** Bounds the single re-plan below, so a pathological race cannot recurse forever. */
+  replanned = false,
 ): Promise<void> {
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
@@ -275,10 +290,10 @@ async function enqueueFollowUpSyncLog(
   // derived from the entry id, so creating a replacement row would post the retry under a
   // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
   // payment lands on the invoice.
-  const failedRow = liveRowExists ? null : await db.accountingSyncLog.findFirst({
+  const failedRows = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true },
+    select: { id: true, payload: true, createdAt: true },
   })
   const plan = planFollowUpEnqueue({
     connector: XERO_CONNECTOR,
@@ -287,15 +302,38 @@ async function enqueueFollowUpSyncLog(
     referenceId,
     payload,
     liveRowExists,
-    failedRow,
+    failedRows,
   })
   if (plan.action === 'skip') return
+  if (plan.action === 'refuse') {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: ${plan.reason}`,
+      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+    })
+    return
+  }
+  if (plan.action === 'reuse' && plan.divergedFields.length > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_followup_reuse_diverged',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Reviving Xero ${type} for ${referenceType} ${referenceId} under its original idempotency token; `
+        + `recomputed ${plan.divergedFields.join(', ')} ${isMoneyMovingFollowUp(type) ? 'was suppressed' : 'was applied'}.`,
+      metadata: { type, referenceType, referenceId, syncLogId: plan.syncLogId, divergedFields: plan.divergedFields },
+    })
+  }
 
   try {
-    await db.$transaction(async (tx) => {
+    const outcome = await db.$transaction(async (tx) => {
       if (plan.action === 'reuse') {
-        // Fenced on status: if another run revived the same row first, this updates
-        // nothing rather than resetting a claim it does not own.
+        // Fenced on status: if another run revived the same row first — or retention
+        // deleted it between the read and here (o3d-nepa) — this updates nothing rather
+        // than resetting a claim it does not own.
         const revived = await tx.accountingSyncLog.updateMany({
           where: { id: plan.syncLogId, status: 'FAILED' },
           data: {
@@ -306,14 +344,15 @@ async function enqueueFollowUpSyncLog(
             processingStartedAt: null,
           },
         })
-        if (revived.count === 0) return
+        if (revived.count === 0) return 'row-gone' as const
         await scheduleXeroAccountingOutbox(tx, {
           accountingSyncLogId: plan.syncLogId,
-          // The original outbox job for this row is spent (SUCCEEDED or exhausted), so
-          // the revived entry needs a fresh attempt budget or it would never be picked up.
-          resetAttempts: true,
+          // Explicit 0 rather than resetAttempts: a PROCESSING outbox row honours only an
+          // explicit `attempts` (outbox.ts) and ignores resetAttempts, so the revived entry
+          // would keep a spent attempt budget and never be claimed (Codex review, r1 #6).
+          attempts: 0,
         })
-        return
+        return 'done' as const
       }
       const log = await tx.accountingSyncLog.create({
         data: {
@@ -328,7 +367,14 @@ async function enqueueFollowUpSyncLog(
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })
+      return 'done' as const
     })
+    if (outcome === 'row-gone' && !replanned) {
+      // The row we planned to revive is no longer FAILED — another run revived it, or
+      // retention deleted it between the read and the update (o3d-nepa). Re-plan once
+      // against the current state so the follow-up is neither dropped nor duplicated.
+      await enqueueFollowUpSyncLog(type, referenceType, referenceId, payload, true)
+    }
   } catch (error) {
     // A concurrent run created the same live follow-up first — the unique index
     // rejected ours. That row (and its outbox job) already exist, so this enqueue
@@ -1290,7 +1336,7 @@ async function processEntry(
           Account: { AccountID: account.externalAccountId },
           Date: paymentDate,
           Amount: amount,
-        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'invoice-payment', payload) })
+        }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment') })
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
         }
@@ -1391,7 +1437,7 @@ async function processEntry(
           Date: paymentDate,
           Amount: amount,
           Reference: (payload.reference as string | undefined) ?? undefined,
-        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'bill-payment', payload) })
+        }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'bill-payment') })
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
         }
@@ -1453,7 +1499,7 @@ async function processEntry(
       }
       const result = await allocatePurchaseCreditNote(
         { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
-        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note-allocation', payload) },
+        { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },
       )
       // No externalId to back-reference — the allocation is a sub-resource of the
       // credit note, not a standalone document.

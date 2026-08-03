@@ -4,8 +4,10 @@ import path from 'node:path'
 import test from 'node:test'
 
 import {
+  FOLLOW_UP_IDEMPOTENCY_KEY,
   buildFollowUpIdempotencySource,
   planFollowUpEnqueue,
+  readFollowUpIdempotencyKey,
   withFollowUpIdempotencyKey,
 } from '@/lib/domain/accounting/followup-idempotency'
 
@@ -73,58 +75,74 @@ test('an amount or date change does NOT change the key — a retry must still de
   )
 })
 
+test('the follow-up key is a field of its OWN, never the generic queue\'s _idempotencyKey (o3d-h2wx)', () => {
+  // The blocker Codex found in r1: addPayment already queues INVOICE_PAYMENT rows through
+  // queueAccountingSyncTx carrying `_idempotencyKey: invoice-payment:payment:<id>`. Xero's
+  // payment branches have ALWAYS ignored that field, so teaching them to read it would
+  // change the token of every manual-receipt payment in flight at deploy time — opening
+  // the very window this fix closes. A distinct field is only ever set here.
+  assert.notEqual(FOLLOW_UP_IDEMPOTENCY_KEY, '_idempotencyKey')
+  assert.equal(readFollowUpIdempotencyKey({ _idempotencyKey: 'invoice-payment:payment:p1' }), undefined)
+  assert.equal(readFollowUpIdempotencyKey({ [FOLLOW_UP_IDEMPOTENCY_KEY]: 'stable' }), 'stable')
+  // Blank is not a token — treating it as present would drop the row's only stable identity.
+  assert.equal(readFollowUpIdempotencyKey({ [FOLLOW_UP_IDEMPOTENCY_KEY]: '   ' }), undefined)
+  for (const junk of [null, undefined, 'nope', 42, []]) {
+    assert.equal(readFollowUpIdempotencyKey(junk), undefined)
+  }
+})
+
 test('withFollowUpIdempotencyKey stamps the key but never overwrites an existing one (o3d-h2wx)', () => {
   const stamped = withFollowUpIdempotencyKey({ ...ORDER, payload: { accountingInvoiceId: 'inv-9' } })
-  assert.equal(stamped._idempotencyKey, buildFollowUpIdempotencySource({ ...ORDER, payload: { accountingInvoiceId: 'inv-9' } }))
+  assert.equal(stamped[FOLLOW_UP_IDEMPOTENCY_KEY], buildFollowUpIdempotencySource({ ...ORDER, payload: { accountingInvoiceId: 'inv-9' } }))
 
-  const preserved = withFollowUpIdempotencyKey({ ...ORDER, payload: { accountingInvoiceId: 'inv-9', _idempotencyKey: 'already-set' } })
-  assert.equal(preserved._idempotencyKey, 'already-set')
+  const preserved = withFollowUpIdempotencyKey({ ...ORDER, payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'already-set' } })
+  assert.equal(preserved[FOLLOW_UP_IDEMPOTENCY_KEY], 'already-set')
 
-  // Blank is not a key — both connectors' builders treat it as absent, so it must be replaced.
-  const blank = withFollowUpIdempotencyKey({ ...ORDER, payload: { accountingInvoiceId: 'inv-9', _idempotencyKey: '   ' } })
-  assert.notEqual(blank._idempotencyKey, '   ')
+  const blank = withFollowUpIdempotencyKey({ ...ORDER, payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: '   ' } })
+  assert.notEqual(blank[FOLLOW_UP_IDEMPOTENCY_KEY], '   ')
 })
 
 test('a live follow-up row short-circuits the enqueue (o3d-h2wx)', () => {
-  const plan = planFollowUpEnqueue({ ...ORDER, payload: { accountingInvoiceId: 'inv-9' }, liveRowExists: true, failedRow: null })
+  const plan = planFollowUpEnqueue({ ...ORDER, payload: { accountingInvoiceId: 'inv-9' }, liveRowExists: true, failedRows: [] })
   assert.equal(plan.action, 'skip')
 })
 
 test('with no prior row the enqueue creates one carrying the stable key (o3d-h2wx)', () => {
-  const plan = planFollowUpEnqueue({ ...ORDER, payload: { accountingInvoiceId: 'inv-9' }, liveRowExists: false, failedRow: null })
+  const plan = planFollowUpEnqueue({ ...ORDER, payload: { accountingInvoiceId: 'inv-9' }, liveRowExists: false, failedRows: [] })
   assert.equal(plan.action, 'create')
   assert.equal(
-    plan.action === 'create' ? plan.payload._idempotencyKey : undefined,
+    plan.action === 'create' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined,
     buildFollowUpIdempotencySource({ ...ORDER, payload: { accountingInvoiceId: 'inv-9' } }),
   )
 })
 
 test('a FAILED follow-up is REUSED, not replaced, so its row id survives (o3d-h2wx)', () => {
   // Reuse is the stronger half of the fix: preserving the row id preserves EVERY token
-  // derived from it, including ones stamped before this change existed.
+  // derived from it, including rows already sitting FAILED today with no stamped key.
   const plan = planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
-    failedRow: { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 } },
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 } }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
 })
 
 test('reusing a LEGACY FAILED row must NOT stamp a key — that would rotate its token (o3d-h2wx)', () => {
-  // A row enqueued before this change has no _idempotencyKey, so its token comes from the
+  // A row enqueued before this change has no follow-up key, so its token comes from the
   // row id. Reuse keeps that row id, so the token is already stable. Stamping a key now
   // would CHANGE it and re-create the double-pay window the fix closes.
   const plan = planFollowUpEnqueue({
     ...ORDER,
+    type: 'INVOICE_PDF', // non-money, so the fresh payload is kept and only the key rule is under test
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
-    failedRow: { id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9', amount: 120 } },
+    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9', amount: 120 } }],
   })
   assert.equal(plan.action, 'reuse')
   assert.ok(
-    plan.action === 'reuse' && !('_idempotencyKey' in plan.payload),
+    plan.action === 'reuse' && !(FOLLOW_UP_IDEMPOTENCY_KEY in plan.payload),
     'a legacy FAILED row must be retried under the token it already used',
   )
 })
@@ -132,15 +150,15 @@ test('reusing a LEGACY FAILED row must NOT stamp a key — that would rotate its
 test('reuse carries the FAILED row\'s original key forward, not a freshly derived one (o3d-h2wx)', () => {
   const plan = planFollowUpEnqueue({
     ...ORDER,
-    // The re-enqueue resolved a DIFFERENT invoice id, which would derive a different key.
-    payload: { accountingInvoiceId: 'inv-10', amount: 120 },
+    type: 'INVOICE_PDF',
+    payload: { accountingInvoiceId: 'inv-9', invoiceNumber: 'INV-2' },
     liveRowExists: false,
-    failedRow: { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', _idempotencyKey: 'original-key' } },
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'original-key' } }],
   })
   assert.equal(plan.action, 'reuse')
-  assert.equal(plan.action === 'reuse' ? plan.payload._idempotencyKey : undefined, 'original-key')
-  // The rest of the payload is the fresh one — only the token is pinned.
-  assert.equal(plan.action === 'reuse' ? plan.payload.accountingInvoiceId : undefined, 'inv-10')
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'original-key')
+  // A non-money follow-up re-drives with fresh inputs; only the token is pinned.
+  assert.equal(plan.action === 'reuse' ? plan.payload.invoiceNumber : undefined, 'INV-2')
 })
 
 test('a non-object payload on the FAILED row does not crash or forge a key (o3d-h2wx)', () => {
@@ -149,38 +167,138 @@ test('a non-object payload on the FAILED row does not crash or forge a key (o3d-
       ...ORDER,
       payload: { accountingInvoiceId: 'inv-9' },
       liveRowExists: false,
-      failedRow: { id: 'log-old', payload: stored },
+      failedRows: [{ id: 'log-old', payload: stored }],
     })
     assert.equal(plan.action, 'reuse')
     assert.ok(
-      plan.action === 'reuse' && !('_idempotencyKey' in plan.payload),
+      plan.action === 'reuse' && !(FOLLOW_UP_IDEMPOTENCY_KEY in plan.payload),
       'an unreadable stored payload means "no key was recorded" — fall back to the preserved row id',
     )
   }
 })
 
+test('a money-moving reuse pins the REQUEST BODY, not just the token (o3d-h2wx)', () => {
+  // Codex r1 #3: posting a recomputed amount under a token the remote system has already
+  // seen returns the ORIGINAL payment. We would then record a settlement for an amount
+  // that was never posted — local evidence disagreeing with the ledger.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 150, bankAccountId: 'bank-2' },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-1' } }],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 120)
+  assert.equal(plan.action === 'reuse' ? plan.payload.bankAccountId : undefined, 'bank-1')
+  // Suppressing a real change silently would be its own defect, so it is reported.
+  assert.deepEqual(
+    plan.action === 'reuse' ? plan.divergedFields.slice().sort() : [],
+    ['amount', 'bankAccountId'],
+  )
+})
+
+test('a reuse targeting a DIFFERENT document gets a fresh key, not the old token (o3d-h2wx)', () => {
+  // Codex r1 #2: the anchors were being derived and then thrown away on reuse. A failed
+  // attempt against inv-9 cannot have committed a payment against inv-10, so carrying its
+  // token would make the remote system hand back the OLD payment.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-10', amount: 120 },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'old-token' } }],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.payload.accountingInvoiceId : undefined, 'inv-10')
+  assert.equal(
+    plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined,
+    buildFollowUpIdempotencySource({ ...ORDER, payload: { accountingInvoiceId: 'inv-10' } }),
+  )
+})
+
+test('several FAILED money-moving rows REFUSE rather than guess which token committed (o3d-h2wx)', () => {
+  // Codex r1 #4: pre-fix behaviour created a replacement after every failure, and FAILED
+  // rows are outside the live-follow-up unique index, so legacy scopes can hold several —
+  // each with its own token. Any one may have committed; picking the newest is a guess.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 } },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 } },
+    ],
+  })
+  assert.equal(plan.action, 'refuse')
+  assert.match(plan.action === 'refuse' ? plan.reason : '', /duplicate|manually/i)
+})
+
+test('several FAILED NON-money rows still retry — a duplicate PDF is not a financial error (o3d-h2wx)', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    type: 'INVOICE_PDF',
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' } },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' } },
+    ],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-new')
+})
+
 /**
- * Xero's two payment branches call buildXeroIdempotencyKey(entryId, op) WITHOUT the
- * payload argument, so the builder's `payload._idempotencyKey` preference never fires and
- * a stamped key would be silently ignored — leaving Xero exposed to exactly the hazard
- * this issue describes. Asserted against the source because the invariant has to hold for
- * every money-moving call site in the file, including ones added later.
+ * Xero's money-moving branches built their Idempotency-Key straight from `entryId`, so a
+ * stamped follow-up token was ignored and a regenerated row posted under a key Xero had
+ * never seen. They now resolve the source through followUpIdempotencySource(entryId,
+ * payload). Asserted against the source because the invariant has to hold for every
+ * money-moving call site in the file, including ones added later.
  */
 const XERO_PROCESSOR = path.join(process.cwd(), 'lib/connectors/xero/sync-processor.ts')
+const MONEY_MOVING_XERO_OPS = ['invoice-payment', 'bill-payment', 'purchase-credit-note-allocation']
 
-test('every Xero money-moving idempotency key is built WITH the payload (o3d-h2wx)', async () => {
+/**
+ * The source argument is itself a call now, so the balanced-paren group is not optional:
+ * a plain `[^)]*` stops at the INNER paren and matches nothing, which silently turns both
+ * assertions below into no-ops.
+ */
+function xeroKeyCalls(source: string, op: string): string[] {
+  const arg = String.raw`(?:[^()]|\([^()]*\))*`
+  return source.match(new RegExp(String.raw`buildXeroIdempotencyKey\(${arg}'${op}'${arg}\)`, 'g')) ?? []
+}
+
+test('every Xero money-moving key resolves its source through the follow-up token (o3d-h2wx)', async () => {
   const source = await readFile(XERO_PROCESSOR, 'utf8')
-  const moneyMovingOps = ['invoice-payment', 'bill-payment', 'purchase-credit-note-allocation']
 
-  for (const op of moneyMovingOps) {
-    const calls = source.match(new RegExp(String.raw`buildXeroIdempotencyKey\([^)]*'${op}'[^)]*\)`, 'g')) ?? []
+  for (const op of MONEY_MOVING_XERO_OPS) {
+    const calls = xeroKeyCalls(source, op)
     assert.ok(calls.length > 0, `expected a '${op}' idempotency key to be built`)
     for (const call of calls) {
       assert.match(
         call,
-        /,\s*payload\s*\)/,
-        `${call} must pass the payload, or a stamped _idempotencyKey is ignored and a `
-          + 'regenerated follow-up posts a duplicate',
+        /followUpIdempotencySource\(\s*entryId\s*,\s*payload\s*\)/,
+        `${call} must resolve its source via followUpIdempotencySource, or a regenerated `
+          + 'follow-up posts under a key Xero has never seen and duplicates the payment',
+      )
+    }
+  }
+})
+
+test('Xero money-moving branches must NOT start reading the generic _idempotencyKey (o3d-h2wx)', async () => {
+  // The r1 blocker, pinned. buildXeroIdempotencyKey prefers payload._idempotencyKey when a
+  // payload is passed, and addPayment already sets that field on in-flight INVOICE_PAYMENT
+  // rows. Passing `payload` to these branches would rotate their key at deploy time.
+  const source = await readFile(XERO_PROCESSOR, 'utf8')
+
+  for (const op of MONEY_MOVING_XERO_OPS) {
+    const calls = xeroKeyCalls(source, op)
+    assert.ok(calls.length > 0, `expected a '${op}' idempotency key to be built`)
+    for (const call of calls) {
+      assert.doesNotMatch(
+        call,
+        /'\s*,\s*payload\s*\)/,
+        `${call} must not pass payload as the builder's third argument — that makes it prefer `
+          + 'the generic _idempotencyKey and changes the key of every payment already in flight',
       )
     }
   }
