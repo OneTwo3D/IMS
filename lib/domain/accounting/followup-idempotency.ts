@@ -18,17 +18,24 @@
  * SECOND payment lands against the same invoice. Per-entry idempotency is real; it just
  * does not survive regenerating the entry.
  *
- * THE FIX, in two layers:
+ * THE FIX. Stop deriving the token from anything that can change, and WRITE IT DOWN.
  *
- *  1. REUSE the FAILED row instead of creating a replacement. This preserves the row id,
- *     and therefore preserves every token derived from it — including rows already sitting
- *     FAILED in the database today, which no new payload field can reach.
- *  2. STAMP a stable `_followUpIdempotencyKey` on newly created follow-ups, derived from
- *     the follow-up's LOGICAL identity rather than its row id, so the token survives the
- *     FAILED row being purged by retention (o3d-nepa) or otherwise going missing.
+ *  1. A new follow-up is stamped with a `_followUpIdempotencyKey` derived from its LOGICAL
+ *     identity — connector, type, reference, and the external document it targets — never
+ *     from its row id. Regenerating the row cannot move it.
+ *  2. A pre-existing FAILED row has no such key: its token IS its row id. So when one is
+ *     reused, the connector resolves the token that row actually posted under and the
+ *     planner stamps THAT value onto the payload. The legacy token becomes explicit.
  *
- * Layer 1 alone leaves purged rows exposed; layer 2 alone cannot help a row enqueued
- * before the deploy. Together they close both.
+ * Step 2 is what makes the rest simple. Because the token is a value on the payload rather
+ * than a property of the row, it survives the row: a re-plan after retention deletes it
+ * (o3d-nepa) creates a replacement that posts under the identical remote key. Earlier
+ * revisions instead tried to keep the ROW alive — refusing whenever it was lost, then adding
+ * a tombstone to make the refusal visible, which could itself be resurrected under a rotated
+ * token (Codex reviews r2–r4). Carrying the value removes the whole class.
+ *
+ * What still refuses is genuine ambiguity: several FAILED rows for the same document, each
+ * under a different token, where any one might be the one that committed.
  *
  * WHY NOT REUSE THE EXISTING `_idempotencyKey` FIELD. It is already populated on rows this
  * module does not own: `addPayment` queues an INVOICE_PAYMENT through the generic
@@ -152,6 +159,15 @@ export type FollowUpEnqueuePlan =
 export type FailedFollowUpRow = {
   id: string
   payload: unknown
+  /**
+   * The token this row's attempt ACTUALLY posted under, as its own connector would have
+   * derived it. Supplied by the connector because the two derive it differently: Xero falls
+   * back to the row id, while QuickBooks consults the generic queue's `_idempotencyKey`
+   * first. Capturing it here is what lets a pinned token outlive the row it came from —
+   * stamping this value onto the payload reproduces the identical remote key even after the
+   * original row is gone, which is why losing the row no longer has to refuse (Codex r4).
+   */
+  effectiveToken: string
 }
 
 export type FollowUpEnqueueInput = FollowUpIdentity & {
@@ -242,23 +258,31 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
 
   const pinnable = couldHaveCommitted[0]
   if (pinnable) {
-    // The token is pinned backwards, either explicitly via the stored key or implicitly via
-    // the preserved row id.
+    // The token is pinned backwards, and pinned EXPLICITLY: the row's effective token is
+    // stamped onto the payload rather than left implicit in the row id.
+    //
+    // That is the whole point. A legacy row's token is its own id, which dies with the row —
+    // so an earlier revision had to refuse whenever retention deleted one, and then needed a
+    // tombstone to make the refusal visible, which could itself be resurrected under a
+    // rotated token (Codex r4). Writing the value down instead means the token outlives the
+    // row: the same string reproduces a byte-identical remote key wherever it is carried,
+    // and nothing has to be refused to keep it safe.
     const stored = asPayload(pinnable.payload)
-    const storedKey = readFollowUpIdempotencyKey(stored)
     const divergedFields = stored ? divergedRequestFields(stored, input.payload) : []
+    const pin = (body: FollowUpPayload): FollowUpPayload => ({
+      ...body,
+      [FOLLOW_UP_IDEMPOTENCY_KEY]: pinnable.effectiveToken,
+    })
 
     // For money movement the BODY is pinned with the token. Posting a recomputed amount
     // under a token the remote system has already seen returns the ORIGINAL payment, and we
     // would record a settlement for an amount never posted — local evidence that disagrees
-    // with the ledger (Codex r1 #3). A genuinely invalid body is not stranded by this: the
-    // connector proves such failures pre-call, which drops the row out of `ambiguous` above
-    // and lets the recomputed request through (Codex r2 #3).
+    // with the ledger (Codex r1 #3).
     if (stored && moneyMoving) {
       return {
         action: 'reuse',
         syncLogId: pinnable.id,
-        payload: stored,
+        payload: pin(stored),
         tokenDisposition: 'pinned',
         bodyDisposition: 'pinned',
         divergedFields,
@@ -266,14 +290,12 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     }
 
     // Non-money follow-ups (PDF, email, note, attachment) are safe to re-drive with fresh
-    // inputs. Carry the stored key if it has one; stamp NOTHING if it does not, because the
-    // preserved row id already IS its stable token and stamping would rotate it.
+    // inputs; only the token is carried back.
     const { [FOLLOW_UP_IDEMPOTENCY_KEY]: _discarded, ...rest } = input.payload
-    const payload: FollowUpPayload = storedKey ? { ...rest, [FOLLOW_UP_IDEMPOTENCY_KEY]: storedKey } : rest
     return {
       action: 'reuse',
       syncLogId: pinnable.id,
-      payload,
+      payload: pin(rest),
       tokenDisposition: 'pinned',
       bodyDisposition: 'fresh',
       divergedFields,

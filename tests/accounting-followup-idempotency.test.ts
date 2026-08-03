@@ -124,37 +124,44 @@ test('a FAILED follow-up is REUSED, not replaced, so its row id survives (o3d-h2
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 } }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old' }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
 })
 
-test('reusing a LEGACY FAILED row must NOT stamp a key — that would rotate its token (o3d-h2wx)', () => {
-  // A row enqueued before this change has no follow-up key, so its token comes from the
-  // row id. Reuse keeps that row id, so the token is already stable. Stamping a key now
-  // would CHANGE it and re-create the double-pay window the fix closes.
+test('reusing a LEGACY FAILED row pins its token EXPLICITLY, not implicitly (o3d-h2wx)', () => {
+  // A legacy row's token is its own id. An earlier revision left that implicit -- stamp
+  // nothing, rely on the row id surviving -- which meant the token died with the row, so
+  // losing it to retention had to be refused. Writing the value down instead reproduces a
+  // byte-identical remote key wherever the payload is carried (Codex r4).
   const plan = planFollowUpEnqueue({
     ...ORDER,
-    type: 'INVOICE_PDF', // non-money, so the fresh payload is kept and only the key rule is under test
+    type: 'INVOICE_PDF',
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9', amount: 120 } }],
+    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-legacy' }],
   })
   assert.equal(plan.action, 'reuse')
-  assert.ok(
-    plan.action === 'reuse' && !(FOLLOW_UP_IDEMPOTENCY_KEY in plan.payload),
-    'a legacy FAILED row must be retried under the token it already used',
+  assert.equal(
+    plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined,
+    'log-legacy',
+    'the stamped key must be the exact token the row already posted under -- its own id',
   )
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
 })
 
-test('reuse carries the FAILED row\'s original key forward, not a freshly derived one (o3d-h2wx)', () => {
+test('reuse carries the FAILED row effective token forward, not a freshly derived one (o3d-h2wx)', () => {
   const plan = planFollowUpEnqueue({
     ...ORDER,
     type: 'INVOICE_PDF',
     payload: { accountingInvoiceId: 'inv-9', invoiceNumber: 'INV-2' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'original-key' } }],
+    failedRows: [{
+      id: 'log-old',
+      payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'original-key' },
+      effectiveToken: 'original-key',
+    }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'original-key')
@@ -162,19 +169,19 @@ test('reuse carries the FAILED row\'s original key forward, not a freshly derive
   assert.equal(plan.action === 'reuse' ? plan.payload.invoiceNumber : undefined, 'INV-2')
 })
 
-test('a non-object payload on the FAILED row does not crash or forge a key (o3d-h2wx)', () => {
+test('a non-object payload on the FAILED row does not crash or lose its token (o3d-h2wx)', () => {
   for (const stored of [null, undefined, 'nope', 42]) {
     const plan = planFollowUpEnqueue({
       ...ORDER,
       payload: { accountingInvoiceId: 'inv-9' },
       liveRowExists: false,
-      failedRows: [{ id: 'log-old', payload: stored }],
+      failedRows: [{ id: 'log-old', payload: stored, effectiveToken: 'log-old' }],
     })
     assert.equal(plan.action, 'reuse')
-    assert.ok(
-      plan.action === 'reuse' && !(FOLLOW_UP_IDEMPOTENCY_KEY in plan.payload),
-      'an unreadable stored payload means "no key was recorded" — fall back to the preserved row id',
-    )
+    // An unreadable payload still has a token -- the connector resolved it from the row --
+    // and an unknown target counts as possibly-this-one, so it must be pinned.
+    assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'log-old')
+    assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
   }
 })
 
@@ -186,7 +193,7 @@ test('a money-moving reuse pins the REQUEST BODY, not just the token (o3d-h2wx)'
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 150, bankAccountId: 'bank-2' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-1' } }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-1' }, effectiveToken: 'log-old' }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 120)
@@ -206,7 +213,7 @@ test('a reuse targeting a DIFFERENT document gets a fresh key, not the old token
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-10', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'old-token' } }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, [FOLLOW_UP_IDEMPOTENCY_KEY]: 'old-token' }, effectiveToken: 'log-old' }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.payload.accountingInvoiceId : undefined, 'inv-10')
@@ -225,8 +232,8 @@ test('several FAILED money-moving rows REFUSE rather than guess which token comm
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 } },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 } },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-new' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old' },
     ],
   })
   assert.equal(plan.action, 'refuse')
@@ -240,8 +247,8 @@ test('several FAILED NON-money rows still retry — a duplicate PDF is not a fin
     payload: { accountingInvoiceId: 'inv-9' },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' } },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' } },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-new' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-old' },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -326,7 +333,7 @@ test('a same-target money reuse pins the stored body even when it looks wrong (o
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-new' },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-deleted' } }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120, bankAccountId: 'bank-deleted' }, effectiveToken: 'log-old' }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.payload.bankAccountId : undefined, 'bank-deleted')
@@ -342,8 +349,8 @@ test('several FAILED rows do NOT refuse when none of them targeted this document
     payload: { accountingInvoiceId: 'inv-new', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-new', payload: { accountingInvoiceId: 'inv-old', amount: 120 } },
-      { id: 'log-old', payload: { accountingInvoiceId: 'inv-old', amount: 120 } },
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-old', amount: 120 }, effectiveToken: 'log-new' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-old', amount: 120 }, effectiveToken: 'log-old' },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -357,8 +364,8 @@ test('only rows targeting THIS document count toward the ambiguity (o3d-h2wx)', 
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
     failedRows: [
-      { id: 'log-other', payload: { accountingInvoiceId: 'inv-other', amount: 120 } },
-      { id: 'log-ambiguous', payload: { accountingInvoiceId: 'inv-9', amount: 110 } },
+      { id: 'log-other', payload: { accountingInvoiceId: 'inv-other', amount: 120 }, effectiveToken: 'log-other' },
+      { id: 'log-ambiguous', payload: { accountingInvoiceId: 'inv-9', amount: 110 }, effectiveToken: 'log-ambiguous' },
     ],
   })
   assert.equal(plan.action, 'reuse')
@@ -375,7 +382,7 @@ test('a FAILED row with no recorded target counts as possibly-this-one (o3d-h2wx
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-legacy', payload: { amount: 120 } }],
+    failedRows: [{ id: 'log-legacy', payload: { amount: 120 }, effectiveToken: 'log-legacy' }],
   })
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
@@ -388,7 +395,7 @@ test('a same-target money reuse reports pinned/pinned, so the log cannot lie (o3
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9', amount: 150 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 } }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old' }],
   })
   assert.equal(pinned.action === 'reuse' ? pinned.tokenDisposition : undefined, 'pinned')
   assert.equal(pinned.action === 'reuse' ? pinned.bodyDisposition : undefined, 'pinned')
@@ -397,7 +404,7 @@ test('a same-target money reuse reports pinned/pinned, so the log cannot lie (o3
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-10', amount: 120 },
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 } }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-old' }],
   })
   assert.equal(rotated.action === 'reuse' ? rotated.tokenDisposition : undefined, 'rotated')
   assert.equal(rotated.action === 'reuse' ? rotated.bodyDisposition : undefined, 'fresh')
@@ -416,7 +423,7 @@ test('a rotated disposition is only reported when the token VALUE actually chang
     liveRowExists: false,
     // Different anchors on the stored payload, so it drops out of the could-have-committed
     // set — but the key it was stamped with is the one we would derive now.
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: sameKey } }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: sameKey }, effectiveToken: 'log-old' }],
   })
   assert.equal(unchanged.action === 'reuse' ? unchanged.tokenDisposition : undefined, 'pinned')
 
@@ -424,14 +431,67 @@ test('a rotated disposition is only reported when the token VALUE actually chang
     ...ORDER,
     payload: fresh,
     liveRowExists: false,
-    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'some-other-key' } }],
+    failedRows: [{ id: 'log-old', payload: { accountingInvoiceId: 'inv-9', [FOLLOW_UP_IDEMPOTENCY_KEY]: 'some-other-key' }, effectiveToken: 'log-old' }],
   })
   assert.equal(changed.action === 'reuse' ? changed.tokenDisposition : undefined, 'rotated')
 })
 
-test('the planner exposes no way to infer "not posted" from free text (o3d-h2wx)', () => {
-  // Codex r3 blocker A, pinned structurally: the input type must not carry an error
-  // message or a derived flag, so the sound-looking shortcut cannot come back by accident.
-  const row: FailedFollowUpRow = { id: 'log-1', payload: {} }
-  assert.deepEqual(Object.keys(row).sort(), ['id', 'payload'])
+test('the planner exposes no way to infer not-posted from free text (o3d-h2wx)', () => {
+  // Codex r3 blocker A, pinned structurally: the input type must not carry an error message
+  // or a flag derived from one, so the sound-looking shortcut cannot come back by accident.
+  // effectiveToken is a VALUE the connector resolved, not an inference about what happened.
+  const row: FailedFollowUpRow = { id: 'log-1', payload: {}, effectiveToken: 'log-1' }
+  assert.deepEqual(Object.keys(row).sort(), ['effectiveToken', 'id', 'payload'])
+})
+
+test('a pinned token survives the row it came from disappearing (o3d-h2wx)', () => {
+  // THE invariant the design rests on, and what let the tombstone go away (Codex r4).
+  //
+  // Retention hard-deletes accounting rows by age alone (o3d-nepa), so the FAILED row a
+  // pinned token came from can vanish mid-flight. Because the planner writes that token onto
+  // the payload, the connector re-plans by feeding plan.payload back in — and the row the
+  // re-plan CREATES posts under the identical remote token. No refusal, no tombstone, and
+  // nothing that a later retry could resurrect under a rotated token.
+  const pinned = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', amount: 120 },
+    liveRowExists: false,
+    failedRows: [{ id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'log-legacy' }],
+  })
+  assert.equal(pinned.action, 'reuse')
+  const carried = pinned.action === 'reuse' ? pinned.payload : {}
+  assert.equal(carried[FOLLOW_UP_IDEMPOTENCY_KEY], 'log-legacy')
+
+  // The row is gone by the time we re-plan.
+  const replanned = planFollowUpEnqueue({ ...ORDER, payload: carried, liveRowExists: false, failedRows: [] })
+  assert.equal(replanned.action, 'create')
+  assert.equal(
+    replanned.action === 'create' ? replanned.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined,
+    'log-legacy',
+    'the created row must post under the vanished row\'s token, or the retry duplicates the payment',
+  )
+
+  // And again, so a second lost race cannot rotate it either.
+  const twice = planFollowUpEnqueue({
+    ...ORDER,
+    payload: replanned.action === 'create' ? replanned.payload : {},
+    liveRowExists: false,
+    failedRows: [],
+  })
+  assert.equal(twice.action === 'create' ? twice.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'log-legacy')
+})
+
+test('two racing workers that both lose the CAS converge on ONE token (o3d-h2wx)', () => {
+  // Codex r4 #3: concurrent lost-CAS workers each wrote their own tombstone with a distinct
+  // rotated token. Now both re-plan from the same pinned value, so whichever rows they
+  // create carry the identical remote key and the ledger deduplicates them.
+  const row = { id: 'log-legacy', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'log-legacy' }
+  const workers = [row, row].map(() => planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [row],
+  }))
+  const tokens = workers.map((plan) => (plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : null))
+  assert.deepEqual(tokens, ['log-legacy', 'log-legacy'])
 })

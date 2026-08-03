@@ -172,7 +172,15 @@ async function enqueueFollowUpSyncLog(
     orderBy: { createdAt: 'desc' },
     select: { id: true, payload: true },
   })
-  const failedRows = failedLogs.map((row) => ({ id: row.id, payload: row.payload }))
+  const failedRows = failedLogs.map((row) => ({
+    id: row.id,
+    payload: row.payload,
+    // Exactly what getIdempotencySource would have produced for this row, so pinning it
+    // reproduces a byte-identical Request-Id even after the row itself is gone. Note this
+    // consults the generic `_idempotencyKey`, which QuickBooks has always honoured — unlike
+    // Xero, whose payment branches never did.
+    effectiveToken: getIdempotencySource(row.id, type, referenceId, (row.payload ?? {}) as SyncPayload),
+  }))
   const plan = planFollowUpEnqueue({
     connector: QBO_CONNECTOR,
     type,
@@ -217,7 +225,10 @@ async function enqueueFollowUpSyncLog(
           referenceId,
           plan,
           replanned,
-          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, payload, true),
+          // plan.payload carries the PINNED token, and withFollowUpIdempotencyKey never
+          // overwrites one — so a row created by the re-plan posts under the same remote
+          // key as the row that vanished. That is what makes losing the row survivable.
+          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, true),
         })
         return
       }
