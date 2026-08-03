@@ -108,7 +108,7 @@ test('the CSV rename path re-validates structure under its locks (o3d-42hw)', as
   const source = await readFile(IMPORT_ACTIONS, 'utf8')
   const renameAt = source.indexOf('lockProductSkusForWrite(tx, [sku, existingProduct.sku])')
   assert.notEqual(renameAt, -1, 'the CSV rename must lock BOTH the old and the new sku')
-  const body = source.slice(renameAt, renameAt + 2600)
+  const body = source.slice(renameAt, renameAt + 3400)
 
   assert.match(body, /validateProductStructureChange\(/, 'the rename must re-validate under the locks')
   assert.match(body, /client: tx/, 'the re-validation must run against tx, or it re-reads pre-lock state')
@@ -201,5 +201,45 @@ test('the editor VERIFIES its lock set once the locks are held (o3d-42hw)', asyn
     editBody.slice(verifyAt, verifyAt + 400),
     /ProductStructureChangedError/,
     'a lock set chosen against a stale sku must abandon the attempt, not proceed on a guess',
+  )
+})
+
+test('the CSV rename defaults omitted columns from the LOCKED read, not the snapshot (o3d-42hw)', async () => {
+  // The destructive one (Codex r2). An omitted CSV column means "preserve current". Taking
+  // that current value from the pre-lock snapshot models a transformation the row never
+  // asked for: a product that went SIMPLE -> KIT before the locks were taken gets validated
+  // as a KIT -> SIMPLE conversion, and because updateData omits `type` the write leaves it
+  // KIT while the resulting clearComponents / clearExternalMapping delete its components and
+  // drop its external mapping.
+  const source = await readFile(IMPORT_ACTIONS, 'utf8')
+  const renameAt = source.indexOf('lockProductSkusForWrite(tx, [sku, existingProduct.sku])')
+  const body = source.slice(renameAt, renameAt + 2600)
+
+  const validateAt = body.indexOf('validateProductStructureChange(')
+  assert.notEqual(validateAt, -1, 'the rename must re-validate under the locks')
+  const inputs = body.slice(validateAt, validateAt + 400)
+
+  assert.match(inputs, /\?\?\s*current\.type/, 'the type default must come from the locked read')
+  assert.match(inputs, /\?\?\s*current\.parentId/, 'the parent default must come from the locked read')
+  assert.ok(
+    !/\?\?\s*existingProduct\./.test(inputs) && !inputs.includes('requestedParentId'),
+    'no re-validation input may default to the pre-lock snapshot — that is the whole defect',
+  )
+
+  // The locked read has to actually select the columns those defaults use.
+  const currentRead = body.slice(body.indexOf('const current = await tx.product.findUnique'), validateAt)
+  assert.match(currentRead, /sku: true, type: true, parentId: true/, 'the locked read must select what the defaults need')
+})
+
+test('a concurrent writer performing THIS row\'s rename does not drop the row (o3d-42hw)', async () => {
+  // The lock set covers both skus either way, so when another writer merely did the rename
+  // this row wanted, proceeding is safe and dropping the row's other updates is not.
+  const source = await readFile(IMPORT_ACTIONS, 'utf8')
+  const renameAt = source.indexOf('lockProductSkusForWrite(tx, [sku, existingProduct.sku])')
+  const body = source.slice(renameAt, renameAt + 1400)
+  assert.match(
+    body,
+    /current\.sku !== existingProduct\.sku && current\.sku !== sku/,
+    'a move TO this row\'s target sku must not be treated as a lost lock set',
   )
 })

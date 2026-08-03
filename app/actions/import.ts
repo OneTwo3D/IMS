@@ -438,14 +438,20 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             // Both skus are locked; the helper collapses them when the sku is unchanged.
             await lockProductSkusForWrite(tx, [sku, existingProduct.sku])
 
-            // Verified under the locks. The lock SET was chosen from `existingProduct`, read
-            // before this transaction, so a concurrent rename would leave us holding the lock
-            // for a sku this product no longer has — locked, but against the wrong thing.
+            // Re-read under the locks. `existingProduct` is a PRE-LOCK snapshot, and this row
+            // depends on it twice over: to choose the lock set, and — because an omitted CSV
+            // column means "preserve current" — to supply the defaults below.
             const current = await tx.product.findUnique({
               where: { id: existingProduct.id },
-              select: { sku: true },
+              select: { sku: true, type: true, parentId: true },
             })
-            if (!current || current.sku !== existingProduct.sku) return 'moved' as const
+            if (!current) return 'moved' as const
+
+            // The lock set was chosen for the snapshot's sku. It still covers this product
+            // when a concurrent writer merely performed the rename this row wanted anyway —
+            // both skus are held either way — so that case proceeds rather than dropping the
+            // row's other updates. Any other move means the locks are against the wrong thing.
+            if (current.sku !== existingProduct.sku && current.sku !== sku) return 'moved' as const
 
             // The destination sku may have been taken since the pre-transaction check.
             if (sku !== existingProduct.sku) {
@@ -458,11 +464,18 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
             // Re-validated under the locks, against tx: `structureValidation` was decided
             // before this transaction, and type/parentId are written unconditionally below.
+            //
+            // The DEFAULTS come from `current`, not the snapshot. An omitted column means
+            // "preserve what the product has", so defaulting to a stale value models a
+            // transformation the row never asked for: a product that went SIMPLE -> KIT
+            // before these locks were taken would be validated as a KIT -> SIMPLE conversion,
+            // and since updateData omits `type` the write leaves it KIT while the resulting
+            // clearComponents / clearExternalMapping delete its components and drop its
+            // external mapping (Codex review, r2).
             const revalidated = await validateProductStructureChange({
               productId: existingProduct.id,
-              // The same inputs the pre-transaction validation used, re-decided under the locks.
-              type: (updateData.type as ProductType | undefined) ?? existingProduct.type,
-              parentId: requestedParentId,
+              type: (updateData.type as ProductType | undefined) ?? current.type,
+              parentId: (updateData.parentId as string | null | undefined) ?? current.parentId,
               client: tx,
             })
             if (!revalidated.ok) return 'structure' as const
