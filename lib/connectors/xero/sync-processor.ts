@@ -371,7 +371,8 @@ async function enqueueFollowUpSyncLog(
         type,
         referenceType,
         referenceId,
-        plan,
+        payload: plan.payload,
+        syncLogId: plan.syncLogId,
         attempt,
         // plan.payload carries the PINNED token, and withFollowUpIdempotencyKey never
           // overwrites one — so a row created by the re-plan posts under the same remote
@@ -382,10 +383,25 @@ async function enqueueFollowUpSyncLog(
     }
     if (plan.action === 'reuse') await logFollowUpRevival(XERO_CONNECTOR, type, referenceType, referenceId, plan)
   } catch (error) {
-    // A concurrent run created the same live follow-up first — the unique index
-    // rejected ours. That row (and its outbox job) already exist, so this enqueue
-    // is a no-op; anything else is a real failure.
-    if (isUniqueConstraintViolation(error)) return
+    // A concurrent run took the live slot and the partial unique index
+    // (accounting_sync_logs_followup_live_unique) rejected ours. This used to return as an
+    // idempotent no-op, which silently accepted a winner posting under a DIFFERENT token
+    // while ours may already have committed (Codex review, r7 #1). It now goes through the
+    // same resolver as a lost compare-and-set, which only accepts a live row carrying our
+    // token.
+    if (isUniqueConstraintViolation(error)) {
+      await resolveLostFollowUpRevival({
+        connector: XERO_CONNECTOR,
+        type,
+        referenceType,
+        referenceId,
+        payload: plan.payload,
+        syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
+        attempt,
+        retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+      })
+      return
+    }
     throw error
   }
 }
@@ -1655,10 +1671,17 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
       result.failed++
       continue
     }
-    if (!missing) continue
+    // A row whose back-reference is already applied but is STILL FAILED is precisely the
+    // "back-reference done, follow-ups not enqueued" state a previous pass can leave behind.
+    // Skipping it on `!missing` meant those follow-ups were never retried — leaving the row
+    // FAILED accomplished nothing, because the sweep never looked at it again (Codex r7 #2).
+    // Such a row falls through to the follow-up enqueue below; applyBackReference is skipped
+    // since there is nothing to apply.
+    const followUpsOnly = !missing && row.status === 'FAILED'
+    if (!missing && !followUpsOnly) continue
     result.checked++
     try {
-      await applyBackReference(db, params)
+      if (!followUpsOnly) await applyBackReference(db, params)
       // The follow-ups (PDF, payment, attachment) never ran on the original
       // failed pass — enqueue them now. hasExistingSyncLog makes this idempotent.
       let followUpsEnqueued = true

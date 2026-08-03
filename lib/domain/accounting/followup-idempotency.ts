@@ -177,6 +177,28 @@ export type FollowUpEnqueueInput = FollowUpIdentity & {
   failedRows: FailedFollowUpRow[]
 }
 
+/**
+ * Fields each money-moving follow-up REQUIRES before its connector will attempt a remote
+ * call. Both connectors reject a body missing any of these before building a request, so a
+ * stored body missing one PROVES that attempt never reached the ledger — the only sound
+ * "this did not post" signal available, since errorMessage carries no provenance.
+ *
+ * Used when several rows share a token: the oldest is normally the one that would have
+ * committed, but an incomplete oldest cannot have, and pinning it would strand the payment
+ * behind a request that can never succeed (Codex review, r7 #3).
+ */
+const REQUIRED_BODY_FIELDS: Record<string, readonly string[]> = {
+  INVOICE_PAYMENT: ['accountingInvoiceId', 'bankAccountId', 'amount'],
+  PURCHASE_CREDIT_NOTE_ALLOCATION: ['creditNoteId', 'accountingInvoiceId', 'amount'],
+}
+
+function bodyCouldHaveReachedTheLedger(type: string, stored: FollowUpPayload | null): boolean {
+  const required = REQUIRED_BODY_FIELDS[type]
+  if (!required) return true
+  if (stored === null) return true
+  return required.every((field) => stored[field] !== undefined && stored[field] !== null)
+}
+
 /** Fields whose value defines the remote request, so a divergence is worth reporting. */
 const REQUEST_DEFINING_FIELDS = [
   'accountingInvoiceId',
@@ -273,7 +295,12 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // failedRows arrive newest-first, so the oldest match is the last one.
   const pinnedTokenValue = carried ?? couldHaveCommitted[0]?.effectiveToken
   const sameToken = couldHaveCommitted.filter((row) => row.effectiveToken === pinnedTokenValue)
-  const pinnable = sameToken[sameToken.length - 1] ?? couldHaveCommitted[0]
+  // ...but only among bodies that could actually have reached the ledger. An incomplete body
+  // is rejected pre-call by both connectors, so it provably never posted and pinning it
+  // would strand the request behind one that can never succeed.
+  const postable = sameToken.filter((row) => bodyCouldHaveReachedTheLedger(input.type, asPayload(row.payload)))
+  const oldest = <T,>(rows: T[]): T | undefined => rows[rows.length - 1]
+  const pinnable = oldest(postable) ?? oldest(sameToken) ?? couldHaveCommitted[0]
   if (pinnable) {
     // The token is pinned backwards, and pinned EXPLICITLY: the row's effective token is
     // stamped onto the payload rather than left implicit in the row id.

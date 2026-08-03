@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { readFollowUpIdempotencyKey, type FollowUpEnqueuePlan } from './followup-idempotency'
+import { readFollowUpIdempotencyKey, type FollowUpEnqueuePlan, type FollowUpPayload } from './followup-idempotency'
 
 /**
  * o3d-h2wx — the I/O half of the follow-up revival rule, shared by both accounting
@@ -14,7 +14,10 @@ type RevivalContext = {
   type: string
   referenceType: string
   referenceId: string
-  plan: ReusePlan
+  /** The payload this attempt intended to write — the carrier of the pinned token. */
+  payload: FollowUpPayload
+  /** The row a reuse targeted, for diagnostics. Absent when the plan was a create. */
+  syncLogId?: string
 }
 
 /**
@@ -74,11 +77,30 @@ export const MAX_FOLLOW_UP_REVIVAL_ATTEMPTS = 3
  * write failures, so the loss could be invisible (Codex review, r5 #2). Throwing hands it to
  * the connector's existing failure handling, which records it against the entry and retries.
  */
+/**
+ * Handles an enqueue that could not take the slot: a compare-and-set that matched no row
+ * (another run revived it first, or retention hard-deleted it — o3d-nepa), or a create /
+ * revive that the live-follow-up unique index rejected with P2002.
+ *
+ * BOTH must come through here. An earlier revision swallowed the P2002 as an idempotent
+ * no-op, which meant a concurrently-created row under a DIFFERENT token silently won the
+ * slot while our token's request may already have committed — the exact race the token
+ * comparison below exists to catch (Codex review, r7 #1).
+ *
+ * Re-planning is safe BECAUSE the token is carried on the payload rather than held in the
+ * row id: the caller re-plans with this payload, and a carried token is authoritative in the
+ * planner, so whatever row the re-plan lands on posts under the same remote key.
+ *
+ * If every attempt is lost, this THROWS rather than returning. An earlier revision logged a
+ * warning and returned, which silently dropped the follow-up: `logActivity` swallows its own
+ * write failures, so the loss could be invisible (Codex r5 #2). Throwing hands it to the
+ * connector's existing failure handling.
+ */
 export async function resolveLostFollowUpRevival(
   context: RevivalContext & { attempt: number; retry: () => Promise<void> },
 ): Promise<void> {
-  const { connector, type, referenceType, referenceId, plan, attempt, retry } = context
-  const pinnedToken = readFollowUpIdempotencyKey(plan.payload)
+  const { connector, type, referenceType, referenceId, payload, syncLogId, attempt, retry } = context
+  const pinnedToken = readFollowUpIdempotencyKey(payload)
 
   // Another run got there first. That is only the outcome we wanted if the row it left
   // behind carries OUR token: counting live rows without comparing tokens would accept a
@@ -111,7 +133,8 @@ export async function resolveLostFollowUpRevival(
   }
 
   throw new Error(
-    `Could not enqueue ${connector} ${type} for ${referenceType} ${referenceId}: lost the revival race on all `
-    + `${MAX_FOLLOW_UP_REVIVAL_ATTEMPTS} attempts and no live row exists (last candidate ${plan.syncLogId}).`,
+    `Could not enqueue ${connector} ${type} for ${referenceType} ${referenceId}: lost the enqueue race on all `
+    + `${MAX_FOLLOW_UP_REVIVAL_ATTEMPTS} attempts and no live row carries its token`
+    + `${syncLogId ? ` (last candidate ${syncLogId})` : ''}.`,
   )
 }

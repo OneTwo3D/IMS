@@ -223,7 +223,8 @@ async function enqueueFollowUpSyncLog(
           type,
           referenceType,
           referenceId,
-          plan,
+          payload: plan.payload,
+          syncLogId: plan.syncLogId,
           attempt,
           // plan.payload carries the PINNED token, and withFollowUpIdempotencyKey never
           // overwrites one — so a row created by the re-plan posts under the same remote
@@ -246,10 +247,25 @@ async function enqueueFollowUpSyncLog(
       },
     })
   } catch (error) {
-    // A concurrent run won the same live follow-up — the partial unique index
-    // (accounting_sync_logs_followup_live_unique) rejected ours. That row already exists,
-    // so this enqueue is an idempotent no-op; anything else is a real failure.
-    if (isUniqueConstraintViolation(error)) return
+    // A concurrent run took the live slot and the partial unique index
+    // (accounting_sync_logs_followup_live_unique) rejected ours. This used to return as an
+    // idempotent no-op, which silently accepted a winner posting under a DIFFERENT token
+    // while ours may already have committed (Codex review, r7 #1). It now goes through the
+    // same resolver as a lost compare-and-set, which only accepts a live row carrying our
+    // token.
+    if (isUniqueConstraintViolation(error)) {
+      await resolveLostFollowUpRevival({
+        connector: QBO_CONNECTOR,
+        type,
+        referenceType,
+        referenceId,
+        payload: plan.payload,
+        syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
+        attempt,
+        retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+      })
+      return
+    }
     throw error
   }
 }

@@ -588,3 +588,55 @@ test('a carried token selects the row that used it, not merely the newest (o3d-h
   assert.equal(plan.action, 'reuse')
   assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'carried')
 })
+
+test('an INCOMPLETE oldest body is skipped in favour of one that could have posted (o3d-h2wx)', () => {
+  // Codex r7 #3: pinning the oldest unconditionally could select a body missing a required
+  // field. Both connectors reject such a body BEFORE any HTTP call, so it provably never
+  // posted — and pinning it strands the payment behind a request that can never succeed.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 150 }, effectiveToken: 'shared' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'shared' },
+    ],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-new')
+  assert.equal(plan.action === 'reuse' ? plan.payload.bankAccountId : undefined, 'bank-1')
+  // The token is still the shared one — completeness selects the BODY, never the token.
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'shared')
+})
+
+test('when every shared-token body is incomplete the oldest is still pinned (o3d-h2wx)', () => {
+  // No candidate could have posted, so there is nothing to prefer — fall back rather than
+  // silently dropping to a rotated token.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9', amount: 150 }, effectiveToken: 'shared' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 120 }, effectiveToken: 'shared' },
+    ],
+  })
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'shared')
+})
+
+test('completeness only applies to money-moving types (o3d-h2wx)', () => {
+  // A PDF or note has no required-field guard to prove anything by, so the oldest stands.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    type: 'INVOICE_PDF',
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-new', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'shared' },
+      { id: 'log-old', payload: { accountingInvoiceId: 'inv-9' }, effectiveToken: 'shared' },
+    ],
+  })
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-old')
+})
