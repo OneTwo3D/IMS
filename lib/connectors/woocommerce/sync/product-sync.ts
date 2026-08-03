@@ -268,7 +268,10 @@ async function snapshotProductSyncContext(): Promise<{
   syncVersion: string
 }> {
   return db.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+    // SHARED, not exclusive: this path only READS the settings. The rebind/reset writers
+    // take the lock exclusively (app/actions/wc-sync.ts), so shared still blocks them —
+    // which is the whole guarantee — while letting concurrent imports proceed.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${WC_SYNC_ADVISORY_LOCK_KEY})`
     const rows = await tx.setting.findMany({
       where: {
         key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret', WC_SETTINGS_VERSION_KEY] },
@@ -513,7 +516,15 @@ export async function syncWcProductToIms(
         // Fence step 3 (o3d-mlc7): the settings lock comes FIRST, before any per-SKU lock.
         // Both families are taken inside this transaction, so a fixed order between them is
         // what keeps them from deadlocking against each other.
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+        //
+        // SHARED mode matters here. This transaction can run for up to
+        // PRODUCT_WRITE_TX_TIMEOUT_MS (60s) on a product with hundreds of variations, and
+        // taking the GLOBAL settings key exclusively for that long would serialize every
+        // unrelated product import behind it — a contention regression, not a safety gain
+        // (Codex review). Imports do not need to exclude each other; the per-SKU locks below
+        // already do that. They only need to stop a rebind committing underneath them, and a
+        // shared lock does exactly that, because the rebind writers take it exclusively.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${WC_SYNC_ADVISORY_LOCK_KEY})`
 
         // Fence step 4: with that lock held, the version cannot move under us. If it moved
         // while we were reading WooCommerce, everything in hand describes the OLD store and

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
 
 /**
@@ -355,4 +357,72 @@ test('an omitted observedVersion keeps the old contract for callers that cannot 
   const result = await syncWcProductToIms(variableProduct())
 
   assert.equal(result.success, true, 'callers without a fetch-time version must still work')
+})
+
+/**
+ * The tests above exercise the version comparison itself. These pin the PRODUCTION WIRING:
+ * without them, deleting `pageVersion` from the bulk call site or `syncVersion` from the
+ * category-mirror call would leave every assertion above still passing (Codex review).
+ * Asserted against the source because the invariant is about the call sites, and has to
+ * hold for ones added later too.
+ */
+const PRODUCT_SYNC_SOURCE = path.join(process.cwd(), 'lib/connectors/woocommerce/sync/product-sync.ts')
+
+test('the bulk import passes the page version to every product (o3d-mlc7)', async () => {
+  const source = await readFile(PRODUCT_SYNC_SOURCE, 'utf8')
+
+  assert.match(
+    source,
+    /const \{ creds: pageCreds, syncVersion: pageVersion \} = await snapshotProductSyncContext\(\)/,
+    'the bulk loop must snapshot before its page fetch',
+  )
+  assert.match(
+    source,
+    /wcFetch\('\/products', params, pageCreds\)/,
+    'the page fetch must use the pinned credentials',
+  )
+  assert.match(
+    source,
+    /syncWcProductToIms\(product, pageVersion\)/,
+    'every product must be imported under the version its page was fetched at, or a payload '
+      + 'from the previous store is written with no check able to see it',
+  )
+})
+
+test('the category mirror is asked for THIS run\'s version (o3d-mlc7)', async () => {
+  const source = await readFile(PRODUCT_SYNC_SOURCE, 'utf8')
+  assert.match(
+    source,
+    /ensureWcCategoryTreeMirrored\(pinnedCreds, syncVersion\)/,
+    'the mirror must be keyed on the snapshotted version, or its cache serves the previous store',
+  )
+})
+
+test('the settings lock is taken in SHARED mode on the import path (o3d-mlc7)', async () => {
+  // Exclusive would be correct but would serialize every product import behind a write
+  // transaction that can run for a minute. Shared still blocks the rebind writers, which
+  // take the key exclusively — that is the guarantee the fence actually needs.
+  //
+  // Scoped to the two acquisitions this fence owns. The other holders in this file are on
+  // the IMS -> WC PUSH path and predate it; their mode is deliberately not asserted here.
+  const source = await readFile(PRODUCT_SYNC_SOURCE, 'utf8')
+
+  const snapshotStart = source.indexOf('async function snapshotProductSyncContext')
+  assert.notEqual(snapshotStart, -1, 'the settings snapshot helper must still exist')
+  assert.match(
+    // A fixed window, not up to the first '}' — that lands inside the return-type
+    // annotation, which silently truncated this assertion to nothing.
+    source.slice(snapshotStart, snapshotStart + 900),
+    /pg_advisory_xact_lock_shared\(\$\{WC_SYNC_ADVISORY_LOCK_KEY\}\)/,
+    'the settings snapshot only READS, so it must take the lock shared',
+  )
+
+  const fenceStep3 = source.indexOf('Fence step 3 (o3d-mlc7)')
+  assert.notEqual(fenceStep3, -1, 'the write transaction must still take the settings lock')
+  assert.match(
+    source.slice(fenceStep3, fenceStep3 + 1200),
+    /pg_advisory_xact_lock_shared\(\$\{WC_SYNC_ADVISORY_LOCK_KEY\}\)/,
+    'the write transaction must take the lock SHARED: it can run for a minute, and an '
+      + 'exclusive hold that long serializes every unrelated product import',
+  )
 })
