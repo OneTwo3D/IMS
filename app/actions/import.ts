@@ -19,6 +19,7 @@ import {
 } from '@/lib/products/categories'
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
@@ -540,6 +541,17 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               lifecycleStatus,
             }
           : await db.$transaction(async (tx) => {
+              // o3d-42hw: join the per-SKU write protocol. The uniqueness decision that led
+              // here was made against a snapshot taken before this transaction, so a
+              // WooCommerce import or a manual create landing in between raised a P2002 that
+              // aborted the row — and, inside an interactive transaction, the transaction
+              // with it (o3d-md4q).
+              await lockProductSkusForWrite(tx, [sku])
+              const taken = await tx.product.findUnique({ where: { sku }, select: { id: true } })
+              // Returned, not thrown: this loop has no per-row catch, so a throw would abort
+              // the whole import over one contended row.
+              if (taken) return null
+
               const createCategoryId = await resolveImportedCategoryId(categoryName, tx)
               return tx.product.create({
                 data: {
@@ -549,6 +561,13 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 },
               })
             })
+        if (!created) {
+          result.errors.push(
+            `Row ${lineNum} (${sku}): another writer created this SKU while the import was running — re-run to pick it up`,
+          )
+          result.skipped++
+          continue
+        }
         rememberImportedCategoryId(categoryName, created.categoryId)
         skuToId.set(sku, created.id)
         if (barcode) {
