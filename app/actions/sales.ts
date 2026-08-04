@@ -1615,7 +1615,7 @@ export async function applySalesOrderStatusTransition(
     // partially-allocated order will ever be retried, and its one-shot replenishment trigger
     // has already been consumed. Runs before the lock because autoAllocateOrder opens its own
     // transaction; see the module docstring for why this is a backstop rather than a gate.
-    if (!orderUpdated && entersFulfilment(targetStatus)) {
+    if (!orderUpdated && entersFulfilment(so.status, targetStatus)) {
       await reconcileAllocationBeforeFulfilment(id)
     }
 

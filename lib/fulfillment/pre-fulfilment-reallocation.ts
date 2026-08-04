@@ -1,6 +1,8 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { selectOrdersNeedingAllocation } from '@/lib/fulfillment/order-allocation-coverage'
+import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 
 /**
  * o3d-c9mi — one last allocation attempt as an order leaves the automatically-recoverable set.
@@ -36,10 +38,28 @@ import { selectOrdersNeedingAllocation } from '@/lib/fulfillment/order-allocatio
  */
 
 /** Statuses whose entry takes an order out of the sweep's reach for good. */
-const FULFILMENT_ENTRY_STATUSES = new Set(['PICKING', 'PACKING'])
+const FULFILMENT_STATUSES = new Set(['PICKING', 'PACKING'])
 
-export function entersFulfilment(targetStatus: string): boolean {
-  return FULFILMENT_ENTRY_STATUSES.has(targetStatus)
+/**
+ * Statuses an order may legally be in while still OUTSIDE fulfilment, per the state machine:
+ * PICKING is reachable from ALLOCATED and ON_HOLD, PACKING from ON_HOLD.
+ *
+ * Doubles as `requireStatusUnderLock` for the allocator (o3d-6ab), which re-checks it while
+ * holding the order lock. That is what makes the decision safe despite being taken outside
+ * one — a status that moved in between turns the allocation into an explicit no-op.
+ */
+const PRE_FULFILMENT_STATUSES = ['ALLOCATED', 'ON_HOLD'] as const satisfies readonly SalesOrderStatus[]
+
+/**
+ * True only when this transition CROSSES INTO fulfilment from outside it.
+ *
+ * The target alone is not enough. PICKING -> PACKING is legal and targets a fulfilment
+ * status, but the order is already being picked, and reallocating there is precisely what the
+ * issue warns against: the allocator releases, deletes and recreates allocations that
+ * fulfilment already owns (Codex review).
+ */
+export function entersFulfilment(currentStatus: string, targetStatus: string): boolean {
+  return FULFILMENT_STATUSES.has(targetStatus) && !FULFILMENT_STATUSES.has(currentStatus)
 }
 
 export type PreFulfilmentReallocationResult =
@@ -67,13 +87,34 @@ export async function reconcileAllocationBeforeFulfilment(
   // autoAllocateOrder rebuilds OrderAllocation without touching committed ShipmentLines, so
   // reallocating an order that already has shipments would decrement stock against stale
   // rows. The sweep pre-excludes these for the same reason.
-  if (order._count.shipments > 0) return { attempted: false, reason: 'has-shipments' }
-
+  // Coverage FIRST, so a short order is reported even when it cannot be reallocated.
   const needing = await selectOrdersNeedingAllocation([order])
   if (needing.length === 0) return { attempted: false, reason: 'fully-covered' }
 
+  // autoAllocateOrder rebuilds OrderAllocation without touching committed ShipmentLines, so
+  // reallocating an order that already has shipments would decrement stock against stale
+  // rows. It is skipped — but it is still SHORT and still leaving the sweep's reach, and an
+  // earlier revision returned here silently, which meant the partial-fulfilment workflow this
+  // fix exists to protect got neither the attempt nor the warning (Codex review).
+  if (order._count.shipments > 0) {
+    await warnEnteringFulfilmentShort(order, 'existing shipments prevent an automatic reallocation')
+    return { attempted: false, reason: 'has-shipments' }
+  }
+
   const { autoAllocateOrder } = await import('@/app/actions/allocation')
-  await autoAllocateOrder(orderId).catch(() => undefined)
+  await autoAllocateOrder(orderId, {
+    // The WooCommerce status mappings drive PICKING/PACKING through the SESSIONLESS
+    // transition bypass, and autoAllocateOrder requires an authenticated permission. Without
+    // this the webhook path failed the permission check, was swallowed by the catch, and the
+    // order proceeded short with no attempt made at all (Codex review).
+    internalBypassToken: INTERNAL_ACTION_BYPASS,
+    // Closes the TOCTOU on the check above: a concurrent confirmation can create shipment
+    // lines between that read and this call, and the allocator re-checks under its own lock.
+    refuseIfShipmentsExist: true,
+    // Likewise for the status: if the order reached PICKING/PACKING in between, this becomes
+    // an explicit no-op rather than rewriting allocations fulfilment now owns.
+    requireStatusUnderLock: PRE_FULFILMENT_STATUSES,
+  }).catch(() => undefined)
 
   // Re-read: allocation rewrote the rows, so coverage has to be recomputed rather than
   // inferred from the allocator's return value, which reports its own run rather than the
@@ -89,21 +130,29 @@ export async function reconcileAllocationBeforeFulfilment(
   const stillShort = after ? (await selectOrdersNeedingAllocation([after])).length > 0 : true
 
   if (stillShort) {
-    // The order is about to leave the recoverable set genuinely short. Nothing will retry it,
-    // so this is the record that it happened — previously the shortfall simply disappeared.
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: 'fulfilment_entry_under_allocated',
-      tag: 'sales',
-      level: 'WARNING',
-      description: `Order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} is entering fulfilment `
-        + 'without full allocation coverage. A final allocation attempt was made and did not close the shortfall, '
-        + 'and the periodic reallocation sweep does not reach PICKING/PACKING, so the remainder will not be '
-        + 'allocated automatically.',
-      metadata: { orderId },
-    })
+    await warnEnteringFulfilmentShort(order, 'a final allocation attempt did not close the shortfall')
   }
 
   return { attempted: true, stillShort }
+}
+
+/**
+ * The record that an order crossed into fulfilment short. Nothing will retry it after this,
+ * so without this line the shortfall simply disappears.
+ */
+async function warnEnteringFulfilmentShort(
+  order: { id: string; orderNumber: string | null; externalOrderNumber: string | null },
+  because: string,
+): Promise<void> {
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: order.id,
+    action: 'fulfilment_entry_under_allocated',
+    tag: 'sales',
+    level: 'WARNING',
+    description: `Order ${order.orderNumber ?? order.externalOrderNumber ?? order.id} is entering fulfilment `
+      + `without full allocation coverage: ${because}. The periodic reallocation sweep does not reach `
+      + 'PICKING/PACKING, so the remainder will not be allocated automatically.',
+    metadata: { orderId: order.id, reason: because },
+  })
 }

@@ -18,6 +18,7 @@ const state = {
   orders: [] as Row[],
   activity: [] as Row[],
   allocateCalls: [] as string[],
+  allocateOptions: [] as Array<Record<string, unknown> | null>,
   /** Orders the coverage selector should report as short, by id. */
   short: new Set<string>(),
   /** Ids the allocator manages to fully cover on its run. */
@@ -39,8 +40,9 @@ mock.module('@/lib/fulfillment/order-allocation-coverage', {
 
 mock.module('@/app/actions/allocation', {
   namedExports: {
-    autoAllocateOrder: async (orderId: string) => {
+    autoAllocateOrder: async (orderId: string, options?: Record<string, unknown>) => {
       state.allocateCalls.push(orderId)
+      state.allocateOptions.push(options ?? null)
       if (state.allocatorThrows.has(orderId)) throw new Error('allocator exploded')
       // A successful run closes the shortfall for the ids the fixture nominates.
       if (state.allocatorFixes.has(orderId)) state.short.delete(orderId)
@@ -79,19 +81,30 @@ function reset() {
   state.orders.length = 0
   state.activity.length = 0
   state.allocateCalls.length = 0
+  state.allocateOptions.length = 0
   state.short.clear()
   state.allocatorFixes.clear()
   state.allocatorThrows.clear()
 }
 
-test('only PICKING and PACKING count as entering fulfilment (o3d-c9mi)', async () => {
+test('only a CROSSING into fulfilment counts, not any PICKING/PACKING target (o3d-c9mi)', async () => {
   const { entersFulfilment } = await loadHelper()
-  // These are the statuses the sweep cannot reach and that nothing exits automatically.
-  assert.equal(entersFulfilment('PICKING'), true)
-  assert.equal(entersFulfilment('PACKING'), true)
+
+  // Crossing in from outside: this is the last automatic chance.
+  assert.equal(entersFulfilment('ALLOCATED', 'PICKING'), true)
+  assert.equal(entersFulfilment('ON_HOLD', 'PICKING'), true)
+  assert.equal(entersFulfilment('ON_HOLD', 'PACKING'), true)
+
+  // Already inside fulfilment. PICKING -> PACKING is legal and targets a fulfilment status,
+  // but reallocating an order a picker is working on is exactly what the issue warns against:
+  // the allocator would release, delete and recreate allocations fulfilment already owns.
+  assert.equal(entersFulfilment('PICKING', 'PACKING'), false)
+  assert.equal(entersFulfilment('PICKING', 'PICKING'), false)
+  assert.equal(entersFulfilment('PACKING', 'PACKING'), false)
+
   // ALLOCATED and PROCESSING are the sweep's own set — reallocating there is its job.
-  for (const status of ['ALLOCATED', 'PROCESSING', 'SHIPPED', 'ON_HOLD', 'CANCELLED', 'DRAFT']) {
-    assert.equal(entersFulfilment(status), false, `${status} must not trigger the boundary attempt`)
+  for (const target of ['ALLOCATED', 'PROCESSING', 'SHIPPED', 'ON_HOLD', 'CANCELLED', 'DRAFT']) {
+    assert.equal(entersFulfilment('ALLOCATED', target), false, `${target} must not trigger the boundary attempt`)
   }
 })
 
@@ -134,6 +147,10 @@ test('an order with shipments is never reallocated (o3d-c9mi)', async () => {
 
   assert.deepEqual(result, { attempted: false, reason: 'has-shipments' })
   assert.deepEqual(state.allocateCalls, [], 'an order with shipments must not be reallocated')
+  // ...but it is still short and still leaving the sweep's reach. Returning silently meant the
+  // partial-fulfilment workflow this fix protects got neither the attempt nor the warning.
+  assert.equal(state.activity.length, 1, 'a short order with shipments must still be reported')
+  assert.match(String(state.activity[0]?.description), /existing shipments/)
 })
 
 test('a shortfall that survives the attempt is RECORDED, not silently dropped (o3d-c9mi)', async () => {
@@ -195,4 +212,63 @@ test('an allocator that throws does not block the transition (o3d-c9mi)', async 
 
   assert.deepEqual(result, { attempted: true, stillShort: true }, 'a thrown allocator still reports the shortfall')
   assert.equal(state.activity.length, 1, 'and the unresolved shortfall is still recorded')
+})
+
+test('the allocator is called with every guard the boundary needs (o3d-c9mi)', async () => {
+  // This call is made OUTSIDE the order lock, so each of these is what makes that safe.
+  const { reconcileAllocationBeforeFulfilment } = await loadHelper()
+  reset()
+  seedOrder('o7')
+  state.short.add('o7')
+
+  await reconcileAllocationBeforeFulfilment('o7')
+
+  const options = state.allocateOptions[0]
+  assert.ok(options, 'the allocator must be given options, not called bare')
+
+  // Woo status mappings drive PICKING/PACKING through the sessionless transition bypass, and
+  // autoAllocateOrder requires an authenticated permission. Without the token the webhook
+  // path fails the permission check, the catch swallows it, and no attempt is ever made.
+  assert.ok(options.internalBypassToken, 'the sessionless path needs the internal bypass token')
+
+  // Closes the TOCTOU on the shipments read: a concurrent confirmation can create shipment
+  // lines in between, and only the allocator can re-check under its own lock.
+  assert.equal(options.refuseIfShipmentsExist, true, 'the allocator must re-check shipments under its lock')
+
+  // Likewise the status: if the order reached PICKING/PACKING in between, this must become an
+  // explicit no-op rather than rewriting allocations fulfilment now owns.
+  assert.deepEqual(
+    options.requireStatusUnderLock,
+    ['ALLOCATED', 'ON_HOLD'],
+    'the allocator must refuse to run once the order is already in fulfilment',
+  )
+})
+
+/**
+ * The suite above drives the helper directly. These pin the PRODUCTION WIRING: without them,
+ * deleting the hook in sales.ts or passing only the target status would leave every assertion
+ * above green (Codex review).
+ */
+test('the status transition actually calls the boundary attempt, with BOTH statuses (o3d-c9mi)', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'app/actions/sales.ts'), 'utf8')
+
+  assert.match(
+    source,
+    /entersFulfilment\(so\.status, targetStatus\)/,
+    'the guard must consider the CURRENT status too, or PICKING -> PACKING reallocates an order being picked',
+  )
+  assert.match(
+    source,
+    /await reconcileAllocationBeforeFulfilment\(id\)/,
+    'the transition must actually make the attempt',
+  )
+
+  // It has to run BEFORE the transition transaction: autoAllocateOrder opens its own
+  // transaction, so calling it inside the lock would nest.
+  const hookAt = source.indexOf('reconcileAllocationBeforeFulfilment(id)')
+  const txAt = source.indexOf('const transitionResult = await db.$transaction')
+  assert.ok(hookAt !== -1 && txAt !== -1, 'both the hook and the transition transaction must exist')
+  assert.ok(hookAt < txAt, 'the attempt must precede the transition transaction, or it nests inside its lock')
 })
