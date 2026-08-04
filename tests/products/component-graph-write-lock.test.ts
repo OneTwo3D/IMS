@@ -26,15 +26,33 @@ type Row = { productId: string; componentId: string }
 
 const state = { edges: [] as Row[], reads: [] as unknown[] }
 
+/**
+ * Stands in for the recursive CTE: reachability over `state.edges` from the roots the query was
+ * given. Deliberately deduplicates its frontier, exactly as `UNION` does — a mock using an
+ * unbounded worklist would hang on the pre-existing-cycle fixture below, which is the same trap
+ * `UNION ALL` would be in the real query.
+ */
+function reachabilityMock(_strings: TemplateStringsArray, ...values: unknown[]) {
+  state.reads.push('queryRaw')
+  const roots = values[0] as string[]
+  const target = values[1] as string
+  const seen = new Set<string>()
+  const frontier = [...roots]
+  while (frontier.length > 0) {
+    const current = frontier.shift()!
+    if (seen.has(current)) continue
+    seen.add(current)
+    for (const edge of state.edges) {
+      if (edge.productId === current) frontier.push(edge.componentId)
+    }
+  }
+  return seen.has(target) ? [{ reached: true }] : []
+}
+
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      productComponent: {
-        findMany: async ({ where }: { where: { productId: string } }) => {
-          state.reads.push('db')
-          return state.edges.filter((edge) => edge.productId === where.productId)
-        },
-      },
+      $queryRaw: async (...args: [TemplateStringsArray, ...unknown[]]) => reachabilityMock(...args),
     },
   },
 })
@@ -69,26 +87,25 @@ test('the cycle check reads through the CLIENT it is given (o3d-t0zq)', async ()
   reset()
   state.edges.push({ productId: 'A', componentId: 'B' })
 
-  const txReads: string[] = []
+  let txQueries = 0
   const tx = {
-    productComponent: {
-      findMany: async ({ where }: { where: { productId: string } }) => {
-        txReads.push(where.productId)
-        return state.edges.filter((edge) => edge.productId === where.productId)
-      },
+    $queryRaw: async (...args: [TemplateStringsArray, ...unknown[]]) => {
+      txQueries += 1
+      return reachabilityMock(...args)
     },
   }
 
+  state.reads.length = 0
   await detectComponentCycle('B', ['A'], tx as never)
-  assert.ok(txReads.length > 0, 'the walk must use the supplied client')
-  assert.deepEqual(state.reads, [], 'it must not touch the module-level db when given a client')
+  assert.equal(txQueries, 1, 'the whole walk must be ONE query on the supplied client')
+  assert.deepEqual(state.reads, ['queryRaw'], 'and it must not go through the module-level db')
 })
 
 test('self-reference is caught before any read (o3d-t0zq)', async () => {
   const detectComponentCycle = await loadCycle()
   reset()
   assert.deepEqual(await detectComponentCycle('A', ['A']), { kind: 'self' })
-  assert.deepEqual(state.reads, [], 'a self-reference needs no graph walk')
+  assert.deepEqual(state.reads, [], 'a self-reference needs no graph query at all')
 })
 
 // --- Where the lock and the re-check sit ---
