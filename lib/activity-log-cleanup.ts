@@ -16,6 +16,11 @@ const DEFAULTS: Record<string, number> = {
  *
  * Anything added here must be a row that something else is responsible for CLEARING. A marker
  * that is resolved is deleted by the resolver, so this exempts only ones still outstanding.
+ *
+ * The predicate is `<> ALL`, NOT `<> ANY`. `action <> ANY(ARRAY['a','b'])` is true when the
+ * action differs from AT LEAST ONE element, so `'a' <> 'b'` alone satisfies it and a row whose
+ * action IS exempt gets deleted anyway. With one entry the two forms agree, which is exactly
+ * what makes it a landmine: it would work until the day someone added a second action.
  */
 const RETAINED_ACTIONS = [DIRECT_CREATE_PENDING_ACTION]
 
@@ -67,7 +72,7 @@ export async function purgeExpiredActivityLogs() {
             FROM "activity_logs"
             WHERE level = ${level}::"ActivityLogLevel"
               AND "createdAt" < ${cutoff}
-              AND action <> ANY(${RETAINED_ACTIONS}::text[])
+              AND action <> ALL(${RETAINED_ACTIONS}::text[])
             ORDER BY "createdAt" ASC
             LIMIT ${DELETE_BATCH_SIZE}
           )

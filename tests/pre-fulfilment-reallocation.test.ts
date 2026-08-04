@@ -647,7 +647,24 @@ test('retention cleanup cannot age out an unresolved marker (o3d-z82a)', async (
   const source = await readFile(path.join(process.cwd(), 'lib/activity-log-cleanup.ts'), 'utf8')
 
   assert.match(source, /const RETAINED_ACTIONS = \[DIRECT_CREATE_PENDING_ACTION\]/, 'the marker action must be exempt')
-  assert.match(source, /action <> ANY\(\$\{RETAINED_ACTIONS\}::text\[\]\)/, 'and the exemption must be in the DELETE')
+  assert.match(source, /action <> ALL\(\$\{RETAINED_ACTIONS\}::text\[\]\)/, 'and the exemption must be in the DELETE')
   const at = source.indexOf('DELETE FROM "activity_logs"')
   assert.ok(source.indexOf('RETAINED_ACTIONS', at) !== -1, 'the exemption must apply to the deleting statement')
+})
+
+test('the retention exemption uses ALL, not ANY (o3d-z82a)', async () => {
+  // `action <> ANY(ARRAY['a','b'])` is true when the action differs from AT LEAST ONE element,
+  // so 'a' <> 'b' alone satisfies it and an exempt row is deleted anyway. With a single entry
+  // the two forms agree — which is precisely what makes it a landmine: it would have worked
+  // until the day someone added a second retained action, and then silently stopped.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/activity-log-cleanup.ts'), 'utf8')
+
+  // Scoped to the STATEMENT, not the file — the comment above it explains the ANY pitfall by
+  // name, and an assertion that forbids the string anywhere fails on its own documentation.
+  const sqlAt = source.indexOf('DELETE FROM "activity_logs"')
+  const statement = source.slice(sqlAt, source.indexOf('RETURNING', sqlAt))
+  assert.match(statement, /action <> ALL\(\$\{RETAINED_ACTIONS\}::text\[\]\)/, 'must be <> ALL')
+  assert.ok(!/<> ANY\(/.test(statement), '<> ANY is wrong as soon as there is a second entry')
 })
