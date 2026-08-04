@@ -150,8 +150,12 @@ const txClient = {
   product: productDelegate,
   // o3d-t0zq part 2: counted alongside the children, under the same lock.
   productComponent: { count: async () => 0 },
+  bomItem: { count: async () => 0 },
+  kitItem: { count: async () => 0 },
   activityLog: { create: async ({ data }: { data: Row }) => data },
   productOption: {
+    // o3d-t0zq part 2: options are one of the row families that keep a parent's type meaningful.
+    count: async () => 0,
     upsert: async ({ create }: { create: Row }) => {
       state.options.push({ ...create })
       return create

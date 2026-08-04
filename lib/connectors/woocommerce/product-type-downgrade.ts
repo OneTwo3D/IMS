@@ -11,11 +11,14 @@
  * there: components that no longer drive stock, or variants whose parent no longer accepts
  * children. The editor forbids exactly this transformation; the sync ran none of those checks.
  *
- * REFUSING IS NOT THE CONSERVATIVE-BY-DEFAULT CHOICE, IT IS THE ONLY SAFE ONE. Deleting the
- * structure to match the new type is worse: a KIT's components are the reservation source that
- * invariants.ts reads for an in-flight ASSEMBLY order, so clearing them silently changes what
- * an order in progress is entitled to. Keeping the local type costs a stale type on a product
- * nobody is selling as a kit; clearing the components corrupts an order someone is picking.
+ * REFUSING RATHER THAN DELETING. Clearing the structure to match the incoming type would make
+ * rows disappear that other systems still read: invariants.ts reads live ProductComponent rows,
+ * and the replenishment and inventory-health reports condition their use of BomItem/KitItem on
+ * the parent still being BOM/KIT. An in-progress ASSEMBLY order is NOT at risk -- it freezes a
+ * componentSnapshot at creation and consumes that, and normal assembly creation takes BOM
+ * products rather than KITs (an earlier version of this note claimed otherwise; it was wrong).
+ * The cost of keeping the local type is a stale type on a product nobody sells that way. The
+ * cost of deleting is rows that several reports silently stop counting.
  */
 
 /** Types whose meaning depends on rows this sync does not own. */
@@ -43,8 +46,10 @@ export function planTypeWrite(params: {
   // A new product, or no change: nothing to protect.
   if (!existingType || existingType === incomingType) return { action: 'write', type: incomingType }
 
-  // Only DOWNGRADES out of a structured type are refused. Upgrading SIMPLE -> VARIABLE is how a
-  // product legitimately gains variants, and must keep working.
+  // Only changes OUT OF a structured type are refused. That includes KIT -> VARIABLE, not just
+  // the SIMPLE case -- any move away from a type whose dependent rows would be left behind.
+  // Moving INTO a structured type (SIMPLE -> VARIABLE, how a product legitimately gains
+  // variants) is unaffected, because the existing type is what is checked.
   if (!STRUCTURED_DOWNGRADE_TYPES.has(existingType)) return { action: 'write', type: incomingType }
 
   // A structured type with nothing left depending on it can be rewritten freely: the whole

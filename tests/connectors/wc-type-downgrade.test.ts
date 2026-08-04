@@ -110,3 +110,59 @@ test('a refused downgrade is recorded, not silently swallowed (o3d-t0zq)', async
   assert.match(body, /keptType: typePlan\.type/, 'and must record what was kept')
   assert.match(body, /incomingType: productType/, 'and what was refused')
 })
+
+test('a refused type applies NONE of the shape-derived data (o3d-t0zq)', async () => {
+  // The worst thing the first cut did: keep the local type while still nulling prices, creating
+  // variations and writing options from the incoming shape. A kept KIT receiving a WooCommerce
+  // `variable` would have had VARIATIONS CREATED BENEATH IT — the exact forbidden structure this
+  // change exists to prevent, produced by the change itself (Codex review).
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/connectors/woocommerce/sync/product-sync.ts'),
+    'utf8',
+  )
+
+  assert.match(source, /const typeRefused = typePlan\.action === 'keep'/, 'the refusal must be a named condition')
+  assert.match(source, /if \(isVariable && !typeRefused\)/, 'variations must not be applied under a refused type')
+  assert.match(source, /if \(!typeRefused\) \{\s*\n\s*await applyProductOptions/, 'nor options')
+
+  // Prices must be left alone entirely, not merely branched differently.
+  const priceAt = source.indexOf('// Prices — only set on non-VARIABLE')
+  const priceBlock = source.slice(priceAt, priceAt + 700)
+  assert.match(priceBlock, /if \(typeRefused\)/, 'prices must be skipped on a refused type')
+  assert.ok(
+    !/if \(productType !== 'VARIABLE'\)/.test(priceBlock),
+    'the price branch must use the EFFECTIVE type, not the rejected incoming one',
+  )
+})
+
+test('the structure check covers every type-dependent row family (o3d-t0zq)', async () => {
+  // ProductComponent and child products were the obvious two. A VARIABLE parent with options but
+  // no children yet would still have become SIMPLE with its ProductOption rows stranded; and
+  // BomItem/KitItem rows are read by replenishment and inventory-health only while the parent is
+  // still BOM/KIT, so a product with those and no ProductComponent would drop out silently.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/connectors/woocommerce/sync/product-sync.ts'),
+    'utf8',
+  )
+  const at = source.indexOf('let hasStructure = false')
+  const body = source.slice(at, source.indexOf('const typePlan', at))
+
+  for (const probe of [
+    'tx.productComponent.count',
+    'tx.product.count({ where: { parentId: existing.id } })',
+    'tx.productOption.count',
+    'tx.bomItem.count({ where: { parentProductId: existing.id } })',
+    'tx.kitItem.count({ where: { parentProductId: existing.id } })',
+  ]) {
+    assert.ok(body.includes(probe), `${probe} must be counted`)
+  }
+
+  // And only when the type is actually changing — an unchanged VARIABLE product paid five
+  // indexed counts per sync for nothing, which across a catalogue is thousands of statements
+  // inside write transactions.
+  assert.match(body, /existing\.type !== productType/, 'counts must be skipped when the type is unchanged')
+})

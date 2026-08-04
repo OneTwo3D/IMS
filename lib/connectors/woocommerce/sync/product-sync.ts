@@ -560,12 +560,27 @@ export async function syncWcProductToIms(
         // unlocked read and this update would otherwise be stranded by the very check meant to
         // prevent it — the lock-set verification this protocol has needed at every other site.
         let hasStructure = false
-        if (existing && STRUCTURED_DOWNGRADE_TYPES.has(existing.type)) {
-          const [componentCount, childCount] = await Promise.all([
+        if (existing && STRUCTURED_DOWNGRADE_TYPES.has(existing.type) && existing.type !== productType) {
+          // Every row family whose meaning depends on the parent's type. ProductComponent and
+          // child products are the obvious two; the other three were missed on the first pass
+          // (Codex review):
+          //   ProductOption — a VARIABLE parent with options but no children yet would have
+          //     become SIMPLE with its option rows stranded and unreachable;
+          //   BomItem / KitItem — replenishment and inventory-health reports condition their use
+          //     on the parent still being BOM/KIT, so a product with those rows and no
+          //     ProductComponent would silently drop out of both calculations.
+          //
+          // Only counted when the type is actually CHANGING: an unchanged VARIABLE product paid
+          // these counts on every sync for nothing, which across a full catalogue is thousands
+          // of statements inside write transactions.
+          const [componentCount, childCount, optionCount, bomCount, kitCount] = await Promise.all([
             tx.productComponent.count({ where: { productId: existing.id } }),
             tx.product.count({ where: { parentId: existing.id } }),
+            tx.productOption.count({ where: { productId: existing.id } }),
+            tx.bomItem.count({ where: { parentProductId: existing.id } }),
+            tx.kitItem.count({ where: { parentProductId: existing.id } }),
           ])
-          hasStructure = componentCount > 0 || childCount > 0
+          hasStructure = componentCount + childCount + optionCount + bomCount + kitCount > 0
         }
         const typePlan = planTypeWrite({
           existingType: existing?.type,
@@ -573,6 +588,14 @@ export async function syncWcProductToIms(
           hasStructure,
           sku,
         })
+        // When the incoming type is REFUSED, none of the shape-derived data may be applied
+        // either. Keeping the local type while still nulling prices, creating variations and
+        // writing options would produce something worse than the bug being fixed: variations
+        // beneath a KIT, or parent prices written onto a kept VARIABLE (Codex review).
+        //
+        // Type-INDEPENDENT fields — name, description, images, dimensions, trade attributes —
+        // keep syncing, because nothing about them depends on the shape.
+        const typeRefused = typePlan.action === 'keep'
         // Never reassign a row another WooCommerce object already maps (o3d-fsi): the
         // update branch below overwrites type/parentId/externalProductId. Checked here so a
         // conflict fails BEFORE any write, and re-checked atomically inside the update itself.
@@ -604,8 +627,12 @@ export async function syncWcProductToIms(
             externalProductId: BigInt(wcProduct.id),
           }
 
-          // Prices — only set on non-VARIABLE products (VARIABLE shows min-max from variants)
-          if (productType !== 'VARIABLE') {
+          // Prices — only set on non-VARIABLE products (VARIABLE shows min-max from variants).
+          // Skipped entirely on a refused type: the incoming shape does not describe this
+          // product, so neither does its pricing.
+          if (typeRefused) {
+            // leave both alone
+          } else if (typePlan.type !== 'VARIABLE') {
             if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
             if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
           } else {
@@ -690,12 +717,16 @@ export async function syncWcProductToIms(
         }
 
         // --- Variations (VARIABLE products) — already fetched, just applied here ---
-        if (isVariable) {
+        // Not applied when the type was refused: creating children beneath a product that is
+        // NOT a VARIABLE parent is exactly the forbidden structure this change exists to stop.
+        if (isVariable && !typeRefused) {
           await applyVariations(tx, variations, productId, wcProduct.name, imsCategoryId)
         }
 
         // --- Product options (variation attributes) ---
-        await applyProductOptions(tx, productId, variationAttrs)
+        if (!typeRefused) {
+          await applyProductOptions(tx, productId, variationAttrs)
+        }
 
         await tx.shoppingSyncLog.create({
           data: {
