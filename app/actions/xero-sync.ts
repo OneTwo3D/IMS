@@ -5,6 +5,7 @@ import { freshAuthFailureResult, requireFreshPermission, requirePermission, requ
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { effectiveTokenFor, planManualRetry } from '@/lib/domain/accounting/followup-retry-guard'
 import { getAuthorizationUrl, disconnect, isConnected, getGrantedScopes, missingScopes } from '@/lib/connectors/xero'
 import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
 import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
@@ -454,24 +455,97 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
   }
 }
 
-export async function retryFailedXeroSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
+export async function retryFailedXeroSync(entryId?: string): Promise<{ success: boolean; reset: number; refused?: number; error?: string }> {
   try {
     await requireAdmin()
-    const where = entryId
-      ? { id: entryId, connector: 'xero', status: 'FAILED' as const }
-      : { connector: 'xero', status: 'FAILED' as const }
+
+    // o3d-0m56: refuse what the automatic enqueue refuses. Several FAILED rows for one
+    // reference under DIFFERENT idempotency tokens mean any of them may have committed
+    // remotely, so re-posting picks a token the ledger may never have seen and a second payment
+    // lands. The bulk path is the worse one — without this it re-queues every ambiguous scope
+    // at once, each row under its own token.
+    const candidates = await db.accountingSyncLog.findMany({
+      where: entryId
+        ? { id: entryId, connector: 'xero', status: 'FAILED' as const }
+        : { connector: 'xero', status: 'FAILED' as const },
+      select: { id: true, type: true, referenceType: true, referenceId: true, payload: true },
+    })
+    if (candidates.length === 0) return { success: true, reset: 0 }
+
+    const scopeKey = (row: { type: string; referenceType: string; referenceId: string }) =>
+      `${row.type}\u0000${row.referenceType}\u0000${row.referenceId}`
+    const scopes = [...new Set(candidates.map(scopeKey))]
+
+    // Every FAILED row in each touched scope, not just the ones selected — a single-row retry
+    // is only ambiguous relative to its SIBLINGS, which the id filter above excludes.
+    const siblingRows = await db.accountingSyncLog.findMany({
+      where: {
+        connector: 'xero',
+        status: 'FAILED',
+        OR: candidates.map((row) => ({
+          type: row.type,
+          referenceType: row.referenceType,
+          referenceId: row.referenceId,
+        })),
+      },
+      select: { id: true, type: true, referenceType: true, referenceId: true, payload: true },
+    })
+    const siblingsByScope = new Map<string, typeof siblingRows>()
+    for (const row of siblingRows) {
+      const key = scopeKey(row)
+      siblingsByScope.set(key, [...(siblingsByScope.get(key) ?? []), row])
+    }
+
+    const refusedIds = new Set<string>()
+    const refusals: string[] = []
+    for (const scope of scopes) {
+      const rows = siblingsByScope.get(scope) ?? []
+      const target = rows[0]
+      if (!target) continue
+      const plan = planManualRetry({
+        type: target.type,
+        reference: `${target.referenceType} ${target.referenceId}`,
+        target: { id: target.id, payload: target.payload, effectiveToken: effectiveTokenFor('xero', target) },
+        siblings: rows.map((row) => ({
+          id: row.id,
+          payload: row.payload,
+          effectiveToken: effectiveTokenFor('xero', row),
+        })),
+      })
+      if (plan.action === 'refuse') {
+        for (const row of rows) refusedIds.add(row.id)
+        refusals.push(plan.reason)
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_manual_retry_refused',
+          tag: 'sync',
+          level: 'WARNING',
+          description: plan.reason,
+          metadata: { failedRowIds: rows.map((row) => row.id), tokenCount: plan.tokenCount },
+        })
+      }
+    }
+
+    const allowedIds = candidates.map((row) => row.id).filter((id) => !refusedIds.has(id))
+    if (allowedIds.length === 0) {
+      // Nothing to do and a reason worth showing: the single-row path returns it as the error
+      // so the existing surfaces render it inline.
+      return { success: false, reset: 0, refused: refusedIds.size, error: refusals[0] ?? 'Nothing to retry' }
+    }
+
     const result = await db.accountingSyncLog.updateMany({
-      where,
+      where: { id: { in: allowedIds }, connector: 'xero', status: 'FAILED' },
       data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
     })
     await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_retry_failed',
       tag: 'sync',
-      description: `Reset ${result.count} failed Xero sync entry/entries for retry`,
+      description: `Reset ${result.count} failed Xero sync entry/entries for retry`
+        + (refusedIds.size > 0 ? `; refused ${refusedIds.size} needing manual reconciliation` : ''),
     })
     revalidatePath('/sync')
-    return { success: true, reset: result.count }
+    return { success: true, reset: result.count, ...(refusedIds.size > 0 ? { refused: refusedIds.size } : {}) }
   } catch (e) {
     return { success: false, reset: 0, error: String(e) }
   }
