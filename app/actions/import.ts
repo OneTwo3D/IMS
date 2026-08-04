@@ -245,7 +245,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
   const supplierIdByName = new Map(suppliers.map((supplier) => [supplier.name.trim().toLocaleLowerCase('en-US'), supplier.id]))
 
   // Track rows with components to process in second pass
-  const componentRows: { lineNum: number; sku: string; components: string }[] = []
+  // o3d-w998: the immutable product id is captured AT ENQUEUE, not resolved from `skuToId`
+  // during pass 2. That map is mutated by every rename in pass 1, so a SKU freed by one row
+  // and reassigned to a different product by a later row resolved to the WRONG product —
+  // which then passed both the sku and type checks, and had its component list replaced.
+  const componentRows: { lineNum: number; sku: string; productId: string; components: string }[] = []
   const touchedProducts: Array<{ id: string; lifecycleStatus: ProductLifecycleStatus }> = []
   const categoryIdCache = new Map<string, string>()
   type ProductCategoryResolverClient = Pick<Prisma.TransactionClient, 'productCategory'> | Pick<typeof db, 'productCategory'>
@@ -701,7 +705,10 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
       // row only to reject it later with a conflict the operator did not cause (o3d-w998).
       const committedType = productById.get(skuToId.get(sku) ?? '')?.type ?? type
       if (componentsStr && COMPONENT_BEARING_TYPES.has(committedType)) {
-        componentRows.push({ lineNum, sku, components: componentsStr })
+        const componentProductId = skuToId.get(sku)
+        if (componentProductId) {
+          componentRows.push({ lineNum, sku, productId: componentProductId, components: componentsStr })
+        }
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -712,8 +719,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
   // Pass 2: Set up components for KIT/BOM products
   for (const cr of componentRows) {
-    const productId = skuToId.get(cr.sku)
-    if (!productId) continue
+    const productId = cr.productId
 
     // Parse "SKU1:qty;SKU2:qty" format
     const parts = cr.components.split(';').map((s) => s.trim()).filter(Boolean)

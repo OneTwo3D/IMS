@@ -130,3 +130,24 @@ test('the lifecycle write guard cannot be satisfied by an invalid cell alone (o3
   assert.equal(writes('BOGUS', false, true), true, 'an explicit active column still writes')
   assert.equal(writes(null, true, false), false, 'no cell and no active column writes nothing')
 })
+
+test('the component pass addresses the product it QUEUED, not whatever holds the sku (o3d-w998)', async () => {
+  // Codex: `skuToId` is mutated by every rename in pass 1, so resolving the id during pass 2
+  // could land on a different product entirely. Row 1 renames P to B and queues components;
+  // row 2 renames P again to C; row 3 assigns the now-free B to KIT Q. Pass 2 resolved B to
+  // Q, locked B, and Q passed BOTH the sku and type checks — so P's component list replaced
+  // Q's. The sku check cannot catch it, because the sku genuinely belongs to Q by then.
+  const src = await source()
+
+  assert.match(
+    src,
+    /componentRows: \{ lineNum: number; sku: string; productId: string; components: string \}\[\]/,
+    'the queue must carry the immutable product id',
+  )
+  assert.match(src, /componentRows\.push\(\{ lineNum, sku, productId: componentProductId/, 'the id must be captured at enqueue')
+  assert.match(src, /const productId = cr\.productId/, 'pass 2 must use the queued id')
+  assert.ok(
+    !/for \(const cr of componentRows\) \{\s*\n\s*const productId = skuToId\.get\(cr\.sku\)/.test(src),
+    'pass 2 must not re-resolve the id through the mutable skuToId map',
+  )
+})
