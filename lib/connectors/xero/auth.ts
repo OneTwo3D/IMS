@@ -7,6 +7,7 @@
  */
 
 import { db } from '@/lib/db'
+import { assertTenantAllowed } from '@/lib/connectors/accounting-tenant-guard'
 import { logActivity } from '@/lib/activity-log'
 import { setAuthToken, consumeAuthToken } from '@/lib/auth/token-store'
 import { notify } from '@/lib/notifications'
@@ -112,6 +113,13 @@ async function upsertStoredToken(params: {
   tenantName: string | null
   grantedScopes: string | null
 }): Promise<void> {
+  // o3d-iaqy: refuse to PERSIST a token for an organisation this instance may not use. The
+  // call-boundary guard would stop the requests anyway, but only after the operator had already
+  // bound the wrong organisation and walked away believing it worked. Also covers token
+  // REFRESH, so an allowlist tightened after connection takes effect at the next refresh
+  // rather than leaving a live binding in place.
+  assertTenantAllowed({ connector: 'xero', tenantId: params.tenantId })
+
   const data = {
     connector: XERO_CONNECTOR,
     accessToken: encryptSecret(params.accessToken),

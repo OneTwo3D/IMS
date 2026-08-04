@@ -4,6 +4,7 @@
 
 import { getAccessToken } from './auth'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { assertTenantAllowed } from '@/lib/connectors/accounting-tenant-guard'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
 const XERO_MAX_RETRIES = 3
@@ -264,6 +265,13 @@ async function xeroFetchWithAuth<T = unknown>(
   body?: unknown,
   opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
 ): Promise<XeroResponse<T>> {
+  // o3d-iaqy: the LAST point before the request leaves. Checked here rather than in the sync
+  // processors because every path — invoices, payments, the repair sweep, both pollers,
+  // reference-data reads — funnels through this one function, and a guard that covers all of
+  // them cannot be bypassed by a caller nobody remembered to update.
+
+  assertTenantAllowed({ connector: 'xero', tenantId: auth.tenantId })
+
   const url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
 
   const headers: Record<string, string> = {

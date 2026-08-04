@@ -6,6 +6,7 @@
  */
 
 import { db } from '@/lib/db'
+import { assertTenantAllowed } from '@/lib/connectors/accounting-tenant-guard'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getAccessToken } from './auth'
 import { getQuickBooksSettings } from './settings'
@@ -82,6 +83,10 @@ async function getBaseUrl(): Promise<string> {
 }
 
 function buildUrl(baseUrl: string, realmId: string, path: string): string {
+  // o3d-iaqy: the realm is stamped into the URL here, so this is the one place every QuickBooks
+  // request — writes, the pollers, reference reads — must pass through. Guarding here cannot be
+  // bypassed by a caller nobody remembered to update.
+  assertTenantAllowed({ connector: 'quickbooks', tenantId: realmId })
   const separator = path.includes('?') ? '&' : '?'
   return `${baseUrl}/${realmId}/${path}${separator}minorversion=${QBO_MINOR_VERSION}`
 }
