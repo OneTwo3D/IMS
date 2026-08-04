@@ -394,6 +394,10 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
         id: row.id,
         payload: row.payload,
         effectiveToken: effectiveTokenFor('quickbooks', row),
+        // Threaded through so the planner can tell an UNRESOLVED sibling from a settled one.
+        // Selected but discarded previously, which is how CANCELLED and SYNCED rows came to
+        // strand legitimate payments.
+        status: row.status,
       }
       siblingsByScope.set(key, [...(siblingsByScope.get(key) ?? []), planned])
       siblingIdsByScope.set(key, [...(siblingIdsByScope.get(key) ?? []), row.id])
@@ -417,6 +421,7 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
           id: candidate.id,
           payload: candidate.payload,
           effectiveToken: effectiveTokenFor('quickbooks', candidate),
+          status: 'FAILED', // the candidate query selects only FAILED rows
         },
         siblings: rows,
       })

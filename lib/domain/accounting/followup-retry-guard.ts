@@ -29,16 +29,7 @@ import {
  * So the refusal is narrow by construction: money-moving, same target document, more than one
  * distinct token.
  *
- * THE ONE FALSE REFUSAL THIS ACCEPTS, stated plainly because it is a real cost and not a
- * theoretical one: a PART-PAYMENT history. Two genuine payments against one invoice under
- * different tokens -- the first SYNCED, the second FAILED -- look exactly like one payment
- * attempted twice. Both are ordinary. Nothing in the rows distinguishes them, so the retry is
- * refused and the second payment has to be posted in the accounting system by hand.
- *
- * That direction is chosen deliberately. A refusal is recoverable by a human who can see the
- * invoice; a duplicate payment is a financial error someone has to find first. The refusal
- * message therefore names this case explicitly rather than only warning about duplication, so
- * an operator who hits it knows immediately what to check.
+ * Ambiguity means UNRESOLVED outcomes, not merely several rows -- see UNRESOLVED_STATUSES.
  */
 
 export type RetryCandidateRow = {
@@ -46,6 +37,44 @@ export type RetryCandidateRow = {
   /** The token this row's attempt actually posted under, as its own connector derives it. */
   effectiveToken: string
   payload: unknown
+  /** Sync status. Absent is treated as UNRESOLVED, which is the conservative reading. */
+  status?: string | null
+}
+
+/**
+ * Statuses whose remote OUTCOME IS UNKNOWN, and the only ones that create ambiguity.
+ *
+ *   FAILED      — may have posted before the failure was recorded.
+ *   PENDING     — has not been attempted, but will be.
+ *   PROCESSING  — may be mid-flight right now.
+ *
+ * Deliberately NOT here:
+ *
+ *   CANCELLED — proven never attempted. Counting it permanently blocked a corrected row: a
+ *     receipt deleted while still PENDING is safely cancelled without ever reaching the
+ *     connector, yet its complete payload and distinct token refused its replacement forever
+ *     (Codex review).
+ *
+ *   SYNCED — its outcome is KNOWN, so it is not ambiguity. This is a reversal of an earlier
+ *     revision that counted it as "the strongest evidence available", and the reversal matters:
+ *
+ *       - retrying a FAILED row preserves its row id and payload, so it re-posts under ITS OWN
+ *         token. If that token already reached the ledger the remote deduplicates. A sibling's
+ *         success says nothing about whether THIS token posted;
+ *       - counting it stranded two ordinary flows permanently, through the only manual route
+ *         there is: a PART-PAYMENT history (two genuine payments against one invoice), and a
+ *         payment that was reversed in the ledger and legitimately re-posted, where the stale
+ *         SYNCED row blocks its own replacement forever (Codex review).
+ *
+ *     What it cannot distinguish is a SYNCED row that is the same logical payment re-created
+ *     under a new token. In that situation the original FAILED row should be resolved rather
+ *     than retried — and unlike the cases above, that one is visible to a human looking at the
+ *     document.
+ */
+const UNRESOLVED_STATUSES = new Set(['FAILED', 'PENDING', 'PROCESSING'])
+
+function outcomeIsUnknown(status: string | null | undefined): boolean {
+  return status === null || status === undefined || UNRESOLVED_STATUSES.has(status)
 }
 
 export type ManualRetryPlan =
@@ -161,6 +190,10 @@ export function planManualRetry(params: {
   if (!isMoneyMovingSyncType(type)) return { action: 'allow' }
 
   const contenders = siblings
+    // Only rows whose outcome is UNKNOWN create ambiguity. A CANCELLED row never posted and a
+    // SYNCED row's fate is settled -- neither says anything about whether THIS row's token
+    // reached the ledger, and counting them stranded legitimate payments permanently.
+    .filter((row) => outcomeIsUnknown(row.status))
     // A sibling missing a field its connector requires was rejected BEFORE any HTTP call, so it
     // cannot have committed anything and must not make a valid payment un-retryable. Without
     // this, one malformed row permanently strands the good one through the only manual route
@@ -173,11 +206,10 @@ export function planManualRetry(params: {
   return {
     action: 'refuse',
     tokenCount: tokens.size,
-    reason: `${tokens.size} attempts for ${reference} were made under different idempotency keys. `
-      + 'Any one of them may have reached the ledger, so retrying could duplicate a payment. '
-      + 'Check the ledger for an existing payment against this document — if the outstanding '
-      + 'amount is genuinely still due (a part-payment, for example), post it there and resolve '
-      + 'these rows manually.',
+    reason: `${tokens.size} unresolved attempts for ${reference} were made under different `
+      + 'idempotency keys. Any one of them may have reached the ledger, so retrying could '
+      + 'duplicate a payment. Check the ledger for an existing payment against this document, '
+      + 'then resolve these rows manually.',
   }
 }
 

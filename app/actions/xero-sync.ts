@@ -517,6 +517,10 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
         id: row.id,
         payload: row.payload,
         effectiveToken: effectiveTokenFor('xero', row),
+        // Threaded through so the planner can tell an UNRESOLVED sibling from a settled one.
+        // Selected but discarded previously, which is how CANCELLED and SYNCED rows came to
+        // strand legitimate payments.
+        status: row.status,
       }
       siblingsByScope.set(key, [...(siblingsByScope.get(key) ?? []), planned])
       siblingIdsByScope.set(key, [...(siblingIdsByScope.get(key) ?? []), row.id])
@@ -540,6 +544,7 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
           id: candidate.id,
           payload: candidate.payload,
           effectiveToken: effectiveTokenFor('xero', candidate),
+          status: 'FAILED', // the candidate query selects only FAILED rows
         },
         siblings: rows,
       })

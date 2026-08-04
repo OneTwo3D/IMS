@@ -360,23 +360,70 @@ test('a partial refusal is not reported as plain success (o3d-0m56)', async () =
   }
 })
 
-test('a part-payment history IS refused, and the message says what to check (o3d-0m56)', async () => {
-  // The one false refusal this design accepts, and it is real rather than theoretical. Two
-  // genuine payments against one invoice under different tokens -- the first SYNCED, the second
-  // FAILED -- are indistinguishable from one payment attempted twice. Both are ordinary.
-  //
-  // Chosen deliberately: a refusal is recoverable by a human who can see the invoice, while a
-  // duplicate payment is a financial error someone has to find first. Pinned as a test so the
-  // trade-off cannot be reversed silently by someone who reads it as a bug.
-  const rows = [
-    { id: 'log-paid', effectiveToken: 'log-paid', payload: postable('inv-9') },
-    { id: 'log-second', effectiveToken: 'log-second', payload: postable('inv-9') },
-  ]
-  const plan = planManualRetry({ ...scopeArgs, target: rows[1]!, siblings: rows })
+test('a settled sibling does not create ambiguity (o3d-0m56)', () => {
+  // Reversal of an earlier revision that counted SYNCED rows as "the strongest evidence
+  // available". Its outcome is KNOWN, so it is not ambiguity -- and retrying a FAILED row
+  // re-posts under ITS OWN token, which the remote deduplicates if it already landed. Counting
+  // it stranded two ordinary flows permanently, through the only manual route there is.
+  const paid = { id: 'log-paid', effectiveToken: 'log-paid', payload: postable('inv-9'), status: 'SYNCED' }
+  const failed = { id: 'log-second', effectiveToken: 'log-second', payload: postable('inv-9'), status: 'FAILED' }
 
-  assert.equal(plan.action, 'refuse')
-  assert.ok(plan.action === 'refuse')
-  assert.match(plan.reason, /part-payment/, 'the message must name the likely innocent explanation')
-  assert.match(plan.reason, /Check the ledger/, 'and tell the operator what to look at')
-  assert.match(plan.reason, /resolve these rows manually/, 'and how to get out of it')
+  // (a) A PART-PAYMENT history: two genuine payments against one invoice.
+  assert.deepEqual(
+    planManualRetry({ ...scopeArgs, target: failed, siblings: [paid, failed] }),
+    { action: 'allow' },
+    'a second genuine payment must stay retryable',
+  )
+
+  // (b) A payment REVERSED in the ledger and legitimately re-posted: the stale SYNCED row would
+  // otherwise block its own replacement forever.
+  const reposted = { id: 'log-repost', effectiveToken: 'log-repost', payload: postable('bill-1'), status: 'FAILED' }
+  const reversed = { id: 'log-old', effectiveToken: 'log-old', payload: postable('bill-1'), status: 'SYNCED' }
+  assert.deepEqual(
+    planManualRetry({ type: 'BILL_PAYMENT', reference: 'PurchaseInvoice pi-1', target: reposted, siblings: [reversed, reposted] }),
+    { action: 'allow' },
+  )
 })
+
+test('a CANCELLED sibling proves it never posted (o3d-0m56)', () => {
+  // A receipt deleted while still PENDING is safely cancelled without ever reaching the
+  // connector. Its complete payload and distinct token refused its replacement forever.
+  const cancelled = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'CANCELLED' }
+  const corrected = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
+  assert.deepEqual(
+    planManualRetry({ ...scopeArgs, target: corrected, siblings: [cancelled, corrected] }),
+    { action: 'allow' },
+  )
+})
+
+test('an in-flight sibling DOES create ambiguity (o3d-0m56)', () => {
+  // The direction that must keep refusing. A PENDING or PROCESSING row has not failed yet: it
+  // can post and land in FAILED between the snapshot and the reset, which is exactly the race
+  // that motivated reading every status in the first place.
+  for (const status of ['PENDING', 'PROCESSING', 'FAILED']) {
+    const inflight = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status }
+    const target = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
+    assert.equal(
+      planManualRetry({ ...scopeArgs, target, siblings: [inflight, target] }).action,
+      'refuse',
+      `an ${status} sibling under a different token is unresolved, so it counts`,
+    )
+  }
+
+  // An unknown/absent status is read conservatively as unresolved.
+  const unknown = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9') }
+  const target = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
+  assert.equal(planManualRetry({ ...scopeArgs, target, siblings: [unknown, target] }).action, 'refuse')
+})
+
+for (const action of ACTIONS) {
+  test(`${action.name}: sibling status is threaded to the planner (o3d-0m56)`, async () => {
+    // It was selected and then discarded, which is how CANCELLED and SYNCED rows came to strand
+    // legitimate payments.
+    const source = await readFile(path.join(process.cwd(), action.file), 'utf8')
+    const at = source.indexOf('const planned: RetryCandidateRow')
+    assert.notEqual(at, -1, 'sibling rows must be mapped once into planner rows')
+    assert.match(source.slice(at, at + 600), /status: row\.status/, 'status must reach the planner')
+    assert.match(source, /payload: true, status: true/, 'and be selected in the first place')
+  })
+}
