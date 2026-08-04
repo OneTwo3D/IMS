@@ -652,11 +652,30 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               // WooCommerce import or a manual create landing in between raised a P2002 that
               // aborted the row — and, inside an interactive transaction, the transaction
               // with it (o3d-md4q).
-              await lockProductSkusForWrite(tx, [sku])
+              // o3d-1a84: the PARENT's sku too. The structure validation above ran before this
+              // transaction and only the new child was locked, so the WooCommerce sync could
+              // change the parent from VARIABLE to SIMPLE in between and this would commit a
+              // child pointing at a parent that can no longer have children. Both skus go
+              // through the one helper so they are acquired in the single ascending id order.
+              const parentIdToWrite = structureValidation.normalizedParentId
+              const parentSkuToLock = parentIdToWrite ? productById.get(parentIdToWrite)?.sku ?? null : null
+              await lockProductSkusForWrite(tx, parentSkuToLock ? [sku, parentSkuToLock] : [sku])
+
               const taken = await tx.product.findUnique({ where: { sku }, select: { id: true } })
               // Returned, not thrown: this loop has no per-row catch, so a throw would abort
               // the whole import over one contended row.
               if (taken) return null
+
+              if (parentIdToWrite) {
+                const parent = await tx.product.findUnique({
+                  where: { id: parentIdToWrite },
+                  select: { sku: true, type: true },
+                })
+                // The lock set was chosen from a pre-transaction snapshot of the parent, so a
+                // rename since then means we hold the lock for a sku it no longer has.
+                if (!parent || parent.sku !== parentSkuToLock) return 'parent-moved' as const
+                if (parent.type !== ProductType.VARIABLE) return 'parent-not-variable' as const
+              }
 
               const createCategoryId = await resolveImportedCategoryId(categoryName, tx)
               return tx.product.create({
@@ -667,6 +686,15 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 },
               })
             })
+        if (created === 'parent-moved' || created === 'parent-not-variable') {
+          result.errors.push(
+            created === 'parent-not-variable'
+              ? `Row ${lineNum} (${sku}): its parent stopped being a variable product while the import was running — not created`
+              : `Row ${lineNum} (${sku}): its parent was renamed while the import was running — re-run to pick it up`,
+          )
+          result.skipped++
+          continue
+        }
         if (!created) {
           result.errors.push(
             `Row ${lineNum} (${sku}): another writer created this SKU while the import was running — re-run to pick it up`,

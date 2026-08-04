@@ -176,12 +176,14 @@ test('the CSV import skips a contended row instead of aborting the run (o3d-42hw
   // This loop has no per-row catch, so a throw would discard every remaining row over one
   // contended SKU.
   const source = await readFile(IMPORT_ACTIONS, 'utf8')
-  // The CREATE site specifically. The bare helper name matches the import statement at the
-  // top of the file, and `(tx,` now matches the RENAME site first — both windowed the wrong
-  // region and asserted nothing about the create.
-  const lockAt = source.indexOf('lockProductSkusForWrite(tx, [sku])')
-  assert.notEqual(lockAt, -1, 'the CSV create must take the write lock')
-  const body = source.slice(lockAt, lockAt + 600)
+  // The CREATE site specifically. The bare helper name matches the import statement at the top
+  // of the file, and `(tx,` matches the RENAME site first — both windowed the wrong region.
+  // Anchored on a marker unique to the create branch rather than on the lock call's exact
+  // argument list, which o3d-1a84 changed when it added the parent sku.
+  const lockAt = source.indexOf('const parentIdToWrite = structureValidation.normalizedParentId')
+  assert.notEqual(lockAt, -1, 'the CSV create must still resolve the parent it writes')
+  const body = source.slice(lockAt, lockAt + 1600)
+  assert.match(body, /lockProductSkusForWrite\(tx,/, 'the CSV create must take the write lock')
   assert.match(body, /if \(taken\) return null/, 'a contended row must return, not throw')
   assert.match(
     source,
