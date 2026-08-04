@@ -285,3 +285,77 @@ for (const action of ACTIONS) {
     assert.match(body, /target: \{\s*id: candidate\.id/, 'the candidate must be the plan target, not an arbitrary sibling')
   })
 }
+
+for (const action of ACTIONS) {
+  test(`${action.name}: the sibling snapshot reads EVERY status, not just FAILED (o3d-0m56)`, async () => {
+    // Restricting it to FAILED made the guard blind in both directions:
+    //   - a PENDING/PROCESSING sibling under a different token has not failed YET; it can post
+    //     and land in FAILED after the read but before the reset, so the retry proceeds against
+    //     a snapshot that never showed it;
+    //   - a SYNCED sibling under a different token is the strongest evidence available -- that
+    //     token demonstrably reached the ledger.
+    const source = await readFile(path.join(process.cwd(), action.file), 'utf8')
+    const at = source.indexOf('const siblingRows = await db.accountingSyncLog.findMany')
+    assert.notEqual(at, -1, 'the sibling snapshot must still exist')
+    const query = source.slice(at, source.indexOf('})', source.indexOf('select:', at)))
+
+    assert.ok(
+      !/status:\s*'FAILED'/.test(query),
+      'the sibling snapshot must NOT filter on status — an in-flight or already-synced sibling counts',
+    )
+    assert.match(query, /connector: '(xero|quickbooks)'/, 'it must still be scoped to the connector')
+
+    // The reset itself must stay narrow: only FAILED rows may be re-queued.
+    const update = source.slice(source.indexOf('await db.accountingSyncLog.updateMany'))
+    assert.match(update.slice(0, 400), /status: 'FAILED'/, 'the UPDATE must still only touch FAILED rows')
+  })
+
+  test(`${action.name}: the scope filter is deduplicated (o3d-0m56)`, async () => {
+    // "Retry All" over hundreds of rows in a handful of scopes built one OR arm per candidate.
+    const source = await readFile(path.join(process.cwd(), action.file), 'utf8')
+    const at = source.indexOf('const siblingRows = await db.accountingSyncLog.findMany')
+    const query = source.slice(at, at + 700)
+    assert.match(query, /OR: \[\.\.\.scopes\.values\(\)\]\.map/, 'the OR must be built from deduplicated scopes')
+    assert.ok(!/OR: candidates\.map/.test(query), 'not one arm per candidate')
+  })
+
+  test(`${action.name}: refusals are logged once per scope, not once per row (o3d-0m56)`, async () => {
+    // One sequential activityLog.create per refused candidate produced N near-duplicate
+    // warnings before any allowed row was reset.
+    const source = await readFile(path.join(process.cwd(), action.file), 'utf8')
+    const at = source.indexOf('const refusedIds')
+    const body = source.slice(at, source.indexOf('const allowedIds', at))
+    assert.match(body, /for \(const \[key, entry\] of refusedByScope\)/, 'the log must be emitted per scope')
+    const loopAt = body.indexOf('for (const candidate of candidates)')
+    const logAt = body.indexOf('await logActivity')
+    assert.ok(loopAt !== -1 && logAt !== -1 && logAt > body.indexOf('for (const [key, entry]'),
+      'no logActivity inside the per-candidate loop')
+  })
+
+  test(`${action.name}: the surfaced reason does not depend on candidate order (o3d-0m56)`, async () => {
+    // The DECISION never did, but refusals[0] made the displayed MESSAGE order-dependent when
+    // several scopes were all refused.
+    const source = await readFile(path.join(process.cwd(), action.file), 'utf8')
+    assert.match(source, /\[\.\.\.refusals\]\.sort\(\)\[0\]/, 'the reason must be chosen deterministically')
+    assert.ok(!/error: refusals\[0\]/.test(source), 'not the arbitrary first refusal')
+  })
+}
+
+test('a partial refusal is not reported as plain success (o3d-0m56)', async () => {
+  // The guard can allow SOME rows and refuse others in one call. Every wrapper between the
+  // action and the UI dropped `refused`, so "Retry All" rendered "Reset N" while the refused
+  // rows silently stayed FAILED.
+  const files = {
+    'lib/connectors/accounting-registry.ts': /retryFailedSync\(entryId\?: string\): Promise<\{[^}]*refused\?: number/,
+    'app/actions/accounting-sync.ts': /retryFailedAccountingSync\([^)]*\): Promise<\{[^}]*refused\?: number/,
+  }
+  for (const [file, pattern] of Object.entries(files)) {
+    const source = await readFile(path.join(process.cwd(), file), 'utf8')
+    assert.match(source, pattern, `${file} must carry refused through`)
+  }
+  for (const file of ['app/(dashboard)/sync/xero-client.tsx', 'app/(dashboard)/sync/failed-sync-banner.tsx']) {
+    const source = await readFile(path.join(process.cwd(), file), 'utf8')
+    assert.match(source, /result\.refused|res\.refused/, `${file} must render the refused count`)
+    assert.match(source, /could duplicate a payment/, `${file} must say WHY they were not re-queued`)
+  }
+})

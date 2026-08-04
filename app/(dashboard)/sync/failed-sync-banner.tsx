@@ -31,7 +31,14 @@ export function FailedSyncBanner({ summary }: { summary: FailedAccountingSyncSum
     startTransition(async () => {
       const res = await retryFailedAccountingSync()
       if (res.success) {
-        setMessage(`Re-queued ${res.reset} failed row(s) — they will retry on the next sync.`)
+        // A partial refusal must not read as plain success: the guard can allow some rows and
+        // refuse others in one call, and the refused ones stay FAILED (o3d-0m56).
+        setMessage(
+          res.refused
+            ? `Re-queued ${res.reset} failed row(s). ${res.refused} row(s) were NOT re-queued because `
+              + 'retrying them could duplicate a payment — reconcile them in the accounting system.'
+            : `Re-queued ${res.reset} failed row(s) — they will retry on the next sync.`,
+        )
         router.refresh()
       } else {
         setMessage(res.error ?? 'Failed to re-queue the failed rows.')

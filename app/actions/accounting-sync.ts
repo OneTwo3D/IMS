@@ -426,7 +426,7 @@ export async function triggerAccountingSync(): Promise<{ success: boolean; resul
   return (connector ?? getAccountingConnector('xero')).triggerSync()
 }
 
-export async function retryFailedAccountingSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
+export async function retryFailedAccountingSync(entryId?: string): Promise<{ success: boolean; reset: number; refused?: number; error?: string }> {
   const connector = await getActiveAccountingConnector()
   return (connector ?? getAccountingConnector('xero')).retryFailedSync(entryId)
 }

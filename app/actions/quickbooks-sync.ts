@@ -4,7 +4,7 @@ import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { effectiveTokenFor, planManualRetry } from '@/lib/domain/accounting/followup-retry-guard'
+import { effectiveTokenFor, planManualRetry, type RetryCandidateRow } from '@/lib/domain/accounting/followup-retry-guard'
 import {
   getAuthorizationUrl,
   disconnect,
@@ -351,26 +351,52 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
 
     const scopeKey = (row: { type: string; referenceType: string; referenceId: string }) =>
       `${row.type}\u0000${row.referenceType}\u0000${row.referenceId}`
-    const scopes = [...new Set(candidates.map(scopeKey))]
+    // Deduplicated by key but carrying the ORIGINAL typed row, so the Prisma filter keeps its
+    // enum types rather than being rebuilt from split strings.
+    const scopes = new Map<string, (typeof candidates)[number]>()
+    for (const row of candidates) if (!scopes.has(scopeKey(row))) scopes.set(scopeKey(row), row)
 
-    // Every FAILED row in each touched scope, not just the ones selected — a single-row retry
-    // is only ambiguous relative to its SIBLINGS, which the id filter above excludes.
+    // Every row in each touched scope, at ANY status — not just FAILED, and not just the ones
+    // selected. A single-row retry is only ambiguous relative to its SIBLINGS, which the id
+    // filter above excludes; and restricting the snapshot to FAILED made the guard blind in
+    // both directions (Codex review):
+    //
+    //   - a PENDING or PROCESSING sibling under a different token has not failed YET. It can
+    //     post remotely and land in FAILED after this read but before the reset below, so the
+    //     retry proceeds against a snapshot that never showed it. An in-flight attempt is if
+    //     anything MORE dangerous than a failed one, since it may still be mid-flight.
+    //   - a SYNCED sibling under a different token is the strongest evidence available: that
+    //     token demonstrably reached the ledger. Ignoring it was the clearest possible miss.
+    //
+    // Reading every status closes both. This is a snapshot, not a lock, so it narrows the
+    // window rather than eliminating it — the remaining exposure is a sibling created entirely
+    // after this read, which no read-then-write can exclude without serialising the queue.
     const siblingRows = await db.accountingSyncLog.findMany({
       where: {
         connector: 'quickbooks',
-        status: 'FAILED',
-        OR: candidates.map((row) => ({
+        // Deduplicated: one arm per SCOPE, not one per candidate. "Retry All" over hundreds of
+        // rows in a handful of scopes built a needlessly enormous OR.
+        OR: [...scopes.values()].map((row) => ({
           type: row.type,
           referenceType: row.referenceType,
           referenceId: row.referenceId,
         })),
       },
-      select: { id: true, type: true, referenceType: true, referenceId: true, payload: true },
+      select: { id: true, type: true, referenceType: true, referenceId: true, payload: true, status: true },
     })
-    const siblingsByScope = new Map<string, typeof siblingRows>()
+    // Mapped ONCE per row rather than once per candidate: a scope with hundreds of rows made
+    // the per-candidate loop quadratic in token derivation (Codex review).
+    const siblingsByScope = new Map<string, RetryCandidateRow[]>()
+    const siblingIdsByScope = new Map<string, string[]>()
     for (const row of siblingRows) {
       const key = scopeKey(row)
-      siblingsByScope.set(key, [...(siblingsByScope.get(key) ?? []), row])
+      const planned: RetryCandidateRow = {
+        id: row.id,
+        payload: row.payload,
+        effectiveToken: effectiveTokenFor('quickbooks', row),
+      }
+      siblingsByScope.set(key, [...(siblingsByScope.get(key) ?? []), planned])
+      siblingIdsByScope.set(key, [...(siblingIdsByScope.get(key) ?? []), row.id])
     }
 
     // Planned PER CANDIDATE, against that candidate's own siblings. An earlier revision
@@ -381,6 +407,7 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
     // ordering, and refuses exactly the row it judged.
     const refusedIds = new Set<string>()
     const refusals: string[] = []
+    const refusedByScope = new Map<string, { reason: string; tokenCount: number; ids: string[] }>()
     for (const candidate of candidates) {
       const rows = siblingsByScope.get(scopeKey(candidate)) ?? []
       const plan = planManualRetry({
@@ -391,31 +418,49 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
           payload: candidate.payload,
           effectiveToken: effectiveTokenFor('quickbooks', candidate),
         },
-        siblings: rows.map((row) => ({
-          id: row.id,
-          payload: row.payload,
-          effectiveToken: effectiveTokenFor('quickbooks', row),
-        })),
+        siblings: rows,
       })
       if (plan.action === 'refuse') {
         refusedIds.add(candidate.id)
         if (!refusals.includes(plan.reason)) refusals.push(plan.reason)
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: 'quickbooks_manual_retry_refused',
-          tag: 'sync',
-          level: 'WARNING',
-          description: plan.reason,
-          metadata: { syncLogId: candidate.id, siblingIds: rows.map((row) => row.id), tokenCount: plan.tokenCount },
+        // Collected, then logged ONCE PER SCOPE below. One sequential write per refused
+        // candidate produced N near-duplicate warnings before any allowed row was reset.
+        const key = scopeKey(candidate)
+        refusedByScope.set(key, {
+          reason: plan.reason,
+          tokenCount: plan.tokenCount,
+          ids: [...(refusedByScope.get(key)?.ids ?? []), candidate.id],
         })
       }
+    }
+
+    for (const [key, entry] of refusedByScope) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'quickbooks_manual_retry_refused',
+        tag: 'sync',
+        level: 'WARNING',
+        description: entry.reason,
+        metadata: {
+          syncLogIds: entry.ids,
+          siblingIds: siblingIdsByScope.get(key) ?? [],
+          tokenCount: entry.tokenCount,
+        },
+      })
     }
 
     const allowedIds = candidates.map((row) => row.id).filter((id) => !refusedIds.has(id))
     if (allowedIds.length === 0) {
       // Nothing to do and a reason worth showing: the single-row path returns it as the error
       // so the existing surfaces render it inline.
-      return { success: false, reset: 0, refused: refusedIds.size, error: refusals[0] ?? 'Nothing to retry' }
+      // Sorted so the surfaced reason does not depend on candidate order — the decision never
+      // did, but the MESSAGE did when several scopes were all refused (Codex review).
+      return {
+        success: false,
+        reset: 0,
+        refused: refusedIds.size,
+        error: [...refusals].sort()[0] ?? 'Nothing to retry',
+      }
     }
 
     const result = await db.accountingSyncLog.updateMany({

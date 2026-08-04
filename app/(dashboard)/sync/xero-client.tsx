@@ -398,7 +398,15 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     const result = await retryFailedAccountingSync()
     setRetryingAll(false)
     if (result.success) {
-      setRetryMsg(`Reset ${result.reset} failed entry/entries for retry.`)
+      // "Retry All" is the worst case for the o3d-0m56 guard — it can allow some rows and
+      // refuse others in one call. Reporting only the reset count made a partial refusal read
+      // as a clean success, and the refused rows silently stayed FAILED.
+      setRetryMsg(
+        result.refused
+          ? `Reset ${result.reset} failed entry/entries. ${result.refused} were NOT reset because `
+            + 'retrying them could duplicate a payment — reconcile them in the accounting system.'
+          : `Reset ${result.reset} failed entry/entries for retry.`,
+      )
       router.refresh()
     } else {
       setRetryMsg(`Retry failed: ${result.error}`)

@@ -99,7 +99,12 @@ export type AccountingConnector = AccountingConnectorDef & {
   ): Promise<MissingTaxRateGenerateResult>
   getSyncLogs(limit?: number): Promise<AccountingSyncLogRow[]>
   triggerSync(): Promise<{ success: boolean; result?: unknown; error?: string }>
-  retryFailedSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }>
+  /**
+   * `refused` is part of the contract, not an optional extra: the guard can allow SOME rows
+   * and refuse others in one call, and a caller that drops it reports partial success as plain
+   * success (o3d-0m56).
+   */
+  retryFailedSync(entryId?: string): Promise<{ success: boolean; reset: number; refused?: number; error?: string }>
   getSyncReadiness(): Promise<AccountingSyncReadiness>
 }
 
