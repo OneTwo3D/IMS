@@ -151,3 +151,44 @@ test('the component pass addresses the product it QUEUED, not whatever holds the
     'pass 2 must not re-resolve the id through the mutable skuToId map',
   )
 })
+
+test('the CSV create locks the PARENT too, and re-reads it under the lock (o3d-1a84)', async () => {
+  // o3d-w998 recorded that the pre-lock structure validation could only cause a false SKIP.
+  // That holds for UPDATES, which re-validate under the lock — but NOT for creates: the parent
+  // was validated before the transaction and only the new child was locked, so the WooCommerce
+  // sync could change the parent VARIABLE -> SIMPLE in between and this committed a child
+  // pointing at a parent that can no longer have children.
+  const src = await source()
+  const at = src.indexOf('const parentIdToWrite = structureValidation.normalizedParentId')
+  assert.notEqual(at, -1, 'the create must resolve the parent it is about to write')
+  const body = src.slice(at, at + 1600)
+
+  // Both skus through the ONE helper, so they are acquired in the single ascending id order
+  // rather than as two independent acquisitions that could deadlock.
+  assert.match(
+    body,
+    /lockProductSkusForWrite\(tx, parentSkuToLock \? \[sku, parentSkuToLock\] : \[sku\]\)/,
+    'the parent sku must be locked alongside the child, via the same helper',
+  )
+
+  const lockAt = body.indexOf('lockProductSkusForWrite')
+  const parentReadAt = body.indexOf('where: { id: parentIdToWrite }')
+  const typeAt = body.indexOf('parent.type !== ProductType.VARIABLE')
+  assert.ok([lockAt, parentReadAt, typeAt].every((i) => i !== -1), 'lock, parent re-read and type check must be present')
+  assert.ok(lockAt < parentReadAt, 'the lock must precede the parent re-read')
+  assert.ok(parentReadAt < typeAt, 'the type must come from the locked read')
+
+  // The lock set was chosen from a pre-transaction snapshot, so a rename invalidates it —
+  // the same verification every other writer in this protocol needs.
+  assert.match(body, /parent\.sku !== parentSkuToLock/, 'the chosen parent lock must be verified under the lock')
+})
+
+test('a parent that changed is reported per row, not thrown (o3d-1a84)', async () => {
+  const src = await source()
+  assert.match(src, /stopped being a variable product while the import was running/, 'the refusal must name what happened')
+  assert.match(src, /its parent was renamed while the import was running/, 'a lost parent lock set must be reported too')
+  // This loop has no per-row catch — a throw would discard every remaining row.
+  const at = src.indexOf('const parentIdToWrite = structureValidation.normalizedParentId')
+  const body = src.slice(at, at + 1600)
+  assert.match(body, /return 'parent-not-variable' as const/, 'it must return a decision rather than throwing')
+})
