@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { selectOrdersNeedingAllocation } from '@/lib/fulfillment/order-allocation-coverage'
@@ -196,9 +197,7 @@ async function warnEnteringFulfilmentShort(
  * is always reported.
  */
 export async function recordShortfallUnderLock(params: {
-  tx: Pick<typeof db, 'orderAllocation' | 'salesOrderRefundLine'> & {
-    salesOrder: { findUnique: (args: unknown) => Promise<unknown> }
-  }
+  tx: Prisma.TransactionClient
   orderId: string
   previousStatus: string
   targetStatus: string
@@ -223,6 +222,24 @@ export async function recordShortfallUnderLock(params: {
   const short = await selectOrdersNeedingAllocation([order], undefined, tx)
   if (short.length === 0) return { recorded: false }
 
-  await warnEnteringFulfilmentShort(order, `it crossed ${previousStatus} -> ${targetStatus} without full coverage`)
+  // Written through the TRANSACTION, not logActivity. logActivity swallows its own insert
+  // failures by design ("never break the caller"), so routing the authoritative record
+  // through it meant claiming recorded:true for a row that may never have been written
+  // (Codex review, r3). Inside the transaction the record and the crossing are one atomic
+  // fact: if it cannot be written, the transition does not happen either — which is exactly
+  // what "always recorded" has to mean to be worth anything.
+  await tx.activityLog.create({
+    data: {
+      entityType: 'SALES_ORDER',
+      entityId: order.id,
+      action: 'fulfilment_entry_under_allocated',
+      tag: 'sales',
+      level: 'WARNING',
+      description: `Order ${order.orderNumber ?? order.externalOrderNumber ?? order.id} crossed `
+        + `${previousStatus} -> ${targetStatus} without full allocation coverage. The periodic reallocation `
+        + 'sweep does not reach PICKING/PACKING, so the remainder will not be allocated automatically.',
+      metadata: { orderId: order.id, previousStatus, targetStatus },
+    },
+  })
   return { recorded: true }
 }

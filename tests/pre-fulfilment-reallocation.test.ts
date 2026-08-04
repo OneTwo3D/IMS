@@ -332,33 +332,64 @@ test('a status that moved under the allocator lock is reported as such (o3d-c9mi
 test('the under-lock recorder catches what the pre-lock attempt cannot (o3d-c9mi)', async () => {
   // The attempt must run outside the transition lock, so its inputs can be stale by the time
   // the transition commits — a source status read as PICKING, or coverage reduced afterwards
-  // by the rebalancer. Detection is cheap and CAN run under the lock, so it does.
+  // by the rebalancer. Detection CAN run under the lock, so it does.
   const { recordShortfallUnderLock } = await loadHelper()
   reset()
   seedOrder('o11')
   state.short.add('o11')
 
-  const tx = {
-    salesOrder: { findUnique: async () => state.orders.find((o) => o.id === 'o11') ?? null },
-  } as never
+  const written: Row[] = []
+  const txFor = (id: string) => ({
+    salesOrder: { findUnique: async () => state.orders.find((o) => o.id === id) ?? null },
+    activityLog: { create: async ({ data }: { data: Row }) => { written.push(data); return data } },
+  }) as never
 
-  // The real previous status, as observed under the lock, crosses into fulfilment.
   const crossed = await recordShortfallUnderLock({
-    tx, orderId: 'o11', previousStatus: 'ON_HOLD', targetStatus: 'PACKING',
+    tx: txFor('o11'), orderId: 'o11', previousStatus: 'ON_HOLD', targetStatus: 'PACKING',
   })
   assert.deepEqual(crossed, { recorded: true }, 'a short crossing must always be recorded')
-  assert.equal(state.activity.length, 1)
+
+  // Written through the TRANSACTION, not logActivity — which swallows its own insert failures
+  // by design, so routing it there meant claiming recorded:true for a row that might not exist.
+  assert.equal(written.length, 1, 'the record must be written through the transaction')
+  assert.equal(written[0]?.action, 'fulfilment_entry_under_allocated')
+  assert.equal(state.activity.length, 0, 'it must NOT go through the error-swallowing logger')
+  assert.deepEqual(
+    (written[0]?.metadata as Row),
+    { orderId: 'o11', previousStatus: 'ON_HOLD', targetStatus: 'PACKING' },
+    'the record must name the crossing it is about',
+  )
 
   // Already inside fulfilment: not a crossing, so not this hook's business.
   reset()
   seedOrder('o12')
   state.short.add('o12')
+  written.length = 0
   const inside = await recordShortfallUnderLock({
-    tx: { salesOrder: { findUnique: async () => state.orders[0] } } as never,
-    orderId: 'o12', previousStatus: 'PICKING', targetStatus: 'PACKING',
+    tx: txFor('o12'), orderId: 'o12', previousStatus: 'PICKING', targetStatus: 'PACKING',
   })
   assert.deepEqual(inside, { recorded: false })
-  assert.equal(state.activity.length, 0)
+  assert.equal(written.length, 0)
+})
+
+test('a failed record fails the TRANSITION rather than being silently swallowed (o3d-c9mi)', async () => {
+  // The whole point of "always recorded": if the record cannot be written, the order must not
+  // quietly cross into fulfilment short anyway.
+  const { recordShortfallUnderLock } = await loadHelper()
+  reset()
+  seedOrder('o13')
+  state.short.add('o13')
+
+  const tx = {
+    salesOrder: { findUnique: async () => state.orders[0] },
+    activityLog: { create: async () => { throw new Error('activity insert failed') } },
+  } as never
+
+  await assert.rejects(
+    () => recordShortfallUnderLock({ tx, orderId: 'o13', previousStatus: 'ON_HOLD', targetStatus: 'PICKING' }),
+    /activity insert failed/,
+    'the failure must propagate and roll the transition back',
+  )
 })
 
 test('the transition wires the under-lock recorder against the REAL previous status (o3d-c9mi)', async () => {
@@ -371,4 +402,24 @@ test('the transition wires the under-lock recorder against the REAL previous sta
   const call = source.slice(at, at + 400)
   assert.match(call, /tx: lockedTx/, 'it must read through the LOCKED client, not db')
   assert.match(call, /previousStatus: beforeStatus/, 'it must use the status observed under the lock, not the pre-read one')
+})
+
+test('the coverage selector reads EVERYTHING through one client (o3d-c9mi)', async () => {
+  // The under-lock caller passes `tx`. If any read inside still goes through the global `db`,
+  // two things break at once: it takes a SECOND pooled connection while the caller already
+  // holds one — twenty concurrent crossings exhaust the pool and each waits for a connection
+  // the others hold — and it mixes snapshots, so a KIT definition committed in between makes
+  // allocations look complete against the old graph while being short against the new one.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/fulfillment/order-allocation-coverage.ts'), 'utf8')
+
+  const body = source.slice(source.indexOf('export async function selectOrdersNeedingAllocation'))
+  const globalReads = body.match(/\bawait db\.\w+/g) ?? []
+  assert.deepEqual(
+    globalReads,
+    [],
+    `every read must go through the passed client; found global reads: ${globalReads.join(', ')}`,
+  )
+  assert.match(body, /loadFulfillmentProductGraph\(client,/, 'the product graph must load on the caller\'s client')
 })

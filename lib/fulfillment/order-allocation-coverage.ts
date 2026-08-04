@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import type { Prisma } from '@/app/generated/prisma/client'
 import {
   calculateCoverageByLine,
   requirementsMapToRows,
@@ -50,7 +51,7 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
    * must pass `tx` — reading through `db` would see pre-lock state and decide against a
    * snapshot the lock exists to rule out (o3d-c9mi).
    */
-  client: Pick<typeof db, 'orderAllocation' | 'salesOrderRefundLine'> & { $queryRaw?: unknown } = db,
+  client: Prisma.TransactionClient | typeof db = db,
 ): Promise<T[]> {
   if (candidates.length === 0) return []
 
@@ -63,7 +64,13 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
       ),
     ),
   ]
-  const graph = await loadFulfillmentProductGraph(db, lineProductIds)
+  // Through the SAME client as everything below. Loading the graph on the global `db` while
+  // the caller holds an interactive transaction takes a SECOND pooled connection — twenty
+  // concurrent callers exhaust the pool and each waits for a connection the others hold. It
+  // also mixes snapshots: a KIT definition committed after this read makes existing
+  // allocations look complete against the old graph while being short against the new one,
+  // so the shortfall is never recorded (Codex review, o3d-c9mi r3).
+  const graph = await loadFulfillmentProductGraph(client, lineProductIds)
   const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
   for (const order of candidates) {
     for (const line of order.lines) {
