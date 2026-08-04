@@ -29,7 +29,8 @@ import {
  * So the refusal is narrow by construction: money-moving, same target document, more than one
  * distinct token.
  *
- * Ambiguity means UNRESOLVED outcomes, not merely several rows -- see UNRESOLVED_STATUSES.
+ * Ambiguity means more than one distinct token among rows that could have posted -- and no
+ * status is safe to drop from that set. See the note above the contender filter.
  */
 
 export type RetryCandidateRow = {
@@ -37,46 +38,38 @@ export type RetryCandidateRow = {
   /** The token this row's attempt actually posted under, as its own connector derives it. */
   effectiveToken: string
   payload: unknown
-  /** Sync status. Absent is treated as UNRESOLVED, which is the conservative reading. */
+  /**
+   * Sync status. Carried for the refusal message and for future settlement work; it does NOT
+   * exclude a row from the token set -- see the note above on why no status is safe to drop.
+   */
   status?: string | null
 }
 
 /**
- * Statuses whose remote OUTCOME IS UNKNOWN, and the only ones that create ambiguity.
+ * EVERY status in the scope counts. Two attempts I made to narrow this were both wrong, in the
+ * dangerous direction, and the reasoning is worth keeping because it is not obvious.
  *
- *   FAILED      — may have posted before the failure was recorded.
- *   PENDING     — has not been attempted, but will be.
- *   PROCESSING  — may be mid-flight right now.
+ * I excluded SYNCED on the grounds that its outcome is known, and that retrying a FAILED row
+ * re-posts under ITS OWN token which the remote would deduplicate. THE SECOND HALF IS FALSE FOR
+ * XERO: Xero retains an Idempotency-Key only for a short, documented window (minutes), after
+ * which the same key is processed as a brand-new request. A MANUAL retry is by nature minutes
+ * to days after the failure, so it is essentially never inside that window. QuickBooks does
+ * replay by `requestid`, so the same-token case is protected there -- but the guard cannot be
+ * correct on one connector only, and the cross-token case (A never landed, replacement B is
+ * SYNCED, retrying A posts a second payment beside B) is unprotected on BOTH.
  *
- * Deliberately NOT here:
+ * I also excluded CANCELLED as "proven never attempted". It is not: a row whose remote call
+ * COMMITTED but whose response was lost is returned to PENDING for retry, and deleting the
+ * local receipt then cancels that row. A cancelled sibling can therefore represent money that
+ * is already in the ledger.
  *
- *   CANCELLED — proven never attempted. Counting it permanently blocked a corrected row: a
- *     receipt deleted while still PENDING is safely cancelled without ever reaching the
- *     connector, yet its complete payload and distinct token refused its replacement forever
- *     (Codex review).
- *
- *   SYNCED — its outcome is KNOWN, so it is not ambiguity. This is a reversal of an earlier
- *     revision that counted it as "the strongest evidence available", and the reversal matters:
- *
- *       - retrying a FAILED row preserves its row id and payload, so it re-posts under ITS OWN
- *         token. If that token already reached the ledger the remote deduplicates. A sibling's
- *         success says nothing about whether THIS token posted;
- *       - counting it stranded two ordinary flows permanently, through the only manual route
- *         there is: a PART-PAYMENT history (two genuine payments against one invoice), and a
- *         payment that was reversed in the ledger and legitimately re-posted, where the stale
- *         SYNCED row blocks its own replacement forever (Codex review).
- *
- *     What it cannot distinguish is a SYNCED row that is the same logical payment re-created
- *     under a new token. In that situation the original FAILED row should be resolved rather
- *     than retried — and unlike the cases above, that one is visible to a human looking at the
- *     document.
+ * THE COST, stated because it is real and permanent today: a part-payment history, and a
+ * payment reversed in the ledger then legitimately re-posted, are both refused -- the settled
+ * sibling's token blocks its own replacement. There is currently NO per-row settlement action
+ * for a FAILED row, so "resolve these rows manually" means editing the ledger and leaving the
+ * row, not clearing it. Tracked as a follow-up; it is the right fix for the stranding, and it
+ * is a better fix than making this guard guess.
  */
-const UNRESOLVED_STATUSES = new Set(['FAILED', 'PENDING', 'PROCESSING'])
-
-function outcomeIsUnknown(status: string | null | undefined): boolean {
-  return status === null || status === undefined || UNRESOLVED_STATUSES.has(status)
-}
-
 export type ManualRetryPlan =
   | { action: 'allow' }
   | { action: 'refuse'; reason: string; tokenCount: number }
@@ -190,10 +183,6 @@ export function planManualRetry(params: {
   if (!isMoneyMovingSyncType(type)) return { action: 'allow' }
 
   const contenders = siblings
-    // Only rows whose outcome is UNKNOWN create ambiguity. A CANCELLED row never posted and a
-    // SYNCED row's fate is settled -- neither says anything about whether THIS row's token
-    // reached the ledger, and counting them stranded legitimate payments permanently.
-    .filter((row) => outcomeIsUnknown(row.status))
     // A sibling missing a field its connector requires was rejected BEFORE any HTTP call, so it
     // cannot have committed anything and must not make a valid payment un-retryable. Without
     // this, one malformed row permanently strands the good one through the only manual route
@@ -206,10 +195,10 @@ export function planManualRetry(params: {
   return {
     action: 'refuse',
     tokenCount: tokens.size,
-    reason: `${tokens.size} unresolved attempts for ${reference} were made under different `
-      + 'idempotency keys. Any one of them may have reached the ledger, so retrying could '
-      + 'duplicate a payment. Check the ledger for an existing payment against this document, '
-      + 'then resolve these rows manually.',
+    reason: `${tokens.size} attempts for ${reference} were made under different idempotency `
+      + 'keys. Any one of them may have reached the ledger, and a manual retry is too late for '
+      + 'the remote to deduplicate it, so retrying could post a second payment. Check the '
+      + 'ledger for an existing payment against this document before acting.',
   }
 }
 

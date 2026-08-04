@@ -404,7 +404,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       setRetryMsg(
         result.refused
           ? `Reset ${result.reset} failed entry/entries. ${result.refused} were NOT reset because `
-            + 'retrying them could duplicate a payment — reconcile them in the accounting system.'
+            + 'retrying them could post a second payment — check the ledger before acting.'
           : `Reset ${result.reset} failed entry/entries for retry.`,
       )
       router.refresh()

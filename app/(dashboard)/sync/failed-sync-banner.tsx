@@ -36,7 +36,7 @@ export function FailedSyncBanner({ summary }: { summary: FailedAccountingSyncSum
         setMessage(
           res.refused
             ? `Re-queued ${res.reset} failed row(s). ${res.refused} row(s) were NOT re-queued because `
-              + 'retrying them could duplicate a payment — reconcile them in the accounting system.'
+              + 'retrying them could post a second payment — check the ledger before acting.'
             : `Re-queued ${res.reset} failed row(s) — they will retry on the next sync.`,
         )
         router.refresh()

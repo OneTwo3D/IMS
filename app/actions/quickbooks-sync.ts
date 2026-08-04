@@ -365,8 +365,10 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
     //     post remotely and land in FAILED after this read but before the reset below, so the
     //     retry proceeds against a snapshot that never showed it. An in-flight attempt is if
     //     anything MORE dangerous than a failed one, since it may still be mid-flight.
-    //   - a SYNCED sibling under a different token is the strongest evidence available: that
-    //     token demonstrably reached the ledger. Ignoring it was the clearest possible miss.
+    //   - a SYNCED or CANCELLED sibling can also represent money already in the ledger. SYNCED
+    //     obviously so; CANCELLED less obviously -- a row whose call COMMITTED but whose
+    //     response was lost goes back to PENDING, and deleting the local receipt then cancels
+    //     it. Neither is safe to drop; see the note in followup-retry-guard.ts.
     //
     // Reading every status closes both. This is a snapshot, not a lock, so it narrows the
     // window rather than eliminating it — the remaining exposure is a sibling created entirely
@@ -394,9 +396,8 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
         id: row.id,
         payload: row.payload,
         effectiveToken: effectiveTokenFor('quickbooks', row),
-        // Threaded through so the planner can tell an UNRESOLVED sibling from a settled one.
-        // Selected but discarded previously, which is how CANCELLED and SYNCED rows came to
-        // strand legitimate payments.
+        // Carried for the refusal message and future settlement work. It does NOT exclude a
+        // row from the token set -- no status is safe to drop.
         status: row.status,
       }
       siblingsByScope.set(key, [...(siblingsByScope.get(key) ?? []), planned])

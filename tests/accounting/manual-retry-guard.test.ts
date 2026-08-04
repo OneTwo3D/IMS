@@ -52,7 +52,7 @@ test('DISTINCT tokens for the same document refuse (o3d-0m56)', () => {
   const plan = planManualRetry({ ...scopeArgs, target: rows[0]!, siblings: rows })
   assert.equal(plan.action, 'refuse')
   assert.equal(plan.action === 'refuse' ? plan.tokenCount : 0, 2)
-  assert.match(plan.action === 'refuse' ? plan.reason : '', /could duplicate a payment/)
+  assert.match(plan.action === 'refuse' ? plan.reason : '', /could post a second payment/)
   assert.match(plan.action === 'refuse' ? plan.reason : '', /SalesOrder so-1/, 'the refusal must name the reference')
 })
 
@@ -356,64 +356,57 @@ test('a partial refusal is not reported as plain success (o3d-0m56)', async () =
   for (const file of ['app/(dashboard)/sync/xero-client.tsx', 'app/(dashboard)/sync/failed-sync-banner.tsx']) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     assert.match(source, /result\.refused|res\.refused/, `${file} must render the refused count`)
-    assert.match(source, /could duplicate a payment/, `${file} must say WHY they were not re-queued`)
+    assert.match(source, /could post a second payment/, `${file} must say WHY they were not re-queued`)
   }
 })
 
-test('a settled sibling does not create ambiguity (o3d-0m56)', () => {
-  // Reversal of an earlier revision that counted SYNCED rows as "the strongest evidence
-  // available". Its outcome is KNOWN, so it is not ambiguity -- and retrying a FAILED row
-  // re-posts under ITS OWN token, which the remote deduplicates if it already landed. Counting
-  // it stranded two ordinary flows permanently, through the only manual route there is.
-  const paid = { id: 'log-paid', effectiveToken: 'log-paid', payload: postable('inv-9'), status: 'SYNCED' }
-  const failed = { id: 'log-second', effectiveToken: 'log-second', payload: postable('inv-9'), status: 'FAILED' }
-
-  // (a) A PART-PAYMENT history: two genuine payments against one invoice.
-  assert.deepEqual(
-    planManualRetry({ ...scopeArgs, target: failed, siblings: [paid, failed] }),
-    { action: 'allow' },
-    'a second genuine payment must stay retryable',
-  )
-
-  // (b) A payment REVERSED in the ledger and legitimately re-posted: the stale SYNCED row would
-  // otherwise block its own replacement forever.
-  const reposted = { id: 'log-repost', effectiveToken: 'log-repost', payload: postable('bill-1'), status: 'FAILED' }
-  const reversed = { id: 'log-old', effectiveToken: 'log-old', payload: postable('bill-1'), status: 'SYNCED' }
-  assert.deepEqual(
-    planManualRetry({ type: 'BILL_PAYMENT', reference: 'PurchaseInvoice pi-1', target: reposted, siblings: [reversed, reposted] }),
-    { action: 'allow' },
-  )
-})
-
-test('a CANCELLED sibling proves it never posted (o3d-0m56)', () => {
-  // A receipt deleted while still PENDING is safely cancelled without ever reaching the
-  // connector. Its complete payload and distinct token refused its replacement forever.
-  const cancelled = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'CANCELLED' }
-  const corrected = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
-  assert.deepEqual(
-    planManualRetry({ ...scopeArgs, target: corrected, siblings: [cancelled, corrected] }),
-    { action: 'allow' },
-  )
-})
-
-test('an in-flight sibling DOES create ambiguity (o3d-0m56)', () => {
-  // The direction that must keep refusing. A PENDING or PROCESSING row has not failed yet: it
-  // can post and land in FAILED between the snapshot and the reset, which is exactly the race
-  // that motivated reading every status in the first place.
-  for (const status of ['PENDING', 'PROCESSING', 'FAILED']) {
-    const inflight = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status }
+test('a SETTLED sibling still counts, because settled does not mean unposted (o3d-0m56)', () => {
+  // Two attempts to narrow this were both wrong in the dangerous direction.
+  //
+  // SYNCED: I argued its outcome is known, and that retrying re-posts under the failed row's
+  // OWN token which the remote deduplicates. The second half is FALSE for Xero -- it retains an
+  // Idempotency-Key only for a short documented window, and a MANUAL retry is minutes to days
+  // later, so essentially never inside it. And the cross-token case (A never landed, its
+  // replacement B is SYNCED, retrying A posts a second payment beside B) is unprotected on both
+  // connectors regardless.
+  //
+  // CANCELLED: I argued it proves the row never posted. It does not -- a row whose call
+  // COMMITTED but whose response was lost returns to PENDING, and deleting the local receipt
+  // then cancels it. That row can represent money already in the ledger.
+  for (const status of ['SYNCED', 'CANCELLED', 'PENDING', 'PROCESSING', 'FAILED']) {
+    const settled = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status }
     const target = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
     assert.equal(
-      planManualRetry({ ...scopeArgs, target, siblings: [inflight, target] }).action,
+      planManualRetry({ ...scopeArgs, target, siblings: [settled, target] }).action,
       'refuse',
-      `an ${status} sibling under a different token is unresolved, so it counts`,
+      `a ${status} sibling under a different token may be money already posted`,
     )
   }
+})
 
-  // An unknown/absent status is read conservatively as unresolved.
-  const unknown = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9') }
-  const target = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
-  assert.equal(planManualRetry({ ...scopeArgs, target, siblings: [unknown, target] }).action, 'refuse')
+test('the refusal says the remote will NOT save us (o3d-0m56)', () => {
+  // The message used to imply the duplicate risk was speculative. It is not: by the time an
+  // operator clicks retry, any remote idempotency window has long closed.
+  const rows = [
+    { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'SYNCED' },
+    { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' },
+  ]
+  const plan = planManualRetry({ ...scopeArgs, target: rows[1]!, siblings: rows })
+  assert.ok(plan.action === 'refuse')
+  assert.match(plan.reason, /too late for the remote to deduplicate/)
+  assert.match(plan.reason, /Check the ledger/)
+})
+
+test('a single row in its scope is still allowed (o3d-0m56)', () => {
+  // The narrowness that matters most: one row, one token, nothing to be ambiguous with.
+  const only = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'FAILED' }
+  assert.deepEqual(planManualRetry({ ...scopeArgs, target: only, siblings: [only] }), { action: 'allow' })
+
+  // And rows SHARING a token stay allowed however many there are.
+  const shared = ['a', 'b', 'c'].map((id) => ({
+    id: `log-${id}`, effectiveToken: 'shared-token', payload: postable('inv-9'), status: 'FAILED',
+  }))
+  assert.deepEqual(planManualRetry({ ...scopeArgs, target: shared[0]!, siblings: shared }), { action: 'allow' })
 })
 
 for (const action of ACTIONS) {
@@ -424,6 +417,15 @@ for (const action of ACTIONS) {
     const at = source.indexOf('const planned: RetryCandidateRow')
     assert.notEqual(at, -1, 'sibling rows must be mapped once into planner rows')
     assert.match(source.slice(at, at + 600), /status: row\.status/, 'status must reach the planner')
+    // And no status may be used to DROP a row from the token set.
+    // Scoped to the FILTER CHAIN, not the file: the surrounding note explains the discarded
+    // rule by name, and a file-wide assertion fails on its own documentation. (Same trap as the
+    // <> ANY / <> ALL assertion in the o3d-z82a work.)
+    const guard = await readFile(path.join(process.cwd(), 'lib/domain/accounting/followup-retry-guard.ts'), 'utf8')
+    const chainAt = guard.indexOf('const contenders = siblings')
+    const chain = guard.slice(chainAt, guard.indexOf('const tokens =', chainAt))
+    assert.ok(!/\.filter\(\(row\) => outcomeIsUnknown/.test(chain), 'no status-based exclusion may return')
+    assert.match(chain, /couldHaveReachedTheLedger\(type, row\.payload\)/, 'structural filtering stays')
     assert.match(source, /payload: true, status: true/, 'and be selected in the first place')
   })
 }
