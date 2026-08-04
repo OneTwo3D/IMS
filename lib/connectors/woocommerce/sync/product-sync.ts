@@ -4,6 +4,7 @@
 
 import { after } from 'next/server'
 import { db } from '@/lib/db'
+import { planTypeWrite, STRUCTURED_DOWNGRADE_TYPES } from '@/lib/connectors/woocommerce/product-type-downgrade'
 import { logActivity } from '@/lib/activity-log'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { getSettingValue } from '@/lib/settings-store'
@@ -548,6 +549,30 @@ export async function syncWcProductToIms(
         }
 
         const existing = await tx.product.findFirst({ where: { sku } })
+
+        // o3d-t0zq part 2 / o3d-0hhu: decide the type to persist BEFORE building updateData.
+        // WooCommerce only distinguishes `variable` from everything else, so a local KIT, BOM or
+        // VARIABLE parent was being rewritten to SIMPLE while its ProductComponent rows and
+        // VARIANT children stayed put — the exact transformation the editor forbids, performed
+        // by a path that ran none of the editor's checks.
+        //
+        // Counted under the SAME lock as the write. A component or child added between an
+        // unlocked read and this update would otherwise be stranded by the very check meant to
+        // prevent it — the lock-set verification this protocol has needed at every other site.
+        let hasStructure = false
+        if (existing && STRUCTURED_DOWNGRADE_TYPES.has(existing.type)) {
+          const [componentCount, childCount] = await Promise.all([
+            tx.productComponent.count({ where: { productId: existing.id } }),
+            tx.product.count({ where: { parentId: existing.id } }),
+          ])
+          hasStructure = componentCount > 0 || childCount > 0
+        }
+        const typePlan = planTypeWrite({
+          existingType: existing?.type,
+          incomingType: productType,
+          hasStructure,
+          sku,
+        })
         // Never reassign a row another WooCommerce object already maps (o3d-fsi): the
         // update branch below overwrites type/parentId/externalProductId. Checked here so a
         // conflict fails BEFORE any write, and re-checked atomically inside the update itself.
@@ -575,7 +600,7 @@ export async function syncWcProductToIms(
             heightCm: heightCm ?? existing.heightCm,
             active,
             lifecycleStatus,
-            type: productType,
+            type: typePlan.type,
             externalProductId: BigInt(wcProduct.id),
           }
 
@@ -608,6 +633,28 @@ export async function syncWcProductToIms(
           // Category — link to mirrored IMS category for the deepest WC category
           // referenced by this product. If WC dropped all categories, clear the link.
           if (imsCategoryId !== undefined) updateData.categoryId = imsCategoryId
+
+          // A silent keep is its own bug: the operator changed the type in WooCommerce and it
+          // did not take, so they must be told why and what to do. Written through the
+          // transaction so the record and the refusal are one fact rather than best-effort.
+          if (typePlan.action === 'keep') {
+            await tx.activityLog.create({
+              data: {
+                entityType: 'PRODUCT',
+                entityId: existing.id,
+                action: 'wc_type_downgrade_refused',
+                tag: 'sync',
+                level: 'WARNING',
+                description: typePlan.reason,
+                metadata: {
+                  sku,
+                  keptType: typePlan.type,
+                  incomingType: productType,
+                  externalProductId: String(wcProduct.id),
+                },
+              },
+            })
+          }
 
           await updateProductGuardingOwnership(tx, existing, parentClaimants, updateData)
           // `sku` is never in updateData — the row is resolved BY sku — so the pre-update values

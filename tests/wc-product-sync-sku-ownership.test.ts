@@ -138,10 +138,19 @@ const productDelegate = {
     return row
   },
   upsert: async () => ({}),
+  // o3d-t0zq part 2: the sync counts VARIANT children under the write lock before deciding
+  // whether a type downgrade would strand them.
+  count: async ({ where }: { where?: { parentId?: string } } = {}) =>
+    where?.parentId === undefined
+      ? state.products.length
+      : state.products.filter((row) => row.parentId === where.parentId).length,
 }
 
 const txClient = {
   product: productDelegate,
+  // o3d-t0zq part 2: counted alongside the children, under the same lock.
+  productComponent: { count: async () => 0 },
+  activityLog: { create: async ({ data }: { data: Row }) => data },
   productOption: {
     upsert: async ({ create }: { create: Row }) => {
       state.options.push({ ...create })
