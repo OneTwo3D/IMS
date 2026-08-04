@@ -70,7 +70,10 @@ test('an empty or blank SKU set takes no locks at all', async () => {
 const WRITERS = [
   {
     file: PRODUCTS_ACTIONS,
-    sites: ['manual product create', 'product editor', 'variant generation'],
+    // saveProductComponents is not a sku create/rename, but it takes the same lock for the
+    // same reason (o3d-t0zq): its type check must serialize against the writers that CHANGE
+    // that type, and those hold only the per-SKU lock.
+    sites: ['manual product create', 'product editor', 'variant generation', 'component save'],
   },
   {
     file: IMPORT_ACTIONS,
