@@ -359,3 +359,24 @@ test('a partial refusal is not reported as plain success (o3d-0m56)', async () =
     assert.match(source, /could duplicate a payment/, `${file} must say WHY they were not re-queued`)
   }
 })
+
+test('a part-payment history IS refused, and the message says what to check (o3d-0m56)', async () => {
+  // The one false refusal this design accepts, and it is real rather than theoretical. Two
+  // genuine payments against one invoice under different tokens -- the first SYNCED, the second
+  // FAILED -- are indistinguishable from one payment attempted twice. Both are ordinary.
+  //
+  // Chosen deliberately: a refusal is recoverable by a human who can see the invoice, while a
+  // duplicate payment is a financial error someone has to find first. Pinned as a test so the
+  // trade-off cannot be reversed silently by someone who reads it as a bug.
+  const rows = [
+    { id: 'log-paid', effectiveToken: 'log-paid', payload: postable('inv-9') },
+    { id: 'log-second', effectiveToken: 'log-second', payload: postable('inv-9') },
+  ]
+  const plan = planManualRetry({ ...scopeArgs, target: rows[1]!, siblings: rows })
+
+  assert.equal(plan.action, 'refuse')
+  assert.ok(plan.action === 'refuse')
+  assert.match(plan.reason, /part-payment/, 'the message must name the likely innocent explanation')
+  assert.match(plan.reason, /Check the ledger/, 'and tell the operator what to look at')
+  assert.match(plan.reason, /resolve these rows manually/, 'and how to get out of it')
+})

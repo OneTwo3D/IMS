@@ -28,6 +28,17 @@ import {
  *
  * So the refusal is narrow by construction: money-moving, same target document, more than one
  * distinct token.
+ *
+ * THE ONE FALSE REFUSAL THIS ACCEPTS, stated plainly because it is a real cost and not a
+ * theoretical one: a PART-PAYMENT history. Two genuine payments against one invoice under
+ * different tokens -- the first SYNCED, the second FAILED -- look exactly like one payment
+ * attempted twice. Both are ordinary. Nothing in the rows distinguishes them, so the retry is
+ * refused and the second payment has to be posted in the accounting system by hand.
+ *
+ * That direction is chosen deliberately. A refusal is recoverable by a human who can see the
+ * invoice; a duplicate payment is a financial error someone has to find first. The refusal
+ * message therefore names this case explicitly rather than only warning about duplication, so
+ * an operator who hits it knows immediately what to check.
  */
 
 export type RetryCandidateRow = {
@@ -162,9 +173,11 @@ export function planManualRetry(params: {
   return {
     action: 'refuse',
     tokenCount: tokens.size,
-    reason: `${tokens.size} failed attempts for ${reference} posted under different idempotency keys. `
+    reason: `${tokens.size} attempts for ${reference} were made under different idempotency keys. `
       + 'Any one of them may have reached the ledger, so retrying could duplicate a payment. '
-      + 'Reconcile them in the accounting system, then resolve these rows manually.',
+      + 'Check the ledger for an existing payment against this document — if the outstanding '
+      + 'amount is genuinely still due (a part-payment, for example), post it there and resolve '
+      + 'these rows manually.',
   }
 }
 
