@@ -425,183 +425,171 @@ test('the coverage selector reads EVERYTHING through one client (o3d-c9mi)', asy
 })
 
 /**
- * A transaction stub for the direct-create recorder. It reads an existing-record COUNT (the
- * idempotency check) and the order's CURRENT status (the cancelled-in-the-gap check) as well as
- * the order itself, so a stub missing either would make those guards untestable.
+ * A transaction stub for the marker-based recorder. It serves the MARKER lookup, the order
+ * read, the record insert and the marker delete — so a stub missing any of them would make the
+ * corresponding guard untestable.
  */
-function directCreateTx(orderId: string, written: Row[], currentStatus = 'PICKING') {
-  return {
-    salesOrder: {
-      findUnique: async ({ select }: { select?: Record<string, unknown> }) =>
-        select && 'status' in select
-          ? { status: currentStatus }
-          : state.orders.find((o) => o.id === orderId) ?? null,
-    },
+function markerTx(
+  orderId: string,
+  written: Row[],
+  marker: { id: string; metadata: unknown } | null = { id: 'm1', metadata: { orderId, createdAtStatus: 'PICKING' } },
+) {
+  const deleted: string[] = []
+  const tx = {
     activityLog: {
-      count: async () => written.length,
+      findFirst: async () => marker,
       create: async ({ data }: { data: Row }) => { written.push(data); return data },
+      delete: async ({ where }: { where: { id: string } }) => { deleted.push(where.id); return { id: where.id } },
     },
+    salesOrder: { findUnique: async () => state.orders.find((o) => o.id === orderId) ?? null },
   } as never
+  return { tx, deleted }
 }
 
-test('an order CREATED in fulfilment is recorded, though it never transitions (o3d-z82a)', async () => {
-  // The WooCommerce importer writes an operator-configured status straight into
-  // SalesOrder.status, and the mapping UI offers PICKING and PACKING. Such an order never
-  // transitions, so the transition-side recorder never sees it — while sitting in exactly the
-  // state that record exists for: outside the sweep's set, with nothing to revisit it.
-  const { recordShortfallOnDirectCreate } = await loadHelper()
+test('the marker carries the CREATION status, not the current one (o3d-z82a)', async () => {
+  // The retry path used to infer "created in fulfilment" from the order's CURRENT status, which
+  // is unsound in BOTH directions: an order created PROCESSING and later moved to PICKING by a
+  // transition (which has its own recorder) would get a false "created directly at PICKING",
+  // and a genuinely direct-created order that reached SHIPPED before the retry would be skipped
+  // and lose its record permanently.
+  const { directCreateMarker, resolveDirectCreateMarker } = await loadHelper()
   reset()
-  seedOrder('o20')
-  state.short.add('o20')
+  seedOrder('o30')
+  state.short.add('o30')
 
+  const marker = directCreateMarker('o30', 'PICKING')
+  assert.equal(marker.action, 'fulfilment_entry_pending_verification')
+  assert.deepEqual(marker.metadata, { orderId: 'o30', createdAtStatus: 'PICKING' })
+  assert.equal(marker.level, 'WARNING', 'an unresolved marker must itself be visible')
+
+  // The order is SHIPPED by the time the marker is resolved. The record must still be written,
+  // and must still say PICKING.
   const written: Row[] = []
-  const tx = directCreateTx('o20', written)
+  const { tx, deleted } = markerTx('o30', written, { id: 'm1', metadata: marker.metadata })
+  const result = await resolveDirectCreateMarker({ tx, orderId: 'o30' })
 
-  assert.deepEqual(
-    await recordShortfallOnDirectCreate({ tx, orderId: 'o20', createdStatus: 'PICKING' }),
-    { recorded: true },
-  )
-  assert.equal(written.length, 1, 'the record must be written through the transaction')
-  assert.equal(written[0]?.action, 'fulfilment_entry_under_allocated', 'and share the transition path\'s action')
+  assert.deepEqual(result, { recorded: true, resolved: true })
   assert.match(String(written[0]?.description), /was created directly at PICKING/)
-  assert.deepEqual(
-    written[0]?.metadata,
-    { orderId: 'o20', previousStatus: null, createdAtStatus: 'PICKING' },
-    'previousStatus must be null rather than a fabricated one',
-  )
+  assert.deepEqual(written[0]?.metadata, { orderId: 'o30', previousStatus: null, createdAtStatus: 'PICKING' })
+  assert.deepEqual(deleted, ['m1'], 'the marker must be cleared in the same transaction')
 })
 
-test('a direct create OUTSIDE fulfilment records nothing (o3d-z82a)', async () => {
-  const { recordShortfallOnDirectCreate } = await loadHelper()
-  const written: Row[] = []
-  for (const status of ['PROCESSING', 'ALLOCATED', 'ON_HOLD', 'DRAFT', 'CANCELLED']) {
-    reset()
-    seedOrder('o21')
-    state.short.add('o21')
-    const tx = directCreateTx('o21', written, status)
-    assert.deepEqual(
-      await recordShortfallOnDirectCreate({ tx, orderId: 'o21', createdStatus: status }),
-      { recorded: false },
-      `${status} is inside the sweep's reach or not fulfilment — nothing to record`,
-    )
-  }
-  assert.equal(written.length, 0)
-})
-
-test('a fully covered direct create records nothing (o3d-z82a)', async () => {
-  const { recordShortfallOnDirectCreate } = await loadHelper()
+test('no marker means already resolved, so this is safe to call repeatedly (o3d-z82a)', async () => {
+  // The marker is the provenance AND the idempotency key. Counting shortfall rows instead
+  // conflated this event with the transition-side record and the earlier best-effort warning,
+  // so a later transition warning could suppress recovery of the original (Codex review).
+  const { resolveDirectCreateMarker } = await loadHelper()
   reset()
-  seedOrder('o22') // not added to state.short
+  seedOrder('o31')
+  state.short.add('o31')
   const written: Row[] = []
-  const tx = directCreateTx('o22', written, 'PACKING')
-  assert.deepEqual(await recordShortfallOnDirectCreate({ tx, orderId: 'o22', createdStatus: 'PACKING' }), { recorded: false })
-  assert.equal(written.length, 0, 'a covered order is not a shortfall')
+  const { tx, deleted } = markerTx('o31', written, null)
+
+  assert.deepEqual(await resolveDirectCreateMarker({ tx, orderId: 'o31' }), { recorded: false, resolved: false })
+  assert.equal(written.length, 0)
+  assert.equal(deleted.length, 0)
 })
 
-test('both entry points share one record writer (o3d-z82a)', async () => {
+test('a covered order clears its marker without recording a shortfall (o3d-z82a)', async () => {
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o32') // not short
+  const written: Row[] = []
+  const { tx, deleted } = markerTx('o32', written)
+
+  assert.deepEqual(await resolveDirectCreateMarker({ tx, orderId: 'o32' }), { recorded: false, resolved: true })
+  assert.equal(written.length, 0, 'a covered order is not a shortfall')
+  assert.deepEqual(deleted, ['m1'], 'but its marker must still be cleared — coverage WAS verified')
+})
+
+test('a marker with no readable created status is left alone (o3d-z82a)', async () => {
+  // Better to leave a visible unresolved marker than to guess a status and write a false record.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o33')
+  state.short.add('o33')
+  const written: Row[] = []
+  const { tx, deleted } = markerTx('o33', written, { id: 'm1', metadata: { orderId: 'o33' } })
+
+  assert.deepEqual(await resolveDirectCreateMarker({ tx, orderId: 'o33' }), { recorded: false, resolved: false })
+  assert.equal(written.length, 0)
+  assert.equal(deleted.length, 0, 'the marker must survive so the problem stays visible')
+})
+
+
+test('both entry points share one shortfall writer (o3d-z82a)', async () => {
   // Two writers of the same action string would drift; an operator searching for
   // fulfilment_entry_under_allocated must find both shapes.
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
   const source = await readFile(path.join(process.cwd(), 'lib/fulfillment/pre-fulfilment-reallocation.ts'), 'utf8')
 
-  const creates = source.match(/tx\.activityLog\.create\(/g) ?? []
-  assert.equal(creates.length, 1, 'there must be exactly ONE place that writes the record')
+  // Exactly one AUTHORITATIVE writer — the one that goes through the caller's transaction.
+  // There is deliberately a second, best-effort emitter (warnEnteringFulfilmentShort, via
+  // logActivity, from o3d-c9mi's pre-lock attempt); that one is allowed to be lost, which is
+  // precisely why the authoritative path exists. Conflating the two is what made a count-based
+  // idempotency check wrong, and why provenance is now keyed on the marker instead.
+  const transactionalWrites = source.match(/await tx\.activityLog\.create\(/g) ?? []
+  assert.equal(transactionalWrites.length, 1, 'exactly ONE place may write the record through a transaction')
+  const bestEffort = source.indexOf('async function warnEnteringFulfilmentShort(')
+  assert.notEqual(bestEffort, -1, 'the best-effort pre-lock warning must still exist')
+  assert.match(source.slice(bestEffort, bestEffort + 500), /await logActivity\(/, 'and must remain the best-effort one')
   assert.match(source, /async function writeShortfallRecord\(/, 'both entry points must delegate to it')
-  for (const entry of ['recordShortfallUnderLock', 'recordShortfallOnDirectCreate']) {
+  for (const entry of ['recordShortfallUnderLock', 'resolveDirectCreateMarker']) {
     const at = source.indexOf(`export async function ${entry}(`)
     assert.notEqual(at, -1, `${entry} must exist`)
-    assert.match(source.slice(at, at + 2200), /return writeShortfallRecord\(/, `${entry} must delegate`)
+    assert.match(source.slice(at, at + 2400), /writeShortfallRecord\(/, `${entry} must delegate`)
   }
 })
 
-test('the importer records a create-at-fulfilment under the order lock (o3d-z82a)', async () => {
+test('the marker is written in the SAME transaction as the order (o3d-z82a)', async () => {
+  // This is what makes it durable provenance rather than another thing that can be lost — and
+  // what lets the resolver be non-fatal to the import.
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
   const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
 
-  const at = source.indexOf('async function recordDirectCreateShortfall(')
-  assert.notEqual(at, -1, 'the importer must have a recorder helper')
-  const helper = source.slice(at, at + 900)
-  assert.match(helper, /isFulfilmentStatus\(status\)/, 'it must gate on a fulfilment status')
-  assert.match(helper, /lockSalesOrder\(tx, orderId\)/, 'the record must be written under the order lock')
-  assert.match(helper, /recordShortfallOnDirectCreate\(\{ tx/, 'and through the transaction, not best-effort')
-
-  // The create path must pass the PERSISTED status: a refund disposition can downgrade
-  // imsStatus to PROCESSING while lifecycleStatus is what actually reached the row.
+  const at = source.indexOf('so = await db.$transaction')
+  assert.notEqual(at, -1, 'the create must run in a transaction')
+  const body = source.slice(at, source.indexOf('} catch (error) {', at))
+  assert.match(body, /tx\.salesOrder\.create\(/, 'the order is created in it')
   assert.match(
-    source,
-    /await recordDirectCreateShortfall\(so\.id, lifecycleStatus\)/,
-    'the create path must pass the status it persisted, not the raw mapping',
+    body,
+    /tx\.activityLog\.create\(\{ data: directCreateMarker\(created\.id, lifecycleStatus\) \}\)/,
+    'and the marker with it, carrying the PERSISTED status',
   )
-  assert.ok(!/recordDirectCreateShortfall\(so\.id, imsStatus\)/.test(source), 'not the raw mapping status')
-
-  // The importer already allocates; re-running it would be a redundant release/re-reserve
-  // cycle on an order fulfilment may already be working.
-  assert.ok(
-    !source.includes('reconcileAllocationBeforeFulfilment'),
-    'the importer must NOT re-run allocation — it already called autoAllocateOrder',
-  )
+  assert.match(body, /isFulfilmentStatus\(lifecycleStatus\)/, 'only for an order created in fulfilment')
+  assert.ok(!/directCreateMarker\(created\.id, imsStatus\)/.test(source), 'not the raw mapping status')
 })
 
-test('the direct-create record is IDEMPOTENT, so a redelivery cannot duplicate it (o3d-z82a)', async () => {
-  // The import is retried — a webhook redelivery or a re-run bulk import reaches the same order
-  // again — so this must be safe to call repeatedly.
-  const { recordShortfallOnDirectCreate } = await loadHelper()
-  reset()
-  seedOrder('o23')
-  state.short.add('o23')
-  const written: Row[] = []
-  const tx = directCreateTx('o23', written)
-
-  assert.deepEqual(await recordShortfallOnDirectCreate({ tx, orderId: 'o23', createdStatus: 'PICKING' }), { recorded: true })
-  assert.deepEqual(
-    await recordShortfallOnDirectCreate({ tx, orderId: 'o23', createdStatus: 'PICKING' }),
-    { recorded: false },
-    'a second call must not write a second record',
-  )
-  assert.equal(written.length, 1)
-})
-
-test('an order cancelled in the unlocked gap is not falsely recorded (o3d-z82a)', async () => {
-  // The order was created and allocated in earlier, already-committed transactions, so it can
-  // have been cancelled before this record's transaction takes the lock. Recording a shortfall
-  // for an order no longer heading to fulfilment would be a false alarm.
-  const { recordShortfallOnDirectCreate } = await loadHelper()
-  reset()
-  seedOrder('o24')
-  state.short.add('o24')
-  const written: Row[] = []
-  // Created at PICKING, but CANCELLED by the time the lock is held.
-  const tx = directCreateTx('o24', written, 'CANCELLED')
-
-  assert.deepEqual(
-    await recordShortfallOnDirectCreate({ tx, orderId: 'o24', createdStatus: 'PICKING' }),
-    { recorded: false },
-  )
-  assert.equal(written.length, 0)
-})
-
-test('the importer completes a missing record on redelivery (o3d-z82a)', async () => {
-  // The blocker this closes: the record's transaction can fail AFTER the order and its
-  // allocation have committed. That fails the import, the webhook retries — and the retry
-  // returns from the already-imported branch BEFORE reaching the recorder, losing the record
-  // permanently while reporting success.
+test('the resolver is non-fatal, and keyed on the marker not the status (o3d-z82a)', async () => {
+  // The order and its allocation are already committed when the resolver runs, so failing the
+  // import undoes nothing — it only produces a retry that returns from the already-imported
+  // branch without repairing anything. The marker is what makes swallowing safe: it survives as
+  // a visible WARNING that coverage was never verified.
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
   const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
 
-  // Anchored on the already-imported branch's own call, not on `if (existing) {` — that
-  // matches a shoppingSyncLog branch 136 lines earlier and windowed the wrong region.
-  const at = source.indexOf('await updateExistingWcOrderFromPayload(existing.id, wcOrder)')
-  assert.notEqual(at, -1, 'the already-imported branch must still exist')
-  const body = source.slice(at, at + 900)
-  assert.match(body, /await recordDirectCreateShortfall\(existing\.id\)/, 'a redelivery must attempt the record')
-  const recordAt = body.indexOf('recordDirectCreateShortfall')
-  const returnAt = body.indexOf('return { success: true, orderId: existing.id }')
-  assert.ok(recordAt !== -1 && returnAt !== -1 && recordAt < returnAt, 'it must run BEFORE the early return')
+  const at = source.indexOf('async function resolveDirectCreateShortfall(')
+  assert.notEqual(at, -1, 'the resolver helper must exist')
+  const helper = source.slice(at, at + 1000)
+  assert.match(helper, /catch \(error\)/, 'it must not fail the import, and must report rather than pass silently')
+  assert.match(helper, /lockSalesOrder\(tx, orderId\)/, 'the resolve must hold the order lock')
+  assert.match(helper, /timeout: 20_000/, "the coverage check needs more than Prisma's 5s default")
 
-  // And the record's transaction needs a budget matching the transition path's — the coverage
-  // check loads the fulfilment product graph, which Prisma's 5s default does not allow for.
-  assert.match(source, /timeout: 20_000/, 'the record transaction must not use the 5s default')
+  // It takes NO status argument: provenance comes from the marker. Passing the current status
+  // was the unsound inference this replaced.
+  assert.match(helper, /resolveDirectCreateShortfall\(orderId: string\)/, 'no status parameter')
+  assert.ok(!/resolveDirectCreateShortfall\([^)]*createdStatus/.test(source), 'no status may be threaded in')
+
+  // Both call sites — the create path and the redelivery path.
+  const redeliveryAt = source.indexOf('await updateExistingWcOrderFromPayload(existing.id, wcOrder)')
+  const redelivery = source.slice(redeliveryAt, redeliveryAt + 900)
+  assert.match(redelivery, /await resolveDirectCreateShortfall\(existing\.id\)/, 'a redelivery must finish an unresolved marker')
+  const callAt = redelivery.indexOf('resolveDirectCreateShortfall')
+  const returnAt = redelivery.indexOf('return { success: true, orderId: existing.id }')
+  assert.ok(callAt !== -1 && returnAt !== -1 && callAt < returnAt, 'it must run BEFORE the early return')
+
+  assert.ok(!source.includes('reconcileAllocationBeforeFulfilment'), 'the importer must NOT re-run allocation')
 })

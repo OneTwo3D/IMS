@@ -15,7 +15,7 @@ import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { isFulfilmentStatus, recordShortfallOnDirectCreate } from '@/lib/fulfillment/pre-fulfilment-reallocation'
+import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import { addMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -361,23 +361,28 @@ async function updateExistingWcOrderFromPayload(
 }
 
 /**
- * Write the o3d-c9mi shortfall record for an order that is ALREADY in fulfilment, under the
- * order lock and in its own transaction.
+ * Resolve the direct-create marker: verify coverage under the order lock, record a shortfall if
+ * there is one, and clear the marker.
  *
- * Given an explicit `createdStatus` on the create path; on the redelivery path the status is
- * read from the row, because by then it is whatever the order currently is.
+ * NON-FATAL BY DESIGN. The order and its allocation are already committed by the time this
+ * runs, so failing the import undoes nothing — it only produces a retry that returns from the
+ * already-imported branch without repairing anything. The MARKER is what makes that safe: it is
+ * written atomically with the order, so if this never succeeds the marker still stands as a
+ * visible WARNING that coverage was never verified. Swallowing here loses nothing; the signal
+ * is already durable.
  *
- * A LONGER TIMEOUT than Prisma's 5s default, matching the transition path's budget: the
- * coverage check loads the fulfilment product graph, and a KIT-heavy order can take real time.
+ * A longer budget than Prisma's 5s default, matching the transition path: the coverage check
+ * loads the fulfilment product graph and a KIT-heavy order can genuinely take longer.
  */
-async function recordDirectCreateShortfall(orderId: string, createdStatus?: string): Promise<void> {
-  const status = createdStatus
-    ?? (await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } }))?.status
-  if (!status || !isFulfilmentStatus(status)) return
-  await db.$transaction(async (tx) => {
-    await lockSalesOrder(tx, orderId)
-    await recordShortfallOnDirectCreate({ tx, orderId, createdStatus: status })
-  }, { maxWait: 5_000, timeout: 20_000 })
+async function resolveDirectCreateShortfall(orderId: string): Promise<void> {
+  try {
+    await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      await resolveDirectCreateMarker({ tx, orderId })
+    }, { maxWait: 5_000, timeout: 20_000 })
+  } catch (error) {
+    console.error(`[wc-import] could not verify fulfilment coverage for ${orderId}:`, error)
+  }
 }
 
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
@@ -396,12 +401,11 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     if (existing) {
       await updateExistingWcOrderFromPayload(existing.id, wcOrder)
       if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, existing.id)
-      // o3d-z82a: a redelivery finishes a record an earlier attempt failed to write. Without
-      // this the recorder below could fail, the import would report failure, and the RETRY
-      // would return here before ever reaching it — losing the record permanently while
-      // reporting success. The recorder is idempotent and re-checks the current status, so
-      // this is a no-op for every ordinary redelivery.
-      await recordDirectCreateShortfall(existing.id)
+      // o3d-z82a: a redelivery finishes verification an earlier attempt failed to complete.
+      // Keyed on the MARKER, so it is a cheap indexed miss for every ordinary redelivery and,
+      // crucially, does not depend on the order's current status — which by now may be
+      // anything, and never told us where the order STARTED.
+      await resolveDirectCreateShortfall(existing.id)
       return { success: true, orderId: existing.id }
     }
 
@@ -694,7 +698,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // Create the sales order
     let so
     try {
-      so = await db.salesOrder.create({
+      so = await db.$transaction(async (tx) => {
+        const created = await tx.salesOrder.create({
         data: {
           externalOrderNumber: wcOrder.number,
           orderNumber,
@@ -743,7 +748,20 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           },
           lines: { create: lineData },
         },
-      })
+        })
+
+        // o3d-z82a: the marker is written in the SAME transaction as the order, so it cannot be
+        // lost. It carries the CREATION status as durable provenance — the retry path used to
+        // infer that from the order's current status, which is unsound in both directions: an
+        // order created PROCESSING and later moved to PICKING by a transition (which has its
+        // own recorder) would get a false "created directly at PICKING", and a genuinely
+        // direct-created order that reached SHIPPED first would be skipped and lose its record
+        // permanently (Codex review).
+        if (isFulfilmentStatus(lifecycleStatus)) {
+          await tx.activityLog.create({ data: directCreateMarker(created.id, lifecycleStatus) })
+        }
+        return created
+      }, { maxWait: 5_000, timeout: 20_000 })
     } catch (error) {
       if (!isUniqueConstraintError(error)) throw error
       const concurrent = await db.salesOrder.findFirst({
@@ -798,12 +816,16 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // transition — never sees it. Yet it is in exactly the state that record exists for:
     // outside the reallocation sweep's set (PROCESSING + ALLOCATED), with nothing to revisit
     // it, and the allocation above can legitimately leave it short ('No stock available' is
-    // tolerated three lines up, and partial coverage returns success).
+    // tolerated by the allocation block above, and partial coverage returns success when every
+    // uncovered line is backorderEligible -- which requires a shortage AND oversellAllowed, not
+    // either one).
     //
     // No allocation attempt here — the importer already made one. What was missing is the
     // record. Written under the order lock and in one transaction so it carries the same
     // guarantee as the transition-side record rather than being best-effort.
-    await recordDirectCreateShortfall(so.id, lifecycleStatus)
+    // Resolves the marker written with the order above. Non-fatal: if it never succeeds the
+    // marker remains as the durable signal.
+    await resolveDirectCreateShortfall(so.id)
 
     // Queue accounting sales invoice — only for PROCESSING orders and when
     // accounting is not explicitly skipped (e.g. initial import).

@@ -230,49 +230,72 @@ export async function recordShortfallUnderLock(params: {
   })
 }
 
+/** Marker action written atomically with an order created already in fulfilment. */
+export const DIRECT_CREATE_PENDING_ACTION = 'fulfilment_entry_pending_verification'
+
 /**
- * The same authoritative record, for an order CREATED already in fulfilment rather than moved
- * there (o3d-z82a).
+ * The marker row, to be created in the SAME transaction as the order (o3d-z82a).
  *
- * The WooCommerce importer writes an operator-configured status straight into
- * `SalesOrder.status`, and the mapping UI offers PICKING and PACKING. Such an order never
- * transitions, so `recordShortfallUnderLock` never sees it — and passing its status as both
- * previous and target would not help: `entersFulfilment` requires the SOURCE to be outside
- * fulfilment, so it would silently return false. Faking a previous status would work
- * mechanically and write a lie into the record.
+ * DURABLE PROVENANCE, and it has to be. An earlier revision inferred "was created in
+ * fulfilment" from the order's CURRENT status on the retry path, which is unsound in both
+ * directions (Codex review): an order created PROCESSING and later moved to PICKING by a
+ * transition — which has its own recorder — would get a false "created directly at PICKING",
+ * while a genuinely direct-created order that reached SHIPPED before the retry would be skipped
+ * and lose its record permanently. Current status is not a proxy for creation status.
  *
- * NO allocation attempt here. The importer already calls autoAllocateOrder immediately after
- * creating the order, so re-running it would be a redundant release/re-reserve cycle. What was
- * missing is only the record.
+ * It is also the FAIL-SAFE. Because it is atomic with the order it cannot be lost, so if the
+ * coverage check below never succeeds the marker still stands as a visible WARNING that this
+ * order entered fulfilment without its coverage being verified. That is what lets the recorder
+ * be non-fatal to the import.
  */
-export async function recordShortfallOnDirectCreate(params: {
+export function directCreateMarker(orderId: string, createdStatus: string): Prisma.ActivityLogCreateInput {
+  return {
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: DIRECT_CREATE_PENDING_ACTION,
+    tag: 'sales',
+    level: 'WARNING',
+    description: `Order was created directly at ${createdStatus}, outside the reallocation `
+      + 'sweep\'s reach. Allocation coverage has not yet been verified.',
+    metadata: { orderId, createdAtStatus: createdStatus },
+  }
+}
+
+/**
+ * Resolve the marker: verify coverage under the order lock, record a shortfall if there is one,
+ * and clear the marker either way.
+ *
+ * The marker — not the order's current status — is the provenance AND the idempotency key. No
+ * marker means already resolved, so this is safe to call repeatedly; and the created status is
+ * read back from the marker rather than inferred.
+ */
+export async function resolveDirectCreateMarker(params: {
   tx: Prisma.TransactionClient
   orderId: string
-  createdStatus: string
-}): Promise<{ recorded: boolean }> {
-  const { tx, orderId, createdStatus } = params
-  if (!isFulfilmentStatus(createdStatus)) return { recorded: false }
+}): Promise<{ recorded: boolean; resolved: boolean }> {
+  const { tx, orderId } = params
 
-  // IDEMPOTENT, unlike the transition-side entry point, and it has to be. The import is
-  // RETRIED — a webhook redelivery or a re-run bulk import reaches the same order again — so
-  // this must be safe to call repeatedly, and must be callable from the already-imported path
-  // so a retry can finish a record an earlier attempt failed to write (Codex review).
-  const existing = await tx.activityLog.count({
-    where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'fulfilment_entry_under_allocated' },
+  const marker = await tx.activityLog.findFirst({
+    where: { entityType: 'SALES_ORDER', entityId: orderId, action: DIRECT_CREATE_PENDING_ACTION },
+    select: { id: true, metadata: true },
+    orderBy: { createdAt: 'asc' },
   })
-  if (existing > 0) return { recorded: false }
+  if (!marker) return { recorded: false, resolved: false }
 
-  // Re-checked under the lock: the order was created and allocated in earlier, already
-  // committed transactions, so it can have been cancelled in the gap. Recording a shortfall
-  // for an order that is no longer heading for fulfilment would be a false alarm.
-  const current = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
-  if (!current || !isFulfilmentStatus(current.status)) return { recorded: false }
+  const metadata = marker.metadata as { createdAtStatus?: unknown } | null
+  const createdStatus = typeof metadata?.createdAtStatus === 'string' ? metadata.createdAtStatus : null
+  if (!createdStatus) return { recorded: false, resolved: false }
 
-  return writeShortfallRecord(tx, orderId, {
+  const result = await writeShortfallRecord(tx, orderId, {
     reachedStatus: createdStatus,
     how: `was created directly at ${createdStatus}`,
     metadata: { previousStatus: null, createdAtStatus: createdStatus },
   })
+
+  // Cleared in the SAME transaction as the record. If the record could not be written the
+  // marker survives with it, so the two can never disagree.
+  await tx.activityLog.delete({ where: { id: marker.id } })
+  return { recorded: result.recorded, resolved: true }
 }
 
 /**
