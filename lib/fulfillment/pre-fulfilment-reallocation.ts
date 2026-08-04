@@ -41,14 +41,18 @@ import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 const FULFILMENT_STATUSES = new Set(['PICKING', 'PACKING'])
 
 /**
- * Statuses an order may legally be in while still OUTSIDE fulfilment, per the state machine:
- * PICKING is reachable from ALLOCATED and ON_HOLD, PACKING from ON_HOLD.
+ * Statuses an order may be in while still OUTSIDE fulfilment. The state machine reaches
+ * PICKING from ALLOCATED and ON_HOLD and PACKING from ON_HOLD — but PROCESSING belongs here
+ * too, because the WooCommerce status mappings drive transitions through the FULL bypass,
+ * which deliberately permits moves the state machine would refuse. Omitting it meant a forced
+ * PROCESSING -> PICKING ran the helper and then had its allocation skipped, so the attempt
+ * this fix promises never actually happened (Codex review, r2).
  *
  * Doubles as `requireStatusUnderLock` for the allocator (o3d-6ab), which re-checks it while
  * holding the order lock. That is what makes the decision safe despite being taken outside
  * one — a status that moved in between turns the allocation into an explicit no-op.
  */
-const PRE_FULFILMENT_STATUSES = ['ALLOCATED', 'ON_HOLD'] as const satisfies readonly SalesOrderStatus[]
+const PRE_FULFILMENT_STATUSES = ['PROCESSING', 'ALLOCATED', 'ON_HOLD'] as const satisfies readonly SalesOrderStatus[]
 
 /**
  * True only when this transition CROSSES INTO fulfilment from outside it.
@@ -64,6 +68,8 @@ export function entersFulfilment(currentStatus: string, targetStatus: string): b
 
 export type PreFulfilmentReallocationResult =
   | { attempted: false; reason: 'not-fulfilment-entry' | 'fully-covered' | 'has-shipments' | 'order-missing' }
+  /** The allocator declined under its own lock — a shipment or status appeared in between. */
+  | { attempted: false; reason: 'refused-under-lock'; stillShort: true }
   | { attempted: true; stillShort: boolean }
 
 export async function reconcileAllocationBeforeFulfilment(
@@ -102,7 +108,7 @@ export async function reconcileAllocationBeforeFulfilment(
   }
 
   const { autoAllocateOrder } = await import('@/app/actions/allocation')
-  await autoAllocateOrder(orderId, {
+  const run = await autoAllocateOrder(orderId, {
     // The WooCommerce status mappings drive PICKING/PACKING through the SESSIONLESS
     // transition bypass, and autoAllocateOrder requires an authenticated permission. Without
     // this the webhook path failed the permission check, was swallowed by the catch, and the
@@ -115,6 +121,19 @@ export async function reconcileAllocationBeforeFulfilment(
     // an explicit no-op rather than rewriting allocations fulfilment now owns.
     requireStatusUnderLock: PRE_FULFILMENT_STATUSES,
   }).catch(() => undefined)
+
+  // The allocator declines cleanly rather than throwing when a shipment or a status change
+  // appeared under its lock. Reporting that as "an attempt did not close the shortfall" is
+  // untrue — no allocation ran at all (Codex review, r2).
+  if (run?.refused || run?.skipped) {
+    await warnEnteringFulfilmentShort(
+      order,
+      run.refused
+        ? 'a shipment appeared before the allocation could run'
+        : `the order was already ${run.skippedStatus ?? 'past this point'} when the allocation ran`,
+    )
+    return { attempted: false, reason: 'refused-under-lock', stillShort: true }
+  }
 
   // Re-read: allocation rewrote the rows, so coverage has to be recomputed rather than
   // inferred from the allocator's return value, which reports its own run rather than the
@@ -155,4 +174,55 @@ async function warnEnteringFulfilmentShort(
       + 'PICKING/PACKING, so the remainder will not be allocated automatically.',
     metadata: { orderId: order.id, reason: because },
   })
+}
+
+/**
+ * The AUTHORITATIVE shortfall check, run INSIDE the status transition's lock.
+ *
+ * The attempt above is necessarily made outside that lock — `autoAllocateOrder` opens its own
+ * transaction — which means every input it used can be stale by the time the transition
+ * commits (Codex review, r2):
+ *
+ *   - the SOURCE status: a request can read PICKING and target PACKING, so the hook is skipped
+ *     as "already in fulfilment"; if another request moves PICKING -> ON_HOLD first, the
+ *     locked validation then accepts ON_HOLD -> PACKING and the order crosses in unexamined.
+ *   - COVERAGE: after the helper observes full coverage, the over-allocation rebalancer can
+ *     reduce allocations without eliminating them, and the picking guard only requires a
+ *     non-zero count.
+ *
+ * Either way the order enters fulfilment short with nothing recorded. The ATTEMPT cannot move
+ * under the lock, but the DETECTION can and is cheap, so this runs there against the real
+ * previous status: whatever else races, an order that actually crosses into fulfilment short
+ * is always reported.
+ */
+export async function recordShortfallUnderLock(params: {
+  tx: Pick<typeof db, 'orderAllocation' | 'salesOrderRefundLine'> & {
+    salesOrder: { findUnique: (args: unknown) => Promise<unknown> }
+  }
+  orderId: string
+  previousStatus: string
+  targetStatus: string
+}): Promise<{ recorded: boolean }> {
+  const { tx, orderId, previousStatus, targetStatus } = params
+  if (!entersFulfilment(previousStatus, targetStatus)) return { recorded: false }
+
+  const order = (await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      id: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      refundStatus: true,
+      lines: { select: { id: true, qty: true, productId: true } },
+    },
+  })) as
+    | { id: string; orderNumber: string | null; externalOrderNumber: string | null; refundStatus: string | null; lines: Array<{ id: string; qty: unknown; productId: string | null }> }
+    | null
+  if (!order) return { recorded: false }
+
+  const short = await selectOrdersNeedingAllocation([order], undefined, tx)
+  if (short.length === 0) return { recorded: false }
+
+  await warnEnteringFulfilmentShort(order, `it crossed ${previousStatus} -> ${targetStatus} without full coverage`)
+  return { recorded: true }
 }

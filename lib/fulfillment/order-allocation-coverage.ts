@@ -44,6 +44,13 @@ const QUANTITY_TOLERANCE = 1e-6
 export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
   candidates: T[],
   lineNeedsAllocation?: (line: CoverageOrderLine, requirements: FulfillmentRequirement[]) => boolean,
+  /**
+   * Client to read coverage against. Defaults to the module-level `db`, which is what the
+   * sweep and the backorder allocator use. A caller deciding something under an order lock
+   * must pass `tx` — reading through `db` would see pre-lock state and decide against a
+   * snapshot the lock exists to rule out (o3d-c9mi).
+   */
+  client: Pick<typeof db, 'orderAllocation' | 'salesOrderRefundLine'> & { $queryRaw?: unknown } = db,
 ): Promise<T[]> {
   if (candidates.length === 0) return []
 
@@ -70,7 +77,7 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
 
   // Coverage from OrderAllocation only (component units for KIT lines). Shipped orders are excluded by
   // the caller, so there are no committed shipment rows to add here.
-  const allocRows = await db.orderAllocation.findMany({
+  const allocRows = await client.orderAllocation.findMany({
     where: { orderId: { in: candidates.map((o) => o.id) } },
     select: { orderId: true, lineId: true, productId: true, qty: true },
   })
@@ -102,7 +109,7 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
   // Aggregating under the refund's OWN orderId makes a bad link inert instead of contagious.
   const refundedByOrderLine = new Map<string, number>()
   const refundKey = (orderId: string, lineId: string) => `${orderId}\u0000${lineId}`
-  const refundLines = await db.salesOrderRefundLine.findMany({
+  const refundLines = await client.salesOrderRefundLine.findMany({
     where: { refund: { orderId: { in: candidates.map((o) => o.id) } } },
     select: { salesOrderLineId: true, qty: true, refund: { select: { orderId: true } } },
   })

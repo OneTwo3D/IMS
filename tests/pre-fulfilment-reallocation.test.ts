@@ -25,6 +25,10 @@ const state = {
   allocatorFixes: new Set<string>(),
   /** Ids for which the allocator throws instead of returning. */
   allocatorThrows: new Set<string>(),
+  /** Ids the allocator declines under its own lock (shipment appeared). */
+  allocatorRefuses: new Set<string>(),
+  /** Ids whose status moved under the allocator's lock. */
+  allocatorSkips: new Set<string>(),
 }
 
 mock.module('@/lib/activity-log', {
@@ -46,6 +50,8 @@ mock.module('@/app/actions/allocation', {
       if (state.allocatorThrows.has(orderId)) throw new Error('allocator exploded')
       // A successful run closes the shortfall for the ids the fixture nominates.
       if (state.allocatorFixes.has(orderId)) state.short.delete(orderId)
+      if (state.allocatorRefuses.has(orderId)) return { success: false, refused: true, allocationCount: 0 }
+      if (state.allocatorSkips.has(orderId)) return { success: false, skipped: true, skippedStatus: 'PICKING' }
       return { success: true, allocationCount: 1 }
     },
   },
@@ -85,6 +91,8 @@ function reset() {
   state.short.clear()
   state.allocatorFixes.clear()
   state.allocatorThrows.clear()
+  state.allocatorRefuses.clear()
+  state.allocatorSkips.clear()
 }
 
 test('only a CROSSING into fulfilment counts, not any PICKING/PACKING target (o3d-c9mi)', async () => {
@@ -239,8 +247,9 @@ test('the allocator is called with every guard the boundary needs (o3d-c9mi)', a
   // explicit no-op rather than rewriting allocations fulfilment now owns.
   assert.deepEqual(
     options.requireStatusUnderLock,
-    ['ALLOCATED', 'ON_HOLD'],
-    'the allocator must refuse to run once the order is already in fulfilment',
+    ['PROCESSING', 'ALLOCATED', 'ON_HOLD'],
+    'the allocator must refuse to run once the order is already in fulfilment, while still '
+      + 'accepting every predecessor a forced Woo transition can start from',
   )
 })
 
@@ -271,4 +280,95 @@ test('the status transition actually calls the boundary attempt, with BOTH statu
   const txAt = source.indexOf('const transitionResult = await db.$transaction')
   assert.ok(hookAt !== -1 && txAt !== -1, 'both the hook and the transition transaction must exist')
   assert.ok(hookAt < txAt, 'the attempt must precede the transition transaction, or it nests inside its lock')
+})
+
+test('a forced PROCESSING -> PICKING still gets a real attempt (o3d-c9mi)', async () => {
+  // The WooCommerce mappings drive transitions through the FULL bypass, which deliberately
+  // permits moves the state machine would refuse. With PROCESSING missing from the required
+  // set the helper ran, the allocator skipped, and the promised attempt never happened.
+  const { entersFulfilment } = await loadHelper()
+  assert.equal(entersFulfilment('PROCESSING', 'PICKING'), true, 'a forced Woo transition must still qualify')
+
+  const { reconcileAllocationBeforeFulfilment } = await loadHelper()
+  reset()
+  seedOrder('o8')
+  state.short.add('o8')
+  await reconcileAllocationBeforeFulfilment('o8')
+
+  assert.ok(
+    (state.allocateOptions[0]?.requireStatusUnderLock as string[]).includes('PROCESSING'),
+    'PROCESSING must be an accepted predecessor, or the forced path allocates nothing',
+  )
+})
+
+test('an allocator refusal is reported as a refusal, not a failed attempt (o3d-c9mi)', async () => {
+  // It declines cleanly rather than throwing when a shipment appeared under its lock.
+  // Calling that "an attempt did not close the shortfall" is untrue — nothing ran.
+  const { reconcileAllocationBeforeFulfilment } = await loadHelper()
+  reset()
+  seedOrder('o9')
+  state.short.add('o9')
+  state.allocatorRefuses.add('o9')
+
+  const result = await reconcileAllocationBeforeFulfilment('o9')
+
+  assert.deepEqual(result, { attempted: false, reason: 'refused-under-lock', stillShort: true })
+  assert.match(String(state.activity[0]?.description), /shipment appeared/)
+})
+
+test('a status that moved under the allocator lock is reported as such (o3d-c9mi)', async () => {
+  const { reconcileAllocationBeforeFulfilment } = await loadHelper()
+  reset()
+  seedOrder('o10')
+  state.short.add('o10')
+  state.allocatorSkips.add('o10')
+
+  const result = await reconcileAllocationBeforeFulfilment('o10')
+
+  assert.equal(result.attempted, false)
+  assert.match(String(state.activity[0]?.description), /already PICKING/)
+})
+
+test('the under-lock recorder catches what the pre-lock attempt cannot (o3d-c9mi)', async () => {
+  // The attempt must run outside the transition lock, so its inputs can be stale by the time
+  // the transition commits — a source status read as PICKING, or coverage reduced afterwards
+  // by the rebalancer. Detection is cheap and CAN run under the lock, so it does.
+  const { recordShortfallUnderLock } = await loadHelper()
+  reset()
+  seedOrder('o11')
+  state.short.add('o11')
+
+  const tx = {
+    salesOrder: { findUnique: async () => state.orders.find((o) => o.id === 'o11') ?? null },
+  } as never
+
+  // The real previous status, as observed under the lock, crosses into fulfilment.
+  const crossed = await recordShortfallUnderLock({
+    tx, orderId: 'o11', previousStatus: 'ON_HOLD', targetStatus: 'PACKING',
+  })
+  assert.deepEqual(crossed, { recorded: true }, 'a short crossing must always be recorded')
+  assert.equal(state.activity.length, 1)
+
+  // Already inside fulfilment: not a crossing, so not this hook's business.
+  reset()
+  seedOrder('o12')
+  state.short.add('o12')
+  const inside = await recordShortfallUnderLock({
+    tx: { salesOrder: { findUnique: async () => state.orders[0] } } as never,
+    orderId: 'o12', previousStatus: 'PICKING', targetStatus: 'PACKING',
+  })
+  assert.deepEqual(inside, { recorded: false })
+  assert.equal(state.activity.length, 0)
+})
+
+test('the transition wires the under-lock recorder against the REAL previous status (o3d-c9mi)', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'app/actions/sales.ts'), 'utf8')
+
+  const at = source.indexOf('recordShortfallUnderLock({')
+  assert.notEqual(at, -1, 'the transition must record shortfalls under its lock')
+  const call = source.slice(at, at + 400)
+  assert.match(call, /tx: lockedTx/, 'it must read through the LOCKED client, not db')
+  assert.match(call, /previousStatus: beforeStatus/, 'it must use the status observed under the lock, not the pre-read one')
 })

@@ -7,7 +7,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS, isWmsConnectorId } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
-import { entersFulfilment, reconcileAllocationBeforeFulfilment } from '@/lib/fulfillment/pre-fulfilment-reallocation'
+import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
@@ -1655,6 +1655,21 @@ export async function applySalesOrderStatusTransition(
                   'This order\u2019s EU withdrawal request was approved; its status cannot be moved backwards.',
                 )
               }
+            }
+            // o3d-c9mi: the AUTHORITATIVE record, under the lock, against the real previous
+            // status. The attempt above runs outside it and can therefore be skipped or
+            // wrong; this cannot be. Detection only — the transition still proceeds, because
+            // partial fulfilment is intentional.
+            const beforeStatus = (await lockedTx.salesOrder.findUnique({
+              where: { id }, select: { status: true },
+            }))?.status
+            if (beforeStatus) {
+              await recordShortfallUnderLock({
+                tx: lockedTx as never,
+                orderId: id,
+                previousStatus: beforeStatus,
+                targetStatus,
+              })
             }
             if (targetStatus === 'PICKING') {
               const allocCount = await lockedTx.orderAllocation.count({ where: { orderId: id } })
