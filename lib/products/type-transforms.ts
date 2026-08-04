@@ -14,6 +14,14 @@ type ProductStructureInput = {
   productId?: string
   type: ProductType
   parentId?: string | null
+  /**
+   * Client to validate against. Defaults to the module-level `db`, which is what the
+   * pre-transaction fast path uses. The editor re-validates INSIDE its write transaction
+   * (o3d-42hw) and must pass `tx`, or it would re-read the same pre-lock state and prove
+   * nothing — a WooCommerce import committing in between would still be overwritten with
+   * structure decided against a state that no longer exists.
+   */
+  client?: Pick<typeof db, 'product'>
 }
 
 type CurrentProductShape = {
@@ -129,10 +137,11 @@ async function getProductTransformBlockers(productId: string): Promise<ProductTr
 export async function validateProductStructureChange(
   input: ProductStructureInput,
 ): Promise<ProductStructureValidationResult> {
+  const client = input.client ?? db
   const normalizedParentId = input.parentId?.trim() ? input.parentId.trim() : null
 
   const current = input.productId
-    ? await db.product.findUnique({
+    ? await client.product.findUnique({
         where: { id: input.productId },
         select: { id: true, sku: true, type: true, parentId: true },
       })
@@ -173,7 +182,7 @@ export async function validateProductStructureChange(
   }
 
   if (normalizedParentId) {
-    const parent = await db.product.findUnique({
+    const parent = await client.product.findUnique({
       where: { id: normalizedParentId },
       select: { id: true, type: true },
     })
