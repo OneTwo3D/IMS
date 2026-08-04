@@ -1,6 +1,5 @@
 import {
   FOLLOW_UP_IDEMPOTENCY_KEY,
-  isMoneyMovingFollowUp,
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
 } from './followup-idempotency'
@@ -41,6 +40,68 @@ export type RetryCandidateRow = {
 export type ManualRetryPlan =
   | { action: 'allow' }
   | { action: 'refuse'; reason: string; tokenCount: number }
+
+/**
+ * Every sync type whose remote call MOVES MONEY.
+ *
+ * Deliberately BROADER than `isMoneyMovingFollowUp`, which o3d-h2wx scoped to the types its
+ * enqueue helper produces. BILL_PAYMENT is not one of those — it is queued elsewhere — but both
+ * processors post a real supplier payment for it, and this guard sees every FAILED row an
+ * operator can click, not just follow-ups. Using the narrower set let two failed bill payments
+ * with distinct tokens sail through, and "Retry All" re-queue both (Codex review).
+ */
+const MONEY_MOVING_SYNC_TYPES = new Set([
+  'INVOICE_PAYMENT',
+  'BILL_PAYMENT',
+  'PURCHASE_CREDIT_NOTE_ALLOCATION',
+])
+
+export function isMoneyMovingSyncType(type: string): boolean {
+  return MONEY_MOVING_SYNC_TYPES.has(type)
+}
+
+/**
+ * Fields each money-moving type REQUIRES before its connector will attempt a remote call. Both
+ * processors reject a body missing any of these before building a request, so such a row
+ * PROVABLY never posted — it carries no token worth defending.
+ *
+ * This is the only sound "did not post" signal available. o3d-h2wx established that the error
+ * MESSAGE cannot be used, because both connectors overwrite `HTTP nnn` with the remote system's
+ * own text. Structure can be.
+ */
+const REQUIRED_BODY_FIELDS: Record<string, readonly { field: string; kind: 'id' | 'amount' }[]> = {
+  INVOICE_PAYMENT: [
+    { field: 'accountingInvoiceId', kind: 'id' },
+    { field: 'bankAccountId', kind: 'id' },
+    { field: 'amount', kind: 'amount' },
+  ],
+  BILL_PAYMENT: [
+    { field: 'accountingInvoiceId', kind: 'id' },
+    { field: 'bankAccountId', kind: 'id' },
+    { field: 'amount', kind: 'amount' },
+  ],
+  PURCHASE_CREDIT_NOTE_ALLOCATION: [
+    { field: 'creditNoteId', kind: 'id' },
+    { field: 'accountingInvoiceId', kind: 'id' },
+    { field: 'amount', kind: 'amount' },
+  ],
+}
+
+/**
+ * Mirrors the connectors' guards, which are NOT uniform: an id is rejected when FALSY, so an
+ * empty string counts as missing, but an amount only when null/undefined, so a legitimate zero
+ * does not.
+ */
+function couldHaveReachedTheLedger(type: string, payload: unknown): boolean {
+  const required = REQUIRED_BODY_FIELDS[type]
+  if (!required) return true
+  const record = asPayload(payload)
+  if (record === null) return true
+  return required.every(({ field, kind }) => {
+    const value = record[field]
+    return kind === 'amount' ? value !== undefined && value !== null : Boolean(value)
+  })
+}
 
 const ANCHOR_FIELDS = ['accountingInvoiceId', 'creditNoteId'] as const
 
@@ -86,9 +147,15 @@ export function planManualRetry(params: {
   siblings: RetryCandidateRow[]
 }): ManualRetryPlan {
   const { type, reference, target, siblings } = params
-  if (!isMoneyMovingFollowUp(type)) return { action: 'allow' }
+  if (!isMoneyMovingSyncType(type)) return { action: 'allow' }
 
-  const contenders = siblings.filter((row) => couldBeTheSameDocument(row.payload, target.payload))
+  const contenders = siblings
+    // A sibling missing a field its connector requires was rejected BEFORE any HTTP call, so it
+    // cannot have committed anything and must not make a valid payment un-retryable. Without
+    // this, one malformed row permanently strands the good one through the only manual route
+    // available (Codex review).
+    .filter((row) => couldHaveReachedTheLedger(type, row.payload))
+    .filter((row) => couldBeTheSameDocument(row.payload, target.payload))
   const tokens = new Set(contenders.map((row) => row.effectiveToken))
   if (tokens.size <= 1) return { action: 'allow' }
 
@@ -117,7 +184,13 @@ export function effectiveTokenFor(
   if (stamped) return stamped
   if (connector === 'quickbooks') {
     const generic = asPayload(row.payload)?._idempotencyKey
-    if (typeof generic === 'string' && generic.trim()) return generic
+    // `typeof === 'string'`, NOT a truthiness or trim check — this must mirror
+    // getIdempotencySource EXACTLY. That accepts an empty string as the source, so two rows
+    // both carrying `_idempotencyKey: ''` post under the SAME token; requiring a non-blank
+    // value here gave them their row ids instead, two distinct tokens, and refused a retry
+    // that was safe. A guard that reasons about a token the connector will not actually send
+    // is worse than no guard, and it fails in the stranding direction.
+    if (typeof generic === 'string') return generic
   }
   return row.id
 }

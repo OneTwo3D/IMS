@@ -373,16 +373,24 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
       siblingsByScope.set(key, [...(siblingsByScope.get(key) ?? []), row])
     }
 
+    // Planned PER CANDIDATE, against that candidate's own siblings. An earlier revision
+    // planned once per SCOPE from an arbitrary rows[0] and then refused every sibling id: with
+    // one safe row targeting a replacement invoice and two ambiguous rows targeting the old
+    // one, array order decided whether the ambiguous pair was allowed through or the safe row
+    // was refused along with them (Codex review). A per-candidate decision cannot depend on
+    // ordering, and refuses exactly the row it judged.
     const refusedIds = new Set<string>()
     const refusals: string[] = []
-    for (const scope of scopes) {
-      const rows = siblingsByScope.get(scope) ?? []
-      const target = rows[0]
-      if (!target) continue
+    for (const candidate of candidates) {
+      const rows = siblingsByScope.get(scopeKey(candidate)) ?? []
       const plan = planManualRetry({
-        type: target.type,
-        reference: `${target.referenceType} ${target.referenceId}`,
-        target: { id: target.id, payload: target.payload, effectiveToken: effectiveTokenFor('quickbooks', target) },
+        type: candidate.type,
+        reference: `${candidate.referenceType} ${candidate.referenceId}`,
+        target: {
+          id: candidate.id,
+          payload: candidate.payload,
+          effectiveToken: effectiveTokenFor('quickbooks', candidate),
+        },
         siblings: rows.map((row) => ({
           id: row.id,
           payload: row.payload,
@@ -390,15 +398,15 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
         })),
       })
       if (plan.action === 'refuse') {
-        for (const row of rows) refusedIds.add(row.id)
-        refusals.push(plan.reason)
+        refusedIds.add(candidate.id)
+        if (!refusals.includes(plan.reason)) refusals.push(plan.reason)
         await logActivity({
           entityType: 'SYSTEM',
           action: 'quickbooks_manual_retry_refused',
           tag: 'sync',
           level: 'WARNING',
           description: plan.reason,
-          metadata: { failedRowIds: rows.map((row) => row.id), tokenCount: plan.tokenCount },
+          metadata: { syncLogId: candidate.id, siblingIds: rows.map((row) => row.id), tokenCount: plan.tokenCount },
         })
       }
     }
