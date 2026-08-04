@@ -50,7 +50,13 @@ export async function detectComponentCycle(
 ): Promise<ComponentCycleResult> {
   if (componentIds.some((id) => id === productId)) return { kind: 'self' }
 
-  const roots = [...new Set(componentIds.filter(Boolean))]
+  // Deduplicated, but NOT filtered. An earlier revision dropped falsy ids with
+  // `filter(Boolean)`, which silently removed the empty string — and the BFS this replaces
+  // treated "" as an ordinary vertex. `Product.id` carries no non-empty constraint, so an
+  // empty-id product with a path back to `productId` would have had its cycle answered as
+  // `ok`: the one input where the two implementations disagreed, and in the unsafe direction
+  // (Codex review). Dropping a root can only ever hide a cycle, never invent one.
+  const roots = [...new Set(componentIds)]
   if (roots.length === 0) return { kind: 'ok' }
 
   // Reachability from the proposed components: if `productId` is reachable from any of them,

@@ -225,3 +225,21 @@ test('delete-only writers deliberately do NOT take the graph lock (o3d-t0zq)', a
     'the CSV rename must NOT take the graph lock after its per-SKU lock',
   )
 })
+
+test('an empty-string component id is a vertex, not something to filter away (o3d-quia)', async () => {
+  // Product.id has no non-empty constraint, and the BFS this replaced treated "" as an
+  // ordinary vertex. Dropping it with filter(Boolean) meant an empty-id product with a path
+  // back to the parent answered `ok` — a cycle hidden, which is the unsafe direction, and it
+  // disproved the "fails closed by construction" claim (Codex review).
+  const detectComponentCycle = await loadCycle()
+  reset()
+  state.edges.push({ productId: '', componentId: 'P' })
+
+  // Adding P -> "" would close P -> "" -> P.
+  assert.deepEqual(await detectComponentCycle('P', ['']), { kind: 'cycle' })
+
+  // A genuinely empty request is still a no-op.
+  reset()
+  assert.deepEqual(await detectComponentCycle('P', []), { kind: 'ok' })
+  assert.deepEqual(state.reads, [], 'no roots means no query')
+})
