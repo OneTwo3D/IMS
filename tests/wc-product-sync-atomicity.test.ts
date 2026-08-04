@@ -155,7 +155,17 @@ const txClient = {
   product: productDelegate,
   productOption: productOptionDelegate,
   shoppingSyncLog: shoppingSyncLogDelegate,
-  setting: { upsert: async () => ({}), findUnique: async () => null },
+  // The credential-rebind fence (o3d-mlc7) snapshots settings before any remote read and
+  // re-reads the version inside the write transaction. Neither is what this suite is about,
+  // so the version is held CONSTANT: findMany returns no rows (version defaults to '0') and
+  // findUnique agrees, which is the "nothing was rebound" case. Without these the fence
+  // throws a TypeError before the sync starts — and because tests 1 and 2 assert FAILURE,
+  // they would have kept passing while testing nothing at all.
+  setting: {
+    upsert: async () => ({}),
+    findMany: async () => [],
+    findUnique: async () => null,
+  },
   $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
     state.advisoryLocks.push(String(values[values.length - 1] ?? strings.join('')))
     return 1
