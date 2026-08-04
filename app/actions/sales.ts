@@ -7,6 +7,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS, isWmsConnectorId } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
+import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
@@ -1609,6 +1610,15 @@ export async function applySalesOrderStatusTransition(
       await refreshDraftOrderFxAtFinalization(id, new Date())
     }
 
+    // o3d-c9mi: PICKING / PACKING are outside the reallocation sweep's reach, and nothing
+    // moves an order back out of them automatically — so this is the LAST point at which a
+    // partially-allocated order will ever be retried, and its one-shot replenishment trigger
+    // has already been consumed. Runs before the lock because autoAllocateOrder opens its own
+    // transaction; see the module docstring for why this is a backstop rather than a gate.
+    if (!orderUpdated && entersFulfilment(so.status, targetStatus)) {
+      await reconcileAllocationBeforeFulfilment(id)
+    }
+
     if (!orderUpdated) {
       const transitionResult = await db.$transaction(async (tx) => {
         return updateSalesOrderStatusUnderLock(tx, {
@@ -1645,6 +1655,21 @@ export async function applySalesOrderStatusTransition(
                   'This order\u2019s EU withdrawal request was approved; its status cannot be moved backwards.',
                 )
               }
+            }
+            // o3d-c9mi: the AUTHORITATIVE record, under the lock, against the real previous
+            // status. The attempt above runs outside it and can therefore be skipped or
+            // wrong; this cannot be. Detection only — the transition still proceeds, because
+            // partial fulfilment is intentional.
+            const beforeStatus = (await lockedTx.salesOrder.findUnique({
+              where: { id }, select: { status: true },
+            }))?.status
+            if (beforeStatus) {
+              await recordShortfallUnderLock({
+                tx: lockedTx as never,
+                orderId: id,
+                previousStatus: beforeStatus,
+                targetStatus,
+              })
             }
             if (targetStatus === 'PICKING') {
               const allocCount = await lockedTx.orderAllocation.count({ where: { orderId: id } })
