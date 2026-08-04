@@ -933,18 +933,8 @@ export async function runDailyBatchSync(): Promise<{
         // shipped net of refunds. Either way hold the true-up until this batch holds
         // the order's final dispatched-but-unjournaled shipment, so a batch-window
         // split cannot recognize a later shipment's revenue early.
-        //
-        // o3d-0i5y: the coverage check applies to EVERY order, not only a partially
-        // refunded one. A terminal status does not mean the units shipped —
-        // reconcileOrderAfterShipment promotes an order to SHIPPED once its existing
-        // shipments are all SHIPPED, without ever comparing shipped qty against ordered
-        // demand, and shipments are built from allocations only. So an order dispatched
-        // SHORT reached this gate with `refundStatus: NONE`, skipped the check entirely on
-        // the strength of its status, and trued up deferred revenue for units that were
-        // never sent. Requiring coverage of every order costs one extra coverage
-        // computation and removes status as a proxy for delivery.
-        let isTrueUpEligible = isFullyShippedTerminalStatus(firstShipment.order.status)
-        if (isTrueUpEligible) {
+        let isTrueUpEligible = isFullyShippedTerminalStatus(firstShipment.order.status) && firstShipment.order.refundStatus !== 'PARTIAL'
+        if (!isTrueUpEligible && firstShipment.order.refundStatus === 'PARTIAL') {
           const combinedCoverageByLine = calculateCoverageByLine(requirementsByLine, [
             ...(shippedRowsByOrder.get(orderId) ?? []),
             ...(refundedUnshippedRowsByOrder.get(orderId) ?? []),
