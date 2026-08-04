@@ -14,6 +14,17 @@ export type ComponentCycleResult =
 export async function detectComponentCycle(
   productId: string,
   componentIds: string[],
+  /**
+   * Client to walk the graph with. Defaults to the module-level `db`, which is what a
+   * pre-transaction preflight uses.
+   *
+   * A caller deciding whether to WRITE must pass its `tx` (o3d-t0zq). Walking through `db`
+   * from inside a transaction reads on a different connection — outside that transaction's
+   * snapshot and outside the advisory lock it holds — so the check proves nothing about the
+   * graph it is about to commit into. Same reason `validateProductStructureChange` takes a
+   * client.
+   */
+  client: Pick<typeof db, 'productComponent'> = db,
 ): Promise<ComponentCycleResult> {
   if (componentIds.some((id) => id === productId)) return { kind: 'self' }
 
@@ -26,7 +37,7 @@ export async function detectComponentCycle(
     if (visited.has(current)) continue
     visited.add(current)
 
-    const children = await db.productComponent.findMany({
+    const children = await client.productComponent.findMany({
       where: { productId: current },
       select: { componentId: true },
     })

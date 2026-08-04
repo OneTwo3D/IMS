@@ -20,6 +20,7 @@ import {
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
+import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 
 /**
  * Product types that can own ProductComponent rows. The CSV import queues a row for the
@@ -749,12 +750,14 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
     }
 
     if (components.length > 0) {
-      const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId))
-      if (cycle.kind === 'self') {
+      // Preflight only. The authoritative check runs under the graph lock inside the write
+      // transaction below — this one reads a graph another writer may change before we commit.
+      const preflight = await detectComponentCycle(productId, components.map((c) => c.componentId))
+      if (preflight.kind === 'self') {
         result.errors.push(`Row ${cr.lineNum}: ${cr.sku} cannot be a component of itself`)
         continue
       }
-      if (cycle.kind === 'cycle') {
+      if (preflight.kind === 'cycle') {
         result.errors.push(`Row ${cr.lineNum}: circular BOM reference detected for ${cr.sku}`)
         continue
       }
@@ -772,6 +775,13 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           // namespace as every other Product writer (o3d-42hw), so this contends with the
           // editor and the WooCommerce sync rather than racing them.
           const wrote = await db.$transaction(async (tx) => {
+            // o3d-t0zq: the GRAPH lock, before the per-SKU one. A cycle is a property of the
+            // graph rather than of any product, so a per-product lock cannot serialize the
+            // writers that form one — two writers adding B->C and D->A hold disjoint per-SKU
+            // sets, never block, and together close A->B->C->D->A with both cycle checks
+            // having passed. Fixed order relative to the per-SKU lock below keeps the two
+            // families deadlock-free.
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
             await lockProductSkusForWrite(tx, [cr.sku])
             const current = await tx.product.findUnique({
               where: { id: productId },
@@ -783,6 +793,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             // rename path needs (o3d-42hw).
             if (!current || current.sku !== cr.sku) return false
             if (!COMPONENT_BEARING_TYPES.has(current.type)) return false
+
+            // Re-checked under the graph lock, against tx. The preflight above proved nothing
+            // about the graph this transaction is committing into.
+            const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId), tx)
+            if (cycle.kind !== 'ok') return false
 
             await tx.productComponent.deleteMany({ where: { productId } })
             await tx.productComponent.createMany({

@@ -25,6 +25,7 @@ import { detectComponentCycle } from '@/lib/products/component-cycle'
 import { blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
 import { productSchema } from '@/lib/products/product-schema'
 import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
+import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
   cleanProductCategoryName,
   listProductCategoryNodes,
@@ -1291,11 +1292,13 @@ export async function saveProductComponents(
   try {
     await requirePermission('inventory.edit')
 
-    const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId))
-    if (cycle.kind === 'self') {
+    // Preflight only — the authoritative check runs under the graph lock below. Kept so the
+    // common rejection still returns a clean message without opening a transaction.
+    const preflight = await detectComponentCycle(productId, components.map((c) => c.componentId))
+    if (preflight.kind === 'self') {
       return { success: false, error: 'A product cannot be a component of itself' }
     }
-    if (cycle.kind === 'cycle') {
+    if (preflight.kind === 'cycle') {
       return { success: false, error: 'Circular reference detected — a component eventually references this product' }
     }
 
@@ -1311,16 +1314,51 @@ export async function saveProductComponents(
       select: { id: true, reference: true },
     })
 
-    await db.productComponent.deleteMany({ where: { productId } })
-    if (components.length > 0) {
-      await db.productComponent.createMany({
-        data: components.map((c, i) => ({
-          productId,
-          componentId: c.componentId,
-          qty: c.qty,
-          sortOrder: i,
-        })),
-      })
+    // o3d-t0zq. Two defects here, both closed by the same transaction.
+    //
+    // ATOMICITY: the delete and the create were separate top-level statements, so a reader
+    // landing between them saw a KIT with NO components — and a failure between them left it
+    // that way permanently.
+    //
+    // SERIALIZATION: the cycle check above ran outside any transaction or lock, so two
+    // concurrent saves could each validate and then both commit a cycle. The graph lock makes
+    // check-and-write atomic with respect to the graph being checked; see its docstring for
+    // why a per-product lock cannot do this.
+    const conflict = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
+
+      // Re-checked under the lock, against tx — the preflight above read a graph another
+      // writer may since have changed.
+      const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId), tx)
+      if (cycle.kind === 'self') return 'self' as const
+      if (cycle.kind === 'cycle') return 'cycle' as const
+
+      // This never checked the product's own type at all, so it would happily write components
+      // onto a SIMPLE product — the state o3d-w998 stops the CSV import creating.
+      const current = await tx.product.findUnique({ where: { id: productId }, select: { type: true } })
+      if (!current) return 'missing' as const
+      if (current.type !== 'KIT' && current.type !== 'BOM') return 'not-component-bearing' as const
+
+      await tx.productComponent.deleteMany({ where: { productId } })
+      if (components.length > 0) {
+        await tx.productComponent.createMany({
+          data: components.map((c, i) => ({
+            productId,
+            componentId: c.componentId,
+            qty: c.qty,
+            sortOrder: i,
+          })),
+        })
+      }
+      return null
+    })
+    if (conflict === 'self') return { success: false, error: 'A product cannot be a component of itself' }
+    if (conflict === 'cycle') {
+      return { success: false, error: 'Circular reference detected — a component eventually references this product' }
+    }
+    if (conflict === 'missing') return { success: false, error: 'Product not found' }
+    if (conflict === 'not-component-bearing') {
+      return { success: false, error: 'This product is no longer a kit or BOM, so it cannot have components' }
     }
     const warnings = await findMatchingProductComponentConfigurations(productId, components)
     await logActivity({

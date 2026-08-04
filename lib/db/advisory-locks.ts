@@ -62,6 +62,23 @@ export const WC_SYNC_ADVISORY_LOCK_KEY = 918_273_645
 export const SWEEP_CURSOR_LOCK_KEY = 918_273_912
 
 /**
+ * ONE lock for the whole ProductComponent graph (o3d-t0zq).
+ *
+ * Deliberately coarse, and the coarseness IS the correctness argument. A component cycle is a
+ * property of the graph, not of any one product, so a per-product or even per-edge lock cannot
+ * serialize the writers that form one: two writers adding B->C and D->A hold DISJOINT lock
+ * sets, never block each other, and together close A->B->C->D->A while each one's own cycle
+ * check passed. Only a lock covering every component write makes the check-then-write
+ * atomic with respect to the graph it is checking.
+ *
+ * Affordable precisely because component edits are rare and low-throughput — a kit or BOM
+ * definition changes when a human edits it or a CSV import carries a components column, not on
+ * any hot path. Serializing them costs nothing measurable and removes an entire class of
+ * argument about which subset of products a writer needed to hold.
+ */
+export const COMPONENT_GRAPH_WRITE_LOCK_KEY = 918_274_101
+
+/**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
  * declared here — the test fails on any module that writes its own key literal.
  */
@@ -70,6 +87,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   PAYMENT_WRITE_LOCK_KEY,
   WC_SYNC_ADVISORY_LOCK_KEY,
   SWEEP_CURSOR_LOCK_KEY,
+  COMPONENT_GRAPH_WRITE_LOCK_KEY,
 } as const
 
 /**
