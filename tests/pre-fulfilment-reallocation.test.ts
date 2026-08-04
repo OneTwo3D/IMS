@@ -423,3 +423,106 @@ test('the coverage selector reads EVERYTHING through one client (o3d-c9mi)', asy
   )
   assert.match(body, /loadFulfillmentProductGraph\(client,/, 'the product graph must load on the caller\'s client')
 })
+
+test('an order CREATED in fulfilment is recorded, though it never transitions (o3d-z82a)', async () => {
+  // The WooCommerce importer writes an operator-configured status straight into
+  // SalesOrder.status, and the mapping UI offers PICKING and PACKING. Such an order never
+  // transitions, so the transition-side recorder never sees it — while sitting in exactly the
+  // state that record exists for: outside the sweep's set, with nothing to revisit it.
+  const { recordShortfallOnDirectCreate } = await loadHelper()
+  reset()
+  seedOrder('o20')
+  state.short.add('o20')
+
+  const written: Row[] = []
+  const tx = {
+    salesOrder: { findUnique: async () => state.orders.find((o) => o.id === 'o20') ?? null },
+    activityLog: { create: async ({ data }: { data: Row }) => { written.push(data); return data } },
+  } as never
+
+  assert.deepEqual(
+    await recordShortfallOnDirectCreate({ tx, orderId: 'o20', createdStatus: 'PICKING' }),
+    { recorded: true },
+  )
+  assert.equal(written.length, 1, 'the record must be written through the transaction')
+  assert.equal(written[0]?.action, 'fulfilment_entry_under_allocated', 'and share the transition path\'s action')
+  assert.match(String(written[0]?.description), /was created directly at PICKING/)
+  assert.deepEqual(
+    written[0]?.metadata,
+    { orderId: 'o20', previousStatus: null, createdAtStatus: 'PICKING' },
+    'previousStatus must be null rather than a fabricated one',
+  )
+})
+
+test('a direct create OUTSIDE fulfilment records nothing (o3d-z82a)', async () => {
+  const { recordShortfallOnDirectCreate } = await loadHelper()
+  const written: Row[] = []
+  for (const status of ['PROCESSING', 'ALLOCATED', 'ON_HOLD', 'DRAFT', 'CANCELLED']) {
+    reset()
+    seedOrder('o21')
+    state.short.add('o21')
+    const tx = {
+      salesOrder: { findUnique: async () => state.orders[0] },
+      activityLog: { create: async ({ data }: { data: Row }) => { written.push(data); return data } },
+    } as never
+    assert.deepEqual(
+      await recordShortfallOnDirectCreate({ tx, orderId: 'o21', createdStatus: status }),
+      { recorded: false },
+      `${status} is inside the sweep's reach or not fulfilment — nothing to record`,
+    )
+  }
+  assert.equal(written.length, 0)
+})
+
+test('a fully covered direct create records nothing (o3d-z82a)', async () => {
+  const { recordShortfallOnDirectCreate } = await loadHelper()
+  reset()
+  seedOrder('o22') // not added to state.short
+  const written: Row[] = []
+  const tx = {
+    salesOrder: { findUnique: async () => state.orders[0] },
+    activityLog: { create: async ({ data }: { data: Row }) => { written.push(data); return data } },
+  } as never
+  assert.deepEqual(await recordShortfallOnDirectCreate({ tx, orderId: 'o22', createdStatus: 'PACKING' }), { recorded: false })
+  assert.equal(written.length, 0, 'a covered order is not a shortfall')
+})
+
+test('both entry points share one record writer (o3d-z82a)', async () => {
+  // Two writers of the same action string would drift; an operator searching for
+  // fulfilment_entry_under_allocated must find both shapes.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/fulfillment/pre-fulfilment-reallocation.ts'), 'utf8')
+
+  const creates = source.match(/tx\.activityLog\.create\(/g) ?? []
+  assert.equal(creates.length, 1, 'there must be exactly ONE place that writes the record')
+  assert.match(source, /async function writeShortfallRecord\(/, 'both entry points must delegate to it')
+  for (const entry of ['recordShortfallUnderLock', 'recordShortfallOnDirectCreate']) {
+    const at = source.indexOf(`export async function ${entry}(`)
+    assert.notEqual(at, -1, `${entry} must exist`)
+    assert.match(source.slice(at, at + 900), /return writeShortfallRecord\(/, `${entry} must delegate`)
+  }
+})
+
+test('the importer records a create-at-fulfilment under the order lock (o3d-z82a)', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
+
+  const at = source.indexOf('isFulfilmentStatus(lifecycleStatus)')
+  assert.notEqual(at, -1, 'the importer must check the status it actually persisted')
+  const body = source.slice(at, at + 500)
+  assert.match(body, /lockSalesOrder\(tx, so\.id\)/, 'the record must be written under the order lock')
+  assert.match(body, /recordShortfallOnDirectCreate\(\{ tx/, 'and through the transaction, not best-effort')
+
+  // The importer already allocates; re-running it here would be a redundant
+  // release/re-reserve cycle on an order fulfilment may already be working.
+  assert.ok(
+    !body.includes('reconcileAllocationBeforeFulfilment'),
+    'the importer must NOT re-run allocation — it already called autoAllocateOrder',
+  )
+
+  // It must gate on the PERSISTED status, not the raw mapping: a refund disposition can
+  // downgrade imsStatus to PROCESSING, and lifecycleStatus is what actually reached the row.
+  assert.ok(!/isFulfilmentStatus\(imsStatus\)/.test(source), 'the gate must use the persisted status')
+})

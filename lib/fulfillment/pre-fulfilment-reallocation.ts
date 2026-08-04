@@ -67,6 +67,11 @@ export function entersFulfilment(currentStatus: string, targetStatus: string): b
   return FULFILMENT_STATUSES.has(targetStatus) && !FULFILMENT_STATUSES.has(currentStatus)
 }
 
+/** Exported so callers outside this module do not re-hardcode the set. */
+export function isFulfilmentStatus(status: string): boolean {
+  return FULFILMENT_STATUSES.has(status)
+}
+
 export type PreFulfilmentReallocationResult =
   | { attempted: false; reason: 'not-fulfilment-entry' | 'fully-covered' | 'has-shipments' | 'order-missing' }
   /** The allocator declined under its own lock — a shipment or status appeared in between. */
@@ -218,7 +223,56 @@ export async function recordShortfallUnderLock(params: {
 }): Promise<{ recorded: boolean }> {
   const { tx, orderId, previousStatus, targetStatus } = params
   if (!entersFulfilment(previousStatus, targetStatus)) return { recorded: false }
+  return writeShortfallRecord(tx, orderId, {
+    reachedStatus: targetStatus,
+    how: `crossed ${previousStatus} -> ${targetStatus}`,
+    metadata: { previousStatus, targetStatus },
+  })
+}
 
+/**
+ * The same authoritative record, for an order CREATED already in fulfilment rather than moved
+ * there (o3d-z82a).
+ *
+ * The WooCommerce importer writes an operator-configured status straight into
+ * `SalesOrder.status`, and the mapping UI offers PICKING and PACKING. Such an order never
+ * transitions, so `recordShortfallUnderLock` never sees it — and passing its status as both
+ * previous and target would not help: `entersFulfilment` requires the SOURCE to be outside
+ * fulfilment, so it would silently return false. Faking a previous status would work
+ * mechanically and write a lie into the record.
+ *
+ * NO allocation attempt here. The importer already calls autoAllocateOrder immediately after
+ * creating the order, so re-running it would be a redundant release/re-reserve cycle. What was
+ * missing is only the record.
+ */
+export async function recordShortfallOnDirectCreate(params: {
+  tx: Prisma.TransactionClient
+  orderId: string
+  createdStatus: string
+}): Promise<{ recorded: boolean }> {
+  const { tx, orderId, createdStatus } = params
+  if (!isFulfilmentStatus(createdStatus)) return { recorded: false }
+  return writeShortfallRecord(tx, orderId, {
+    reachedStatus: createdStatus,
+    how: `was created directly at ${createdStatus}`,
+    metadata: { previousStatus: null, createdAtStatus: createdStatus },
+  })
+}
+
+/**
+ * Shared by both entry points: read the order under the caller's lock, decide coverage against
+ * the same client, and write the record in the SAME transaction.
+ *
+ * Never logActivity — it swallows its own insert failures by design ("never break the caller"),
+ * so routing the authoritative record through it meant claiming `recorded: true` for a row that
+ * may never have been written (o3d-c9mi r3). Inside the transaction the record and the event it
+ * describes are one atomic fact.
+ */
+async function writeShortfallRecord(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  context: { reachedStatus: string; how: string; metadata: Record<string, unknown> },
+): Promise<{ recorded: boolean }> {
   const order = (await tx.salesOrder.findUnique({
     where: { id: orderId },
     select: {
@@ -236,12 +290,6 @@ export async function recordShortfallUnderLock(params: {
   const short = await selectOrdersNeedingAllocation([order], undefined, tx)
   if (short.length === 0) return { recorded: false }
 
-  // Written through the TRANSACTION, not logActivity. logActivity swallows its own insert
-  // failures by design ("never break the caller"), so routing the authoritative record
-  // through it meant claiming recorded:true for a row that may never have been written
-  // (Codex review, r3). Inside the transaction the record and the crossing are one atomic
-  // fact: if it cannot be written, the transition does not happen either — which is exactly
-  // what a recording guarantee has to mean to be worth anything.
   await tx.activityLog.create({
     data: {
       entityType: 'SALES_ORDER',
@@ -249,10 +297,10 @@ export async function recordShortfallUnderLock(params: {
       action: 'fulfilment_entry_under_allocated',
       tag: 'sales',
       level: 'WARNING',
-      description: `Order ${order.orderNumber ?? order.externalOrderNumber ?? order.id} crossed `
-        + `${previousStatus} -> ${targetStatus} without full allocation coverage. The periodic reallocation `
-        + 'sweep does not reach PICKING/PACKING, so the remainder will not be allocated automatically.',
-      metadata: { orderId: order.id, previousStatus, targetStatus },
+      description: `Order ${order.orderNumber ?? order.externalOrderNumber ?? order.id} ${context.how} `
+        + 'without full allocation coverage. The periodic reallocation sweep does not reach '
+        + 'PICKING/PACKING, so the remainder will not be allocated automatically.',
+      metadata: { orderId: order.id, ...context.metadata },
     },
   })
   return { recorded: true }

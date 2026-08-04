@@ -15,6 +15,8 @@ import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+import { isFulfilmentStatus, recordShortfallOnDirectCreate } from '@/lib/fulfillment/pre-fulfilment-reallocation'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import { addMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
@@ -762,6 +764,24 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       if (!allocation.success && allocation.error !== 'No stock available for allocation') {
         throw new Error(`WooCommerce order imported but auto-allocation failed: ${allocation.error ?? 'Unknown error'}`)
       }
+    }
+
+    // o3d-z82a: the status written above is operator-configured via ShoppingStatusMapping, and
+    // the mapping UI offers PICKING and PACKING. An order CREATED in fulfilment never
+    // transitions, so o3d-c9mi's authoritative shortfall record — which hangs off the status
+    // transition — never sees it. Yet it is in exactly the state that record exists for:
+    // outside the reallocation sweep's set (PROCESSING + ALLOCATED), with nothing to revisit
+    // it, and the allocation above can legitimately leave it short ('No stock available' is
+    // tolerated three lines up, and partial coverage returns success).
+    //
+    // No allocation attempt here — the importer already made one. What was missing is the
+    // record. Written under the order lock and in one transaction so it carries the same
+    // guarantee as the transition-side record rather than being best-effort.
+    if (isFulfilmentStatus(lifecycleStatus)) {
+      await db.$transaction(async (tx) => {
+        await lockSalesOrder(tx, so.id)
+        await recordShortfallOnDirectCreate({ tx, orderId: so.id, createdStatus: lifecycleStatus })
+      })
     }
 
     // Queue accounting sales invoice — only for PROCESSING orders and when
