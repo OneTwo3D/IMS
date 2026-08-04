@@ -657,6 +657,13 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               // change the parent from VARIABLE to SIMPLE in between and this would commit a
               // child pointing at a parent that can no longer have children. Both skus go
               // through the one helper so they are acquired in the single ascending id order.
+              //
+              // THIS CLOSES ONE ORDERING, NOT BOTH. If the CSV wins the lock and commits the
+              // child, the WooCommerce sync then acquires the same lock and writes type=SIMPLE
+              // without checking for existing children, recreating the same forbidden state
+              // from the other side. The lock makes the two writers serialize; it cannot make
+              // the second one care. That half needs the WC sync to consult the editor's
+              // transform blockers, which it currently bypasses entirely — o3d-0hhu.
               const parentIdToWrite = structureValidation.normalizedParentId
               const parentSkuToLock = parentIdToWrite ? productById.get(parentIdToWrite)?.sku ?? null : null
               await lockProductSkusForWrite(tx, parentSkuToLock ? [sku, parentSkuToLock] : [sku])
