@@ -17,6 +17,9 @@ import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
+import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
+import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -90,6 +93,12 @@ function getIdempotencySource(
   referenceId: string,
   payload: SyncPayload,
 ): string {
+  // o3d-h2wx: a follow-up stamped with the stable token derives from THAT, so regenerating
+  // its row cannot rotate the Request-Id. Ordered above `_idempotencyKey` — which is the
+  // generic queue's, set by callers this module does not own — because only the follow-up
+  // token is guaranteed to be identical across a re-enqueue.
+  const followUpKey = readFollowUpIdempotencyKey(payload)
+  if (followUpKey) return followUpKey
   if (typeof payload._idempotencyKey === 'string') return payload._idempotencyKey
   return type.startsWith('DAILY_BATCH_') ? `${type}:${referenceId}` : entryId
 }
@@ -150,18 +159,115 @@ async function enqueueFollowUpSyncLog(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
+  attempt = 0,
 ): Promise<void> {
-  if (await hasExistingSyncLog(type, referenceType, referenceId)) return
-  await db.accountingSyncLog.create({
-    data: {
-      connector: QBO_CONNECTOR,
-      type,
-      status: 'PENDING',
-      referenceType,
-      referenceId,
-      payload: payload as never,
-    },
+  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
+  // o3d-h2wx: a FAILED row is REUSED rather than replaced. The QuickBooks Request-Id is
+  // derived from the entry id, so a replacement row posts the retry under a request id
+  // Intuit has never seen — and if the failed attempt had actually committed, a SECOND
+  // payment lands on the invoice.
+  const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
+    where: { connector: QBO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true, payload: true },
   })
+  const failedRows = failedLogs.map((row) => ({
+    id: row.id,
+    payload: row.payload,
+    // Exactly what getIdempotencySource would have produced for this row, so pinning it
+    // reproduces a byte-identical Request-Id even after the row itself is gone. Note this
+    // consults the generic `_idempotencyKey`, which QuickBooks has always honoured — unlike
+    // Xero, whose payment branches never did.
+    effectiveToken: getIdempotencySource(row.id, type, referenceId, (row.payload ?? {}) as SyncPayload),
+  }))
+  const plan = planFollowUpEnqueue({
+    connector: QBO_CONNECTOR,
+    type,
+    referenceType,
+    referenceId,
+    payload,
+    liveRowExists,
+    failedRows,
+  })
+  if (plan.action === 'skip') return
+  if (plan.action === 'refuse') {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: ${plan.reason}`,
+      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+    })
+    return
+  }
+  try {
+    if (plan.action === 'reuse') {
+      // Fenced on status: if another run revived the same row first — or retention deleted
+      // it between the read and here (o3d-nepa) — this updates nothing rather than
+      // resetting a claim it does not own.
+      const revived = await db.accountingSyncLog.updateMany({
+        where: { id: plan.syncLogId, status: 'FAILED' },
+        data: {
+          status: 'PENDING',
+          payload: plan.payload as never,
+          retryCount: 0,
+          errorMessage: null,
+          processingStartedAt: null,
+        },
+      })
+      if (revived.count === 0) {
+        await resolveLostFollowUpRevival({
+          connector: QBO_CONNECTOR,
+          type,
+          referenceType,
+          referenceId,
+          payload: plan.payload,
+          syncLogId: plan.syncLogId,
+          attempt,
+          // plan.payload carries the PINNED token, and withFollowUpIdempotencyKey never
+          // overwrites one — so a row created by the re-plan posts under the same remote
+          // key as the row that vanished. That is what makes losing the row survivable.
+          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+        })
+        return
+      }
+      await logFollowUpRevival(QBO_CONNECTOR, type, referenceType, referenceId, plan)
+      return
+    }
+    await db.accountingSyncLog.create({
+      data: {
+        connector: QBO_CONNECTOR,
+        type,
+        status: 'PENDING',
+        referenceType,
+        referenceId,
+        payload: plan.payload as never,
+      },
+    })
+  } catch (error) {
+    // A concurrent run took the live slot and the partial unique index
+    // (accounting_sync_logs_followup_live_unique) rejected ours. This used to return as an
+    // idempotent no-op, which silently accepted a winner posting under a DIFFERENT token
+    // while ours may already have committed (Codex review, r7 #1). It now goes through the
+    // same resolver as a lost compare-and-set, which only accepts a live row carrying our
+    // token.
+    if (isUniqueConstraintViolation(error)) {
+      await resolveLostFollowUpRevival({
+        connector: QBO_CONNECTOR,
+        type,
+        referenceType,
+        referenceId,
+        payload: plan.payload,
+        syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
+        attempt,
+        retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+      })
+      return
+    }
+    throw error
+  }
 }
 
 export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
@@ -292,12 +398,19 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
         } catch (followUpError) {
+          // ERROR, not WARNING: the external post is committed and this entry is about to be
+          // marked succeeded, so nothing will drive these follow-ups again. A payment or PDF
+          // that never got enqueued is silently missing until someone notices, and at WARNING
+          // nobody does (Codex review, r6).
           await logActivity({
             entityType: 'SYSTEM',
             action: 'quickbooks_followup_error',
             tag: 'sync',
-            level: 'WARNING',
-            description: `QuickBooks sync entry ${entry.id} posted successfully but follow-up work failed: ${String(followUpError)}`,
+            level: 'ERROR',
+            description: `QuickBooks sync entry ${entry.id} posted successfully but its follow-up work was NOT `
+              + `enqueued: ${String(followUpError)}. The document is in QuickBooks; its payment, PDF or email `
+              + 'follow-ups need to be re-driven manually.',
+            metadata: { syncLogId: entry.id, type: entry.type, referenceType: entry.referenceType, referenceId: entry.referenceId },
           })
         }
 

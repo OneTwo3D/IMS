@@ -18,6 +18,8 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { applyBackReference, backReferenceIsMissing, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
+import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
@@ -92,6 +94,19 @@ export function buildXeroIdempotencyKey(entryId: string, operation: string, payl
   const key = `ims-${operation}-${entryId}`
   if (key.length <= XERO_IDEMPOTENCY_KEY_MAX_LENGTH) return key
   return `ims-${operation}-${createHash('sha256').update(entryId).digest('hex')}`
+}
+
+/**
+ * o3d-h2wx: the source a money-moving follow-up's Idempotency-Key is built from. Prefers
+ * the stable follow-up token when this row carries one, so the key survives the row being
+ * regenerated; otherwise the entry id, exactly as before.
+ *
+ * Deliberately does NOT consult the generic `payload._idempotencyKey`. These branches have
+ * always ignored it, and starting to read it would change the key of every manual-receipt
+ * payment already in flight at deploy time — creating the double-post window this closes.
+ */
+function followUpIdempotencySource(entryId: string, payload: SyncPayload): string {
+  return readFollowUpIdempotencyKey(payload) ?? entryId
 }
 
 function getRateLimitBackoffMs(retryCount: number, message: string): number {
@@ -266,12 +281,75 @@ async function enqueueFollowUpSyncLog(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
+  attempt = 0,
 ): Promise<void> {
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
-  if (await hasExistingSyncLog(type, referenceType, referenceId)) return
+  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
+  // o3d-h2wx: a FAILED row is REUSED rather than replaced. Xero's Idempotency-Key is
+  // derived from the entry id, so creating a replacement row would post the retry under a
+  // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
+  // payment lands on the invoice.
+  const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
+    where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true, payload: true },
+  })
+  const failedRows = failedLogs.map((row) => ({
+    id: row.id,
+    payload: row.payload,
+    // Exactly what followUpIdempotencySource would have produced for this row, so pinning it
+    // reproduces a byte-identical Idempotency-Key even after the row itself is gone.
+    effectiveToken: followUpIdempotencySource(row.id, (row.payload ?? {}) as SyncPayload),
+  }))
+  const plan = planFollowUpEnqueue({
+    connector: XERO_CONNECTOR,
+    type,
+    referenceType,
+    referenceId,
+    payload,
+    liveRowExists,
+    failedRows,
+  })
+  if (plan.action === 'skip') return
+  if (plan.action === 'refuse') {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: ${plan.reason}`,
+      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+    })
+    return
+  }
   try {
-    await db.$transaction(async (tx) => {
+    const outcome = await db.$transaction(async (tx) => {
+      if (plan.action === 'reuse') {
+        // Fenced on status: if another run revived the same row first — or retention
+        // deleted it between the read and here (o3d-nepa) — this updates nothing rather
+        // than resetting a claim it does not own.
+        const revived = await tx.accountingSyncLog.updateMany({
+          where: { id: plan.syncLogId, status: 'FAILED' },
+          data: {
+            status: 'PENDING',
+            payload: plan.payload as never,
+            retryCount: 0,
+            errorMessage: null,
+            processingStartedAt: null,
+          },
+        })
+        if (revived.count === 0) return 'cas-lost' as const
+        await scheduleXeroAccountingOutbox(tx, {
+          accountingSyncLogId: plan.syncLogId,
+          // Explicit 0 rather than resetAttempts: a PROCESSING outbox row honours only an
+          // explicit `attempts` (outbox.ts) and ignores resetAttempts, so the revived entry
+          // would keep a spent attempt budget and never be claimed (Codex review, r1 #6).
+          attempts: 0,
+        })
+        return 'done' as const
+      }
       const log = await tx.accountingSyncLog.create({
         data: {
           connector: XERO_CONNECTOR,
@@ -279,18 +357,51 @@ async function enqueueFollowUpSyncLog(
           status: 'PENDING',
           referenceType,
           referenceId,
-          payload: payload as never,
+          payload: plan.payload as never,
         },
       })
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })
+      return 'done' as const
     })
+    if (outcome === 'cas-lost' && plan.action === 'reuse') {
+      await resolveLostFollowUpRevival({
+        connector: XERO_CONNECTOR,
+        type,
+        referenceType,
+        referenceId,
+        payload: plan.payload,
+        syncLogId: plan.syncLogId,
+        attempt,
+        // plan.payload carries the PINNED token, and withFollowUpIdempotencyKey never
+          // overwrites one — so a row created by the re-plan posts under the same remote
+          // key as the row that vanished. That is what makes losing the row survivable.
+          retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+      })
+      return
+    }
+    if (plan.action === 'reuse') await logFollowUpRevival(XERO_CONNECTOR, type, referenceType, referenceId, plan)
   } catch (error) {
-    // A concurrent run created the same live follow-up first — the unique index
-    // rejected ours. That row (and its outbox job) already exist, so this enqueue
-    // is a no-op; anything else is a real failure.
-    if (isUniqueConstraintViolation(error)) return
+    // A concurrent run took the live slot and the partial unique index
+    // (accounting_sync_logs_followup_live_unique) rejected ours. This used to return as an
+    // idempotent no-op, which silently accepted a winner posting under a DIFFERENT token
+    // while ours may already have committed (Codex review, r7 #1). It now goes through the
+    // same resolver as a lost compare-and-set, which only accepts a live row carrying our
+    // token.
+    if (isUniqueConstraintViolation(error)) {
+      await resolveLostFollowUpRevival({
+        connector: XERO_CONNECTOR,
+        type,
+        referenceType,
+        referenceId,
+        payload: plan.payload,
+        syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
+        attempt,
+        retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
+      })
+      return
+    }
     throw error
   }
 }
@@ -1247,7 +1358,7 @@ async function processEntry(
           Account: { AccountID: account.externalAccountId },
           Date: paymentDate,
           Amount: amount,
-        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'invoice-payment') })
+        }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment') })
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
         }
@@ -1348,7 +1459,7 @@ async function processEntry(
           Date: paymentDate,
           Amount: amount,
           Reference: (payload.reference as string | undefined) ?? undefined,
-        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'bill-payment') })
+        }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'bill-payment') })
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
         }
@@ -1410,7 +1521,7 @@ async function processEntry(
       }
       const result = await allocatePurchaseCreditNote(
         { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
-        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'purchase-credit-note-allocation') },
+        { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },
       )
       // No externalId to back-reference — the allocation is a sub-resource of the
       // credit note, not a standalone document.
@@ -1560,20 +1671,61 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
       result.failed++
       continue
     }
-    if (!missing) continue
+    // A row whose back-reference is already applied but is STILL FAILED is precisely the
+    // "back-reference done, follow-ups not enqueued" state a previous pass can leave behind.
+    // Skipping it on `!missing` meant those follow-ups were never retried — leaving the row
+    // FAILED accomplished nothing, because the sweep never looked at it again (Codex r7 #2).
+    // Such a row falls through to the follow-up enqueue below; applyBackReference is skipped
+    // since there is nothing to apply.
+    const followUpsOnly = !missing && row.status === 'FAILED'
+    if (!missing && !followUpsOnly) continue
+    // Counted as CHECKED either way, but a follow-ups-only pass is not a repair: nothing was
+    // re-applied, so it must not inflate `repaired` or claim a back-reference fix that did
+    // not happen (Codex review, r8).
     result.checked++
     try {
-      await applyBackReference(db, params)
+      if (!followUpsOnly) await applyBackReference(db, params)
       // The follow-ups (PDF, payment, attachment) never ran on the original
       // failed pass — enqueue them now. hasExistingSyncLog makes this idempotent.
+      let followUpsEnqueued = true
       try {
         await enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, { externalId: row.externalTransactionId, invoiceNumber: params.invoiceNumber })
       } catch (followUpError) {
+        followUpsEnqueued = false
         console.error('repairXeroBackReferences: follow-up enqueue failed', row.id, followUpError)
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_backreference_followup_deferred',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Applied the Xero back-reference for ${row.referenceType} ${row.referenceId} but could not `
+            + `enqueue its follow-ups: ${String(followUpError)}. The row stays FAILED so the next sweep retries them.`,
+          metadata: { syncLogId: row.id, referenceType: row.referenceType, referenceId: row.referenceId },
+        })
       }
-      // A FAILED row whose back-reference is now applied is fully reconciled.
-      if (row.status === 'FAILED') {
+      // A FAILED row whose back-reference is now applied is fully reconciled — but ONLY if
+      // its follow-ups were actually enqueued. Marking it SYNCED regardless retired the one
+      // source that would retry them, so a transient enqueue failure lost the payment or PDF
+      // permanently (Codex review, r6). Leaving it FAILED is what makes the retry durable.
+      if (row.status === 'FAILED' && followUpsEnqueued) {
         await db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', errorMessage: null } })
+      }
+      if (followUpsOnly) {
+        // Nothing was repaired — this pass existed only to retry the follow-ups. Reporting it
+        // as a repair would overstate what the sweep did, and the INFO line below would claim
+        // a re-application that never occurred.
+        if (followUpsEnqueued) {
+          await logActivity({
+            entityType: 'SYSTEM',
+            action: 'xero_backreference_followups_recovered',
+            tag: 'sync',
+            level: 'INFO',
+            description: `Enqueued the outstanding Xero follow-ups for ${row.referenceType} ${row.referenceId}; its `
+              + 'back-reference was already applied by an earlier pass.',
+            metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
+          })
+        }
+        continue
       }
       result.repaired++
       await logActivity({
@@ -1813,7 +1965,10 @@ async function enqueuePurchaseCreditNoteFollowUps(
     creditNoteId: syncResult.externalId,
     accountingInvoiceId: allocateToInvoiceId,
     amount: allocateAmount,
-    date: payload.date as string | undefined,
+    // Resolved HERE rather than left undefined for processEntry to fill from the wall
+    // clock. An unset date made the allocation body differ on every execution, so a
+    // retry of a pinned request was no longer the same request (Codex review, r2 #3).
+    date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
     sourceEntryId: entryId,
   })
 }
