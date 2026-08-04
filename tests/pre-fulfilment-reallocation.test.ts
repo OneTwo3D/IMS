@@ -424,6 +424,26 @@ test('the coverage selector reads EVERYTHING through one client (o3d-c9mi)', asy
   assert.match(body, /loadFulfillmentProductGraph\(client,/, 'the product graph must load on the caller\'s client')
 })
 
+/**
+ * A transaction stub for the direct-create recorder. It reads an existing-record COUNT (the
+ * idempotency check) and the order's CURRENT status (the cancelled-in-the-gap check) as well as
+ * the order itself, so a stub missing either would make those guards untestable.
+ */
+function directCreateTx(orderId: string, written: Row[], currentStatus = 'PICKING') {
+  return {
+    salesOrder: {
+      findUnique: async ({ select }: { select?: Record<string, unknown> }) =>
+        select && 'status' in select
+          ? { status: currentStatus }
+          : state.orders.find((o) => o.id === orderId) ?? null,
+    },
+    activityLog: {
+      count: async () => written.length,
+      create: async ({ data }: { data: Row }) => { written.push(data); return data },
+    },
+  } as never
+}
+
 test('an order CREATED in fulfilment is recorded, though it never transitions (o3d-z82a)', async () => {
   // The WooCommerce importer writes an operator-configured status straight into
   // SalesOrder.status, and the mapping UI offers PICKING and PACKING. Such an order never
@@ -435,10 +455,7 @@ test('an order CREATED in fulfilment is recorded, though it never transitions (o
   state.short.add('o20')
 
   const written: Row[] = []
-  const tx = {
-    salesOrder: { findUnique: async () => state.orders.find((o) => o.id === 'o20') ?? null },
-    activityLog: { create: async ({ data }: { data: Row }) => { written.push(data); return data } },
-  } as never
+  const tx = directCreateTx('o20', written)
 
   assert.deepEqual(
     await recordShortfallOnDirectCreate({ tx, orderId: 'o20', createdStatus: 'PICKING' }),
@@ -461,10 +478,7 @@ test('a direct create OUTSIDE fulfilment records nothing (o3d-z82a)', async () =
     reset()
     seedOrder('o21')
     state.short.add('o21')
-    const tx = {
-      salesOrder: { findUnique: async () => state.orders[0] },
-      activityLog: { create: async ({ data }: { data: Row }) => { written.push(data); return data } },
-    } as never
+    const tx = directCreateTx('o21', written, status)
     assert.deepEqual(
       await recordShortfallOnDirectCreate({ tx, orderId: 'o21', createdStatus: status }),
       { recorded: false },
@@ -479,10 +493,7 @@ test('a fully covered direct create records nothing (o3d-z82a)', async () => {
   reset()
   seedOrder('o22') // not added to state.short
   const written: Row[] = []
-  const tx = {
-    salesOrder: { findUnique: async () => state.orders[0] },
-    activityLog: { create: async ({ data }: { data: Row }) => { written.push(data); return data } },
-  } as never
+  const tx = directCreateTx('o22', written, 'PACKING')
   assert.deepEqual(await recordShortfallOnDirectCreate({ tx, orderId: 'o22', createdStatus: 'PACKING' }), { recorded: false })
   assert.equal(written.length, 0, 'a covered order is not a shortfall')
 })
@@ -500,7 +511,7 @@ test('both entry points share one record writer (o3d-z82a)', async () => {
   for (const entry of ['recordShortfallUnderLock', 'recordShortfallOnDirectCreate']) {
     const at = source.indexOf(`export async function ${entry}(`)
     assert.notEqual(at, -1, `${entry} must exist`)
-    assert.match(source.slice(at, at + 900), /return writeShortfallRecord\(/, `${entry} must delegate`)
+    assert.match(source.slice(at, at + 2200), /return writeShortfallRecord\(/, `${entry} must delegate`)
   }
 })
 
@@ -509,20 +520,88 @@ test('the importer records a create-at-fulfilment under the order lock (o3d-z82a
   const path = await import('node:path')
   const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
 
-  const at = source.indexOf('isFulfilmentStatus(lifecycleStatus)')
-  assert.notEqual(at, -1, 'the importer must check the status it actually persisted')
-  const body = source.slice(at, at + 500)
-  assert.match(body, /lockSalesOrder\(tx, so\.id\)/, 'the record must be written under the order lock')
-  assert.match(body, /recordShortfallOnDirectCreate\(\{ tx/, 'and through the transaction, not best-effort')
+  const at = source.indexOf('async function recordDirectCreateShortfall(')
+  assert.notEqual(at, -1, 'the importer must have a recorder helper')
+  const helper = source.slice(at, at + 900)
+  assert.match(helper, /isFulfilmentStatus\(status\)/, 'it must gate on a fulfilment status')
+  assert.match(helper, /lockSalesOrder\(tx, orderId\)/, 'the record must be written under the order lock')
+  assert.match(helper, /recordShortfallOnDirectCreate\(\{ tx/, 'and through the transaction, not best-effort')
 
-  // The importer already allocates; re-running it here would be a redundant
-  // release/re-reserve cycle on an order fulfilment may already be working.
+  // The create path must pass the PERSISTED status: a refund disposition can downgrade
+  // imsStatus to PROCESSING while lifecycleStatus is what actually reached the row.
+  assert.match(
+    source,
+    /await recordDirectCreateShortfall\(so\.id, lifecycleStatus\)/,
+    'the create path must pass the status it persisted, not the raw mapping',
+  )
+  assert.ok(!/recordDirectCreateShortfall\(so\.id, imsStatus\)/.test(source), 'not the raw mapping status')
+
+  // The importer already allocates; re-running it would be a redundant release/re-reserve
+  // cycle on an order fulfilment may already be working.
   assert.ok(
-    !body.includes('reconcileAllocationBeforeFulfilment'),
+    !source.includes('reconcileAllocationBeforeFulfilment'),
     'the importer must NOT re-run allocation — it already called autoAllocateOrder',
   )
+})
 
-  // It must gate on the PERSISTED status, not the raw mapping: a refund disposition can
-  // downgrade imsStatus to PROCESSING, and lifecycleStatus is what actually reached the row.
-  assert.ok(!/isFulfilmentStatus\(imsStatus\)/.test(source), 'the gate must use the persisted status')
+test('the direct-create record is IDEMPOTENT, so a redelivery cannot duplicate it (o3d-z82a)', async () => {
+  // The import is retried — a webhook redelivery or a re-run bulk import reaches the same order
+  // again — so this must be safe to call repeatedly.
+  const { recordShortfallOnDirectCreate } = await loadHelper()
+  reset()
+  seedOrder('o23')
+  state.short.add('o23')
+  const written: Row[] = []
+  const tx = directCreateTx('o23', written)
+
+  assert.deepEqual(await recordShortfallOnDirectCreate({ tx, orderId: 'o23', createdStatus: 'PICKING' }), { recorded: true })
+  assert.deepEqual(
+    await recordShortfallOnDirectCreate({ tx, orderId: 'o23', createdStatus: 'PICKING' }),
+    { recorded: false },
+    'a second call must not write a second record',
+  )
+  assert.equal(written.length, 1)
+})
+
+test('an order cancelled in the unlocked gap is not falsely recorded (o3d-z82a)', async () => {
+  // The order was created and allocated in earlier, already-committed transactions, so it can
+  // have been cancelled before this record's transaction takes the lock. Recording a shortfall
+  // for an order no longer heading to fulfilment would be a false alarm.
+  const { recordShortfallOnDirectCreate } = await loadHelper()
+  reset()
+  seedOrder('o24')
+  state.short.add('o24')
+  const written: Row[] = []
+  // Created at PICKING, but CANCELLED by the time the lock is held.
+  const tx = directCreateTx('o24', written, 'CANCELLED')
+
+  assert.deepEqual(
+    await recordShortfallOnDirectCreate({ tx, orderId: 'o24', createdStatus: 'PICKING' }),
+    { recorded: false },
+  )
+  assert.equal(written.length, 0)
+})
+
+test('the importer completes a missing record on redelivery (o3d-z82a)', async () => {
+  // The blocker this closes: the record's transaction can fail AFTER the order and its
+  // allocation have committed. That fails the import, the webhook retries — and the retry
+  // returns from the already-imported branch BEFORE reaching the recorder, losing the record
+  // permanently while reporting success.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
+
+  // Anchored on the already-imported branch's own call, not on `if (existing) {` — that
+  // matches a shoppingSyncLog branch 136 lines earlier and windowed the wrong region.
+  const at = source.indexOf('await updateExistingWcOrderFromPayload(existing.id, wcOrder)')
+  assert.notEqual(at, -1, 'the already-imported branch must still exist')
+  const body = source.slice(at, at + 900)
+  assert.match(body, /await recordDirectCreateShortfall\(existing\.id\)/, 'a redelivery must attempt the record')
+  const recordAt = body.indexOf('recordDirectCreateShortfall')
+  const returnAt = body.indexOf('return { success: true, orderId: existing.id }')
+  assert.ok(recordAt !== -1 && returnAt !== -1 && recordAt < returnAt, 'it must run BEFORE the early return')
+
+  // And the record's transaction needs a budget matching the transition path's — the coverage
+  // check loads the fulfilment product graph, which Prisma's 5s default does not allow for.
+  assert.match(source, /timeout: 20_000/, 'the record transaction must not use the 5s default')
 })

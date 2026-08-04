@@ -360,6 +360,26 @@ async function updateExistingWcOrderFromPayload(
   })
 }
 
+/**
+ * Write the o3d-c9mi shortfall record for an order that is ALREADY in fulfilment, under the
+ * order lock and in its own transaction.
+ *
+ * Given an explicit `createdStatus` on the create path; on the redelivery path the status is
+ * read from the row, because by then it is whatever the order currently is.
+ *
+ * A LONGER TIMEOUT than Prisma's 5s default, matching the transition path's budget: the
+ * coverage check loads the fulfilment product graph, and a KIT-heavy order can take real time.
+ */
+async function recordDirectCreateShortfall(orderId: string, createdStatus?: string): Promise<void> {
+  const status = createdStatus
+    ?? (await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } }))?.status
+  if (!status || !isFulfilmentStatus(status)) return
+  await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    await recordShortfallOnDirectCreate({ tx, orderId, createdStatus: status })
+  }, { maxWait: 5_000, timeout: 20_000 })
+}
+
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
   try {
     // Skip if already imported
@@ -376,6 +396,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     if (existing) {
       await updateExistingWcOrderFromPayload(existing.id, wcOrder)
       if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, existing.id)
+      // o3d-z82a: a redelivery finishes a record an earlier attempt failed to write. Without
+      // this the recorder below could fail, the import would report failure, and the RETRY
+      // would return here before ever reaching it — losing the record permanently while
+      // reporting success. The recorder is idempotent and re-checks the current status, so
+      // this is a no-op for every ordinary redelivery.
+      await recordDirectCreateShortfall(existing.id)
       return { success: true, orderId: existing.id }
     }
 
@@ -777,12 +803,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // No allocation attempt here — the importer already made one. What was missing is the
     // record. Written under the order lock and in one transaction so it carries the same
     // guarantee as the transition-side record rather than being best-effort.
-    if (isFulfilmentStatus(lifecycleStatus)) {
-      await db.$transaction(async (tx) => {
-        await lockSalesOrder(tx, so.id)
-        await recordShortfallOnDirectCreate({ tx, orderId: so.id, createdStatus: lifecycleStatus })
-      })
-    }
+    await recordDirectCreateShortfall(so.id, lifecycleStatus)
 
     // Queue accounting sales invoice — only for PROCESSING orders and when
     // accounting is not explicitly skipped (e.g. initial import).

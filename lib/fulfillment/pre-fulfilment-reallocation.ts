@@ -252,6 +252,22 @@ export async function recordShortfallOnDirectCreate(params: {
 }): Promise<{ recorded: boolean }> {
   const { tx, orderId, createdStatus } = params
   if (!isFulfilmentStatus(createdStatus)) return { recorded: false }
+
+  // IDEMPOTENT, unlike the transition-side entry point, and it has to be. The import is
+  // RETRIED — a webhook redelivery or a re-run bulk import reaches the same order again — so
+  // this must be safe to call repeatedly, and must be callable from the already-imported path
+  // so a retry can finish a record an earlier attempt failed to write (Codex review).
+  const existing = await tx.activityLog.count({
+    where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'fulfilment_entry_under_allocated' },
+  })
+  if (existing > 0) return { recorded: false }
+
+  // Re-checked under the lock: the order was created and allocated in earlier, already
+  // committed transactions, so it can have been cancelled in the gap. Recording a shortfall
+  // for an order that is no longer heading for fulfilment would be a false alarm.
+  const current = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+  if (!current || !isFulfilmentStatus(current.status)) return { recorded: false }
+
   return writeShortfallRecord(tx, orderId, {
     reachedStatus: createdStatus,
     how: `was created directly at ${createdStatus}`,
