@@ -74,7 +74,11 @@ const WRITERS = [
   },
   {
     file: IMPORT_ACTIONS,
-    sites: ['CSV create', 'CSV rename/update'],
+    // The component pass is a Product-structure writer rather than a sku create/rename, but
+    // it takes the same lock for the same reason (o3d-w998): it writes ProductComponent rows
+    // long after the row that queued it committed, so it must re-check under the lock that
+    // the product still accepts components.
+    sites: ['CSV create', 'CSV rename/update', 'CSV component pass'],
   },
 ]
 

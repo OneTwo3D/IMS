@@ -20,6 +20,13 @@ import {
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
+
+/**
+ * Product types that can own ProductComponent rows. The CSV import queues a row for the
+ * component pass on the type it read BEFORE the row's lock, so the pass re-checks against
+ * this under its own lock (o3d-w998).
+ */
+const COMPONENT_BEARING_TYPES = new Set<string>(['KIT', 'BOM'])
 import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
@@ -238,7 +245,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
   const supplierIdByName = new Map(suppliers.map((supplier) => [supplier.name.trim().toLocaleLowerCase('en-US'), supplier.id]))
 
   // Track rows with components to process in second pass
-  const componentRows: { lineNum: number; sku: string; components: string }[] = []
+  // o3d-w998: the immutable product id is captured AT ENQUEUE, not resolved from `skuToId`
+  // during pass 2. That map is mutated by every rename in pass 1, so a SKU freed by one row
+  // and reassigned to a different product by a later row resolved to the WRONG product —
+  // which then passed both the sku and type checks, and had its component list replaced.
+  const componentRows: { lineNum: number; sku: string; productId: string; components: string }[] = []
   const touchedProducts: Array<{ id: string; lifecycleStatus: ProductLifecycleStatus }> = []
   const categoryIdCache = new Map<string, string>()
   type ProductCategoryResolverClient = Pick<Prisma.TransactionClient, 'productCategory'> | Pick<typeof db, 'productCategory'>
@@ -320,7 +331,21 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
     const csvOriginIso = csvOriginRaw ? normalizeCsvCountryOfOrigin(csvOriginRaw) : null
 
     const lifecycleStatusRaw = row['lifecycleStatus']?.trim() || row['lifecyclestatus']?.trim() || null
-    const lifecycleStatus = lifecycleStatusRaw === 'DRAFT' || lifecycleStatusRaw === 'ACTIVE' || lifecycleStatusRaw === 'EOL' || lifecycleStatusRaw === 'ARCHIVED'
+    // o3d-w998: an UNRECOGNISED lifecycle cell used to fall through to the PRE-LOCK snapshot
+    // value — and because `lifecycleStatusRaw` is truthy, the write guard below then wrote
+    // it. So a malformed cell silently overwrote a concurrent archive with a stale status,
+    // and the bad value itself was never reported. It is now an error for that field: the
+    // row keeps importing, but its lifecycle is left alone rather than reset from a snapshot.
+    const lifecycleStatusValid = lifecycleStatusRaw === null
+      || lifecycleStatusRaw === 'DRAFT' || lifecycleStatusRaw === 'ACTIVE'
+      || lifecycleStatusRaw === 'EOL' || lifecycleStatusRaw === 'ARCHIVED'
+    if (!lifecycleStatusValid) {
+      result.errors.push(
+        `Row ${lineNum} (${sku}): unrecognised lifecycleStatus "${lifecycleStatusRaw}" — the product's current `
+        + 'lifecycle was left unchanged',
+      )
+    }
+    const lifecycleStatus = lifecycleStatusValid && lifecycleStatusRaw !== null
       ? lifecycleStatusRaw as ProductLifecycleStatus
       : hasCsvValue(row, 'active')
         ? deriveLifecycleStatusFromLegacyActive((row['active'] ?? 'TRUE').trim().toUpperCase() !== 'FALSE')
@@ -394,7 +419,9 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           updateData.preferredSupplierUpdatedAt = preferredSupplierId ? new Date() : null
         }
         if (preferredSupplierLocked !== undefined) updateData.preferredSupplierLocked = preferredSupplierLocked
-        if (lifecycleStatusRaw || hasCsvValue(row, 'active')) {
+        // An invalid cell no longer counts as "the CSV asked for a lifecycle change" — writing
+        // the snapshot value on its behalf is exactly how a concurrent archive got reverted.
+        if ((lifecycleStatusRaw && lifecycleStatusValid) || hasCsvValue(row, 'active')) {
           updateData.active = deriveLegacyActiveFromLifecycleStatus(lifecycleStatus)
           updateData.lifecycleStatus = lifecycleStatus
         }
@@ -672,8 +699,16 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
       // Track components for second pass
       const componentsStr = (row['components'] ?? '').trim()
-      if (componentsStr && (type === 'KIT' || type === 'BOM')) {
-        componentRows.push({ lineNum, sku, components: componentsStr })
+      // Gated on the COMMITTED type, which the locked transaction has just written into
+      // productById, rather than the pre-lock `type`. Pass 2 re-checks under its own lock
+      // regardless, so this is not what makes it safe — it stops the common case queueing a
+      // row only to reject it later with a conflict the operator did not cause (o3d-w998).
+      const committedType = productById.get(skuToId.get(sku) ?? '')?.type ?? type
+      if (componentsStr && COMPONENT_BEARING_TYPES.has(committedType)) {
+        const componentProductId = skuToId.get(sku)
+        if (componentProductId) {
+          componentRows.push({ lineNum, sku, productId: componentProductId, components: componentsStr })
+        }
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -684,8 +719,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
   // Pass 2: Set up components for KIT/BOM products
   for (const cr of componentRows) {
-    const productId = skuToId.get(cr.sku)
-    if (!productId) continue
+    const productId = cr.productId
 
     // Parse "SKU1:qty;SKU2:qty" format
     const parts = cr.components.split(';').map((s) => s.trim()).filter(Boolean)
@@ -727,7 +761,29 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
       try {
         if (!preview) {
-          await db.$transaction(async (tx) => {
+          // o3d-w998: this pass runs LONG after the row that queued it, in its own
+          // transaction, and the decision to queue it was made on `type` — which falls back
+          // to the PRE-LOCK snapshot when the CSV omits the column (`rawType ||
+          // existingProduct?.type`). A product converted KIT/BOM -> SIMPLE in between would
+          // have had its components deleted and rewritten here even though it no longer
+          // accepts any.
+          //
+          // So the lock is taken HERE and the type re-read under it. Same protocol and
+          // namespace as every other Product writer (o3d-42hw), so this contends with the
+          // editor and the WooCommerce sync rather than racing them.
+          const wrote = await db.$transaction(async (tx) => {
+            await lockProductSkusForWrite(tx, [cr.sku])
+            const current = await tx.product.findUnique({
+              where: { id: productId },
+              select: { sku: true, type: true },
+            })
+            // The lock is on cr.sku, but the product is addressed by the id `skuToId` held at
+            // the END of pass 1 — a rename since then means we hold the lock for a sku this
+            // product no longer has, so it protects nothing. Same lock-set verification the
+            // rename path needs (o3d-42hw).
+            if (!current || current.sku !== cr.sku) return false
+            if (!COMPONENT_BEARING_TYPES.has(current.type)) return false
+
             await tx.productComponent.deleteMany({ where: { productId } })
             await tx.productComponent.createMany({
               data: components.map((c, i) => ({
@@ -737,7 +793,17 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 sortOrder: i,
               })),
             })
+            return true
           })
+          if (!wrote) {
+            // Reported, not silent: the operator supplied components for this row and none
+            // were written. Returning rather than throwing keeps the remaining rows going.
+            result.errors.push(
+              `Row ${cr.lineNum}: ${cr.sku} no longer accepts components (its type changed while the import `
+              + 'was running) — components were not written',
+            )
+            continue
+          }
           const product = touchedProducts.find((entry) => entry.id === productId)
           if (!product) {
             const lifecycleRow = await db.product.findUnique({
