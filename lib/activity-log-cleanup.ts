@@ -1,10 +1,24 @@
 import { db } from '@/lib/db'
+import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 
 const DEFAULTS: Record<string, number> = {
   INFO: 30,
   WARNING: 60,
   ERROR: 90,
 }
+/**
+ * Actions exempt from retention, because they are STATE rather than history.
+ *
+ * A direct-create marker is an open obligation: it says an order entered fulfilment and its
+ * allocation coverage has not been verified yet. Deleting it does not age out a record — it
+ * silently discharges the obligation, and the resolver then reads "no marker" as "already
+ * resolved" and can never write the shortfall record (o3d-z82a, Codex review).
+ *
+ * Anything added here must be a row that something else is responsible for CLEARING. A marker
+ * that is resolved is deleted by the resolver, so this exempts only ones still outstanding.
+ */
+const RETAINED_ACTIONS = [DIRECT_CREATE_PENDING_ACTION]
+
 const DELETE_BATCH_SIZE = 10_000
 const DEFAULT_CRON_RUN_RETENTION_DAYS = 90
 
@@ -53,6 +67,7 @@ export async function purgeExpiredActivityLogs() {
             FROM "activity_logs"
             WHERE level = ${level}::"ActivityLogLevel"
               AND "createdAt" < ${cutoff}
+              AND action <> ANY(${RETAINED_ACTIONS}::text[])
             ORDER BY "createdAt" ASC
             LIMIT ${DELETE_BATCH_SIZE}
           )

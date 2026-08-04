@@ -433,15 +433,21 @@ function markerTx(
   orderId: string,
   written: Row[],
   marker: { id: string; metadata: unknown } | null = { id: 'm1', metadata: { orderId, createdAtStatus: 'PICKING' } },
+  currentStatus = 'PICKING',
 ) {
   const deleted: string[] = []
   const tx = {
     activityLog: {
       findFirst: async () => marker,
       create: async ({ data }: { data: Row }) => { written.push(data); return data },
-      delete: async ({ where }: { where: { id: string } }) => { deleted.push(where.id); return { id: where.id } },
+      deleteMany: async ({ where }: { where: { id: string } }) => { deleted.push(where.id); return { count: 1 } },
     },
-    salesOrder: { findUnique: async () => state.orders.find((o) => o.id === orderId) ?? null },
+    salesOrder: {
+      findUnique: async ({ select }: { select?: Record<string, unknown> }) =>
+        select && 'status' in select
+          ? { status: currentStatus }
+          : state.orders.find((o) => o.id === orderId) ?? null,
+    },
   } as never
   return { tx, deleted }
 }
@@ -462,10 +468,9 @@ test('the marker carries the CREATION status, not the current one (o3d-z82a)', a
   assert.deepEqual(marker.metadata, { orderId: 'o30', createdAtStatus: 'PICKING' })
   assert.equal(marker.level, 'WARNING', 'an unresolved marker must itself be visible')
 
-  // The order is SHIPPED by the time the marker is resolved. The record must still be written,
-  // and must still say PICKING.
+  // Still in fulfilment: the record is written, and says PICKING regardless of any later move.
   const written: Row[] = []
-  const { tx, deleted } = markerTx('o30', written, { id: 'm1', metadata: marker.metadata })
+  const { tx, deleted } = markerTx('o30', written, { id: 'm1', metadata: marker.metadata }, 'PACKING')
   const result = await resolveDirectCreateMarker({ tx, orderId: 'o30' })
 
   assert.deepEqual(result, { recorded: true, resolved: true })
@@ -592,4 +597,57 @@ test('the resolver is non-fatal, and keyed on the marker not the status (o3d-z82
   assert.ok(callAt !== -1 && returnAt !== -1 && callAt < returnAt, 'it must run BEFORE the early return')
 
   assert.ok(!source.includes('reconcileAllocationBeforeFulfilment'), 'the importer must NOT re-run allocation')
+})
+
+test('an order that has LEFT fulfilment is cleared without a record (o3d-z82a)', async () => {
+  // Creation status is durable; creation-time COVERAGE is not — it is read at resolve time. A
+  // fully covered order created at PICKING whose first resolve timed out, and which was then
+  // CANCELLED (deleting its allocations), would have the deferred read see zero coverage and
+  // write an authoritative record claiming it was created under-allocated. That is a fabricated
+  // historical claim about a moment we can no longer observe.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  for (const status of ['CANCELLED', 'SHIPPED', 'COMPLETED']) {
+    reset()
+    seedOrder('o40')
+    state.short.add('o40') // reads as short NOW, because allocations are gone
+    const written: Row[] = []
+    const { tx, deleted } = markerTx('o40', written, undefined, status)
+
+    assert.deepEqual(
+      await resolveDirectCreateMarker({ tx, orderId: 'o40' }),
+      { recorded: false, resolved: true },
+      `${status} — the question is moot, so record nothing`,
+    )
+    assert.equal(written.length, 0, 'no fabricated shortfall')
+    assert.deepEqual(deleted, ['m1'], 'but the marker must still be cleared, not left dangling')
+  }
+})
+
+test('clearing the marker cannot roll back the record it was written with (o3d-z82a)', async () => {
+  // `delete` throws when the row is already gone — a concurrent removal would abort the
+  // transaction and lose the shortfall record that had just been written, losing BOTH.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/fulfillment/pre-fulfilment-reallocation.ts'), 'utf8')
+
+  assert.ok(
+    !/tx\.activityLog\.delete\(/.test(source),
+    'the marker must be cleared with deleteMany, so an already-removed row is a no-op',
+  )
+  assert.match(source, /tx\.activityLog\.deleteMany\(\{ where: \{ id: marker\.id \} \}\)/)
+})
+
+test('retention cleanup cannot age out an unresolved marker (o3d-z82a)', async () => {
+  // The marker is STATE, not history: it says an order entered fulfilment and its coverage has
+  // not been verified. Deleting it does not age out a record — it silently discharges the
+  // obligation, and the resolver then reads "no marker" as "already resolved" and can never
+  // write the record. WARNING rows default to 60 days.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/activity-log-cleanup.ts'), 'utf8')
+
+  assert.match(source, /const RETAINED_ACTIONS = \[DIRECT_CREATE_PENDING_ACTION\]/, 'the marker action must be exempt')
+  assert.match(source, /action <> ANY\(\$\{RETAINED_ACTIONS\}::text\[\]\)/, 'and the exemption must be in the DELETE')
+  const at = source.indexOf('DELETE FROM "activity_logs"')
+  assert.ok(source.indexOf('RETAINED_ACTIONS', at) !== -1, 'the exemption must apply to the deleting statement')
 })

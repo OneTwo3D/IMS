@@ -286,15 +286,34 @@ export async function resolveDirectCreateMarker(params: {
   const createdStatus = typeof metadata?.createdAtStatus === 'string' ? metadata.createdAtStatus : null
   if (!createdStatus) return { recorded: false, resolved: false }
 
+  // Creation STATUS is durable; creation-time COVERAGE is not. Coverage is read now, so a
+  // resolve deferred past the order leaving fulfilment would describe a different world: a
+  // fully covered order created at PICKING, whose first resolve timed out and which was then
+  // CANCELLED, has its allocations deleted — and the deferred read would see zero coverage and
+  // write an authoritative record claiming it was created under-allocated (Codex review).
+  //
+  // Once the order has left fulfilment the question is moot either way: cancelled needs no
+  // allocation, and shipped already consumed what it had. So clear the marker and record
+  // nothing, rather than assert something about a moment we can no longer observe.
+  const current = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+  if (!current || !isFulfilmentStatus(current.status)) {
+    await tx.activityLog.deleteMany({ where: { id: marker.id } })
+    return { recorded: false, resolved: true }
+  }
+
   const result = await writeShortfallRecord(tx, orderId, {
     reachedStatus: createdStatus,
     how: `was created directly at ${createdStatus}`,
     metadata: { previousStatus: null, createdAtStatus: createdStatus },
   })
 
-  // Cleared in the SAME transaction as the record. If the record could not be written the
-  // marker survives with it, so the two can never disagree.
-  await tx.activityLog.delete({ where: { id: marker.id } })
+  // Cleared in the SAME transaction as the record, so if the record could not be written the
+  // marker survives with it and the two can never disagree.
+  //
+  // deleteMany, NOT delete: a concurrent deletion of this row would make `delete` throw and
+  // roll back the shortfall record we just wrote, losing BOTH (Codex review). Clearing a marker
+  // that is already gone is exactly the no-op it should be.
+  await tx.activityLog.deleteMany({ where: { id: marker.id } })
   return { recorded: result.recorded, resolved: true }
 }
 
