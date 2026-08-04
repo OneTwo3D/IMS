@@ -28,6 +28,13 @@
  *   SETTINGS_ENCRYPTION_KEY=... DATABASE_URL=postgresql://.../onetwo3d_ims_e2e \
  *     node_modules/.bin/tsx scripts/audit-xero-live-contamination.ts --tenant "Your Live Org Ltd"
  *
+ * The consent step assumes NOTHING about where your browser is. A localhost redirect resolves in
+ * the browser's own machine, so a laptop browser cannot reach a listener on this server — and Xero
+ * allows plain http only for localhost, so a LAN address is not permitted either. The script
+ * therefore waits on the loopback listener AND on stdin at the same time: if the redirect fails to
+ * load, paste the browser's address bar back in and it proceeds. An SSH tunnel
+ * (`ssh -L 53100:localhost:53100 <host>`) makes the listener work directly instead.
+ *
  *   --csv <path>       contamination CSV (default /root/xero-live-e2e-contamination-20260804.csv)
  *   --out <path>       reconciliation CSV to write (default ./xero-live-reconciliation-<date>.csv)
  *   --tenant <name>    which connected organisation to audit; required when >1 is authorised
@@ -42,6 +49,7 @@
  */
 import { Client } from 'pg'
 import { createServer } from 'node:http'
+import { createInterface } from 'node:readline'
 import { createDecipheriv, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 
@@ -195,9 +203,18 @@ function saveToken(token: StoredToken): void {
   chmodSync(TOKEN_FILE, 0o600)
 }
 
-/** Wait for Xero to redirect back to the loopback listener, and hand back the code. */
-function awaitAuthorizationCode(expectedState: string): Promise<string> {
-  return new Promise((resolve, reject) => {
+/**
+ * Wait for Xero to redirect back to the loopback listener, and hand back the code.
+ *
+ * Only reachable when the BROWSER runs on this machine, or through an SSH tunnel
+ * (`ssh -L <port>:localhost:<port> <host>`). A redirect to localhost resolves in the browser's
+ * own machine, so a laptop browser hitting a server-side listener sees nothing — which is why
+ * awaitPastedCode runs alongside this rather than instead of it. Xero permits plain http only for
+ * localhost/127.0.0.1, so pointing the redirect at the server's LAN address is not an option.
+ */
+function awaitAuthorizationCode(expectedState: string): { promise: Promise<string>; cancel: () => void } {
+  let cancel = () => {}
+  const promise = new Promise<string>((resolve, reject) => {
     const server = createServer((req, res) => {
       const url = new URL(req.url ?? '/', `http://localhost:${CALLBACK_PORT}`)
       if (url.pathname !== '/callback') {
@@ -231,9 +248,85 @@ function awaitAuthorizationCode(expectedState: string): Promise<string> {
       server.close()
       resolve(code)
     })
-    server.on('error', reject)
+    // A port already in use must NOT kill the attempt — the paste path still works, and on a
+    // headless box it is the path that was always going to be used.
+    server.on('error', (e) => {
+      console.log(`  (loopback listener unavailable: ${e.message} — use the paste option below)`)
+    })
     server.listen(CALLBACK_PORT)
+    cancel = () => server.close()
   })
+  return { promise, cancel }
+}
+
+/**
+ * The fallback for the normal case: script on a server, browser on a laptop. The redirect fails to
+ * load (nothing listens on the laptop's port), but the address bar still holds ?code=...&state=...,
+ * so the operator can paste the URL straight back. Requires nothing of the network.
+ */
+function awaitPastedCode(expectedState: string): { promise: Promise<string>; cancel: () => void } {
+  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  const promise = new Promise<string>((resolve, reject) => {
+    rl.on('line', (line) => {
+      const input = line.trim()
+      if (!input) return
+
+      let code = input
+      let state: string | null = null
+      // Accept the whole redirect URL, or a bare code for the case where the browser ate it.
+      if (input.includes('code=')) {
+        try {
+          const url = new URL(input.startsWith('http') ? input : `http://localhost/?${input.replace(/^\?/, '')}`)
+          code = url.searchParams.get('code') ?? ''
+          state = url.searchParams.get('state')
+          const error = url.searchParams.get('error')
+          if (error) {
+            reject(new Error(`Xero authorization failed: ${error}`))
+            return
+          }
+        } catch {
+          console.log('  could not parse that as a URL — paste the whole address, or just the code value')
+          return
+        }
+      }
+
+      if (!code) {
+        console.log('  no code found in that input, try again')
+        return
+      }
+      // A mistyped line must not be spent as if it were the code: consuming it ends the run and
+      // forces the whole consent round trip again. Authorization codes are long and unbroken, so
+      // anything with whitespace or obviously too short gets a hint and another chance.
+      if (/\s/.test(code) || code.length < 20) {
+        console.log(`  "${code.slice(0, 40)}" does not look like an authorization code — paste the full`)
+        console.log('  redirect URL from the browser address bar, or just the code= value from it')
+        return
+      }
+      // Only enforceable when the full URL was pasted; a bare code carries no state to check.
+      if (state && state !== expectedState) {
+        reject(new Error('OAuth state mismatch — the pasted URL is not from this authorization attempt'))
+        return
+      }
+      resolve(code)
+    })
+  })
+  return { promise, cancel: () => rl.close() }
+}
+
+/**
+ * Whichever arrives first wins: the loopback callback (browser on this box, or an SSH tunnel) or a
+ * pasted redirect URL (browser anywhere else). The operator does not have to declare which setup
+ * they are in.
+ */
+async function obtainAuthorizationCode(expectedState: string): Promise<string> {
+  const listener = awaitAuthorizationCode(expectedState)
+  const paste = awaitPastedCode(expectedState)
+  try {
+    return await Promise.race([listener.promise, paste.promise])
+  } finally {
+    listener.cancel()
+    paste.cancel()
+  }
 }
 
 async function exchange(
@@ -281,12 +374,20 @@ async function authorize(): Promise<StoredToken> {
 
   console.log('\n--- AUTHORIZE (read-only) ---')
   console.log(`This asks Xero for READ-ONLY scopes:\n  ${AUDIT_SCOPES}`)
-  console.log(`\nThe redirect URI below must be registered on the Xero app first:\n  ${REDIRECT_URI}`)
-  console.log('\nOpen this URL and pick the LIVE organisation:\n')
+  console.log(`\nRegister this redirect URI on the Xero app first (developer.xero.com):\n  ${REDIRECT_URI}`)
+  console.log('\nOpen this URL in a browser and pick the LIVE organisation:\n')
   console.log(authUrl)
-  console.log('\nWaiting for the callback...\n')
+  console.log(`\nThen EITHER:`)
+  console.log(`  (a) if that browser runs on THIS machine, or you opened an SSH tunnel with`)
+  console.log(`      ssh -L ${CALLBACK_PORT}:localhost:${CALLBACK_PORT} <this-host>`)
+  console.log(`      — nothing more to do, the callback lands here automatically; or`)
+  console.log(`  (b) if the browser is elsewhere, the redirect will fail to load ("can't reach this`)
+  console.log(`      page") — that is expected. Copy the FULL address from the browser's address`)
+  console.log(`      bar and paste it below. It contains the code; the failed page load does not`)
+  console.log(`      matter.`)
+  console.log('\nWaiting for the callback, or for a pasted URL...\n')
 
-  const code = await awaitAuthorizationCode(state)
+  const code = await obtainAuthorizationCode(state)
   const t = await exchange(clientId, clientSecret, {
     grant_type: 'authorization_code',
     code,
