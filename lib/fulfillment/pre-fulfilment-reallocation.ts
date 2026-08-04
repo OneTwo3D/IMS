@@ -192,9 +192,23 @@ async function warnEnteringFulfilmentShort(
  *     non-zero count.
  *
  * Either way the order enters fulfilment short with nothing recorded. The ATTEMPT cannot move
- * under the lock, but the DETECTION can and is cheap, so this runs there against the real
- * previous status: whatever else races, an order that actually crosses into fulfilment short
- * is always reported.
+ * under the lock, but the DETECTION can, so this runs there against the real previous status.
+ *
+ * WHAT IT DOES AND DOES NOT GUARANTEE. It closes the two races above: both inputs are read
+ * under the lock, and the record commits with the transition.
+ *
+ * It does NOT guarantee a record when the KIT GRAPH ITSELF changes underneath. Component edits
+ * (app/actions/products.ts) run on the global client, take no order lock and join no
+ * transaction, so a definition replaced between this graph load and the status write leaves
+ * coverage computed against the old shape: an allocation of 1xX reads as complete while the
+ * new definition needs 2xX, and the order commits short unrecorded. No isolation level or
+ * ordering available here closes it — that needs product-structure edits to participate in
+ * order-level locking, which is its own change (o3d-ryyd). Written down rather than glossed,
+ * because an overstated guarantee is worse than a documented gap.
+ *
+ * COST, honestly. Not cheap: it holds the order lock through an order/lines read, one product
+ * query per level of KIT nesting, and the coverage queries. Justified only because it runs
+ * solely on an actual crossing — and the nesting depth is unbounded (o3d-ryyd).
  */
 export async function recordShortfallUnderLock(params: {
   tx: Prisma.TransactionClient
@@ -227,7 +241,7 @@ export async function recordShortfallUnderLock(params: {
   // through it meant claiming recorded:true for a row that may never have been written
   // (Codex review, r3). Inside the transaction the record and the crossing are one atomic
   // fact: if it cannot be written, the transition does not happen either — which is exactly
-  // what "always recorded" has to mean to be worth anything.
+  // what a recording guarantee has to mean to be worth anything.
   await tx.activityLog.create({
     data: {
       entityType: 'SALES_ORDER',
