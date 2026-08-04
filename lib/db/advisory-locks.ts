@@ -73,8 +73,15 @@ export const SWEEP_CURSOR_LOCK_KEY = 918_273_912
  *
  * Affordable precisely because component edits are rare and low-throughput — a kit or BOM
  * definition changes when a human edits it or a CSV import carries a components column, not on
- * any hot path. Serializing them costs nothing measurable and removes an entire class of
- * argument about which subset of products a writer needed to hold.
+ * any hot path. Held for one row's transaction, not a whole import.
+ *
+ * SCOPE, precisely. Taken by the writers that CREATE edges — saveProductComponents and the CSV
+ * component pass — because only those can form a cycle. The delete-only writers (the editor's
+ * and the CSV rename's clearComponents, and the admin reset) deliberately do NOT take it:
+ * removing edges cannot create a cycle, and adding it AFTER their per-SKU lock would invert the
+ * order and create a deadlock. The cost of that omission is that a concurrent delete can make
+ * the walk below transiently reject a write that would have been fine — a false rejection, not
+ * a false acceptance.
  */
 export const COMPONENT_GRAPH_WRITE_LOCK_KEY = 918_274_101
 

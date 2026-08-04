@@ -156,3 +156,55 @@ test('the pre-transaction cycle checks are labelled as preflights (o3d-t0zq)', a
     assert.match(source, /const preflight = await detectComponentCycle\(/, `${path.basename(file)} must name its unlocked check a preflight`)
   }
 })
+
+test('saveProductComponents takes BOTH lock families, graph first (o3d-t0zq)', async () => {
+  // The graph lock alone serializes it against other COMPONENT writers, but the editor and the
+  // CSV conversion paths take only the PER-SKU lock and so never contend with it. An editor
+  // could commit type=SIMPLE and delete the components between the type read and the create,
+  // leaving a SIMPLE product with components (Codex review).
+  const body = await componentWriteBody(PRODUCTS_ACTIONS, 'const conflict = await db.$transaction')
+
+  const graphAt = body.indexOf('COMPONENT_GRAPH_WRITE_LOCK_KEY')
+  const skuAt = body.indexOf('lockProductSkusForWrite')
+  const typeAt = body.indexOf("current.type !== 'KIT'")
+  assert.ok([graphAt, skuAt, typeAt].every((i) => i !== -1), 'both locks and the type check must be present')
+  assert.ok(graphAt < skuAt, 'graph lock first — the same order the CSV pass uses, which is what keeps them deadlock-free')
+  assert.ok(skuAt < typeAt, 'the type must be read once BOTH locks are held, or it is still a TOCTOU')
+})
+
+test('saveProductComponents verifies the sku its lock set was chosen for (o3d-t0zq)', async () => {
+  // `_sku` is read before the transaction. A rename since then means the per-SKU lock is held
+  // for a sku this product no longer has — the same lock-set verification every other writer
+  // in this protocol needs.
+  const body = await componentWriteBody(PRODUCTS_ACTIONS, 'const conflict = await db.$transaction')
+  assert.match(body, /current\.sku !== _sku/, 'the chosen lock set must be verified under the lock')
+  const source = await readFile(PRODUCTS_ACTIONS, 'utf8')
+  assert.match(source, /renamed while saving/, 'a lost lock set must be reported, not silently written through')
+})
+
+test('delete-only writers deliberately do NOT take the graph lock (o3d-t0zq)', async () => {
+  // Not an oversight: removing edges cannot create a cycle, and taking the graph lock AFTER
+  // their per-SKU lock would invert the order and create a deadlock against the writers above.
+  // Pinned so a later "consistency" change cannot quietly introduce that inversion.
+  const [products, importActions] = await Promise.all([
+    readFile(PRODUCTS_ACTIONS, 'utf8'),
+    readFile(IMPORT_ACTIONS, 'utf8'),
+  ])
+
+  // The editor's clearComponents, inside the per-SKU-locked update transaction.
+  const editorAt = products.indexOf('updatedCategoryChange = await db.$transaction')
+  const editorBody = products.slice(editorAt, products.indexOf('await logActivity', editorAt))
+  assert.match(editorBody, /tx\.productComponent\.deleteMany/, 'the editor must still clear components')
+  assert.ok(
+    !editorBody.includes('COMPONENT_GRAPH_WRITE_LOCK_KEY'),
+    'the editor must NOT take the graph lock after its per-SKU lock — that inverts the order',
+  )
+
+  // The CSV rename branch's clearComponents.
+  const renameAt = importActions.indexOf('lockProductSkusForWrite(tx, [sku, existingProduct.sku])')
+  const renameBody = importActions.slice(renameAt, renameAt + 3400)
+  assert.ok(
+    !renameBody.includes('COMPONENT_GRAPH_WRITE_LOCK_KEY'),
+    'the CSV rename must NOT take the graph lock after its per-SKU lock',
+  )
+})

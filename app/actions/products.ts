@@ -1327,6 +1327,14 @@ export async function saveProductComponents(
     const conflict = await db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
 
+      // BOTH families, graph first — the same order the CSV component pass uses, which is what
+      // keeps them deadlock-free. The graph lock alone is not enough: it serializes this
+      // against other COMPONENT writers, but the editor and the CSV conversion paths take only
+      // the PER-SKU lock, so they never contend with it. Without this, an editor could commit
+      // type=SIMPLE and delete the components between the type read below and the create,
+      // leaving a SIMPLE product with components (Codex review).
+      await lockProductSkusForWrite(tx, [_sku])
+
       // Re-checked under the lock, against tx — the preflight above read a graph another
       // writer may since have changed.
       const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId), tx)
@@ -1335,8 +1343,12 @@ export async function saveProductComponents(
 
       // This never checked the product's own type at all, so it would happily write components
       // onto a SIMPLE product — the state o3d-w998 stops the CSV import creating.
-      const current = await tx.product.findUnique({ where: { id: productId }, select: { type: true } })
+      const current = await tx.product.findUnique({ where: { id: productId }, select: { sku: true, type: true } })
       if (!current) return 'missing' as const
+      // The lock set was chosen from `_sku`, read before this transaction. If the product has
+      // been renamed since, the lock is held for a sku it no longer has — locked, but against
+      // the wrong thing.
+      if (current.sku !== _sku) return 'moved' as const
       if (current.type !== 'KIT' && current.type !== 'BOM') return 'not-component-bearing' as const
 
       await tx.productComponent.deleteMany({ where: { productId } })
@@ -1357,6 +1369,9 @@ export async function saveProductComponents(
       return { success: false, error: 'Circular reference detected — a component eventually references this product' }
     }
     if (conflict === 'missing') return { success: false, error: 'Product not found' }
+    if (conflict === 'moved') {
+      return { success: false, error: 'This product was renamed while saving — reload and try again' }
+    }
     if (conflict === 'not-component-bearing') {
       return { success: false, error: 'This product is no longer a kit or BOM, so it cannot have components' }
     }
