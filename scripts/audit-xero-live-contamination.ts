@@ -59,15 +59,31 @@ const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections'
 const XERO_API_BASE = 'https://api.xero.com/api.xro/2.0'
 
 /**
- * READ-ONLY scopes. accounting.transactions.read covers invoices, credit notes, payments AND manual
- * journals. Nothing here grants write access — that is the point.
+ * READ-ONLY scopes, one per endpoint family this audit reads. Nothing here grants write access —
+ * that is the point of the whole script.
+ *
+ * NOT accounting.transactions.read, which is the obvious choice and which Xero REJECTS for this
+ * app with invalid_scope. Probed against the live authorize endpoint: accounting.transactions,
+ * accounting.transactions.read, accounting.journals.read and accounting.reports.read are all
+ * refused, while the granular per-endpoint family below is accepted — the same vocabulary
+ * XERO_REQUESTED_SCOPES already uses (lib/connectors/xero/scopes.ts). Whatever the app was
+ * registered as, that is the vocabulary it has.
+ *
+ *   accounting.invoices.read       Invoices (ACCREC + ACCPAY) AND CreditNotes — scopes.ts:27
+ *                                  records that accounting.invoices spans both.
+ *   accounting.payments.read       Payments.
+ *   accounting.manualjournals.read ManualJournals.
+ *   accounting.contacts.read       Contacts.
+ *   accounting.settings.read       Organisation (incl. the lock dates) and Items.
  */
 const AUDIT_SCOPES = [
   'openid',
   'profile',
   'email',
   'offline_access',
-  'accounting.transactions.read',
+  'accounting.invoices.read',
+  'accounting.payments.read',
+  'accounting.manualjournals.read',
   'accounting.contacts.read',
   'accounting.settings.read',
 ].join(' ')
