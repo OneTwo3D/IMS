@@ -113,7 +113,19 @@ const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}/callback`
 // Secrets: a local copy of lib/secrets' decrypt, so this file imports nothing
 // from the app (see header).
 // ---------------------------------------------------------------------------
-const ENCRYPTED_PREFIX = 'enc:v1:'
+/**
+ * Settings-table ciphertext, per lib/security/encrypted-settings.ts. Two things here are easy to
+ * get wrong and both fail SILENTLY into a wrong secret rather than an error:
+ *
+ *  1. The current prefix is `enc:setting:v1:`, not the legacy `enc:v1:` from lib/secrets.ts. A
+ *     decrypt keyed on the legacy prefix does not throw on a settings value — it falls through and
+ *     returns the CIPHERTEXT as if it were plaintext, which then goes out as the client secret and
+ *     comes back from Xero as an opaque invalid_request.
+ *  2. The settings format binds AAD = `setting:<key>`. Decrypting without it fails the auth tag.
+ */
+const ENCRYPTED_SETTING_PREFIX = 'enc:setting:v1:'
+const DRAFT_ENCRYPTED_SETTING_PREFIX = 'enc:v2:'
+const LEGACY_ENCRYPTED_PREFIX = 'enc:v1:'
 
 function resolveEncryptionKey(): Buffer | null {
   const raw = (process.env.SETTINGS_ENCRYPTION_KEY ?? process.env.ENCRYPTION_KEY ?? '').trim()
@@ -125,12 +137,27 @@ function resolveEncryptionKey(): Buffer | null {
   return utf8.length === 32 ? utf8 : null
 }
 
-function decryptSecret(value: string): string {
-  if (!value.startsWith(ENCRYPTED_PREFIX)) return value
+function decryptSettingValue(settingKey: string, value: string): string {
+  const prefix = value.startsWith(ENCRYPTED_SETTING_PREFIX)
+    ? ENCRYPTED_SETTING_PREFIX
+    : value.startsWith(DRAFT_ENCRYPTED_SETTING_PREFIX)
+      ? DRAFT_ENCRYPTED_SETTING_PREFIX
+      : value.startsWith(LEGACY_ENCRYPTED_PREFIX)
+        ? LEGACY_ENCRYPTED_PREFIX
+        : null
+
+  // Plaintext — xero_client_id is stored unencrypted, so this is a normal path, not a fallback.
+  if (!prefix) return value
+
   const key = resolveEncryptionKey()
-  if (!key) throw new Error('SETTINGS_ENCRYPTION_KEY is required to read xero_client_secret')
-  const payload = Buffer.from(value.slice(ENCRYPTED_PREFIX.length), 'base64')
+  if (!key) throw new Error(`SETTINGS_ENCRYPTION_KEY is required to read ${settingKey}`)
+
+  const payload = Buffer.from(value.slice(prefix.length), 'base64')
   const decipher = createDecipheriv('aes-256-gcm', key, payload.subarray(0, 12))
+  // The legacy lib/secrets format binds no AAD; both settings formats bind the key name.
+  if (prefix !== LEGACY_ENCRYPTED_PREFIX) {
+    decipher.setAAD(Buffer.from(`setting:${settingKey}`, 'utf8'))
+  }
   decipher.setAuthTag(payload.subarray(12, 28))
   return Buffer.concat([decipher.update(payload.subarray(28)), decipher.final()]).toString('utf8')
 }
@@ -199,7 +226,10 @@ async function readCredentials(): Promise<{ clientId: string; clientSecret: stri
     const clientId = map.get('xero_client_id')
     const clientSecret = map.get('xero_client_secret')
     if (!clientId || !clientSecret) throw new Error('xero_client_id / xero_client_secret not found in settings')
-    return { clientId: decryptSecret(clientId), clientSecret: decryptSecret(clientSecret) }
+    return {
+      clientId: decryptSettingValue('xero_client_id', clientId),
+      clientSecret: decryptSettingValue('xero_client_secret', clientSecret),
+    }
   } finally {
     await db.end()
   }
