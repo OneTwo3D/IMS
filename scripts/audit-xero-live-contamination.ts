@@ -276,14 +276,44 @@ function awaitAuthorizationCode(expectedState: string): { promise: Promise<strin
 }
 
 /**
+ * ONE readline over stdin for the whole run. Two separate prompts read from it — the pasted
+ * redirect URL, then the choice of organisation — and closing it after the first would make the
+ * second unreadable, so it is created once and closed only when authorization is finished.
+ */
+let sharedRl: ReturnType<typeof createInterface> | null = null
+function sharedStdin() {
+  if (!sharedRl) sharedRl = createInterface({ input: process.stdin, output: process.stdout })
+  return sharedRl
+}
+function closeSharedStdin() {
+  sharedRl?.close()
+  sharedRl = null
+}
+
+/** Read a single line, for prompts that come after the authorization code. */
+function askLine(): Promise<string> {
+  const rl = sharedStdin()
+  return new Promise((resolve) => {
+    const onLine = (line: string) => {
+      const value = line.trim()
+      if (!value) return
+      rl.off('line', onLine)
+      resolve(value)
+    }
+    rl.on('line', onLine)
+  })
+}
+
+/**
  * The fallback for the normal case: script on a server, browser on a laptop. The redirect fails to
  * load (nothing listens on the laptop's port), but the address bar still holds ?code=...&state=...,
  * so the operator can paste the URL straight back. Requires nothing of the network.
  */
 function awaitPastedCode(expectedState: string): { promise: Promise<string>; cancel: () => void } {
-  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  const rl = sharedStdin()
+  let cancelPaste = () => {}
   const promise = new Promise<string>((resolve, reject) => {
-    rl.on('line', (line) => {
+    const onLine = (line: string) => {
       const input = line.trim()
       if (!input) return
 
@@ -324,9 +354,13 @@ function awaitPastedCode(expectedState: string): { promise: Promise<string>; can
         return
       }
       resolve(code)
-    })
+    }
+    rl.on('line', onLine)
+    // Detach the listener rather than closing stdin: the same channel is used again straight
+    // after, to choose which connected organisation to audit.
+    cancelPaste = () => rl.off('line', onLine)
   })
-  return { promise, cancel: () => rl.close() }
+  return { promise, cancel: () => cancelPaste() }
 }
 
 /**
@@ -426,10 +460,27 @@ async function authorize(): Promise<StoredToken> {
     }
     conn = match
   } else if (connections.length > 1) {
-    throw new Error(
-      `${connections.length} organisations are authorised — pass --tenant "<name>" to choose. ` +
-        `Authorised: ${connections.map((c) => c.tenantName).join(', ')}`,
-    )
+    // ASK rather than abort. Consent is expensive here — every authorization re-establishes a
+    // connection to the live organisation — so throwing at this point would waste the whole round
+    // trip over a name we can simply read out and let the operator pick from.
+    console.log(`\n${connections.length} organisations are authorised for this app:\n`)
+    connections.forEach((c, i) => console.log(`  ${i + 1}) ${c.tenantName}   [${c.tenantId}]`))
+    console.log('\nEnter the NUMBER of the organisation to audit (the LIVE one, not Demo):')
+    for (;;) {
+      const answer = await askLine()
+      const pick = Number(answer)
+      if (Number.isInteger(pick) && pick >= 1 && pick <= connections.length) {
+        conn = connections[pick - 1]
+        break
+      }
+      const byName = connections.find((c) => c.tenantName === answer)
+      if (byName) {
+        conn = byName
+        break
+      }
+      console.log(`  "${answer}" is not one of 1..${connections.length} or an exact name — try again`)
+    }
+    console.log(`\nSelected: ${conn.tenantName}`)
   }
 
   const token: StoredToken = {
@@ -440,6 +491,8 @@ async function authorize(): Promise<StoredToken> {
     expiresAt: Date.now() + t.expires_in * 1000,
   }
   saveToken(token)
+  // Nothing else reads stdin; leaving it open would hold the process alive after the sweep.
+  closeSharedStdin()
   return token
 }
 
