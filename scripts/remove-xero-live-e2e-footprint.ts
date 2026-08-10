@@ -50,6 +50,9 @@ const XERO_API_BASE = 'https://api.xero.com/api.xro/2.0'
 const WRITE_SCOPES = [
   'openid', 'profile', 'email', 'offline_access',
   'accounting.invoices',
+  // A credit note can carry a REFUND payment, which blocks the void exactly as an allocation does.
+  // Deleting one needs its own scope: accounting.invoices does not reach /Payments.
+  'accounting.payments',
   'accounting.contacts',
   'accounting.settings',
 ].join(' ')
@@ -288,7 +291,7 @@ async function pageAll<T>(token: Token, path: string, key: string, maxPages = 25
 }
 
 // ---------------------------------------------------------------------------
-type CreditNote = { CreditNoteID: string; CreditNoteNumber?: string; Status: string; Total?: number; Contact?: { Name?: string }; Allocations?: Array<{ AllocationID?: string; Amount: number; Invoice?: { InvoiceID: string } }> }
+type CreditNote = { CreditNoteID: string; CreditNoteNumber?: string; Status: string; Total?: number; Contact?: { Name?: string }; Allocations?: Array<{ AllocationID?: string; Amount: number; Invoice?: { InvoiceID: string } }>; Payments?: Array<{ PaymentID: string; Amount: number }> }
 type Invoice = { InvoiceID: string; InvoiceNumber?: string; Status: string; Total?: number; Contact?: { Name?: string }; Payments?: Array<{ PaymentID: string }>; CreditNotes?: Array<{ CreditNoteID: string }> }
 type Contact = { ContactID: string; Name: string; ContactStatus: string }
 type Item = { ItemID: string; Code: string }
@@ -296,7 +299,7 @@ type Item = { ItemID: string; Code: string }
 const isE2eContact = (name?: string) => !!name && name.startsWith(CONTACT_PREFIX)
 const TERMINAL = new Set(['VOIDED', 'DELETED'])
 
-const stats = { allocationsDeleted: 0, creditNotesVoided: 0, invoicesVoided: 0, contactsArchived: 0, itemsDeleted: 0, skipped: 0, failed: 0 }
+const stats = { allocationsDeleted: 0, refundsDeleted: 0, creditNotesVoided: 0, invoicesVoided: 0, contactsArchived: 0, itemsDeleted: 0, skipped: 0, failed: 0 }
 const failures: string[] = []
 
 function act(what: string): void {
@@ -357,6 +360,16 @@ async function main() {
         const res = await xero(token, 'DELETE', `CreditNotes/${cn.CreditNoteID}/Allocations/${alloc.AllocationID}`)
         if (res.ok) stats.allocationsDeleted++
         else { stats.failed++; failures.push(`allocation ${alloc.AllocationID} on ${cn.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
+      }
+
+      // A refund paid out against the credit note blocks the void the same way an allocation does.
+      // Xero has no DELETE verb for a payment — the reversal is a POST moving it to DELETED.
+      for (const payment of cn.Payments ?? []) {
+        act(`delete refund payment ${payment.PaymentID} (${payment.Amount}) on ${cn.CreditNoteNumber}`)
+        if (!APPLY) { stats.refundsDeleted++; continue }
+        const res = await xero(token, 'POST', `Payments/${payment.PaymentID}`, { Status: 'DELETED' })
+        if (res.ok) stats.refundsDeleted++
+        else { stats.failed++; failures.push(`refund ${payment.PaymentID} on ${cn.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
       }
     }
   }
@@ -427,6 +440,7 @@ async function main() {
 
   console.log(`\n=== ${APPLY ? 'APPLIED' : 'DRY RUN'} ===`)
   console.log(`  allocations deleted: ${stats.allocationsDeleted}`)
+  console.log(`  refund payments deleted: ${stats.refundsDeleted}`)
   console.log(`  credit notes voided: ${stats.creditNotesVoided}`)
   console.log(`  invoices voided:     ${stats.invoicesVoided}`)
   console.log(`  contacts archived:   ${stats.contactsArchived}`)
