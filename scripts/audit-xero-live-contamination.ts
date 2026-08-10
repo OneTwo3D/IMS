@@ -674,8 +674,12 @@ async function sweepInvoices(token: StoredToken, rows: ContaminationRow[]): Prom
       continue
     }
     for (const inv of res.data?.Invoices ?? []) {
+      // Never index blind on a server-supplied id. If Xero ignores an unsupported filter it
+      // answers with the WHOLE collection, and a non-null assertion here turns that into a crash
+      // mid-sweep (which is exactly what CreditNotes did).
+      const row = byId.get(inv.InvoiceID)
+      if (!row) continue
       found.add(inv.InvoiceID)
-      const row = byId.get(inv.InvoiceID)!
       // What must be undone BEFORE this invoice can be voided, in Xero's own terms.
       const blockers: string[] = []
       for (const p of inv.Payments ?? []) blockers.push(`payment:${p.PaymentID}`)
@@ -714,7 +718,11 @@ async function sweepCreditNotes(token: StoredToken, rows: ContaminationRow[]): P
   const byId = new Map(rows.map((r) => [r.externalTransactionId, r]))
   const found = new Set<string>()
 
-  // Try the batched IDs filter first; fall back to per-id GETs if this Xero endpoint rejects it.
+  // Try the batched IDs filter first, then verify it was actually HONOURED.
+  //
+  // CreditNotes does not support IDs=. Xero does not reject the unknown parameter — it returns 200
+  // with the org's ENTIRE credit-note collection, which silently looks like success. Detect it by
+  // the only reliable signal available: a returned id that we never asked for.
   let batchWorks = true
   for (const batch of chunk([...byId.keys()], 40)) {
     const res = await xeroGet<{ CreditNotes?: XeroCreditNote[] }>(token, `CreditNotes?IDs=${batch.join(',')}`)
@@ -723,9 +731,17 @@ async function sweepCreditNotes(token: StoredToken, rows: ContaminationRow[]): P
       batchWorks = false
       break
     }
-    for (const cn of res.data?.CreditNotes ?? []) {
+    const returned = res.data?.CreditNotes ?? []
+    if (returned.some((cn) => !byId.has(cn.CreditNoteID))) {
+      console.log('  ! CreditNotes ignored the IDs filter (returned unrequested ids) — falling back to per-id reads')
+      batchWorks = false
+      break
+    }
+    for (const cn of returned) {
+      const row = byId.get(cn.CreditNoteID)
+      if (!row) continue
       found.add(cn.CreditNoteID)
-      findings.push(creditNoteFinding(cn, byId.get(cn.CreditNoteID)!))
+      findings.push(creditNoteFinding(cn, row))
     }
   }
 
