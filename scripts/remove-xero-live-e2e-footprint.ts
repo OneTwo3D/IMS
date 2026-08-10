@@ -303,6 +303,18 @@ function act(what: string): void {
   console.log(`${APPLY ? '  ' : '  [dry-run] '}${what}`)
 }
 
+/**
+ * The terminal status Xero will actually accept for a document, which depends on where it already
+ * is. VOIDED is only reachable from an approved document; a DRAFT or SUBMITTED one must be DELETED
+ * instead, and asking for VOIDED there returns a bare ValidationException that names no field.
+ *
+ * That is what left 13 SUBMITTED credit notes behind on the first pass — the request was simply
+ * the wrong transition for their status, not a permissions or ordering problem.
+ */
+function terminalStatusFor(status: string): 'VOIDED' | 'DELETED' {
+  return status === 'DRAFT' || status === 'SUBMITTED' ? 'DELETED' : 'VOIDED'
+}
+
 async function main() {
   if (!existsSync(READ_TOKEN_FILE)) throw new Error(`No read token at ${READ_TOKEN_FILE}`)
   const readToken = JSON.parse(readFileSync(READ_TOKEN_FILE, 'utf8')) as Token
@@ -311,6 +323,12 @@ async function main() {
   const token: Token = APPLY ? await getWriteToken() : readToken
 
   const org = await xero<{ Organisations?: Array<{ Name: string }> }>(token, 'GET', 'Organisation')
+  // Distinguish "could not ask" from "asked and got the wrong org". Both must stop the run, but
+  // reporting an expired token as connected to "undefined" sends the operator hunting a tenant
+  // mix-up that never happened. Access tokens last 30 minutes.
+  if (!org.ok) {
+    throw new Error(`ABORT: could not read the organisation (HTTP ${org.status}). ${org.status === 401 ? 'The token has expired — re-authorize.' : org.error ?? ''}`)
+  }
   const name = org.data?.Organisations?.[0]?.Name
   if (token.tenantId !== EXPECTED_TENANT_ID || name !== EXPECTED_TENANT_NAME) {
     throw new Error(`ABORT: connected to "${name}" (${token.tenantId}), expected ${EXPECTED_TENANT_NAME} (${EXPECTED_TENANT_ID})`)
@@ -349,9 +367,10 @@ async function main() {
     for (const cn of creditNotes) {
       if (!isE2eContact(cn.Contact?.Name)) { stats.skipped++; continue }
       if (TERMINAL.has(cn.Status)) { stats.skipped++; continue }
-      act(`void credit note ${cn.CreditNoteNumber} (${cn.Status}, ${cn.Total})`)
+      const target = terminalStatusFor(cn.Status)
+      act(`${target === 'DELETED' ? 'delete' : 'void'} credit note ${cn.CreditNoteNumber} (${cn.Status}, ${cn.Total})`)
       if (!APPLY) { stats.creditNotesVoided++; continue }
-      const res = await xero(token, 'POST', `CreditNotes/${cn.CreditNoteID}`, { Status: 'VOIDED' })
+      const res = await xero(token, 'POST', `CreditNotes/${cn.CreditNoteID}`, { Status: target })
       if (res.ok) stats.creditNotesVoided++
       else { stats.failed++; failures.push(`credit note ${cn.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
     }
@@ -363,9 +382,10 @@ async function main() {
     for (const inv of invoices) {
       if (!isE2eContact(inv.Contact?.Name)) { stats.skipped++; continue }
       if (TERMINAL.has(inv.Status)) { stats.skipped++; continue }
-      act(`void invoice ${inv.InvoiceNumber} (${inv.Status}, ${inv.Total})`)
+      const target = terminalStatusFor(inv.Status)
+      act(`${target === 'DELETED' ? 'delete' : 'void'} invoice ${inv.InvoiceNumber} (${inv.Status}, ${inv.Total})`)
       if (!APPLY) { stats.invoicesVoided++; continue }
-      const res = await xero(token, 'POST', `Invoices/${inv.InvoiceID}`, { Status: 'VOIDED' })
+      const res = await xero(token, 'POST', `Invoices/${inv.InvoiceID}`, { Status: target })
       if (res.ok) stats.invoicesVoided++
       else { stats.failed++; failures.push(`invoice ${inv.InvoiceNumber}: HTTP ${res.status} ${res.error}`) }
     }
