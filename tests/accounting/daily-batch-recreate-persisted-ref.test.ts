@@ -208,16 +208,150 @@ test('Xero: a legacy row still sees a digest-suffixed live log for its derived d
   assert.deepEqual(created, [], 'the derived prefix probe must survive the persisted-ref change')
 })
 
-test('Xero: a persisted-ref row ALSO honours a live log found only by the derived shape (o3d-0qoo)', async () => {
+test('Xero: a persisted-ref row is NOT vouched for by another batch\'s log on the stamp date (o3d-0qoo r1)', async () => {
   reset()
   salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: XERO_A1_REF, unearnedRevenueAmount: 120 }]
-  // Nothing under the persisted ref; only the old derived shape. The probe is a UNION, so
-  // the sweep can never see FEWER live logs than it did before the column existed.
+  // The only live log belongs to the 2026-07-21 batch. Our row was staged into the
+  // 2026-07-20 batch and merely STAMPED on the 21st (midnight crossing). This log is
+  // therefore a DIFFERENT batch's, and until o3d-0qoo r1 the derived probe matched it and
+  // suppressed the recreate — the 07-20 journal stayed missing, silently.
   syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21-deadbeef', status: 'SYNCED' }]
 
   await runXeroSweep()
 
-  assert.deepEqual(created, [], 'on ambiguity the sweep must assume a live log and skip')
+  assert.equal(created.length, 1, 'a known identity is only vouched for by its OWN log')
+  assert.equal(created[0].referenceId, XERO_A1_REF)
+  assert.equal(created[0].payload.date, '2026-07-20')
+})
+
+// --- o3d-0qoo r1: the split-batch understatement (Codex adversarial review) ---
+//
+// Xero's live writer stamps `<group>-<date>-<8 hex digest>`, so ONE date can carry several
+// batches — a window split (takeDailyBatchWindow) posts a second batch the same day with a
+// different entity digest. The recreate probe used to widen every bucket to the derived
+// `<group>-<date>` key AND its `<key>-` prefix, which matches BOTH digests. A live A1-D-aaaa
+// then made a MISSING A1-D-bbbb look live: no recreate, no report, an understated ledger.
+
+test('Xero: a SPLIT A1 batch recreates ONLY the missing half (o3d-0qoo r1)', async () => {
+  reset()
+  salesOrderRows.a1 = [
+    // Split one — its log is live.
+    { revenueDeferredDate: new Date('2026-07-20T09:00:00.000Z'), revenueDeferredBatchRef: 'A1-2026-07-20-aaaaaaaa', unearnedRevenueAmount: 100 },
+    { revenueDeferredDate: new Date('2026-07-20T09:00:01.000Z'), revenueDeferredBatchRef: 'A1-2026-07-20-aaaaaaaa', unearnedRevenueAmount: 40 },
+    // Split two — SAME group, SAME date, SAME stamp day, no log at all.
+    { revenueDeferredDate: new Date('2026-07-20T17:30:00.000Z'), revenueDeferredBatchRef: 'A1-2026-07-20-bbbbbbbb', unearnedRevenueAmount: 25 },
+  ]
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-20-aaaaaaaa', status: 'SYNCED' }]
+
+  await runXeroSweep()
+
+  assert.equal(created.length, 1, 'exactly one recreate: the live split must not be re-posted, the missing one must not be skipped')
+  assert.equal(created[0].referenceId, 'A1-2026-07-20-bbbbbbbb', 'the missing split is rebuilt under its OWN identity')
+  assert.equal(created[0].payload.date, '2026-07-20')
+  assert.match(String(created[0].payload.narration), /1 order\(s\), £25\.00/, 'only the missing split\'s value')
+})
+
+test('Xero: a SPLIT A1 batch is skipped entirely once BOTH halves are live (o3d-0qoo r1)', async () => {
+  reset()
+  salesOrderRows.a1 = [
+    { revenueDeferredDate: new Date('2026-07-20T09:00:00.000Z'), revenueDeferredBatchRef: 'A1-2026-07-20-aaaaaaaa', unearnedRevenueAmount: 100 },
+    { revenueDeferredDate: new Date('2026-07-20T17:30:00.000Z'), revenueDeferredBatchRef: 'A1-2026-07-20-bbbbbbbb', unearnedRevenueAmount: 25 },
+  ]
+  syncLogs = [
+    { connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-20-aaaaaaaa', status: 'SYNCED' },
+    { connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-20-bbbbbbbb', status: 'PENDING' },
+  ]
+
+  await runXeroSweep()
+
+  assert.deepEqual(created, [], 'narrowing the probe must not start double-posting live batches')
+})
+
+test('Xero: a SPLIT Group B batch recreates only the missing half, with only its shipments (o3d-0qoo r1)', async () => {
+  reset()
+  shipmentRows = [
+    { id: 'ship-live', shipmentJournalDate: new Date('2026-07-20T09:00:00.000Z'), shipmentJournalBatchRef: 'B-2026-07-20-aaaaaaaa', revenueRecognizedAmount: 60, cogsBatchAmount: 40 },
+    { id: 'ship-missing', shipmentJournalDate: new Date('2026-07-20T19:00:00.000Z'), shipmentJournalBatchRef: 'B-2026-07-20-bbbbbbbb', revenueRecognizedAmount: 10, cogsBatchAmount: 7 },
+  ]
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-07-20-aaaaaaaa', status: 'SYNCED' }]
+
+  await runXeroSweep()
+
+  assert.equal(created.length, 1)
+  assert.equal(created[0].referenceId, 'B-2026-07-20-bbbbbbbb')
+  assert.equal(created[0].payload.date, '2026-07-20')
+  assert.deepEqual(
+    cogsMovements,
+    [{ sourceRef: 'ship-missing', journalDate: '2026-07-20' }],
+    'the live split\'s shipment must not be re-journaled, the missing one must be',
+  )
+})
+
+test('Xero: a SPLIT A2 batch recreates only the missing half (o3d-0qoo r1)', async () => {
+  reset()
+  salesOrderRows.a2 = [
+    { inventoryAllocatedDate: new Date('2026-07-20T09:00:00.000Z'), inventoryAllocatedBatchRef: 'A2-2026-07-20-aaaaaaaa', allocationBatchAmount: 80 },
+    { inventoryAllocatedDate: new Date('2026-07-20T19:00:00.000Z'), inventoryAllocatedBatchRef: 'A2-2026-07-20-bbbbbbbb', allocationBatchAmount: 15 },
+  ]
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: 'A2-2026-07-20-aaaaaaaa', status: 'PENDING' }]
+
+  await runXeroSweep()
+
+  assert.equal(created.length, 1)
+  assert.equal(created[0].referenceId, 'A2-2026-07-20-bbbbbbbb')
+  assert.match(String(created[0].payload.narration), /1 order\(s\), £15\.00/)
+})
+
+// --- The mirror image: the scjz.37 digest probe must SURVIVE for derived identities ---
+
+test('Xero: a LEGACY row on the same date as a live digest-suffixed log is still treated as live (scjz.37, o3d-0qoo r1)', async () => {
+  reset()
+  // Pre-migration row: no persisted ref, so its identity is only APPROXIMATED from the
+  // stamp. The live batch's own referenceId carries a digest we cannot know, so the bare
+  // key never matches it exactly — only the `<key>-` prefix does. Losing that probe would
+  // double-post a journal already in the ledger, which is the failure the narrowing must
+  // not cause.
+  salesOrderRows.a1 = [{ revenueDeferredDate: new Date('2026-07-20T09:00:00.000Z'), revenueDeferredBatchRef: null, unearnedRevenueAmount: 120 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: new Date('2026-07-20T09:00:00.000Z'), inventoryAllocatedBatchRef: null, allocationBatchAmount: 80 }]
+  shipmentRows = [{ id: 'ship-legacy', shipmentJournalDate: new Date('2026-07-20T09:00:00.000Z'), shipmentJournalBatchRef: null, revenueRecognizedAmount: 60, cogsBatchAmount: 40 }]
+  syncLogs = [
+    { connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-20-aaaaaaaa', status: 'SYNCED' },
+    { connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: 'A2-2026-07-20-bbbbbbbb', status: 'SYNCED' },
+    { connector: 'xero', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-07-20-cccccccc', status: 'PENDING' },
+  ]
+
+  await runXeroSweep()
+
+  assert.deepEqual(created, [], 'a bucket with no known identity must keep the wide digest-prefix probe')
+  assert.deepEqual(cogsMovements, [], 'and must not write a duplicate DISPATCH subledger row')
+})
+
+test('Xero: an UNPARSEABLE persisted ref still widens to the derived digest probe (o3d-0qoo r1)', async () => {
+  // Each of these fails parseDailyBatchReference for a different reason — unpadded month,
+  // wrong group prefix, uppercase digest — so the bucket's identity is NOT known and it
+  // must fall back to the wide derived probe rather than trusting the junk string.
+  for (const badRef of ['A1-2026-7-20', 'INVRECON-2026-07-20', 'A1-2026-07-20-ABCDEF12']) {
+    reset()
+    salesOrderRows.a1 = [{ revenueDeferredDate: new Date('2026-07-20T09:00:00.000Z'), revenueDeferredBatchRef: badRef, unearnedRevenueAmount: 120 }]
+    syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-20-aaaaaaaa', status: 'SYNCED' }]
+
+    await runXeroSweep()
+
+    assert.deepEqual(created, [], `an unparseable ref (${badRef}) must not narrow the probe and double-post`)
+  }
+})
+
+test('Xero: an UNPARSEABLE persisted ref is still probed for EXACTLY on top of the derived key (o3d-0qoo r1)', async () => {
+  reset()
+  salesOrderRows.a1 = [{ revenueDeferredDate: new Date('2026-07-20T09:00:00.000Z'), revenueDeferredBatchRef: 'INVRECON-2026-07-20', unearnedRevenueAmount: 120 }]
+  // The live log sits under the junk string ITSELF, a shape neither the bare derived key
+  // 'A1-2026-07-20' nor its 'A1-2026-07-20-' prefix can reach. Only the exact candidate
+  // finds it — proving the unparseable ref is still contributed to `exact`.
+  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'INVRECON-2026-07-20', status: 'SYNCED' }]
+
+  await runXeroSweep()
+
+  assert.deepEqual(created, [], 'an unparseable ref only ever WIDENS its bucket\'s probe')
 })
 
 test('Xero: an unparseable persisted ref falls back to the stamp instead of posting a junk date (o3d-0qoo)', async () => {
@@ -306,14 +440,115 @@ test('QuickBooks: a legacy row with a live log on its derived date is skipped (o
   assert.deepEqual(created, [])
 })
 
-test('QuickBooks: a persisted-ref row ALSO honours a live log found only by the derived shape (o3d-0qoo)', async () => {
+// o3d-0qoo r1 on the QuickBooks side.
+//
+// QuickBooks' live writer stamps the BARE `<group>-<date>` (no entity digest), so two
+// same-date batches share one referenceId and a digest split cannot arise here. The same
+// defect still does: a persisted `A1-2026-07-20` bucket whose rows were stamped after UTC
+// midnight also probed the derived `A1-2026-07-21`, which is a REAL and DIFFERENT daily
+// batch's identity on this connector. A live 07-21 log therefore vouched for a missing
+// 07-20 one, and the 07-20 journal was never rebuilt — the same silent understatement.
+
+test('QuickBooks: a persisted-ref row is NOT vouched for by the NEXT DAY\'s batch log (o3d-0qoo r1)', async () => {
   reset()
   salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: QBO_A1_REF, unearnedRevenueAmount: 120 }]
   syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' }]
 
   await runQboSweep()
 
-  assert.deepEqual(created, [], 'the probe is a UNION — it can never see fewer live logs than before')
+  assert.equal(created.length, 1, 'A1-2026-07-21 is another batch — it cannot stand in for A1-2026-07-20')
+  assert.equal(created[0].referenceId, QBO_A1_REF)
+  assert.equal(created[0].payload.date, '2026-07-20')
+})
+
+test('QuickBooks: one live batch and one missing batch on adjacent days recreates exactly one (o3d-0qoo r1)', async () => {
+  reset()
+  salesOrderRows.a1 = [
+    // Batch 2026-07-20, stamped after midnight. Its log is MISSING.
+    { revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: QBO_A1_REF, unearnedRevenueAmount: 120 },
+    // Batch 2026-07-21, stamped the same day. Its log is LIVE.
+    { revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: 'A1-2026-07-21', unearnedRevenueAmount: 55 },
+  ]
+  syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' }]
+
+  await runQboSweep()
+
+  assert.deepEqual(
+    created.map((log) => [log.referenceId, log.payload.date, log.payload.narration]),
+    [[QBO_A1_REF, '2026-07-20', 'Recreated revenue deferral batch: 1 order(s), £120.00']],
+    'only the missing batch, carrying only its own value',
+  )
+})
+
+test('QuickBooks: a missing Group B batch is not vouched for by the next day\'s live one (o3d-0qoo r1)', async () => {
+  reset()
+  shipmentRows = [
+    { shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: QBO_B_REF, revenueRecognizedAmount: 60, cogsBatchAmount: 40 },
+    { shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: 'B-2026-07-21', revenueRecognizedAmount: 5, cogsBatchAmount: 3 },
+  ]
+  syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-07-21', status: 'SYNCED' }]
+
+  await runQboSweep()
+
+  assert.deepEqual(
+    created.map((log) => [log.type, log.referenceId, log.payload.date]),
+    [['DAILY_BATCH_GROUP_B', QBO_B_REF, '2026-07-20']],
+  )
+})
+
+test('QuickBooks: a missing A2 batch is not vouched for by the next day\'s live one (o3d-0qoo r1)', async () => {
+  reset()
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80 }]
+  syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: 'A2-2026-07-21', status: 'SYNCED' }]
+
+  await runQboSweep()
+
+  assert.equal(created.length, 1)
+  assert.equal(created[0].referenceId, QBO_A2_REF)
+  assert.equal(created[0].payload.date, '2026-07-20')
+})
+
+test('QuickBooks: a persisted-ref batch whose OWN log is live is still skipped (o3d-0qoo r1)', async () => {
+  reset()
+  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: QBO_A1_REF, unearnedRevenueAmount: 120 }]
+  syncLogs = [
+    { connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: QBO_A1_REF, status: 'PENDING' },
+    { connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' },
+  ]
+
+  await runQboSweep()
+
+  assert.deepEqual(created, [], 'narrowing the probe must not start double-posting live batches')
+})
+
+test('QuickBooks: a LEGACY row on the same date as a live log is still treated as live (o3d-0qoo r1)', async () => {
+  reset()
+  // No persisted ref → identity unknown → keeps the wide derived probe. Losing it would
+  // double-post a journal already in the ledger.
+  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: null, unearnedRevenueAmount: 120 }]
+  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: null, allocationBatchAmount: 80 }]
+  shipmentRows = [{ shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: null, revenueRecognizedAmount: 60, cogsBatchAmount: 40 }]
+  syncLogs = [
+    { connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' },
+    { connector: 'quickbooks', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: 'A2-2026-07-21', status: 'SYNCED' },
+    { connector: 'quickbooks', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-07-21', status: 'PENDING' },
+  ]
+
+  await runQboSweep()
+
+  assert.deepEqual(created, [], 'a bucket with no known identity must keep the derived probe')
+})
+
+test('QuickBooks: an UNPARSEABLE persisted ref still widens to the derived probe (o3d-0qoo r1)', async () => {
+  for (const badRef of ['A1-2026-7-20', 'INVRECON-2026-07-20', 'A1-2026-07-20-ABCDEF12']) {
+    reset()
+    salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: badRef, unearnedRevenueAmount: 120 }]
+    syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' }]
+
+    await runQboSweep()
+
+    assert.deepEqual(created, [], `an unparseable ref (${badRef}) must not narrow the probe and double-post`)
+  }
 })
 
 test('QuickBooks: a live log for ANOTHER connector never counts as this one (o3d-0qoo)', async () => {

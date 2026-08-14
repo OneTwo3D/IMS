@@ -1367,12 +1367,20 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         // an immutable, correctly-dated row. The reconciliation reads the ledger (not
         // the live, revaluation-mutated cogsBatchAmount), so a same-window dispatch +
         // revaluation can't double-count. Idempotent per shipment.
+        //
+        // Dated on `today` — the BATCH's date — NOT on shipmentJournalDate (o3d-0qoo r1,
+        // found by Codex). The GL journal above is posted under `today`, while the stamp is
+        // written with a later new Date(); on a midnight-crossing run the two differ, and
+        // the subledger row would land a day after the journal whose value it records.
+        // Reconciliation windows on journalDate, so that gap reads as a real one — and
+        // because this upsert is first-write-wins and keyed per shipment, a row written on
+        // the wrong day can never be corrected by a later run.
         await recordCogsSubledgerMovement(tx, {
           sourceType: 'DISPATCH',
           sourceRef: shipment.id,
           idempotencyKey: `dispatch:${shipment.id}`,
           baseDelta: resultForShipment.cogs,
-          journalDate: shipmentJournalDate,
+          journalDate: today,
         })
       }
 

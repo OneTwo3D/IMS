@@ -86,6 +86,12 @@ export type DailyBatchRecreateBucket<TSummary> = {
   referenceId: string
   /** The payload date: the BATCH's own date, falling back to the stamp key for legacy rows. */
   date: string
+  /**
+   * Where this bucket's identity came from. 'persisted' means `referenceId` IS the id the
+   * batch's log was created under, so the probe can and MUST match it exactly; 'derived'
+   * means the identity was reconstructed from a stage stamp and only approximates it.
+   */
+  identity: 'persisted' | 'derived'
   /** Persisted referenceIds seen on this bucket's rows — matched EXACTLY. */
   exactRefs: Set<string>
   /** Derived `<group>-<date>` keys from this bucket's stage stamps — matched as before. */
@@ -96,25 +102,46 @@ export type DailyBatchRecreateBucket<TSummary> = {
 /**
  * The referenceIds a live-log probe must cover for a bucket.
  *
- * The UNION — persisted AND derived, never one instead of the other — is deliberate and
- * is the safety property of this whole change. The recreate sweep RE-POSTS journals: a
- * live log it fails to see becomes a DUPLICATE journal in the ledger, which nothing can
- * take back out. So the probe must never match a strictly smaller set than it did before
- * the persisted column existed. Over-matching costs a skipped recreate, which an operator
- * can spot and re-run; under-matching costs a double-posted journal.
+ * The recreate sweep RE-POSTS journals, so a live log it fails to see becomes a DUPLICATE
+ * journal nothing can take back out. That argues for probing as widely as possible — but
+ * width has a symmetric failure the other way, and for a bucket whose identity is KNOWN it
+ * is the worse of the two:
+ *
+ *   A split batch writes A1-D-aaaa and A1-D-bbbb on the same date. If the bbbb log is
+ *   missing while aaaa is live, a probe that also matches the derived `A1-D` prefix sees
+ *   aaaa, calls bbbb live, and bbbb's value is NEVER rebuilt — an understated ledger, and
+ *   silent, because the sweep reports nothing to recreate.
+ *
+ * So: a bucket keyed on a PERSISTED reference probes that reference and nothing else. That
+ * is not a narrowing in any meaningful sense — the persisted reference is by construction
+ * the exact id its log was created under (the writers stamp the very string they hand to
+ * createPendingSyncLog), so an exact match sees every log the batch could have. Nothing
+ * rewrites a referenceId after the fact.
+ *
+ * Derived matching — the bare key AND, on Xero, the `<key>-<digest>` prefix that scjz.37
+ * added — is what a bucket gets when its identity is NOT known: pre-migration rows, and
+ * rows whose persisted reference refuses to parse. There, approximating widely is right,
+ * because the alternative is posting a duplicate. An unparseable reference is still added
+ * to `exact` on top, so those buckets only ever widen.
+ *
+ * Found by Codex adversarial review of this change (o3d-0qoo r1).
  */
 export type DailyBatchLiveRefs = {
   /** Matched exactly. */
   exact: string[]
-  /** Matched bare AND (Xero) as a `<key>-<digest>` prefix. */
+  /** Matched bare AND (Xero) as a `<key>-<digest>` prefix. Empty for a persisted identity. */
   derived: string[]
 }
 
 export function dailyBatchLiveRefs(bucket: {
+  identity: 'persisted' | 'derived'
   exactRefs: Set<string>
   derivedRefs: Set<string>
 }): DailyBatchLiveRefs {
-  return { exact: [...bucket.exactRefs], derived: [...bucket.derivedRefs] }
+  return {
+    exact: [...bucket.exactRefs],
+    derived: bucket.identity === 'persisted' ? [] : [...bucket.derivedRefs],
+  }
 }
 
 /**
@@ -123,7 +150,12 @@ export function dailyBatchLiveRefs(bucket: {
  * Bucket key = the persisted reference when it parses, else the derived `<group>-<date>`
  * key (identical to the pre-persistence bucketing, so legacy rows behave exactly as they
  * did). A persisted reference that REFUSES to parse falls back to the derived key too,
- * but is still added to `exactRefs` so the live-log probe only ever widens.
+ * but is still added to `exactRefs` so that bucket's live-log probe only ever widens.
+ *
+ * Splits matter here: two batches of the same group and date differ only by digest, so
+ * they get two buckets and each must be probed on its OWN identity — see
+ * `DailyBatchLiveRefs` for why a shared derived key would let a surviving split silently
+ * suppress a missing one.
  *
  * Returns the bucket's summary for the caller to accumulate into, or null when the row
  * has no usable stage stamp (which the callers' queries already exclude).
@@ -146,6 +178,7 @@ export function foldDailyBatchRow<TSummary>(
     bucket = {
       referenceId: key,
       date: usePersisted ? batchDate! : stampKey,
+      identity: usePersisted ? 'persisted' : 'derived',
       exactRefs: new Set<string>(),
       derivedRefs: new Set<string>(),
       summary: makeSummary(),

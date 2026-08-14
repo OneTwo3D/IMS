@@ -86,10 +86,11 @@ test('foldDailyBatchRow buckets a midnight-crossing row by its BATCH, not its st
   assert.ok(bucket, 'bucketed under the persisted reference')
   assert.equal(bucket.referenceId, 'A2-2026-07-20-1a2b3c4d', 'recreates under the SAME identity')
   assert.equal(bucket.date, '2026-07-20', 'journal date is the batch date, not the stamp date')
+  assert.equal(bucket.identity, 'persisted')
   assert.deepEqual(dailyBatchLiveRefs(bucket), {
     exact: ['A2-2026-07-20-1a2b3c4d'],
-    derived: ['A2-2026-07-21'],
-  }, 'the live-log probe is the UNION — never narrower than the old derived-only probe')
+    derived: [],
+  }, 'a KNOWN identity probes itself and nothing else — the derived key names a different batch')
 })
 
 test('foldDailyBatchRow keeps legacy (unpersisted) rows on the derived key (o3d-0qoo)', () => {
@@ -105,6 +106,7 @@ test('foldDailyBatchRow keeps legacy (unpersisted) rows on the derived key (o3d-
   assert.ok(bucket, 'pre-migration rows behave exactly as before')
   assert.equal(bucket.referenceId, 'A1-2026-07-21')
   assert.equal(bucket.date, '2026-07-21')
+  assert.equal(bucket.identity, 'derived')
   assert.deepEqual(dailyBatchLiveRefs(bucket), { exact: [], derived: ['A1-2026-07-21'] })
 })
 
@@ -120,6 +122,7 @@ test('foldDailyBatchRow falls back for an UNPARSEABLE ref but still widens the p
   const bucket = buckets.get('A1-2026-07-21')
   assert.ok(bucket, 'a ref we cannot understand must not become a journal date')
   assert.equal(bucket.date, '2026-07-21')
+  assert.equal(bucket.identity, 'derived', 'a ref we cannot parse is not an identity we know')
   assert.deepEqual(dailyBatchLiveRefs(bucket), {
     exact: ['garbage'],
     derived: ['A1-2026-07-21'],
@@ -143,12 +146,94 @@ test('foldDailyBatchRow merges rows of one batch and separates split batches (o3
 
   assert.deepEqual([...buckets.keys()], ['B-2026-07-20-aaaaaaaa', 'B-2026-07-20-bbbbbbbb'])
   const first = buckets.get('B-2026-07-20-aaaaaaaa')!
+  const second = buckets.get('B-2026-07-20-bbbbbbbb')!
   assert.equal(first.summary.n, 2, 'both rows of the batch land in one journal')
   assert.equal(first.date, '2026-07-20')
-  assert.deepEqual(dailyBatchLiveRefs(first), {
-    exact: ['B-2026-07-20-aaaaaaaa'],
-    derived: ['B-2026-07-20', 'B-2026-07-21'],
-  }, 'every stamp key the batch touched stays in the probe')
+
+  // What actually protects the split is that neither half's probe can see the other's
+  // log. Both halves share the derived key `B-2026-07-20` (and on Xero the probe widens
+  // that to the `B-2026-07-20-` prefix, which matches BOTH digests), so as long as the
+  // derived key is in either probe a live aaaaaaaa suppresses a missing bbbbbbbb.
+  const firstRefs = dailyBatchLiveRefs(first)
+  const secondRefs = dailyBatchLiveRefs(second)
+  assert.deepEqual(firstRefs, { exact: ['B-2026-07-20-aaaaaaaa'], derived: [] })
+  assert.deepEqual(secondRefs, { exact: ['B-2026-07-20-bbbbbbbb'], derived: [] })
+  const allFirst = [...firstRefs.exact, ...firstRefs.derived]
+  const allSecond = [...secondRefs.exact, ...secondRefs.derived]
+  assert.deepEqual(
+    allFirst.filter((ref) => allSecond.includes(ref)),
+    [],
+    'no probe candidate is shared, so neither split can vouch for the other',
+  )
+  // Stronger than set-disjointness, because the Xero probe also matches `<derived>-`
+  // as a PREFIX: no candidate of one split may prefix-match the other split's identity.
+  for (const candidate of allFirst) {
+    assert.ok(
+      !second.referenceId.startsWith(`${candidate}-`),
+      `${candidate} would prefix-match ${second.referenceId} and silently suppress its recreate`,
+    )
+  }
+  for (const candidate of allSecond) {
+    assert.ok(
+      !first.referenceId.startsWith(`${candidate}-`),
+      `${candidate} would prefix-match ${first.referenceId} and silently suppress its recreate`,
+    )
+  }
+})
+
+test('dailyBatchLiveRefs drops the derived probe for a PERSISTED identity only (o3d-0qoo r1)', () => {
+  // The whole asymmetry in one place. A persisted reference IS the id the log was created
+  // under, so an exact match already sees every log the batch could have; adding the
+  // derived key can only pull in ANOTHER batch's log and suppress a real recreate. A
+  // derived identity has no such guarantee, so it keeps the wide probe — over-matching
+  // there costs a skipped recreate, under-matching costs a double-posted journal.
+  assert.deepEqual(
+    dailyBatchLiveRefs({
+      identity: 'persisted',
+      exactRefs: new Set(['A1-2026-07-20-aaaaaaaa']),
+      derivedRefs: new Set(['A1-2026-07-20', 'A1-2026-07-21']),
+    }),
+    { exact: ['A1-2026-07-20-aaaaaaaa'], derived: [] },
+  )
+  assert.deepEqual(
+    dailyBatchLiveRefs({
+      identity: 'derived',
+      exactRefs: new Set(),
+      derivedRefs: new Set(['A1-2026-07-20', 'A1-2026-07-21']),
+    }),
+    { exact: [], derived: ['A1-2026-07-20', 'A1-2026-07-21'] },
+    'the scjz.37 derived/digest-prefix double-post guard must survive for unknown identities',
+  )
+  assert.deepEqual(
+    dailyBatchLiveRefs({
+      identity: 'derived',
+      exactRefs: new Set(['INVRECON-2026-07-20']),
+      derivedRefs: new Set(['A1-2026-07-20']),
+    }),
+    { exact: ['INVRECON-2026-07-20'], derived: ['A1-2026-07-20'] },
+    'an unparseable persisted ref only ever WIDENS a derived bucket',
+  )
+})
+
+test('foldDailyBatchRow gives two same-date split batches non-overlapping probes (o3d-0qoo r1)', () => {
+  // Two batches, same group, same date, same stamp day — they differ only by digest.
+  // Before the identity split, both probed the shared derived key `A1-2026-07-20`, so a
+  // live aaaaaaaa log made the MISSING bbbbbbbb look live and its value was never rebuilt.
+  const buckets = new Map<string, DailyBatchRecreateBucket<{ n: number }>>()
+  const stagedAt = new Date('2026-07-20T18:00:00.000Z')
+  for (const persistedRef of ['A1-2026-07-20-aaaaaaaa', 'A1-2026-07-20-bbbbbbbb']) {
+    foldDailyBatchRow(buckets, 'A1', { stagedAt, persistedRef }, () => ({ n: 0 }))
+  }
+
+  assert.equal(buckets.size, 2, 'a split is two batches, not one')
+  for (const bucket of buckets.values()) {
+    assert.equal(bucket.identity, 'persisted')
+    assert.deepEqual(dailyBatchLiveRefs(bucket), { exact: [bucket.referenceId], derived: [] })
+    assert.ok(
+      !dailyBatchLiveRefs(bucket).derived.includes('A1-2026-07-20'),
+      'the shared derived key is exactly what let one split vouch for the other',
+    )
+  }
 })
 
 test('foldDailyBatchRow skips a row with no usable stage stamp (o3d-0qoo)', () => {
